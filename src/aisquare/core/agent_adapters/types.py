@@ -542,8 +542,8 @@ class AgentCapabilities:
     one_directory_options: frozenset[str] = frozenset()
     """Options that take one directory each where Claude Code's same spelling takes several
     (Codex's ``--add-dir``): given ``--add-dir a b``, the agent reads ``b`` as its prompt or a
-    command, and Codex exits before its first screen. A spawn and a hand launch refuse a bare
-    word after one's value (:func:`stray_directory`)."""
+    command, and Codex exits before its first screen. A fleet spawn, ``team spawn`` and a hand
+    launch refuse a bare word after one's value (:func:`stray_directory`)."""
 
 
 @dataclass(frozen=True)

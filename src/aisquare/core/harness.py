@@ -1968,9 +1968,8 @@ def parse_env_pairs(pairs: Sequence[str]) -> dict[str, str]:
 def binding_agent(profile: RoleLaunchProfile) -> str:
     """The agent a role binding's arguments are for: the agent it names, else the one its
     ``bin`` runs, else the default agent, which a binding naming neither has always run
-    (``agent_adapters.default_adapter``). Its arguments reach no other agent's launch: a
-    Claude Code binding's ``--effort`` stopped every Codex start of the role at Codex's
-    argument parser."""
+    (``agent_adapters.default_adapter``). Its arguments reach no other agent's launch, whose
+    parser need not take them: Codex's refuses Claude Code's ``--effort``."""
     from aisquare.core.agent_adapters import DEFAULT_AGENT, adapter_for_binary
 
     if profile.agent:

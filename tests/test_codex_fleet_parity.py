@@ -3905,8 +3905,8 @@ def test_a_codex_spawn_takes_add_dir_once_per_directory_and_a_resume_after_one(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The role's ``--add-dir a`` is followed on the window's line by the resume's own
-    subcommand, which its ``aisquare launch`` hands Codex as it is."""
+    """This test reads the window's line and the argv its launch execs for a resumed Codex
+    spawn whose role passes ``--add-dir a`` and whose spawn passes ``--add-dir b``."""
     config = load_config()
     config.fleet.roles["coder"] = FleetRoleSettings(
         worktree=False, agent_args={"codex": ["--add-dir", "a"]}
@@ -3980,8 +3980,8 @@ def test_the_accounts_rung_crossing_a_claude_bound_role_to_codex_leaves_its_bind
     project: ProjectInfo,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No ``--agent``: both Claude Code accounts at 97 % of their week, both Codex accounts
-    with room, so the accounts rung sends the reviewer to Codex."""
+    """This test reads the window line of a reviewer spawn with no ``--agent``, both Claude
+    Code accounts at 97 % of their week and both Codex accounts with room."""
     from tests.test_the_spawn_dialogs_account_is_the_one_its_spawn_runs_on import (
         _home,
         _reading,

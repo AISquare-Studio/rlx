@@ -338,7 +338,8 @@ def resolve(
         and not (source == "user" and adapter.id == default_adapter().id)
     ):
         raise UnknownWrapperError(chosen_binary.binary, role)
-    # The binding's arguments for the agent chosen, none of another's (`harness.binding_agent`).
+    # Read once the agent is chosen: a binding's arguments are its own agent's alone
+    # (`harness.binding_agent`).
     profile = harness.resolve_profile(
         role, env_overrides=env_overrides, extra_args=extra_args, agent=adapter.id
     )
