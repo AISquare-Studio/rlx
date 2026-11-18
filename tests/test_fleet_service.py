@@ -14354,7 +14354,10 @@ def _found_dead(project: ProjectInfo, by: str) -> None:
             id="codex",
         ),
         pytest.param(
-            COMMANDER_REFUSAL, 1, "coder-1 exited (1): error: unknown option '--add-dirs'", id="claude"
+            COMMANDER_REFUSAL,
+            1,
+            "coder-1 exited (1): error: unknown option '--add-dirs'",
+            id="claude",
         ),
         pytest.param(CLAP_REFUSAL, 0, "coder-1 exited (0)", id="clean-exit"),
         pytest.param(["Goodbye.", ""], 2, "coder-1 exited (2)", id="no-error-line"),
