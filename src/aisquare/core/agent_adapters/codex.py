@@ -849,6 +849,8 @@ class CodexAdapter:
                 "-o",
             }
         ),
+        # `--add-dir <DIR>` (0.167.0's help): `--add-dir a b` exited 2 before its first screen.
+        one_directory_options=frozenset({"--add-dir"}),
         switch_options=frozenset(
             {
                 "--no-alt-screen",
@@ -1366,19 +1368,11 @@ class CodexAdapter:
         reviewer = harness.base_role(role) == "reviewer"
         native_sandbox, native_approval = _native_approvals(native)
         if approve_for_me:
-            clash = (
-                f"--sandbox {sandbox}"
-                if sandbox not in (None, "", "workspace-write")
-                else f"--ask-for-approval {approval}"
-                if approval is not None
-                else native_sandbox or native_approval
+            refusal = _approve_for_me_refusal(
+                role, sandbox, approval, native_sandbox or native_approval
             )
-            if clash is not None:
-                raise ValueError(
-                    f"Codex --approve-for-me reviews approvals in the workspace-write sandbox "
-                    f"and cannot run with {clash}; set fleet.roles.{role}.approve_for_me = "
-                    "false to use it"
-                )
+            if refusal is not None:
+                raise ValueError(refusal)
             return ["--approve-for-me", *self._sandbox("workspace", native)]
         if sandbox is None:
             sandbox = "read-only" if reviewer else "workspace-write"
@@ -2144,6 +2138,45 @@ def _native_approvals(args: Sequence[str]) -> tuple[str | None, str | None]:
         for value in option_values(args, option):
             approval = approval or f"{option} {value}"
     return sandbox, approval
+
+
+def _approve_for_me_refusal(
+    role: str, sandbox: str | None, approval: str | None, native: str | None
+) -> str | None:
+    """Why ``fleet.roles.<role>.approve_for_me = true`` cannot run beside the role's own
+    ``sandbox`` or ``approval_policy``, or beside ``native``, the option its arguments choose
+    either with (:func:`_native_approvals`); ``None`` when nothing clashes. asq passes no
+    ``--sandbox`` for the read-only sandbox and no policy flag for its reviewer, so the
+    refusal names the setting, and the ``permission`` that runs that sandbox or policy with
+    Codex's reviewer where there is one; ``approve_for_me = false`` gives the approvals to
+    the person."""
+    key = f"fleet.roles.{role}"
+    lead = (
+        f"Codex reviews approvals itself only in the workspace-write sandbox, so "
+        f"{key}.approve_for_me = true"
+    )
+    yourself = f"set {key}.approve_for_me = false to answer its approvals yourself"
+
+    def reviewed(scope: WriteScope) -> str:
+        permission = json.dumps(str(PermissionIntent(scope, "auto")))
+        return f"set {key}.permission = {permission} to run it with Codex's reviewer, or {yourself}"
+
+    if sandbox not in (None, "", "workspace-write"):
+        scope = _SCOPES.get(sandbox)
+        return f"{lead} cannot go with {key}.sandbox = {json.dumps(sandbox)}: " + (
+            reviewed(scope) if scope is not None else yourself
+        )
+    if approval == "never":
+        return (
+            f'{lead} cannot go with {key}.approval_policy = "never", under which Codex asks '
+            "for no approval: unset one of them"
+        )
+    if approval is not None:
+        policy = json.dumps(approval)
+        return f"{lead} cannot go with {key}.approval_policy = {policy}: {reviewed('workspace')}"
+    if native is not None:
+        return f"{lead} cannot run with {native} in its arguments: drop it, or {yourself}"
+    return None
 
 
 def _native_setting(args: Sequence[str], keys: Sequence[str]) -> str | None:

@@ -188,6 +188,36 @@ class TestResolveProfile:
         monkeypatch.setattr("aisquare.core.config.load_config", explode)
         assert harness.resolve_profile(ROLE).is_empty
 
+    @pytest.mark.parametrize(
+        ("binding", "owner", "other"),
+        [
+            pytest.param({}, "claude-code", "codex", id="names-neither"),
+            pytest.param({"agent": "codex"}, "codex", "claude-code", id="names-codex"),
+            pytest.param({"bin": "/opt/bin/codex"}, "codex", "claude-code", id="runs-codex"),
+            pytest.param({"bin": "claude2"}, "claude-code", "codex", id="a-wrapper"),
+        ],
+    )
+    def test_the_bindings_args_reach_a_launch_of_its_own_agent_alone(
+        self, binding: dict[str, str], owner: str, other: str
+    ) -> None:
+        """This test reads a binding that names no agent and no bin, one naming Codex, one whose
+        bin runs Codex and a wrapper's, each for a launch of its own agent and of the other."""
+        args = ["--model", "claude-opus-5-5[1m]", "--effort", "xhigh"]
+        _bind(ROLE, args=args, **binding)
+        assert harness.binding_agent(load_config().team.profiles[ROLE]) == owner
+        own = harness.resolve_profile(ROLE, extra_args=["-p", "go"], agent=owner)
+        assert (own.args, own.args_for) == ([*args, "-p", "go"], None)
+        theirs = harness.resolve_profile(ROLE, extra_args=["-p", "go"], agent=other)
+        assert (theirs.args, theirs.args_for) == (["-p", "go"], owner)
+        assert harness.binding_args(ROLE, owner) == args
+        assert harness.binding_args(ROLE, other) == []
+
+    def test_a_record_with_no_agent_reads_the_default_agents_binding_args(self) -> None:
+        _bind(ROLE, args=["--effort", "xhigh"])
+        assert harness.binding_args(ROLE, None) == ["--effort", "xhigh"]
+        _bind(ROLE, args=["--search"], agent="codex")
+        assert harness.binding_args(ROLE, None) == []
+
 
 class TestNoPathIsEverInferred:
     def test_a_bare_name_is_not_turned_into_a_directory(self) -> None:

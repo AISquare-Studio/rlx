@@ -19,6 +19,7 @@ from aisquare.core.agent_adapters import (
     adapter_for_binary,
     default_adapter,
     get_adapter,
+    recorded_adapter,
 )
 from aisquare.core.agent_adapters.types import (
     AgentAdapter,
@@ -253,7 +254,6 @@ def resolve(
     which keeps the launch on it, so no other agent's account takes it for its room. A launch
     that names a model no agent claims passes ``measure=False``: the order alone, no
     crossing (review r29 of #113, m1, and its delta's)."""
-    profile = harness.resolve_profile(role, env_overrides=env_overrides, extra_args=extra_args)
     chosen_binary = harness.resolve_binary(role, override=binary)
     try:
         config = load_config()
@@ -338,6 +338,10 @@ def resolve(
         and not (source == "user" and adapter.id == default_adapter().id)
     ):
         raise UnknownWrapperError(chosen_binary.binary, role)
+    # The binding's arguments for the agent chosen, none of another's (`harness.binding_agent`).
+    profile = harness.resolve_profile(
+        role, env_overrides=env_overrides, extra_args=extra_args, agent=adapter.id
+    )
     effective_env = {**os.environ, **profile.env}
     return ResolvedAgent(
         adapter,
@@ -348,6 +352,19 @@ def resolve(
         # written, as every reader names it: core.agents._claude_home).
         adapter.config_dir(agents._home(), effective_env),
         pick if source == "accounts" else None,
+    )
+
+
+def binding_left_out(selected: ResolvedAgent, role: str) -> str | None:
+    """What a launch of ``role`` says when its binding's arguments are another agent's and it
+    starts without them (``LaunchProfile.args_for``); ``None`` when it does not."""
+    owner = selected.profile.args_for
+    if owner is None:
+        return None
+    named = recorded_adapter(owner)
+    return (
+        f"team.profiles.{role}.args are {named.label if named else owner}'s, so "
+        f"{selected.adapter.label} starts without them"
     )
 
 

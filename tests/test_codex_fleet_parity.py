@@ -55,12 +55,14 @@ from aisquare.core.keys import Drop, Translation, translate
 from aisquare.core.store import SqliteStore, store_session
 from aisquare.models import (
     ClaudeAccount,
+    ClaudeUsage,
     FleetAgent,
     FleetAgentStatus,
     LaunchSpec,
     ProjectInfo,
     TeamSession,
     TeamTask,
+    UsageWindow,
 )
 from aisquare.services import (
     agent_events,
@@ -3859,6 +3861,228 @@ def test_a_codex_spawn_passes_each_option_once_its_own_over_its_roles_and_its_bi
     replayed = _spawn_native(tmux)
     assert [arg for arg in replayed if arg in {"--model", "-m"}] == ["--model"], replayed
     assert _pair(replayed, "--model") == "gpt-own" and replayed.count("--search") == 1, replayed
+
+
+@pytest.mark.parametrize(
+    ("own", "role", "bound"),
+    [
+        pytest.param(["--add-dir", "a", "b"], [], [], id="spawn"),
+        pytest.param(["--add-dir=a", "b"], [], [], id="spawn-joined"),
+        pytest.param([], ["--add-dir", "a", "b"], [], id="role"),
+        pytest.param([], [], ["--add-dir", "a", "b"], id="binding"),
+    ],
+)
+def test_a_codex_spawn_given_claude_codes_add_dir_spelling_is_refused_before_a_window(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    own: list[str],
+    role: list[str],
+    bound: list[str],
+) -> None:
+    """This test reads the spawn's own arguments, the role's ``agent_args`` and a Codex
+    binding's, each holding ``--add-dir a b``."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": role})
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=bound)
+    save_config(config)
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.spawn(project, "coder", agent="codex", agent_args=own)
+    assert str(refused.value) == (
+        "Codex takes one directory per --add-dir, so 'b' after --add-dir a would reach it as "
+        "its prompt or a command: give --add-dir before each directory"
+    )
+    assert tmux.spawned == []
+
+
+def test_a_codex_spawn_takes_add_dir_once_per_directory_and_a_resume_after_one(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The role's ``--add-dir a`` is followed on the window's line by the resume's own
+    subcommand, which its ``aisquare launch`` hands Codex as it is."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(
+        worktree=False, agent_args={"codex": ["--add-dir", "a"]}
+    )
+    save_config(config)
+    resume = fleet_service.ResumeSpec(
+        session_id=THREAD_ONE, transcript_path=tmp_path / "rollout.jsonl"
+    )
+    fleet_service.spawn(
+        project, "coder", agent="codex", agent_args=["--add-dir", "b"], resume=resume
+    )
+    native = _spawn_native(tmux)
+    at = native.index("--add-dir")
+    assert native[at : at + 6] == ["--add-dir", "a", "resume", THREAD_ONE, "--add-dir", "b"]
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    agent_core.install_hooks("codex", home)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    environment = tmux.spawned[-1]["env"]
+    assert isinstance(environment, dict)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    argv = _launched_argv(_command(tmux), runner, monkeypatch)
+    at = argv.index("--add-dir")
+    assert argv[at : at + 6] == ["--add-dir", "a", "resume", THREAD_ONE, "--add-dir", "b"]
+
+
+#: The live machine's role bindings: Claude Code's model and effort, no agent named.
+CLAUDE_BINDING = ["--model", "claude-opus-5-5[1m]", "--effort", "xhigh"]
+
+
+def _claude_bound(role: str) -> None:
+    config = load_config()
+    config.fleet.roles[role] = FleetRoleSettings(worktree=False)
+    config.team.profiles[role] = RoleLaunchProfile(args=CLAUDE_BINDING)
+    save_config(config)
+
+
+@pytest.mark.parametrize("role", ["coder", "reviewer"])
+def test_a_codex_spawn_of_a_claude_bound_role_runs_without_its_binding_and_says_so(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    role: str,
+) -> None:
+    """This test reads the window line and the receipt of a Codex spawn and a Claude Code
+    spawn of the role, and what ``role_pin`` shows for each agent."""
+    _claude_bound(role)
+    receipt = fleet_service.spawn(project, role, agent="codex")
+    native = _spawn_native(tmux)
+    assert not {"--effort", "xhigh", "claude-opus-5-5[1m]"} & set(native), native
+    assert (
+        f"team.profiles.{role}.args are Claude Code's, so Codex starts without them"
+        in receipt.notes
+    ), receipt.notes
+    assert fleet_service.role_pin(role, agent="codex") == model_memory.Pick()
+    claude = fleet_service.spawn(project, role, agent="claude-code", label=f"{role}-claude")
+    line = _native(_command(tmux))
+    assert {"--effort", "xhigh", "claude-opus-5-5[1m]"} <= set(line), line
+    assert not any("starts without them" in note for note in claude.notes), claude.notes
+    assert fleet_service.role_pin(role, agent="claude-code") == model_memory.Pick(
+        "claude-opus-5-5[1m]", "xhigh"
+    )
+
+
+def test_the_accounts_rung_crossing_a_claude_bound_role_to_codex_leaves_its_binding(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``--agent``: both Claude Code accounts at 97 % of their week, both Codex accounts
+    with room, so the accounts rung sends the reviewer to Codex."""
+    from tests.test_the_spawn_dialogs_account_is_the_one_its_spawn_runs_on import (
+        _home,
+        _reading,
+    )
+
+    home = _home()
+    resets = datetime.now(tz=UTC) + timedelta(days=3)
+    busy = ClaudeUsage(
+        available=True,
+        windows=(
+            UsageWindow(name="session", minutes=300, used_percent=97.0, resets_at=resets),
+            UsageWindow(name="week", minutes=10080, used_percent=97.0, resets_at=resets),
+        ),
+    )
+    readings = {
+        home["work"].slot: busy,
+        home["spare"].slot: busy,
+        home["codex-a"].slot: _reading(),
+        home["codex-b"].slot: _reading(),
+    }
+
+    def cached(accounts: Any, **_: Any) -> dict[int, Any]:
+        return {account.slot: readings[account.slot] for account in accounts}
+
+    monkeypatch.setattr(accounts_service, "cached_usage", cached)
+    monkeypatch.setattr(accounts_service, "read_usage", lambda accounts, **_: cached(accounts))
+    _claude_bound("reviewer")
+    receipt = fleet_service.spawn(project, "reviewer")
+    native = _spawn_native(tmux)
+    assert receipt.agent.agent == "codex"
+    assert not {"--effort", "xhigh", "claude-opus-5-5[1m]"} & set(native), native
+
+
+def test_team_spawn_of_a_claude_bound_role_as_codex_prints_none_of_its_binding(
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    runner: CliRunner,
+) -> None:
+    _claude_bound("reviewer")
+    result = runner.invoke(app, ["team", "spawn", "reviewer", "--agent", "codex"])
+    assert result.exit_code == 0, result.output
+    assert not {"--effort", "xhigh", "claude-opus-5-5[1m]"} & set(result.stdout.split())
+    assert "claude-opus-5-5[1m]" not in result.stdout, result.stdout
+    assert (
+        "team.profiles.reviewer.args are Claude Code's, so Codex starts without them"
+        in result.stderr
+    ), result.stderr
+
+
+@pytest.mark.parametrize("execs", [False, True], ids=["prints", "execs"])
+def test_team_spawn_of_codex_given_claude_codes_add_dir_spelling_is_refused(
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    execs: bool,
+) -> None:
+    executed = Mock()
+    monkeypatch.setattr(os, "execvpe", executed)
+    line = ["--arg=--add-dir", "--arg=a", "--arg=b", *(["--exec"] if execs else [])]
+    result = runner.invoke(app, ["team", "spawn", "coder", "--agent", "codex", *line])
+    assert result.exit_code != 0
+    assert (
+        "Codex takes one directory per --add-dir, so 'b' after --add-dir a would reach it as its "
+        "prompt or a command: give --add-dir before each directory"
+    ) in " ".join(result.output.split())
+    assert "aisquare launch" not in result.stdout and "rlx launch" not in result.stdout
+    executed.assert_not_called()
+
+
+def test_what_a_codex_row_ran_reads_no_claude_binding(tmp_path: Path) -> None:
+    """This test reads ``model_memory``'s launch flags of a Codex row and a Claude Code row, and
+    the models chosen for a session of each, with a binding naming no agent."""
+    _claude_bound("coder")
+    now = datetime.now(tz=UTC)
+    for agent, ran in (
+        ("codex", model_memory.Pick()),
+        ("claude-code", model_memory.Pick("claude-opus-5-5[1m]", "xhigh")),
+    ):
+        row = FleetAgent(
+            id=f"row-{agent}",
+            project_id="p",
+            label="coder",
+            role="coder",
+            agent=agent,
+            pane_id="%1",
+            cwd=tmp_path,
+            created_at=now,
+            launch_spec=LaunchSpec(binary=agent, extra_args=[]),
+        )
+        assert model_memory._launch_flags(row) == ran
+        session = TeamSession(
+            id=f"s-{agent}",
+            project_id="p",
+            role="coder",
+            agent=agent,
+            started_at=now,
+            last_seen_at=now,
+        )
+        chosen = model_memory.chosen_models(session)
+        assert ("claude-opus-5-5[1m]" in chosen) == (agent == "claude-code"), chosen
 
 
 @pytest.mark.parametrize(

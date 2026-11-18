@@ -68,7 +68,7 @@ from aisquare.core import program as prog
 from aisquare.core.paths import aisquare_home, cache_dir, expand_user
 
 if TYPE_CHECKING:  # runtime import stays lazy: config imports harness back
-    from aisquare.core.config import FleetSettings, TeamSettings
+    from aisquare.core.config import FleetSettings, RoleLaunchProfile, TeamSettings
 
 _OFF_VALUES = {"0", "false", "no", "off"}
 PROBE_TIMEOUT_SECONDS = 150
@@ -1893,6 +1893,9 @@ class LaunchProfile(BaseModel):
     #: seat on the DEFAULT install while reporting success, so the caller MUST
     #: surface this. See the no-silent-fail-soft rule.
     notice: str | None = None
+    #: The agent the binding's args are for, when this launch runs another and they were
+    #: left out (:func:`resolve_profile`'s ``agent``): the callers say so.
+    args_for: str | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -1962,13 +1965,32 @@ def parse_env_pairs(pairs: Sequence[str]) -> dict[str, str]:
     return parsed
 
 
-def binding_args(role: str) -> list[str]:
-    """The arguments ``role``'s binding adds to every launch (``team bind --arg``), as
-    :func:`resolve_profile` gives them, without reading its bound files; none when the config
-    cannot be read."""
+def binding_agent(profile: RoleLaunchProfile) -> str:
+    """The agent a role binding's arguments are for: the agent it names, else the one its
+    ``bin`` runs, else the default agent, which a binding naming neither has always run
+    (``agent_adapters.default_adapter``). Its arguments reach no other agent's launch: a
+    Claude Code binding's ``--effort`` stopped every Codex start of the role at Codex's
+    argument parser."""
+    from aisquare.core.agent_adapters import DEFAULT_AGENT, adapter_for_binary
+
+    if profile.agent:
+        return profile.agent
+    runs = adapter_for_binary(profile.bin) if profile.bin else None
+    return runs.id if runs is not None else DEFAULT_AGENT
+
+
+def binding_args(role: str, agent: str | None) -> list[str]:
+    """The arguments ``role``'s binding adds to a launch of ``agent`` (``team bind --arg``), as
+    :func:`resolve_profile` gives them, without reading its bound files: none for another
+    agent's launch (:func:`binding_agent`), and none when the config cannot be read. ``agent``
+    ``None`` is a record's from before adapters, the default agent's."""
+    from aisquare.core.agent_adapters import DEFAULT_AGENT
+
     team, _unreadable = _team_settings()
     profile = (team.profiles or {}).get(role) if team is not None else None
-    return list(profile.args or []) if profile is not None else []
+    if profile is None or binding_agent(profile) != (agent or DEFAULT_AGENT):
+        return []
+    return list(profile.args or [])
 
 
 def resolve_profile(
@@ -1976,13 +1998,16 @@ def resolve_profile(
     *,
     env_overrides: dict[str, str] | None = None,
     extra_args: Sequence[str] | None = None,
+    agent: str | None = None,
 ) -> LaunchProfile:
     """Merge the role's configured profile with this launch's overrides.
 
     Env merges PER KEY — a flag can override one variable without discarding
     the rest of the role's profile, which is what makes a one-off tweak cheap.
     Args APPEND rather than replace, because the configured ones are the role's
-    standing shape and the caller's are additions to it.
+    standing shape and the caller's are additions to it. ``agent`` is the agent this
+    launch runs: the binding's args are left out for another agent's
+    (:func:`binding_agent`), and :attr:`LaunchProfile.args_for` names theirs.
 
     A variable bound to a file (``env_files``) is read here, at every launch, into
     :attr:`LaunchProfile.file_env`; it wins over the same key in the binding's ``env``,
@@ -1993,6 +2018,7 @@ def resolve_profile(
     sources: dict[str, str] = {}
     args: list[str] = []
     files: dict[str, str] = {}
+    args_for: str | None = None
     team, unreadable = _team_settings()
     profile = (team.profiles or {}).get(role) if team is not None else None
     if profile is not None:
@@ -2000,7 +2026,11 @@ def resolve_profile(
             env[key] = expand_value(value)
             sources[key] = "config"
         files = {key: expand_value(value) for key, value in (profile.env_files or {}).items()}
-        args.extend(profile.args or [])
+        owner = binding_agent(profile)
+        if agent is None or owner == agent:
+            args.extend(profile.args or [])
+        elif profile.args:
+            args_for = owner
     for key, value in (env_overrides or {}).items():
         env[key] = expand_value(value)
         sources[key] = "flag"
@@ -2047,4 +2077,5 @@ def resolve_profile(
         file_env=file_env if refusal is None else {},
         refusal=refusal,
         notice=unreadable,
+        args_for=args_for,
     )

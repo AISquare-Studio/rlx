@@ -4219,6 +4219,29 @@ def _exit_detail(status: int | None) -> str | None:
     return f"exit {status}" if status is not None else None
 
 
+DEATH_WHY_CHARS = 160
+"""The most of a dead pane's line an exit's ``why`` carries (:func:`_death_why`): the board
+keeps the event and shows it in asq and on Remote, and the line can echo the launch's own
+arguments."""
+
+
+def _death_why(pane: PlacedPane, status: int | None) -> str | None:
+    """Why an agent found dead with a non-zero ``status`` stopped, read off its pane, which tmux
+    keeps (``remain-on-exit``): the last line on its screen that opens with ``error``, the form
+    an agent's argument parser refuses its start in (Codex's clap: ``error: unexpected argument
+    '--effort' found``; Claude Code's commander: ``error: unknown option '--x'``), cut to
+    :data:`DEATH_WHY_CHARS`. ``None`` for a clean exit or none recorded, a screen with no such
+    line, or one tmux cannot read: the death is ended and announced as it was either way."""
+    if not status:
+        return None
+    try:
+        rows = pane.screen()
+    except (TmuxError, TmuxUnavailable, OSError):
+        return None
+    said = [row.strip() for row in rows if row.strip().lower().startswith("error")]
+    return said[-1][:DEATH_WHY_CHARS] if said else None
+
+
 def exit_code_of(status: FleetAgentStatus) -> int | None:
     """The exit code of a row that ended: the one recorded, else, for a dead pane not
     recorded yet, the one its pane holds (``status.detail``, :func:`_exit_detail`'s words).
@@ -5604,7 +5627,7 @@ def spawn(
     exited = _before_a_server_starts(srv, config, selected.adapter.id).exited
     if exited:
         notes.append(_exited_note(srv, exited))
-    from aisquare.core.agent_adapters.types import fleet_extra_args
+    from aisquare.core.agent_adapters.types import fleet_extra_args, stray_directory
 
     # A replayed spec already holds the role's arguments as they were at spawn;
     # adding today's would double them (or add ones the agent never had). The
@@ -5625,6 +5648,11 @@ def spawn(
     # The window's `launch` options among the spawn's own arguments, read by it as 0.9.2's was
     # (#105): recorded with them below, so a restart reads them again.
     launch_options, extra = _launch_options(extra, selected.adapter)
+    # The operator's arguments in the order the agent reads them, before this spawn adds a
+    # resume's subcommand: the CLI's, the Spawn dialog's, the role's and a replay's alike.
+    stray = stray_directory(selected.adapter, [*selected.profile.args, *role_args, *extra])
+    if stray is not None:
+        raise FleetError(stray)
     # The model and the effort: what this spawn chose, else the role's settings, else
     # `[agents.models.<agent>]`, else the owner's last pick, else nothing (the account's own
     # default); a replay starts what the agent runs now (#441). Asked before the account, whose
@@ -5759,6 +5787,9 @@ def spawn(
             f"Legacy fleet extra_args apply only to Claude Code; use "
             f"fleet.roles.{role}.agent_args.{selected.adapter.id} for native arguments"
         )
+    left_out = agent_launch.binding_left_out(selected, role) if spec is None else None
+    if left_out is not None:
+        notes.append(left_out)
     # Nothing up to the codename below writes the project's registration: every
     # refusal that needs no window is given first (#139). A spawn refused for its
     # account, its worktree, its task, the cap or a second manager had already
@@ -10269,9 +10300,10 @@ def _end_dead_rows(
     places has no view, and is ended by nothing here.
     """
     dead = [
-        (placement.row, pane)
+        (placement.row, pane, placement.pane)
         for placement in placements
-        if placement.row.ended_at is None
+        if isinstance(placement, Placed)
+        and placement.row.ended_at is None
         and (observed := _view(placement, views)) is not None
         and (pane := _pane_in(placement.agent, observed)) is not None
         and pane.dead
@@ -10285,7 +10317,7 @@ def _end_dead_rows(
     tolerated = (sqlite3.Error,) if best_effort else ()
     now = _now()
     with suppress(*tolerated), store_session() as store:
-        for agent, pane in dead:
+        for agent, pane, placed in dead:
             session = store.get_session(agent.session_id) if agent.session_id else None
             if _handed_over(agent, session, now):
                 continue  # a hand-over is stopping it — see above
@@ -10297,7 +10329,8 @@ def _end_dead_rows(
                 # stay with the ended session until their lease lapses, as
                 # `_release_or_say` tells the callers that have one.
                 released, _ = _release_or_say(store, row, why="agent exited")
-                if _emit_exit(store, row, released=len(released)):
+                why = _death_why(placed, pane.dead_status)
+                if _emit_exit(store, row, released=len(released), why=why):
                     mine.append(row)  # only an exit that wakes is nudged (P1 WS-2, #279)
             else:  # another reader ended it first, and announced it
                 row = store.get_fleet_agent(agent.id)
@@ -11362,10 +11395,10 @@ def _model_choice(
             native.effort if native.effort is not None else effort,
         )
         kept = model_memory.remembered(agent=kind.id)
-        passed = kind.native_choice([*harness.binding_args(role), *role_args, *extra])
+        passed = kind.native_choice([*harness.binding_args(role, kind.id), *role_args, *extra])
         own, why = _own_runs(passed, chose, _configured(kind, role), kept)
         return _ModelChoice(role_args, extra, model_memory.Pick(), own, chose, kept, why)
-    bound = harness.binding_args(role)
+    bound = harness.binding_args(role, kind.id)
     # The owner's last pick names a model of the agent's own, so only a binary whose name
     # runs that agent is given it, as main 0.9.2's `harness.is_default_agent` gate had it
     # (its test_another_binary_gets_no_model_flag): a coder bound to aider by
@@ -11469,7 +11502,7 @@ def _own_replay(
     except ValueError as exc:
         raise FleetError(str(exc)) from exc
     role_args, extra = kind.merged_args(role_args, own), kind.merged_args(extra, own)
-    bound = kind.merged_args(harness.binding_args(role), own)
+    bound = kind.merged_args(harness.binding_args(role, kind.id), own)
     if kind.native_choice([*bound, *role_args, *extra]).model is not None:
         extra = [*extra, *own]
     ran = kind.native_choice([*role_args, *extra])
@@ -11861,7 +11894,7 @@ def role_pin(
     settings = role_settings(role, config)
     adapter = recorded_adapter(agent)
     pinned = _configured(adapter, role) if adapter is not None else model_memory.Pick()
-    bound = harness.binding_args(role)
+    bound = harness.binding_args(role, agent)
     if adapter is not None and not adapter.capabilities.model_ladders:
         own = fleet_extra_args(adapter, settings.extra_args, settings.agent_args)
         chosen = adapter.native_choice([*bound, *own])
@@ -13446,8 +13479,11 @@ def _record_lost(agent: FleetAgent, reason: str, report: ShutdownReport) -> None
     report.recorded.append(ShutdownRow(ended, reason))
 
 
-def _record_self_exit(agent: FleetAgent, dead_status: int | None, report: ShutdownReport) -> None:
-    """End a late row whose pane tmux still holds DEAD, keeping the status tmux kept.
+def _record_self_exit(
+    agent: FleetAgent, dead_status: int | None, report: ShutdownReport, *, why: str | None
+) -> None:
+    """End a late row whose pane tmux still holds DEAD, keeping the status tmux kept, with the
+    ``why`` its pane said (:func:`_death_why`).
 
     A spawn that landed AFTER the kill phase brought a session of its own up and
     then EXITED on its own before this reconciliation; ``remain-on-exit`` keeps
@@ -13466,7 +13502,7 @@ def _record_self_exit(agent: FleetAgent, dead_status: int | None, report: Shutdo
             store.end_fleet_agent(agent.id, exit_status=dead_status, ended_by="stopped")
             ended = store.mark_fleet_agent_stopped(agent.id)
             _release_in(store, ended, report)
-            _emit_exit(store, ended)
+            _emit_exit(store, ended, why=why)
     except Exception as exc:  # a vanished row (KeyError), a locked store
         report.failed.append(ShutdownRow(agent, f"its row could not be ended ({exc})"))
         _not_down(report, agent.project_id)
@@ -13889,7 +13925,8 @@ def _record_late_rows(
                 # claimed a kill that never targeted this late session (review
                 # of #121, round 8). `_record_lost` below is now reserved for a
                 # pane that is genuinely GONE (`facts is None`).
-                _record_self_exit(agent, facts.dead_status, report)
+                why = _death_why(placement.pane, facts.dead_status)
+                _record_self_exit(agent, facts.dead_status, report, why=why)
                 # …and the pane tmux is still HOLDING is not left standing under a
                 # report that says the fleet is down (round 9): see
                 # :func:`_retire_late_panes`, run once the left-live set is final.
@@ -18404,7 +18441,8 @@ def reap(project: ProjectInfo | None = None, *, server_down: bool = False) -> Re
                             released, failed = _release_or_say(store, ended, why="agent exited")
                             _count_release(report, ended, released, failed)
                             report.ended.append(ended)
-                            if _emit_exit(store, ended, released=len(released)):
+                            why = _death_why(placed.pane, pane.dead_status)
+                            if _emit_exit(store, ended, released=len(released), why=why):
                                 waking.append(ended)
             _remove_finished_worktrees(store, current, report)
     gone: dict[str, list[str]] = {}

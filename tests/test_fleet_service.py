@@ -13506,6 +13506,32 @@ def test_shutdown_keeps_a_late_dead_panes_observed_exit_status(
     assert [s.agent.id for s in fleet_service.list_agents(project)] == [], "its row is ended"
 
 
+def test_shutdown_announces_a_late_self_exit_with_the_error_line_it_left(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _coder(project)
+    late: list[FleetAgent] = []
+    real_kill = fleet_service._kill_fleet_sessions
+
+    def kill_then_late_exit(*args: object, **kwargs: object) -> None:
+        real_kill(*args, **kwargs)  # type: ignore[arg-type]
+        agent = _coder(project)
+        tmux.screens[agent.pane_id] = CLAP_REFUSAL
+        tmux.die(agent.pane_id, 2)
+        late.append(agent)
+
+    monkeypatch.setattr(fleet_service, "_kill_fleet_sessions", kill_then_late_exit)
+
+    fleet_service.shutdown(project, force=True)
+
+    said = [
+        event.text
+        for event in _board_events(project, "agent_exited")
+        if event.session_id == late[0].session_id
+    ]
+    assert said == [f"{late[0].label} exited (2): error: unexpected argument '--effort' found"]
+
+
 def test_shutdown_keeps_the_claim_of_a_row_whose_pane_death_was_not_confirmed(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
 ) -> None:
@@ -14290,6 +14316,104 @@ def test_reap_ends_dead_panes_and_tells_the_board(
     # Idempotent: a second pass finds nothing new and emits nothing more.
     assert fleet_service.reap(project).ended == []
     assert len(_events(project, "agent_exited")) == 1
+
+
+#: Codex 0.167.0 refusing its arguments (clap), on its pane under tmux's own last line.
+CLAP_REFUSAL = [
+    "Launching codex as coder on the repo board…",
+    "error: unexpected argument '--effort' found",
+    "",
+    "  tip: to pass '--effort' as a value, use '-- --effort'",
+    "",
+    "Usage: codex [OPTIONS] [PROMPT]",
+    "       codex [OPTIONS] <COMMAND> [ARGS]",
+    "",
+    "For more information, try '--help'.",
+    "",
+    "Pane is dead (status 2, Wed Nov 19 03:24:20 2026)",
+]
+#: Claude Code refusing an option (commander).
+COMMANDER_REFUSAL = ["error: unknown option '--add-dirs'", ""]
+
+
+def _found_dead(project: ProjectInfo, by: str) -> None:
+    if by == "reap":
+        fleet_service.reap(project)
+    else:
+        fleet_service.list_agents(project)
+
+
+@pytest.mark.parametrize("by", ["reap", "listing"])
+@pytest.mark.parametrize(
+    ("screen", "status", "said"),
+    [
+        pytest.param(
+            CLAP_REFUSAL,
+            2,
+            "coder-1 exited (2): error: unexpected argument '--effort' found",
+            id="codex",
+        ),
+        pytest.param(
+            COMMANDER_REFUSAL, 1, "coder-1 exited (1): error: unknown option '--add-dirs'", id="claude"
+        ),
+        pytest.param(CLAP_REFUSAL, 0, "coder-1 exited (0)", id="clean-exit"),
+        pytest.param(["Goodbye.", ""], 2, "coder-1 exited (2)", id="no-error-line"),
+    ],
+)
+def test_a_death_found_on_its_pane_is_announced_with_the_error_line_it_left(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    by: str,
+    screen: list[str],
+    status: int,
+    said: str,
+) -> None:
+    """This test reads the exit the sweep and a listing announce for a dead pane showing
+    Codex's refusal, Claude Code's, either after a clean exit, and a screen with no error."""
+    coder = _coder(project)
+    tmux.screens[coder.pane_id] = screen
+    tmux.die(coder.pane_id, status)
+
+    _found_dead(project, by)
+
+    assert _events(project, "agent_exited") == [said]
+
+
+@pytest.mark.parametrize("by", ["reap", "listing"])
+def test_a_death_whose_pane_cannot_be_read_is_announced_with_its_status(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    by: str,
+) -> None:
+    coder = _coder(project)
+    tmux.screens[coder.pane_id] = CLAP_REFUSAL
+    tmux.die(coder.pane_id, 2)
+
+    def unreadable(pane_id: str) -> list[str]:
+        raise TmuxError(f"can't find pane: {pane_id}")
+
+    monkeypatch.setattr(tmux, "screen_text", unreadable)
+    _found_dead(project, by)
+
+    assert _events(project, "agent_exited") == ["coder-1 exited (2)"]
+
+
+def test_a_deaths_error_line_is_cut_to_its_bound(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    coder = _coder(project)
+    line = "error: unexpected argument '" + "x" * 2 * fleet_service.DEATH_WHY_CHARS + "' found"
+    tmux.screens[coder.pane_id] = [line]
+    tmux.die(coder.pane_id, 2)
+
+    fleet_service.reap(project)
+
+    assert _events(project, "agent_exited") == [
+        f"coder-1 exited (2): {line[: fleet_service.DEATH_WHY_CHARS]}"
+    ]
 
 
 def test_reap_marks_vanished_panes_lost_without_an_exit_event(

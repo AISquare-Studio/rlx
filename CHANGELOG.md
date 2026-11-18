@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Codex agent given Claude Code's `--add-dir a b` is stopped before it starts, with the
+  form Codex takes:** `--add-dir a --add-dir b`. Codex takes one directory per `--add-dir`,
+  read `b` as its prompt, and exited before its first screen. `rlx fleet spawn`, the Spawn
+  dialog's extra arguments, a role's `agent_args` or binding, `rlx team spawn` and
+  `rlx launch` all check it.
+- **A role's bound arguments reach only the agent they are for.** The `team bind --arg`
+  arguments of a binding that names no agent are Claude Code's, as its binary always was. A
+  Codex start of that role, by `--agent codex` or on a Codex account the accounts pick chose,
+  got them too, and Codex exited on `--effort`. It now starts without them, and says so. A
+  binding that names Codex, or binds Codex's own binary, keeps its arguments for
+  Codex.
+- **An agent found dead says why on the board.** When it stops with a failing status and its
+  window shows an error line, such as Codex's or Claude Code's refusal of an argument, the
+  exit reads `coder-1 exited (2): error: unexpected argument '--effort' found`, where it
+  said `coder-1 exited (2)` alone.
+- **Refusing `approve_for_me = true` beside a Codex role's sandbox or approval policy names
+  that setting**, not a flag rlx never passes, and the way to keep Codex's automatic
+  reviewer: `permission = "read_only:auto"` for the read-only sandbox, `"workspace:auto"`
+  for `on-request`.
+
 ## [0.10.1] - 2026-11-18
 
 ### Added

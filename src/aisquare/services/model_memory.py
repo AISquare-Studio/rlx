@@ -451,7 +451,7 @@ def caught_up(agent: FleetAgent, session: TeamSession | None) -> None:
     """Before a replay of ``agent`` (a restart, a switch, a hand-over, a fork:
     ``fleet._running``): read what its transcript holds since the last read, as its Stop
     would, so a ``/model`` or ``/effort`` the owner ran after its last turn and before the
-    replay is kept (seq 3797 (2)): only a Stop read it, and the replacement's record begins
+    replay is kept: only a Stop read it, and the replacement's record begins
     after it. ``agent`` is the row fleet replays (stopped by then, for all but a fork's
     source), not a session's say. No turn ended, so nothing of a turn's readings fills the
     launch or the board. Fail-open: a store or a transcript that cannot be read leaves the
@@ -700,7 +700,7 @@ def chosen_models(session: TeamSession) -> list[str]:
         roles = load_config().fleet.roles
         settings = roles.get(session.role) or roles.get(harness.base_role(session.role))
         own = settings.extra_args if settings is not None else []
-        chosen.append(harness.model_arg([*own, *harness.binding_args(session.role)]))
+        chosen.append(harness.model_arg([*own, *harness.binding_args(session.role, session.agent)]))
     except Exception:  # an advisory chip: what cannot be read chose nothing
         pass
     return [model for model in chosen if model is not None]
@@ -710,11 +710,11 @@ def _launch_flags(agent: FleetAgent) -> Pick:
     """The ``--model`` and ``--effort`` the agent was launched with, by the rule ``aisquare
     launch`` applies: its window's own (its arguments', else what the spawn added beside
     them), else its role's binding's (``team bind --arg``), which launch adds to every window
-    and no spec records (seq 3797 (1): a bound ultracode read as the Stop's ``xhigh``)."""
+    and no spec records (for example, a bound ultracode read as the Stop's ``xhigh``)."""
     spec = agent.launch_spec
     if spec is None:
         return Pick()
-    bound = harness.binding_args(agent.role)
+    bound = harness.binding_args(agent.role, agent.agent)
     return Pick(
         harness.model_arg(spec.extra_args) or spec.model or harness.model_arg(bound),
         harness.effort_arg(spec.extra_args) or spec.effort or harness.effort_arg(bound),

@@ -25,6 +25,7 @@ from aisquare.core.config import (
     REVIEWER_ARGS,
     AppConfig,
     FleetRoleSettings,
+    RoleLaunchProfile,
     save_config,
 )
 from aisquare.core.orchestrator import team_project
@@ -1368,6 +1369,63 @@ def test_launch_persona_on_codex_adds_it_to_the_operators_developer_instructions
     value = tomllib.loads(seams[0])["developer_instructions"]
     assert value == "Answer in French.\n\n" + _briefed("skeptic")
     assert not (paths.aisquare_home() / "cache" / "persona-prompts").exists()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param(["--add-dir", "a", "b"], id="options"),
+        pytest.param(["--", "--add-dir", "a", "b"], id="after-dashes"),
+    ],
+)
+def test_a_hand_launch_of_codex_given_claude_codes_add_dir_spelling_is_refused_before_exec(
+    runner: CliRunner, work_dir: Path, spy: dict[str, Any], line: list[str]
+) -> None:
+    result = runner.invoke(app, ["launch", "coder", "--agent", "codex", *line])
+
+    assert result.exit_code != 0
+    assert (
+        "Codex takes one directory per --add-dir, so 'b' after --add-dir a would reach it as its "
+        "prompt or a command: give --add-dir before each directory, and a prompt before the "
+        "agent's arguments"
+    ) in " ".join(result.output.split())
+    assert spy == {}
+
+
+def test_a_hand_launch_of_codex_takes_add_dir_once_per_directory(
+    runner: CliRunner, work_dir: Path, spy: dict[str, Any]
+) -> None:
+    result = runner.invoke(
+        app, ["launch", "coder", "--agent", "codex", "--add-dir", "a", "--add-dir", "b"]
+    )
+
+    assert result.exit_code == 0, result.output
+    argv = spy["argv"]
+    at = argv.index("--add-dir")
+    assert argv[at : at + 4] == ["--add-dir", "a", "--add-dir", "b"], argv
+
+
+@pytest.mark.parametrize(
+    ("agent", "kept"), [pytest.param("codex", False), pytest.param("claude-code", True)]
+)
+def test_a_hand_launch_passes_a_bindings_args_to_its_own_agent_alone(
+    runner: CliRunner, work_dir: Path, spy: dict[str, Any], agent: str, kept: bool
+) -> None:
+    """This test reads the launch of a role whose binding names no agent, as Codex and as
+    Claude Code."""
+    config = AppConfig()
+    config.team.profiles["coder"] = RoleLaunchProfile(
+        args=["--model", "claude-opus-5-5[1m]", "--effort", "xhigh"]
+    )
+    save_config(config)
+
+    result = runner.invoke(app, ["launch", "coder", "--agent", agent])
+
+    assert result.exit_code == 0, result.output
+    binding = {"--effort", "claude-opus-5-5[1m]"}
+    assert binding & set(spy["argv"]) == (binding if kept else set()), spy["argv"]
+    said = "team.profiles.coder.args are Claude Code's, so Codex starts without them"
+    assert (said in " ".join(result.output.split())) is not kept, result.output
 
 
 def test_launch_persona_on_codex_leaves_the_operators_own_developer_instructions_alone(

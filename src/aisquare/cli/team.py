@@ -22,7 +22,7 @@ from aisquare.core import claude_accounts as claude_accounts_core
 from aisquare.core import harness, orchestrator, selfcli
 from aisquare.core import program as prog
 from aisquare.core.agent_adapters import agents_named, recorded_adapter
-from aisquare.core.agent_adapters.types import BadEffortError
+from aisquare.core.agent_adapters.types import BadEffortError, stray_directory
 from aisquare.core.config import (
     ExplainabilitySettings,
     FleetSettings,
@@ -479,6 +479,9 @@ def spawn(
         )
     if launch_profile.refusal is not None:
         fail(launch_profile.refusal, error="env_file_unreadable", detail=launch_profile.refusal)
+    stray = stray_directory(selected.adapter, launch_profile.args)
+    if stray is not None:
+        fail(stray, error="agent_configuration")
     # A key written into config.toml by hand (`team bind` refuses one) is set as a shell word
     # in the line below, where it is no assignment: refused, as no paste could start the role.
     unnamed = sorted(
@@ -513,7 +516,8 @@ def spawn(
     )
     # Role defaults were resolved before normalization. They precede any native
     # literal separator, and stand down for explicit flags or their opt-outs.
-    notes = [*defaults.notes, *policy.notes]
+    left_out = agent_launch.binding_left_out(selected, role_name)
+    notes = [*defaults.notes, *policy.notes, *([left_out] if left_out else [])]
     for note in [] if get_state().json_output else notes:
         # The banner is meant to be pasted; a flag this role would normally
         # carry and does not is part of what the paste will do. Under --json,
