@@ -58,7 +58,7 @@ from aisquare.core import claude_accounts as claude_accounts_core
 from aisquare.core import experimental, harness, launchers, orchestrator, paths, personas
 from aisquare.core import program as prog
 from aisquare.core.agent_adapters import adapter_for_binary, agents_named
-from aisquare.core.agent_adapters.types import BadEffortError, LaunchPart, stray_directory
+from aisquare.core.agent_adapters.types import BadEffortError, LaunchPart
 from aisquare.core.config import (
     FleetSettings,
     denied_tools_at,
@@ -733,10 +733,6 @@ def launch(
     left_out = agent_launch.binding_left_out(selected, role) if bound_args else None
     if left_out is not None:
         stderr_console().print(f"role bindings: {left_out}", style="dim")
-    # A fleet window's line was asked by its spawn, before a resume's own subcommand joined it.
-    stray = None if fleet_decided else stray_directory(selected.adapter, [*profile.args, *line])
-    if stray is not None:
-        fail(f"{stray}, and a prompt before the agent's arguments", error="agent_configuration")
     env.update(profile.env)
     env.update(profile.file_env)
     parent_run = agent_launch.launch_identity(env, selected, project.root if project else None)

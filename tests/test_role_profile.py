@@ -40,6 +40,7 @@ from aisquare.core.config import (
     load_config,
     save_config,
 )
+from aisquare.services import agent_launch
 from aisquare.services import settings as settings_service
 from tests.role_policy import policy_args
 
@@ -204,19 +205,56 @@ class TestResolveProfile:
         bin runs Codex and a wrapper's, each for a launch of its own agent and of the other."""
         args = ["--model", "claude-opus-5-5[1m]", "--effort", "xhigh"]
         _bind(ROLE, args=args, **binding)
-        assert harness.binding_agent(load_config().team.profiles[ROLE]) == owner
-        own = harness.resolve_profile(ROLE, extra_args=["-p", "go"], agent=owner)
-        assert (own.args, own.args_for) == ([*args, "-p", "go"], None)
-        theirs = harness.resolve_profile(ROLE, extra_args=["-p", "go"], agent=other)
-        assert (theirs.args, theirs.args_for) == (["-p", "go"], owner)
-        assert harness.binding_args(ROLE, owner) == args
-        assert harness.binding_args(ROLE, other) == []
+        assert agent_launch.binding_agent(ROLE) == owner
+        assert agent_launch.binding_args(ROLE, owner) == args
+        assert agent_launch.binding_args(ROLE, other) == []
+
+    @pytest.mark.parametrize(
+        ("binding", "owner"),
+        [
+            pytest.param({}, "codex", id="names-neither"),
+            pytest.param({"bin": "claude2"}, "claude-code", id="a-wrapper"),
+        ],
+    )
+    def test_a_bindings_agent_under_a_codex_user_default(
+        self, binding: dict[str, str], owner: str
+    ) -> None:
+        """This test reads a binding that names no agent and no bin, and a wrapper's, on a
+        machine whose user default agent is Codex."""
+        _bind(ROLE, args=["--search"], **binding)
+        config = load_config()
+        config.agents.default = "codex"
+        save_config(config)
+        assert agent_launch.binding_agent(ROLE) == owner
+        assert agent_launch.binding_args(ROLE, owner) == ["--search"]
+
+    def test_a_binding_account_two_agents_hold_names_no_agent_for_its_args(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def ambiguous(account: str | None, role: str) -> str | None:
+            raise ValueError("account 2 is held by Claude Code and Codex")
+
+        monkeypatch.setattr(agent_launch, "account_agent", ambiguous)
+        _bind(ROLE, args=["--search"], account="2")
+        assert agent_launch.binding_agent(ROLE) == "claude-code"
+
+    def test_a_profile_for_another_agent_leaves_the_bindings_args_out_and_names_it(self) -> None:
+        _bind(ROLE, args=["--effort", "xhigh"])
+        own = harness.resolve_profile(ROLE, extra_args=["-p", "go"])
+        assert (own.args, own.args_for) == (["--effort", "xhigh", "-p", "go"], None)
+        theirs = harness.resolve_profile(ROLE, extra_args=["-p", "go"], args_for="claude-code")
+        assert (theirs.args, theirs.args_for) == (["-p", "go"], "claude-code")
+
+    def test_a_profile_for_another_agent_names_no_owner_for_a_binding_with_no_args(self) -> None:
+        _bind(ROLE, args=[])
+        empty = harness.resolve_profile(ROLE, args_for="claude-code")
+        assert (empty.args, empty.args_for) == ([], None)
 
     def test_a_record_with_no_agent_reads_the_default_agents_binding_args(self) -> None:
         _bind(ROLE, args=["--effort", "xhigh"])
-        assert harness.binding_args(ROLE, None) == ["--effort", "xhigh"]
+        assert agent_launch.binding_args(ROLE, None) == ["--effort", "xhigh"]
         _bind(ROLE, args=["--search"], agent="codex")
-        assert harness.binding_args(ROLE, None) == []
+        assert agent_launch.binding_args(ROLE, None) == []
 
 
 class TestNoPathIsEverInferred:

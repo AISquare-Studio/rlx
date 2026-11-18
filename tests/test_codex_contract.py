@@ -183,49 +183,53 @@ def test_a_chosen_sandbox_or_policy_turns_the_default_off() -> None:
     ]
 
 
+#: What the refusal of ``approve_for_me = true`` names beside every clash: the setting, the
+#: Codex switch it passes and the one sandbox that switch takes.
+_APPROVE_FOR_ME = ("fleet.roles.coder.approve_for_me = true", "--approve-for-me", "workspace-write")
+_YOURSELF = "fleet.roles.coder.approve_for_me = false"
+
+
 @pytest.mark.parametrize(
-    "kwargs, refusal",
+    "kwargs, named",
     [
         (
             {"sandbox": "read-only"},
-            'with fleet.roles.coder.sandbox = "read-only": set fleet.roles.coder.permission = '
-            '"read_only:auto" to run it with Codex\'s reviewer, or set '
-            "fleet.roles.coder.approve_for_me = false to answer its approvals yourself",
+            (
+                'fleet.roles.coder.sandbox = "read-only"',
+                'fleet.roles.coder.permission = "read_only:auto"',
+                _YOURSELF,
+            ),
         ),
         (
             {"sandbox": "danger-full-access"},
-            'with fleet.roles.coder.sandbox = "danger-full-access": set '
-            "fleet.roles.coder.approve_for_me = false to answer its approvals yourself",
+            ('fleet.roles.coder.sandbox = "danger-full-access"', _YOURSELF),
         ),
         (
             {"approval": "on-request"},
-            'with fleet.roles.coder.approval_policy = "on-request": set '
-            'fleet.roles.coder.permission = "workspace:auto" to run it with Codex\'s reviewer',
+            (
+                'fleet.roles.coder.approval_policy = "on-request"',
+                'fleet.roles.coder.permission = "workspace:auto"',
+                _YOURSELF,
+            ),
         ),
-        (
-            {"approval": "never"},
-            'with fleet.roles.coder.approval_policy = "never", under which Codex asks for no '
-            "approval: unset one of them",
-        ),
-        ({"native": ["-a", "never"]}, "cannot run with -a never in its arguments: drop it"),
-        ({"native": ["--yolo"]}, "cannot run with --yolo in its arguments: drop it"),
+        ({"approval": "never"}, ('fleet.roles.coder.approval_policy = "never"',)),
+        ({"native": ["-a", "never"]}, ("-a never", _YOURSELF)),
+        ({"native": ["--yolo"]}, ("--yolo", _YOURSELF)),
     ],
     ids=["read-only", "full", "on-request", "never", "native-policy", "native-switch"],
 )
 def test_approve_for_me_beside_a_clash_is_refused_naming_what_clashes_and_the_way_out(
-    kwargs: dict[str, object], refusal: str
+    kwargs: dict[str, object], named: tuple[str, ...]
 ) -> None:
     """This test reads the refusal beside the role's read-only and danger-full-access
     sandboxes, its on-request and never policies, and a policy and a switch in its arguments."""
     with pytest.raises(ValueError) as refused:
         codex.fleet_args("coder", "c", None, approve_for_me=True, **kwargs)  # type: ignore[arg-type]
-    assert refusal in str(refused.value)
-    assert "--sandbox" not in str(refused.value)
-    assert "--ask-for-approval" not in str(refused.value)
-    assert str(refused.value).startswith(
-        "Codex reviews approvals itself only in the workspace-write sandbox, so "
-        "fleet.roles.coder.approve_for_me = true cannot "
-    )
+    said = str(refused.value)
+    for fact in (*_APPROVE_FOR_ME, *named):
+        assert fact in said, (fact, said)
+    assert ("permission" in said) == any("permission" in fact for fact in named), said
+    assert "--sandbox" not in said and "--ask-for-approval" not in said, said
 
 
 @pytest.mark.parametrize(

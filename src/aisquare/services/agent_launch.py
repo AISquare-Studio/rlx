@@ -33,6 +33,7 @@ from aisquare.core.spawn import LAUNCH_PID_ENV
 from aisquare.core.store import store_session
 
 if TYPE_CHECKING:
+    from aisquare.core.config import RoleLaunchProfile
     from aisquare.services.claude_accounts import AgentPick
 
 # Operator preference; launches export their own family under LAUNCH_AGENT_ENV.
@@ -212,6 +213,94 @@ def project_default(cwd: Path | None = None) -> str | None:
         return store.get_meta(f"coding-agent:{project.id}")
 
 
+@dataclass(frozen=True)
+class _Choice:
+    """The agent :func:`resolve` runs, by the rung that chose it, before its refusals."""
+
+    agent: str
+    source: str
+    binary: harness.BinaryResolution
+    inferred: AgentAdapter | None
+    bound: RoleLaunchProfile | None
+    pick: AgentPick | None
+
+
+def _choose(
+    role: str,
+    *,
+    agent: str | None = None,
+    binary: str | None = None,
+    cwd: Path | None = None,
+    account: str | None = None,
+    measure: bool = True,
+    family: Callable[[], str | None] | None = None,
+    model_agent: str | None = None,
+    folder_default: bool = True,
+    ambiguous_names_none: bool = False,
+) -> _Choice:
+    """:func:`resolve`'s rungs, which it documents. ``ambiguous_names_none`` takes an account
+    two agents' accounts hold as naming no agent, where ``resolve`` refuses it."""
+    chosen_binary = harness.resolve_binary(role, override=binary)
+    try:
+        config = load_config()
+    except Exception:
+        config = AppConfig()  # profile.notice carries the existing fail-open explanation
+    bound = config.team.profiles.get(role)
+    inferred = (
+        adapter_for_binary(chosen_binary.binary) if chosen_binary.source != "default" else None
+    )
+    try:
+        preferred = project_default(cwd) if folder_default else None
+    except Exception:
+        preferred = None  # a damaged board must not prevent launching
+    inherited = os.environ.get(ACTIVE_AGENT_ENV)
+    # Launch identity and operator preference have different lifetimes. A
+    # parent's executable family cannot identify an arbitrary wrapper.
+    owned_family = os.environ.get(LAUNCH_AGENT_ENV) if chosen_binary.source == "default" else None
+    above_the_folder = agent or (bound.agent if bound else None) or inferred
+    # THE FOLDER DECIDES ONLY WHERE NOTHING NAMED DOES (#100's reopen 6, B6-2).
+    # The account the launch names, else the one its binding names, names its agent above the
+    # project's default (B5 (b)): asked where nothing above pins the agent and no binary was
+    # named (one that names no agent is the default agent's wrapper, as it always was).
+    named: str | None = None
+    if not above_the_folder and chosen_binary.source == "default":
+        try:
+            named = account_agent(account, role)
+        except ValueError:
+            if not ambiguous_names_none:
+                raise
+    if inferred is None and chosen_binary.source == "config":
+        # A binding's binary no agent's name claims (`team bind R --bin claude2`) is the
+        # machine default agent's wrapper, as 0.9.2 read it, from every folder: a project's
+        # default never re-reads a binding, and never refuses it as an unknown family.
+        preferred = None
+    pinned = above_the_folder or named or preferred
+    # Nothing pins the agent and no binary was named: the agent of the best account, by
+    # the one priority order and headroom (owner, PR #113).
+    unpinned = not pinned and chosen_binary.source == "default"
+    model = model_agent if unpinned and not named else None
+    pick = (
+        accounts_pick(measure=measure, family=family)
+        if unpinned and not named and not model
+        else None
+    )
+    choices = (
+        (agent, "flag"),
+        (bound.agent if bound else None, "role"),
+        (inferred.id if inferred else None, chosen_binary.source),
+        (named, "account"),
+        (preferred, "project"),
+        (model, "model"),
+        (pick.agent if pick else None, "accounts"),
+        (owned_family, "inherited"),
+        (inherited, "operator"),
+        (config.agents.default, "user"),
+        (DEFAULT_AGENT, "default"),
+    )
+    name, source = next((value, origin) for value, origin in choices if value)
+    return _Choice(name, source, chosen_binary, inferred, bound, pick)
+
+
 def resolve(
     role: str = "coder",
     *,
@@ -254,63 +343,24 @@ def resolve(
     which keeps the launch on it, so no other agent's account takes it for its room. A launch
     that names a model no agent claims passes ``measure=False``: the order alone, no
     crossing (review r29 of #113, m1, and its delta's)."""
-    chosen_binary = harness.resolve_binary(role, override=binary)
-    try:
-        config = load_config()
-    except Exception:
-        config = AppConfig()  # profile.notice carries the existing fail-open explanation
-    bound = config.team.profiles.get(role)
-    inferred = (
-        adapter_for_binary(chosen_binary.binary) if chosen_binary.source != "default" else None
+    choice = _choose(
+        role,
+        agent=agent,
+        binary=binary,
+        cwd=cwd,
+        account=account,
+        measure=measure,
+        family=family,
+        model_agent=model_agent,
+        folder_default=folder_default,
     )
-    try:
-        preferred = project_default(cwd) if folder_default else None
-    except Exception:
-        preferred = None  # a damaged board must not prevent launching
-    inherited = os.environ.get(ACTIVE_AGENT_ENV)
-    # Launch identity and operator preference have different lifetimes. A
-    # parent's executable family cannot identify an arbitrary wrapper.
-    owned_family = os.environ.get(LAUNCH_AGENT_ENV) if chosen_binary.source == "default" else None
-    above_the_folder = agent or (bound.agent if bound else None) or inferred
-    # THE FOLDER DECIDES ONLY WHERE NOTHING NAMED DOES (#100's reopen 6, B6-2).
-    # The account the launch names, else the one its binding names, names its agent above the
-    # project's default (B5 (b)): asked where nothing above pins the agent and no binary was
-    # named (one that names no agent is the default agent's wrapper, as it always was).
-    named = (
-        account_agent(account, role)
-        if not above_the_folder and chosen_binary.source == "default"
-        else None
+    chosen_binary, inferred, bound, source = (
+        choice.binary,
+        choice.inferred,
+        choice.bound,
+        choice.source,
     )
-    if inferred is None and chosen_binary.source == "config":
-        # A binding's binary no agent's name claims (`team bind R --bin claude2`) is the
-        # machine default agent's wrapper, as 0.9.2 read it, from every folder: a project's
-        # default never re-reads a binding, and never refuses it as an unknown family.
-        preferred = None
-    pinned = above_the_folder or named or preferred
-    # Nothing pins the agent and no binary was named: the agent of the best account, by
-    # the one priority order and headroom (owner, PR #113).
-    unpinned = not pinned and chosen_binary.source == "default"
-    model = model_agent if unpinned and not named else None
-    pick = (
-        accounts_pick(measure=measure, family=family)
-        if unpinned and not named and not model
-        else None
-    )
-    choices = (
-        (agent, "flag"),
-        (bound.agent if bound else None, "role"),
-        (inferred.id if inferred else None, chosen_binary.source),
-        (named, "account"),
-        (preferred, "project"),
-        (model, "model"),
-        (pick.agent if pick else None, "accounts"),
-        (owned_family, "inherited"),
-        (inherited, "operator"),
-        (config.agents.default, "user"),
-        (DEFAULT_AGENT, "default"),
-    )
-    name, source = next((value, origin) for value, origin in choices if value)
-    adapter = get_adapter(name)
+    adapter = get_adapter(choice.agent)
     if chosen_binary.source == "default":
         # The selected agent's own binary, chosen by no rung of the binary's: its source stays
         # "default", as 0.9.2 said it, and why the AGENT was chosen is `source` (agent_source).
@@ -338,10 +388,17 @@ def resolve(
         and not (source == "user" and adapter.id == default_adapter().id)
     ):
         raise UnknownWrapperError(chosen_binary.binary, role)
-    # Read once the agent is chosen: a binding's arguments are its own agent's alone
-    # (`harness.binding_agent`).
+    # Read once the agent is chosen: a binding's arguments are its own agent's alone.
+    owner = (
+        binding_agent(role, cwd=cwd, folder_default=folder_default)
+        if bound is not None and bound.args
+        else adapter.id
+    )
     profile = harness.resolve_profile(
-        role, env_overrides=env_overrides, extra_args=extra_args, agent=adapter.id
+        role,
+        env_overrides=env_overrides,
+        extra_args=extra_args,
+        args_for=None if owner == adapter.id else owner,
     )
     effective_env = {**os.environ, **profile.env}
     return ResolvedAgent(
@@ -352,7 +409,7 @@ def resolve(
         # The binding's or this shell's, as the agent itself reads it (Claude Code's as
         # written, as every reader names it: core.agents._claude_home).
         adapter.config_dir(agents._home(), effective_env),
-        pick if source == "accounts" else None,
+        choice.pick if source == "accounts" else None,
     )
 
 
@@ -367,6 +424,34 @@ def binding_left_out(selected: ResolvedAgent, role: str) -> str | None:
         f"team.profiles.{role}.args are {named.label if named else owner}'s, so "
         f"{selected.adapter.label} starts without them"
     )
+
+
+def binding_agent(role: str, *, cwd: Path | None = None, folder_default: bool = True) -> str:
+    """The agent ``role``'s binding's arguments (``team bind --arg``) are for: the one
+    :func:`resolve` runs ``role`` on when the launch chooses nothing itself, by its own rungs
+    (the binding's agent, its binary's, its account's, the project's default, the accounts in
+    their order with no usage read, the user's default). A launch's own ``--agent``, ``--bin``,
+    ``--account`` or model, or the accounts' headroom, can run another agent, whose parser need
+    not take them: Codex's refuses Claude Code's ``--effort``. A binary no agent's name claims
+    runs the default agent unless the binding names another (:func:`resolve` refuses the rest),
+    and an account two agents' accounts hold names none."""
+    choice = _choose(
+        role, cwd=cwd, measure=False, folder_default=folder_default, ambiguous_names_none=True
+    )
+    wrapper = choice.inferred is None and choice.binary.source != "default"
+    return DEFAULT_AGENT if wrapper and choice.source != "role" else choice.agent
+
+
+def binding_args(role: str, agent: str | None, *, cwd: Path | None = None) -> list[str]:
+    """The arguments ``role``'s binding adds to a launch of ``agent``, as :func:`resolve` passes
+    them, without reading its bound files: none for another agent's launch than
+    :func:`binding_agent`'s, and none when the config cannot be read. ``agent`` ``None`` is a
+    record's from before adapters, the default agent's."""
+    team, _unreadable = harness._team_settings()
+    bound = (team.profiles or {}).get(role) if team is not None else None
+    if bound is None or not bound.args or binding_agent(role, cwd=cwd) != (agent or DEFAULT_AGENT):
+        return []
+    return list(bound.args)
 
 
 def account_agent(account: str | None, role: str) -> str | None:

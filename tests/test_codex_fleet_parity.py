@@ -21,13 +21,13 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from pathlib import Path, PureWindowsPath
-from typing import Any, cast
+from typing import Any, Literal, cast
 from unittest.mock import Mock
 
 import pytest
@@ -81,6 +81,7 @@ from tests.test_codex_account_switch import codex_on_path  # noqa: F401 - fixtur
 from tests.test_fleet_service import (  # noqa: F401 - fixtures, by name
     FakeClock,
     FakeTmux,
+    _add_task,
     _command,
     _events,
     _first_lines,
@@ -3072,7 +3073,7 @@ def test_an_intent_is_refused_before_a_window_beside_a_native_flag_or_where_an_a
         fleet_service.spawn(
             project, "coder", agent="codex", permission_mode="workspace:ask", sandbox="read-only"
         )
-    with pytest.raises(fleet_service.FleetError, match="only in the workspace-write sandbox"):
+    with pytest.raises(fleet_service.FleetError, match="use full:ask or full:never"):
         fleet_service.spawn(project, "coder", agent="codex", permission_mode="full:auto")
     with pytest.raises(fleet_service.FleetError, match="WRITE:APPROVALS"):
         fleet_service.spawn(project, "coder", agent="codex", permission_mode="workspace:maybe")
@@ -3872,7 +3873,7 @@ def test_a_codex_spawn_passes_each_option_once_its_own_over_its_roles_and_its_bi
         pytest.param([], [], ["--add-dir", "a", "b"], id="binding"),
     ],
 )
-def test_a_codex_spawn_given_claude_codes_add_dir_spelling_is_refused_before_a_window(
+def test_a_codex_spawn_given_a_prompt_refuses_claude_codes_add_dir_spelling_before_a_window(
     tmux: FakeTmux,  # noqa: F811
     claude_on_path: Path,  # noqa: F811
     codex_on_path: Path,  # noqa: F811
@@ -3881,19 +3882,104 @@ def test_a_codex_spawn_given_claude_codes_add_dir_spelling_is_refused_before_a_w
     role: list[str],
     bound: list[str],
 ) -> None:
-    """This test reads the spawn's own arguments, the role's ``agent_args`` and a Codex
-    binding's, each holding ``--add-dir a b``."""
+    """This test reads a spawn given a prompt whose own arguments, role's ``agent_args`` or
+    Codex binding hold ``--add-dir a b``."""
     config = load_config()
     config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": role})
     config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=bound)
     save_config(config)
     with pytest.raises(fleet_service.FleetError) as refused:
-        fleet_service.spawn(project, "coder", agent="codex", agent_args=own)
-    assert str(refused.value) == (
-        "Codex takes one directory per --add-dir, so 'b' after --add-dir a would reach it as "
-        "its prompt or a command: give --add-dir before each directory"
-    )
+        fleet_service.spawn(project, "coder", agent="codex", agent_args=own, prompt="go")
+    said = str(refused.value)
+    assert "'b'" in said and "--add-dir 'a'" in said, said
     assert tmux.spawned == []
+
+
+def test_a_codex_spawn_for_a_task_refuses_claude_codes_add_dir_spelling_before_a_window(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+) -> None:
+    """This test reads a spawn for a task, with no prompt, whose own arguments hold
+    ``--add-dir a b``: the task's kickoff is its first message."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
+    save_config(config)
+    task = _add_task(project, "Ship auth")
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.spawn(
+            project, "coder", agent="codex", agent_args=["--add-dir", "a", "b"], task_id=task.id
+        )
+    said = str(refused.value)
+    assert "'b'" in said and "--add-dir 'a'" in said, said
+    assert tmux.spawned == []
+
+
+def test_a_resumed_codex_spawn_given_a_prompt_refuses_a_word_after_its_own_add_dir(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    tmp_path: Path,
+) -> None:
+    """This test reads a resumed spawn given a prompt whose own arguments hold
+    ``--add-dir b c``, after the resume's subcommand on its line."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
+    save_config(config)
+    resume = fleet_service.ResumeSpec(
+        session_id=THREAD_ONE, transcript_path=tmp_path / "rollout.jsonl"
+    )
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.spawn(
+            project,
+            "coder",
+            agent="codex",
+            agent_args=["--add-dir", "b", "c"],
+            resume=resume,
+            prompt="go",
+        )
+    said = str(refused.value)
+    assert "'c'" in said and "--add-dir 'b'" in said, said
+    assert tmux.spawned == []
+
+
+@pytest.mark.parametrize(
+    ("first_prompt", "prompt", "resumed"),
+    [
+        pytest.param("argv", None, False, id="no-first-message"),
+        pytest.param("type", "go", False, id="first-message-typed"),
+        pytest.param("argv", "go", True, id="before-a-resume"),
+    ],
+)
+def test_a_codex_spawn_passes_add_dir_a_b_where_its_first_message_is_no_second_prompt_beside_b(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    tmp_path: Path,
+    first_prompt: Literal["argv", "type"],
+    prompt: str | None,
+    resumed: bool,
+) -> None:
+    """This test reads the window line of a spawn whose role passes ``--add-dir a b`` with no
+    first message, with its first message typed, and before a resume's subcommand."""
+    config = load_config()
+    config.fleet.first_prompt = first_prompt
+    config.fleet.roles["coder"] = FleetRoleSettings(
+        worktree=False, agent_args={"codex": ["--add-dir", "a", "b"]}
+    )
+    save_config(config)
+    resume = (
+        fleet_service.ResumeSpec(session_id=THREAD_ONE, transcript_path=tmp_path / "rollout")
+        if resumed
+        else None
+    )
+    fleet_service.spawn(project, "coder", agent="codex", prompt=prompt, resume=resume)
+    native = _spawn_native(tmux)
+    at = native.index("--add-dir")
+    assert native[at : at + 3] == ["--add-dir", "a", "b"], native
 
 
 def test_a_codex_spawn_takes_add_dir_once_per_directory_and_a_resume_after_one(
@@ -3954,23 +4040,69 @@ def test_a_codex_spawn_of_a_claude_bound_role_runs_without_its_binding_and_says_
     role: str,
 ) -> None:
     """This test reads the window line and the receipt of a Codex spawn and a Claude Code
-    spawn of the role, and what ``role_pin`` shows for each agent."""
+    spawn of the role, and what ``role_pin`` and ``spawn_runs`` give for each agent."""
     _claude_bound(role)
     receipt = fleet_service.spawn(project, role, agent="codex")
     native = _spawn_native(tmux)
     assert not {"--effort", "xhigh", "claude-opus-5-5[1m]"} & set(native), native
-    assert (
-        f"team.profiles.{role}.args are Claude Code's, so Codex starts without them"
-        in receipt.notes
-    ), receipt.notes
+    assert _left_out(receipt.notes, role) == ["Claude Code", "Codex"], receipt.notes
     assert fleet_service.role_pin(role, agent="codex") == model_memory.Pick()
+    assert fleet_service.spawn_runs(role, agent="codex").model is None
     claude = fleet_service.spawn(project, role, agent="claude-code", label=f"{role}-claude")
     line = _native(_command(tmux))
     assert {"--effort", "xhigh", "claude-opus-5-5[1m]"} <= set(line), line
-    assert not any("starts without them" in note for note in claude.notes), claude.notes
+    assert _left_out(claude.notes, role) == [], claude.notes
     assert fleet_service.role_pin(role, agent="claude-code") == model_memory.Pick(
         "claude-opus-5-5[1m]", "xhigh"
     )
+    assert fleet_service.spawn_runs(role, agent="claude-code").model == "claude-opus-5-5[1m]"
+
+
+def _left_out(notes: Sequence[str], role: str) -> list[str]:
+    """The agents a note that ``role``'s binding was left out names, in its order."""
+    said = [note for note in notes if f"team.profiles.{role}.args" in note]
+    return [
+        label
+        for note in said
+        for _, label in sorted(
+            (note.index(label), label) for label in ("Claude Code", "Codex") if label in note
+        )
+    ]
+
+
+@pytest.mark.parametrize("by", ["user-default", "binding-account"])
+def test_a_spawn_of_a_role_its_binding_runs_on_codex_passes_codex_its_arguments(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    by: str,
+) -> None:
+    """This test reads the window line and the receipt of a spawn with no ``--agent`` of a role
+    whose binding names no agent, run on Codex by the user's default agent and by the binding's
+    Codex account."""
+    account: str | None = None
+    if by == "binding-account":
+        from tests.test_the_spawn_dialogs_account_is_the_one_its_spawn_runs_on import (
+            _home,
+            _reading,
+            _scripted,
+        )
+
+        home = _home()
+        _scripted(monkeypatch, {slot.slot: _reading() for slot in home.values()})
+        account = str(home["codex-a"].slot)
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
+    if by == "user-default":
+        config.agents.default = "codex"
+    config.team.profiles["coder"] = RoleLaunchProfile(args=["--search"], account=account)
+    save_config(config)
+    receipt = fleet_service.spawn(project, "coder")
+    assert receipt.agent.agent == "codex"
+    assert "--search" in _spawn_native(tmux)
+    assert _left_out(receipt.notes, "coder") == [], receipt.notes
 
 
 def test_the_accounts_rung_crossing_a_claude_bound_role_to_codex_leaves_its_binding(
@@ -4025,31 +4157,32 @@ def test_team_spawn_of_a_claude_bound_role_as_codex_prints_none_of_its_binding(
     assert result.exit_code == 0, result.output
     assert not {"--effort", "xhigh", "claude-opus-5-5[1m]"} & set(result.stdout.split())
     assert "claude-opus-5-5[1m]" not in result.stdout, result.stdout
-    assert (
-        "team.profiles.reviewer.args are Claude Code's, so Codex starts without them"
-        in result.stderr
-    ), result.stderr
+    assert _left_out(result.stderr.splitlines(), "reviewer") == ["Claude Code", "Codex"], (
+        result.stderr
+    )
 
 
 @pytest.mark.parametrize("execs", [False, True], ids=["prints", "execs"])
-def test_team_spawn_of_codex_given_claude_codes_add_dir_spelling_is_refused(
+def test_team_spawn_of_codex_passes_add_dir_a_b_through(
     claude_on_path: Path,  # noqa: F811
     codex_on_path: Path,  # noqa: F811
     runner: CliRunner,
     monkeypatch: pytest.MonkeyPatch,
     execs: bool,
 ) -> None:
+    """This test reads the line ``team spawn`` prints and the one it execs for ``--add-dir a b``,
+    which puts no prompt after ``b``."""
     executed = Mock()
     monkeypatch.setattr(os, "execvpe", executed)
     line = ["--arg=--add-dir", "--arg=a", "--arg=b", *(["--exec"] if execs else [])]
     result = runner.invoke(app, ["team", "spawn", "coder", "--agent", "codex", *line])
-    assert result.exit_code != 0
-    assert (
-        "Codex takes one directory per --add-dir, so 'b' after --add-dir a would reach it as its "
-        "prompt or a command: give --add-dir before each directory"
-    ) in " ".join(result.output.split())
-    assert "aisquare launch" not in result.stdout and "rlx launch" not in result.stdout
-    executed.assert_not_called()
+    assert result.exit_code == 0, result.output
+    if execs:
+        argv = list(executed.call_args.args[1])
+        at = argv.index("--add-dir")
+        assert argv[at : at + 3] == ["--add-dir", "a", "b"], argv
+    else:
+        assert "--add-dir a b" in result.stdout, result.stdout
 
 
 def test_what_a_codex_row_ran_reads_no_claude_binding(tmp_path: Path) -> None:

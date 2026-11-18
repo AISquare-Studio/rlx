@@ -618,6 +618,10 @@ class StopReceipt:
     marked_only: bool = False
     """The agent had ended already and no window of its was left to remove: the stop
     recorded it as stopped on purpose and nothing else, so Restart all leaves it (#38)."""
+    died: str | None = None
+    """What the agent's pane said when this stop first found it already dead
+    (:func:`_death_why`), read before the kill took its screen: a hand-over, which announces
+    no exit, says it on its own line (:func:`_died_note`)."""
 
 
 @dataclass(frozen=True)
@@ -4227,16 +4231,18 @@ arguments."""
 
 def _death_why(pane: PlacedPane, status: int | None) -> str | None:
     """Why an agent found dead with a non-zero ``status`` stopped, read off its pane, which tmux
-    keeps (``remain-on-exit``): the last line on its screen that opens with ``error``, the form
-    an agent's argument parser refuses its start in (Codex's clap: ``error: unexpected argument
-    '--effort' found``; Claude Code's commander: ``error: unknown option '--x'``), cut to
+    keeps (``remain-on-exit``) until a stop kills it: the last line on its screen that starts
+    with ``error`` in any letter case once its leading spaces are dropped, the form an agent's
+    argument parser refuses its start in (Codex's clap: ``error: unexpected argument '--effort'
+    found``; Claude Code's commander: ``error: unknown option '--x'``), cut to
     :data:`DEATH_WHY_CHARS`. ``None`` for a clean exit or none recorded, a screen with no such
-    line, or one tmux cannot read: the death is ended and announced as it was either way."""
+    line, or one tmux cannot read (every way its read fails is a :class:`TmuxError`): the death
+    is ended and announced as it was either way."""
     if not status:
         return None
     try:
         rows = pane.screen()
-    except (TmuxError, TmuxUnavailable, OSError):
+    except TmuxError:
         return None
     said = [row.strip() for row in rows if row.strip().lower().startswith("error")]
     return said[-1][:DEATH_WHY_CHARS] if said else None
@@ -5648,11 +5654,26 @@ def spawn(
     # The window's `launch` options among the spawn's own arguments, read by it as 0.9.2's was
     # (#105): recorded with them below, so a restart reads them again.
     launch_options, extra = _launch_options(extra, selected.adapter)
-    # The operator's arguments in the order the agent reads them, before this spawn adds a
-    # resume's subcommand: the CLI's, the Spawn dialog's, the role's and a replay's alike.
-    stray = stray_directory(selected.adapter, [*selected.profile.args, *role_args, *extra])
+    # The operator's arguments, the CLI's, the Spawn dialog's, the role's and a replay's alike,
+    # beside the first message this spawn puts after `--` on its window's line: the agent reads
+    # a word after one directory as the prompt of the command the word sits in, its own or, after
+    # a replay's resume or fork, that command's, and refuses the first message as a second one.
+    on_line = _first_message_given(prompt, task_id, kickoff) and (
+        delivery.first_prompt_way(
+            positional=selected.adapter.capabilities.positional_prompt,
+            setting=config.first_prompt,
+        )
+        == "argv"
+    )
+    beside = extra if resume is not None else [*selected.profile.args, *role_args, *extra]
+    stray = stray_directory(selected.adapter, beside) if on_line else None
     if stray is not None:
-        raise FleetError(stray)
+        raise FleetError(
+            f"{selected.adapter.label} takes one directory per {stray.option} and reads "
+            f"{stray.word!r} after {stray.option} {stray.value!r} as its prompt, so it would "
+            f"refuse this spawn's first message after it: give {stray.option} before each "
+            "directory"
+        )
     # The model and the effort: what this spawn chose, else the role's settings, else
     # `[agents.models.<agent>]`, else the owner's last pick, else nothing (the account's own
     # default); a replay starts what the agent runs now (#441). Asked before the account, whose
@@ -5669,6 +5690,7 @@ def spawn(
         model=model,
         effort=effort,
         adapter=selected.adapter,
+        cwd=project.root,
     )
     role_args, extra = models.role_args, models.extra
     # The spawn's own arguments over the role's, each option once (`AgentAdapter.merged_args`):
@@ -9499,6 +9521,12 @@ def _first_message(
     return "\n\n".join(parts) if parts else None
 
 
+def _first_message_given(prompt: str | None, task_id: str | None, kickoff: bool) -> bool:
+    """Whether a spawn of ``prompt`` and ``task_id`` gives its agent a first message
+    (:func:`_first_message`), asked before its task is read."""
+    return bool(prompt) or (task_id is not None and kickoff)
+
+
 def _first_prompt_unsent(agent: FleetAgent, why: str) -> bool:
     """Move ``agent``'s first message to ``unsent``, and say so on its board once: the
     ``prompt_unsent`` event, which wakes its manager (``team.MANAGER_WAKE_KINDS``). The
@@ -11340,8 +11368,11 @@ def _model_choice(
     model: str | None,
     effort: str | None,
     adapter: AgentAdapter | None = None,
+    cwd: Path | None = None,
 ) -> _ModelChoice:
-    """The model and the effort a spawn of ``role`` runs, each decided on its own.
+    """The model and the effort a spawn of ``role`` runs, each decided on its own. ``cwd`` is
+    the folder the spawn's agent is chosen for, whose project's default may own its binding's
+    arguments (``agent_launch.binding_args``).
 
     A new agent (#16 on the board; #338 passed the role ladder's top rung here, which
     overrode the default the owner saved with ``/model``): ``extra``'s own flag, else
@@ -11379,7 +11410,7 @@ def _model_choice(
     kind = adapter or adapter_for_binary(binary)
     if kind is None or not kind.capabilities.model_ladders:
         if kind is not None and spec is not None and (model is not None or effort is not None):
-            return _own_replay(kind, role, role_args, extra, model, effort)
+            return _own_replay(kind, role, role_args, extra, model, effort, cwd=cwd)
         named = [*role_args, *extra]
         ran = model_memory.Pick(harness.model_arg(named), harness.effort_arg(named))
         if kind is None or spec is not None:
@@ -11395,10 +11426,11 @@ def _model_choice(
             native.effort if native.effort is not None else effort,
         )
         kept = model_memory.remembered(agent=kind.id)
-        passed = kind.native_choice([*harness.binding_args(role, kind.id), *role_args, *extra])
+        bound = agent_launch.binding_args(role, kind.id, cwd=cwd)
+        passed = kind.native_choice([*bound, *role_args, *extra])
         own, why = _own_runs(passed, chose, _configured(kind, role), kept)
         return _ModelChoice(role_args, extra, model_memory.Pick(), own, chose, kept, why)
-    bound = harness.binding_args(role, kind.id)
+    bound = agent_launch.binding_args(role, kind.id, cwd=cwd)
     # The owner's last pick names a model of the agent's own, so only a binary whose name
     # runs that agent is given it, as main 0.9.2's `harness.is_default_agent` gate had it
     # (its test_another_binary_gets_no_model_flag): a coder bound to aider by
@@ -11488,6 +11520,8 @@ def _own_replay(
     extra: list[str],
     model: str | None,
     effort: str | None,
+    *,
+    cwd: Path | None = None,
 ) -> _ModelChoice:
     """A replay given ``model`` / ``effort`` (``fleet restart … --model``) of an agent that keeps
     its own models: that agent's, each on its own, over what its spawn recorded and its binding
@@ -11502,7 +11536,7 @@ def _own_replay(
     except ValueError as exc:
         raise FleetError(str(exc)) from exc
     role_args, extra = kind.merged_args(role_args, own), kind.merged_args(extra, own)
-    bound = kind.merged_args(harness.binding_args(role, kind.id), own)
+    bound = kind.merged_args(agent_launch.binding_args(role, kind.id, cwd=cwd), own)
     if kind.native_choice([*bound, *role_args, *extra]).model is not None:
         extra = [*extra, *own]
     ran = kind.native_choice([*role_args, *extra])
@@ -11894,7 +11928,7 @@ def role_pin(
     settings = role_settings(role, config)
     adapter = recorded_adapter(agent)
     pinned = _configured(adapter, role) if adapter is not None else model_memory.Pick()
-    bound = harness.binding_args(role, agent)
+    bound = agent_launch.binding_args(role, agent)
     if adapter is not None and not adapter.capabilities.model_ladders:
         own = fleet_extra_args(adapter, settings.extra_args, settings.agent_args)
         chosen = adapter.native_choice([*bound, *own])
@@ -12319,8 +12353,11 @@ def _stop_row(
     exited_here = False  # this stop's `/exit` reached a pane that was running
     killed: str | None = None  # why no `/exit` was typed, when one was not
     dismissed: str | None = None  # the key pressed at a dialog before the `/exit`
+    why: str | None = None  # what a pane dead before this stop said, read before the kill
     try:
         window = _window()
+        if window is not None and window.dead:
+            why = _death_why(pane, window.dead_status)
         if unrecorded is not None and window is not None and not window.dead:
             killed = (
                 f"{unrecorded}: its window was killed, with no exit command typed into a "
@@ -12461,14 +12498,26 @@ def _stop_row(
         if not handover:
             released, release_failed = _release_or_say(store, ended, why="agent stopped")
             wakes = _emit_exit(
-                store, ended, actor=actor, force=force, released=len(released), reason=reason
+                store,
+                ended,
+                why=why,
+                actor=actor,
+                force=force,
+                released=len(released),
+                reason=reason,
             ) and not _managers_own(store, ended, actor)
     # Outside the store session, as ``reap`` does: the nudge types into a pane
     # and must not hold the write lock the woken manager's own hooks will want.
     if not handover and nudge and wakes:
         nudge_manager(ended.project_id, reason=f"{ended.label} exited", board=_board_of_row(ended))
     return StopReceipt(
-        ended, released, release_failed, killed=killed, dismissed=dismissed, withheld=handover
+        ended,
+        released,
+        release_failed,
+        killed=killed,
+        dismissed=dismissed,
+        withheld=handover,
+        died=why,
     )
 
 
@@ -14770,7 +14819,8 @@ def switch(
         )
     except Exception:
         if handed_over.withheld:
-            _abandon_handover(stopped)  # no replacement is coming for the parked claims
+            # No replacement is coming for the parked claims.
+            _abandon_handover(stopped, handed_over.died)
         raise
     notes.extend(more)
     failures.extend(receipt.failures)
@@ -14799,7 +14849,7 @@ def switch(
             store,
             _board_of_row(receipt.agent),
             "switched",
-            f"{label} moved from {from_name} to {to_name}{why} — {how}",
+            f"{label} moved from {from_name} to {to_name}{why} — {how}{_died_note(handed_over)}",
             session_id=receipt.agent.session_id,
         )
     return SwitchReceipt(
@@ -16339,7 +16389,8 @@ def restart(
         )
     except Exception:
         if handed_over is not None and handed_over.withheld:
-            _abandon_handover(handed_over.agent)  # no replacement is coming for the parked claims
+            # No replacement is coming for the parked claims.
+            _abandon_handover(handed_over.agent, handed_over.died)
         elif held_back and bool(_team().exit_wakes({"status": agent.exit_status, "released": 0})):
             # The exit went out with its wake-up held back for a replacement that has
             # now failed to start: left unwoken, a waiting manager never hears of the
@@ -16363,7 +16414,8 @@ def restart(
             store,
             _board_of_row(receipt.agent),
             "restarted",
-            f"{label} {'resumed after a pause' if paused else 'restarted'}{onto_named} — {how}",
+            f"{label} {'resumed after a pause' if paused else 'restarted'}{onto_named} — {how}"
+            + _died_note(handed_over),
             session_id=receipt.agent.session_id,
         )
     return RestartReceipt(
@@ -16999,15 +17051,25 @@ def _unmark_handing_over(session: TeamSession) -> str | None:
 HANDOVER_FAILED = "its replacement did not start"
 
 
-def _abandon_handover(stopped: FleetAgent) -> None:
+def _abandon_handover(stopped: FleetAgent, died: str | None = None) -> None:
     """The replacement never started: release what was parked and record the exit withheld,
-    saying so (:data:`HANDOVER_FAILED`)."""
+    saying so (:data:`HANDOVER_FAILED`), and what its pane said when the hand-over found it
+    already dead (``StopReceipt.died``)."""
     with contextlib.suppress(Exception), store_session() as store:
         _team().release_agent_claims(store, stopped, why="hand-over failed")
-        _emit_exit(store, stopped, why=HANDOVER_FAILED)
+        _emit_exit(store, stopped, why=f"{HANDOVER_FAILED}; {died}" if died else HANDOVER_FAILED)
     nudge_manager(
         stopped.project_id, reason=f"{stopped.label} exited", board=_board_of_row(stopped)
     )
+
+
+def _died_note(stopped: StopReceipt | None) -> str:
+    """What a hand-over's own line (``switched``, ``restarted``, ``agent_paused``) adds for an
+    agent its stop found already dead: its status and what its pane said
+    (``StopReceipt.died``); nothing for any other."""
+    if stopped is None or stopped.died is None:
+        return ""
+    return f"; it had exited ({stopped.agent.exit_status}): {stopped.died}"
 
 
 def _how_started(resumed: bool, *, typed: Typed, brief: bool = False) -> str:
@@ -17291,7 +17353,7 @@ def pause_agent(
                     _board_of_row(ended),
                     "agent_paused",
                     f"{ended.label} paused — its claims, worktree and session are kept; "
-                    f"`{resume}` brings it back",
+                    f"`{resume}` brings it back{_died_note(replace(receipt, agent=ended))}",
                     session_id=ended.session_id,
                     actor=actor,
                 )

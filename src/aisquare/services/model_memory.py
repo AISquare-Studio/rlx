@@ -49,6 +49,7 @@ from aisquare.core import program as prog
 from aisquare.core.agent_adapters import adapters, get_adapter, model_owner
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import FleetAgent, TeamSession
+from aisquare.services import agent_launch
 
 _MODEL_KEY = "fleet-model"
 _EFFORT_KEY = "fleet-effort"
@@ -700,7 +701,8 @@ def chosen_models(session: TeamSession) -> list[str]:
         roles = load_config().fleet.roles
         settings = roles.get(session.role) or roles.get(harness.base_role(session.role))
         own = settings.extra_args if settings is not None else []
-        chosen.append(harness.model_arg([*own, *harness.binding_args(session.role, session.agent)]))
+        bound = agent_launch.binding_args(session.role, session.agent)
+        chosen.append(harness.model_arg([*own, *bound]))
     except Exception:  # an advisory chip: what cannot be read chose nothing
         pass
     return [model for model in chosen if model is not None]
@@ -714,7 +716,7 @@ def _launch_flags(agent: FleetAgent) -> Pick:
     spec = agent.launch_spec
     if spec is None:
         return Pick()
-    bound = harness.binding_args(agent.role, agent.agent)
+    bound = agent_launch.binding_args(agent.role, agent.agent)
     return Pick(
         harness.model_arg(spec.extra_args) or spec.model or harness.model_arg(bound),
         harness.effort_arg(spec.extra_args) or spec.effort or harness.effort_arg(bound),

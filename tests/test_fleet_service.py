@@ -14359,8 +14359,6 @@ def _found_dead(project: ProjectInfo, by: str) -> None:
             "coder-1 exited (1): error: unknown option '--add-dirs'",
             id="claude",
         ),
-        pytest.param(CLAP_REFUSAL, 0, "coder-1 exited (0)", id="clean-exit"),
-        pytest.param(["Goodbye.", ""], 2, "coder-1 exited (2)", id="no-error-line"),
     ],
 )
 def test_a_death_found_on_its_pane_is_announced_with_the_error_line_it_left(
@@ -14373,12 +14371,136 @@ def test_a_death_found_on_its_pane_is_announced_with_the_error_line_it_left(
     said: str,
 ) -> None:
     """This test reads the exit the sweep and a listing announce for a dead pane showing
-    Codex's refusal, Claude Code's, either after a clean exit, and a screen with no error."""
+    Codex's refusal and Claude Code's."""
     coder = _coder(project)
     tmux.screens[coder.pane_id] = screen
     tmux.die(coder.pane_id, status)
 
     _found_dead(project, by)
+
+    assert _events(project, "agent_exited") == [said]
+
+
+@pytest.mark.parametrize("by", ["reap", "listing"])
+@pytest.mark.parametrize(
+    ("screen", "status"),
+    [
+        pytest.param(CLAP_REFUSAL, 0, id="clean-exit"),
+        pytest.param(["Goodbye.", ""], 2, id="no-error-line"),
+    ],
+)
+def test_a_death_found_on_its_pane_with_a_clean_exit_or_no_error_line_is_announced_with_its_status(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    by: str,
+    screen: list[str],
+    status: int,
+) -> None:
+    """This test reads the exit the sweep and a listing announce for a dead pane showing
+    Codex's refusal after a clean exit, and a failing one with no error line."""
+    coder = _coder(project)
+    tmux.screens[coder.pane_id] = screen
+    tmux.die(coder.pane_id, status)
+
+    _found_dead(project, by)
+
+    assert _events(project, "agent_exited") == [f"coder-1 exited ({status})"]
+
+
+@pytest.mark.parametrize("how", ["stop", "stop-force", "shutdown"])
+def test_a_stop_that_finds_its_agent_dead_announces_the_error_line_it_left(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, how: str
+) -> None:
+    """This test reads the exit a stop, a forced stop and a shutdown announce for an agent whose
+    pane died with Codex's refusal before any listing saw it."""
+    coder = _coder(project)
+    tmux.screens[coder.pane_id] = CLAP_REFUSAL
+    tmux.die(coder.pane_id, 2)
+
+    if how == "shutdown":
+        fleet_service.shutdown(project, force=True)
+    else:
+        fleet_service.stop(project, coder.label, force=how == "stop-force")
+
+    [said] = _events(project, "agent_exited")
+    assert said.startswith("coder-1 exited (2): error: unexpected argument '--effort' found"), said
+
+
+#: What a hand-over's own line adds for a pane found dead with Codex's refusal on it.
+HAD_EXITED = "; it had exited (2): error: unexpected argument '--effort' found"
+
+
+@pytest.mark.parametrize(
+    ("status", "added"),
+    [pytest.param(2, HAD_EXITED, id="codex"), pytest.param(0, "", id="clean-exit")],
+)
+@pytest.mark.parametrize("how", ["switch", "pause", "restart"])
+def test_a_hand_over_of_an_agent_found_dead_says_on_its_own_line_what_its_pane_said(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    how: str,
+    status: int,
+    added: str,
+) -> None:
+    """This test reads the line a switch, a pause and a restart that took the pane for running
+    write for an agent whose pane died, with Codex's refusal on it, before their stop looked:
+    with a failing status and after a clean exit."""
+    _two_slots_with_usage(monkeypatch, work=95, personal=10)
+    agent = fleet_service.spawn(project, "coder", worktree=False, account="2").agent
+    tmux.screens[agent.pane_id] = CLAP_REFUSAL
+    tmux.die(agent.pane_id, status)
+
+    if how == "switch":
+        fleet_service.switch(project, agent.label, reason="session limit")
+    elif how == "pause":
+        fleet_service.pause_agent(project, agent.label, grace=0)
+    else:
+        monkeypatch.setattr(fleet_service, "_pane_alive", lambda pane: True)
+        fleet_service.restart(project, agent.label)
+
+    kind = {"switch": "switched", "pause": "agent_paused", "restart": "restarted"}[how]
+    [line] = _events(project, kind)
+    assert line.endswith(added) and line.count("had exited") == (1 if added else 0), line
+    assert _events(project, "agent_exited") == []
+
+
+@pytest.mark.parametrize(
+    ("status", "said"),
+    [
+        pytest.param(
+            2,
+            f"coder-1 exited (2): {fleet_service.HANDOVER_FAILED}; error: unexpected argument "
+            "'--effort' found",
+            id="codex",
+        ),
+        pytest.param(0, f"coder-1 exited (0): {fleet_service.HANDOVER_FAILED}", id="clean-exit"),
+    ],
+)
+def test_an_abandoned_hand_over_of_an_agent_found_dead_says_what_its_pane_said(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    said: str,
+) -> None:
+    """This test reads the exit a switch announces when its replacement does not start, for an
+    agent whose pane died with Codex's refusal on it, with a failing status and after a clean
+    exit."""
+    _two_slots_with_usage(monkeypatch, work=95, personal=10)
+    agent = fleet_service.spawn(project, "coder", worktree=False, account="2").agent
+    tmux.screens[agent.pane_id] = CLAP_REFUSAL
+    tmux.die(agent.pane_id, status)
+
+    def spawn_refuses(*args: Any, **kwargs: Any) -> fleet_service.SpawnReceipt:
+        raise FleetError("tmux could not start the window: boom")
+
+    monkeypatch.setattr(fleet_service, "spawn", spawn_refuses)
+    with pytest.raises(FleetError, match="boom"):
+        fleet_service.switch(project, agent.label, reason="session limit")
 
     assert _events(project, "agent_exited") == [said]
 

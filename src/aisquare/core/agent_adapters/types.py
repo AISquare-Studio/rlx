@@ -541,9 +541,9 @@ class AgentCapabilities:
     switch_options: frozenset[str] = frozenset()
     one_directory_options: frozenset[str] = frozenset()
     """Options that take one directory each where Claude Code's same spelling takes several
-    (Codex's ``--add-dir``): given ``--add-dir a b``, the agent reads ``b`` as its prompt or a
-    command, and Codex exits before its first screen. A fleet spawn, ``team spawn`` and a hand
-    launch refuse a bare word after one's value (:func:`stray_directory`)."""
+    (Codex's ``--add-dir``): in ``--add-dir a b`` the agent reads ``b`` as the prompt of the
+    command it sits in, and refuses another one after it, such as the first message a fleet
+    spawn puts after ``--``, which that spawn refuses before it starts (:func:`stray_directory`)."""
 
 
 @dataclass(frozen=True)
@@ -2236,20 +2236,24 @@ def _before_separator(args: Sequence[str]) -> list[str]:
     return list(args[: args.index("--")] if "--" in args else args)
 
 
-def stray_directory(adapter: AgentAdapter, args: Sequence[str]) -> str | None:
-    """Why ``args`` cannot start ``adapter``'s agent when a bare word follows the value of one
-    of its ``one_directory_options`` before the native ``--`` (Claude Code's ``--add-dir a b``
-    given to Codex), else ``None``."""
+class StrayWord(NamedTuple):
+    """A bare word after the value of one of an agent's ``one_directory_options``."""
+
+    option: str
+    value: str
+    word: str
+
+
+def stray_directory(adapter: AgentAdapter, args: Sequence[str]) -> StrayWord | None:
+    """The first bare word after the value of one of ``adapter``'s ``one_directory_options``
+    before the native ``--`` (Claude Code's ``--add-dir a b`` given to Codex), which the agent
+    reads as no directory; ``None`` when there is none."""
     options, held = adapter.capabilities.one_directory_options, _before_separator(args)
     for item in option_occurrences(args, *options):
         following = held[item.value_index + 1 : item.value_index + 2]
         if following and not following[0].startswith("-"):
             option = (item.prefix or args[item.index]).removesuffix("=")
-            return (
-                f"{adapter.label} takes one directory per {option}, so {following[0]!r} after "
-                f"{option} {item.value} would reach it as its prompt or a command: give "
-                f"{option} before each directory"
-            )
+            return StrayWord(option, item.value, following[0])
     return None
 
 

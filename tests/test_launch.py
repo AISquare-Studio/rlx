@@ -31,6 +31,7 @@ from aisquare.core.config import (
 from aisquare.core.orchestrator import team_project
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import FleetAgent, LaunchSpec
+from aisquare.services import agent_launch
 from aisquare.services import settings as settings_service
 from aisquare.services.explainability import join_records
 from tests import bundled_personas
@@ -1372,24 +1373,23 @@ def test_launch_persona_on_codex_adds_it_to_the_operators_developer_instructions
 
 
 @pytest.mark.parametrize(
-    "line",
+    "after",
     [
-        pytest.param(["--add-dir", "a", "b"], id="options"),
-        pytest.param(["--", "--add-dir", "a", "b"], id="after-dashes"),
+        pytest.param(["fix the bug"], id="a-prompt"),
+        pytest.param(["resume", "019a2b3c-4d5e-7f60-8a1b-000000000001"], id="a-resume"),
     ],
 )
-def test_a_hand_launch_of_codex_given_claude_codes_add_dir_spelling_is_refused_before_exec(
-    runner: CliRunner, work_dir: Path, spy: dict[str, Any], line: list[str]
+def test_a_hand_launch_of_codex_passes_a_word_after_add_dir_through(
+    runner: CliRunner, work_dir: Path, spy: dict[str, Any], after: list[str]
 ) -> None:
-    result = runner.invoke(app, ["launch", "coder", "--agent", "codex", *line])
+    """This test reads the argv a hand launch execs for ``--add-dir a`` followed by a prompt
+    and by Codex's ``resume`` with its session."""
+    result = runner.invoke(app, ["launch", "coder", "--agent", "codex", "--add-dir", "a", *after])
 
-    assert result.exit_code != 0
-    assert (
-        "Codex takes one directory per --add-dir, so 'b' after --add-dir a would reach it as its "
-        "prompt or a command: give --add-dir before each directory, and a prompt before the "
-        "agent's arguments"
-    ) in " ".join(result.output.split())
-    assert spy == {}
+    assert result.exit_code == 0, result.output
+    argv = spy["argv"]
+    at = argv.index("--add-dir")
+    assert argv[at : at + 2 + len(after)] == ["--add-dir", "a", *after], argv
 
 
 def test_a_hand_launch_of_codex_takes_add_dir_once_per_directory(
@@ -1424,8 +1424,31 @@ def test_a_hand_launch_passes_a_bindings_args_to_its_own_agent_alone(
     assert result.exit_code == 0, result.output
     binding = {"--effort", "claude-opus-5-5[1m]"}
     assert binding & set(spy["argv"]) == (binding if kept else set()), spy["argv"]
-    said = "team.profiles.coder.args are Claude Code's, so Codex starts without them"
-    assert (said in " ".join(result.output.split())) is not kept, result.output
+    said = [line for line in result.output.splitlines() if "team.profiles.coder.args" in line]
+    assert len(said) == (0 if kept else 1), result.output
+    assert all("Claude Code" in line and "Codex" in line for line in said), said
+
+
+@pytest.mark.parametrize("by", ["user-default", "project-default"])
+def test_a_hand_launch_of_a_role_its_binding_runs_on_codex_passes_codex_its_arguments(
+    runner: CliRunner, work_dir: Path, spy: dict[str, Any], by: str
+) -> None:
+    """This test reads the argv of a launch with no ``--agent`` of a role whose binding names no
+    agent, run on Codex by the user's default agent and by the project's."""
+    config = AppConfig()
+    config.team.profiles["coder"] = RoleLaunchProfile(args=["--search"])
+    if by == "user-default":
+        config.agents.default = "codex"
+    save_config(config)
+    if by == "project-default":
+        agent_launch.use("codex", project=True)
+
+    result = runner.invoke(app, ["launch", "coder"])
+
+    assert result.exit_code == 0, result.output
+    assert Path(spy["argv"][0]).name == "codex", spy["argv"]
+    assert "--search" in spy["argv"], spy["argv"]
+    assert "team.profiles.coder.args" not in result.output, result.output
 
 
 def test_launch_persona_on_codex_leaves_the_operators_own_developer_instructions_alone(

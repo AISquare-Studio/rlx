@@ -849,7 +849,8 @@ class CodexAdapter:
                 "-o",
             }
         ),
-        # `--add-dir <DIR>` (0.167.0's help): `--add-dir a b` exited 2 before its first screen.
+        # `--add-dir <DIR>` (0.167.0's help): `--add-dir a b -- <prompt>` exited 2 before its first
+        # screen, `b` taken as the prompt and `<prompt>` refused as a second.
         one_directory_options=frozenset({"--add-dir"}),
         switch_options=frozenset(
             {
@@ -1414,8 +1415,8 @@ class CodexAdapter:
         (:meth:`_sandbox`)."""
         if intent.approvals == "auto" and intent.write == "full":
             raise ValueError(
-                "Codex reviews approvals automatically only in the workspace-write sandbox; "
-                "use full:ask or full:never"
+                "Codex's automatic reviewer is run in the workspace and read-only sandboxes "
+                "(workspace:auto, read_only:auto), not in full; use full:ask or full:never"
             )
         native_sandbox, native_approval = _native_approvals(native)
         sandbox = self._sandbox(intent.write, native)
@@ -2152,8 +2153,8 @@ def _approve_for_me_refusal(
     the person."""
     key = f"fleet.roles.{role}"
     lead = (
-        f"Codex reviews approvals itself only in the workspace-write sandbox, so "
-        f"{key}.approve_for_me = true"
+        f"{key}.approve_for_me = true passes Codex's --approve-for-me, which works only in the "
+        "workspace-write sandbox, so it"
     )
     yourself = f"set {key}.approve_for_me = false to answer its approvals yourself"
 

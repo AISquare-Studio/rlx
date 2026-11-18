@@ -33,8 +33,9 @@ setting it comes from.
   It also holds the board's work briefs (`rlx brief`): their text, and for
   each recorded check the artifact's SHA-256 and where it was. When a fleet
   agent is found dead with a failing exit status, its exit on the board keeps
-  the last line its window showed that starts with `error`, cut short: such a
-  line can repeat the agent's own arguments.
+  the last line its window showed that starts with `error` in any letter case
+  once its leading spaces are dropped, cut short: such a line can repeat the
+  agent's own arguments.
 - `briefs/<project>/<brief>/` holds a **copy of every artifact** a brief check
   recorded (`rlx brief evidence|finding --artifact`, up to 16 MiB each),
   restricted to your user. A screenshot of a secret is kept here until the
