@@ -13480,7 +13480,7 @@ def _record_lost(agent: FleetAgent, reason: str, report: ShutdownReport) -> None
 
 
 def _record_self_exit(
-    agent: FleetAgent, dead_status: int | None, report: ShutdownReport, *, why: str | None
+    agent: FleetAgent, dead_status: int | None, report: ShutdownReport, *, why: str | None = None
 ) -> None:
     """End a late row whose pane tmux still holds DEAD, keeping the status tmux kept, with the
     ``why`` its pane said (:func:`_death_why`).
