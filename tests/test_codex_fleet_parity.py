@@ -4218,6 +4218,52 @@ def test_what_a_codex_row_ran_reads_no_claude_binding(tmp_path: Path) -> None:
         assert ("claude-opus-5-5[1m]" in chosen) == (agent == "claude-code"), chosen
 
 
+@pytest.mark.parametrize(
+    ("agent", "ran"),
+    [
+        pytest.param("codex", model_memory.Pick(), id="codex"),
+        pytest.param("claude-code", model_memory.Pick("claude-opus-5-5[1m]", "xhigh"), id="claude"),
+    ],
+)
+def test_a_rows_launch_flags_and_chosen_models_are_read_off_its_recorded_window_line(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    agent: str,
+    ran: model_memory.Pick,
+) -> None:
+    """This test reads ``model_memory``'s launch flags of a row and the models chosen for its
+    session, for a role whose binding names no agent and passes Claude Code's model and effort,
+    spawned on ``agent`` with no usable account from a process with no ``LAUNCH_AGENT_ENV``, and
+    read where ``LAUNCH_AGENT_ENV`` names Codex (a Codex window's hooks)."""
+    _claude_bound("coder")
+    monkeypatch.setattr(
+        accounts_service, "agent_pick", lambda **_: accounts_service.AgentPick(None, None)
+    )
+    monkeypatch.delenv(agent_launch.LAUNCH_AGENT_ENV, raising=False)
+    monkeypatch.delenv(agent_launch.ACTIVE_AGENT_ENV, raising=False)
+    row = fleet_service.spawn(project, "coder", agent=agent).agent
+    with store_session() as store:
+        store.adopt_fleet_agent_session(
+            row.id, row.session_id, THREAD_ONE, datetime.now(tz=UTC) + timedelta(hours=1)
+        )
+    monkeypatch.setenv(agent_launch.LAUNCH_AGENT_ENV, "codex")
+    assert model_memory._launch_flags(row) == ran
+    now = datetime.now(tz=UTC)
+    session = TeamSession(
+        id=THREAD_ONE,
+        project_id=project.id,
+        role="coder",
+        agent=agent,
+        started_at=now,
+        last_seen_at=now,
+    )
+    chosen = model_memory.chosen_models(session)
+    assert ("claude-opus-5-5[1m]" in chosen) == (ran.model is not None), chosen
+
+
 def test_the_readers_of_a_binding_its_project_runs_on_codex_read_it_from_another_folder(
     tmux: FakeTmux,  # noqa: F811
     claude_on_path: Path,  # noqa: F811

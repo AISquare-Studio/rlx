@@ -688,8 +688,9 @@ def _own_row(store: ContextStore, session_id: str, agent_id: str | None) -> Flee
 def chosen_models(session: TeamSession) -> list[str]:
     """The models the owner chose for ``session``'s agent, which the board's ``⚠ off-ladder``
     chip stands down for (#16, review of #441, 6): the pick, the agent's own launch flags
-    (its spawn's args, its role's ``extra_args`` as recorded, or what a replay started) and
-    its role's settings (``[fleet.roles.<role>] extra_args``, a binding's ``--arg``).
+    (:func:`_launch_flags`: its window line as recorded, or what a replay started) and its
+    role's settings (``[fleet.roles.<role>] extra_args``, and a binding's ``--arg`` where no
+    recorded line says what its agent ran, read in the session's project).
     Fail-open: what cannot be read chose nothing, and the chip says what the ladder says."""
     chosen: list[str | None] = []
     try:
@@ -702,23 +703,43 @@ def chosen_models(session: TeamSession) -> list[str]:
         roles = load_config().fleet.roles
         settings = roles.get(session.role) or roles.get(harness.base_role(session.role))
         own = settings.extra_args if settings is not None else []
+        recorded = agent is not None and _window_line(agent) is not None
         folder = project.root if project is not None else None
-        bound = agent_launch.binding_args(session.role, session.agent, cwd=folder)
+        bound = (
+            [] if recorded else agent_launch.binding_args(session.role, session.agent, cwd=folder)
+        )
         chosen.append(harness.model_arg([*own, *bound]))
     except Exception:  # an advisory chip: what cannot be read chose nothing
         pass
     return [model for model in chosen if model is not None]
 
 
+def _window_line(agent: FleetAgent) -> list[str] | None:
+    """The agent's arguments on its recorded window line (``LaunchSpec.command``): what its
+    window's ``launch`` passed after its first ``--`` (``fleet._the_windows_own_options`` is
+    what came before), its role binding's as its spawn passed them included. ``None`` for a
+    row with no record, or a record that kept no line."""
+    command = list(agent.launch_spec.command) if agent.launch_spec is not None else []
+    if "launch" not in command:
+        return None
+    rest = command[command.index("launch") + 1 :]
+    return rest[rest.index("--") + 1 :] if "--" in rest else None
+
+
 def _launch_flags(agent: FleetAgent) -> Pick:
-    """The ``--model`` and ``--effort`` the agent was launched with, by the rule ``aisquare
-    launch`` applies: its window's own (its arguments', else what the spawn added beside
-    them), else its role's binding's (``team bind --arg``), which launch adds to every window
-    and no spec records (for example, a bound ultracode read as the Stop's ``xhigh``), read
-    in the folder its window ran in, whose project's default may own them."""
+    """The ``--model`` and ``--effort`` the agent was launched with: those on its recorded
+    window line (:func:`_window_line`), which holds what its spawn added and its binding's
+    arguments as the spawn decided them, whatever process reads it. A record that kept no line
+    is read by the rule ``aisquare launch`` applies: its window's own (its arguments', else
+    what the spawn added beside them), else its role's binding's (``team bind --arg``), which
+    no spec records otherwise (for example, a bound ultracode read as the Stop's ``xhigh``),
+    read in the folder its window ran in."""
     spec = agent.launch_spec
     if spec is None:
         return Pick()
+    line = _window_line(agent)
+    if line is not None:
+        return Pick(harness.model_arg(line), harness.effort_arg(line))
     bound = agent_launch.binding_args(agent.role, agent.agent, cwd=agent.cwd)
     return Pick(
         harness.model_arg(spec.extra_args) or spec.model or harness.model_arg(bound),
