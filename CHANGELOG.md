@@ -8,8 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Doctor reports the keyboard protocol as unknown for iTerm2 and the VS Code terminal.**
-  Doctor points to Ctrl+J for a newline when the protocol is unknown or unavailable.
+- **Doctor reports the keyboard protocol as unknown for iTerm2, the VS Code terminal,
+  WezTerm, Windows Terminal and alacritty.** Doctor points to Ctrl+J for a newline when the
+  protocol is unknown or unavailable.
 
 ## [0.10.1] - 2026-11-18
 

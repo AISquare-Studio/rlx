@@ -49,10 +49,10 @@ class Sign:
 SIGNS: tuple[Sign, ...] = (
     Sign("KITTY_WINDOW_ID", None, "kitty", True, "accepts"),
     Sign("GHOSTTY_RESOURCES_DIR", None, "ghostty", True, "accepts"),
-    Sign("WEZTERM_EXECUTABLE", None, "wezterm", True, "accepts"),
-    Sign("WT_SESSION", None, "Windows Terminal", False, "accepts"),
+    Sign("WEZTERM_EXECUTABLE", None, "wezterm", None, "accepts"),
+    Sign("WT_SESSION", None, "Windows Terminal", None, "accepts"),
     Sign("TERM_PROGRAM", "iTerm", "iTerm2", None, "asks", mac=True),
-    Sign("TERM_PROGRAM", "WezTerm", "wezterm", True, "accepts"),
+    Sign("TERM_PROGRAM", "WezTerm", "wezterm", None, "accepts"),
     Sign("TERM_PROGRAM", "ghostty", "ghostty", True, "accepts"),
     Sign("TERM_PROGRAM", "vscode", "the VS Code terminal", None),
     Sign("TERM_PROGRAM", "Apple_Terminal", "Terminal.app", False, "drops", mac=True),
@@ -63,13 +63,17 @@ SIGNS: tuple[Sign, ...] = (
     # A terminal's own TERM is the one sign ssh always carries.
     Sign("TERM", "xterm-kitty", "kitty", True, "accepts"),
     Sign("TERM", "xterm-ghostty", "ghostty", True, "accepts"),
-    Sign("TERM", "wezterm", "wezterm", True, "accepts"),
+    Sign("TERM", "wezterm", "wezterm", None, "accepts"),
     Sign("TERM", "foot", "foot", True, "accepts"),
-    Sign("TERM", "alacritty", "alacritty", True, "accepts"),
+    Sign("TERM", "alacritty", "alacritty", None, "accepts"),
 )
 """How the outer terminal is recognised, first match winning. ``TERM_PROGRAM`` is checked
 after the terminal-specific variables because a multiplexer or an IDE can leave an outer
-one behind, and ``TERM`` last: anything in between may set it to a name of its own."""
+one behind, and ``TERM`` last: anything in between may set it to a name of its own.
+
+A sign's ``kitty`` is True or False only where the name settles it: every release still
+shipped answers the same way at its defaults. Where the version or a setting decides, it is
+None."""
 
 
 def sign_of(env: Mapping[str, str], *, sent: bool = True) -> Sign | None:
