@@ -5002,7 +5002,7 @@ def test_a_replay_whose_record_holds_a_bare_word_is_refused_before_its_agent_sto
 
     said = str(refused.value)
     _names(said, word, option, value)
-    assert "nothing was stopped" in said, said
+    assert f"nothing was stopped: the word is in the arguments {agent.label!r} recorded" in said
     _left_running(tmux, agent, spawned)
 
 
@@ -5027,7 +5027,7 @@ def test_a_restart_after_the_binding_changed_to_a_bare_word_is_refused_before_th
 
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
-    assert "nothing was stopped" in said, said
+    assert "nothing was stopped: the word is in the role's binding" in said, said
     _left_running(tmux, agent, spawned)
 
 
@@ -5061,7 +5061,7 @@ def test_a_fresh_replacement_whose_role_holds_a_bare_word_is_refused_before_the_
 
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
-    assert "nothing was stopped" in said, said
+    assert "nothing was stopped: the word is in the role's agent_args" in said, said
     _left_running(tmux, agent, spawned)
 
 
@@ -5082,7 +5082,9 @@ def test_a_paused_codex_rows_resume_whose_record_holds_a_bare_word_is_refused(
     with pytest.raises(fleet_service.FleetError) as refused:
         fleet_service.restart(project, agent.label, verb="resume")
 
-    _names(str(refused.value), "b", "--add-dir", "a")
+    said = str(refused.value)
+    _names(said, "b", "--add-dir", "a")
+    assert f"nothing was stopped: the word is in the arguments {agent.label!r} recorded" in said
     assert len(tmux.spawned) == spawned
     with store_session() as store:
         row = store.get_fleet_agent(agent.id)

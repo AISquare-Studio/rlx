@@ -194,7 +194,15 @@ def test_the_receiver_is_ready_without_asking_the_resolver_its_own_name(
         thread.join(timeout=5)
 
 
-@pytest.mark.parametrize("native", [["--model", "opus"], ["--add-dir", "/repo"]])
+@pytest.mark.parametrize(
+    "native",
+    [
+        ["--model", "opus"],
+        ["--add-dir", "/repo"],
+        ["--thread-source", "x"],
+        ["--cyber-access-program", "x"],
+    ],
+)
 def test_native_value_then_prompt_opens_boundary_only_at_the_prompt(native: list[str]) -> None:
     command = get_command(app).commands["launch"]  # type: ignore[attr-defined]
     with command.make_context(
@@ -203,6 +211,17 @@ def test_native_value_then_prompt_opens_boundary_only_at_the_prompt(native: list
     ) as ctx:
         assert ctx.params["agent"] == "codex"
         assert ctx.args == [*native, "exec", "--", "-c", "literal"]
+
+
+def test_native_switch_then_prompt_opens_boundary_only_at_the_prompt() -> None:
+    """This test reads ``launch coder --worktree --agent codex exec -- -c literal``."""
+    command = get_command(app).commands["launch"]  # type: ignore[attr-defined]
+    with command.make_context(
+        "launch",
+        ["coder", "--worktree", "--agent", "codex", "exec", "--", "-c", "literal"],
+    ) as ctx:
+        assert ctx.params["agent"] == "codex"
+        assert ctx.args == ["--worktree", "exec", "--", "-c", "literal"]
 
 
 def test_unknown_native_arity_cannot_silently_choose_the_wrong_binary(runner: CliRunner) -> None:

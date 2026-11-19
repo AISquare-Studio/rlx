@@ -492,10 +492,6 @@ _DAEMON_COMMANDS = frozenset(
 ``codex__app__server__daemon``): ``daemon`` followed by none of them is a prompt's word, and
 one of them but :data:`_PID_UPDATE_LOOP` as the last word is a prompt's as well, as a
 subcommand's own is (:func:`_daemons`)."""
-_FLAGS = frozenset({_MANAGED_DAEMON})
-"""The options known to take no value (``codex completion bash`` completes none for them):
-the word after one is never its value (:func:`_could_be_prompt`), so ``codex 'app-server
---managed-daemon crashes'`` reads as a prompt's."""
 _REMOTE = "--remote"
 """The option that connects Codex's TUI to an app-server it names (``--remote <ADDR>``:
 ``ws://``, ``wss://`` or ``unix://[PATH]``), its own or the daemon's; Codex refuses it with
@@ -647,14 +643,20 @@ def _could_be_prompt(words: Sequence[str], own: frozenset[str]) -> bool:
     (``app-server --listen ws://127.0.0.1:4500``, ``execpolicy check --rules /r.rules`` and
     ``exec resume --last`` cannot; ``exec the tests``, ``exec review the diff`` and ``login
     status`` can). An option's value is the word right after it, unless it is joined to it
-    or the option takes none (:data:`_FLAGS`). One of its own that is the last word is a
-    prompt's as well as it is that subcommand: ``codex 'login status'`` lists as ``codex
-    login status``, a TUI measured connected to the daemon (tester-51-final), so it is a
-    possible client, the lesser harm (the MANAGER DECISION, as for a first word)."""
+    or the option takes none: a switch of Codex's help (``codex.SWITCHES``, so ``exec --json
+    x`` and ``review --uncommitted x`` can), or app-server's :data:`_MANAGED_DAEMON`, which its
+    help does not list (``codex 'app-server --managed-daemon crashes'`` can). An option no help
+    page lists still takes the word after it as its value. One of its own that is the last
+    word is a prompt's as well as it is that subcommand: ``codex 'login status'`` lists as
+    ``codex login status``, a TUI measured connected to the daemon (tester-51-final), so it is
+    a possible client, the lesser harm (the MANAGER DECISION, as for a first word)."""
+    from aisquare.core.agent_adapters.codex import SWITCHES
+
+    switches = SWITCHES | {_MANAGED_DAEMON}
     valued = False
     for at, word in enumerate(words):
         if word.startswith("-") and word != "--":
-            valued = "=" not in word and word not in _FLAGS
+            valued = "=" not in word and word not in switches
         elif valued:
             valued = False
         elif word in own and at < len(words) - 1:

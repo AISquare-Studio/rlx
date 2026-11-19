@@ -22,6 +22,7 @@ from aisquare.core import agents as agent_core
 from aisquare.core.agent_adapters import codex_config
 from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, load_config, save_config
 from aisquare.core.orchestrator import TEAM_HUB_ENV_VAR
+from aisquare.core.store import store_session
 from aisquare.services import fleet as fleet_service
 from aisquare.services.captain import brain
 from aisquare.services.captain import state as captain_state
@@ -189,3 +190,28 @@ def test_a_captains_restart_passes_its_roles_agent_args_as_its_start_did(
     _, native = _as_launch_reads(tmux.spawned[-1]["command"])
     assert _per_start(fresh).count(switch) == 1, fresh
     assert _per_start(native) == _per_start(fresh), native
+
+
+@pytest.mark.needs_captain
+@pytest.mark.parametrize("captain_on_its_agent", ["codex"], indirect=True)
+def test_a_codex_captains_restart_after_its_agent_args_gained_a_bare_word_stops_nothing(
+    tmux: FakeTmux, captain_on_its_agent: str
+) -> None:
+    """This test reads a restart of a running Codex captain whose role's ``agent_args`` for
+    Codex became ``--add-dir a b`` after its start."""
+    agent = brain.start().agent
+    config = load_config()
+    config.fleet.roles["captain"] = FleetRoleSettings(agent_args={"codex": ["--add-dir", "a", "b"]})
+    save_config(config)
+    spawned, killed = len(tmux.spawned), list(tmux.killed)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.restart(captain_state.home_project(), "captain")
+
+    said = str(refused.value)
+    assert "nothing was stopped: the word is in the role's agent_args" in said, said
+    assert tmux.typed == [] and tmux.killed == killed, (tmux.typed, tmux.killed)
+    assert len(tmux.spawned) == spawned
+    with store_session() as store:
+        row = store.get_fleet_agent(agent.id)
+    assert row is not None and row.ended_at is None, row

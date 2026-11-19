@@ -90,18 +90,24 @@ MODEL_FLAGS = ("--model", "-m")
 
 class _Option(NamedTuple):
     """One of Codex's options: its ``spellings``, whether it takes a ``value`` (one word each;
-    ``--image`` takes several, given one at a time here), and whether Codex refuses it given
-    twice (``once``)."""
+    ``--image`` takes several, given one at a time here), whether Codex refuses it given
+    twice (``once``), and whether it is one of its own command line's or ``codex exec``'s
+    (``lane``)."""
 
     spellings: tuple[str, ...]
     value: bool
     once: bool = False
+    lane: bool = True
 
 
-#: Codex's options, those of its own command line and of ``codex exec`` (0.167.0's help), the
-#: one place the adapter states which take a value and which are switches:
-#: ``capabilities.value_options``, ``capabilities.switch_options``, :data:`TAKEN_ONCE` and
-#: :data:`SWITCHED_ONCE` are read off it. ``once`` was measured on 0.164.0, which does not
+#: Codex's options (0.167.0's help), the one place the adapter states which take a value and
+#: which are switches. Its ``lane`` rows are those of its own command line and of ``codex
+#: exec``: ``capabilities.value_options``, ``capabilities.switch_options``, :data:`TAKEN_ONCE`
+#: and :data:`SWITCHED_ONCE` are read off them alone. The rest are every other switch its help
+#: lists, its other commands' and ``resume``'s and ``fork``'s own, none of them on its own
+#: command line's page; ``--help``, ``-h``, ``--version`` and ``-V``, which print and exit,
+#: are not here. :data:`SWITCHES` is read off every row, by the process table's reader
+#: (``codex_transcript``). ``once`` was measured on 0.164.0, which does not
 #: start on ``-m a --model b`` ("error: the argument '--model <MODEL>' cannot be used multiple
 #: times") nor ``--search --search``; ``-c``, ``--enable``, ``--disable``, ``--add-dir`` and
 #: ``--image`` repeat, and ``codex exec``'s own were not measured. ``--yolo`` is
@@ -139,11 +145,56 @@ OPTIONS = (
     _Option(("--ephemeral",), value=False),
     _Option(("--ignore-user-config",), value=False),
     _Option(("--ignore-rules",), value=False),
+    *(
+        _Option((spelling,), value=False, lane=False)
+        for spelling in (
+            "--all",
+            "--analytics-default-enabled",
+            "--apply",
+            "--ascii",
+            "--available",
+            "--aws-sigv4",
+            "--bundled",
+            "--device-auth",
+            "--executor-credential-stdin",
+            "--exit-on-stdin-close",
+            "--experimental",
+            "--force",
+            "--include-managed-config",
+            "--include-non-interactive",
+            "--last",
+            "--log-denials",
+            "--network-only",
+            "--no-browser",
+            "--no-color",
+            "--print-startup-config",
+            "--proxy-private-ips-via-upstream",
+            "--resume",
+            "--sandbox-state-disable-network",
+            "--startup-sign-out",
+            "--stdio",
+            "--summary",
+            "--uncommitted",
+            "--use-agent-identity-auth",
+            "--verbose",
+            "--with-access-token",
+            "--with-api-key",
+        )
+    ),
 )
 #: The options with a value Codex refuses given twice, each with its spellings (:data:`OPTIONS`).
-TAKEN_ONCE = tuple(option.spellings for option in OPTIONS if option.value and option.once)
+TAKEN_ONCE = tuple(
+    option.spellings for option in OPTIONS if option.lane and option.value and option.once
+)
 #: The switches Codex refuses given twice, each with its spellings (:data:`OPTIONS`).
-SWITCHED_ONCE = tuple(option.spellings for option in OPTIONS if not option.value and option.once)
+SWITCHED_ONCE = tuple(
+    option.spellings for option in OPTIONS if option.lane and not option.value and option.once
+)
+#: Every switch of Codex's, its own command line's, ``codex exec``'s and its other commands'
+#: (:data:`OPTIONS`).
+SWITCHES = frozenset(
+    spelling for option in OPTIONS if not option.value for spelling in option.spellings
+)
 #: The features whose tools :meth:`CodexAdapter.tools_only_args` switches off (with
 #: ``web_search="disabled"``), by their names in ``codex features list``. Measured on 0.162.1:
 #: ``exec`` offers ``exec_command``, ``write_stdin``, ``request_user_input``, ``view_image``,
@@ -853,7 +904,10 @@ class CodexAdapter:
         # (#105): -a is their --account, so Codex's own is spelled --ask-for-approval or given
         # after --; -c is their binary, and -c KEY=VALUE stays Codex's by its shape.
         value_options=frozenset(
-            spelling for option in OPTIONS if option.value for spelling in option.spellings
+            spelling
+            for option in OPTIONS
+            if option.lane and option.value
+            for spelling in option.spellings
         ),
         # The fleet fills Codex's positionals itself, its resume or fork and its first message after
         # --, at every start and replay: 0.167.0 takes one directory per --add-dir and reads a bare
@@ -861,7 +915,10 @@ class CodexAdapter:
         # screen).
         options_only=True,
         switch_options=frozenset(
-            spelling for option in OPTIONS if not option.value for spelling in option.spellings
+            spelling
+            for option in OPTIONS
+            if option.lane and not option.value
+            for spelling in option.spellings
         ),
     )
 

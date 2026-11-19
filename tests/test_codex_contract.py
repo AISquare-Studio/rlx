@@ -20,7 +20,14 @@ from aisquare.cli.app import app
 from aisquare.core import agents
 from aisquare.core.agent_adapters import codex_config, get_adapter
 from aisquare.core.agent_adapters import get_adapter as _get_adapter
-from aisquare.core.agent_adapters.codex import TOOL_FEATURES, TUI_TOOLS_SERVER, CodexAdapter
+from aisquare.core.agent_adapters.codex import (
+    OPTIONS,
+    SWITCHED_ONCE,
+    TAKEN_ONCE,
+    TOOL_FEATURES,
+    TUI_TOOLS_SERVER,
+    CodexAdapter,
+)
 from aisquare.core.agent_adapters.codex_transcript import CodexTranscript
 from aisquare.core.agent_adapters.types import (
     BadEffortError,
@@ -185,8 +192,6 @@ def test_a_chosen_sandbox_or_policy_turns_the_default_off() -> None:
     ]
 
 
-#: What the refusal of ``approve_for_me = true`` names beside every clash: the setting, the
-#: Codex switch it passes and the one sandbox that switch takes.
 #: Argument lists and the word Codex's adapter finds among them, with the option and value it
 #: follows; ``None`` for options with one value each.
 BARE_WORDS: list[tuple[list[str], BareWord | None]] = [
@@ -228,6 +233,50 @@ def test_bare_word_reads_codexs_arguments_as_options_with_one_value_each(
     assert bare_word(_get_adapter("claude-code"), args) is None
 
 
+def test_codex_options_name_each_spelling_once_and_give_the_lane_these_four_sets() -> None:
+    """This test reads every spelling in ``codex.OPTIONS`` and the four sets read off its
+    ``lane`` rows: ``capabilities.value_options``, ``capabilities.switch_options``,
+    ``TAKEN_ONCE`` and ``SWITCHED_ONCE``."""
+    spellings = [spelling for option in OPTIONS for spelling in option.spellings]
+    assert len(spellings) == len(set(spellings)), spellings
+    assert CodexAdapter.capabilities.value_options == {
+        *("--add-dir", "--ask-for-approval", "--cd", "--color", "--config"),
+        *("--cyber-access-program", "--disable", "--enable", "--image", "--local-provider"),
+        *("--model", "--output-last-message", "--output-schema", "--profile", "--remote"),
+        *("--remote-auth-token-env", "--sandbox", "--thread-source"),
+        *("-C", "-a", "-c", "-i", "-m", "-o", "-p", "-s"),
+    }
+    assert CodexAdapter.capabilities.switch_options == {
+        *("--approve-for-me", "--dangerously-bypass-approvals-and-sandbox"),
+        *("--dangerously-bypass-hook-trust", "--ephemeral", "--ignore-rules"),
+        *("--ignore-user-config", "--json", "--no-alt-screen", "--no-daemon", "--oss"),
+        *("--search", "--skip-git-repo-check", "--strict-config", "--worktree", "--yolo"),
+    }
+    assert TAKEN_ONCE == (
+        ("--model", "-m"),
+        ("--profile", "-p"),
+        ("--sandbox", "-s"),
+        ("--ask-for-approval", "-a"),
+        ("--cd", "-C"),
+        ("--local-provider",),
+        ("--remote",),
+        ("--remote-auth-token-env",),
+    )
+    assert SWITCHED_ONCE == (
+        ("--oss",),
+        ("--strict-config",),
+        ("--approve-for-me",),
+        ("--dangerously-bypass-approvals-and-sandbox", "--yolo"),
+        ("--dangerously-bypass-hook-trust",),
+        ("--worktree",),
+        ("--search",),
+        ("--no-alt-screen",),
+        ("--no-daemon",),
+    )
+
+
+#: What the refusal of ``approve_for_me = true`` names beside every clash: the setting, the
+#: Codex switch it passes and the one sandbox that switch takes.
 _APPROVE_FOR_ME = ("fleet.roles.coder.approve_for_me = true", "--approve-for-me", "workspace-write")
 _YOURSELF = "fleet.roles.coder.approve_for_me = false"
 

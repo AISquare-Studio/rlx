@@ -7055,7 +7055,8 @@ def _agent_arguments(
 
 def _refuse_a_bare_word(adapter: AgentAdapter, args: Sequence[str], *, after: str = "") -> None:
     """Refuse ``args`` when the agent takes options alone and :func:`bare_word` finds another
-    word among them, naming the spelling that works; ``after`` ends a replay's refusal."""
+    word among them, naming the spelling that works; ``after`` ends a replacement's refusal
+    (:func:`_refuse_a_replacements_bare_word`)."""
     bare = bare_word(adapter, args)
     if bare is None:
         return
@@ -7081,15 +7082,30 @@ def _refuse_a_bare_word(adapter: AgentAdapter, args: Sequence[str], *, after: st
     raise FleetError(f"{lead}: {word!r} is not one, so {ways}{after}")
 
 
-def _nothing_stopped_for_a_bare_word(label: str, *, replay: bool) -> str:
-    """:func:`_refuse_a_bare_word`'s ``after`` for a replacement of the row ``label``, asked
-    before anything is stopped. A ``replay`` reads today's binding and the arguments its record
-    holds, never the role's ``agent_args`` of today, which a fresh start of the role reads."""
-    changed = "the role's binding" if replay else "the role's binding or agent_args"
-    return (
-        f"; nothing was stopped: change {changed} if the word is there, else stop {label!r} and "
-        "spawn it again"
-    )
+def _refuse_a_replacements_bare_word(
+    adapter: AgentAdapter,
+    label: str,
+    *,
+    binding: Sequence[str],
+    role: Sequence[str],
+    recorded: Sequence[str] = (),
+) -> None:
+    """:func:`_refuse_a_bare_word` before anything is stopped, for a replacement of the row
+    ``label`` given, in this order, its binding's arguments, its role's (:func:`_role_args`)
+    and the ones its record holds (``recorded``, :func:`_spawn_args`), as the caller reads
+    them, naming the one the word is in: the first that :func:`bare_word` finds a word in,
+    read after the ones before it."""
+    read: list[str] = []
+    for part, where in (
+        (binding, "the role's binding, so change it there"),
+        (role, "the role's agent_args, so change them there"),
+        (recorded, f"the arguments {label!r} recorded at its start, so stop it and spawn it again"),
+    ):
+        read += part
+        if bare_word(adapter, read) is not None:
+            _refuse_a_bare_word(
+                adapter, read, after=f"; nothing was stopped: the word is in {where}"
+            )
 
 
 #: The options of the window's `launch` that 0.9.2's `fleet spawn` let through to it among the
@@ -15101,14 +15117,14 @@ def _refuse_a_cross_agent_start(
 def _refuse_a_fresh_starts_bare_word(
     selected: agent_launch.ResolvedAgent, role: str, label: str
 ) -> None:
-    """:func:`_refuse_a_bare_word` before anything is stopped, for a replacement that starts
-    ``role`` fresh as today's config launches it on ``selected``'s agent (a crossing, a
-    take-over as another role): the binding's arguments for that agent, and the role's."""
-    role_args = _role_args(role, None, selected.adapter, role_settings(role))
-    _refuse_a_bare_word(
+    """:func:`_refuse_a_replacements_bare_word` for a replacement that starts ``role`` fresh
+    as today's config launches it on ``selected``'s agent (a crossing, a take-over as another
+    role): the binding's arguments for that agent, and the role's."""
+    _refuse_a_replacements_bare_word(
         selected.adapter,
-        [*selected.profile.args, *role_args],
-        after=_nothing_stopped_for_a_bare_word(label, replay=False),
+        label,
+        binding=selected.profile.args,
+        role=_role_args(role, None, selected.adapter, role_settings(role)),
     )
 
 
@@ -15731,9 +15747,9 @@ def _refuse_a_replay_that_cannot_start(
     branch to make it again on (:func:`_branch_of_a_gone_tree`, which writes nothing), in
     ``project``'s root; ``branch`` is the one its row recorded the tree on. A refusal names
     ``project`` in the commands it gives. And a word among the replay's arguments that an agent
-    whose arguments are options alone refuses (:func:`_refuse_a_bare_word`): a record written
-    before that check, or a binding changed since, stopped the agent and then had its
-    replacement refused.
+    whose arguments are options alone refuses (:func:`_refuse_a_replacements_bare_word`): a
+    record written before that check, or a binding changed since, stopped the agent and then
+    had its replacement refused.
     """
     family = record.session.agent if record.session is not None else None
     replayed = _launch_binary(
@@ -15770,10 +15786,12 @@ def _refuse_a_replay_that_cannot_start(
         binary=selected.binary.binary,
         family=family,
     )
-    _refuse_a_bare_word(
+    _refuse_a_replacements_bare_word(
         selected.adapter,
-        [*selected.profile.args, *role_args, *extra],
-        after=_nothing_stopped_for_a_bare_word(record.label or "", replay=True),
+        record.label or "",
+        binding=selected.profile.args,
+        role=role_args,
+        recorded=extra,
     )
     if not selected.adapter.capabilities.model_ladders:
         try:

@@ -1037,6 +1037,23 @@ def test_a_codex_process_says_how_it_holds_what_it_writes() -> None:
         "exec say hi",  # or ``codex 'exec say hi'``, which ps lists alike
         "e say hi",
         "-m gpt-5.5 exec --json say hi",
+        "exec --json x",  # ``--json`` a switch of Codex's (``codex.SWITCHES``): as ``exec x``
+        "exec --json daemon",
+        "e --skip-git-repo-check x",
+        # Another command's switch, one per command, read as that command and ``x``.
+        "review --uncommitted x",
+        "exec resume --last x",
+        "login --device-auth x",
+        "doctor --summary x",
+        "delete --force x",
+        "queue --resume x",
+        "mcp login --no-browser x",
+        "app-server --stdio x",
+        "exec-server --aws-sigv4 x",
+        "sandbox --log-denials x",
+        "migrate-rollouts --apply x",
+        "plugin list --available x",
+        "debug models --bundled x",
         "app-server is down, fix it",
         "-- use -c and --search",  # a prompt
         "-- -c is broken",  # ``-c`` the prompt's, after ``--``
@@ -1109,7 +1126,7 @@ def test_a_codex_process_says_how_it_holds_what_it_writes() -> None:
         *NO_CLIENTS,
         "app-server --listen stdio://",
         "exec",
-        "exec --json daemon",
+        "exec -m x",  # ``x`` the value of ``-m``
         "exec --json",
         "e --skip-git-repo-check",
         "review --uncommitted",
