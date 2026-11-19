@@ -20,7 +20,7 @@ from aisquare.cli.app import app
 from aisquare.core import agent_adapters, launch_seal, paths
 from aisquare.core import agents as agent_core
 from aisquare.core.agent_adapters import codex_config
-from aisquare.core.config import RoleLaunchProfile, load_config, save_config
+from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, load_config, save_config
 from aisquare.core.orchestrator import TEAM_HUB_ENV_VAR
 from aisquare.services import fleet as fleet_service
 from aisquare.services.captain import brain
@@ -168,3 +168,24 @@ def test_a_captain_row_0_8_2_recorded_restarts_with_todays_arguments_alone(
     assert pairs == _pairs()
     assert _per_start(native) == _per_start(fresh), native
     assert "mcp.json" not in " ".join(native)
+
+
+@pytest.mark.needs_captain
+@pytest.mark.parametrize("captain_on_its_agent", _confinable(), indirect=True)
+def test_a_captains_restart_passes_its_roles_agent_args_as_its_start_did(
+    tmux: FakeTmux, captain_on_its_agent: str
+) -> None:
+    """This test reads the agent's line of a captain's start and of its restart, for a captain
+    role whose ``agent_args`` for its agent hold one switch."""
+    switch = {"claude-code": "--verbose", "codex": "--search"}[captain_on_its_agent]
+    config = load_config()
+    config.fleet.roles["captain"] = FleetRoleSettings(agent_args={captain_on_its_agent: [switch]})
+    save_config(config)
+    brain.start()
+    _, fresh = _as_launch_reads(tmux.spawned[-1]["command"])
+
+    fleet_service.restart(captain_state.home_project(), "captain")
+
+    _, native = _as_launch_reads(tmux.spawned[-1]["command"])
+    assert _per_start(fresh).count(switch) == 1, fresh
+    assert _per_start(native) == _per_start(fresh), native

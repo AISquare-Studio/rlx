@@ -3952,6 +3952,8 @@ CODEX_REFUSED = [
     pytest.param(["--add-dir", "a", "--search", "review"], "review", "", "", id="switch-review"),
     pytest.param(["-i", "x.png", "b"], "b", "-i", "x.png", id="image-then-word"),
     pytest.param(["--search", "b"], "b", "", "", id="switch-then-word"),
+    pytest.param(["--worktree", "b"], "b", "", "", id="worktree-then-word"),
+    pytest.param(["-"], "-", "", "", id="lone-dash"),
     pytest.param(["--add-dir", "x", "a"], "a", "--add-dir", "x", id="dir-named-a"),
     pytest.param(["--add-dir", "x", "e"], "e", "--add-dir", "x", id="dir-named-e"),
     pytest.param(
@@ -4045,6 +4047,8 @@ def test_a_resumed_or_forked_codex_spawn_refuses_a_bare_word_before_a_window(
         pytest.param(["-c", "a.b=1"], "argv", id="config"),
         pytest.param(["--model", "gpt-5.4"], "argv", id="model"),
         pytest.param(["--search"], "argv", id="switch"),
+        pytest.param(["--worktree"], "argv", id="worktree"),
+        pytest.param(["--add-dir", "-"], "argv", id="dash-as-a-value"),
         pytest.param(["--future", "v"], "argv", id="undeclared-option"),
     ],
 )
@@ -4369,6 +4373,20 @@ def test_a_rows_launch_flags_and_chosen_models_are_read_off_its_recorded_window_
     )
     chosen = model_memory.chosen_models(session)
     assert ("claude-opus-5-5[1m]" in chosen) == (ran.model is not None), chosen
+
+
+def test_a_codex_rows_launch_flags_read_its_effort_off_its_window_line(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+) -> None:
+    """This test reads ``model_memory``'s launch flags of a Codex row spawned with a model and
+    an effort."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
+    save_config(config)
+    row = fleet_service.spawn(project, "coder", agent="codex", model="gpt-5.4", effort="high").agent
+    assert model_memory._launch_flags(row) == model_memory.Pick("gpt-5.4", "high")
 
 
 def test_the_readers_of_a_binding_its_project_runs_on_codex_read_it_from_another_folder(
@@ -4949,6 +4967,7 @@ def _left_running(tmux: FakeTmux, agent: FleetAgent, spawned: int) -> None:  # n
         pytest.param(
             ["--add-dir", "a", "fix-the-bug"], "fix-the-bug", "--add-dir", "a", id="prompt"
         ),
+        pytest.param(["--worktree", "b"], "b", "", "", id="worktree-then-word"),
     ],
 )
 @pytest.mark.parametrize("how", ["restart", "switch"])

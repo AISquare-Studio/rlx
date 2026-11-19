@@ -15,8 +15,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the fleet. Codex takes one directory per `--add-dir` and reads `b` as its prompt, so it
   refused the first message `rlx fleet spawn` puts after it and exited before its first
   screen, or started with a path as its prompt and without that directory; and a prompt or
-  command among the arguments met the fleet's own at every restart and switch, which Codex
-  refused. The check reads the spawn's own arguments, the Spawn dialog's, a role's
+  command among the arguments met the fleet's own at a restart or switch whose first message
+  goes on the command line, which Codex refused. The check reads the spawn's own arguments, the Spawn dialog's, a role's
   `agent_args` and binding and a replay's, and a restart or switch asks it before it stops the
   agent.
 - **A role's bound arguments reach only the agent they are for.** The `team bind --arg`

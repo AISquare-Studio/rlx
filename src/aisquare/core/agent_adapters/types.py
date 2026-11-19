@@ -2251,9 +2251,10 @@ def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
     """The first word of ``args`` that a fleet spawn of ``adapter`` refuses
     (``capabilities.options_only``): read with the adapter's ``switch_options`` taking no value
     and any other option, declared in ``value_options`` or not, taking the next word as its one
-    value unless that word starts with ``-``, a value joined to its option taking none; the
-    native ``--`` is itself such a word. ``None`` for an adapter without ``options_only`` and
-    for arguments that are options alone."""
+    value unless that word is an option, a value joined to its option taking none; an option is
+    a word that starts with ``-`` other than ``-`` alone, which is a word as Codex reads it (its
+    prompt), and the native ``--`` is itself such a word. ``None`` for an adapter without
+    ``options_only`` and for arguments that are options alone."""
     capabilities = adapter.capabilities
     if not capabilities.options_only:
         return None
@@ -2263,7 +2264,7 @@ def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
         word = args[at]
         if word == "--":
             return BareWord(word)
-        if not word.startswith("-"):
+        if not _an_option(word):
             return BareWord(word, option, value)
         name, joined, rest = word.partition("=")
         following = args[at + 1] if at + 1 < len(args) else None
@@ -2271,11 +2272,17 @@ def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
             option, value, at = name, rest, at + 1
         elif not word.startswith("--") and len(word) > 2:
             option, value, at = word[:2], word[2:], at + 1
-        elif word in capabilities.switch_options or following is None or following.startswith("-"):
+        elif word in capabilities.switch_options or following is None or _an_option(following):
             option, value, at = "", "", at + 1
         else:
             option, value, at = word, following, at + 2
     return None
+
+
+def _an_option(word: str) -> bool:
+    """Whether ``word`` is an option's spelling to :func:`bare_word`: it starts with ``-`` and
+    is not ``-`` alone."""
+    return word.startswith("-") and word != "-"
 
 
 def rewrite_option_values(

@@ -46,7 +46,8 @@ from pathlib import Path
 
 from aisquare.core import harness, transcripts
 from aisquare.core import program as prog
-from aisquare.core.agent_adapters import adapters, get_adapter, model_owner
+from aisquare.core.agent_adapters import adapters, get_adapter, model_owner, recorded_adapter
+from aisquare.core.agent_adapters.types import model_overrides
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import FleetAgent, TeamSession
 from aisquare.services import agent_launch
@@ -715,29 +716,29 @@ def chosen_models(session: TeamSession) -> list[str]:
 
 
 def _window_line(agent: FleetAgent) -> list[str] | None:
-    """The agent's arguments on its recorded window line (``LaunchSpec.command``): what its
-    window's ``launch`` passed after its first ``--`` (``fleet._the_windows_own_options`` is
-    what came before), its role binding's as its spawn passed them included. ``None`` for a
-    row with no record, or a record that kept no line."""
-    command = list(agent.launch_spec.command) if agent.launch_spec is not None else []
-    if "launch" not in command:
-        return None
-    rest = command[command.index("launch") + 1 :]
-    return rest[rest.index("--") + 1 :] if "--" in rest else None
+    """The arguments the agent's recorded window line passed it (``LaunchSpec.window_line``),
+    its role binding's as its spawn passed them included. ``None`` for a row with no record,
+    or a record whose line kept no ``--``."""
+    line = agent.launch_spec.window_line() if agent.launch_spec is not None else None
+    return line[1] if line is not None else None
 
 
 def _launch_flags(agent: FleetAgent) -> Pick:
-    """The ``--model`` and ``--effort`` the agent was launched with: those on its recorded
-    window line (:func:`_window_line`), which holds what its spawn added and its binding's
-    arguments as the spawn decided them, whatever process reads it. A record that kept no line
-    is read by the rule ``aisquare launch`` applies: its window's own (its arguments', else
-    what the spawn added beside them), else its role's binding's (``team bind --arg``), which
-    no spec records otherwise (for example, a bound ultracode read as the Stop's ``xhigh``),
-    read in the folder its window ran in."""
+    """The model and effort the agent was launched with: those on its recorded window line
+    (:func:`_window_line`), which holds what its spawn added and its binding's arguments as the
+    spawn decided them, whatever process reads it, in its own agent's words
+    (``AgentAdapter.native_choice``: Codex's ``-c model_reasoning_effort=…``). A record that
+    kept no line is read by the rule ``aisquare launch`` applies: its window's own (its
+    arguments', else what the spawn added beside them), else its role's binding's (``team bind
+    --arg``), which no spec records otherwise (for example, a bound ultracode read as the
+    Stop's ``xhigh``), read in the folder its window ran in."""
     spec = agent.launch_spec
     if spec is None:
         return Pick()
     line = _window_line(agent)
+    adapter = recorded_adapter(agent.agent)
+    if line is not None and adapter is not None:
+        return Pick(*model_overrides(adapter.id, line))
     if line is not None:
         return Pick(harness.model_arg(line), harness.effort_arg(line))
     bound = agent_launch.binding_args(agent.role, agent.agent, cwd=agent.cwd)

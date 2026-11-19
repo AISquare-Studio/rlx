@@ -2120,6 +2120,22 @@ class LaunchSpec(BaseModel):
     as its spawn resolved it, so a restart or switch keeps it. ``None`` on a spec recorded
     before it: the role's setting applies."""
 
+    def window_line(self) -> tuple[list[str], list[str] | None] | None:
+        """:attr:`command` read as the window line it records, split at the first ``--``
+        after its ``launch``: the options that ``launch`` read, and the arguments it passed
+        the agent, the binding's as its spawn passed them included. A line with no such ``--``
+        (0.9.2's window, whose ``launch`` read its options among the arguments) is every word
+        after ``launch``, and ``None`` for the agent's. ``None`` for a command with no
+        ``launch``."""
+        command = list(self.command)
+        if "launch" not in command:
+            return None
+        rest = command[command.index("launch") + 1 :]
+        if "--" not in rest:
+            return rest, None
+        at = rest.index("--")
+        return rest[:at], rest[at + 1 :]
+
 
 class FleetAgent(BaseModel):
     """One agent the fleet started: a tmux pane, the role it runs, and its board row.

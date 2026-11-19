@@ -5545,8 +5545,7 @@ def spawn(
         worktree = worktree if worktree is not None else spec.worktree
         if remote_control is None:
             remote_control = spec.remote_control  # Claude Code's Remote Control, as spawned
-        if replayed_args and not experimental.captain_role(role):
-            agent_args = _replayed_args(role, spec, config)
+        agent_args = _spawn_args(role, spec, agent_args, config)
         if wrapper is None:
             # The program the record's window ran AS its agent (`--command BIN`, 0.9.2's or
             # this release's), its agent and session the record's own (#105's reopen 2).
@@ -5638,18 +5637,7 @@ def spawn(
     exited = _before_a_server_starts(srv, config, selected.adapter.id).exited
     if exited:
         notes.append(_exited_note(srv, exited))
-    from aisquare.core.agent_adapters.types import fleet_extra_args
-
-    # A replayed spec already holds the role's arguments as they were at spawn;
-    # adding today's would double them (or add ones the agent never had). The
-    # captain's are never replayed (above): its tools and its environment are given at
-    # every launch (below), and a row 0.8.2 recorded holds its old confinement, a
-    # second --mcp-config naming a frozen mcp.json (review r17 of #113, finding 6).
-    role_args = (
-        []
-        if spec is not None and not experimental.captain_role(role)
-        else fleet_extra_args(selected.adapter, role_config.extra_args, role_config.agent_args)
-    )
+    role_args = _role_args(role, spec, selected.adapter, role_config)
     launch_options, extra = _agent_arguments(
         agent_args,
         selected.adapter,
@@ -7018,6 +7006,31 @@ def _in_place_of_recorded(
     return today
 
 
+def _spawn_args(
+    role: str, spec: LaunchSpec | None, agent_args: Sequence[str], config: FleetSettings
+) -> list[str]:
+    """A spawn's own arguments: ``agent_args`` as given, else, for a replay of ``spec``, the
+    ones it recorded (:func:`_replayed_args`); never the captain's, whose tools and environment
+    are given at every launch (:func:`_role_args`). :func:`spawn` and
+    :func:`_refuse_a_replay_that_cannot_start` read them so."""
+    if spec is not None and not agent_args and not experimental.captain_role(role):
+        return _replayed_args(role, spec, config)
+    return list(agent_args)
+
+
+def _role_args(
+    role: str, spec: LaunchSpec | None, adapter: AgentAdapter, role_config: FleetRoleSettings
+) -> list[str]:
+    """The role's arguments a spawn adds (``extra_args``, ``agent_args``): none for a replay of
+    ``spec``, which already holds them as they were at spawn, so adding today's would double
+    them (or add ones the agent never had); the captain's at every launch, as its record is
+    never replayed and a row 0.8.2 recorded holds its old confinement, a second
+    --mcp-config naming a frozen mcp.json (review r17 of #113, finding 6)."""
+    if spec is not None and not experimental.captain_role(role):
+        return []
+    return fleet_extra_args(adapter, role_config.extra_args, role_config.agent_args)
+
+
 def _agent_arguments(
     agent_args: Sequence[str],
     adapter: AgentAdapter,
@@ -7068,12 +7081,14 @@ def _refuse_a_bare_word(adapter: AgentAdapter, args: Sequence[str], *, after: st
     raise FleetError(f"{lead}: {word!r} is not one, so {ways}{after}")
 
 
-def _nothing_stopped_for_a_bare_word(label: str) -> str:
+def _nothing_stopped_for_a_bare_word(label: str, *, replay: bool) -> str:
     """:func:`_refuse_a_bare_word`'s ``after`` for a replacement of the row ``label``, asked
-    before anything is stopped."""
+    before anything is stopped. A ``replay`` reads today's binding and the arguments its record
+    holds, never the role's ``agent_args`` of today, which a fresh start of the role reads."""
+    changed = "the role's binding" if replay else "the role's binding or agent_args"
     return (
-        "; nothing was stopped: change the role's binding or agent_args if the word is there, "
-        f"else stop {label!r} and spawn it again"
+        f"; nothing was stopped: change {changed} if the word is there, else stop {label!r} and "
+        "spawn it again"
     )
 
 
@@ -7168,7 +7183,8 @@ def window_read(spec: LaunchSpec) -> WindowRead:
     there as the agent's (Codex's ``-- -a never``), and so does a build of this one that
     still said 0.9.2. 0.9.2 recorded ``-c BIN`` as ``BIN`` alone, which cannot be told
     from the agent's own argument: it stays one."""
-    own = _the_windows_own_options(spec.command)
+    line = spec.window_line()
+    own = line[0] if line is not None else None
     args = list(spec.extra_args)
     account: str | None = None
     binary: str | None = None
@@ -7199,16 +7215,6 @@ def window_read(spec: LaunchSpec) -> WindowRead:
         left.append(token)
         index += 1
     return WindowRead(account, binary, tuple(left))
-
-
-def _the_windows_own_options(command: Sequence[str]) -> list[str] | None:
-    """The arguments of a recorded window line's `launch` before its first ``--``: its own
-    options, the ones it read. ``None`` for a record that kept no line (every release before
-    this one, whose windows had no ``--``)."""
-    if "launch" not in command:
-        return None
-    rest = list(command[command.index("launch") + 1 :])
-    return rest[: rest.index("--")] if "--" in rest else rest
 
 
 def _holds_run(tokens: Sequence[str], run: Sequence[str]) -> bool:
@@ -15098,14 +15104,11 @@ def _refuse_a_fresh_starts_bare_word(
     """:func:`_refuse_a_bare_word` before anything is stopped, for a replacement that starts
     ``role`` fresh as today's config launches it on ``selected``'s agent (a crossing, a
     take-over as another role): the binding's arguments for that agent, and the role's."""
-    role_config = role_settings(role)
+    role_args = _role_args(role, None, selected.adapter, role_settings(role))
     _refuse_a_bare_word(
         selected.adapter,
-        [
-            *selected.profile.args,
-            *fleet_extra_args(selected.adapter, role_config.extra_args, role_config.agent_args),
-        ],
-        after=_nothing_stopped_for_a_bare_word(label),
+        [*selected.profile.args, *role_args],
+        after=_nothing_stopped_for_a_bare_word(label, replay=False),
     )
 
 
@@ -15755,14 +15758,13 @@ def _refuse_a_replay_that_cannot_start(
     except ValueError as exc:
         raise FleetError(str(exc)) from exc
     # The arguments the replacement is given, read as `spawn` reads a replay's: the binding's,
-    # then the record's (the role's are among them, as its spawn passed them).
-    recorded = (
-        []
-        if experimental.captain_role(record.role)
-        else _replayed_args(record.role, record.spec, settings())
+    # the role's (none but the captain's) and the record's.
+    fleet_config = settings()
+    role_args = _role_args(
+        record.role, record.spec, selected.adapter, role_settings(record.role, fleet_config)
     )
     _, extra = _agent_arguments(
-        recorded,
+        _spawn_args(record.role, record.spec, [], fleet_config),
         selected.adapter,
         replayed=True,
         binary=selected.binary.binary,
@@ -15770,8 +15772,8 @@ def _refuse_a_replay_that_cannot_start(
     )
     _refuse_a_bare_word(
         selected.adapter,
-        [*selected.profile.args, *extra],
-        after=_nothing_stopped_for_a_bare_word(record.label or ""),
+        [*selected.profile.args, *role_args, *extra],
+        after=_nothing_stopped_for_a_bare_word(record.label or "", replay=True),
     )
     if not selected.adapter.capabilities.model_ladders:
         try:
@@ -15780,12 +15782,12 @@ def _refuse_a_replay_that_cannot_start(
             raise FleetError(f"{exc} — nothing was stopped") from exc
     account = home or (Path(record.account_home) if record.account_home else None)
     if selected.adapter.capabilities.sandboxes_tools:
-        # The agent's arguments as its window's `launch` passes them: after the `--` of
-        # the recorded command line (the extra ones, for a record from before there was one);
-        # with a new permission mode, that mode's in place of the recorded ones.
-        command = list(record.spec.command)
+        # The agent's arguments as its window's `launch` passes them (`LaunchSpec.window_line`;
+        # the extra ones, for a record from before its line had a `--`); with a new permission
+        # mode, that mode's in place of the recorded ones.
+        line = record.spec.window_line()
         native = (
-            command[command.index("--") + 1 :] if "--" in command else list(record.spec.extra_args)
+            line[1] if line is not None and line[1] is not None else list(record.spec.extra_args)
         )
         if permission_mode:
             given = _replay_permission_args(

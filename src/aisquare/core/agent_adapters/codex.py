@@ -12,7 +12,7 @@ from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NamedTuple
 
 from aisquare.core import harness
 from aisquare.core.agent_adapters import codex_config
@@ -86,33 +86,64 @@ _APPROVAL_SWITCHES = frozenset(
 )
 #: Its model option's spellings (``CodexAdapter.model_flags``).
 MODEL_FLAGS = ("--model", "-m")
-#: The options with a value Codex refuses given twice, each with its spellings: 0.164.0 does
-#: not start on ``-m a --model b`` ("error: the argument '--model <MODEL>' cannot be used
-#: multiple times"), nor on any of these doubled (measured). ``-c``, ``--enable``,
-#: ``--disable``, ``--add-dir`` and ``--image`` repeat.
-TAKEN_ONCE = (
-    MODEL_FLAGS,
-    ("--profile", "-p"),
-    ("--sandbox", "-s"),
-    ("--ask-for-approval", "-a"),
-    ("--cd", "-C"),
-    ("--local-provider",),
-    ("--remote",),
-    ("--remote-auth-token-env",),
+
+
+class _Option(NamedTuple):
+    """One of Codex's options: its ``spellings``, whether it takes a ``value`` (one word each;
+    ``--image`` takes several, given one at a time here), and whether Codex refuses it given
+    twice (``once``)."""
+
+    spellings: tuple[str, ...]
+    value: bool
+    once: bool = False
+
+
+#: Codex's options, those of its own command line and of ``codex exec`` (0.167.0's help), the
+#: one place the adapter states which take a value and which are switches:
+#: ``capabilities.value_options``, ``capabilities.switch_options``, :data:`TAKEN_ONCE` and
+#: :data:`SWITCHED_ONCE` are read off it. ``once`` was measured on 0.164.0, which does not
+#: start on ``-m a --model b`` ("error: the argument '--model <MODEL>' cannot be used multiple
+#: times") nor ``--search --search``; ``-c``, ``--enable``, ``--disable``, ``--add-dir`` and
+#: ``--image`` repeat, and ``codex exec``'s own were not measured. ``--yolo`` is
+#: ``--dangerously-bypass-approvals-and-sandbox``'s alias, which the help does not list.
+OPTIONS = (
+    _Option(MODEL_FLAGS, value=True, once=True),
+    _Option(("--profile", "-p"), value=True, once=True),
+    _Option(("--sandbox", "-s"), value=True, once=True),
+    _Option(("--ask-for-approval", "-a"), value=True, once=True),
+    _Option(("--cd", "-C"), value=True, once=True),
+    _Option(("--local-provider",), value=True, once=True),
+    _Option(("--remote",), value=True, once=True),
+    _Option(("--remote-auth-token-env",), value=True, once=True),
+    _Option(("--config", "-c"), value=True),
+    _Option(("--enable",), value=True),
+    _Option(("--disable",), value=True),
+    _Option(("--add-dir",), value=True),
+    _Option(("--image", "-i"), value=True),
+    _Option(("--color",), value=True),
+    _Option(("--output-schema",), value=True),
+    _Option(("--output-last-message", "-o"), value=True),
+    _Option(("--thread-source",), value=True),
+    _Option(("--cyber-access-program",), value=True),
+    _Option(("--oss",), value=False, once=True),
+    _Option(("--strict-config",), value=False, once=True),
+    _Option(("--approve-for-me",), value=False, once=True),
+    _Option(("--dangerously-bypass-approvals-and-sandbox", "--yolo"), value=False, once=True),
+    _Option(("--dangerously-bypass-hook-trust",), value=False, once=True),
+    _Option(("--worktree",), value=False, once=True),
+    _Option(("--search",), value=False, once=True),
+    _Option(("--no-alt-screen",), value=False, once=True),
+    _Option(("--no-daemon",), value=False, once=True),
+    _Option(("--json",), value=False),
+    _Option(("--skip-git-repo-check",), value=False),
+    _Option(("--ephemeral",), value=False),
+    _Option(("--ignore-user-config",), value=False),
+    _Option(("--ignore-rules",), value=False),
 )
-#: The switches Codex refuses given twice (0.164.0, measured: ``--search --search``), each
-#: with its spellings.
-SWITCHED_ONCE = (
-    ("--oss",),
-    ("--strict-config",),
-    ("--approve-for-me",),
-    ("--dangerously-bypass-approvals-and-sandbox", "--yolo"),
-    ("--dangerously-bypass-hook-trust",),
-    ("--worktree",),
-    ("--search",),
-    ("--no-alt-screen",),
-    ("--no-daemon",),
-)
+#: The options with a value Codex refuses given twice, each with its spellings (:data:`OPTIONS`).
+TAKEN_ONCE = tuple(option.spellings for option in OPTIONS if option.value and option.once)
+#: The switches Codex refuses given twice, each with its spellings (:data:`OPTIONS`).
+SWITCHED_ONCE = tuple(option.spellings for option in OPTIONS if not option.value and option.once)
 #: The features whose tools :meth:`CodexAdapter.tools_only_args` switches off (with
 #: ``web_search="disabled"``), by their names in ``codex features list``. Measured on 0.162.1:
 #: ``exec`` offers ``exec_command``, ``write_stdin``, ``request_user_input``, ``view_image``,
@@ -822,32 +853,7 @@ class CodexAdapter:
         # (#105): -a is their --account, so Codex's own is spelled --ask-for-approval or given
         # after --; -c is their binary, and -c KEY=VALUE stays Codex's by its shape.
         value_options=frozenset(
-            {
-                "--model",
-                "-m",
-                "--config",
-                "-c",
-                "--add-dir",
-                "--cd",
-                "-C",
-                "--image",
-                "-i",
-                "--profile",
-                "-p",
-                "--sandbox",
-                "-s",
-                "--ask-for-approval",
-                "-a",
-                "--enable",
-                "--disable",
-                "--local-provider",
-                "--remote",
-                "--remote-auth-token-env",
-                "--color",
-                "--output-schema",
-                "--output-last-message",
-                "-o",
-            }
+            spelling for option in OPTIONS if option.value for spelling in option.spellings
         ),
         # The fleet fills Codex's positionals itself, its resume or fork and its first message after
         # --, at every start and replay: 0.167.0 takes one directory per --add-dir and reads a bare
@@ -855,22 +861,7 @@ class CodexAdapter:
         # screen).
         options_only=True,
         switch_options=frozenset(
-            {
-                "--no-alt-screen",
-                "--yolo",
-                "--search",
-                "--oss",
-                "--json",
-                "--approve-for-me",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--dangerously-bypass-hook-trust",
-                "--no-daemon",
-                "--strict-config",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--ignore-user-config",
-                "--ignore-rules",
-            }
+            spelling for option in OPTIONS if not option.value for spelling in option.spellings
         ),
     )
 
