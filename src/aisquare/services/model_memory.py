@@ -696,12 +696,14 @@ def chosen_models(session: TeamSession) -> list[str]:
         with store_session() as store:
             agent = store.fleet_agent_for_session(session.id)
             chosen += [remembered(store=store).model, _launch_flags(agent).model if agent else None]
+            project = store.get_project(session.project_id)
         from aisquare.core.config import load_config  # config imports harness back
 
         roles = load_config().fleet.roles
         settings = roles.get(session.role) or roles.get(harness.base_role(session.role))
         own = settings.extra_args if settings is not None else []
-        bound = agent_launch.binding_args(session.role, session.agent)
+        folder = project.root if project is not None else None
+        bound = agent_launch.binding_args(session.role, session.agent, cwd=folder)
         chosen.append(harness.model_arg([*own, *bound]))
     except Exception:  # an advisory chip: what cannot be read chose nothing
         pass
@@ -712,11 +714,12 @@ def _launch_flags(agent: FleetAgent) -> Pick:
     """The ``--model`` and ``--effort`` the agent was launched with, by the rule ``aisquare
     launch`` applies: its window's own (its arguments', else what the spawn added beside
     them), else its role's binding's (``team bind --arg``), which launch adds to every window
-    and no spec records (for example, a bound ultracode read as the Stop's ``xhigh``)."""
+    and no spec records (for example, a bound ultracode read as the Stop's ``xhigh``), read
+    in the folder its window ran in, whose project's default may own them."""
     spec = agent.launch_spec
     if spec is None:
         return Pick()
-    bound = agent_launch.binding_args(agent.role, agent.agent)
+    bound = agent_launch.binding_args(agent.role, agent.agent, cwd=agent.cwd)
     return Pick(
         harness.model_arg(spec.extra_args) or spec.model or harness.model_arg(bound),
         harness.effort_arg(spec.extra_args) or spec.effort or harness.effort_arg(bound),

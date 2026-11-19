@@ -1580,10 +1580,12 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
         return value if isinstance(value, str) else ACCOUNT_DEFAULT
 
     def _role_pin(self, role: str) -> model_memory.Pick:
-        """What ``role``'s settings pin (``fleet.role_pin``); nothing when the config cannot be
-        read, which the spawn says itself."""
+        """What ``role``'s settings pin (``fleet.role_pin``) in the dialog's project; nothing
+        when the config cannot be read, which the spawn says itself."""
         try:
-            return fleet_service.role_pin(role, self._fleet, agent=self._pick_agent)
+            return fleet_service.role_pin(
+                role, self._fleet, agent=self._pick_agent, cwd=self.project.root
+            )
         except Exception:  # a hint, never a reason to fail
             return model_memory.Pick()
 

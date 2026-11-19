@@ -428,28 +428,37 @@ def binding_left_out(selected: ResolvedAgent, role: str) -> str | None:
 
 def binding_agent(role: str, *, cwd: Path | None = None, folder_default: bool = True) -> str:
     """The agent ``role``'s binding's arguments (``team bind --arg``) are for: the one
-    :func:`resolve` runs ``role`` on when the launch chooses nothing itself, by its own rungs
-    (the binding's agent, its binary's, its account's, the project's default, the accounts in
-    their order with no usage read, the user's default). A launch's own ``--agent``, ``--bin``,
-    ``--account`` or model, or the accounts' headroom, can run another agent, whose parser need
-    not take them: Codex's refuses Claude Code's ``--effort``. A binary no agent's name claims
-    runs the default agent unless the binding names another (:func:`resolve` refuses the rest),
-    and an account two agents' accounts hold names none."""
-    choice = _choose(
-        role, cwd=cwd, measure=False, folder_default=folder_default, ambiguous_names_none=True
+    :func:`resolve` runs ``role`` on in the folder ``cwd`` when the launch chooses nothing
+    itself, by its own rungs (the binding's agent, its binary's, its account's, the project's
+    default, the accounts in their order with no usage read, then this process's
+    ``LAUNCH_AGENT_ENV`` where no binary was named and ``ACTIVE_AGENT_ENV``, the user's
+    default). A launch's own ``--agent``, ``--bin``, ``--account`` or model, or the accounts'
+    headroom, can run another agent, whose parser need not take them: Codex's refuses Claude
+    Code's ``--effort``. A binary no agent's name claims runs the default agent unless the
+    binding names another (:func:`resolve` refuses the rest), and an account two agents'
+    accounts hold names none."""
+    return _args_owner(
+        _choose(
+            role, cwd=cwd, measure=False, folder_default=folder_default, ambiguous_names_none=True
+        )
     )
+
+
+def _args_owner(choice: _Choice) -> str:
+    """:func:`binding_agent` as ``choice`` gives it."""
     wrapper = choice.inferred is None and choice.binary.source != "default"
     return DEFAULT_AGENT if wrapper and choice.source != "role" else choice.agent
 
 
 def binding_args(role: str, agent: str | None, *, cwd: Path | None = None) -> list[str]:
-    """The arguments ``role``'s binding adds to a launch of ``agent``, as :func:`resolve` passes
-    them, without reading its bound files: none for another agent's launch than
-    :func:`binding_agent`'s, and none when the config cannot be read. ``agent`` ``None`` is a
-    record's from before adapters, the default agent's."""
-    team, _unreadable = harness._team_settings()
-    bound = (team.profiles or {}).get(role) if team is not None else None
-    if bound is None or not bound.args or binding_agent(role, cwd=cwd) != (agent or DEFAULT_AGENT):
+    """The arguments ``role``'s binding adds to a launch of ``agent`` in the folder ``cwd``, as
+    :func:`resolve` passes them, without reading its bound files: none for another agent's
+    launch than :func:`binding_agent`'s, and none when the config cannot be read. The binding
+    and its agent come from one read (:func:`_choose`). ``agent`` ``None`` is a record's from
+    before adapters, the default agent's."""
+    choice = _choose(role, cwd=cwd, measure=False, ambiguous_names_none=True)
+    bound = choice.bound
+    if bound is None or not bound.args or _args_owner(choice) != (agent or DEFAULT_AGENT):
         return []
     return list(bound.args)
 

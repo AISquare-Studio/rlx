@@ -1402,8 +1402,8 @@ class CodexAdapter:
           danger-full-access``.
         - ``auto`` is Codex's automatic reviewer: ``--approve-for-me`` in the workspace,
           ``on-request`` with ``approvals_reviewer="auto_review"`` read-only (a reviewer's
-          seats); ``full:auto`` is refused, as ``--approve-for-me`` runs only in
-          workspace-write.
+          seats); ``full:auto`` is refused, the reviewer being run in those two sandboxes
+          and not in full.
         - ``ask`` is ``on-request`` with ``approvals_reviewer="user"``: the human answers,
           on a resumed thread too, which keeps the reviewer it ran under otherwise, and
           whatever config.toml names.

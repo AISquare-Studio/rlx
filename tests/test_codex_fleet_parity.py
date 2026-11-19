@@ -4218,6 +4218,119 @@ def test_what_a_codex_row_ran_reads_no_claude_binding(tmp_path: Path) -> None:
         assert ("claude-opus-5-5[1m]" in chosen) == (agent == "claude-code"), chosen
 
 
+def test_the_readers_of_a_binding_its_project_runs_on_codex_read_it_from_another_folder(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This test reads, from a folder outside ``project``, ``role_pin`` and ``spawn_runs`` for
+    Codex given ``project``'s folder, ``model_memory``'s launch flags of a Codex row whose window
+    ran there and the models chosen for a Codex session of ``project``, for a role whose binding
+    names no agent and passes ``-m gpt-5.4``, which ``project``'s default runs on Codex."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
+    config.team.profiles["coder"] = RoleLaunchProfile(args=["-m", "gpt-5.4"])
+    save_config(config)
+    agent_launch.use("codex", project=True, cwd=project.root)
+    receipt = fleet_service.spawn(project, "coder")
+    assert receipt.agent.agent == "codex"
+    assert "gpt-5.4" in _spawn_native(tmux)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    now = datetime.now(tz=UTC)
+    row = FleetAgent(
+        id="row-codex",
+        project_id=project.id,
+        label="coder",
+        role="coder",
+        agent="codex",
+        pane_id="%1",
+        cwd=project.root,
+        created_at=now,
+        launch_spec=LaunchSpec(binary="codex", extra_args=[]),
+    )
+    assert model_memory._launch_flags(row).model == "gpt-5.4"
+    session = TeamSession(
+        id="s-codex",
+        project_id=project.id,
+        role="coder",
+        agent="codex",
+        started_at=now,
+        last_seen_at=now,
+    )
+    assert "gpt-5.4" in model_memory.chosen_models(session)
+    assert fleet_service.role_pin("coder", agent="codex", cwd=project.root).model == "gpt-5.4"
+    assert fleet_service.spawn_runs("coder", agent="codex", cwd=project.root).model == "gpt-5.4"
+
+
+def test_the_ladder_family_a_spawn_weighs_reads_its_binding_in_the_spawns_folder(
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This test reads ``ladder_family`` for a spawn in ``project``, which names no default,
+    asked from a folder whose project's default is Codex, for a role whose binding names no
+    agent and passes Claude Code's ``--model claude-opus-5-5[1m]``."""
+    _claude_bound("coder")
+    other = tmp_path / "other"
+    other.mkdir()
+    agent_launch.use("codex", project=True, cwd=other)
+    monkeypatch.chdir(other)
+    expected = harness.model_family("claude-opus-5-5[1m]")
+    family = fleet_service.ladder_family("coder", cwd=project.root)
+    assert expected is not None and family == expected, family
+
+
+def test_a_spawns_accounts_rung_and_account_label_weigh_its_binding_in_the_spawns_folder(
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This test reads the family ``role_agent``'s accounts rung weighs and the one
+    ``launch_default`` gives the Claude Code accounts, for a spawn in ``project``, which names no
+    default, asked from a folder whose project's default is Codex, for a role whose binding names
+    no agent and passes Claude Code's ``--model claude-opus-5-5[1m]``."""
+    _claude_bound("coder")
+    other = tmp_path / "other"
+    other.mkdir()
+    agent_launch.use("codex", project=True, cwd=other)
+    monkeypatch.chdir(other)
+    weighed: list[str | None] = []
+
+    def agent_pick(
+        *, measure: bool = True, family: str | None = None, **_: Any
+    ) -> accounts_service.AgentPick:
+        if measure:
+            weighed.append(family)
+        return accounts_service.AgentPick("claude-code", None)
+
+    def launch_default(
+        role: str | None,
+        *,
+        project: ProjectInfo | None = None,
+        family: str | None = None,
+        agent: str | None = None,
+        pick: accounts_service.AgentPick | None = None,
+    ) -> accounts_service.LaunchDefault:
+        weighed.append(family)
+        return accounts_service.LaunchDefault(accounts_service.AccountChoice(None, None))
+
+    monkeypatch.setattr(accounts_service, "agent_pick", agent_pick)
+    monkeypatch.setattr(accounts_service, "launch_default", launch_default)
+    fleet_service.role_agent(project, "coder")
+    fleet_service.launch_default(project, "coder", agent="claude-code")
+    expected = harness.model_family("claude-opus-5-5[1m]")
+    assert expected is not None and weighed == [expected, expected], weighed
+
+
 @pytest.mark.parametrize(
     ("under", "over", "kept"),
     [

@@ -12,6 +12,7 @@ holds that half).
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,11 +21,11 @@ from textual.widgets import Input, Select
 
 from aisquare.cli.ui import spawn as spawn_module
 from aisquare.cli.ui.spawn import ACCOUNT_DEFAULT_CHOICE, SpawnDialog
-from aisquare.core.config import FleetRoleSettings, load_config, save_config
+from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, load_config, save_config
 from aisquare.models import FleetAgentStatus, ProjectInfo
+from aisquare.services import agent_launch, model_memory
 from aisquare.services import claude_accounts as accounts_service
 from aisquare.services import fleet as fleet_service
-from aisquare.services import model_memory
 from tests import test_ui_spawn as spawn_suite
 from tests.test_ui_spawn import (
     UNTOUCHED,
@@ -255,6 +256,30 @@ def test_the_account_label_reads_the_family_the_spawn_runs(
     spawn_module.read_launch_default(git_project, "reviewer", ["--model", "opus"])
     spawn_module.read_launch_default(git_project, "reviewer", [])
     assert families == ["opus", "haiku"]
+
+
+def test_a_bindings_pin_shows_for_the_dialogs_project_opened_from_another_folder(
+    git_project: ProjectInfo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This test reads the Model and Effort fields for the reviewer, whose binding names no
+    agent and passes ``--model haiku --effort low``, in a dialog for a project that names no
+    default, opened from a folder whose project's default is Codex."""
+    config = load_config()
+    config.team.profiles["reviewer"] = RoleLaunchProfile(
+        args=["--model", "haiku", "--effort", "low"]
+    )
+    save_config(config)
+    other = tmp_path / "other"
+    other.mkdir()
+    agent_launch.use("codex", project=True, cwd=other)
+    monkeypatch.chdir(other)
+
+    async def scenario(pilot: Pilot[None], host: Host, dialog: SpawnDialog) -> tuple[str, str]:
+        select(dialog, "role").value = "reviewer"
+        await pilot.pause()
+        return fields(dialog)
+
+    assert drive(git_project, scenario) == ("haiku", "low")
 
 
 def test_a_cleared_field_on_a_pinned_role_says_the_pin_runs(

@@ -14427,14 +14427,11 @@ def test_a_stop_that_finds_its_agent_dead_announces_the_error_line_it_left(
     assert said.startswith("coder-1 exited (2): error: unexpected argument '--effort' found"), said
 
 
-#: What a hand-over's own line adds for a pane found dead with Codex's refusal on it.
-HAD_EXITED = "; it had exited (2): error: unexpected argument '--effort' found"
+#: The error line on :data:`CLAP_REFUSAL`'s screen.
+CLAP_ERROR_LINE = CLAP_REFUSAL[1]
 
 
-@pytest.mark.parametrize(
-    ("status", "added"),
-    [pytest.param(2, HAD_EXITED, id="codex"), pytest.param(0, "", id="clean-exit")],
-)
+@pytest.mark.parametrize("status", [pytest.param(2, id="codex"), pytest.param(0, id="clean-exit")])
 @pytest.mark.parametrize("how", ["switch", "pause", "restart"])
 def test_a_hand_over_of_an_agent_found_dead_says_on_its_own_line_what_its_pane_said(
     tmux: FakeTmux,
@@ -14443,7 +14440,6 @@ def test_a_hand_over_of_an_agent_found_dead_says_on_its_own_line_what_its_pane_s
     monkeypatch: pytest.MonkeyPatch,
     how: str,
     status: int,
-    added: str,
 ) -> None:
     """This test reads the line a switch, a pause and a restart that took the pane for running
     write for an agent whose pane died, with Codex's refusal on it, before their stop looked:
@@ -14463,7 +14459,11 @@ def test_a_hand_over_of_an_agent_found_dead_says_on_its_own_line_what_its_pane_s
 
     kind = {"switch": "switched", "pause": "agent_paused", "restart": "restarted"}[how]
     [line] = _events(project, kind)
-    assert line.endswith(added) and line.count("had exited") == (1 if added else 0), line
+    if status:
+        before, found, after = line.partition(CLAP_ERROR_LINE)
+        assert found and after == "" and before.count(f"({status})") == 1, line
+    else:
+        assert CLAP_ERROR_LINE not in line and "(0)" not in line, line
     assert _events(project, "agent_exited") == []
 
 

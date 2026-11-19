@@ -11735,11 +11735,13 @@ def spawn_runs(
     binary: str | None = None,
     config: FleetSettings | None = None,
     agent: str | None = None,
+    cwd: Path | None = None,
 ) -> model_memory.Pick:
     """The model and effort a new spawn of ``role`` runs (``None`` each: the account's own
     default), worked out by the spawn's own rule (:func:`_model_choice`), with ``agent_args``
     and the Spawn dialog's ``model`` / ``effort`` as :func:`spawn` takes them, on ``agent``
-    (else the agent ``binary`` runs, the role's own binary by default). The ONE answer the
+    (else the agent ``binary`` runs, the role's own binary by default), in the folder ``cwd``
+    (the spawn's project's root; ``None`` this process's folder). The ONE answer the
     dialog's account label reads, for the family a headroom pick reads (#277), so the two
     never disagree (review of #441, round 2, minor 1; review r28 of #113, M1). An empty flag
     in ``agent_args``, which the spawn refuses, runs nothing."""
@@ -11752,6 +11754,7 @@ def spawn_runs(
             binary=binary,
             config=config,
             agent=agent,
+            cwd=cwd,
         )[0]
     except FleetError:
         return model_memory.Pick()
@@ -11766,6 +11769,7 @@ def spawn_choice(
     binary: str | None = None,
     config: FleetSettings | None = None,
     agent: str | None = None,
+    cwd: Path | None = None,
 ) -> tuple[model_memory.Pick, model_memory.Pick]:
     """:func:`spawn_runs`'s answer, and which rung decided each of its model and effort
     (:data:`SPAWN_SOURCES`; ``None`` for no value, the account's own default): what
@@ -11790,6 +11794,7 @@ def spawn_choice(
         model=model,
         effort=effort,
         adapter=kind,
+        cwd=cwd,
     )
     return choice.runs, choice.why
 
@@ -11801,16 +11806,19 @@ def ladder_family(
     model: str | None = None,
     effort: str | None = None,
     config: FleetSettings | None = None,
+    cwd: Path | None = None,
 ) -> str | None:
-    """The model family a new spawn of ``role`` runs on an agent of AISquare's model ladders
-    (``capabilities.model_ladders``: Claude Code), by :func:`spawn_runs` on it: what a spawn's
-    agent rung weighs, which picks the agent before it is known (``agent_launch.resolve``,
-    ``claude_accounts.agent_pick``, #277). ``None`` for no model (the account's own default)
-    or no such agent."""
+    """The model family a new spawn of ``role`` in the folder ``cwd`` runs on an agent of
+    AISquare's model ladders (``capabilities.model_ladders``: Claude Code), by
+    :func:`spawn_runs` on it: what a spawn's agent rung weighs, which picks the agent before it
+    is known (``agent_launch.resolve``, ``claude_accounts.agent_pick``, #277). ``None`` for no
+    model (the account's own default) or no such agent."""
     ladder = next((kind for kind in adapters() if kind.capabilities.model_ladders), None)
     if ladder is None:
         return None
-    runs = spawn_runs(role, agent_args, model=model, effort=effort, config=config, agent=ladder.id)
+    runs = spawn_runs(
+        role, agent_args, model=model, effort=effort, config=config, agent=ladder.id, cwd=cwd
+    )
     return harness.model_family(runs.model)
 
 
@@ -11861,7 +11869,9 @@ def role_agent(
         cwd=project.root,
         account=account,
         measure=named is None,
-        family=None if replay else _rung_family(role, agent_args, model, effort, config),
+        family=None
+        if replay
+        else _rung_family(role, agent_args, model, effort, config, project.root),
         model_agent=agent_launch.model_owner(named),
     )
 
@@ -11872,9 +11882,12 @@ def _rung_family(
     model: str | None,
     effort: str | None,
     config: FleetSettings | None,
+    cwd: Path,
 ) -> Callable[[], str | None]:
     """:func:`ladder_family` for a new spawn, asked by the agent rung only when it picks."""
-    return lambda: ladder_family(role, agent_args, model=model, effort=effort, config=config)
+    return lambda: ladder_family(
+        role, agent_args, model=model, effort=effort, config=config, cwd=cwd
+    )
 
 
 def launch_default(
@@ -11903,7 +11916,7 @@ def launch_default(
     else:
         selected = role_agent(project, role, agent_args, model=model, config=config)
         kind, pick = selected.adapter, selected.pick
-    runs = spawn_runs(role, agent_args, model=model, config=config, agent=kind.id)
+    runs = spawn_runs(role, agent_args, model=model, config=config, agent=kind.id, cwd=project.root)
     return claude_accounts_service.launch_default(
         role,
         project=project,
@@ -11914,7 +11927,11 @@ def launch_default(
 
 
 def role_pin(
-    role: str, config: FleetSettings | None = None, *, agent: str | None = None
+    role: str,
+    config: FleetSettings | None = None,
+    *,
+    agent: str | None = None,
+    cwd: Path | None = None,
 ) -> model_memory.Pick:
     """The model and effort ``role``'s settings pin (``[fleet.roles.<role>]``'s arguments for
     the agent, else its binding's ``--arg``), else ``[agents.models.<agent>]``
@@ -11924,11 +11941,13 @@ def role_pin(
     Codex), what the arguments a spawn of it passes choose, in its own words (its
     ``agent_args`` over its binding's, as ``AgentAdapter.merged_args`` passes them;
     ``AgentAdapter.native_choice``), never Claude Code's ``extra_args``. ``agent`` ``None`` is
-    the default agent."""
+    the default agent. ``cwd`` is the folder the spawn runs in (its project's root; ``None``
+    this process's folder), whose project's default may own the binding's arguments
+    (``agent_launch.binding_args``)."""
     settings = role_settings(role, config)
     adapter = recorded_adapter(agent)
     pinned = _configured(adapter, role) if adapter is not None else model_memory.Pick()
-    bound = agent_launch.binding_args(role, agent)
+    bound = agent_launch.binding_args(role, agent, cwd=cwd)
     if adapter is not None and not adapter.capabilities.model_ladders:
         own = fleet_extra_args(adapter, settings.extra_args, settings.agent_args)
         chosen = adapter.native_choice([*bound, *own])
