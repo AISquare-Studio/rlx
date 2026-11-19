@@ -82,17 +82,17 @@ from aisquare.core.agent_adapters.native_models import configured as configured_
 from aisquare.core.agent_adapters.types import (
     AgentAdapter,
     AgentScreen,
-    BareWord,
     ForkArgs,
     NativeChoice,
     PermissionIntent,
+    Stray,
     an_option,
-    bare_word,
     fleet_extra_args,
     open_option,
     option_values,
     screen_of,
     stepped_down,
+    stray_argument,
 )
 from aisquare.core.config import (
     BUSY_HOLD_DEFAULT_MINUTES,
@@ -5516,8 +5516,9 @@ def spawn(
     record and the row hold only text, and the window runs what they hold, so a restart
     replays what the spawn ran (one held raw failed the record's write: r39 reopen of #113).
     An agent whose arguments are options alone (``capabilities.options_only``: Codex's) is
-    refused a bare word among them, the role's and the binding's with them, before any window
-    (:func:`_refuse_a_bare_word`), and a replay before its stop
+    refused a word or an option among them, the role's and the binding's with them, that are
+    not options with one value each, before any window (:func:`_refuse_stray_arguments`), and a
+    replay before its stop
     (:func:`_refuse_a_replay_that_cannot_start`).
     """
     undecodable = [argument for argument in agent_args if not names_core.holds_utf8(argument)]
@@ -5649,9 +5650,9 @@ def spawn(
         family=family,
     )
     # A fleet lane's arguments are replayed under the fleet's own resume and first message, so
-    # an agent whose arguments are options alone (Codex) is refused any other word among them:
-    # the binding's, the role's and the spawn's own, before the lead joins them.
-    _refuse_a_bare_word(
+    # an agent whose arguments are options alone (Codex) is refused any other word or option
+    # among them: the binding's, the role's and the spawn's own, before the lead joins them.
+    _refuse_stray_arguments(
         selected.adapter,
         binding=selected.profile.args,
         role=role_args,
@@ -7062,47 +7063,48 @@ def _agent_arguments(
     return _launch_options(extra, adapter)
 
 
-def _refuse_a_bare_word(
+def _refuse_stray_arguments(
     adapter: AgentAdapter,
     *,
     binding: Sequence[str],
     role: Sequence[str],
     own: Sequence[str] = (),
     own_are: str = "",
+    own_advice: str = "",
     stopping: bool = False,
 ) -> None:
     """Refuse a start when the agent takes options alone and its arguments are not options with
     one value each, each part holding its options whole: read in this order, its binding's
     arguments, its role's (:func:`_role_args`) and its own (``own``, which ``own_are`` names: a
-    spawn's, or the ones a replay's record holds, :func:`_spawn_args`), as the caller reads
-    them. Refused: a word :func:`bare_word` finds, each part read after the ones before it; an
-    option that ends a part (:func:`open_option`) while the next part's first word would be its
-    value, as a replay puts its resume or fork lead between the role's and its own and
+    spawn's, or the ones a replay's record holds, :func:`_spawn_args`; ``own_advice`` says what
+    to do about them, if anything), as the caller reads them. Refused: a word or an option
+    :func:`stray_argument` finds, each part read after the ones before it; an option that ends
+    a part (:func:`open_option`) while the next part's first word would be its value, as a
+    replay puts its resume or fork lead between the role's and its own and
     :meth:`AgentAdapter.merged_args` reads each part alone; and an option of ``value_options``
-    given no value. The refusal names the part the word or the option is in; for a word, the
-    ways a first message, a thread and a command reach the agent, and, right after the value of
-    an option the agent takes again for each value (``capabilities.repeated_options``), that
-    option before each value. ``stopping``: asked for a replacement before anything is
-    stopped, which the refusal says."""
+    given no value. The refusal names the part the word or the option is in, and that part's
+    advice; for a word, the ways a first message, a thread and a command reach the agent, and,
+    right after the value of an option the agent takes again for each value
+    (``capabilities.repeated_options``), that option before each value. ``stopping``: asked for
+    a replacement before anything is stopped, which the refusal says."""
     parts = (
-        (binding, "the role's binding, so change it there"),
-        (role, "the role's agent_args, so change them there"),
-        (own, own_are),
+        (binding, "the role's binding", "so change it there"),
+        (role, "the role's agent_args", "so change them there"),
+        (own, own_are, own_advice),
     )
     stopped = "nothing was stopped: " if stopping else ""
     read: list[str] = []
-    for at, (part, where) in enumerate(parts):
+    for at, (part, name, advice) in enumerate(parts):
+        where = f"{name}, {advice}" if advice else name
         read += part
-        bare = bare_word(adapter, read)
-        if bare is not None:
-            held = "option" if bare.valueless else "word"
-            raise FleetError(
-                f"{_bare_word_refusal(adapter, bare)}; {stopped}the {held} is in {where}"
-            )
+        stray = stray_argument(adapter, read)
+        if stray is not None:
+            held = "option" if stray.valueless else "word"
+            raise FleetError(f"{_stray_refusal(adapter, stray)}; {stopped}the {held} is in {where}")
         option = open_option(adapter, read) if part else ""
         then = next((later for later in parts[at + 1 :] if later[0]), None)
         if option and then is not None and not an_option(then[0][0]):
-            refusal = _open_option_refusal(adapter, option, ends=where, then=then[1])
+            refusal = _open_option_refusal(adapter, option, ends=name, then=then[1])
         elif option in adapter.capabilities.value_options:
             refusal = _open_option_refusal(adapter, option)
         else:
@@ -7125,17 +7127,16 @@ def _open_option_refusal(
     the part ``ends`` names and its value would open that one; else it is given none."""
     lead = _options_lead(adapter)
     if then:
-        ending, opening = (where.split(", so ")[0] for where in (ends, then))
         return (
-            f"{lead}: {option} ends {ending} and its value would open {opening}, so give {option} "
+            f"{lead}: {option} ends {ends} and its value would open {then}, so give {option} "
             "and its value together in one of them"
         )
     return f"{lead}: {option} takes a value and is given none, so give its value right after it"
 
 
-def _bare_word_refusal(adapter: AgentAdapter, bare: BareWord) -> str:
-    if bare.valueless:
-        return _open_option_refusal(adapter, bare.word)
+def _stray_refusal(adapter: AgentAdapter, stray: Stray) -> str:
+    if stray.valueless:
+        return _open_option_refusal(adapter, stray.word)
     lead = _options_lead(adapter)
     ways = prog.shell_advice(
         "give a first message with --prompt (the Spawn dialog's First prompt), bring a thread in "
@@ -7145,7 +7146,7 @@ def _bare_word_refusal(adapter: AgentAdapter, bare: BareWord) -> str:
         "a conversation on the Accounts page, and run a one-shot command such as exec or review "
         "outside the fleet",
     )
-    word, option, value, _ = bare
+    word, option, value, _ = stray
     if option in adapter.capabilities.repeated_options:
         return (
             f"{lead}: {word!r} after {option} {value!r} is not one, so give {option} before each "
@@ -15136,7 +15137,7 @@ def _refuse_a_cross_agent_start(
             f"{selected.binary.source}) — install {selected.adapter.label}, or change the "
             "role's binding; nothing was stopped"
         )
-    _refuse_a_fresh_starts_bare_word(selected, runs_as)
+    _refuse_a_fresh_starts_stray_arguments(selected, runs_as)
     if selected.adapter.capabilities.sandboxes_tools:
         flags, _ = permission_flags(selected.adapter, runs_as, label, role_settings(runs_as))
         _refuse_an_install_the_sandbox_writes(
@@ -15162,11 +15163,11 @@ def _refuse_a_cross_agent_start(
     _refuse_a_freed_socket(srv, config, srv.listener())
 
 
-def _refuse_a_fresh_starts_bare_word(selected: agent_launch.ResolvedAgent, role: str) -> None:
-    """:func:`_refuse_a_bare_word` before anything is stopped, for a replacement that starts
+def _refuse_a_fresh_starts_stray_arguments(selected: agent_launch.ResolvedAgent, role: str) -> None:
+    """:func:`_refuse_stray_arguments` before anything is stopped, for a replacement that starts
     ``role`` fresh as today's config launches it on ``selected``'s agent (a crossing, a
     take-over as another role): the binding's arguments for that agent, and the role's."""
-    _refuse_a_bare_word(
+    _refuse_stray_arguments(
         selected.adapter,
         binding=selected.profile.args,
         role=_role_args(role, None, selected.adapter, role_settings(role)),
@@ -15792,8 +15793,8 @@ def _refuse_a_replay_that_cannot_start(
     which left it down (review of #259, round 2). And a worktree that is gone with no
     branch to make it again on (:func:`_branch_of_a_gone_tree`, which writes nothing), in
     ``project``'s root; ``branch`` is the one its row recorded the tree on. A refusal names
-    ``project`` in the commands it gives. And a word among the replay's arguments that an agent
-    whose arguments are options alone refuses (:func:`_refuse_a_bare_word`): a
+    ``project`` in the commands it gives. And a word or an option among the replay's arguments
+    that an agent whose arguments are options alone refuses (:func:`_refuse_stray_arguments`): a
     record written before that check, or a binding changed since, stopped the agent and then
     had its replacement refused.
     """
@@ -15832,13 +15833,13 @@ def _refuse_a_replay_that_cannot_start(
         binary=selected.binary.binary,
         family=family,
     )
-    _refuse_a_bare_word(
+    _refuse_stray_arguments(
         selected.adapter,
         binding=selected.profile.args,
         role=role_args,
         own=extra,
-        own_are=f"the arguments {record.label or ''!r} recorded at its start, so stop it and "
-        "spawn it again",
+        own_are=f"the arguments {record.label or ''!r} recorded at its start",
+        own_advice="so stop it and spawn it again",
         stopping=True,
     )
     if not selected.adapter.capabilities.model_ladders:
@@ -16350,7 +16351,7 @@ def restart(
                 taken_over = agent_launch.resolve(runs_as, agent=record.agent, cwd=project.root)
             except ValueError as exc:
                 raise FleetError(f"{exc} — nothing was stopped") from exc
-            _refuse_a_fresh_starts_bare_word(taken_over, runs_as)
+            _refuse_a_fresh_starts_stray_arguments(taken_over, runs_as)
         if persona:
             _chosen_persona(project, runs_as, persona, role_settings(runs_as, settings()), [])
         whose = replays.id if replays is not None else claude_accounts_core.AGENT

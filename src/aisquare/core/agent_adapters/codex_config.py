@@ -29,7 +29,7 @@ from aisquare.core.agent_adapters.types import HookTrustError, option_values
 
 #: Codex's config option's spellings, whose value is a ``key=value`` assignment: stated here
 #: alone, for every reader of a ``-c`` override (this module's, ``codex``'s,
-#: ``codex_transcript``'s).
+#: ``codex_transcript``'s, and the CLI's ``native_args``, which writes one in the long spelling).
 CONFIG_FLAGS = ("--config", "-c")
 #: The system layer of Codex's config, under every user's: 0.162.1 reads it (in its binary,
 #: review r14 of #113, finding 9).

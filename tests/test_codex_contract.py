@@ -33,15 +33,15 @@ from aisquare.core.agent_adapters.codex import (
 from aisquare.core.agent_adapters.codex_transcript import CodexTranscript
 from aisquare.core.agent_adapters.types import (
     BadEffortError,
-    BareWord,
     ForkArgs,
     PermissionIntent,
     SkillDirs,
+    Stray,
     WriteScope,
-    bare_word,
     open_option,
     screen_of,
     store_dir,
+    stray_argument,
 )
 from aisquare.core.config import (
     AgentModelSettings,
@@ -195,34 +195,34 @@ def test_a_chosen_sandbox_or_policy_turns_the_default_off() -> None:
     ]
 
 
-#: Argument lists and the word Codex's adapter finds among them, with the option and value it
-#: follows; ``None`` for options with one value each.
-BARE_WORDS: list[tuple[list[str], BareWord | None]] = [
-    (["--add-dir", "a", "b"], BareWord("b", "--add-dir", "a")),
-    (["--add-dir=a", "b"], BareWord("b", "--add-dir", "a")),
-    (["--add-dir", "a", "b", "--add-dir", "c", "d"], BareWord("b", "--add-dir", "a")),
-    (["-ix.png", "b"], BareWord("b", "-i", "x.png")),
-    (["-i", "x.png", "b"], BareWord("b", "-i", "x.png")),
-    (["--search", "b"], BareWord("b")),
-    (["--add-dir", "a", "--search", "review"], BareWord("review")),
-    (["fix the bug", "--add-dir", "a"], BareWord("fix the bug")),
-    (["--add-dir", "a", "resume", "019a"], BareWord("resume", "--add-dir", "a")),
-    (["--", "hi"], BareWord("--")),
-    (["--add-dir", "a", "--", "hi"], BareWord("--")),
-    (["--future", "v", "w"], BareWord("w", "--future", "v")),
-    (["--worktree", "b"], BareWord("b")),
-    (["-"], BareWord("-")),
-    (["--search", "-"], BareWord("-")),
+#: Argument lists and the word or option Codex's adapter finds among them: a word with the option
+#: and value it follows, or an option given no value; ``None`` for options with one value each.
+STRAYS: list[tuple[list[str], Stray | None]] = [
+    (["--add-dir", "a", "b"], Stray("b", "--add-dir", "a")),
+    (["--add-dir=a", "b"], Stray("b", "--add-dir", "a")),
+    (["--add-dir", "a", "b", "--add-dir", "c", "d"], Stray("b", "--add-dir", "a")),
+    (["-ix.png", "b"], Stray("b", "-i", "x.png")),
+    (["-i", "x.png", "b"], Stray("b", "-i", "x.png")),
+    (["--search", "b"], Stray("b")),
+    (["--add-dir", "a", "--search", "review"], Stray("review")),
+    (["fix the bug", "--add-dir", "a"], Stray("fix the bug")),
+    (["--add-dir", "a", "resume", "019a"], Stray("resume", "--add-dir", "a")),
+    (["--", "hi"], Stray("--")),
+    (["--add-dir", "a", "--", "hi"], Stray("--")),
+    (["--future", "v", "w"], Stray("w", "--future", "v")),
+    (["--worktree", "b"], Stray("b")),
+    (["-"], Stray("-")),
+    (["--search", "-"], Stray("-")),
     (["--add-dir", "-", "--worktree"], None),
     (["--add-dir", "a", "--add-dir", "b"], None),
     (["--add-dir=a", "--add-dir=b"], None),
     (["-i", "x.png", "-i", "b"], None),
     (["-c", "a.b=1", "--model", "gpt-5.4", "--search"], None),
     (["--future", "v"], None),
-    (["--add-dir", "--search"], BareWord("--add-dir", valueless=True)),
-    (["--model", "--search"], BareWord("--model", valueless=True)),
-    (["-c", "--model", "m"], BareWord("-c", valueless=True)),
-    (["--model", "--", "hi"], BareWord("--model", valueless=True)),
+    (["--add-dir", "--search"], Stray("--add-dir", valueless=True)),
+    (["--model", "--search"], Stray("--model", valueless=True)),
+    (["-c", "--model", "m"], Stray("-c", valueless=True)),
+    (["--model", "--", "hi"], Stray("--model", valueless=True)),
     (["--future", "--search"], None),
     (["--sandbox=read-only", "--search"], None),
     (["--add-dir"], None),
@@ -231,15 +231,15 @@ BARE_WORDS: list[tuple[list[str], BareWord | None]] = [
 
 
 @pytest.mark.parametrize(
-    ("args", "found"), BARE_WORDS, ids=[" ".join(args) or "none" for args, _ in BARE_WORDS]
+    ("args", "found"), STRAYS, ids=[" ".join(args) or "none" for args, _ in STRAYS]
 )
-def test_bare_word_reads_codexs_arguments_as_options_with_one_value_each(
-    args: list[str], found: BareWord | None
+def test_stray_argument_reads_codexs_arguments_as_options_with_one_value_each(
+    args: list[str], found: Stray | None
 ) -> None:
-    """This test reads ``bare_word`` for Codex's adapter and Claude Code's over each list of
-    :data:`BARE_WORDS`."""
-    assert bare_word(_get_adapter("codex"), args) == found
-    assert bare_word(_get_adapter("claude-code"), args) is None
+    """This test reads ``stray_argument`` for Codex's adapter and Claude Code's over each list of
+    :data:`STRAYS`."""
+    assert stray_argument(_get_adapter("codex"), args) == found
+    assert stray_argument(_get_adapter("claude-code"), args) is None
 
 
 #: Argument lists and the option Codex's adapter finds ending them waiting for a value, else

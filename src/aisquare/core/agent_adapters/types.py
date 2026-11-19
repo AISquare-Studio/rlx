@@ -542,17 +542,18 @@ class AgentCapabilities:
     repeated_options: frozenset[str] = frozenset()
     """The options of :attr:`value_options` the agent takes again for each further value, whose
     value can be any word (Codex's ``--add-dir``, read off ``codex.OPTIONS``): a bare word right
-    after one's value (:func:`bare_word`) is refused naming that option before each value. Not
-    one: an option the agent refuses given twice, and one whose value has a form a word may
+    after one's value (:func:`stray_argument`) is refused naming that option before each value.
+    Not one: an option the agent refuses given twice, and one whose value has a form a word may
     lack."""
     options_only: bool = False
     """A fleet spawn gives the agent its arguments as options with one value each (Codex): the
     fleet fills the agent's positionals itself, its resume or fork lead and its first message,
     at every start and replay, so a bare word among them, the native ``--`` and what follows it
-    included, is refused before a window and before a replay's stop (:func:`bare_word`), and so
-    is an option whose value would open another part of them, and one of :attr:`value_options`
-    given none (:func:`open_option`). Claude Code's several-value options (``--add-dir a b``)
-    leave it off."""
+    included, is refused before a window and before a replay's stop (:func:`stray_argument`);
+    and so is an option whose value would open another part of them (:func:`open_option`), and
+    one of :attr:`value_options` given none (:func:`stray_argument` where another option follows
+    it, :func:`open_option` where it ends them). Claude Code's several-value options
+    (``--add-dir a b``) leave it off."""
 
 
 @dataclass(frozen=True)
@@ -2245,11 +2246,12 @@ def _before_separator(args: Sequence[str]) -> list[str]:
     return list(args[: args.index("--")] if "--" in args else args)
 
 
-class BareWord(NamedTuple):
-    """A word among an agent's fleet arguments that a fleet spawn refuses (:func:`bare_word`):
-    one that is no option and no option's one value, ``word``, with the ``option`` and ``value``
-    it comes right after, else empty; or, ``valueless``, an option of
-    ``capabilities.value_options``, ``word``, that the option after it leaves with no value."""
+class Stray(NamedTuple):
+    """A word or an option among an agent's fleet arguments that a fleet spawn refuses
+    (:func:`stray_argument`): a word that is no option and no option's one value, ``word``,
+    with the ``option`` and ``value`` it comes right after, else empty; or, ``valueless``, an
+    option of ``capabilities.value_options``, ``word``, that the option after it leaves with no
+    value."""
 
     word: str
     option: str = ""
@@ -2257,8 +2259,8 @@ class BareWord(NamedTuple):
     valueless: bool = False
 
 
-def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
-    """The first word of ``args`` that a fleet spawn of ``adapter`` refuses
+def stray_argument(adapter: AgentAdapter, args: Sequence[str]) -> Stray | None:
+    """The first word or option of ``args`` that a fleet spawn of ``adapter`` refuses
     (``capabilities.options_only``): read with the adapter's ``switch_options`` taking no value
     and any other option, declared in ``value_options`` or not, taking the next word as its one
     value unless that word is an option, a value joined to its option taking none; an option is
@@ -2271,15 +2273,15 @@ def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
 
 
 def open_option(adapter: AgentAdapter, args: Sequence[str]) -> str:
-    """The option that ends ``args`` waiting for a value, as :func:`bare_word` reads them: no
+    """The option that ends ``args`` waiting for a value, as :func:`stray_argument` reads them: no
     switch, and its value not joined to it, so the word after ``args`` would be its value.
-    Empty where ``args`` end otherwise, hold a word :func:`bare_word` refuses, or the adapter
-    has no ``options_only``."""
+    Empty where ``args`` end otherwise, hold a word or an option :func:`stray_argument` refuses,
+    or the adapter has no ``options_only``."""
     return _read_options(adapter, args)[1]
 
 
-def _read_options(adapter: AgentAdapter, args: Sequence[str]) -> tuple[BareWord | None, str]:
-    """:func:`bare_word` and :func:`open_option` of ``args``, from one reading of them."""
+def _read_options(adapter: AgentAdapter, args: Sequence[str]) -> tuple[Stray | None, str]:
+    """:func:`stray_argument` and :func:`open_option` of ``args``, from one reading of them."""
     capabilities = adapter.capabilities
     if not capabilities.options_only:
         return None, ""
@@ -2288,9 +2290,9 @@ def _read_options(adapter: AgentAdapter, args: Sequence[str]) -> tuple[BareWord 
     while at < len(args):
         word = args[at]
         if word == "--":
-            return BareWord(word), ""
+            return Stray(word), ""
         if not an_option(word):
-            return BareWord(word, option, value), ""
+            return Stray(word, option, value), ""
         name, joined, rest = word.partition("=")
         following = args[at + 1] if at + 1 < len(args) else None
         if word.startswith("--") and joined:
@@ -2303,7 +2305,7 @@ def _read_options(adapter: AgentAdapter, args: Sequence[str]) -> tuple[BareWord 
             return None, word
         elif an_option(following):
             if word in capabilities.value_options:
-                return BareWord(word, valueless=True), ""
+                return Stray(word, valueless=True), ""
             option, value, at = "", "", at + 1
         else:
             option, value, at = word, following, at + 2
@@ -2311,8 +2313,8 @@ def _read_options(adapter: AgentAdapter, args: Sequence[str]) -> tuple[BareWord 
 
 
 def an_option(word: str) -> bool:
-    """Whether ``word`` is an option's spelling to :func:`bare_word`: it starts with ``-`` and
-    is not ``-`` alone."""
+    """Whether ``word`` is an option's spelling to :func:`stray_argument`: it starts with ``-``
+    and is not ``-`` alone."""
     return word.startswith("-") and word != "-"
 
 

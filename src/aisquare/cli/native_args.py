@@ -8,8 +8,15 @@ from typer._click.exceptions import UsageError
 from typer.core import TyperCommand, TyperOption
 
 from aisquare.core.agent_adapters import adapters
+from aisquare.core.agent_adapters.codex_config import CONFIG_FLAGS
 from aisquare.core.agent_adapters.types import is_config_assignment
 from aisquare.core.names import holds_utf8, undecodable_said
+
+#: Codex's config option, its short spelling and its long one (``codex_config.CONFIG_FLAGS``):
+#: an assignment given with the short one, which a command can also own (its binary), reaches
+#: Codex in the long one.
+_CONFIG_SHORT = next(flag for flag in CONFIG_FLAGS if not flag.startswith("--"))
+_CONFIG_LONG = next(flag for flag in CONFIG_FLAGS if flag.startswith("--"))
 
 
 class PassthroughCommand(TyperCommand):
@@ -80,17 +87,22 @@ class NativeForwardingCommand(PassthroughCommand):
                 role_seen = True
                 rewritten.append(token)
                 continue
-            if token == "-c" and "-c" in valued:
+            joined = token[len(_CONFIG_SHORT) :]
+            if token == _CONFIG_SHORT and _CONFIG_SHORT in valued:
                 following = next(tokens, None)
                 value = following[1] if following is not None else None
                 if value is not None and is_config_assignment(value):
-                    rewritten.append("--config=" + value)
+                    rewritten.append(f"{_CONFIG_LONG}={value}")
                 else:
                     rewritten.append(token)
                     if value is not None:
                         rewritten.append(value)
-            elif "-c" in valued and token.startswith("-c") and is_config_assignment(token[2:]):
-                rewritten.append("--config=" + token[2:])
+            elif (
+                _CONFIG_SHORT in valued
+                and token.startswith(_CONFIG_SHORT)
+                and is_config_assignment(joined)
+            ):
+                rewritten.append(f"{_CONFIG_LONG}={joined}")
             elif (
                 token.startswith("-")
                 and not token.startswith("--")

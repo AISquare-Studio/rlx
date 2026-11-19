@@ -706,6 +706,32 @@ def test_fleet_spawn_forwards_codexs_short_options(native: list[str]) -> None:
         assert ctx.params["binary"] is None and ctx.args == ["--config=model=o3"]
 
 
+@pytest.mark.parametrize("joined", [False, True], ids=["spaced", "joined"])
+@pytest.mark.parametrize(("command", "own"), [("launch", "command"), ("spawn", "binary")])
+def test_codexs_short_config_spelling_reaches_it_in_the_long_one_codex_config_states(
+    command: str, own: str, joined: bool
+) -> None:
+    """This test reads the arguments ``launch`` and ``fleet spawn`` forward for Codex given
+    ``model=o3`` with its config option's short spelling, spaced and joined, both spellings
+    read from ``codex_config.CONFIG_FLAGS``."""
+    from typer.core import TyperGroup
+    from typer.main import get_command
+
+    from aisquare.core.agent_adapters.codex_config import CONFIG_FLAGS
+
+    short = next(flag for flag in CONFIG_FLAGS if not flag.startswith("--"))
+    long = next(flag for flag in CONFIG_FLAGS if flag.startswith("--"))
+    root = get_command(app)
+    assert isinstance(root, TyperGroup)
+    group = root.commands["fleet"] if command == "spawn" else root
+    assert isinstance(group, TyperGroup)
+    native = [short + "model=o3"] if joined else [short, "model=o3"]
+    with group.commands[command].make_context(
+        command, ["coder", "--agent", "codex", *native]
+    ) as ctx:
+        assert ctx.params[own] is None and ctx.args == [f"{long}=model=o3"]
+
+
 def test_fleet_spawns_a_is_the_account_and_codexs_own_goes_after_the_separator() -> None:
     """`fleet spawn`'s -a is --account, as launch's is: 0.9.2's spawn ran `-a N` as the account,
     through its window's launch (#105). Codex's own -a is given after --, or spelled out."""

@@ -4222,7 +4222,7 @@ def test_a_codex_spawns_refusal_names_an_option_before_each_value_where_codex_ta
 
 
 #: Arguments a Codex spawn refuses, with the word it names and the option and value it
-#: follows (``types.BareWord``'s fields).
+#: follows (``types.Stray``'s fields).
 CODEX_REFUSED = [
     pytest.param(["--add-dir", "a", "b", "c"], "b", "--add-dir", "a", id="three-paths"),
     pytest.param(["--add-dir", "a", "b", "c", "d"], "b", "--add-dir", "a", id="four-paths"),
