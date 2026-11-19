@@ -321,7 +321,7 @@ def _help_options() -> dict[str, list[tuple[tuple[str, ...], bool]]]:
     return pages
 
 
-def test_codex_options_hold_every_option_codexs_help_lists() -> None:
+def test_codex_options_hold_codex_and_codex_execs_options_and_every_switch_its_help_lists() -> None:
     """This test reads each option line of every page of :data:`CODEX_HELP` against
     ``codex.OPTIONS``: Codex's own page's and ``codex exec``'s options are its ``lane`` rows,
     each taking a value as the help says (``--yolo``, an alias the help does not list, beside

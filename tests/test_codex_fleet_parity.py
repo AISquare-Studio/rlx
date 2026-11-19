@@ -3864,6 +3864,54 @@ def test_a_codex_spawn_passes_each_option_once_its_own_over_its_roles_and_its_bi
     assert _pair(replayed, "--model") == "gpt-own" and replayed.count("--search") == 1, replayed
 
 
+#: Each option ``codex exec`` alone lists that Codex 0.167.0's parser refuses given twice
+#: (``CODEX_TWICE`` in test_codex_contract.py), as the binding, the role's ``agent_args`` and
+#: the spawn's own arguments spell it, and whether it takes a value.
+CODEX_EXEC_ONCE = [
+    pytest.param(("--color",) * 3, True, id="--color"),
+    pytest.param(("--output-schema",) * 3, True, id="--output-schema"),
+    pytest.param(("--output-last-message", "-o", "-o"), True, id="-o"),
+    pytest.param(("-o", "-o", "--output-last-message"), True, id="--output-last-message"),
+    pytest.param(("--thread-source",) * 3, True, id="--thread-source"),
+    pytest.param(("--cyber-access-program",) * 3, True, id="--cyber-access-program"),
+    pytest.param(("--json",) * 3, False, id="--json"),
+    pytest.param(("--skip-git-repo-check",) * 3, False, id="--skip-git-repo-check"),
+    pytest.param(("--ephemeral",) * 3, False, id="--ephemeral"),
+    pytest.param(("--ignore-user-config",) * 3, False, id="--ignore-user-config"),
+    pytest.param(("--ignore-rules",) * 3, False, id="--ignore-rules"),
+]
+
+
+@pytest.mark.parametrize(("spellings", "value"), CODEX_EXEC_ONCE)
+def test_a_codex_spawn_passes_an_exec_only_option_codex_refuses_twice_once_with_the_spawns_value(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    spellings: tuple[str, str, str],
+    value: bool,
+) -> None:
+    """This test reads the window line and the record of a Codex spawn whose binding, role's
+    ``agent_args`` and own arguments each give one option of :data:`CODEX_EXEC_ONCE`, with the
+    values ``v-bound``, ``v-role`` and ``v-own`` where it takes one."""
+    bound, role, own = (
+        [spelling, f"v-{part}"] if value else [spelling]
+        for spelling, part in zip(spellings, ("bound", "role", "own"), strict=True)
+    )
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": role})
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=bound)
+    save_config(config)
+    receipt = fleet_service.spawn(project, "coder", agent="codex", agent_args=own)
+    spec = receipt.agent.launch_spec
+    assert spec is not None
+    for native in (_spawn_native(tmux), spec.extra_args):
+        assert [arg for arg in native if arg in spellings] == [spellings[2]], native
+        if value:
+            assert _pair(native, spellings[2]) == "v-own", native
+            assert not {"v-bound", "v-role"} & set(native), native
+
+
 def _codex_spawn_refused(
     tmux: FakeTmux,  # noqa: F811
     project: ProjectInfo,  # noqa: F811
@@ -3922,6 +3970,9 @@ BINDINGS = "the role's binding, so change it there"
         pytest.param(["--add-dir=a", "b"], [], [], OWN, id="spawn-joined"),
         pytest.param([], ["--add-dir", "a", "b"], [], ROLES, id="role"),
         pytest.param([], [], ["--add-dir", "a", "b"], BINDINGS, id="binding"),
+        pytest.param(["b"], ["--add-dir", "a"], [], OWN, id="role-then-spawn"),
+        pytest.param([], ["b"], ["--add-dir", "a"], ROLES, id="binding-then-role"),
+        pytest.param(["b"], [], ["--add-dir", "a"], OWN, id="binding-then-spawn"),
     ],
 )
 def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_naming_its_place(
@@ -3936,12 +3987,42 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_nam
     message: str,
 ) -> None:
     """This test reads a Codex spawn whose own arguments, joined form, role's ``agent_args``
-    or binding hold ``--add-dir a b``, its first message on the line, typed, a task's kickoff
-    or none."""
+    or binding hold ``--add-dir a b``, or whose binding or role's ``agent_args`` hold
+    ``--add-dir a`` and a later part ``b`` (the role's, the spawn's own), its first message on
+    the line, typed, a task's kickoff or none."""
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
     _names(said, "b", "--add-dir", "a")
     assert f"; the word is in {where}" in said, said
     assert "nothing was stopped" not in said, said
+
+
+@pytest.mark.parametrize(
+    ("own", "role", "bound"),
+    [
+        pytest.param(["a"], ["--add-dir"], [], id="role-then-spawn"),
+        pytest.param([], ["a"], ["--add-dir"], id="binding-then-role"),
+        pytest.param(["a"], [], ["--add-dir"], id="binding-then-spawn"),
+    ],
+)
+def test_a_codex_spawn_passes_an_option_ending_one_part_with_its_value_opening_the_next(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    own: list[str],
+    role: list[str],
+    bound: list[str],
+) -> None:
+    """This test reads the window line of a Codex spawn whose binding or role's
+    ``agent_args`` end with ``--add-dir`` and whose next part (the role's, the spawn's own)
+    is ``a``, its first message on the line."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": role})
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=bound)
+    save_config(config)
+    fleet_service.spawn(project, "coder", agent="codex", agent_args=own, prompt="go")
+    native = _spawn_native(tmux)
+    assert native.count("--add-dir") == 1 and _pair(native, "--add-dir") == "a", native
 
 
 def test_a_codex_spawn_that_replays_a_record_holding_a_bare_word_names_the_record(
