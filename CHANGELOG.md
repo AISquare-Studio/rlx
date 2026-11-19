@@ -19,10 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   goes on the command line, which Codex refused. The check reads the spawn's own arguments,
   the Spawn dialog's, a role's `agent_args` and binding and a replay's, and a restart or switch
   asks it before it stops the agent, naming which of them holds the word.
-- **`rlx fleet adopt` reads a Codex someone started with a word after a switch its help
-  lists, `codex exec --json x` or `codex review --uncommitted x`, as it reads `codex exec x`
-  or `codex review x`:** a possible client of Codex's background app-server, where it read
-  the word as the switch's value.
+- **`rlx fleet adopt` reads a Codex someone started as `codex exec --json x` or `codex review
+  --uncommitted x` as it reads `codex exec x` or `codex review x`,** a possible client of
+  Codex's background app-server, where it read `x` as the switch's value.
 - **A role's bound arguments reach only the agent they are for.** The `team bind --arg`
   arguments are for the agent a launch of the role runs when it chooses none itself: no
   `--agent`, binary, `--account` or model of its own, and the accounts taken in their order.
