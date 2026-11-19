@@ -85,6 +85,7 @@ from aisquare.core.agent_adapters.types import (
     ForkArgs,
     NativeChoice,
     PermissionIntent,
+    bare_word,
     fleet_extra_args,
     option_values,
     screen_of,
@@ -5511,6 +5512,10 @@ def spawn(
     as its escape (``core.names.as_text``) before anything is made of them: the launch
     record and the row hold only text, and the window runs what they hold, so a restart
     replays what the spawn ran (one held raw failed the record's write: r39 reopen of #113).
+    An agent whose arguments are options alone (``capabilities.options_only``: Codex's) is
+    refused a bare word among them, the role's and the binding's with them, before any window
+    (:func:`_refuse_a_bare_word`), and a replay before its stop
+    (:func:`_refuse_a_replay_that_cannot_start`).
     """
     undecodable = [argument for argument in agent_args if not names_core.holds_utf8(argument)]
     agent_args = [names_core.as_text(argument) for argument in agent_args]
@@ -5633,7 +5638,7 @@ def spawn(
     exited = _before_a_server_starts(srv, config, selected.adapter.id).exited
     if exited:
         notes.append(_exited_note(srv, exited))
-    from aisquare.core.agent_adapters.types import fleet_extra_args, stray_directory
+    from aisquare.core.agent_adapters.types import fleet_extra_args
 
     # A replayed spec already holds the role's arguments as they were at spawn;
     # adding today's would double them (or add ones the agent never had). The
@@ -5645,35 +5650,17 @@ def spawn(
         if spec is not None and not experimental.captain_role(role)
         else fleet_extra_args(selected.adapter, role_config.extra_args, role_config.agent_args)
     )
-    extra = list(agent_args)
-    if replayed_args:
-        # Filtered on the way OUT as well as on the way in: a spec written before
-        # session choices were left out of it still holds them, and the board session
-        # its hook joined is what shows the binary to be that agent's whatever its name.
-        extra = _without_session_choice(resolution.binary, extra, family=family)
-    # The window's `launch` options among the spawn's own arguments, read by it as 0.9.2's was
-    # (#105): recorded with them below, so a restart reads them again.
-    launch_options, extra = _launch_options(extra, selected.adapter)
-    # The operator's arguments, the CLI's, the Spawn dialog's, the role's and a replay's alike,
-    # beside the first message this spawn puts after `--` on its window's line: the agent reads
-    # a word after one directory as the prompt of the command the word sits in, its own or, after
-    # a replay's resume or fork, that command's, and refuses the first message as a second one.
-    on_line = _first_message_given(prompt, task_id, kickoff) and (
-        delivery.first_prompt_way(
-            positional=selected.adapter.capabilities.positional_prompt,
-            setting=config.first_prompt,
-        )
-        == "argv"
+    launch_options, extra = _agent_arguments(
+        agent_args,
+        selected.adapter,
+        replayed=replayed_args,
+        binary=resolution.binary,
+        family=family,
     )
-    beside = extra if resume is not None else [*selected.profile.args, *role_args, *extra]
-    stray = stray_directory(selected.adapter, beside) if on_line else None
-    if stray is not None:
-        raise FleetError(
-            f"{selected.adapter.label} takes one directory per {stray.option} and reads "
-            f"{stray.word!r} after {stray.option} {stray.value!r} as its prompt, so it would "
-            f"refuse this spawn's first message after it: give {stray.option} before each "
-            "directory"
-        )
+    # A fleet lane's arguments are replayed under the fleet's own resume and first message, so
+    # an agent whose arguments are options alone (Codex) is refused any other word among them:
+    # the binding's, the role's and the spawn's own, before the lead joins them.
+    _refuse_a_bare_word(selected.adapter, [*selected.profile.args, *role_args, *extra])
     # The model and the effort: what this spawn chose, else the role's settings, else
     # `[agents.models.<agent>]`, else the owner's last pick, else nothing (the account's own
     # default); a replay starts what the agent runs now (#441). Asked before the account, whose
@@ -7029,6 +7016,65 @@ def _in_place_of_recorded(
         )
     notes.append(f"{gone} — starting {today.binary!r} (chosen by: {today.source}) instead")
     return today
+
+
+def _agent_arguments(
+    agent_args: Sequence[str],
+    adapter: AgentAdapter,
+    *,
+    replayed: bool,
+    binary: str,
+    family: str | None,
+) -> tuple[list[str], list[str]]:
+    """``(the window launch's options, the agent's own arguments)`` among a spawn's
+    ``agent_args``, as :func:`spawn` and :func:`_refuse_a_replay_that_cannot_start` read them.
+    A replay's recorded ones (``replayed``) lose what chose a session first, filtered on the way
+    OUT as well as on the way in: a spec written before session choices were left out of it
+    still holds them, and the board session its hook joined is what shows ``binary`` to be
+    that agent's whatever its name (:func:`_without_session_choice`). The window's `launch`
+    options among them are read as 0.9.2's was (#105, :func:`_launch_options`), and recorded
+    with them, so a restart reads them again."""
+    extra = list(agent_args)
+    if replayed:
+        extra = _without_session_choice(binary, extra, family=family)
+    return _launch_options(extra, adapter)
+
+
+def _refuse_a_bare_word(adapter: AgentAdapter, args: Sequence[str], *, after: str = "") -> None:
+    """Refuse ``args`` when the agent takes options alone and :func:`bare_word` finds another
+    word among them, naming the spelling that works; ``after`` ends a replay's refusal."""
+    bare = bare_word(adapter, args)
+    if bare is None:
+        return
+    agent = adapter.label
+    lead = (
+        f"{agent} fleet arguments are options with one value each, as the fleet gives {agent} its "
+        "first message and its session itself at every start and restart"
+    )
+    ways = prog.shell_advice(
+        "give a first message with --prompt (the Spawn dialog's First prompt), bring a thread in "
+        f"with `{prog.word()} fleet adopt <id>`, and run a one-shot command such as exec or review "
+        "outside the fleet",
+        app="give a first message in the Spawn dialog's First prompt, bring a thread in with Adopt "
+        "a conversation on the Accounts page, and run a one-shot command such as exec or review "
+        "outside the fleet",
+    )
+    word, option, value = bare
+    if option:
+        raise FleetError(
+            f"{lead}: {word!r} after {option} {value!r} is not one, so give {option} before each "
+            f"value ({option} {value} {option} {word}), or {ways}{after}"
+        )
+    raise FleetError(f"{lead}: {word!r} is not one, so {ways}{after}")
+
+
+def _nothing_stopped_for_a_bare_word(label: str) -> str:
+    """:func:`_refuse_a_bare_word`'s ``after`` for a replacement of the row ``label``, asked
+    before anything is stopped."""
+    return (
+        "; nothing was stopped: change the role's binding or agent_args if the word is there, "
+        f"else stop {label!r} and spawn it again"
+    )
 
 
 #: The options of the window's `launch` that 0.9.2's `fleet spawn` let through to it among the
@@ -9519,12 +9565,6 @@ def _first_message(
     )
     parts = [part for part in (opening, prompt) if part]
     return "\n\n".join(parts) if parts else None
-
-
-def _first_message_given(prompt: str | None, task_id: str | None, kickoff: bool) -> bool:
-    """Whether a spawn of ``prompt`` and ``task_id`` gives its agent a first message
-    (:func:`_first_message`), asked before its task is read."""
-    return bool(prompt) or (task_id is not None and kickoff)
 
 
 def _first_prompt_unsent(agent: FleetAgent, why: str) -> bool:
@@ -15026,6 +15066,7 @@ def _refuse_a_cross_agent_start(
             f"{selected.binary.source}) — install {selected.adapter.label}, or change the "
             "role's binding; nothing was stopped"
         )
+    _refuse_a_fresh_starts_bare_word(selected, runs_as, label)
     if selected.adapter.capabilities.sandboxes_tools:
         flags, _ = permission_flags(selected.adapter, runs_as, label, role_settings(runs_as))
         _refuse_an_install_the_sandbox_writes(
@@ -15049,6 +15090,23 @@ def _refuse_a_cross_agent_start(
     config = settings()
     srv = server(config)
     _refuse_a_freed_socket(srv, config, srv.listener())
+
+
+def _refuse_a_fresh_starts_bare_word(
+    selected: agent_launch.ResolvedAgent, role: str, label: str
+) -> None:
+    """:func:`_refuse_a_bare_word` before anything is stopped, for a replacement that starts
+    ``role`` fresh as today's config launches it on ``selected``'s agent (a crossing, a
+    take-over as another role): the binding's arguments for that agent, and the role's."""
+    role_config = role_settings(role)
+    _refuse_a_bare_word(
+        selected.adapter,
+        [
+            *selected.profile.args,
+            *fleet_extra_args(selected.adapter, role_config.extra_args, role_config.agent_args),
+        ],
+        after=_nothing_stopped_for_a_bare_word(label),
+    )
 
 
 def _respawn(
@@ -15669,14 +15727,18 @@ def _refuse_a_replay_that_cannot_start(
     which left it down (review of #259, round 2). And a worktree that is gone with no
     branch to make it again on (:func:`_branch_of_a_gone_tree`, which writes nothing), in
     ``project``'s root; ``branch`` is the one its row recorded the tree on. A refusal names
-    ``project`` in the commands it gives.
+    ``project`` in the commands it gives. And a word among the replay's arguments that an agent
+    whose arguments are options alone refuses (:func:`_refuse_a_bare_word`): a record written
+    before that check, or a binding changed since, stopped the agent and then had its
+    replacement refused.
     """
+    family = record.session.agent if record.session is not None else None
     replayed = _launch_binary(
         project,
         record.role,
         binary=None,
         spec=record.spec,
-        family=record.session.agent if record.session is not None else None,
+        family=family,
         notes=[],
         bin_flag=False,
     )
@@ -15692,6 +15754,25 @@ def _refuse_a_replay_that_cannot_start(
         )
     except ValueError as exc:
         raise FleetError(str(exc)) from exc
+    # The arguments the replacement is given, read as `spawn` reads a replay's: the binding's,
+    # then the record's (the role's are among them, as its spawn passed them).
+    recorded = (
+        []
+        if experimental.captain_role(record.role)
+        else _replayed_args(record.role, record.spec, settings())
+    )
+    _, extra = _agent_arguments(
+        recorded,
+        selected.adapter,
+        replayed=True,
+        binary=selected.binary.binary,
+        family=family,
+    )
+    _refuse_a_bare_word(
+        selected.adapter,
+        [*selected.profile.args, *extra],
+        after=_nothing_stopped_for_a_bare_word(record.label or ""),
+    )
     if not selected.adapter.capabilities.model_ladders:
         try:
             _replay_slot(selected.adapter, record.spec, pick or model_memory.Pick())
@@ -16193,10 +16274,15 @@ def restart(
             # keeps its source's label and tree (review of #240, finding 6).
             _refuse_a_take_over_that_would_move(project, agent, runs_as)
             # Another role launches as today's config says for it, not as the record
-            # holds the old one: that binary is the one to ask about.
+            # holds the old one: that binary is the one to ask about, and its arguments.
             _launch_binary(
                 project, runs_as, binary=None, spec=None, family=None, notes=[], bin_flag=False
             )
+            try:
+                taken_over = agent_launch.resolve(runs_as, agent=record.agent, cwd=project.root)
+            except ValueError as exc:
+                raise FleetError(f"{exc} — nothing was stopped") from exc
+            _refuse_a_fresh_starts_bare_word(taken_over, runs_as, label)
         if persona:
             _chosen_persona(project, runs_as, persona, role_settings(runs_as, settings()), [])
         whose = replays.id if replays is not None else claude_accounts_core.AGENT

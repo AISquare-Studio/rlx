@@ -849,9 +849,11 @@ class CodexAdapter:
                 "-o",
             }
         ),
-        # `--add-dir <DIR>` (0.167.0's help): `--add-dir a b -- <prompt>` exited 2 before its first
-        # screen, `b` taken as the prompt and `<prompt>` refused as a second.
-        one_directory_options=frozenset({"--add-dir"}),
+        # The fleet fills Codex's positionals itself, its resume or fork and its first message after
+        # --, at every start and replay: 0.167.0 takes one directory per --add-dir and reads a bare
+        # word as its prompt or a command (--add-dir a b -- <prompt> exited 2 before its first
+        # screen).
+        options_only=True,
         switch_options=frozenset(
             {
                 "--no-alt-screen",

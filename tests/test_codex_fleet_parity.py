@@ -27,7 +27,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from pathlib import Path, PureWindowsPath
-from typing import Any, Literal, cast
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -3864,6 +3864,51 @@ def test_a_codex_spawn_passes_each_option_once_its_own_over_its_roles_and_its_bi
     assert _pair(replayed, "--model") == "gpt-own" and replayed.count("--search") == 1, replayed
 
 
+def _codex_spawn_refused(
+    tmux: FakeTmux,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    *,
+    own: Sequence[str] = (),
+    role: Sequence[str] = (),
+    bound: Sequence[str] = (),
+    message: str = "argv",
+    resume: fleet_service.ResumeSpec | None = None,
+) -> str:
+    """The refusal of a Codex spawn whose own arguments are ``own``, whose role's
+    ``agent_args`` are ``role`` and whose Codex binding passes ``bound``, its first message on
+    the line (``argv``), typed (``type``), a task's kickoff (``task``) or none (``none``); and
+    that it made no window and no row."""
+    config = load_config()
+    config.fleet.first_prompt = "type" if message == "type" else "argv"
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": [*role]})
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=[*bound])
+    save_config(config)
+    task = _add_task(project, "Ship auth") if message == "task" else None
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.spawn(
+            project,
+            "coder",
+            agent="codex",
+            agent_args=[*own],
+            prompt="go" if message in {"argv", "type"} else None,
+            task_id=task.id if task is not None else None,
+            resume=resume,
+        )
+    assert tmux.spawned == []
+    with store_session() as store:
+        assert store.fleet_agents(project.id) == []
+    return str(refused.value)
+
+
+def _names(said: str, word: str, option: str = "", value: str = "") -> None:
+    """``said`` names ``word``, and where it follows an option's value the spelling that
+    works: that option before each value."""
+    assert repr(word) in said, said
+    if option:
+        assert f"({option} {value} {option} {word})" in said, said
+
+
+@pytest.mark.parametrize("message", ["argv", "type", "task", "none"])
 @pytest.mark.parametrize(
     ("own", "role", "bound"),
     [
@@ -3873,7 +3918,7 @@ def test_a_codex_spawn_passes_each_option_once_its_own_over_its_roles_and_its_bi
         pytest.param([], [], ["--add-dir", "a", "b"], id="binding"),
     ],
 )
-def test_a_codex_spawn_given_a_prompt_refuses_claude_codes_add_dir_spelling_before_a_window(
+def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window(
     tmux: FakeTmux,  # noqa: F811
     claude_on_path: Path,  # noqa: F811
     codex_on_path: Path,  # noqa: F811
@@ -3881,103 +3926,165 @@ def test_a_codex_spawn_given_a_prompt_refuses_claude_codes_add_dir_spelling_befo
     own: list[str],
     role: list[str],
     bound: list[str],
+    message: str,
 ) -> None:
-    """This test reads a spawn given a prompt whose own arguments, role's ``agent_args`` or
-    Codex binding hold ``--add-dir a b``."""
-    config = load_config()
-    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": role})
-    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=bound)
-    save_config(config)
-    with pytest.raises(fleet_service.FleetError) as refused:
-        fleet_service.spawn(project, "coder", agent="codex", agent_args=own, prompt="go")
-    said = str(refused.value)
-    assert "'b'" in said and "--add-dir 'a'" in said, said
-    assert tmux.spawned == []
+    """This test reads a Codex spawn whose own arguments, joined form, role's ``agent_args``
+    or binding hold ``--add-dir a b``, its first message on the line, typed, a task's kickoff
+    or none."""
+    said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
+    _names(said, "b", "--add-dir", "a")
 
 
-def test_a_codex_spawn_for_a_task_refuses_claude_codes_add_dir_spelling_before_a_window(
+#: Arguments a Codex spawn refuses, with the word it names and the option and value it
+#: follows (``types.BareWord``'s fields).
+CODEX_REFUSED = [
+    pytest.param(["--add-dir", "a", "b", "c"], "b", "--add-dir", "a", id="three-paths"),
+    pytest.param(["--add-dir", "a", "b", "c", "d"], "b", "--add-dir", "a", id="four-paths"),
+    pytest.param(
+        ["--add-dir", "a", "b", "--add-dir", "c", "d"], "b", "--add-dir", "a", id="two-pairs"
+    ),
+    pytest.param(["--add-dir=a", "b", "c"], "b", "--add-dir", "a", id="joined-three-paths"),
+    pytest.param(["--add-dir", "a", "fix-the-bug"], "fix-the-bug", "--add-dir", "a", id="prompt"),
+    pytest.param(["fix the bug", "--add-dir", "a"], "fix the bug", "", "", id="prompt-first"),
+    pytest.param(["fix the bug", "--add-dir", "a", "b"], "fix the bug", "", "", id="prompt-a-b"),
+    pytest.param(["--add-dir", "a", "exec", "x"], "exec", "--add-dir", "a", id="exec"),
+    pytest.param(["--add-dir", "a", "review"], "review", "--add-dir", "a", id="review"),
+    pytest.param(["--add-dir", "a", "--search", "review"], "review", "", "", id="switch-review"),
+    pytest.param(["-i", "x.png", "b"], "b", "-i", "x.png", id="image-then-word"),
+    pytest.param(["--search", "b"], "b", "", "", id="switch-then-word"),
+    pytest.param(["--add-dir", "x", "a"], "a", "--add-dir", "x", id="dir-named-a"),
+    pytest.param(["--add-dir", "x", "e"], "e", "--add-dir", "x", id="dir-named-e"),
+    pytest.param(
+        ["--add-dir", "a", "resume", THREAD_ONE], "resume", "--add-dir", "a", id="own-resume"
+    ),
+    pytest.param(["--", "hi"], "--", "", "", id="native-separator"),
+]
+
+
+@pytest.mark.parametrize(("own", "word", "option", "value"), CODEX_REFUSED)
+def test_a_codex_spawn_given_a_message_refuses_a_bare_word_among_its_arguments(
     tmux: FakeTmux,  # noqa: F811
     claude_on_path: Path,  # noqa: F811
     codex_on_path: Path,  # noqa: F811
     project: ProjectInfo,  # noqa: F811
+    own: list[str],
+    word: str,
+    option: str,
+    value: str,
 ) -> None:
-    """This test reads a spawn for a task, with no prompt, whose own arguments hold
-    ``--add-dir a b``: the task's kickoff is its first message."""
-    config = load_config()
-    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
-    save_config(config)
-    task = _add_task(project, "Ship auth")
-    with pytest.raises(fleet_service.FleetError) as refused:
-        fleet_service.spawn(
-            project, "coder", agent="codex", agent_args=["--add-dir", "a", "b"], task_id=task.id
-        )
-    said = str(refused.value)
-    assert "'b'" in said and "--add-dir 'a'" in said, said
-    assert tmux.spawned == []
-
-
-def test_a_resumed_codex_spawn_given_a_prompt_refuses_a_word_after_its_own_add_dir(
-    tmux: FakeTmux,  # noqa: F811
-    claude_on_path: Path,  # noqa: F811
-    codex_on_path: Path,  # noqa: F811
-    project: ProjectInfo,  # noqa: F811
-    tmp_path: Path,
-) -> None:
-    """This test reads a resumed spawn given a prompt whose own arguments hold
-    ``--add-dir b c``, after the resume's subcommand on its line."""
-    config = load_config()
-    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
-    save_config(config)
-    resume = fleet_service.ResumeSpec(
-        session_id=THREAD_ONE, transcript_path=tmp_path / "rollout.jsonl"
-    )
-    with pytest.raises(fleet_service.FleetError) as refused:
-        fleet_service.spawn(
-            project,
-            "coder",
-            agent="codex",
-            agent_args=["--add-dir", "b", "c"],
-            resume=resume,
-            prompt="go",
-        )
-    said = str(refused.value)
-    assert "'c'" in said and "--add-dir 'b'" in said, said
-    assert tmux.spawned == []
+    """This test reads a Codex spawn whose first message goes on its line and whose own
+    arguments hold the words of :data:`CODEX_REFUSED`."""
+    said = _codex_spawn_refused(tmux, project, own=own)
+    _names(said, word, option, value)
 
 
 @pytest.mark.parametrize(
-    ("first_prompt", "prompt", "resumed"),
+    ("own", "role", "fork", "message", "word", "option", "value"),
     [
-        pytest.param("argv", None, False, id="no-first-message"),
-        pytest.param("type", "go", False, id="first-message-typed"),
-        pytest.param("argv", "go", True, id="before-a-resume"),
+        pytest.param(["--add-dir", "b", "c"], [], False, "argv", "c", "--add-dir", "b", id="own-m"),
+        pytest.param(["--add-dir", "b", "c"], [], False, "none", "c", "--add-dir", "b", id="own"),
+        pytest.param(
+            ["--add-dir", "b", "c", "d"], [], False, "none", "c", "--add-dir", "b", id="own-3"
+        ),
+        pytest.param(["--add-dir", "b", "c"], [], True, "argv", "c", "--add-dir", "b", id="fork-m"),
+        pytest.param(["--add-dir", "b", "c"], [], True, "none", "c", "--add-dir", "b", id="fork"),
+        pytest.param(
+            ["--add-dir", "b", "c", "d"], [], True, "none", "c", "--add-dir", "b", id="fork-3"
+        ),
+        pytest.param(
+            [], ["--add-dir", "a", "b"], False, "argv", "b", "--add-dir", "a", id="role-m"
+        ),
+        pytest.param([], ["--add-dir", "a", "b"], False, "none", "b", "--add-dir", "a", id="role"),
+        pytest.param(
+            [], ["--add-dir", "a", "b", "c"], False, "none", "b", "--add-dir", "a", id="role-3"
+        ),
+        pytest.param(
+            ["resume", THREAD_ONE, "--add-dir", "a"],
+            [],
+            False,
+            "argv",
+            "resume",
+            "",
+            "",
+            id="resume",
+        ),
     ],
 )
-def test_a_codex_spawn_passes_add_dir_a_b_where_its_first_message_is_no_second_prompt_beside_b(
+def test_a_resumed_or_forked_codex_spawn_refuses_a_bare_word_before_a_window(
     tmux: FakeTmux,  # noqa: F811
     claude_on_path: Path,  # noqa: F811
     codex_on_path: Path,  # noqa: F811
     project: ProjectInfo,  # noqa: F811
     tmp_path: Path,
-    first_prompt: Literal["argv", "type"],
-    prompt: str | None,
-    resumed: bool,
+    own: list[str],
+    role: list[str],
+    fork: bool,
+    message: str,
+    word: str,
+    option: str,
+    value: str,
 ) -> None:
-    """This test reads the window line of a spawn whose role passes ``--add-dir a b`` with no
-    first message, with its first message typed, and before a resume's subcommand."""
+    """This test reads a resumed and a forked Codex spawn whose own arguments or role's
+    ``agent_args`` hold a word after an ``--add-dir`` value or its own ``resume <id>``, with
+    its first message on the line or none."""
+    resume = fleet_service.ResumeSpec(
+        session_id=THREAD_ONE, transcript_path=tmp_path / "rollout.jsonl", fork=fork
+    )
+    said = _codex_spawn_refused(tmux, project, own=own, role=role, message=message, resume=resume)
+    _names(said, word, option, value)
+
+
+@pytest.mark.parametrize(
+    ("own", "message"),
+    [
+        pytest.param(["--add-dir", "a", "--add-dir", "b"], "argv", id="two-dirs-message"),
+        pytest.param(["--add-dir", "a", "--add-dir", "b"], "type", id="two-dirs-typed"),
+        pytest.param(["--add-dir", "a", "--add-dir", "b"], "none", id="two-dirs"),
+        pytest.param([], "argv", id="message-alone"),
+        pytest.param(["-i", "x.png", "-i", "b"], "argv", id="two-images"),
+        pytest.param(["-c", "a.b=1"], "argv", id="config"),
+        pytest.param(["--model", "gpt-5.4"], "argv", id="model"),
+        pytest.param(["--search"], "argv", id="switch"),
+        pytest.param(["--future", "v"], "argv", id="undeclared-option"),
+    ],
+)
+def test_a_codex_spawn_whose_arguments_are_options_alone_starts_with_them(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    own: list[str],
+    message: str,
+) -> None:
+    """This test reads the window line of a Codex spawn whose own arguments are options with
+    one value each, its first message on the line, typed or none."""
     config = load_config()
-    config.fleet.first_prompt = first_prompt
-    config.fleet.roles["coder"] = FleetRoleSettings(
-        worktree=False, agent_args={"codex": ["--add-dir", "a", "b"]}
-    )
+    config.fleet.first_prompt = "type" if message == "type" else "argv"
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
     save_config(config)
-    resume = (
-        fleet_service.ResumeSpec(session_id=THREAD_ONE, transcript_path=tmp_path / "rollout")
-        if resumed
-        else None
+    fleet_service.spawn(
+        project, "coder", agent="codex", agent_args=own, prompt=None if message == "none" else "go"
     )
-    fleet_service.spawn(project, "coder", agent="codex", prompt=prompt, resume=resume)
     native = _spawn_native(tmux)
+    assert any(native[at : at + len(own)] == own for at in range(len(native))), native
+
+
+@pytest.mark.parametrize("prompt", ["go", None])
+def test_a_claude_code_spawn_passes_add_dir_a_b_as_given(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    prompt: str | None,
+) -> None:
+    """This test reads the window line of a Claude Code spawn given ``--add-dir a b``, with a
+    first message and with none."""
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
+    save_config(config)
+    fleet_service.spawn(
+        project, "coder", agent="claude-code", agent_args=["--add-dir", "a", "b"], prompt=prompt
+    )
+    native = _native(_command(tmux))
     at = native.index("--add-dir")
     assert native[at : at + 3] == ["--add-dir", "a", "b"], native
 
@@ -4823,6 +4930,144 @@ def test_the_fleets_install_check_reads_the_path_its_window_will_have(
     with pytest.raises(fleet_service.FleetError, match="could not work out"):
         fleet_service.spawn(project, "tester", label="tester-x", agent="codex", worktree=False)
     assert "tester-x" not in str(tmux.sessions)
+
+
+def _left_running(tmux: FakeTmux, agent: FleetAgent, spawned: int) -> None:  # noqa: F811
+    """Nothing typed into ``agent``'s pane or killed, no window started since ``spawned``, and
+    its row still live."""
+    assert tmux.typed == [] and agent.pane_id not in tmux.killed, (tmux.typed, tmux.killed)
+    assert len(tmux.spawned) == spawned
+    with store_session() as store:
+        row = store.get_fleet_agent(agent.id)
+    assert row is not None and row.ended_at is None, row
+
+
+@pytest.mark.parametrize(
+    ("recorded", "word", "option", "value"),
+    [
+        pytest.param(["--add-dir", "a", "b"], "b", "--add-dir", "a", id="two-paths"),
+        pytest.param(
+            ["--add-dir", "a", "fix-the-bug"], "fix-the-bug", "--add-dir", "a", id="prompt"
+        ),
+    ],
+)
+@pytest.mark.parametrize("how", ["restart", "switch"])
+def test_a_replay_whose_record_holds_a_bare_word_is_refused_before_its_agent_stops(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    how: str,
+    recorded: list[str],
+    word: str,
+    option: str,
+    value: str,
+) -> None:
+    """This test reads a restart and a switch onto another Codex account of a running Codex
+    row whose launch record's arguments hold ``recorded``, as one written before the spawn's
+    check holds them."""
+    from tests.test_codex_accounts import _sign_in
+
+    agent = fleet_service.spawn(project, "coder", agent="codex", worktree=False).agent
+    record = launch_seal.read(agent.id)
+    assert isinstance(record, launch_seal.LaunchRecord)
+    _recorded(agent, spec=record.spec.model_copy(update={"extra_args": recorded}))
+    roomy = accounts_core.create_account("codex")
+    _sign_in(roomy.config_dir, "roomy@example.com")
+    spawned = len(tmux.spawned)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        if how == "restart":
+            fleet_service.restart(project, agent.label)
+        else:
+            fleet_service.switch(project, agent.label, to=str(roomy.slot))
+
+    said = str(refused.value)
+    _names(said, word, option, value)
+    assert "nothing was stopped" in said, said
+    _left_running(tmux, agent, spawned)
+
+
+def test_a_restart_after_the_binding_changed_to_a_bare_word_is_refused_before_the_stop(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+) -> None:
+    """This test reads a restart of a running Codex row whose role's Codex binding passed
+    ``--search`` at its spawn and ``--add-dir a b`` since."""
+    config = load_config()
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=["--search"])
+    save_config(config)
+    agent = fleet_service.spawn(project, "coder", agent="codex", worktree=False).agent
+    config = load_config()
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=["--add-dir", "a", "b"])
+    save_config(config)
+    spawned = len(tmux.spawned)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.restart(project, agent.label)
+
+    said = str(refused.value)
+    _names(said, "b", "--add-dir", "a")
+    assert "nothing was stopped" in said, said
+    _left_running(tmux, agent, spawned)
+
+
+@pytest.mark.parametrize("how", ["onto-codex", "as-another-role"])
+def test_a_fresh_replacement_whose_role_holds_a_bare_word_is_refused_before_the_stop(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    how: str,
+) -> None:
+    """This test reads a restart of a running row onto Codex from Claude Code, and of a running
+    Codex row as another role, where the role it starts as passes Codex ``--add-dir a b`` in
+    its ``agent_args``."""
+    adds = {"codex": ["--add-dir", "a", "b"]}
+    config = load_config()
+    config.fleet.roles["coder"] = FleetRoleSettings(
+        worktree=False, agent_args=adds if how == "onto-codex" else {}
+    )
+    config.fleet.roles["tester"] = FleetRoleSettings(worktree=False, agent_args=adds)
+    save_config(config)
+    runs = "claude-code" if how == "onto-codex" else "codex"
+    agent = fleet_service.spawn(project, "coder", agent=runs, worktree=False).agent
+    spawned = len(tmux.spawned)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        if how == "onto-codex":
+            fleet_service.restart(project, agent.label, to_agent="codex")
+        else:
+            fleet_service.restart(project, agent.label, role="tester")
+
+    said = str(refused.value)
+    _names(said, "b", "--add-dir", "a")
+    assert "nothing was stopped" in said, said
+    _left_running(tmux, agent, spawned)
+
+
+def test_a_paused_codex_rows_resume_whose_record_holds_a_bare_word_is_refused(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+) -> None:
+    """This test reads the resume of a paused Codex row whose launch record's arguments hold
+    ``--add-dir a b``."""
+    agent = fleet_service.spawn(project, "coder", agent="codex", worktree=False).agent
+    record = launch_seal.read(agent.id)
+    assert isinstance(record, launch_seal.LaunchRecord)
+    _recorded(agent, spec=record.spec.model_copy(update={"extra_args": ["--add-dir", "a", "b"]}))
+    fleet_service.pause_agent(project, agent.label, grace=0)
+    spawned = len(tmux.spawned)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.restart(project, agent.label, verb="resume")
+
+    _names(str(refused.value), "b", "--add-dir", "a")
+    assert len(tmux.spawned) == spawned
+    with store_session() as store:
+        row = store.get_fleet_agent(agent.id)
+    assert row is not None and row.paused_at is not None, row
 
 
 def test_a_restart_mode_beside_the_roles_own_sandbox_is_refused_before_the_stop(

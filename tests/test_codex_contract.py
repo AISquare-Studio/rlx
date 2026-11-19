@@ -24,10 +24,12 @@ from aisquare.core.agent_adapters.codex import TOOL_FEATURES, TUI_TOOLS_SERVER, 
 from aisquare.core.agent_adapters.codex_transcript import CodexTranscript
 from aisquare.core.agent_adapters.types import (
     BadEffortError,
+    BareWord,
     ForkArgs,
     PermissionIntent,
     SkillDirs,
     WriteScope,
+    bare_word,
     screen_of,
     store_dir,
 )
@@ -185,6 +187,43 @@ def test_a_chosen_sandbox_or_policy_turns_the_default_off() -> None:
 
 #: What the refusal of ``approve_for_me = true`` names beside every clash: the setting, the
 #: Codex switch it passes and the one sandbox that switch takes.
+#: Argument lists and the word Codex's adapter finds among them, with the option and value it
+#: follows; ``None`` for options with one value each.
+BARE_WORDS: list[tuple[list[str], BareWord | None]] = [
+    (["--add-dir", "a", "b"], BareWord("b", "--add-dir", "a")),
+    (["--add-dir=a", "b"], BareWord("b", "--add-dir", "a")),
+    (["--add-dir", "a", "b", "--add-dir", "c", "d"], BareWord("b", "--add-dir", "a")),
+    (["-ix.png", "b"], BareWord("b", "-i", "x.png")),
+    (["-i", "x.png", "b"], BareWord("b", "-i", "x.png")),
+    (["--search", "b"], BareWord("b")),
+    (["--add-dir", "a", "--search", "review"], BareWord("review")),
+    (["fix the bug", "--add-dir", "a"], BareWord("fix the bug")),
+    (["--add-dir", "a", "resume", "019a"], BareWord("resume", "--add-dir", "a")),
+    (["--", "hi"], BareWord("--")),
+    (["--add-dir", "a", "--", "hi"], BareWord("--")),
+    (["--future", "v", "w"], BareWord("w", "--future", "v")),
+    (["--add-dir", "a", "--add-dir", "b"], None),
+    (["--add-dir=a", "--add-dir=b"], None),
+    (["-i", "x.png", "-i", "b"], None),
+    (["-c", "a.b=1", "--model", "gpt-5.4", "--search"], None),
+    (["--future", "v"], None),
+    (["--add-dir", "--search"], None),
+    ([], None),
+]
+
+
+@pytest.mark.parametrize(
+    ("args", "found"), BARE_WORDS, ids=[" ".join(args) or "none" for args, _ in BARE_WORDS]
+)
+def test_bare_word_reads_codexs_arguments_as_options_with_one_value_each(
+    args: list[str], found: BareWord | None
+) -> None:
+    """This test reads ``bare_word`` for Codex's adapter and Claude Code's over each list of
+    :data:`BARE_WORDS`."""
+    assert bare_word(_get_adapter("codex"), args) == found
+    assert bare_word(_get_adapter("claude-code"), args) is None
+
+
 _APPROVE_FOR_ME = ("fleet.roles.coder.approve_for_me = true", "--approve-for-me", "workspace-write")
 _YOURSELF = "fleet.roles.coder.approve_for_me = false"
 

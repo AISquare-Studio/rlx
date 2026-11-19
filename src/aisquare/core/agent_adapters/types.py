@@ -539,11 +539,12 @@ class AgentCapabilities:
     an explicitly passed mode and its ``agent_args``."""
     value_options: frozenset[str] = frozenset()
     switch_options: frozenset[str] = frozenset()
-    one_directory_options: frozenset[str] = frozenset()
-    """Options that take one directory each where Claude Code's same spelling takes several
-    (Codex's ``--add-dir``): in ``--add-dir a b`` the agent reads ``b`` as the prompt of the
-    command it sits in, and refuses another one after it, such as the first message a fleet
-    spawn puts after ``--``, which that spawn refuses before it starts (:func:`stray_directory`)."""
+    options_only: bool = False
+    """A fleet spawn gives the agent its arguments as options with one value each (Codex): the
+    fleet fills the agent's positionals itself, its resume or fork lead and its first message,
+    at every start and replay, so a bare word among them, the native ``--`` and what follows it
+    included, is refused before a window and before a replay's stop (:func:`bare_word`). Claude
+    Code's several-value options (``--add-dir a b``) leave it off."""
 
 
 @dataclass(frozen=True)
@@ -2236,24 +2237,44 @@ def _before_separator(args: Sequence[str]) -> list[str]:
     return list(args[: args.index("--")] if "--" in args else args)
 
 
-class StrayWord(NamedTuple):
-    """A bare word after the value of one of an agent's ``one_directory_options``."""
+class BareWord(NamedTuple):
+    """A word among an agent's fleet arguments that is no option and no option's one value
+    (:func:`bare_word`): ``word``, and the ``option`` and ``value`` it comes right after, else
+    empty."""
 
-    option: str
-    value: str
     word: str
+    option: str = ""
+    value: str = ""
 
 
-def stray_directory(adapter: AgentAdapter, args: Sequence[str]) -> StrayWord | None:
-    """The first bare word after the value of one of ``adapter``'s ``one_directory_options``
-    before the native ``--`` (Claude Code's ``--add-dir a b`` given to Codex), which the agent
-    reads as no directory; ``None`` when there is none."""
-    options, held = adapter.capabilities.one_directory_options, _before_separator(args)
-    for item in option_occurrences(args, *options):
-        following = held[item.value_index + 1 : item.value_index + 2]
-        if following and not following[0].startswith("-"):
-            option = (item.prefix or args[item.index]).removesuffix("=")
-            return StrayWord(option, item.value, following[0])
+def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
+    """The first word of ``args`` that a fleet spawn of ``adapter`` refuses
+    (``capabilities.options_only``): read with the adapter's ``switch_options`` taking no value
+    and any other option, declared in ``value_options`` or not, taking the next word as its one
+    value unless that word starts with ``-``, a value joined to its option taking none; the
+    native ``--`` is itself such a word. ``None`` for an adapter without ``options_only`` and
+    for arguments that are options alone."""
+    capabilities = adapter.capabilities
+    if not capabilities.options_only:
+        return None
+    option = value = ""
+    at = 0
+    while at < len(args):
+        word = args[at]
+        if word == "--":
+            return BareWord(word)
+        if not word.startswith("-"):
+            return BareWord(word, option, value)
+        name, joined, rest = word.partition("=")
+        following = args[at + 1] if at + 1 < len(args) else None
+        if word.startswith("--") and joined:
+            option, value, at = name, rest, at + 1
+        elif not word.startswith("--") and len(word) > 2:
+            option, value, at = word[:2], word[2:], at + 1
+        elif word in capabilities.switch_options or following is None or following.startswith("-"):
+            option, value, at = "", "", at + 1
+        else:
+            option, value, at = word, following, at + 2
     return None
 
 

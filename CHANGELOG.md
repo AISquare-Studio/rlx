@@ -8,12 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **A Codex fleet agent given Claude Code's `--add-dir a b` is stopped before it starts,
-  with the form Codex takes:** `--add-dir a --add-dir b`. Codex takes one directory per
-  `--add-dir` and reads `b` as its prompt, so it refused the first message `rlx fleet spawn`
-  puts after it on the command line and exited before its first screen. The spawn checks
-  the spawn's own arguments, the Spawn dialog's, a role's `agent_args` or binding and a
-  restart's, whenever its first message goes on the command line.
+- **A Codex fleet agent's arguments are options with one value each, and a spawn, restart or
+  switch whose arguments hold any other word is stopped before it starts, naming the spelling
+  that works:** Claude Code's `--add-dir a b` names `--add-dir a --add-dir b`, and a prompt, a
+  thread or a Codex command among them names `--prompt`, `rlx fleet adopt` or a run outside
+  the fleet. Codex takes one directory per `--add-dir` and reads `b` as its prompt, so it
+  refused the first message `rlx fleet spawn` puts after it and exited before its first
+  screen, or started with a path as its prompt and without that directory; and a prompt or
+  command among the arguments met the fleet's own at every restart and switch, which Codex
+  refused. The check reads the spawn's own arguments, the Spawn dialog's, a role's
+  `agent_args` and binding and a replay's, and a restart or switch asks it before it stops the
+  agent.
 - **A role's bound arguments reach only the agent they are for.** The `team bind --arg`
   arguments are for the agent a launch of the role runs when it chooses none itself: no
   `--agent`, binary, `--account` or model of its own, and the accounts taken in their order.
