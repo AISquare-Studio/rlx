@@ -93,8 +93,8 @@ def outer_terminal(environ: Mapping[str, str] | None = None) -> tuple[str, bool 
 
     Behind tmux or screen the ``LC_TERMINAL`` ssh sent names whoever started it
     (:func:`multiplexed`), and is passed over: a tmux started over SSH from iTerm2 and
-    reattached from kitty was named iTerm2 (review of #266, round 3). The terminal's own
-    variables are read there as they always were.
+    reattached from kitty would otherwise be named iTerm2 (review of #266, round 3). The
+    terminal's own variables are read there.
     """
     env = os.environ if environ is None else environ
     sign = sign_of(env, sent=not multiplexed(env))
