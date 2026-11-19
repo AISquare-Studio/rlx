@@ -1386,6 +1386,25 @@ def test_the_fleet_terminal_row_never_starts_a_server_and_survives_an_unknown_te
     assert "fleet terminal" in _by_name(diagnostics.doctor()), "it reaches the real doctor"
 
 
+@pytest.mark.parametrize(
+    ("env", "outer"),
+    [
+        ({"TERM_PROGRAM": "iTerm.app"}, "outer terminal iTerm2 (protocol unknown"),
+        ({"LC_TERMINAL": "iTerm2"}, "outer terminal iTerm2 (protocol unknown"),
+        ({"TERM_PROGRAM": "vscode"}, "outer terminal the VS Code terminal (protocol unknown"),
+        ({"TERM_PROGRAM": "Apple_Terminal"}, "outer terminal Terminal.app (no kitty keyboard"),
+    ],
+    ids=["iterm2", "iterm2-over-ssh", "vscode", "terminal-app"],
+)
+def test_the_fleet_terminal_row_names_the_terminal_its_protocol_and_ctrl_j(
+    env: dict[str, str], outer: str
+) -> None:
+    check = _terminal_row(FakeServer(absent=True), env)
+
+    assert outer in check.detail
+    assert "ctrl+j for a newline" in check.detail
+
+
 def test_the_fleet_terminal_row_comes_after_the_actionable_checks() -> None:
     """It can warn (a server's kept prefix), and the not-ok rows are read in doctor
     order (the fleet sidebar showed only the first three): inserted beside
@@ -1406,8 +1425,8 @@ def test_the_fleet_terminal_row_comes_after_the_actionable_checks() -> None:
         ({"GHOSTTY_RESOURCES_DIR": "/x"}, "ghostty", True),
         ({"WEZTERM_EXECUTABLE": "/x"}, "wezterm", True),
         ({"WT_SESSION": "x"}, "Windows Terminal", False),
-        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2", False),
-        ({"TERM_PROGRAM": "vscode"}, "the VS Code terminal", False),
+        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2", None),
+        ({"TERM_PROGRAM": "vscode"}, "the VS Code terminal", None),
         ({"TERM_PROGRAM": "Apple_Terminal"}, "Terminal.app", False),
         ({"VTE_VERSION": "7800"}, "a VTE terminal (GNOME Terminal, Tilix, …)", False),
         ({"TERM": "xterm-kitty"}, "kitty", True),
@@ -1421,12 +1440,11 @@ def test_outer_terminal_recognition(env: dict[str, str], name: str, kitty: bool 
 
 
 def test_behind_a_multiplexer_the_terminal_ssh_named_is_nobody_s() -> None:
-    """Review of #266, round 3: the ``LC_TERMINAL`` ssh sends is kept by a tmux for as long
-    as it runs. Started over SSH from iTerm2 and reattached from kitty, the row said
-    iTerm2 with no kitty keyboard protocol, and sent the user after a shift+enter fix for
-    a terminal they were not using. The row said "unknown" there before that sign."""
+    """The ``LC_TERMINAL`` ssh sends is kept by a tmux for as long as it runs (review of #266,
+    round 3). This test reads ``outer_terminal`` for iTerm2's ``LC_TERMINAL`` alone, behind
+    tmux and behind screen, and the fleet terminal row behind tmux."""
     iterm = {"LC_TERMINAL": "iTerm2", "LC_TERMINAL_VERSION": "3.5.4"}
-    assert outer_terminal(iterm) == ("iTerm2", False), "over SSH, with nothing between"
+    assert outer_terminal(iterm) == ("iTerm2", None), "over SSH, with nothing between"
     behind_tmux = {**iterm, "TMUX": "/tmp/tmux-1/default,1,0", "TERM": "tmux-256color"}
     assert outer_terminal(behind_tmux) == ("unknown (TERM=tmux-256color)", None)
     behind_screen = {**iterm, "STY": "1234.pts-0.host", "TERM": "screen", "VTE_VERSION": "7800"}

@@ -33,9 +33,9 @@ class Sign:
     prefix: str | None
     """The value starts with this; ``None`` for any value."""
     name: str
-    kitty: bool
-    """Speaks the kitty keyboard protocol: what decides whether shift+enter and the other
-    shifted chords reach an agent at all (docs/fleet.md, Keys)."""
+    kitty: bool | None
+    """Whether this terminal signature indicates kitty keyboard protocol support. None means
+    support is unknown."""
     osc52: Osc52 | None = None
     """``None`` where nobody has said."""
     mac: bool = False
@@ -51,14 +51,14 @@ SIGNS: tuple[Sign, ...] = (
     Sign("GHOSTTY_RESOURCES_DIR", None, "ghostty", True, "accepts"),
     Sign("WEZTERM_EXECUTABLE", None, "wezterm", True, "accepts"),
     Sign("WT_SESSION", None, "Windows Terminal", False, "accepts"),
-    Sign("TERM_PROGRAM", "iTerm", "iTerm2", False, "asks", mac=True),
+    Sign("TERM_PROGRAM", "iTerm", "iTerm2", None, "asks", mac=True),
     Sign("TERM_PROGRAM", "WezTerm", "wezterm", True, "accepts"),
     Sign("TERM_PROGRAM", "ghostty", "ghostty", True, "accepts"),
-    Sign("TERM_PROGRAM", "vscode", "the VS Code terminal", False),
+    Sign("TERM_PROGRAM", "vscode", "the VS Code terminal", None),
     Sign("TERM_PROGRAM", "Apple_Terminal", "Terminal.app", False, "drops", mac=True),
     # An LC_* variable, which macOS's ssh sends by default. A tmux keeps the one of
     # whoever started it, so behind a multiplexer it names nobody (`multiplexed`).
-    Sign("LC_TERMINAL", "iTerm2", "iTerm2", False, "asks", mac=True, sent=True),
+    Sign("LC_TERMINAL", "iTerm2", "iTerm2", None, "asks", mac=True, sent=True),
     Sign("VTE_VERSION", None, "a VTE terminal (GNOME Terminal, Tilix, …)", False),
     # A terminal's own TERM is the one sign ssh always carries.
     Sign("TERM", "xterm-kitty", "kitty", True, "accepts"),
@@ -87,13 +87,14 @@ def sign_of(env: Mapping[str, str], *, sent: bool = True) -> Sign | None:
 def outer_terminal(environ: Mapping[str, str] | None = None) -> tuple[str, bool | None]:
     """``(name, speaks the kitty keyboard protocol)`` for the terminal this shell runs in.
 
-    ``None`` for the protocol when the terminal is not recognised — a guess in either
-    direction would send the operator chasing the wrong fix.
+    ``None`` for the protocol when the terminal is not recognised or its sign leaves support
+    unknown (:attr:`Sign.kitty`): a guess in either direction would send the operator
+    chasing the wrong fix.
 
     Behind tmux or screen the ``LC_TERMINAL`` ssh sent names whoever started it
     (:func:`multiplexed`), and is passed over: a tmux started over SSH from iTerm2 and
-    reattached from kitty was named iTerm2, with no kitty keyboard protocol (review of
-    #266, round 3). The terminal's own variables are read there as they always were.
+    reattached from kitty was named iTerm2 (review of #266, round 3). The terminal's own
+    variables are read there as they always were.
     """
     env = os.environ if environ is None else environ
     sign = sign_of(env, sent=not multiplexed(env))
