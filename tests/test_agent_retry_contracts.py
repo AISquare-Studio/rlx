@@ -211,8 +211,16 @@ def test_unknown_native_arity_cannot_silently_choose_the_wrong_binary(runner: Cl
     assert "put rlx options before it" in result.output
 
 
-@pytest.mark.parametrize("entry", ["launch", "team", "fleet"])
-@pytest.mark.parametrize("saved", [[], ["--", "literal prompt"]])
+@pytest.mark.parametrize(
+    ("entry", "saved"),
+    [
+        pytest.param("launch", [], id="launch"),
+        pytest.param("launch", ["--", "literal prompt"], id="launch-literal"),
+        pytest.param("team", [], id="team"),
+        pytest.param("team", ["--", "literal prompt"], id="team-literal"),
+        pytest.param("fleet", [], id="fleet"),
+    ],
+)
 def test_complete_fleet_arguments_preserve_aliases_and_the_literal_boundary(
     entry: str,
     saved: list[str],
@@ -247,6 +255,26 @@ def test_complete_fleet_arguments_preserve_aliases_and_the_literal_boundary(
         assert argv[argv.index("--") :] == profile
     else:
         assert model_overrides("codex", argv[1:])[1] == "max"
+
+
+def test_a_codex_fleet_spawn_refuses_its_bindings_literal_boundary_before_a_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """This test reads a fleet spawn of a role whose Codex binding passes ``-- "literal prompt"
+    -c model_reasoning_effort=ultracode``."""
+    cfg = load_config()
+    cfg.team.profiles["coder"] = RoleLaunchProfile(
+        agent="codex", args=["--", "literal prompt", "-c", "model_reasoning_effort=ultracode"]
+    )
+    cfg.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
+    save_config(cfg)
+    tmux = FakeTmux()
+    monkeypatch.setattr(fleet, "server", lambda config: tmux)
+    with pytest.raises(fleet.FleetError) as refused:
+        fleet.spawn(team_project(tmp_path), "coder")
+    assert repr("--") in str(refused.value), str(refused.value)
+    assert tmux.spawned == []
 
 
 def test_fleet_does_not_validate_fragments_after_creating_a_worktree(
