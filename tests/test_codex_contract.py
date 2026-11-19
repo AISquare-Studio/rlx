@@ -39,6 +39,7 @@ from aisquare.core.agent_adapters.types import (
     SkillDirs,
     WriteScope,
     bare_word,
+    open_option,
     screen_of,
     store_dir,
 )
@@ -218,7 +219,13 @@ BARE_WORDS: list[tuple[list[str], BareWord | None]] = [
     (["-i", "x.png", "-i", "b"], None),
     (["-c", "a.b=1", "--model", "gpt-5.4", "--search"], None),
     (["--future", "v"], None),
-    (["--add-dir", "--search"], None),
+    (["--add-dir", "--search"], BareWord("--add-dir", valueless=True)),
+    (["--model", "--search"], BareWord("--model", valueless=True)),
+    (["-c", "--model", "m"], BareWord("-c", valueless=True)),
+    (["--model", "--", "hi"], BareWord("--model", valueless=True)),
+    (["--future", "--search"], None),
+    (["--sandbox=read-only", "--search"], None),
+    (["--add-dir"], None),
     ([], None),
 ]
 
@@ -233,6 +240,33 @@ def test_bare_word_reads_codexs_arguments_as_options_with_one_value_each(
     :data:`BARE_WORDS`."""
     assert bare_word(_get_adapter("codex"), args) == found
     assert bare_word(_get_adapter("claude-code"), args) is None
+
+
+#: Argument lists and the option Codex's adapter finds ending them waiting for a value, else
+#: empty.
+OPEN_OPTIONS: list[tuple[list[str], str]] = [
+    (["--add-dir"], "--add-dir"),
+    (["--search", "-c"], "-c"),
+    (["--future"], "--future"),
+    (["--add-dir", "a"], ""),
+    (["--add-dir=a"], ""),
+    (["-ix.png"], ""),
+    (["--search"], ""),
+    (["--add-dir", "a", "b", "--model"], ""),
+    ([], ""),
+]
+
+
+@pytest.mark.parametrize(
+    ("args", "found"), OPEN_OPTIONS, ids=[" ".join(args) or "none" for args, _ in OPEN_OPTIONS]
+)
+def test_open_option_reads_the_option_codexs_arguments_end_waiting_for_a_value(
+    args: list[str], found: str
+) -> None:
+    """This test reads ``open_option`` for Codex's adapter and Claude Code's over each list of
+    :data:`OPEN_OPTIONS`."""
+    assert open_option(_get_adapter("codex"), args) == found
+    assert open_option(_get_adapter("claude-code"), args) == ""
 
 
 def test_codex_options_name_each_spelling_once_and_give_the_lane_these_five_sets() -> None:
@@ -321,13 +355,13 @@ def _help_options() -> dict[str, list[tuple[tuple[str, ...], bool]]]:
     return pages
 
 
-def test_codex_options_hold_codex_and_codex_execs_options_and_every_switch_its_help_lists() -> None:
-    """This test reads each option line of every page of :data:`CODEX_HELP` against
-    ``codex.OPTIONS``: Codex's own page's and ``codex exec``'s options are its ``lane`` rows,
-    each taking a value as the help says (``--yolo``, an alias the help does not list, beside
-    them); every other page's switches are in ``SWITCHES``, which holds no other spelling; no
-    spelling takes a value on one page and none on another; and no row outside the lane takes a
-    value."""
+def test_codex_options_hold_codex_and_exec_options_and_each_switch_but_help_and_version() -> None:
+    """This test reads each option line but ``--help`` and ``--version`` of every page of
+    :data:`CODEX_HELP` against ``codex.OPTIONS``: Codex's own page's and ``codex exec``'s
+    options are its ``lane`` rows, each taking a value as the help says (``--yolo``, an alias the
+    help does not list, beside them); every other page's switches are in ``SWITCHES``, which
+    holds no other spelling but ``--yolo``; no spelling takes a value on one page and none on
+    another; and no row outside the lane takes a value."""
     pages = _help_options()
     takes: dict[str, set[bool]] = {}
     for options in pages.values():

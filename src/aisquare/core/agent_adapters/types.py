@@ -549,8 +549,10 @@ class AgentCapabilities:
     """A fleet spawn gives the agent its arguments as options with one value each (Codex): the
     fleet fills the agent's positionals itself, its resume or fork lead and its first message,
     at every start and replay, so a bare word among them, the native ``--`` and what follows it
-    included, is refused before a window and before a replay's stop (:func:`bare_word`). Claude
-    Code's several-value options (``--add-dir a b``) leave it off."""
+    included, is refused before a window and before a replay's stop (:func:`bare_word`), and so
+    is an option whose value would open another part of them, and one of :attr:`value_options`
+    given none (:func:`open_option`). Claude Code's several-value options (``--add-dir a b``)
+    leave it off."""
 
 
 @dataclass(frozen=True)
@@ -2244,13 +2246,15 @@ def _before_separator(args: Sequence[str]) -> list[str]:
 
 
 class BareWord(NamedTuple):
-    """A word among an agent's fleet arguments that is no option and no option's one value
-    (:func:`bare_word`): ``word``, and the ``option`` and ``value`` it comes right after, else
-    empty."""
+    """A word among an agent's fleet arguments that a fleet spawn refuses (:func:`bare_word`):
+    one that is no option and no option's one value, ``word``, with the ``option`` and ``value``
+    it comes right after, else empty; or, ``valueless``, an option of
+    ``capabilities.value_options``, ``word``, that the option after it leaves with no value."""
 
     word: str
     option: str = ""
     value: str = ""
+    valueless: bool = False
 
 
 def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
@@ -2258,34 +2262,55 @@ def bare_word(adapter: AgentAdapter, args: Sequence[str]) -> BareWord | None:
     (``capabilities.options_only``): read with the adapter's ``switch_options`` taking no value
     and any other option, declared in ``value_options`` or not, taking the next word as its one
     value unless that word is an option, a value joined to its option taking none; an option is
-    a word that starts with ``-`` other than ``-`` alone, which is a word as Codex reads it (its
-    prompt), and the native ``--`` is itself such a word. ``None`` for an adapter without
-    ``options_only`` and for arguments that are options alone."""
+    a word that starts with ``-`` other than ``-`` alone (:func:`an_option`), which is a word as
+    Codex reads it (its prompt), and the native ``--`` is itself such a word. An option of
+    ``value_options`` that another option follows has no value, and is refused too
+    (``valueless``); one that ends ``args`` is :func:`open_option`'s. ``None`` for an adapter
+    without ``options_only`` and for arguments that are options with one value each."""
+    return _read_options(adapter, args)[0]
+
+
+def open_option(adapter: AgentAdapter, args: Sequence[str]) -> str:
+    """The option that ends ``args`` waiting for a value, as :func:`bare_word` reads them: no
+    switch, and its value not joined to it, so the word after ``args`` would be its value.
+    Empty where ``args`` end otherwise, hold a word :func:`bare_word` refuses, or the adapter
+    has no ``options_only``."""
+    return _read_options(adapter, args)[1]
+
+
+def _read_options(adapter: AgentAdapter, args: Sequence[str]) -> tuple[BareWord | None, str]:
+    """:func:`bare_word` and :func:`open_option` of ``args``, from one reading of them."""
     capabilities = adapter.capabilities
     if not capabilities.options_only:
-        return None
+        return None, ""
     option = value = ""
     at = 0
     while at < len(args):
         word = args[at]
         if word == "--":
-            return BareWord(word)
-        if not _an_option(word):
-            return BareWord(word, option, value)
+            return BareWord(word), ""
+        if not an_option(word):
+            return BareWord(word, option, value), ""
         name, joined, rest = word.partition("=")
         following = args[at + 1] if at + 1 < len(args) else None
         if word.startswith("--") and joined:
             option, value, at = name, rest, at + 1
         elif not word.startswith("--") and len(word) > 2:
             option, value, at = word[:2], word[2:], at + 1
-        elif word in capabilities.switch_options or following is None or _an_option(following):
+        elif word in capabilities.switch_options:
+            option, value, at = "", "", at + 1
+        elif following is None:
+            return None, word
+        elif an_option(following):
+            if word in capabilities.value_options:
+                return BareWord(word, valueless=True), ""
             option, value, at = "", "", at + 1
         else:
             option, value, at = word, following, at + 2
-    return None
+    return None, ""
 
 
-def _an_option(word: str) -> bool:
+def an_option(word: str) -> bool:
     """Whether ``word`` is an option's spelling to :func:`bare_word`: it starts with ``-`` and
     is not ``-`` alone."""
     return word.startswith("-") and word != "-"

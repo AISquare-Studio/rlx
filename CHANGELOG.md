@@ -19,7 +19,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the fleet's own at a restart or switch whose first message goes on the command line, which
   Codex refused. The check reads the spawn's own arguments, the Spawn dialog's, a role's
   `agent_args` and binding and a replay's, naming which of them holds the word, and a restart
-  or switch asks it before it stops the agent.
+  or switch asks it before it stops the agent. Each of them holds its options whole: an option
+  that ends one while the next would give its value, such as a binding ending `--sandbox` with
+  `read-only` in the spawn's own arguments, is refused too, as a restart puts the thread's
+  `resume <id>` before the spawn's own arguments, where Codex took `resume` as the option's
+  value; and so is an option Codex takes a value for given none, such as `--model --search`.
 - **`rlx fleet adopt` reads a Codex someone started as `codex exec --json x` or `codex review
   --uncommitted x` as it reads `codex exec x` or `codex review x`,** a possible client of
   Codex's background app-server, where it read `x` as the switch's value.

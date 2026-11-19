@@ -194,8 +194,8 @@ TAKEN_ONCE = tuple(
 SWITCHED_ONCE = tuple(
     option.spellings for option in OPTIONS if option.lane and not option.value and option.once
 )
-#: Every switch of Codex's, its own command line's, ``codex exec``'s and its other commands'
-#: (:data:`OPTIONS`).
+#: The switches of every row of :data:`OPTIONS`: its own command line's, ``codex exec``'s and its
+#: other commands'.
 SWITCHES = frozenset(
     spelling for option in OPTIONS if not option.value for spelling in option.spellings
 )

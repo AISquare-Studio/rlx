@@ -222,7 +222,10 @@ none of launch's), `switch_options`, `repeated_options` (the ones of its `value_
 again for each further value, any word each), `options_only` (a fleet spawn gives the agent its
 arguments as options with one value each, Codex's: a `BareWord`, its `word` and the `option` and
 `value` it follows, is what `bare_word` finds among them and the spawn refuses, naming the option
-before each value where it is one of `repeated_options`).
+before each value where it is one of `repeated_options`; a `valueless` one is an option of
+`value_options` another option follows. Each part of them, the binding's, the role's and the
+spawn's own, holds its options whole: an option that ends one, `open_option`, is refused where
+the next part's first word would be its value, and one of `value_options` where none follows).
 
 Its screen is read through one optional reader, `screen`, an `AgentScreen` (`types.py`): nine parts, each optional, and three readings derived from them where the agent declares nothing more of its own, `AgentScreen.ready` (a typed line lands as a prompt: `ready_on_screen`, else its empty prompt with no turn running on it), `AgentScreen.drawn` (its prompt drawn, busy or not: `prompt_on_screen`, else its empty prompt) and `AgentScreen.modal` (what a line must not go into: `modal_on_screen`, else `dialog_on_screen`'s words, else `screen_prompt`'s question). An adapter with no screen (`screen = None`) reads as `types.NO_SCREEN`, never at its prompt and never ready (`types.screen_of`): the third agent of the suite runs so. Remote reads its empty prompt by `idle_on_screen` and `idle_prompt_mark` alone (`AgentScreen.reads_empty_prompt`, `at_empty_prompt`), never by `ready_on_screen`. The parts: `idle_prompt_mark` (what the last line of the screen starts with at an empty prompt,
 Codex's `? for shortcuts`: where a pane its hooks say nothing fresh about is typed into,

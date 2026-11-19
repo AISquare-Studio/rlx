@@ -86,8 +86,10 @@ from aisquare.core.agent_adapters.types import (
     ForkArgs,
     NativeChoice,
     PermissionIntent,
+    an_option,
     bare_word,
     fleet_extra_args,
+    open_option,
     option_values,
     screen_of,
     stepped_down,
@@ -7069,35 +7071,72 @@ def _refuse_a_bare_word(
     own_are: str = "",
     stopping: bool = False,
 ) -> None:
-    """Refuse a start when the agent takes options alone and :func:`bare_word` finds another
-    word among, in this order, its binding's arguments, its role's (:func:`_role_args`) and its
-    own (``own``, which ``own_are`` names: a spawn's, or the ones a replay's record holds,
-    :func:`_spawn_args`), as the caller reads them. The refusal names the part the word is in,
-    the first that :func:`bare_word` finds a word in, read after the ones before it; the ways a
-    first message, a thread and a command reach the agent; and, for a word right after the value
-    of an option the agent takes again for each value (``capabilities.repeated_options``), that
+    """Refuse a start when the agent takes options alone and its arguments are not options with
+    one value each, each part holding its options whole: read in this order, its binding's
+    arguments, its role's (:func:`_role_args`) and its own (``own``, which ``own_are`` names: a
+    spawn's, or the ones a replay's record holds, :func:`_spawn_args`), as the caller reads
+    them. Refused: a word :func:`bare_word` finds, each part read after the ones before it; an
+    option that ends a part (:func:`open_option`) while the next part's first word would be its
+    value, as a replay puts its resume or fork lead between the role's and its own and
+    :meth:`AgentAdapter.merged_args` reads each part alone; and an option of ``value_options``
+    given no value. The refusal names the part the word or the option is in; for a word, the
+    ways a first message, a thread and a command reach the agent, and, right after the value of
+    an option the agent takes again for each value (``capabilities.repeated_options``), that
     option before each value. ``stopping``: asked for a replacement before anything is
     stopped, which the refusal says."""
-    read: list[str] = []
-    for part, where in (
+    parts = (
         (binding, "the role's binding, so change it there"),
         (role, "the role's agent_args, so change them there"),
         (own, own_are),
-    ):
+    )
+    stopped = "nothing was stopped: " if stopping else ""
+    read: list[str] = []
+    for at, (part, where) in enumerate(parts):
         read += part
         bare = bare_word(adapter, read)
         if bare is not None:
-            refusal = _bare_word_refusal(adapter, bare)
-            stopped = "nothing was stopped: " if stopping else ""
-            raise FleetError(f"{refusal}; {stopped}the word is in {where}")
+            held = "option" if bare.valueless else "word"
+            raise FleetError(
+                f"{_bare_word_refusal(adapter, bare)}; {stopped}the {held} is in {where}"
+            )
+        option = open_option(adapter, read) if part else ""
+        then = next((later for later in parts[at + 1 :] if later[0]), None)
+        if option and then is not None and not an_option(then[0][0]):
+            refusal = _open_option_refusal(adapter, option, ends=where, then=then[1])
+        elif option in adapter.capabilities.value_options:
+            refusal = _open_option_refusal(adapter, option)
+        else:
+            continue
+        raise FleetError(f"{refusal}; {stopped}the option is in {where}")
 
 
-def _bare_word_refusal(adapter: AgentAdapter, bare: BareWord) -> str:
+def _options_lead(adapter: AgentAdapter) -> str:
     agent = adapter.label
-    lead = (
+    return (
         f"{agent} fleet arguments are options with one value each, as the fleet gives {agent} its "
         "first message and its session itself at every start and restart"
     )
+
+
+def _open_option_refusal(
+    adapter: AgentAdapter, option: str, *, ends: str = "", then: str = ""
+) -> str:
+    """The refusal of ``option``, one that takes a value: where ``then`` names a part, it ends
+    the part ``ends`` names and its value would open that one; else it is given none."""
+    lead = _options_lead(adapter)
+    if then:
+        ending, opening = (where.split(", so ")[0] for where in (ends, then))
+        return (
+            f"{lead}: {option} ends {ending} and its value would open {opening}, so give {option} "
+            "and its value together in one of them"
+        )
+    return f"{lead}: {option} takes a value and is given none, so give its value right after it"
+
+
+def _bare_word_refusal(adapter: AgentAdapter, bare: BareWord) -> str:
+    if bare.valueless:
+        return _open_option_refusal(adapter, bare.word)
+    lead = _options_lead(adapter)
     ways = prog.shell_advice(
         "give a first message with --prompt (the Spawn dialog's First prompt), bring a thread in "
         f"with `{prog.word()} fleet adopt <id>`, and run a one-shot command such as exec or review "
@@ -7106,7 +7145,7 @@ def _bare_word_refusal(adapter: AgentAdapter, bare: BareWord) -> str:
         "a conversation on the Accounts page, and run a one-shot command such as exec or review "
         "outside the fleet",
     )
-    word, option, value = bare
+    word, option, value, _ = bare
     if option in adapter.capabilities.repeated_options:
         return (
             f"{lead}: {word!r} after {option} {value!r} is not one, so give {option} before each "

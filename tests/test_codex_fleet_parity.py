@@ -3996,33 +3996,138 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_nam
     assert "nothing was stopped" not in said, said
 
 
-@pytest.mark.parametrize(
-    ("own", "role", "bound"),
-    [
-        pytest.param(["a"], ["--add-dir"], [], id="role-then-spawn"),
-        pytest.param([], ["a"], ["--add-dir"], id="binding-then-role"),
-        pytest.param(["a"], [], ["--add-dir"], id="binding-then-spawn"),
-    ],
-)
-def test_a_codex_spawn_passes_an_option_ending_one_part_with_its_value_opening_the_next(
+#: Each part of a Codex fleet agent's arguments: its name in a refusal, and where the refusal
+#: says the option it refuses is.
+PARTS = {
+    "binding": ("the role's binding", BINDINGS),
+    "role": ("the role's agent_args", ROLES),
+    "own": ("the spawn's own arguments", OWN),
+}
+
+#: A Codex spawn's binding, role's ``agent_args`` and own arguments in which an option ends one
+#: part and the next part's first word would be its value: the option, the part it ends and
+#: the part its value would open.
+SPLIT_OPTIONS = [
+    pytest.param([], ["--add-dir"], ["a"], "--add-dir", "role", "own", id="role-then-spawn"),
+    pytest.param(["--add-dir"], ["a"], [], "--add-dir", "binding", "role", id="binding-then-role"),
+    pytest.param(["--add-dir"], [], ["a"], "--add-dir", "binding", "own", id="binding-then-spawn"),
+    pytest.param(["--sandbox"], [], ["read-only"], "--sandbox", "binding", "own", id="sandbox"),
+    pytest.param(["--model"], [], ["gpt-x"], "--model", "binding", "own", id="model"),
+    pytest.param(
+        ["--sandbox"],
+        [],
+        ["read-only", "--sandbox", "workspace-write"],
+        "--sandbox",
+        "binding",
+        "own",
+        id="sandbox-named-again",
+    ),
+    pytest.param(
+        [], ["--color"], ["v", "--color", "w"], "--color", "role", "own", id="color-named-again"
+    ),
+    pytest.param(["-c"], [], ["a=1"], "-c", "binding", "own", id="config"),
+    pytest.param(["--future"], [], ["v"], "--future", "binding", "own", id="undeclared"),
+]
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["fresh", "resumed"])
+@pytest.mark.parametrize(("bound", "role", "own", "option", "ends", "opens"), SPLIT_OPTIONS)
+def test_a_codex_spawn_refuses_an_option_ending_one_part_with_its_value_opening_the_next(
     tmux: FakeTmux,  # noqa: F811
     claude_on_path: Path,  # noqa: F811
     codex_on_path: Path,  # noqa: F811
     project: ProjectInfo,  # noqa: F811
-    own: list[str],
-    role: list[str],
+    tmp_path: Path,
     bound: list[str],
+    role: list[str],
+    own: list[str],
+    option: str,
+    ends: str,
+    opens: str,
+    resumed: bool,
 ) -> None:
-    """This test reads the window line of a Codex spawn whose binding or role's
-    ``agent_args`` end with ``--add-dir`` and whose next part (the role's, the spawn's own)
-    is ``a``, its first message on the line."""
+    """This test reads the refusal of a Codex spawn whose binding, role's ``agent_args`` and
+    own arguments are each row of :data:`SPLIT_OPTIONS`, fresh and given a thread to resume."""
+    resume = (
+        fleet_service.ResumeSpec(session_id=THREAD_ONE, transcript_path=tmp_path / "r.jsonl")
+        if resumed
+        else None
+    )
+    said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, resume=resume)
+    ending, opening = PARTS[ends][0], PARTS[opens][0]
+    assert f"{option} ends {ending} and its value would open {opening}" in said, said
+    assert f"so give {option} and its value together in one of them" in said, said
+    assert f"; the option is in {PARTS[ends][1]}" in said, said
+
+
+#: A Codex spawn's binding, role's ``agent_args`` and own arguments holding an option of
+#: ``capabilities.value_options`` given no value: the option and its part.
+VALUELESS = [
+    pytest.param([], [], ["--model", "--search"], "--model", "own", id="before-a-switch"),
+    pytest.param([], [], ["-c", "--model", "m"], "-c", "own", id="before-an-option"),
+    pytest.param([], ["--add-dir"], ["--search"], "--add-dir", "role", id="before-the-next-part"),
+    pytest.param(["--sandbox"], [], [], "--sandbox", "binding", id="ending-the-binding"),
+    pytest.param([], [], ["--add-dir"], "--add-dir", "own", id="ending-the-arguments"),
+]
+
+
+@pytest.mark.parametrize("message", ["argv", "type", "task", "none"])
+@pytest.mark.parametrize(("bound", "role", "own", "option", "part"), VALUELESS)
+def test_a_codex_spawn_refuses_an_option_codex_takes_a_value_for_given_none(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    bound: list[str],
+    role: list[str],
+    own: list[str],
+    option: str,
+    part: str,
+    message: str,
+) -> None:
+    """This test reads the refusal of a Codex spawn whose binding, role's ``agent_args`` and
+    own arguments are each row of :data:`VALUELESS`, its first message on the line, typed, a
+    task's kickoff or none."""
+    said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
+    assert f"{option} takes a value and is given none, so give its value right after it" in said
+    assert f"; the option is in {PARTS[part][1]}" in said, said
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["fresh", "resumed"])
+@pytest.mark.parametrize(
+    "sandbox", [["--sandbox", "read-only"], ["--sandbox=read-only"]], ids=["pair", "joined"]
+)
+def test_a_codex_spawn_starts_each_option_whole_in_its_part_fresh_and_resumed(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    tmp_path: Path,
+    sandbox: list[str],
+    resumed: bool,
+) -> None:
+    """This test reads the window line of a Codex spawn whose binding gives ``sandbox``, whose
+    role's ``agent_args`` give ``--add-dir a`` and whose own arguments give ``--model gpt-x``,
+    fresh and given a thread to resume."""
     config = load_config()
-    config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": role})
-    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=bound)
+    config.fleet.roles["coder"] = FleetRoleSettings(
+        worktree=False, agent_args={"codex": ["--add-dir", "a"]}
+    )
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=sandbox)
     save_config(config)
-    fleet_service.spawn(project, "coder", agent="codex", agent_args=own, prompt="go")
+    resume = (
+        fleet_service.ResumeSpec(session_id=THREAD_ONE, transcript_path=tmp_path / "r.jsonl")
+        if resumed
+        else None
+    )
+    fleet_service.spawn(
+        project, "coder", agent="codex", agent_args=["--model", "gpt-x"], resume=resume
+    )
     native = _spawn_native(tmux)
-    assert native.count("--add-dir") == 1 and _pair(native, "--add-dir") == "a", native
+    lead = ["resume", THREAD_ONE] if resumed else []
+    line = [*sandbox, "--add-dir", "a", *lead, "--model", "gpt-x"]
+    at = native.index(sandbox[0])
+    assert native[at : at + len(line)] == line, native
 
 
 def test_a_codex_spawn_that_replays_a_record_holding_a_bare_word_names_the_record(
@@ -5218,6 +5323,44 @@ def test_a_restart_after_the_binding_changed_to_a_bare_word_is_refused_before_th
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
     assert "nothing was stopped: the word is in the role's binding" in said, said
+    _left_running(tmux, agent, spawned)
+
+
+@pytest.mark.parametrize("how", ["restart", "restart-with-a-model", "switch"])
+def test_a_replay_whose_binding_ends_with_the_option_of_its_records_value_stops_nothing(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    how: str,
+) -> None:
+    """This test reads a restart, a restart with a model picked and a switch onto another Codex
+    account of a running Codex row whose launch record's arguments are ``gpt-x``, as one
+    written before the spawn's check holds them, and whose role's Codex binding has passed
+    ``--model`` since."""
+    from tests.test_codex_accounts import _sign_in
+
+    agent = fleet_service.spawn(project, "coder", agent="codex", worktree=False).agent
+    record = launch_seal.read(agent.id)
+    assert isinstance(record, launch_seal.LaunchRecord)
+    _recorded(agent, spec=record.spec.model_copy(update={"extra_args": ["gpt-x"]}))
+    config = load_config()
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=["--model"])
+    save_config(config)
+    roomy = accounts_core.create_account("codex")
+    _sign_in(roomy.config_dir, "roomy@example.com")
+    spawned = len(tmux.spawned)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        if how == "switch":
+            fleet_service.switch(project, agent.label, to=str(roomy.slot))
+        else:
+            model = "gpt-new" if how == "restart-with-a-model" else None
+            fleet_service.restart(project, agent.label, model=model)
+
+    said = str(refused.value)
+    recorded = f"the arguments {agent.label!r} recorded at its start"
+    assert f"--model ends the role's binding and its value would open {recorded}" in said, said
+    assert "nothing was stopped: the option is in the role's binding" in said, said
     _left_running(tmux, agent, spawned)
 
 
