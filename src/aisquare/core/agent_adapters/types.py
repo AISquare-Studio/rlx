@@ -539,6 +539,12 @@ class AgentCapabilities:
     an explicitly passed mode and its ``agent_args``."""
     value_options: frozenset[str] = frozenset()
     switch_options: frozenset[str] = frozenset()
+    repeated_options: frozenset[str] = frozenset()
+    """The options of :attr:`value_options` the agent takes again for each further value, whose
+    value can be any word (Codex's ``--add-dir``, read off ``codex.OPTIONS``): a bare word right
+    after one's value (:func:`bare_word`) is refused naming that option before each value. Not
+    one: an option the agent refuses given twice, and one whose value has a form a word may
+    lack."""
     options_only: bool = False
     """A fleet spawn gives the agent its arguments as options with one value each (Codex): the
     fleet fills the agent's positionals itself, its resume or fork lead and its first message,

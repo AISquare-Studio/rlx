@@ -3908,17 +3908,23 @@ def _names(said: str, word: str, option: str = "", value: str = "") -> None:
         assert f"({option} {value} {option} {word})" in said, said
 
 
+#: The part a spawn's refusal names the word in: its own arguments, its role's, its binding's.
+OWN = "the spawn's own arguments"
+ROLES = "the role's agent_args, so change them there"
+BINDINGS = "the role's binding, so change it there"
+
+
 @pytest.mark.parametrize("message", ["argv", "type", "task", "none"])
 @pytest.mark.parametrize(
-    ("own", "role", "bound"),
+    ("own", "role", "bound", "where"),
     [
-        pytest.param(["--add-dir", "a", "b"], [], [], id="spawn"),
-        pytest.param(["--add-dir=a", "b"], [], [], id="spawn-joined"),
-        pytest.param([], ["--add-dir", "a", "b"], [], id="role"),
-        pytest.param([], [], ["--add-dir", "a", "b"], id="binding"),
+        pytest.param(["--add-dir", "a", "b"], [], [], OWN, id="spawn"),
+        pytest.param(["--add-dir=a", "b"], [], [], OWN, id="spawn-joined"),
+        pytest.param([], ["--add-dir", "a", "b"], [], ROLES, id="role"),
+        pytest.param([], [], ["--add-dir", "a", "b"], BINDINGS, id="binding"),
     ],
 )
-def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window(
+def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_naming_its_place(
     tmux: FakeTmux,  # noqa: F811
     claude_on_path: Path,  # noqa: F811
     codex_on_path: Path,  # noqa: F811
@@ -3926,6 +3932,7 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window(
     own: list[str],
     role: list[str],
     bound: list[str],
+    where: str,
     message: str,
 ) -> None:
     """This test reads a Codex spawn whose own arguments, joined form, role's ``agent_args``
@@ -3933,6 +3940,81 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window(
     or none."""
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
     _names(said, "b", "--add-dir", "a")
+    assert f"; the word is in {where}" in said, said
+    assert "nothing was stopped" not in said, said
+
+
+def test_a_codex_spawn_that_replays_a_record_holding_a_bare_word_names_the_record(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+) -> None:
+    """This test reads the refusal of a Codex spawn given a launch record (``spec``) whose
+    arguments hold ``--add-dir a b`` and no arguments of its own, as a restart's spawn reads
+    the record."""
+    spec = LaunchSpec(binary="codex", extra_args=["--add-dir", "a", "b"])
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.spawn(project, "coder", agent="codex", spec=spec, worktree=False)
+    said = str(refused.value)
+    _names(said, "b", "--add-dir", "a")
+    assert "; the word is in the arguments its record holds" in said, said
+    assert tmux.spawned == []
+
+
+#: Each option of Codex's own command line and ``codex exec``'s that takes a value, a value of
+#: it, and whether the refusal of a word right after that value names the option before each
+#: value: where Codex 0.167.0's parser takes the option twice (``CODEX_TWICE`` in
+#: test_codex_contract.py) and a bare word as its value (it refuses ``-c x``).
+CODEX_VALUE_OPTIONS = [
+    ("--add-dir", "a", True),
+    ("--image", "x.png", True),
+    ("-i", "x.png", True),
+    ("--enable", "f", True),
+    ("--disable", "f", True),
+    ("--config", "a=1", False),
+    ("-c", "a=1", False),
+    ("--model", "gpt-5", False),
+    ("-m", "gpt-5", False),
+    ("--profile", "p", False),
+    ("-p", "p", False),
+    ("--sandbox", "read-only", False),
+    ("-s", "read-only", False),
+    ("--ask-for-approval", "never", False),
+    ("-a", "never", False),
+    ("--cd", "d", False),
+    ("-C", "d", False),
+    ("--local-provider", "ollama", False),
+    ("--remote", "ws://h:1", False),
+    ("--remote-auth-token-env", "T", False),
+    ("--color", "always", False),
+    ("--output-schema", "s.json", False),
+    ("--output-last-message", "m.txt", False),
+    ("-o", "m.txt", False),
+    ("--thread-source", "t", False),
+    ("--cyber-access-program", "standard", False),
+]
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "again"),
+    CODEX_VALUE_OPTIONS,
+    ids=[option for option, _, _ in CODEX_VALUE_OPTIONS],
+)
+def test_a_codex_spawns_refusal_names_an_option_before_each_value_where_codex_takes_it_again(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    option: str,
+    value: str,
+    again: bool,
+) -> None:
+    """This test reads the refusal of a Codex spawn whose own arguments are each option of
+    :data:`CODEX_VALUE_OPTIONS`, its value and ``x``."""
+    said = _codex_spawn_refused(tmux, project, own=[option, value, "x"])
+    assert f"'x' after {option} {value!r}" in said, said
+    assert (f"({option} {value} {option} x)" in said) == again, said
+    assert "--prompt" in said, said
 
 
 #: Arguments a Codex spawn refuses, with the word it names and the option and value it
@@ -4456,6 +4538,33 @@ def test_the_ladder_family_a_spawn_weighs_reads_its_binding_in_the_spawns_folder
     expected = harness.model_family("claude-opus-5-5[1m]")
     family = fleet_service.ladder_family("coder", cwd=project.root)
     assert expected is not None and family == expected, family
+
+
+def test_a_spawn_run_from_another_folder_runs_the_model_its_binding_names_in_its_project(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This test reads the window line of a spawn of ``project``, which names no default, run
+    from a folder whose project's default is Codex, for a role whose binding names no agent and
+    passes Claude Code's ``--model claude-opus-5-5[1m]``, beside an ``[agents.models.claude-code]``
+    model of ``sonnet``."""
+    _claude_bound("coder")
+    config = load_config()
+    config.agents.models["claude-code"] = AgentModelSettings(model="sonnet")
+    save_config(config)
+    other = tmp_path / "other"
+    other.mkdir()
+    agent_launch.use("codex", project=True, cwd=other)
+    monkeypatch.chdir(other)
+    receipt = fleet_service.spawn(project, "coder")
+    assert receipt.agent.agent == "claude-code"
+    native = _spawn_native(tmux)
+    assert native.count("--model") == 1, native
+    assert _pair(native, "--model") == "claude-opus-5-5[1m]", native
 
 
 def test_a_spawns_accounts_rung_and_account_label_weigh_its_binding_in_the_spawns_folder(

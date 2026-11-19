@@ -14359,6 +14359,24 @@ def _found_dead(project: ProjectInfo, by: str) -> None:
             "coder-1 exited (1): error: unknown option '--add-dirs'",
             id="claude",
         ),
+        pytest.param(
+            ["Error: No such file or directory (os error 2)", ""],
+            1,
+            "coder-1 exited (1): Error: No such file or directory (os error 2)",
+            id="capital",
+        ),
+        pytest.param(
+            ["Launching codex as coder…", "   error: unexpected argument 'b'", ""],
+            2,
+            "coder-1 exited (2): error: unexpected argument 'b'",
+            id="indented",
+        ),
+        pytest.param(
+            ["Error loading config.toml: unknown field", "", *CLAP_REFUSAL[1:]],
+            2,
+            "coder-1 exited (2): error: unexpected argument '--effort' found",
+            id="two-lines",
+        ),
     ],
 )
 def test_a_death_found_on_its_pane_is_announced_with_the_error_line_it_left(
@@ -14371,7 +14389,8 @@ def test_a_death_found_on_its_pane_is_announced_with_the_error_line_it_left(
     said: str,
 ) -> None:
     """This test reads the exit the sweep and a listing announce for a dead pane showing
-    Codex's refusal and Claude Code's."""
+    Codex's refusal, Claude Code's, an ``Error:`` line, an indented ``error:`` line, and an
+    ``Error`` line above Codex's refusal."""
     coder = _coder(project)
     tmux.screens[coder.pane_id] = screen
     tmux.die(coder.pane_id, status)

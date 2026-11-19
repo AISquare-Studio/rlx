@@ -86,6 +86,8 @@ _APPROVAL_SWITCHES = frozenset(
 )
 #: Its model option's spellings (``CodexAdapter.model_flags``).
 MODEL_FLAGS = ("--model", "-m")
+#: Its config option's spellings, whose value is a ``key=value`` assignment.
+CONFIG_FLAGS = ("--config", "-c")
 
 
 class _Option(NamedTuple):
@@ -102,15 +104,14 @@ class _Option(NamedTuple):
 
 #: Codex's options (0.167.0's help), the one place the adapter states which take a value and
 #: which are switches. Its ``lane`` rows are those of its own command line and of ``codex
-#: exec``: ``capabilities.value_options``, ``capabilities.switch_options``, :data:`TAKEN_ONCE`
-#: and :data:`SWITCHED_ONCE` are read off them alone. The rest are every other switch its help
-#: lists, its other commands' and ``resume``'s and ``fork``'s own, none of them on its own
-#: command line's page; ``--help``, ``-h``, ``--version`` and ``-V``, which print and exit,
-#: are not here. :data:`SWITCHES` is read off every row, by the process table's reader
-#: (``codex_transcript``). ``once`` was measured on 0.164.0, which does not
-#: start on ``-m a --model b`` ("error: the argument '--model <MODEL>' cannot be used multiple
-#: times") nor ``--search --search``; ``-c``, ``--enable``, ``--disable``, ``--add-dir`` and
-#: ``--image`` repeat, and ``codex exec``'s own were not measured. ``--yolo`` is
+#: exec``: ``capabilities.value_options``, ``capabilities.switch_options``,
+#: ``capabilities.repeated_options``, :data:`TAKEN_ONCE` and :data:`SWITCHED_ONCE` are read off
+#: them alone. The rest are every other switch its help lists, on every page below its own
+#: (its other commands' and ``resume``'s and ``fork``'s own); ``--help``, ``-h``, ``--version``
+#: and ``-V``, which print and exit, are not here. :data:`SWITCHES` is read off every row, by
+#: the process table's reader (``codex_transcript``). ``once`` is whether 0.167.0's parser
+#: refuses the option given twice ("error: the argument '--model <MODEL>' cannot be used
+#: multiple times"), measured for each ``lane`` row. ``--yolo`` is
 #: ``--dangerously-bypass-approvals-and-sandbox``'s alias, which the help does not list.
 OPTIONS = (
     _Option(MODEL_FLAGS, value=True, once=True),
@@ -121,16 +122,16 @@ OPTIONS = (
     _Option(("--local-provider",), value=True, once=True),
     _Option(("--remote",), value=True, once=True),
     _Option(("--remote-auth-token-env",), value=True, once=True),
-    _Option(("--config", "-c"), value=True),
+    _Option(("--color",), value=True, once=True),
+    _Option(("--output-schema",), value=True, once=True),
+    _Option(("--output-last-message", "-o"), value=True, once=True),
+    _Option(("--thread-source",), value=True, once=True),
+    _Option(("--cyber-access-program",), value=True, once=True),
+    _Option(CONFIG_FLAGS, value=True),
     _Option(("--enable",), value=True),
     _Option(("--disable",), value=True),
     _Option(("--add-dir",), value=True),
     _Option(("--image", "-i"), value=True),
-    _Option(("--color",), value=True),
-    _Option(("--output-schema",), value=True),
-    _Option(("--output-last-message", "-o"), value=True),
-    _Option(("--thread-source",), value=True),
-    _Option(("--cyber-access-program",), value=True),
     _Option(("--oss",), value=False, once=True),
     _Option(("--strict-config",), value=False, once=True),
     _Option(("--approve-for-me",), value=False, once=True),
@@ -140,11 +141,12 @@ OPTIONS = (
     _Option(("--search",), value=False, once=True),
     _Option(("--no-alt-screen",), value=False, once=True),
     _Option(("--no-daemon",), value=False, once=True),
-    _Option(("--json",), value=False),
-    _Option(("--skip-git-repo-check",), value=False),
-    _Option(("--ephemeral",), value=False),
-    _Option(("--ignore-user-config",), value=False),
-    _Option(("--ignore-rules",), value=False),
+    _Option(("--json",), value=False, once=True),
+    _Option(("--skip-git-repo-check",), value=False, once=True),
+    _Option(("--ephemeral",), value=False, once=True),
+    _Option(("--ignore-user-config",), value=False, once=True),
+    _Option(("--ignore-rules",), value=False, once=True),
+    _Option(("--yes", "-y"), value=False, lane=False),
     *(
         _Option((spelling,), value=False, lane=False)
         for spelling in (
@@ -160,6 +162,7 @@ OPTIONS = (
             "--exit-on-stdin-close",
             "--experimental",
             "--force",
+            "--from-cli",
             "--include-managed-config",
             "--include-non-interactive",
             "--last",
@@ -169,6 +172,7 @@ OPTIONS = (
             "--no-color",
             "--print-startup-config",
             "--proxy-private-ips-via-upstream",
+            "--remote-control",
             "--resume",
             "--sandbox-state-disable-network",
             "--startup-sign-out",
@@ -918,6 +922,14 @@ class CodexAdapter:
             spelling
             for option in OPTIONS
             if option.lane and not option.value
+            for spelling in option.spellings
+        ),
+        # Not -c: a bare word is no key=value, and 0.167.0 refuses `-c x` ("Invalid override
+        # (missing '='): x").
+        repeated_options=frozenset(
+            spelling
+            for option in OPTIONS
+            if option.lane and option.value and not option.once and option.spellings != CONFIG_FLAGS
             for spelling in option.spellings
         ),
     )
@@ -2196,16 +2208,17 @@ def _approve_for_me_refusal(
 ) -> str | None:
     """Why ``fleet.roles.<role>.approve_for_me = true`` cannot run beside the role's own
     ``sandbox`` or ``approval_policy``, or beside ``native``, the option its arguments choose
-    either with (:func:`_native_approvals`); ``None`` when nothing clashes. asq passes no
-    ``--sandbox`` for the read-only sandbox and no policy flag for its reviewer, so the
-    refusal names the setting, and the ``permission`` that runs that sandbox or policy with
-    Codex's reviewer where there is one; ``approve_for_me = false`` gives the approvals to
-    the person."""
+    either with (:func:`_native_approvals`); ``None`` when nothing clashes. Each clash gives
+    its own reason: a sandbox, that the switch works only in the workspace-write one; a policy,
+    that the switch routes the approvals to Codex's reviewer itself (and Codex refuses it
+    beside the ``--ask-for-approval`` a policy passes); an option among the
+    arguments, that Codex refuses the switch beside it. asq passes no ``--sandbox`` for the
+    read-only sandbox, so the refusal names the setting, and the ``permission`` that runs that
+    sandbox or policy with Codex's reviewer where there is one; ``approve_for_me = false``
+    gives the approvals to the person."""
     key = f"fleet.roles.{role}"
-    lead = (
-        f"{key}.approve_for_me = true passes Codex's --approve-for-me, which works only in the "
-        "workspace-write sandbox, so it"
-    )
+    passes = f"{key}.approve_for_me = true passes Codex's --approve-for-me"
+    routes = "which routes Codex's approval requests to its automatic reviewer"
     yourself = f"set {key}.approve_for_me = false to answer its approvals yourself"
 
     def reviewed(scope: WriteScope) -> str:
@@ -2214,19 +2227,27 @@ def _approve_for_me_refusal(
 
     if sandbox not in (None, "", "workspace-write"):
         scope = _SCOPES.get(sandbox)
-        return f"{lead} cannot go with {key}.sandbox = {json.dumps(sandbox)}: " + (
-            reviewed(scope) if scope is not None else yourself
-        )
+        return (
+            f"{passes}, which works only in the workspace-write sandbox, so it cannot go with "
+            f"{key}.sandbox = {json.dumps(sandbox)}: "
+        ) + (reviewed(scope) if scope is not None else yourself)
     if approval == "never":
         return (
-            f'{lead} cannot go with {key}.approval_policy = "never", under which Codex asks '
-            "for no approval: unset one of them"
+            f'{passes}, {routes}, so it cannot go with {key}.approval_policy = "never", under '
+            "which Codex asks for no approval: unset one of them"
         )
     if approval is not None:
         policy = json.dumps(approval)
-        return f"{lead} cannot go with {key}.approval_policy = {policy}: {reviewed('workspace')}"
+        return (
+            f"{passes}, {routes} and which Codex refuses beside the --ask-for-approval that "
+            f"{key}.approval_policy passes, so it cannot go with {key}.approval_policy = "
+            f"{policy}: {reviewed('workspace')}"
+        )
     if native is not None:
-        return f"{lead} cannot run with {native} in its arguments: drop it, or {yourself}"
+        return (
+            f"{passes}, which Codex refuses beside {native} in its arguments: drop it, or "
+            f"{yourself}"
+        )
     return None
 
 

@@ -1054,6 +1054,11 @@ def test_a_codex_process_says_how_it_holds_what_it_writes() -> None:
         "migrate-rollouts --apply x",
         "plugin list --available x",
         "debug models --bundled x",
+        # The daemon's own subcommands' switches, three commands deep: a prompt's words.
+        "app-server daemon update --yes x",
+        "app-server daemon update -y x",
+        "app-server daemon update --from-cli x",
+        "app-server daemon bootstrap --remote-control x",
         "app-server is down, fix it",
         "-- use -c and --search",  # a prompt
         "-- -c is broken",  # ``-c`` the prompt's, after ``--``

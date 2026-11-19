@@ -8,6 +8,7 @@ configuration reference, and the flag conflicts from the binary itself (it refus
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
@@ -23,6 +24,7 @@ from aisquare.core.agent_adapters import get_adapter as _get_adapter
 from aisquare.core.agent_adapters.codex import (
     OPTIONS,
     SWITCHED_ONCE,
+    SWITCHES,
     TAKEN_ONCE,
     TOOL_FEATURES,
     TUI_TOOLS_SERVER,
@@ -233,10 +235,10 @@ def test_bare_word_reads_codexs_arguments_as_options_with_one_value_each(
     assert bare_word(_get_adapter("claude-code"), args) is None
 
 
-def test_codex_options_name_each_spelling_once_and_give_the_lane_these_four_sets() -> None:
-    """This test reads every spelling in ``codex.OPTIONS`` and the four sets read off its
+def test_codex_options_name_each_spelling_once_and_give_the_lane_these_five_sets() -> None:
+    """This test reads every spelling in ``codex.OPTIONS`` and the five sets read off its
     ``lane`` rows: ``capabilities.value_options``, ``capabilities.switch_options``,
-    ``TAKEN_ONCE`` and ``SWITCHED_ONCE``."""
+    ``capabilities.repeated_options``, ``TAKEN_ONCE`` and ``SWITCHED_ONCE``."""
     spellings = [spelling for option in OPTIONS for spelling in option.spellings]
     assert len(spellings) == len(set(spellings)), spellings
     assert CodexAdapter.capabilities.value_options == {
@@ -252,6 +254,9 @@ def test_codex_options_name_each_spelling_once_and_give_the_lane_these_four_sets
         *("--ignore-user-config", "--json", "--no-alt-screen", "--no-daemon", "--oss"),
         *("--search", "--skip-git-repo-check", "--strict-config", "--worktree", "--yolo"),
     }
+    assert CodexAdapter.capabilities.repeated_options == {
+        *("--add-dir", "--disable", "--enable", "--image", "-i"),
+    }
     assert TAKEN_ONCE == (
         ("--model", "-m"),
         ("--profile", "-p"),
@@ -261,6 +266,11 @@ def test_codex_options_name_each_spelling_once_and_give_the_lane_these_four_sets
         ("--local-provider",),
         ("--remote",),
         ("--remote-auth-token-env",),
+        ("--color",),
+        ("--output-schema",),
+        ("--output-last-message", "-o"),
+        ("--thread-source",),
+        ("--cyber-access-program",),
     )
     assert SWITCHED_ONCE == (
         ("--oss",),
@@ -272,13 +282,92 @@ def test_codex_options_name_each_spelling_once_and_give_the_lane_these_four_sets
         ("--search",),
         ("--no-alt-screen",),
         ("--no-daemon",),
+        ("--json",),
+        ("--skip-git-repo-check",),
+        ("--ephemeral",),
+        ("--ignore-user-config",),
+        ("--ignore-rules",),
     )
 
 
-#: What the refusal of ``approve_for_me = true`` names beside every clash: the setting, the
-#: Codex switch it passes and the one sandbox that switch takes.
-_APPROVE_FOR_ME = ("fleet.roles.coder.approve_for_me = true", "--approve-for-me", "workspace-write")
+#: Codex 0.167.0's help, its own page and every command's below it (``codex <words> --help``),
+#: each under a ``==> codex <words> --help <==`` line, with its lines' trailing spaces dropped
+#: and the one default that named the folder it ran in written ``$TMPDIR``.
+CODEX_HELP = Path(__file__).parent / "fixtures" / "codex_help-0.167.0.txt"
+#: Codex 0.167.0's parser given each option of its own page and ``codex exec``'s twice: by page
+#: (``""`` its own) and option, the error line it exits 2 with, ``""`` where it takes the line.
+CODEX_TWICE = Path(__file__).parent / "fixtures" / "codex_twice-0.167.0.json"
+
+
+def _help_options() -> dict[str, list[tuple[tuple[str, ...], bool]]]:
+    """Each page of :data:`CODEX_HELP` by its command's words (``""`` Codex's own), with each
+    option its ``Options:`` lists but ``--help`` and ``--version``: its spellings, and whether
+    it takes a value."""
+    pages: dict[str, list[tuple[tuple[str, ...], bool]]] = {}
+    options: list[tuple[tuple[str, ...], bool]] = []
+    inside = False
+    for line in CODEX_HELP.read_text("utf-8").splitlines():
+        if (page := re.fullmatch(r"==> codex (.*?) ?--help <==", line)) is not None:
+            options = pages.setdefault(page.group(1), [])
+            inside = False
+        elif re.fullmatch(r"[A-Z][A-Za-z ]*:", line):
+            inside = line == "Options:"
+        elif inside and re.match(r" {2,6}-", line):
+            listed = re.fullmatch(r" {2,6}((?:-\w, )?--[\w-]+|-\w)( <\w[^>]*>(?:\.\.\.)?)?", line)
+            assert listed is not None, line
+            spellings = tuple(listed.group(1).split(", "))
+            if not {"--help", "--version"} & set(spellings):
+                options.append((spellings, listed.group(2) is not None))
+    return pages
+
+
+def test_codex_options_hold_every_option_codexs_help_lists() -> None:
+    """This test reads each option line of every page of :data:`CODEX_HELP` against
+    ``codex.OPTIONS``: Codex's own page's and ``codex exec``'s options are its ``lane`` rows,
+    each taking a value as the help says (``--yolo``, an alias the help does not list, beside
+    them); every other page's switches are in ``SWITCHES``, which holds no other spelling; no
+    spelling takes a value on one page and none on another; and no row outside the lane takes a
+    value."""
+    pages = _help_options()
+    takes: dict[str, set[bool]] = {}
+    for options in pages.values():
+        for spellings, value in options:
+            for spelling in spellings:
+                takes.setdefault(spelling, set()).add(value)
+    assert {spelling: kinds for spelling, kinds in takes.items() if len(kinds) > 1} == {}
+    switches = {spelling for spelling, kinds in takes.items() if kinds == {False}}
+    assert switches - SWITCHES == set()
+    assert SWITCHES - switches == {"--yolo"}
+    own = {s: value for page in ("", "exec") for spellings, value in pages[page] for s in spellings}
+    lane = {s: option.value for option in OPTIONS if option.lane for s in option.spellings}
+    assert lane == {**own, "--yolo": False}
+    assert [option for option in OPTIONS if not option.lane and option.value] == []
+
+
+def test_codex_options_once_is_what_its_parser_refuses_given_twice() -> None:
+    """This test reads :data:`CODEX_TWICE`, Codex 0.167.0's parser given each option of its own
+    page and ``codex exec``'s twice, against the ``once`` of each ``lane`` row of
+    ``codex.OPTIONS``: ``once`` where the parser refused the line, on every page it read the
+    option on."""
+    twice = json.loads(CODEX_TWICE.read_text("utf-8"))
+    refused: dict[str, set[bool]] = {}
+    for page in twice.values():
+        for name, error in page.items():
+            twice_refused = rf"error: the argument '{re.escape(name)}( <\w+>)?' cannot be used "
+            assert error == "" or re.fullmatch(f"{twice_refused}multiple times", error), error
+            refused.setdefault(name, set()).add(bool(error))
+    rows = {option.spellings[0]: {option.once} for option in OPTIONS if option.lane}
+    assert rows == refused
+
+
+#: What the refusal of ``approve_for_me = true`` names beside every clash: the setting and the
+#: Codex switch it passes.
+_APPROVE_FOR_ME = ("fleet.roles.coder.approve_for_me = true", "--approve-for-me")
 _YOURSELF = "fleet.roles.coder.approve_for_me = false"
+#: Why a sandbox clashes: the one sandbox that switch works in.
+_SANDBOX = "works only in the workspace-write sandbox"
+#: Why a policy clashes: that switch routes the approvals itself.
+_REVIEWER = "routes Codex's approval requests to its automatic reviewer"
 
 
 @pytest.mark.parametrize(
@@ -287,6 +376,7 @@ _YOURSELF = "fleet.roles.coder.approve_for_me = false"
         (
             {"sandbox": "read-only"},
             (
+                _SANDBOX,
                 'fleet.roles.coder.sandbox = "read-only"',
                 'fleet.roles.coder.permission = "read_only:auto"',
                 _YOURSELF,
@@ -294,34 +384,38 @@ _YOURSELF = "fleet.roles.coder.approve_for_me = false"
         ),
         (
             {"sandbox": "danger-full-access"},
-            ('fleet.roles.coder.sandbox = "danger-full-access"', _YOURSELF),
+            (_SANDBOX, 'fleet.roles.coder.sandbox = "danger-full-access"', _YOURSELF),
         ),
         (
             {"approval": "on-request"},
             (
+                _REVIEWER,
+                "Codex refuses beside the --ask-for-approval",
                 'fleet.roles.coder.approval_policy = "on-request"',
                 'fleet.roles.coder.permission = "workspace:auto"',
                 _YOURSELF,
             ),
         ),
-        ({"approval": "never"}, ('fleet.roles.coder.approval_policy = "never"',)),
-        ({"native": ["-a", "never"]}, ("-a never", _YOURSELF)),
-        ({"native": ["--yolo"]}, ("--yolo", _YOURSELF)),
+        ({"approval": "never"}, (_REVIEWER, 'fleet.roles.coder.approval_policy = "never"')),
+        ({"native": ["-a", "never"]}, ("Codex refuses beside -a never", _YOURSELF)),
+        ({"native": ["--yolo"]}, ("Codex refuses beside --yolo", _YOURSELF)),
     ],
     ids=["read-only", "full", "on-request", "never", "native-policy", "native-switch"],
 )
-def test_approve_for_me_beside_a_clash_is_refused_naming_what_clashes_and_the_way_out(
+def test_approve_for_me_beside_a_clash_is_refused_naming_what_clashes_why_and_the_way_out(
     kwargs: dict[str, object], named: tuple[str, ...]
 ) -> None:
     """This test reads the refusal beside the role's read-only and danger-full-access
-    sandboxes, its on-request and never policies, and a policy and a switch in its arguments."""
+    sandboxes, its on-request and never policies, and a policy and a switch in its arguments;
+    the workspace-write sandbox is named beside the two sandboxes alone."""
     with pytest.raises(ValueError) as refused:
         codex.fleet_args("coder", "c", None, approve_for_me=True, **kwargs)  # type: ignore[arg-type]
     said = str(refused.value)
     for fact in (*_APPROVE_FOR_ME, *named):
         assert fact in said, (fact, said)
     assert ("permission" in said) == any("permission" in fact for fact in named), said
-    assert "--sandbox" not in said and "--ask-for-approval" not in said, said
+    assert ("workspace-write" in said) == (_SANDBOX in named), said
+    assert "--sandbox" not in said, said
 
 
 @pytest.mark.parametrize(

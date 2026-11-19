@@ -9,16 +9,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **A Codex fleet agent's arguments are options with one value each, and a spawn, restart or
-  switch whose arguments hold any other word is stopped before it starts, naming the spelling
-  that works:** Claude Code's `--add-dir a b` names `--add-dir a --add-dir b`, and a prompt, a
-  thread or a Codex command among them names `--prompt`, `rlx fleet adopt` or a run outside
-  the fleet. Codex takes one directory per `--add-dir` and reads `b` as its prompt, so it
-  refused the first message `rlx fleet spawn` puts after it and exited before its first
-  screen, or started with a path as its prompt and without that directory; and a prompt or
-  command among the arguments met the fleet's own at a restart or switch whose first message
-  goes on the command line, which Codex refused. The check reads the spawn's own arguments,
-  the Spawn dialog's, a role's `agent_args` and binding and a replay's, and a restart or switch
-  asks it before it stops the agent, naming which of them holds the word.
+  switch whose arguments hold any other word is stopped before it starts, naming the ways that
+  work:** Claude Code's `--add-dir a b` names `--add-dir a --add-dir b`, an option Codex takes
+  only once, such as `--model`, names no second one, and a prompt, a thread or a Codex command
+  among them names `--prompt`, `rlx fleet adopt` or a run outside the fleet. Codex takes one
+  directory per `--add-dir` and reads `b` as its prompt, so it refused the first message
+  `rlx fleet spawn` puts after it and exited before its first screen, or started with a path
+  as its prompt and without that directory; and a prompt or command among the arguments met
+  the fleet's own at a restart or switch whose first message goes on the command line, which
+  Codex refused. The check reads the spawn's own arguments, the Spawn dialog's, a role's
+  `agent_args` and binding and a replay's, naming which of them holds the word, and a restart
+  or switch asks it before it stops the agent.
 - **`rlx fleet adopt` reads a Codex someone started as `codex exec --json x` or `codex review
   --uncommitted x` as it reads `codex exec x` or `codex review x`,** a possible client of
   Codex's background app-server, where it read `x` as the switch's value.
@@ -36,10 +37,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that finds it dead adds it to its own line, and to the exit when its replacement does not
   start.
 - **Refusing `approve_for_me = true` beside a Codex role's sandbox or approval policy names
-  that setting**, not a flag rlx never passes, and the way to keep Codex's automatic
-  reviewer: `permission = "read_only:auto"` for the read-only sandbox, `"workspace:auto"`
-  for `on-request`. Refusing `full:auto` no longer says Codex reviews approvals only in the
-  workspace-write sandbox, as `read_only:auto` runs its reviewer too.
+  that setting and why it clashes**, not a flag rlx never passes, and the way to keep Codex's
+  automatic reviewer: `permission = "read_only:auto"` for the read-only sandbox,
+  `"workspace:auto"` for `on-request`. Refusing `full:auto` no longer says Codex reviews
+  approvals only in the workspace-write sandbox, as `read_only:auto` runs its reviewer too.
 
 ## [0.10.1] - 2026-11-18
 
