@@ -64,6 +64,7 @@ from typing import Any
 
 from aisquare.core import program as prog
 from aisquare.core import prompt_origin
+from aisquare.core.agent_adapters.codex_config import CONFIG_FLAGS
 from aisquare.core.agent_adapters.transcripts import (
     DIM,
     MAX_LINE,
@@ -376,8 +377,7 @@ _DAEMON_DIR = "/packages/app-server-daemon/"
 app-server-daemon/releases/<version>/bin/codex``): whatever runs from there is the daemon."""
 _EMBEDDED = frozenset(
     {
-        "-c",
-        "--config",
+        *CONFIG_FLAGS,
         "--search",
         "--no-daemon",
         "--strict-config",

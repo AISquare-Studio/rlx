@@ -16,6 +16,7 @@ from typing import Any, NamedTuple
 
 from aisquare.core import harness
 from aisquare.core.agent_adapters import codex_config
+from aisquare.core.agent_adapters.codex_config import CONFIG_FLAGS
 from aisquare.core.agent_adapters.codex_shared import SHARE_PARTS
 from aisquare.core.agent_adapters.mcp_servers import DEVTOOLS_NAME, DEVTOOLS_PACKAGE, CodexMcp
 from aisquare.core.agent_adapters.types import (
@@ -86,8 +87,6 @@ _APPROVAL_SWITCHES = frozenset(
 )
 #: Its model option's spellings (``CodexAdapter.model_flags``).
 MODEL_FLAGS = ("--model", "-m")
-#: Its config option's spellings, whose value is a ``key=value`` assignment.
-CONFIG_FLAGS = ("--config", "-c")
 
 
 class _Option(NamedTuple):
@@ -980,7 +979,7 @@ class CodexAdapter:
         if profile and Path(profile).name == profile and profile not in {".", ".."}:
             selected = home / f"{profile}.config.toml"
             layers.append((_toml_features(selected), selected, ""))
-        for item in option_occurrences(args, "-c", "--config", "--enable", "--disable"):
+        for item in option_occurrences(args, *CONFIG_FLAGS, "--enable", "--disable"):
             option = item.prefix.rstrip("=") or args[item.index]
             spelled = f"{option} {item.value}"
             if option in {"--enable", "--disable"}:
@@ -1147,7 +1146,7 @@ class CodexAdapter:
         """``-c model=…``/``-c model_reasoning_effort=…``, and ``--model``/``-m`` over both.
         The effort is a native config value, Codex's to validate: no ``effort_index``."""
         model = effort = None
-        for item in option_occurrences(args, "-c", "--config"):
+        for item in option_occurrences(args, *CONFIG_FLAGS):
             parsed = config_assignment(item.value)
             if parsed is None:
                 continue
@@ -1173,7 +1172,7 @@ class CodexAdapter:
                     return key + "=" + value.partition("=")[2]
             return value
 
-        return rewrite_option_values(args, config, "-c", "--config")
+        return rewrite_option_values(args, config, *CONFIG_FLAGS)
 
     def mcp_args(
         self,
@@ -1360,7 +1359,7 @@ class CodexAdapter:
             over,
             once=TAKEN_ONCE,
             switches=SWITCHED_ONCE,
-            keyed=("-c", "--config"),
+            keyed=CONFIG_FLAGS,
             same={"model": MODEL_FLAGS},
         )
 
@@ -1551,7 +1550,7 @@ class CodexAdapter:
         codex_home = home if home is not None else _codex_home(None)
         files = codex_config.layers(codex_home, args)  # the managed one the files' last word
         settings: dict[str, str] = {}
-        for value in option_values(args, "-c", "--config"):
+        for value in option_values(args, *CONFIG_FLAGS):
             parsed = config_assignment(value)
             if parsed is not None:
                 settings[parsed[0]] = value.partition("=")[2].strip()
@@ -1637,7 +1636,7 @@ class CodexAdapter:
             found = True
             return f"{key}={table}"
 
-        rewritten = rewrite_option_values(args, rewrite, "-c", "--config")
+        rewritten = rewrite_option_values(args, rewrite, *CONFIG_FLAGS)
         return rewritten if found else None
 
     def _sandbox(self, write: WriteScope, native: Sequence[str]) -> list[str]:
@@ -1808,7 +1807,7 @@ class CodexAdapter:
         ``args`` set ``developer_instructions`` themselves. A thread keeps the value of its
         first turn across ``codex resume`` and ignores a new one
         (``capabilities.resume_keeps_system_prompt``)."""
-        for item in option_occurrences(args, "-c", "--config"):
+        for item in option_occurrences(args, *CONFIG_FLAGS):
             parsed = config_assignment(item.value)
             if parsed is not None and parsed[0] == "developer_instructions":
                 return None
@@ -2057,7 +2056,7 @@ def _mcp_servers(home: Path, args: Sequence[str], cwd: Path) -> list[str]:
             names.update(
                 dict.fromkeys(name for name, it in servers.items() if isinstance(it, dict))
             )
-    for item in option_occurrences(args, "-c", "--config"):
+    for item in option_occurrences(args, *CONFIG_FLAGS):
         key, sep, value = item.value.partition("=")
         path = key.strip().split(".")
         if not sep or path[0] != "mcp_servers":
@@ -2254,7 +2253,7 @@ def _approve_for_me_refusal(
 def _native_setting(args: Sequence[str], keys: Sequence[str]) -> str | None:
     """The first ``-c`` in ``args`` that sets one of ``keys`` or a key of its table, as
     written, else ``None``."""
-    for item in option_occurrences(args, "-c", "--config"):
+    for item in option_occurrences(args, *CONFIG_FLAGS):
         key = item.value.partition("=")[0].strip()
         if any(key == name or key.startswith(f"{name}.") for name in keys):
             return item.value

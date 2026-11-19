@@ -4025,6 +4025,24 @@ SPLIT_OPTIONS = [
     pytest.param(
         [], ["--color"], ["v", "--color", "w"], "--color", "role", "own", id="color-named-again"
     ),
+    pytest.param(
+        ["--profile"],
+        ["p1"],
+        ["--profile", "p2"],
+        "--profile",
+        "binding",
+        "role",
+        id="profile-named-again",
+    ),
+    pytest.param(
+        [],
+        ["--profile"],
+        ["p1", "--profile", "p2"],
+        "--profile",
+        "role",
+        "own",
+        id="profile-named-again-by-the-spawn",
+    ),
     pytest.param(["-c"], [], ["a=1"], "-c", "binding", "own", id="config"),
     pytest.param(["--future"], [], ["v"], "--future", "binding", "own", id="undeclared"),
 ]

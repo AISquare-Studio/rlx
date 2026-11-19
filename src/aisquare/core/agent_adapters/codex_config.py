@@ -27,6 +27,10 @@ from typing import Any
 
 from aisquare.core.agent_adapters.types import HookTrustError, option_values
 
+#: Codex's config option's spellings, whose value is a ``key=value`` assignment: stated here
+#: alone, for every reader of a ``-c`` override (this module's, ``codex``'s,
+#: ``codex_transcript``'s).
+CONFIG_FLAGS = ("--config", "-c")
 #: The system layer of Codex's config, under every user's: 0.162.1 reads it (in its binary,
 #: review r14 of #113, finding 9).
 SYSTEM_CONFIG = Path("/etc/codex/config.toml")
@@ -153,7 +157,7 @@ def _overrides(args: list[str]) -> list[tuple[str, dict[str, Any]]]:
     """Each ``-c``/``--config`` override in ``args``: its key as written, and its value parsed
     as Codex parses it; one that does not parse is Codex's to refuse, and skipped."""
     overrides: list[tuple[str, dict[str, Any]]] = []
-    for value in option_values(args, "-c", "--config"):
+    for value in option_values(args, *CONFIG_FLAGS):
         key, separator, raw = value.partition("=")
         if not separator:
             continue
