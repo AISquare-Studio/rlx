@@ -706,8 +706,8 @@ def test_codexs_short_config_spelling_parses_into_the_long_one_codex_config_stat
     ``codex_config.CONFIG_FLAGS`` as shipped, with its long spelling changed, and with both
     changed, the short one to ``-a``, which the commands also own (their ``--account``): the
     arguments they leave for Codex (``ctx.args``), whether any of their own options took the
-    value, their ``--command``, which the shipped short spelling also is, their ``--agent``,
-    and the spawn's ``--label``."""
+    value, alone or among several, their ``--command``, which the shipped short spelling also
+    is, their ``--agent``, and the spawn's ``--label``."""
     from typer.core import TyperGroup
     from typer.main import get_command
 
@@ -727,7 +727,12 @@ def test_codexs_short_config_spelling_parses_into_the_long_one_codex_config_stat
         command, ["coder", "--agent", "codex", *native, *label]
     ) as ctx:
         assert ctx.params["agent"] == "codex" and ctx.params["command"] is None
-        assert "model=o3" not in ctx.params.values(), ctx.params
+        held = [
+            one
+            for value in ctx.params.values()
+            for one in (value if isinstance(value, (list, tuple)) else [value])
+        ]
+        assert "model=o3" not in held, ctx.params
         assert ctx.args == [f"{long}=model=o3"]
         assert ctx.params.get("label") == ("fix" if label else None)
 
