@@ -689,11 +689,13 @@ def test_native_option_values_cannot_swallow_aisquare_options(native: list[str])
 
 
 @pytest.mark.parametrize(
-    "flags", [None, ("--configure", "-c")], ids=["as-shipped", "long-spelling-changed"]
+    "flags",
+    [None, ("--configure", "-c"), ("--configure", "-a")],
+    ids=["as-shipped", "long-spelling-changed", "both-spellings-changed"],
 )
 @pytest.mark.parametrize("joined", [False, True], ids=["spaced", "joined"])
 @pytest.mark.parametrize("command", ["launch", "spawn"])
-def test_codexs_short_config_spelling_reaches_it_in_the_long_one_codex_config_states(
+def test_codexs_short_config_spelling_parses_into_the_long_one_codex_config_states(
     command: str,
     joined: bool,
     flags: tuple[str, str] | None,
@@ -701,9 +703,11 @@ def test_codexs_short_config_spelling_reaches_it_in_the_long_one_codex_config_st
 ) -> None:
     """This test reads what ``launch`` and ``fleet spawn`` parse from Codex's ``model=o3`` given
     with its config option's short spelling, spaced and joined, with
-    ``codex_config.CONFIG_FLAGS`` as shipped and with its long spelling changed: the arguments
-    they pass Codex, their own ``--command``, which that short spelling also is, their
-    ``--agent``, and the spawn's ``--label``."""
+    ``codex_config.CONFIG_FLAGS`` as shipped, with its long spelling changed, and with both
+    changed, the short one to ``-a``, which the commands also own (their ``--account``): the
+    arguments they leave for Codex (``ctx.args``), whether any of their own options took the
+    value, their ``--command``, which the shipped short spelling also is, their ``--agent``,
+    and the spawn's ``--label``."""
     from typer.core import TyperGroup
     from typer.main import get_command
 
@@ -723,6 +727,7 @@ def test_codexs_short_config_spelling_reaches_it_in_the_long_one_codex_config_st
         command, ["coder", "--agent", "codex", *native, *label]
     ) as ctx:
         assert ctx.params["agent"] == "codex" and ctx.params["command"] is None
+        assert "model=o3" not in ctx.params.values(), ctx.params
         assert ctx.args == [f"{long}=model=o3"]
         assert ctx.params.get("label") == ("fix" if label else None)
 

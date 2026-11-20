@@ -3960,6 +3960,10 @@ def _names(said: str, word: str, option: str = "", value: str = "") -> None:
 OWN = "the spawn's own arguments"
 ROLES = "the role's agent_args, so change them there"
 BINDINGS = "the role's binding, so change it there"
+#: How every refusal of a Codex fleet agent's arguments opens (`fleet._options_lead`).
+LEAD = (
+    "Codex fleet arguments are switches and options with one value each, as the fleet gives Codex"
+)
 
 
 @pytest.mark.parametrize("message", ["argv", "type", "task", "none"])
@@ -3992,8 +3996,9 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_nam
     the line, typed, a task's kickoff or none."""
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
     _names(said, "b", "--add-dir", "a")
-    assert f"; the word is in {where}" in said, said
+    assert said.endswith(f"; the word is in {where}"), said
     assert "nothing was stopped" not in said, said
+    assert LEAD in said, said
 
 
 #: Each part of a Codex fleet agent's arguments: its name in a refusal, and where the refusal
@@ -4076,7 +4081,8 @@ def test_a_codex_spawn_refuses_an_option_ending_one_part_with_its_value_opening_
     split = f"{option} ends {ending} and its value would open {opening}, so give {option} "
     assert split in said, said
     assert f"so give {option} and its value together in one of them" in said, said
-    assert f"; the option is in {PARTS[ends][1]}" in said, said
+    assert said.endswith(f"; the option is in {PARTS[ends][1]}"), said
+    assert LEAD in said, said
 
 
 #: A Codex spawn's binding, role's ``agent_args`` and own arguments holding an option of
@@ -4109,7 +4115,8 @@ def test_a_codex_spawn_refuses_an_option_codex_takes_a_value_for_given_none(
     task's kickoff or none."""
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
     assert f"{option} takes a value and is given none, so give its value right after it" in said
-    assert f"; the option is in {PARTS[part][1]}" in said, said
+    assert said.endswith(f"; the option is in {PARTS[part][1]}"), said
+    assert LEAD in said, said
 
 
 @pytest.mark.parametrize("resumed", [False, True], ids=["fresh", "resumed"])
@@ -4162,7 +4169,7 @@ def test_a_codex_spawn_that_replays_a_record_holding_a_bare_word_names_the_recor
         fleet_service.spawn(project, "coder", agent="codex", spec=spec, worktree=False)
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
-    assert "; the word is in the arguments its record holds" in said, said
+    assert said.endswith("; the word is in the arguments its record holds"), said
     assert tmux.spawned == []
 
 
@@ -5316,7 +5323,8 @@ def test_a_replay_whose_record_holds_a_bare_word_is_refused_before_its_agent_sto
 
     said = str(refused.value)
     _names(said, word, option, value)
-    assert f"nothing was stopped: the word is in the arguments {agent.label!r} recorded" in said
+    holder = f"the arguments {agent.label!r} recorded at its start, so stop it and spawn it again"
+    assert said.endswith(f"nothing was stopped: the word is in {holder}"), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5341,7 +5349,7 @@ def test_a_restart_after_the_binding_changed_to_a_bare_word_is_refused_before_th
 
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
-    assert "nothing was stopped: the word is in the role's binding" in said, said
+    assert said.endswith(f"nothing was stopped: the word is in {BINDINGS}"), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5380,7 +5388,7 @@ def test_a_replay_whose_binding_ends_with_the_option_of_its_records_value_stops_
     recorded = f"the arguments {agent.label!r} recorded at its start"
     split = f"--model ends the role's binding and its value would open {recorded}, so give --model "
     assert split in said, said
-    assert "nothing was stopped: the option is in the role's binding" in said, said
+    assert said.endswith(f"nothing was stopped: the option is in {BINDINGS}"), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5414,7 +5422,7 @@ def test_a_fresh_replacement_whose_role_holds_a_bare_word_is_refused_before_the_
 
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
-    assert "nothing was stopped: the word is in the role's agent_args" in said, said
+    assert said.endswith(f"nothing was stopped: the word is in {ROLES}"), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5437,7 +5445,8 @@ def test_a_paused_codex_rows_resume_whose_record_holds_a_bare_word_is_refused(
 
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
-    assert f"nothing was stopped: the word is in the arguments {agent.label!r} recorded" in said
+    holder = f"the arguments {agent.label!r} recorded at its start, so stop it and spawn it again"
+    assert said.endswith(f"nothing was stopped: the word is in {holder}"), said
     assert len(tmux.spawned) == spawned
     with store_session() as store:
         row = store.get_fleet_agent(agent.id)

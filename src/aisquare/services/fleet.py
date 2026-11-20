@@ -7075,13 +7075,12 @@ def _refuse_stray_arguments(
 ) -> None:
     """Refuse a start when the agent takes options alone and its arguments are not switches and
     options that take a value, each given one, with each part holding its options whole: read in
-    this order, its binding's
-    arguments, its role's (:func:`_role_args`) and its own (``own``, which ``own_are`` names: a
-    spawn's, or the ones a replay's record holds, :func:`_spawn_args`; ``own_advice`` says what
-    to do about them, if anything), as the caller reads them. Refused: a word or an option
-    :func:`stray_argument` finds, each part read after the ones before it; an option that ends
-    a part (:func:`open_option`) while the next part's first word would be its value, as a
-    replay puts its resume or fork lead between the role's and its own and
+    this order, its binding's arguments, its role's (:func:`_role_args`) and its own (``own``,
+    which ``own_are`` names: a spawn's, or the ones a replay's record holds, :func:`_spawn_args`;
+    ``own_advice`` says what to do about them, if anything), as the caller reads them. Refused:
+    a word or an option :func:`stray_argument` finds, each part read after the ones before it;
+    an option that ends a part (:func:`open_option`) while the next part's first word would be
+    its value, as a replay puts its resume or fork lead between the role's and its own and
     :meth:`AgentAdapter.merged_args` reads each part alone; and an option of ``value_options``
     given no value. The refusal names the part the word or the option is in, and that part's
     advice; for a word, the ways a first message, a thread and a command reach the agent, and,
@@ -7116,8 +7115,8 @@ def _refuse_stray_arguments(
 def _options_lead(adapter: AgentAdapter) -> str:
     agent = adapter.label
     return (
-        f"{agent} fleet arguments are options with one value each, as the fleet gives {agent} its "
-        "first message and its session itself at every start and restart"
+        f"{agent} fleet arguments are switches and options with one value each, as the fleet gives "
+        f"{agent} its first message and its session itself at every start and restart"
     )
 
 

@@ -209,7 +209,8 @@ def test_a_codex_captains_restart_after_its_agent_args_gained_a_bare_word_stops_
         fleet_service.restart(captain_state.home_project(), "captain")
 
     said = str(refused.value)
-    assert "nothing was stopped: the word is in the role's agent_args" in said, said
+    roles = "the role's agent_args, so change them there"
+    assert said.endswith(f"nothing was stopped: the word is in {roles}"), said
     assert tmux.typed == [] and tmux.killed == killed, (tmux.typed, tmux.killed)
     assert len(tmux.spawned) == spawned
     with store_session() as store:

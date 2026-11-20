@@ -12,7 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   restart or switch whose arguments hold any other word is stopped before it starts, naming the
   ways that work:** Claude Code's `--add-dir a b` names `--add-dir a --add-dir b`, an option
   Codex takes only once, such as `--model`, names no second one, and a prompt, a thread or a
-  Codex command among them names `--prompt`, `rlx fleet adopt` or a run outside the fleet.
+  Codex command among them names `--prompt`, `rlx fleet adopt` or a run outside the fleet (in
+  the app, the Spawn dialog's First prompt, *Adopt a conversation* on the Accounts page or a
+  run outside the fleet).
   Codex takes one directory per `--add-dir` and reads `b` as its prompt, so it refused the
   first message `rlx fleet spawn` puts after it and exited before its first screen, or started
   with a path as its prompt and without that directory; and a prompt or command among the
