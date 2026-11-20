@@ -3949,7 +3949,9 @@ def _codex_spawn_refused(
     assert tmux.spawned == []
     with store_session() as store:
         assert store.fleet_agents(project.id) == []
-    return str(refused.value)
+    said = str(refused.value)
+    assert STOP_MARKER not in said, said
+    return said
 
 
 def _assert_word_refused(refusal: str, word: str, option: str, value: str) -> None:
@@ -3960,9 +3962,10 @@ def _assert_word_refused(refusal: str, word: str, option: str, value: str) -> No
 
 
 def _passed_on_refusal(error: BaseException) -> str:
-    """A restart and a resume raise their own error from the refusal they pass on, and these
-    tests leave that error's words to its own tests."""
+    """A restart and a resume raise their own error from the refusal they pass on: these tests
+    read the lead on that chained error, and of their own message its ending and its lead."""
     assert isinstance(error.__cause__, fleet_service.FleetError), error
+    assert LEAD in str(error), error
     return str(error.__cause__)
 
 
@@ -4028,7 +4031,6 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_nam
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
     _assert_word_refused(said, "b", "--add-dir", "a")
     assert said.endswith(_expected_tail(_part_location(part))), said
-    assert STOP_MARKER not in said, said
 
 
 #: A Codex spawn's binding, role's ``agent_args`` and own arguments in which an option ends one
@@ -4102,7 +4104,6 @@ def test_a_codex_spawn_refuses_an_option_ending_one_part_with_its_value_opening_
     ending, opening = PART_NAME_AND_ADVICE[ends][0], PART_NAME_AND_ADVICE[opens][0]
     assert _expected_split(option, ending, opening) in said, said
     assert said.endswith(_expected_tail(_part_location(ends), "option")), said
-    assert STOP_MARKER not in said, said
     assert said.startswith(LEAD), said
 
 
@@ -4138,7 +4139,6 @@ def test_a_codex_spawn_refuses_an_option_codex_takes_a_value_for_given_none(
     assert f"{option} takes a value" in said, said
     assert "so give its value right after it" in said, said
     assert said.endswith(_expected_tail(_part_location(part), "option")), said
-    assert STOP_MARKER not in said, said
     assert said.startswith(LEAD), said
 
 
@@ -5524,18 +5524,19 @@ def test_a_usage_limit_hand_over_whose_record_or_binding_holds_a_bare_word_stops
     project: ProjectInfo,  # noqa: F811
     held_by: str,
 ) -> None:
-    """This test reads the automatic hand-over (`fleet.switch` with ``automatic``) of a running
-    Codex row on a full Codex account, a roomy one beside it, whose launch record's arguments
-    hold ``--add-dir a b``, as one written before the spawn's check holds them, or whose
-    role's Codex binding has passed ``--add-dir a b`` since its spawn."""
+    """This test reads the check before the stop of the automatic hand-over (`fleet.switch`
+    with ``automatic``) of a running Codex row on its ``source`` account, a roomy one beside
+    it, whose launch record's arguments hold ``--add-dir a b``, as one written before the
+    spawn's check holds them, or whose role's Codex binding has passed ``--add-dir a b`` since
+    its spawn. The source needs no usage reading: the pick leaves it out."""
     from tests.test_codex_accounts import _codex_slot, _rollout, _token_count, _window
 
     now = datetime.now(tz=UTC)
-    full = _codex_slot("full@example.com")
+    source = _codex_slot("source@example.com")
     roomy = _codex_slot("roomy@example.com")
     _rollout(roomy.config_dir, [_token_count(now, _window(15, 300, now + timedelta(hours=4)))])
     agent = fleet_service.spawn(
-        project, "coder", agent="codex", worktree=False, account=str(full.slot)
+        project, "coder", agent="codex", worktree=False, account=str(source.slot)
     ).agent
     stray_args = ["--add-dir", "a", "b"]
     if held_by == "record":
