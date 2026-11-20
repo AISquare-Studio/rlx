@@ -1424,7 +1424,7 @@ def test_the_fleet_terminal_row_names_the_terminal_its_protocol_and_ctrl_j(
 ) -> None:
     detail = _terminal_row(FakeServer(absent=True), env).detail
 
-    assert name in detail
+    assert f"outer terminal {name} (" in detail
     assert protocol in detail
     assert "ctrl+j" in detail
 
