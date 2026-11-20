@@ -74,10 +74,12 @@ from tests import toast_log
 from tests.pane_harness import (
     FakePane,
     FakeTmux,
+    bracketed_paste,
     click,
     drag,
     mouse_event,
     move,
+    post_terminal_input,
     press,
     release,
 )
@@ -810,6 +812,33 @@ def test_paste_goes_through_the_paste_buffer_not_send_keys(fake: FakeTmux, tmp_p
     pasted = [call for call in fake.input if call[0] in ("load-buffer", "paste-buffer")]
     assert pasted == [("load-buffer", "one\ntwo\n"), ("paste-buffer", "%1")]
     assert fake.sent() == []  # the negative: no Enter per line
+
+
+def test_a_paste_holding_a_raw_escape_reaches_the_agent_whole_with_no_key(
+    fake: FakeTmux, tmp_path: Path
+) -> None:
+    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
+    the paste once sent the rest of it as keys, its Enter submitting half a prompt
+    (``cli.ui.paste_guard``). This test reads every paste-buffer write and every send-keys."""
+
+    async def drive() -> None:
+        host = Host(fake.server(tmp_path), "%1")
+        async with host.run_test(size=(40, 6)) as pilot:
+            host.pane.focus()
+            await pilot.pause()
+            post_terminal_input(host, bracketed_paste("one\x1b\rtwo"))
+            post_terminal_input(host, bracketed_paste("one\x1b"))
+            await pilot.pause()
+
+    run(drive())
+    pasted = [call for call in fake.input if call[0] in ("load-buffer", "paste-buffer")]
+    assert pasted == [
+        ("load-buffer", "one\x1b\rtwo"),
+        ("paste-buffer", "%1"),
+        ("load-buffer", "one\x1b"),
+        ("paste-buffer", "%1"),
+    ]
+    assert fake.sent() == []  # no Enter, no Escape, no text typed
 
 
 def test_a_typed_separator_is_a_keystroke_not_a_paste(fake: FakeTmux, tmp_path: Path) -> None:

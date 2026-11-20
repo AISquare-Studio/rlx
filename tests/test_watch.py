@@ -16,6 +16,7 @@ from aisquare.cli.watch import feed_line
 from aisquare.services import team as team_service
 from tests import toast_log
 from tests.fake_clipboard import NEEDS_POSIX, TEXT, install
+from tests.pane_harness import bracketed_paste, post_terminal_input
 from tests.projects import add_project
 from tests.ui_workers import settle_page
 
@@ -158,6 +159,36 @@ def test_screenshot_key_saves_svg_locally(
     shots = asyncio.run(snap())
     assert len(shots) == 1
     assert "<svg" in shots[0].read_text(encoding="utf-8")[:200]
+
+
+def test_a_paste_holding_a_raw_escape_neither_quits_the_board_nor_opens_its_themes(
+    runner: CliRunner, work_dir: Path, isolated_home: Path
+) -> None:
+    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
+    a paste once sent the rest of it as keys, so a ``q`` in it quit the board and a ``t``
+    opened its themes (``cli.ui.paste_guard``). This test reads the app's return code, its
+    screens and its theme."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    from aisquare.cli import watch as watch_mod
+
+    team_service.activate()
+
+    async def paste() -> tuple[list[str], str, str, int | None]:
+        app_cls = watch_mod._build_app_class(interval=60.0)
+        async with app_cls().run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            theme = str(pilot.app.theme)
+            post_terminal_input(pilot.app, bracketed_paste("one\x1b\x1btwo"))
+            await pilot.pause()
+            screens = [type(screen).__name__ for screen in pilot.app.screen_stack]
+            post_terminal_input(pilot.app, bracketed_paste("x\x1bq"))
+            await pilot.pause()
+            return screens, theme, str(pilot.app.theme), pilot.app.return_code
+
+    screens, before, after, return_code = asyncio.run(paste())
+    assert screens == ["Screen"], "a screen opened over the board"
+    assert after == before
+    assert return_code is None, "the board quit"
 
 
 def test_palette_change_theme_opens_our_picker(
