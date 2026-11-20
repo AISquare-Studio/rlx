@@ -23,13 +23,20 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, TypeAlias
 
 from textual import events
 
-Parse = Callable[[Any, Callable[[Any], None]], Generator[Any, str, None]]
-"""The shape of ``XTermParser.parse``: given the parser and where its tokens go, a generator
-that yields what it waits for and is sent each character read."""
+if TYPE_CHECKING:  # at run time only install() reaches them, inside its try
+    from textual._parser import Peek1, Read1
+    from textual._xterm_parser import XTermParser
+    from textual.message import Message
+
+    Parse: TypeAlias = Callable[
+        [XTermParser, Callable[[Message], None]], Generator[Read1 | Peek1, str, None]
+    ]
+    """The shape of ``XTermParser.parse``: given the parser and where its tokens go, a
+    generator that yields what it waits for and is sent each character read."""
 
 
 @dataclass(frozen=True)
@@ -56,8 +63,7 @@ def install() -> bool:
         import textual._parser as textual_parser
         import textual._xterm_parser as xterm_parser
 
-        parser_class = xterm_parser.XTermParser
-        current = parser_class.parse
+        current = xterm_parser.XTermParser.parse
         if _installed is not None and current is _installed.guarded_parse:
             return True
         guarded = _guard(
@@ -72,7 +78,7 @@ def install() -> bool:
         return False
     if not inspect.isgeneratorfunction(current):
         return False
-    parser_class.parse = guarded  # type: ignore[method-assign]
+    xterm_parser.XTermParser.parse = guarded  # type: ignore[method-assign, assignment]
     _installed = _Installed(current, guarded)
     return True
 
@@ -80,7 +86,7 @@ def install() -> bool:
 def _guard(
     textual: Parse,
     *,
-    read1: Callable[[], Any],
+    read1: Callable[[], Read1],
     timeout: type[Exception],
     eof: type[Exception],
     start: str,
@@ -89,10 +95,12 @@ def _guard(
     """``textual``'s parse with each paste's body read here: everything after ``start``,
     which ``textual`` reads and so opens its paste, up to the first ``end``."""
 
-    def parse(self: Any, token_callback: Callable[[Any], None]) -> Generator[Any, str, None]:
+    def parse(
+        self: XTermParser, token_callback: Callable[[Message], None]
+    ) -> Generator[Read1 | Peek1, str, None]:
         replaying_end = False
 
-        def on_token(token: Any) -> None:
+        def on_token(token: Message) -> None:
             if replaying_end and isinstance(token, events.Paste) and not token.text:
                 return  # the paste ``textual`` flushes for the end marker alone: ours follows
             token_callback(token)
@@ -132,7 +140,7 @@ def _guard(
     return parse
 
 
-def _paste_body(read1: Callable[[], Any], end: str) -> Generator[Any, str, list[str]]:
+def _paste_body(read1: Callable[[], Read1], end: str) -> Generator[Read1, str, list[str]]:
     """The characters read up to and including the first ``end``, joined by the caller once."""
     body: list[str] = []
     while "".join(body[-len(end) :]) != end:
