@@ -727,12 +727,12 @@ def test_codexs_short_config_spelling_parses_into_the_long_one_codex_config_stat
         command, ["coder", "--agent", "codex", *native, *label]
     ) as ctx:
         assert ctx.params["agent"] == "codex" and ctx.params["command"] is None
-        held = [
-            one
+        parameter_values = [
+            parameter_value
             for value in ctx.params.values()
-            for one in (value if isinstance(value, (list, tuple)) else [value])
+            for parameter_value in (value if isinstance(value, (list, tuple)) else [value])
         ]
-        assert "model=o3" not in held, ctx.params
+        assert "model=o3" not in parameter_values, ctx.params
         assert ctx.args == [f"{long}=model=o3"]
         assert ctx.params.get("label") == ("fix" if label else None)
 

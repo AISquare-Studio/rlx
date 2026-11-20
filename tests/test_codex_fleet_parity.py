@@ -3948,40 +3948,59 @@ def _codex_spawn_refused(
     return str(refused.value)
 
 
-def _names(said: str, word: str, option: str = "", value: str = "", opening: str = "") -> None:
-    """``said`` opens with ``opening``, what the route puts before the refusal it passes on (a
-    restart's or a resume's ``cannot <verb> <label>: ``), then :data:`LEAD`, and names ``word``,
-    and where it follows an option's value the spelling that works: that option before each
-    value."""
-    assert said.startswith(opening + LEAD), said
+def _names(said: str, word: str, option: str, value: str, *, wrapped: bool = False) -> None:
+    """Checks a refusal of ``word``; ``wrapped`` where its route passes the refusal on inside a
+    message of its own (:func:`_refusal_of`)."""
+    assert _refusal_of(said, wrapped=wrapped).startswith(LEAD), said
     assert repr(word) in said, said
     if option:
         assert f"({option} {value} {option} {word})" in said, said
 
 
-#: The part a spawn's refusal names the word in: its own arguments, its role's, its binding's.
-OWN = "the spawn's own arguments"
-ROLES = "the role's agent_args, so change them there"
-BINDINGS = "the role's binding, so change it there"
-#: The lead, with the colon after it, that opens each refusal text for Codex that
-#: `fleet._stray_refusal` and `fleet._open_option_refusal` build (`fleet._options_lead`).
+def _refusal_of(said: str, *, wrapped: bool) -> str:
+    """The refusal in ``said``: a restart and a resume pass it on after a message of their own,
+    whose words these tests leave to that message's tests, and a spawn and a switch raise it
+    as it is."""
+    return said.partition(": ")[2] if wrapped else said
+
+
+#: Written out rather than read from `fleet._options_lead`, so that a change of the lead's
+#: words fails these tests.
 LEAD = (
     "Codex fleet arguments are switches and options with one value each, as the fleet gives Codex"
     " its first message and its session itself at every start and restart: "
 )
 
+#: What a refusal calls each part of a Codex fleet agent's arguments, and its advice there.
+PARTS = {
+    "binding": ("the role's binding", "so change it there"),
+    "role": ("the role's agent_args", "so change them there"),
+    "own": ("the spawn's own arguments", ""),
+}
+
+
+def _in(part: str) -> str:
+    """Where a refusal says its word or option is, for ``part`` of :data:`PARTS`."""
+    name, advice = PARTS[part]
+    return f"{name}, {advice}" if advice else name
+
+
+def _tail(place: str, held: str = "word", *, stopped: bool = False) -> str:
+    """How a refusal ends; ``stopped`` for a replacement's, which is asked before any stop."""
+    return f"; {'nothing was stopped: ' if stopped else ''}the {held} is in {place}"
+
 
 @pytest.mark.parametrize("message", ["argv", "type", "task", "none"])
 @pytest.mark.parametrize(
-    ("own", "role", "bound", "where"),
+    ("own", "role", "bound", "part"),
     [
-        pytest.param(["--add-dir", "a", "b"], [], [], OWN, id="spawn"),
-        pytest.param(["--add-dir=a", "b"], [], [], OWN, id="spawn-joined"),
-        pytest.param([], ["--add-dir", "a", "b"], [], ROLES, id="role"),
-        pytest.param([], [], ["--add-dir", "a", "b"], BINDINGS, id="binding"),
-        pytest.param(["b"], ["--add-dir", "a"], [], OWN, id="role-then-spawn"),
-        pytest.param([], ["b"], ["--add-dir", "a"], ROLES, id="binding-then-role"),
-        pytest.param(["b"], [], ["--add-dir", "a"], OWN, id="binding-then-spawn"),
+        pytest.param(["--add-dir", "a", "b"], [], [], "own", id="spawn"),
+        pytest.param(["--add-dir=a", "b"], [], [], "own", id="spawn-joined"),
+        pytest.param([], ["--add-dir", "a", "b"], [], "role", id="role"),
+        pytest.param([], [], ["--add-dir", "a", "b"], "binding", id="binding"),
+        pytest.param(["b"], ["--add-dir", "a"], [], "own", id="role-then-spawn"),
+        pytest.param([], ["b"], ["--add-dir", "a"], "role", id="binding-then-role"),
+        pytest.param(["b"], [], ["--add-dir", "a"], "own", id="binding-then-spawn"),
     ],
 )
 def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_naming_its_place(
@@ -3992,7 +4011,7 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_nam
     own: list[str],
     role: list[str],
     bound: list[str],
-    where: str,
+    part: str,
     message: str,
 ) -> None:
     """This test reads a Codex spawn whose own arguments, joined form, role's ``agent_args``
@@ -4001,17 +4020,8 @@ def test_a_codex_spawn_refuses_claude_codes_add_dir_spelling_before_a_window_nam
     the line, typed, a task's kickoff or none."""
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
     _names(said, "b", "--add-dir", "a")
-    assert said.endswith(f"; the word is in {where}"), said
-    assert "nothing was stopped" not in said, said
+    assert said.endswith(_tail(_in(part))), said
 
-
-#: Each part of a Codex fleet agent's arguments: its name in a refusal, and where the refusal
-#: says the option it refuses is.
-PARTS = {
-    "binding": ("the role's binding", BINDINGS),
-    "role": ("the role's agent_args", ROLES),
-    "own": ("the spawn's own arguments", OWN),
-}
 
 #: A Codex spawn's binding, role's ``agent_args`` and own arguments in which an option ends one
 #: part and the next part's first word would be its value: the option, the part it ends and
@@ -4085,7 +4095,7 @@ def test_a_codex_spawn_refuses_an_option_ending_one_part_with_its_value_opening_
     split = f"{option} ends {ending} and its value would open {opening}, so give {option} "
     assert split in said, said
     assert f"so give {option} and its value together in one of them" in said, said
-    assert said.endswith(f"; the option is in {PARTS[ends][1]}"), said
+    assert said.endswith(_tail(_in(ends), "option")), said
     assert said.startswith(LEAD), said
 
 
@@ -4119,7 +4129,7 @@ def test_a_codex_spawn_refuses_an_option_codex_takes_a_value_for_given_none(
     task's kickoff or none."""
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, message=message)
     assert f"{option} takes a value and is given none, so give its value right after it" in said
-    assert said.endswith(f"; the option is in {PARTS[part][1]}"), said
+    assert said.endswith(_tail(_in(part), "option")), said
     assert said.startswith(LEAD), said
 
 
@@ -4173,7 +4183,7 @@ def test_a_codex_spawn_that_replays_a_record_holding_a_bare_word_names_the_recor
         fleet_service.spawn(project, "coder", agent="codex", spec=spec, worktree=False)
     said = str(refused.value)
     _names(said, "b", "--add-dir", "a")
-    assert said.endswith("; the word is in the arguments its record holds"), said
+    assert said.endswith(_tail("the arguments its record holds")), said
     assert tmux.spawned == []
 
 
@@ -5288,16 +5298,10 @@ def _left_running(tmux: FakeTmux, agent: FleetAgent, spawned: int) -> None:  # n
 
 def _its_record(agent: FleetAgent, *, advised: bool = False) -> str:
     """What a replay's refusal calls the arguments ``agent``'s launch record holds
-    (`fleet._refuse_a_replay_that_cannot_start`), with the advice it gives for a word there
-    where ``advised``."""
+    (`fleet._refuse_a_replay_that_cannot_start`): the split case needs the name alone, and the
+    word cases the name with its advice, which ends their refusal (``advised``)."""
     name = f"the arguments {agent.label!r} recorded at its start"
     return f"{name}, so stop it and spawn it again" if advised else name
-
-
-def _passed_on(agent: FleetAgent, verb: str = "restart") -> str:
-    """What a restart, or a resume when ``verb`` says so, puts before the refusal it passes on
-    for ``agent`` (`fleet.restart`); a switch puts nothing."""
-    return f"cannot {verb} {agent.label!r}: "
 
 
 @pytest.mark.parametrize(
@@ -5341,9 +5345,8 @@ def test_a_replay_whose_record_holds_a_bare_word_is_refused_before_its_agent_sto
             fleet_service.switch(project, agent.label, to=str(roomy.slot))
 
     said = str(refused.value)
-    _names(said, word, option, value, _passed_on(agent) if how == "restart" else "")
-    holder = _its_record(agent, advised=True)
-    assert said.endswith(f"nothing was stopped: the word is in {holder}"), said
+    _names(said, word, option, value, wrapped=how == "restart")
+    assert said.endswith(_tail(_its_record(agent, advised=True), stopped=True)), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5367,8 +5370,8 @@ def test_a_restart_after_the_binding_changed_to_a_bare_word_is_refused_before_th
         fleet_service.restart(project, agent.label)
 
     said = str(refused.value)
-    _names(said, "b", "--add-dir", "a", _passed_on(agent))
-    assert said.endswith(f"nothing was stopped: the word is in {BINDINGS}"), said
+    _names(said, "b", "--add-dir", "a", wrapped=True)
+    assert said.endswith(_tail(_in("binding"), stopped=True)), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5404,11 +5407,11 @@ def test_a_replay_whose_binding_ends_with_the_option_of_its_records_value_stops_
             fleet_service.restart(project, agent.label, model=model)
 
     said = str(refused.value)
-    recorded = _its_record(agent)
-    split = f"--model ends the role's binding and its value would open {recorded}, so give --model "
-    assert said.startswith(("" if how == "switch" else _passed_on(agent)) + LEAD), said
+    recorded, ending = _its_record(agent), PARTS["binding"][0]
+    split = f"--model ends {ending} and its value would open {recorded}, so give --model "
+    assert _refusal_of(said, wrapped=how != "switch").startswith(LEAD), said
     assert split in said, said
-    assert said.endswith(f"nothing was stopped: the option is in {BINDINGS}"), said
+    assert said.endswith(_tail(_in("binding"), "option", stopped=True)), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5441,8 +5444,8 @@ def test_a_fresh_replacement_whose_role_holds_a_bare_word_is_refused_before_the_
             fleet_service.restart(project, agent.label, role="tester")
 
     said = str(refused.value)
-    _names(said, "b", "--add-dir", "a", _passed_on(agent))
-    assert said.endswith(f"nothing was stopped: the word is in {ROLES}"), said
+    _names(said, "b", "--add-dir", "a", wrapped=True)
+    assert said.endswith(_tail(_in("role"), stopped=True)), said
     _left_running(tmux, agent, spawned)
 
 
@@ -5464,13 +5467,87 @@ def test_a_paused_codex_rows_resume_whose_record_holds_a_bare_word_is_refused(
         fleet_service.restart(project, agent.label, verb="resume")
 
     said = str(refused.value)
-    _names(said, "b", "--add-dir", "a", _passed_on(agent, "resume"))
-    holder = _its_record(agent, advised=True)
-    assert said.endswith(f"nothing was stopped: the word is in {holder}"), said
+    _names(said, "b", "--add-dir", "a", wrapped=True)
+    assert said.endswith(_tail(_its_record(agent, advised=True), stopped=True)), said
     assert len(tmux.spawned) == spawned
     with store_session() as store:
         row = store.get_fleet_agent(agent.id)
     assert row is not None and row.paused_at is not None, row
+
+
+@pytest.mark.parametrize("part", ["role", "binding"])
+def test_a_switch_onto_codex_whose_role_or_binding_gained_a_bare_word_is_refused_before_the_stop(
+    tmux: FakeTmux,  # noqa: F811
+    claude_on_path: Path,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    part: str,
+) -> None:
+    """This test reads a switch onto Codex of a running Claude Code row where, since its spawn,
+    the role's ``agent_args`` for Codex or the role's Codex binding have come to pass
+    ``--add-dir a b``."""
+    agent = fleet_service.spawn(project, "coder", agent="claude-code", worktree=False).agent
+    config = load_config()
+    adds = ["--add-dir", "a", "b"]
+    if part == "role":
+        config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": adds})
+    else:
+        config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=adds)
+    save_config(config)
+    spawned = len(tmux.spawned)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.switch(project, agent.label, to_agent="codex")
+
+    said = str(refused.value)
+    _names(said, "b", "--add-dir", "a")
+    assert said.endswith(_tail(_in(part), stopped=True)), said
+    _left_running(tmux, agent, spawned)
+
+
+@pytest.mark.parametrize("held", ["record", "binding"])
+def test_a_usage_limit_hand_over_whose_record_or_binding_holds_a_bare_word_stops_nothing(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    held: str,
+) -> None:
+    """This test reads the automatic hand-over (`fleet.switch` with ``automatic``) of a running
+    Codex row on a full Codex account, a roomy one beside it, whose launch record's arguments
+    hold ``--add-dir a b``, as one written before the spawn's check holds them, or whose
+    role's Codex binding has passed ``--add-dir a b`` since its spawn."""
+    from tests.test_codex_accounts import _rollout, _sign_in, _token_count, _window
+
+    now = datetime.now(tz=UTC)
+    full = accounts_core.create_account("codex")
+    roomy = accounts_core.create_account("codex")
+    for slot, email in ((full, "full@example.com"), (roomy, "roomy@example.com")):
+        _sign_in(slot.config_dir, email)
+    _rollout(full.config_dir, [_token_count(now, _window(100, 300, now + timedelta(hours=2)))])
+    _rollout(roomy.config_dir, [_token_count(now, _window(15, 300, now + timedelta(hours=4)))])
+    agent = fleet_service.spawn(
+        project, "coder", agent="codex", worktree=False, account=str(full.slot)
+    ).agent
+    adds = ["--add-dir", "a", "b"]
+    if held == "record":
+        record = launch_seal.read(agent.id)
+        assert isinstance(record, launch_seal.LaunchRecord)
+        _recorded(agent, spec=record.spec.model_copy(update={"extra_args": adds}))
+        place = _its_record(agent, advised=True)
+    else:
+        config = load_config()
+        config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", args=adds)
+        save_config(config)
+        place = _in("binding")
+    spawned = len(tmux.spawned)
+
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.switch(project, agent.label, reason="session limit", automatic=True)
+
+    said = str(refused.value)
+    _names(said, "b", "--add-dir", "a")
+    assert said.endswith(_tail(place, stopped=True)), said
+    _left_running(tmux, agent, spawned)
 
 
 def test_a_restart_mode_beside_the_roles_own_sandbox_is_refused_before_the_stop(
