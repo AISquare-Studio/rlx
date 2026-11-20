@@ -47,7 +47,7 @@ class Sign:
 
 
 SIGNS: tuple[Sign, ...] = (
-    Sign("KITTY_WINDOW_ID", None, "kitty", True, "accepts"),
+    Sign("KITTY_WINDOW_ID", None, "kitty", None, "accepts"),
     Sign("GHOSTTY_RESOURCES_DIR", None, "ghostty", True, "accepts"),
     Sign("WEZTERM_EXECUTABLE", None, "wezterm", None, "accepts"),
     Sign("WT_SESSION", None, "Windows Terminal", None, "accepts"),
@@ -61,19 +61,18 @@ SIGNS: tuple[Sign, ...] = (
     Sign("LC_TERMINAL", "iTerm2", "iTerm2", None, "asks", mac=True, sent=True),
     Sign("VTE_VERSION", None, "a VTE terminal (GNOME Terminal, Tilix, …)", False),
     # A terminal's own TERM is the one sign ssh always carries.
-    Sign("TERM", "xterm-kitty", "kitty", True, "accepts"),
+    Sign("TERM", "xterm-kitty", "kitty", None, "accepts"),
     Sign("TERM", "xterm-ghostty", "ghostty", True, "accepts"),
     Sign("TERM", "wezterm", "wezterm", None, "accepts"),
-    Sign("TERM", "foot", "foot", True, "accepts"),
+    Sign("TERM", "foot", "foot", None, "accepts"),
     Sign("TERM", "alacritty", "alacritty", None, "accepts"),
 )
 """How the outer terminal is recognised, first match winning. ``TERM_PROGRAM`` is checked
 after the terminal-specific variables because a multiplexer or an IDE can leave an outer
 one behind, and ``TERM`` last: anything in between may set it to a name of its own.
 
-A sign's ``kitty`` is True or False only where the name settles it: every release still
-shipped answers the same way at its defaults. Where the version or a setting decides, it is
-None."""
+A sign's ``kitty`` is True only if every release of that terminal that emits the sign speaks
+the kitty keyboard protocol, False only if none does, and None otherwise."""
 
 
 def sign_of(env: Mapping[str, str], *, sent: bool = True) -> Sign | None:

@@ -1286,12 +1286,12 @@ def test_the_fleet_terminal_row_names_the_outer_terminal_tmux_and_the_server() -
         ("show-options", "-gv", "prefix"): "None\n",
         ("show-environment", "-g"): "DISPLAY=:1\nWAYLAND_DISPLAY=wayland-0\n-SSH_AUTH_SOCK\n",
     }
-    env = {"KITTY_WINDOW_ID": "3", "DISPLAY": ":1", "WAYLAND_DISPLAY": "wayland-0"}
+    env = {"GHOSTTY_RESOURCES_DIR": "/x", "DISPLAY": ":1", "WAYLAND_DISPLAY": "wayland-0"}
 
     check = _terminal_row(server, env)
 
     assert check.name == "fleet terminal" and check.status is CheckStatus.ok
-    assert "outer terminal kitty (kitty keyboard protocol" in check.detail
+    assert "outer terminal ghostty (kitty keyboard protocol" in check.detail
     assert "tmux 3.7 carries extended keys" in check.detail
     assert "server prefix None" in check.detail and "stale" not in check.detail
 
@@ -1333,8 +1333,9 @@ def test_the_fleet_terminal_row_names_the_running_servers_tmux_not_the_binary_on
 
     check = _terminal_row(server, {"KITTY_WINDOW_ID": "3"})
 
+    tmux_note = diagnostics._extended_keys_note((3, 4))
     assert check.status is CheckStatus.ok
-    assert "tmux 3.4 has no extended keys" in check.detail and "ctrl+j" in check.detail
+    assert tmux_note in check.detail and "ctrl+j" in tmux_note
     assert "carries extended keys" not in check.detail
     assert "this shell's tmux is 3.7; the running server keeps 3.4 until it restarts" in (
         check.detail
@@ -1358,8 +1359,9 @@ def test_the_fleet_terminal_row_warns_about_a_kept_prefix_and_lists_stale_vars()
     check = _terminal_row(server, env)
 
     assert check.status is CheckStatus.warn
+    tmux_note = diagnostics._extended_keys_note((3, 4))
     assert "a VTE terminal" in check.detail and "no kitty keyboard protocol" in check.detail
-    assert "tmux 3.4 has no extended keys" in check.detail and "ctrl+j" in check.detail
+    assert tmux_note in check.detail and "ctrl+j" in tmux_note
     assert "stale on the running server: DISPLAY, WAYLAND_DISPLAY, COLORTERM" in check.detail
     assert "SSH_AUTH_SOCK" not in check.detail.split("stale on the running server:")[1]
     assert "still has prefix C-b" in check.detail
@@ -1387,19 +1389,24 @@ def test_the_fleet_terminal_row_never_starts_a_server_and_survives_an_unknown_te
 
 
 @pytest.mark.parametrize(
-    ("env", "outer"),
+    ("env", "name", "protocol"),
     [
-        ({"TERM_PROGRAM": "iTerm.app"}, "outer terminal iTerm2 (protocol unknown"),
-        ({"LC_TERMINAL": "iTerm2"}, "outer terminal iTerm2 (protocol unknown"),
-        ({"TERM_PROGRAM": "vscode"}, "outer terminal the VS Code terminal (protocol unknown"),
-        ({"WEZTERM_EXECUTABLE": "/x"}, "outer terminal wezterm (protocol unknown"),
-        ({"TERM_PROGRAM": "WezTerm"}, "outer terminal wezterm (protocol unknown"),
-        ({"TERM": "wezterm"}, "outer terminal wezterm (protocol unknown"),
-        ({"WT_SESSION": "x"}, "outer terminal Windows Terminal (protocol unknown"),
-        ({"TERM": "alacritty"}, "outer terminal alacritty (protocol unknown"),
-        ({"TERM_PROGRAM": "Apple_Terminal"}, "outer terminal Terminal.app (no kitty keyboard"),
+        ({"KITTY_WINDOW_ID": "1"}, "kitty", "unknown"),
+        ({"TERM": "xterm-kitty"}, "kitty", "unknown"),
+        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2", "unknown"),
+        ({"LC_TERMINAL": "iTerm2"}, "iTerm2", "unknown"),
+        ({"TERM_PROGRAM": "vscode"}, "the VS Code terminal", "unknown"),
+        ({"WEZTERM_EXECUTABLE": "/x"}, "wezterm", "unknown"),
+        ({"TERM_PROGRAM": "WezTerm"}, "wezterm", "unknown"),
+        ({"TERM": "wezterm"}, "wezterm", "unknown"),
+        ({"WT_SESSION": "x"}, "Windows Terminal", "unknown"),
+        ({"TERM": "foot"}, "foot", "unknown"),
+        ({"TERM": "alacritty"}, "alacritty", "unknown"),
+        ({"TERM_PROGRAM": "Apple_Terminal"}, "Terminal.app", "no kitty"),
     ],
     ids=[
+        "kitty",
+        "kitty-term",
         "iterm2",
         "iterm2-over-ssh",
         "vscode",
@@ -1407,17 +1414,19 @@ def test_the_fleet_terminal_row_never_starts_a_server_and_survives_an_unknown_te
         "wezterm-term-program",
         "wezterm-term",
         "windows-terminal",
+        "foot",
         "alacritty",
         "terminal-app",
     ],
 )
 def test_the_fleet_terminal_row_names_the_terminal_its_protocol_and_ctrl_j(
-    env: dict[str, str], outer: str
+    env: dict[str, str], name: str, protocol: str
 ) -> None:
-    check = _terminal_row(FakeServer(absent=True), env)
+    detail = _terminal_row(FakeServer(absent=True), env).detail
 
-    assert outer in check.detail
-    assert "ctrl+j for a newline" in check.detail
+    assert name in detail
+    assert protocol in detail
+    assert "ctrl+j" in detail
 
 
 def test_the_fleet_terminal_row_comes_after_the_actionable_checks() -> None:
@@ -1436,18 +1445,20 @@ def test_the_fleet_terminal_row_comes_after_the_actionable_checks() -> None:
 @pytest.mark.parametrize(
     ("env", "name", "kitty"),
     [
-        ({"KITTY_WINDOW_ID": "1"}, "kitty", True),
+        ({"KITTY_WINDOW_ID": "1"}, "kitty", None),
         ({"GHOSTTY_RESOURCES_DIR": "/x"}, "ghostty", True),
         ({"WEZTERM_EXECUTABLE": "/x"}, "wezterm", None),
         ({"WT_SESSION": "x"}, "Windows Terminal", None),
         ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2", None),
         ({"TERM_PROGRAM": "WezTerm"}, "wezterm", None),
+        ({"TERM_PROGRAM": "ghostty"}, "ghostty", True),
         ({"TERM_PROGRAM": "vscode"}, "the VS Code terminal", None),
         ({"TERM_PROGRAM": "Apple_Terminal"}, "Terminal.app", False),
         ({"VTE_VERSION": "7800"}, "a VTE terminal (GNOME Terminal, Tilix, …)", False),
-        ({"TERM": "xterm-kitty"}, "kitty", True),
+        ({"TERM": "xterm-kitty"}, "kitty", None),
+        ({"TERM": "xterm-ghostty"}, "ghostty", True),
         ({"TERM": "wezterm"}, "wezterm", None),
-        ({"TERM": "foot"}, "foot", True),
+        ({"TERM": "foot"}, "foot", None),
         ({"TERM": "alacritty"}, "alacritty", None),
         ({}, "unknown", None),
     ],
