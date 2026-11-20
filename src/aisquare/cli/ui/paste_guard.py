@@ -7,12 +7,13 @@ prompt.
 
 :func:`install` wraps that parse, once per process. Once Textual's own parse has read a
 paste's start marker, the text up to the end marker is read here and delivered as one
-``Paste`` with its exact text; every character outside a paste still goes through Textual's
-parse. It leans on private Textual names: ``XTermParser.parse``, ``textual._parser.Read1``,
-``ParseTimeout`` and ``ParseEOF``, ``BRACKETED_PASTE_START`` and ``BRACKETED_PASTE_END``, and
-the empty ``Paste`` that Textual's parse flushes for an end marker read with no text before
-it, which is how the wrapper closes Textual's own paste. ``tests/test_paste_guard.py`` pins
-them; should they be missing when asq starts, Textual's parse stays as it is.
+``Paste`` holding it, NULs dropped as Textual drops them; every character outside a paste
+still goes through Textual's parse. It leans on private Textual names: ``XTermParser.parse``,
+``textual._parser.Read1``, ``ParseTimeout`` and ``ParseEOF``, ``BRACKETED_PASTE_START`` and
+``BRACKETED_PASTE_END``, and the empty ``Paste`` that Textual's parse flushes for an end marker
+read with no text before it, which is how the wrapper closes Textual's own paste.
+``tests/test_paste_guard.py`` pins them; should a name it reads be missing when asq starts,
+Textual's parse stays as it is.
 
 Delete this module, its install in ``ClipboardApp`` and the seam test once a Textual release
 keeps an Escape inside a paste as text.

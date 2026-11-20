@@ -494,10 +494,11 @@ def test_an_empty_name_is_the_folders_and_the_field_holds_255_characters(
 def test_a_paste_holding_a_raw_escape_neither_submits_nor_cancels_the_rename(
     tmp_path: Path, script: Script
 ) -> None:
-    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
-    a paste once sent its Enter to the field, saving half of it, and a trailing one closed
-    the field (``cli.ui.paste_guard``). This test reads the messages the field posts, and
-    its value: each paste's first line, as the field takes any paste."""
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends an Enter that follows an Escape in a paste to the field, which saves half of it, and
+    a trailing Escape closes the field; the guard keeps it one paste (``cli.ui.paste_guard``).
+    This test reads the messages the field posts, and its value: each paste's first line, as
+    the field takes any paste."""
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def go(pilot: Pilot[None]) -> tuple[list[str], str]:

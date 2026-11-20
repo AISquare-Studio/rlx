@@ -817,9 +817,10 @@ def test_paste_goes_through_the_paste_buffer_not_send_keys(fake: FakeTmux, tmp_p
 def test_a_paste_holding_a_raw_escape_reaches_the_agent_whole_with_no_key(
     fake: FakeTmux, tmp_path: Path
 ) -> None:
-    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
-    the paste once sent the rest of it as keys, its Enter submitting half a prompt
-    (``cli.ui.paste_guard``). This test reads every paste-buffer write and every send-keys."""
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends what follows an Escape in a paste as keys, its Enter submitting half a prompt; the
+    guard keeps it one paste (``cli.ui.paste_guard``). This test reads every paste-buffer
+    write and every send-keys."""
 
     async def drive() -> None:
         host = Host(fake.server(tmp_path), "%1")

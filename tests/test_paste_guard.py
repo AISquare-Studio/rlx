@@ -8,7 +8,7 @@ reads moves it past ``ESCAPE_DELAY`` and ticks the parser, as the driver ticks i
 guard must change nothing, its output is compared with Textual's own parse
 (:func:`paste_guard.textual_parse`) fed the same reads.
 
-Each consumer's own regression sits beside its posted-paste tests: the pane
+Each consumer's own regression sits beside its paste or key tests: the pane
 (``tests/test_terminal_pane.py``), the router, a dialog's field and a text area
 (``tests/test_ui_shell.py``), the rename field (``tests/test_ui_project_cards.py``) and the
 board (``tests/test_watch.py``).
@@ -45,6 +45,7 @@ RAW_ESCAPE_BODIES = [
     pytest.param("one\x1b[20two", id="escape [20"),
     pytest.param("one\x1b[201two", id="escape [201"),
     pytest.param("one\x1b[201", id="escape [201 before the end marker"),
+    pytest.param("\x1b[201x[201~y", id="escape [201x, then the end marker's tail alone"),
     pytest.param(
         "one\x1b" + "abcdefghij" * 4 + "\rz", id="escape and a tail longer than Textual's cut"
     ),
@@ -58,6 +59,7 @@ KEYS_REPORTS_AND_PASTES = [
     pytest.param(bracketed_paste(""), id="paste: empty"),
     pytest.param(bracketed_paste("a\nb"), id="paste: line feed"),
     pytest.param(bracketed_paste("a\x00b"), id="paste: NUL"),
+    pytest.param(bracketed_paste("one[201~two"), id="paste: the end marker's tail alone"),
     pytest.param("a" + bracketed_paste("mid") + "b", id="key a, paste, key b"),
     pytest.param(bracketed_paste("one") + bracketed_paste("two"), id="two pastes"),
     pytest.param("\r", id="key enter"),
@@ -277,7 +279,7 @@ def test_keys_reports_and_ordinary_pastes_give_what_textuals_parse_gives(
 ) -> None:
     """Fed in one read; in two reads split at each position; and in two reads split at each
     position but inside an end marker, with a pause between them. Inside an end marker
-    Textual's own parse loses the paste (the tests above)."""
+    Textual's own parse loses the paste."""
     paused_at = [at for at in everywhere(raw) if at not in inside_an_end_marker(raw)]
     readings = [
         ([raw], False),
@@ -368,7 +370,7 @@ def _no_generator(self: Any, token_callback: Callable[[Any], None]) -> None:
     ],
 )
 @pytest.mark.usefixtures("uninstalled")
-def test_with_a_textual_name_moved_or_its_parse_changed_install_says_no_and_leaves_it(
+def test_with_a_textual_name_moved_or_its_parse_no_generator_install_says_no_and_leaves_it(
     move: Callable[[pytest.MonkeyPatch], None], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     move(monkeypatch)

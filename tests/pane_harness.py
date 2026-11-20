@@ -390,8 +390,9 @@ def bracketed_paste(text: str) -> str:
 
 
 def post_terminal_input(app: App[Any], raw: str) -> None:
-    """Post to ``app`` what the driver posts for ``raw``: each message Textual's
-    ``XTermParser`` makes of it, as the driver's input thread runs one.
+    """Post to ``app`` each message Textual's ``XTermParser`` makes of ``raw`` fed in one read,
+    as the driver's input thread posts them. The parser is not ticked: a sequence still pending
+    at the end of ``raw`` (a lone Escape) posts nothing.
 
     ``Pilot.press`` and a posted ``Paste`` never run the parser, so a test of what it
     makes of the terminal's bytes (a raw Escape inside a paste) cannot use them. Build

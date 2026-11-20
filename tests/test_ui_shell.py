@@ -7177,10 +7177,10 @@ class PressCountingButton(Button):
 def test_a_paste_holding_a_raw_escape_presses_no_focused_button_and_reaches_the_pane_whole(
     tmp_path: Path, script: Script
 ) -> None:
-    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
-    a paste once sent the rest of it as keys, its Enter pressing the focused button
-    (``cli.ui.paste_guard``). This test reads the button's presses and what the one live
-    pane forwarded."""
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends what follows an Escape in a paste as keys, its Enter pressing the focused button;
+    the guard keeps it one paste (``cli.ui.paste_guard``). This test reads the button's
+    presses and what the one live pane forwarded."""
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def go(pilot: Pilot[None]) -> tuple[list[tuple[str, str | bytes]], int]:
@@ -7340,10 +7340,11 @@ def test_a_paste_into_a_dialogs_input_never_reaches_a_pane_and_nothing_passes_a_
 def test_a_paste_holding_a_raw_escape_into_a_dialogs_input_submits_nothing(
     tmp_path: Path, script: Script
 ) -> None:
-    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
-    a paste once sent its Enter to the field, submitting it (``cli.ui.paste_guard``). This
-    test reads the messages the Spawn dialog's label posts, and its value: the paste's
-    first line, as ``Input`` takes any paste."""
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends an Enter that follows an Escape in a paste to the field, submitting it; the guard
+    keeps it one paste (``cli.ui.paste_guard``). This test reads the messages the Spawn
+    dialog's label posts, and its value: the paste's first line, as ``Input`` takes any
+    paste."""
     from aisquare.cli.ui.spawn import SpawnDialog
 
     [project] = seed(tmp_path, ("prj_a", "alpha", None))
@@ -7402,10 +7403,11 @@ def test_a_paste_a_text_area_took_is_not_sent_to_the_pane_as_well(
 def test_a_paste_holding_a_raw_escape_into_a_text_area_is_inserted_as_the_whole_paste_is(
     tmp_path: Path, script: Script
 ) -> None:
-    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
-    a paste once typed the rest of it into the text area as keys, ahead of a cut-short
-    paste (``cli.ui.paste_guard``). This test reads two text areas, one given the bytes and
-    one given the same paste posted whole, and what the pane behind them forwarded."""
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    types what follows an Escape in a paste into the text area as keys, ahead of a cut-short
+    paste; the guard keeps it one paste (``cli.ui.paste_guard``). This test reads two text
+    areas, one given the bytes and one given the same paste posted whole, and what the pane
+    behind them forwarded."""
     from textual.widgets import TextArea
 
     seed(tmp_path, ("prj_a", "alpha", None))

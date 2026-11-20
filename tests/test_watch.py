@@ -164,10 +164,10 @@ def test_screenshot_key_saves_svg_locally(
 def test_a_paste_holding_a_raw_escape_neither_quits_the_board_nor_opens_its_themes(
     runner: CliRunner, work_dir: Path, isolated_home: Path
 ) -> None:
-    """From the terminal's bytes, through Textual's parser as the driver runs it: an Escape in
-    a paste once sent the rest of it as keys, so a ``q`` in it quit the board and a ``t``
-    opened its themes (``cli.ui.paste_guard``). This test reads the app's return code, its
-    screens and its theme."""
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends what follows an Escape in a paste as keys, so a ``q`` in it quits the board and a
+    ``t`` opens its themes; the guard keeps it one paste (``cli.ui.paste_guard``). This test
+    reads the app's return code, its screens and its theme."""
     pytest.importorskip("textual", reason="the [tui] extra is not installed")
     from aisquare.cli import watch as watch_mod
 
