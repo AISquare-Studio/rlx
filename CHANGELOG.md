@@ -160,7 +160,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   folder-trust question:** the agent needs you and the row names the folder, where it read
   working.
 - **A paste holding a raw Escape arrives whole.** Some terminals pass on an Escape copied
-  with text, from coloured log output say, and asq turned the rest of such a paste into
+  with text, from coloured log output say, and rlx turned the rest of such a paste into
   keystrokes ahead of a cut-short paste: an Enter among them sent a half-pasted prompt to
   the agent, and a field in a dialog could submit or close. It now arrives as one paste,
   Escape included, in an agent's pane, a field and the board. 0.10.0 had this too.
