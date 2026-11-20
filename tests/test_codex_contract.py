@@ -431,7 +431,10 @@ _REVIEWER = "routes Codex's approval requests to its automatic reviewer"
                 _YOURSELF,
             ),
         ),
-        ({"approval": "never"}, (_REVIEWER, 'fleet.roles.coder.approval_policy = "never"')),
+        (
+            {"approval": "never"},
+            (_REVIEWER, 'fleet.roles.coder.approval_policy = "never"', "unset one of them"),
+        ),
         ({"native": ["-a", "never"]}, ("Codex refuses beside -a never", _YOURSELF)),
         ({"native": ["--yolo"]}, ("Codex refuses beside --yolo", _YOURSELF)),
     ],

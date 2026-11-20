@@ -28,7 +28,7 @@ from aisquare.services.captain import brain
 from aisquare.services.captain import state as captain_state
 from tests import fakebin
 from tests import test_fleet_service as fleet_suite
-from tests.test_codex_fleet_parity import _in, _tail
+from tests.test_codex_fleet_parity import LEAD, _expected_tail, _part_location, _passed_on_refusal
 from tests.test_fleet_service import FakeTmux
 
 tmux = fleet_suite.tmux
@@ -210,7 +210,8 @@ def test_a_codex_captains_restart_after_its_agent_args_gained_a_bare_word_stops_
         fleet_service.restart(captain_state.home_project(), "captain")
 
     said = str(refused.value)
-    assert said.endswith(_tail(_in("role"), stopped=True)), said
+    assert _passed_on_refusal(refused.value).startswith(LEAD), said
+    assert said.endswith(_expected_tail(_part_location("role"), before_a_stop=True)), said
     assert tmux.typed == [] and tmux.killed == killed, (tmux.typed, tmux.killed)
     assert len(tmux.spawned) == spawned
     with store_session() as store:
