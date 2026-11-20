@@ -7,16 +7,20 @@ from typer._click.core import Context
 from typer._click.exceptions import UsageError
 from typer.core import TyperCommand, TyperOption
 
-from aisquare.core.agent_adapters import adapters
-from aisquare.core.agent_adapters.codex_config import CONFIG_FLAGS
+from aisquare.core.agent_adapters import adapters, codex_config
 from aisquare.core.agent_adapters.types import is_config_assignment
 from aisquare.core.names import holds_utf8, undecodable_said
 
-#: Codex's config option, its short spelling and its long one (``codex_config.CONFIG_FLAGS``):
-#: an assignment given with the short one, which a command can also own (its binary), reaches
-#: Codex in the long one.
-_CONFIG_SHORT = next(flag for flag in CONFIG_FLAGS if not flag.startswith("--"))
-_CONFIG_LONG = next(flag for flag in CONFIG_FLAGS if flag.startswith("--"))
+
+def _config_spellings() -> tuple[str, str]:
+    """Codex's config option's short spelling and its long one, as ``codex_config.CONFIG_FLAGS``
+    states them when a command line is parsed: an assignment given with the short one, which is
+    also ``launch``'s and ``fleet spawn``'s own ``--command``, reaches Codex in the long one."""
+    flags = codex_config.CONFIG_FLAGS
+    return (
+        next(flag for flag in flags if not flag.startswith("--")),
+        next(flag for flag in flags if flag.startswith("--")),
+    )
 
 
 class PassthroughCommand(TyperCommand):
@@ -50,6 +54,7 @@ class NativeForwardingCommand(PassthroughCommand):
         Known AISquare option values and everything after -- remain untouched.
         """
         rewritten: list[str] = []
+        config_short, config_long = _config_spellings()
         protected: dict[str, str] = {}
         valued = {
             option
@@ -87,22 +92,22 @@ class NativeForwardingCommand(PassthroughCommand):
                 role_seen = True
                 rewritten.append(token)
                 continue
-            joined = token[len(_CONFIG_SHORT) :]
-            if token == _CONFIG_SHORT and _CONFIG_SHORT in valued:
+            joined = token[len(config_short) :]
+            if token == config_short and config_short in valued:
                 following = next(tokens, None)
                 value = following[1] if following is not None else None
                 if value is not None and is_config_assignment(value):
-                    rewritten.append(f"{_CONFIG_LONG}={value}")
+                    rewritten.append(f"{config_long}={value}")
                 else:
                     rewritten.append(token)
                     if value is not None:
                         rewritten.append(value)
             elif (
-                _CONFIG_SHORT in valued
-                and token.startswith(_CONFIG_SHORT)
+                config_short in valued
+                and token.startswith(config_short)
                 and is_config_assignment(joined)
             ):
-                rewritten.append(f"{_CONFIG_LONG}={joined}")
+                rewritten.append(f"{config_long}={joined}")
             elif (
                 token.startswith("-")
                 and not token.startswith("--")

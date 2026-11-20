@@ -196,7 +196,8 @@ def test_a_chosen_sandbox_or_policy_turns_the_default_off() -> None:
 
 
 #: Argument lists and the word or option Codex's adapter finds among them: a word with the option
-#: and value it follows, or an option given no value; ``None`` for options with one value each.
+#: and value it follows, or an option given no value; ``None`` for switches and options with their
+#: one value each, and for a list that ends with an option still waiting for its value.
 STRAYS: list[tuple[list[str], Stray | None]] = [
     (["--add-dir", "a", "b"], Stray("b", "--add-dir", "a")),
     (["--add-dir=a", "b"], Stray("b", "--add-dir", "a")),
@@ -233,7 +234,7 @@ STRAYS: list[tuple[list[str], Stray | None]] = [
 @pytest.mark.parametrize(
     ("args", "found"), STRAYS, ids=[" ".join(args) or "none" for args, _ in STRAYS]
 )
-def test_stray_argument_reads_codexs_arguments_as_options_with_one_value_each(
+def test_stray_argument_finds_the_stray_word_or_valueless_option_among_codexs_arguments(
     args: list[str], found: Stray | None
 ) -> None:
     """This test reads ``stray_argument`` for Codex's adapter and Claude Code's over each list of

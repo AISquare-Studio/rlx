@@ -8,22 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **A Codex fleet agent's arguments are options with one value each, and a spawn, restart or
-  switch whose arguments hold any other word is stopped before it starts, naming the ways that
-  work:** Claude Code's `--add-dir a b` names `--add-dir a --add-dir b`, an option Codex takes
-  only once, such as `--model`, names no second one, and a prompt, a thread or a Codex command
-  among them names `--prompt`, `rlx fleet adopt` or a run outside the fleet. Codex takes one
-  directory per `--add-dir` and reads `b` as its prompt, so it refused the first message
-  `rlx fleet spawn` puts after it and exited before its first screen, or started with a path
-  as its prompt and without that directory; and a prompt or command among the arguments met
-  the fleet's own at a restart or switch whose first message goes on the command line, which
-  Codex refused. The check reads the spawn's own arguments, the Spawn dialog's, a role's
-  `agent_args` and binding and a replay's, naming which of them holds the word, and a restart
-  or switch asks it before it stops the agent. Each of them holds its options whole: an option
-  that ends one while the next would give its value, such as a binding ending `--sandbox` with
-  `read-only` in the spawn's own arguments, is refused too, as a restart puts the thread's
-  `resume <id>` before the spawn's own arguments, where Codex took `resume` as the option's
-  value; and so is an option Codex takes a value for given none, such as `--model --search`.
+- **A Codex fleet agent's arguments are switches and options with one value each, and a spawn,
+  restart or switch whose arguments hold any other word is stopped before it starts, naming the
+  ways that work:** Claude Code's `--add-dir a b` names `--add-dir a --add-dir b`, an option
+  Codex takes only once, such as `--model`, names no second one, and a prompt, a thread or a
+  Codex command among them names `--prompt`, `rlx fleet adopt` or a run outside the fleet.
+  Codex takes one directory per `--add-dir` and reads `b` as its prompt, so it refused the
+  first message `rlx fleet spawn` puts after it and exited before its first screen, or started
+  with a path as its prompt and without that directory; and a prompt or command among the
+  arguments met the fleet's own at a restart or switch whose first message goes on the command
+  line, which Codex refused. The check reads the spawn's own arguments, the Spawn dialog's, a
+  role's `agent_args` and binding and a replay's, naming which of them holds the word, and a
+  restart or switch asks it before it stops the agent. Each of them holds its options whole: an
+  option that ends one while the next would give its value, such as a binding ending
+  `--sandbox` with `read-only` in the spawn's own arguments, is refused too, as a restart puts
+  the thread's `resume <id>` before the spawn's own arguments, where Codex took `resume` as the
+  option's value; and so is an option Codex takes a value for given none, such as
+  `--model --search`.
 - **`rlx fleet adopt` reads a Codex someone started as `codex exec --json x` or `codex review
   --uncommitted x` as it reads `codex exec x` or `codex review x`,** a possible client of
   Codex's background app-server, where it read `x` as the switch's value.

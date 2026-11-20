@@ -688,48 +688,43 @@ def test_native_option_values_cannot_swallow_aisquare_options(native: list[str])
         assert ctx.args == native
 
 
-@pytest.mark.parametrize("native", [["-c", "model=o3"], ["-cmodel=o3"]])
-def test_fleet_spawn_forwards_codexs_short_options(native: list[str]) -> None:
-    """Codex's -c KEY=VALUE reaches it by its shape, as `launch` passes it: spelled out, since
-    the spawn's own -c is its binary, as launch's is (#105)."""
-    from typer.core import TyperGroup
-    from typer.main import get_command
-
-    root = get_command(app)
-    assert isinstance(root, TyperGroup)
-    fleet_group = root.commands["fleet"]
-    assert isinstance(fleet_group, TyperGroup)
-    with fleet_group.commands["spawn"].make_context(
-        "spawn", ["coder", "--agent", "codex", *native, "--label", "fix"]
-    ) as ctx:
-        assert ctx.params["label"] == "fix" and ctx.params["agent"] == "codex"
-        assert ctx.params["binary"] is None and ctx.args == ["--config=model=o3"]
-
-
+@pytest.mark.parametrize(
+    "flags", [None, ("--configure", "-c")], ids=["as-shipped", "long-spelling-changed"]
+)
 @pytest.mark.parametrize("joined", [False, True], ids=["spaced", "joined"])
-@pytest.mark.parametrize(("command", "own"), [("launch", "command"), ("spawn", "binary")])
+@pytest.mark.parametrize("command", ["launch", "spawn"])
 def test_codexs_short_config_spelling_reaches_it_in_the_long_one_codex_config_states(
-    command: str, own: str, joined: bool
+    command: str,
+    joined: bool,
+    flags: tuple[str, str] | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """This test reads the arguments ``launch`` and ``fleet spawn`` forward for Codex given
-    ``model=o3`` with its config option's short spelling, spaced and joined, both spellings
-    read from ``codex_config.CONFIG_FLAGS``."""
+    """This test reads what ``launch`` and ``fleet spawn`` parse from Codex's ``model=o3`` given
+    with its config option's short spelling, spaced and joined, with
+    ``codex_config.CONFIG_FLAGS`` as shipped and with its long spelling changed: the arguments
+    they pass Codex, their own ``--command``, which that short spelling also is, their
+    ``--agent``, and the spawn's ``--label``."""
     from typer.core import TyperGroup
     from typer.main import get_command
 
-    from aisquare.core.agent_adapters.codex_config import CONFIG_FLAGS
+    from aisquare.core.agent_adapters import codex_config
 
-    short = next(flag for flag in CONFIG_FLAGS if not flag.startswith("--"))
-    long = next(flag for flag in CONFIG_FLAGS if flag.startswith("--"))
+    if flags is not None:
+        monkeypatch.setattr(codex_config, "CONFIG_FLAGS", flags)
+    short = next(flag for flag in codex_config.CONFIG_FLAGS if not flag.startswith("--"))
+    long = next(flag for flag in codex_config.CONFIG_FLAGS if flag.startswith("--"))
     root = get_command(app)
     assert isinstance(root, TyperGroup)
     group = root.commands["fleet"] if command == "spawn" else root
     assert isinstance(group, TyperGroup)
     native = [short + "model=o3"] if joined else [short, "model=o3"]
+    label = ["--label", "fix"] if command == "spawn" else []
     with group.commands[command].make_context(
-        command, ["coder", "--agent", "codex", *native]
+        command, ["coder", "--agent", "codex", *native, *label]
     ) as ctx:
-        assert ctx.params[own] is None and ctx.args == [f"{long}=model=o3"]
+        assert ctx.params["agent"] == "codex" and ctx.params["command"] is None
+        assert ctx.args == [f"{long}=model=o3"]
+        assert ctx.params.get("label") == ("fix" if label else None)
 
 
 def test_fleet_spawns_a_is_the_account_and_codexs_own_goes_after_the_separator() -> None:

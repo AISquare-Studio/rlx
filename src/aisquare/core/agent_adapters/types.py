@@ -546,14 +546,14 @@ class AgentCapabilities:
     Not one: an option the agent refuses given twice, and one whose value has a form a word may
     lack."""
     options_only: bool = False
-    """A fleet spawn gives the agent its arguments as options with one value each (Codex): the
-    fleet fills the agent's positionals itself, its resume or fork lead and its first message,
-    at every start and replay, so a bare word among them, the native ``--`` and what follows it
-    included, is refused before a window and before a replay's stop (:func:`stray_argument`);
-    and so is an option whose value would open another part of them (:func:`open_option`), and
-    one of :attr:`value_options` given none (:func:`stray_argument` where another option follows
-    it, :func:`open_option` where it ends them). Claude Code's several-value options
-    (``--add-dir a b``) leave it off."""
+    """A fleet spawn gives the agent its arguments as switches and options that take a value,
+    each given one (Codex): the fleet fills the agent's positionals itself, its resume or fork
+    lead and its first message, at every start and replay, so a bare word among them, the
+    native ``--`` and what follows it included, is refused before a window and before a
+    replay's stop (:func:`stray_argument`); and so is an option whose value would open another
+    part of them (:func:`open_option`), and one of :attr:`value_options` given none
+    (:func:`stray_argument` where another option follows it, :func:`open_option` where it ends
+    them). Claude Code's several-value options (``--add-dir a b``) leave it off."""
 
 
 @dataclass(frozen=True)
@@ -2268,7 +2268,8 @@ def stray_argument(adapter: AgentAdapter, args: Sequence[str]) -> Stray | None:
     Codex reads it (its prompt), and the native ``--`` is itself such a word. An option of
     ``value_options`` that another option follows has no value, and is refused too
     (``valueless``); one that ends ``args`` is :func:`open_option`'s. ``None`` for an adapter
-    without ``options_only`` and for arguments that are options with one value each."""
+    without ``options_only``, and for arguments that are switches and options with their one
+    value each, or end with an option still waiting for its value."""
     return _read_options(adapter, args)[0]
 
 

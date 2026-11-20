@@ -4073,7 +4073,8 @@ def test_a_codex_spawn_refuses_an_option_ending_one_part_with_its_value_opening_
     )
     said = _codex_spawn_refused(tmux, project, own=own, role=role, bound=bound, resume=resume)
     ending, opening = PARTS[ends][0], PARTS[opens][0]
-    assert f"{option} ends {ending} and its value would open {opening}" in said, said
+    split = f"{option} ends {ending} and its value would open {opening}, so give {option} "
+    assert split in said, said
     assert f"so give {option} and its value together in one of them" in said, said
     assert f"; the option is in {PARTS[ends][1]}" in said, said
 
@@ -4346,8 +4347,8 @@ def test_a_codex_spawn_whose_arguments_are_options_alone_starts_with_them(
     own: list[str],
     message: str,
 ) -> None:
-    """This test reads the window line of a Codex spawn whose own arguments are options with
-    one value each, its first message on the line, typed or none."""
+    """This test reads the window line of a Codex spawn whose own arguments are switches and
+    options with their one value each, its first message on the line, typed or none."""
     config = load_config()
     config.fleet.first_prompt = "type" if message == "type" else "argv"
     config.fleet.roles["coder"] = FleetRoleSettings(worktree=False)
@@ -5377,7 +5378,8 @@ def test_a_replay_whose_binding_ends_with_the_option_of_its_records_value_stops_
 
     said = str(refused.value)
     recorded = f"the arguments {agent.label!r} recorded at its start"
-    assert f"--model ends the role's binding and its value would open {recorded}" in said, said
+    split = f"--model ends the role's binding and its value would open {recorded}, so give --model "
+    assert split in said, said
     assert "nothing was stopped: the option is in the role's binding" in said, said
     _left_running(tmux, agent, spawned)
 

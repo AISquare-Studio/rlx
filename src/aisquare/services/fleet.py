@@ -5516,10 +5516,10 @@ def spawn(
     record and the row hold only text, and the window runs what they hold, so a restart
     replays what the spawn ran (one held raw failed the record's write: r39 reopen of #113).
     An agent whose arguments are options alone (``capabilities.options_only``: Codex's) is
-    refused a word or an option among them, the role's and the binding's with them, that are
-    not options with one value each, before any window (:func:`_refuse_stray_arguments`), and a
-    replay before its stop
-    (:func:`_refuse_a_replay_that_cannot_start`).
+    refused, among them, the role's and the binding's with them, a word that is no option's
+    value, an option whose value would open another part of them, and an option that takes a
+    value given none, before any window (:func:`_refuse_stray_arguments`), and a replay before
+    its stop (:func:`_refuse_a_replay_that_cannot_start`).
     """
     undecodable = [argument for argument in agent_args if not names_core.holds_utf8(argument)]
     agent_args = [names_core.as_text(argument) for argument in agent_args]
@@ -7073,8 +7073,9 @@ def _refuse_stray_arguments(
     own_advice: str = "",
     stopping: bool = False,
 ) -> None:
-    """Refuse a start when the agent takes options alone and its arguments are not options with
-    one value each, each part holding its options whole: read in this order, its binding's
+    """Refuse a start when the agent takes options alone and its arguments are not switches and
+    options that take a value, each given one, with each part holding its options whole: read in
+    this order, its binding's
     arguments, its role's (:func:`_role_args`) and its own (``own``, which ``own_are`` names: a
     spawn's, or the ones a replay's record holds, :func:`_spawn_args`; ``own_advice`` says what
     to do about them, if anything), as the caller reads them. Refused: a word or an option
