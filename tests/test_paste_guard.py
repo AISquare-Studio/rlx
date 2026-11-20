@@ -31,8 +31,6 @@ from aisquare.cli.ui import paste_guard
 from aisquare.cli.ui.clipboard import ClipboardApp
 from tests.pane_harness import PASTE_END, PASTE_START, bracketed_paste
 
-TAIL = "abcdefghij" * 4
-
 RAW_ESCAPE_BODIES = [
     pytest.param("one\x1b", id="escape last"),
     pytest.param("one\x1b\x1btwo", id="escape escape"),
@@ -47,7 +45,9 @@ RAW_ESCAPE_BODIES = [
     pytest.param("one\x1b[20two", id="escape [20"),
     pytest.param("one\x1b[201two", id="escape [201"),
     pytest.param("one\x1b[201", id="escape [201 before the end marker"),
-    pytest.param("one\x1b" + TAIL + "\rz", id="escape and a 40-character tail"),
+    pytest.param(
+        "one\x1b" + "abcdefghij" * 4 + "\rz", id="escape and a tail longer than Textual's cut"
+    ),
     pytest.param("\x1ba^x", id="escape a caret x"),
     pytest.param("\x1ba\x1bx", id="escape a escape x"),
 ]
@@ -84,7 +84,7 @@ KEYS_REPORTS_AND_PASTES = [
 ]
 
 PARSE_SOURCE_SHA256 = "f9837587f1778f18"
-"""The first 16 hex digits of the SHA-256 of ``XTermParser.parse``'s source as Textual 8.2.0 to
+"""The start of the SHA-256 hex digest of ``XTermParser.parse``'s source as Textual 8.2.0 to
 8.2.8 ship it, taken at 8.2.0, 8.2.4 and 8.2.8. The guard leans on how that parse reads a
 paste: a release that changes it is read again before this moves."""
 
@@ -118,7 +118,7 @@ def textuals_parser() -> XTermParser:
 
 
 def fed(parser: XTermParser, reads: list[str], clock: Clock, *, paused: bool) -> list[str]:
-    """Every message ``parser`` emits for ``reads``, shown. With ``paused`` the clock moves
+    """Every message ``parser`` emits for ``reads``, by its repr. With ``paused`` the clock moves
     past ``ESCAPE_DELAY`` and the parser ticks between two reads; after the last it always
     does, so a sequence still pending resolves."""
     messages: list[Any] = []
@@ -133,7 +133,7 @@ def fed(parser: XTermParser, reads: list[str], clock: Clock, *, paused: bool) ->
 
 
 def paste(text: str) -> list[str]:
-    """One paste of ``text``, shown as :func:`fed` shows it."""
+    """One paste of ``text``, by its repr, as :func:`fed` gives it."""
     return [repr(events.Paste(text))]
 
 
@@ -313,7 +313,8 @@ def test_the_textual_seam_is_where_the_guard_expects_it(clock: Clock) -> None:
     )
     assert all(hasattr(_parser, name) for name in ("Read1", "ParseTimeout", "ParseEOF"))
     source = textuals_parse_source(inspect.getsource(_xterm_parser))
-    assert hashlib.sha256(source.encode()).hexdigest()[:16] == PARSE_SOURCE_SHA256, (
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    assert digest[: len(PARSE_SOURCE_SHA256)] == PARSE_SOURCE_SHA256, (
         "Textual's XTermParser.parse has changed: read it against paste_guard before the pin moves"
     )
     handshake = fed(textuals_parser(), [PASTE_START, PASTE_END], clock, paused=False)
@@ -346,7 +347,7 @@ def test_building_a_clipboard_app_installs_the_guard(clock: Clock) -> None:
     assert after == paste("one\x1b\rtwo")
 
 
-def test_a_second_install_says_it_is_installed_and_changes_nothing() -> None:
+def test_a_second_install_says_installed_and_keeps_the_guard_and_textuals_parse() -> None:
     parse, textual = XTermParser.parse, paste_guard.textual_parse()
     assert paste_guard.install() is True
     assert (XTermParser.parse, paste_guard.textual_parse()) == (parse, textual)
@@ -367,7 +368,7 @@ def _no_generator(self: Any, token_callback: Callable[[Any], None]) -> None:
     ],
 )
 @pytest.mark.usefixtures("uninstalled")
-def test_with_textuals_names_moved_install_says_no_and_leaves_textuals_parse(
+def test_with_a_textual_name_moved_or_its_parse_changed_install_says_no_and_leaves_it(
     move: Callable[[pytest.MonkeyPatch], None], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     move(monkeypatch)
