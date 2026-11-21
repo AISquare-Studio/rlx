@@ -4296,6 +4296,7 @@ def test_a_codex_spawn_given_a_message_refuses_a_bare_word_among_its_arguments(
     """This test reads a Codex spawn whose first message goes on its line and whose own
     arguments hold the words of :data:`CODEX_REFUSED`."""
     said = _codex_spawn_refused(tmux, project, own=own)
+    assert said.startswith(LEAD), said
     _assert_word_refused(said, word, option, value)
 
 
@@ -4352,6 +4353,7 @@ def test_a_resumed_or_forked_codex_spawn_refuses_a_bare_word_before_a_window(
         session_id=THREAD_ONE, transcript_path=tmp_path / "rollout.jsonl", fork=fork
     )
     said = _codex_spawn_refused(tmux, project, own=own, role=role, message=message, resume=resume)
+    assert said.startswith(LEAD), said
     _assert_word_refused(said, word, option, value)
 
 
