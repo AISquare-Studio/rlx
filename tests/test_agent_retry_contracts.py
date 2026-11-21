@@ -46,6 +46,7 @@ from aisquare.services import (
     native_telemetry,
 )
 from tests.test_agent_native_boundaries import published
+from tests.test_codex_fleet_parity import STOP_MARKER
 from tests.test_fleet_service import FakeTmux
 from tests.test_store import _dogfooded_113
 
@@ -293,6 +294,7 @@ def test_a_codex_fleet_spawn_refuses_its_bindings_literal_boundary_before_a_wind
     with pytest.raises(fleet.FleetError) as refused:
         fleet.spawn(team_project(tmp_path), "coder")
     assert repr("--") in str(refused.value), str(refused.value)
+    assert STOP_MARKER not in str(refused.value), str(refused.value)
     assert tmux.spawned == []
 
 
