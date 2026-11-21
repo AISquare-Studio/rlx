@@ -3956,6 +3956,10 @@ def _codex_spawn_refused(
 
 def _assert_word_refused(refusal: str, word: str, option: str, value: str) -> None:
     assert refusal.startswith(LEAD), refusal
+    _assert_names_word(refusal, word, option, value)
+
+
+def _assert_names_word(refusal: str, word: str, option: str, value: str) -> None:
     assert repr(word) in refusal, refusal
     if option:
         assert f"({option} {value} {option} {word})" in refusal, refusal
@@ -4297,7 +4301,7 @@ def test_a_codex_spawn_given_a_message_refuses_a_bare_word_among_its_arguments(
     arguments hold the words of :data:`CODEX_REFUSED`."""
     said = _codex_spawn_refused(tmux, project, own=own)
     assert said.startswith(LEAD), said
-    _assert_word_refused(said, word, option, value)
+    _assert_names_word(said, word, option, value)
 
 
 @pytest.mark.parametrize(
@@ -4354,7 +4358,7 @@ def test_a_resumed_or_forked_codex_spawn_refuses_a_bare_word_before_a_window(
     )
     said = _codex_spawn_refused(tmux, project, own=own, role=role, message=message, resume=resume)
     assert said.startswith(LEAD), said
-    _assert_word_refused(said, word, option, value)
+    _assert_names_word(said, word, option, value)
 
 
 @pytest.mark.parametrize(
