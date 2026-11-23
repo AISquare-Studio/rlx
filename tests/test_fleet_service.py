@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -16420,13 +16420,14 @@ def test_shutdown_and_spawn_read_no_record_of_a_row_long_ended(
         )
         store._conn.commit()
     reads: list[str] = []
-    real = launch_seal.read
+    real = launch_seal.read_all
 
-    def counting(agent_id: str) -> launch_seal.LaunchRecord | str:
-        reads.append(agent_id)
-        return real(agent_id)
+    def counting(agent_ids: Iterable[str]) -> dict[str, launch_seal.LaunchRecord | str]:
+        asked = list(agent_ids)
+        reads.extend(asked)
+        return real(asked)
 
-    monkeypatch.setattr(launch_seal, "read", counting)
+    monkeypatch.setattr(launch_seal, "read_all", counting)
 
     live = _coder(project)
     fleet_service.list_agents(project)
@@ -17453,13 +17454,14 @@ def test_tell_reads_its_launch_record_once(
     _board_session(first, "waiting")
     tmux.set_command(first.pane_id, "claude")
     reads: list[str] = []
-    real = launch_seal.read
+    real = launch_seal.read_all
 
-    def counting(agent_id: str) -> launch_seal.LaunchRecord | str:
-        reads.append(agent_id)
-        return real(agent_id)
+    def counting(agent_ids: Iterable[str]) -> dict[str, launch_seal.LaunchRecord | str]:
+        asked = list(agent_ids)
+        reads.extend(asked)
+        return real(asked)
 
-    monkeypatch.setattr(launch_seal, "read", counting)
+    monkeypatch.setattr(launch_seal, "read_all", counting)
 
     assert fleet_service.tell(project, first.label, "please rebase").delivered
     assert reads == [first.id]
