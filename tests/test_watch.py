@@ -167,26 +167,26 @@ def test_a_paste_holding_a_raw_escape_neither_quits_the_board_nor_opens_its_them
     """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
     sends what follows an Escape in a paste as keys, so a ``q`` in it quits the board and a
     ``t`` opens its themes; the guard keeps it one paste (``cli.ui.paste_guard``). This test
-    reads the app's return code, its screens and its theme."""
+    reads the app's return code, its screens after each paste and its theme."""
     pytest.importorskip("textual", reason="the [tui] extra is not installed")
     from aisquare.cli import watch as watch_mod
 
     team_service.activate()
 
-    async def paste() -> tuple[list[str], str, str, int | None]:
+    async def paste() -> tuple[list[list[str]], str, str, int | None]:
         app_cls = watch_mod._build_app_class(interval=60.0)
         async with app_cls().run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             theme = str(pilot.app.theme)
-            post_terminal_input(pilot.app, bracketed_paste("one\x1b\x1btwo"))
-            await pilot.pause()
-            screens = [type(screen).__name__ for screen in pilot.app.screen_stack]
-            post_terminal_input(pilot.app, bracketed_paste("x\x1bq"))
-            await pilot.pause()
+            screens = []
+            for raw in (bracketed_paste("one\x1b\x1btwo"), bracketed_paste("x\x1bq")):
+                post_terminal_input(pilot.app, raw)
+                await pilot.pause()
+                screens.append([type(screen).__name__ for screen in pilot.app.screen_stack])
             return screens, theme, str(pilot.app.theme), pilot.app.return_code
 
     screens, before, after, return_code = asyncio.run(paste())
-    assert screens == ["Screen"], "a screen opened over the board"
+    assert screens == [["Screen"], ["Screen"]], "a screen opened over the board"
     assert after == before
     assert return_code is None, "the board quit"
 
