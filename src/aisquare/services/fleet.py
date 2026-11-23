@@ -1360,8 +1360,10 @@ def _census_refusal(
     live = {launch_seal.digest(row.id) for rows_live in running.values() for row in rows_live}
     held_labels: dict[str, dict[str, str]] = {}
     for project_id in {row.project_id for row in rows}:
-        for other in running.get(project_id, ()):
-            record = launch_seal.read(other.id)
+        others = running.get(project_id, ())
+        records = launch_seal.read_all(other.id for other in others)
+        for other in others:
+            record = records[other.id]
             if isinstance(record, launch_seal.LaunchRecord) and record.label:
                 held_labels.setdefault(project_id, {}).setdefault(record.label, other.id)
 
@@ -1425,14 +1427,15 @@ def _records_of(rows: Sequence[FleetAgent]) -> dict[str, launch_seal.LaunchRecor
     by an aisquare that keeps no records is placed by the first read that meets it, however
     long after the upgrade, a rollback or another such row it comes. A row the census
     refuses has its reason."""
-    records = {row.id: launch_seal.read(row.id) for row in rows}
+    records = launch_seal.read_all(row.id for row in rows)
     untaken = [
         row for row in rows if isinstance(records[row.id], str) and not launch_seal.recorded(row.id)
     ]
     if untaken:
         refused = take_census(untaken)
+        taken = launch_seal.read_all(row.id for row in untaken if not refused.get(row.id))
         for row in untaken:
-            records[row.id] = refused.get(row.id) or launch_seal.read(row.id)
+            records[row.id] = refused.get(row.id) or taken[row.id]
     return records
 
 
@@ -1447,7 +1450,7 @@ def records_as_read(rows: Sequence[FleetAgent]) -> dict[str, launch_seal.LaunchR
     the census records it would take included, writing nothing: what the doctor judges a
     row by, so it offers no command the fleet then refuses (R3 of 0.10.0, F4). Never
     raises: what cannot be read is the record's own reason."""
-    records = {row.id: launch_seal.read(row.id) for row in rows}
+    records = launch_seal.read_all(row.id for row in rows)
     untaken = [
         row for row in rows if isinstance(records[row.id], str) and not launch_seal.recorded(row.id)
     ]
