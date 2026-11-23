@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import copy
 import hashlib
 import json
 import os
@@ -52,7 +51,6 @@ from typing import TYPE_CHECKING, Any
 from aisquare.core import paths
 from aisquare.core.claude_accounts import FailedTurn, LimitNotice, LoginUnreadable
 from aisquare.core.codex_sharing import CodexFolderTrust
-from aisquare.core.parsed_files import json_object, parsed_or
 from aisquare.models import (
     SESSION_WINDOW,
     WEEK_WINDOW,
@@ -125,6 +123,14 @@ def auth_path(home: Path) -> Path:
     return home / "auth.json"
 
 
+def _read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        loaded: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
 def _claims(token: Any) -> dict[str, Any] | None:
     """The payload of a JWT, decoded and NOT verified — identity claims for display only."""
     if not isinstance(token, str) or token.count(".") != 2:
@@ -142,13 +148,10 @@ def _has(value: Any) -> bool:
 
 
 def _login(home: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """``auth.json`` and its id token's claims (``None`` each when absent or unreadable), each
-    a copy of its own, parsed again only once the file changed (``core.parsed_files``)."""
-    return copy.deepcopy(parsed_or(auth_path(home), _login_in_file, (None, None)))
-
-
-def _login_in_file(path: Path, text: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    data = json_object(path, text)
+    """``auth.json`` and its id token's claims (``None`` each when absent or unreadable)."""
+    data = _read_json(auth_path(home))
+    if data is None:
+        return None, None
     tokens = data.get("tokens")
     claims = _claims(tokens.get("id_token")) if isinstance(tokens, dict) else None
     return data, claims

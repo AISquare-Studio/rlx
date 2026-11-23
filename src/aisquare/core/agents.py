@@ -9,7 +9,6 @@ known context file) exists. The set of connected agents is persisted in
 from __future__ import annotations
 
 import contextlib
-import copy
 import errno
 import functools
 import importlib.metadata
@@ -45,7 +44,7 @@ from aisquare.core.agent_adapters.types import (
     hook_args,
 )
 from aisquare.core.agent_adapters.types import version_in as native_version
-from aisquare.core.parsed_files import json_object, parsed, parsed_or
+from aisquare.core.parsed_files import json_object, parsed_or
 from aisquare.core.version import DISTRIBUTION, __version__
 from aisquare.models import AgentHookSite, AgentInfo
 
@@ -325,12 +324,7 @@ def read_settings(path: Path) -> dict[str, Any]:
     """
     if not path.exists():
         return {}
-    return _settings_in_file(path, path.read_text(encoding="utf-8"))
-
-
-def _settings_in_file(path: Path, text: str) -> dict[str, Any]:
-    """The object ``text``, the settings file ``path``'s, holds, as :func:`read_settings`
-    reads it."""
+    text = path.read_text(encoding="utf-8")
     if not text.strip():
         return {}
     try:
@@ -364,6 +358,8 @@ def inspection_snapshot() -> Iterator[None]:
 
 def _read_settings(path: Path, *, strict: bool = False) -> dict[str, Any]:
     """Optional caches fail open; hook inspection must distinguish unreadable files."""
+    import copy
+
     snapshot = _SETTINGS_SNAPSHOT.get()
     key = _dir_key(path)
     if snapshot is not None and key in snapshot:
@@ -380,12 +376,10 @@ def _read_settings(path: Path, *, strict: bool = False) -> dict[str, Any]:
 
 
 def _read_settings_file(path: Path, *, strict: bool = False) -> dict[str, Any]:
-    """:func:`read_settings` for inspection: every failure an :class:`AgentSettingsError`.
-    Parsed again only once the file changed (``core.parsed_files``), each caller handed a copy."""
+    """:func:`read_settings` for inspection: every failure an :class:`AgentSettingsError`."""
     try:
-        if _regular_settings(path) is None:
-            return {}
-        return copy.deepcopy(parsed(path, _settings_in_file))
+        _regular_settings(path)
+        return read_settings(path)
     except FileNotFoundError:
         return {}
     except AgentSettingsError:
@@ -1445,8 +1439,8 @@ def enabled_plugins(config_dir: Path) -> list[str]:
 
 def _enabled_in(settings: Path) -> list[str]:
     """The ``enabledPlugins`` keys one settings file sets to true: a config dir's
-    (:func:`enabled_plugins`) or a repository's (:func:`claude_repo_plugins`). Parsed again only
-    once the file changed (``core.parsed_files``)."""
+    (:func:`enabled_plugins`) or a repository's (:func:`claude_repo_plugins`). The keys are kept
+    while the file is unchanged, once its last write has settled (``core.parsed_files``)."""
     return list(parsed_or(settings, _enabled_in_file, ()))
 
 
@@ -1556,18 +1550,12 @@ def claude_plugin(config_dir: Path | None = None) -> ClaudePlugin | None:
 
 def _plugin_records(config_dir: Path) -> list[Any]:
     """The aisquare plugin's install records in ``config_dir``'s
-    ``plugins/installed_plugins.json``: a list since its version 2, one record before. Parsed
-    again only once the file changed (``core.parsed_files``), each caller handed a copy."""
-    installed = config_dir / "plugins" / "installed_plugins.json"
-    return copy.deepcopy(list(parsed_or(installed, _plugin_records_in_file, ())))
-
-
-def _plugin_records_in_file(path: Path, text: str) -> tuple[Any, ...]:
-    installed = json_object(path, text).get("plugins")
+    ``plugins/installed_plugins.json``: a list since its version 2, one record before."""
+    installed = read_json(config_dir / "plugins" / "installed_plugins.json").get("plugins")
     records = installed.get(CLAUDE_PLUGIN_ID) if isinstance(installed, dict) else None
     if isinstance(records, dict):
-        return (records,)
-    return tuple(records) if isinstance(records, list) else ()
+        return [records]
+    return records if isinstance(records, list) else []
 
 
 #: The file in a repository's ``.claude`` that enables a plugin installed at each

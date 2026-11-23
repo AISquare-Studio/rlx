@@ -396,8 +396,8 @@ class ClaudeCodeAdapter:
         self, home: Path, settings_path: Path, args: Sequence[str] = ()
     ) -> HooksSwitch | None:
         """``"disableAllHooks": true`` in ``settings.json``, a literal ``true`` as Claude
-        Code reads it; ``args`` are not read. Parsed again only once the file changed
-        (``core.parsed_files``)."""
+        Code reads it; ``args`` are not read. The answer is kept while the file is unchanged,
+        once its last write has settled (``core.parsed_files``)."""
         if parsed_or(settings_path, _hooks_off_in_file, False):
             return HooksSwitch(self.hooks_off_setting, settings_path)
         return None

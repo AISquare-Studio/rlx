@@ -779,8 +779,9 @@ def identity(
 
 
 def read_identity(path: Path) -> ClaudeIdentity | None:
-    """Read stable account identity without using or fingerprinting rotating tokens, parsed
-    again only once the file changed (``core.parsed_files``)."""
+    """Read stable account identity without using or fingerprinting rotating tokens. The
+    identity is kept while the file is unchanged, once its last write has settled
+    (``core.parsed_files``)."""
     identity = parsed_or(path, _identity_in_file, None)
     return identity.model_copy() if identity is not None else None
 
@@ -932,18 +933,8 @@ def stored_login(account: ClaudeAccount, *, fresh: bool = False) -> StoredLogin:
         read = read_keychain(keychain_service(account), keychain_account(), fresh=fresh)
         if read.found or read.unreadable is not None:
             return StoredLogin(read.credentials, read.unreadable, read.problem)
-        return StoredLogin(_credentials_file(plaintext_credentials_path(account)))
-    return StoredLogin(_credentials_file(credentials_path(account)))
-
-
-def _credentials_file(path: Path) -> ClaudeCredentials | None:
-    """The credentials the file at ``path`` holds (:func:`credentials_in`), ``None`` when it
-    cannot be read, parsed again only once it changed (``core.parsed_files``)."""
-    return parsed_or(path, _credentials_in_file, None)
-
-
-def _credentials_in_file(path: Path, text: str) -> ClaudeCredentials | None:
-    return credentials_in(json_object(path, text))
+        return StoredLogin(credentials_in(_read_json(plaintext_credentials_path(account))))
+    return StoredLogin(credentials_in(_read_json(credentials_path(account))))
 
 
 def keychain_item(account: ClaudeAccount) -> str | None:

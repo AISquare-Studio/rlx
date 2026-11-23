@@ -500,17 +500,23 @@ def test_a_fleet_read_works_out_the_record_folder_and_reads_the_census_as_often_
     fleet: tuple[list[ProjectInfo], Panes], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """This test reads the count of folder lookups and census reads in one fleet read of the
-    tick (``_read_fleet``) with 1 row ended an hour ago, then in one with 40 more."""
+    tick (``_read_fleet``) with 1 row ended an hour ago, then in one with 40 more, and the live
+    rows each read shows of the project."""
     projects, _panes = fleet
     monkeypatch.setattr(fleet_service, "_now", lambda: LATER)
     history(projects[0], 1, ended=LATER - timedelta(hours=1), label="first")
     fleet_service.take_census()
     with folder_and_census_counted(monkeypatch) as few:
-        app_mod._read_fleet(False, viewed=[projects[0].id])
+        first = app_mod._read_fleet(False, viewed=[projects[0].id])
     history(projects[0], 40, ended=LATER - timedelta(hours=1), label="recent")
     fleet_service.take_census()
     with folder_and_census_counted(monkeypatch) as many:
-        app_mod._read_fleet(False, viewed=[projects[0].id])
+        second = app_mod._read_fleet(False, viewed=[projects[0].id])
+    live = [f"coder-{k}" for k in range(AGENTS_EACH)]
+    for read in (first, second):
+        assert read.error is None and not read.notices
+        assert [s.agent.label for s in read.agents[projects[0].id]] == live
+    assert "folder" in few and "census" in few
     assert sorted(many) == sorted(few)
 
 

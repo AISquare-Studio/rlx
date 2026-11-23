@@ -447,9 +447,9 @@ def read(agent_id: str) -> LaunchRecord | str:
 
 
 def read_all(agent_ids: Iterable[str]) -> dict[str, LaunchRecord | str]:
-    """:func:`read` of each of ``agent_ids``, by id, with :func:`seals_dir` worked out once and
-    the census read at most once for them all: a fleet listing reads the record of every row
-    it keeps. Never raises."""
+    """:func:`read` of each of ``agent_ids``, by id, with :func:`seals_dir` worked out once for
+    their record and window files, and the census (which works out its own) read at most once
+    for them all: a fleet listing reads the record of every row it keeps. Never raises."""
     directory = seals_dir()
     census: LegacyCensus | None = None
     records: dict[str, LaunchRecord | str] = {}
