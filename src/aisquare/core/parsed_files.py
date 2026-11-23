@@ -52,7 +52,7 @@ def _now() -> float:
     return time.time()
 
 
-def _signature(stat: os.stat_result) -> _Signature:
+def _stat_signature(stat: os.stat_result) -> _Signature:
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
@@ -73,13 +73,13 @@ def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
     try:
         before = os.stat(path)
         settled = _now() - before.st_mtime >= SETTLED
-        signature = _signature(before)
+        signature = _stat_signature(before)
         with _LOCK:
             kept = _KEPT.get(key)
         if kept is not None and kept[0] == signature:
             return cast(T, kept[1])
         value = parse(path, path.read_text(encoding="utf-8"))
-        unchanged = _signature(os.stat(path)) == signature
+        unchanged = _stat_signature(os.stat(path)) == signature
     except Exception:
         _forget(key)
         raise
