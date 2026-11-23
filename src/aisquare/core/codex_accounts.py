@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any
 from aisquare.core import paths
 from aisquare.core.claude_accounts import FailedTurn, LimitNotice, LoginUnreadable
 from aisquare.core.codex_sharing import CodexFolderTrust
-from aisquare.core.parsed_files import json_object, parsed
+from aisquare.core.parsed_files import json_object, parsed_or
 from aisquare.models import (
     SESSION_WINDOW,
     WEEK_WINDOW,
@@ -143,13 +143,8 @@ def _has(value: Any) -> bool:
 
 def _login(home: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """``auth.json`` and its id token's claims (``None`` each when absent or unreadable), each
-    a copy of its own, parsed again only once the file changed (``core.parsed_files``): ``asq``
-    asks it of every slot several times after each fleet frame."""
-    try:
-        data, claims = parsed(auth_path(home), _login_in_file)
-    except (OSError, ValueError):
-        return None, None
-    return copy.deepcopy(data), copy.deepcopy(claims)
+    a copy of its own, parsed again only once the file changed (``core.parsed_files``)."""
+    return copy.deepcopy(parsed_or(auth_path(home), _login_in_file, (None, None)))
 
 
 def _login_in_file(path: Path, text: str) -> tuple[dict[str, Any], dict[str, Any] | None]:

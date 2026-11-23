@@ -169,7 +169,8 @@ def test_a_changed_settings_file_is_read_and_shown_by_the_next_read(
     with account_files_read(fake_home, monkeypatch) as read:
         shown = rows(service.overview())
     assert [row[6] for row in shown] == [False, False, True, False]
-    assert read and all(path.is_relative_to(slots[2].config_dir) for path in read)
+    assert slots[2].config_dir / "settings.json" in read
+    assert all(path.is_relative_to(slots[2].config_dir) for path in read)
 
 
 def test_a_slot_added_is_listed_and_one_removed_is_dropped_by_the_next_read(
@@ -225,8 +226,7 @@ def test_an_empty_account_file_is_read_as_often_by_the_second_of_two_reads_as_by
     slots: list[ClaudeAccount], fake_home: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     """Slot 2's ``name`` empty, as a write caught halfway leaves it, an hour old: this test
-    counts the reads of the file in each of two overviews. An empty ``.claude.json`` is no JSON;
-    an empty ``settings.json`` reads as no settings."""
+    counts the reads of the file in each of two overviews."""
     path = slots[1].config_dir / name
     path.write_text("", encoding="utf-8")
     settle(fake_home)
@@ -237,11 +237,10 @@ def test_an_empty_account_file_is_read_as_often_by_the_second_of_two_reads_as_by
     assert second.count(path) == first.count(path) > 0
 
 
-def test_two_writes_of_one_size_inside_one_clock_tick_show_the_second_on_the_next_read(
+def test_two_writes_with_one_stat_show_the_second_on_the_next_read(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A file system whose clock ticks coarsely gives two writes inside one tick one signature.
-    This test pins the stat of slot 2's ``.claude.json`` at a first write's, writes the file
+    """This test pins the stat of slot 2's ``.claude.json`` at a first write's, writes the file
     again at the same size, and reads the email in an overview after each write."""
     path = core.claude_json_path(slots[1])
     path.write_text(json.dumps({"oauthAccount": {"emailAddress": "first@example.com"}}))
@@ -282,8 +281,8 @@ def test_a_callers_change_to_its_answer_is_not_handed_to_the_next_caller(
     slot_at: int,
     answer: Callable[[ClaudeAccount], dict[str, Any]],
 ) -> None:
-    """Three readers that hand out a dict, each asked twice for one file written an hour ago:
-    this test changes the first answer and reads the second."""
+    """This test asks each of three readers twice for one file written an hour ago, changes the
+    first answer, and reads the second."""
     slot = slots[slot_at]
     installed = slot.config_dir / "plugins" / "installed_plugins.json"
     installed.parent.mkdir(parents=True, exist_ok=True)
@@ -298,12 +297,11 @@ def test_a_callers_change_to_its_answer_is_not_handed_to_the_next_caller(
     assert json.dumps(answer(slot), sort_keys=True) == before
 
 
-def test_every_lookup_and_keep_of_a_parse_holds_the_lock(
+def test_each_lookup_and_keep_of_a_parse_in_two_overviews_holds_the_lock(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two overviews of the ``slots`` fixture (the first keeps each parse, the second finds
-    them), with the kept parses' map replaced by one that notes, at each lookup and each keep,
-    whether the map's lock is held."""
+    """This test reads, at each lookup and each keep in the kept parses' map over two overviews
+    of the ``slots`` fixture, whether the map's lock is held."""
     from aisquare.core import parsed_files
 
     held: list[bool] = []

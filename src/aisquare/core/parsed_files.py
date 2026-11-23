@@ -32,10 +32,11 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 T = TypeVar("T")
+U = TypeVar("U")
 
 SETTLED = 2.0
-"""Seconds since a file's last write before its parse is kept: two writes inside the coarsest
-clock a file system here keeps (FAT's, two seconds) show a cache one signature."""
+"""Seconds since a file's last write before its parse is kept: one tick of the coarsest clock
+a file system here keeps times by (FAT's), inside which two writes show one signature."""
 
 _Signature = tuple[int, int, int, int, int]
 _KEPT: dict[tuple[Path, Callable[..., object]], tuple[_Signature, object]] = {}
@@ -63,6 +64,15 @@ def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
         with _LOCK:
             _KEPT[key] = (signature, value)
     return value
+
+
+def parsed_or(path: Path, parse: Callable[[Path, str], T], unreadable: U) -> T | U:
+    """:func:`parsed`, or ``unreadable`` where the file is missing or cannot be read or ``parse``
+    raises ``ValueError``: the answer of a reader that never raises."""
+    try:
+        return parsed(path, parse)
+    except (OSError, ValueError):
+        return unreadable
 
 
 def json_object(path: Path, text: str) -> dict[str, Any]:

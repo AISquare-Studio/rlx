@@ -496,12 +496,11 @@ def folder_and_census_counted(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[
 
 
 @TMUX_ONLY
-def test_a_tick_works_out_the_record_folder_and_reads_the_census_as_often_for_41_rows_as_for_1(
+def test_a_fleet_read_works_out_the_record_folder_and_reads_the_census_as_often_for_41_rows_as_1(
     fleet: tuple[list[ProjectInfo], Panes], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The tick reads the launch record of every row it keeps (the live rows and those ended
-    within ``RECENTLY_ENDED``): this test reads the count of folder lookups and census reads in
-    one tick with 1 row ended an hour ago, then with 40 more."""
+    """This test reads the count of folder lookups and census reads in one fleet read of the
+    tick (``_read_fleet``) with 1 row ended an hour ago, then in one with 40 more."""
     projects, _panes = fleet
     monkeypatch.setattr(fleet_service, "_now", lambda: LATER)
     history(projects[0], 1, ended=LATER - timedelta(hours=1), label="first")
@@ -525,8 +524,8 @@ def test_a_record_reader_works_out_the_folder_and_reads_the_census_as_often_for_
     monkeypatch: pytest.MonkeyPatch,
     reader: Callable[[Sequence[FleetAgent]], dict[str, launch_seal.LaunchRecord | str]],
 ) -> None:
-    """``reader`` called once with 1 row the census holds and once with 40: the counts of folder
-    lookups and census reads, and each of the 40 rows' record, the census's."""
+    """This test reads the counts of folder lookups and census reads when ``reader`` is called
+    with 1 row the census holds and with 40, and each of the 40 rows' record."""
     projects, _panes = fleet
     rows = history(projects[0], 40, ended=STARTED, label="census")
     fleet_service.take_census()
@@ -545,9 +544,9 @@ def test_a_record_reader_works_out_the_folder_and_reads_the_census_as_often_for_
 def test_a_read_that_takes_the_census_of_40_rows_reads_the_census_as_often_as_for_1(
     fleet: tuple[list[ProjectInfo], Panes], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_records_of`` called with 1 row that no record names and the census does not hold, then
-    with 40 more: each call takes the census of its rows and reads their records back. This
-    test reads the count of census reads in each call, and each of the 40 rows' record."""
+    """This test reads the count of census reads when ``_records_of`` is called with 1 row that
+    no record names and the census does not hold, then with 40 more, and each of the 40 rows'
+    record."""
     projects, _panes = fleet
     fleet_service.take_census()  # the live rows': both calls find a census there
     rows = history(projects[0], 41, ended=STARTED, label="untaken")
@@ -566,11 +565,9 @@ def test_a_read_that_takes_the_census_of_40_rows_reads_the_census_as_often_as_fo
 def test_a_census_taken_beside_23_running_rows_reads_the_census_as_often_as_beside_3(
     fleet: tuple[list[ProjectInfo], Panes], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_records_of`` of one row that no record names and the census does not hold, in a
-    project with the fixture's 3 running rows, then of another once 20 more run there: taking
-    the census reads the running rows' records (a row under a label one of them holds is
-    refused). This test reads the count of census reads in each call, and the second row's
-    record."""
+    """This test reads the count of census reads when ``_records_of`` is called with one row that
+    no record names and the census does not hold, in a project with the fixture's 3 running
+    rows, then with another once 20 more run there, and the second row's record."""
     projects, _panes = fleet
     project = projects[0]
     fleet_service.take_census()
@@ -598,9 +595,10 @@ def test_a_census_taken_beside_23_running_rows_reads_the_census_as_often_as_besi
 def test_a_batch_read_answers_each_id_what_a_read_of_it_alone_answers(
     fleet: tuple[list[ProjectInfo], Panes],
 ) -> None:
-    """``launch_seal.read_all`` over one batch of six ids, one of each kind of record: a spawn's
-    with its window, a spawn's with no window file, the census's, none at all, a file that is
-    no record, and a file holding another row's record."""
+    """This test reads ``launch_seal.read_all``'s answer for one batch of six ids, one of each
+    kind of record (a spawn's with its window, a spawn's with no window file, the census's, none
+    at all, a file that is no record, and a file holding another row's record), and
+    ``launch_seal.read``'s for each id alone."""
     projects, _panes = fleet
     project = projects[0]
     [placed, unplaced, census, missing, broken, other] = history(

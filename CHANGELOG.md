@@ -10,8 +10,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The app does less work on each refresh.** It works out where the agents' launch records
   are once a refresh, not once an agent, and it parses each account's `.claude.json`, login,
-  settings and plugins again only after the file changes, where every refresh parsed each of
-  them several times.
+  settings and plugins again only after the file changes (one that is empty or cannot be read,
+  each time), where every refresh parsed each of them several times.
 
 ## [0.10.1] - 2026-11-18
 

@@ -60,7 +60,7 @@ from aisquare.core.claude_accounts import (
     ClaudeCodeAccounts,
 )
 from aisquare.core.config import FleetSettings
-from aisquare.core.parsed_files import json_object, parsed
+from aisquare.core.parsed_files import json_object, parsed_or
 from aisquare.core.process_table import PaneProcesses
 
 #: ``--permission-mode`` for each approvals intent (``core.config.CLAUDE_PERMISSION_MODES``);
@@ -154,7 +154,7 @@ SKILL_NAMES_SETTINGS = '{"skillListingMaxDescChars": 1}'
 _NPM_PACKAGE = "@anthropic-ai/claude-code"
 
 
-def _hooks_off_in(path: Path, text: str) -> bool:
+def _hooks_off_in_file(path: Path, text: str) -> bool:
     return json_object(path, text).get("disableAllHooks") is True
 
 
@@ -397,12 +397,10 @@ class ClaudeCodeAdapter:
     ) -> HooksSwitch | None:
         """``"disableAllHooks": true`` in ``settings.json``, a literal ``true`` as Claude
         Code reads it; ``args`` are not read. Parsed again only once the file changed
-        (``core.parsed_files``): ``asq`` asks it of every slot after each fleet frame."""
-        try:
-            hooks_off = parsed(settings_path, _hooks_off_in)
-        except (OSError, ValueError):
-            hooks_off = False
-        return HooksSwitch(self.hooks_off_setting, settings_path) if hooks_off else None
+        (``core.parsed_files``)."""
+        if parsed_or(settings_path, _hooks_off_in_file, False):
+            return HooksSwitch(self.hooks_off_setting, settings_path)
+        return None
 
     def hook_entry(self, spec: HookSpec, command: str) -> dict[str, Any]:
         """``{"type": "command", "command": …, "timeout": <seconds>}`` in a ``settings.json``
