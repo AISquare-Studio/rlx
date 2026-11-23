@@ -90,6 +90,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from aisquare.core import claude_sharing, paths, tls
 from aisquare.core.harness import MODEL_FAMILIES, model_family
 from aisquare.core.names import name_flaw, name_key
+from aisquare.core.parsed_files import json_object, parsed
 from aisquare.core.version import __version__
 from aisquare.models import (
     ClaudeAccount,
@@ -778,8 +779,18 @@ def identity(
 
 
 def read_identity(path: Path) -> ClaudeIdentity | None:
-    """Read stable account identity without using or fingerprinting rotating tokens."""
-    return identity_in(_read_json(path))
+    """Read stable account identity without using or fingerprinting rotating tokens, parsed
+    again only once the file changed (``core.parsed_files``): ``asq`` asks it of every slot
+    after each fleet frame."""
+    try:
+        identity = parsed(path, _identity_in_file)
+    except (OSError, ValueError):
+        return None
+    return identity.model_copy() if identity is not None else None
+
+
+def _identity_in_file(path: Path, text: str) -> ClaudeIdentity | None:
+    return identity_in(json_object(path, text))
 
 
 def identity_in(data: Mapping[str, Any] | None) -> ClaudeIdentity | None:
@@ -925,8 +936,22 @@ def stored_login(account: ClaudeAccount, *, fresh: bool = False) -> StoredLogin:
         read = read_keychain(keychain_service(account), keychain_account(), fresh=fresh)
         if read.found or read.unreadable is not None:
             return StoredLogin(read.credentials, read.unreadable, read.problem)
-        return StoredLogin(credentials_in(_read_json(plaintext_credentials_path(account))))
-    return StoredLogin(credentials_in(_read_json(credentials_path(account))))
+        return StoredLogin(_credentials_file(plaintext_credentials_path(account)))
+    return StoredLogin(_credentials_file(credentials_path(account)))
+
+
+def _credentials_file(path: Path) -> ClaudeCredentials | None:
+    """The credentials the file at ``path`` holds (:func:`credentials_in`), ``None`` when it
+    cannot be read, parsed again only once it changed (``core.parsed_files``): ``asq`` reads
+    each slot's login several times after each fleet frame."""
+    try:
+        return parsed(path, _credentials_in_file)
+    except (OSError, ValueError):
+        return None
+
+
+def _credentials_in_file(path: Path, text: str) -> ClaudeCredentials | None:
+    return credentials_in(json_object(path, text))
 
 
 def keychain_item(account: ClaudeAccount) -> str | None:
