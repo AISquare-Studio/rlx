@@ -95,8 +95,11 @@ Clock = list[float]
 
 
 @pytest.fixture(autouse=True)
-def guarded() -> None:
-    """The guard in place, as building any asq app puts it (``ClipboardApp``)."""
+def guarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard in place, as building any rlx app puts it (``ClipboardApp``); the parse and
+    the install record this process had before are put back after the test."""
+    monkeypatch.setattr(XTermParser, "parse", XTermParser.parse)
+    monkeypatch.setattr(paste_guard, "_installed", paste_guard._installed)
     assert paste_guard.install()
 
 
