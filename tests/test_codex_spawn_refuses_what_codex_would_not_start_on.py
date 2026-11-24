@@ -25,14 +25,14 @@ from tests.test_fleet_service import (  # noqa: F401 - fixtures, by name
 CODEX = get_adapter("codex")
 
 
-def _configure(bound: list[str], role: list[str], *, first_prompt: str | None = None) -> None:
+def _configure(bound: list[str], role: list[str], *, typed: bool = False) -> None:
     """The coder role's binding, made for Claude Code, holding ``bound``, and its Codex
-    ``agent_args`` holding ``role``."""
+    ``agent_args`` holding ``role``; ``typed``: ``[fleet] first_prompt = "type"``."""
     config = load_config()
     config.fleet.roles["coder"] = FleetRoleSettings(worktree=False, agent_args={"codex": role})
     config.team.profiles["coder"] = RoleLaunchProfile(agent="claude-code", args=bound)
-    if first_prompt is not None:
-        config.fleet.first_prompt = first_prompt
+    if typed:
+        config.fleet.first_prompt = "type"
     save_config(config)
 
 
@@ -118,11 +118,11 @@ def test_a_second_folder_in_the_spawns_own_arguments_is_refused_beside_its_first
 
 
 @pytest.mark.parametrize(
-    ("own", "prompt", "first_prompt"),
+    ("own", "prompt", "typed"),
     [
-        (["--add-dir", "/a", "--add-dir", "/b"], "start", None),
-        (["--add-dir", "/a", "fix the bug"], None, None),
-        (["--add-dir", "/a", "fix the bug"], "start", "type"),
+        (["--add-dir", "/a", "--add-dir", "/b"], "start", False),
+        (["--add-dir", "/a", "fix the bug"], None, False),
+        (["--add-dir", "/a", "fix the bug"], "start", True),
     ],
     ids=["one-each-beside-prompt", "own-prompt", "own-prompt-beside-typed"],
 )
@@ -132,12 +132,12 @@ def test_a_codex_spawn_opens_its_window_with_its_own_arguments_in_order(
     project: ProjectInfo,  # noqa: F811
     own: list[str],
     prompt: str | None,
-    first_prompt: str | None,
+    typed: bool,
 ) -> None:
     """One ``--add-dir`` per folder, and a word after one where the fleet puts no first message
     on the command line (none given, or typed under ``[fleet] first_prompt = "type"``), with
     Codex's effort in the role's ``agent_args``: one window, whose command holds ``own``."""
-    _configure([], ["-c", 'model_reasoning_effort="high"'], first_prompt=first_prompt)
+    _configure([], ["-c", 'model_reasoning_effort="high"'], typed=typed)
     fleet_service.spawn(project, "coder", agent="codex", agent_args=own, prompt=prompt)
     assert len(tmux.spawned) == 1 and _holds(_command(tmux), own), _command(tmux)
 
