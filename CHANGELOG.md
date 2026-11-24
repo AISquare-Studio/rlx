@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The README shows how agents on different accounts reach each other,** with
+  `rlx --json fleet top` and `rlx fleet tell -P <project_id> <label>`; Claude Code's own
+  `/peers` and `SendMessage` stay within one account.
+
 ## [0.10.1] - 2026-11-18
 
 ### Added

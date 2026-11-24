@@ -135,6 +135,18 @@ rlx outcomes                         # what the agents got done this week, and w
 rlx doctor                           # is everything wired? (and how to fix anything)
 ```
 
+Agents on different accounts reach each other through rlx; Claude Code's own `/peers`
+and `SendMessage` stay within one account:
+
+```sh
+rlx --json fleet top                           # every project's live agents: project_id, label
+rlx fleet tell -P <project_id> <label> "done"  # a message to one of them
+```
+
+Within this project, `rlx fleet ls` and `rlx fleet tell <label> "done"` are enough. A
+waiting agent has the message typed at its prompt; a busy one gets it later, when its
+turn ends or at its next prompt.
+
 ## Requirements
 
 - macOS, Linux, or Windows through WSL2.
