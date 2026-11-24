@@ -36,18 +36,23 @@ def folder(env: Mapping[str, str], sockets: PeerSockets) -> Path:
     return Path(named) if named else paths.messaging_dir().absolute()
 
 
-def problem(where: Path, sockets: PeerSockets) -> str | None:
-    """Why a session cannot put its socket under ``where``, or ``None`` when it can.
-
-    Its longest socket path (:data:`WIDEST_PID`) must fit ``sockets.max_bytes``, and a folder
-    that exists must be a directory of this user's, closed to everyone else (``0700``), as the
-    XDG spec asks of a runtime dir: other programs in the session read the variable too. A
-    folder not made yet has only the length to fail.
-    """
+def too_long(where: Path, sockets: PeerSockets) -> str | None:
+    """Why ``where`` is too long for the sessions' sockets, or ``None``: its longest socket
+    path (:data:`WIDEST_PID`) must fit ``sockets.max_bytes``."""
     longest = where / sockets.subfolder / f"{WIDEST_PID}.sock"
     size = len(os.fsencode(str(longest)))
     if size > sockets.max_bytes:
         return f"{longest} is {size} bytes, over the {sockets.max_bytes} a socket path may take"
+    return None
+
+
+def not_private(where: Path) -> str | None:
+    """Why ``where`` is no runtime dir of this user's, or ``None``.
+
+    A folder that exists must be a directory of this user's, closed to everyone else
+    (``0700``), as the XDG spec asks of a runtime dir: other programs in the session read the
+    variable too. A folder not made yet has nothing to fail.
+    """
     try:
         facts = where.lstat()
     except FileNotFoundError:
@@ -69,16 +74,19 @@ def apply(env: dict[str, str], sockets: PeerSockets | None) -> dict[str, str]:
     and return ``env``.
 
     Only where ``env`` names no folder of its own, never on Windows (no unix sockets: Claude
-    Code's are named pipes there), and only a folder a session can use: made ``0700`` here, and
-    left out of ``env`` while :func:`problem` has a reason, which the doctor's row names.
+    Code's are named pipes there), and only a folder a session can use: short enough
+    (:func:`too_long`), made ``0700`` here, and left out of ``env`` while :func:`not_private`
+    has a reason. The doctor's row names either reason.
     """
     if sockets is None or sys.platform == "win32" or env.get(sockets.folder_env, "").strip():
         return env
     shared = folder(env, sockets)
+    if too_long(shared, sockets) is not None:
+        return env
     try:
         shared.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError:
         return env  # the doctor's row says why
-    if problem(shared, sockets) is None:
+    if not_private(shared) is None:
         env[sockets.folder_env] = str(shared)
     return env

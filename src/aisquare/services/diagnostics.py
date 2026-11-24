@@ -736,9 +736,12 @@ def _check_home_filesystem() -> DoctorCheck:
 def _peer_sockets_checks() -> list[DoctorCheck]:
     """A row for each agent whose sessions message each other over sockets
     (``capabilities.peer_sockets``): the folder a session launched from here puts its socket
-    under (``core.peer_sockets.folder``), and why a session cannot use it
-    (``core.peer_sockets.problem``). It only reads: a launch makes the folder. None on
-    Windows, where no launch names one."""
+    under (``core.peer_sockets.folder``), and why a session cannot use it. A folder that is no
+    private one of this user's warns (``core.peer_sockets.not_private``); one too long for the
+    sockets is said on an ok row (``core.peer_sockets.too_long``): a launch then names no folder,
+    and the sessions keep their sockets where they did before it, as every long home (a test
+    home among them) would. It only reads: a launch makes the folder. None on Windows, where
+    no launch names one."""
     if sys.platform == "win32":
         return []
     rows: list[DoctorCheck] = []
@@ -752,17 +755,20 @@ def _peer_sockets_checks() -> list[DoctorCheck]:
             whose = f"{sockets.folder_env} as this shell sets it, which launches keep"
         else:
             whose = f"rlx's own, which launches set as {sockets.folder_env}"
-        reason = peer_sockets.problem(where, sockets)
+        reason = peer_sockets.not_private(where)
         if reason is not None:
             rows.append(
                 _warn(
                     name,
                     f"{where} ({whose}) cannot hold the sessions' sockets: {reason}",
-                    "Make it a folder of yours with mode 0700, on a path short enough for "
-                    f"its socket paths (AISQUARE_HOME moves rlx's own; {sockets.folder_env} "
-                    "names another)",
+                    "Make it a folder of yours with mode 0700, or name another with "
+                    f"{sockets.folder_env}",
                 )
             )
+            continue
+        long = peer_sockets.too_long(where, sockets)
+        if long is not None:
+            rows.append(_ok(name, f"{where} ({whose}) cannot hold the sessions' sockets: {long}"))
             continue
         made = "" if where.exists() else "; the first launch makes it"
         rows.append(

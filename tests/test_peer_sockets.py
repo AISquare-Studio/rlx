@@ -242,8 +242,8 @@ def test_a_socket_path_of_exactly_max_bytes_fits_and_one_byte_more_does_not() ->
     over = Path(f"{fits}g")
     assert len(os.fsencode(f"{fits}{tail}")) == SOCKETS.max_bytes
 
-    assert peer_sockets.problem(fits, SOCKETS) is None
-    reason = peer_sockets.problem(over, SOCKETS)
+    assert peer_sockets.too_long(fits, SOCKETS) is None
+    reason = peer_sockets.too_long(over, SOCKETS)
     assert reason == (
         f"{over}{tail} is {SOCKETS.max_bytes + 1} bytes, over the {SOCKETS.max_bytes} a "
         "socket path may take"
@@ -251,15 +251,18 @@ def test_a_socket_path_of_exactly_max_bytes_fits_and_one_byte_more_does_not() ->
 
 
 @posix_only
-def test_a_home_too_long_for_a_socket_path_is_left_out_of_the_launch_and_named_by_the_doctor(
+def test_a_home_too_long_for_a_socket_path_gets_no_folder_and_an_ok_row_naming_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A launch then leaves the variable unset, as before the shared folder: no warning, which
+    the installer's summary and asq's Doctor would list as something to act on."""
     home = tmp_path / ("h" * SOCKETS.max_bytes)
     monkeypatch.setenv(paths.HOME_ENV_VAR, str(home))
 
     assert VAR not in peer_sockets.apply({}, SOCKETS)
+    assert not paths.messaging_dir().exists()
     row = _doctor_row()
-    assert row.status == CheckStatus.warn
+    assert row.status == CheckStatus.ok
     assert str(paths.messaging_dir().absolute()) in row.detail
     assert f"over the {SOCKETS.max_bytes} a socket path may take" in row.detail
 
