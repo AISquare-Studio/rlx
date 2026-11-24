@@ -345,12 +345,13 @@ def test_the_cap_drops_the_least_recently_used_parse(
 def test_lookups_keeps_drops_evictions_and_both_sweep_steps_hold_the_lock(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """This test reads whether the map's lock is held at each operation on the kept parses, by
-    kind: a lookup, a keep, the drop a failed read makes, an eviction, and the sweep's selection
-    and its removal of a parse. It drives two overviews of the ``slots`` fixture, the second
-    once slot 2 is removed with its parse still kept and slot 3's ``.claude.json`` is gone,
-    then one read of slot 3's file written again, with
-    :data:`~aisquare.core.parsed_files.MAX_KEPT` patched to one."""
+    """This test reads whether the map's lock is held, by kind, at these calls on the kept
+    parses: ``get`` and ``move_to_end`` (a lookup), an assignment (a keep), ``pop`` from
+    ``_forget`` (a failed read's drop), ``popitem`` (an eviction), iteration (the sweep's
+    selection) and ``pop`` from ``forget_under`` (the sweep's removal). Each call is read on its
+    own. It drives two overviews of the ``slots`` fixture, the second once slot 2 is removed
+    with its parse still kept and slot 3's ``.claude.json`` is gone, then one read of slot 3's
+    file written again, with :data:`~aisquare.core.parsed_files.MAX_KEPT` patched to one."""
     held: dict[str, list[bool]] = {
         "lookup": [],
         "keep": [],

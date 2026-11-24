@@ -122,7 +122,7 @@ import hashlib
 import logging
 import re
 import tempfile
-from collections.abc import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -310,17 +310,16 @@ def digest(agent_id: str) -> str:
     return hashlib.sha256(agent_id.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def _path(agent_id: str, directory: Path | None = None) -> Path:
+def _path(agent_id: str) -> Path:
     """The record of the row ``agent_id``, named by the id's digest: the id is the
     store's, and joined into the path it could name a file the sandbox wrote (``..``, a
-    separator, an absolute path). In ``directory``, :func:`seals_dir` as a reader of many
-    records worked it out (:func:`read_all`), else here."""
-    return (directory if directory is not None else seals_dir()) / f"{digest(agent_id)}.json"
+    separator, an absolute path)."""
+    return seals_dir() / f"{digest(agent_id)}.json"
 
 
-def _window_path(agent_id: str, directory: Path | None = None) -> Path:
+def _window_path(agent_id: str) -> Path:
     """Where the row ``agent_id``'s window is recorded (:func:`placed`), beside its record."""
-    record = _path(agent_id, directory)
+    record = _path(agent_id)
     return record.with_name(f"{record.stem}.window.json")
 
 
@@ -394,12 +393,11 @@ def placed(agent_id: str, window: WindowPlace) -> str | None:
     return None
 
 
-def _window(path: Path) -> WindowPlace | None:
-    """Where :func:`placed` recorded a row's window, in its window file ``path``
-    (:func:`_window_path`); ``None`` when it did not, or what it wrote cannot be read (so
-    nothing is typed into or killed on its word)."""
+def _window(agent_id: str) -> WindowPlace | None:
+    """Where :func:`placed` recorded the row's window; ``None`` when it did not, or what
+    it wrote cannot be read (so nothing is typed into or killed on its word)."""
     try:
-        return WindowPlace.model_validate_json(path.read_text(encoding="utf-8"))
+        return WindowPlace.model_validate_json(_window_path(agent_id).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValidationError):
         return None
 
@@ -443,34 +441,16 @@ def read(agent_id: str) -> LaunchRecord | str:
     """The record of the row ``agent_id``, or why there is none to replay. Never raises.
     A row spawned by an aisquare that keeps no records has the one the census made for it
     (:func:`take_census`), once it took it."""
-    return read_all([agent_id])[agent_id]
-
-
-def read_all(agent_ids: Iterable[str]) -> dict[str, LaunchRecord | str]:
-    """:func:`read` of each of ``agent_ids``, by id, with :func:`seals_dir` worked out once for
-    their record and window files, and the census (which works out its own) read at most once
-    for them all: a fleet listing reads the record of every row it keeps. Never raises."""
-    directory = seals_dir()
-    census: LegacyCensus | None = None
-    records: dict[str, LaunchRecord | str] = {}
-    for agent_id in agent_ids:
-        try:
-            body = _path(agent_id, directory).read_text(encoding="utf-8")
-        except FileNotFoundError:
-            if census is None:
-                census = _census()
-            legacy = census.records.get(agent_id)
-            records[agent_id] = UNRECORDED if legacy is None or legacy.id != agent_id else legacy
-        except (OSError, UnicodeDecodeError) as exc:
-            records[agent_id] = f"its launch record could not be read ({exc})"
-        else:
-            records[agent_id] = _record_in(body, agent_id, directory)
-    return records
-
-
-def _record_in(body: str, agent_id: str, directory: Path) -> LaunchRecord | str:
-    """The record of the row ``agent_id`` its file in ``directory`` holds (``body``), with its
-    window, or why it cannot be replayed (:func:`read`)."""
+    path = _path(agent_id)
+    try:
+        body = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        legacy = _census().records.get(agent_id) if census_taken() else None
+        if legacy is not None and legacy.id == agent_id:
+            return legacy
+        return UNRECORDED
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"its launch record could not be read ({exc})"
     try:
         record = LaunchRecord.model_validate_json(body)
     except ValidationError as exc:
@@ -482,7 +462,7 @@ def _record_in(body: str, agent_id: str, directory: Path) -> LaunchRecord | str:
         )
     if record.id != agent_id:
         return "its launch record names another row"
-    return record.model_copy(update={"window": _window(_window_path(agent_id, directory))})
+    return record.model_copy(update={"window": _window(agent_id)})
 
 
 def _census_path() -> Path:

@@ -18,8 +18,8 @@ Limits:
   is the caller's, and it is kept under that read's own digest; the file's final bytes miss it.
 - A read that raises (no file there, any other ``OSError``) and a parse that raises (bytes that are
   no UTF-8, no JSON object, an empty file) drop the path's kept answer, and the exception goes on to
-  the caller (:func:`parsed_or` turns ``OSError`` and ``ValueError`` into a fallback). The next
-  read that succeeds parses again.
+  the caller (:func:`parsed_or` turns ``OSError`` and ``ValueError`` into a fallback). A later
+  read of the same bytes parses them again unless another reader has kept their answer since.
 - At most :data:`MAX_KEPT` answers are kept, the least recently used dropped first, and an accounts
   overview drops those of slots it no longer lists (:func:`forget_under`). Both are eventual: a read
   that began before a slot was removed can keep its answer until the next sweep or eviction.
@@ -86,8 +86,8 @@ def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
 
 
 def parsed_or(path: Path, parse: Callable[[Path, str], T], unreadable: U) -> T | U:
-    """:func:`parsed`, or ``unreadable`` where reading the file raises ``OSError`` or decoding it
-    or ``parse`` raises ``ValueError``; any other exception goes on to the caller."""
+    """:func:`parsed`, or ``unreadable`` where it raises ``OSError`` or ``ValueError``, whether
+    from the read, the decoding or ``parse``; any other exception goes on to the caller."""
     try:
         return parsed(path, parse)
     except (OSError, ValueError):
