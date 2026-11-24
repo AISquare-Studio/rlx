@@ -5709,11 +5709,11 @@ def spawn(
         prompt_way = delivery.first_prompt_way(
             positional=selected.adapter.capabilities.positional_prompt, setting=config.first_prompt
         )
-        ours = prompt_way == "argv" and bool(prompt or (task_id is not None and kickoff))
+        prompt_in_argv = prompt_way == "argv" and bool(prompt or (task_id is not None and kickoff))
         for source, args, may_prompt in (
             (f"team.profiles.{role}.args", bound, False),
             (f"fleet.roles.{role}.agent_args.{selected.adapter.id}", role_args, False),
-            ("the spawn's own arguments", extra, not ours),
+            ("the spawn's own arguments", extra, not prompt_in_argv),
         ):
             if refusal := selected.adapter.args_refusal(args, may_prompt=may_prompt):
                 raise FleetError(f"{source}: {refusal}")

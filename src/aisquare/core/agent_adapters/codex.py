@@ -50,6 +50,7 @@ from aisquare.core.agent_adapters.types import (
     TelemetryReader,
     Vocabulary,
     WriteScope,
+    _before_separator,
     block_reply,
     command_entry,
     config_assignment,
@@ -85,7 +86,7 @@ APPROVAL_POLICIES = ("on-request", "never")
 _APPROVAL_SWITCHES = frozenset(
     {"--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "--yolo"}
 )
-#: Claude Code's flags that rlx's own settings write, which stock Codex has no option for.
+#: Claude Code's flags that rlx itself writes for it, which stock Codex has no option for.
 FOREIGN_FLAGS = ("--effort", "--disallowedTools", "--allowedTools", "--permission-mode", "--chrome")
 #: Its model option's spellings (``CodexAdapter.model_flags``).
 MODEL_FLAGS = ("--model", "-m")
@@ -1397,7 +1398,7 @@ class CodexAdapter:
         """Up to Codex's ``--``: a flag of :data:`FOREIGN_FLAGS`, an ``--add-dir`` with no
         folder, and unless ``may_prompt`` a word after its folder, which Codex would read as
         its prompt. Every other option is Codex's to refuse."""
-        head = list(args[: args.index("--")] if "--" in args else args)
+        head = _before_separator(args)
         for at, arg in enumerate(head):
             name, inline, folder = arg.partition("=")
             if name in FOREIGN_FLAGS:
@@ -1408,16 +1409,16 @@ class CodexAdapter:
             if name != "--add-dir":
                 continue
             if not inline:
-                folder = next(iter(head[at + 1 : at + 2]), "-")
+                folder = head[at + 1] if at + 1 < len(head) else "-"
             if not folder or (folder.startswith("-") and not inline):
                 return "--add-dir is given no folder"
-            after = head[at + 1 :] if inline else head[at + 2 :]
-            words = list(takewhile(lambda word: not word.startswith("-"), after))
-            if words and not may_prompt:
-                each = " ".join(f"--add-dir {path}" for path in (folder, *words))
+            following = head[at + 1 :] if inline else head[at + 2 :]
+            more_folders = list(takewhile(lambda word: not word.startswith("-"), following))
+            if more_folders and not may_prompt:
+                one_each = " ".join(f"--add-dir {path}" for path in (folder, *more_folders))
                 return (
-                    f"--add-dir takes one folder, and Codex would read {words[0]!r} as its "
-                    f"prompt: write {each}"
+                    f"--add-dir takes one folder, and Codex would read {more_folders[0]!r} as "
+                    f"its prompt: write {one_each}"
                 )
         return None
 

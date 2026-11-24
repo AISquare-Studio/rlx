@@ -9,11 +9,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **A fleet spawn of Codex refuses, before its window opens, arguments Codex would not start
-  on, naming the setting they came from.** That is a Claude Code flag rlx's own settings write,
-  such as `--effort` or `--disallowedTools`; an `--add-dir` with no folder; and a second folder
-  after one `--add-dir`, which Codex would read as its prompt (in the role's binding or its
-  `agent_args`, or beside the first message the fleet gives). Write `--add-dir` once per
-  folder, and put a role's flags for each agent in
+  on, naming the setting they came from.** That is a Claude Code flag rlx itself writes for
+  Claude Code, such as `--effort` or `--disallowedTools`; an `--add-dir` with no folder; and a
+  second folder after one `--add-dir`, which Codex would read as its prompt (in the role's
+  binding or its `agent_args`, or beside the first message the fleet gives). Write `--add-dir`
+  once per folder, and put a role's flags for each agent in
   `fleet.roles.<role>.agent_args.codex` or `.claude-code`; Codex's effort is
   `-c model_reasoning_effort=<level>`. Codex's own parser still checks every other option.
 
