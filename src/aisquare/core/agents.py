@@ -44,7 +44,6 @@ from aisquare.core.agent_adapters.types import (
     hook_args,
 )
 from aisquare.core.agent_adapters.types import version_in as native_version
-from aisquare.core.parsed_files import json_object, parsed_or
 from aisquare.core.version import DISTRIBUTION, __version__
 from aisquare.models import AgentHookSite, AgentInfo
 
@@ -1439,16 +1438,11 @@ def enabled_plugins(config_dir: Path) -> list[str]:
 
 def _enabled_in(settings: Path) -> list[str]:
     """The ``enabledPlugins`` keys one settings file sets to true: a config dir's
-    (:func:`enabled_plugins`) or a repository's (:func:`claude_repo_plugins`). The keys are kept
-    while the file is unchanged, once its last write has settled (``core.parsed_files``)."""
-    return list(parsed_or(settings, _enabled_in_file, ()))
-
-
-def _enabled_in_file(path: Path, text: str) -> tuple[str, ...]:
-    plugins = json_object(path, text).get("enabledPlugins")
+    (:func:`enabled_plugins`) or a repository's (:func:`claude_repo_plugins`)."""
+    plugins = read_json(settings).get("enabledPlugins")
     if not isinstance(plugins, dict):
-        return ()
-    return tuple(str(key) for key, enabled in plugins.items() if enabled)
+        return []
+    return [str(key) for key, enabled in plugins.items() if enabled]
 
 
 ClaudePlugin = PluginInstall

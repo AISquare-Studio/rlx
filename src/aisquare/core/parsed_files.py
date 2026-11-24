@@ -1,93 +1,85 @@
-"""Small answers parsed out of a slot's files, parsed again only once the file changed.
+"""A small answer parsed out of a file, parsed again only when the file's bytes differ.
 
 ``asq`` reads every account slot's files after each fleet frame
-(``services.claude_accounts.overview``), several times a slot a read. Three readers keep what
-they parse here: the account's identity from its ``.claude.json``, in which Claude Code keeps
-tens of KB to tens of MB, and from its ``settings.json`` the plugins it enables and whether it
-switches every hook off. Each keeps a small answer (an identity, a tuple, a bool), never a
-login, never a whole decoded file. :func:`parsed` keeps an answer by the file's path and its
-parser while the file's signature (device, inode, size, modification and change times) is the
-one it was read under; a later call with that signature is handed the kept answer.
+(``services.claude_accounts.overview``), and asks each slot's ``.claude.json`` for its identity
+several times a read; Claude Code keeps tens of KB to tens of MB in that file.
+``claude_accounts.read_identity`` reads it here. :func:`parsed` reads the file on every call and
+keeps the parser's answer under the SHA-256 digest of the bytes it parsed: a call whose bytes have
+that digest is handed the kept answer without a parse, any other is parsed. An answer handed out is
+so the parse of the bytes just read, assuming no SHA-256 collision; no stat or clock decides it.
 
-An answer is kept only when the read can be told apart from any later write:
+What is kept: per path and parser, one digest and one answer, which may be ``None`` (a JSON object
+with nothing to project). Nothing of a file's bytes, and never a login.
 
-- The file was last written at least :data:`SETTLED` seconds before it was stat'ed. A write
-  after the stat then lands in a later tick of even a coarse clock, and changes the signature.
-- Its stat after the read is the one before it, so no write landed while it was read.
+Limits:
 
-A read that raises (no file there, any other ``OSError``, bytes that are no UTF-8), a parse that
-raises (an empty file holds no JSON), and a read that is not kept each drop what the file had
-kept: the caller answers as it does for a file it cannot read, and the next call reads again.
-Two callers that miss at once each parse the file.
+- A read that overlaps an in-place write can return valid partial or mixed JSON. That read's answer
+  is the caller's, and it is kept under that read's own digest; the file's final bytes miss it.
+- A read that raises (no file there, any other ``OSError``) and a parse that raises (bytes that are
+  no UTF-8, no JSON object, an empty file) drop the path's kept answer, and the exception goes on to
+  the caller (:func:`parsed_or` turns ``OSError`` and ``ValueError`` into a fallback).
+- At most :data:`MAX_KEPT` answers are kept, the least recently used dropped first, and an accounts
+  overview drops those of slots it no longer lists (:func:`forget_under`). Both are eventual: a read
+  that began before a slot was removed can keep its answer until the next sweep or eviction.
+  Neither decides an answer; the bytes read do.
 
-``asq`` reads accounts from more than one thread, so the map of kept answers is read and written
-under a lock; a read and a parse run outside it.
+``asq`` reads accounts from more than one thread, so the map is read, written, reordered and swept
+under one lock. A read, its hash and a parse run outside it; two callers that miss at once each
+parse.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-import os
 import threading
-import time
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
 T = TypeVar("T")
 U = TypeVar("U")
 
-SETTLED = 2.0
-"""Seconds between a file's last write and its stat before its parse is kept: one tick of the
-coarsest clock a file system here keeps times by (FAT's), inside which two writes show one
-signature."""
+MAX_KEPT = 32
+"""The most answers kept at once: one a Claude slot's ``.claude.json``, with room for many slots."""
 
-_Signature = tuple[int, int, int, int, int]
-_KEPT: dict[tuple[Path, Callable[..., object]], tuple[_Signature, object]] = {}
+_Key = tuple[Path, Callable[..., object]]
+_KEPT: OrderedDict[_Key, tuple[bytes, object]] = OrderedDict()
 _LOCK = threading.Lock()
 
 
-def _now() -> float:
-    """The wall clock a file's modification time is judged by."""
-    return time.time()
-
-
-def _stat_signature(stat: os.stat_result) -> _Signature:
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
-
-
-def _forget(key: tuple[Path, Callable[..., object]]) -> None:
+def _forget(key: _Key) -> None:
     with _LOCK:
         _KEPT.pop(key, None)
 
 
 def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
-    """``parse(path, text)`` of the file at ``path``, or its kept answer while the file's
-    signature is the one it was read under.
+    """``parse(path, text)`` of the bytes the file at ``path`` holds now, or the answer kept for
+    bytes with the same SHA-256 digest.
 
     Kept by ``path`` and ``parse``, so ``parse`` is a function defined once, never one made per
     call; every caller is handed the same answer, so it is immutable or each caller copies it.
     Raises what reading the file raises (``FileNotFoundError`` where none is there, any other
-    ``OSError``, ``UnicodeDecodeError``) and what ``parse`` raises."""
+    ``OSError``), ``UnicodeDecodeError`` and what ``parse`` raises; each drops the kept answer."""
     key = (path, parse)
     try:
-        before = os.stat(path)
-        settled = _now() - before.st_mtime >= SETTLED
-        signature = _stat_signature(before)
+        body = path.read_bytes()
+        digest = hashlib.sha256(body).digest()
         with _LOCK:
             kept = _KEPT.get(key)
-        if kept is not None and kept[0] == signature:
-            return cast(T, kept[1])
-        value = parse(path, path.read_text(encoding="utf-8"))
-        unchanged = _stat_signature(os.stat(path)) == signature
+            if kept is not None and kept[0] == digest:
+                _KEPT.move_to_end(key)
+                return cast(T, kept[1])
+        value = parse(path, body.decode("utf-8"))
     except Exception:
         _forget(key)
         raise
-    if settled and unchanged:
-        with _LOCK:
-            _KEPT[key] = (signature, value)
-    else:
-        _forget(key)
+    with _LOCK:
+        _KEPT[key] = (digest, value)
+        _KEPT.move_to_end(key)
+        while len(_KEPT) > MAX_KEPT:
+            _KEPT.popitem(last=False)
     return value
 
 
@@ -98,6 +90,19 @@ def parsed_or(path: Path, parse: Callable[[Path, str], T], unreadable: U) -> T |
         return parsed(path, parse)
     except (OSError, ValueError):
         return unreadable
+
+
+def forget_under(root: Path, keep: Collection[Path]) -> None:
+    """Drop the answers kept for files under ``root`` that are under none of ``keep``: the slots an
+    accounts overview no longer lists."""
+    with _LOCK:
+        gone = [
+            key
+            for key in _KEPT
+            if key[0].is_relative_to(root) and not any(key[0].is_relative_to(k) for k in keep)
+        ]
+        for key in gone:
+            _KEPT.pop(key)
 
 
 def json_object(path: Path, text: str) -> dict[str, Any]:
