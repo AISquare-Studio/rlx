@@ -5703,6 +5703,20 @@ def spawn(
             beside = [*defaults.args, *unbound, *role_args, *extra]
             if slot_args and selected.adapter.native_choice(beside).model is None:
                 bound = unbound
+        # A list the agent would not start on is refused, named, before a worktree, codename or
+        # window is made; a word after the options may be its prompt only in the spawn's own,
+        # beside no first message of the fleet's on its command line.
+        prompt_way = delivery.first_prompt_way(
+            positional=selected.adapter.capabilities.positional_prompt, setting=config.first_prompt
+        )
+        ours = prompt_way == "argv" and bool(prompt or (task_id is not None and kickoff))
+        for source, args, may_prompt in (
+            (f"team.profiles.{role}.args", bound, False),
+            (f"fleet.roles.{role}.agent_args.{selected.adapter.id}", role_args, False),
+            ("the spawn's own arguments", extra, not ours),
+        ):
+            if refusal := selected.adapter.args_refusal(args, may_prompt=may_prompt):
+                raise FleetError(f"{source}: {refusal}")
         # The binding's first for an agent that keeps 0.9.2's order (`binding_args_first`):
         # the window's line opens with them (`agent_launch.BOUND_IN_LINE_FLAG`), so the
         # window's own flags and the user's come later and win, as on 0.9.2 (R8, F-bound).

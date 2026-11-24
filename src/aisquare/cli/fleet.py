@@ -364,7 +364,9 @@ def spawn(
 
     Arguments after the options are passed to the agent, as with `rlx launch`
     — which is also why `--json` must come BEFORE `spawn`: after the role it
-    belongs to the agent.
+    belongs to the agent. A role's own flags for each agent go in
+    fleet.roles.<role>.agent_args.codex or .claude-code; Codex's effort is
+    -c model_reasoning_effort=<level>.
     """
     target = _project(project)
     try:

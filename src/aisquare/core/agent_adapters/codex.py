@@ -10,6 +10,7 @@ import tomllib
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import datetime
+from itertools import takewhile
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -84,6 +85,8 @@ APPROVAL_POLICIES = ("on-request", "never")
 _APPROVAL_SWITCHES = frozenset(
     {"--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "--yolo"}
 )
+#: Claude Code's flags that rlx's own settings write, which stock Codex has no option for.
+FOREIGN_FLAGS = ("--effort", "--disallowedTools", "--allowedTools", "--permission-mode", "--chrome")
 #: Its model option's spellings (``CodexAdapter.model_flags``).
 MODEL_FLAGS = ("--model", "-m")
 #: The options with a value Codex refuses given twice, each with its spellings: 0.164.0 does
@@ -1389,6 +1392,34 @@ class CodexAdapter:
             *(self._reviewer("ask", native) if approval != "never" else []),
             *(self._sandbox(_SCOPES.get(sandbox, "full"), native) if sandbox else []),
         ]
+
+    def args_refusal(self, args: Sequence[str], *, may_prompt: bool) -> str | None:
+        """Up to Codex's ``--``: a flag of :data:`FOREIGN_FLAGS`, an ``--add-dir`` with no
+        folder, and unless ``may_prompt`` a word after its folder, which Codex would read as
+        its prompt. Every other option is Codex's to refuse."""
+        head = list(args[: args.index("--")] if "--" in args else args)
+        for at, arg in enumerate(head):
+            name, inline, folder = arg.partition("=")
+            if name in FOREIGN_FLAGS:
+                return (
+                    f"{name} is a Claude Code flag; a role's Codex flags go in its "
+                    "agent_args.codex, and Codex's effort is -c model_reasoning_effort=<level>"
+                )
+            if name != "--add-dir":
+                continue
+            if not inline:
+                folder = next(iter(head[at + 1 : at + 2]), "-")
+            if not folder or (folder.startswith("-") and not inline):
+                return "--add-dir is given no folder"
+            after = head[at + 1 :] if inline else head[at + 2 :]
+            words = list(takewhile(lambda word: not word.startswith("-"), after))
+            if words and not may_prompt:
+                each = " ".join(f"--add-dir {path}" for path in (folder, *words))
+                return (
+                    f"--add-dir takes one folder, and Codex would read {words[0]!r} as its "
+                    f"prompt: write {each}"
+                )
+        return None
 
     def permission_args(
         self, intent: PermissionIntent, role: str, native: Sequence[str] = ()

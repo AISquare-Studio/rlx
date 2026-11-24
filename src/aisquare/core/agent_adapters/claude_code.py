@@ -757,6 +757,9 @@ class ClaudeCodeAdapter:
             self.label_args(label).args
         )
 
+    def args_refusal(self, args: Sequence[str], *, may_prompt: bool) -> str | None:
+        return None  # none checked: its own parser refuses what it does not take
+
     def label_args(self, label: str) -> LaunchPart:
         return LaunchPart(("--name", label))
 

@@ -948,6 +948,9 @@ class FakeAgentAdapter:
         )
         return [*self.permission_args(intent, role).args, *self.label_args(label).args]
 
+    def args_refusal(self, args: Sequence[str], *, may_prompt: bool) -> str | None:
+        return None
+
     def label_args(self, label: str) -> LaunchPart:
         return LaunchPart(("--title", label))
 
