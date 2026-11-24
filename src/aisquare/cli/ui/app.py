@@ -1378,6 +1378,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """The fleet read in flight, or the last one; only one runs at a time."""
         self._fleet_owed = False
         """A frame was asked for while a read was in flight: read once more after it."""
+        self._fleet_viewed: frozenset[str] = frozenset()
+        """The project the next fleet read reads though folded (:meth:`_viewed_projects`)."""
         self._fleet_calls = 0
         """How many calls have asked for a fleet frame (:meth:`refresh_data`): the newest
         one's number. It orders a call against an accounts read where a clock cannot:
@@ -1846,12 +1848,14 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """Start the fleet read that answers the calls up to number ``asked``, the newest."""
         after = [*self._fleet_owed_after, *([] if then is None else [then])]
         self._fleet_owed, self._fleet_owed_after = False, []
-        # `a`'s choice is read as the read begins, so one held for a hand-over and started
-        # when it is called off reads what is shown then.
+        # `a`'s choice and the viewed project are read as the read begins, so one held for a
+        # hand-over and started when it is called off reads what is shown then.
         self._fleet_since = time.monotonic()
-        viewed = self._viewed_projects()  # asked here, on the UI thread, not in the worker
+        self._fleet_viewed = self._viewed_projects()  # asked here, on the UI thread
         self._fleet_worker = self.run_worker(
-            lambda: _read_frame(self.show_captured, self.captain_on, viewed, self.scope),
+            lambda: _read_frame(
+                self.show_captured, self.captain_on, self._fleet_viewed, self.scope
+            ),
             name=FLEET_WORKER,
             group=FLEET_WORKER,
             thread=True,
@@ -2149,12 +2153,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.refresh_headroom()
 
     def _viewed_projects(self) -> frozenset[str]:
-        """The projects an open Project or Agent view shows (:func:`_read_fleet`'s ``viewed``)."""
-        content = self.content
-        return frozenset(
-            [view.project.id for view in content.query_children(ProjectView)]
-            + [view.status.agent.project_id for view in content.query_children(AgentView)]
-        )
+        """The project the right pane's Project or Agent view shows now (:func:`_read_fleet`'s
+        ``viewed``): a view left open behind another keeps its folded project unread."""
+        shown = self._shown_project_id()
+        return frozenset() if shown is None else frozenset({shown})
 
     def _feed_open_views(self, snapshot: FleetSnapshot) -> None:
         """Hand every open Project/Agent view its row from the new frame.
@@ -3564,9 +3566,15 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.query_one("#accounts", AccountsView).begin_claude_sign_in(None, agent=event.agent)
 
     def _content_switched(self, current: str | None) -> None:
-        """Any other page than Accounts drops the way back: the user went elsewhere first."""
+        """Any other page than Accounts drops the way back: the user went elsewhere first. A
+        Project or Agent view opened or gone back to, of a project the last frame did not
+        read, has it read at once."""
         if current != "accounts":
             self.after_sign_in = None
+        self._fleet_viewed = self._viewed_projects()  # what a read held for a hand-over reads
+        snapshot = self.snapshot
+        if snapshot is not None and self._fleet_viewed - snapshot.agents.keys():
+            self.refresh_data()
 
     async def on_sign_in_landed(self, event: SignInLanded) -> None:
         """A sign-in landed: back to where it was started from, used once — or, from

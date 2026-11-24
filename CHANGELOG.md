@@ -12,6 +12,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each Claude account's `.claude.json`, up to three times, but while it keeps a parse of the
   same bytes it reuses who is signed in from that parse; before, it parsed the file on every
   read. Settings, logins, plugin records and Codex's config are read and parsed as before.
+- **A view you have left no longer keeps its collapsed group's project read.** Only the
+  Project or Agent view on screen keeps a collapsed group's member read on each refresh;
+  going back to a view reads its project at once. A collapsed group's project that no view
+  on screen shows is not read, so a failure in it shows when its view opens, as for any
+  collapsed group's member before.
 
 ## [0.10.1] - 2026-11-18
 
