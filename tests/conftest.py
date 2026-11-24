@@ -196,6 +196,10 @@ AMBIENT_ENV_VARS = (
     # uv its cache (`install_route`). Left set, a test of `uninstall --purge` would
     # plan, and delete, the developer's own answers file.
     "XDG_CACHE_HOME",
+    # The messaging folder a launch keeps when set and names when not (`core.peer_sockets`).
+    # A Linux desktop sets it, and so does every session rlx launches: left set, a launch
+    # test would hand its stand-in the developer's own folder and make no folder of its own.
+    "XDG_RUNTIME_DIR",
     # The build the plugin's launcher runs in place of the pinned release. Left set by a
     # developer checking a wheel, the launcher tests would run their wheel where the
     # pinned release is expected.

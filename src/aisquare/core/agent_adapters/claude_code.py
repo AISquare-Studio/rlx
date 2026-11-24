@@ -34,6 +34,7 @@ from aisquare.core.agent_adapters.types import (
     LastingInstall,
     LaunchPart,
     NativeChoice,
+    PeerSockets,
     PermissionArgs,
     PermissionIntent,
     PluginInstall,
@@ -300,6 +301,10 @@ class ClaudeCodeAdapter:
         pid_env="CLAUDE_PID",
         # Set in its hooks and its tools' shells alike: who sent a tell (0.9.2's origin).
         process_env="CLAUDECODE",
+        # Its `getDefaultUdsSocketPath`, read in 2.1.311: `$XDG_RUNTIME_DIR`, else
+        # `CLAUDE_CODE_TMPDIR`, else `/tmp`, then `cc-socks/<pid>.sock`; a path longer than
+        # `max_bytes` goes to a per-user folder of its own under `/tmp`.
+        peer_sockets=PeerSockets(folder_env="XDG_RUNTIME_DIR", subfolder="cc-socks", max_bytes=103),
         exports_home_env=False,
         own_doctor_check=True,
         model_proxy=True,

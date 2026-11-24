@@ -25,6 +25,7 @@ from aisquare.core import (
     harness,
     orchestrator,
     paths,
+    peer_sockets,
     tls,
 )
 from aisquare.core import ignore as ignore_core
@@ -199,6 +200,8 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             # Beside the fleet terminal row, which reads the same running server (fix 4 of
             # the fleet-board card): it can warn, so it waits with the other late rows.
             _check_fleet_server_env(cwd=cwd),
+            # Can warn (a messaging folder no session can use), so it waits with the late rows.
+            *_peer_sockets_checks(),
             # Only when this aisquare lives where a sandboxed agent may write (r11 of #113).
             *_optional(_sandboxed_install_check(cwd)),
             *_optional(_sandbox_path_check(cwd)),
@@ -728,6 +731,48 @@ def _check_home_filesystem() -> DoctorCheck:
     if kind in _NATIVE_FILESYSTEMS:
         return _ok("filesystem", f"{home} on {kind}, config: {shape} — atomic writes hold")
     return _ok("filesystem", f"{home} on {kind} ({shape}) — atomicity unmeasured here")
+
+
+def _peer_sockets_checks() -> list[DoctorCheck]:
+    """A row for each agent whose sessions message each other over sockets
+    (``capabilities.peer_sockets``): the folder a session launched from here puts its socket
+    under (``core.peer_sockets.folder``), and why a session cannot use it
+    (``core.peer_sockets.problem``). It only reads: a launch makes the folder. None on
+    Windows, where no launch names one."""
+    if sys.platform == "win32":
+        return []
+    rows: list[DoctorCheck] = []
+    for adapter in adapters():
+        sockets = adapter.capabilities.peer_sockets
+        if sockets is None:
+            continue
+        name = f"{adapter.id} messaging"
+        where = peer_sockets.folder(os.environ, sockets)
+        if os.environ.get(sockets.folder_env, "").strip():
+            whose = f"{sockets.folder_env} as this shell sets it, which launches keep"
+        else:
+            whose = f"rlx's own, which launches set as {sockets.folder_env}"
+        reason = peer_sockets.problem(where, sockets)
+        if reason is not None:
+            rows.append(
+                _warn(
+                    name,
+                    f"{where} ({whose}) cannot hold the sessions' sockets: {reason}",
+                    f"Make it a folder of yours with mode 0700, on a path short enough for "
+                    f"its socket paths (AISQUARE_HOME moves rlx's own; {sockets.folder_env} "
+                    "names another)",
+                )
+            )
+            continue
+        made = "" if where.exists() else "; the first launch makes it"
+        rows.append(
+            _ok(
+                name,
+                f"{where} ({whose}): the sessions rlx launches, on every account, put their "
+                f"sockets in its {sockets.subfolder}{made}",
+            )
+        )
+    return rows
 
 
 def _check_config() -> DoctorCheck:

@@ -71,7 +71,7 @@ from typing import Any, Literal
 from aisquare.core import agents as agent_core
 from aisquare.core import claude_accounts as core
 from aisquare.core import claude_sharing as sharing
-from aisquare.core import paths, tls
+from aisquare.core import paths, peer_sockets, tls
 from aisquare.core import program as prog
 from aisquare.core.agent_adapters import get_adapter
 from aisquare.core.agent_adapters.types import FolderTrust, SharePart, trusted_by
@@ -5540,10 +5540,11 @@ def session_env(account: ClaudeAccount, base: Mapping[str, str] | None = None) -
     The tracing identity is dropped (``core.spawn.untraced_env``): a session
     started from the Accounts page or from ``accounts run`` is not a board role
     and must not file its work under whichever traced session happened to
-    start it.
+    start it. Its messaging socket goes in the folder every account's sessions
+    share (``core.peer_sockets``), as a fleet launch's does.
     """
-    env = untraced_env(base)
-    return core.apply_launch_env(env, account, shell=base)
+    env = core.apply_launch_env(untraced_env(base), account, shell=base)
+    return peer_sockets.apply(env, get_adapter(account.agent).capabilities.peer_sockets)
 
 
 def _leave_it_to_the_child(signum: int, frame: Any) -> None:

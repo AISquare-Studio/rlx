@@ -297,6 +297,22 @@ class CompactCommand:
 
 
 @dataclass(frozen=True)
+class PeerSockets:
+    """Where the agent's sessions put the sockets they message each other on
+    (``capabilities.peer_sockets``), read by ``core.peer_sockets``."""
+
+    folder_env: str
+    """The variable naming the folder it puts them under when the variable is set: Claude
+    Code's ``XDG_RUNTIME_DIR``, else its account's own scratch dir."""
+    subfolder: str
+    """The folder under that one which holds them, one ``<pid>.sock`` each: Claude Code's
+    ``cc-socks``."""
+    max_bytes: int
+    """The longest socket path the agent binds there; past it, it binds in a folder of its own
+    choosing."""
+
+
+@dataclass(frozen=True)
 class AgentCapabilities:
     """What one agent does differently, as flags the shared services read instead of its id.
 
@@ -425,6 +441,12 @@ class AgentCapabilities:
     (measured on 0.164.0's native binary under ``codex exec``; its npm launcher's
     ``CODEX_MANAGED_BY_NPM`` is the package manager's, not Codex's), and its tools' shells
     are :attr:`tool_shell_env`'s."""
+    peer_sockets: PeerSockets | None = None
+    """Where its sessions put the sockets they message each other on (:class:`PeerSockets`):
+    a launch whose environment names no such folder names the one shared folder
+    (``core.peer_sockets.apply``), so sessions on every account find each other's sockets in
+    one place, and the doctor says when a session cannot use it. ``None`` for an agent whose
+    sessions message none."""
     exports_home_env: bool = True
     """A launch sets :attr:`AgentAdapter.home_env` to the config dir it resolved; Claude
     Code's ``CLAUDE_CONFIG_DIR`` stays as the shell or the binding wrote it."""

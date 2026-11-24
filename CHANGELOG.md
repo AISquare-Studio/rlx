@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude Code sessions on different accounts keep their messaging sockets in one folder.**
+  Where your shell sets no `XDG_RUNTIME_DIR`, as on macOS, every Claude Code session rlx
+  launches, on any account, now gets `~/.aisquare/run` (made restricted to you) as its
+  `XDG_RUNTIME_DIR`, so its socket lands beside every other account's. Each account keeps
+  its own scratch folder. A shell that
+  sets `XDG_RUNTIME_DIR` keeps it. `rlx doctor` names the folder and says when a session
+  cannot use it.
+
 ## [0.10.1] - 2026-11-18
 
 ### Added

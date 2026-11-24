@@ -45,6 +45,10 @@ setting it comes from.
   (`.credentials.json`), and in the Keychain on macOS. `rlx accounts remove`
   renames the directory and signs nothing out, so run `/logout` in the account
   first (`rlx accounts run <n>`).
+- `run/` is where the Claude Code sessions rlx launches, on every account, keep
+  the sockets they message each other on. rlx makes it restricted to your user
+  and hands it to each launch as `XDG_RUNTIME_DIR`, unless your shell sets that
+  already; `rlx doctor` says when it is not restricted to you.
 - `reports/` holds what `rlx exec` saved: each command's argv, working
   directory, the first 1 MiB of its standard output and error (more with
   `--max-output-bytes`), and with `--project` a hash of each source file. Readable
