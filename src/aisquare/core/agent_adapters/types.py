@@ -444,8 +444,8 @@ class AgentCapabilities:
     peer_sockets: PeerSockets | None = None
     """Where its sessions put the sockets they message each other on (:class:`PeerSockets`):
     a launch whose environment names no such folder names the one shared folder
-    (``core.peer_sockets.apply``), so sessions on every account find each other's sockets in
-    one place, and the doctor says when a session cannot use it. ``None`` for an agent whose
+    (``core.peer_sockets.apply``), so sessions on every account put their sockets in one
+    place, and the doctor says when a session cannot use it. ``None`` for an agent whose
     sessions message none."""
     exports_home_env: bool = True
     """A launch sets :attr:`AgentAdapter.home_env` to the config dir it resolved; Claude

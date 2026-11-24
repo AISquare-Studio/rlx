@@ -19,7 +19,7 @@ from aisquare.cli.app import app
 from aisquare.core import claude_accounts as core
 from aisquare.core import paths, peer_sockets
 from aisquare.core.agent_adapters import get_adapter
-from aisquare.models import CheckStatus
+from aisquare.models import CheckStatus, DoctorCheck
 from aisquare.services import claude_accounts as service
 from aisquare.services import diagnostics
 from tests import private_fleets
@@ -64,7 +64,7 @@ def _launches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]
     return captured
 
 
-def _doctor_row() -> Any:
+def _doctor_row() -> DoctorCheck:
     (row,) = diagnostics._peer_sockets_checks()
     return row
 

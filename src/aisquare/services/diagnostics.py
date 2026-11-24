@@ -758,7 +758,7 @@ def _peer_sockets_checks() -> list[DoctorCheck]:
                 _warn(
                     name,
                     f"{where} ({whose}) cannot hold the sessions' sockets: {reason}",
-                    f"Make it a folder of yours with mode 0700, on a path short enough for "
+                    "Make it a folder of yours with mode 0700, on a path short enough for "
                     f"its socket paths (AISQUARE_HOME moves rlx's own; {sockets.folder_env} "
                     "names another)",
                 )

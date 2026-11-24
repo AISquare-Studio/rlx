@@ -791,7 +791,7 @@ def launch(
     if choice.account is not None:
         claude_accounts_core.apply_launch_env(env, choice.account, shell=os.environ)
     # On any account, or on none the launch chose: its messaging socket goes in the folder every
-    # account's sessions share, so a session on another login can answer it.
+    # account's sessions share.
     peer_sockets.apply(env, selected.adapter.capabilities.peer_sockets)
     # The folder's trust from whichever account has it, so the agent does not stop at
     # Claude Code's "trust this folder?" — whose highlighted answer is "No, exit" — for

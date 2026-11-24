@@ -4,10 +4,10 @@ An agent whose sessions message each other over sockets says where it puts them
 (``capabilities.peer_sockets``): Claude Code under ``$XDG_RUNTIME_DIR``, else under its
 account's scratch dir. Each managed account has a scratch dir of its own
 (``core.claude_accounts``, "Both variables, always"), so where ``XDG_RUNTIME_DIR`` is unset, as
-on macOS, every account kept its sockets in a folder of its own, and a session could not answer
-one on another account. A launch whose environment names no folder is given this one, under the
-aisquare home (``paths.messaging_dir``), made ``0700``; a launch whose environment names one
-(most Linux desktops set ``XDG_RUNTIME_DIR``) keeps it. The scratch dirs stay each account's own.
+on macOS, each account's sessions would keep their sockets in a folder of that account's own.
+A launch whose environment names no folder is given this one, under the aisquare home
+(``paths.messaging_dir``), made ``0700``; a launch whose environment names one (most Linux
+desktops set ``XDG_RUNTIME_DIR``) keeps it. The scratch dirs stay each account's own.
 """
 
 from __future__ import annotations
