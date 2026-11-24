@@ -547,6 +547,34 @@ def test_a_record_reader_works_out_the_folder_and_reads_the_census_as_often_for_
     )
 
 
+def test_the_doctors_records_hold_a_row_the_census_took_after_their_batch_read_it(
+    fleet: tuple[list[ProjectInfo], Panes], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row A is in the census and row B, added later, is not. The doctor's read of both
+    (``records_as_read``) reads the census for A's missing record, and right after that read
+    another fleet read takes B into the census. This test reads the doctor's answer for B."""
+    projects, _panes = fleet
+    [held] = history(projects[0], 1, ended=STARTED, label="held")
+    fleet_service.take_census()
+    [later] = history(projects[0], 1, ended=STARTED, label="later")
+    census_or_why = launch_seal._census_or_why
+    taken: list[str] = []
+
+    def then_taken() -> launch_seal.LegacyCensus | str:
+        census = census_or_why()
+        if not taken:
+            taken.append(later.id)
+            fleet_service.take_census([later])
+        return census
+
+    monkeypatch.setattr(launch_seal, "_census_or_why", then_taken)
+    records = fleet_service.records_as_read([held, later])
+    record = records[later.id]
+    assert taken == [later.id]
+    assert isinstance(record, launch_seal.LaunchRecord) and record.legacy
+    assert record.id == later.id
+
+
 def test_a_read_that_takes_the_census_of_40_rows_reads_the_census_as_often_as_for_1(
     fleet: tuple[list[ProjectInfo], Panes], monkeypatch: pytest.MonkeyPatch
 ) -> None:

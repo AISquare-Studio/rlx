@@ -10,9 +10,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The app does less work on each refresh.** It works out where the agents' launch records
   are once for each batch of records it reads, not once an agent. It still reads each
-  account's `.claude.json` on every refresh, but parses who is signed in out of it again only
-  when its bytes differ from the last parse's, where every refresh parsed it several times.
-  Settings, logins, plugin records and Codex's config are read and parsed as before.
+  account's `.claude.json` on every refresh, but when it still keeps a parse of the same
+  bytes it reuses who is signed in from that parse, where every refresh parsed the file
+  several times. Settings, logins, plugin records and Codex's config are read and parsed as
+  before.
 
 ## [0.10.1] - 2026-11-18
 

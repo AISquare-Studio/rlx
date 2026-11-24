@@ -171,8 +171,10 @@ def test_a_rewrite_holding_the_stat_of_the_file_it_replaced_shows_on_the_next_re
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Slot 2's ``.claude.json`` holds A, written an hour ago, and is read once; then B, of the same
-    size, is written in place while ``os.stat`` of the file answers A's stat (size, inode,
-    modification and change times). This test reads the email of the read after B."""
+    size, is written in place and given A's modification time back, while ``os.stat`` of the
+    file, with or without keywords (``Path.stat`` passes one), answers A's stat. This test reads
+    the stat ``Path.stat`` and ``os.stat`` give after B, B's own size, inode and modification
+    time, and the email of the read after B."""
     path = core.claude_json_path(slots[1])
     _write_email(path, "first@example.com")
     old = time.time() - 3600
@@ -182,12 +184,20 @@ def test_a_rewrite_holding_the_stat_of_the_file_it_replaced_shows_on_the_next_re
     real_stat = os.stat
 
     def as_before(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
-        if not args and not kwargs and Path(target) == path:
+        if isinstance(target, (str, os.PathLike)) and Path(target) == path:
             return pinned
         return real_stat(target, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", as_before)
     _write_email(path, "again@example.com")
+    os.utime(path, ns=(pinned.st_atime_ns, pinned.st_mtime_ns))
+    assert path.stat() == pinned and os.stat(path) == pinned
+    real = real_stat(path)
+    assert (real.st_size, real.st_ino, real.st_mtime_ns) == (
+        pinned.st_size,
+        pinned.st_ino,
+        pinned.st_mtime_ns,
+    )
     assert _email(path) == "again@example.com"
 
 
@@ -332,20 +342,25 @@ def test_the_cap_drops_the_least_recently_used_parse(
     assert _kept(second) == []
 
 
-def test_each_lookup_keep_drop_eviction_and_sweep_of_a_parse_holds_the_lock(
+def test_lookups_keeps_drops_evictions_and_both_sweep_steps_hold_the_lock(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """This test reads, at each lookup, keep, drop, eviction and sweep of the kept parses over
-    three overviews of the ``slots`` fixture with :data:`~aisquare.core.parsed_files.MAX_KEPT`
-    patched below its three ``.claude.json`` files (the third overview once slot 2 is removed
-    and slot 3's ``.claude.json`` is gone), whether the map's lock is held, by kind."""
+    """This test reads whether the map's lock is held at each operation on the kept parses, by
+    kind: a lookup, a keep, the drop a failed read makes, an eviction, and the sweep's selection
+    and its removal of a parse. It drives two overviews of the ``slots`` fixture, the second
+    once slot 2 is removed with its parse still kept and slot 3's ``.claude.json`` is gone,
+    then one read of slot 3's file written again, with
+    :data:`~aisquare.core.parsed_files.MAX_KEPT` patched to one."""
     held: dict[str, list[bool]] = {
         "lookup": [],
         "keep": [],
         "drop": [],
         "eviction": [],
-        "sweep": [],
+        "sweep selection": [],
+        "sweep removal": [],
     }
+    #: Who removes a parse by ``pop``, by the function that calls it.
+    removers = {"_forget": "drop", "forget_under": "sweep removal"}
 
     class Noting(OrderedDict[Any, Any]):
         def get(self, key: Any, default: Any = None) -> Any:
@@ -361,7 +376,9 @@ def test_each_lookup_keep_drop_eviction_and_sweep_of_a_parse_holds_the_lock(
             super().__setitem__(key, value)
 
         def pop(self, key: Any, default: Any = None) -> Any:
-            held["drop"].append(parsed_files._LOCK.locked())
+            caller = sys._getframe(1).f_code.co_name
+            kind = removers.get(caller, f"pop in {caller}")
+            held.setdefault(kind, []).append(parsed_files._LOCK.locked())
             return super().pop(key, default)
 
         def popitem(self, last: bool = True) -> tuple[Any, Any]:
@@ -369,16 +386,20 @@ def test_each_lookup_keep_drop_eviction_and_sweep_of_a_parse_holds_the_lock(
             return super().popitem(last)
 
         def __iter__(self) -> Iterator[Any]:
-            held["sweep"].append(parsed_files._LOCK.locked())
+            held["sweep selection"].append(parsed_files._LOCK.locked())
             return super().__iter__()
 
     monkeypatch.setattr(parsed_files, "_KEPT", Noting())
-    monkeypatch.setattr(parsed_files, "MAX_KEPT", 2)
+    removed, gone = core.claude_json_path(slots[1]), core.claude_json_path(slots[2])
     service.overview()
-    service.overview()
+    assert _kept(removed) != []
     core.remove_account(slots[1])
-    core.claude_json_path(slots[2]).unlink()
+    gone.unlink()
     service.overview()
+    assert _kept(removed) == [] and _kept(gone) == []
+    monkeypatch.setattr(parsed_files, "MAX_KEPT", 1)
+    _write_email(gone, "back@example.com")
+    assert _email(gone) == "back@example.com"
     assert all(held.values()), held
     assert all(all(seen) for seen in held.values()), held
 

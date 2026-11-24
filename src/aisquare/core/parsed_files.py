@@ -1,12 +1,13 @@
-"""A small answer parsed out of a file, parsed again only when the file's bytes differ.
+"""A small answer parsed out of a file, reused while a parse of the same bytes is kept.
 
 ``asq`` reads every account slot's files after each fleet frame
 (``services.claude_accounts.overview``), and asks each slot's ``.claude.json`` for its identity
 several times a read; Claude Code keeps tens of KB to tens of MB in that file.
 ``claude_accounts.read_identity`` reads it here. :func:`parsed` reads the file on every call and
 keeps the parser's answer under the SHA-256 digest of the bytes it parsed: a call whose bytes have
-that digest is handed the kept answer without a parse, any other is parsed. An answer handed out is
-so the parse of the bytes just read, assuming no SHA-256 collision; no stat or clock decides it.
+the digest of the answer kept for its path is handed that answer without a parse; any other call
+parses, including one whose answer was dropped (limits below). An answer handed out is so the
+parse of the bytes just read, assuming no SHA-256 collision; no stat or clock decides it.
 
 What is kept: per path and parser, one digest and one answer, which may be ``None`` (a JSON object
 with nothing to project). Nothing of a file's bytes, and never a login.
@@ -17,7 +18,8 @@ Limits:
   is the caller's, and it is kept under that read's own digest; the file's final bytes miss it.
 - A read that raises (no file there, any other ``OSError``) and a parse that raises (bytes that are
   no UTF-8, no JSON object, an empty file) drop the path's kept answer, and the exception goes on to
-  the caller (:func:`parsed_or` turns ``OSError`` and ``ValueError`` into a fallback).
+  the caller (:func:`parsed_or` turns ``OSError`` and ``ValueError`` into a fallback). The next
+  read that succeeds parses again.
 - At most :data:`MAX_KEPT` answers are kept, the least recently used dropped first, and an accounts
   overview drops those of slots it no longer lists (:func:`forget_under`). Both are eventual: a read
   that began before a slot was removed can keep its answer until the next sweep or eviction.
@@ -84,8 +86,8 @@ def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
 
 
 def parsed_or(path: Path, parse: Callable[[Path, str], T], unreadable: U) -> T | U:
-    """:func:`parsed`, or ``unreadable`` where the file is missing or cannot be read or ``parse``
-    raises ``ValueError``: the answer of a reader that never raises."""
+    """:func:`parsed`, or ``unreadable`` where reading the file raises ``OSError`` or decoding it
+    or ``parse`` raises ``ValueError``; any other exception goes on to the caller."""
     try:
         return parsed(path, parse)
     except (OSError, ValueError):

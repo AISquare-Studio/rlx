@@ -1226,7 +1226,7 @@ def take_census(rows: Sequence[FleetAgent] | None = None) -> dict[str, str]:
     would take (:func:`records_as_read`)."""
     refused: dict[str, str] = {}
     with suppress(Exception):
-        made, refused = _census_records(rows)
+        made, refused, _held = _census_records(rows)
         if made or not launch_seal.census_taken():
             launch_seal.take_census(list(made.values()))
     return refused
@@ -1234,11 +1234,14 @@ def take_census(rows: Sequence[FleetAgent] | None = None) -> dict[str, str]:
 
 def _census_records(
     rows: Sequence[FleetAgent] | None,
-) -> tuple[dict[str, launch_seal.LaunchRecord], dict[str, str]]:
+) -> tuple[
+    dict[str, launch_seal.LaunchRecord], dict[str, str], dict[str, launch_seal.LaunchRecord]
+]:
     """The census records :func:`take_census` would add for ``rows`` (every project's when
-    ``None``), by row id, and why each row it would not take was refused. Writes nothing;
-    opens the store only for rows the files alone do not refuse."""
-    held = {record.id for record in launch_seal.census_records()}
+    ``None``), by row id; why each row it would not take was refused; and the records the
+    census already holds, as read here, by row id. Writes nothing; opens the store only for
+    rows the files alone do not refuse."""
+    held = {record.id: record for record in launch_seal.census_records()}
     refused: dict[str, str] = {}
     first = _first_census()
     if first:
@@ -1248,7 +1251,7 @@ def _census_records(
         refused = _refused_by_the_records(rows, first=first)
         rows = [row for row in rows if row.id not in refused]
         if not rows:
-            return {}, refused
+            return {}, refused, held
     with store_session() as store:
         projects = {
             project.id: project for project in store.list_projects(all=True, include_forgotten=True)
@@ -1273,7 +1276,7 @@ def _census_records(
         for row in missing
         if row.id not in refused
     }
-    return made, refused
+    return made, refused, held
 
 
 def _first_census() -> bool:
@@ -1448,17 +1451,21 @@ def _read_record(row: FleetAgent) -> launch_seal.LaunchRecord | str:
 def records_as_read(rows: Sequence[FleetAgent]) -> dict[str, launch_seal.LaunchRecord | str]:
     """Each row's launch record as the fleet's next read would hold it (:func:`_records_of`),
     the census records it would take included, writing nothing: what the doctor judges a
-    row by, so it offers no command the fleet then refuses (R3 of 0.10.0, F4). Never
-    raises: what cannot be read is the record's own reason."""
+    row by, so it offers no command the fleet then refuses (R3 of 0.10.0, F4). A row with
+    no record when the batch read the census, which the census holds when asked again (a
+    fleet read took it in between), has the record it holds then. Never raises: what cannot
+    be read is the record's own reason."""
     records = launch_seal.read_all(row.id for row in rows)
     untaken = [
         row for row in rows if isinstance(records[row.id], str) and not launch_seal.recorded(row.id)
     ]
     if untaken:
         with suppress(Exception):
-            made, refused = _census_records(untaken)
+            made, refused, held = _census_records(untaken)
             for row in untaken:
-                records[row.id] = made.get(row.id) or refused.get(row.id) or records[row.id]
+                records[row.id] = (
+                    made.get(row.id) or held.get(row.id) or refused.get(row.id) or records[row.id]
+                )
     return records
 
 
