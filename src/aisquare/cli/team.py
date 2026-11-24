@@ -19,7 +19,7 @@ import typer
 from aisquare.cli import board_names
 from aisquare.cli.common import expected_config_write_errors, fail, local_time, parse_since
 from aisquare.core import claude_accounts as claude_accounts_core
-from aisquare.core import harness, orchestrator, selfcli
+from aisquare.core import harness, orchestrator, peer_sockets, selfcli
 from aisquare.core import program as prog
 from aisquare.core.agent_adapters import agents_named, recorded_adapter
 from aisquare.core.agent_adapters.types import BadEffortError
@@ -664,6 +664,9 @@ def spawn(
                 f"board: context.db unreadable ({exc}) — launching without a board row", err=True
             )
         env = dict(os.environ)
+        # Not the runtime dir a launch set for its own agent: this exec names no shared folder
+        # of its own, so the role it starts gets what it did before that folder.
+        peer_sockets.drop_set(env)
         env["AISQUARE_ROLE"] = role_name
         # The operator's variables, carried verbatim. We do not validate them:
         # this layer has no idea what any given key means, and guessing which

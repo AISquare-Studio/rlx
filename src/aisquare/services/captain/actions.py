@@ -40,6 +40,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 import re
 import socket
 import sqlite3
@@ -2332,10 +2333,16 @@ def run_stdio(*, close_after: int) -> None:
     drainer (T3's ``speaker.start_drainer``) starts here and lives as long as the
     server, so ``speak()`` is heard whether or not the voice page or the TUI is
     open (manager, seq 13143).
+
+    A Claude captain hands this server its whole environment, the runtime dir its launch set
+    among it, which is no desktop's: the speaker's ``spd-say`` finds speech-dispatcher by the
+    desktop's own (``core.peer_sockets.drop_set``).
     """
+    from aisquare.core import peer_sockets
     from aisquare.services import mcp_server
     from aisquare.services.captain import speaker
 
+    peer_sockets.drop_set(os.environ)
     speaker.start_drainer(speaker.server_voice())
     mcp_server.run_stdio(
         close_after=close_after,

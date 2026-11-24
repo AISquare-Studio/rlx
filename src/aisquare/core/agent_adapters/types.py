@@ -443,10 +443,11 @@ class AgentCapabilities:
     are :attr:`tool_shell_env`'s."""
     peer_sockets: PeerSockets | None = None
     """Where its sessions put the sockets they message each other on (:class:`PeerSockets`):
-    a launch whose environment names no such folder names the one shared folder
-    (``core.peer_sockets.apply``), so sessions on every account put their sockets in one
-    place, and the doctor says when a session cannot use it. ``None`` for an agent whose
-    sessions message none."""
+    an ``aisquare launch`` or ``accounts run`` whose environment names no such folder names
+    the one shared folder where it can (``core.peer_sockets.apply``), so those sessions put
+    their sockets in one place whatever their account, and the doctor says when it cannot.
+    ``None`` for an agent whose sessions message none: its launch drops a folder value another
+    launch set."""
     exports_home_env: bool = True
     """A launch sets :attr:`AgentAdapter.home_env` to the config dir it resolved; Claude
     Code's ``CLAUDE_CONFIG_DIR`` stays as the shell or the binding wrote it."""

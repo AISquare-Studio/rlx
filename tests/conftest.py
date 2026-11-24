@@ -200,6 +200,9 @@ AMBIENT_ENV_VARS = (
     # A Linux desktop sets it, and so does every session rlx launches: left set, a launch
     # test would hand its stand-in the developer's own folder and make no folder of its own.
     "XDG_RUNTIME_DIR",
+    # Its record when a launch set it (`core.peer_sockets.SET_ENV`): left set, a forwarding
+    # test would drop a desktop value that matched the developer's own launch.
+    "AISQUARE_PEER_SOCKETS_SET",
     # The build the plugin's launcher runs in place of the pinned release. Left set by a
     # developer checking a wheel, the launcher tests would run their wheel where the
     # pinned release is expected.

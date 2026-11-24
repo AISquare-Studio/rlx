@@ -197,8 +197,9 @@ ignores a new one, Codex's: a restart's receipt says a persona changed since rea
 through the briefing alone), `peer_sockets` (a
 `PeerSockets(folder_env, subfolder, max_bytes)`: where its sessions put the sockets they
 message each other on, Claude Code's `cc-socks` under `XDG_RUNTIME_DIR`; a launch whose
-environment names no such folder names the one shared folder, `core.peer_sockets`, and the
-doctor says when a session cannot use it),
+environment names no such folder names the one shared folder where it can, `core.peer_sockets`,
+and nothing rlx starts from that session gets the value it set; the doctor says when a
+launch cannot use it),
 `exports_home_env`, `own_doctor_check` (the doctor has a dedicated check for it, Claude Code's, which Welcome's step 2 probes it with too; the per-adapter row and the generic probe skip it), `model_ladders`,
 `model_proxy` (its traffic goes through the explainability proxy, the lane the doctor and
 Remote's card judge it by; with `native_telemetry` instead, the card judges its own

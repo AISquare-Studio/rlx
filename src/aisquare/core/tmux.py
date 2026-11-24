@@ -90,7 +90,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-from aisquare.core import paths
+from aisquare.core import paths, peer_sockets
 from aisquare.core.memory import _sysctl
 from aisquare.core.spawn import tmux_client_env
 
@@ -240,9 +240,12 @@ def desktop_environment(environ: Mapping[str, str] | None = None) -> dict[str, s
 
     Only the variables that ARE set travel: an unset one here says nothing about
     the server's copy (a headless spawn from a cron job must not blank the
-    display of an agent started from a desktop), and ``-e`` can only set.
+    display of an agent started from a desktop), and ``-e`` can only set. Nor does
+    the runtime dir a launch set for its own agent (``core.peer_sockets.drop_set``):
+    it is no desktop's.
     """
-    source = os.environ if environ is None else environ
+    source = dict(os.environ if environ is None else environ)
+    peer_sockets.drop_set(source)
     return {name: source[name] for name in DESKTOP_ENV_VARS if source.get(name, "").strip()}
 
 

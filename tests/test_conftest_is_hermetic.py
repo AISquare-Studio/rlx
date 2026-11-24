@@ -79,8 +79,10 @@ DIRTY_SHELL = {
     "CLAUDE_CODE_TMPDIR": "/home/someone/.cache/claude-account1",
     # Where the plugin's answers about uv live, which a purge deletes.
     "XDG_CACHE_HOME": "/home/someone/.cache",
-    # A desktop's runtime dir, which a launch keeps as its messaging folder.
+    # A desktop's runtime dir, which a launch keeps as its messaging folder, and the record
+    # a launch that set one itself leaves.
     "XDG_RUNTIME_DIR": "/run/user/1000",
+    "AISQUARE_PEER_SOCKETS_SET": "XDG_RUNTIME_DIR=/home/someone/.aisquare/runtime",
     # The shell's own two, as a launch onto one of that login's managed slots
     # keeps them (`claude_accounts.PLAIN_VARS`) — read as slot 1 whenever a test
     # points CLAUDE_CONFIG_DIR at a managed slot, as the account tests do.

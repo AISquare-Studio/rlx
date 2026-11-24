@@ -720,8 +720,12 @@ def tmux_client_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     environment as its global one, so a server the fleet starts holds no team
     variable: ``AISQUARE_PERSONA`` among them, so a window opened in it by hand is briefed
     as no one's persona (review of #201, F7). Nor the identity of the agent whose tool
-    shell started it. The home (``AISQUARE_HOME``) stays: the windows need it.
+    shell started it, nor the runtime dir its launch set (``core.peer_sockets.drop_set``).
+    The home (``AISQUARE_HOME``) stays: the windows need it.
     """
+    from aisquare.core import peer_sockets  # lazy, as the adapters are
+
     env = untraced_env(base)
+    peer_sockets.drop_set(env)
     dropped = {*TEAM_ENV_VARS, *agent_identity_env_vars(), *tool_shell_homes(env)}
     return {k: v for k, v in env.items() if k not in dropped}

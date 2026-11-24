@@ -2838,14 +2838,15 @@ def _run_token_refresh(account: ClaudeAccount, command: Sequence[str]) -> bool:
     ``account`` and wait for it: whether it ran. Whether it WORKED is the login's to say,
     read again after.
 
-    In the environment a session on the account runs with (:func:`session_env`), so it is
-    that account's login it refreshes, from its own directory; no terminal, nothing on
-    stdin, its output dropped. Registered in ``core.spawn.SEAMS`` as excluded.
+    In the account's environment (:func:`account_env`), so it is that account's login it
+    refreshes, from its own directory; no terminal, nothing on stdin, its output dropped. Not
+    a session's: no messaging folder is named or made for it. Registered in
+    ``core.spawn.SEAMS`` as excluded.
     """
     try:
         subprocess.run(  # argv, never a shell
             list(command),
-            env=session_env(account),
+            env=account_env(account),
             cwd=account.config_dir if account.config_dir.is_dir() else None,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -5534,16 +5535,22 @@ def _retarget_bindings(
 # --- running ------------------------------------------------------------------------------------
 
 
-def session_env(account: ClaudeAccount, base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment a plain session on ``account`` runs with.
+def account_env(account: ClaudeAccount, base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment a process on ``account`` runs with, a session or not.
 
     The tracing identity is dropped (``core.spawn.untraced_env``): a session
     started from the Accounts page or from ``accounts run`` is not a board role
     and must not file its work under whichever traced session happened to
-    start it. Its messaging socket goes in the folder every account's sessions
-    share (``core.peer_sockets``), as a fleet launch's does.
+    start it.
     """
-    env = core.apply_launch_env(untraced_env(base), account, shell=base)
+    return core.apply_launch_env(untraced_env(base), account, shell=base)
+
+
+def session_env(account: ClaudeAccount, base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment a plain session on ``account`` runs with: :func:`account_env`, its
+    messaging socket in the folder every account's sessions share (``core.peer_sockets``), as
+    a fleet launch's is."""
+    env = account_env(account, base)
     return peer_sockets.apply(env, get_adapter(account.agent).capabilities.peer_sockets)
 
 

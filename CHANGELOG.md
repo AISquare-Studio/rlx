@@ -9,12 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **Claude Code sessions on different accounts keep their messaging sockets in one folder.**
-  Where your shell sets no `XDG_RUNTIME_DIR`, as on macOS, every Claude Code session rlx
-  launches, on any account, now gets `~/.aisquare/runtime` (made restricted to you) as its
-  `XDG_RUNTIME_DIR`, so its socket lands beside every other account's. Each account keeps
-  its own scratch folder. A shell that
-  sets `XDG_RUNTIME_DIR` keeps it. `rlx doctor` names the folder and says when a session
-  cannot use it.
+  Where the launch's environment sets no `XDG_RUNTIME_DIR` (a blank one counts as unset), as
+  on macOS, the Claude Code sessions that `rlx launch` (every fleet window) and
+  `rlx accounts run` start, on any account, now get `~/.aisquare/runtime` (made restricted
+  to you) as their `XDG_RUNTIME_DIR`, so their sockets land side by side. Not on Windows,
+  and not for `team spawn --exec`, which starts Claude Code itself. Each account keeps its
+  own scratch folder, and an `XDG_RUNTIME_DIR` the environment sets is kept. rlx passes the
+  value it set to no other agent and not to tmux. If the folder is not a directory of yours
+  with mode 0700, or the path is too long for a socket, a launch sets nothing, as before;
+  `rlx doctor` names the folder and says why. Sessions still list only the sessions on their
+  own account: Claude Code reads that list from each account's own folder.
 
 ## [0.10.1] - 2026-11-18
 

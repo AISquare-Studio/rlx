@@ -33,7 +33,7 @@ from aisquare.core import program as prog
 from aisquare.core import tmux as tmux_core
 from aisquare.core.agent_adapters import adapter_for_binary, adapters, get_adapter
 from aisquare.core.agent_adapters.mcp_servers import DEVTOOLS_COMMAND, DEVTOOLS_NAME
-from aisquare.core.agent_adapters.types import AgentAdapter, PluginInstall
+from aisquare.core.agent_adapters.types import AgentAdapter, PeerSockets, PluginInstall
 from aisquare.core.config import RETIRED_SECTIONS, load_config, retired_sections
 from aisquare.core.injection import load_last
 from aisquare.core.keys import EXTENDED_MINIMUM
@@ -735,50 +735,66 @@ def _check_home_filesystem() -> DoctorCheck:
 
 def _peer_sockets_checks() -> list[DoctorCheck]:
     """A row for each agent whose sessions message each other over sockets
-    (``capabilities.peer_sockets``): the folder a session launched from here puts its socket
-    under (``core.peer_sockets.folder``), and why a session cannot use it. A folder that is no
-    private one of this user's warns (``core.peer_sockets.not_private``); one too long for the
-    sockets is said on an ok row (``core.peer_sockets.too_long``): a launch then names no folder,
-    and the sessions keep their sockets where they did before it, as every long home (a test
-    home among them) would. It only reads: a launch makes the folder. None on Windows, where
-    no launch names one."""
+    (``capabilities.peer_sockets``), about launches from THIS shell: a role's bound environment
+    or the fleet's tmux server can name another folder for a launch. It only reads. None on
+    Windows, where no launch names one."""
     if sys.platform == "win32":
         return []
-    rows: list[DoctorCheck] = []
-    for adapter in adapters():
-        sockets = adapter.capabilities.peer_sockets
-        if sockets is None:
-            continue
-        name = f"{adapter.id} messaging"
-        where = peer_sockets.folder(os.environ, sockets)
-        if os.environ.get(sockets.folder_env, "").strip():
-            whose = f"{sockets.folder_env} as this shell sets it, which launches keep"
-        else:
-            whose = f"rlx's own, which launches set as {sockets.folder_env}"
-        reason = peer_sockets.not_private(where)
+    return [
+        _peer_sockets_row(f"{adapter.id} messaging", adapter.capabilities.peer_sockets)
+        for adapter in adapters()
+        if adapter.capabilities.peer_sockets is not None
+    ]
+
+
+def _peer_sockets_row(name: str, sockets: PeerSockets) -> DoctorCheck:
+    """The folder this shell names of its own (``core.peer_sockets.named``), which launches keep
+    and rlx never makes, else rlx's own (``core.peer_sockets.shared``), which a launch makes: said
+    apart. One that cannot hold the sockets (``core.peer_sockets.unusable``) warns. One too long
+    for them, or rlx's own under a parent a launch cannot write, is said on an ok row: launches
+    from this shell then set nothing, as before the shared folder."""
+    named = peer_sockets.named(os.environ, sockets)
+    if named is not None:
+        where = Path(named)
+        whose = f"{sockets.folder_env} in this shell, which launches from it keep"
+        reason = peer_sockets.unusable(where)
         if reason is not None:
-            rows.append(
-                _warn(
-                    name,
-                    f"{where} ({whose}) cannot hold the sessions' sockets: {reason}",
-                    "Make it a folder of yours with mode 0700, or name another with "
-                    f"{sockets.folder_env}",
-                )
+            return _warn(
+                name,
+                f"{where} ({whose}) cannot hold the sessions' sockets: {reason}",
+                f"Make it a folder of yours with mode 0700, or unset {sockets.folder_env}",
             )
-            continue
         long = peer_sockets.too_long(where, sockets)
         if long is not None:
-            rows.append(_ok(name, f"{where} ({whose}) cannot hold the sessions' sockets: {long}"))
-            continue
-        made = "" if where.exists() else "; the first launch makes it"
-        rows.append(
-            _ok(
-                name,
-                f"{where} ({whose}): the sessions rlx launches, on every account, put their "
-                f"sockets in its {sockets.subfolder}{made}",
-            )
+            return _ok(name, f"{where} ({whose}) cannot hold the sessions' sockets: {long}")
+        return _ok(
+            name,
+            f"{where} ({whose}): sessions launched from this shell put their sockets in its "
+            f"{sockets.subfolder}",
         )
-    return rows
+    where = peer_sockets.shared()
+    whose = f"rlx's own, which launches from this shell set as {sockets.folder_env}"
+    long = peer_sockets.too_long(where, sockets)
+    if long is not None:
+        return _ok(name, f"{where} ({whose}) is too long: {long}, so launches set nothing")
+    if os.path.lexists(where):
+        reason = peer_sockets.unusable(where)
+        if reason is not None:
+            return _warn(
+                name,
+                f"{where} ({whose}) cannot hold the sessions' sockets: {reason}, so launches "
+                "set nothing",
+                f"Remove {where}: the next launch makes it, mode 0700",
+            )
+        return _ok(
+            name,
+            f"{where} ({whose}): sessions launched from this shell, on every account, put their "
+            f"sockets in its {sockets.subfolder}",
+        )
+    blocked = peer_sockets.cannot_make(where)
+    if blocked is not None:
+        return _ok(name, f"{where} ({whose}) cannot be made: {blocked}, so launches set nothing")
+    return _ok(name, f"{where} ({whose}) is not made yet: the next launch from this shell makes it")
 
 
 def _check_config() -> DoctorCheck:

@@ -30,7 +30,7 @@ from rich.text import Text
 
 from aisquare.cli.common import USAGE_ERROR, fail, format_reset, refuse_conflicting_scope
 from aisquare.cli.native_args import NativeForwardingCommand, PassthroughCommand
-from aisquare.core import harness
+from aisquare.core import harness, peer_sockets
 from aisquare.core import program as prog
 from aisquare.core.agent_adapters import agents_named, recorded_adapter
 from aisquare.core.agent_adapters.types import staged_label
@@ -1086,8 +1086,12 @@ def _released_line(count: int) -> str:
 
 
 def _exec_attach(argv: list[str]) -> None:
-    """Replace this process with `tmux attach` (indirection so tests can intercept)."""
-    os.execvp(argv[0], argv)
+    """Replace this process with `tmux attach` (indirection so tests can intercept), without
+    the runtime dir a launch set (`core.peer_sockets.drop_set`): the session takes the
+    attaching client's desktop variables (`update-environment`), and that one is no desktop's."""
+    env = dict(os.environ)
+    peer_sockets.drop_set(env)
+    os.execvpe(argv[0], argv, env)
 
 
 def _stdin_is_a_terminal() -> bool:
