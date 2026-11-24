@@ -9,7 +9,7 @@ Layout:
     ├── claude-accounts/# one CLAUDE_CONFIG_DIR per managed account (core.claude_accounts)
     ├── codex-accounts/ # one CODEX_HOME per managed Codex account (core.codex_accounts)
     ├── cache/          # disposable cached data (incl. each managed account's TMPDIR)
-    ├── run/            # the messaging folder launched sessions share (core.peer_sockets)
+    ├── runtime/        # the messaging folder launched sessions share (core.peer_sockets)
     ├── explainability/ # session→Run join records (see services.explainability)
     └── log/            # capture and diagnostic logs
 
@@ -756,8 +756,10 @@ def agent_accounts_dir(name: str) -> Path:
 
 def messaging_dir() -> Path:
     """The one folder the sessions rlx launches, on every account, put their messaging sockets
-    under (``core.peer_sockets``): short, as a socket's path is bounded."""
-    return aisquare_home() / "run"
+    under (``core.peer_sockets``): short, as a socket's path is bounded, and its own, as it must
+    be ``0700`` and ``run/`` is made with the umask's mode (``services.delivery.prompts_dir``,
+    ``core.prompt_origin.origin_markers_dir``)."""
+    return aisquare_home() / "runtime"
 
 
 def agents_registry_path() -> Path:

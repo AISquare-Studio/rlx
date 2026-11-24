@@ -21,7 +21,7 @@ from aisquare.core import paths, peer_sockets
 from aisquare.core.agent_adapters import get_adapter
 from aisquare.models import CheckStatus, DoctorCheck
 from aisquare.services import claude_accounts as service
-from aisquare.services import diagnostics
+from aisquare.services import delivery, diagnostics
 from tests import private_fleets
 
 posix_only = pytest.mark.skipif(
@@ -160,6 +160,21 @@ def test_the_shared_folder_is_made_0700_and_owned_by_this_user_under_umask_0(
     facts = paths.messaging_dir().lstat()
     assert stat.S_IMODE(facts.st_mode) == 0o700
     assert facts.st_uid == private_fleets.uid()
+
+
+@posix_only
+def test_a_home_whose_prompts_folder_exists_with_the_umasks_mode_still_gets_the_shared_folder(
+    short_home: Path,
+) -> None:
+    """A machine that has spawned an agent has ``services.delivery.prompts_dir``, its parent
+    made with the umask's mode, before any launch made the shared folder."""
+    previous = os.umask(0o022)
+    try:
+        delivery.prompts_dir().mkdir(parents=True)
+    finally:
+        os.umask(previous)
+
+    assert peer_sockets.apply({}, SOCKETS)[VAR] == _shared()
 
 
 def test_on_windows_a_launch_sets_no_folder_and_the_doctor_has_no_row(
