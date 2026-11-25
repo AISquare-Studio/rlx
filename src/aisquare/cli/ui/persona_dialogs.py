@@ -124,18 +124,9 @@ def name_problem(name: str) -> str | None:
     return None
 
 
-def layer_radios(root: Path | None, prefix: str) -> RadioSet:
-    """User (default) or project — the project layer only with a project's root. asq opens
-    every dialog with none (Settings ▸ Personas, R27): user is the one choice."""
-    buttons = [RadioButton("user", value=True, id=f"{prefix}-user")]
-    if root is not None:
-        buttons.append(RadioButton("project", id=f"{prefix}-project"))
-    return RadioSet(*buttons, id=f"{prefix}-layer")
-
-
-def chosen_layer(radios: RadioSet) -> Layer:
-    pressed = radios.pressed_button
-    return "project" if pressed is not None and (pressed.id or "").endswith("-project") else "user"
+WRITES: Layer = "user"
+"""The one layer every dialog here writes: yours. Since 0.10.2 (the owner's decision on #21)
+nothing writes a project's own persona layer, and a dialog offers no layer to choose."""
 
 
 def failure(exc: Exception) -> str:
@@ -208,9 +199,6 @@ class ImportPersonaScreen(_Dialog):
                 with Horizontal(classes="dialog-row"):
                     yield Label("Browse skills")
                     yield Select[str]([], prompt="agent skills — reading…", id="import-browse")
-                with Horizontal(classes="dialog-row"):
-                    yield Label("Layer")
-                    yield layer_radios(self.root, "import")
                 with Horizontal(classes="dialog-row"):
                     yield Label("Name")
                     yield Input(placeholder="(from the source)", id="import-name")
@@ -289,7 +277,7 @@ class ImportPersonaScreen(_Dialog):
         name = self.query_one("#import-name", Input).value
         return {
             "source": self.query_one("#import-source", Input).value.strip(),
-            "layer": chosen_layer(self.query_one("#import-layer", RadioSet)),
+            "layer": WRITES,
             "root": self.root,
             "name": name or None,
             "force": self.query_one("#import-force", Switch).value,
@@ -547,9 +535,6 @@ class NewPersonaScreen(_Dialog):
                 yield Input(placeholder="pair-programmer", id="new-name")
             yield Static(id="new-name-rule", classes="dialog-note")
             with Horizontal(classes="dialog-row"):
-                yield Label("Layer")
-                yield layer_radios(self.root, "new")
-            with Horizontal(classes="dialog-row"):
                 yield Label("Description")
                 yield Input(placeholder="one line: how this persona works", id="new-description")
             yield Static(id="new-status", classes="dialog-status")
@@ -579,7 +564,7 @@ class NewPersonaScreen(_Dialog):
         if not self._validate():
             return
         name = self.query_one("#new-name", Input).value
-        layer = chosen_layer(self.query_one("#new-layer", RadioSet))
+        layer = WRITES
         description = self.query_one("#new-description", Input).value.strip()
         try:
             directory = personas_service.new(name, layer=layer, root=self.root)
@@ -654,8 +639,7 @@ class EditPersonaScreen(_Dialog):
             yield Static(id="edit-status", classes="dialog-status")
             if self.read_only:
                 with Horizontal(classes="dialog-row"):
-                    yield Label("Save as… into")
-                    yield layer_radios(self.root, "save-as")
+                    yield Label("Save as… into your personas")
                     yield Label("force", classes="dialog-hint")
                     yield Switch(False, id="save-as-force")
             with Horizontal(classes="dialog-buttons"):
@@ -716,9 +700,8 @@ class EditPersonaScreen(_Dialog):
 
     @on(Button.Pressed, "#edit-save-as")
     def _save_as(self) -> None:
-        layer = chosen_layer(self.query_one("#save-as-layer", RadioSet))
         try:
-            base = dict(core.layer_dirs(self.root))[layer]
+            base = dict(core.layer_dirs(None))[WRITES]  # yours, with a project or without
             written = personas_service.export(
                 self.persona_name,
                 root=self.root,
@@ -739,7 +722,7 @@ class EditPersonaScreen(_Dialog):
 
 
 def personas_bundled_hint() -> str:
-    return "bundled — read-only; Save as… copies it into a layer, where it shadows this one"
+    return "bundled — read-only; Save as… copies it into your personas, where it shadows this one"
 
 
 # --- Edit in $EDITOR (#212) ---------------------------------------------------------------

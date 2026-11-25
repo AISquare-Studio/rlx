@@ -6,7 +6,9 @@ in ``cli/ui/persona_dialogs.py``). asq shows it on Settings ▸ Personas with no
 dialog it opens writes the user layer. Built with a project (``PersonasTab(project)``, the
 Project view's tab until R27, which nothing in asq builds now), its project supplies the
 project layer (``core.project_root``), the one ``fleet spawn`` checks and ``aisquare
-persona`` reads from the project's directory; the CLI and the services keep that layer.
+persona`` reads from the project's directory. The CLI and the services still READ that
+layer, where an agent starts; since 0.10.2 nothing writes it (the owner's decision on #21),
+and every dialog writes yours.
 
 **The tab holds no state the disk does not.** Every action ends by re-reading
 ``core.personas.catalogue``, and the selection is kept by row key (``layer:name``),

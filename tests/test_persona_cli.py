@@ -21,6 +21,7 @@ from aisquare.core import agents as agents_core
 from aisquare.core import claude_accounts
 from aisquare.core import personas as core
 from aisquare.core.personas import PersonaError
+from aisquare.services import personas as persona_service
 from tests import bundled_personas
 
 
@@ -969,6 +970,25 @@ def test_a_projects_own_persona_is_still_read_but_never_changed(
     assert result.exit_code == 1, result.output
     said = " ".join(result.stderr.split())
     assert "rlx no longer writes, edits or removes a project's persona" in said
+    assert str(skill.parent) in said, "it names the project's persona it leaves alone"
     assert "Traceback" not in result.output
     assert skill.read_bytes() == before, "the project's file is untouched"
     assert (code, shown["layer"]) == (0, "project"), "and still read"
+
+
+def test_export_refuses_a_projects_persona_layer_as_its_destination(
+    runner: CliRunner, repo: Path
+) -> None:
+    """The review of #561: ``export --to <repo>/.aisquare/personas`` (the dialog's old
+    *Save as… into: project*) wrote the project's layer around ``_layer_dir``'s refusal."""
+    layer = repo / ".aisquare" / "personas"
+
+    code, payload = _json(runner, "export", "skeptic", "--to", str(layer))
+    with pytest.raises(PersonaError) as refused:
+        persona_service.export("skeptic", root=repo, to=layer, skill=None, force=False)
+
+    assert (code, payload["error"]) == (1, "project_layer_retired")
+    assert refused.value.code == "project_layer_retired"
+    assert not (layer / "skeptic").exists()
+    exported = runner.invoke(app, ["persona", "export", "skeptic", "--to", str(repo / "out")])
+    assert exported.exit_code == 0, exported.output  # any other directory is still fine

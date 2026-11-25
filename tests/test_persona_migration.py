@@ -176,3 +176,61 @@ def test_the_personas_page_says_what_was_copied_once(repo: Path) -> None:
     assert shown and "Copied your project personas to your personas: tempo." in text
     assert "tempo" in names, "and the page lists it as yours"
     assert not again, "said once: the second opening has nothing to say"
+
+
+def _outside(tmp_path: Path) -> Path:
+    """A directory outside the repository, standing for ``~/.ssh``: a persona with a key."""
+    stolen = tmp_path / "outside" / "stolen"
+    _skill(stolen, "Outside the repository.")
+    (stolen / "id_rsa").write_text("PRIVATE KEY MATERIAL\n", encoding="utf-8")
+    return stolen
+
+
+def _nothing_stolen() -> None:
+    assert not list(_user().rglob("id_rsa")), "a file from outside the repository is yours now"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symbolic links need privileges on Windows")
+def test_a_persona_directory_that_is_a_link_is_skipped_and_nothing_is_copied(
+    tmp_path: Path,
+) -> None:
+    """The review of #561: ``.aisquare/personas/stolen -> <outside>`` copied ``id_rsa``."""
+    root = tmp_path / "repo"
+    (root / ".aisquare" / "personas").mkdir(parents=True)
+    (root / ".aisquare" / "personas" / "stolen").symlink_to(
+        _outside(tmp_path), target_is_directory=True
+    )
+
+    report = persona_service.migrate_project_personas([root])
+
+    assert [(item.name, item.outcome) for item in report.personas] == [("stolen", "skipped")]
+    assert "symbolic link" in (report.personas[0].detail or "")
+    assert not (_user() / "stolen").exists()
+    _nothing_stolen()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symbolic links need privileges on Windows")
+@pytest.mark.parametrize("linked", [".aisquare", "personas"])
+def test_a_projects_layer_reached_through_a_link_is_skipped_whole(
+    tmp_path: Path, linked: str
+) -> None:
+    """A repository that commits ``.aisquare -> …`` or ``.aisquare/personas -> …``: nothing
+    under the link is read, and the report says why."""
+    root = tmp_path / "repo"
+    elsewhere = tmp_path / "elsewhere"
+    stolen = _outside(tmp_path)
+    if linked == ".aisquare":
+        (elsewhere / "personas").mkdir(parents=True)
+        (elsewhere / "personas" / "stolen").symlink_to(stolen, target_is_directory=True)
+        root.mkdir()
+        (root / ".aisquare").symlink_to(elsewhere, target_is_directory=True)
+    else:
+        (root / ".aisquare").mkdir(parents=True)
+        (root / ".aisquare" / "personas").symlink_to(stolen.parent, target_is_directory=True)
+
+    report = persona_service.migrate_project_personas([root])
+
+    assert [(item.name, item.outcome) for item in report.personas] == [(linked, "skipped")]
+    assert "symbolic link" in (report.personas[0].detail or "")
+    assert not (_user() / "stolen").exists()
+    _nothing_stolen()

@@ -1925,7 +1925,7 @@ def test_import_beside_the_persona_select_selects_what_it_imports(
         return seen
 
     opened, screen, value, description = drive(git_project, scenario)
-    assert opened == [None, ["import-user"]]
+    assert opened == [None, []]  # no layer to choose: an import is yours (0.10.2)
     assert [(call["root"], call["layer"]) for call in asked] == [(None, "user")]
     assert (screen, value, description) == ("SpawnDialog", "fresh-one", "Fresh.")
     assert spawns.calls[0][2]["persona"] == "fresh-one"

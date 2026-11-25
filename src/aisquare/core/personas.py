@@ -405,8 +405,8 @@ def project_root(where: ProjectInfo | Path | None = None) -> Path | None:
 
     ``None`` — the user and bundled layers only — for a directory in no project: no git
     repository and no marker on the way up, where that walk names the directory itself.
-    Its layer could not exist (``<dir>/.aisquare`` would mark it), so no read changes, and
-    ``persona new --project`` there still refuses rather than make a folder a project.
+    Its layer could not exist (``<dir>/.aisquare`` would mark it), so no read changes.
+    (Nothing writes a project's layer since 0.10.2: ``persona new --project`` is retired.)
     ``None`` too when the directory cannot be read (a symlink loop on the way to it).
 
     No project at all is ``None`` handed to :func:`catalogue` itself: App settings' role

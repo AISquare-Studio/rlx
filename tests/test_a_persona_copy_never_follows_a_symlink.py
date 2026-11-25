@@ -248,20 +248,26 @@ def test_import_copies_everything_but_the_link_and_names_what_it_skipped(
     skill = _skill(repo / ".claude" / "skills")
     named = plant(skill, vault)
 
-    result = _import(str(skill), root=repo)  # the service, into your layer (0.10.2)
-    by_cli = runner.invoke(app, ["persona", "import", str(skill), "--user", "--force"])
-
     project, user = repo / ".aisquare", cli_suite._user_layer()
+    result = _import(str(skill), root=repo)  # the service, into your layer (0.10.2)
+    # Checked before the CLI's import, which goes under a name of its own: the service's copy
+    # is judged by itself, never by a later import that replaced it (the review of #561).
     assert result.persona.path == user / "helper"
     for layer in (project, user):
         assert _holding_the_secret(layer) == []
         assert _links(_snapshot(layer)) == []
     assert result.skipped_links == [named]
+    assert _copied(result.persona.path) == _the_rest(skill)  # the rest, byte for byte
+
+    by_cli = runner.invoke(
+        app, ["persona", "import", str(skill), "--user", "--name", "helper-by-cli"]
+    )
+
     assert by_cli.exit_code == 0, repr(by_cli.exception)
     warned = f"⚠ skipped 1 symbolic link, never followed and not copied: {named}"
     assert warned in by_cli.stderr.splitlines()
-    for copy in (result.persona.path, user / "helper"):
-        assert _copied(copy) == _the_rest(skill)  # the rest, byte for byte
+    assert _holding_the_secret(user) == [] and _links(_snapshot(user)) == []
+    assert _copied(user / "helper-by-cli") == _the_rest(skill)
 
 
 def test_every_skipped_link_is_named_once_in_path_order(repo: Path, vault: Path) -> None:

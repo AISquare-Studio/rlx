@@ -1066,6 +1066,8 @@ def remove(name: str, *, layer: Layer, root: Path | None) -> Path:
     """Delete ``<layer>/<name>/``. Bundled personas cannot be removed."""
     if layer == "bundled":
         raise _bundled_refusal(name, "removed")
+    if layer == "project":
+        raise _project_refusal(dict(core.layer_dirs(root)).get("project", Path()) / name)
     directory = _layer_dir(layer, root) / name
     if not (_is_skill_name(name) and directory.is_dir()):
         raise PersonaError(
@@ -1103,6 +1105,7 @@ def export(
     else:
         assert to is not None
         base = to.expanduser()
+        _refuse_a_project_layer(base)
     dest = base / persona.name
     if _occupied(dest) and not force:
         raise PersonaError(f"{dest} already exists — --force replaces it", code="target_exists")
@@ -1167,6 +1170,19 @@ def _layer_dir(layer: Layer, root: Path | None) -> Path:
     if layer == "project":
         raise _project_refusal(None)
     return dict(core.layer_dirs(root))["user"]
+
+
+def _refuse_a_project_layer(base: Path) -> None:
+    """Refuse a destination that is a project's own persona layer (``<root>/.aisquare/personas``,
+    the user layer aside): an export there wrote what ``_layer_dir`` refuses, by a path
+    (the review of #561: *Save as… into: project*)."""
+    user = dict(core.layer_dirs(None))["user"]
+    try:
+        where, mine = base.resolve(), user.resolve()
+    except OSError:
+        return
+    if where != mine and where.name == "personas" and where.parent.name == ".aisquare":
+        raise _project_refusal(base)
 
 
 def _project_refusal(directory: Path | None) -> PersonaError:
@@ -1408,7 +1424,21 @@ def migrate_project_personas(roots: list[Path] | None = None) -> MigrationReport
     report = MigrationReport()
     seen: set[Path] = set()
     for root in roots:
-        layer = root / ".aisquare" / "personas"
+        marker = root / ".aisquare"
+        layer = marker / "personas"
+        linked = next((path for path in (marker, layer) if path.is_symlink()), None)
+        if linked is not None:
+            # A cloned repository can commit `.aisquare -> ~/.ssh`: nothing under a link is
+            # read, let alone copied (the review of #561, as #240 finding 15 for import).
+            report.personas.append(
+                MigratedPersona(
+                    name=linked.name,
+                    source=linked,
+                    outcome="skipped",
+                    detail="it is a symbolic link, never followed",
+                )
+            )
+            continue
         try:
             if layer.resolve() == user.resolve() or layer.resolve() in seen:
                 continue
@@ -1416,16 +1446,29 @@ def migrate_project_personas(roots: list[Path] | None = None) -> MigrationReport
         except OSError:
             continue
         for directory in core._candidates(layer):
-            report.personas.append(_migrate_one(directory, user, copied_from))
+            report.personas.append(_migrate_one(directory, layer, user, copied_from))
     return report
 
 
-def _migrate_one(directory: Path, user: Path, copied_from: dict[str, Path]) -> MigratedPersona:
+def _migrate_one(
+    directory: Path, layer: Path, user: Path, copied_from: dict[str, Path]
+) -> MigratedPersona:
     name = directory.name
 
     def outcome(kind: MigrationOutcome, detail: str | None = None) -> MigratedPersona:
         return MigratedPersona(name=name, source=directory, outcome=kind, detail=detail)
 
+    # ``core._candidates`` keeps what ``is_dir()`` says is a directory, which follows a link:
+    # a persona directory that is one is skipped whole, and one that resolves outside its
+    # project's layer is too (the review of #561).
+    if directory.is_symlink():
+        return outcome("skipped", "it is a symbolic link, never followed")
+    try:
+        inside = directory.resolve().parent == layer.resolve()
+    except OSError:
+        inside = False
+    if not inside:
+        return outcome("skipped", "it is not inside the project's personas")
     if not _is_skill_name(name):
         return outcome("skipped", "its name is not one a persona can have")
     skill = directory / core.SKILL_FILE
@@ -1453,7 +1496,9 @@ def _migrate_one(directory: Path, user: Path, copied_from: dict[str, Path]) -> M
 def migrate_once(roots: list[Path] | None = None) -> MigrationReport:
     """:func:`migrate_project_personas`, the first time it is asked on this machine; a report
     with ``ran=False`` every time after. What it did is kept in ``state.json``
-    (:data:`MIGRATION_KEY`). Never raises: a move that fails is tried again next time."""
+    (:data:`MIGRATION_KEY`), so it does not run again: a persona it could not copy is reported
+    ``skipped`` with its reason, and left where it is. Never raises; only a failure to read
+    the projects or to record the result (nothing recorded) lets it run again next time."""
     from aisquare.core import state_file
 
     try:
