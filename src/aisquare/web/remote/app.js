@@ -702,7 +702,7 @@ function turnTime(iso) {
 const STATES = {
   working: ["working", "s-working"], waiting: ["waiting", "s-waiting"], attention: ["NEEDS YOU", "s-attention"],
   limited: ["limited", "s-limited"], exited: ["exited 💤", "s-exited"], lost: ["lost", "s-lost"],
-  paused: ["paused ⏯", "s-paused"], unknown: ["unknown", "s-unknown"],
+  paused: ["paused ⏸", "s-paused"], unknown: ["unknown", "s-unknown"],
 };
 
 const STATE_SENTENCES = {

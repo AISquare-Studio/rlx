@@ -31,6 +31,7 @@ from typing import Any, TypeVar
 
 import pytest
 from rich.color import Color
+from textual.containers import VerticalScroll
 from textual.pilot import Pilot
 from textual.widgets import Button, DataTable, Select, Static, Switch
 
@@ -260,11 +261,35 @@ def confirm_box(app: Any) -> remote_view.RemoteConfirm:
     return screen
 
 
+async def box_up(pilot: Pilot[None]) -> remote_view.RemoteConfirm:
+    """The box *Regenerate* or *New link* asks in, laid out, waited for a bounded time: the
+    press is a message, the push its handler's, and the box composed and placed after."""
+    for _ in range(250):
+        screen = pilot.app.screen
+        if isinstance(screen, remote_view.RemoteConfirm) and any(
+            button.region for button in screen.query("#remote-confirm-yes").results(Button)
+        ):
+            break
+        await pilot.pause(0.02)
+    return confirm_box(pilot.app)
+
+
+async def focus_on(pilot: Pilot[None], wanted: str) -> str | None:
+    """The id of what has the focus once ``wanted`` has it, or after a bounded wait: a pushed
+    box's ``AUTO_FOCUS`` lands as its screen is activated, a loop turn or more after the push
+    on a slow runner (windows-py3.12, CI run 45651778096, read one pause after the push)."""
+    app = pilot.app
+    for _ in range(250):
+        if app.focused is not None and app.focused.id == wanted:
+            break
+        await pilot.pause(0.02)
+    return app.focused.id if app.focused is not None else None
+
+
 async def press_and_confirm(pilot: Pilot[None], modal: RemotePanel, button: str) -> None:
     """Press *Regenerate* or *New link* (``button``'s id) and answer its box yes."""
     modal.query_one(f"#{button}", Button).press()
-    await pilot.pause()
-    confirm_box(pilot.app).query_one("#remote-confirm-yes", Button).press()
+    (await box_up(pilot)).query_one("#remote-confirm-yes", Button).press()
     await pilot.pause()
     assert pilot.app.screen is modal, "the box answered, the panel is back on top"
 
@@ -1642,20 +1667,18 @@ def test_new_link_and_regenerate_ask_first_and_cancel_or_esc_changes_nothing(
         assert runtime.unlock_device(runtime.password, "iPhone Safari") is not None
         seen: dict[str, Any] = {"before": saved_link()}
         modal.query_one(f"#{button}", Button).press()
-        await pilot.pause()
-        box = confirm_box(app)
+        box = await box_up(pilot)
         seen["asked"] = (
             shown(box.query_one("#remote-confirm-question", Static)),
             shown(box.query_one("#remote-confirm-breaks", Static)),
             str(box.query_one("#remote-confirm-yes", Button).label),
         )
-        seen["focused"] = app.focused.id if app.focused is not None else None
+        seen["focused"] = await focus_on(pilot, "remote-confirm-cancel")
         box.query_one("#remote-confirm-cancel", Button).press()
         await written(pilot)
         seen["cancelled"] = (app.screen is modal, saved_link())
         modal.query_one(f"#{button}", Button).press()
-        await pilot.pause()
-        confirm_box(app)
+        await box_up(pilot)
         await pilot.press("escape")
         await written(pilot)
         seen["escaped"] = (app.screen is modal, saved_link())
@@ -1667,12 +1690,150 @@ def test_new_link_and_regenerate_ask_first_and_cancel_or_esc_changes_nothing(
     seen = drive(go, tunnel=missing_ngrok)
     before, after = seen["before"], seen["after"]
     assert seen["asked"] == asked
-    assert seen["focused"] == "remote-confirm-yes", "Enter answers yes, as R17's boxes do"
+    assert seen["focused"] == "remote-confirm-cancel", "a second Enter is not a yes"
     assert seen["cancelled"] == (True, before), "Cancel: nothing changed on disk"
     assert seen["escaped"] == (True, before), "Esc: nothing changed on disk, the panel stays"
     assert before["devices"] and after["devices"] == [], "confirmed: every device signed out"
     for key in ("token", "password"):
         assert (after[key] != before[key]) is (key in changes), key
+
+
+SMALL = (80, 24)
+"""The smallest terminal asq is laid out for: where the panel scrolls, and a centred box's
+button sat on the panel's *Regenerate* (#17's round 2)."""
+ASKED = {
+    "remote-new-link": remote_view.NEW_LINK_CONFIRM,
+    "remote-regen": remote_view.REGENERATE_CONFIRM,
+}
+
+
+async def remote_on_and_a_phone_in(pilot: Pilot[None]) -> RemotePanel:
+    """The panel, Remote on and one device signed in: what a misclick here would sign out."""
+    modal = await open_panel(pilot)
+    modal.query_one("#remote-on", Switch).toggle()
+    await written(pilot)
+    modal.repaint()
+    await pilot.pause()
+    runtime = remote_server.runtime()
+    assert runtime.unlock_device(runtime.password, "iPhone Safari") is not None
+    return modal
+
+
+async def scrolled(pilot: Pilot[None], modal: RemotePanel, y: int, button: str) -> bool:
+    """Scroll the panel to ``y``; whether every cell of ``button`` is in sight there."""
+    scroll = modal.query_one("#remotebox", VerticalScroll)
+    scroll.scroll_to(y=y, animate=False)
+    await pilot.pause()
+    return scroll.region.contains_region(modal.query_one(f"#{button}", Button).region)
+
+
+async def back_to(pilot: Pilot[None], modal: RemotePanel) -> None:
+    """Esc the box, and wait, bounded, for the panel to be on top again."""
+    await pilot.press("escape")
+    for _ in range(250):
+        if pilot.app.screen is modal:
+            return
+        await pilot.pause(0.02)
+    raise AssertionError(f"on top: a {type(pilot.app.screen).__name__}")
+
+
+@pytest.mark.parametrize("button", list(ASKED))
+def test_the_box_opens_away_from_the_button_that_opened_it_with_cancel_focused(
+    button: str,
+) -> None:
+    """#17's round 2: the box sat in the centre, and at 80x24 its own *Regenerate* covered the
+    cells where the panel's was, so a double-click regenerated with no box left on screen.
+    At every scroll of the panel that shows the button, the box's action button is off its
+    cells, and Cancel has the focus, as fresh's and fleet_bulk's error boxes give it."""
+
+    async def go(pilot: Pilot[None]) -> list[tuple[int, Any, Any, str | None]]:
+        modal = await remote_on_and_a_phone_in(pilot)
+        before = saved_link()
+        seen = []
+        scroll = modal.query_one("#remotebox", VerticalScroll)
+        for y in range(scroll.max_scroll_y + 1):
+            if not await scrolled(pilot, modal, y, button):
+                continue
+            pressed = modal.query_one(f"#{button}", Button)
+            at = pressed.region
+            pressed.press()
+            box = await box_up(pilot)
+            focused = await focus_on(pilot, "remote-confirm-cancel")
+            seen.append((y, at, box.query_one("#remote-confirm-yes", Button).region, focused))
+            await back_to(pilot, modal)
+        await written(pilot)
+        assert saved_link() == before, "Esc each time: nothing changed"
+        return seen
+
+    seen = drive(go, tunnel=missing_ngrok, size=SMALL)
+    assert len(seen) > 1, "the panel scrolls at 80x24"
+    if button == "remote-regen":  # the box opened at the top, and at the bottom
+        assert {at.y < SMALL[1] // 2 for _, at, _, _ in seen} == {True, False}
+    for y, at, yes, focused in seen:
+        assert not yes.overlaps(at), f"scrolled to {y}: the box's button {yes} on {at}"
+        assert focused == "remote-confirm-cancel", f"scrolled to {y}"
+
+
+@pytest.mark.parametrize(
+    ("button", "how"),
+    [
+        ("remote-regen", "double-click"),
+        ("remote-regen", "double-click, 250 ms"),
+        ("remote-regen", "Enter, Enter"),
+        ("remote-new-link", "Enter, Enter"),
+        ("remote-regen", "two presses in a frame"),
+        ("remote-new-link", "two presses in a frame"),
+    ],
+)
+def test_a_double_click_or_a_second_enter_on_new_link_or_regenerate_changes_nothing(
+    button: str, how: str
+) -> None:
+    """#17's round 2, the tester's misclicks at 80x24: a double-click on *Regenerate* at
+    normal speed changed the password on disk with no box left on screen, and Enter, Enter on
+    *New link* signed every device out, the box's focus on its own *New link*. The click is
+    at the cells where a centred box drew its action button over the panel's; two presses
+    that reach the button before the box ask once."""
+
+    async def go(pilot: Pilot[None]) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+        app = pilot.app
+        modal = await remote_on_and_a_phone_in(pilot)
+        pressed = modal.query_one(f"#{button}", Button)
+        if how.startswith("double-click"):
+            # Where the box drew its button when it sat in the centre, as before the fix.
+            app.push_screen(remote_view.RemoteConfirm(*ASKED[button]))
+            centred = (await box_up(pilot)).query_one("#remote-confirm-yes", Button).region
+            await back_to(pilot, modal)
+            scroll = modal.query_one("#remotebox", VerticalScroll)
+            for y in range(scroll.max_scroll_y + 1):
+                if await scrolled(pilot, modal, y, button) and pressed.region.overlaps(centred):
+                    break
+            cell = pressed.region.intersection(centred)
+            assert cell, f"the premise: {pressed.region} under a centred box's {centred}"
+            before = saved_link()
+            await pilot.click(offset=(cell.x, cell.y))
+            if how.endswith("250 ms"):
+                await box_up(pilot)
+                await pilot.pause(0.25)
+            await pilot.click(offset=(cell.x, cell.y))
+        elif how == "Enter, Enter":
+            pressed.focus()
+            await pilot.pause()
+            before = saved_link()
+            await pilot.press("enter", "enter")
+        else:
+            before = saved_link()
+            pressed.press()
+            pressed.press()
+        await written(pilot)
+        await settle(pilot)
+        await written(pilot)
+        return before, saved_link(), [type(screen).__name__ for screen in app.screen_stack]
+
+    before, after, stack = drive(go, tunnel=missing_ngrok, size=SMALL)
+    assert after == before, f"{how}: remote.json changed"
+    assert stack.count("RemoteConfirm") <= 1, f"{how}: one box, not two: {stack}"
+    if how != "Enter, Enter":
+        assert stack[-1] == "RemoteConfirm", f"{how}: the box still asks"
 
 
 def test_with_remote_off_the_lockout_line_says_turn_remote_on_then_new_link() -> None:

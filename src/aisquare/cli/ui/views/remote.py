@@ -19,7 +19,9 @@ ngrok's link at each turn-on: here the link, its QR and *Copy* are on screen, an
 human did not ask for put Remote's link on the clipboard.
 
 *New link* and *Regenerate* ask first (:class:`RemoteConfirm`): each signs every device out,
-and New link also stops every phone's saved link from opening.
+and New link also stops every phone's saved link from opening. The box guards a misclick: its
+Cancel has the focus, and it opens in the half of the screen away from the button pressed, so
+neither a second Enter nor a double-click's second click is a yes.
 
 The QR is segno's compact terminal rendering (half-block characters, ~18 rows
 for an ngrok URL) of exactly the text in the link row — one string feeds both,
@@ -39,6 +41,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Region
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Label, Select, Static, Switch
 from textual.widgets.data_table import ColumnKey
@@ -494,9 +497,9 @@ class RemotePanel(ModalScreen[None]):
         thread; the fleet UI says each once it is done (``RemoteController.on_done``).
         *Regenerate* and *New link* ask first, saying what each breaks."""
         if event.button.id == "remote-regen":
-            self._confirm_remote(REGENERATE_CONFIRM, new_link=False)
+            self._confirm_remote(REGENERATE_CONFIRM, new_link=False, pressed=event.button.region)
         elif event.button.id == "remote-new-link":
-            self._confirm_remote(NEW_LINK_CONFIRM, new_link=True)
+            self._confirm_remote(NEW_LINK_CONFIRM, new_link=True, pressed=event.button.region)
         elif event.button.id == "remote-copy":
             url = self.controller.link_url()
             if url is not None:
@@ -513,16 +516,22 @@ class RemotePanel(ModalScreen[None]):
             return
         self.repaint()
 
-    def _confirm_remote(self, asked: tuple[str, str, str], *, new_link: bool) -> None:
-        """Ask ``asked`` (:class:`RemoteConfirm`), and once confirmed write the new passphrase,
-        with a new link when ``new_link``. Cancel and Esc change nothing."""
+    def _confirm_remote(
+        self, asked: tuple[str, str, str], *, new_link: bool, pressed: Region
+    ) -> None:
+        """Ask ``asked`` (:class:`RemoteConfirm`), away from ``pressed``, the button's cells,
+        and once confirmed write the new passphrase, with a new link when ``new_link``.
+        Cancel and Esc change nothing. A second press that reached the button before the box
+        did (two Enters, two clicks in one frame) asks nothing more: one box, not two."""
+        if self.app.screen is not self:
+            return
 
         def remote_confirm_answered(confirmed: bool | None) -> None:
             if confirmed:
                 self.controller.regenerate_password(wait=False, new_link=new_link)
                 self.repaint()
 
-        self.app.push_screen(RemoteConfirm(*asked), remote_confirm_answered)
+        self.app.push_screen(RemoteConfirm(*asked, away_from=pressed), remote_confirm_answered)
 
     def _revoke_selected(self) -> None:
         table = self.query_one("#remote-devices", DataTable)
@@ -538,9 +547,15 @@ class RemotePanel(ModalScreen[None]):
 
 class RemoteConfirm(ModalScreen[bool]):
     """*New link?* or *New password?*: what breaks, the action's button and Cancel. Answers
-    ``True`` at the action's button, ``None`` at Cancel or Esc. The action's button has the
-    focus on open, so Enter confirms; no *Don't ask again*, as a misclick here signs every
-    phone out."""
+    ``True`` at the action's button, ``None`` at Cancel or Esc; no *Don't ask again*, as a
+    misclick here signs every phone out.
+
+    It guards that misclick (#17's round 2: at 80x24 a double-click on *Regenerate*, or Enter
+    twice, regenerated with no box left on screen). Cancel has the focus on open, as every
+    other ``variant="error"`` box's does (``fresh``'s *Start fresh*, ``fleet_bulk``'s
+    :class:`ConfirmBulk`). And it opens in the half of the screen away from ``away_from``, the
+    cells of the button that opened it: from 80x24 up its buttons stay in the half it opens
+    in, so a second click there lands on the panel's backdrop, never on the action's button."""
 
     DEFAULT_CSS = """
     RemoteConfirm { align: center middle; }
@@ -552,13 +567,22 @@ class RemoteConfirm(ModalScreen[bool]):
     RemoteConfirm Horizontal Button { margin-left: 2; min-width: 10; }
     """
     BINDINGS: ClassVar = [Binding("escape", "cancel", "cancel")]
-    AUTO_FOCUS = "#remote-confirm-yes"
+    AUTO_FOCUS = "#remote-confirm-cancel"
 
-    def __init__(self, question: str, breaks: str, verb: str) -> None:
+    def __init__(
+        self, question: str, breaks: str, verb: str, *, away_from: Region | None = None
+    ) -> None:
         super().__init__()
         self.question_text = question
         self.breaks_text = breaks
         self.verb = verb
+        self.away_from = away_from
+
+    def on_mount(self) -> None:
+        """Top or bottom, before the first paint: the half the pressed button is not in."""
+        if self.away_from:
+            middle = self.away_from.y + self.away_from.height / 2
+            self.styles.align_vertical = "top" if middle >= self.app.size.height / 2 else "bottom"
 
     def compose(self) -> ComposeResult:
         with Vertical():
