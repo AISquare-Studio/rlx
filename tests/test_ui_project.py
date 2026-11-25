@@ -1115,12 +1115,16 @@ def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInf
             if inside():
                 break
             await pilot.pause(0.02)
+        else:
+            pytest.fail(f"the tab's click left the focus outside the board: {host.focused!r}")
         took = inside()
         await pilot.press("d")  # no click inside the board first
         for _ in range(500):
             if str(table.border_title).startswith("done archive"):
                 break
             await pilot.pause(0.02)
+        else:
+            pytest.fail(f"d did not reach the board: the tasks read {table.border_title!r}")
         return took, str(table.border_title)
 
     inside, title = drive(project, scenario)

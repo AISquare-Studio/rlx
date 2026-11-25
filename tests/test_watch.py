@@ -1298,6 +1298,13 @@ def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> 
             if rebuilt and focused and laid_out and wanted <= {key for key, _ in keys}:
                 break
             await pilot.pause(0.02)
+        else:
+            # The bound ran out: fail, never hand back a footer composed for another widget
+            # (review of #573 / #582, #797: a withheld rebuild passed on the stale one).
+            pytest.fail(
+                f"the footer was never ready for {target}: rebuilt={rebuilt} "
+                f"focused={focused} laid_out={laid_out} keys={keys}"
+            )
         return keys
 
     async def drive() -> list[tuple[str, list[tuple[str, int]]]]:
