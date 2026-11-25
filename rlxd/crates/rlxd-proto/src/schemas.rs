@@ -6,7 +6,7 @@
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema};
 
-use crate::{Envelope, Event, HelloData, HelloParams, Request};
+use crate::{DaemonRecord, Envelope, Event, HelloData, HelloParams, Request};
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +20,7 @@ pub struct SchemaFile {
 /// Every schema file of this schema version, in name order.
 pub fn all() -> Vec<SchemaFile> {
     let mut files = vec![
+        file::<DaemonRecord>("daemon-record.json"),
         file::<Envelope>("envelope.json"),
         file::<Event>("event.json"),
         list_of::<Event>(

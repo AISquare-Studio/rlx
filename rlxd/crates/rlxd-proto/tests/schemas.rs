@@ -8,8 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
-    Data, Envelope, ErrorBody, Event, HelloData, HelloParams, PROTOCOL_VERSION, PROTOCOL_VERSIONS,
-    Request, Role, RunScope, SCHEMA_VERSION, codes, schemas, topics,
+    DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, PROTOCOL_VERSION,
+    PROTOCOL_VERSIONS, Request, Role, RunScope, SCHEMA_VERSION, codes, daemon_kinds, schemas,
+    topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -139,7 +140,12 @@ fn the_checked_in_schemas_are_the_generated_ones() {
 fn every_schema_is_a_valid_draft_2020_12_schema() {
     let files = schemas::all();
     let names: Vec<_> = files.iter().map(|file| file.name).collect();
-    for name in ["envelope.json", "event.json", "event-list.json"] {
+    for name in [
+        "envelope.json",
+        "event.json",
+        "event-list.json",
+        "daemon-record.json",
+    ] {
         assert!(names.contains(&name), "{name} is not generated");
     }
     for file in files {
@@ -543,4 +549,82 @@ fn the_schemas_also_hold_what_the_types_leave_to_the_reader() {
         with(&reply, "protocol_version", json!(0)),
     );
     schema_refuses("hello-reply.json", with(&reply, "rlxd_version", json!("")));
+}
+
+#[test]
+fn a_daemon_record_reads_as_python_writes_it() {
+    // core/daemons.py always writes `cwd`, a string or null, and `+00:00` offsets.
+    let record = example("daemon-record.json");
+    assert_eq!(
+        agrees::<DaemonRecord>("daemon-record.json", &record),
+        record
+    );
+    let built = DaemonRecord::new(
+        "0123456789ab",
+        daemon_kinds::WATCH,
+        4242,
+        "mac.local",
+        "0.10.1",
+        "2026-11-25T18:00:00.123456+00:00",
+        "2026-11-25T18:00:05.123456+00:00",
+        vec!["rlx".to_owned(), "watch".to_owned()],
+        true,
+    )
+    .with_cwd("/Users/me/project");
+    assert_eq!(serde_json::to_value(&built).unwrap(), record);
+
+    // A null cwd reads as absent, and `Z` as an offset.
+    let no_cwd = example("daemon-record-no-cwd.json");
+    let printed = agrees::<DaemonRecord>("daemon-record.json", &no_cwd);
+    assert_eq!(printed, without(&no_cwd, "cwd"));
+    assert_eq!(
+        serde_json::from_value::<DaemonRecord>(no_cwd).unwrap().cwd,
+        None
+    );
+
+    // A later release's kind or field is kept, not refused (4.1).
+    agrees::<DaemonRecord>("daemon-record.json", &with(&record, "kind", json!("later")));
+    agrees::<DaemonRecord>("daemon-record.json", &with(&record, "later", json!(1)));
+    for kind in daemon_kinds::ALL {
+        assert_valid("daemon-record.json", &with(&record, "kind", json!(kind)));
+    }
+}
+
+#[test]
+fn a_daemon_record_refuses_its_wrong_shapes() {
+    let record = example("daemon-record.json");
+    for field in [
+        "id",
+        "kind",
+        "pid",
+        "host",
+        "version",
+        "started_at",
+        "heartbeat_at",
+        "argv",
+        "restartable",
+    ] {
+        both_refuse::<DaemonRecord>("daemon-record.json", without(&record, field));
+    }
+    for (field, value) in [
+        ("pid", json!(-1)),
+        ("pid", json!("4242")),
+        ("argv", json!("rlx watch")),
+        ("restartable", json!("yes")),
+        ("cwd", json!(7)),
+    ] {
+        both_refuse::<DaemonRecord>("daemon-record.json", with(&record, field, value));
+    }
+    for (field, value) in [
+        ("id", json!("0123456789AB")),
+        ("id", json!("0123456789a")),
+        ("id", json!("0123456789abc")),
+        ("kind", json!("")),
+        ("pid", json!(0)),
+        ("argv", json!([])),
+        ("started_at", json!("yesterday")),
+        ("heartbeat_at", json!("2026-11-25 18:00")),
+    ] {
+        schema_refuses("daemon-record.json", with(&record, field, value));
+    }
 }

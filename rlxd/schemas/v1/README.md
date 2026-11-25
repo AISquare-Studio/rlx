@@ -18,6 +18,7 @@ cargo run -p rlxd-proto --bin gen-schemas -- --check # what CI runs: exit 1 on d
 
 | File | What it describes |
 |---|---|
+| `daemon-record.json` | One record in `<home>/daemons/` (4.1): `{id, kind, pid, host, version, started_at, heartbeat_at, argv, restartable, cwd?}`, which Python's registry and rlxd share |
 | `envelope.json` | Every response: `{schema_version, ok, data}` or `{schema_version, ok, error{code, message, hint?, detail?}}`, plus `id` on the socket. `incompatible_protocol` must carry `detail.supported` |
 | `event.json` | One event: `{schema_version, seq, time, topic, type, data}`. On the `run` topic, `data` also carries `run_id` and `run_seq` |
 | `event-list.json` | A JSON array of events, as `jq -s .` makes of `rlxd events`' lines |

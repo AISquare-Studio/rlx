@@ -10,7 +10,9 @@
 //! - [`HelloParams`] and [`HelloData`] (7.2, spec 3): the protocol handshake, the first
 //!   frame on a connection and its reply;
 //! - [`Event`] (7.3, spec 1): one event on the event stream; `event-list.json` is an
-//!   array of them.
+//!   array of them;
+//! - [`DaemonRecord`] (4.1): one non-UI rlx process in `<home>/daemons/`, a file that
+//!   Python's registry and rlxd both write and read.
 //!
 //! # The handshake
 //!
@@ -56,6 +58,7 @@
 //! Engine change spec now, and the third revision may still rename or move what is
 //! here. Until then, v1 can change in ways the rules above would otherwise forbid.
 
+mod daemon;
 mod envelope;
 mod event;
 mod hello;
@@ -63,6 +66,7 @@ mod marker;
 mod request;
 pub mod schemas;
 
+pub use daemon::{DaemonRecord, kinds as daemon_kinds};
 pub use envelope::{Data, Envelope, ErrorBody, Outcome, codes};
 pub use event::{Event, RunScope, topics};
 pub use hello::{HelloData, HelloParams, Role};

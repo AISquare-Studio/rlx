@@ -1,0 +1,1 @@
+{"id": "0123456789ab", "kind": "watch", "pid": 4242, "host": "mac.local", "version": "0.10.1", "started_at": "2026-11-25T18:00:00.123456+00:00", "heartbeat_at": "2026-11-25T18:00:05.123456+00:00", "argv": ["rlx", "watch"], "restartable": true, "cwd": "/Users/me/project"}
