@@ -170,12 +170,12 @@ def test_pause_all_lists_who_by_project_with_cancel_focused(running: Script) -> 
     listed, label, focused, title = drive(go)
     assert listed == [
         "alpha",
-        "  manager · manager · ⏸ waiting",
+        "  manager · manager · ◦ waiting",
         "  coder-1 · coder · ▶ working",
         "",
         "beta",
         "  manager · manager · ▶ working",
-        "  coder-1 · coder · ⏸ waiting",
+        "  coder-1 · coder · ◦ waiting",
         "  tester-1 · tester · 💤 exited — left: exited",
     ]
     assert label == "Pause 4 agents"
@@ -204,7 +204,7 @@ def test_confirming_pause_all_pauses_each_agent_with_a_toast_and_sets_the_signal
         "⏸ paused coder-1 (beta)",
     ]
     assert [t for t in toasts if t.startswith("paused ")] == [
-        "paused 4 · skipped 1 · failed 0\nfleet-paused: alpha, beta\n"
+        "paused 4 · skipped 1 · failed 0\nprojects paused: alpha, beta\n"
         "skipped: tester-1 (beta) — exited"
     ]
 
@@ -236,8 +236,8 @@ def test_a_partial_pause_pauses_the_agents_picked_and_fleet_pauses_only_a_whole_
     ]
     assert acting_on_running.signals == [("on", "prj_b")], "alpha's manager runs: no signal"
     assert [t for t in toasts if t.startswith("paused ")] == [
-        "paused 3 · skipped 2 · failed 0\nfleet-paused: beta\n"
-        f"skipped: manager (alpha) — {fleet_service.NOT_CHOSEN}; tester-1 (beta) — exited"
+        "paused 3 · skipped 1 · failed 0\nprojects paused: beta\n"
+        "skipped: tester-1 (beta) — exited"  # the unticked manager is not listed (0.10.2)
     ]
 
 
@@ -263,7 +263,7 @@ def test_a_partial_resume_resumes_the_agents_picked_and_keeps_the_project_paused
     ]
     assert ("off", "prj_a") not in acting_on_paused.signals, "alpha's manager is still paused"
     [summary] = [t for t in toasts if t.startswith("resumed ")]
-    assert "still fleet-paused: alpha (1 still paused)" in summary.splitlines(), summary
+    assert "projects still paused: alpha (1 still paused)" in summary.splitlines(), summary
 
 
 def test_resume_all_lists_the_paused_agents_and_leaves_the_rest(acting_on_paused: Paused) -> None:
@@ -274,8 +274,8 @@ def test_resume_all_lists_the_paused_agents_and_leaves_the_rest(acting_on_paused
     listed, label = drive(go)
     assert listed == [
         "alpha",
-        "  coder-1 · coder · ⏯ paused — will be resumed",
-        "  manager · manager · ⏯ paused — will be resumed",
+        "  coder-1 · coder · ⏸ paused — will be resumed",
+        "  manager · manager · ⏸ paused — will be resumed",
         "",
         "beta",
         "  tester-1 · tester · 💤 exited — left: not paused",
@@ -297,9 +297,12 @@ def _options(pilot: Pilot[None]) -> list[tuple[str | None, bool]]:
     ]
 
 
-def test_the_card_menu_offers_pause_and_resume_greying_the_one_that_does_nothing(
+def test_the_card_menu_offers_only_the_pause_or_resume_that_acts(
     acting_on_paused: Paused,
 ) -> None:
+    """Q11 (the UX audit): the one that would do nothing was listed greyed beside the other;
+    the card's menu lists what acts, alpha's Resume, beta's Pause."""
+
     async def go(pilot: Pilot[None]) -> list[list[tuple[str | None, bool]]]:
         app = _app(pilot)
         seen = []
@@ -312,8 +315,8 @@ def test_the_card_menu_offers_pause_and_resume_greying_the_one_that_does_nothing
         return seen
 
     alpha, beta = drive(go)
-    assert alpha == [("pause", True), ("resume", False)], "alpha is paused"
-    assert beta == [("pause", False), ("resume", True)], "beta runs, and nothing is paused"
+    assert alpha == [("resume", False)], "alpha is paused"
+    assert beta == [("pause", False)], "beta runs, and nothing is paused"
 
 
 def test_the_card_menus_resume_asks_for_that_project_and_resumes_it_alone(
@@ -337,8 +340,8 @@ def test_the_card_menus_resume_asks_for_that_project_and_resumes_it_alone(
     assert title == "Resume the paused agents of alpha?"
     assert listed == [
         "alpha",
-        "  coder-1 · coder · ⏯ paused — will be resumed",
-        "  manager · manager · ⏯ paused — will be resumed",
+        "  coder-1 · coder · ⏸ paused — will be resumed",
+        "  manager · manager · ⏸ paused — will be resumed",
     ]
     assert [(verb, label) for verb, label, _ in acting_on_paused.calls] == [
         ("restart", "coder-1"),
@@ -461,7 +464,7 @@ def test_a_resume_that_is_not_the_owners_previews_each_paused_row_as_refused() -
 
     text = " ".join(plan_text(plan).plain.split())
 
-    assert f"coder-1 · coder · ⏯ paused — refused: {why}" in text, text
+    assert f"coder-1 · coder · ⏸ paused — refused: {why}" in text, text
     assert WILL_RESUME not in text
     assert plan.targets == [] and not plan.acts
 

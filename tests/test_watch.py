@@ -1301,24 +1301,50 @@ def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> 
 
     team_service.activate()
 
+    wanted = {"b", "d", "a", "o", "/", "q", "t", "?"}
+
+    async def footer_of(pilot: Any, target: str, stale: list[Any]) -> list[tuple[str, int]]:
+        """The footer as it is for ``target``: rebuilt since ``stale`` (the keys it showed before
+        the focus moved, kept alive so none of them can pass for a new one), ``target`` holding
+        the focus, and every key laid out. Read at once, the footer was still the one before
+        (review of #573), or half rebuilt with no key at all on a slow Windows runner (rc gate
+        45659530340). Bounded: 10 s at most."""
+        keys: list[tuple[str, int]] = []
+        for _ in range(500):
+            shown = list(pilot.app.screen.query_one(Footer).query("FooterKey"))
+            keys = [(str(getattr(key, "key_display", "")), key.region.right) for key in shown]
+            rebuilt = not any(key is old for key in shown for old in stale)
+            focused = pilot.app.focused is pilot.app.query_one(target)
+            laid_out = bool(shown) and all(key.region.width for key in shown)
+            if rebuilt and focused and laid_out and wanted <= {key for key, _ in keys}:
+                break
+            await pilot.pause(0.02)
+        else:
+            # The bound ran out: fail, never hand back a footer composed for another widget
+            # (review of #573 / #582, #797: a withheld rebuild passed on the stale one).
+            pytest.fail(
+                f"the footer was never ready for {target}: rebuilt={rebuilt} "
+                f"focused={focused} laid_out={laid_out} keys={keys}"
+            )
+        return keys
+
     async def drive() -> list[tuple[str, list[tuple[str, int]]]]:
         app, _size = _board_w()
         seen = []
         async with app.run_test(size=(90, 30)) as pilot:
             await pilot.pause()
-            for target in ("#tasks", "#feed"):
-                pilot.app.query_one(target).focus()
-                await pilot.pause()
-                footer = pilot.app.screen.query_one(Footer)
-                keys = [
-                    (str(getattr(key, "key_display", "")), key.region.right)
-                    for key in footer.query("FooterKey")
-                ]
-                seen.append((target, keys))
+            footer = pilot.app.screen.query_one(Footer)
+            # The tasks have the focus from the start (B1): their footer, once composed.
+            seen.append(("#tasks", await footer_of(pilot, "#tasks", [])))
+            stale = list(footer.query("FooterKey"))
+            if not pilot.app.query_one("#feedpane").display:
+                pilot.app.board.action_toggle_board()  # 90 columns: one half at a time (B2)
+            pilot.app.query_one("#feed").focus()
+            seen.append(("#feed", await footer_of(pilot, "#feed", stale)))
         return seen
 
     for target, keys in asyncio.run(drive()):
-        assert {"b", "d", "a", "o", "/", "q", "t", "?"} <= {key for key, _ in keys}, (target, keys)
+        assert wanted <= {key for key, _ in keys}, (target, keys)
         assert all(right <= 90 for _, right in keys), (target, keys)
 
 
@@ -1337,3 +1363,46 @@ def test_board_w_opens_with_the_tasks_focused(runner: CliRunner, work_dir: Path)
             return pilot.app.focused.id if pilot.app.focused is not None else None
 
     assert asyncio.run(drive()) == "tasks"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "agent_exited",
+        "agent_paused",
+        "agent_renamed",
+        "restarted",
+        "switched",
+        "limited",
+        "limited_handing_over",
+        "handover_failed",
+        "before_limit",
+        "attention",
+        "notice",
+        "prompt_unsent",
+        "linked",
+        "linked_all_done",
+    ],
+)
+def test_the_fleets_own_lines_read_as_words_not_their_kind(kind: str) -> None:
+    """B2's tester (#695): a Stream line's kind chip showed these by their raw kind
+    (``• agent_paused``). Each has words now; a pause is ⏸ (Q4)."""
+    from datetime import UTC, datetime
+
+    from aisquare.cli.ui.board import stream_line
+    from aisquare.cli.watch import _KIND_VERB
+    from aisquare.models import TeamEvent
+
+    event = TeamEvent(
+        id="evt_1",
+        project_id="prj_x",
+        session_id="ses_1",
+        kind=kind,
+        text="what happened",
+        created_at=datetime.now(UTC),
+    )
+    emoji, verb = _KIND_VERB[kind]
+    line = str(stream_line(event, {"ses_1": "coder"}, {"ses_1": "coder-auth"}))
+    # The kind's words (some are the kind itself: "restarted"), never its bare id: "• <kind>".
+    assert f" {emoji} {verb} " in line and f"• {kind}" not in line and "•" not in line
+    assert _KIND_VERB["agent_paused"][0] == "⏸"

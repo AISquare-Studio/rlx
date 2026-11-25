@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from typing import Annotated
+from typing import Annotated, NamedTuple
 from urllib.parse import urlparse
 
 import typer
@@ -166,13 +166,31 @@ def _show_verification(grant: iam.DeviceAuthorization, *, no_browser: bool) -> N
         _say("⚠ Failed to open a browser. Visit the URL above manually.")
 
 
+class _Ended(NamedTuple):
+    """How a wait for approval ended without a token: what ``fail`` says, once the countdown
+    is gone (:func:`_wait_for_approval`)."""
+
+    message: str
+    error: str
+    exit_code: int = 1
+
+
+_EXPIRED = _Ended("The code expired before it was approved. Run aisquare login again.", "expired")
+
+
 def _wait_for_approval(
     endpoints: iam.Endpoints, grant: iam.DeviceAuthorization
 ) -> dict[str, object]:
-    """RFC 8628 section 3.4 polling, with a countdown and Esc to cancel."""
+    """RFC 8628 section 3.4 polling, with a countdown and Esc to cancel.
+
+    A wait that ends without a token is said only after the countdown has stopped. ``fail``
+    prints through a console of its own, which writes to the terminal past the live display's
+    redirect (Rich's ``rich_proxied_file``): said while the countdown ran, the line landed on
+    the countdown's last row, and the countdown's last redraw and its transient clean-up
+    erased it. The pane was left with "code expires in 0:00" and no word of why the sign-in
+    ended (the 0.10.1 release's exploratory test, 2026-11-18).
+    """
     deadline = _monotonic() + grant.expires_in + 60
-    interval = float(max(1, grant.interval))
-    backoff: float | None = None
     cancel = threading.Event()
     status = _LiveStatus(deadline) if _interactive() else None
     watcher = _EscapeWatcher(cancel) if _interactive() and sys.stdin.isatty() else None
@@ -186,53 +204,63 @@ def _wait_for_approval(
             watcher.start()
         if status:
             status.start()
-        while True:
-            wait = backoff if backoff is not None else interval * 1.2 + random.uniform(0, 1)
-            if not _pause(wait, cancel, status):
-                fail("Sign-in cancelled. Nothing was stored.", error="cancelled", exit_code=130)
-            if _monotonic() > deadline:
-                fail(
-                    "The code expired before it was approved. Run aisquare login again.",
-                    error="expired",
-                )
-            try:
-                outcome = iam.poll_token(endpoints, grant)
-            except iam.IamError as exc:
-                if exc.code != "unreachable":
-                    raise
-                backoff = min(_MAX_BACKOFF_SECONDS, (backoff or interval) * 2)
-                continue
-            backoff = None
-            if outcome.kind == "token" and outcome.token is not None:
-                return dict(outcome.token)
-            if outcome.kind == "pending":
-                continue
-            if outcome.kind == "slow_down":
-                interval = float(outcome.interval or interval + 5)
-                continue
-            if outcome.kind == "rate_limited":
-                backoff = float(min(outcome.retry_after or 30, _MAX_RETRY_AFTER_SECONDS))
-                continue
-            if outcome.kind == "denied":
-                fail(
-                    "The request was denied in the browser. Nothing was stored.",
-                    error="access_denied",
-                )
-            if outcome.kind == "expired":
-                fail(
-                    "The code expired before it was approved. Run aisquare login again.",
-                    error="expired",
-                )
-            if outcome.kind == "paused":
-                fail("Sign-in from rlx is temporarily paused. Try again later.", error="paused")
-            raise iam.IamError(
-                "unsupported_server", f"Unexpected answer from {endpoints.issuer} while waiting."
-            )
+        answer = _poll_until_answered(endpoints, grant, deadline, cancel, status)
     finally:
         if status:
             status.stop()
         if watcher:
             watcher.stop()
+    if isinstance(answer, _Ended):
+        fail(answer.message, error=answer.error, exit_code=answer.exit_code)
+    return answer
+
+
+def _poll_until_answered(
+    endpoints: iam.Endpoints,
+    grant: iam.DeviceAuthorization,
+    deadline: float,
+    cancel: threading.Event,
+    status: _LiveStatus | None,
+) -> dict[str, object] | _Ended:
+    """Poll until the token comes, or say how the wait ended (:class:`_Ended`), never printing
+    it: the countdown is still on screen here (:func:`_wait_for_approval`)."""
+    interval = float(max(1, grant.interval))
+    backoff: float | None = None
+    while True:
+        wait = backoff if backoff is not None else interval * 1.2 + random.uniform(0, 1)
+        if not _pause(wait, cancel, status):
+            return _Ended("Sign-in cancelled. Nothing was stored.", "cancelled", exit_code=130)
+        if _monotonic() > deadline:
+            return _EXPIRED
+        try:
+            outcome = iam.poll_token(endpoints, grant)
+        except iam.IamError as exc:
+            if exc.code != "unreachable":
+                raise
+            backoff = min(_MAX_BACKOFF_SECONDS, (backoff or interval) * 2)
+            continue
+        backoff = None
+        if outcome.kind == "token" and outcome.token is not None:
+            return dict(outcome.token)
+        if outcome.kind == "pending":
+            continue
+        if outcome.kind == "slow_down":
+            interval = float(outcome.interval or interval + 5)
+            continue
+        if outcome.kind == "rate_limited":
+            backoff = float(min(outcome.retry_after or 30, _MAX_RETRY_AFTER_SECONDS))
+            continue
+        if outcome.kind == "denied":
+            return _Ended(
+                "The request was denied in the browser. Nothing was stored.", "access_denied"
+            )
+        if outcome.kind == "expired":
+            return _EXPIRED
+        if outcome.kind == "paused":
+            return _Ended("Sign-in from rlx is temporarily paused. Try again later.", "paused")
+        raise iam.IamError(
+            "unsupported_server", f"Unexpected answer from {endpoints.issuer} while waiting."
+        )
 
 
 def _pause(seconds: float, cancel: threading.Event, status: _LiveStatus | None) -> bool:

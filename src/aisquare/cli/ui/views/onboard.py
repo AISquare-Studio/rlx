@@ -141,13 +141,13 @@ class OnboardView(Vertical):
             yield Button(
                 "↻", id="onboard-reload", compact=True, tooltip="Reload directories (ctrl+r)"
             )
-            yield Static("Onboard a project — type a directory, or browse:", classes="hint")
+            yield Static("Add a project — type a directory, or browse:", classes="hint")
         with Horizontal(id="onboard-body"):
             yield ProjectTree(self.root, show_hidden=self.show_hidden, id="onboard-tree")
             with Vertical(id="onboard-form"):
                 yield Input(placeholder="~/Code/your-repo", id="onboard-path")
                 yield Static(render_verdict(self.verdict), id="onboard-verdict")
-                yield Button("Onboard", variant="primary", id="onboard-run", disabled=True)
+                yield Button("Add a project", variant="primary", id="onboard-run", disabled=True)
                 yield RichLog(id="onboard-log", wrap=True, markup=False, highlight=False)
                 doctor = DoctorView(run=self._run, id="onboard-doctor")
                 doctor.display = False

@@ -863,6 +863,51 @@ def slot_labels(store: ContextStore | None = None) -> dict[int, str]:
         return {}
 
 
+def display_name(account: ClaudeAccount, identity: ClaudeIdentity | None) -> str:
+    """What a person reads an account as (the 0.10.2 UX audit's Q1, "accounts named by email"):
+    the alias the operator gave it, else the email it is signed in as, else its built-in
+    name (``plain claude``, ``account 3``: :func:`core.label`).
+
+    Display only. The board text hooks inject into agents, a launch line and ``fleet ls``
+    keep :func:`slot_labels`: an agent names an account by it in its own commands
+    (``--to "account 3"``), and an email in the injected text would put a person's address
+    in every agent's prompt. ``identity`` is the account's signed-in identity
+    (``ClaudeAccountStatus.identity``, or ``core.identity``)."""
+    if account.alias:
+        return account.alias
+    if identity is not None and identity.email:
+        return identity.email
+    return core.label(account)
+
+
+def display_labels(statuses: Iterable[ClaudeAccountStatus] | None = None) -> dict[int, str]:
+    """Slot → :func:`display_name`, for the surfaces a person reads an account on (the
+    Accounts page, the agent header, the account picker): :func:`slot_labels`' shape, so a
+    surface can take either. From ``statuses`` when the caller holds them (the shell's
+    ``AccountsOverview.accounts``: no reading at all), else read here, each account's
+    identity from its home (``core.identity``: Claude Code's ``.claude.json``, which can be
+    large, so not for a hot path). Fails open as :func:`slot_labels` does: ``{}`` when the
+    accounts cannot be listed, and a slot whose identity cannot be read by its built-in
+    name."""
+    if statuses is not None:
+        return {
+            status.account.slot: display_name(status.account, status.identity)
+            for status in statuses
+        }
+    try:
+        accounts = list_accounts()
+    except Exception:
+        return {}
+    labels: dict[int, str] = {}
+    for account in accounts:
+        try:
+            identity = core.identity(account)
+        except Exception:
+            identity = None
+        labels[account.slot] = display_name(account, identity)
+    return labels
+
+
 def slot_of(config_dir: str | Path) -> int | None:
     """Which slot a Claude config directory IS: a managed slot's number, 1 for the plain
     claude's directory, ``None`` for a directory the CLI does not own (a hand-made layout).

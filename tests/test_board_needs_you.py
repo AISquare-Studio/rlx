@@ -21,6 +21,7 @@ from aisquare.cli import watch
 from aisquare.cli.ui import board as board_mod
 from aisquare.cli.ui import board_parts
 from aisquare.cli.ui.board import EMPTY_ROW, NOTHING_NEEDS_YOU, BoardPanel, NeedsYou, needs_you
+from aisquare.core import event_time
 from aisquare.core import tmux as tmux_core
 from aisquare.models import ProjectInfo, TaskStatus, TeamEvent, TeamSession, TeamTask
 from aisquare.services import fleet as fleet_service
@@ -161,6 +162,10 @@ def board(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
         return read
 
     monkeypatch.setattr(team_service, "board_read", board_read)
+    # One clock for the whole test (#823): a card's age and "N new since HH:MM" read NOW, not
+    # the wall clock, which moved on between the module's import and the frame.
+    monkeypatch.setattr(board_mod, "_now", lambda: NOW)
+    monkeypatch.setattr(event_time, "_now", lambda: NOW)
     monkeypatch.setattr(team_service, "store_session", refused("team.store_session"))
     monkeypatch.setattr(queue, "store_session", refused("queue.store_session"))
     monkeypatch.setattr(fleet_service, "list_agents", refused("fleet.list_agents"))
@@ -587,6 +592,9 @@ def test_in_the_shell_at_90_columns_the_board_tab_answers_at_once_and_its_footer
                 (str(getattr(key, "key_display", "")), key.region.right)
                 for key in footer.query("FooterKey")
             ]
+            await pilot.press("b")  # the Stream: Work goes out of sight
+            await settle_page(app)
+            seen["hidden"] = not panel.query_one("#board-side").display
             await pilot.press("d")
             await settle_page(app)
             seen["shown"] = panel.query_one("#board-side").display
@@ -600,7 +608,8 @@ def test_in_the_shell_at_90_columns_the_board_tab_answers_at_once_and_its_footer
     keys = {key for key, _ in seen["keys"]}
     assert {"b", "d", "a", "o", "/", "?"} <= keys, seen["keys"]
     assert all(right <= 90 for _, right in seen["keys"]), seen["keys"]
-    assert seen["shown"] and not seen["done"], "d answered: Work shows, Done unfolded"
+    assert seen["hidden"], "the premise: b put the Stream in Work's place"
+    assert seen["shown"] and not seen["done"], "d brought Work back, Done unfolded"
 
 
 def test_no_new_lines_marker_while_the_feed_shows_its_last_line(board: dict[str, Any]) -> None:

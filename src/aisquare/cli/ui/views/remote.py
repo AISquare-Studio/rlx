@@ -1,4 +1,5 @@
-"""``RemotePanel`` — the ``R`` modal: Remote on/off, password, link + QR, devices.
+"""``RemotePanel`` — the one Remote page: Remote on/off, ngrok's token, password, link + QR,
+devices.
 
 PLAN §5 step 1: "press ``m`` → Remote on → modal shows link, QR, password" (``R``
 now: the sidebar took ``m`` for marking cards). The
@@ -7,6 +8,20 @@ dialog is a view over the app's one :class:`RemoteController` (see
 from it, and a one-second tick repaints too, because the public URL arrives
 from ngrok's log on a background thread. Opened like the theme picker
 (``push_screen``), closed with Esc.
+
+Remote in one place (0.10.2, Q17): Remote lived here, in App settings' *Remote* tab and on
+the Settings hub's *Remote control* row, two pages over one controller that each had what
+the other lacked. This one stays, and every way in opens it (:func:`open_remote_page`):
+``R``, the palette, the sidebar's chip, the hub's row and App settings' *Remote* tab. What
+only the Settings page had came here: the ngrok token's slot and the missing-ngrok line
+(``settings_remote``), looked at on a worker, and *Change* for the token. Not its copy of
+ngrok's link at each turn-on: here the link, its QR and *Copy* are on screen, and a copy the
+human did not ask for put Remote's link on the clipboard.
+
+*New link* and *Regenerate* ask first (:class:`RemoteConfirm`): each signs every device out,
+and New link also stops every phone's saved link from opening. The box guards a misclick: its
+Cancel has the focus, and it opens in the half of the screen away from the button pressed, so
+neither a second Enter nor a double-click's second click is a yes.
 
 The QR is segno's compact terminal rendering (half-block characters, ~18 rows
 for an ngrok URL) of exactly the text in the link row — one string feeds both,
@@ -22,19 +37,29 @@ from datetime import UTC, datetime, tzinfo
 from typing import Any, ClassVar
 
 from rich.text import Text
-from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual import on
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Region
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Label, Select, Static, Switch
+from textual.widgets import Button, DataTable, Input, Label, Select, Static, Switch
 from textual.widgets.data_table import ColumnKey
+from textual.worker import Worker
 
 from aisquare.cli.ui.clipboard import copy_and_tell
-from aisquare.cli.ui.remote_control import (
-    AUTO_OFF_CHOICES,
-    RemoteController,
-    read_only_reason,
-)
+from aisquare.cli.ui.remote_control import AUTO_OFF_CHOICES, RemoteController
 from aisquare.cli.ui.ticks import while_running
+from aisquare.cli.ui.views import settings_remote
+from aisquare.cli.ui.views.settings_remote import (
+    CHECK_WORKER,
+    TOKEN_TROUBLE,
+    NgrokLookedFor,
+    NgrokMissing,
+    TokenSaved,
+    TokenSlot,
+)
+from aisquare.services.ngrok_sdk import BAD_TOKEN
 from aisquare.services.remote_server import _remote_instant
 
 QR_UNAVAILABLE = "QR unavailable: this install lacks segno"
@@ -55,6 +80,34 @@ def served_elsewhere_state() -> str:
 def served_elsewhere_link() -> str:
     """The link row, then: that Remote's link is the other process's to show."""
     return "its link is shown where it runs"
+
+
+WRITES_ON = "writes reach the fleet"
+WRITES_OFF = "writes are off: phones can watch the fleet, not act on it"
+"""Beside *Allow write actions* while it is off. Not the server's refusal
+(``read_only_reason``), which tells a phone to switch it "in the R panel": said in the R
+panel, beside the switch it names (0.10.1's final review)."""
+LOCKOUT = "new unlocks paused; if the link leaked, New link replaces it and the password"
+LOCKOUT_OFF = "new unlocks paused; if the link leaked, turn Remote on, then New link"
+"""The lockout's advice while Remote is off here: New link is greyed until Remote is on, so
+it says the step before (0.10.1's final review)."""
+LOCKOUT_ELSEWHERE = (
+    "new unlocks paused; if the link leaked, give it a new link where Remote runs: another "
+    "process or another rlx"
+)
+NEW_LINK_CONFIRM = (
+    "New link?",
+    "Every phone's saved link stops opening, and every device is signed out. Each one needs "
+    "the new link and the new password.",
+    "New link",
+)
+REGENERATE_CONFIRM = (
+    "New password?",
+    "Every device is signed out and unlocks again with the new password. The link stays.",
+    "Regenerate",
+)
+"""What *New link* and *Regenerate* ask first (:class:`RemoteConfirm`): the question, what
+breaks, and the button that does it. Each acted on one click (0.10.1's final review)."""
 
 
 LOCAL_ZONE: tzinfo | None = None
@@ -118,6 +171,16 @@ class RemotePanel(ModalScreen[None]):
     def __init__(self, controller: RemoteController) -> None:
         super().__init__()
         self.controller = controller
+        self.ngrok: bool | None = None
+        """Whether there is an ngrok to start, as last looked (``settings_remote.ngrok_found``);
+        ``None`` until the first look answers."""
+        self.token: bool | None = None
+        """Whether an ngrok token is configured, as last looked (``has_authtoken``)."""
+        self.env_token = False
+        """Whether ``NGROK_AUTHTOKEN`` is set, as last looked."""
+        self._replacing = False
+        """*Change* beside the token opened its slot, until a token is saved."""
+        self._was_running: bool | None = None
         self._device_rows: list[tuple[str, ...]] = []
         """The devices table's cells as last painted, a row per device, its id first."""
         self._device_columns: list[ColumnKey] = []
@@ -140,6 +203,10 @@ class RemotePanel(ModalScreen[None]):
                 yield Switch(self.controller.running, id="remote-on")
                 yield Static("", id="remote-state")
             yield Static("", id="remote-status")
+            # What Remote needs from the owner, under why it has no tunnel: only a damaged
+            # install's missing ngrok, and the token while there is none or ngrok refused it.
+            yield NgrokMissing(id="settings-remote-ngrok-missing")
+            yield TokenSlot(id="settings-remote-token")
             # Copy sits on the LABEL row and the link gets a line of its own.
             # Sharing one row cost the demo its most important control: a real
             # ngrok link is ~84 characters, which with the 22-wide label runs
@@ -174,6 +241,9 @@ class RemotePanel(ModalScreen[None]):
                     allow_blank=False,
                     id="remote-auto-off",
                 )
+            with Horizontal(classes="row", id="remote-token-row"):
+                yield Label("ngrok token")
+                yield Button("Change", id="remote-change-token", compact=True)
             yield Label("Connected devices")
             yield Static("", id="remote-unlocks")
             yield DataTable(id="remote-devices", cursor_type="row", zebra_stripes=True)
@@ -184,8 +254,55 @@ class RemotePanel(ModalScreen[None]):
         table = self.query_one("#remote-devices", DataTable)
         self._device_columns = table.add_columns("id", "device", "last seen", "expires", "")
         self.repaint()
+        self.remote_needs_check()
         self.set_interval(1.0, self.repaint)
         self.query_one("#remote-on", Switch).focus()
+
+    # --- what Remote needs (an ngrok, its token) ------------------------------------------------
+
+    def remote_needs_check(self) -> None:
+        """Look again at what Remote needs, off the UI thread, and paint once it answers: the
+        SDK's import loads a native library, and the token is looked for in up to two YAML
+        files of ngrok's (review of #274, m6)."""
+        self.run_worker(
+            settings_remote.remote_needs,
+            name=CHECK_WORKER,
+            group=CHECK_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    @on(Worker.StateChanged)
+    def _remote_needs_answered(self, event: Worker.StateChanged) -> None:
+        needs = event.worker.result
+        if event.worker.name != CHECK_WORKER or not isinstance(needs, tuple):
+            return
+        self.ngrok, self.token, self.env_token = needs
+        self._paint_remote_needs()  # what the answer changes, and only that
+
+    def _paint_remote_needs(self) -> None:
+        """The missing-ngrok line while ngrok is missing; the token slot while there is no
+        token, ngrok refused the one there is (on and off alike), or *Change* asked for it,
+        and *Change* itself while there is one. Neither before the first look answers."""
+        self.query_one(NgrokMissing).display = self.ngrok is False
+        trouble = self.controller.tunnel_error()
+        slot = self.query_one(TokenSlot)
+        slot.display = self.token is False or trouble in TOKEN_TROUBLE or self._replacing
+        slot.remote_paint(
+            replacing=bool(self.token) or trouble == BAD_TOKEN, env_token=self.env_token
+        )
+        self.query_one("#remote-token-row").display = bool(self.token)
+
+    def on_token_saved(self, event: TokenSaved) -> None:
+        event.stop()
+        self._replacing = False
+        self.controller.token_saved()  # a tunnel not up, or signing in, starts with the new one
+        self.remote_needs_check()
+
+    def on_ngrok_looked_for(self, event: NgrokLookedFor) -> None:
+        event.stop()
+        self.remote_needs_check()
 
     # --- paint from the controller -------------------------------------------------------------
 
@@ -201,6 +318,9 @@ class RemotePanel(ModalScreen[None]):
         """
         controller = self.controller
         running = controller.running
+        if self._was_running and not running:
+            self.remote_needs_check()  # back to off: look again
+        self._was_running = running
         elsewhere = not running and controller.served_elsewhere()
         writes = controller.write_actions_allowed()
         status = controller.remote_status()
@@ -210,11 +330,12 @@ class RemotePanel(ModalScreen[None]):
         # Text, never a str, which is read as markup: the sentences carry exception text
         # and paths, where "[b]" was a tag and "[/b]" a MarkupError out of the repaint.
         self.query_one("#remote-status", Static).update(Text(controller.status_line()))
+        self._paint_remote_needs()
         self.query_one("#remote-password", Static).update(
             Text(controller.password() or "—", style="bold")
         )
         self.query_one("#remote-write-hint", Static).update(
-            "writes reach the fleet" if writes else read_only_reason()
+            Text(WRITES_ON if writes else WRITES_OFF)
         )
         self.query_one("#remote-unlocks", Static).update(
             self._unlocks_text(status, elsewhere=elsewhere)
@@ -285,22 +406,21 @@ class RemotePanel(ModalScreen[None]):
 
     def _unlocks_text(self, status: dict[str, Any], *, elsewhere: bool = False) -> Text:
         """Wrong passphrases lately, and, once they paused new unlocks, what to do about it:
-        New link here, or where Remote runs when another process serves it (its New link is
-        disabled here, as Regenerate is)."""
+        New link here, Remote on first while it is off here (New link is greyed until then),
+        or where Remote runs when another process serves it (its New link is disabled here,
+        as Regenerate is)."""
         failed, until = self.controller.unlock_failures(status)
         if not failed:
             return Text("")
         if until is None:
             return Text(f"{failed} failed unlocks in 30 min", style="dim")
         if elsewhere:
-            return Text(
-                f"{failed} failed unlocks in 30 min — new unlocks paused; if the link leaked, "
-                "give it a new link where Remote runs: another process or another rlx"
-            )
-        return Text(
-            f"{failed} failed unlocks in 30 min — new unlocks paused; if the link leaked, New "
-            "link replaces it and the password"
-        )
+            advice = LOCKOUT_ELSEWHERE
+        elif not self.controller.running:
+            advice = LOCKOUT_OFF
+        else:
+            advice = LOCKOUT
+        return Text(f"{failed} failed unlocks in 30 min — {advice}")
 
     def _paint_devices(self, devices: list[dict[str, Any]]) -> None:
         """The devices table, kept to ``devices``. The same devices get their changed cells
@@ -374,18 +494,44 @@ class RemotePanel(ModalScreen[None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """The buttons. A new passphrase and a revoke are written on the controller's writer
-        thread; the fleet UI says each once it is done (``RemoteController.on_done``)."""
+        thread; the fleet UI says each once it is done (``RemoteController.on_done``).
+        *Regenerate* and *New link* ask first, saying what each breaks."""
         if event.button.id == "remote-regen":
-            self.controller.regenerate_password(wait=False)
+            self._confirm_remote(REGENERATE_CONFIRM, new_link=False, pressed=event.button.region)
         elif event.button.id == "remote-new-link":
-            self.controller.regenerate_password(wait=False, new_link=True)
+            self._confirm_remote(NEW_LINK_CONFIRM, new_link=True, pressed=event.button.region)
         elif event.button.id == "remote-copy":
             url = self.controller.link_url()
             if url is not None:
                 copy_and_tell(self.app, url, "Link copied", sent="the link")
         elif event.button.id == "remote-revoke":
             self._revoke_selected()
+        elif event.button.id == "remote-change-token":
+            self._replacing = not self._replacing  # pressed again, it closes the slot
+            self.repaint()
+            if self._replacing:
+                field = self.query_one("#settings-remote-token-field", Input)
+                field.focus()
+                field.scroll_visible(animate=False)
+            return
         self.repaint()
+
+    def _confirm_remote(
+        self, asked: tuple[str, str, str], *, new_link: bool, pressed: Region
+    ) -> None:
+        """Ask ``asked`` (:class:`RemoteConfirm`), away from ``pressed``, the button's cells,
+        and once confirmed write the new passphrase, with a new link when ``new_link``.
+        Cancel and Esc change nothing. A second press that reached the button before the box
+        did (two Enters, two clicks in one frame) asks nothing more: one box, not two."""
+        if self.app.screen is not self:
+            return
+
+        def remote_confirm_answered(confirmed: bool | None) -> None:
+            if confirmed:
+                self.controller.regenerate_password(wait=False, new_link=new_link)
+                self.repaint()
+
+        self.app.push_screen(RemoteConfirm(*asked, away_from=pressed), remote_confirm_answered)
 
     def _revoke_selected(self) -> None:
         table = self.query_one("#remote-devices", DataTable)
@@ -397,6 +543,73 @@ class RemotePanel(ModalScreen[None]):
 
     def action_close_panel(self) -> None:
         self.dismiss(None)
+
+
+class RemoteConfirm(ModalScreen[bool]):
+    """*New link?* or *New password?*: what breaks, the action's button and Cancel. Answers
+    ``True`` at the action's button, ``None`` at Cancel or Esc; no *Don't ask again*, as a
+    misclick here signs every phone out.
+
+    It guards that misclick (#17's round 2: at 80x24 a double-click on *Regenerate*, or Enter
+    twice, regenerated with no box left on screen). Cancel has the focus on open, as every
+    other ``variant="error"`` box's does (``fresh``'s *Start fresh*, ``fleet_bulk``'s
+    :class:`ConfirmBulk`). And it opens in the half of the screen away from ``away_from``, the
+    cells of the button that opened it: from 80x24 up its buttons stay in the half it opens
+    in, so a second click there lands on the panel's backdrop, never on the action's button."""
+
+    DEFAULT_CSS = """
+    RemoteConfirm { align: center middle; }
+    RemoteConfirm > Vertical { width: 64; max-width: 92%; height: auto; border: heavy $accent;
+                               background: $surface; padding: 0 1; }
+    RemoteConfirm #remote-confirm-question { height: auto; padding: 1 0 0 0; text-style: bold; }
+    RemoteConfirm #remote-confirm-breaks { height: auto; padding: 1 0; }
+    RemoteConfirm Horizontal { height: auto; align-horizontal: right; padding-bottom: 1; }
+    RemoteConfirm Horizontal Button { margin-left: 2; min-width: 10; }
+    """
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "cancel")]
+    AUTO_FOCUS = "#remote-confirm-cancel"
+
+    def __init__(
+        self, question: str, breaks: str, verb: str, *, away_from: Region | None = None
+    ) -> None:
+        super().__init__()
+        self.question_text = question
+        self.breaks_text = breaks
+        self.verb = verb
+        self.away_from = away_from
+
+    def on_mount(self) -> None:
+        """Top or bottom, before the first paint: the half the pressed button is not in."""
+        if self.away_from:
+            middle = self.away_from.y + self.away_from.height / 2
+            self.styles.align_vertical = "top" if middle >= self.app.size.height / 2 else "bottom"
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(Text(self.question_text), id="remote-confirm-question")
+            yield Static(Text(self.breaks_text), id="remote-confirm-breaks")
+            with Horizontal():
+                yield Button(self.verb, id="remote-confirm-yes", variant="error")
+                yield Button("Cancel", id="remote-confirm-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "remote-confirm-yes":
+            self.dismiss(True)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+def open_remote_page(app: App[Any]) -> None:
+    """Open the one Remote page over ``app``'s one controller (``FleetApp.remote``): what
+    ``R``, the palette, the sidebar's chip, the Settings hub's *Remote control* and App
+    settings' *Remote* tab all call. Never a second one over the first."""
+    if isinstance(app.screen, RemotePanel):
+        return
+    app.push_screen(RemotePanel(app.remote))  # type: ignore[attr-defined]
 
 
 def _link_text(url: str | None, *, public: bool) -> Text:

@@ -236,7 +236,15 @@ def _resolved_or_spelled(path: Path) -> Path:
     try:
         return _resolved(path)
     except OSError:  # a symlink loop (ELOOP)
-        return Path(os.path.abspath(path))
+        return _spelled(path)
+
+
+def _spelled(path: Path) -> Path:
+    """``path`` as it is spelled, made absolute: no link followed, ``..`` taken by its words.
+    The loop fallback of :func:`_resolved_or_spelled`, and the name a destination was given,
+    which a link renames once resolved (the persona export guard, the tester of #21, round 5).
+    The one place this is spelled out (``test_project_root_symlink_loop``)."""
+    return Path(os.path.abspath(path))
 
 
 def _resolved_dir(path: Path) -> tuple[Path, bool]:
