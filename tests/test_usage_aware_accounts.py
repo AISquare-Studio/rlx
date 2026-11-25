@@ -2111,7 +2111,7 @@ def test_a_limited_agents_move_offer_is_the_account_with_the_most_room(
     from aisquare.cli.ui.views.agent import MoveOffer, move_offer
 
     _slot("work@example.com", "tok-work")  # slot 2: the agent's, at its limit
-    _slot("personal@example.com", "tok-personal")  # slot 3: 20% used
+    personal = _slot("personal@example.com", "tok-personal")  # slot 3: 20% used
     _slot("third@example.com", "tok-third")  # slot 4: 60% used
     fetch = _Usage(
         {"tok-work": _payload(100), "tok-personal": _payload(20), "tok-third": _payload(60)}
@@ -2137,6 +2137,22 @@ def test_a_limited_agents_move_offer_is_the_account_with_the_most_room(
     service.set_alias("3", "personal")
     named = move_offer(limited)
     assert named is not None and (named.ref, named.name) == ("claude-code:3", "personal")
+    # A row its spawn put on no account leaves the one its session runs under, read as the
+    # switch reads it (``leaving_slot``): never offered that one (#579's tester, note 4).
+    on_three = TeamSession(
+        id="s",
+        project_id=work.id,
+        role="coder",
+        started_at=datetime.now(tz=UTC),
+        last_seen_at=datetime.now(tz=UTC),
+        account=str(personal.config_dir),
+    )
+    no_slot = FleetAgentStatus(
+        agent=agent.model_copy(update={"account_slot": None}), state="limited", session=on_three
+    )
+    assert move_offer(no_slot) == MoveOffer(
+        ref="claude-code:4", name="third@example.com", left=40.0
+    )
 
 
 def test_a_removed_slots_readings_do_not_rate_the_next_occupant(fake_home: Path) -> None:

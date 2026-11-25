@@ -16,6 +16,7 @@ tests/test_config.py.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1153,6 +1154,16 @@ tests/test_usage_aware_accounts.py's ``…_move_offer_is_the_account_with_the_mo
 SwitchCall = tuple[str, str, str | None, str | None]
 """One switch as :class:`Switched` records it: project, label, ``to`` and ``agent_id``."""
 
+NOTED = "account 3 read 20% used just now"
+"""A note every switch has (the headroom read), in the receipt :class:`Switched` answers."""
+
+FAILED = "its claims were not moved: the board was busy"
+"""What the switch could NOT do with its replacement up: a failure, in ``notes`` too."""
+
+MOVED = "⇄ coder-auth (alpha) moved to personal@example.com — resumed its session"
+"""A Move's one toast that it went, the shell's (``AgentRestarted.headline``), naming the
+project as a restart's does."""
+
 
 class Switched:
     """Stands in for ``fleet_service.switch``: records each call, and answers the receipt the
@@ -1185,6 +1196,8 @@ class Switched:
             to_slot=3,
             resumed=True,
             tmux_session="asq-x",
+            notes=[NOTED, FAILED],
+            failures=[FAILED],
         )
 
 
@@ -1238,8 +1251,9 @@ def test_move_moves_this_row_to_the_offered_account_and_wait_calls_nothing(
     tmp_path: Path, script: Script, switched: Switched
 ) -> None:
     """*Move* is the switch ``fleet switch --to`` runs, to the account offered (``to``) and
-    pinned to THIS row (``agent_id``); the toast says where it went. *Wait* calls nothing,
-    and puts the offer away while this limit lasts."""
+    pinned to THIS row (``agent_id``); one toast says where it went and how it began (never
+    also "✓ restarted"), and the switch's notes follow it (review of #579, m3). *Wait* calls
+    nothing, and puts the offer away while this limit lasts."""
     one_coder(tmp_path, script, "limited")
 
     async def go(pilot: Pilot[None]) -> tuple[list[SwitchCall], bool, list[SwitchCall]]:
@@ -1260,7 +1274,9 @@ def test_move_moves_this_row_to_the_offered_account_and_wait_calls_nothing(
     waited, hidden, moved = drive(go)
     assert waited == [] and hidden, "Wait calls nothing and puts the offer away"
     assert moved == [("prj_a", "coder-auth", "claude-code:3", CODER)]
-    assert "⇄ coder-auth moved to personal@example.com" in messages()
+    said = messages()
+    assert [m for m in said if m.startswith(("⇄", "✓ restarted"))] == [MOVED], "said once"
+    assert NOTED in said and FAILED in said, "the switch's notes and failures, as a restart's"
 
 
 @pytest.mark.parametrize("view_open", [False, True], ids=["no-view", "view-open"])
@@ -1269,7 +1285,9 @@ def test_a_limited_agents_menu_offers_move_and_wait_and_move_runs_the_switch(
 ) -> None:
     """The ⋯ menu offers what the header does, first: *Move to personal@example.com (80%
     left)* once the account is found, and *Wait*. Move from the menu is the same switch, to
-    the same account, pinned to the row, with the view open or not; Wait calls nothing."""
+    the same account, pinned to the row, with the view open or not, and is said the same
+    way: one headline, then the switch's notes and failures, as Restart from the menu says
+    a restart's (review of #579, m2). Wait calls nothing."""
     one_coder(tmp_path, script, "limited")
 
     async def go(
@@ -1293,7 +1311,78 @@ def test_a_limited_agents_menu_offers_move_and_wait_and_move_runs_the_switch(
     assert listed[:2] == [("⇄ Move to personal@example.com (80% left)", False), ("⏳ Wait", False)]
     assert waited == []
     assert moved == [("prj_a", "coder-auth", "claude-code:3", CODER)]
-    assert "⇄ coder-auth moved to personal@example.com" in messages()
+    said = messages()
+    assert [m for m in said if m.startswith(("⇄", "✓ restarted"))] == [MOVED], "said once"
+    assert NOTED in said and FAILED in said, "the switch's notes and failures, view or none"
+
+
+SPARE = MoveOffer(ref="claude-code:4", name="spare@example.com", left=60.0)
+"""Where a later limit's own read says Move would take the agent."""
+
+
+def test_when_the_limit_ends_the_offer_goes_and_the_next_limit_offers_its_own_read(
+    tmp_path: Path, script: Script, switched: Switched, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #579, m4: the offer was kept past its limit, so the next limit on the row
+    showed the last one's *Move to X (N% left)* until its own read landed, an account and
+    room read minutes before. The offer goes with its limit: a new limit shows nothing until
+    its read answers, then that read's account."""
+    row = one_coder(tmp_path, script, "limited")
+    reads: list[str] = []
+
+    def offer(status: FleetAgentStatus) -> MoveOffer | None:
+        reads.append(status.state)
+        return OFFER if len(reads) == 1 else SPARE
+
+    monkeypatch.setattr(agent_view_module, "move_offer", offer)
+
+    async def go(pilot: Pilot[None]) -> tuple[list[str], MoveOffer | None, bool, list[str]]:
+        app = fleet_app(pilot)
+        view = await open_view(pilot, app, CODER)
+        await settle(app)
+        first = offer_bar(view)[1]
+        view.refresh_status(row.model_copy(update={"state": "working"}))
+        after = view.offer
+        view.refresh_status(row)  # limited again: nothing shown before its own read answers
+        between = offer_bar(view)[0]
+        await settle(app)
+        return first, after, between, offer_bar(view)[1]
+
+    first, after, between, again = drive(go)
+    assert first == ["Move to personal@example.com (80% left)", "Wait"]
+    assert after is None, "the offer goes with its limit"
+    assert not between, "no stale Move to the last limit's account"
+    assert again == ["Move to spare@example.com (60% left)", "Wait"]
+    assert switched.calls == []
+
+
+def test_a_second_move_from_the_menu_while_the_first_runs_does_nothing(
+    tmp_path: Path, script: Script, switched: Switched, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One move of a row at a time from its ⋯ menu, as from its view (review of #579, nit):
+    the switch would refuse the second, but it is not asked."""
+    row = one_coder(tmp_path, script, "limited")
+    running, gate = threading.Event(), threading.Event()
+
+    def held(*args: object, **kwargs: object) -> fleet_service.SwitchReceipt:
+        running.set()
+        assert gate.wait(10)
+        return switched(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fleet_service, "switch", held)
+
+    async def go(pilot: Pilot[None]) -> list[SwitchCall]:
+        app = fleet_app(pilot)
+        await settle(app)
+        agent_view_module.from_menu(app, row, agent_view_module.MOVE, OFFER)
+        # The first is under way (its switch called) before the second press.
+        assert await asyncio.get_running_loop().run_in_executor(None, running.wait, 10)
+        agent_view_module.from_menu(app, row, agent_view_module.MOVE, OFFER)
+        gate.set()
+        await settle(app)
+        return list(switched.calls)
+
+    assert drive(go) == [("prj_a", "coder-auth", "claude-code:3", CODER)]
 
 
 def test_a_working_agents_menu_has_no_move() -> None:

@@ -285,12 +285,16 @@ def agent_task(status: FleetAgentStatus) -> TeamTask | None:
     """The task ``status``'s agent is on (the 0.10.2 UX audit's M2): the one its session has
     claimed and is doing, else one it holds blocked or in review, else the task it was spawned
     for (``FleetAgent.task_id``). ``None`` with none, or a store that cannot be read: a header
-    is a courtesy. A store read, so off the UI thread (:class:`AgentTask`)."""
+    is a courtesy. A store read, so off the UI thread (:class:`AgentTask`).
+
+    The tasks are the row's board's (``fleet.board_of_row``), the one its sessions claim on:
+    under a hub, or for a project rooted in a sub-folder or at a linked worktree, that is not
+    the fleet project's own."""
     agent = status.agent
     session = status.session.id if status.session is not None else None
     try:
         with store_session() as store:
-            tasks = store.team_tasks(agent.project_id)
+            tasks = store.team_tasks(fleet_service.board_of_row(agent))
     except Exception:
         return None
     held = [
@@ -383,11 +387,16 @@ def move_offer(status: FleetAgentStatus) -> MoveOffer | None:
         if adapter is not None and adapter.capabilities.model_ladders
         else None
     )
+    # The account it leaves, read as the switch reads it: the row's slot, else its session's
+    # config dir's, so a row its spawn put on no account is not offered the one it is on.
+    leaving = accounts_service.leaving_slot(
+        agent.account_slot, session.account if session is not None else None
+    )
     try:
         choice = accounts_service.choose_for_handover(
             role=agent.role,
             project=fleet_service.project_of(agent),
-            exclude=[agent.account_slot] if agent.account_slot is not None else [],
+            exclude=[leaving] if leaving is not None else [],
             agent=kind,
             family=family,
             max_age=accounts_service.USAGE_MAX_AGE_SECONDS,
@@ -435,17 +444,25 @@ def start_move(node: Widget | App[Any], agent: FleetAgent, offer: MoveOffer) -> 
     )
 
 
-def said_moved(
-    node: Widget | App[Any], agent: FleetAgent, offer: MoveOffer, event: Worker.StateChanged
-) -> None:
-    """A move that finished, toasted from ``node``: where it went, or why not in the switch's
-    own words."""
-    if event.state is WorkerState.SUCCESS:
-        node.notify(f"⇄ {agent.label} moved to {offer.name}", timeout=6, markup=False)
-    elif event.state is WorkerState.ERROR:
-        error = event.worker.error
-        why = str(error) if isinstance(error, fleet_service.FleetError) else repr(error)
-        node.notify(f"{agent.label} not moved: {why}", severity="error", timeout=8, markup=False)
+def not_moved(agent: FleetAgent, error: BaseException | None) -> str:
+    """``coder-auth not moved: <why>``, in the switch's own words for a refusal."""
+    why = str(error) if isinstance(error, fleet_service.FleetError) else repr(error)
+    return f"{agent.label} not moved: {why}"
+
+
+def said_moved(node: Widget | App[Any], agent: FleetAgent, event: Worker.StateChanged) -> None:
+    """A move that did not go, toasted from ``node``. One that went is the shell's to say,
+    with the switch's notes, as a restart's is (:meth:`AgentRestarted.headline`)."""
+    if event.state is WorkerState.ERROR:
+        said = not_moved(agent, event.worker.error)
+        node.notify(said, severity="error", timeout=8, markup=False)
+
+
+def moving(app: App[Any], agent: FleetAgent) -> bool:
+    """Whether a *Move* of ``agent``'s row still runs, from its view or its menu: one at a
+    time, a second press does nothing."""
+    group = f"{MOVE_WORKER}-{agent.id}"
+    return any(worker.group == group and not worker.is_finished for worker in app.workers)
 
 
 def from_menu(
@@ -454,27 +471,27 @@ def from_menu(
     """An agent ⋯ menu's *Move* or *Wait* on a limited agent (``agent_menu``), handed over by
     the shell's menu answer: the open view's own press when the agent's view is open
     (:meth:`AgentView.act`, to the menu's ``offer``); with none, *Move* runs here, on a
-    worker of the app's, and says how it went itself. *Wait* calls nothing either way."""
+    worker of the app's, and is said as from the view: :class:`AgentRestarted` for one that
+    went (the headline and the switch's notes), the refusal for one that did not. *Wait*
+    calls nothing either way."""
     if choice not in (MOVE, WAIT):
         return
     view = next((v for v in app.query(AgentView) if v.status.agent.id == status.agent.id), None)
     if view is not None:
         view.act(choice, offer)
         return
-    if choice != MOVE or offer is None:
-        return
     agent = status.agent
+    if choice != MOVE or offer is None or moving(app, agent):
+        return
 
     def move_and_say() -> None:
         try:
-            move_agent(agent, offer)
+            receipt = move_agent(agent, offer)
         except Exception as exc:
-            why = str(exc) if isinstance(exc, fleet_service.FleetError) else repr(exc)
-            said = f"{agent.label} not moved: {why}"
+            said = not_moved(agent, exc)
             app.call_from_thread(app.notify, said, severity="error", timeout=8, markup=False)
             return
-        said = f"⇄ {agent.label} moved to {offer.name}"
-        app.call_from_thread(app.notify, said, timeout=6, markup=False)
+        app.call_from_thread(app.post_message, AgentRestarted(receipt, moved_to=offer.name))
         refresh = getattr(app, "refresh_data", None)
         if callable(refresh):
             app.call_from_thread(refresh)
@@ -922,10 +939,13 @@ class AgentView(Vertical):
         ``is_mounted`` is not yet true)."""
         status = self.status
         bar = self.query_one("#agent-offer", Horizontal)
-        offer = self.offer
         if status.state != "limited":
-            self._waited = None  # the limit is over: the next one offers again
+            # The limit is over: the next one offers again, from a read of its own, and never
+            # this one's account and room in the meantime.
+            self._waited = None
             self._offer_for = None
+            self.offer = None
+        offer = self.offer
         shown = (
             status.state == "limited"
             and offer is not None
@@ -1127,7 +1147,12 @@ class AgentView(Vertical):
     def _start_move(self, offer: MoveOffer | None) -> None:
         """*Move* to ``offer``'s account, the row the one shown at the press; nothing with no
         offer, or while this view's move, restart or pause runs."""
-        if offer is None or self._busy() or self.status.state != "limited":
+        if (
+            offer is None
+            or self._busy()
+            or moving(self.app, self.status.agent)
+            or self.status.state != "limited"
+        ):
             return
         self._moving = (self.status.agent, offer)
         start_move(self, self.status.agent, offer)
@@ -1185,12 +1210,15 @@ class AgentView(Vertical):
         label = self.status.agent.label
         if event.worker.name == MOVE_WORKER and self._moving is not None:
             agent, offer = self._moving
-            said_moved(self, agent, offer, event)
             receipt = event.worker.result
             if event.state is WorkerState.SUCCESS and isinstance(
                 receipt, fleet_service.SwitchReceipt
             ):
-                self.post_message(AgentRestarted(receipt))  # its new row, as a restart's
+                # The shell says it, once, with its notes, and shows the new row as after a
+                # restart (:class:`AgentRestarted`).
+                self.post_message(AgentRestarted(receipt, moved_to=offer.name))
+            else:
+                said_moved(self, agent, event)
         elif event.worker.name == PAUSE_WORKER:
             said_paused(self, self.status.agent, event)
         elif event.state is WorkerState.ERROR:
@@ -1223,11 +1251,27 @@ class AgentRestarted(Message):
     pane (user feedback, 2026-10-19: a manager destroyed that way more than once).
     """
 
-    def __init__(self, receipt: fleet_service.RestartReceipt | fleet_service.SwitchReceipt) -> None:
+    def __init__(
+        self,
+        receipt: fleet_service.RestartReceipt | fleet_service.SwitchReceipt,
+        *,
+        moved_to: str | None = None,
+    ) -> None:
         super().__init__()
         self.receipt = receipt
         """A restart's, or a *Move*'s switch (#14): a restart onto another account, whose
         new row the view follows the same way."""
+        self.moved_to = moved_to
+        """The account a *Move* took it to, as its button named it (:class:`MoveOffer`)."""
+
+    def headline(self, named: str) -> str:
+        """The one toast that says it went, the shell's (``FleetApp.on_agent_restarted``),
+        with the receipt's notes after it: ``✓ restarted manager — resumed its session``, or
+        for a *Move*, ``⇄ coder-auth moved to personal@example.com — resumed its session``.
+        A move is said once, from its view or its menu alike."""
+        if self.moved_to is not None:
+            return f"⇄ {named} moved to {self.moved_to} — {self.receipt.how}"
+        return f"✓ restarted {named} — {self.receipt.how}"
 
     @property
     def agent(self) -> FleetAgent:

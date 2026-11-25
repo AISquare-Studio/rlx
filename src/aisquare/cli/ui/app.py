@@ -2659,7 +2659,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         started = event.agent
         project = self.snapshot.project(started.project_id) if self.snapshot else None
         named = agent_name(started.label, project)
-        self.notify(f"✓ restarted {named} — {receipt.how}", timeout=6, markup=False)
+        self.notify(event.headline(named), timeout=6, markup=False)  # or a Move's (#14)
         for note in receipt.notes:
             self.notify(note, severity="warning", timeout=8, markup=False)
         await self._show_restarted(event, read_again=True)
