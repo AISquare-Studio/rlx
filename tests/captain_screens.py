@@ -91,6 +91,13 @@ MID_TURN_LIST = [
     "✻ Thinking… (esc to interrupt)",
 ]
 CHOOSER_NO_FIRST = [" Allow this?", f" {MARK} 1. No", "   2. Yes", " Esc to cancel"]
+REAL_SURVEY_2_1_332 = _capture("real_survey_2_1_332.txt")
+"""A live capture (#19, 2026-11-25): Claude Code 2.1.332 in a 120x40 pane of a tmux server of
+its own, started in an empty folder with ``CLAUDE_FORCE_DISPLAY_SURVEY=1`` (its own switch for
+the survey) and no prompt sent; ``tmux capture-pane -p -J``, the pane's rows 6 to 40 verbatim
+(the logo rows above, which named the scratch folder and the plan, are left out). The survey,
+then the effort row ``◉ xhigh · /effort``, then the box: on 2.1.318 and 2.1.327 too, and the
+reader read only the two rows above the box, so it named no survey there."""
 RATING_ABOVE_BOX = [
     "How is Claude doing this session? (optional)",
     "1: Bad  2: Fine  3: Good  0: Dismiss",

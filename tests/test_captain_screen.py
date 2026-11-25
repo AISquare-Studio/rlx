@@ -75,6 +75,18 @@ def _codex(what: str) -> list[str]:
             None,
             "the session-rating prompt",
         ),
+        (
+            "the rating survey above the effort row, live on 2.1.332",
+            shots.REAL_SURVEY_2_1_332,
+            None,
+            "the session-rating prompt",
+        ),
+        (
+            "an effort row above the box with no survey",
+            ["  ✻ Baked for 2s", " " * 60 + "◉ xhigh · /effort", *shots.INPUT_BOX],
+            None,
+            None,
+        ),
         ("a model picker", shots.MODEL_PICKER, None, "a dialog waiting for Enter or Esc"),
         ("a real box drawn mid-turn, its top rule named", shots.REAL_WORKING, None, None),
         ("a real idle box after the first Stop, named", shots.REAL_IDLE_AFTER_STOP, None, None),
