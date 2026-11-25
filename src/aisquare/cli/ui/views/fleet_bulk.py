@@ -85,19 +85,20 @@ ABOUT: dict[fleet_service.BulkAction, str] = {
     "transcript when that is on disk. An agent that died without being stopped (killed, "
     "crashed, its tmux server gone) is brought back too; one stopped on purpose is left as "
     "it is.",
-    "stop": "Each one is sent {exit}, given a grace period, and then its window is killed. "
-    "Its claims go back to the board. Exited (💤) agents are left as they are.",
-    "pause": "Each one is sent {exit} as a stop does, and keeps its label, task claim, "
-    "worktree, account and session for a resume. Picking every agent of a project also "
-    "fleet-pauses it, so its manager spawns nothing. Exited (💤) agents are left as they are.",
+    "stop": "Each one is asked to quit (rlx types {exit}) and closed a few seconds later. "
+    "The tasks it took go back to the board. Agents that have exited (💤) are left as they are.",
+    "pause": "Each one is asked to quit (rlx types {exit}), as a stop does, and keeps its name, "
+    "task, worktree, account and conversation for a resume. Pausing every agent of a project "
+    "pauses the project too, so its manager starts no new agents. Agents that have exited (💤) "
+    "are left as they are.",
     "resume": "Each paused agent is started again under its label, with the same role, task, "
-    "worktree and account, its session resumed from its transcript when that is on disk; its "
-    "project's fleet-paused signal is cleared. An agent that exited without a pause stays as "
+    "worktree and account, its conversation resumed from its transcript when that is on disk, "
+    "and its project is no longer paused. An agent that exited without a pause stays as "
     "it is.",
 }
 """What each action does, above the list (:func:`about_text`): ``{exit}`` is what a stop or a
 pause types into each agent, :func:`exit_words`'s, and never spelled here."""
-OWN_EXIT = "its own exit command"
+OWN_EXIT = "each agent's own exit command"
 """What a stop or a pause is said to type into agents whose exit commands differ (a Claude
 Code agent beside one whose command is its own), or before the plan says whose they are."""
 WILL_START = "will be started again"
@@ -606,7 +607,7 @@ def report_toast(node: Widget | App[Any], event: Worker.StateChanged, action: st
         node.notify(
             summary_text(report),
             severity="error" if failed else ("information" if report.ok else "warning"),
-            timeout=12 if not report.ok or report.of("skipped") else 6,
+            timeout=12 if not report.ok or said(report).of("skipped") else 6,
             markup=False,
         )
     elif event.state is WorkerState.ERROR:
@@ -618,15 +619,31 @@ def report_toast(node: Widget | App[Any], event: Worker.StateChanged, action: st
         )
 
 
+def said(report: fleet_service.BulkReport) -> fleet_service.BulkReport:
+    """``report`` without the agents the person unticked in the pick-list: leaving them was
+    their choice, so they are neither counted as skipped nor listed (0.10.2: the toast listed
+    each one as skipped, with the reason that it was not picked)."""
+    return replace(
+        report,
+        receipts=tuple(
+            receipt
+            for receipt in report.receipts
+            if not (receipt.outcome == "skipped" and receipt.why == fleet_service.NOT_CHOSEN)
+        ),
+    )
+
+
 def summary_text(report: fleet_service.BulkReport) -> str:
-    """``restarted 4 · skipped 1 · failed 0``, then who was skipped and who failed, and why."""
+    """``restarted 4 · skipped 1 · failed 0``, then who was skipped and who failed, and why.
+    An agent the person unticked is not in it (:func:`said`)."""
+    report = said(report)
     parts = [report.summary()]
     if report.signals:
-        word = "fleet-paused" if report.action == "pause" else "no longer fleet-paused"
+        word = "projects paused" if report.action == "pause" else "projects no longer paused"
         parts.append(f"{word}: " + ", ".join(project_name(project) for project in report.signals))
     if report.kept:
         kept = [f"{project_name(project)} ({left} still paused)" for project, left in report.kept]
-        parts.append("still fleet-paused: " + ", ".join(kept))
+        parts.append("projects still paused: " + ", ".join(kept))
     skipped = [f"{named(r)} — {r.why}" for r in report.of("skipped")]
     failed = [f"{named(r)} — {r.why}" for r in report.of("failed")]
     unread = [f"{project_name(project)} — {why}" for project, why in report.unread]

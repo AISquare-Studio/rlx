@@ -594,7 +594,8 @@ def test_a_refresh_that_fails_inside_the_window_keeps_the_figure_and_says_the_tr
 def test_the_page_says_the_fleets_share_left_now_and_of_the_week(
     no_network: dict[str, Any], clock: Clock, tmp_path: Path
 ) -> None:
-    """#287 slice 2a: under the usage bar, the fleet in one line, from the readings shown."""
+    """#287 slice 2a: under the usage bar, the fleet in one line, from the readings shown; the
+    account named as its row names it, by its email (Q1 of the 0.10.2 UX audit)."""
 
     def usage(account: ClaudeAccount) -> ClaudeUsage:
         return ClaudeUsage(
@@ -618,7 +619,8 @@ def test_the_page_says_the_fleets_share_left_now_and_of_the_week(
     after = drive(go, overview=frame)
     reset = core.format_reset(NOW + timedelta(days=2), now=NOW)
     assert after == (
-        f"Fleet: 70% left now · week: 0.8 of 1 account left · next weekly reset {reset} (account 2)"
+        f"Fleet: 70% left now · week: 0.8 of 1 account left · next weekly reset {reset} "
+        "(slot2@example.com)"
     ), after
 
 

@@ -14,7 +14,7 @@ import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
-from aisquare.core import harness
+from aisquare.core import event_time, harness
 from aisquare.core.ids import new_task_id
 from aisquare.core.orchestrator import team_project
 from aisquare.core.store import ContextStore, store_session
@@ -2304,10 +2304,359 @@ def test_aisquare_board_names_each_session_as_the_left_pane_does(
     ended = runner.invoke(app, ["board"])
 
     assert board.exit_code == 0, board.output
-    assert "  - coder-auth — " in board.stdout and "  - manager — " in board.stdout
+    # The person's text board (B1 #14): a row per agent, its name first.
+    assert "\n  coder-auth " in board.stdout and "\n  manager " in board.stdout
     assert "coder-auth note: PR ready" in board.stdout
     assert "owner note: ship it" in board.stdout, "agents run it too: never 'you'"
     assert "bbbb2222" not in board.stdout and "aaaa1111" not in board.stdout
     assert {s["id"] for s in shown["sessions"]} >= {CODER, PLANNER}, "--json keeps the ids"
     assert ended.exit_code == 0, ended.output
-    assert "  - coder-auth note: PR ready" in ended.stdout, "ended, it keeps its name"
+    assert "  coder-auth note: PR ready" in ended.stdout, "ended, it keeps its name"
+
+
+# --- the board's two readers: the agents' text, byte for byte, and the human's (B1 #14) ---------
+
+BOARD_NOW = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
+"""The fixture board's clock: ``team._now`` is pinned to it, so every age reads the same."""
+
+
+def _board_fixture() -> tuple[Any, list[TeamSession], list[TeamTask], list[Any], datetime]:
+    """A board with every part an agent's text draws: live sessions (one stale, one with a
+    focus, a model and a persona), an ended one, tasks in each status (one waiting on another,
+    more open than the board lists), and events of several kinds, addressed and not."""
+    from aisquare.models import ProjectInfo, TeamEvent
+
+    project = ProjectInfo(id="prj_golden", root=Path("/nowhere/golden-repo"))
+
+    def session(sid: str, role: str, **extra: Any) -> TeamSession:
+        fields: dict[str, Any] = {
+            "started_at": BOARD_NOW - timedelta(hours=1),
+            "last_seen_at": BOARD_NOW - timedelta(minutes=2),
+        }
+        fields.update(extra)
+        return TeamSession(id=sid, project_id=project.id, role=role, **fields)
+
+    sessions = [
+        session("aaaa1111-golden", "manager", state="waiting", model="golden-model-x"),
+        session(
+            "bbbb2222-golden",
+            "coder",
+            label="coder-auth",
+            focus="wire the login",
+            persona="skeptic",
+            state="working",
+        ),
+        session(
+            "cccc3333-golden",
+            "tester",
+            label="tester-1",
+            state="attention",
+            last_seen_at=BOARD_NOW - timedelta(minutes=45),
+        ),
+        session(
+            "dddd4444-golden", "coder", label="coder-old", ended_at=BOARD_NOW - timedelta(hours=2)
+        ),
+    ]
+
+    def task(number: int, title: str, status: str, **extra: Any) -> TeamTask:
+        return TeamTask(
+            id=f"tsk_golden{number:04d}",
+            project_id=project.id,
+            number=number,
+            key=f"golden-{number}",
+            title=title,
+            status=status,
+            created_at=BOARD_NOW - timedelta(hours=3),
+            updated_at=BOARD_NOW - timedelta(minutes=number),
+            **extra,
+        )
+
+    tasks = [
+        task(1, "wire auth", "doing", claimed_by="bbbb2222-golden"),
+        task(2, "fix the login race", "blocked"),
+        task(3, "add the retry", "review", claimed_by="cccc3333-golden"),
+        task(4, "write the docs", "todo", needs=["tsk_golden0002"]),
+        task(5, "ship it", "done"),
+        task(6, "old idea", "dropped"),
+        *(task(n, f"chore {n}", "todo") for n in range(7, 14)),
+    ]
+
+    def event(seq: int, kind: str, text: str, minutes: int, **extra: Any) -> TeamEvent:
+        return TeamEvent(
+            seq=seq,
+            id=f"evt_golden{seq}",
+            project_id=project.id,
+            kind=kind,
+            text=text,
+            created_at=BOARD_NOW - timedelta(minutes=minutes),
+            **extra,
+        )
+
+    events = [
+        event(
+            1,
+            "task_added",
+            "wire auth",
+            120,
+            session_id="aaaa1111-golden",
+            task_id="tsk_golden0001",
+            to_role="coder",
+        ),
+        event(
+            2,
+            "task_claimed",
+            "wire auth",
+            90,
+            session_id="bbbb2222-golden",
+            task_id="tsk_golden0001",
+        ),
+        event(3, "note", "ship it\nthen tell me", 60 * 26),
+        event(4, "question", "staging or prod first?", 30, session_id="aaaa1111-golden"),
+        event(
+            5,
+            "task_blocked",
+            "fix the login race — no API key",
+            20,
+            session_id="bbbb2222-golden",
+            task_id="tsk_golden0002",
+        ),
+        event(
+            6,
+            "result",
+            "PASS " + "x" * 200,
+            5,
+            session_id="cccc3333-golden",
+            task_id="tsk_golden0003",
+        ),
+    ]
+    return project, sessions, tasks, events, BOARD_NOW
+
+
+#: ``render_board``'s agent text for :func:`_board_fixture` as 0.10.1 printed it (the MCP
+#: ``team_board``), byte for byte: the human board changed in B1 (#14), this must not.
+GOLDEN_AGENT_BOARD = "\n".join(
+    [
+        "<aisquare-team>",
+        "sessions:",
+        "  - aaaa1111 manager [golden-model-x] ⚠ off-ladder — 2m ago",
+        "  - bbbb2222 coder persona:skeptic — focus: wire the login — 2m ago",
+        "  - cccc3333 tester — 45m ago (stale)",
+        "tasks (8 todo, 1 doing, 1 review, 1 blocked, 1 done):",
+        "  - #1 tsk_golden0001 [doing @bbbb2222] wire auth",
+        "  - #2 tsk_golden0002 [blocked] fix the login race",
+        "  - #3 tsk_golden0003 [review @cccc3333] add the retry",
+        "  - #4 tsk_golden0004 [todo] write the docs ⧗ waits on #2",
+        "  - #7 tsk_golden0007 [todo] chore 7",
+        "  - #8 tsk_golden0008 [todo] chore 8",
+        "  - #9 tsk_golden0009 [todo] chore 9",
+        "  - #10 tsk_golden0010 [todo] chore 10",
+        "  … 3 more — `rlx task list`",
+        "recent updates:",
+        "  - aaaa1111 (manager) added → coder: [#1 tsk_golden0001] wire auth",
+        "  - bbbb2222 (coder) claimed: [#1 tsk_golden0001] wire auth",
+        "  - cli note: ship it",
+        "then tell me",
+        "  - aaaa1111 (manager) question: staging or prod first?",
+        "  - bbbb2222 (coder) blocked: [#2 tsk_golden0002] fix the login race — no API key",
+        "  - cccc3333 (tester) result: [#3 tsk_golden0003] PASS " + "x" * 200,
+        "</aisquare-team>",
+    ]
+)
+
+#: The board part of an agent's injected text (a SessionStart's, a prompt's) for the same
+#: fixture, as 0.10.1 wrote it: up to the protocol, which other parts of the code own.
+GOLDEN_INJECTED_BOARD = "\n".join(
+    [
+        "<aisquare-team>",
+        "You are team session bbbb2222 (role: coder) in project golden-repo.",
+        "sessions:",
+        "  - aaaa1111 manager [golden-model-x] ⚠ off-ladder — 2m ago",
+        "  - bbbb2222 coder (you) persona:skeptic — focus: wire the login — 2m ago",
+        "  - cccc3333 tester — 45m ago (stale)",
+        "tasks (8 todo, 1 doing, 1 review, 1 blocked, 1 done):",
+        "  - #1 tsk_golden0001 [doing @bbbb2222] wire auth",
+        "  - #2 tsk_golden0002 [blocked] fix the login race",
+        "  - #3 tsk_golden0003 [review @cccc3333] add the retry",
+        "  - #4 tsk_golden0004 [todo] write the docs ⧗ waits on #2",
+        "  - #7 tsk_golden0007 [todo] chore 7",
+        "  - #8 tsk_golden0008 [todo] chore 8",
+        "  - #9 tsk_golden0009 [todo] chore 9",
+        "  - #10 tsk_golden0010 [todo] chore 10",
+        "  … 3 more — `aisquare task list`",
+        "recent updates:",
+        "  - #1 manager added → coder #1: wire auth",
+        "  - #2 coder-auth claimed #1: wire auth",
+        "  - #3 cli note: ship it … → aisquare team show 3",
+        "  - #4 manager question: staging or prod first?",
+        "  - #5 coder-auth blocked #2: fix the login race — no API key",
+        "  - #6 tester-1 result #3: PASS " + "x" * 155 + " … → aisquare team show 6",
+        "Protocol: ",
+    ]
+)
+
+
+@pytest.fixture
+def golden_board(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+    """:func:`_board_fixture` with the board's clock pinned (the command word is ``rlx`` in
+    every test: conftest's ``hints_print_rlx``)."""
+    project, sessions, tasks, events, now = _board_fixture()
+    monkeypatch.setattr(team_service, "_now", lambda: now)
+    return project, sessions, tasks, events
+
+
+def test_the_agents_board_text_is_byte_for_byte_what_it_was(golden_board: tuple[Any, ...]) -> None:
+    """B1 (#14) gave people a text board of their own; the MCP board an agent reads is the
+    same renderer's other branch, and must not move by a byte."""
+    project, sessions, tasks, events = golden_board
+
+    assert team_service.render_board(project, sessions, tasks, events) == GOLDEN_AGENT_BOARD
+
+
+def test_an_agents_injected_board_is_byte_for_byte_what_it_was(
+    golden_board: tuple[Any, ...],
+) -> None:
+    """The text a SessionStart or a prompt injects comes from the same renderer, with ``me``."""
+    project, sessions, tasks, events = golden_board
+
+    injected = team_service._render_board(project, sessions, tasks, events, me=sessions[1])
+
+    board, protocol, _rest = injected.partition("Protocol: ")
+    assert protocol, "the protocol still follows the board"
+    assert board + protocol == GOLDEN_INJECTED_BOARD
+
+
+def test_a_persons_board_is_a_text_board_of_its_own(golden_board: tuple[Any, ...]) -> None:
+    """B1 #14: ``aisquare board`` printed a person the block an agent's prompt is fenced in.
+    Its own text board: a title, then the team (a row per agent, its state in words), the open
+    tasks (number, status, title, who has it), and the updates, each by its time — dated when
+    it is not today's — with a text of several lines kept under its first."""
+    project, sessions, tasks, events = golden_board
+    names = {s.id: s.label or s.role for s in sessions}
+
+    text = team_service.render_board(project, sessions, tasks, events, names=names)
+    lines = text.splitlines()
+
+    assert "<aisquare-team>" not in text and "sessions:" not in text
+    assert lines[0] == "rlx board — golden-repo"
+    team = lines.index("team — 3 live")
+    assert [line.split()[0] for line in lines[team + 1 : team + 4]] == [
+        "manager",
+        "coder-auth",
+        "tester-1",
+    ]
+    assert "waiting for input  golden-model-x ⚠ off-ladder · 2m ago" in lines[team + 1]
+    assert lines[team + 2].endswith("persona skeptic · 2m ago · focus: wire the login")
+    assert "NEEDS YOU" in lines[team + 3] and lines[team + 3].endswith("45m ago (stale)")
+    assert "tasks — 8 to do · 1 doing · 1 in review · 1 blocked · 1 done" in lines
+    assert "  #1   doing      wire auth — coder-auth" in lines
+    assert "  #4   to do      write the docs ⧗ waits on #2" in lines
+    assert "  … 3 more — `rlx task list`" in lines
+    recent = lines[lines.index("recent updates") + 1 :]
+    stamps = [event_time.stamp(e.created_at, now=BOARD_NOW) for e in events]
+    note = BOARD_NOW - timedelta(hours=26)  # yesterday, in every timezone
+    assert stamps[2] == f"{note.astimezone():%b} {note.astimezone().day} {note.astimezone():%H:%M}"
+    width = max(len(stamp) for stamp in stamps)
+    assert recent[2] == f"  {stamps[2]:>{width}}  owner note: ship it"
+    assert recent[3] == " " * (2 + width + 2) + "then tell me", "its next line, under it"
+    assert recent[4] == f"  {stamps[3]:>{width}}  manager question: staging or prod first?"
+
+
+#: ``aisquare board``'s text for :func:`_board_fixture`, named (#140), as 0.10.1 printed it for
+#: everyone — what an agent that runs it reads, byte for byte (review of #554).
+GOLDEN_AGENT_NAMED_BOARD = "\n".join(
+    [
+        "<aisquare-team>",
+        "sessions:",
+        "  - manager [golden-model-x] ⚠ off-ladder — 2m ago",
+        "  - coder-auth persona:skeptic — focus: wire the login — 2m ago",
+        "  - tester-1 — 45m ago (stale)",
+        "tasks (8 todo, 1 doing, 1 review, 1 blocked, 1 done):",
+        "  - #1 tsk_golden0001 [doing @coder-auth] wire auth",
+        "  - #2 tsk_golden0002 [blocked] fix the login race",
+        "  - #3 tsk_golden0003 [review @tester-1] add the retry",
+        "  - #4 tsk_golden0004 [todo] write the docs ⧗ waits on #2",
+        "  - #7 tsk_golden0007 [todo] chore 7",
+        "  - #8 tsk_golden0008 [todo] chore 8",
+        "  - #9 tsk_golden0009 [todo] chore 9",
+        "  - #10 tsk_golden0010 [todo] chore 10",
+        "  … 3 more — `rlx task list`",
+        "recent updates:",
+        "  - manager added → coder: [#1 tsk_golden0001] wire auth",
+        "  - coder-auth claimed: [#1 tsk_golden0001] wire auth",
+        "  - owner note: ship it",
+        "then tell me",
+        "  - manager question: staging or prod first?",
+        "  - coder-auth blocked: [#2 tsk_golden0002] fix the login race — no API key",
+        "  - tester-1 result: [#3 tsk_golden0003] PASS " + "x" * 200,
+        "</aisquare-team>",
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("AISQUARE_FLEET_AGENT", "agt_golden"),  # a fleet window
+        ("CLAUDECODE", "1"),  # a process Claude Code started
+        ("CODEX_THREAD_ID", "thr_golden"),  # a Codex tool shell
+        ("AISQUARE_BROKERED", "1"),  # a sandboxed agent's broker runs it
+    ],
+    ids=["fleet-window", "claude-code", "codex-tool-shell", "broker"],
+)
+def test_an_agent_reading_aisquare_board_gets_its_block_byte_for_byte(
+    golden_board: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch, variable: str, value: str
+) -> None:
+    """Review of #554: the protocol sends agents to ``aisquare board``, and what they read
+    there is the ``<aisquare-team>`` block as 0.10.1 printed it, fence and all. The person's
+    text board (B1 #14) is for a person alone."""
+    project, sessions, tasks, events = golden_board
+    names = {s.id: s.label or s.role for s in sessions}
+
+    person = team_service.render_board(project, sessions, tasks, events, names=names)
+    monkeypatch.setenv(variable, value)
+    agent = team_service.render_board(project, sessions, tasks, events, names=names)
+
+    assert agent == GOLDEN_AGENT_NAMED_BOARD
+    assert person.startswith("rlx board — golden-repo\n"), "without the mark, a person's"
+
+
+def test_aisquare_board_prints_an_agent_its_block_and_a_person_the_text_board(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the command: the same board, inside a fleet window and at a shell."""
+    team_service.activate()
+    runner.invoke(app, ["task", "add", "wire auth"])
+    runner.invoke(app, ["note", "ship it\nthen tell me"])
+
+    person = runner.invoke(app, ["board"])
+    monkeypatch.setenv("AISQUARE_FLEET_AGENT", "agt_cli")
+    agent = runner.invoke(app, ["board"])
+
+    assert person.exit_code == 0 and agent.exit_code == 0, (person.output, agent.output)
+    assert agent.stdout.startswith("<aisquare-team>\n") and agent.stdout.endswith(
+        "</aisquare-team>\n"
+    )
+    assert "  - owner note: ship it\nthen tell me\n" in agent.stdout
+    assert "<aisquare-team>" not in person.stdout and person.stdout.startswith("rlx board — ")
+
+
+def test_a_persons_board_lines_up_names_by_their_cells(golden_board: tuple[Any, ...]) -> None:
+    """A name with an emoji or a wide character in it takes two cells a character; padded by
+    ``len``, every column after it sat one cell off per such character (review of #554)."""
+    from rich.cells import cell_len
+
+    project, sessions, tasks, events = golden_board
+    names = {s.id: s.label or s.role for s in sessions}
+    names[sessions[1].id] = "coder-🚀"
+    names[sessions[2].id] = "テスター"
+
+    text = team_service.render_board(project, sessions, tasks, events, names=names)
+    lines = text.splitlines()
+    team = lines.index("team — 3 live")
+    rows = lines[team + 1 : team + 4]
+    starts = [
+        cell_len(row[: row.index(word)])
+        for row, word in zip(rows, ["waiting", "working", "NEEDS"], strict=True)
+    ]
+
+    assert len(set(starts)) == 1, f"the state column starts at {starts}"

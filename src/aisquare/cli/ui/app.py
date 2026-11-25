@@ -97,7 +97,6 @@ from aisquare.cli.ui.sidebar import (
     HEADROOM_DOT,
     RED,
     SETTINGS_KEY,
-    TIMES,
     AccountsSelected,
     AddProject,
     AgentHeadroom,
@@ -802,9 +801,9 @@ class HelpScreen(ModalScreen[None]):
         text.append(" what the doctor's last run found; its page has the report\n")
         text.append("\nThe line under ⚙ Settings", style="bold")
         text.append(" (a click on it opens Accounts)\n", style="dim")
-        text.append("  ● 3", style="bold cyan")
-        text.append(f"{TIMES} claude", style="bold cyan")
-        text.append("  usable Claude accounts; the dot is the room LEFT across them:\n")
+        # The line's own words (Q8), as the sidebar draws them.
+        text.append("  ● Claude: 3 accounts · 58% left\n", style="bold cyan")
+        text.append("     the usable Claude accounts and the room LEFT across them; the dot:\n")
         text.append("     each account 100 - max(session % used, week % used), averaged —\n")
         text.append("     ")
         # The line's own dots, so the legend paints exactly what the line does.
@@ -825,9 +824,8 @@ class HelpScreen(ModalScreen[None]):
         text.append("●", style=RED)
         text.append(" and ⚠ — accounts that need a login (signed out, token expired or refused);\n")
         text.append("     the dot is red when every enabled account needs one\n")
-        text.append("  ● 1", style="bold cyan")
-        text.append(f"{TIMES} codex", style="bold cyan")
-        text.append("  another agent's accounts (Codex's), read the same way, on a line\n")
+        text.append("  ● Codex: 1 account · 70% left\n", style="bold cyan")
+        text.append("     another agent's accounts (Codex's), read the same way, on a line\n")
         text.append("     of their own under the first\n")
         text.append("\nEsc closes this", style="dim")
         return text
@@ -4641,6 +4639,7 @@ def _writing_workers() -> dict[str, str]:
         accounts.RENAME_WORKER: "an account's rename",
         accounts.ADOPT_WORKER: "a conversation's adoption",
         usage_sharing.SHARE_WORKER: "the usage-sharing switch",
+        usage_sharing.PING_WORKER: "the daily active ping's switch",
         CONSENT_WORKER: "the answer to the usage-sharing question",
         PROJECT_REMOVE_WORKER: "a project's removal",
         PROJECT_FRESH_WORKER: "a project's fresh start",
@@ -4738,6 +4737,7 @@ def _cut_off_workers() -> frozenset[str]:
             usage_stats.SWEEP_WORKER,
             usage_sharing.SHIP_WORKER,
             usage_sharing.PREVIEW_WORKER,
+            usage_sharing.USAGE_WORKER,
             CONSENT_DUE_WORKER,
         }
     )

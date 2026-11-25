@@ -1400,7 +1400,7 @@ def test_every_agent_state_has_its_own_badge_and_sentence(node_report: dict[str,
     """Review of the #457 fold, m3: a state the fleet derives that the page's tables lack is
     drawn as ``unknown``, "in a state tmux does not say" — a paused manager was, on the phone.
     Each of ``FleetAgentState`` has a badge with a class of its own and a sentence; a paused
-    one says paused, as the sidebar's ``⏯ paused`` does."""
+    one says paused, as the sidebar's ``⏸ paused`` does."""
     from typing import get_args
 
     from aisquare.models import FleetAgentState
