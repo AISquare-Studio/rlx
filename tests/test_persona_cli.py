@@ -8,6 +8,7 @@ every test runs outside any repository unless it asks for one.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +22,9 @@ from aisquare.core import agents as agents_core
 from aisquare.core import claude_accounts
 from aisquare.core import personas as core
 from aisquare.core.personas import PersonaError
+from aisquare.services import personas as persona_service
 from tests import bundled_personas
+from tests.fsperms import can_symlink
 
 
 @pytest.fixture(autouse=True)
@@ -659,9 +662,10 @@ def test_a_skill_imported_then_exported_is_byte_identical(
     assert (out / "reviewer-pro" / ".persona.json").is_file()
 
 
-def test_new_in_a_repository_scaffolds_the_project_layer_and_opens_the_editor(
+def test_new_in_a_repository_scaffolds_your_persona_and_opens_the_editor(
     runner: CliRunner, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """0.10.2: personas are yours wherever the command runs; nothing goes into the repository."""
     log = tmp_path / "opened.log"
     monkeypatch.setenv(
         "EDITOR",
@@ -672,13 +676,13 @@ def test_new_in_a_repository_scaffolds_the_project_layer_and_opens_the_editor(
         ),
     )
 
-    result = runner.invoke(app, ["persona", "new", "pair", "--project"])
+    result = runner.invoke(app, ["persona", "new", "pair"])
 
     assert result.exit_code == 0, result.output
-    assert (repo / ".aisquare" / "personas" / "pair" / "SKILL.md").is_file()
+    assert not (repo / ".aisquare" / "personas").exists()
     assert len(log.read_text(encoding="utf-8").splitlines()) == 1
     listed = runner.invoke(app, ["persona", "list"]).stdout.splitlines()
-    assert next(row for row in listed if row.startswith("pair")).split()[1] == "project"
+    assert next(row for row in listed if row.startswith("pair")).split()[1] == "user"
 
 
 def test_new_with_editor_true_leaves_the_valid_template(
@@ -686,17 +690,37 @@ def test_new_with_editor_true_leaves_the_valid_template(
 ) -> None:
     monkeypatch.setenv("EDITOR", "true")
 
-    result = runner.invoke(app, ["persona", "new", "pair", "--project"])
+    result = runner.invoke(app, ["persona", "new", "pair"])
 
     assert result.exit_code == 0, result.output
     persona = core.resolve("pair", repo)
-    assert (persona.layer, persona.frontmatter["name"]) == ("project", "pair")
+    assert (persona.layer, persona.frontmatter["name"]) == ("user", "pair")
 
 
-def test_new_refuses_the_project_layer_outside_a_repository(runner: CliRunner) -> None:
-    code, payload = _json(runner, "new", "pair", "--project")
+@pytest.mark.parametrize(
+    "command",
+    [["new", "pair"], ["rm", "pair"], ["import", "-"]],
+    ids=["new", "rm", "import"],
+)
+def test_project_is_retired_and_refused_in_plain_words(
+    runner: CliRunner, repo: Path, command: list[str]
+) -> None:
+    """In a repository or not, ``--project`` writes nothing and says why (0.10.2)."""
+    result = runner.invoke(app, ["persona", *command, "--project"], input="")
+    code, payload = _json(runner, *command, "--project")
 
-    assert (code, payload["error"]) == (1, "no_project")
+    assert result.exit_code == 1
+    said = " ".join(result.stderr.split())
+    assert "--project is retired: personas are yours (the user level) since 0.10.1" in said
+    assert "Traceback" not in result.output
+    assert (code, payload["error"]) == (1, "project_layer_retired")
+    assert not (repo / ".aisquare" / "personas").exists()
+
+
+def test_project_is_no_longer_offered_in_help(runner: CliRunner) -> None:
+    for command in ("new", "rm", "import"):
+        shown = runner.invoke(app, ["persona", command, "--help"]).stdout
+        assert "--project" not in shown, command
 
 
 def test_new_without_an_editor_scaffolds_and_says_how_to_edit(runner: CliRunner) -> None:
@@ -928,3 +952,286 @@ def test_import_help_names_the_config_table_behind_both_defaults(runner: CliRunn
     page = " ".join(result.output.split())
     assert "(default: [persona.import] engine)" in page
     assert "(default: [persona.import] api_model)" in page
+
+
+@pytest.mark.parametrize("command", [["edit", "tempo"], ["rm", "tempo"]], ids=["edit", "rm"])
+def test_a_projects_own_persona_is_still_read_but_never_changed(
+    runner: CliRunner, repo: Path, monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """The owner's decision on #21 (B): a repository's committed persona is still what its
+    agents start as, and ``show`` reads it, but rlx neither edits nor removes it."""
+    skill = repo / ".aisquare" / "personas" / "tempo" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: tempo\ndescription: The repo's.\n---\nKeep tempo.\n")
+    before = skill.read_bytes()
+    monkeypatch.setenv("EDITOR", "true")
+
+    result = runner.invoke(app, ["persona", *command])
+    code, shown = _json(runner, "show", "tempo")
+
+    assert result.exit_code == 1, result.output
+    said = " ".join(result.stderr.split())
+    assert "rlx no longer writes, edits or removes a project's persona" in said
+    assert str(skill.parent) in said, "it names the project's persona it leaves alone"
+    assert "Traceback" not in result.output
+    assert skill.read_bytes() == before, "the project's file is untouched"
+    assert (code, shown["layer"]) == (0, "project"), "and still read"
+
+
+def test_export_refuses_a_projects_persona_layer_as_its_destination(
+    runner: CliRunner, repo: Path
+) -> None:
+    """The review of #561: ``export --to <repo>/.aisquare/personas`` (the dialog's old
+    *Save as… into: project*) wrote the project's layer around ``_layer_dir``'s refusal."""
+    layer = repo / ".aisquare" / "personas"
+
+    code, payload = _json(runner, "export", "skeptic", "--to", str(layer))
+    with pytest.raises(PersonaError) as refused:
+        persona_service.export("skeptic", root=repo, to=layer, skill=None, force=False)
+
+    assert (code, payload["error"]) == (1, "project_layer_retired")
+    assert refused.value.code == "project_layer_retired"
+    assert not (layer / "skeptic").exists()
+    exported = runner.invoke(app, ["persona", "export", "skeptic", "--to", str(repo / "out")])
+    assert exported.exit_code == 0, exported.output  # any other directory is still fine
+
+
+def test_export_refuses_a_projects_layer_in_any_case(runner: CliRunner, repo: Path) -> None:
+    """The tester of #21, round 3: ``.AISQUARE/Personas`` is the project's layer on macOS and
+    Windows, whose file systems ignore case; it was written to. Refused by name, everywhere."""
+    layer = repo / ".AISQUARE" / "Personas"
+
+    with pytest.raises(PersonaError) as refused:
+        persona_service.export("skeptic", root=repo, to=layer, skill=None, force=False)
+
+    assert refused.value.code == "project_layer_retired"
+    assert not (layer / "skeptic").exists()
+    assert not (repo / ".aisquare" / "personas" / "skeptic").exists()
+
+
+def test_edit_user_edits_yours_where_the_repositorys_own_wins_and_the_refusal_says_so(
+    runner: CliRunner, repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In a repository whose own ``tempo`` wins there, ``persona edit tempo`` refuses, and
+    says how to edit yours; ``--user`` edits yours and leaves the repository's alone."""
+    theirs = repo / ".aisquare" / "personas" / "tempo" / "SKILL.md"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text("---\nname: tempo\ndescription: The repo's.\n---\nKeep tempo.\n")
+    mine = _user_layer() / "tempo" / "SKILL.md"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("---\nname: tempo\ndescription: Mine.\n---\nMy tempo.\n")
+    before = theirs.read_bytes()
+    monkeypatch.setenv(
+        "EDITOR",
+        _editor(
+            tmp_path,
+            "rewrite.py",
+            "text = open(path, encoding='utf-8').read().replace('My tempo.', 'My new tempo.')\n"
+            "open(path, 'w', encoding='utf-8').write(text)",
+        ),
+    )
+
+    refused = runner.invoke(app, ["persona", "edit", "tempo"])
+    edited = runner.invoke(app, ["persona", "edit", "tempo", "--user"])
+
+    assert refused.exit_code == 1
+    assert "rlx persona edit tempo --user" in " ".join(refused.stderr.split())
+    assert edited.exit_code == 0, edited.output
+    assert "My new tempo." in mine.read_text(encoding="utf-8")
+    assert theirs.read_bytes() == before, "the repository's file is untouched"
+
+
+def test_rm_of_a_repositorys_persona_names_rm_user() -> None:
+    error = persona_service._project_refusal(Path("/repo/.aisquare/personas/tempo"), "rm")
+
+    assert "persona rm tempo --user" in str(error)
+
+
+# --- round 4 of #21 (tester #280, reviewer via #285) ------------------------------------
+
+
+def test_an_export_refused_into_a_projects_layer_says_to_export_elsewhere(
+    runner: CliRunner, repo: Path
+) -> None:
+    """It advised editing a persona named after the folder (`persona edit Personas --user`)."""
+    result = runner.invoke(
+        app, ["persona", "export", "mentor", "--to", str(repo / ".AISQUARE" / "Personas")]
+    )
+
+    said = " ".join(result.stderr.split())
+    assert result.exit_code == 1
+    assert "export it to any other folder" in said
+    assert "persona edit" not in said and "Personas --user" not in said
+    assert "change your own" not in said, "an export changes no persona (round 4)"
+
+
+@pytest.mark.parametrize("command", ["edit", "rm"])
+@pytest.mark.parametrize("name", ["tempo", "skeptic"], ids=["none of yours", "bundled"])
+def test_edit_or_rm_user_of_a_persona_you_do_not_have_says_how_to_get_one(
+    runner: CliRunner, repo: Path, monkeypatch: pytest.MonkeyPatch, command: str, name: str
+) -> None:
+    monkeypatch.setenv("EDITOR", "true")
+
+    result = runner.invoke(app, ["persona", command, name, "--user"])
+
+    said = " ".join(result.stderr.split())
+    assert result.exit_code == 1, result.output
+    assert f"you have no persona named '{name}'" in said
+    assert f"persona new {name}" in said
+    if name == "skeptic":  # rlx's, not a project's: no project to import it from (round 4)
+        assert "bundled" in said and "persona import" not in said
+    else:
+        assert "persona import" in said
+    assert "No such file or directory" not in result.output and "Traceback" not in result.output
+
+
+def test_edit_user_refuses_a_name_that_leaves_your_personas_before_opening_anything(
+    runner: CliRunner, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`edit ../../outside/secret --user` opened that SKILL.md in $EDITOR and exited 0."""
+    outside = tmp_path / "outside" / "secret"
+    outside.mkdir(parents=True)
+    (outside / "SKILL.md").write_text("---\nname: secret\ndescription: Not yours.\n---\nNo.\n")
+    opened = tmp_path / "opened.log"
+    monkeypatch.setenv(
+        "EDITOR",
+        _editor(tmp_path, "spy.py", f"open({str(opened)!r}, 'a').write(path + '\\n')"),
+    )
+    relative = os.path.relpath(outside, _user_layer())
+
+    result = runner.invoke(app, ["persona", "edit", relative, "--user"])
+
+    assert result.exit_code == 1, result.output
+    assert "breaks the skill-name rule" in " ".join(result.stderr.split())
+    assert not opened.exists(), "nothing was opened in the editor"
+
+
+def test_a_destination_that_cannot_be_resolved_is_refused_not_let_through(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails closed (the reviewer of #21, round 3): a stat that fails is no pass."""
+    layer = repo.parent / "another-repo" / ".aisquare" / "personas"  # not the lookup's layer
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        if "another-repo" in self.parts:
+            raise OSError("cannot stat")
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    with pytest.raises(PersonaError) as refused:
+        persona_service.export("mentor", root=repo, to=layer, skill=None, force=False)
+
+    assert refused.value.code == "project_layer_retired"
+    assert not (layer / "mentor").exists()
+
+
+# --- round 6 of #21 (tester #974) -----------------------------------------------------------
+
+THEIRS = "---\nname: {name}\ndescription: The project's.\n---\nTHE PROJECT'S OWN {name}.\n"
+
+
+def _linked_layer(repo: Path) -> Path:
+    """``<repo>/.aisquare/personas -> ../../shared``, a shared folder holding the project's
+    own ``mentor``; returns that SKILL.md. Yours is in your own layer."""
+    shared = repo.parent / "shared"
+    theirs = shared / "mentor" / "SKILL.md"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text(THEIRS.format(name="mentor"), encoding="utf-8")
+    (repo / ".aisquare").mkdir()
+    (repo / ".aisquare" / "personas").symlink_to(
+        Path("..") / ".." / "shared", target_is_directory=True
+    )
+    _skill(_user_layer(), "mentor", description="MY mentor.")
+    return theirs
+
+
+@pytest.mark.skipif(not can_symlink(), reason="needs symlinks")
+@pytest.mark.parametrize(
+    ("to", "name", "force"),
+    [
+        ("repo/.aisquare/personas", "mentor", True),
+        ("repo/.aisquare/personas", "careful", False),
+        ("alias", "mentor", True),
+        ("linked-dot/personas", "mentor", True),
+    ],
+    ids=[
+        "linked layer, --force",
+        "linked layer, a new name",
+        "alias to it",
+        "via linked .aisquare",
+    ],
+)
+def test_an_export_into_a_projects_layer_that_is_a_link_is_refused(
+    runner: CliRunner,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    to: str,
+    name: str,
+    force: bool,
+) -> None:
+    """Judged by the resolved path's name alone, ``export mentor --to repo/.aisquare/personas
+    --force`` through a link to ``../../shared`` exited 0 and overwrote the project's mentor
+    with yours; without --force it wrote a new persona the project then reads (the tester of
+    #21, round 5). Any name the destination goes by counts: as written, or a link on the way."""
+    theirs = _linked_layer(repo)
+    (tmp_path / "alias").symlink_to(repo / ".aisquare" / "personas", target_is_directory=True)
+    (tmp_path / "linked-dot").symlink_to(repo / ".aisquare", target_is_directory=True)
+    before = theirs.read_bytes()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)  # from a folder outside the repository, as the tester ran it
+
+    result = runner.invoke(
+        app,
+        ["persona", "export", name, "--to", str(tmp_path / to), *(["--force"] if force else [])],
+    )
+
+    said = " ".join(result.stderr.split())
+    assert result.exit_code == 1, result.output
+    assert "export it to any other folder" in said
+    assert theirs.read_bytes() == before, "the project's persona is untouched"
+    assert sorted(path.name for path in theirs.parent.parent.iterdir()) == ["mentor"]
+
+
+def test_an_export_into_a_projects_real_layer_is_still_refused_with_force(
+    runner: CliRunner, repo: Path
+) -> None:
+    """The control for the linked case: the same folder as a real directory."""
+    theirs = repo / ".aisquare" / "personas" / "mentor" / "SKILL.md"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text(THEIRS.format(name="mentor"), encoding="utf-8")
+    _skill(_user_layer(), "mentor", description="MY mentor.")
+    before = theirs.read_bytes()
+
+    result = runner.invoke(
+        app, ["persona", "export", "mentor", "--to", str(theirs.parent.parent), "--force"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "export it to any other folder" in " ".join(result.stderr.split())
+    assert theirs.read_bytes() == before
+
+
+@pytest.mark.skipif(not can_symlink(), reason="needs symlinks")
+@pytest.mark.parametrize("via", ["the layer", "an alias"])
+def test_your_own_layer_named_dot_aisquare_personas_and_linked_to_dotfiles_still_exports(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, via: str
+) -> None:
+    """``~/.aisquare/personas`` is named like a project's layer; as a link to your dotfiles,
+    or reached by an alias, it is still yours, and an export there is allowed."""
+    home = tmp_path / "me" / ".aisquare"
+    home.mkdir(parents=True)
+    dotfiles = tmp_path / "dotfiles" / "personas"
+    dotfiles.mkdir(parents=True)
+    (home / "personas").symlink_to(dotfiles, target_is_directory=True)
+    monkeypatch.setenv("AISQUARE_HOME", str(home))
+    (tmp_path / "alias").symlink_to(home / "personas", target_is_directory=True)
+    to = home / "personas" if via == "the layer" else tmp_path / "alias"
+
+    result = runner.invoke(app, ["persona", "export", "careful", "--to", str(to)])
+
+    assert result.exit_code == 0, result.output
+    assert (dotfiles / "careful" / "SKILL.md").is_file()

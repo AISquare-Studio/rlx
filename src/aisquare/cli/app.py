@@ -122,8 +122,10 @@ def main_callback(
 _NOT_FEATURES = frozenset({"hook", "serve", "inject", "uninstall"})
 
 
-#: The detached shipper itself: not a feature, and it must not start another.
+#: The detached shipper and the detached pinger themselves: not features, and neither may start
+#: another.
 _SHIPPER = "cli.metrics.ship"
+_PINGER = "cli.metrics.ping"
 
 
 #: The hidden aliases of a group (registered below with the group's own app): counted under the
@@ -180,14 +182,29 @@ def command_path(ctx: typer.Context) -> str | None:
 def _count_command(ctx: typer.Context) -> None:
     """Count this command in the local feature counters: an append to a spool file, failing
     open (``core.feature_use``). Not one run in the launch of an agent whose usage is not
-    shared (:func:`_launch_usage_shared`)."""
+    shared (:func:`_launch_usage_shared`). Also the day's anonymous active ping
+    (:func:`_ping_today`), whoever runs the command: once the command is done, so that the
+    command that turns the ping off (``config set sharing.active_ping false``) sends none."""
     try:
         path = command_path(ctx)
-        if path is not None and path != _SHIPPER:
+        if path is not None and path not in (_SHIPPER, _PINGER):
             if _launch_usage_shared():
                 feature_use.record(path)
             sharing.start_background_ship()  # a detached `metrics ship`, once in 6 h if on
+            ctx.call_on_close(_ping_today)
     except Exception:  # a counter never costs a command
+        return
+
+
+def _ping_today() -> None:
+    """Start the detached ``metrics ping`` if today's anonymous active ping is due: a feature
+    command or the app opening is a day rlx is used. Imported here and not at the top, so a
+    hook, which never gets here, never loads it (``services.active_ping``)."""
+    try:
+        from aisquare.services import active_ping
+
+        active_ping.start_background()
+    except Exception:  # the ping never costs a command
         return
 
 
@@ -235,6 +252,7 @@ def _no_arguments(ctx: typer.Context) -> None:
     if not fleet.interactive_terminal():
         typer.echo(ctx.get_help())
         raise typer.Exit(2)
+    _ping_today()
     fleet.ui()
 
 

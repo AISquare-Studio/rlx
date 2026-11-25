@@ -6,7 +6,7 @@ that no Claude Code session resumes, and a Claude Code transcript is nothing Cod
 So a hand-off onto another agent starts the target FRESH, and what carries the work is a
 **brief**: the source's task, contract and claims, its last board entries, the state of its
 tree, and the newest of its conversation. ``fleet switch --agent`` (or ``--to`` an account
-of another agent), the Spawn dialog's *Hand off from* with another Agent, and the automatic
+of another agent), the Spawn dialog's *Continue from* with another Agent, and the automatic
 hand-over once the agent's own accounts are all limited (:func:`pick_across`) all start
 one.
 

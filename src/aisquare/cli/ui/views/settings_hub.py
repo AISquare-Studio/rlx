@@ -1,17 +1,18 @@
 """The Settings hub: what *⚙ Settings* in the sidebar opens.
 
 Nine links, each a button with one line saying what is behind it — *App
-settings* (the machine-wide settings, ``views.app_settings``), *Remote control* and
-*Captain* (App settings again, on its *Remote* tab and on the *Agent settings* tab the
-captain's box tops: one obvious way in to each, #41), *Accounts* (the AISquare sign-in
+settings* (the machine-wide settings, ``views.app_settings``), *Remote control* (the one
+Remote page, which ``R`` opens too: ``views.remote``, Q17), *Captain* (App settings again,
+its *Agent settings* scrolled to the captain's box, its last section, Q18: one obvious way
+in, #41), *Accounts* (the AISquare sign-in
 and the Claude Code and Codex accounts, ``views.accounts``), *Personas* (yours and the
 bundled ones, for every project: ``views.personas_tab`` with no project, R27), *Usage &
 stats* (what all your agents' sessions on this machine spent, ``views.usage_stats``), *Agent
 resources* (what each live agent consumes, ``views.resources``), *tmux* (every window on rlx's
 tmux server, ``views.tmux_page``) and *Doctor* (the checks, which opening it runs). A link posts
-the message the app routes (*tmux* shows its page among the app's itself); the pages it opens
-keep *⚙ Settings* highlighted in the sidebar. ↑/↓ move between the links, Enter or a click opens
-one.
+the message the app routes (*Remote control* and *tmux* show their pages themselves); the pages
+it opens keep *⚙ Settings* highlighted in the sidebar. ↑/↓ move between the links, Enter or a
+click opens one.
 
 Under them, *Fleet*: *Restart all…* and *Stop all…*, for every running agent of every
 project, and *Pause all…* and *Resume all…*, ``fleet pause --all`` and ``fleet resume --all``
@@ -20,8 +21,8 @@ the UI thread, with a toast per agent as it is done and one that sums it up. Eve
 greyed while it runs. Each of the four is a ``GuardedButton`` (``click_guard``): a click
 that reaches it before the page is painted under the pointer opens nothing.
 
-Remote control and the Captain box were sections of this page (#33). They live in App
-settings' tabs now, in its format, where the owner placed them (#41).
+Remote control and the Captain box were sections of this page (#33), then App settings'
+tabs (#41). Remote is one page of its own now; the Captain box ends App settings' first tab.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ from aisquare.cli.ui.sidebar import (
     doctor_badge,
 )
 from aisquare.cli.ui.views import tmux_page
-from aisquare.cli.ui.views.app_settings import AGENT_TAB, REMOTE_TAB
+from aisquare.cli.ui.views.app_settings import CAPTAIN
 from aisquare.cli.ui.views.fleet_bulk import (
     BULK_WORKER,
     ConfirmBulk,
@@ -58,6 +59,7 @@ from aisquare.cli.ui.views.fleet_bulk import (
     bulk_running,
     report_toast,
 )
+from aisquare.cli.ui.views.remote import open_remote_page
 from aisquare.services import fleet as fleet_service
 
 LINKS: tuple[tuple[str, str, str], ...] = (
@@ -67,7 +69,7 @@ LINKS: tuple[tuple[str, str, str], ...] = (
         "agent settings (roles, the fleet, accounts' rules) and your preferences",
     ),
     ("remote", "Remote control", "the fleet on your phone: a link, its QR code and a password"),
-    ("captain", "Captain", "the experimental captain, on or off (App settings ▸ Agent settings)"),
+    ("captain", "Captain", "the experimental captain, on or off (App settings, last)"),
     ("accounts", "Accounts", "the AISquare sign-in and the Claude Code and Codex accounts"),
     ("personas", "Personas", "who an agent can be: browse, edit and import personas"),
     (
@@ -157,14 +159,17 @@ class SettingsHubView(VerticalScroll, can_focus=False):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         stem = (event.button.id or "").removeprefix("hub-")
+        if stem == "remote":  # the one Remote page, as R opens it (Q17)
+            event.stop()
+            open_remote_page(self.app)
+            return
         if stem == "tmux":  # a page of its own, shown among the app's (``views.tmux_page``)
             event.stop()
             tmux_page.show_page(self.app)
             return
         message: Message | None = {
             "app-settings": AppSettingsSelected(),
-            "remote": AppSettingsSelected(REMOTE_TAB),
-            "captain": AppSettingsSelected(AGENT_TAB),
+            "captain": AppSettingsSelected(CAPTAIN),
             "accounts": AccountsSelected(),
             "personas": PersonasSelected(),
             "usage-stats": UsageStatsSelected(),

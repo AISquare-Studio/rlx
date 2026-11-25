@@ -353,7 +353,7 @@ def evidence(
         typer.Option(
             "--artifact",
             help="The file that shows it, such as a screenshot: manual evidence.",
-            click_type=AgentPath(),
+            parser=AgentPath(),
         ),
     ] = None,
     report: Annotated[
@@ -397,7 +397,7 @@ def check(
         typer.Option(
             "--source-root",
             help="Compare every pass with this one checkout (the project's, or a worktree).",
-            click_type=AgentPath(),
+            parser=AgentPath(),
         ),
     ] = None,
     as_session: SessionRef = None,
@@ -448,7 +448,7 @@ def finding(
     summary: Summary,
     artifact: Annotated[
         Path | None,
-        typer.Option("--artifact", help="A file that shows the failure.", click_type=AgentPath()),
+        typer.Option("--artifact", help="A file that shows the failure.", parser=AgentPath()),
     ] = None,
     as_session: SessionRef = None,
 ) -> None:

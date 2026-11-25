@@ -15150,8 +15150,7 @@ def _respawn(
         ]
         said = f"{', '.join(kept)} and arguments" if kept else "arguments"
         notes.append(
-            f"launched as recorded — {said} come from its launch record, not from today's "
-            "config (#144)"
+            f"launched as recorded — {said} come from its launch record, not from today's config"
         )
     notes.extend(receipt.notes)
     return receipt, resume is not None, notes
@@ -16455,7 +16454,7 @@ def hand_off(
     agent_id: str | None = None,
     to_agent: str | None = None,
 ) -> HandoffReceipt:
-    """Start an agent from teammate ``source``: the Spawn dialog's *Hand off from*.
+    """Start an agent from teammate ``source``: the Spawn dialog's *Continue from*.
 
     **Fork**, the default, touches nothing of the source: no mark, no stop, no claim, and
     neither its row, its window, its tree nor its branch. The new agent takes a label that
@@ -16718,7 +16717,7 @@ def _handoff_row(
 
     The label alone names the newest row that carries it, and two rows of a project can
     carry one label over time: an exited coder-1 and the coder-1 started since. The Spawn
-    dialog's *Hand off from* can show the older one, so by label its fork forked, and its
+    dialog's *Continue from* can show the older one, so by label its fork forked, and its
     take-over stopped and restarted, the NEWER agent (review of #240, "also confirmed":
     hand-off by label). A caller that means one teammate names its row, as the agent view
     does for :func:`stop` and :func:`restart`: by its whole id, as theirs is. A row of
@@ -17299,7 +17298,7 @@ its replacement is a deliberate add, and would bring the project back to every l
 NOT_PAUSED = "not paused"
 """Why a resume by :func:`bulk` leaves a row: running, or exited (💤) without a pause — only
 the agents a ``fleet pause`` stopped come back."""
-NOT_CHOSEN = "not chosen"
+NOT_CHOSEN = "unticked in the pick-list"
 """Why :func:`bulk` leaves a row the plan it was shown would have acted on: the person
 unticked it in asq's dialog (R17, its pick-list). A pause that leaves one of a project's
 agents so does not fleet-pause the project (:func:`_fully_picked`)."""

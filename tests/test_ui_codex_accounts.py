@@ -253,13 +253,15 @@ def test_a_codex_row_says_how_old_its_reading_is_and_never_asks_to_open_a_sessio
         key: text.plain
         for key, text in account_cells(_codex_status(4, "me@example.com"), reading, now=NOW).items()
     }
-    assert (shown_row["slot"], shown_row["name"]) == ("4", "account 4")
-    assert (shown_row["email"], shown_row["plan"]) == ("me@example.com", "plus")
+    # Named by its email (Q1 of the 0.10.2 UX audit), in the one name column.
+    assert (shown_row["slot"], shown_row["name"]) == ("4", "me@example.com")
+    assert "email" not in shown_row and shown_row["plan"] == "plus"
     # The age is said beside the bar, as a kept reading's is; the whole line is the tooltip.
     assert (shown_row["session"], shown_row["week"]) == ("▮▮▯▯▯ 42% · 3h", "▯▯▯▯▯ 7%")
     unfinished = account_cells(_codex_status(0, "me@example.com", signed_in=False), None, now=NOW)
-    assert unfinished["name"].plain == "plain codex"
-    assert unfinished["session"].plain == "!"  # one mark across the usage, why on hover
+    assert unfinished["name"].plain == "me@example.com"  # whose it is, its login unfinished
+    # The mark and why across the usage (Q19), the whole reason and the fix on hover.
+    assert unfinished["session"].plain == "! login incomplete"
     tip = problem_tooltip(_codex_status(0, "me@example.com", signed_in=False), None, now=NOW)
     assert tip is not None
     assert tip.splitlines()[0] == "login incomplete"  # never "token missing": Claude's
@@ -355,7 +357,7 @@ def test_a_codex_slot_renders_in_the_one_table_with_offline_usage_bars(
     seen = drive(go, overview=overview)
     assert seen["section"] and seen["title"].startswith("Codex 0.162.1") and seen["header"]
     assert seen["in_table"], "every agent's rows are in the one table"
-    assert f"{slot}  account {slot}" in seen["line"]
+    assert f"{slot}  codex@example.com" in seen["line"]  # by its email (Q1 of 0.10.2)
     assert seen["cells"]["agent"] == ">_"  # the first word of the name's column, Codex's mark
     assert "codex@example.com  ▮▮▯▯▯ 42% · 3h" in seen["line"] and seen["line"].endswith("plus")
     shown_cells = seen["cells"]

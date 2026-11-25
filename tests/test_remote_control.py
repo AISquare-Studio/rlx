@@ -3512,6 +3512,15 @@ def test_a_port_the_panel_cannot_use_is_a_sentence_and_unset_is_the_default() ->
             given.turn_off()
 
 
+def _out_of_range(message: str, low: int, high: int) -> bool:
+    """Whether ``message`` is typer's refusal of a number outside ``low``..``high``: click's
+    words up to typer 0.28, pydantic's (the bound it broke) from 0.29."""
+    return f"not in the range {low}<=x<={high}" in message or any(
+        f"Input should be {side} than or equal to {bound}" in message
+        for side, bound in (("greater", low), ("less", high))
+    )
+
+
 @pytest.mark.parametrize("raw", ["0", "-1", "65536", "70000"])
 def test_a_port_no_command_can_use_is_a_usage_error_never_a_dead_link_or_a_traceback(
     raw: str, monkeypatch: pytest.MonkeyPatch
@@ -3539,7 +3548,7 @@ def test_a_port_no_command_can_use_is_a_usage_error_never_a_dead_link_or_a_trace
         assert result.exit_code == 2, (command, exports, result.output)
         answer = json.loads(result.stdout)
         assert answer["error"] == "usage", (command, exports)
-        assert "not in the range 1<=x<=65535" in answer["message"], (command, exports)
+        assert _out_of_range(answer["message"], 1, 65535), (command, exports, answer)
     assert not paths.remote_state_path().exists(), "refused before anything was read or made"
     with pytest.MonkeyPatch.context() as env:
         env.setenv(PORT_ENV, raw)
@@ -3567,7 +3576,7 @@ def test_an_auto_off_past_a_week_is_a_usage_error_never_a_traceback(
         exported = runner.invoke(cli, ["--json", "remote", "serve"], env={AUTO_OFF_ENV: raw})
         for result in (flagged, exported):
             assert result.exit_code == 2, result.output
-            assert "not in the range 0<=x<=10080" in json.loads(result.stdout)["message"]
+            assert _out_of_range(json.loads(result.stdout)["message"], 0, 10080), result.stdout
     for raw in ("10080", "0"):
         assert runner.invoke(cli, ["remote", "serve", "--auto-off", raw]).exit_code == 0
     assert timers == [10080, 0]

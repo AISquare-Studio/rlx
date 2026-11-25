@@ -578,3 +578,140 @@ def test_two_renamed_host_asqs_asked_to_quit_at_once_are_both_waited_out(
     assert "predates the registry" not in said
     for stand_in in stand_ins:
         assert f"✓ rlx 0.0.1 (pid {stand_in.pid}) quit" in said
+
+
+# --- #28: a record Windows will not let its asq delete -------------------------------------
+
+#: Prepended to a stand-in: every delete of its own record is refused as Windows refuses one a
+#: reader has open (WinError 32, a sharing violation), for as long as the stand-in runs. The
+#: gate's own process deletes as usual.
+_RECORD_STUCK = r"""
+import pathlib
+_unlink = pathlib.Path.unlink
+def _refused(self, *args, **kwargs):
+    if self.name.endswith(".json") and self.parent.name == "instances":
+        raise PermissionError(32, "used by another process (WinError 32)", str(self))
+    return _unlink(self, *args, **kwargs)
+pathlib.Path.unlink = _refused
+"""
+
+STUCK_WAIT_S = 8.0
+"""The gate's wait in these tests: past the stand-ins' exit (their refused deletes are tried
+for a second each, then a second's linger), well under the record's 60 s heartbeat."""
+
+
+@pytest.mark.parametrize("host", ["same", "renamed"])
+def test_a_record_its_asq_could_not_delete_does_not_hold_the_gate(
+    host: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#28 (the product race behind #20's [renamed] flake): on Windows the quitting asq's
+    record delete fails while the gate's wait has it open, and the record stays. Naming another
+    host name, it read as live by its heartbeat for 60 s: the gate waited out its time and
+    refused the person's yes. On this machine (its lock held when the gate read it) the gate
+    now asks the process and the lock, and removes the leftover once the process has ended.
+    ``same`` was already judged by its pid: the control."""
+    argv = [sys.executable, "-c", _RECORD_STUCK + _LINGERING_STAND_IN]
+    if host == "renamed":
+        argv.append("dhcp-10-0-0-5.example.net")
+    stand_in = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+    threading.Thread(target=stand_in.wait, daemon=True).start()  # reaped as it ends: no zombie
+    assert stand_in.stdout is not None and stand_in.stdout.readline().strip() == "ready"
+    line = _line(stand_in.pid, 1, "05:00", "ttys004", f"{UV} {BIN}/asq")
+    monkeypatch.setattr(
+        instance_scan, "_ps", lambda: line + "\n" if procs.alive(stand_in.pid) else ""
+    )
+    monkeypatch.setattr(instance_scan, "_environment", lambda process: None)
+
+    try:
+        registration = instance_gate.admit(
+            ask=lambda question: True, interactive=True, wait_s=STUCK_WAIT_S
+        )
+    finally:
+        stand_in.kill()
+
+    said = capsys.readouterr().err
+    assert registration is not None, said
+    assert f"✓ rlx 0.0.1 (pid {stand_in.pid}) quit" in said and "has not quit" not in said
+    assert [i.pid for i in instances.live_instances()] == [os.getpid()], "the leftover removed"
+
+
+def test_two_renamed_host_asqs_whose_records_stay_are_both_waited_out(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The two-at-once case of #466's re-review, with both records left behind (#28)."""
+    renamed = "dhcp-10-0-0-5.example.net"
+    stand_ins: list[subprocess.Popen[str]] = []
+    for linger in ("0", "1.0"):
+        stand_in = subprocess.Popen(
+            [sys.executable, "-c", _RECORD_STUCK + _RENAMED_STAND_IN, renamed, linger],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        threading.Thread(target=stand_in.wait, daemon=True).start()
+        assert stand_in.stdout is not None and stand_in.stdout.readline().strip() == "ready"
+        stand_ins.append(stand_in)
+    lines = {
+        stand_in.pid: _line(stand_in.pid, 1, "05:00", f"ttys00{at}", f"{UV} {BIN}/asq")
+        for at, stand_in in enumerate(stand_ins)
+    }
+    monkeypatch.setattr(
+        instance_scan,
+        "_ps",
+        lambda: "".join(line + "\n" for pid, line in lines.items() if procs.alive(pid)),
+    )
+    monkeypatch.setattr(instance_scan, "_environment", lambda process: None)
+
+    try:
+        registration = instance_gate.admit(
+            ask=lambda question: True, interactive=True, wait_s=STUCK_WAIT_S
+        )
+    finally:
+        for stand_in in stand_ins:
+            stand_in.kill()
+
+    said = capsys.readouterr().err
+    assert registration is not None, said
+    for stand_in in stand_ins:
+        assert f"✓ rlx 0.0.1 (pid {stand_in.pid}) quit" in said
+
+
+def test_a_record_of_another_live_machine_is_still_waited_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#28's control: a record naming another host, its lock not held here and its heartbeat
+    fresh, is another machine's asq, which this one cannot ask about its pids. Its record alone
+    says it runs, and the wait honours it: never taken for gone, never removed."""
+    from tests.asq_elsewhere import asq_running
+
+    now = [0.0]
+    monkeypatch.setattr(time, "sleep", lambda seconds: now.__setitem__(0, now[0] + 1))
+    with asq_running(host="elsewhere.example.net", pid=4242, hold_lock=False) as other:
+        gone = instances.wait_gone(other, 3.0, clock=lambda: now[0])
+        assert not gone, "a live machine's asq is waited for"
+        assert instances.registry_dir().joinpath(f"{other.id}.json").exists(), "never removed"
+
+
+def test_a_refused_delete_is_tried_again_until_the_reader_lets_go(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The root of #28, in the quitting asq: a delete Windows refuses while a reader has the
+    file open is tried again for a bounded time, so the record goes once the read is over."""
+    record = tmp_path / "abc.json"
+    record.write_text("{}", encoding="utf-8")
+    refusals = [PermissionError(32, "in use"), PermissionError(32, "in use")]
+    real = Path.unlink
+
+    def unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == record and refusals:
+            raise refusals.pop(0)
+        real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    assert instances._unlink(record) and not record.exists() and refusals == []
+    # Refused for good: given up at the bound, never raised.
+    record.write_text("{}", encoding="utf-8")
+    clock = iter([0.0, 0.5, 2.0])
+    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+    refusals.extend(PermissionError(32, "in use") for _ in range(5))
+    assert not instances._unlink(record) and record.exists()

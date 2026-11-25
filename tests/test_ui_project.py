@@ -780,7 +780,7 @@ def test_the_team_strip_counts_each_role_by_state_and_hides_with_only_the_manage
         return (*team, strip.display)
 
     text, displayed, alone = drive(project, scenario)
-    assert text == "🔨 2▶  🧪 1⏸  👀 1🔔  · board for detail"
+    assert text == "🔨 2▶  🧪 1◦  👀 1🔔  · board for detail"
     assert displayed is True
     assert alone is False
 
@@ -796,7 +796,7 @@ def test_the_team_strip_shows_each_state_of_a_role_and_a_role_it_has_no_icon_for
     ]
     text = project_view_module.team_strip_text(frame)
     assert text is not None
-    assert text.plain == "🔨 1▶ 1⏸ 1⏳  🤖 docs-writer 1⏸  · board for detail"
+    assert text.plain == "🔨 1▶ 1◦ 1⏳  🤖 docs-writer 1◦  · board for detail"
     assert project_view_module.team_strip_text(frame[:0]) is None
 
 
@@ -1023,7 +1023,11 @@ def test_board_tab_shows_this_projects_tasks_and_not_anothers(
 
     async def rows(pilot: Pilot[None], host: Host) -> int:
         """The task rows: with none open, the table's one row is the empty state (#286)."""
-        return sum(key.value != EMPTY_ROW for key in host.query_one("#tasks", DataTable).rows)
+        table = host.query_one("#tasks", DataTable)
+        # Not the empty state, nor a group's heading (B2): the tasks.
+        return sum(
+            key.value != EMPTY_ROW and not str(key.value).startswith("group:") for key in table.rows
+        )
 
     assert drive(project, rows) == 2
     assert drive(other, rows) == 0  # the panel reads the project it was given, not the cwd
@@ -1099,19 +1103,37 @@ def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInf
     """B1 #1: a click on the Board tab left the focus on the tab row, outside the panel, and
     ``d``, ``b`` or ``a`` did nothing until a second click inside the board."""
 
-    async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, str]:
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, bool, bool]:
         await pilot.click("#--content-tab-tab-board")
-        await pilot.pause()
         panel = host.query_one("#board-panel", BoardPanel)
-        focused = host.focused
-        inside = focused is not None and panel in focused.ancestors_with_self
-        await pilot.press("d")  # no click inside the board first
-        await pilot.pause()
-        return inside, str(panel.query_one("#tasks", DataTable).border_title)
 
-    inside, title = drive(project, scenario)
+        def inside() -> bool:
+            focused = host.focused
+            return focused is not None and panel in focused.ancestors_with_self
+
+        # The click's chain (the tab activated, its pane shown, the panel's on_show taking the
+        # keys) is several messages long; one pause() guesses "idle" from CPU time and, on a
+        # loaded Windows runner, returned before its end (#29). Wait for the focus itself.
+        for _ in range(500):  # bounded: 10 s at most
+            if inside():
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"the tab's click left the focus outside the board: {host.focused!r}")
+        took = inside()
+        folded = "done" in panel.folds
+        await pilot.press("d")  # no click inside the board first: Done unfolds (B2)
+        for _ in range(500):
+            if "done" not in panel.folds:
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"d did not reach the board: its folds read {sorted(panel.folds)}")
+        return took, folded, "done" in panel.folds
+
+    inside, folded, still = drive(project, scenario)
     assert inside, "the tab's click left the focus outside the board"
-    assert title.startswith("done archive"), title
+    assert folded and not still, "d answered with no click first"
 
 
 class BesideAField(Host):

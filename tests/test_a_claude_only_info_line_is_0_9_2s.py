@@ -81,14 +81,14 @@ ROWS = {
 
 #: 0.9.2's painted line for each row at each width (a nowrap, ellipsis row of that width).
 LINES_0_9_2 = {
-    ("manager", 38): "🧭 manager  ⏸ waiting  account 3 · 0%…",
-    ("manager", 45): "🧭 manager  ⏸ waiting  account 3 · 0%  %3",
-    ("manager", 60): "🧭 manager  ⏸ waiting  account 3 · 0%  %3",
-    ("manager", 200): "🧭 manager  ⏸ waiting  account 3 · 0%  %3",
-    ("coder-r2l", 38): "🔨 coder-…  ⏸ waiting  account 3 · 0%…",
-    ("coder-r2l", 45): "🔨 coder-r2l  ⏸ waiting  account 3 · 0%  cla…",
-    ("coder-r2l", 60): "🔨 coder-r2l  ⏸ waiting  account 3 · 0%  claude-haiku-5-5 m…",
-    ("coder-r2l", 200): "🔨 coder-r2l  ⏸ waiting  account 3 · 0%  claude-haiku-5-5 medium  %3",
+    ("manager", 38): "🧭 manager  ◦ waiting  account 3 · 0%…",
+    ("manager", 45): "🧭 manager  ◦ waiting  account 3 · 0%  %3",
+    ("manager", 60): "🧭 manager  ◦ waiting  account 3 · 0%  %3",
+    ("manager", 200): "🧭 manager  ◦ waiting  account 3 · 0%  %3",
+    ("coder-r2l", 38): "🔨 coder-…  ◦ waiting  account 3 · 0%…",
+    ("coder-r2l", 45): "🔨 coder-r2l  ◦ waiting  account 3 · 0%  cla…",
+    ("coder-r2l", 60): "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-haiku-5-5 m…",
+    ("coder-r2l", 200): "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-haiku-5-5 medium  %3",
     ("coder-01m78wvz", 38): "🔨 coder-01m78…  ▶ working  work · 7%…",
     ("coder-01m78wvz", 45): "🔨 coder-01m78wvz  ▶ working  work · 7%  cla…",
     ("coder-01m78wvz", 60): "🔨 coder-01m78wvz  ▶ working  work · 7%  claude-opus-5-5 hi…",
@@ -98,12 +98,12 @@ LINES_0_9_2 = {
 #: 0.9.2's line with its styles (``Text.markup``) where the label is cut and where it is not.
 MARKUP_0_9_2 = {
     ("coder-r2l", 38): (
-        "🔨 [bold]coder-…[/bold]  [yellow]⏸ waiting[/yellow]  [blue]account 3[dim][/blue] · "
+        "🔨 [bold]coder-…[/bold]  [dim]◦ waiting[/dim]  [blue]account 3[dim][/blue] · "
         "[#3fb950][/dim]0%[/#3fb950]  [dim cyan]claude-haiku-5-5[/dim cyan] [cyan]medium"
         "[/cyan]  [dim italic]%3[/dim italic]"
     ),
     ("coder-r2l", 200): (
-        "🔨 [bold]coder-r2l[/bold]  [yellow]⏸ waiting[/yellow]  [blue]account 3[dim][/blue] · "
+        "🔨 [bold]coder-r2l[/bold]  [dim]◦ waiting[/dim]  [blue]account 3[dim][/blue] · "
         "[#3fb950][/dim]0%[/#3fb950]  [dim cyan]claude-haiku-5-5[/dim cyan] [cyan]medium"
         "[/cyan]  [dim italic]%3[/dim italic]"
     ),
@@ -154,10 +154,10 @@ def test_beside_another_agents_accounts_a_narrow_row_keeps_0_9_2s_account_and_us
 @pytest.mark.parametrize(
     ("row", "line"),
     [
-        ("manager", "🧭 manager  ⏸ waiting  account 3 · 0%  claude-code  %3"),
+        ("manager", "🧭 manager  ◦ waiting  account 3 · 0%  claude-code  %3"),
         (
             "coder-r2l",
-            "🔨 coder-r2l  ⏸ waiting  account 3 · 0%  claude-code  claude-haiku-5-5 medium  %3",
+            "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-code  claude-haiku-5-5 medium  %3",
         ),
         (
             "coder-01m78wvz",
