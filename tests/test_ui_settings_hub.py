@@ -33,7 +33,6 @@ from aisquare.cli.ui.sidebar import (
     ORANGE_RED,
     RED,
     SETTINGS_KEY,
-    TIMES,
     YELLOW,
     AgentHeadroom,
     OthersSection,
@@ -564,7 +563,8 @@ def test_the_claude_dot_follows_the_headroom_level(
     text = status_line_text(summary)
     assert text.plain.startswith(dot)
     if summary is not None:
-        assert f"{summary.usable}{TIMES} claude" in text.plain
+        accounts = "account" if summary.usable == 1 else "accounts"
+        assert f"Claude: {summary.usable} {accounts}" in text.plain  # in words (Q8)
 
 
 @pytest.mark.parametrize("width", [38, 45, 60, 90, 200])
@@ -619,7 +619,7 @@ def test_the_sidebar_names_no_aisquare_and_the_accounts_page_has_the_sign_in(
             return await go(pilot)
 
     sidebar, line, page = asyncio.run(run())
-    assert line and line[0].startswith(f"● 3{TIMES} claude"), line  # its first cell, no gap
+    assert line and line[0].startswith("● Claude: 3 accounts"), line  # its first cell, no gap
     assert not [row for row in sidebar if "aisquare" in row.lower()], sidebar
     said = {
         "signed in": "✓ Signed in as me@aisquare.studio",
@@ -637,16 +637,16 @@ def test_the_help_legend_of_the_line_names_no_aisquare_and_starts_codex_unindent
     text = HelpScreen("f12").keys_text().plain
     legend = text[text.index("The line under ⚙ Settings") : text.index("Esc closes this")]
     assert "aisquare" not in legend.lower(), legend
-    agents = [row for row in legend.splitlines() if row.lstrip().startswith("● ") and TIMES in row]
-    assert agents == [
-        f"  ● 3{TIMES} claude  usable Claude accounts; the dot is the room LEFT across them:",
-        f"  ● 1{TIMES} codex  another agent's accounts (Codex's), read the same way, on a line",
-    ], legend
+    agents = [row for row in legend.splitlines() if row.lstrip().startswith("● ") and ": " in row]
+    # In the line's own words (Q8), each starting in the same column.
+    assert agents == ["  ● Claude: 3 accounts · 58% left", "  ● Codex: 1 account · 70% left"], (
+        legend
+    )
 
 
 def test_a_login_due_puts_a_warning_on_the_line() -> None:
     due = HeadroomSummary(level="fair", percent_left=30.0, usable=1, needs_login=1)
-    assert status_line_text(due).plain == f"● 1{TIMES} claude 30% ⚠"
+    assert status_line_text(due).plain == "● Claude: 1 account · 30% left ⚠"
     assert "⚠" not in status_line_text(GOOD).plain
 
 
@@ -674,15 +674,18 @@ def test_a_login_due_keeps_its_warning_in_the_cells_the_line_has() -> None:
             painted.append(composited(line).rstrip())
         return painted
 
+    # The sidebar's 28 cells: " left" gives way, the figure and the ⚠ stay (Q8's words).
     assert _drive(go) == [
-        f"● 2{TIMES} claude 58% ⚠",
-        f"● 2{TIMES} claude 3% ⚠",
-        f"● 9{TIMES} claude 100%",
+        "● Claude: 2 accounts · 58% ⚠",
+        "● Claude: 2 accounts · 3% ⚠",
+        "● Claude: 9 accounts · 100%",
     ]
-    narrow = {left: status_line_text(due[left], width=16).plain for left in due}
-    assert narrow == {58.0: f"● 2{TIMES} claude ⚠", 3.0: f"● 2{TIMES} claude 3% ⚠"}
-    wide = status_line_text(due[58.0], width=17)
-    assert wide.plain == f"● 2{TIMES} claude 58% ⚠", "with room, both"
+    narrow = {left: status_line_text(due[left], width=27).plain for left in due}
+    assert narrow == {58.0: "● Claude: 2 accounts ⚠", 3.0: "● Claude: 2 accounts · 3% ⚠"}
+    wide = status_line_text(due[58.0], width=28)
+    assert wide.plain == "● Claude: 2 accounts · 58% ⚠", "with room, both"
+    widest = status_line_text(due[58.0], width=33)
+    assert widest.plain == "● Claude: 2 accounts · 58% left ⚠", "with more, the word too"
 
 
 def test_the_line_paints_the_injected_headroom() -> None:
@@ -691,7 +694,7 @@ def test_the_line_paints_the_injected_headroom() -> None:
     async def go(pilot: Pilot[None]) -> str:
         return _shown(_app(pilot).query_one(StatusLine))
 
-    assert _drive(go, headroom=lambda accounts: critical) == f"● 2{TIMES} claude 3% ⚠"
+    assert _drive(go, headroom=lambda accounts: critical) == "● Claude: 2 accounts · 3% ⚠"
 
 
 def _delta_e(one: Color, other: Color) -> float:
@@ -822,7 +825,7 @@ def test_a_signed_out_account_puts_a_warning_on_the_line(
     )
     # Slot 1 signed out, slot 2 good: the 60% and the ⚠, in the sidebar's 28 cells now no
     # AISquare dot takes 12 of them (R21; the figure gives way where both do not fit, #357).
-    assert line == f"● 1{TIMES} claude 60% ⚠", line
+    assert line == "● Claude: 1 account · 60% ⚠", line
     assert headroom is not None and headroom.needs_login == 1 and headroom.usable == 1
     assert headroom.percent_left == 60.0
     assert calls == [good.slot], "only the signed-in slot was asked"
@@ -839,7 +842,7 @@ def test_every_account_signed_out_is_a_red_dot_and_a_warning_not_grey(fake_home:
     line, dot = _drive(
         go, headroom=accounts_service.read_fleet_headroom, accounts=accounts_service.overview
     )
-    assert line.endswith(f"● 0{TIMES} claude ⚠"), line
+    assert line.endswith("● Claude: 0 accounts ⚠"), line
     assert dot == ("●", RED)  # every enabled account needs a login
 
 
@@ -891,7 +894,7 @@ def test_an_unreachable_main_account_beside_a_signed_out_spare_is_grey_with_a_wa
     line, dot = _drive(
         go, headroom=accounts_service.read_fleet_headroom, accounts=accounts_service.overview
     )
-    assert line.endswith(f"● 0{TIMES} claude ⚠"), line
+    assert line.endswith("● Claude: 0 accounts ⚠"), line
     assert dot == ("●", "grey50")
 
 
@@ -957,8 +960,8 @@ def test_another_agents_accounts_have_a_dot_of_their_own_under_the_first() -> No
     text = status_line_text(GOOD, more=[AgentHeadroom("codex", codex)])
     # Each agent's line carries its share left beside the count (#287): 80 % of Claude Code's,
     # 10 % of Codex's, whose signed-out slot is the ⚠.
-    assert text.plain == (f"● 3{TIMES} claude 80%\n● 1{TIMES} codex 10% ⚠")
-    assert status_line_text(GOOD).plain == f"● 3{TIMES} claude 80%", "alone"
+    assert text.plain == ("● Claude: 3 accounts · 80% left\n● Codex: 1 account · 10% left ⚠")
+    assert status_line_text(GOOD).plain == "● Claude: 3 accounts · 80% left", "alone"
 
 
 def test_the_status_line_reads_and_names_the_codex_accounts_apart_from_claudes() -> None:
@@ -988,7 +991,7 @@ def test_the_status_line_reads_and_names_the_codex_accounts_apart_from_claudes()
 
     line, more = _drive(go, headroom=reader, accounts=overview)
 
-    assert line == f"● 1{TIMES} claude 40%\n● 1{TIMES} codex 70% ⚠"
+    assert line == "● Claude: 1 account · 40%\n● Codex: 1 account · 70% ⚠"
     assert asked[-2:] == [[("claude-code", 1)], [("codex", 0), ("codex", 3)]]
     assert more == (AgentHeadroom("codex", codex.model_copy(update={"needs_login": 1})),)
 
@@ -996,8 +999,8 @@ def test_the_status_line_reads_and_names_the_codex_accounts_apart_from_claudes()
 def test_the_line_paints_the_fleets_share_left_beside_the_count() -> None:
     """#287 slice 2a: the dot had no number. Percent LEFT, as the band means, in its colour."""
     text = status_line_text(HeadroomSummary(level="fair", percent_left=41.6, usable=3))
-    assert text.plain == f"● 3{TIMES} claude 42%"
-    figure = next(span for span in text.spans if text.plain[span.start : span.end] == " 42%")
+    assert text.plain == "● Claude: 3 accounts · 42% left"
+    figure = next(span for span in text.spans if text.plain[span.start : span.end] == "42%")
     assert str(figure.style) == headroom_dot(HeadroomSummary(level="fair", percent_left=41.6))[1]
     unread = status_line_text(HeadroomSummary(level="unknown"))
-    assert unread.plain == f"● 0{TIMES} claude", "no reading, no number"
+    assert unread.plain == "● Claude: 0 accounts", "no reading, no number"

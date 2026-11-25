@@ -25,6 +25,7 @@ from textual.css.query import NoMatches
 from textual.pilot import Pilot
 from textual.widgets import Button
 
+from aisquare.cli.ui.adopt_picker import AddMenu
 from aisquare.cli.ui.app import FleetApp
 from aisquare.cli.ui.sidebar import Disclosure, ProjectCard, ProjectTitle, Sidebar, StatusLine
 from aisquare.cli.ui.spawn import SpawnDialog
@@ -174,6 +175,9 @@ def test_passing_over_add_spawn_and_a_group_header_only_highlights_them(
         await settle(app)
         await pilot.click("#add-project")
         await settle(app)
+        assert isinstance(app.screen, AddMenu), "the + opens its menu (M6)"
+        await pilot.press("enter")  # its first entry: Add a project…
+        await settle(app)
         return walk, folded, dialog, (highlighted(app), str(app.content.current))
 
     walk, folded, dialog, after_add = drive(go)
@@ -192,7 +196,7 @@ def test_passing_over_add_spawn_and_a_group_header_only_highlights_them(
     ]
     assert not folded, "passing over the group's header folded it"
     assert dialog == SpawnDialog.__name__, "Enter on Spawn agent opens its dialog"
-    assert after_add == ([], "onboard"), "a click on + onboards and highlights no row"
+    assert after_add == ([], "onboard"), "+ ▸ Add a project… onboards and highlights no row"
 
 
 def test_there_is_never_a_second_highlight_through_a_refresh_a_fold_and_put_cursor(
