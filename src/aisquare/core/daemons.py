@@ -8,7 +8,7 @@ start it again (§4.2). rlxd, written in Rust, registers in this same folder, so
 is the format, precisely, for any language; this module is its Python side. The record's
 JSON Schema is ``rlxd/schemas/v1/daemon-record.json`` (generated from rlxd-proto); a home's
 records are checked against it with ``uvx check-jsonschema --schemafile
-rlxd/schemas/v1/daemon-record.json "$AISQUARE_HOME"/daemons/*.json``, and
+rlxd/schemas/v1/daemon-record.json "${AISQUARE_HOME:-$HOME/.aisquare}"/daemons/*.json``, and
 ``tests/test_daemons.py`` checks every record Python writes the same way.
 
 **The folder**, ``<home>/daemons/``, a sibling of ``instances/``: a registry by the rules of

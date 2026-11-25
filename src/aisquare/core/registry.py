@@ -135,6 +135,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import errno
 import json
 import os
 import re
@@ -404,12 +405,16 @@ class Registry:
         path is still the one ``fd`` holds (same device and inode, or volume and file id); else,
         another process having deleted or replaced it, the lock file created and locked again
         (:meth:`take`), under :meth:`gate`, and ``fd`` closed. A ``stat`` of ``fd`` that fails
-        (``ESTALE``) counts as "not the file it holds". A record whose lock file is gone reads
+        (``ESTALE``) counts as "not the file it holds"; ``EBADF``, a ``fd`` that is no
+        descriptor at all, is raised: a new lock could take its number and be closed as "the
+        old one". A record whose lock file is gone reads
         as dead, so a writer that keeps its record fresh calls this before each rewrite.
         ``OSError`` when the gate or the new lock cannot be had, ``fd`` then left as it was."""
         try:
             mine: os.stat_result | None = os.fstat(fd)
-        except OSError:  # ESTALE on NFS once another client deleted it: not the file it holds
+        except OSError as exc:  # ESTALE on NFS once another client deleted it: not the file
+            if exc.errno == errno.EBADF:  # not a descriptor at all: the caller's, raised
+                raise
             mine = None
         try:
             there: os.stat_result | None = os.stat(self.lock(record_id))
@@ -560,14 +565,18 @@ class Registry:
 
     def _prune(self, doomed: list[str], *, gated: bool) -> list[str]:
         """Delete the records ``doomed``, under :meth:`gate` (``gated``: held already), each
-        only once a second probe finds its lock still free: a writer that took its lock again
-        since the read (:meth:`keep_lock`, under the same gate) keeps it. The ids deleted; none
-        when the gate cannot be had (a later read prunes them)."""
+        but one a second probe finds held: a writer that took its lock again since the read
+        (:meth:`keep_lock`, under the same gate) keeps it. A lock still untellable (a lock file
+        this user cannot open) is pruned on the read's verdict, so it is pruned once and no
+        later read takes the gate for it. The ids deleted; none when the gate cannot be had (a
+        later read prunes them)."""
         pruned: list[str] = []
         try:
             with contextlib.nullcontext() if gated else self.gate():
                 for record_id in doomed:
-                    if self.lock_held(record_id) is not False:  # taken again, or untellable
+                    # Taken again since the read: kept. A lock that still cannot be told is the
+                    # read's verdict over again (its pid or heartbeat said dead): pruned.
+                    if self.lock_held(record_id) is True:
                         continue
                     self.forget(record_id)
                     pruned.append(record_id)

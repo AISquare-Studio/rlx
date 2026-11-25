@@ -120,6 +120,26 @@ def test_keep_lock_takes_a_deleted_or_replaced_lock_file_again() -> None:
         THINGS.leave("0123456789ab", renewed)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows renames no file a process holds")
+def test_keep_lock_takes_the_lock_again_when_its_file_was_moved_aside_still_linked() -> None:
+    # The held file renamed away (still linked: st_nlink 1) and a new one in its name: only the
+    # device-and-inode comparison tells them apart.
+    fd = THINGS.take("0123456789ab")
+    lock = THINGS.lock("0123456789ab")
+    aside = lock.with_name("aside")
+    os.rename(lock, aside)
+    lock.touch()
+    assert os.fstat(fd).st_nlink == 1
+    renewed = THINGS.keep_lock("0123456789ab", fd)
+    try:
+        assert renewed != fd
+        assert os.fstat(renewed).st_ino == lock.stat().st_ino != aside.stat().st_ino
+        assert THINGS.lock_held("0123456789ab") is True
+    finally:
+        THINGS.leave("0123456789ab", renewed)
+        aside.unlink()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows deletes no file a process holds")
 def test_keep_lock_says_so_when_another_holds_the_new_file_and_keeps_its_own() -> None:
     fd = THINGS.take("0123456789ab")
@@ -161,6 +181,18 @@ def test_keep_lock_takes_the_lock_again_when_its_own_descriptor_cannot_be_stat()
         assert THINGS.lock_held("0123456789ab") is True
     finally:
         THINGS.leave("0123456789ab", renewed)
+
+
+def test_keep_lock_raises_for_a_descriptor_that_is_none_at_all() -> None:
+    # A closed fd: a new lock taken in its place could reuse its number and then be closed as
+    # "the old one". Raised, and nothing taken.
+    fd = THINGS.take("0123456789ab")
+    os.close(fd)
+    with pytest.raises(OSError) as raised:
+        THINGS.keep_lock("0123456789ab", fd)
+    assert raised.value.errno == errno.EBADF
+    assert THINGS.lock_held("0123456789ab") is False, "no new lock taken"
+    THINGS.leave("0123456789ab", None)
 
 
 def test_an_unreadable_record_whose_age_cannot_be_read_is_reported_never_dropped() -> None:

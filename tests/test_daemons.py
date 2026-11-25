@@ -67,17 +67,35 @@ RECORD_SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text(encoding="utf-8
 """The record's published JSON Schema (handoff §4.1), generated from rlxd-proto (#575): what
 every record Python writes is checked against, as rlxd's are."""
 
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
+_DATE_TIME = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?"
+    r"(?:[Zz]|[+-]([0-9]{2}):([0-9]{2}))"
+)
 FORMATS = jsonschema.FormatChecker()
 """jsonschema's own ``date-time`` check needs ``rfc3339-validator``, which the dev environment
-does not install, and passes anything without it: this one checks RFC 3339 itself."""
+does not install, and passes anything without it: this one is rlxd-proto's rule
+(``rlxd/crates/rlxd-proto/src/check.rs``, ``is_date_time``), the one rlxd reads by."""
 
 
 @FORMATS.checks("date-time", raises=ValueError)
 def _date_time(value: object) -> bool:
-    if not isinstance(value, str) or not _RFC3339.fullmatch(value):
+    """rlxd-proto's ``is_date_time``: ``YYYY-MM-DD``, ``T`` or ``t``, ``HH:MM:SS``, a fraction of
+    one digit or more, then ``Z``, ``z`` or ``±HH:MM``; any year (``0000`` too, leap by the
+    Gregorian rule), a day its month has, hours to 23, minutes and seconds to 59, the offset's
+    hours to 23 and minutes to 59. ASCII digits only."""
+    found = _DATE_TIME.fullmatch(value) if isinstance(value, str) else None
+    if found is None:
         raise ValueError(f"not an RFC 3339 date-time: {value!r}")
-    datetime.fromisoformat(value.replace("z", "Z"))  # a real date and time, not 2026-13-45
+    year, month, day, hour, minute, second = (int(found.group(n)) for n in range(1, 7))
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days = {1: 31, 3: 31, 5: 31, 7: 31, 8: 31, 10: 31, 12: 31, 4: 30, 6: 30, 9: 30, 11: 30}
+    days[2] = 29 if leap else 28
+    if month not in days or not 1 <= day <= days[month]:
+        raise ValueError(f"no such day: {value!r}")
+    if hour > 23 or minute > 59 or second > 59:
+        raise ValueError(f"no such time: {value!r}")
+    if found.group(7) is not None and (int(found.group(7)) > 23 or int(found.group(8)) > 59):
+        raise ValueError(f"no such offset: {value!r}")
     return True
 
 
@@ -197,6 +215,42 @@ def test_the_schema_check_can_fail() -> None:
     ):
         with pytest.raises(jsonschema.ValidationError):
             _conforms(bad)
+
+
+@pytest.mark.parametrize(
+    ("value", "takes"),
+    [
+        ("2026-11-25T12:03:00.123456+00:00", True),  # what Python writes
+        ("2026-11-25T12:03:00Z", True),
+        ("2026-11-25t12:03:00z", True),
+        ("2026-11-25T12:03:00.123456789-05:30", True),
+        ("2024-02-29T00:00:00Z", True),
+        ("0000-02-29T00:00:00Z", True),  # year 0, a leap year, as check.rs reads it
+        ("2026-11-25T12:03:00+23:59", True),
+        ("2026-11-25T12:03:00+00:60", False),
+        ("2026-11-25T12:03:00+05:99", False),
+        ("2026-11-25T12:03:00+24:00", False),
+        ("2026-11-25T24:00:00Z", False),
+        ("2026-11-25T23:60:00Z", False),
+        ("2026-11-25T23:59:60Z", False),
+        ("2025-02-29T00:00:00Z", False),
+        ("1900-02-29T00:00:00Z", False),
+        ("2026-04-31T00:00:00Z", False),
+        ("2026-13-01T00:00:00Z", False),
+        ("2026-11-25T12:03:00.Z", False),
+        ("2026-11-25T12:03:00", False),
+        ("2026-11-25 12:03:00Z", False),
+        ("2026-11-25T12:03:00+0000", False),
+        ("\u0662026-11-25T12:03:00Z", False),  # a non-ASCII digit
+    ],
+)
+def test_the_schema_checks_times_by_rlxd_protos_rule(value: str, takes: bool) -> None:
+    record = {**_record(), "id": "0123456789ab", "started_at": value}
+    if takes:
+        _conforms(record)
+    else:
+        with pytest.raises(jsonschema.ValidationError):
+            _conforms(record)
 
 
 @pytest.mark.parametrize("kind", daemons.KINDS)
@@ -599,6 +653,31 @@ def test_a_beat_takes_its_lost_lock_again_only_under_the_gate(
         registration.deregister()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+@pytest.mark.skipif(sys.platform != "win32" and os.geteuid() == 0, reason="root opens mode 000")
+def test_a_dead_record_whose_lock_cannot_be_probed_is_pruned_once(
+    registry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This host's record of a pid that is gone, its lock file one this user cannot open (left
+    # by a `sudo rlx …`): the read judges it dead by its pid, and the prune keeps that verdict.
+    ended = subprocess.Popen([sys.executable, "-c", "pass"])
+    ended.wait(30)
+    _write(registry, "0123456789ab", _record(pid=ended.pid))
+    (registry / "0123456789ab.lock").chmod(0o000)
+    assert daemons.REGISTRY.lock_held("0123456789ab") is None, "cannot be told"
+    real_gate, gates = daemons.REGISTRY.gate, []
+
+    def gate(**kwargs: Any) -> Any:
+        gates.append(True)
+        return real_gate(**kwargs)
+
+    monkeypatch.setattr(daemons.REGISTRY, "gate", gate)
+    reads = [daemons.roll() for _ in range(3)]
+    assert [r.pruned for r in reads] == [["0123456789ab"], [], []]
+    assert len(gates) == 1, "only the read that prunes takes the gate"
+    assert _files() == []
+
+
 def test_a_reader_that_cannot_have_the_gate_prunes_nothing_that_read(
     registry: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -646,31 +725,46 @@ def test_a_beat_whose_lock_descriptor_went_stale_takes_the_lock_again() -> None:
     [
         "{not json",
         json.dumps([1, 2]),
-        json.dumps(_record(kind=7)),
-        json.dumps(_record(pid=True)),
-        json.dumps(_record(argv="rlx serve")),
-        json.dumps(_record(restartable="yes")),
-        json.dumps({k: v for k, v in _record().items() if k != "heartbeat_at"}),
-        json.dumps(_record()),  # no id
-        json.dumps(_record(id="fedcba987654")),  # another record's id
-        json.dumps(_record(argv=[])),
+        # Each dict differs from a readable record by its one defect: _write gives it its id.
+        _record(kind=7),
+        _record(kind=""),
+        _record(pid=True),
+        _record(argv="rlx serve"),
+        _record(argv=[]),
+        _record(argv=["rlx", 7]),
+        _record(restartable="yes"),
+        _record(host=7),
+        _record(version=None),
+        _record(cwd=7),
+        {k: v for k, v in _record().items() if k != "heartbeat_at"},
+        {k: v for k, v in _record().items() if k != "started_at"},
+        json.dumps(_record()),  # a string, so no id is added: no id
+        _record(id="fedcba987654"),  # another record's id
     ],
     ids=[
         "not-json",
         "not-an-object",
-        "kind",
+        "kind-number",
+        "kind-empty",
         "pid-bool",
         "argv-str",
+        "argv-empty",
+        "argv-not-all-str",
         "restartable",
+        "host",
+        "version",
+        "cwd",
         "no-beat",
+        "no-start",
         "no-id",
         "another-id",
-        "argv-empty",
     ],
 )
 def test_an_unreadable_record_is_reported_and_kept_while_its_lock_is_held(
-    registry: Path, body: str
+    registry: Path, body: object
 ) -> None:
+    good = {"id": "0123456789ab", **_record()}
+    assert daemons.Daemon.from_record("0123456789ab", good) is not None, "the one defect decides"
     path = _write(registry, "0123456789ab", body)
     _age(path, daemons.STALE_SECONDS * 10)  # old: only the held lock keeps it
     fd = _hold(registry / "0123456789ab.lock")
