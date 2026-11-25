@@ -2156,8 +2156,34 @@ class TerminalPane(Widget, can_focus=True):
             self.refresh()
         if toast and not self._reported_gone and self.pane_id is not None:
             self._reported_gone = True
-            self.notify(f"{self.pane_id}: {notice}", severity="warning", markup=False)
+            if not (notice == PANE_GONE and self._replaced_by_restart()):
+                self.notify(f"{self.pane_id}: {notice}", severity="warning", markup=False)
         return changed
+
+    def _replaced_by_restart(self) -> bool:
+        """Whether a restart of the agent this pane shows is running: its pane going is the
+        restart's doing, and the restart's own toast says how it ended (or that it failed).
+
+        Restarting the only agent warned ``%0: (pane gone)`` (0.10.1's exploratory test). The
+        restart is a worker of the agent's view, around this pane (its header's Restart or
+        Resume, and its menu's while the view is open), or else one the app runs from the
+        agent's menu, which it is asked about (``restarting_pane``). The screen and the app
+        are no view of one agent, so a restart they run of another agent is not this one's.
+        """
+        from aisquare.cli.ui.views.agent import RESTART_WORKER  # that view imports this module
+
+        views = {
+            node
+            for node in self.ancestors_with_self
+            if isinstance(node, Widget) and not isinstance(node, Screen)
+        }
+        if any(
+            worker.name == RESTART_WORKER and not worker.is_finished and worker.node in views
+            for worker in self.app.workers
+        ):
+            return True
+        ask = getattr(self.app, "restarting_pane", None)
+        return bool(callable(ask) and ask(self.server, self.pane_id))
 
     def _repaint_rows(self, rows: set[int]) -> None:
         """Mark exactly ``rows`` dirty; Textual asks :meth:`render_line` for those alone.

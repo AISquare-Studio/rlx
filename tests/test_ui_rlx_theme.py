@@ -52,7 +52,16 @@ from aisquare.services import team as team_service
 from tests import test_ui_shell as ui_suite
 from tests.projects import add_project
 from tests.test_ui_agent_mark_contrast import contrast
-from tests.test_ui_shell import Script, _state, _write_state, drive, fleet_app, seed, settle
+from tests.test_ui_shell import (
+    Script,
+    _state,
+    _write_state,
+    drive,
+    fleet_app,
+    from_welcome,
+    seed,
+    settle,
+)
 from tests.ui_workers import settle_page
 
 no_real_tmux = ui_suite.no_real_tmux
@@ -531,7 +540,7 @@ async def _focus(app: FleetApp, side: Widget) -> None:
 
 
 async def _marks(pilot: Pilot[None], themes: list[str]) -> Marks:
-    app = fleet_app(pilot)
+    app = await from_welcome(pilot)  # its heading is drawn where it shows (start opens home)
     app.sidebar.show_live_total(3)
     await settle(app)
     seen: Marks = {}
@@ -696,7 +705,7 @@ async def _drawn_both_ways(pilot: Pilot[None], themes: list[str]) -> Drawn:
     """Each theme, the keyboard on the content (the sidebar faded), then on the sidebar (the
     content faded), then on the content again: the top-left mark and its count, Welcome's
     heading and the line under it, as drawn on each side."""
-    app = fleet_app(pilot)
+    app = await from_welcome(pilot)  # its heading is drawn where it shows (start opens home)
     app.sidebar.show_live_total(3)
     seen: Drawn = {}
     page = app.query_one(WelcomeView)
@@ -740,7 +749,7 @@ def test_the_rest_of_a_marks_widget_still_fades(tmp_path: Path, script: Script) 
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def body(pilot: Pilot[None]) -> tuple[Drawn, dict[str, Color]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)  # Welcome on screen (start opens home since L1)
         app.sidebar.show_live_total(3)
         page = app.query_one(WelcomeView)
         intro = page.query_one("#welcome-intro", MarkStatic)

@@ -367,6 +367,13 @@ SEAMS: dict[str, Seam] = {
         "command that started it",
         strips_identity=True,
     ),
+    "aisquare/services/active_ping.py::_spawn": Seam(
+        EXCLUDED,
+        "a detached `aisquare metrics ping` of ours — the anonymous daily active ping, started "
+        "once a day by a command or the app opening; a worker, not an agent session, and it "
+        "outlives the command that started it",
+        strips_identity=True,
+    ),
     "aisquare/services/outcomes.py::_commit_lines": Seam(
         EXCLUDED,
         "`git diff-tree --numstat` over a week's commits, for `aisquare outcomes`' lines added "

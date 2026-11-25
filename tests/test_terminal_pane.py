@@ -5559,6 +5559,77 @@ def test_agent_view_offers_stop_and_restart_and_routes_them_through_the_service(
     assert len(refreshed) == 1  # one fresh frame per action, never an optimistic repaint
 
 
+@pytest.mark.parametrize("restarting", [True, False])
+def test_restarting_the_only_agent_says_nothing_of_its_pane_going(
+    fake: FakeTmux, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restarting: bool
+) -> None:
+    """0.10.1's exploratory test: Restart on the only agent warned ``%0: (pane gone)`` — the
+    restart had stopped it, and its server with it. Its pane goes while the view's own restart
+    runs, and the restart's toast is the one said. A pane that goes with no restart of its
+    agent running still warns (``restarting=False``)."""
+    import threading
+
+    from aisquare.models import ProjectInfo
+    from aisquare.services import fleet as fleet_service
+
+    settings_service.stop_asking_first("restart")
+    server = fake.server(tmp_path)
+    fake.panes["%0"] = FakePane(screen=["the only agent"])
+    project = ProjectInfo(id="prj_1", root=Path("/home/me/repo"), linked_repos=[])
+    only = _status(pane_id="%0")
+    started = _status(pane_id="%0").agent.model_copy(update={"id": "fa_2"})
+    stopped = threading.Event()
+    release = threading.Event()
+
+    def fake_restart(
+        target: ProjectInfo, label: str, **kwargs: object
+    ) -> fleet_service.RestartReceipt:
+        fake.panes["%0"].gone = True  # stopped: its window, its session and its server go
+        stopped.set()
+        assert release.wait(10), "the test never let the restart finish"
+        return fleet_service.RestartReceipt(
+            replaced=only.agent, started=started, resumed=True, was_running=True,
+            tmux_session="asq-amber-otter",
+        )  # fmt: skip
+
+    monkeypatch.setattr(fleet_service, "project_of", lambda agent: project)
+    monkeypatch.setattr(fleet_service, "restart", fake_restart)
+
+    class ViewHost(App[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.notices: list[str] = []
+
+        def compose(self) -> ComposeResult:
+            yield AgentView(only, server=server, escape_key="f12", id="view")
+
+        def refresh_data(self) -> None:
+            pass
+
+        def notify(self, message: str, **kwargs: Any) -> None:
+            self.notices.append(message)
+
+    async def drive() -> tuple[str | None, list[str]]:
+        host = ViewHost()
+        async with host.run_test(size=(80, 12)) as pilot:
+            view = host.query_one("#view", AgentView)
+            await wait_until(pilot, lambda: synced(view.pane))
+            if restarting:
+                await pilot.click("#agent-restart")
+                await wait_until(pilot, stopped.is_set)
+            else:
+                fake.panes["%0"].gone = True
+            await wait_until(pilot, lambda: view.pane.notice == PANE_GONE)
+            release.set()
+            await wait_until(pilot, lambda: not view._busy())
+            return view.pane.notice, list(host.notices)
+
+    notice, notices = run(drive())
+    assert notice == PANE_GONE, "the pane still says so in its bottom row"
+    warned = [n for n in notices if PANE_GONE in n]
+    assert warned == ([] if restarting else [f"%0: {PANE_GONE}"]), notices
+
+
 def test_agent_view_buttons_come_back_when_their_own_worker_ends_whatever_other_views_run(
     fake: FakeTmux, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

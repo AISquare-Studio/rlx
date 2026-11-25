@@ -226,7 +226,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ),
     *(
         ("metrics", command)
-        for command in ("show", "list", "tokens", "ledger", "stats", "backfill", "ship")
+        for command in ("show", "list", "tokens", "ledger", "stats", "backfill", "ship", "ping")
     ),
     *(("metrics", "share", command) for command in ("on", "off", "status", "preview", "reset-id")),
     *(

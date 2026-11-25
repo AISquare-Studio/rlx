@@ -31,13 +31,14 @@ from typing import Any, TypeVar
 
 import pytest
 from rich.color import Color
+from textual.containers import VerticalScroll
 from textual.pilot import Pilot
 from textual.widgets import Button, DataTable, Select, Static, Switch
 
 from aisquare.cli.ui import app as app_mod
 from aisquare.cli.ui import remote_control
 from aisquare.cli.ui.app import FleetApp, HelpScreen
-from aisquare.cli.ui.remote_control import RemoteController, load_remote_state, read_only_reason
+from aisquare.cli.ui.remote_control import RemoteController, load_remote_state
 from aisquare.cli.ui.views import remote as remote_view
 from aisquare.cli.ui.views.remote import RemotePanel, qr_text
 from aisquare.core import clipboard, paths, state_file
@@ -71,6 +72,14 @@ def no_real_tmux(monkeypatch: pytest.MonkeyPatch) -> None:
         return Completed(1, "", "no server running (a UI test addresses no real fleet)\n")
 
     monkeypatch.setattr(tmux_core, "_tmux", refuse)
+
+
+@pytest.fixture(autouse=True)
+def ngrok_has_its_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A machine whose ngrok has its token, whatever the developer's own ngrok config holds:
+    the panel's token slot shows only without one (``RemotePanel._paint_remote_needs``), and
+    ``test_ui_settings_remote`` drives it."""
+    monkeypatch.setenv("NGROK_AUTHTOKEN", "a-token")
 
 
 @pytest.fixture(autouse=True)
@@ -245,6 +254,46 @@ async def open_panel(pilot: Pilot[None]) -> RemotePanel:
     return panel(pilot)
 
 
+def confirm_box(app: Any) -> remote_view.RemoteConfirm:
+    """The box *Regenerate* or *New link* asks in, on top."""
+    screen = app.screen
+    assert isinstance(screen, remote_view.RemoteConfirm), f"on top: a {type(screen).__name__}"
+    return screen
+
+
+async def box_up(pilot: Pilot[None]) -> remote_view.RemoteConfirm:
+    """The box *Regenerate* or *New link* asks in, laid out, waited for a bounded time: the
+    press is a message, the push its handler's, and the box composed and placed after."""
+    for _ in range(250):
+        screen = pilot.app.screen
+        if isinstance(screen, remote_view.RemoteConfirm) and any(
+            button.region for button in screen.query("#remote-confirm-yes").results(Button)
+        ):
+            break
+        await pilot.pause(0.02)
+    return confirm_box(pilot.app)
+
+
+async def focus_on(pilot: Pilot[None], wanted: str) -> str | None:
+    """The id of what has the focus once ``wanted`` has it, or after a bounded wait: a pushed
+    box's ``AUTO_FOCUS`` lands as its screen is activated, a loop turn or more after the push
+    on a slow runner (windows-py3.12, CI run 45651778096, read one pause after the push)."""
+    app = pilot.app
+    for _ in range(250):
+        if app.focused is not None and app.focused.id == wanted:
+            break
+        await pilot.pause(0.02)
+    return app.focused.id if app.focused is not None else None
+
+
+async def press_and_confirm(pilot: Pilot[None], modal: RemotePanel, button: str) -> None:
+    """Press *Regenerate* or *New link* (``button``'s id) and answer its box yes."""
+    modal.query_one(f"#{button}", Button).press()
+    (await box_up(pilot)).query_one("#remote-confirm-yes", Button).press()
+    await pilot.pause()
+    assert pilot.app.screen is modal, "the box answered, the panel is back on top"
+
+
 _NO_WORKER = "no worker"
 """A group no worker is in: a settle passed it waits for the messages alone (a test of this
 module may hold a writer's thread on purpose)."""
@@ -316,7 +365,7 @@ def test_shift_r_opens_the_remote_panel_and_the_switch_turns_remote_on_and_off()
         assert password == remote_server.runtime().password and len(password.split("-")) == 4
         qr = shown(modal.query_one("#remote-qr", Static))
         assert qr == qr_text(expected) and 15 <= len(qr.splitlines()) <= 22
-        assert shown(modal.query_one("#remote-write-hint", Static)) == read_only_reason()
+        assert shown(modal.query_one("#remote-write-hint", Static)) == remote_view.WRITES_OFF
         assert modal.query_one("#remote-allow-write", Switch).value is False
 
         switch.toggle()
@@ -776,7 +825,9 @@ def test_r_remote_is_in_the_footer_and_the_footer_still_fits_80_columns() -> Non
     footer = drive(go, tunnel=missing_ngrok, size=(80, 24))
     assert "help" in footer, f"the last row is the footer: {footer!r}"
     assert "R remote" in footer and "↓↑ move" in footer, footer
-    assert footer.index("R remote") < footer.index("? help"), "nothing after it is cut off"
+    # ``?`` leads the row since Q9, so the key drawn last is the one that would be cut off.
+    assert footer.lstrip().startswith("? help"), footer
+    assert footer.rstrip().endswith("r refresh"), f"nothing after it is cut off: {footer!r}"
 
 
 # --- state survives a restart of the TUI ---------------------------------------------------------
@@ -814,7 +865,7 @@ def test_the_modal_state_survives_a_restart_of_the_tui() -> None:
         assert modal.query_one("#remote-on", Switch).value is True
         assert modal.query_one("#remote-allow-write", Switch).value is False
         assert modal.query_one("#remote-auto-off", Select).value == 120
-        assert shown(modal.query_one("#remote-write-hint", Static)) == read_only_reason()
+        assert shown(modal.query_one("#remote-write-hint", Static)) == remote_view.WRITES_OFF
         assert json.loads(paths.remote_state_path().read_text())["allow_write"] is False
         # The persisted token is the same one, so the link the phone kept still works.
         assert remote_server.runtime().token in shown(modal.query_one("#remote-link", Static))
@@ -833,7 +884,7 @@ def test_a_fresh_home_opens_with_write_actions_off() -> None:
         modal = await open_panel(pilot)
         assert modal.query_one("#remote-allow-write", Switch).value is False
         assert modal.query_one("#remote-on", Switch).value is False
-        assert shown(modal.query_one("#remote-write-hint", Static)) == read_only_reason()
+        assert shown(modal.query_one("#remote-write-hint", Static)) == remote_view.WRITES_OFF
 
     drive(go, tunnel=missing_ngrok)
     assert not paths.state_path().exists() or "allow_write" not in json.loads(
@@ -1299,7 +1350,7 @@ def test_a_remote_json_that_will_not_write_is_a_sentence_for_each_control_of_the
         await written(pilot)
         assert "could not be revoked in remote.json" in status()
         assert not any(text.startswith("Revoked") for text in toasts(app)), "the revoke failed"
-        modal.query_one("#remote-regen", Button).press()
+        await press_and_confirm(pilot, modal, "remote-regen")
         await written(pilot)
         assert "\nthe new password could not be saved to remote.json" in status()
         modal.query_one("#remote-allow-write", Switch).toggle()
@@ -1510,6 +1561,7 @@ def test_the_panels_controls_never_wait_for_remote_jsons_lock_on_textuals_thread
                 lambda: modal.query_one("#remote-allow-write", Switch).toggle(),
                 lambda: setattr(modal.query_one("#remote-auto-off", Select), "value", 120),
                 lambda: modal.query_one("#remote-regen", Button).press(),
+                lambda: confirm_box(app).query_one("#remote-confirm-yes", Button).press(),
                 lambda: modal.query_one("#remote-revoke", Button).press(),
             ]
             # A press that waited for the lock would take all ten seconds of its wait. One
@@ -1563,7 +1615,7 @@ def test_new_link_replaces_the_link_and_the_password_and_signs_every_device_out(
         runtime = remote_server.runtime()
         assert runtime.unlock_device(runtime.password, "iPhone Safari") is not None
         old_token, old_password = remote_server.remote_link_token(), runtime.password
-        new_link.press()
+        await press_and_confirm(pilot, modal, "remote-new-link")
         await written(pilot)
         saved = json.loads(paths.remote_state_path().read_text())
         assert saved["token"] != old_token and saved["password"] != old_password
@@ -1577,6 +1629,282 @@ def test_new_link_replaces_the_link_and_the_password_and_signs_every_device_out(
         assert remote_control.NEW_LINK_NEWS in toasts(app)
 
     drive(go, tunnel=missing_ngrok)
+
+
+def saved_link() -> dict[str, Any]:
+    """What ``remote.json`` holds of the link and who is in: the token, the password, the
+    devices' ids."""
+    saved = json.loads(paths.remote_state_path().read_text())
+    return {
+        "token": saved["token"],
+        "password": saved["password"],
+        "devices": [device["id"] for device in saved["devices"]],
+    }
+
+
+@pytest.mark.parametrize(
+    ("button", "asked", "changes"),
+    [
+        ("remote-new-link", remote_view.NEW_LINK_CONFIRM, {"token", "password"}),
+        ("remote-regen", remote_view.REGENERATE_CONFIRM, {"password"}),
+    ],
+)
+def test_new_link_and_regenerate_ask_first_and_cancel_or_esc_changes_nothing(
+    button: str, asked: tuple[str, str, str], changes: set[str]
+) -> None:
+    """0.10.1's final review: New link and Regenerate acted on one click, beside Copy, though
+    each signs every device out and New link breaks every phone's saved link. Each asks now,
+    in a box that says what breaks; Cancel and Esc leave remote.json as it was, and the
+    box's own button does it."""
+
+    async def go(pilot: Pilot[None]) -> dict[str, Any]:
+        app = pilot.app
+        assert isinstance(app, FleetApp)
+        modal = await open_panel(pilot)
+        modal.query_one("#remote-on", Switch).toggle()
+        await written(pilot)
+        modal.repaint()
+        await pilot.pause()
+        runtime = remote_server.runtime()
+        assert runtime.unlock_device(runtime.password, "iPhone Safari") is not None
+        seen: dict[str, Any] = {"before": saved_link()}
+        modal.query_one(f"#{button}", Button).press()
+        box = await box_up(pilot)
+        seen["asked"] = (
+            shown(box.query_one("#remote-confirm-question", Static)),
+            shown(box.query_one("#remote-confirm-breaks", Static)),
+            str(box.query_one("#remote-confirm-yes", Button).label),
+        )
+        seen["focused"] = await focus_on(pilot, "remote-confirm-cancel")
+        box.query_one("#remote-confirm-cancel", Button).press()
+        await written(pilot)
+        seen["cancelled"] = (app.screen is modal, saved_link())
+        modal.query_one(f"#{button}", Button).press()
+        await box_up(pilot)
+        await pilot.press("escape")
+        await written(pilot)
+        seen["escaped"] = (app.screen is modal, saved_link())
+        await press_and_confirm(pilot, modal, button)
+        await written(pilot)
+        seen["after"] = saved_link()
+        return seen
+
+    seen = drive(go, tunnel=missing_ngrok)
+    before, after = seen["before"], seen["after"]
+    assert seen["asked"] == asked
+    assert seen["focused"] == "remote-confirm-cancel", "a second Enter is not a yes"
+    assert seen["cancelled"] == (True, before), "Cancel: nothing changed on disk"
+    assert seen["escaped"] == (True, before), "Esc: nothing changed on disk, the panel stays"
+    assert before["devices"] and after["devices"] == [], "confirmed: every device signed out"
+    for key in ("token", "password"):
+        assert (after[key] != before[key]) is (key in changes), key
+
+
+SMALL = (80, 24)
+"""The smallest terminal asq is laid out for: where the panel scrolls, and a centred box's
+button sat on the panel's *Regenerate* (#17's round 2)."""
+ASKED = {
+    "remote-new-link": remote_view.NEW_LINK_CONFIRM,
+    "remote-regen": remote_view.REGENERATE_CONFIRM,
+}
+
+
+async def remote_on_and_a_phone_in(pilot: Pilot[None]) -> RemotePanel:
+    """The panel, Remote on and one device signed in: what a misclick here would sign out."""
+    modal = await open_panel(pilot)
+    modal.query_one("#remote-on", Switch).toggle()
+    await written(pilot)
+    modal.repaint()
+    await pilot.pause()
+    runtime = remote_server.runtime()
+    assert runtime.unlock_device(runtime.password, "iPhone Safari") is not None
+    return modal
+
+
+async def scrolled(pilot: Pilot[None], modal: RemotePanel, y: int, button: str) -> bool:
+    """Scroll the panel to ``y``; whether every cell of ``button`` is in sight there."""
+    scroll = modal.query_one("#remotebox", VerticalScroll)
+    scroll.scroll_to(y=y, animate=False)
+    await pilot.pause()
+    return scroll.region.contains_region(modal.query_one(f"#{button}", Button).region)
+
+
+async def back_to(pilot: Pilot[None], modal: RemotePanel) -> None:
+    """Esc the box, and wait, bounded, for the panel to be on top again."""
+    await pilot.press("escape")
+    for _ in range(250):
+        if pilot.app.screen is modal:
+            return
+        await pilot.pause(0.02)
+    raise AssertionError(f"on top: a {type(pilot.app.screen).__name__}")
+
+
+@pytest.mark.parametrize("button", list(ASKED))
+def test_the_box_opens_away_from_the_button_that_opened_it_with_cancel_focused(
+    button: str,
+) -> None:
+    """#17's round 2: the box sat in the centre, and at 80x24 its own *Regenerate* covered the
+    cells where the panel's was, so a double-click regenerated with no box left on screen.
+    At every scroll of the panel that shows the button, the box's action button is off its
+    cells, and Cancel has the focus, as fresh's and fleet_bulk's error boxes give it."""
+
+    async def go(pilot: Pilot[None]) -> list[tuple[int, Any, Any, str | None]]:
+        modal = await remote_on_and_a_phone_in(pilot)
+        before = saved_link()
+        seen = []
+        scroll = modal.query_one("#remotebox", VerticalScroll)
+        for y in range(scroll.max_scroll_y + 1):
+            if not await scrolled(pilot, modal, y, button):
+                continue
+            pressed = modal.query_one(f"#{button}", Button)
+            at = pressed.region
+            pressed.press()
+            box = await box_up(pilot)
+            focused = await focus_on(pilot, "remote-confirm-cancel")
+            seen.append((y, at, box.query_one("#remote-confirm-yes", Button).region, focused))
+            await back_to(pilot, modal)
+        await written(pilot)
+        assert saved_link() == before, "Esc each time: nothing changed"
+        return seen
+
+    seen = drive(go, tunnel=missing_ngrok, size=SMALL)
+    assert len(seen) > 1, "the panel scrolls at 80x24"
+    if button == "remote-regen":  # the box opened at the top, and at the bottom
+        assert {at.y < SMALL[1] // 2 for _, at, _, _ in seen} == {True, False}
+    for y, at, yes, focused in seen:
+        assert not yes.overlaps(at), f"scrolled to {y}: the box's button {yes} on {at}"
+        assert focused == "remote-confirm-cancel", f"scrolled to {y}"
+
+
+@pytest.mark.parametrize(
+    ("button", "how"),
+    [
+        ("remote-regen", "double-click"),
+        ("remote-regen", "double-click, 250 ms"),
+        ("remote-regen", "Enter, Enter"),
+        ("remote-new-link", "Enter, Enter"),
+        ("remote-regen", "two presses in a frame"),
+        ("remote-new-link", "two presses in a frame"),
+    ],
+)
+def test_a_double_click_or_a_second_enter_on_new_link_or_regenerate_changes_nothing(
+    button: str, how: str
+) -> None:
+    """#17's round 2, the tester's misclicks at 80x24: a double-click on *Regenerate* at
+    normal speed changed the password on disk with no box left on screen, and Enter, Enter on
+    *New link* signed every device out, the box's focus on its own *New link*. The click is
+    at the cells where a centred box drew its action button over the panel's; two presses
+    that reach the button before the box ask once."""
+
+    async def go(pilot: Pilot[None]) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+        app = pilot.app
+        modal = await remote_on_and_a_phone_in(pilot)
+        pressed = modal.query_one(f"#{button}", Button)
+        if how.startswith("double-click"):
+            # Where the box drew its button when it sat in the centre, as before the fix.
+            app.push_screen(remote_view.RemoteConfirm(*ASKED[button]))
+            centred = (await box_up(pilot)).query_one("#remote-confirm-yes", Button).region
+            await back_to(pilot, modal)
+            scroll = modal.query_one("#remotebox", VerticalScroll)
+            for y in range(scroll.max_scroll_y + 1):
+                if await scrolled(pilot, modal, y, button) and pressed.region.overlaps(centred):
+                    break
+            cell = pressed.region.intersection(centred)
+            assert cell, f"the premise: {pressed.region} under a centred box's {centred}"
+            before = saved_link()
+            await pilot.click(offset=(cell.x, cell.y))
+            if how.endswith("250 ms"):
+                await box_up(pilot)
+                await pilot.pause(0.25)
+            await pilot.click(offset=(cell.x, cell.y))
+        elif how == "Enter, Enter":
+            pressed.focus()
+            await pilot.pause()
+            before = saved_link()
+            await pilot.press("enter", "enter")
+        else:
+            before = saved_link()
+            pressed.press()
+            pressed.press()
+        await written(pilot)
+        await settle(pilot)
+        await written(pilot)
+        return before, saved_link(), [type(screen).__name__ for screen in app.screen_stack]
+
+    before, after, stack = drive(go, tunnel=missing_ngrok, size=SMALL)
+    assert after == before, f"{how}: remote.json changed"
+    assert stack.count("RemoteConfirm") <= 1, f"{how}: one box, not two: {stack}"
+    if how != "Enter, Enter":
+        assert stack[-1] == "RemoteConfirm", f"{how}: the box still asks"
+
+
+def test_with_remote_off_the_lockout_line_says_turn_remote_on_then_new_link() -> None:
+    """0.10.1's final review: with Remote off and a lockout still in remote.json, the line said
+    "New link replaces it and the password" beside a New link greyed until Remote is on."""
+
+    async def go(pilot: Pilot[None]) -> tuple[str, str, bool]:
+        app = pilot.app
+        assert isinstance(app, FleetApp)
+        modal = await open_panel(pilot)
+        modal.query_one("#remote-on", Switch).toggle()
+        await written(pilot)
+        budget = UnlockBudget(remote_server.runtime())
+        for _ in range(UNLOCK_GLOBAL_FAILURES):
+            budget.record_failed_unlock()
+        modal.repaint()
+        await pilot.pause()
+        on = shown(modal.query_one("#remote-unlocks", Static))
+        modal.query_one("#remote-on", Switch).toggle()
+        await written(pilot)
+        assert app.remote.wait_until_off(10)
+        modal.repaint()
+        await pilot.pause()
+        off = shown(modal.query_one("#remote-unlocks", Static))
+        return on, off, modal.query_one("#remote-new-link", Button).disabled
+
+    on, off, greyed = drive(go, tunnel=missing_ngrok)
+    failed = f"{UNLOCK_GLOBAL_FAILURES} failed unlocks in 30 min — "
+    assert on == failed + remote_view.LOCKOUT, "on: New link is there to press"
+    assert greyed, "the premise: off, New link is greyed"
+    assert off == failed + remote_view.LOCKOUT_OFF
+    assert "turn Remote on, then New link" in off
+
+
+def said_in_panel(modal: RemotePanel) -> list[str]:
+    """Every sentence the panel shows now, buttons' and labels' included."""
+    said = [str(button.label) for button in modal.query(Button) if button.display]
+    for static in modal.query(Static).results(Static):
+        if isinstance(static, Button) or not all(
+            node.display for node in (static, *static.ancestors) if hasattr(node, "display")
+        ):
+            continue
+        plain = getattr(static.visual, "plain", None)
+        if isinstance(plain, str) and plain:
+            said.append(plain)
+    return said
+
+
+def test_the_r_panel_never_sends_the_human_to_the_r_panel() -> None:
+    """0.10.1's final exploratory test: beside *Allow write actions*, the panel said "switch
+    Allow write actions in the R panel", the server's word to a phone (``read_only_reason``).
+    Off and on, writes off and on, it names no R panel."""
+
+    async def go(pilot: Pilot[None]) -> list[str]:
+        app = pilot.app
+        assert isinstance(app, FleetApp)
+        modal = await open_panel(pilot)
+        await settle(pilot)
+        said = said_in_panel(modal)
+        modal.query_one("#remote-on", Switch).toggle()
+        await written(pilot)
+        said += said_in_panel(modal)
+        modal.query_one("#remote-allow-write", Switch).toggle()
+        await written(pilot)
+        return said + said_in_panel(modal)
+
+    said = drive(go, tunnel=missing_ngrok)
+    assert remote_view.WRITES_OFF in said and remote_view.WRITES_ON in said, "the premise"
+    assert [line for line in said if "R panel" in line] == []
 
 
 def test_the_panel_says_remote_is_on_while_another_process_serves_this_home(
@@ -1727,7 +2055,7 @@ def test_the_sentences_beside_the_switches_are_painted_whole_at_any_width(
             dated = f"auto-off at {deadline:%b} {deadline.day} 21:58"
             assert painted_in(app, state) == f"{remote_view.served_elsewhere_state()} · {dated}"
             hint = modal.query_one("#remote-write-hint", Static)
-            assert painted_in(app, hint) == read_only_reason()
+            assert painted_in(app, hint) == remote_view.WRITES_OFF
         finally:
             unlock(fd)
             os.close(fd)

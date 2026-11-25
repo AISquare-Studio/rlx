@@ -1796,13 +1796,18 @@ class Runtime:
             return self._public_origin
 
     def remote_json(self) -> dict[str, object]:
-        """``GET /api/remote`` — the ONE place remote-specific state is exposed (§4-B)."""
+        """``GET /api/remote`` — the ONE place remote-specific state is exposed (§4-B).
+
+        ``read_only_reason`` is what every 403 ``read_only`` says (:func:`read_only_reason`),
+        so the page says it in this program's words before any write is refused, never a
+        command of its own (0.10.1's final review)."""
         self.reload_if_changed()
         with self._lock:
             return {
                 "allow_write": self._state.allow_write,
                 "auto_off_at": self._state.auto_off_at,
                 "version": __version__,
+                "read_only_reason": read_only_reason(),
             }
 
     # -- switches --
