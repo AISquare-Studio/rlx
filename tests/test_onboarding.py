@@ -15,6 +15,7 @@ import ast
 import inspect
 import json
 import os
+import shutil
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -841,3 +842,48 @@ def test_the_child_that_runs_init_never_has_a_terminal_on_stdin() -> None:
     # The flag stays regardless: §4.2 puts the consent on the `explainability
     # enable` button, not on a prompt in a subprocess nobody is looking at.
     assert "--no-explainability" in onboarding.INIT_FLAGS
+
+
+# --------------------------------------------------------------------------- pane fixes (#15)
+
+
+def _offered(name: str, offer: str) -> DoctorCheck:
+    return DoctorCheck(name=name, status=CheckStatus.ok, detail="d", offer=offer)
+
+
+def test_the_three_pane_fixes_come_quiet_from_ok_rows_and_loud_from_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hub's one pattern (#15, seq 229): an OK row's offer is a quiet pane button, never a
+    problem; the browser-tools warning (a ui-tester is wanted) has the same button as its fix."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    add = "claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest"
+    rows = [
+        _offered("status line", "rlx accounts statusline --install"),
+        _offered("gh", "gh auth login"),
+        _fix("browser tools", f"Add the Chrome DevTools MCP to Claude Code: {add}"),
+    ]
+
+    fixes = fix_commands(rows)
+
+    assert [(f.check, f.title, f.pane, f.foreign, f.quiet) for f in fixes] == [
+        ("status line", "Install status line", True, False, True),
+        ("gh", "Sign in to GitHub", True, True, True),
+        ("browser tools", "Add browser tools", True, True, False),
+    ]
+    assert fixes[1].label == "gh auth login" and fixes[2].argv[:3] == ("claude", "mcp", "add")
+    for fix in fixes:
+        result = apply_fix(fix, None, run=Scripted({}))
+        assert not result.ok and "pane" in (result.reason or "")  # never run here
+
+
+def test_a_pane_fix_is_offered_only_where_its_tool_is_installed_and_named_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert fix_commands([_offered("gh", "gh auth login")]) == [], "no gh on PATH: no button"
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    for not_it in ("gh auth login --with-token", "gh auth logins", "run gh auth status"):
+        assert fix_commands([_offered("gh", not_it)]) == [], not_it
+    assert fix_commands([_fix("status line", "rlx accounts statusline --install --wrap")]) == []

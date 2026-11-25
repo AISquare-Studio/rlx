@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,7 @@ from pydantic import TypeAdapter, ValidationError
 from aisquare.core import program, selfcli
 from aisquare.core.agent_adapters import adapters, get_adapter
 from aisquare.core.selfcli import CliResult
+from aisquare.core.shell_line import command_line
 from aisquare.core.store import store_session
 from aisquare.core.workspace import find_project_root, git_common_root, project_id_for
 from aisquare.models import CheckStatus, DoctorCheck, ProjectInfo, SetupReport
@@ -486,6 +488,40 @@ _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 """A fleet label's shape, matched in full: nothing a shell or a flag could read otherwise."""
 
 
+@dataclass(frozen=True)
+class _PaneFix:
+    """A command asq runs in a pane of its own on one click (#15): it may ask questions (a
+    sign-in, a server to add), so it gets a terminal. Matched whole in a row's ``fix`` or
+    ``offer``; nothing the hint carries beyond these words is passed on."""
+
+    command: tuple[str, ...]
+    title: str
+    foreign: bool = True
+    """Another tool's command (``gh``, ``claude``), offered only where it is on PATH; ``False``
+    for one of ours, run as this install's own (``selfcli.argv_for``)."""
+
+
+#: The pane fixes, the one pattern for all three (the hub's decision on #15, seq 229): the row
+#: they come from stays OK, its button quiet, unless its own check says otherwise.
+PANE_FIXES: tuple[_PaneFix, ...] = (
+    _PaneFix(("accounts", "statusline", "--install"), "Install status line", foreign=False),
+    _PaneFix(
+        (
+            "claude",
+            "mcp",
+            "add",
+            "-s",
+            "user",
+            "chrome-devtools",
+            "npx",
+            "chrome-devtools-mcp@latest",
+        ),
+        "Add browser tools",
+    ),
+    _PaneFix(("gh", "auth", "login"), "Sign in to GitHub"),
+)
+
+
 #: The doctor hints that become buttons. ``init`` is deliberately absent — from
 #: the UI that is the Onboard flow, not a fix. Extending this table is the whole review
 #: surface for "what can one click run".
@@ -560,11 +596,20 @@ class FixCommand:
     """The hint text, verbatim, for a tooltip."""
     interactive: bool = False
     """A sign-in the user finishes in the agent's own terminal (see ``_KnownFix``)."""
+    pane: bool = False
+    """It runs in a pane of asq's own (:data:`PANE_FIXES`), never here: :func:`apply_fix`
+    refuses it, and the Doctor opens it."""
+    foreign: bool = False
+    """A pane fix whose ``argv`` is another tool's whole command, not ours."""
+    quiet: bool = False
+    """Offered on an OK row (``DoctorCheck.offer``): an improvement, never a problem."""
 
     @property
     def label(self) -> str:
         """The command as the fix it came from prints it, quoted for this shell, with the word
-        hints start with (``core.program.words``)."""
+        hints start with (``core.program.words``); another tool's as it is."""
+        if self.foreign:
+            return command_line(list(self.argv))
         return program.words(*self.argv)
 
     @property
@@ -592,6 +637,10 @@ class FixCommand:
             return "Stop the watcher"
         if self.argv == ("watch", "--detach"):
             return "Start the watcher"
+        if self.pane:
+            for known in PANE_FIXES:
+                if known.command == self.argv:
+                    return known.title
         if self.sign_in_slot is not None:
             return f"Sign in account {self.sign_in_slot}"
         return self.label
@@ -691,7 +740,39 @@ def fix_commands(checks: Iterable[DoctorCheck]) -> list[FixCommand]:
                     interactive=known.interactive,
                 )
             )
+    for check in checks:
+        hints = [(check.offer, True)] if check.offer else []
+        if check.status is not CheckStatus.ok and check.fix:
+            hints.append((check.fix, False))
+        for text, quiet in hints:
+            for pane in PANE_FIXES:
+                if pane.command in seen or not _names_whole(text, pane):
+                    continue
+                if pane.foreign and shutil.which(pane.command[0]) is None:
+                    continue  # not installed: its own row says so
+                seen.add(pane.command)
+                fixes.append(
+                    FixCommand(
+                        check=check.name,
+                        argv=pane.command,
+                        scope="machine",
+                        source=text,
+                        pane=True,
+                        foreign=pane.foreign,
+                        quiet=quiet and check.status is CheckStatus.ok,
+                    )
+                )
     return fixes
+
+
+def _names_whole(text: str, pane: _PaneFix) -> bool:
+    """Whether ``text`` names ``pane``'s command word for word and no more of it: ``gh auth
+    login`` in "then: gh auth login", never in "gh auth login --with-token"; one of ours after
+    the program's word (``rlx`` or ``aisquare``)."""
+    words = r"\s+".join(re.escape(word) for word in pane.command)
+    if not pane.foreign:
+        words = "(?:" + "|".join(re.escape(w) for w in program.PRINTED) + r")\s+" + words
+    return re.search(rf"(?<![\w-]){words}(?![\w-]|\s+-)", text) is not None
 
 
 @dataclass(frozen=True)
@@ -735,6 +816,8 @@ def apply_fix(fix: FixCommand, cwd: Path | None, *, run: Runner = selfcli.run) -
             returncode=None,
             reason="it opens the agent's own sign-in: run it in a terminal, or from rlx → Accounts",
         )
+    if fix.pane:
+        return FixResult(fix=fix, returncode=None, reason="it runs in a pane of its own, in rlx")
     result, asked = _invoke(run, ["--json", *fix.argv], cwd)
     if result is None:
         return FixResult(fix=fix, returncode=None, reason=asked)

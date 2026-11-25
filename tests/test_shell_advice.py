@@ -164,6 +164,9 @@ ALLOWED: dict[str, str] = {
         "doctor-fix: the switches its row's fix names"
     ),
     "services/diagnostics.py::_check_claude_code": "doctor-fix: the connects its row's fix names",
+    "services/diagnostics.py::_check_statusline": (
+        "doctor-fix: the install its OK row offers, a quiet pane button in asq (#15)"
+    ),
     "services/diagnostics.py::_check_database": (
         "doctor-fix: the copy (cp) its fix says to keep; the search its detail names is "
         "detail_advice"

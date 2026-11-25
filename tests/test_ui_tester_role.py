@@ -1070,3 +1070,26 @@ def test_the_tui_register_button_names_the_gap_too(
     notice = view.register_roster()
     assert "not in explainability.roles" in notice.message
     assert ROLE in notice.message
+
+
+def test_the_no_browser_tools_row_offers_the_add_quietly_and_warns_only_while_one_is_wanted(
+    tmp_path: Path, config_dirs: Callable[..., None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hub's decision on #15 (seq 229): an OK row with a quiet 'Add browser tools' offer,
+    never a problem; a warning, the same add its fix, only while a ui-tester is wanted."""
+    bare = tmp_path / "claude-a"
+    bare.mkdir()
+    config_dirs(bare)
+
+    monkeypatch.setattr(diagnostics, "_ui_tester_wanted", lambda: False)
+    quiet = diagnostics._check_browser_tools(tmp_path)
+    monkeypatch.setattr(diagnostics, "_ui_tester_wanted", lambda: True)
+    loud = diagnostics._check_browser_tools(tmp_path)
+
+    assert (quiet.status, quiet.offer, quiet.fix) == (
+        CheckStatus.ok,
+        diagnostics.BROWSER_TOOLS_ADD,
+        None,
+    )
+    assert loud.status is CheckStatus.warn and loud.offer is None
+    assert loud.fix is not None and diagnostics.BROWSER_TOOLS_ADD in loud.fix

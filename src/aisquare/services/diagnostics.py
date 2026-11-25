@@ -172,6 +172,7 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             *_claude_accounts_checks(),
             *_shared_number_checks(),
             *_other_accounts_checks(),
+            *_optional(_check_statusline()),
             *_optional(_undeclared_share_check()),
             *_check_role_bindings(),
             _check_tmux(),
@@ -410,8 +411,10 @@ def _live_only(live: bool, check: Callable[[], DoctorCheck | None]) -> list[Doct
     return [found] if found is not None else []
 
 
-def _ok(name: str, detail: str) -> DoctorCheck:
-    return DoctorCheck(name=name, status=CheckStatus.ok, detail=detail)
+def _ok(name: str, detail: str, *, offer: str | None = None) -> DoctorCheck:
+    """A passing row; ``offer`` is an optional improvement asq's Doctor makes a quiet button
+    of (``DoctorCheck.offer``, #15), never a problem."""
+    return DoctorCheck(name=name, status=CheckStatus.ok, detail=detail, offer=offer)
 
 
 def _warn(name: str, detail: str, fix: str, *, ui_fix: str | None = None) -> DoctorCheck:
@@ -3667,21 +3670,50 @@ def _check_browser_tools(cwd: Path | None = None) -> DoctorCheck:
             f"{', '.join(dict.fromkeys(declared))} declared — the ui-tester can measure; "
             f"{chrome_note}",
         )
-    return _ok(
-        name,
+    detail = (
         f"no browser MCP/plugin declared in {len(dirs)} config dir(s) or {_short_path(mcp_json)}; "
         f"{chrome_note}. Without one the ui-tester reopens UI tasks as 'not browser-verified' "
         "rather than passing them on code alone — "
         # In the app, the same advice without the shell's command (review of #542).
         + prog.detail_advice(
             "add the Chrome DevTools MCP with "
-            "`claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest` (what "
+            f"`{BROWSER_TOOLS_ADD}` (what "
             "install.sh --with chrome-devtools runs), or install the "
             "Claude in Chrome extension (claude.ai/chrome)",
             "add the Chrome DevTools MCP to Claude Code, or install the Claude in Chrome "
             "extension (claude.ai/chrome)",
-        ),
+        )
     )
+    # OK, with the add as a quiet offer (#15). A warning, the add its fix, only while a
+    # ui-tester is wanted: one running, or the role in the person's own config. A fresh
+    # install has neither, so install.sh's amber set (the docstring) never meets it.
+    if _ui_tester_wanted():
+        return _warn(
+            name, detail, f"Add the Chrome DevTools MCP to Claude Code: {BROWSER_TOOLS_ADD}"
+        )
+    return _ok(name, detail, offer=BROWSER_TOOLS_ADD)
+
+
+BROWSER_TOOLS_ADD = "claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest"
+"""What the browser-tools row offers (#15): the Chrome DevTools MCP, as install.sh adds it."""
+
+
+def _ui_tester_wanted() -> bool:
+    """Whether a ui-tester is wanted here: one runs on the fleet, or the person's own
+    ``config.toml`` names the role (the built-in default alone does not: every install has
+    it). Read-only and failing closed: no store, no file, or one that cannot be read is no."""
+    try:
+        if paths.db_path().exists():
+            with store_session() as store:
+                if any(agent.role == "ui-tester" for agent in store.live_fleet_agents()):
+                    return True
+        import tomllib
+
+        own = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
+        roles = own.get("fleet", {}).get("roles", {})
+        return isinstance(roles, dict) and "ui-tester" in roles
+    except Exception:
+        return False
 
 
 def _agents_own_browser(cwd: Path) -> DoctorCheck | None:
@@ -3767,6 +3799,36 @@ def _short_path(path: PurePath, home: PurePath | None = None) -> str:
         return str(path)
 
 
+STATUSLINE_INSTALL = ("accounts", "statusline", "--install")
+"""What the status line row offers (#15): ``asq-statusline`` where an account has none."""
+GH_SIGN_IN = "gh auth login"
+"""What the gh row offers while no sign-in is visible (#15): GitHub CLI's own sign-in."""
+
+
+def _check_statusline() -> DoctorCheck | None:
+    """``status line``: Claude Code's ``asq-statusline`` on each account, which is opt-in
+    (#287). Where some account has no status line, an OK row with a quiet offer to install
+    it (#15, the hub's decision): never a problem, and nothing when every account has one,
+    none does a status line, or the accounts cannot be read."""
+    try:
+        if not paths.db_path().exists():  # a doctor run creates nothing
+            return None
+        sites = claude_accounts_service.statusline_sites(action="status")
+    except Exception:
+        return None
+    off = [site for site in sites if site.state == "none"]
+    if not off:
+        return None
+    command = prog.words(*STATUSLINE_INSTALL)
+    return _ok(
+        "status line",
+        f"off on {len(off)} account(s): Claude Code's status line can show each account's use "
+        "and the session's context"
+        + prog.detail_advice(f"; `{command}` sets it", app=" (optional)"),
+        offer=command,
+    )
+
+
 def _check_gh() -> DoctorCheck:
     """GitHub CLI: the fleet's coder and reviewer open and review PRs through it (§3.5)."""
     name = "gh"
@@ -3781,7 +3843,12 @@ def _check_gh() -> DoctorCheck:
                 ui_fix=f"Install GitHub CLI and sign in to it as {GH_INSTALL_PAGE} says, then "
                 "re-run the checks",
             )
-        return _ok(name, f"gh at {found} — PR flow available{_gh_login_note()}")
+        note = _gh_login_note()
+        # Signed out stays OK (an earlier decision, pinned in test_doctor_fleet): the sign-in
+        # is a quiet offer, a pane in asq (#15).
+        return _ok(
+            name, f"gh at {found} — PR flow available{note}", offer=GH_SIGN_IN if note else None
+        )
     except Exception as exc:  # diagnostics must never crash
         # The last check in this file without the guard every sibling has, and
         # the gap was reachable: see _gh_login_note. Failing open costs this

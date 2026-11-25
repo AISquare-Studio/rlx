@@ -2023,3 +2023,42 @@ def test_asqs_doctor_shows_no_tmux_words(
         assert word not in shown, (word, shown)
     assert "rlx's agent server" in shown
     assert "every key you type reaches the agent in its pane" in shown
+
+
+def test_a_ui_tester_is_wanted_when_one_runs_or_the_persons_own_config_names_it(
+    home: Path, tmp_path: Path
+) -> None:
+    """The built-in default role alone is not wanting one: every install has it (#15)."""
+    assert diagnostics._ui_tester_wanted() is False, "a fresh home: no file, no agent"
+
+    paths.config_path().write_text("[fleet.roles.ui-tester]\nworktree = false\n", "utf-8")
+    assert diagnostics._ui_tester_wanted() is True, "the person's own config names it"
+
+    paths.config_path().unlink()
+    project = _seed(tmp_path / "repo")
+    tester = _agent(project.id, "ui-tester-1", "%4").model_copy(update={"role": "ui-tester"})
+    _seed(tmp_path / "repo", tester)
+    assert diagnostics._ui_tester_wanted() is True, "one runs"
+
+
+def test_the_status_line_row_is_ok_with_a_quiet_install_offer(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    states = ["none", "ours", "none"]
+    from aisquare.services import claude_accounts as accounts_service
+
+    monkeypatch.setattr(
+        accounts_service,
+        "statusline_sites",
+        lambda **_: [SimpleNamespace(state=state) for state in states],
+    )
+
+    row = diagnostics._check_statusline()
+
+    assert row is not None and row.status is CheckStatus.ok
+    assert row.detail.startswith("off on 2 account(s)")
+    assert row.offer is not None and row.offer.endswith("accounts statusline --install")
+    states[:] = ["ours", "wrapped", "foreign"]
+    assert diagnostics._check_statusline() is None, "every account has one: no row"

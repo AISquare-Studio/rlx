@@ -224,6 +224,10 @@ class DoctorCheck(BaseModel):
     button, the page, the row to press (R13, #146). ``fix`` stays the shell's: the CLI prints
     it, its commands make the page's buttons, and a manager asked to fix the row is handed
     it. ``None``: the page says the button or the manager that fixes it, never a command."""
+    offer: str | None = None
+    """An ok row's optional improvement, as the shell would run it (``rlx accounts statusline
+    --install``, ``gh auth login``): asq's Doctor makes it a quiet button in the folded passing
+    section, which opens it in a pane. Never a problem, never counted (0.10.2, #15)."""
 
 
 class PromptRecord(BaseModel):

@@ -23,19 +23,24 @@ UI it replaces, and asq comes back after it.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Any, ClassVar
 
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Button, Collapsible, Static
 
 from aisquare.cli.ui.sidebar import AccountsSelected
+from aisquare.cli.ui.terminal import EscapeToSidebar, TerminalPane
 from aisquare.core import program, selfcli
 from aisquare.core.agent_adapters import stage_mark_of
 from aisquare.core.selfcli import CliResult
@@ -118,7 +123,10 @@ def ui_way(
     own ``ui_fix``; else the one-click button its fix makes (``buttons``: check name → its
     title); else, when a manager runs, the Ask button beside it; else plain words. ``None``
     for a row that is ok or has no fix. Never a command: the manager, asked, is handed it."""
-    if check.status is CheckStatus.ok or not (check.fix or check.ui_fix):
+    if check.status is CheckStatus.ok:
+        offered = buttons.get(check.name) if check.offer else None
+        return f"{offered} below, if you want it" if offered else None
+    if not (check.fix or check.ui_fix):
         return None
     if check.ui_fix:
         return check.ui_fix
@@ -290,8 +298,11 @@ class DoctorView(VerticalScroll):
         machine: bool = False,
         update_refusal: Callable[[], str | None] | None = None,
         manager: Callable[[Path | None], str | None] | None = None,
+        launch_pane: PaneLauncher | None = None,
     ) -> None:
         super().__init__(id=id, classes=classes)
+        self._launch_pane = launch_pane
+        """How a pane fix opens its window (:func:`launch_fix_pane`); a test's stand-in."""
         self._manager = manager
         """Who *Ask the manager* asks for a report about ``cwd`` (``"coder's manager"``), from
         what the app already holds; ``None`` (or no seam): no manager runs, and a row says so."""
@@ -427,7 +438,7 @@ class DoctorView(VerticalScroll):
         fold = self.query_one("#doctor-passed", Collapsible)
         fold.title = passed_title(len(passed))
         fold.display = bool(passed)
-        self.query_one("#doctor-passed-list", Static).update(render_checks(passed))
+        self.query_one("#doctor-passed-list", Static).update(render_checks(passed, buttons))
         self.call_later(self._rebuild_fixes)
 
     def _show_about(self) -> None:
@@ -452,8 +463,14 @@ class DoctorView(VerticalScroll):
             # ``Text``, never the str: a Button parses a str label as markup. What it does,
             # never its command line (R13): ``Connect Claude Code``, ``Sign in account 3``.
             slot = fix.sign_in_slot
-            button = Button(Text(fix.title), variant="warning", id=button_id)
+            button = Button(
+                Text(fix.title), variant="default" if fix.quiet else "warning", id=button_id
+            )
             tooltip = Text(f"Fixes the {fix.check} check.")
+            if fix.quiet:
+                tooltip = Text("Optional: opens it in a pane of its own here.")
+            elif fix.pane:
+                tooltip = Text(f"Fixes the {fix.check} check, in a pane of its own here.")
             if slot is not None:
                 tooltip = Text(f"Opens the Accounts page to sign in to account {slot}.")
             if fix.scope == "project" and self.cwd is None:
@@ -515,6 +532,14 @@ class DoctorView(VerticalScroll):
             # pane and records the account when it lands; the report follows its refresh.
             self.post_message(AccountsSelected(sign_in=fix.sign_in_slot))
             return
+        if fix.pane:
+            if self.busy:
+                return
+            self.app.push_screen(
+                FixPaneScreen(fix, launch=self._launch_pane),
+                lambda status: self._pane_closed(fix, status),
+            )
+            return
         if self.busy:
             return
         self.busy = True
@@ -522,6 +547,34 @@ class DoctorView(VerticalScroll):
             button.disabled = True
         self._set_status(Text(f"… {fix.title}", style="dim"))
         self._apply(fix)
+
+    def _pane_closed(self, fix: FixCommand, status: PaneOutcome) -> None:
+        """A pane fix's pane closed: say how, and run the checks again for what it changed."""
+        if status is None:
+            said = Text(f"{fix.title}: closed", style="dim")
+        elif isinstance(status, str):
+            said = Text(f"✗ {fix.title}: {status}", style="bold red")
+        elif status == 0:
+            said = Text(f"✓ {fix.title}", style="green")
+        else:
+            said = Text(f"✗ {fix.title}: it exited {status}", style="bold red")
+        self._set_status(said)
+        self.busy = True
+        self._recheck()
+
+    @work(thread=True, exclusive=True, name=FIX_WORKER, group=FIX_WORKER, exit_on_error=False)
+    def _recheck(self) -> None:
+        """The checks again after a pane fix, off the UI thread."""
+        try:
+            checks: list[DoctorCheck] | None = self._refresh(self.cwd)
+        except Exception:  # the re-run gave no answer; keep the last report
+            checks = None
+        self.app.call_from_thread(self._rechecked, checks)
+
+    def _rechecked(self, checks: list[DoctorCheck] | None) -> None:
+        self.busy = False
+        if checks is not None:
+            self.show(checks)
 
     @work(thread=True, exclusive=True, name=FIX_WORKER, group=FIX_WORKER, exit_on_error=False)
     def _apply(self, fix: FixCommand) -> None:
@@ -551,3 +604,133 @@ class DoctorView(VerticalScroll):
         self.post_message(FixApplied(result))
         if checks is not None:
             self.post_message(DoctorRefreshed(checks, self.cwd))
+
+
+# ---------------------------------------------------------------- a fix in a pane (#15)
+
+FIX_PANE_SESSION = "asq-doctor-fix"
+"""The session on the fleet's tmux server a pane fix's window opens in, beside the persona
+editor's ``asq-persona-edit`` and the Accounts sign-in's ``asq-accounts``."""
+FIX_PANE_POLL = 0.5
+"""Seconds between asks of whether the fix's command has exited."""
+
+PaneLauncher = Callable[[FixCommand], tuple[Any, str]]
+"""``fix -> (server, pane id)``: how a pane fix's window opens (:func:`launch_fix_pane`)."""
+PaneOutcome = int | str | None
+"""How a pane fix ended: its exit status, why its pane could not open, or ``None`` (closed)."""
+
+
+def launch_fix_pane(fix: FixCommand) -> tuple[Any, str]:
+    """Open ``fix``'s command in a window of the fleet's own tmux server, in the home folder:
+    another tool's command as it is, one of ours as this install runs it (``selfcli``)."""
+    from aisquare.services import fleet as fleet_service
+
+    argv = list(fix.argv) if fix.foreign else selfcli.argv_for(list(fix.argv))
+    config = fleet_service.settings()
+    server = fleet_service.server(config)
+    window = fleet_service.open_window(
+        server,
+        FIX_PANE_SESSION,
+        name=f"fix-{fix.argv[0]}",
+        cwd=Path.home(),
+        command=argv,
+        config=config,
+    )
+    return server, window.pane_id
+
+
+class FixPaneScreen(ModalScreen[PaneOutcome]):
+    """A pane fix (#15) in a terminal of its own over the Doctor: ``gh auth login``, the Chrome
+    DevTools MCP's ``claude mcp add``, the status line's install. The person answers whatever
+    it asks there; when it exits the pane closes and the Doctor checks again. *Close* ends it
+    early. Dismisses with the exit status, why no pane could open, or ``None``."""
+
+    CSS = """
+    FixPaneScreen { align: center middle; }
+    FixPaneScreen > Vertical {
+        width: 90%; height: 90%; border: heavy $primary; background: $surface; padding: 0 1;
+    }
+    FixPaneScreen #fix-pane-title { height: auto; text-style: bold; }
+    FixPaneScreen #fix-pane { height: 1fr; min-height: 6; }
+    FixPaneScreen #fix-pane-status { height: auto; }
+    FixPaneScreen #fix-pane-buttons { height: auto; align: right middle; }
+    """
+    BINDINGS: ClassVar = [("escape", "close", "close")]
+
+    def __init__(self, fix: FixCommand, *, launch: PaneLauncher | None = None) -> None:
+        super().__init__()
+        self.fix = fix
+        self._launch = launch or launch_fix_pane
+        self._server: Any = None
+        self._pane: str | None = None
+        self._timer: Timer | None = None
+
+    def compose(self) -> ComposeResult:
+        escape = str(getattr(self.app, "escape_key", "f12"))
+        with Vertical():
+            yield Static(
+                Text(f"{self.fix.title} — answer it here; {escape.upper()} leaves the pane"),
+                id="fix-pane-title",
+            )
+            yield TerminalPane(None, escape_key=escape, label=self.fix.title, id="fix-pane")
+            yield Static("", id="fix-pane-status")
+            with Horizontal(id="fix-pane-buttons"):
+                yield Button("Close", id="fix-pane-close")
+
+    def on_mount(self) -> None:
+        from aisquare.core.tmux import TmuxError
+        from aisquare.services import fleet as fleet_service
+
+        try:
+            self._server, self._pane = self._launch(self.fix)
+        except (TmuxError, fleet_service.FleetError, OSError) as exc:
+            self.dismiss(f"no pane could be opened here ({exc})")
+            return
+        pane = self.query_one("#fix-pane", TerminalPane)
+        pane.server = self._server
+        pane.attach(self._pane)
+        pane.focus()
+        self._timer = self.set_interval(FIX_PANE_POLL, self._poll)
+
+    def _poll(self) -> None:
+        """Whether the command has exited: its pane dead (the fleet keeps it, remain-on-exit)
+        or gone. A server that could not be asked is asked again next tick."""
+        from aisquare.core.tmux import TmuxError
+
+        if self._server is None or self._pane is None:
+            return
+        try:
+            facts = self._server.pane_facts_or_raise(self._pane)
+        except TmuxError:
+            return
+        if facts is not None and not facts.dead:
+            return
+        status = facts.dead_status if facts is not None else None
+        self._close_window()
+        self.dismiss(status if status is not None else 0)
+
+    def _close_window(self) -> None:
+        from aisquare.core.tmux import TmuxError
+
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        server, pane, self._pane = self._server, self._pane, None
+        if server is not None and pane is not None:
+            with contextlib.suppress(TmuxError):  # already gone is what we want
+                server.kill_window(pane)
+        self.query_one("#fix-pane", TerminalPane).attach(None)
+
+    def on_escape_to_sidebar(self, event: EscapeToSidebar) -> None:
+        """The pane's escape hatch: in a dialog there is no sidebar, so Close takes focus."""
+        event.stop()
+        self.query_one("#fix-pane-close", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "fix-pane-close":
+            event.stop()
+            self.action_close()
+
+    def action_close(self) -> None:
+        self._close_window()
+        self.dismiss(None)

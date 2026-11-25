@@ -11,9 +11,11 @@ shared check says the directory is connected.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 from textual.app import App, ComposeResult
@@ -25,7 +27,7 @@ from aisquare.core.selfcli import CliResult
 from aisquare.models import CheckStatus, DoctorCheck
 from aisquare.services import agents as agents_service
 from aisquare.services import diagnostics
-from tests.ui_workers import settle_page
+from tests.ui_workers import settle_page, settle_until
 
 
 @dataclass
@@ -244,3 +246,176 @@ def test_each_new_fix_is_one_click_that_runs_its_command(
 
     assert label in labels.values(), labels
     assert ["--json", *argv] in run.calls, run.calls
+
+
+# --- #15: quiet offers, run in a pane of their own ----------------------------------------
+
+
+PRIVATE_SOCKET = "asq-test-doctor-pane"
+FIX_PANE = "%9"
+
+
+@dataclass
+class PaneWorld:
+    """The fleet's server a private socket whose every argv fails; ``open_window`` replaced by
+    a recorder, and the pane answered dead at once with ``status``."""
+
+    opened: list[dict[str, Any]] = field(default_factory=list)
+    killed: list[str] = field(default_factory=list)
+    status: int = 0
+
+
+@pytest.fixture
+def pane_world(monkeypatch: pytest.MonkeyPatch) -> PaneWorld:
+    from aisquare.core import tmux as tmux_core
+    from aisquare.core.tmux import Completed, PaneFacts, TmuxServer, WindowInfo
+    from aisquare.services import fleet as fleet_service
+
+    world = PaneWorld()
+    monkeypatch.setattr(
+        tmux_core, "_tmux", lambda argv, stdin: Completed(1, "", "no server (a UI test)\n")
+    )
+    monkeypatch.setattr(fleet_service, "server", lambda config=None: TmuxServer(PRIVATE_SOCKET))
+
+    def open_window(server: Any, session: str, **kwargs: Any) -> WindowInfo:
+        world.opened.append({"session": session, **kwargs, "command": list(kwargs["command"])})
+        return WindowInfo(
+            session=session,
+            window_id="@9",
+            name=kwargs["name"],
+            pane_id=FIX_PANE,
+            dead=False,
+            dead_status=None,
+            current_command="gh",
+            activity=False,
+        )
+
+    def facts(server: Any, pane_id: str) -> PaneFacts:
+        return PaneFacts(
+            pane_id=pane_id,
+            width=80,
+            height=24,
+            cursor_x=0,
+            cursor_y=0,
+            cursor_visible=True,
+            alternate_on=False,
+            history_size=0,
+            dead=True,
+            dead_status=world.status,
+            in_mode=False,
+            current_command="gh",
+            title="",
+        )
+
+    monkeypatch.setattr(fleet_service, "open_window", open_window)
+    monkeypatch.setattr(TmuxServer, "pane_facts_or_raise", facts)
+    monkeypatch.setattr(TmuxServer, "kill_window", lambda server, pane: world.killed.append(pane))
+    return world
+
+
+def _offer(name: str, offer: str) -> DoctorCheck:
+    return DoctorCheck(name=name, status=CheckStatus.ok, detail=f"{name} detail", offer=offer)
+
+
+def test_an_ok_rows_offer_is_a_quiet_button_beside_it_in_the_fold_and_no_problem() -> None:
+    checks = [_offer("status line", "rlx accounts statusline --install")]
+
+    async def drive() -> tuple[str, str, dict[str, str], str]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)):
+            view.show(checks)
+            await settle_page(host)
+            button = view.query_one("#fix-0", Button)
+            return (
+                str(view.query_one("#doctor-report", Static).render()),
+                str(view.query_one("#doctor-passed-list", Static).render()),
+                _labels(view),
+                str(button.variant),
+            )
+
+    report, passed, labels, variant = asyncio.run(drive())
+
+    assert report == "No problems found.", "an offer is never a problem"
+    assert "→ Install status line below, if you want it" in passed
+    assert labels == {"fix-0": "Install status line"} and variant == "default"
+
+
+@pytest.mark.parametrize(
+    ("check", "title", "command"),
+    [
+        (
+            _offer("status line", "rlx accounts statusline --install"),
+            "Install status line",
+            None,  # ours, as this install runs it
+        ),
+        (_offer("gh", "gh auth login"), "Sign in to GitHub", ["gh", "auth", "login"]),
+    ],
+)
+def test_a_pane_fix_opens_its_command_in_a_pane_and_the_checks_run_again_when_it_ends(
+    pane_world: PaneWorld,
+    monkeypatch: pytest.MonkeyPatch,
+    check: DoctorCheck,
+    title: str,
+    command: list[str] | None,
+) -> None:
+    from aisquare.core import selfcli
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    refreshed: list[Path | None] = []
+
+    def refresh(cwd: Path | None) -> list[DoctorCheck]:
+        refreshed.append(cwd)
+        return [check]
+
+    async def drive() -> str:
+        view = DoctorView(run=Spy(), refresh=refresh)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            await pilot.click("#fix-0")
+            await settle_until(host, lambda: bool(refreshed))
+            await settle_page(host)
+            return str(view.query_one("#doctor-status", Static).render())
+
+    status = asyncio.run(drive())
+
+    (opened,) = pane_world.opened
+    assert opened["session"] == "asq-doctor-fix" and opened["cwd"] == Path.home()
+    want = command or selfcli.argv_for(["accounts", "statusline", "--install"])
+    assert opened["command"] == want
+    assert pane_world.killed == [FIX_PANE], "its window closed once it ended"
+    assert status == f"✓ {title}" and refreshed, "and the checks ran again"
+
+
+def test_a_pane_that_cannot_open_says_why_and_runs_nothing(
+    pane_world: PaneWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aisquare.services import fleet as fleet_service
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("no tmux here")
+
+    monkeypatch.setattr(fleet_service, "open_window", refuse)
+    check = _offer("gh", "gh auth login")
+
+    async def drive() -> tuple[str, str]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: [check])
+        host = Host(view)
+        async with host.run_test(size=(120, 40)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            await pilot.click("#fix-0")
+            await settle_until(host, lambda: type(host.screen).__name__ != "FixPaneScreen")
+            await settle_page(host)
+            said = str(view.query_one("#doctor-status", Static).render())
+            return type(host.screen).__name__, said
+
+    screen, status = asyncio.run(drive())
+
+    assert screen != "FixPaneScreen"
+    assert status.startswith("✗ Sign in to GitHub: no pane could be opened here")
+    assert "no tmux here" in status
