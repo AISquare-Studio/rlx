@@ -2605,6 +2605,17 @@ def stopped_because(task: TeamTask) -> str | None:
     return text[len(prefix) :] if text.startswith(prefix) else None
 
 
+def task_history(task: TeamTask, *, limit: int = 200) -> list[TeamEvent]:
+    """Every event that names ``task``, oldest first, the newest ``limit`` of them: what the
+    board's reader shows under a task (B2). A read, as :func:`stopped_because` is, and it fails
+    open the same way: a store that cannot be read costs the history, never the board."""
+    try:
+        with store_session() as store:
+            return store.filtered_events(task.project_id, task_id=task.id, limit=limit)
+    except Exception:
+        return []
+
+
 def last_feedback(task: TeamTask) -> str | None:
     """The reason given at the task's newest ``task reopen``, whatever its status now (#74).
 

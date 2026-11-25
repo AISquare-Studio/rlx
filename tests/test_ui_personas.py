@@ -357,6 +357,7 @@ def test_the_app_level_page_shows_no_project_layer_and_attaches_nothing(
         page = tab(host)
         seen: dict[str, Any] = {
             "root": page.root,
+            "title": shown(page.query_one("#personas-title", Static)),
             "chips": [str(box.label) for box in page.query(Checkbox)],
             "rows": [(row[0], row[1]) for row in rows(host)],
             "buttons": [str(button.id) for button in page.query("#persona-actions Button")],
@@ -376,7 +377,8 @@ def test_the_app_level_page_shows_no_project_layer_and_attaches_nothing(
 
     seen = drive(scenario, app_level=True)
     assert seen["root"] is None
-    assert seen["chips"] == ["user", "bundled"]
+    assert seen["title"] == "Personas"  # the page names itself (0.10.1's exploratory test)
+    assert seen["chips"] == [], "no layer checkboxes: the page is yours and the bundled ones"
     assert ("skeptic", "bundled") in seen["rows"] and ("pair", "user") in seen["rows"]
     assert all(layer != "project" for _, layer in seen["rows"]), seen["rows"]
     assert seen["buttons"] == [
@@ -423,10 +425,10 @@ def test_no_dialog_the_app_level_page_opens_offers_the_project_layer(
         return seen
 
     seen = drive(scenario, app_level=True)
-    assert seen == {
-        "new": ["new-user"],
-        "import": ["import-user"],
-        "save as": ["save-as-user"],
+    assert seen == {  # no layer to choose (0.10.2): every dialog writes yours
+        "new": [],
+        "import": [],
+        "save as": [],
         "export": ["export-personal-claude-code", "export-personal-codex", "export-directory"],
     }
     assert skills.calls == [{"args": [None]}]
@@ -463,7 +465,7 @@ def test_the_catalogue_lists_layer_description_roles_and_marks(
     assert "description" in broken[2]  # the reason is the row's description
 
 
-def test_search_narrows_by_name_description_and_tag_and_the_chips_by_layer(
+def test_search_narrows_by_name_description_and_tag(
     project: ProjectInfo, catalogue: dict[str, Path]
 ) -> None:
     async def scenario(pilot: Pilot[None], host: Host) -> list[list[str]]:
@@ -473,13 +475,6 @@ def test_search_narrows_by_name_description_and_tag_and_the_chips_by_layer(
             search.value = query
             await pilot.pause()
             seen.append([row[0] for row in rows(host)])
-        search.value = ""
-        host.query_one("#layer-bundled", Checkbox).value = False
-        await pilot.pause()
-        seen.append([row[0] for row in rows(host)])
-        host.query_one("#layer-user", Checkbox).value = False
-        await pilot.pause()
-        seen.append([row[0] for row in rows(host)])
         return seen
 
     assert drive(scenario, project=project) == [
@@ -487,8 +482,6 @@ def test_search_narrows_by_name_description_and_tag_and_the_chips_by_layer(
         ["pair"],  # description
         ["pair"],  # tag
         ["skeptic"],  # case-insensitive
-        ["broken", "pair", "skeptic"],  # bundled chip off
-        ["skeptic"],  # user chip off too
     ]
 
 
@@ -689,13 +682,13 @@ def skills(monkeypatch: pytest.MonkeyPatch) -> Recorder:
     return recorder
 
 
-def test_the_import_dialog_browses_skills_and_guards_the_layer_and_the_name(
+def test_the_import_dialog_browses_skills_offers_no_layer_and_guards_the_name(
     skills: Recorder, repo: Path
 ) -> None:
     async def outside_git(pilot: Pilot[None], host: Host) -> list[Any]:
         dialog = host.screen
         assert isinstance(dialog, ImportPersonaScreen)
-        layers = [str(radio.id) for radio in dialog.query("#import-layer RadioButton")]
+        layers = [str(radio.id) for radio in dialog.query(RadioButton)]
         browse: Select[str] = dialog.query_one("#import-browse", Select)
         prompts = [str(option[0]) for option in browse._options]
         # Each change is handled in a later message, which one pilot.pause() did not always
@@ -718,17 +711,17 @@ def test_the_import_dialog_browses_skills_and_guards_the_layer_and_the_name(
     layers, prompts, source, bad, good_disabled = drive(
         outside_git, dialog=ImportPersonaScreen(None)
     )
-    assert layers == ["import-user"]  # no project's root: no project layer offered (R27)
+    assert layers == []  # no layer offered: an import is yours (0.10.2)
     assert any("code-review" in p and "imported" in p for p in prompts)
     assert source == str(Path("/claude/skills/code-review"))  # Browse fills the Source field
     assert bad == (True, NAME_RULE)
     assert good_disabled is False
     assert skills.calls == [{"args": [None]}]
 
-    async def inside_git(pilot: Pilot[None], host: Host) -> bool:
-        return host.screen.query_one("#import-project", RadioButton).disabled
+    async def inside_git(pilot: Pilot[None], host: Host) -> list[str]:
+        return [str(radio.id) for radio in host.screen.query(RadioButton)]
 
-    assert drive(inside_git, dialog=ImportPersonaScreen(repo)) is False
+    assert drive(inside_git, dialog=ImportPersonaScreen(repo)) == [], "a project's root too"
 
 
 def test_a_skill_description_with_brackets_is_listed_verbatim_not_parsed_as_markup(
@@ -930,7 +923,6 @@ def test_the_import_recorder_receives_exactly_the_chosen_options(
     async def chosen(pilot: Pilot[None], host: Host) -> None:
         dialog = host.screen
         dialog.query_one("#import-source", Input).value = "./skills/y"
-        dialog.query_one("#import-project", RadioButton).value = True
         dialog.query_one("#import-name", Input).value = "renamed"
         dialog.query_one("#import-force", Switch).value = True
         dialog.query_one("#import-llm", Switch).value = False
@@ -963,7 +955,7 @@ def test_the_import_recorder_receives_exactly_the_chosen_options(
     assert second == {
         "args": [],
         "source": "./skills/y",
-        "layer": "project",
+        "layer": "user",  # with a project's root too: nothing writes a project's layer
         "root": repo,
         "name": "renamed",
         "force": True,
@@ -1053,7 +1045,7 @@ def test_the_editor_saves_only_text_that_parses_and_only_through_the_service(
     assert (directory / "SKILL.md").read_bytes() == before  # the UI wrote nothing itself
 
 
-def test_a_bundled_persona_opens_read_only_and_saves_as_a_copy_into_a_layer(
+def test_a_bundled_persona_opens_read_only_and_saves_as_a_copy_into_your_personas(
     project: ProjectInfo, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     export = Recorder(lambda name, *, root, to, skill, force: to / name)
@@ -1068,14 +1060,16 @@ def test_a_bundled_persona_opens_read_only_and_saves_as_a_copy_into_a_layer(
         seen: list[Any] = [
             editor.query_one("#edit-text", TextArea).read_only,
             len(editor.query("#edit-save")),
+            len(editor.query(RadioButton)),
         ]
         await press(pilot, "#edit-save-as")
         await settle(pilot)
         seen.append(type(host.screen).__name__)
         return seen
 
-    read_only, save_buttons, screen = drive(scenario, project=project)
+    read_only, save_buttons, radios, screen = drive(scenario, project=project)
     assert read_only is True and save_buttons == 0
+    assert radios == 0, "no 'into' choice: with a project's root too, Save as… writes yours"
     assert export.calls == [
         {"args": ["skeptic"], "root": repo, "to": user_layer(), "skill": None, "force": False}
     ]

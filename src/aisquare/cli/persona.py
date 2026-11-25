@@ -2,9 +2,14 @@
 
 A persona is ``<name>/SKILL.md`` in one of three layers — project
 (``<project>/.aisquare/personas``), user (``$AISQUARE_HOME/personas``), bundled —
-and the same directory is ``/name`` in Claude Code. Guide: docs/personas.md.
-Every write goes through ``services.personas``; this module parses flags and
-reports.
+and the same directory is ``/name`` in Claude Code. Every write goes through
+``services.personas``; this module parses flags and reports.
+
+Personas are yours (the user layer) since 0.10.1. A project's own layer is still read, so a
+repository that commits personas starts its agents as them, but nothing here writes, edits or
+removes one (0.10.2, the owner's decision on #21): ``--project`` on ``new``, ``rm`` and
+``import`` is retired and refused in plain words, and a project's personas were copied to
+yours once (``services.personas.migrate_once``).
 """
 
 from __future__ import annotations
@@ -38,8 +43,26 @@ app = typer.Typer(
 PersonaName = Annotated[str, typer.Argument(help="Persona name (its directory name).")]
 UserFlag = Annotated[bool, typer.Option("--user", help="The user layer ($AISQUARE_HOME).")]
 ProjectFlag = Annotated[
-    bool, typer.Option("--project", help="The project layer (<project>/.aisquare/personas).")
+    bool, typer.Option("--project", help="With --skill: the project's own skill directory.")
 ]
+RetiredProjectFlag = Annotated[
+    bool,
+    typer.Option(
+        "--project", hidden=True, help="Retired: personas are yours (the user level) since 0.10.1."
+    ),
+]
+"""``--project`` on a command that wrote a persona into a project's layer: refused in plain
+words (:func:`_refuse_project`), so an old script learns why rather than of an unknown option."""
+
+PROJECT_RETIRED = (
+    "--project is retired: personas are yours (the user level) since 0.10.1, and rlx writes no "
+    "persona into a project; drop --project to use yours"
+)
+
+
+def _refuse_project(project: bool) -> None:
+    if project:
+        fail(PROJECT_RETIRED, error="project_layer_retired", hint="drop --project")
 
 
 def _root() -> Path | None:
@@ -188,10 +211,11 @@ def show(name: PersonaName) -> None:
 
 
 @app.command("new")
-def new(name: PersonaName, user: UserFlag = False, project: ProjectFlag = False) -> None:
-    """Scaffold a persona from the template and open it in $EDITOR (default: --user)."""
+def new(name: PersonaName, user: UserFlag = False, project: RetiredProjectFlag = False) -> None:
+    """Scaffold one of your personas from the template and open it in $EDITOR."""
+    _refuse_project(project)
     root = _root()
-    layer: Layer = resolve_pool(user, project) or "user"
+    layer: Layer = "user"
     with _reported():
         path = persona_service.new(name, layer=layer, root=root)
     if not _json():
@@ -209,17 +233,22 @@ def new(name: PersonaName, user: UserFlag = False, project: ProjectFlag = False)
 
 
 @app.command("edit")
-def edit(name: PersonaName) -> None:
-    """Edit a project or user persona's SKILL.md in $EDITOR; invalid text is not saved."""
+def edit(name: PersonaName, user: UserFlag = False) -> None:
+    """Edit one of your personas' SKILL.md in $EDITOR; invalid text is not saved. In a
+    repository whose own persona of that name wins there, --user edits yours."""
     root = _root()
     with _reported():
-        layer, directory = persona_service.locate(name, root)
+        if user:
+            layer: Layer = "user"
+            directory = dict(core.layer_dirs(None))["user"] / name
+        else:
+            layer, directory = persona_service.locate(name, root)
         if layer != "bundled" and not _editor_available():
             fail(
                 "no editor to open — set $EDITOR (or $VISUAL), or run this at a terminal",
                 error="no_editor",
             )
-        persona = persona_service.edit(name, root=root)
+        persona = persona_service.edit(name, root=root, layer="user" if user else None)
     if _json():
         warnings = [] if persona is None else core.warnings(persona)
         _emit(
@@ -240,11 +269,12 @@ def edit(name: PersonaName) -> None:
 
 
 @app.command("rm")
-def rm(name: PersonaName, user: UserFlag = False, project: ProjectFlag = False) -> None:
-    """Remove a project or user persona (default: the layer it resolves from)."""
+def rm(name: PersonaName, user: UserFlag = False, project: RetiredProjectFlag = False) -> None:
+    """Remove one of your personas."""
+    _refuse_project(project)
     root = _root()
     with _reported():
-        layer: Layer = resolve_pool(user, project) or persona_service.locate(name, root)[0]
+        layer: Layer = "user" if user else persona_service.locate(name, root)[0]
         path = persona_service.remove(name, layer=layer, root=root)
     if _json():
         _emit({"name": name, "layer": layer, "path": str(path)})
@@ -328,7 +358,7 @@ def import_(
         ),
     ] = None,
     user: UserFlag = False,
-    project: ProjectFlag = False,
+    project: RetiredProjectFlag = False,
     name: Annotated[
         str | None, typer.Option("--name", help="Save under this name (the directory only).")
     ] = None,
@@ -370,10 +400,11 @@ def import_(
     ] = False,
 ) -> None:
     """Import personas: a skill is copied byte for byte; anything else is converted
-    by an engine and shown before it is saved (default: --user). Several sources, or
+    by an engine and shown before it is saved, into your personas. Several sources, or
     --from-dir, are imported one after another into one receipt table; one refusal does
     not stop the rest, and the exit is 1 if any was refused. Ctrl-C ends the import, and
     any engine it started, and exits 130."""
+    _refuse_project(project)
     root = _root()
     if list_skills:
         _emit_skills(root)
@@ -389,7 +420,7 @@ def import_(
             f"skill from `{prog.word()} persona import --list`",
             error="missing_source",
         )
-    layer: Layer = resolve_pool(user, project) or "user"
+    layer: Layer = "user"
     mode: Literal["auto", "always", "never"] = (
         "auto" if llm is None else "always" if llm else "never"
     )

@@ -91,6 +91,21 @@ _KIND_VERB = {
     "capacity_freed": ("🟢", "freed capacity"),
     "brief_created": ("📝", "wrote a brief"),
     "fleet": ("🚢", "acted on the fleet"),
+    # The fleet's own lines, which a Stream chip showed by their raw kind (B2's tester, #695).
+    "agent_exited": ("💤", "exited"),
+    "agent_paused": ("⏸", "paused"),  # Q4: ⏸ means paused everywhere
+    "agent_renamed": ("🏷", "was renamed"),
+    "restarted": ("🔁", "restarted"),
+    "switched": ("⇄", "switched accounts"),
+    "limited": ("⏳", "hit a usage limit"),
+    "limited_handing_over": ("⏳", "hit a usage limit, moving"),
+    "handover_failed": ("🚫", "could not be moved"),
+    "before_limit": ("⏳", "nears a usage limit"),
+    "attention": ("🔔", "needs you"),
+    "notice": ("📣", "said"),
+    "prompt_unsent": ("📭", "did not start its prompt"),
+    "linked": ("🔗", "linked"),
+    "linked_all_done": ("🔗", "finished its linked tasks"),
 }
 """kind → (emoji, verb): how a feed line says what happened. A kind without one shows ``•``
 and the kind itself."""

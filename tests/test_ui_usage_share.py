@@ -623,18 +623,19 @@ def test_the_question_is_asked_once_after_onboarding_and_no_thanks_is_remembered
         app = _fleet(fake)
         async with app.run_test(size=(130, 50)) as pilot:
             await settle_page(app)
-            asked_at_start = [type(app.screen).__name__]  # the welcome page: not asked yet
-            await _open_settings(app, pilot)
-            during = type(app.screen).__name__
+            # Start opens home since L1, the project's own view: the first view after
+            # onboarding, where the question is asked, once.
+            asked_at_start = type(app.screen).__name__
             default_focus = getattr(app.screen.focused, "id", None)
             await pilot.click("#consent-no")
             await settle_page(app)
             after = len(app.screen_stack)
-            await pilot.click(app.query_one(SettingsRow))  # another page: not asked again
+            await _open_settings(app, pilot)  # another page: not asked again
+            await pilot.click(app.query_one(SettingsRow))
             await settle_page(app)
             asked_again = [type(app.screen).__name__]
             return (
-                [*asked_at_start, during, str(default_focus)],
+                [asked_at_start, str(default_focus)],
                 str(after),
                 len(app.screen_stack),
                 asked_again,
@@ -642,8 +643,8 @@ def test_the_question_is_asked_once_after_onboarding_and_no_thanks_is_remembered
 
     first, after, depth, again = asyncio.run(go())
 
-    assert first[0] != "ConsentDialog" and first[1] == "ConsentDialog"
-    assert first[2] == "consent-no", "No thanks has the focus: Enter alone does not opt in"
+    assert first[0] == "ConsentDialog", "asked at start, on home: there is a project to work in"
+    assert first[1] == "consent-no", "No thanks has the focus: Enter alone does not opt in"
     assert after == "1" and depth == 1 and again[0] != "ConsentDialog"
     assert fake.calls.count("consent_due") == 1 and fake.calls.count("declined") == 1
     assert "share" not in fake.calls and "enable" not in fake.calls
