@@ -89,15 +89,16 @@ class RemoveRow(ConfirmButton):
 
 
 class ProjectMenu(ModalScreen[str | None]):
-    """Rename, Pin / Unpin, Open settings, Pause agents…, Resume agents…, Start fresh…, Remove
-    from fleet — under the card it is about.
+    """Under the card it is about, in three groups (Q11 of the UX audit): the project (Rename,
+    Pin / Unpin, Open settings), its agents (Pause agents… and Resume agents…), and starting
+    over (Start fresh…, then Remove from fleet, a row of its own).
 
     Answers :data:`RENAME`, :data:`PIN`, :data:`SETTINGS`, :data:`PAUSE`, :data:`RESUME`,
     :data:`FRESH`, or :data:`REMOVE` once Remove was pressed twice; Esc (with Remove armed, the
     first Esc disarms it), or a click anywhere off the menu, answers ``None``.
     ``can`` says whether a pause and a resume would act on any of its agents
-    (``fleet_bulk.applicable``): the one that would not is shown greyed, never hidden, so the
-    menu keeps its shape.
+    (``fleet_bulk.applicable``): only the ones that would are listed, where both were, one of
+    them greyed. With neither, Pause is listed greyed, so the agents' group is never empty.
     """
 
     CSS = """
@@ -129,6 +130,21 @@ class ProjectMenu(ModalScreen[str | None]):
         """Where the card is on screen: the menu opens under its header line."""
         self.can = can if can is not None else {PAUSE: True, RESUME: True}
 
+    def agent_options(self) -> list[Option]:
+        """The agents' group: Pause agents… and Resume agents…, each where it would act on one
+        of the project's agents; with neither, a greyed Pause agents… holds the group's row."""
+        pause = self.can.get(PAUSE, True)
+        resume = self.can.get(RESUME, True)
+        options = []
+        if pause or not resume:
+            options.append(Option("⏸ Pause agents…", id=PAUSE, disabled=not pause))
+        if resume:
+            options.append(Option("▶ Resume agents…", id=RESUME))
+        return options
+
+    SEPARATORS = 2
+    """The lines between the menu's three groups (:meth:`compose`), counted into its height."""
+
     def compose(self) -> ComposeResult:
         pin = "Unpin" if self.project.pinned_at is not None else "Pin"
         with Vertical(id="project-menu"):
@@ -137,8 +153,9 @@ class ProjectMenu(ModalScreen[str | None]):
                 Option("✎ Rename", id=RENAME),
                 Option(f"📌 {pin}", id=PIN),
                 Option(f"{SETTINGS_ICON} Open settings", id=SETTINGS),
-                Option("⏸ Pause agents…", id=PAUSE, disabled=not self.can.get(PAUSE, True)),
-                Option("▶ Resume agents…", id=RESUME, disabled=not self.can.get(RESUME, True)),
+                None,
+                *self.agent_options(),
+                None,
                 Option("↺ Start fresh…", id=FRESH),
                 id="project-menu-options",
             )
@@ -158,7 +175,7 @@ class ProjectMenu(ModalScreen[str | None]):
         # The title, Remove and the border; and room for the note Remove shows when armed, so
         # that showing it moves nothing and is not cut by the screen's edge.
         note = remove_note(self.project).wrap(self.app.console, NOTE_WIDTH)
-        height = options.option_count + 4 + len(note)
+        height = options.option_count + self.SEPARATORS + 4 + len(note)
         width, rows = self.app.size
         x = max(0, min(self.near.x + 2, width - MENU_WIDTH))
         y = max(0, min(self.near.y + 1, rows - height))

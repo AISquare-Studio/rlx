@@ -21,6 +21,7 @@ under every theme, as a cue. Its text is measured here with the keyboard on its 
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,7 @@ from typing import Any
 
 import pytest
 from rich.style import Style
-from textual.app import ComposeResult
+from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.pilot import Pilot
 from textual.screen import Screen
@@ -329,3 +330,44 @@ def test_a_buttons_label_follows_the_fade_both_ways(tmp_path: Path, script: Scri
             side,
             f"{ratio:.2f}",
         )
+
+
+@pytest.mark.parametrize("theme", ["rlx", "textual-light"])
+def test_a_ticked_checkbox_shows_a_check_and_an_unticked_one_is_blank(theme: str) -> None:
+    """Q13 (the UX audit): a checkbox says its state by its glyph, not by colour alone. Textual
+    drew a dim ``X`` in both states; ticked is ✓ now, unticked blank, and a click flips it."""
+    from textual.widgets import Checkbox
+
+    from aisquare.cli.ui.theme import CHECK_MARK, register_themes
+
+    class Host(App[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            register_themes(self)  # as both of our apps do
+
+        def compose(self) -> ComposeResult:
+            yield Checkbox("ticked", True, id="on")
+            yield Checkbox("unticked", False, id="off")
+
+    def box(app: App[None], ident: str) -> str:
+        """The three cells between the box's sides, ``▐?▌``, as drawn."""
+        widget = app.query_one(f"#{ident}", Checkbox)
+        strips = app.screen._compositor.render_full_update(simplify=True).strips
+        (strip,) = strips[widget.region.y + widget.region.height // 2]
+        row = strip.text
+        return row[row.index("▐") : row.index("▌") + 1]
+
+    async def go() -> tuple[str, str, str]:
+        app = Host()
+        async with app.run_test(size=(40, 8)) as pilot:
+            app.theme = theme
+            await pilot.pause()
+            on, off = box(app, "on"), box(app, "off")
+            app.query_one("#off", Checkbox).toggle()
+            await pilot.pause()
+            return on, off, box(app, "off")
+
+    on, off, flipped = asyncio.run(go())
+    assert on == f"▐{CHECK_MARK}▌", on
+    assert off == "▐ ▌", off
+    assert flipped == f"▐{CHECK_MARK}▌", flipped
