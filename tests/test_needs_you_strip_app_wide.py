@@ -308,3 +308,87 @@ def test_the_key_opens_a_blocked_card_on_a_board_built_before(projects: dict[str
     line, reader = drive((100, 30), go)
     assert "#2 fix the login race — blocked" in line
     assert reader.startswith("fix the login race\n#2 · blocked"), "opened in the board's reader"
+
+
+def _blocked_behind_five_reviews(project: ProjectInfo) -> tuple[list[Any], list[Any], list[Any]]:
+    """The tester of #11's lane (#1593): one blocked card, five cards in review."""
+    tasks = [_task(project, 2, "fix the login race", "blocked")]
+    tasks += [_task(project, 10 + i, f"review thing {i}", "review") for i in range(5)]
+    return [], tasks, []
+
+
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+def test_the_bar_names_the_first_row_of_the_lane_and_the_key_opens_it(
+    projects: dict[str, Any], warm: bool
+) -> None:
+    """The tester of #11 (#1593): the bar put a blocked card before cards in review, the lane
+    the other way round and five rows deep, so the card the bar named was past the rows the
+    lane draws and F6 opened nothing. One order now (the lane's): the bar names the lane's
+    first row, and F6 opens it, whether the board was built before or not."""
+    from aisquare.cli.ui.sidebar import ProjectSelected
+
+    alpha, beta = projects["alpha"], projects["beta"]
+
+    async def go(pilot: Any, app: Any) -> tuple[str, list[Any], str]:
+        if warm:
+            app.post_message(ProjectSelected(alpha.id))
+            await settle_page(app)
+        await _on_betas_settings(pilot, app, beta)
+        projects["frames"][alpha.id] = _blocked_behind_five_reviews(alpha)
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        line = bar.line().plain
+        await pilot.press(needs_you_bar.OPEN_KEY)
+        await _until(
+            pilot,
+            lambda: bool((board := _alphas_board(app, alpha)) and board.reader_text),
+            what="the card in alpha's reader",
+        )
+        panel = _alphas_board(app, alpha)
+        assert panel is not None
+        return line, list(panel.lane), panel.reader_text
+
+    line, lane, reader = drive((100, 30), go)
+    assert line.startswith("needs you: 6") and "#10 review thing 0 — in review" in line, line
+    assert lane[0][0] == "review", "the lane's first row is the card the bar names"
+    assert reader.startswith("review thing 0\n#10 · review"), reader
+
+
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+def test_a_card_past_the_rows_the_lane_draws_still_opens(
+    projects: dict[str, Any], warm: bool
+) -> None:
+    """The bar opens the card it is given wherever the lane has it: the blocked card is the
+    sixth item behind five in review, past the rows the lane draws (its row acts only when
+    drawn), and still opens in the reader."""
+    from aisquare.cli.ui.sidebar import ProjectSelected
+
+    alpha, beta = projects["alpha"], projects["beta"]
+
+    async def go(pilot: Any, app: Any) -> tuple[int, int, str]:
+        if warm:
+            app.post_message(ProjectSelected(alpha.id))
+            await settle_page(app)
+        await _on_betas_settings(pilot, app, beta)
+        projects["frames"][alpha.id] = _blocked_behind_five_reviews(alpha)
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        blocked = next(need for need in bar.needs if need.kind == "blocked")
+        bar.open_need(blocked)
+        await _until(
+            pilot,
+            lambda: bool((board := _alphas_board(app, alpha)) and board.reader_text),
+            what="the blocked card in alpha's reader",
+        )
+        panel = _alphas_board(app, alpha)
+        assert panel is not None
+        from aisquare.cli.ui.board_parts import NeedsYouLane
+
+        index = panel.lane.index(("blocked", blocked.target))
+        return index, panel.query_one(NeedsYouLane).drawn, panel.reader_text
+
+    index, drawn, reader = drive((100, 30), go)
+    assert index >= drawn, f"the premise: the card is past the lane's drawn rows ({index}, {drawn})"
+    assert reader.startswith("fix the login race\n#2 · blocked"), reader

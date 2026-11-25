@@ -3,10 +3,9 @@ project has something that needs the person.
 
 A project's board says what needs the person on that board (``board.needs_you``, its lane);
 this bar says it across every project the sidebar lists, whichever view is open. It names how
-many things need the person and the first of them with its project — a question first, then an
-agent whose usage-limit hand-over failed, an agent waiting in its pane, a blocked card, a card
-in review — and :data:`OPEN_KEY` or a click opens that project's Board tab on it. With nothing,
-the bar takes no space.
+many things need the person and the first of them with its project, in the board's own order
+(:data:`KIND_ORDER`) — and :data:`OPEN_KEY` or a click opens that project's Board tab on it.
+With nothing, the bar takes no space.
 
 Its read is its own and off the UI thread: every :data:`BAR_SECONDS`, each listed project's
 board, as the board's own tick reads it (``team.board_read``), counted by the board's own rule
@@ -15,6 +14,7 @@ board, as the board's own tick reads it (``team.board_read``), counted by the bo
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -24,11 +24,12 @@ from rich.text import Text
 from textual import on
 from textual.css.query import NoMatches
 from textual.widget import Widget
-from textual.widgets import Static
+from textual.widgets import DataTable, Static
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli import watch
 from aisquare.cli.ui.board import NEEDS_YOU, BoardPanel, needs_you
+from aisquare.cli.ui.board_parts import NeedsYouLane
 from aisquare.cli.ui.sidebar import ProjectSelected, project_name
 from aisquare.cli.ui.ticks import while_running
 from aisquare.cli.ui.views.project import ProjectView
@@ -44,8 +45,16 @@ OPEN_KEY = "f6"
 form's field. A terminal pane keeps every key but the escape key, so it works outside one."""
 HANDOVER = "handover"
 """An agent on a usage limit whose automatic hand-over to another account failed (#277)."""
-KIND_ORDER: tuple[str, ...] = ("question", HANDOVER, "waiting", "blocked", "review")
-"""Which comes first across projects: what only the person can answer, then what is stuck."""
+KIND_ORDER: tuple[str, ...] = tuple(
+    kind
+    for board_kind, *_rest in NEEDS_YOU
+    for kind in ((board_kind, HANDOVER) if board_kind == "waiting" else (board_kind,))
+)
+"""Which comes first across projects: the board's lane's order (``board.NEEDS_YOU``: an agent
+waiting, a question, a card in review, a blocked card), the hand-over the lane has not, beside
+the waiting agent. One order: the bar's first item is its project's first lane row, so it is
+on the lane the key opens (tester of #11: blocked before review here, review before blocked
+there, and the card the bar named was past the rows the lane draws)."""
 GLYPHS: dict[str, str] = {kind: glyph for kind, glyph, _one, _many in NEEDS_YOU} | {HANDOVER: "⏳"}
 LAND_TRIES = 40
 """How many short waits the bar gives a project's view to be built before it gives up."""
@@ -197,12 +206,21 @@ class NeedsYouBar(Static):
     def open_first(self) -> None:
         """Open the first item on its project's board: the project's view, its Board tab, and
         a card in the board's reader."""
-        if not self.needs:
-            return
-        need = self.needs[0]
+        if self.needs:
+            self.open_need(self.needs[0])
+
+    def open_need(self, need: Need) -> None:
+        """Open ``need`` on its project's board, wherever it sits on the lane."""
         self.app.post_message(ProjectSelected(need.project.id))
         self._landing = (need, 0)
         self.call_after_refresh(self._land)
+
+    @staticmethod
+    def _cursor_on(panel: BoardPanel, task_id: str) -> None:
+        """The work list's cursor on ``task_id``, when its row is listed (not folded)."""
+        table = panel.query_one("#tasks", DataTable)
+        with contextlib.suppress(Exception):  # a folded group lists no row for it
+            table.move_cursor(row=table.get_row_index(task_id))
 
     def _land(self) -> None:
         """Once the project's view is built: its Board tab, on the item."""
@@ -235,7 +253,14 @@ class NeedsYouBar(Static):
             # now, as its tick does, so the card is there to open.
             panel.refresh_data()
         if need.kind in ("blocked", "review") and card in panel.lane:
-            panel.action_lane_item(panel.lane.index(card))
+            index = panel.lane.index(card)
+            if index < panel.query_one(NeedsYouLane).drawn:
+                panel.action_lane_item(index)  # the lane's own row: cursor, fold, reader
+            else:
+                # Past the rows the lane draws (it acts on a drawn row only): the card in the
+                # board's reader all the same, the one the bar named.
+                self._cursor_on(panel, need.target)
+                panel.open_reader(need.target)
             return
         target: Widget = panel.query_one("#tasks")
         if target.display:
