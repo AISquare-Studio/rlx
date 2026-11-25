@@ -532,8 +532,9 @@ def test_the_board_and_its_event_lines_say_the_number_beside_the_id(
     assert one is not None and two is not None
     board = runner.invoke(app, ["board"])
     assert board.exit_code == 0, board.output
-    assert f"  - #1 {one.id} [todo] first" in board.stdout
-    assert f"  - #2 {two.id} [todo] second ⧗ waits on #1" in board.stdout
+    # A person's board (B1 #14) leads each task with its number; the event line keeps the id.
+    assert "  #1  to do  first\n" in board.stdout
+    assert "  #2  to do  second ⧗ waits on #1\n" in board.stdout
     assert f"[#1 {one.id}] first" in board.stdout  # the task_added event line
 
     _, sessions, _, events = team_service.board_data(work_dir)

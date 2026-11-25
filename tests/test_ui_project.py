@@ -1095,6 +1095,56 @@ def test_b_on_the_board_tab_hides_and_brings_back_the_column_every_time(
     assert drive(project, scenario) == [(False, "feed"), (True, "tasks"), (False, "feed")]
 
 
+def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInfo) -> None:
+    """B1 #1: a click on the Board tab left the focus on the tab row, outside the panel, and
+    ``d``, ``b`` or ``a`` did nothing until a second click inside the board."""
+
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, str]:
+        await pilot.click("#--content-tab-tab-board")
+        await pilot.pause()
+        panel = host.query_one("#board-panel", BoardPanel)
+        focused = host.focused
+        inside = focused is not None and panel in focused.ancestors_with_self
+        await pilot.press("d")  # no click inside the board first
+        await pilot.pause()
+        return inside, str(panel.query_one("#tasks", DataTable).border_title)
+
+    inside, title = drive(project, scenario)
+    assert inside, "the tab's click left the focus outside the board"
+    assert title.startswith("done archive"), title
+
+
+class BesideAField(Host):
+    """The Project view beside a field: a focus outside its tabs, as the sidebar is in asq."""
+
+    def compose(self) -> ComposeResult:
+        yield Input(id="outside")
+        yield from super().compose()
+
+
+def test_a_board_shown_from_outside_its_tabs_leaves_the_focus_where_it_was(
+    project: ProjectInfo,
+) -> None:
+    """B1 #1's other half: the board takes the keys from its own tabs only. Shown because the
+    sidebar moved to its project, it left the focus in the sidebar, which the arrows walk."""
+
+    async def scenario(pilot: Pilot[None], host: Host) -> str | None:
+        host.query_one("#outside", Input).focus()
+        await pilot.pause()
+        host.query_one(ProjectView).active = "tab-board"
+        await pilot.pause()
+        await pilot.pause()
+        return host.focused.id if host.focused is not None else None
+
+    async def run() -> str | None:
+        host = BesideAField(project)
+        async with host.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            return await scenario(pilot, host)
+
+    assert asyncio.run(run()) == "outside"
+
+
 class TwoProjects(App[None]):
     """Two Project views mounted at once, the second shown — the fleet UI keeps one per project
     ever selected, so every id inside a board is on the screen once per project."""
