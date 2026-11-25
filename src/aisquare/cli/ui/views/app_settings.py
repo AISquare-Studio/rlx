@@ -10,22 +10,21 @@ holds ``[updates]``, *Check for a new release daily* (``updates.check``), and in
 (``ui.dont_ask``, R17), and *Ask again before every action*, which empties it at once.
 *Display* (R17) is ``[ui]``'s on/off switches for what ``asq`` shows (account usage, agent
 marks, the live count, the fade, the bell, the board's autoscroll, the project directory):
-each applies and is saved as it is ticked (``settings.set_display_choice``). *Remote* is
-Remote control (``views.settings_remote``). Save, Reload and Reset all sit under the tabs
-and act on the first two; they hide on *Display* and *Remote*, whose every control acts at
-once.
+each applies and is saved as it is ticked (``settings.set_display_choice``). *Remote* is a
+way into Remote control, one page that ``R`` opens too (``views.remote``, Q17). Save, Reload
+and Reset all sit under the tabs and act on the first two; they hide on *Display* and
+*Remote*, whose every control acts at once.
 
 **What shows, and what is folded** (#41, the owner's D8: the bare minimum that works in
-view, the rest a click away). *Agent settings* shows the *Captain (experimental)* box on
-top (``views.settings_captain``: it saves at once, as it did on the hub) and how launches
-pick an account and what a usage limit does; its *Advanced* holds the user's coding
-agent, the roles, the fleet, the rest of the accounts' rules and the role bindings. *User
-preferences* shows its switch, and folds *Confirmations* and the note on setting one from a
-shell. *Display*'s rows are one line each, so all of them fit an 80x24 tab.
-*Remote* shows Turn on/off, the token field when one is needed and the link, QR and password
-while on; its own
-*Advanced* holds the rest. A Save refused for a folded field opens that *Advanced*, so
-the reason is never out of sight. The project's own
+view, the rest a click away). *Agent settings* shows how launches pick an account and what
+a usage limit does; its *Advanced* holds the user's coding agent, the roles, the fleet, the
+rest of the accounts' rules and the role bindings; and last, under it, the *Captain
+(experimental)* box (``views.settings_captain``: it saves at once), which topped the tab
+until Q18. *User preferences* shows its switch, and
+folds *Confirmations* and the note on setting one from a shell. *Display*'s rows are one
+line each, so all of them fit an 80x24 tab. *Remote* says whether Remote is on, with *Open
+Remote control*. A Save refused for a folded field opens that *Advanced*, so the reason is
+never out of sight. The project's own
 Settings tab keeps what IS the project's (its nickname). Written through
 ``core.config.save_config`` — the one writer, which keeps only what differs
 from the system defaults — and re-read
@@ -122,7 +121,7 @@ from aisquare.cli.ui.confirm_button import ConfirmButton
 from aisquare.cli.ui.dont_ask import ASK_AGAIN, EVERY_ACTION_ASKS, said_not_asking
 from aisquare.cli.ui.sidebar import short_path
 from aisquare.cli.ui.views.settings_captain import CaptainToggle
-from aisquare.cli.ui.views.settings_remote import RemoteSection
+from aisquare.cli.ui.views.settings_remote import RemoteLink
 from aisquare.core import claude_accounts as accounts_core
 from aisquare.core import paths, personas
 from aisquare.core.agent_adapters import adapters, get_adapter
@@ -175,12 +174,12 @@ DEFAULT_WORKTREE_DIR = FleetSettings().worktree_dir
 DEFAULT_MAX_AGENTS = str(FleetSettings().max_agents_per_project)
 PICK_MODES: tuple[tuple[str, str], ...] = (
     ("the default account", "default"),
-    ("the account with headroom", "headroom"),
+    ("the account with the most room left", "headroom"),
 )
 """``[accounts] pick`` (#146): how a launch chooses when nothing names an account."""
 ON_LIMIT_MODES: tuple[tuple[str, str], ...] = (
     ("wait for the reset, on the same account", "wait"),
-    ("switch to the account with headroom", "switch"),
+    ("switch to the account with the most room left", "switch"),
 )
 """``[accounts] on_limit``: what the fleet does when an agent's turn ends on a usage limit.
 Said of every agent alike: what an agent does at the reset is its own (Claude Code goes on
@@ -296,7 +295,10 @@ AGENT_TAB = "tab-agent-settings"
 PREFERENCES_TAB = "tab-user-preferences"
 """The *User preferences* tab's pane id: ``[ui]``, and ``[updates]`` below it."""
 REMOTE_TAB = "tab-remote"
-"""The *Remote* tab's pane id: Remote control, which acts at once (no Save)."""
+"""The *Remote* tab's pane id: a way into the Remote page (``views.remote``), no Save."""
+CAPTAIN = "captain"
+"""Where the hub's *Captain* lands (:meth:`AppSettingsView.show_tab`): *Agent settings*,
+scrolled to its last section, the Captain box (Q18)."""
 DISPLAY_TAB = "tab-display"
 """The *Display* tab's pane id: ``[ui]``'s switches, each saved as it is ticked (no Save)."""
 AGENT_ADVANCED = "agent-settings-advanced"
@@ -645,9 +647,9 @@ def section_title(title: str, about: str) -> Text:
 
 
 class AppSettingsView(Vertical):
-    """The machine-wide settings in three tabs — *Agent settings* (the captain, roles,
-    fleet, accounts), *User preferences* (``[ui]``, ``[updates]``) and *Remote* — and under
-    the first two Save, Reload, Reset all."""
+    """The machine-wide settings in four tabs — *Agent settings* (accounts, roles, fleet, and
+    the captain last), *User preferences* (``[ui]``, ``[updates]``), *Display* and *Remote* —
+    and under the first two Save, Reload, Reset all."""
 
     DEFAULT_CSS = """
     AppSettingsView { padding: 1 1 0 1; }
@@ -887,9 +889,8 @@ class AppSettingsView(Vertical):
                 TabPane("Agent settings", id=AGENT_TAB),
                 VerticalScroll(id="agent-settings", classes="tab-body"),
             ):
-                yield CaptainToggle(id="settings-captain")
-                # Why the file could not be read, under the box main puts on top (#41): the
-                # defaults shown for a broken file are not saved over it unknowingly.
+                # Why the file could not be read, on top (#41): the defaults shown for a
+                # broken file are not saved over it unknowingly.
                 yield Static(Text(self._config_error), id="settings-config-error")
                 yield from self._compose_accounts()
                 with Collapsible(
@@ -900,6 +901,9 @@ class AppSettingsView(Vertical):
                     yield from self._compose_fleet()
                     yield from self._compose_more_accounts()
                     yield from self._compose_bindings()
+                # Last (Q18): an experimental switch, not what a new user opens App settings
+                # for. It topped the tab (#41).
+                yield CaptainToggle(id="settings-captain")
             with (
                 TabPane("User preferences", id=PREFERENCES_TAB),
                 VerticalScroll(id="user-preferences", classes="tab-body"),
@@ -914,7 +918,7 @@ class AppSettingsView(Vertical):
                 TabPane("Remote", id=REMOTE_TAB),
                 VerticalScroll(id="remote-settings", classes="tab-body"),
             ):
-                yield RemoteSection(id="settings-remote")
+                yield RemoteLink(id="settings-remote")
         with Horizontal(id="settings-buttons"):
             yield Button("Save", id="save-settings", variant="primary", compact=True)
             yield Button("Reload", id="reload-settings", compact=True)
@@ -1293,7 +1297,14 @@ class AppSettingsView(Vertical):
 
     def show_tab(self, tab: str) -> None:
         """Bring ``tab`` (:data:`AGENT_TAB`, :data:`PREFERENCES_TAB`, :data:`REMOTE_TAB`) to
-        the front: the hub's *Remote control* and *Captain* links land on theirs."""
+        the front, or for :data:`CAPTAIN` *Agent settings* scrolled to the Captain box, its
+        last section: where the hub's *Captain* link lands."""
+        if tab == CAPTAIN:
+            self.query_one("#app-settings-tabs", TabbedContent).active = AGENT_TAB
+            # Once the tab is laid out: from another tab, its scroll had no region to reach.
+            box = self.query_one(CaptainToggle)
+            self.call_after_refresh(box.scroll_visible, animate=False, top=True)
+            return
         self.query_one("#app-settings-tabs", TabbedContent).active = tab
         if tab == AGENT_TAB:
             self.query_one("#agent-settings", VerticalScroll).scroll_home(animate=False)
