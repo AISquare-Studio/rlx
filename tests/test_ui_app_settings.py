@@ -1977,3 +1977,32 @@ def test_an_undo_that_fails_says_so_and_keeps_the_change_to_try_again() -> None:
     assert seen["failed"][-1] == "Not undone: the daily release check: off · ctrl+z tries again"
     assert not any(m.startswith("Undone") for m in seen["failed"])
     assert seen["retried"] == ("Undone: the daily release check: off", True, True)
+
+
+def test_reset_all_undone_puts_a_nested_binding_back_whole() -> None:
+    """Reviewer of #24, round 3: the reset's emptied ``team.profiles`` was a setting of its
+    own, put back (as nothing) after the bindings in it, in a set's hash order: the coder's
+    binding came back with no agent and no environment under some PYTHONHASHSEEDs."""
+    from aisquare.core.config import RoleLaunchProfile
+
+    config = load_config()
+    config.team.profiles["coder"] = RoleLaunchProfile(agent="codex", env={"A": "1"})
+    save_config(config)
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> bool:
+        await settle(pilot)
+        reset = host.query_one("#reset-settings", Button)
+        reset.focus()
+        reset.press()
+        await settle(pilot)
+        reset.press()
+        await settle(pilot)
+        emptied = "coder" not in load_config().team.profiles
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        return emptied
+
+    assert drive(scenario), "the premise: the reset took the binding away"
+    coder = load_config().team.profiles.get("coder")
+    assert coder is not None, "ctrl+z: the binding back"
+    assert (coder.agent, coder.env) == ("codex", {"A": "1"}), "whole: its agent and its env"

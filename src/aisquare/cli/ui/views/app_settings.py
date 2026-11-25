@@ -449,11 +449,13 @@ _ABSENT = object()
 
 def _leaves(config: AppConfig) -> dict[tuple[str, ...], object]:
     """Every setting in ``config`` by its path (``("fleet", "escape_key")``): what Reset all's
-    Undo compares, one setting at a time."""
+    Undo compares, one setting at a time. A table is never a setting itself: an empty one
+    (``team.profiles`` after a reset) has none, so putting the file back never takes a whole
+    table away after the bindings in it were put back (reviewer of #24, round 3)."""
     found: dict[tuple[str, ...], object] = {}
 
     def walk(node: object, path: tuple[str, ...]) -> None:
-        if isinstance(node, dict) and node:
+        if isinstance(node, dict):
             for key, value in node.items():
                 walk(value, (*path, str(key)))
         else:
@@ -464,10 +466,14 @@ def _leaves(config: AppConfig) -> dict[tuple[str, ...], object]:
 
 
 def _put_leaf(data: dict[str, Any], path: tuple[str, ...], value: object) -> None:
-    """``value`` at ``path`` in ``data`` (a config's dump); :data:`_ABSENT` takes it out."""
+    """``value`` at ``path`` in ``data`` (a config's dump), the tables above it made as
+    needed; :data:`_ABSENT` takes it out, and makes none (an empty role table reads as a
+    declared role)."""
     *parents, last = path
     node = data
     for key in parents:
+        if value is _ABSENT and not isinstance(node.get(key), dict):
+            return  # nothing there to take out
         node = node.setdefault(key, {})
     if value is _ABSENT:
         node.pop(last, None)
@@ -2072,7 +2078,8 @@ class AppSettingsView(SavesAsYouGo, Vertical):
             return False
         was, reset, data = _leaves(before), _leaves(after), now.model_dump()
         current = _leaves(now)
-        for path in was.keys() | reset.keys():
+        # In one order, the shorter paths first: nothing hangs on a set's hash order.
+        for path in sorted(was.keys() | reset.keys(), key=lambda path: (len(path), path)):
             if was.get(path, _ABSENT) == reset.get(path, _ABSENT):
                 continue  # the reset did not change it
             if current.get(path, _ABSENT) != reset.get(path, _ABSENT):

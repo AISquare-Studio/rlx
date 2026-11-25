@@ -232,7 +232,9 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         nothing (``CommitInput.leaving``). A name the store refuses is not written."""
         if field.id != "nickname":
             return
-        with contextlib.suppress(ValueError, OSError):
+        # Anything: a traceback as rlx exits says nothing to anyone (reviewer of #24; the
+        # service raises KeyError for a project gone, as the token's writer suppresses all).
+        with contextlib.suppress(Exception):
             fleet_service.rename_project(
                 self.project, field.value.strip() or None, notes=[], follow_unchanged=False
             )

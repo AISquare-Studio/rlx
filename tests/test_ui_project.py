@@ -2520,3 +2520,27 @@ def test_a_nickname_typed_and_not_left_is_kept_when_rlx_quits(
     drive(project, scenario)
     with store_session() as store:
         assert store.get_project(project.id).nickname == "Auth"  # type: ignore[union-attr]
+
+
+def test_a_nickname_the_service_cannot_write_on_quit_raises_nothing_as_rlx_exits(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #24: the quit-time write let ``rename_project``'s KeyError (a project gone)
+    out, a traceback as rlx exited. Whatever it raises, rlx exits quietly."""
+    from aisquare.services import fleet as fleet_service
+
+    def gone(*_a: object, **_k: object) -> None:
+        raise KeyError(project.id)
+
+    monkeypatch.setattr(fleet_service, "rename_project", gone)
+
+    async def scenario(pilot: Pilot[None], host: Host) -> None:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        await pilot.click("#nickname")
+        await settle(pilot)
+        await pilot.press(*"Auth")
+        await pilot.pause()
+        host.exit()
+
+    drive(project, scenario)  # raises nothing
