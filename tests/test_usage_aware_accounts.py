@@ -1431,7 +1431,10 @@ def test_choose_uses_headroom_only_when_configured_and_falls_back_to_rank_1(
     spread = service.choose(role="coder", project=work, fetch=fetch)
     assert spread.source == "headroom" and spread.account is not None
     assert spread.account.slot == 3
-    assert spread.describe() == "account 3 · headroom"
+    # The balanced pick (#35) says why: the launch line names the account and its reason.
+    assert spread.describe() == f"account 3 ({spread.why})"
+    assert spread.why.startswith("fair share 1/1 · resets in ")
+    assert spread.why.endswith(" · normal tier")
 
     # A binding still outranks headroom: explicit beats automatic.
     from aisquare.services import settings as settings_service

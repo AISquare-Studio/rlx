@@ -5988,6 +5988,7 @@ def spawn(
                 agent=selected.adapter.id,
                 pick=selected.pick,
                 family=family,
+                task_id=resolved_task_id,  # its tier: a task another one --needs is high (#35)
             )
         except claude_accounts_service.NoSuchAccount as exc:
             message = str(exc)
