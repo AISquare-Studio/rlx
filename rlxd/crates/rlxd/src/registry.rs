@@ -23,6 +23,9 @@
 //!
 //! On Windows a replace or a delete that another handle refuses for a moment
 //! (`ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`) is tried again for 1 s.
+//!
+//! [`read`] is the other side: every record in the folder, and whether it is live by
+//! `core.daemons`' rule, the lock alone. It deletes nothing; pruning is Python's.
 
 use std::fs;
 use std::io::{self, Write};
@@ -240,4 +243,75 @@ fn retry_refused(mut step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
             other => return other,
         }
     }
+}
+
+/// What [`read`] found in the folder.
+#[derive(Debug, Default)]
+pub struct Roll {
+    /// Records whose lock is held: their processes run.
+    pub live: Vec<DaemonRecord>,
+    /// Records whose lock is free or missing: their processes are gone.
+    pub dead: Vec<DaemonRecord>,
+    /// Records whose lock could not be probed at all, such as on a mount with no lock
+    /// manager. `core.daemons` then asks the pid or the heartbeat; rlxd does not judge.
+    pub unknown: Vec<DaemonRecord>,
+    /// Files named `<id>.json` that are not a record this release reads: not JSON, a
+    /// field missing or wrong, or another id inside. Reported, never dropped.
+    pub unreadable: Vec<PathBuf>,
+}
+
+/// Every record in `home`'s registry, by liveness, as `core.daemons` reads them: a record
+/// is live while its `<id>.lock` is held, whatever host it names. Missing folder, no
+/// records. A record whose read fails is read once more 50 ms later, as Python's are.
+pub fn read(home: &Home) -> io::Result<Roll> {
+    let dir = home.daemons();
+    let mut roll = Roll::default();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(roll),
+        Err(error) => return Err(error),
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter_map(|name| name.strip_suffix(".json").map(str::to_owned))
+        .filter(|id| valid_id(id))
+        .collect();
+    ids.sort();
+    for id in ids {
+        let path = dir.join(format!("{id}.json"));
+        let text = match fs::read_to_string(&path).or_else(|_| {
+            thread::sleep(Duration::from_millis(50));
+            fs::read_to_string(&path)
+        }) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                roll.unreadable.push(path);
+                continue;
+            }
+        };
+        let record = match serde_json::from_str::<DaemonRecord>(&text) {
+            Ok(record) if record.id == id => record,
+            _ => {
+                roll.unreadable.push(path);
+                continue;
+            }
+        };
+        match lock::is_held(&dir.join(format!("{id}.lock"))) {
+            Ok(true) => roll.live.push(record),
+            Ok(false) => roll.dead.push(record),
+            Err(_) => roll.unknown.push(record),
+        }
+    }
+    Ok(roll)
+}
+
+/// Whether `text` is a record id: twelve lower-case hex digits, so a path built from it
+/// stays a file in the folder.
+fn valid_id(text: &str) -> bool {
+    text.len() == 12
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
