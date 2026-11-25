@@ -9,9 +9,9 @@ answers ``None``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
-from typing import ClassVar
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
+from typing import Any, ClassVar
 
 from rich.text import Text
 from textual import events, on
@@ -19,11 +19,15 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.geometry import Region
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
+from textual.worker import Worker, WorkerState
 
 from aisquare.core.agent_adapters import recorded_adapter
 from aisquare.models import AdoptableConversation
+from aisquare.services import adopt as adopt_service
+from aisquare.services import fleet as fleet_service
 
 
 def _ago(now: datetime, then: datetime) -> str:
@@ -184,3 +188,90 @@ class AddMenu(ModalScreen[str | None]):
 
     def action_close_menu(self) -> None:
         self.dismiss(None)
+
+
+ADOPT_LIST_WORKER = "adopt-list"
+"""Reads the conversations *Adopt a conversation…* offers (``services.adopt.recent``): a read
+the shell's hand-over waits out (``app._waited_reads``)."""
+ADOPT_WORKER = "adopt-conversation"
+"""Adopts the one picked (``services.adopt.adopt``): a fleet spawn, so a writer a quit refuses
+beside (``app._writing_workers``)."""
+
+Say = Callable[[str, str], None]
+"""How a flow tells the person what happened: its text, and a tone, ``dim`` (under way), ``ok``
+or ``error``, as the Accounts page's notice line takes them."""
+
+
+class AdoptFlow:
+    """*Adopt a conversation…*, one flow for the Accounts page's button and the ``+`` menu's
+    entry (review of #563, seq 463: the two were copies): the conversations read off the UI
+    thread, :class:`AdoptPicker`, the one picked adopted on a worker, and what each step says.
+
+    ``node`` runs the two workers and hands their ends to the flow from its
+    ``on_worker_state_changed`` (:meth:`adoption_answered`); ``say`` tells the person
+    (:data:`Say`); ``adopted``, when
+    given, follows a success: the ``+`` menu reads the frame again so the new row shows."""
+
+    def __init__(
+        self,
+        node: Widget,
+        say: Say,
+        adopted: Callable[[fleet_service.SpawnReceipt], None] | None = None,
+    ) -> None:
+        self.node = node
+        # Every name here is one no other function has: tests/test_config_writes_stay_in_the_cli.py
+        # ties a call to every function of its name (``say`` is a captain command, and a thread's
+        # ``.start()`` reached a method of this flow named ``start``).
+        self.report_adoption = say
+        self.after_adoption = adopted
+
+    def begin_adoption(self) -> None:
+        """``fleet adopt --list`` as a picker: read off the UI thread, then shown."""
+        self.node.run_worker(
+            lambda: adopt_service.recent(),
+            name=ADOPT_LIST_WORKER,
+            group=ADOPT_LIST_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def adoption_answered(self, worker: Worker[Any], state: WorkerState) -> bool:
+        """Deal with ``worker``'s end when it is one of the flow's; ``True`` when it was."""
+        if worker.name == ADOPT_LIST_WORKER:
+            if state is WorkerState.SUCCESS and isinstance(worker.result, list):
+                picker = AdoptPicker(worker.result, datetime.now(tz=UTC))
+                self.node.app.push_screen(picker, self._adopt_conversation_picked)
+            elif state is WorkerState.ERROR:
+                self.report_adoption(
+                    f"✗ the conversations could not be read: {worker.error}", "error"
+                )
+            return True
+        if worker.name == ADOPT_WORKER:
+            receipt = worker.result
+            if state is WorkerState.SUCCESS and isinstance(receipt, fleet_service.SpawnReceipt):
+                agent = receipt.agent
+                self.report_adoption(
+                    f"✓ adopted {(agent.session_id or '')[:8]} as {agent.label}: it runs in the "
+                    "fleet now, on its project's card in the sidebar",
+                    "ok",
+                )
+                if self.after_adoption is not None:
+                    self.after_adoption(receipt)
+            elif state is WorkerState.ERROR:
+                self.report_adoption(f"✗ {worker.error}", "error")
+            return True
+        return False
+
+    def _adopt_conversation_picked(self, session_id: str | None) -> None:
+        if session_id is None:
+            return
+        self.report_adoption(f"adopting {session_id[:8]}…", "dim")
+        self.node.run_worker(
+            lambda: adopt_service.adopt(session_id),
+            name=ADOPT_WORKER,
+            group=ADOPT_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )

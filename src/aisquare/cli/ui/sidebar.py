@@ -58,6 +58,7 @@ from textual.widget import Widget
 from textual.widgets import Input, Static
 from textual.worker import Worker, WorkerState
 
+from aisquare.cli.ui import adopt_picker
 from aisquare.cli.ui.groups import (
     DragState,
     DropGroup,
@@ -71,7 +72,6 @@ from aisquare.cli.ui.groups import (
 from aisquare.cli.ui.instances_chip import InstancesChip
 from aisquare.cli.ui.terminal import InPlaceField
 from aisquare.cli.ui.theme import MARK_STYLE, MarkStatic, readable_on, state_inks, theme_tones
-from aisquare.cli.ui.views import accounts as accounts_view
 from aisquare.cli.ui.views.accounts import agent_mark
 from aisquare.core.agent_adapters import default_binary, recorded_adapter
 from aisquare.core.version import PRODUCT_LOGO
@@ -183,7 +183,7 @@ STOP_STATES: frozenset[str] = ALIVE_STATES | {"exited", "paused"}
 this one constant, never a copy of it: a process to stop (``ALIVE_STATES``), or an
 exited agent's dead window — `remain-on-exit` keeps it for the last screen, and Stop
 on the 💤 row removes it, which takes the row off the listing (``fleet stop`` on an
-ended row, #138). A ✗ lost row has neither: it is ``fleet reap``'s business. A ⏯ paused
+ended row, #138). A ✗ lost row has neither: it is ``fleet reap``'s business. A ⏸ paused
 agent's Stop ends its pause for good: its kept claims go back to the board, and
 ``fleet resume`` leaves it (``fleet stop`` of a paused agent)."""
 
@@ -919,17 +919,18 @@ class Activatable(Static):
         return None
 
 
-# The + menu's *Adopt a conversation…* runs the Accounts page's two workers, by their names:
-# the shell knows them, the list as a read a hand-over waits out (``app._waited_reads``) and
-# the adoption, a fleet spawn, as a writer a quit refuses beside (``app._writing_workers``).
-ADOPT_LIST_WORKER = accounts_view.ADOPT_LIST_WORKER
-ADOPT_WORKER = accounts_view.ADOPT_WORKER
+# The + menu's *Adopt a conversation…* is the Accounts page's flow (``adopt_picker.AdoptFlow``),
+# its workers by their names: the shell knows them, the list as a read a hand-over waits out
+# (``app._waited_reads``) and the adoption, a fleet spawn, as a writer a quit refuses beside
+# (``app._writing_workers``).
+ADOPT_LIST_WORKER = adopt_picker.ADOPT_LIST_WORKER
+ADOPT_WORKER = adopt_picker.ADOPT_WORKER
 
 
 class AddButton(Activatable):
     """The ``+`` beside Fleet: its menu (M6), *Add a project…* (onboard one, as the ``+`` did on
-    its own) or *Adopt a conversation…* (``adopt_picker.AdoptPicker``, as the Accounts page's
-    button opens it, which stays). The app's ``+`` key still onboards at once."""
+    its own) or *Adopt a conversation…* (``adopt_picker.AdoptFlow``, the Accounts page's
+    button's, which stays). The app's ``+`` key still onboards at once."""
 
     DEFAULT_CSS = """
     AddButton { width: 3; text-style: bold; color: $accent; }
@@ -939,80 +940,45 @@ class AddButton(Activatable):
         super().__init__(Text(" + "), id="add-project")
         # The arrows highlight it like any row; once onboarding opens, no row is.
         self.selection_key = "add"
+        self._adopt = adopt_picker.AdoptFlow(
+            self, self._report_adoption_step, adopted=self._read_the_adopted_row
+        )
+        """*Adopt a conversation…*: the Accounts page's flow, said in toasts."""
 
     def message(self) -> Message:
         return AddProject()
 
     def activate(self) -> None:
         """A click on the ``+``, or Enter on it: its menu, under it."""
-        from aisquare.cli.ui.adopt_picker import AddMenu
-
-        self.app.push_screen(AddMenu(self.region), self._chosen)
+        self.app.push_screen(adopt_picker.AddMenu(self.region), self._chosen)
 
     def _chosen(self, choice: str | None) -> None:
-        from aisquare.cli.ui.adopt_picker import ADD_A_PROJECT, ADOPT_A_CONVERSATION
-        from aisquare.services import adopt as adopt_service
-
-        if choice == ADD_A_PROJECT:
+        if choice == adopt_picker.ADD_A_PROJECT:
             super().activate()  # AddProject, from this row, as the + posted it before
-        elif choice == ADOPT_A_CONVERSATION:
-            # ``fleet adopt --list`` as a picker: read off the UI thread, then shown.
-            self.run_worker(
-                lambda: adopt_service.recent(),
-                name=ADOPT_LIST_WORKER,
-                group=ADOPT_LIST_WORKER,
-                exclusive=True,
-                thread=True,
-                exit_on_error=False,
-            )
+        elif choice == adopt_picker.ADOPT_A_CONVERSATION:
+            self._adopt.begin_adoption()
 
-    def _adopt_chosen(self, session_id: str | None) -> None:
-        from aisquare.services import adopt as adopt_service
-
-        if session_id is None:
-            return
-        self.notify(f"adopting {session_id[:8]}…", timeout=4, markup=False)
-        self.run_worker(
-            lambda: adopt_service.adopt(session_id),
-            name=ADOPT_WORKER,
-            group=ADOPT_WORKER,
-            exclusive=True,
-            thread=True,
-            exit_on_error=False,
+    def _report_adoption_step(self, text: str, tone: str) -> None:
+        error = tone == "error"
+        self.notify(
+            text,
+            severity="error" if error else "information",
+            timeout=8 if error else 6,
+            markup=False,
         )
 
+    def _read_the_adopted_row(self, receipt: fleet_service.SpawnReceipt) -> None:
+        """The frame read again, so the adopted agent's row shows on its project's card."""
+        refresh = getattr(self.app, "refresh_data", None)
+        if callable(refresh):
+            refresh()
+
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        """The list read: the picker. The adoption: said, and the frame read again so its row
-        shows on its project's card."""
-        from datetime import UTC, datetime
-
-        from aisquare.cli.ui.adopt_picker import AdoptPicker
-
-        worker, state = event.worker, event.state
-        if worker.name not in (ADOPT_LIST_WORKER, ADOPT_WORKER) or state not in (
+        if event.state in (
             WorkerState.SUCCESS,
             WorkerState.ERROR,
-        ):
-            return
-        event.stop()
-        if state is WorkerState.ERROR:
-            what = "the conversations could not be read" if worker.name == ADOPT_LIST_WORKER else ""
-            said = f"{what}: {worker.error}" if what else str(worker.error)
-            self.notify(f"✗ {said}", severity="error", timeout=8, markup=False)
-        elif worker.name == ADOPT_LIST_WORKER and isinstance(worker.result, list):
-            picker = AdoptPicker(worker.result, datetime.now(tz=UTC))
-            self.app.push_screen(picker, self._adopt_chosen)
-        elif worker.name == ADOPT_WORKER and isinstance(worker.result, fleet_service.SpawnReceipt):
-            agent = worker.result.agent
-            self.notify(
-                f"✓ adopted {(agent.session_id or '')[:8]} as {agent.label}: it runs in the "
-                "fleet now, on its project's card",
-                timeout=6,
-                markup=False,
-            )
-            refresh = getattr(self.app, "refresh_data", None)
-            if callable(refresh):
-                refresh()
+        ) and self._adopt.adoption_answered(event.worker, event.state):
+            event.stop()
 
 
 ACTIVE_ONLY_EMPTY = "No active projects — press l to show all."

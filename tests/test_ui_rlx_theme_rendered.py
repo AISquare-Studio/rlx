@@ -371,3 +371,40 @@ def test_a_ticked_checkbox_shows_a_check_and_an_unticked_one_is_blank(theme: str
     assert on == f"▐{CHECK_MARK}▌", on
     assert off == "▐ ▌", off
     assert flipped == f"▐{CHECK_MARK}▌", flipped
+
+
+def test_a_selection_list_still_draws_once_the_checkboxes_glyph_is_ours() -> None:
+    """Review of #563 (seq 463): the ✓-or-blank glyph was a property on ``ToggleButton``, and
+    Textual's ``SelectionList`` reads ``ToggleButton.BUTTON_INNER`` off the class as a string,
+    so any SelectionList raised ``TypeError`` (str + property) once ``register_themes`` ran.
+    The glyph is ``Checkbox``'s now: a SelectionList mounts and draws its boxes, and a checkbox
+    still shows ✓."""
+    from textual.widgets import Checkbox, SelectionList
+    from textual.widgets._toggle_button import ToggleButton
+
+    from aisquare.cli.ui.theme import CHECK_MARK, register_themes
+
+    class Host(App[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            register_themes(self)  # as both of our apps do, before anything is drawn
+
+        def compose(self) -> ComposeResult:
+            yield SelectionList[str](("one", "one", True), ("two", "two"), id="choices")
+            yield Checkbox("ticked", True, id="box")
+
+    async def go() -> tuple[str, str]:
+        app = Host()
+        async with app.run_test(size=(40, 8)) as pilot:
+            await pilot.pause()
+            strips = app.screen._compositor.render_full_update(simplify=True).strips
+            listed = app.query_one("#choices", SelectionList)
+            (first,) = strips[listed.region.y + listed.styles.border.spacing.top]
+            box = app.query_one("#box", Checkbox)
+            (ticked,) = strips[box.region.y + box.region.height // 2]
+            return first.text, ticked.text
+
+    first, ticked = asyncio.run(go())
+    assert isinstance(ToggleButton.BUTTON_INNER, str), "SelectionList reads it as a string"
+    assert "one" in first, first
+    assert f"▐{CHECK_MARK}▌" in ticked, ticked

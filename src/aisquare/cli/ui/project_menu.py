@@ -97,8 +97,9 @@ class ProjectMenu(ModalScreen[str | None]):
     :data:`FRESH`, or :data:`REMOVE` once Remove was pressed twice; Esc (with Remove armed, the
     first Esc disarms it), or a click anywhere off the menu, answers ``None``.
     ``can`` says whether a pause and a resume would act on any of its agents
-    (``fleet_bulk.applicable``): only the ones that would are listed, where both were, one of
-    them greyed. With neither, Pause is listed greyed, so the agents' group is never empty.
+    (``fleet_bulk.applicable``). Each that would act is listed, and only those: both when both
+    would, enabled; one when one would. When neither would, a greyed Pause holds the agents'
+    group, so it is never empty. (Both used to be listed always, the idle one greyed.)
     """
 
     CSS = """
