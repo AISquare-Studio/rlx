@@ -126,3 +126,23 @@ def test_the_first_listed_project_is_the_sidebars_first_card(
         project_groups.pin(store, "prj_b")
 
     assert drive(_home_shown) == ("project-prj_b", "tab-manager")
+
+
+def test_at_100_by_30_with_two_projects_the_first_screen_is_the_manager_tab(
+    tmp_path: Path, script: Script
+) -> None:
+    """The contract's screen: rlx at 100x30 with two projects shows the Manager tab first, its
+    tab the active one on screen."""
+    _two_projects(tmp_path, script)
+    ui_app._remember_ui_state(ui_app.LAST_PROJECT_KEY, "prj_b")
+
+    async def go(pilot: Pilot[None]) -> tuple[tuple[str | None, str | None], list[str]]:
+        app = fleet_app(pilot)
+        await settle(app)
+        strips = app.screen._compositor.render_full_update(simplify=True).strips
+        return _shown(pilot), [strip.text.rstrip() for (strip,) in strips]
+
+    shown, rows = drive(go, size=(100, 30))
+    assert shown == ("project-prj_b", "tab-manager"), shown
+    tab_row = next(row for row in rows if "Manager" in row and "Board" in row)
+    assert tab_row.index("Manager") < tab_row.index("Board"), tab_row
