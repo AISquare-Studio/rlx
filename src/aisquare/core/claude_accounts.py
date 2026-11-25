@@ -1097,16 +1097,19 @@ a usage reading's cause is read from it, never from the words (``services.claude
 KeychainCode = Literal["ok", "locked", "denied", "timeout", "failed", "none"]
 """A slot's Keychain as ``accounts list --json`` says it (``keychain``, :func:`keychain_code`),
 for an app that never reads the Keychain itself and says the fix: ``locked``, unlock the
-login Keychain; ``denied``, allow rlx in Keychain Access (handoff 0.10.3, 4.3)."""
-KEYCHAIN_CODES: dict[KeychainProblem | None, KeychainCode] = {
-    None: "ok",
+login Keychain; ``denied``, allow rlx in Keychain Access (handoff 0.10.3, 4.3). All six are
+on the wire: 4.3 names ``ok``, ``locked``, ``denied`` and ``timeout``, and ``failed`` (a
+read that failed otherwise) and ``none`` (no Keychain read for the slot) are this
+release's two more, which 4.3 and A1's schema are amended to list (review of #583)."""
+KEYCHAIN_CODES: dict[KeychainProblem, KeychainCode] = {
     "locked": "locked",
     "refused": "denied",
     "timeout": "timeout",
     "failed": "failed",
 }
-"""A read's :data:`KeychainProblem` as its :data:`KeychainCode`. ``None`` is a Keychain that
-answered: the item, or that it holds none (``signed_in`` and ``token_state`` say which)."""
+"""A refused read's :data:`KeychainProblem` as its :data:`KeychainCode`: one for every kind,
+which tests/test_keychain_codes.py pins. A read that answered is ``ok``
+(:func:`keychain_code`)."""
 
 _KEYCHAIN_SERVICE = "Claude Code"
 _KEYCHAIN_OAUTH_SUFFIX = ""
@@ -1367,7 +1370,10 @@ def keychain_code(account: ClaudeAccount) -> KeychainCode:
     """What ``account``'s Keychain item answered here, as a :data:`KeychainCode`.
 
     Read as the rows read it (:func:`item_login`, through the Keychain memo), so a listing
-    that just described the slot asks ``security`` nothing again:
+    that just described the slot asks ``security`` nothing again. It must be asked before
+    anything forgets the memo or outlasts it (``accounts list --usage``: its forced refresh,
+    or a fetch slower than :data:`KEYCHAIN_MEMO_SECONDS`): after that, it would ask the item
+    again, and could disagree with the row's ``signed_in`` and ``token_state``.
 
     - ``ok``: the Keychain answered. The item, or that there is none: no item (exit 44), or
       no login Keychain at all (37, 50), which is a sign-in to do, not a Keychain to fix.
@@ -1375,14 +1381,18 @@ def keychain_code(account: ClaudeAccount) -> KeychainCode:
       say locked (:func:`_keychain_problem`).
     - ``denied``: errSecAuthFailed (51), the Deny on the item's access prompt (``refused``).
     - ``timeout``: no answer in :data:`KEYCHAIN_TIMEOUT_SECONDS`.
-    - ``failed``: anything else: another exit code, or ``security`` that could not run. No
+    - ``failed``: anything else: another exit code, ``security`` that could not run, or a
+      store that would not say and named no kind (``unreadable`` with no ``problem``). No
       fix the app could name applies, and ``ok`` would hide the read that failed.
     - ``none``: no Keychain is read for the slot: off macOS (its login is the credentials
       file), or an agent whose login is no Keychain item (Codex's ``auth.json``).
     """
     if not keychain_platform() or keychain_item(account) is None:
         return "none"
-    return KEYCHAIN_CODES[item_login(account).problem]
+    login = item_login(account)
+    if login.unreadable is None and login.problem is None:
+        return "ok"
+    return KEYCHAIN_CODES[login.problem] if login.problem is not None else "failed"
 
 
 def token_state(creds: ClaudeCredentials | None, now: datetime | None = None) -> str:
