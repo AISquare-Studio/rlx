@@ -6123,7 +6123,7 @@ def shared_memory_root(agent: str | None = None) -> Path:
     memory = core.kind(whose).memory if whose is not None else None
     if memory is None:
         raise ValueError("no agent here shares its memory")
-    return paths.aisquare_home() / memory.root_name / "memory"
+    return paths.shared_memory_dir(memory.root_name)
 
 
 def shared_memory_directory(agent: str, cwd: Path) -> Path | None:

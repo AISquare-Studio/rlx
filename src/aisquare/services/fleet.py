@@ -8944,7 +8944,7 @@ def _memory_refused(record: Mapping[str, object], why: str) -> NoReturn:
 def _log_admission(outcome: str, record: Mapping[str, object]) -> None:
     """One JSON line per refusal and per admission at the budget; never fails a spawn."""
     with contextlib.suppress(OSError):
-        log = paths.aisquare_home() / "fleet" / "admission.jsonl"
+        log = paths.fleet_dir() / "admission.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
         if log.is_file() and log.stat().st_size > _ADMISSION_LOG_MAX:
             log.replace(log.with_name(log.name + ".1"))

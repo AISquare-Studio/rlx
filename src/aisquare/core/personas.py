@@ -378,7 +378,7 @@ def layer_dirs(root: Path | None) -> list[tuple[Layer, Path]]:
     A project layer that IS the user layer (``$AISQUARE_HOME`` at
     ``<repo>/.aisquare``) is dropped, so a persona never shadows itself.
     """
-    user = paths.aisquare_home() / "personas"
+    user = paths.personas_dir()
     dirs: list[tuple[Layer, Path]] = []
     if root is not None:
         project = root / ".aisquare" / "personas"

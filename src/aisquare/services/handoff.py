@@ -122,7 +122,7 @@ _SLUG = re.compile(r"[^A-Za-z0-9-]+")
 def brief_dir() -> Path:
     """Where the briefs are kept: under the aisquare home, which a sandboxed agent's
     profile makes read-only (``types.store_read_only``), so no agent's tools wrote one."""
-    return paths.aisquare_home() / DIR_NAME
+    return paths.handoffs_dir()
 
 
 @dataclass(frozen=True)

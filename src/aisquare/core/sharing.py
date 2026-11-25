@@ -161,7 +161,7 @@ def backoff(failures: int) -> timedelta:
 
 
 def lock_path() -> Any:
-    return paths.aisquare_home() / "usage-share.lock"
+    return paths.usage_share_lock_path()
 
 
 def withhold_today(now: datetime | None = None, tz: tzinfo | None = None) -> bool:

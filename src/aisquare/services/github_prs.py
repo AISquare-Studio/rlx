@@ -56,7 +56,7 @@ class GhError(RuntimeError):
 
 def watch_dir() -> Path:
     """Where ``aisquare watch`` keeps its state, its detail files and the ETags."""
-    return paths.aisquare_home() / "watch"
+    return paths.watch_dir()
 
 
 def _etags_path() -> Path:

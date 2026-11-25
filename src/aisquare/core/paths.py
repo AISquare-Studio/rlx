@@ -798,6 +798,123 @@ def truncation_marker_path() -> Path:
     return aisquare_home() / "store-was-truncated"
 
 
+# --- the home's layout, one helper per thing (#30) -------------------------------------------
+#
+# Every path under the home is built here, by a helper named for what it holds, so that the
+# layout lives in this one file: a module asks for ``launch_seals_dir()``, never joins
+# ``aisquare_home()`` with a name of its own.
+
+
+def projects_dir() -> Path:
+    """Every project's own folder (:func:`project_data_dir`), one per project id."""
+    return aisquare_home() / "projects"
+
+
+def briefs_dir() -> Path:
+    """The work briefs' evidence, one folder per project (:func:`project_briefs_dir`)."""
+    return aisquare_home() / "briefs"
+
+
+def project_briefs_dir(project_id: str) -> Path:
+    """One project's briefs' evidence (:func:`brief_evidence_dir` is one brief's)."""
+    return briefs_dir() / project_id
+
+
+def reports_dir() -> Path:
+    """The command reports a person or an agent asked to keep (``services.command_reports``)."""
+    return aisquare_home() / "reports"
+
+
+def run_dir() -> Path:
+    """What a running rlx keeps while it runs: prompts on their way, typing leases, origins."""
+    return aisquare_home() / "run"
+
+
+def instances_dir() -> Path:
+    """The registry of the rlx instances running on this home (``core.instances``)."""
+    return aisquare_home() / "instances"
+
+
+def launch_seals_dir() -> Path:
+    """The fleet's launch records, one per agent (``core.launch_seal``)."""
+    return aisquare_home() / "launch-seals"
+
+
+def launchers_dir() -> Path:
+    """The launchers the fleet writes for its agents (``core.launchers``)."""
+    return aisquare_home() / "launchers"
+
+
+def handoffs_dir() -> Path:
+    """The hand-off briefs a crossing switch writes (``services.handoff``)."""
+    return aisquare_home() / "handoffs"
+
+
+def fleet_dir() -> Path:
+    """The fleet's own files: its admission log."""
+    return aisquare_home() / "fleet"
+
+
+def tmux_conf_path() -> Path:
+    """The tmux config the fleet's server starts with (``core.tmux.CONF_NAME``)."""
+    return aisquare_home() / "fleet-tmux.conf"
+
+
+def watch_dir() -> Path:
+    """What the watcher keeps: its lock, its pid, the details it files (``services.watch``)."""
+    return aisquare_home() / "watch"
+
+
+def captain_dir() -> Path:
+    """The captain's folder: its brain, its queue, its ui socket's fallback."""
+    return aisquare_home() / "captain"
+
+
+def personas_dir() -> Path:
+    """The user's personas (``core.personas``)."""
+    return aisquare_home() / "personas"
+
+
+def shared_memory_dir(root_name: str) -> Path:
+    """The memory an agent's accounts share, under its accounts' root (``root_name``)."""
+    return aisquare_home() / root_name / "memory"
+
+
+def persona_prompts_dir() -> Path:
+    """The persona prompts a launch writes for its agent: disposable, so under the cache."""
+    return cache_dir() / "persona-prompts"
+
+
+def screenshots_dir() -> Path:
+    """Where the board's screenshot key saves, unless told elsewhere (``cli.watch``)."""
+    return aisquare_home() / "screenshots"
+
+
+def bench_dir() -> Path:
+    """The usage sweep's benchmark scratch (``services.usage_stats``)."""
+    return aisquare_home() / "bench"
+
+
+def usage_share_lock_path() -> Path:
+    """The lock one usage shipment at a time holds (``core.sharing``)."""
+    return aisquare_home() / "usage-share.lock"
+
+
+def active_ping_lock_path() -> Path:
+    """The lock one daily active ping at a time holds (``services.active_ping``)."""
+    return aisquare_home() / "active-ping.lock"
+
+
+def ngrok_token_path() -> Path:
+    """The ngrok authtoken saved in Settings → Remote (``services.ngrok_sdk``)."""
+    return aisquare_home() / "ngrok-authtoken"
+
+
+def ngrok_config_path(name: str) -> Path:
+    """Our ngrok config of one ngrok version (``services.ngrok_tunnel``)."""
+    return aisquare_home() / name
+
+
 def ensure_home() -> Path:
     """Create the aisquare home layout if missing and return its root."""
     home = aisquare_home()

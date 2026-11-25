@@ -302,7 +302,7 @@ _SEEN: dict[str, SessionFacts] = {}
 
 def seals_dir() -> Path:
     """Where the records of the launches ``fleet spawn`` made are kept."""
-    return paths.aisquare_home() / DIR_NAME
+    return paths.launch_seals_dir()
 
 
 def digest(agent_id: str) -> str:

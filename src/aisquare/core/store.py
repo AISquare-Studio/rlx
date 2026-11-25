@@ -683,7 +683,7 @@ def _remove_old_packs() -> None:
     try:
         if marker.exists():
             return
-        inside = (paths.aisquare_home() / "projects").resolve()
+        inside = paths.projects_dir().resolve()
         try:
             projects = list(inside.iterdir())
         except FileNotFoundError:

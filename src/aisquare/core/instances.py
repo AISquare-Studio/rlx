@@ -204,7 +204,7 @@ def _zoned(moment: datetime) -> datetime:
 
 def registry_dir() -> Path:
     """``<home>/instances``; made by the first asq to register, never by a reader."""
-    return paths.aisquare_home() / FOLDER
+    return paths.instances_dir()
 
 
 def valid_id(text: str) -> bool:

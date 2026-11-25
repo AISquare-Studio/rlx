@@ -4016,7 +4016,7 @@ def _fleet_conf() -> Path:
     the path up front skips both. tmux only reads ``-f`` when it STARTS a
     server, and nothing here starts one, so a missing file costs nothing.
     """
-    return paths.aisquare_home() / tmux_core.CONF_NAME
+    return paths.tmux_conf_path()
 
 
 def _fleet_server(socket: str) -> tmux_core.TmuxServer:

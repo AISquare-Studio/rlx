@@ -627,7 +627,7 @@ def _counts(
 
 def _evidence_root(project_id: str) -> Path:
     """``~/.aisquare/briefs/<id>/``: every brief's kept evidence (``paths.brief_evidence_dir``)."""
-    return paths.aisquare_home() / "briefs" / project_id
+    return paths.project_briefs_dir(project_id)
 
 
 def _manager_dir(project_id: str) -> Path:

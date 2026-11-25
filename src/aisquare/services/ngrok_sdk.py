@@ -128,7 +128,7 @@ def failure_sentence(exc: BaseException, token: str) -> str:
 
 
 def token_path() -> Path:
-    return paths.aisquare_home() / TOKEN_FILE_NAME
+    return paths.ngrok_token_path()
 
 
 def saved_token() -> str | None:
