@@ -1697,7 +1697,7 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
             project.root.mkdir()
             store.onboard_project(ProjectInfo(id=project.id, root=project.root))
         # Home is beta (start opens home since L1), so its start run and step 1 differ.
-        store.set_ui_state("fleet.last_project", beta.id)
+        store.set_ui_state(app_mod.LAST_PROJECT_KEY, beta.id)
     listed = tuple(Candidate(root=p.root, is_git=True, project=p) for p in (alpha, beta))
     machine = Machine(claude=[READY], found=Candidates(items=listed))
     scripted(machine)

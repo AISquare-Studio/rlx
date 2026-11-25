@@ -256,12 +256,18 @@ def test_an_upgrade_with_only_the_last_view_remembered_opens_its_project(
 
 
 def test_the_help_names_home_its_key_and_the_logo() -> None:
-    """The ? help says what home is and every way there: Home or Esc from the sidebar, the logo."""
+    """The ? help says what home is and every way there: Home from the sidebar, Esc there when
+    nothing is marked, the logo."""
     from aisquare.cli.ui.app import HelpScreen
 
     (line,) = [row for row in HelpScreen("f12").keys_text().plain.splitlines() if "r\\x" in row]
     assert line.lstrip().startswith("Home  r\\x"), line
-    for said in ("last-used project's Manager tab", "Home or Esc from the sidebar", "logo"):
+    for said in (
+        "last-used project's Manager tab",
+        "Home from the sidebar",
+        "Esc there when nothing is marked",
+        "logo",
+    ):
         assert said in line, (said, line)
 
 
@@ -297,3 +303,34 @@ def test_esc_in_the_sidebar_goes_home_once_no_mark_is_left(tmp_path: Path, scrip
         ("welcome", None, 0),
         ("project-prj_b", "tab-manager", 0),
     ]
+
+
+def test_a_drop_or_a_group_pick_leaves_the_open_view_where_it_is(
+    tmp_path: Path, script: Script
+) -> None:
+    """Esc goes home only through Esc's own action: the shell clears the cards' marks after a
+    drop and after a group pick (``Sidebar.action_clear_marks``), and while Esc's go-home lived
+    there, a drag of one unmarked card or ``g`` on the highlighted one replaced the open view
+    with the Manager tab (review of #580, #981). An agent's view stays open through both."""
+    from aisquare.cli.ui.groups import DropProject, GroupProjects
+    from tests.test_ui_shell import row_for
+
+    _two_projects(tmp_path, script)
+
+    async def go(pilot: Pilot[None]) -> list[str | None]:
+        app = fleet_app(pilot)
+        await settle(app)
+        await pilot.click(row_for(app, "agt_a_manager"))  # alpha's manager: its view
+        await settle(app)
+        seen = [app.content.current]
+        app.post_message(DropProject(["prj_a"], scope=None, before=None))  # a drag, unmarked
+        await settle(app)
+        seen.append(app.content.current)
+        app.post_message(GroupProjects(["prj_a"]))  # g on the highlighted card
+        await settle(app)
+        app.screen.dismiss("new:tools")  # the picker's answer: a new group
+        await settle(app)
+        seen.append(app.content.current)
+        return seen
+
+    assert drive(go) == ["agent-agt_a_manager"] * 3, "the open view stays the agent's"

@@ -2307,7 +2307,7 @@ class Sidebar(Vertical):
         Binding("m", "toggle_mark", "mark", show=False),
         Binding("space", "toggle_collapse", "fold", show=False),
         Binding("u", "undo_layout", "undo", show=False),
-        Binding("escape", "clear_marks", "clear marks", show=False),
+        Binding("escape", "escape", "clear marks · home", show=False),
         # The highlighted card: its name in place, and its menu (⋯).
         Binding("f2", "rename", "rename", show=False),
         Binding("full_stop", "project_menu", "menu", show=False, key_display="."),
@@ -2673,12 +2673,17 @@ class Sidebar(Vertical):
         if target is not None and target[0] == "project":
             self.toggle_mark(target[1])
 
-    def action_clear_marks(self) -> None:
+    def action_escape(self) -> None:
         """Esc in the sidebar: clear the cards' marks, or with none to clear, go home (L1: the
-        last-used project's Manager tab, as the logo and the Home key go; the shell decides)."""
-        if not self._marked:
+        last-used project's Manager tab, as the logo and the Home key go; the shell decides).
+        Esc's own: the shell clears the marks after a drop or a group pick (``clear_marks``),
+        and going home there replaced whatever view was open (review of #580, #981)."""
+        if self._marked:
+            self.action_clear_marks()
+        else:
             self.post_message(HomeRequested())
-            return
+
+    def action_clear_marks(self) -> None:
         self._marked.clear()
         for card in self.query(ProjectCard):
             card.remove_class("marked")
