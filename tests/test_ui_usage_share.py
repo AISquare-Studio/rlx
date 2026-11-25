@@ -33,6 +33,7 @@ from aisquare.cli.ui.views.usage_stats import UsageStatsView
 from aisquare.core import sharing as sharing_core
 from aisquare.models import SharingStatus, ShipReport
 from aisquare.services import usage_share
+from aisquare.services.active_ping import PingStatus
 from tests import guard_paint
 from tests.projects import add_project
 from tests.test_ui_settings_hub import GOOD
@@ -40,6 +41,10 @@ from tests.ui_workers import released, settle_page, settle_until
 
 T = TypeVar("T")
 SENT = datetime(2026, 10, 26, 6, 30, tzinfo=UTC)
+USAGE_LINE = (
+    "Your usage here, the last 30 days: 1.2M tokens in 48 sessions across 6 repositories, "
+    "on 14 days. It stays on this machine unless you share it."
+)
 
 
 class FakeSharing:
@@ -53,7 +58,13 @@ class FakeSharing:
         signed_in: bool = False,
         due: bool = True,
         ship_report: ShipReport | None = None,
+        ping: bool = True,
+        usage_line: str = USAGE_LINE,
     ) -> None:
+        self.ping_now = PingStatus(switch=ping, forced_off=forced_off, last_sent=None)
+        self.ping_calls: list[bool] = []
+        """Each flip of the daily ping's switch (kept apart from ``calls``: it is not sharing)."""
+        self.usage_line = usage_line
         self.status_now = SharingStatus(
             enabled=enabled and forced_off is None,
             switch=enabled,
@@ -116,6 +127,17 @@ class FakeSharing:
             return self.ship_report
         return None
 
+    def ping_status(self) -> PingStatus:
+        return self.ping_now
+
+    def set_ping(self, on: bool) -> PingStatus:
+        self.ping_calls.append(on)
+        self.ping_now = PingStatus(switch=on, forced_off=self.ping_now.forced_off, last_sent=None)
+        return self.ping_now
+
+    def usage(self) -> str:
+        return self.usage_line
+
     def seam(self) -> Sharing:
         return Sharing(
             status=self.status,
@@ -127,6 +149,9 @@ class FakeSharing:
             is_sample=self.is_sample,
             consent_due=self.consent_due,
             answer=self.answer,
+            ping_status=self.ping_status,
+            set_ping=self.set_ping,
+            usage=self.usage,
         )
 
 
@@ -190,7 +215,7 @@ def test_the_switch_starts_off_and_says_nothing_leaves_the_machine() -> None:
 
     assert (label, line, disabled) == (
         "Turn sharing on",
-        "Off — nothing leaves this machine.",
+        "Off — no usage leaves this machine.",
         False,
     )
     assert (
@@ -219,7 +244,7 @@ def test_one_click_turns_it_on_and_sends_the_first_shipment_and_one_click_turns_
     assert fake.calls == ["enable", "ship", "disable"]  # one click each way; nothing else
     assert seen[0][0] == "Turn sharing off" and seen[0][1].startswith("On — last sent")
     assert "linked to your AISquare account" in seen[0][1]
-    assert seen[1] == ("Turn sharing on", "Off — nothing leaves this machine.")
+    assert seen[1] == ("Turn sharing on", "Off — no usage leaves this machine.")
 
 
 def test_a_click_that_lands_as_the_page_appears_is_not_how_someone_agrees_to_share(
@@ -266,6 +291,81 @@ def test_a_forced_off_switch_cannot_be_pressed_and_says_why(why: str) -> None:
     assert (
         label == "Turn sharing on" and line == f"Off — forced: {why}. Nothing leaves this machine."
     )
+
+
+# --- the daily active ping ----------
+
+
+def _ping_line(box: SharingBox) -> str:
+    return _text(box.query_one("#active-ping-status", Static))
+
+
+def _ping_label(box: SharingBox) -> str:
+    return str(box.query_one("#active-ping-toggle", Button).label)
+
+
+def test_the_daily_ping_has_its_own_switch_which_says_it_is_separate_from_sharing() -> None:
+    async def go(pilot: Pilot[None], box: SharingBox) -> tuple[str, str, str, str, bool]:
+        return (
+            _text(box.query_one("#active-ping-title", Static)),
+            _text(box.query_one("#active-ping-about", Static)),
+            _ping_label(box),
+            _ping_line(box),
+            box.query_one("#active-ping-toggle", Button).disabled,
+        )
+
+    title, about, label, line, disabled = _drive_page(FakeSharing(), go)
+
+    assert title == "Daily active ping (separate from usage sharing)"
+    assert "whether usage sharing is on or off" in about
+    for sent in ("the date", "rlx's version", "your OS", "CPU type", "how rlx was installed"):
+        assert sent in about, sent
+    assert "No id, no account, nothing about your work" in about
+    assert (label, line, disabled) == (
+        "Turn the daily ping off",
+        "On — sent once on each day you use rlx.",
+        False,
+    )
+
+
+def test_one_click_turns_the_daily_ping_off_and_one_turns_it_on_and_sharing_is_untouched() -> None:
+    fake = FakeSharing()
+
+    async def go(pilot: Pilot[None], box: SharingBox) -> list[tuple[str, str]]:
+        seen: list[tuple[str, str]] = []
+        for _ in range(2):
+            toggle = box.query_one("#active-ping-toggle", Button)
+            await released(pilot, toggle)
+            await pilot.click("#active-ping-toggle")
+            await settle_page(box.app)
+            seen.append((_ping_label(box), _ping_line(box)))
+        return seen
+
+    seen = _drive_page(fake, go)
+
+    assert fake.ping_calls == [False, True]
+    assert seen == [
+        ("Turn the daily ping on", "Off — no ping is sent."),
+        ("Turn the daily ping off", "On — sent once on each day you use rlx."),
+    ]
+    assert fake.calls == []  # sharing was neither turned on nor off
+
+
+@pytest.mark.parametrize(
+    "why", ["DO_NOT_TRACK is set", "AISQUARE_NO_TELEMETRY is set", "CI is set"]
+)
+def test_a_forced_off_ping_cannot_be_pressed_and_says_why(why: str) -> None:
+    fake = FakeSharing(forced_off=why)
+
+    async def go(pilot: Pilot[None], box: SharingBox) -> tuple[bool, str]:
+        await pilot.click("#active-ping-toggle")
+        await settle_page(box.app)
+        return box.query_one("#active-ping-toggle", Button).disabled, _ping_line(box)
+
+    disabled, line = _drive_page(fake, go)
+
+    assert disabled is True and fake.ping_calls == []
+    assert line == f"Off — forced: {why}. No ping is sent."
 
 
 def test_the_line_says_whether_the_server_linked_the_shipments_to_the_account() -> None:
@@ -362,6 +462,109 @@ def test_the_consent_text_says_only_days_from_yes_on_are_sent() -> None:
     assert "Only days from the moment you say yes are sent" in consent_text()
     assert "every repo you run Claude Code in, including ones you haven't added" in consent_text()
     assert "exactly what's sent" not in consent_text().lower()
+
+
+def test_the_consent_text_names_the_daily_ping_and_that_it_is_separate() -> None:
+    from aisquare.cli.ui.views.usage_sharing import consent_text
+
+    text = consent_text()
+
+    assert "Separate from this, whatever you answer: a daily active ping" in text
+    assert "no id" in text and "It has its own switch there." in text
+    assert "rlx config" not in text and "metrics" not in text  # the app names no command
+
+
+def test_the_question_shows_your_own_usage_before_it_asks() -> None:
+    fake = FakeSharing()
+
+    async def run() -> tuple[str, int, int, int]:
+        class Page(App[None]):
+            def compose(self) -> ComposeResult:
+                yield Static("page")
+
+        app = Page()
+        async with app.run_test(size=(100, 40)):
+            await app.push_screen(ConsentDialog(fake.seam()))
+            await settle_page(app)
+            screen = app.screen
+            usage = screen.query_one("#consent-usage", Static)
+            return (
+                _text(usage),
+                usage.region.y,
+                screen.query_one("#consent-text", Static).region.y,
+                screen.query_one("#consent-share", Button).region.y,
+            )
+
+    usage, usage_y, question_y, share_y = asyncio.run(run())
+
+    assert usage == USAGE_LINE
+    assert usage_y < question_y < share_y  # above the question, which is above its answer
+
+
+@pytest.mark.parametrize("size", [(80, 24), (130, 50)])
+def test_the_question_keeps_its_answers_on_screen_and_its_text_scrolls(
+    size: tuple[int, int],
+) -> None:
+    """At 80x24 the question is taller than the screen: its text scrolls, and the three
+    answers stay inside the box (before 0.10.2 they were cut off below it)."""
+    fake = FakeSharing()
+
+    async def run() -> tuple[bool, bool]:
+        class Page(App[None]):
+            def compose(self) -> ComposeResult:
+                yield Static("page")
+
+        app = Page()
+        async with app.run_test(size=size):
+            await app.push_screen(ConsentDialog(fake.seam()))
+            await settle_page(app)
+            screen = app.screen
+            box = screen.query_one("#consent-box").region
+            inside = all(
+                box.contains_region(screen.query_one(f"#{name}", Button).region)
+                for name in ("consent-see", "consent-share", "consent-no")
+            )
+            scroll = screen.query_one("#consent-scroll")
+            return inside, scroll.virtual_size.height > scroll.region.height
+
+    inside, scrolls = asyncio.run(run())
+
+    assert inside
+    assert scrolls is (size == (80, 24))
+
+
+def test_your_usage_is_the_last_30_days_in_one_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aisquare.cli.ui.views.usage_sharing import your_usage
+    from aisquare.models import UsageRepos, UsageStats, UsageTokens
+    from aisquare.services import usage_stats
+
+    asked: list[str] = []
+
+    def stats(range_: str) -> UsageStats:
+        asked.append(range_)
+        return UsageStats(
+            range="30d",
+            until="2026-11-25",
+            turns=900,
+            sessions=48,
+            active_days=14,
+            tokens=UsageTokens(input=200_000, output=1_000_000),
+            repos=UsageRepos(active=1),
+        )
+
+    monkeypatch.setattr(usage_stats, "stats", stats)
+    line = your_usage()
+    monkeypatch.setattr(
+        usage_stats, "stats", lambda range_: UsageStats(range="30d", until="2026-11-25")
+    )
+    empty = your_usage()
+
+    assert asked == ["30d"]
+    assert line == (
+        "Your usage here, the last 30 days: 1.2M tokens in 48 sessions across 1 repository, "
+        "on 14 days. It stays on this machine unless you share it."
+    )
+    assert empty == "Your usage here, the last 30 days: nothing recorded yet."
 
 
 def test_the_preview_is_built_off_the_ui_thread_and_a_failure_is_said() -> None:

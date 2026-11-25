@@ -188,18 +188,18 @@ class StopAgentScreen(ConfirmActionScreen[FleetAgent | None]):
             text.append(self.label, style="bold")
             text.append(" for good?\n")
             text.append(
-                "It is paused, with no process. Stop ends the pause: the claims it kept go "
-                "back to the board, and a resume leaves it.",
+                "It is paused and not running. Stop ends the pause for good: the tasks it "
+                "kept go back to the board, and a resume no longer brings it back.",
                 style="dim",
             )
             return text
         if not self.has_process():
             text.append("Remove ")
             text.append(self.label, style="bold")
-            text.append("'s dead window?\n")
+            text.append(" from the list?\n")
             text.append(
-                "The agent has exited; tmux kept its window for the last screen. "
-                "Stop removes it and the row leaves the listing.",
+                "The agent has exited; its last screen was kept so you could read it. "
+                "Stop removes it from the list.",
                 style="dim",
             )
             return text
@@ -208,9 +208,10 @@ class StopAgentScreen(ConfirmActionScreen[FleetAgent | None]):
         text.append("?\n")
         command = self.exit_command()
         text.append(
-            f"{command}, then the window is killed after {grace_seconds():g} s. ", style="dim"
+            f"It is asked to quit (rlx types {command}) and closed {grace_seconds():g} s later. ",
+            style="dim",
         )
-        text.append(f"Force skips the {command}.", style="dim")
+        text.append("Force closes it at once.", style="dim")
         if self.is_manager():
             text.append(
                 "\nThis is the project's manager; the agents it started keep running.",
