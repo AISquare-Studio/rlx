@@ -1620,6 +1620,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         for remembered in (_ui_state(LAST_PROJECT_KEY), selected_project(_ui_state(SELECTED_KEY))):
             if remembered and snapshot.project(remembered) is not None:
                 return remembered
+        # The first card as the sidebar lists it (its groups, pins and order), not the store's.
+        for card in self.sidebar.query(ProjectCard):
+            if snapshot.project(card.project.id) is not None:
+                return card.project.id
         return snapshot.projects[0].id
 
     async def go_home(self) -> None:

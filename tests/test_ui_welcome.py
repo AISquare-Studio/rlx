@@ -1321,13 +1321,20 @@ def in_shell(
     *,
     doctor: Callable[[], list[DoctorCheck]] = lambda: [],
 ) -> T:
-    """Run ``fn`` against the real shell, its Welcome page scripted by ``machine``."""
+    """Run ``fn`` against the real shell, its Welcome page scripted by ``machine`` and on screen.
+
+    With a project listed, start opens home since L1, the last-used project's Manager tab
+    (tests/test_manager_tab_is_home.py), and ``w`` brings Welcome back, as it does here; with
+    none, Welcome is what start shows."""
 
     async def run() -> T:
         app = FleetApp(refresh_seconds=3600, doctor=doctor, accounts=None)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.pause()
             await settle_page(app)
+            if app.content.current != "welcome":
+                await app.action_welcome()  # `w`
+                await settle_page(app)
             return await fn(pilot, app, app.query_one("#welcome", WelcomeView))
 
     return asyncio.run(run())
@@ -1676,7 +1683,7 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
     tmp_path: Path,
 ) -> None:
     """Step 2 answers for the project step 1 chose, and the Doctor answered for the folder
-    asq started in. With a project-scope plugin in one and not the other, the Doctor warned
+    asq started in (since L1, the one run at start is about home's project). With a project-scope plugin in one and not the other, the Doctor warned
     "hooks are missing" under a step 2 that said connected, and its Connect would have
     installed them for every repository (review of #257). While Welcome is shown the
     Doctor's scope is its project; once Choose another clears it, the folder asq started
@@ -1722,12 +1729,14 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
     start, chosen, elsewhere, back, cleared, opened = in_shell(
         machine, go, doctor=diagnostics.doctor
     )
-    assert start == (None, [None]), "control: nothing chosen, the folder asq started in"
-    assert chosen == (alpha.id, [None]), "the scope follows step 1; the checks do not run"
-    assert elsewhere == (beta.id, [None]), "another page's project, as before"
-    assert back == (alpha.id, [None]), "back on Welcome, the project step 2 is about"
-    assert cleared == (None, [None])
-    assert opened == (alpha.id, [None, alpha.root]), "the page runs them, for that project"
+    # The one run at start-up was about home's project, alpha (start opens home since L1);
+    # back on Welcome with nothing chosen, the scope is the folder asq started in.
+    assert start == (None, [alpha.root]), "control: nothing chosen on Welcome"
+    assert chosen == (alpha.id, [alpha.root]), "the scope follows step 1; the checks do not run"
+    assert elsewhere == (beta.id, [alpha.root]), "another page's project, as before"
+    assert back == (alpha.id, [alpha.root]), "back on Welcome, the project step 2 is about"
+    assert cleared == (None, [alpha.root])
+    assert opened == (alpha.id, [alpha.root, alpha.root]), "the page runs them, for that project"
 
 
 def test_back_on_welcome_in_the_same_frame_the_doctor_still_takes_its_project(
@@ -1781,9 +1790,10 @@ def test_step_one_reads_the_shells_frame_not_a_second_store_open(
         return None
 
     in_shell(machine, go)
-    assert [[p.id for p in frame] if frame is not None else None for frame in machine.frames] == [
-        ["prj_seeded"]
-    ]
+    # Welcome reads its machine each time it is shown, and it is shown once start has gone home
+    # (L1) and `w` brought it back: every read is the shell's frame, never a store of its own.
+    frames = [[p.id for p in frame] if frame is not None else None for frame in machine.frames]
+    assert frames and all(frame == ["prj_seeded"] for frame in frames), frames
 
 
 def test_a_shell_whose_store_will_not_open_still_shows_the_page(
