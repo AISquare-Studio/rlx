@@ -108,7 +108,10 @@ def project_needs(
 
 def read_needs(projects: Sequence[ProjectInfo]) -> list[Need]:
     """Every listed project's needs, the most pressing kind first, in the sidebar's order within
-    a kind. A board that cannot be read now is left out until the next read."""
+    a kind. A board that cannot be read now is left out until the next read.
+
+    The one function the bar reads through (the manager's #1074): a durable "pending on you"
+    list (0.10.3) points it at its store, and the bar is unchanged."""
     needs: list[Need] = []
     for project in projects:
         try:

@@ -97,12 +97,14 @@ def drive(size: tuple[int, int], fn: Callable[[Any, Any], Awaitable[T]]) -> T:
     return asyncio.run(run())
 
 
-async def _until(pilot: Any, holds: Callable[[], bool]) -> None:
-    """Pause until ``holds()`` (the bar lands on a project's view once it is built), bounded."""
-    for _ in range(100):
+async def _until(pilot: Any, holds: Callable[[], bool], *, what: str = "the view") -> None:
+    """Pause until ``holds()`` (the bar lands on a project's view once it is built), bounded,
+    and fail at the bound: a poll that runs out and returns read a stale screen (#797)."""
+    for _ in range(500):  # 10 s at most
         if holds():
             return
         await pilot.pause(0.02)
+    pytest.fail(f"never came: {what}")
 
 
 def _alphas_board(app: Any, alpha: ProjectInfo) -> BoardPanel | None:
@@ -208,3 +210,69 @@ def test_a_limited_agent_whose_hand_over_failed_needs_you(projects: dict[str, An
     assert [(need.kind, need.target) for need in needs] == [(needs_you_bar.HANDOVER, "coder-auth")]
     moved_on = _event(alpha, 2, coder.id, "switched", "moved to account 2")
     assert needs_you_bar.project_needs(alpha, [coder], [], [failed, moved_on], seq=2) == []
+
+
+def _a_question_in_alpha(projects: dict[str, Any]) -> None:
+    alpha = projects["alpha"]
+    manager = _session(alpha, "ses_alpha_manager", "manager", "manager")
+    projects["frames"][alpha.id] = (
+        [manager],
+        [],
+        [_event(alpha, 1, manager.id, "question", "staging or prod first?")],
+    )
+
+
+def _alphas_board_shown(app: Any, alpha: ProjectInfo) -> bool:
+    views = app.query(f"#project-{alpha.id}")
+    if not views:
+        return False
+    view = app.query_one(f"#project-{alpha.id}", TabbedContent)
+    return bool(view.active == "tab-board" and view.query_one(BoardPanel).is_on_screen)
+
+
+def test_a_click_on_the_bar_opens_its_first_item_as_the_key_does(
+    projects: dict[str, Any],
+) -> None:
+    alpha, beta = projects["alpha"], projects["beta"]
+    _a_question_in_alpha(projects)
+
+    async def go(pilot: Any, app: Any) -> list[tuple[str, str]]:
+        await _on_betas_settings(pilot, app, beta)
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        await pilot.click("#needs-you-bar")
+        await _until(pilot, lambda: _alphas_board_shown(app, alpha), what="alpha's board")
+        return list(app.query_one(f"#project-{alpha.id}").query_one(BoardPanel).lane)
+
+    assert ("question", "manager") in drive((120, 40), go)
+
+
+def test_at_60_columns_the_bar_shows_and_its_key_opens_the_board_in_the_one_pane(
+    projects: dict[str, Any],
+) -> None:
+    """L2 landed: below 70 columns one pane shows at a time. The bar is over it, whole width,
+    one line, and its key brings the project's board up as the one pane."""
+    alpha, beta = projects["alpha"], projects["beta"]
+    _a_question_in_alpha(projects)
+
+    async def go(pilot: Any, app: Any) -> dict[str, Any]:
+        await _on_betas_settings(pilot, app, beta)
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        seen: dict[str, Any] = {
+            "region": (bar.region.x, bar.region.y, bar.region.width, bar.region.height),
+            "line": bar.line().plain,
+            "one pane": app.screen.size.width < 70,
+        }
+        await pilot.press(needs_you_bar.OPEN_KEY)
+        await _until(pilot, lambda: _alphas_board_shown(app, alpha), what="alpha's board")
+        seen["sidebar shown"] = app.query_one("#sidebar").is_on_screen
+        return seen
+
+    seen = drive((60, 24), go)
+    assert seen["one pane"], "the premise: L2's one-pane width"
+    assert seen["region"] == (0, 0, 60, 1), "the top line, the whole width, one row"
+    assert seen["line"].startswith("needs you: 1"), seen["line"]
+    assert not seen["sidebar shown"], "the board is the one pane shown"
