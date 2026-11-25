@@ -1,16 +1,19 @@
 name: rlxd
 
 # The rlxd Cargo workspace (rlxd/), on the three OSes it ships for (handoff 0.10.3,
-# 1.1). ci.yml runs the Python suite; this runs the Rust one. A sub-PR gets it only
-# when it touches rlxd/ or this file; every push to an rc/** branch runs it whatever
-# changed, as does a run by hand (`gh workflow run rlxd.yml --ref <branch>`).
+# 1.1). ci.yml runs the Python suite; this runs the Rust one. A PR gets it when it
+# touches rlxd/ (Cargo.lock included), this file, or pyproject.toml, whose version
+# rlxd/crates/rlxd/tests/version.rs holds rlxd's to. Every push to main or an
+# rc/** branch runs it whatever changed, as does a run by hand
+# (`gh workflow run rlxd.yml --ref <branch>`).
 on:
   pull_request:
     paths:
       - "rlxd/**"
       - ".github/workflows/rlxd.yml"
+      - "pyproject.toml"
   push:
-    branches: ["rc/**"]
+    branches: [main, "rc/**"]
   workflow_dispatch:
 
 # Cancel superseded runs on the same branch/PR, grouped by event as ci.yml's are, so a
@@ -72,8 +75,9 @@ jobs:
       - name: cargo build --release
         run: cargo build --workspace --release --locked
 
+      # --release reuses the build above rather than building gen-schemas again.
       - name: schemas/v1 matches rlxd-proto
-        run: cargo run --locked -p rlxd-proto --bin gen-schemas -- --check
+        run: cargo run --release --locked -p rlxd-proto --bin gen-schemas -- --check
 
   # Licences and RustSec advisories, once: the dependency graph is the same on every
   # OS, since cargo-deny reads every target's dependencies wherever it runs.

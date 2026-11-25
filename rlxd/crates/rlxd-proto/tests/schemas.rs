@@ -1,24 +1,29 @@
 //! The checked-in schemas (`rlxd/schemas/v1/`): up to date with the types, valid draft
-//! 2020-12 schemas, and in agreement with the types on the contract's examples (handoff
-//! 0.10.3, 7.2 and 7.3, with the handshake and per-run sequence of rlxapp's Engine
-//! change spec) and on what each must refuse.
+//! 2020-12 schemas, and in agreement with the types (handoff 0.10.3 rev 5, 7.2, 7.3 and
+//! 4.1). Every document either both accept or both refuse, and every builder prints
+//! what its schema accepts.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
-    DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Request, Role, RunScope, SCHEMA_VERSION, codes, daemon_kinds, schemas,
-    topics,
+    DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, Invalid,
+    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Request, RequestId, Role, RunScope, SCHEMA_VERSION, codes,
+    daemon_kinds, schema_version_of, schemas, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+const TIME: &str = "2026-11-25T12:00:00.000Z";
+
+fn crate_dir() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
 fn schemas_dir() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace = crate_dir.parent().and_then(Path::parent).unwrap();
+    let workspace = crate_dir().parent().and_then(Path::parent).unwrap();
     workspace.join("schemas").join("v1")
 }
 
@@ -36,11 +41,7 @@ fn validator(schema: &str) -> jsonschema::Validator {
 }
 
 fn example(name: &str) -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("examples")
-        .join(name);
-    read_json(&path)
+    read_json(&crate_dir().join("tests").join("examples").join(name))
 }
 
 fn assert_valid(schema: &str, instance: &Value) {
@@ -67,24 +68,24 @@ where
     printed
 }
 
-/// Both the schema and the type refuse `instance`.
-fn both_refuse<T: DeserializeOwned + std::fmt::Debug>(schema: &str, instance: Value) {
+/// Both the schema and the type refuse `instance`. Returns the type's error.
+fn both_refuse<T: DeserializeOwned + std::fmt::Debug>(schema: &str, instance: Value) -> String {
     assert!(
         !validator(schema).is_valid(&instance),
         "{schema} accepts {instance}"
     );
-    if let Ok(parsed) = serde_json::from_value::<T>(instance.clone()) {
-        panic!("{instance} parses as {schema}'s type: {parsed:?}");
+    match serde_json::from_value::<T>(instance.clone()) {
+        Ok(parsed) => panic!("{instance} parses as {schema}'s type: {parsed:?}"),
+        Err(error) => error.to_string(),
     }
 }
 
-/// The schema refuses `instance`. The type may parse it, so a client can read a newer
-/// or a malformed document and say what is wrong with it.
-fn schema_refuses(schema: &str, instance: Value) {
-    assert!(
-        !validator(schema).is_valid(&instance),
-        "{schema} accepts {instance}"
-    );
+/// The field a builder's refusal names.
+fn refused<T>(result: Result<T, Invalid>) -> String {
+    match result {
+        Ok(_) => panic!("the builder accepted it"),
+        Err(error) => error.field().to_owned(),
+    }
 }
 
 fn data(value: Value) -> Data {
@@ -108,6 +109,17 @@ fn with(base: &Value, field: &str, value: Value) -> Value {
     instance
 }
 
+/// `base` with `error.<field>` set to `value`.
+fn with_error(base: &Value, field: &str, value: Value) -> Value {
+    let mut instance = base.clone();
+    instance["error"][field] = value;
+    instance
+}
+
+fn error_base() -> Value {
+    json!({"schema_version": 1, "ok": false, "error": {"code": "c", "message": "m"}})
+}
+
 fn hello_base() -> Value {
     json!({"token": "t", "protocol_version": 1, "client": "rlxapp", "client_version": "0.1.0",
         "role": "app", "capabilities": []})
@@ -118,9 +130,11 @@ fn reply_base() -> Value {
         "capabilities": []})
 }
 
-fn run_event_base() -> Value {
-    example("event.json")
+fn id(n: u32) -> RequestId {
+    RequestId::from(n)
 }
+
+// --- the schemas themselves ---------------------------------------------------------------
 
 #[test]
 fn the_checked_in_schemas_are_the_generated_ones() {
@@ -162,6 +176,27 @@ fn every_schema_is_a_valid_draft_2020_12_schema() {
 }
 
 #[test]
+fn every_schema_comes_from_the_fields_real_types() {
+    // A `#[schemars(with = …)]` override hides a change to its field's Rust type from
+    // gen-schemas --check, so there are none: optional fields drop `null` with a
+    // transform on the schema derived from their own type instead.
+    let src = crate_dir().join("src");
+    for entry in fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains(&["schemars(", "with"].concat()),
+                "{} overrides a field's schema",
+                path.display()
+            );
+        }
+    }
+}
+
+// --- the contract's examples ----------------------------------------------------------------
+
+#[test]
 fn the_contracts_envelopes_validate_and_print_back_as_themselves() {
     for name in [
         "envelope-ok.json",
@@ -187,11 +222,8 @@ fn the_contracts_events_validate_and_print_back_as_themselves() {
 fn a_list_of_events_validates_as_event_list() {
     // 7.3's checks validate `jq -s .` of `rlxd events`' lines against event-list.json.
     let event = example("event.json");
-    let later = with(&with(&event, "seq", json!(43)), "data", {
-        let mut data = event["data"].clone();
-        data["run_seq"] = json!(4);
-        data
-    });
+    let mut later = with(&event, "seq", json!(43));
+    later["data"]["run_seq"] = json!(4);
     let list = json!([example("event-daemon.json"), event.clone(), later]);
     assert_eq!(agrees::<Vec<Event>>("event-list.json", &list), list);
     assert_valid("event-list.json", &json!([]));
@@ -200,7 +232,7 @@ fn a_list_of_events_validates_as_event_list() {
     both_refuse::<Vec<Event>>("event-list.json", json!([event.clone(), unseq]));
     both_refuse::<Vec<Event>>("event-list.json", event.clone());
     let unscoped = with(&event, "data", json!({}));
-    schema_refuses("event-list.json", json!([event, unscoped]));
+    both_refuse::<Vec<Event>>("event-list.json", json!([event, unscoped]));
 }
 
 #[test]
@@ -219,237 +251,470 @@ fn the_handshake_validates_and_prints_back_as_itself() {
     assert_eq!(agrees::<HelloParams>("hello.json", &hello), hello);
     let reply = example("hello-reply.json");
     assert_eq!(agrees::<HelloData>("hello-reply.json", &reply), reply);
-
-    let without_env = with(&hello_base(), "role", json!("cli"));
-    assert_eq!(
-        agrees::<HelloParams>("hello.json", &without_env),
-        without_env
-    );
-
-    for (role, name) in [
-        (Role::App, "app"),
-        (Role::Tui, "tui"),
-        (Role::Remote, "remote"),
-        (Role::Cli, "cli"),
-    ] {
-        let printed = serde_json::to_value(HelloParams::new("t", "c", "1", role)).unwrap();
-        assert_eq!(printed["role"], name);
-        assert_eq!(printed["protocol_version"], PROTOCOL_VERSION);
-        assert_eq!(agrees::<HelloParams>("hello.json", &printed), printed);
-    }
+    let cli = with(&hello_base(), "role", json!("cli"));
+    assert_eq!(agrees::<HelloParams>("hello.json", &cli), cli);
 }
 
 #[test]
-fn the_builders_print_the_documented_shapes() {
-    let ok = Envelope::ok(Data::new());
+fn a_daemon_record_reads_as_python_writes_it() {
+    // core/daemons.py always writes `cwd`, a string or null, and `+00:00` offsets.
+    let record = example("daemon-record.json");
     assert_eq!(
-        serde_json::to_value(&ok).unwrap(),
-        example("envelope-ok.json")
-    );
-    assert!(ok.is_ok());
-
-    let error = ErrorBody::new("not_a_tty", "…")
-        .with_hint("…")
-        .with_detail("…");
-    let refused = Envelope::err(error.clone());
-    assert_eq!(
-        serde_json::to_value(&refused).unwrap(),
-        example("envelope-error.json")
-    );
-    assert!(!refused.is_ok());
-    assert_eq!(refused.into_result(), Err(error));
-
-    let answer = Envelope::ok(data(json!({"run_id": "run_1"}))).with_id(7);
-    assert_eq!(
-        serde_json::to_value(&answer).unwrap(),
-        example("envelope-socket.json")
-    );
-    assert_eq!(
-        Envelope::from(answer.into_result()).with_id(7),
-        serde_json::from_value(example("envelope-socket.json")).unwrap()
+        agrees::<DaemonRecord>("daemon-record.json", &record),
+        record
     );
 
-    let unauthorized = Envelope::err(ErrorBody::new(
-        codes::UNAUTHORIZED,
-        "the first frame must be hello",
-    ))
-    .with_id(1);
-    assert_eq!(
-        serde_json::to_value(&unauthorized).unwrap(),
-        example("envelope-unauthorized.json")
-    );
+    // A null cwd reads as absent, and `Z` as an offset.
+    let no_cwd = example("daemon-record-no-cwd.json");
+    let printed = agrees::<DaemonRecord>("daemon-record.json", &no_cwd);
+    assert_eq!(printed, without(&no_cwd, "cwd"));
 
-    let incompatible = Envelope::err(ErrorBody::incompatible_protocol(99)).with_id(1);
-    assert_eq!(
-        serde_json::to_value(&incompatible).unwrap(),
-        example("envelope-incompatible-protocol.json")
-    );
-
-    let event = Event::for_run(
-        42,
-        "2026-11-25T12:00:00.000Z",
-        "run.text",
-        RunScope::new("…", 3),
-        data(json!({"kind": "task"})),
-    );
-    assert_eq!(event.schema_version, SCHEMA_VERSION);
-    assert_eq!(event.topic, topics::RUN);
-    assert_eq!(serde_json::to_value(&event).unwrap(), example("event.json"));
-    assert_eq!(event.run_scope(), Some(RunScope::new("…", 3)));
-
-    let daemon = Event::new(
-        41,
-        "2026-11-25T12:00:00.000Z",
-        topics::DAEMON,
-        "daemon.started",
-        data(json!({"version": "0.10.1", "pid": 4242})),
-    );
-    assert_eq!(
-        serde_json::to_value(&daemon).unwrap(),
-        example("event-daemon.json")
-    );
-    assert_eq!(daemon.run_scope(), None);
-
-    let request = Request::new(7, "run.start", Data::new());
-    assert_eq!(
-        serde_json::to_value(&request).unwrap(),
-        example("request.json")
-    );
-
-    let env = BTreeMap::from([("CLAUDE_CONFIG_DIR".to_owned(), "cc-test".to_owned())]);
-    let hello = HelloParams::new("0123abcd", "rlxapp", "0.1.0", Role::App).with_env(env);
-    assert_eq!(serde_json::to_value(&hello).unwrap(), example("hello.json"));
-    let able = HelloParams::new("t", "rlxapp", "0.1.0", Role::App)
-        .with_capabilities(vec!["tool_gate".to_owned()]);
-    assert_eq!(
-        serde_json::to_value(&able).unwrap(),
-        with(&hello_base(), "capabilities", json!(["tool_gate"]))
-    );
-
-    let reply = HelloData::new(PROTOCOL_VERSION, "0.10.1", Vec::new());
-    assert_eq!(reply.protocol_versions, PROTOCOL_VERSIONS);
-    assert_eq!(
-        serde_json::to_value(&reply).unwrap(),
-        example("hello-reply.json")
-    );
+    // A later release's kind or field is kept, not refused (4.1).
+    agrees::<DaemonRecord>("daemon-record.json", &with(&record, "kind", json!("later")));
+    agrees::<DaemonRecord>("daemon-record.json", &with(&record, "later", json!(1)));
+    for kind in daemon_kinds::ALL {
+        agrees::<DaemonRecord>("daemon-record.json", &with(&record, "kind", json!(kind)));
+    }
 }
 
 #[test]
 fn what_a_client_does_not_know_is_ignored_not_refused() {
     // New fields keep the schema version (7.2), so neither side may refuse one.
-    let envelope = json!({"schema_version": 1, "ok": true, "data": {}, "later": 1});
-    agrees::<Envelope>("envelope.json", &envelope);
-    let error = json!({"schema_version": 1, "ok": false,
-        "error": {"code": "c", "message": "m", "later": 1}});
-    agrees::<Envelope>("envelope.json", &error);
-    let event = json!({"schema_version": 1, "seq": 1, "time": "2026-11-25T12:00:00.000Z",
-        "topic": "later", "type": "later.thing", "data": {}, "later": 1});
-    agrees::<Event>("event.json", &event);
-    agrees::<Event>("event.json", &with(&run_event_base(), "later", json!(1)));
-    let request = json!({"id": 1, "method": "status", "params": {}, "later": 1});
-    agrees::<Request>("request.json", &request);
-    agrees::<HelloParams>("hello.json", &with(&hello_base(), "later", json!(1)));
-    agrees::<HelloData>("hello-reply.json", &with(&reply_base(), "later", json!(1)));
+    let later = |base: Value| with(&base, "later", json!(1));
+    agrees::<Envelope>("envelope.json", &later(example("envelope-ok.json")));
+    agrees::<Envelope>(
+        "envelope.json",
+        &with_error(&error_base(), "later", json!(1)),
+    );
+    agrees::<Event>("event.json", &later(example("event.json")));
+    let other_topic = json!({"schema_version": 1, "seq": 1, "time": TIME, "topic": "later",
+        "type": "later.thing", "data": {}});
+    agrees::<Event>("event.json", &other_topic);
+    agrees::<Request>("request.json", &later(example("request.json")));
+    agrees::<HelloParams>("hello.json", &later(hello_base()));
+    agrees::<HelloData>("hello-reply.json", &later(reply_base()));
+}
+
+// --- the builders ---------------------------------------------------------------------------
+
+#[test]
+fn every_builder_prints_what_its_schema_accepts() {
+    let error = ErrorBody::new("not_a_tty", "…")
+        .unwrap()
+        .with_hint("…")
+        .with_detail("…")
+        .unwrap();
+    let denied = ErrorBody::new("denied", "the gate denied it")
+        .unwrap()
+        .with_detail(data(json!({"by": "unreachable"})))
+        .unwrap();
+    let unauthorized =
+        ErrorBody::new(codes::UNAUTHORIZED, "the first frame must be hello").unwrap();
+    let not_gate = ErrorBody::new(codes::NOT_GATE, "this connection is not the gate").unwrap();
+    let largest = RequestId::new(RequestId::MAX).unwrap();
+
+    let envelopes = [
+        (Envelope::ok(Data::new()), Some("envelope-ok.json")),
+        (Envelope::err(error), Some("envelope-error.json")),
+        (
+            Envelope::ok(data(json!({"run_id": "run_1"}))).with_id(id(7)),
+            Some("envelope-socket.json"),
+        ),
+        (
+            Envelope::err(unauthorized).with_id(id(1)),
+            Some("envelope-unauthorized.json"),
+        ),
+        (
+            Envelope::err(ErrorBody::incompatible_protocol(99)).with_id(id(1)),
+            Some("envelope-incompatible-protocol.json"),
+        ),
+        (Envelope::err(denied), None),
+        (Envelope::err(not_gate).with_id(id(2)), None),
+        (Envelope::ok(Data::new()).with_id(largest), None),
+    ];
+    for (envelope, shape) in envelopes {
+        let printed = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(agrees::<Envelope>("envelope.json", &printed), printed);
+        if let Some(shape) = shape {
+            assert_eq!(printed, example(shape), "{shape}");
+        }
+    }
+
+    let run_text = Event::for_run(
+        42,
+        TIME,
+        "run.text",
+        RunScope::new("…", 3),
+        data(json!({"kind": "task"})),
+    );
+    let started = Event::new(
+        41,
+        TIME,
+        topics::DAEMON,
+        "daemon.started",
+        data(json!({"version": "0.10.1", "pid": 4242})),
+    );
+    let offset = Event::new(
+        1,
+        "2026-11-25T12:00:00+05:30",
+        "later",
+        "later.thing",
+        Data::new(),
+    );
+    for (event, shape) in [
+        (run_text, Some("event.json")),
+        (started, Some("event-daemon.json")),
+        (offset, None),
+    ] {
+        let event = event.unwrap();
+        assert_eq!(event.schema_version.get(), SCHEMA_VERSION);
+        let printed = serde_json::to_value(&event).unwrap();
+        assert_eq!(agrees::<Event>("event.json", &printed), printed);
+        if let Some(shape) = shape {
+            assert_eq!(printed, example(shape), "{shape}");
+        }
+    }
+
+    let request = Request::new(id(7), "run.start", Data::new()).unwrap();
+    let printed = serde_json::to_value(&request).unwrap();
+    assert_eq!(printed, example("request.json"));
+    agrees::<Request>("request.json", &printed);
+
+    let env = BTreeMap::from([("CLAUDE_CONFIG_DIR".to_owned(), "cc-test".to_owned())]);
+    let app = HelloParams::new("0123abcd", "rlxapp", "0.1.0", Role::App)
+        .unwrap()
+        .with_gate_credential("gc-secret")
+        .unwrap()
+        .with_env(env);
+    let able = HelloParams::new("t", "rlxapp", "0.1.0", Role::App)
+        .unwrap()
+        .with_capabilities(vec!["tool_gate".to_owned()]);
+    let hellos = [
+        (app, Some("hello.json")),
+        (able, None),
+        (
+            HelloParams::new("t", "rlx-tui", "0.10.1", Role::Tui).unwrap(),
+            None,
+        ),
+        (
+            HelloParams::new("t", "remote", "0.10.1", Role::Remote).unwrap(),
+            None,
+        ),
+        (
+            HelloParams::new("t", "rlxd-hook", "0.10.1", Role::Cli).unwrap(),
+            None,
+        ),
+    ];
+    for (hello, shape) in hellos {
+        assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
+        let printed = serde_json::to_value(&hello).unwrap();
+        assert_eq!(agrees::<HelloParams>("hello.json", &printed), printed);
+        if let Some(shape) = shape {
+            assert_eq!(printed, example(shape), "{shape}");
+        }
+    }
+
+    let reply = HelloData::new(PROTOCOL_VERSION, "0.10.1", Vec::new()).unwrap();
+    assert_eq!(reply.protocol_versions, PROTOCOL_VERSIONS);
+    let printed = serde_json::to_value(&reply).unwrap();
+    assert_eq!(printed, example("hello-reply.json"));
+    agrees::<HelloData>("hello-reply.json", &printed);
+
+    let record = DaemonRecord::new(
+        "0123456789ab",
+        daemon_kinds::WATCH,
+        4242,
+        "mac.local",
+        "0.10.1",
+        "2026-11-25T18:00:00.123456+00:00",
+        "2026-11-25T18:00:05.123456+00:00",
+        vec!["rlx".to_owned(), "watch".to_owned()],
+        true,
+    )
+    .unwrap();
+    let printed = serde_json::to_value(&record).unwrap();
+    agrees::<DaemonRecord>("daemon-record.json", &printed);
+    let printed = serde_json::to_value(record.with_cwd("/Users/me/project")).unwrap();
+    assert_eq!(printed, example("daemon-record.json"));
 }
 
 #[test]
-fn an_envelope_is_ok_with_data_or_not_ok_with_an_error_and_nothing_else() {
-    for instance in [
-        json!({"schema_version": 1, "ok": true}),
-        json!({"schema_version": 1, "ok": false}),
-        json!({"schema_version": 1, "ok": true, "error": {"code": "c", "message": "m"}}),
-        json!({"schema_version": 1, "ok": false, "data": {}}),
-        json!({"schema_version": 1, "ok": "true", "data": {}}),
-        json!({"schema_version": 1, "data": {}}),
-        json!({"ok": true, "data": {}}),
-        json!({"schema_version": "1", "ok": true, "data": {}}),
-        json!({"schema_version": 1, "ok": true, "data": []}),
-        json!({"schema_version": 1, "ok": true, "data": null}),
-        json!({"schema_version": 1, "ok": false, "error": {"code": "c"}}),
-        json!({"schema_version": 1, "ok": false, "error": {"message": "m"}}),
-        json!({"schema_version": 1, "ok": false, "error": "not_a_tty"}),
-        json!({"schema_version": 1, "id": "7", "ok": true, "data": {}}),
-        json!({"schema_version": 1, "id": -1, "ok": true, "data": {}}),
-    ] {
-        both_refuse::<Envelope>("envelope.json", instance);
+fn the_builders_refuse_what_the_schemas_refuse() {
+    assert_eq!(refused(ErrorBody::new("", "m")), "code");
+    assert_eq!(refused(ErrorBody::new("c", "")), "message");
+    assert_eq!(
+        refused(ErrorBody::new(codes::INCOMPATIBLE_PROTOCOL, "m")),
+        "detail.supported"
+    );
+    assert_eq!(
+        refused(ErrorBody::incompatible_protocol(9).with_detail("text")),
+        "detail.supported"
+    );
+
+    let none = Data::new;
+    assert_eq!(refused(Event::new(0, TIME, "d", "d.x", none())), "seq");
+    assert_eq!(
+        refused(Event::new(1, "yesterday", "d", "d.x", none())),
+        "time"
+    );
+    let feb_30 = "2026-02-30T00:00:00Z";
+    assert_eq!(refused(Event::new(1, feb_30, "d", "d.x", none())), "time");
+    assert_eq!(refused(Event::new(1, TIME, "", "d.x", none())), "topic");
+    assert_eq!(refused(Event::new(1, TIME, "d", "", none())), "type");
+    let run = topics::RUN;
+    assert_eq!(
+        refused(Event::new(1, TIME, run, "run.text", none())),
+        "data.run_id"
+    );
+    let no_id = RunScope::new("", 1);
+    assert_eq!(
+        refused(Event::for_run(1, TIME, "run.text", no_id, none())),
+        "data.run_id"
+    );
+    let no_seq = RunScope::new("r", 0);
+    assert_eq!(
+        refused(Event::for_run(1, TIME, "run.text", no_seq, none())),
+        "data.run_seq"
+    );
+
+    assert_eq!(refused(Request::new(id(1), "", none())), "method");
+    assert_eq!(refused(HelloParams::new("", "c", "1", Role::Cli)), "token");
+    assert_eq!(refused(HelloParams::new("t", "", "1", Role::Cli)), "client");
+    let app = HelloParams::new("t", "rlxapp", "1", Role::App).unwrap();
+    assert_eq!(refused(app.with_gate_credential("")), "gate_credential");
+    assert_eq!(
+        refused(HelloData::new(0, "0.10.1", Vec::new())),
+        "protocol_version"
+    );
+    assert_eq!(refused(HelloData::new(1, "", Vec::new())), "rlxd_version");
+
+    let record = |id: &str, pid: u32, argv: Vec<String>| {
+        DaemonRecord::new(id, "watch", pid, "h", "v", TIME, TIME, argv, false)
+    };
+    let argv = || vec!["rlx".to_owned()];
+    assert_eq!(refused(record("0123456789AB", 1, argv())), "id");
+    assert_eq!(refused(record("0123456789ab", 0, argv())), "pid");
+    assert_eq!(refused(record("0123456789ab", 1, Vec::new())), "argv");
+
+    assert_eq!(RequestId::new(RequestId::MAX + 1), None);
+    assert_eq!(refused(RequestId::try_from(RequestId::MAX + 1)), "id");
+}
+
+#[test]
+fn a_value_broken_after_it_was_built_does_not_print() {
+    let mut error = ErrorBody::new("c", "m").unwrap();
+    error.code.clear();
+    assert!(serde_json::to_value(Envelope::err(error)).is_err());
+
+    let scope = RunScope::new("r", 1);
+    let mut event = Event::for_run(1, TIME, "run.text", scope, Data::new()).unwrap();
+    event.data.remove("run_seq");
+    assert!(serde_json::to_value(&event).is_err());
+
+    let mut hello = HelloParams::new("t", "c", "1", Role::Cli).unwrap();
+    hello.token.clear();
+    assert!(serde_json::to_value(&hello).is_err());
+}
+
+// --- what both refuse -----------------------------------------------------------------------
+
+#[test]
+fn another_schema_version_fails_to_parse_rather_than_misparse() {
+    // 7.2: a new version renames or removes fields. A v1 reader must not read one.
+    for version in [json!(0), json!(2), json!(99), json!("1"), json!(null)] {
+        let envelope = with(
+            &example("envelope-ok.json"),
+            "schema_version",
+            version.clone(),
+        );
+        let error = both_refuse::<Envelope>("envelope.json", envelope);
+        if version.is_u64() {
+            assert!(error.contains("schema_version"), "{error}");
+        }
+        let event = with(&example("event.json"), "schema_version", version);
+        both_refuse::<Event>("event.json", event);
+    }
+    // A reader can still say which version it was given.
+    let newer = json!({"schema_version": 2, "ok": true, "result": {}});
+    assert_eq!(schema_version_of(&newer), Some(2));
+}
+
+#[test]
+fn ok_decides_which_of_data_and_error_an_envelope_carries() {
+    let ok = example("envelope-ok.json");
+    let refused = error_base();
+    let cases = [
+        (
+            json!({"schema_version": 1, "ok": true}),
+            "data: is required when ok is true",
+        ),
+        (
+            json!({"schema_version": 1, "ok": false}),
+            "error: is required when ok is false",
+        ),
+        (
+            with(&ok, "error", refused["error"].clone()),
+            "error: must be absent when ok is true",
+        ),
+        (
+            with(&refused, "data", json!({})),
+            "data: must be absent when ok is false",
+        ),
+        (
+            with(&ok, "error", json!(null)),
+            "error: must be absent when ok is true",
+        ),
+        (
+            with(&refused, "data", json!(null)),
+            "data: must be absent when ok is false",
+        ),
+        (with(&ok, "data", json!([])), "data: must be an object"),
+        (with(&ok, "data", json!(null)), "data: must be an object"),
+        (
+            with_error(&refused, "message", json!("")),
+            "error: message: must not be empty",
+        ),
+        (
+            json!({"schema_version": 1, "ok": false, "error": {"code": "c"}}),
+            "error: missing field `message`",
+        ),
+        (
+            with(&refused, "error", json!("not_a_tty")),
+            "error: invalid type",
+        ),
+        (without(&ok, "ok"), "missing field `ok`"),
+        (with(&ok, "ok", json!("true")), "invalid type"),
+        (
+            without(&ok, "schema_version"),
+            "missing field `schema_version`",
+        ),
+    ];
+    for (instance, message) in cases {
+        let error = both_refuse::<Envelope>("envelope.json", instance.clone());
+        assert!(
+            error.contains(message),
+            "{instance}: {error:?} lacks {message:?}"
+        );
+    }
+}
+
+#[test]
+fn an_errors_detail_is_a_string_or_an_object_and_never_null() {
+    let refused = error_base();
+    agrees::<Envelope>(
+        "envelope.json",
+        &with_error(&refused, "detail", json!("text")),
+    );
+    let by = with_error(&refused, "detail", json!({"by": "app"}));
+    agrees::<Envelope>("envelope.json", &by);
+    let parsed: Envelope = serde_json::from_value(by).unwrap();
+    assert_eq!(
+        parsed.into_result().unwrap_err().detail,
+        Some(Detail::Object(data(json!({"by": "app"}))))
+    );
+    for detail in [json!(7), json!([1]), json!(true), json!(null)] {
+        both_refuse::<Envelope>("envelope.json", with_error(&refused, "detail", detail));
+    }
+    for hint in [json!(null), json!(7)] {
+        both_refuse::<Envelope>("envelope.json", with_error(&refused, "hint", hint));
     }
 }
 
 #[test]
 fn incompatible_protocol_always_says_which_versions_are_served() {
     let base = example("envelope-incompatible-protocol.json");
-    let error = |detail: Option<Value>| {
-        let mut instance = base.clone();
-        match detail {
-            Some(detail) => instance["error"]["detail"] = detail,
-            None => {
-                instance["error"].as_object_mut().unwrap().remove("detail");
-            }
-        }
-        instance
-    };
     for detail in [
-        None,
-        Some(json!("1")),
-        Some(json!({})),
-        Some(json!({"supported": []})),
-        Some(json!({"supported": [0]})),
-        Some(json!({"supported": ["1"]})),
+        json!("1"),
+        json!({}),
+        json!({"supported": []}),
+        json!({"supported": [0]}),
+        json!({"supported": ["1"]}),
     ] {
-        schema_refuses("envelope.json", error(detail));
+        let instance = with_error(&base, "detail", detail);
+        let error = both_refuse::<Envelope>("envelope.json", instance);
+        assert!(error.contains("detail.supported"), "{error}");
     }
-    assert_valid("envelope.json", &error(Some(json!({"supported": [1, 2]}))));
-    // Any other code's detail may be a string or an object.
-    let other = json!({"schema_version": 1, "ok": false,
-        "error": {"code": "c", "message": "m", "detail": {"anything": true}}});
-    agrees::<Envelope>("envelope.json", &other);
+    let mut bare = base.clone();
+    bare["error"].as_object_mut().unwrap().remove("detail");
+    both_refuse::<Envelope>("envelope.json", bare);
+    let two = with_error(&base, "detail", json!({"supported": [1, 2]}));
+    agrees::<Envelope>("envelope.json", &two);
 }
 
 #[test]
-fn an_event_has_every_field() {
+fn an_id_is_an_integer_a_javascript_client_holds_exactly() {
+    let ok = example("envelope-ok.json");
+    agrees::<Envelope>("envelope.json", &with(&ok, "id", json!(RequestId::MAX)));
+    let largest = json!({"id": RequestId::MAX, "method": "status"});
+    agrees::<Request>("request.json", &largest);
+    for bad in [
+        json!(RequestId::MAX + 1),
+        json!(-1),
+        json!(1.5),
+        json!("7"),
+        json!(null),
+    ] {
+        both_refuse::<Envelope>("envelope.json", with(&ok, "id", bad.clone()));
+        both_refuse::<Request>("request.json", json!({"id": bad, "method": "status"}));
+    }
+    // The one case JSON Schema cannot tell apart: it reads 1.0 as the integer 1, which
+    // the type refuses. No producer writes ids that way.
+    let float_one = json!({"id": 1.0, "method": "status"});
+    assert_valid("request.json", &float_one);
+    assert!(serde_json::from_value::<Request>(float_one).is_err());
+}
+
+#[test]
+fn an_event_has_every_field_and_a_run_event_its_run() {
     let whole = example("event-daemon.json");
     for field in ["schema_version", "seq", "time", "topic", "type", "data"] {
         both_refuse::<Event>("event.json", without(&whole, field));
     }
     for (field, value) in [
+        ("seq", json!(0)),
         ("seq", json!(-1)),
         ("seq", json!("42")),
+        ("time", json!("yesterday")),
+        ("time", json!("2026-11-25 12:00:00Z")),
+        ("time", json!("2026-11-25T12:00:00")),
+        ("time", json!("2026-13-01T00:00:00Z")),
+        ("topic", json!("")),
+        ("topic", json!(1)),
+        ("type", json!("")),
         ("data", json!([])),
         ("data", json!(null)),
-        ("topic", json!(1)),
     ] {
         both_refuse::<Event>("event.json", with(&whole, field, value));
     }
-}
 
-#[test]
-fn a_run_event_carries_its_run_and_its_place_in_it() {
-    let event = run_event_base();
-    let parsed: Event = serde_json::from_value(event.clone()).unwrap();
+    let run = example("event.json");
+    let parsed: Event = serde_json::from_value(run.clone()).unwrap();
     assert_eq!(parsed.run_scope(), Some(RunScope::new("…", 3)));
-
     // The handoff's rev 2 example, before the per-run sequence: valid no more.
-    schema_refuses("event.json", with(&event, "data", json!({})));
-    for field in ["run_id", "run_seq"] {
-        let mut instance = event.clone();
-        instance["data"].as_object_mut().unwrap().remove(field);
-        schema_refuses("event.json", instance.clone());
-        let parsed: Event = serde_json::from_value(instance).unwrap();
-        assert_eq!(parsed.run_scope(), None, "without {field}");
-    }
+    let error = both_refuse::<Event>("event.json", with(&run, "data", json!({})));
+    assert!(error.contains("data.run_id"), "{error}");
     for (field, value) in [
-        ("run_seq", json!(0)),
-        ("run_seq", json!(-1)),
-        ("run_seq", json!("3")),
-        ("run_id", json!("")),
-        ("run_id", json!(7)),
+        ("run_seq", None),
+        ("run_id", None),
+        ("run_seq", Some(json!(0))),
+        ("run_seq", Some(json!(-1))),
+        ("run_seq", Some(json!("3"))),
+        ("run_id", Some(json!(""))),
+        ("run_id", Some(json!(7))),
     ] {
-        let mut instance = event.clone();
-        instance["data"][field] = value;
-        schema_refuses("event.json", instance);
+        let mut instance = run.clone();
+        match value {
+            Some(value) => instance["data"][field] = value,
+            None => {
+                instance["data"].as_object_mut().unwrap().remove(field);
+            }
+        }
+        let error = both_refuse::<Event>("event.json", instance);
+        assert!(error.contains(&format!("data.{field}")), "{error}");
     }
     // Other topics need neither.
-    assert_valid("event.json", &example("event-daemon.json"));
+    let gap = Event::new(1, TIME, "daemon", "daemon.gap", Data::new()).unwrap();
+    assert_eq!(gap.run_scope(), None);
 }
 
 #[test]
@@ -457,8 +722,9 @@ fn requests_and_the_handshake_refuse_their_wrong_shapes() {
     for instance in [
         json!({"method": "status"}),
         json!({"id": 1}),
-        json!({"id": "1", "method": "status"}),
+        json!({"id": 1, "method": ""}),
         json!({"id": 1, "method": "status", "params": []}),
+        json!({"id": 1, "method": "status", "params": null}),
     ] {
         both_refuse::<Request>("request.json", instance);
     }
@@ -475,13 +741,17 @@ fn requests_and_the_handshake_refuse_their_wrong_shapes() {
         both_refuse::<HelloParams>("hello.json", without(&hello, field));
     }
     for (field, value) in [
+        ("token", json!("")),
+        ("protocol_version", json!(0)),
         ("protocol_version", json!("1")),
-        ("protocol_version", json!(-1)),
+        ("client", json!("")),
         ("role", json!("robot")),
+        ("role", json!("hook")),
         ("role", json!("App")),
         ("role", json!(null)),
         ("capabilities", json!("tool_gate")),
         ("env", json!({"A": 1})),
+        ("env", json!(null)),
     ] {
         both_refuse::<HelloParams>("hello.json", with(&hello, field, value));
     }
@@ -495,99 +765,43 @@ fn requests_and_the_handshake_refuse_their_wrong_shapes() {
     ] {
         both_refuse::<HelloData>("hello-reply.json", without(&reply, field));
     }
-    both_refuse::<HelloData>(
-        "hello-reply.json",
-        with(&reply, "protocol_versions", json!(["1"])),
-    );
-}
-
-#[test]
-fn the_schemas_also_hold_what_the_types_leave_to_the_reader() {
-    // The types parse these, so a client can read a newer or a malformed document and
-    // say what is wrong with it (and an optional field's `null` reads as absent); the v1
-    // schemas refuse them, and rlxd never prints them.
-    let envelope = |error: Value| json!({"schema_version": 1, "ok": false, "error": error});
-    schema_refuses(
-        "envelope.json",
-        json!({"schema_version": 2, "ok": true, "data": {}}),
-    );
-    schema_refuses(
-        "envelope.json",
-        envelope(json!({"code": "", "message": "m"})),
-    );
-    schema_refuses(
-        "envelope.json",
-        envelope(json!({"code": "c", "message": ""})),
-    );
-    schema_refuses(
-        "envelope.json",
-        envelope(json!({"code": "c", "message": "m", "hint": null})),
-    );
-
-    let event = example("event-daemon.json");
-    schema_refuses("event.json", with(&event, "seq", json!(0)));
-    schema_refuses("event.json", with(&event, "time", json!("yesterday")));
-    schema_refuses("event.json", with(&event, "topic", json!("")));
-    schema_refuses("request.json", json!({"id": 1, "method": ""}));
-
-    let hello = hello_base();
-    schema_refuses("hello.json", with(&hello, "token", json!("")));
-    schema_refuses("hello.json", with(&hello, "protocol_version", json!(0)));
-    schema_refuses("hello.json", with(&hello, "env", json!(null)));
-
-    let reply = reply_base();
-    schema_refuses(
-        "hello-reply.json",
-        with(&reply, "protocol_versions", json!([])),
-    );
-    schema_refuses(
-        "hello-reply.json",
-        with(&reply, "protocol_versions", json!([0])),
-    );
-    schema_refuses(
-        "hello-reply.json",
-        with(&reply, "protocol_version", json!(0)),
-    );
-    schema_refuses("hello-reply.json", with(&reply, "rlxd_version", json!("")));
-}
-
-#[test]
-fn a_daemon_record_reads_as_python_writes_it() {
-    // core/daemons.py always writes `cwd`, a string or null, and `+00:00` offsets.
-    let record = example("daemon-record.json");
-    assert_eq!(
-        agrees::<DaemonRecord>("daemon-record.json", &record),
-        record
-    );
-    let built = DaemonRecord::new(
-        "0123456789ab",
-        daemon_kinds::WATCH,
-        4242,
-        "mac.local",
-        "0.10.1",
-        "2026-11-25T18:00:00.123456+00:00",
-        "2026-11-25T18:00:05.123456+00:00",
-        vec!["rlx".to_owned(), "watch".to_owned()],
-        true,
-    )
-    .with_cwd("/Users/me/project");
-    assert_eq!(serde_json::to_value(&built).unwrap(), record);
-
-    // A null cwd reads as absent, and `Z` as an offset.
-    let no_cwd = example("daemon-record-no-cwd.json");
-    let printed = agrees::<DaemonRecord>("daemon-record.json", &no_cwd);
-    assert_eq!(printed, without(&no_cwd, "cwd"));
-    assert_eq!(
-        serde_json::from_value::<DaemonRecord>(no_cwd).unwrap().cwd,
-        None
-    );
-
-    // A later release's kind or field is kept, not refused (4.1).
-    agrees::<DaemonRecord>("daemon-record.json", &with(&record, "kind", json!("later")));
-    agrees::<DaemonRecord>("daemon-record.json", &with(&record, "later", json!(1)));
-    for kind in daemon_kinds::ALL {
-        assert_valid("daemon-record.json", &with(&record, "kind", json!(kind)));
+    for (field, value) in [
+        ("protocol_version", json!(0)),
+        ("protocol_versions", json!([])),
+        ("protocol_versions", json!([0])),
+        ("protocol_versions", json!(["1"])),
+        ("rlxd_version", json!("")),
+    ] {
+        both_refuse::<HelloData>("hello-reply.json", with(&reply, field, value));
     }
+}
+
+#[test]
+fn the_gate_credential_is_carried_here_and_checked_by_rlxd() {
+    // Rev 5, 7.2 and 5.1: role app needs a valid credential, which rlxd checks; this
+    // crate carries it.
+    let app = with(&hello_base(), "gate_credential", json!("gc-secret"));
+    assert_eq!(agrees::<HelloParams>("hello.json", &app), app);
+    // A role-app hello without one is well formed: rlxd answers it with not_gate.
+    agrees::<HelloParams>("hello.json", &hello_base());
+    for bad in [json!(""), json!(7), json!(null)] {
+        both_refuse::<HelloParams>("hello.json", with(&app, "gate_credential", bad));
+    }
+
+    // Neither secret shows in a logged hello.
+    let hello = HelloParams::new("tok-secret", "rlxapp", "0.1.0", Role::App)
+        .unwrap()
+        .with_gate_credential("gc-secret")
+        .unwrap();
+    let shown = format!("{hello:?}");
+    assert!(
+        !shown.contains("gc-secret") && !shown.contains("tok-secret"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("<redacted>") && shown.contains("rlxapp"),
+        "{shown}"
+    );
 }
 
 #[test]
@@ -607,67 +821,20 @@ fn a_daemon_record_refuses_its_wrong_shapes() {
         both_refuse::<DaemonRecord>("daemon-record.json", without(&record, field));
     }
     for (field, value) in [
+        ("id", json!("0123456789AB")),
+        ("id", json!("0123456789a")),
+        ("id", json!("0123456789abc")),
+        ("kind", json!("")),
+        ("pid", json!(0)),
         ("pid", json!(-1)),
         ("pid", json!("4242")),
+        ("started_at", json!("yesterday")),
+        ("heartbeat_at", json!("2026-11-25 18:00")),
+        ("argv", json!([])),
         ("argv", json!("rlx watch")),
         ("restartable", json!("yes")),
         ("cwd", json!(7)),
     ] {
         both_refuse::<DaemonRecord>("daemon-record.json", with(&record, field, value));
     }
-    for (field, value) in [
-        ("id", json!("0123456789AB")),
-        ("id", json!("0123456789a")),
-        ("id", json!("0123456789abc")),
-        ("kind", json!("")),
-        ("pid", json!(0)),
-        ("argv", json!([])),
-        ("started_at", json!("yesterday")),
-        ("heartbeat_at", json!("2026-11-25 18:00")),
-    ] {
-        schema_refuses("daemon-record.json", with(&record, field, value));
-    }
-}
-
-#[test]
-fn only_an_app_hello_carries_the_gate_credential() {
-    let app = with(&hello_base(), "gate_credential", json!("gc-secret"));
-    assert_eq!(agrees::<HelloParams>("hello.json", &app), app);
-    let built = HelloParams::new("tok-secret", "rlxapp", "0.1.0", Role::App)
-        .with_gate_credential("gc-secret");
-    assert_eq!(
-        serde_json::to_value(&built).unwrap(),
-        with(&app, "token", json!("tok-secret"))
-    );
-
-    // Any other role carrying one is a client bug, a credential leaked: refused.
-    for role in ["tui", "remote", "cli"] {
-        schema_refuses("hello.json", with(&app, "role", json!(role)));
-    }
-    schema_refuses("hello.json", with(&app, "gate_credential", json!("")));
-    both_refuse::<HelloParams>("hello.json", with(&app, "gate_credential", json!(7)));
-    // Without one, every role's hello is well formed; refusing an app-role one is
-    // rlxd's, with not_gate.
-    for role in ["app", "tui", "remote", "cli"] {
-        assert_valid("hello.json", &with(&hello_base(), "role", json!(role)));
-    }
-
-    // Neither secret shows in a logged hello.
-    let shown = format!("{built:?}");
-    assert!(
-        !shown.contains("gc-secret") && !shown.contains("tok-secret"),
-        "{shown}"
-    );
-    assert!(
-        shown.contains("<redacted>") && shown.contains("rlxapp"),
-        "{shown}"
-    );
-
-    let refused = Envelope::err(ErrorBody::new(
-        codes::NOT_GATE,
-        "this connection is not the gate",
-    ))
-    .with_id(1);
-    let printed = agrees::<Envelope>("envelope.json", &serde_json::to_value(&refused).unwrap());
-    assert_eq!(printed["error"]["code"], "not_gate");
 }

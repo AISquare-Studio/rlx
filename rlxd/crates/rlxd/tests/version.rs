@@ -1,7 +1,9 @@
 //! One version number: rlxd's is rlx's (handoff 0.10.3, 1.2).
 //!
-//! The workspace's `version` must equal `version` in the repo's pyproject.toml, and every
-//! crate must take the workspace's. A release bumps both files together.
+//! The workspace's `version` must equal `version` in the repo's pyproject.toml, every
+//! crate must take the workspace's, and rlxd/Cargo.lock must record it for each of them.
+//! A release bumps three files together: pyproject.toml, rlxd/Cargo.toml, and
+//! rlxd/Cargo.lock (regenerate it with `cargo update --workspace` from rlxd/).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,8 +40,36 @@ fn the_workspace_version_is_rlxs_version() {
     assert_eq!(
         version,
         rlx_version(),
-        "rlxd/Cargo.toml's version differs from pyproject.toml's: bump both together"
+        "rlxd/Cargo.toml's version differs from pyproject.toml's: bump pyproject.toml, \
+         rlxd/Cargo.toml and rlxd/Cargo.lock together"
     );
+}
+
+#[test]
+fn the_lock_records_rlxs_version_for_every_crate() {
+    // `cargo test --locked` fails on a stale lock too, but only after a build; this
+    // names the fix.
+    let crates: Vec<String> = fs::read_dir(repo().join("rlxd").join("crates"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let lock = read_toml(&repo().join("rlxd").join("Cargo.lock"));
+    let packages = lock["package"]
+        .as_array()
+        .expect("Cargo.lock lists packages");
+    for name in &crates {
+        let locked = packages
+            .iter()
+            .find(|p| p["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("Cargo.lock has no {name}"));
+        assert_eq!(
+            locked["version"].as_str(),
+            Some(rlx_version().as_str()),
+            "rlxd/Cargo.lock records {name} at another version: run `cargo update \
+             --workspace` in rlxd/"
+        );
+    }
+    assert!(crates.len() >= 4, "found {} crates", crates.len());
 }
 
 #[test]

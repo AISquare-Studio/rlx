@@ -33,14 +33,24 @@ cargo run -p rlxd-proto --bin gen-schemas -- --check
 cargo deny check            # licences and advisories (deny.toml)
 ```
 
-`.github/workflows/rlxd.yml` runs all of these on ubuntu, macOS and Windows for any PR
-that touches `rlxd/`, and for every push to `rc/**`.
+`.github/workflows/rlxd.yml` runs all of these on ubuntu, macOS and Windows. It runs for any PR
+that touches `rlxd/`, `pyproject.toml` or the workflow, for every push to `main` or
+`rc/**`, and by hand.
 
 ## One version number
 
 rlxd's version is rlx's. `[workspace.package] version` in `Cargo.toml` must equal
 `version` in the repo's `pyproject.toml`, and every crate takes the workspace's.
-`crates/rlxd/tests/version.rs` fails when they differ, so bump both together.
+`crates/rlxd/tests/version.rs` fails when they differ. A release bumps three files
+together:
+
+1. `pyproject.toml`'s `version`;
+2. `rlxd/Cargo.toml`'s `[workspace.package] version`;
+3. `rlxd/Cargo.lock`, by running `cargo update --workspace` in `rlxd/`. Every CI step
+   runs with `--locked`, so a stale lock fails.
+
+`.github/workflows/rlxd.yml` also runs for a PR that changes only `pyproject.toml`, so
+a bump on one side alone fails before it merges.
 
 ## Licence
 

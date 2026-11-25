@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HelloParams",
-  "description": "`hello`'s params: who is connecting, as what, which protocol it speaks, and the\ntoken that lets it in.\n\n```json\n{\"token\": \"…\", \"protocol_version\": 1, \"client\": \"rlxapp\", \"client_version\": \"0.1.0\",\n \"role\": \"app\", \"capabilities\": [], \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```\n\nA `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,\nwhose `detail.supported` lists the versions it does. A `role: app` hello without a\nvalid `gate_credential` gets the error `not_gate`. Only `role: app` may carry one.",
+  "description": "`hello`'s params: who is connecting, as what, which protocol it speaks, and what lets\nit in.\n\n```json\n{\"token\": \"…\", \"protocol_version\": 1, \"client\": \"rlxapp\", \"client_version\": \"0.1.0\",\n \"role\": \"app\", \"gate_credential\": \"…\", \"capabilities\": [], \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```\n\nA `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,\nwhose `detail.supported` lists the versions it does. `role: app` also needs a valid\n`gate_credential` and a peer that passes rlxd's identity check (only the credential,\nin gate dev mode). Anything less gets the error `not_gate`, and a refused hello never\ncounts as an app client.",
   "type": "object",
   "properties": {
     "capabilities": {
@@ -12,7 +12,7 @@
       }
     },
     "client": {
-      "description": "Which client this is, such as `rlxapp`, `rlx` or `remote`.",
+      "description": "Which client this is, such as `rlxapp`, `rlx-tui` or `rlxd-hook`.",
       "type": "string",
       "minLength": 1
     },
@@ -28,7 +28,7 @@
       }
     },
     "gate_credential": {
-      "description": "The credential that makes this connection the tool-call gate, which rlxd mints\nwhen the app is paired. It is sent with `role: app` only, never by another role.\nThe shared token alone does not make a connection the gate.",
+      "description": "The app's gate credential, separate from the shared token, which `gate.pair` mints\nfor a peer that passes rlxd's identity check. A `role: app` hello needs it. Other\nroles have none to send.",
       "type": "string",
       "minLength": 1
     },
@@ -43,18 +43,9 @@
       "$ref": "#/$defs/Role"
     },
     "token": {
-      "description": "The contents of `<home>/rlxd/token`.",
+      "description": "The shared client token: the contents of `<home>/rlxd/token`. It lets a client\nin, but does not make it the gate.",
       "type": "string",
       "minLength": 1
-    }
-  },
-  "dependentSchemas": {
-    "gate_credential": {
-      "properties": {
-        "role": {
-          "const": "app"
-        }
-      }
     }
   },
   "required": [
@@ -67,10 +58,10 @@
   ],
   "$defs": {
     "Role": {
-      "description": "What a client connects as.",
+      "description": "What a client connects as. A later protocol may add roles, so a `match` on this\nneeds a wildcard arm.",
       "oneOf": [
         {
-          "description": "rlxapp. The tool-call gate and `client_connected` jobs need one connected.",
+          "description": "rlxapp, and only rlxapp: the tool-call gate. It needs a valid `gate_credential`\nand a peer that passes rlxd's identity check.",
           "type": "string",
           "const": "app"
         },
@@ -85,7 +76,7 @@
           "const": "remote"
         },
         {
-          "description": "A command-line client, such as `rlxd call`.",
+          "description": "A command-line client, such as `rlxd call`, and `rlxd-hook`.",
           "type": "string",
           "const": "cli"
         }

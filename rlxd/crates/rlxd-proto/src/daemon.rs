@@ -2,7 +2,9 @@
 //! Python's registry (`core/daemons.py`) and rlxd (handoff 0.10.3, 4.1).
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
+use crate::check::{self, Invalid};
 
 /// One record in `<home>/daemons/`. Python's registry and rlxd both write and read
 /// these. A record is live while its `<id>.lock` is held. A reader keeps the fields and
@@ -15,6 +17,7 @@ use serde::{Deserialize, Serialize};
 ///  "restartable": true, "cwd": "/Users/me/project"}
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(remote = "Self")]
 #[schemars(title = "DaemonRecord")]
 #[non_exhaustive]
 pub struct DaemonRecord {
@@ -42,7 +45,7 @@ pub struct DaemonRecord {
     pub argv: Vec<String>,
     /// Whether the upgrade may stop it and start it again from `argv`.
     pub restartable: bool,
-    /// The absolute directory it runs in, when known. Absent and `null` say the same.
+    /// The directory it runs in, when known. Absent and `null` say the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
@@ -67,7 +70,9 @@ pub mod kinds {
 }
 
 impl DaemonRecord {
-    /// A record with no `cwd`.
+    /// A record with no `cwd`. Refuses what `daemon-record.json` refuses: an `id` that is
+    /// not 12 lowercase hex characters, an empty kind, pid 0, times that are not RFC
+    /// 3339, and an empty `argv`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<String>,
@@ -79,8 +84,8 @@ impl DaemonRecord {
         heartbeat_at: impl Into<String>,
         argv: Vec<String>,
         restartable: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Invalid> {
+        let record = Self {
             id: id.into(),
             kind: kind.into(),
             pid,
@@ -91,7 +96,9 @@ impl DaemonRecord {
             argv,
             restartable,
             cwd: None,
-        }
+        };
+        record.validate()?;
+        Ok(record)
     }
 
     /// This record, run from `cwd`.
@@ -99,5 +106,41 @@ impl DaemonRecord {
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
         self
+    }
+}
+
+impl DaemonRecord {
+    /// Whether this record keeps every rule of `daemon-record.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        let hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
+        if self.id.len() != 12 || !self.id.bytes().all(hex) {
+            return Err(Invalid::new(
+                "id",
+                format!("{:?} is not 12 lowercase hex characters", self.id),
+            ));
+        }
+        check::non_empty("kind", &self.kind)?;
+        check::at_least("pid", u64::from(self.pid), 1)?;
+        check::date_time("started_at", &self.started_at)?;
+        check::date_time("heartbeat_at", &self.heartbeat_at)?;
+        if self.argv.is_empty() {
+            return Err(Invalid::new("argv", "must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for DaemonRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        DaemonRecord::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DaemonRecord {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let record = DaemonRecord::deserialize(deserializer)?;
+        record.validate().map_err(de::Error::custom)?;
+        Ok(record)
     }
 }

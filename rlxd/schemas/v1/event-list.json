@@ -20,9 +20,7 @@
         "schema_version": {
           "description": "The schema version this document follows.",
           "type": "integer",
-          "format": "uint32",
-          "const": 1,
-          "minimum": 0
+          "const": 1
         },
         "seq": {
           "description": "Strictly increasing per home, from 1, across every topic. `events.subscribe\n{since}` resumes after it.",

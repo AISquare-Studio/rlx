@@ -4,7 +4,8 @@ members = ["crates/*"]
 
 # One version number: rlxd's is rlx's (handoff 0.10.3, 1.2). It must equal
 # `version` in the repo's pyproject.toml; crates/rlxd/tests/version.rs fails when
-# they differ. Bump both together, at release.
+# they differ. A release bumps three files together: pyproject.toml, this file,
+# and Cargo.lock (`cargo update --workspace` from rlxd/ rewrites it).
 [workspace.package]
 version = "0.10.1"
 edition = "2024"

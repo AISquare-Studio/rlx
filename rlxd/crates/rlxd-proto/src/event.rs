@@ -1,11 +1,13 @@
-//! The event envelope (handoff 0.10.3, 7.3), and the per-run sequence that run events
-//! carry (rlxapp's Engine change spec, section 1).
+//! The event envelope, and the per-run sequence that run events carry (handoff 0.10.3
+//! rev 5, 7.3).
 
 use schemars::{JsonSchema, Schema};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 
-use crate::{Data, SCHEMA_VERSION};
+use crate::Data;
+use crate::check::{self, Invalid};
+use crate::marker::V1;
 
 /// One event on the stream `events.subscribe` opens.
 ///
@@ -19,12 +21,12 @@ use crate::{Data, SCHEMA_VERSION};
 /// whose topic is `run` has one, next to `data.run_id`, so a client can replay one run
 /// from a known point.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(remote = "Self")]
 #[schemars(title = "Event", transform = run_scope_rule)]
 #[non_exhaustive]
 pub struct Event {
     /// The schema version this document follows.
-    #[schemars(extend("const" = 1))]
-    pub schema_version: u32,
+    pub schema_version: V1,
     /// Strictly increasing per home, from 1, across every topic. `events.subscribe
     /// {since}` resumes after it.
     #[schemars(range(min = 1))]
@@ -118,21 +120,25 @@ pub mod topics {
 
 impl Event {
     /// An event of this schema version. For the `run` topic, use [`Event::for_run`].
+    /// Refuses what `event.json` refuses: `seq` 0, a `time` that is not RFC 3339, an
+    /// empty topic or type, and a `run` event without `run_id` and `run_seq`.
     pub fn new(
         seq: u64,
         time: impl Into<String>,
         topic: impl Into<String>,
         r#type: impl Into<String>,
         data: Data,
-    ) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
+    ) -> Result<Self, Invalid> {
+        let event = Self {
+            schema_version: V1,
             seq,
             time: time.into(),
             topic: topic.into(),
             r#type: r#type.into(),
             data,
-        }
+        };
+        event.validate()?;
+        Ok(event)
     }
 
     /// An event on the `run` topic: `data` with the run's `run_id` and `run_seq` set.
@@ -142,14 +148,14 @@ impl Event {
         r#type: impl Into<String>,
         scope: RunScope,
         mut data: Data,
-    ) -> Self {
+    ) -> Result<Self, Invalid> {
         data.insert("run_id".to_owned(), Value::String(scope.run_id));
         data.insert("run_seq".to_owned(), Value::from(scope.run_seq));
         Self::new(seq, time, topics::RUN, r#type, data)
     }
 
     /// The run this event belongs to and its place in that run's stream, when it is on
-    /// the `run` topic and carries both.
+    /// the `run` topic.
     pub fn run_scope(&self) -> Option<RunScope> {
         if self.topic != topics::RUN {
             return None;
@@ -157,6 +163,50 @@ impl Event {
         let run_id = self.data.get("run_id")?.as_str()?.to_owned();
         let run_seq = self.data.get("run_seq")?.as_u64()?;
         Some(RunScope { run_id, run_seq })
+    }
+
+    /// Whether this event keeps every rule of `event.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        check::at_least("seq", self.seq, 1)?;
+        check::date_time("time", &self.time)?;
+        check::non_empty("topic", &self.topic)?;
+        check::non_empty("type", &self.r#type)?;
+        if self.topic == topics::RUN {
+            match self.data.get("run_id") {
+                Some(Value::String(run_id)) => check::non_empty("data.run_id", run_id)?,
+                _ => {
+                    return Err(Invalid::new(
+                        "data.run_id",
+                        "a run event needs its run's id, a string (see Event::for_run)",
+                    ));
+                }
+            }
+            match self.data.get("run_seq").and_then(Value::as_u64) {
+                Some(run_seq) => check::at_least("data.run_seq", run_seq, 1)?,
+                None => {
+                    return Err(Invalid::new(
+                        "data.run_seq",
+                        "a run event needs its place in the run, an integer of at least 1",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for Event {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        Event::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let event = Event::deserialize(deserializer)?;
+        event.validate().map_err(de::Error::custom)?;
+        Ok(event)
     }
 }
 

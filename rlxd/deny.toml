@@ -9,10 +9,12 @@ yanked = "deny"
 ignore = []
 
 [licenses]
-# rlx is MIT. These are the licences of what rlxd's crates are built from today
-# (the test-only dev-dependencies are not in cargo-deny's graph), each permissive
-# and compatible with shipping rlxd's binaries under MIT. A dependency under
-# anything else fails the check: add its licence here only after reading it.
+# rlx is MIT. These are the licences of what rlxd's crates are built from today,
+# each permissive and compatible with shipping rlxd's binaries under MIT. A
+# dependency under anything else fails the check: add its licence here only after
+# reading it. The licence check leaves out dev-dependencies, which never ship
+# (`[licenses] include-dev` defaults to false). They stay in the graph for the
+# advisories, bans and sources checks.
 allow = [
     "Apache-2.0",
     "MIT",

@@ -1,21 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Envelope",
-  "description": "One response.\n\nUnder `--json --schema-version 1`, every rlx command prints exactly one of these.\nOn rlxd's socket, each response is one of these plus the request's `id`.\n\n```json\n{\"schema_version\": 1, \"ok\": true, \"data\": {}}\n{\"schema_version\": 1, \"ok\": false, \"error\": {\"code\": \"not_a_tty\", \"message\": \"…\", \"hint\": \"…\", \"detail\": \"…\"}}\n```",
+  "description": "One response.\n\nUnder `--json --schema-version 1`, every rlx command prints exactly one of these.\nOn rlxd's socket, each response is one of these plus the request's `id`.\n\n```json\n{\"schema_version\": 1, \"ok\": true, \"data\": {}}\n{\"schema_version\": 1, \"ok\": false, \"error\": {\"code\": \"not_a_tty\", \"message\": \"…\", \"hint\": \"…\", \"detail\": \"…\"}}\n```\n\n`ok` decides: `ok: true` carries `data` and no `error`, and `ok: false` carries\n`error` and no `data`. A document with both, or with the wrong one, is refused.",
   "type": "object",
   "properties": {
     "id": {
       "description": "On the socket, the `id` of the request this answers. Absent from the CLI's output.",
       "type": "integer",
-      "format": "uint64",
+      "maximum": 9007199254740991,
       "minimum": 0
     },
     "schema_version": {
       "description": "The schema version this document follows.",
       "type": "integer",
-      "format": "uint32",
-      "const": 1,
-      "minimum": 0
+      "const": 1
     }
   },
   "anyOf": [
@@ -32,6 +30,11 @@
           "description": "`true`.",
           "const": true
         }
+      },
+      "not": {
+        "required": [
+          "error"
+        ]
       },
       "required": [
         "ok",
@@ -50,6 +53,11 @@
           "description": "`false`.",
           "const": false
         }
+      },
+      "not": {
+        "required": [
+          "data"
+        ]
       },
       "required": [
         "ok",
@@ -72,7 +80,11 @@
           "minLength": 1
         },
         "detail": {
-          "description": "More about what went wrong: an underlying error's text, or an object whose\nfields the code defines (`incompatible_protocol` gives `{\"supported\": [1]}`)."
+          "description": "More about what went wrong: a string, such as an underlying error's text, or an\nobject whose fields the code defines, such as `incompatible_protocol`'s\n`{\"supported\": [1]}` or `denied`'s `{\"by\": …}`. Never `null`: absent instead.",
+          "type": [
+            "string",
+            "object"
+          ]
         },
         "hint": {
           "description": "What to do about it, for a person.",

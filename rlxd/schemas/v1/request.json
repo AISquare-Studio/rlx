@@ -7,7 +7,7 @@
     "id": {
       "description": "Chosen by the client; the response carries it back.",
       "type": "integer",
-      "format": "uint64",
+      "maximum": 9007199254740991,
       "minimum": 0
     },
     "method": {

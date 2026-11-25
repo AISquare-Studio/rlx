@@ -1,15 +1,15 @@
 //! The response envelope (handoff 0.10.3, 7.2).
 
+use std::borrow::Cow;
 use std::fmt;
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-
-use schemars::Schema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 
-use crate::marker::{False, True};
-use crate::{PROTOCOL_VERSIONS, RequestId, SCHEMA_VERSION};
+use crate::check::{self, Invalid, drop_null, present};
+use crate::marker::{False, True, V1};
+use crate::{PROTOCOL_VERSIONS, RequestId};
 
 /// A response's or an event's `data`: always a JSON object, so a field can be added
 /// without raising the schema version.
@@ -24,16 +24,18 @@ pub type Data = serde_json::Map<String, serde_json::Value>;
 /// {"schema_version": 1, "ok": true, "data": {}}
 /// {"schema_version": 1, "ok": false, "error": {"code": "not_a_tty", "message": "…", "hint": "…", "detail": "…"}}
 /// ```
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// `ok` decides: `ok: true` carries `data` and no `error`, and `ok: false` carries
+/// `error` and no `data`. A document with both, or with the wrong one, is refused.
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 #[schemars(title = "Envelope")]
 #[non_exhaustive]
 pub struct Envelope {
     /// The schema version this document follows.
-    #[schemars(extend("const" = 1))]
-    pub schema_version: u32,
+    pub schema_version: V1,
     /// On the socket, the `id` of the request this answers. Absent from the CLI's output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "RequestId")]
+    #[schemars(transform = drop_null)]
     pub id: Option<RequestId>,
     /// Whether it worked, and what it returned or why it did not.
     #[serde(flatten)]
@@ -41,8 +43,9 @@ pub struct Envelope {
 }
 
 /// An envelope's `ok`, with the `data` or the `error` that goes with it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(untagged)]
+#[schemars(transform = one_or_the_other)]
 pub enum Outcome {
     /// It worked. The process exits 0.
     Ok {
@@ -61,8 +64,27 @@ pub enum Outcome {
     },
 }
 
+/// The schema's half of "`ok` decides": the `ok: true` branch forbids `error`, and the
+/// `ok: false` branch forbids `data`.
+fn one_or_the_other(schema: &mut Schema) {
+    let Some(Value::Array(branches)) = schema.get_mut("anyOf") else {
+        return;
+    };
+    for branch in branches {
+        let forbidden = match branch.pointer("/properties/ok/const") {
+            Some(Value::Bool(true)) => "error",
+            Some(Value::Bool(false)) => "data",
+            _ => continue,
+        };
+        if let Value::Object(branch) = branch {
+            branch.insert("not".to_owned(), json!({ "required": [forbidden] }));
+        }
+    }
+}
+
 /// Why a request was refused or failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(remote = "Self")]
 #[schemars(rename = "Error", title = "Error", transform = incompatible_protocol_rule)]
 #[non_exhaustive]
 pub struct ErrorBody {
@@ -75,14 +97,77 @@ pub struct ErrorBody {
     #[schemars(length(min = 1))]
     pub message: String,
     /// What to do about it, for a person.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "String")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null)]
     pub hint: Option<String>,
-    /// More about what went wrong: an underlying error's text, or an object whose
-    /// fields the code defines (`incompatible_protocol` gives `{"supported": [1]}`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Value")]
-    pub detail: Option<Value>,
+    /// More about what went wrong: a string, such as an underlying error's text, or an
+    /// object whose fields the code defines, such as `incompatible_protocol`'s
+    /// `{"supported": [1]}` or `denied`'s `{"by": …}`. Never `null`: absent instead.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null)]
+    pub detail: Option<Detail>,
+}
+
+/// An error's `detail`: a string, or an object whose fields its code defines.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Detail {
+    /// Text, such as an underlying error's message.
+    Text(String),
+    /// Fields the error's code defines.
+    Object(Data),
+}
+
+impl<'de> Deserialize<'de> for Detail {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::String(text) => Ok(Self::Text(text)),
+            Value::Object(fields) => Ok(Self::Object(fields)),
+            other => Err(de::Error::custom(format_args!(
+                "detail must be a string or an object, not {other}"
+            ))),
+        }
+    }
+}
+
+impl JsonSchema for Detail {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("Detail")
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": ["string", "object"] })
+    }
+}
+
+impl From<&str> for Detail {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+}
+
+impl From<String> for Detail {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<Data> for Detail {
+    fn from(fields: Data) -> Self {
+        Self::Object(fields)
+    }
 }
 
 /// The schema's half of `incompatible_protocol`: such an error must say, in
@@ -121,9 +206,13 @@ pub mod codes {
     /// `hello` asked for a protocol version this rlxd does not serve. `detail.supported`
     /// lists the ones it does, so the client can say "update" rather than misparse.
     pub const INCOMPATIBLE_PROTOCOL: &str = "incompatible_protocol";
-    /// The connection may not act as the tool-call gate: a `role: app` hello without a
-    /// valid `gate_credential`, or a tool-call decision from a connection that is not
-    /// the gate.
+    /// The connection may not be the tool-call gate (handoff 0.10.3, 5.1 and 7.2). It is
+    /// returned for:
+    /// - a `role: app` hello with no `gate_credential` or a wrong one;
+    /// - a `role: app` hello from a peer that fails the identity check, outside gate dev
+    ///   mode;
+    /// - `gate.pair` from such a peer;
+    /// - a tool-call decision from a connection that is not the gate.
     pub const NOT_GATE: &str = "not_gate";
 }
 
@@ -131,7 +220,7 @@ impl Envelope {
     /// A successful response carrying `data`.
     pub fn ok(data: Data) -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: V1,
             id: None,
             outcome: Outcome::Ok { ok: True, data },
         }
@@ -140,7 +229,7 @@ impl Envelope {
     /// A refused or failed response.
     pub fn err(error: ErrorBody) -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version: V1,
             id: None,
             outcome: Outcome::Err { ok: False, error },
         }
@@ -165,6 +254,14 @@ impl Envelope {
             Outcome::Err { error, .. } => Err(error),
         }
     }
+
+    /// Whether this envelope keeps every rule of `envelope.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        match &self.outcome {
+            Outcome::Ok { .. } => Ok(()),
+            Outcome::Err { error, .. } => error.validate().map_err(|e| e.within("error")),
+        }
+    }
 }
 
 impl From<Result<Data, ErrorBody>> for Envelope {
@@ -176,15 +273,61 @@ impl From<Result<Data, ErrorBody>> for Envelope {
     }
 }
 
+impl<'de> Deserialize<'de> for Envelope {
+    /// Reads `ok` first, then requires the field that goes with it and refuses the one
+    /// that does not, so each error names the field at fault.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            schema_version: V1,
+            #[serde(default, deserialize_with = "present")]
+            id: Option<RequestId>,
+            ok: bool,
+            #[serde(default, deserialize_with = "present")]
+            data: Option<Value>,
+            #[serde(default, deserialize_with = "present")]
+            error: Option<Value>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let refuse = |field: &str, problem: &str| -> D::Error {
+            de::Error::custom(Invalid::new(field, problem))
+        };
+        let outcome = match (fields.ok, fields.data, fields.error) {
+            (true, _, Some(_)) => return Err(refuse("error", "must be absent when ok is true")),
+            (true, None, None) => return Err(refuse("data", "is required when ok is true")),
+            (true, Some(Value::Object(data)), None) => Outcome::Ok { ok: True, data },
+            (true, Some(_), None) => return Err(refuse("data", "must be an object")),
+            (false, Some(_), _) => return Err(refuse("data", "must be absent when ok is false")),
+            (false, None, None) => return Err(refuse("error", "is required when ok is false")),
+            (false, None, Some(error)) => Outcome::Err {
+                ok: False,
+                // The trait's deserialize, which validates; `ErrorBody::deserialize`
+                // here would be the unchecked one `remote = "Self"` generates.
+                error: <ErrorBody as Deserialize>::deserialize(error)
+                    .map_err(|e| de::Error::custom(format_args!("error: {e}")))?,
+            },
+        };
+        Ok(Self {
+            schema_version: fields.schema_version,
+            id: fields.id,
+            outcome,
+        })
+    }
+}
+
 impl ErrorBody {
-    /// An error with a code and a message, and no hint or detail.
-    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
+    /// An error with a code and a message, and no hint or detail. Refuses an empty code
+    /// or message, and `incompatible_protocol`, which needs its `detail`: build that one
+    /// with [`ErrorBody::incompatible_protocol`].
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Result<Self, Invalid> {
+        let error = Self {
             code: code.into(),
             message: message.into(),
             hint: None,
             detail: None,
-        }
+        };
+        error.validate()?;
+        Ok(error)
     }
 
     /// This error, with what to do about it.
@@ -194,21 +337,67 @@ impl ErrorBody {
         self
     }
 
-    /// This error, with more about what went wrong: a string, or an object.
-    #[must_use]
-    pub fn with_detail(mut self, detail: impl Into<Value>) -> Self {
+    /// This error, with more about what went wrong: a string, or an object. Refuses a
+    /// detail the code does not allow.
+    pub fn with_detail(mut self, detail: impl Into<Detail>) -> Result<Self, Invalid> {
         self.detail = Some(detail.into());
-        self
+        self.validate()?;
+        Ok(self)
     }
 
     /// The reply to a `hello` whose `protocol_version` this crate does not serve.
     pub fn incompatible_protocol(requested: u32) -> Self {
-        Self::new(
-            codes::INCOMPATIBLE_PROTOCOL,
-            format!("protocol version {requested} is not one this rlxd serves"),
-        )
-        .with_hint("Update rlx or the app, so that both speak one protocol version.")
-        .with_detail(json!({ "supported": PROTOCOL_VERSIONS }))
+        let mut detail = Data::new();
+        detail.insert("supported".to_owned(), json!(PROTOCOL_VERSIONS));
+        Self {
+            code: codes::INCOMPATIBLE_PROTOCOL.to_owned(),
+            message: format!("protocol version {requested} is not one this rlxd serves"),
+            hint: Some(
+                "Update rlx or the app, so that both speak one protocol version.".to_owned(),
+            ),
+            detail: Some(Detail::Object(detail)),
+        }
+    }
+
+    /// Whether this error keeps every rule of `envelope.json`'s `Error`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        check::non_empty("code", &self.code)?;
+        check::non_empty("message", &self.message)?;
+        if self.code == codes::INCOMPATIBLE_PROTOCOL {
+            let supported = match &self.detail {
+                Some(Detail::Object(fields)) => fields.get("supported"),
+                _ => None,
+            };
+            let versions = supported
+                .and_then(Value::as_array)
+                .filter(|v| !v.is_empty());
+            let valid = versions.is_some_and(|versions| {
+                versions.iter().all(|v| v.as_u64().is_some_and(|v| v >= 1))
+            });
+            if !valid {
+                return Err(Invalid::new(
+                    "detail.supported",
+                    "incompatible_protocol needs the versions rlxd serves, a non-empty list \
+                     of integers of at least 1",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ErrorBody {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        ErrorBody::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ErrorBody {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let error = ErrorBody::deserialize(deserializer)?;
+        error.validate().map_err(de::Error::custom)?;
+        Ok(error)
     }
 }
 

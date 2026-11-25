@@ -13,7 +13,7 @@
       "minItems": 1
     },
     "cwd": {
-      "description": "The absolute directory it runs in, when known. Absent and `null` say the same.",
+      "description": "The directory it runs in, when known. Absent and `null` say the same.",
       "type": [
         "string",
         "null"

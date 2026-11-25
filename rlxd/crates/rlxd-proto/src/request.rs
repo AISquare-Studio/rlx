@@ -1,13 +1,82 @@
 //! The request frame (handoff 0.10.3, 7.2).
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::fmt;
 
-/// A request's `id`, which its response echoes.
-pub type RequestId = u64;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
+use crate::check::{self, Invalid};
 
 /// A request's `params`: always a JSON object, `{}` when the frame has none.
 pub type Params = serde_json::Map<String, serde_json::Value>;
+
+/// A request's `id`, which its response echoes: an integer from 0 to 2^53 - 1, so a
+/// JavaScript client holds every one exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    /// The largest id: 2^53 - 1, JavaScript's `Number.MAX_SAFE_INTEGER`.
+    pub const MAX: u64 = (1 << 53) - 1;
+
+    /// The id `id`, if it is at most [`RequestId::MAX`].
+    pub const fn new(id: u64) -> Option<Self> {
+        if id <= Self::MAX {
+            Some(Self(id))
+        } else {
+            None
+        }
+    }
+
+    /// The id, as a number.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u32> for RequestId {
+    fn from(id: u32) -> Self {
+        Self(u64::from(id))
+    }
+}
+
+impl TryFrom<u64> for RequestId {
+    type Error = Invalid;
+
+    fn try_from(id: u64) -> Result<Self, Invalid> {
+        Self::new(id)
+            .ok_or_else(|| Invalid::new("id", format!("{id} is above 2^53 - 1 ({})", Self::MAX)))
+    }
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = u64::deserialize(deserializer)?;
+        Self::try_from(id).map_err(de::Error::custom)
+    }
+}
+
+impl JsonSchema for RequestId {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("RequestId")
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "integer", "minimum": 0, "maximum": Self::MAX })
+    }
+}
 
 /// One request on rlxd's socket. Frames are newline-delimited JSON:
 ///
@@ -18,6 +87,7 @@ pub type Params = serde_json::Map<String, serde_json::Value>;
 /// The response is an envelope with the same `id`. The first frame on a connection must
 /// be `hello`; any other first frame gets the error `unauthorized`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(remote = "Self")]
 #[schemars(title = "Request")]
 #[non_exhaustive]
 pub struct Request {
@@ -39,12 +109,34 @@ pub mod methods {
 }
 
 impl Request {
-    /// A request for `method` with `params`.
-    pub fn new(id: RequestId, method: impl Into<String>, params: Params) -> Self {
-        Self {
+    /// A request for `method` with `params`. Refuses an empty method.
+    pub fn new(id: RequestId, method: impl Into<String>, params: Params) -> Result<Self, Invalid> {
+        let request = Self {
             id,
             method: method.into(),
             params,
-        }
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Whether this request keeps every rule of `request.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        check::non_empty("method", &self.method)
+    }
+}
+
+impl Serialize for Request {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        Request::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let request = Request::deserialize(deserializer)?;
+        request.validate().map_err(de::Error::custom)?;
+        Ok(request)
     }
 }
