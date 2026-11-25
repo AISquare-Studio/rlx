@@ -422,3 +422,100 @@ def test_the_readers_keys_are_its_own_while_it_is_open(board: dict[str, Any]) ->
     offered, still_folded, back, folded_after = drive((140, 40), go)
     assert (offered, still_folded) == (False, True), "d is off while the reader is open"
     assert (back, folded_after) == (True, False), "back on the board, d unfolds Done"
+
+
+# --- review of #573 -----------------------------------------------------------------------------
+
+
+def test_only_the_lanes_drawn_rows_act_and_more_opens_the_rest(board: dict[str, Any]) -> None:
+    """Major (1): with more items than rows, the keys past the drawn rows and a click on
+    ``+ N more`` opened cards that were not on screen. Now only a drawn row acts, and ``+ N
+    more`` (its key or a click) opens the lane to its nine rows."""
+    board["tasks"] = [_task(n, f"stuck {n}", "blocked", CODER.id) for n in range(1, 7)]
+
+    async def go(pilot: Any, app: Host, panel: BoardPanel) -> dict[str, Any]:
+        def drawn() -> list[str]:
+            return [str(row.render()) for row in panel.query(LaneRow) if row.display]
+
+        seen: dict[str, Any] = {"collapsed": drawn()}
+        await pilot.press("6")  # past the drawn rows
+        await settle_page(app)
+        seen["after_6"] = panel._reading
+        await pilot.click("#lane-4")  # "+ N more"
+        await settle_page(app)
+        seen["expanded"] = drawn()
+        seen["after_more"] = panel._reading
+        await pilot.press("6")
+        await settle_page(app)
+        seen["opened"] = panel._reading
+        return seen
+
+    seen = drive((140, 40), go)
+    lane = [f"tsk_{n:04d}" for n in range(1, 7)]
+    assert len(seen["collapsed"]) == 5 and seen["collapsed"][4].startswith("5     + 4 more")
+    assert seen["after_6"] is None, "a key past the drawn rows opens nothing"
+    assert seen["after_more"] is None, "+ N more opens the lane, not a card"
+    assert len(seen["expanded"]) == 8, "the waiting agent, the question and the six cards"
+    assert seen["opened"] == lane[3], "6: the sixth item, drawn now (the fourth card)"
+
+
+def test_a_remembered_column_width_leaves_the_narrow_column_whole(board: dict[str, Any]) -> None:
+    """Major (2): Work's remembered width (70) was restored a refresh after the single column
+    took the whole width, so Work was 70 of 100 beside a blank band; and widening showed the
+    stylesheet's 58, the remembered 70 lost. Now it fills the column, and comes back wide."""
+    from aisquare.core.state_file import update_state
+
+    update_state(board_mod.COLUMN_WIDTH_KEY, 70)
+
+    async def go(pilot: Any, app: Host, panel: BoardPanel) -> tuple[int, int, int]:
+        await settle_page(app)
+        await pilot.pause()
+        narrow = (panel.query_one("#board-side").outer_size.width, panel.size.width)
+        await pilot.resize_terminal(140, 40)
+        await settle_page(app)
+        await pilot.pause()
+        return *narrow, panel.query_one("#board-side").outer_size.width
+
+    side, room, wide = drive((100, 30), go)
+    assert side == room == 100, "Work has the whole column"
+    assert wide == 70, "the remembered width, beside the Stream again"
+
+
+def test_a_click_on_the_heading_under_the_cursor_folds_it_once(board: dict[str, Any]) -> None:
+    """Minor (3): DataTable selects a click on the cell under its cursor itself; the table's own
+    pick on top folded the heading twice, so not at all."""
+
+    async def go(pilot: Any, app: Host, panel: BoardPanel) -> tuple[str, bool]:
+        table = panel.query_one("#tasks", DataTable)
+        table.move_cursor(row=0, column=0)
+        await settle_page(app)
+        under = str(table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value)
+        await pilot.click("#tasks", offset=(2, 2))  # row 0, the # column
+        await settle_page(app)
+        return under, "doing" in panel.folds
+
+    under, folded = drive((140, 40), go)
+    assert under == f"{GROUP_ROW}doing", "the premise: the cursor is on Doing's heading"
+    assert folded, "one click, one fold"
+
+
+def test_the_new_lines_marker_counts_only_what_the_filter_shows(board: dict[str, Any]) -> None:
+    """Minor (6): scrolled up under a filter, lines the filter hides were counted as new."""
+    board["events"] = [_event(seq, CODER.id, "note", f"keep {seq}") for seq in range(1, 61)]
+
+    async def go(pilot: Any, app: Host, panel: BoardPanel) -> int:
+        await pilot.press("slash", *"keep", "enter")
+        await settle_page(app)
+        feed = panel.query_one("#feed", OptionList)
+        feed.scroll_to(y=0, animate=False)
+        await settle_page(app)
+        board["events"] = [
+            _event(61, CODER.id, "note", "drop this"),
+            _event(62, CODER.id, "note", "keep 62"),
+            _event(63, CODER.id, "note", "drop that"),
+        ]
+        panel.refresh_data()
+        await settle_page(app)
+        return panel.unseen
+
+    assert drive((140, 40), go) == 1, "one line the filter shows came in below"

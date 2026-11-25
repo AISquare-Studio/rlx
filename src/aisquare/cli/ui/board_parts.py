@@ -63,7 +63,10 @@ class BoardSwitch(Horizontal):
 
 
 LANE_ROWS = 5
-"""The most items the needs-you lane lists; the rest are counted on its last row."""
+"""The rows the needs-you lane shows at first; more items are counted on its last row, which
+expands it (its key or a click)."""
+LANE_MAX = 9
+"""The rows an expanded lane shows, one per key ``1`` to ``9``; past them, a count alone."""
 
 
 class LaneRow(Static):
@@ -90,9 +93,18 @@ class NeedsYouLane(Vertical):
     The board's own; the app-wide strip (M7) keeps ``board.NeedsYouStrip``'s counts."""
 
     DEFAULT_CSS = """
-    NeedsYouLane { height: auto; max-height: 7; padding: 0 1; }
+    NeedsYouLane { height: auto; max-height: 11; padding: 0 1; }
     NeedsYouLane #lane-lead { height: 1; }
     """
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self.expanded = False
+        """``+ N more`` was picked: up to :data:`LANE_MAX` rows, until the items fit again."""
+        self.drawn = 0
+        """How many items the rows show: only those act, by key or click (review of #573)."""
+        self.more_row: int | None = None
+        """The row that counts the items not drawn, or ``None``."""
 
     class Picked(Message):
         """A row was clicked, or its key pressed: act on item ``index``."""
@@ -103,20 +115,32 @@ class NeedsYouLane(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="lane-lead")
-        for index in range(LANE_ROWS):
+        for index in range(LANE_MAX):
             yield LaneRow(index)
 
     def show(self, lead: Text, items: list[Text]) -> None:
-        """``lead`` on the first row, then one row per item (the rest counted on the last)."""
+        """``lead`` on the first row, then one row per item drawn; past the rows there is room
+        for, the last counts the rest (and expands the lane, until it is expanded)."""
         self.query_one("#lane-lead", Static).update(lead)
+        if len(items) <= LANE_ROWS:
+            self.expanded = False  # they fit again: the lane folds back
         rows = list(self.query(LaneRow))
-        listed = items if len(items) <= LANE_ROWS else items[: LANE_ROWS - 1]
+        room = LANE_MAX if self.expanded else LANE_ROWS
+        listed = items if len(items) <= room else items[: room - 1]
+        self.drawn = len(listed)
+        self.more_row = None
         for row, item in zip(rows, listed, strict=False):
             row.update(Text.assemble((f"{row.board_key}  ", "bold cyan"), item))
             row.display = True
-        if len(items) > LANE_ROWS:
-            more = rows[LANE_ROWS - 1]
-            more.update(Text(f"   + {len(items) - len(listed)} more", style="dim"))
+        if len(items) > room:
+            self.more_row = room - 1
+            more = rows[self.more_row]
+            count = Text(f"   + {len(items) - len(listed)} more", style="dim")
+            if not self.expanded:
+                count = Text.assemble(
+                    (f"{more.board_key}  ", "bold cyan"), count, (" — shows them", "dim")
+                )
+            more.update(count)
             more.display = True
             listed = [*listed, Text("")]
         for row in rows[len(listed) :]:

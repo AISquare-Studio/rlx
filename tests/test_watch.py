@@ -1303,16 +1303,20 @@ def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> 
 
     wanted = {"b", "d", "a", "o", "/", "q", "t", "?"}
 
-    async def bound_keys(pilot: Any) -> list[tuple[str, int]]:
-        """The footer's keys once those of the focused widget are bound and laid out. The
-        footer recomposes after a focus change, in a later message: read at once, a slow
-        Windows runner saw none of them (rc gate 45659530340). Bounded: 10 s at most."""
+    async def footer_of(pilot: Any, target: str, stale: list[Any]) -> list[tuple[str, int]]:
+        """The footer as it is for ``target``: rebuilt since ``stale`` (the keys it showed before
+        the focus moved, kept alive so none of them can pass for a new one), ``target`` holding
+        the focus, and every key laid out. Read at once, the footer was still the one before
+        (review of #573), or half rebuilt with no key at all on a slow Windows runner (rc gate
+        45659530340). Bounded: 10 s at most."""
         keys: list[tuple[str, int]] = []
         for _ in range(500):
             shown = list(pilot.app.screen.query_one(Footer).query("FooterKey"))
             keys = [(str(getattr(key, "key_display", "")), key.region.right) for key in shown]
-            laid_out = all(key.region.width for key in shown)
-            if laid_out and wanted <= {key for key, _ in keys}:
+            rebuilt = not any(key is old for key in shown for old in stale)
+            focused = pilot.app.focused is pilot.app.query_one(target)
+            laid_out = bool(shown) and all(key.region.width for key in shown)
+            if rebuilt and focused and laid_out and wanted <= {key for key, _ in keys}:
                 break
             await pilot.pause(0.02)
         return keys
@@ -1322,12 +1326,14 @@ def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> 
         seen = []
         async with app.run_test(size=(90, 30)) as pilot:
             await pilot.pause()
-            for target in ("#tasks", "#feed"):
-                pane = "#board-side" if target == "#tasks" else "#feedpane"
-                if not pilot.app.query_one(pane).display:
-                    pilot.app.board.action_toggle_board()  # 90 columns: one half at a time (B2)
-                pilot.app.query_one(target).focus()
-                seen.append((target, await bound_keys(pilot)))
+            footer = pilot.app.screen.query_one(Footer)
+            # The tasks have the focus from the start (B1): their footer, once composed.
+            seen.append(("#tasks", await footer_of(pilot, "#tasks", [])))
+            stale = list(footer.query("FooterKey"))
+            if not pilot.app.query_one("#feedpane").display:
+                pilot.app.board.action_toggle_board()  # 90 columns: one half at a time (B2)
+            pilot.app.query_one("#feed").focus()
+            seen.append(("#feed", await footer_of(pilot, "#feed", stale)))
         return seen
 
     for target, keys in asyncio.run(drive()):

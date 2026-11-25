@@ -566,6 +566,10 @@ class PickableTable(DataTable[Text]):
             return
         if self.cursor_type != "row" and meta.get("out_of_bounds", False):
             return  # mirror DataTable's own out-of-bounds guard
+        if self.show_cursor and Coordinate(row, meta.get("column", 0)) == self.cursor_coordinate:
+            # DataTable selects a click on the cell under the cursor itself (RowSelected): a
+            # pick here as well folded a heading twice, and so not at all (review of #573).
+            return
         try:
             key = self.coordinate_to_cell_key(Coordinate(row, 0)).row_key
         except Exception:  # click raced a rebuild; the row is gone
@@ -652,6 +656,10 @@ class BoardColumn(Vertical):
     def on_resize(self, event: events.Resize) -> None:
         if event.size.height <= 0:
             return  # behind a hidden tab: nothing to fit, and the next show resizes
+        for panel in self.ancestors:
+            if isinstance(panel, BoardPanel):
+                panel._keep_alone()  # a width its line set: noted, or cleared while alone
+                break
         sessions = self.query_children("#sessions").first()
         tasks = self.query_children("#tasks").first()
         floor = floor_of(sessions, "height")
@@ -678,6 +686,7 @@ class BoardPanel(Vertical):
     BoardPanel { height: 1fr; }
     BoardPanel #board-main { height: 1fr; min-height: 8; }
     BoardPanel #board-side { width: 58; min-width: 32; }
+    BoardPanel #board-side.alone { width: 1fr; }
     BoardPanel #board-side.collapsed { display: none; }
     BoardPanel #side-divider.collapsed { display: none; }
     BoardPanel #sessions { height: auto; min-height: 3; border: round $primary;
@@ -788,9 +797,10 @@ class BoardPanel(Vertical):
         """Work's folded groups, by key (:data:`WORK_GROUPS`)."""
         self._work_hidden = False
         """``b`` hid the Work column while the panel is wide (B1's ``b``)."""
-        self._side_alone: Any = None
-        """While Work has the column to itself: the width it had beside the Stream (a drag's,
-        or the stylesheet's), put back when the Stream returns. ``None`` otherwise."""
+        self._side_width: Any = None
+        """Work's width beside the Stream as its line set it (a drag's, a key's, or the one the
+        line remembered and restored), ``None`` for the stylesheet's: kept while Work has the
+        column to itself, and put back when the Stream returns (review of #573)."""
         self._sessions: dict[str, TeamSession] = {}
         self._switches: dict[str, str] = {}
         """The ``fleet switch`` of each limited session the last refresh read, by its id."""
@@ -1266,8 +1276,13 @@ class BoardPanel(Vertical):
         """``1`` to ``9``, or a click on the lane's row: act on that item. A card opens in the
         reader; an agent is selected in asq's left pane (:class:`AgentWanted`), or in
         ``board -w`` what it asks is shown."""
-        if not 0 <= index < len(self.lane):
+        lane = self.query_one(NeedsYouLane)
+        if index == lane.more_row and not lane.expanded:
+            lane.expanded = True  # "+ N more": the lane opens to its nine rows
+            self._show_lane()
             return
+        if not 0 <= index < min(lane.drawn, len(self.lane)):
+            return  # a row not drawn acts on nothing (review of #573)
         kind, target = self.lane[index]
         if kind in ("review", "blocked"):
             self._show_work()
@@ -1396,9 +1411,10 @@ class BoardPanel(Vertical):
             # Scrolled up (or autoscroll off): the view stays where the person put it, and the
             # marker under the feed counts what came in below it (B1 #11) — while it is below
             # it: once laid out, lines a feed that does not overflow shows are not unseen.
-            if not self.unseen:
-                self._unseen_since = fresh[0].created_at
-            self.unseen += len(fresh)
+            shown = [event for event in fresh if self._shows(event)]
+            if shown and not self.unseen:
+                self._unseen_since = shown[0].created_at
+            self.unseen += len(shown)  # a line the filter hides is not unseen (review of #573)
             self._show_unseen()
             self.call_after_refresh(self._recount_unseen)
 
@@ -1844,12 +1860,12 @@ class BoardPanel(Vertical):
         switch.display = not wide and self._reading is None
         switch.show(self.pane)
         alone = work and not stream
-        if alone and self._side_alone is None:
-            self._side_alone = side.styles.width or "stylesheet"
-            side.styles.width = "1fr"
-        elif not alone and self._side_alone is not None:
-            side.styles.width = None if self._side_alone == "stylesheet" else self._side_alone
-            self._side_alone = None
+        if alone != side.has_class("alone"):
+            if alone:
+                self._side_width = side.styles.inline.width  # the line's, kept for the way back
+            side.set_class(alone, "alone")
+            side.styles.width = None if alone else self._side_width
+        self._keep_alone()
         self._retitle_feed()
         self._remember_view()  # the half shown, when b or a pick moved it
         focused = self.app.focused
@@ -1859,6 +1875,19 @@ class BoardPanel(Vertical):
             self._feed_shown().focus()
         elif not stream and self.query_one("#feedpane") in focused.ancestors_with_self:
             self.query_one("#tasks").focus()
+
+    def _keep_alone(self) -> None:
+        """Work's width, kept: beside the Stream, what its line set is noted; with the column to
+        itself, a width its line writes (the remembered one, restored a refresh after mount) is
+        noted and cleared, so Work fills the column (the ``alone`` rule) and gets it back when
+        the Stream returns. Called on every resize of the column."""
+        side = self.query_one("#board-side")
+        width = side.styles.inline.width
+        if not side.has_class("alone"):
+            self._side_width = width
+        elif width is not None:
+            self._side_width = width
+            side.styles.width = None
 
     def on_resize(self, event: events.Resize) -> None:
         self._apply_layout()
@@ -1878,7 +1907,7 @@ class BoardPanel(Vertical):
         side = self.query_one("#board-side")
         side.styles.max_width = (
             None
-            if self._side_alone is not None
+            if side.has_class("alone")
             else max(floor_of(side), width - 1 - floor_of(self.query_one("#feedpane")))
         )
         detail = self.query_one("#detailwrap")
