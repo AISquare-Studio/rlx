@@ -394,3 +394,158 @@ def test_a_long_name_never_wraps_the_sessions_block(board: dict[str, Any]) -> No
 
     # Two sessions, a row each, the block's closing newline, and the border's two.
     assert drive(go) == 2 + 1 + 2, "a long name wrapped the sessions block"
+
+
+# --- B1: the board audit's quick bundle and its "Next" list ------------------------------------
+
+
+class Standalone(Host):
+    """``board -w``'s panel: no shell around it to select an agent in."""
+
+    def compose(self) -> ComposeResult:
+        yield BoardPanel(PROJECT, interval=3600, id="board", standalone=True)
+
+
+def test_in_board_w_a_question_count_shows_the_question(board: dict[str, Any]) -> None:
+    """B1 #10: in ``board -w`` a ❓ count asked for an agent nobody could select, and nothing
+    happened. It shows the question now, picked in the feed; 🔔 says where the agent waits."""
+    from textual.widgets import OptionList
+
+    board["events"] = [
+        _event(1, "ses_manager", "note", "starting"),
+        _event(2, "ses_manager", "question", "staging or prod first?"),
+    ]
+
+    async def run() -> tuple[str, str | None, str, list[tuple[str, str]]]:
+        app = Standalone()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await settle_page(app)
+            panel = app.query_one(BoardPanel)
+            await pilot.click("#needs-you-question")
+            await settle_page(app)
+            feed = panel.query_one("#feed", OptionList)
+            picked = feed.highlighted
+            asked = panel.detail_text
+            await pilot.click("#needs-you-waiting")
+            await settle_page(app)
+            option = feed.get_option_at_index(picked).id if picked is not None else None
+            return asked, option, panel.detail_text, app.wanted
+
+    asked, option, waiting, wanted = asyncio.run(run())
+    assert asked.startswith("question by manager") and "staging or prod first?" in asked
+    assert option == "evt_2", "the question's own line is picked in the feed"
+    assert "coder-auth waits for you in its pane" in waiting
+    assert wanted == [], "nothing asked of a shell that is not there"
+
+
+def test_scrolled_up_the_feed_stays_put_and_counts_what_came_in(board: dict[str, Any]) -> None:
+    """B1 #11: every new line scrolled the feed to its end, under the person reading further
+    up. Scrolled up, the view stays and the feed's foot counts ``↓ N new``; back at the end
+    (End, or scrolling down), the count goes and the feed follows again."""
+    from textual.widgets import OptionList
+
+    board["events"] = [_event(seq, "ses_coder", "note", f"line {seq}") for seq in range(1, 61)]
+
+    async def go(app: Host, panel: BoardPanel) -> dict[str, Any]:
+        feed = panel.query_one("#feed", OptionList)
+        seen: dict[str, Any] = {"followed": feed.scroll_y == feed.max_scroll_y > 0}
+        feed.scroll_to(y=3, animate=False)
+        await settle_page(app)
+        board["events"] = [_event(seq, "ses_coder", "note", f"line {seq}") for seq in (61, 62, 63)]
+        panel.refresh_data()
+        await settle_page(app)
+        seen["stayed"] = feed.scroll_y
+        seen["marker"] = (panel.unseen, str(feed.border_subtitle))
+        feed.focus()
+        feed.action_last()  # End
+        await settle_page(app)
+        seen["cleared"] = (panel.unseen, str(feed.border_subtitle))
+        board["events"] = [_event(64, "ses_coder", "note", "line 64")]
+        panel.refresh_data()
+        await settle_page(app)
+        seen["follows"] = feed.scroll_y == feed.max_scroll_y
+        return seen
+
+    seen = drive(go)
+    assert seen["followed"], "the premise: at the end, the feed followed"
+    assert seen["stayed"] == 3
+    assert seen["marker"] == (3, "↓ 3 new — End shows them")
+    assert seen["cleared"] == (0, "")
+    assert seen["follows"], "back at the end, it follows again"
+
+
+def test_the_team_block_is_one_row_per_agent(board: dict[str, Any]) -> None:
+    """B1 #12: a focus took a second row under its agent; it ends the agent's row now."""
+    from textual.widgets import Static
+
+    focused = CODER.model_copy(update={"focus": "wire the login\nthen the tests"})
+    board["sessions"] = [MANAGER.model_copy(update={"focus": "plan the release"}), focused]
+
+    async def go(app: Host, panel: BoardPanel) -> tuple[int, list[str]]:
+        panel.refresh_data()
+        await settle_page(app)
+        block = panel.query_one("#sessions", Static)
+        plain = getattr(block.visual, "plain", "")
+        return block.region.height, [line for line in plain.splitlines() if line]
+
+    height, rows = drive(go)
+    assert height == 2 + 1 + 2, "two agents, a row each, the closing newline, the border"
+    assert rows[0].startswith("🧭 manager") and rows[0].endswith("🎯 plan the release")
+    assert rows[1].startswith("🔨 coder-auth") and "🎯 wire the login ⏎ then the tests" in rows[1]
+
+
+def test_in_the_shell_at_90_columns_the_board_tab_answers_at_once_and_its_footer_fits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1 #1, #2 and #9 in asq itself, at the screen the tester walks (90x30): a click on the
+    Board tab gives the board the keys, so ``d`` answers with no click inside it; the tasks
+    column, hidden at that width, is said to be, and ``d`` brings it back with the archive; and
+    with the board focused, every key in the footer ends inside 90 columns."""
+    from textual.widgets import Footer, OptionList, TabbedContent
+
+    from aisquare.cli.ui.app import FleetApp
+    from aisquare.cli.ui.sidebar import ProjectSelected
+    from tests.test_ui_spawn import register
+
+    project = register(tmp_path / "alpha", project_id="prj_alpha")
+    monkeypatch.setattr(
+        team_service,
+        "board_read",
+        lambda **_k: team_service.BoardRead(project, [MANAGER, CODER], BOARD_TASKS, [], {}),
+    )
+    monkeypatch.setattr(fleet_service, "list_agents", lambda project, live_only=True: [])
+
+    async def run() -> dict[str, Any]:
+        app = FleetApp(refresh_seconds=3600, doctor=lambda: [], accounts=None)
+        async with app.run_test(size=(90, 30)) as pilot:
+            await pilot.pause()
+            await settle_page(app)
+            app.post_message(ProjectSelected(project.id))
+            await settle_page(app)
+            tabs = app.query_one(f"#project-{project.id}", TabbedContent)
+            await pilot.click(tabs.query_one("#--content-tab-tab-board"))
+            await settle_page(app)
+            panel = app.query_one(BoardPanel)
+            seen: dict[str, Any] = {"active": tabs.active}
+            seen["focus"] = app.focused is not None and panel in app.focused.ancestors_with_self
+            seen["title"] = str(panel.query_one("#feed", OptionList).border_title)
+            footer = app.screen.query_one(Footer)
+            seen["keys"] = [
+                (str(getattr(key, "key_display", "")), key.region.right)
+                for key in footer.query("FooterKey")
+            ]
+            await pilot.press("d")
+            await settle_page(app)
+            seen["shown"] = panel.query_one("#board-side").display
+            seen["table"] = str(panel.query_one("#tasks", DataTable).border_title)
+            return seen
+
+    seen = asyncio.run(run())
+    assert seen["active"] == "tab-board"
+    assert seen["focus"], "the tab's click left the keys outside the board"
+    assert board_mod.TASKS_HIDDEN in seen["title"], seen["title"]
+    keys = {key for key, _ in seen["keys"]}
+    assert {"b", "d", "a", "v", "o", "?"} <= keys, seen["keys"]
+    assert all(right <= 90 for _, right in seen["keys"]), seen["keys"]
+    assert seen["shown"] and seen["table"].startswith("done archive"), seen

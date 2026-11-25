@@ -2304,13 +2304,14 @@ def test_aisquare_board_names_each_session_as_the_left_pane_does(
     ended = runner.invoke(app, ["board"])
 
     assert board.exit_code == 0, board.output
-    assert "  - coder-auth — " in board.stdout and "  - manager — " in board.stdout
+    # The person's text board (B1 #14): a row per agent, its name first.
+    assert "\n  coder-auth " in board.stdout and "\n  manager " in board.stdout
     assert "coder-auth note: PR ready" in board.stdout
     assert "owner note: ship it" in board.stdout, "agents run it too: never 'you'"
     assert "bbbb2222" not in board.stdout and "aaaa1111" not in board.stdout
     assert {s["id"] for s in shown["sessions"]} >= {CODER, PLANNER}, "--json keeps the ids"
     assert ended.exit_code == 0, ended.output
-    assert "  - coder-auth note: PR ready" in ended.stdout, "ended, it keeps its name"
+    assert "  coder-auth note: PR ready" in ended.stdout, "ended, it keeps its name"
 
 
 # --- the board's two readers: the agents' text, byte for byte, and the human's (B1 #14) ---------
@@ -2364,7 +2365,7 @@ def _board_fixture() -> tuple[Any, list[TeamSession], list[TeamTask], list[Any],
             number=number,
             key=f"golden-{number}",
             title=title,
-            status=status,  # type: ignore[arg-type]
+            status=status,
             created_at=BOARD_NOW - timedelta(hours=3),
             updated_at=BOARD_NOW - timedelta(minutes=number),
             **extra,
@@ -2522,3 +2523,39 @@ def test_an_agents_injected_board_is_byte_for_byte_what_it_was(
     board, protocol, _rest = injected.partition("Protocol: ")
     assert protocol, "the protocol still follows the board"
     assert board + protocol == GOLDEN_INJECTED_BOARD
+
+
+def test_a_persons_board_is_a_text_board_of_its_own(golden_board: tuple[Any, ...]) -> None:
+    """B1 #14: ``aisquare board`` printed a person the block an agent's prompt is fenced in.
+    Its own text board: a title, then the team (a row per agent, its state in words), the open
+    tasks (number, status, title, who has it), and the updates, each by its time — dated when
+    it is not today's — with a text of several lines kept under its first."""
+    project, sessions, tasks, events = golden_board
+    names = {s.id: s.label or s.role for s in sessions}
+
+    text = team_service.render_board(project, sessions, tasks, events, names=names)
+    lines = text.splitlines()
+
+    assert "<aisquare-team>" not in text and "sessions:" not in text
+    assert lines[0] == "rlx board — golden-repo"
+    team = lines.index("team — 3 live")
+    assert [line.split()[0] for line in lines[team + 1 : team + 4]] == [
+        "manager",
+        "coder-auth",
+        "tester-1",
+    ]
+    assert "waiting for input  golden-model-x ⚠ off-ladder · 2m ago" in lines[team + 1]
+    assert lines[team + 2].endswith("persona skeptic · 2m ago · focus: wire the login")
+    assert "NEEDS YOU" in lines[team + 3] and lines[team + 3].endswith("45m ago (stale)")
+    assert "tasks — 8 to do · 1 doing · 1 in review · 1 blocked · 1 done" in lines
+    assert "  #1   doing      wire auth — coder-auth" in lines
+    assert "  #4   to do      write the docs ⧗ waits on #2" in lines
+    assert "  … 3 more — `rlx task list`" in lines
+    recent = lines[lines.index("recent updates") + 1 :]
+    stamps = [team_service.when_text(e.created_at, now=BOARD_NOW) for e in events]
+    note = BOARD_NOW - timedelta(hours=26)  # yesterday, in every timezone
+    assert stamps[2] == f"{note.astimezone():%b} {note.astimezone().day} {note.astimezone():%H:%M}"
+    width = max(len(stamp) for stamp in stamps)
+    assert recent[2] == f"  {stamps[2]:>{width}}  owner note: ship it"
+    assert recent[3] == " " * (2 + width + 2) + "then tell me", "its next line, under it"
+    assert recent[4] == f"  {stamps[3]:>{width}}  manager question: staging or prod first?"
