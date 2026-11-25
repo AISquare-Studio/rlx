@@ -15,6 +15,7 @@
       "description": "The protocol version this connection speaks from here on.",
       "type": "integer",
       "format": "uint32",
+      "maximum": 4294967295,
       "minimum": 1
     },
     "protocol_versions": {
@@ -23,6 +24,7 @@
       "items": {
         "type": "integer",
         "format": "uint32",
+        "maximum": 4294967295,
         "minimum": 1
       },
       "minItems": 1

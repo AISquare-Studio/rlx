@@ -86,8 +86,7 @@ impl JsonSchema for RequestId {
 ///
 /// The response is an envelope with the same `id`. The first frame on a connection must
 /// be `hello`; any other first frame gets the error `unauthorized`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(remote = "Self")]
+#[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[schemars(title = "Request")]
 #[non_exhaustive]
 pub struct Request {
@@ -99,6 +98,19 @@ pub struct Request {
     /// The method's parameters. Absent means `{}`.
     #[serde(default)]
     pub params: Params,
+}
+
+/// Request's fields as serde reads and writes them, unchecked. It is private, so the only
+/// way in or out of a Request is through Request's own `Serialize` and `Deserialize`, which run
+/// `validate()`. (`remote = "Self"` on Request itself would make these unchecked functions
+/// public, as `Request::serialize` and `Request::deserialize`.)
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Request")]
+struct UncheckedRequest {
+    id: RequestId,
+    method: String,
+    #[serde(default)]
+    params: Params,
 }
 
 /// The method names this crate defines types for.
@@ -129,13 +141,13 @@ impl Request {
 impl Serialize for Request {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        Request::serialize(self, serializer)
+        UncheckedRequest::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Request {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let request = Request::deserialize(deserializer)?;
+        let request = UncheckedRequest::deserialize(deserializer)?;
         request.validate().map_err(de::Error::custom)?;
         Ok(request)
     }

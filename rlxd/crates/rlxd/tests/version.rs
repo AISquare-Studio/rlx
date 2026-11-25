@@ -23,6 +23,27 @@ fn read_toml(path: &Path) -> toml::Table {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// Every crate of the workspace: each directory under rlxd/crates that holds a
+/// Cargo.toml, with its manifest. A stray file there, such as a `.DS_Store`, is skipped.
+fn crate_manifests() -> Vec<(PathBuf, toml::Table)> {
+    let crates = repo().join("rlxd").join("crates");
+    let mut manifests = Vec::new();
+    for entry in fs::read_dir(&crates).unwrap() {
+        let manifest = entry.unwrap().path().join("Cargo.toml");
+        if manifest.is_file() {
+            let table = read_toml(&manifest);
+            manifests.push((manifest, table));
+        }
+    }
+    assert!(
+        manifests.len() >= 4,
+        "found {} crates under {}",
+        manifests.len(),
+        crates.display()
+    );
+    manifests
+}
+
 fn rlx_version() -> String {
     let pyproject = read_toml(&repo().join("pyproject.toml"));
     pyproject["project"]["version"]
@@ -49,15 +70,14 @@ fn the_workspace_version_is_rlxs_version() {
 fn the_lock_records_rlxs_version_for_every_crate() {
     // `cargo test --locked` fails on a stale lock too, but only after a build; this
     // names the fix.
-    let crates: Vec<String> = fs::read_dir(repo().join("rlxd").join("crates"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
     let lock = read_toml(&repo().join("rlxd").join("Cargo.lock"));
     let packages = lock["package"]
         .as_array()
         .expect("Cargo.lock lists packages");
-    for name in &crates {
+    for (manifest, table) in crate_manifests() {
+        let name = table["package"]["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{}: no [package] name", manifest.display()));
         let locked = packages
             .iter()
             .find(|p| p["name"].as_str() == Some(name))
@@ -69,7 +89,6 @@ fn the_lock_records_rlxs_version_for_every_crate() {
              --workspace` in rlxd/"
         );
     }
-    assert!(crates.len() >= 4, "found {} crates", crates.len());
 }
 
 #[test]
@@ -79,21 +98,13 @@ fn this_binary_carries_rlxs_version() {
 
 #[test]
 fn every_crate_takes_the_workspace_version() {
-    let crates = repo().join("rlxd").join("crates");
-    let mut seen = 0;
-    for entry in fs::read_dir(&crates).unwrap() {
-        let manifest = entry.unwrap().path().join("Cargo.toml");
-        if !manifest.is_file() {
-            continue;
-        }
-        let package = &read_toml(&manifest)["package"];
+    for (manifest, table) in crate_manifests() {
+        let package = &table["package"];
         assert_eq!(
             package.get("version").and_then(|v| v.get("workspace")),
             Some(&toml::Value::Boolean(true)),
             "{}: set `version.workspace = true`",
             manifest.display()
         );
-        seen += 1;
     }
-    assert!(seen >= 4, "found {seen} crates under {}", crates.display());
 }

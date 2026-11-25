@@ -20,8 +20,7 @@ use crate::marker::V1;
 /// `events.subscribe {since}` resumes after it. `data.run_seq` is per run: every event
 /// whose topic is `run` has one, with the run's `run_id`, `kind`, `attempt` and
 /// `job_id?`, so a client can replay one run from a known point.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(remote = "Self")]
+#[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[schemars(title = "Event", transform = event_rules)]
 #[non_exhaustive]
 pub struct Event {
@@ -48,6 +47,21 @@ pub struct Event {
     pub data: Data,
 }
 
+/// Event's fields as serde reads and writes them, unchecked. It is private, so the only
+/// way in or out of a Event is through Event's own `Serialize` and `Deserialize`, which run
+/// `validate()`. (`remote = "Self"` on Event itself would make these unchecked functions
+/// public, as `Event::serialize` and `Event::deserialize`.)
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Event")]
+struct UncheckedEvent {
+    schema_version: V1,
+    seq: u64,
+    time: String,
+    topic: String,
+    r#type: String,
+    data: Data,
+}
+
 /// The run fields every `run`-topic event carries in its `data` (7.5): which run, its
 /// place in that run's own stream, and which attempt of it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -67,7 +81,8 @@ pub struct RunScope {
 }
 
 /// The schema's half of the event rules:
-/// - on each topic this version lists, `type` starts with that topic;
+/// - on each topic this version lists (7.3's, and 7.8's CLI ones), `type` starts with
+///   that topic;
 /// - an event on the `run` topic carries `run_id`, `run_seq`, `kind` and `attempt`, and
 ///   may carry `job_id`.
 fn event_rules(schema: &mut Schema) {
@@ -75,6 +90,7 @@ fn event_rules(schema: &mut Schema) {
         |topic: &str| json!({"properties": {"topic": {"const": topic}}, "required": ["topic"]});
     let mut rules: Vec<Value> = topics::ALL
         .iter()
+        .chain(topics::CLI)
         .map(|topic| {
             json!({
                 "if": on(topic),
@@ -97,6 +113,7 @@ fn event_rules(schema: &mut Schema) {
                     "description": "Strictly increasing per run, from 1.",
                     "type": "integer",
                     "minimum": 1,
+                    "maximum": u64::MAX,
                 },
                 "kind": {
                     "description": "The run's kind, such as task or widget_refresh.",
@@ -107,6 +124,7 @@ fn event_rules(schema: &mut Schema) {
                     "description": "Which attempt of the run, from 1.",
                     "type": "integer",
                     "minimum": 1,
+                    "maximum": u64::MAX,
                 },
                 "job_id": {
                     "description": "The scheduler job that fired the run, if one did.",
@@ -144,10 +162,20 @@ pub mod topics {
     /// The upgrade: `upgrade.started`, `upgrade.done`.
     pub const UPGRADE: &str = "upgrade";
 
-    /// Every topic above.
+    /// Every topic above: the stream's, 7.3's.
     pub const ALL: &[&str] = &[
         DAEMON, RUN, JOB, CONNECTOR, PTY, HOOK, FLEET, BOARD, NEEDS_YOU, UPGRADE,
     ];
+
+    /// The installer's JSON lines (7.8): `install.step`, `install.done`, `install.error`.
+    pub const INSTALL: &str = "install";
+    /// Sign-in's JSON lines (7.8): `signin.open_url`, `signin.waiting`,
+    /// `signin.signed_in`, `signin.error`.
+    pub const SIGNIN: &str = "signin";
+
+    /// The topics only the CLI's `--json-lines` prints (7.8), as event envelopes too.
+    /// `upgrade`, which the stream also carries, is in [`ALL`].
+    pub const CLI: &[&str] = &[INSTALL, SIGNIN];
 }
 
 impl Event {
@@ -263,13 +291,13 @@ impl Event {
 impl Serialize for Event {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        Event::serialize(self, serializer)
+        UncheckedEvent::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Event {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let event = Event::deserialize(deserializer)?;
+        let event = UncheckedEvent::deserialize(deserializer)?;
         event.validate().map_err(de::Error::custom)?;
         Ok(event)
     }

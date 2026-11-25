@@ -4,7 +4,9 @@
 //! `gen-schemas --check` (and this crate's tests) fail when the checked-in files differ.
 
 use schemars::generate::SchemaSettings;
+use schemars::transform::RecursiveTransform;
 use schemars::{JsonSchema, Schema};
+use serde_json::Value;
 
 use crate::{DaemonRecord, Envelope, Event, HelloData, HelloParams, Request};
 
@@ -36,11 +38,29 @@ pub fn all() -> Vec<SchemaFile> {
     files
 }
 
-/// The schema of `T`, as the files hold it: draft 2020-12.
+/// The schema of `T`, as the files hold it: draft 2020-12, and every unsigned integer
+/// bounded by its Rust type's maximum.
 pub fn schema_for<T: JsonSchema>() -> Schema {
     SchemaSettings::draft2020_12()
+        .with_transform(RecursiveTransform(integer_maxima))
         .into_generator()
         .into_root_schema_for::<T>()
+}
+
+/// Gives a `u8`, `u16`, `u32` or `u64` its type's `maximum`. schemars writes only
+/// `format: uint32` and the like, which validators ignore, so without this a schema
+/// would accept a number its type refuses.
+fn integer_maxima(schema: &mut Schema) {
+    let maximum = match schema.get("format").and_then(Value::as_str) {
+        Some("uint8") => u64::from(u8::MAX),
+        Some("uint16") => u64::from(u16::MAX),
+        Some("uint32") => u64::from(u32::MAX),
+        Some("uint64") => u64::MAX,
+        _ => return,
+    };
+    if schema.get("maximum").is_none() {
+        schema.insert("maximum".to_owned(), maximum.into());
+    }
 }
 
 fn file<T: JsonSchema>(name: &'static str) -> SchemaFile {

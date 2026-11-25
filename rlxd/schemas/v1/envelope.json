@@ -119,6 +119,7 @@
                 "type": "array",
                 "items": {
                   "type": "integer",
+                  "maximum": 4294967295,
                   "minimum": 1
                 },
                 "minItems": 1

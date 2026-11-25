@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use rlxd_proto::{
     DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, Invalid,
     PROTOCOL_VERSION, PROTOCOL_VERSIONS, Request, RequestId, Role, RunScope, SCHEMA_VERSION, codes,
-    daemon_kinds, schema_version_of, schemas, topics,
+    daemon_kinds, protocol_version_of, schema_version_of, schemas, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -175,23 +175,85 @@ fn every_schema_is_a_valid_draft_2020_12_schema() {
     }
 }
 
+/// The body of every `#[schemars(…)]` attribute in `text`, its parentheses balanced.
+fn schemars_attributes(text: &str) -> Vec<&str> {
+    let mut bodies = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("#[schemars(") {
+        let body = &rest[at + "#[schemars(".len()..];
+        let mut depth = 1;
+        let end = body
+            .char_indices()
+            .find_map(|(i, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(i)
+            })
+            .unwrap_or(body.len());
+        bodies.push(&body[..end]);
+        rest = &body[end..];
+    }
+    bodies
+}
+
+/// Whether an attribute body sets `with` or `schema_with`, the two schemars options that
+/// replace a field's schema.
+fn overrides_a_schema(body: &str) -> bool {
+    let words: Vec<&str> = body
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '='))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let set = |name: &str| {
+        words.iter().enumerate().any(|(i, w)| {
+            *w == name && words.get(i + 1).is_some_and(|next| next.starts_with('='))
+                || w.strip_prefix(name)
+                    .is_some_and(|tail| tail.starts_with('='))
+        })
+    };
+    set("with") || set("schema_with")
+}
+
 #[test]
 fn every_schema_comes_from_the_fields_real_types() {
-    // A `#[schemars(with = …)]` override hides a change to its field's Rust type from
+    // A `with` or `schema_with` override hides a change to its field's Rust type from
     // gen-schemas --check, so there are none: optional fields drop `null` with a
     // transform on the schema derived from their own type instead.
+    for probe in [
+        "with = \"String\"",
+        "length(min = 1), with = \"String\"",
+        "title = \"x\", with=\"Value\"",
+        "schema_with = \"f\"",
+        "transform = drop_null, schema_with = \"f\"",
+    ] {
+        assert!(overrides_a_schema(probe), "{probe}");
+    }
+    for fine in [
+        "transform = drop_null",
+        "length(min = 1)",
+        "title = \"Error\"",
+    ] {
+        assert!(!overrides_a_schema(fine), "{fine}");
+    }
     let src = crate_dir().join("src");
+    let mut seen = 0;
     for entry in fs::read_dir(&src).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "rs") {
             let text = fs::read_to_string(&path).unwrap();
-            assert!(
-                !text.contains(&["schemars(", "with"].concat()),
-                "{} overrides a field's schema",
-                path.display()
-            );
+            for body in schemars_attributes(&text) {
+                seen += 1;
+                assert!(
+                    !overrides_a_schema(body),
+                    "{} overrides a field's schema: #[schemars({body})]",
+                    path.display()
+                );
+            }
         }
     }
+    assert!(seen > 10, "found only {seen} schemars attributes");
 }
 
 // --- the contract's examples ----------------------------------------------------------------
@@ -958,5 +1020,197 @@ fn a_daemon_record_refuses_its_wrong_shapes() {
         ("cwd", json!(7)),
     ] {
         both_refuse::<DaemonRecord>("daemon-record.json", with(&record, field, value));
+    }
+}
+
+#[test]
+fn second_60_is_refused_in_every_time() {
+    // RFC 3339 allows a leap second, but the validators disagree on it: check-jsonschema
+    // refuses every :60, while the jsonschema crate accepts 23:59:60. So the types refuse
+    // all of them, the bound both agree on. (The tester ran these five through
+    // check-jsonschema, which refused each.)
+    let leaps = [
+        "2026-11-25T12:00:60Z",
+        "2026-11-30T23:59:60Z",
+        "2026-11-25T23:59:60Z",
+        "2026-11-25T23:59:60+01:00",
+        "2026-11-25T12:00:60.500Z",
+    ];
+    let event = example("event-daemon.json");
+    let record = example("daemon-record.json");
+    for time in leaps {
+        assert_eq!(
+            refused(Event::new(1, time, "daemon", "daemon.started", Data::new())),
+            "time"
+        );
+        let parsed = serde_json::from_value::<Event>(with(&event, "time", json!(time)));
+        assert!(parsed.is_err(), "{time}");
+        for field in ["started_at", "heartbeat_at"] {
+            let parsed = serde_json::from_value::<DaemonRecord>(with(&record, field, json!(time)));
+            assert!(parsed.is_err(), "{field} {time}");
+        }
+        let built = DaemonRecord::new(
+            "0123456789ab",
+            "watch",
+            1,
+            "h",
+            "v",
+            time,
+            TIME,
+            vec!["rlx".to_owned()],
+            false,
+        );
+        assert_eq!(refused(built), "started_at");
+    }
+    // Where both validators refuse it, the schema refuses it too.
+    both_refuse::<Event>(
+        "event.json",
+        with(&event, "time", json!("2026-11-25T12:00:60Z")),
+    );
+    let mut late = with(&record, "heartbeat_at", json!("2026-11-25T12:00:60.500Z"));
+    both_refuse::<DaemonRecord>("daemon-record.json", late.clone());
+    late["heartbeat_at"] = json!("2026-11-25T12:00:59.999Z");
+    agrees::<DaemonRecord>("daemon-record.json", &late);
+}
+
+#[test]
+fn every_unsigned_integer_is_bounded_in_the_schema_as_in_its_type() {
+    let big = |text: &str| -> Value { serde_json::from_str(text).unwrap() };
+    let u32_over = json!(u64::from(u32::MAX) + 1);
+    let u64_over = big("18446744073709551616");
+
+    let hello = hello_base();
+    both_refuse::<HelloParams>(
+        "hello.json",
+        with(&hello, "protocol_version", u32_over.clone()),
+    );
+    agrees::<HelloParams>(
+        "hello.json",
+        &with(&hello, "protocol_version", json!(u32::MAX)),
+    );
+    let reply = reply_base();
+    both_refuse::<HelloData>(
+        "hello-reply.json",
+        with(&reply, "protocol_version", u32_over.clone()),
+    );
+    both_refuse::<HelloData>(
+        "hello-reply.json",
+        with(
+            &reply,
+            "protocol_versions",
+            json!([1, u64::from(u32::MAX) + 1]),
+        ),
+    );
+    let record = example("daemon-record.json");
+    both_refuse::<DaemonRecord>("daemon-record.json", with(&record, "pid", u32_over.clone()));
+    let refused_version = example("envelope-incompatible-protocol.json");
+    both_refuse::<Envelope>(
+        "envelope.json",
+        with_error(&refused_version, "detail", json!({"supported": [u32_over]})),
+    );
+
+    let daemon = example("event-daemon.json");
+    both_refuse::<Event>("event.json", with(&daemon, "seq", u64_over.clone()));
+    agrees::<Event>("event.json", &with(&daemon, "seq", json!(u64::MAX)));
+    for field in ["run_seq", "attempt"] {
+        let mut run = example("event.json");
+        run["data"][field] = u64_over.clone();
+        both_refuse::<Event>("event.json", run.clone());
+        run["data"][field] = json!(u64::MAX);
+        agrees::<Event>("event.json", &run);
+    }
+    // Every u32 and u64 the generator wrote has its maximum.
+    for file in schemas::all() {
+        let schema: Value = serde_json::from_str(&file.contents).unwrap();
+        let mut unbounded = Vec::new();
+        find_unbounded(&schema, "", &mut unbounded);
+        assert!(unbounded.is_empty(), "{}: {unbounded:?}", file.name);
+    }
+}
+
+fn find_unbounded(value: &Value, at: &str, found: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            let unsigned = map
+                .get("format")
+                .and_then(Value::as_str)
+                .is_some_and(|f| f.starts_with("uint"));
+            if unsigned && !map.contains_key("maximum") {
+                found.push(at.to_owned());
+            }
+            for (key, child) in map {
+                find_unbounded(child, &format!("{at}/{key}"), found);
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                find_unbounded(child, &format!("{at}/{i}"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn a_hello_rlxd_cannot_parse_can_still_be_told_its_version_is_incompatible() {
+    // 7.2: a version rlxd doesn't serve gets incompatible_protocol, never a parse error.
+    // rlxd reads the version from the raw params first.
+    let hello = hello_base();
+    let later = json!({"protocol_version": 2, "token": "t", "who": {"client": "rlxapp"}});
+    for (params, version) in [
+        (with(&hello, "protocol_version", json!(0)), Some(0)),
+        (
+            with(&hello, "protocol_version", json!(u64::from(u32::MAX) + 1)),
+            Some(u64::from(u32::MAX) + 1),
+        ),
+        (later, Some(2)),
+        (with(&hello, "protocol_version", json!("1")), None),
+        (without(&hello, "protocol_version"), None),
+    ] {
+        assert!(
+            serde_json::from_value::<HelloParams>(params.clone()).is_err(),
+            "{params}"
+        );
+        assert_eq!(protocol_version_of(&params), version, "{params}");
+        if let Some(version) = version {
+            let reply = Envelope::err(ErrorBody::incompatible_protocol(version)).with_id(id(1));
+            let printed = serde_json::to_value(&reply).unwrap();
+            agrees::<Envelope>("envelope.json", &printed);
+            assert!(
+                printed["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&version.to_string())
+            );
+        }
+    }
+    assert_eq!(
+        protocol_version_of(&hello),
+        Some(u64::from(PROTOCOL_VERSION))
+    );
+}
+
+#[test]
+fn the_cli_json_lines_topics_have_their_prefix_checked_too() {
+    // 7.8: install and sign-in print event envelopes from install.sh, install.ps1 and
+    // Python, which don't use these types, so the schema's check is theirs.
+    let daemon = example("event-daemon.json");
+    let on =
+        |topic: &str, kind: &str| with(&with(&daemon, "topic", json!(topic)), "type", json!(kind));
+    for (topic, kind) in [
+        ("install", "install.step"),
+        ("install", "install.done"),
+        ("signin", "signin.open_url"),
+        ("signin", "signin.signed_in"),
+        ("upgrade", "upgrade.done"),
+    ] {
+        agrees::<Event>("event.json", &on(topic, kind));
+    }
+    for (topic, kind) in [
+        ("install", "signin.done"),
+        ("signin", "install.step"),
+        ("upgrade", "install.done"),
+    ] {
+        both_refuse::<Event>("event.json", on(topic, kind));
     }
 }

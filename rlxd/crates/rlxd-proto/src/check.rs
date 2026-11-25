@@ -106,7 +106,9 @@ pub(crate) fn event_type(field: &str, value: &str, topic: &str) -> Result<(), In
 }
 
 /// RFC 3339's `date-time`, as JSON Schema's `format: date-time` takes it:
-/// `2026-11-25T12:00:00.000Z`, or with an offset such as `+00:00`.
+/// `2026-11-25T12:00:00.000Z`, or with an offset such as `+00:00`. Second `60`, a leap
+/// second, is refused: check-jsonschema refuses every one and the jsonschema crate
+/// accepts some, so `59` is the bound both agree on.
 pub(crate) fn date_time(field: &str, value: &str) -> Result<(), Invalid> {
     if is_date_time(value.as_bytes()) {
         Ok(())
@@ -144,7 +146,7 @@ fn is_date_time(b: &[u8]) -> bool {
         || !(1..=days).contains(&day)
         || hour > 23
         || minute > 59
-        || second > 60
+        || second > 59
     {
         return false;
     }

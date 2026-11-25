@@ -42,6 +42,7 @@
       "description": "Its process id.",
       "type": "integer",
       "format": "uint32",
+      "maximum": 4294967295,
       "minimum": 1
     },
     "restartable": {

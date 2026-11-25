@@ -33,8 +33,17 @@
 //! - It reads `1.0` as the integer `1`, which the types refuse. No producer of these
 //!   documents writes integers that way.
 //! - It cannot compare one field with another. So the schema checks that an event's
-//!   `type` starts with its `topic` only for the topics v1 lists, while the types check
-//!   it for every topic.
+//!   `type` starts with its `topic` only for the topics v1 lists (7.3's and 7.8's), while
+//!   the types check it for every topic.
+//!
+//! Every unsigned integer's schema carries its Rust type's `maximum` too, so a
+//! `protocol_version` of 2^32 or a `seq` of 2^64 is refused by both. A `time` with
+//! second `60` is refused: RFC 3339 allows a leap second, but validators disagree on
+//! it, so the types hold to `59`, the bound they agree on.
+//!
+//! The unchecked serde code of each wire type lives on a private mirror struct
+//! (`#[serde(remote = …)]`). So `Event::deserialize` and `Event::serialize`, called by
+//! path, are the validating trait impls; `tests/direct_calls.rs` holds every type to that.
 //!
 //! The doc comments of these types and their fields become the schemas' descriptions,
 //! so they are written for an app's developer and carry no rustdoc links.
@@ -58,7 +67,9 @@
 //!
 //! A version rlxd does not serve gets the error [`codes::INCOMPATIBLE_PROTOCOL`], with
 //! `detail.supported` listing the versions it does, and never a silent misparse
-//! ([`ErrorBody::incompatible_protocol`]). The protocol version is the `schema_version`
+//! ([`ErrorBody::incompatible_protocol`]). rlxd reads the version with
+//! [`protocol_version_of`] before it parses the rest, so a hello it can't parse still
+//! gets that answer. The protocol version is the `schema_version`
 //! of every envelope and event.
 //!
 //! # The gate credential
@@ -157,4 +168,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// document, which the types refuse, from a broken one.
 pub fn schema_version_of(document: &serde_json::Value) -> Option<u64> {
     document.get("schema_version")?.as_u64()
+}
+
+/// A `hello`'s `protocol_version`, read from its raw params without parsing the rest.
+///
+/// rlxd reads this first. [`HelloParams`] refuses version 0, a version above `u32`, and a
+/// later protocol's hello whose other fields have moved. Each of those must still get
+/// [`codes::INCOMPATIBLE_PROTOCOL`] ([`ErrorBody::incompatible_protocol`]), not a parse
+/// error. `None` means the params have no integer `protocol_version` at all.
+pub fn protocol_version_of(params: &serde_json::Value) -> Option<u64> {
+    params.get("protocol_version")?.as_u64()
 }

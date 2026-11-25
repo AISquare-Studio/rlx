@@ -22,9 +22,14 @@ two places JSON Schema can't reach:
 
 - A float with a zero fraction, such as `1.0` where an integer belongs, passes the
   schema and fails to parse.
-- An event's `type` must start with its `topic`. The schema checks that only for the
-  topics v1 lists, because it can't compare one field with another; the types check it
-  for every topic.
+- An event's `type` must start with its `topic`. The schema can't compare one field
+  with another, so it checks that only for the topics v1 lists: 7.3's, plus 7.8's
+  `install` and `signin`. The types check it for every topic.
+
+Every unsigned integer carries its Rust type's `maximum`, so the two agree on range
+too. A `time` with second `60` is refused: RFC 3339 allows a leap second, but
+check-jsonschema refuses every one and the jsonschema crate accepts some, so `59` is the
+bound both validators agree on.
 
 | File | What it describes |
 |---|---|

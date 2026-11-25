@@ -19,12 +19,13 @@ use crate::{PROTOCOL_VERSION, PROTOCOL_VERSIONS};
 /// ```
 ///
 /// A `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,
-/// whose `detail.supported` lists the versions it does. `role: app` also needs a valid
+/// whose `detail.supported` lists the versions it does. rlxd reads the version from the
+/// raw params first (`protocol_version_of`), so a hello this type refuses, such as one
+/// from a later protocol, still gets that answer. `role: app` also needs a valid
 /// `gate_credential` and a peer that passes rlxd's identity check (only the credential,
 /// in gate dev mode). Anything less gets the error `not_gate`, and a refused hello never
 /// counts as an app client.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(remote = "Self")]
+#[derive(Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "HelloParams")]
 #[non_exhaustive]
 pub struct HelloParams {
@@ -46,11 +47,7 @@ pub struct HelloParams {
     /// The app's gate credential, separate from the shared token, which `gate.pair` mints
     /// for a peer that passes rlxd's identity check. A `role: app` hello needs it. Other
     /// roles have none to send.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "present"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, length(min = 1))]
     pub gate_credential: Option<String>,
     /// What the client can do, by name. rlxd ignores names it does not know.
@@ -58,13 +55,36 @@ pub struct HelloParams {
     /// Variables rlxd keeps and passes to the brain and to every Claude Code child, such
     /// as `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Absent leaves what
     /// rlxd already has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub env: Option<BTreeMap<String, String>>,
+}
+
+/// HelloParams's fields as serde reads and writes them, unchecked. It is private, so the only
+/// way in or out of a HelloParams is through HelloParams's own `Serialize` and `Deserialize`, which run
+/// `validate()`. (`remote = "Self"` on HelloParams itself would make these unchecked functions
+/// public, as `HelloParams::serialize` and `HelloParams::deserialize`.)
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "HelloParams")]
+struct UncheckedHello {
+    token: String,
+    protocol_version: u32,
+    client: String,
+    client_version: String,
+    role: Role,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    #[schemars(transform = drop_null)]
-    pub env: Option<BTreeMap<String, String>>,
+    gate_credential: Option<String>,
+    capabilities: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    env: Option<BTreeMap<String, String>>,
 }
 
 /// What a client connects as. A later protocol may add roles, so a `match` on this
@@ -90,8 +110,7 @@ pub enum Role {
 /// ```json
 /// {"protocol_version": 1, "protocol_versions": [1], "rlxd_version": "0.10.3", "capabilities": []}
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(remote = "Self")]
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "HelloData")]
 #[non_exhaustive]
 pub struct HelloData {
@@ -106,6 +125,19 @@ pub struct HelloData {
     pub rlxd_version: String,
     /// What this rlxd can do, by name. A client ignores names it does not know.
     pub capabilities: Vec<String>,
+}
+
+/// HelloData's fields as serde reads and writes them, unchecked. It is private, so the only
+/// way in or out of a HelloData is through HelloData's own `Serialize` and `Deserialize`, which run
+/// `validate()`. (`remote = "Self"` on HelloData itself would make these unchecked functions
+/// public, as `HelloData::serialize` and `HelloData::deserialize`.)
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "HelloData")]
+struct UncheckedReply {
+    protocol_version: u32,
+    protocol_versions: Vec<u32>,
+    rlxd_version: String,
+    capabilities: Vec<String>,
 }
 
 impl HelloParams {
@@ -169,13 +201,13 @@ impl HelloParams {
 impl Serialize for HelloParams {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        HelloParams::serialize(self, serializer)
+        UncheckedHello::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for HelloParams {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let hello = HelloParams::deserialize(deserializer)?;
+        let hello = UncheckedHello::deserialize(deserializer)?;
         hello.validate().map_err(de::Error::custom)?;
         Ok(hello)
     }
@@ -235,13 +267,13 @@ impl HelloData {
 impl Serialize for HelloData {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        HelloData::serialize(self, serializer)
+        UncheckedReply::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for HelloData {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let reply = HelloData::deserialize(deserializer)?;
+        let reply = UncheckedReply::deserialize(deserializer)?;
         reply.validate().map_err(de::Error::custom)?;
         Ok(reply)
     }

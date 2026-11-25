@@ -18,6 +18,7 @@
       "description": "Strictly increasing per home, from 1, across every topic. `events.subscribe\n{since}` resumes after it.",
       "type": "integer",
       "format": "uint64",
+      "maximum": 18446744073709551615,
       "minimum": 1
     },
     "time": {
@@ -231,6 +232,44 @@
       "if": {
         "properties": {
           "topic": {
+            "const": "install"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^install\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "signin"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^signin\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
             "const": "run"
           }
         },
@@ -245,6 +284,7 @@
               "attempt": {
                 "description": "Which attempt of the run, from 1.",
                 "type": "integer",
+                "maximum": 18446744073709551615,
                 "minimum": 1
               },
               "job_id": {
@@ -265,6 +305,7 @@
               "run_seq": {
                 "description": "Strictly increasing per run, from 1.",
                 "type": "integer",
+                "maximum": 18446744073709551615,
                 "minimum": 1
               }
             },

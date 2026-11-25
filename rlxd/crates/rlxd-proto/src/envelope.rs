@@ -83,8 +83,7 @@ fn one_or_the_other(schema: &mut Schema) {
 }
 
 /// Why a request was refused or failed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(remote = "Self")]
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(rename = "Error", title = "Error", transform = incompatible_protocol_rule)]
 #[non_exhaustive]
 pub struct ErrorBody {
@@ -97,23 +96,38 @@ pub struct ErrorBody {
     #[schemars(length(min = 1))]
     pub message: String,
     /// What to do about it, for a person.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "present"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub hint: Option<String>,
     /// More about what went wrong: a string, such as an underlying error's text, or an
     /// object whose fields the code defines, such as `incompatible_protocol`'s
     /// `{"supported": [1]}` or `denied`'s `{"by": …}`. Never `null`: absent instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub detail: Option<Detail>,
+}
+
+/// ErrorBody's fields as serde reads and writes them, unchecked. It is private, so the only
+/// way in or out of a ErrorBody is through ErrorBody's own `Serialize` and `Deserialize`, which run
+/// `validate()`. (`remote = "Self"` on ErrorBody itself would make these unchecked functions
+/// public, as `ErrorBody::serialize` and `ErrorBody::deserialize`.)
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "ErrorBody")]
+struct UncheckedError {
+    code: String,
+    message: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    #[schemars(transform = drop_null)]
-    pub detail: Option<Detail>,
+    hint: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    detail: Option<Detail>,
 }
 
 /// An error's `detail`: a string, or an object whose fields its code defines.
@@ -187,7 +201,7 @@ fn incompatible_protocol_rule(schema: &mut Schema) {
                 "type": "object",
                 "properties": {"supported": {
                     "type": "array",
-                    "items": {"type": "integer", "minimum": 1},
+                    "items": {"type": "integer", "minimum": 1, "maximum": u32::MAX},
                     "minItems": 1,
                 }},
                 "required": ["supported"],
@@ -301,9 +315,7 @@ impl<'de> Deserialize<'de> for Envelope {
             (false, None, None) => return Err(refuse("error", "is required when ok is false")),
             (false, None, Some(error)) => Outcome::Err {
                 ok: False,
-                // The trait's deserialize, which validates; `ErrorBody::deserialize`
-                // here would be the unchecked one `remote = "Self"` generates.
-                error: <ErrorBody as Deserialize>::deserialize(error)
+                error: ErrorBody::deserialize(error)
                     .map_err(|e| de::Error::custom(format_args!("error: {e}")))?,
             },
         };
@@ -345,8 +357,10 @@ impl ErrorBody {
         Ok(self)
     }
 
-    /// The reply to a `hello` whose `protocol_version` this crate does not serve.
-    pub fn incompatible_protocol(requested: u32) -> Self {
+    /// The reply to a `hello` whose `protocol_version` this crate does not serve. Takes a
+    /// `u64`, so a version too large for a `u32` can still be named in the message; read
+    /// it with [`protocol_version_of`](crate::protocol_version_of).
+    pub fn incompatible_protocol(requested: u64) -> Self {
         let mut detail = Data::new();
         detail.insert("supported".to_owned(), json!(PROTOCOL_VERSIONS));
         Self {
@@ -372,13 +386,14 @@ impl ErrorBody {
                 .and_then(Value::as_array)
                 .filter(|v| !v.is_empty());
             let valid = versions.is_some_and(|versions| {
-                versions.iter().all(|v| v.as_u64().is_some_and(|v| v >= 1))
+                let version = |v: &Value| v.as_u64().and_then(|v| u32::try_from(v).ok());
+                versions.iter().all(|v| version(v).is_some_and(|v| v >= 1))
             });
             if !valid {
                 return Err(Invalid::new(
                     "detail.supported",
                     "incompatible_protocol needs the versions rlxd serves, a non-empty list \
-                     of integers of at least 1",
+                     of protocol versions, integers from 1 to 2^32 - 1",
                 ));
             }
         }
@@ -389,13 +404,13 @@ impl ErrorBody {
 impl Serialize for ErrorBody {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        ErrorBody::serialize(self, serializer)
+        UncheckedError::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for ErrorBody {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let error = ErrorBody::deserialize(deserializer)?;
+        let error = UncheckedError::deserialize(deserializer)?;
         error.validate().map_err(de::Error::custom)?;
         Ok(error)
     }

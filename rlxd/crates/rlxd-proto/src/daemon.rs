@@ -16,8 +16,7 @@ use crate::check::{self, Invalid};
 ///  "heartbeat_at": "2026-11-25T18:00:05.123456+00:00", "argv": ["rlx", "watch"],
 ///  "restartable": true, "cwd": "/Users/me/project"}
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(remote = "Self")]
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "DaemonRecord")]
 #[non_exhaustive]
 pub struct DaemonRecord {
@@ -48,6 +47,26 @@ pub struct DaemonRecord {
     /// The directory it runs in, when known. Absent and `null` say the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// DaemonRecord's fields as serde reads and writes them, unchecked. It is private, so the only
+/// way in or out of a DaemonRecord is through DaemonRecord's own `Serialize` and `Deserialize`, which run
+/// `validate()`. (`remote = "Self"` on DaemonRecord itself would make these unchecked functions
+/// public, as `DaemonRecord::serialize` and `DaemonRecord::deserialize`.)
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "DaemonRecord")]
+struct UncheckedRecord {
+    id: String,
+    kind: String,
+    pid: u32,
+    host: String,
+    version: String,
+    started_at: String,
+    heartbeat_at: String,
+    argv: Vec<String>,
+    restartable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
 }
 
 /// The kinds of handoff 0.10.3's 4.1. A reader must also keep kinds not listed here.
@@ -133,13 +152,13 @@ impl DaemonRecord {
 impl Serialize for DaemonRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        DaemonRecord::serialize(self, serializer)
+        UncheckedRecord::serialize(self, serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for DaemonRecord {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let record = DaemonRecord::deserialize(deserializer)?;
+        let record = UncheckedRecord::deserialize(deserializer)?;
         record.validate().map_err(de::Error::custom)?;
         Ok(record)
     }
