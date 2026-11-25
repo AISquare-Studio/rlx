@@ -1607,7 +1607,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     def _remember_selection(self, value: str | None) -> None:
         _remember_ui_state(SELECTED_KEY, value)
         project = selected_project(value)
-        if project is not None:
+        # Only a project the frame lists: the captain's row is ``agent:<home>/<id>``, and its
+        # board is no project, so it erased the last-used one and home fell back to the first
+        # card (the tester of #580, #828).
+        if project is not None and self.snapshot is not None and self.snapshot.project(project):
             _remember_ui_state(LAST_PROJECT_KEY, project)
 
     def home_project(self) -> str | None:
@@ -1645,9 +1648,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     async def action_home(self) -> None:
         await self.go_home()
 
-    @on(events.Click, "#fleet-title")
+    @on(events.Click, "Sidebar #fleet-title")
     async def _logo_clicked(self, event: events.Click) -> None:
-        """The logo, ``r\\x``, at the sidebar's top: home, as a site's logo goes (L1)."""
+        """The logo, ``r\\x``, at the sidebar's top: home, as a site's logo goes (L1). The
+        sidebar's alone: Welcome's step-3 card has a ``#fleet-title`` of its own, and a click on
+        it went home (the tester of #580, #828)."""
         event.stop()
         await self.go_home()
 

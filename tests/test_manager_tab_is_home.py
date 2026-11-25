@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from textual.pilot import Pilot
 
 from aisquare.cli.ui import app as ui_app
@@ -146,3 +147,60 @@ def test_at_100_by_30_with_two_projects_the_first_screen_is_the_manager_tab(
     assert shown == ("project-prj_b", "tab-manager"), shown
     tab_row = next(row for row in rows if "Manager" in row and "Board" in row)
     assert tab_row.index("Manager") < tab_row.index("Board"), tab_row
+
+
+def test_a_click_on_welcomes_fleet_card_title_stays_on_welcome(
+    tmp_path: Path, script: Script
+) -> None:
+    """The logo is the sidebar's ``#fleet-title`` alone: Welcome's step-3 card has one of its
+    own, and a click on it ('3 Fleet') went home (the tester of #580, #828). It stays on
+    Welcome; the logo, clicked after it, still goes home."""
+    from aisquare.cli.ui.views.welcome import WelcomeView
+
+    _two_projects(tmp_path, script)
+
+    async def go(pilot: Pilot[None]) -> tuple[str | None, str | None]:
+        app = fleet_app(pilot)
+        await settle(app)
+        await app.action_welcome()  # `w`
+        await settle(app)
+        await pilot.click(app.query_one(WelcomeView).query_one("#fleet-title"))
+        await settle(app)
+        on_card = app.content.current
+        await pilot.click(app.sidebar.query_one("#fleet-title"))
+        await settle(app)
+        return on_card, app.content.current
+
+    assert drive(go) == ("welcome", "project-prj_a"), "the card stays; the logo goes home"
+
+
+@pytest.mark.needs_captain
+def test_opening_the_captain_keeps_the_last_used_project(tmp_path: Path, script: Script) -> None:
+    """The captain's row is ``agent:<home>/<id>``, and its board is no project: opening it wrote
+    the home's id as the last-used project, and home fell back to the first card (the tester of
+    #580, #828). Beta opened, then the captain: the Home key and a relaunch both open beta."""
+    from aisquare.cli.ui.sidebar import ProjectTitle
+    from aisquare.services.captain import state as captain_state
+    from tests.test_ui_shell import card_for, row_for
+
+    _two_projects(tmp_path, script)
+    home = captain_state.home_project()
+    captain = status(home.id, "captain", "captain", "waiting")
+    script[home.id] = [captain]
+
+    async def go(pilot: Pilot[None]) -> tuple[tuple[str | None, str | None], str | None]:
+        app = fleet_app(pilot)
+        await settle(app)
+        await pilot.click(card_for(app, "prj_b").query_one(ProjectTitle))
+        await settle(app)
+        await pilot.click(row_for(app, captain.agent.id))  # the captain's view
+        await settle(app)
+        app.sidebar.focus()
+        await pilot.press("home")
+        await settle(app)
+        return _shown(pilot), ui_app._ui_state(ui_app.LAST_PROJECT_KEY)
+
+    shown, last = drive(go)
+    assert shown == ("project-prj_b", "tab-manager"), "the Home key: beta, not the first card"
+    assert last == "prj_b", "the captain's board is no project: it is never the last-used one"
+    assert drive(_home_shown) == ("project-prj_b", "tab-manager"), "a relaunch: beta too"
