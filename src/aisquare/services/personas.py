@@ -985,7 +985,28 @@ def _target(name: str, root: Path | None, layer: Layer | None) -> tuple[Layer, P
         return found, directory
     if layer == "bundled":
         return layer, core.BUNDLED_DIR / name
+    if layer == "user":
+        return layer, _yours(name)
     return layer, _layer_dir(layer, root) / name
+
+
+def _yours(name: str) -> Path:
+    """Your persona ``name``'s directory, or a plain refusal: a name no persona can have (so
+    nothing outside your personas folder is ever read, ``../x`` included), or one you have
+    none of, with how to get one (the review of #21, round 3)."""
+    core.check_name(name, name)
+    directory = dict(core.layer_dirs(None))["user"] / name
+    if not directory.is_dir():
+        raise PersonaError(
+            f"you have no persona named '{name}'"
+            + prog.shell_advice(
+                f"; copy a project's with `{prog.word()} persona import "
+                f"<project>/.aisquare/personas/{name} --user`, or start one with "
+                f"`{prog.word()} persona new {name}`"
+            ),
+            code="unknown_persona",
+        )
+    return directory
 
 
 def save(name: str, text: str, *, root: Path | None, layer: Layer | None = None) -> Persona:
@@ -1068,11 +1089,7 @@ def remove(name: str, *, layer: Layer, root: Path | None) -> Path:
         raise _bundled_refusal(name, "removed")
     if layer == "project":
         raise _project_refusal(dict(core.layer_dirs(root)).get("project", Path()) / name, "rm")
-    directory = _layer_dir(layer, root) / name
-    if not (_is_skill_name(name) and directory.is_dir()):
-        raise PersonaError(
-            f"no {layer} persona named '{name}' ({directory.parent})", code="unknown_persona"
-        )
+    directory = _yours(name)  # the user layer is the one left: refused plainly otherwise
     _discard(directory)
     return directory
 
@@ -1178,28 +1195,38 @@ def _refuse_a_project_layer(base: Path) -> None:
     (the review of #561: *Save as… into: project*)."""
     user = dict(core.layer_dirs(None))["user"]
     try:
-        where, mine = base.resolve(), user.resolve()
-        both = where.exists() and mine.exists()
-        yours = where == mine or (both and os.path.samefile(where, mine))
-    except OSError:
-        return
+        where = base.resolve()
+    except OSError:  # cannot be resolved: judged by the path as written
+        where = Path(os.path.abspath(base))
     # By name, case-insensitively: macOS's and Windows' file systems are, so
     # ``.AISQUARE/Personas`` IS the project's layer there (the tester of #21, round 3).
     named = where.name.casefold() == "personas" and where.parent.name.casefold() == ".aisquare"
-    if named and not yours:
-        raise _project_refusal(base)
+    if not named:
+        return
+    try:
+        mine = user.resolve()
+        both = where.exists() and mine.exists()
+        yours = where == mine or (both and os.path.samefile(where, mine))
+    except OSError:
+        yours = False  # it cannot be told from yours: refused (fails closed, the review of #21 r3)
+    if not yours:
+        raise _project_refusal(base, "export")
 
 
-def _project_refusal(directory: Path | None, verb: Literal["edit", "rm"] = "edit") -> PersonaError:
+def _project_refusal(
+    directory: Path | None, verb: Literal["edit", "rm", "export"] = "edit"
+) -> PersonaError:
     """A write that would change a project's own persona layer. Personas are the user's since
     0.10.1, and a project's are copied to them once (:func:`migrate_once`); rlx leaves the
-    project's files as they are."""
+    project's files as they are. ``directory`` is the project's persona (``edit``, ``rm``), or
+    the layer an export was pointed at (``export``), which names no persona."""
     where = "" if directory is None else f" ({directory})"
-    yours = (
-        prog.shell_advice(f": `{prog.word()} persona {verb} {directory.name} --user`")
-        if directory is not None
-        else ""
-    )
+    if verb == "export":
+        yours = "; export it to any other folder"
+    elif directory is not None:
+        yours = prog.shell_advice(f": `{prog.word()} persona {verb} {directory.name} --user`")
+    else:
+        yours = ""
     return PersonaError(
         f"personas are yours (the user level) since 0.10.1: rlx no longer writes, edits or "
         f"removes a project's persona{where}; change your own instead{yours}",
@@ -1404,10 +1431,12 @@ class MigrationReport(BaseModel):
         missed = sum(1 for item in self.personas if item.outcome in ("name_taken", "skipped"))
         parts = [
             *([f"{copied} copied"] if copied else []),
-            *([f"{kept} kept yours"] if kept else []),
-            *([f"{missed} not copied"] if missed else []),
+            *([f"{kept} kept"] if kept else []),
+            *([f"{missed} skipped"] if missed else []),
         ]
-        return "Project personas: " + ", ".join(parts)
+        # Short enough for the fold's title at 80 columns, where the page is 47 wide (the
+        # tester of #21, round 3): which were kept, and why, is the detail behind it.
+        return "From projects: " + ", ".join(parts)
 
     def summary(self) -> str | None:
         """What it did, each persona's line after the copied ones' names, for a person; or

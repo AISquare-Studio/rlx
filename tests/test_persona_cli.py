@@ -8,6 +8,7 @@ every test runs outside any repository unless it asks for one.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1043,3 +1044,78 @@ def test_rm_of_a_repositorys_persona_names_rm_user() -> None:
     error = persona_service._project_refusal(Path("/repo/.aisquare/personas/tempo"), "rm")
 
     assert "persona rm tempo --user" in str(error)
+
+
+# --- round 4 of #21 (tester #280, reviewer via #285) ------------------------------------
+
+
+def test_an_export_refused_into_a_projects_layer_says_to_export_elsewhere(
+    runner: CliRunner, repo: Path
+) -> None:
+    """It advised editing a persona named after the folder (`persona edit Personas --user`)."""
+    result = runner.invoke(
+        app, ["persona", "export", "mentor", "--to", str(repo / ".AISQUARE" / "Personas")]
+    )
+
+    said = " ".join(result.stderr.split())
+    assert result.exit_code == 1
+    assert "export it to any other folder" in said
+    assert "persona edit" not in said and "Personas --user" not in said
+
+
+@pytest.mark.parametrize("command", ["edit", "rm"])
+@pytest.mark.parametrize("name", ["tempo", "skeptic"], ids=["none of yours", "bundled"])
+def test_edit_or_rm_user_of_a_persona_you_do_not_have_says_how_to_get_one(
+    runner: CliRunner, repo: Path, monkeypatch: pytest.MonkeyPatch, command: str, name: str
+) -> None:
+    monkeypatch.setenv("EDITOR", "true")
+
+    result = runner.invoke(app, ["persona", command, name, "--user"])
+
+    said = " ".join(result.stderr.split())
+    assert result.exit_code == 1, result.output
+    assert f"you have no persona named '{name}'" in said
+    assert "persona import" in said and f"persona new {name}" in said
+    assert "No such file or directory" not in result.output and "Traceback" not in result.output
+
+
+def test_edit_user_refuses_a_name_that_leaves_your_personas_before_opening_anything(
+    runner: CliRunner, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`edit ../../outside/secret --user` opened that SKILL.md in $EDITOR and exited 0."""
+    outside = tmp_path / "outside" / "secret"
+    outside.mkdir(parents=True)
+    (outside / "SKILL.md").write_text("---\nname: secret\ndescription: Not yours.\n---\nNo.\n")
+    opened = tmp_path / "opened.log"
+    monkeypatch.setenv(
+        "EDITOR",
+        _editor(tmp_path, "spy.py", f"open({str(opened)!r}, 'a').write(path + '\\n')"),
+    )
+    relative = os.path.relpath(outside, _user_layer())
+
+    result = runner.invoke(app, ["persona", "edit", relative, "--user"])
+
+    assert result.exit_code == 1, result.output
+    assert "breaks the skill-name rule" in " ".join(result.stderr.split())
+    assert not opened.exists(), "nothing was opened in the editor"
+
+
+def test_a_destination_that_cannot_be_resolved_is_refused_not_let_through(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails closed (the reviewer of #21, round 3): a stat that fails is no pass."""
+    layer = repo.parent / "another-repo" / ".aisquare" / "personas"  # not the lookup's layer
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        if "another-repo" in self.parts:
+            raise OSError("cannot stat")
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    with pytest.raises(PersonaError) as refused:
+        persona_service.export("mentor", root=repo, to=layer, skill=None, force=False)
+
+    assert refused.value.code == "project_layer_retired"
+    assert not (layer / "mentor").exists()

@@ -174,7 +174,7 @@ def test_the_personas_page_says_what_was_copied_once(repo: Path) -> None:
     shown, title, folded, text, names = asyncio.run(open_page())
     again, *_rest = asyncio.run(open_page())
 
-    assert shown and title == "Project personas: 1 copied" and folded
+    assert shown and title == "From projects: 1 copied" and folded
     assert "Copied your project personas to your personas: tempo." in text  # behind the fold
     assert "tempo" in names, "and the page lists it as yours"
     assert not again, "said once: the second opening has nothing to say"
@@ -231,10 +231,14 @@ def test_at_80x24_a_long_migration_report_leaves_the_page_usable(
                 )
             }
             regions["table rows"] = (0, page.query_one("#persona-table").region.height)
+            screen = "\n".join(s.text for s in app.screen._compositor.render_strips())
+            whole = "From projects: 1 copied, 5 kept, 1 skipped" in screen
+            regions["title whole"] = (0, int(whole))
             return regions
 
     regions = asyncio.run(drive())
 
+    assert regions.pop("title whole") == (0, 1), "the fold's title fits, not cut (round 4)"
     for name, (_top, bottom) in regions.items():
         if name != "table rows":
             assert bottom <= 24, (name, regions)
