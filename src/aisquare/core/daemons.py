@@ -7,48 +7,21 @@ process registers here while it runs, with what an upgrade needs to count it, st
 start it again (§4.2). rlxd, written in Rust, registers in this same folder, so what follows
 is the format, precisely, for any language; this module is its Python side.
 
-**The folder.** ``<home>/daemons/`` (``<home>`` is ``AISQUARE_HOME``, else ``~/.aisquare``),
-a sibling of ``instances/`` with the same rules. It is ``0700`` and every file in it
-``0600`` on POSIX, so only this user reads or writes them; the first process to register
-makes it, a reader never does. Per daemon, ``<id>`` being twelve lower-case hex digits
-(``[0-9a-f]{12}``, random, new for every process):
+**The folder**, ``<home>/daemons/``, a sibling of ``instances/``: a registry by the rules of
+``core.registry`` (its module docstring is the rest of this format), which says how the
+folder, ``<id>.json`` and ``<id>.lock`` are made, locked, written, read, deleted and pruned.
+What this registry adds:
 
-- ``<id>.json`` — the record, UTF-8 JSON, replaced whole: written to a temp file in the
-  folder whose name is not ``<id>.json`` (this module writes ``.<id>.json.<pid>.<hex>.tmp``)
-  and renamed over it, so a reader sees the old record or the new one, never a part.
-- ``<id>.lock`` — empty, locked by the daemon for as long as it runs. A pid is recycled; a
-  lock is not: the OS drops it with the process, however the process ended, so a record
-  whose lock is free is a crashed daemon's, whatever has its pid now.
-
-**The lock** (``core.locking``), exclusive and never waited on by a reader:
-
-- POSIX: ``flock(fd, LOCK_EX | LOCK_NB)`` on the lock file opened read-write, created
-  ``0600``. ``flock``, not ``fcntl``/``F_SETLK`` record locks, which on Linux do not
-  conflict with it (Rust: ``libc::flock``, or ``std::fs::File::try_lock``, which is
-  ``flock`` on Unix).
-- Windows: ``msvcrt.locking(fd, LK_NBLCK, 1)``, a byte-range lock of ONE byte at offset 0,
-  past the end of the empty file. Any lock whose range covers byte 0 conflicts with it
-  (Rust: ``LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)`` of byte 0, or
-  ``File::try_lock``, whose range is the whole file). Open the file sharing read and write
-  (Rust's default share mode does), as readers open it too, to probe it.
-- Both: the descriptor or handle is not inherited (``O_CLOEXEC``; a non-inheritable handle;
-  Python's ``os.open`` and Rust's ``std::fs`` do so by default), or a child the daemon
-  starts would hold its lock past it, and a crashed daemon would read as running.
-
-A reader probes a lock by taking it without waiting and letting it go at once: taken, the
-lock was free; refused (``EWOULDBLOCK``/``EAGAIN``/``EACCES``), it is held. So a daemon
-takes its own lock with a short bounded retry (:data:`LOCK_WAIT_SECONDS`), as a reader may
-hold it for that instant.
-
-**Registering**, in this order: make the folder; create and lock ``<id>.lock``; write
-``<id>.json``; rewrite it every :data:`HEARTBEAT_SECONDS` with a new ``heartbeat``.
-**Deregistering**, on a clean exit: delete ``<id>.json``; close the lock file (Windows
-deletes no open file); delete ``<id>.lock``. A daemon that cannot finish is a crashed one,
-which the next reader prunes.
+- **Every daemon keeps a lock.** A record with no ``<id>.lock`` beside it is not live.
+- **The heartbeat.** A daemon rewrites its record every :data:`HEARTBEAT_SECONDS` with a new
+  ``heartbeat``; :data:`STALE_SECONDS` is the stale age.
+- **Live** is ``core.registry``'s rule by lock or heartbeat: its lock held, at once; with its
+  lock free, this host's record is a crashed daemon's, whatever has its pid now; another
+  host's (an NFS home) lives while its heartbeat is fresh.
 
 **The record**: one JSON object. Keys this release does not know are ignored, as a later
 release may say more; a record without one of the required keys, or with one of the wrong
-type, is one this release cannot read.
+type, is one this release cannot read (reported, never crashed on: ``core.registry``).
 
 =============== ========== ===========================================================
 key             type       what
@@ -62,16 +35,16 @@ key             type       what
 ``since``       string     when it registered: ISO 8601 / RFC 3339 with an offset, in
                            UTC (``2026-11-25T12:03:00.123456+00:00``; ``Z`` is read
                            too; a time without an offset is read as UTC).
-``argv``        [string]   the command that starts it again, ``argv[0]`` the program.
-                           To restart a daemon: run ``argv`` as a new process, detached
-                           from any terminal (no stdin; output to a null device or a
-                           log), in ``cwd``, with ``AISQUARE_HOME`` naming this home,
-                           and do not wait for it to exit: it may BE the daemon
-                           (``serve``), or start it in a host and return (``watch
-                           --detach``, which opens its tmux window again). Options the
-                           daemon took from its environment are written out, so the
-                           command means what it meant. Recorded whether or not
-                           ``restartable``, for a person to read.
+``argv``        [string]   the command that starts it again, ``argv[0]`` the program,
+                           never empty. To restart a daemon: run ``argv`` as a new
+                           process, detached from any terminal (no stdin; output to a
+                           null device or a log), in ``cwd``, with ``AISQUARE_HOME``
+                           naming this home, and do not wait for it to exit: it may BE
+                           the daemon (``serve``), or start it in a host and return
+                           (``watch --detach``, which opens its tmux window again).
+                           Options the daemon took from its environment are written
+                           out, so the command means what it meant. Recorded whether
+                           or not ``restartable``, for a person to read.
 ``restartable`` boolean    whether an upgrade may stop the daemon and start ``argv``
                            in its place. ``false`` for one a client owns (``serve
                            --stdio``, whose client holds its stdin and stdout) or a
@@ -84,46 +57,23 @@ key             type       what
                 null       absent where none could be named.
 =============== ========== ===========================================================
 
-A record's id is its FILE NAME's (:func:`valid_id`), never anything inside it: every path
-is built from a name the folder listing gave, so no record names a file outside the folder,
-and a file whose name is not ``<id>.json`` is no record, whatever it holds.
-
-**Live** (:func:`is_live`): a record whose lock is held is live, whatever host it names.
-With its lock free, or its lock file gone, a record naming THIS host is a crashed daemon's,
-not live. One naming another host sharing the home (NFS) is live while its heartbeat is
-under :data:`STALE_SECONDS` old: a lock taken on another machine may not show here. Where
-the lock cannot be probed at all (an error other than "held", ``ENOLCK`` on an NFS mount
-with no lock manager), this host's record is live while its pid runs, another host's while
-its heartbeat is fresh.
-
-**Pruning**: every reader (:func:`roll`) deletes a record that is not live, with its lock;
-a record whose lock is held never is. A record this release cannot read is reported
-(:class:`Unreadable`), never crashed on: kept while its lock is held or its file is under
-:data:`STALE_SECONDS` old (a later release's daemon, most likely), deleted with its lock
-once neither holds. Beside the records, a reader deletes only a file of a record that is
-gone (``<id>.lock`` whose lock is free, a temp ``.<id>.…``) once it is as old as a stale
-heartbeat; any other name is left alone, for a later release to give a meaning.
+There is no id in the record: the id is the file's name (``core.registry``).
 """
 
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import os
-import re
-import sys
 import threading
-import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
-from uuid import uuid4
+from typing import Any, Literal
 
-from aisquare.core import atomic, locking, paths, procs
-from aisquare.core.instances import host_name
+from aisquare.core import registry
+from aisquare.core.registry import Unreadable
 
 Kind = Literal["rlxd", "brain", "watch", "serve", "remote", "board_watch"]
 """What a daemon is."""
@@ -138,20 +88,36 @@ a daemon on another host sharing the home reads as live through three missed bea
 
 STALE_SECONDS = 60.0
 """How old the heartbeat of another host's record with no held lock may be before it is
-stale; and how old a file must be before a reader deletes it without a record to say why."""
-
-LOCK_WAIT_SECONDS = 1.0
-"""How long :func:`register` retries its own new lock, which a reader probing the folder may
-hold for an instant."""
+stale; and how old an unreadable record or a gone record's leftover must be before a reader
+deletes it (``core.registry``)."""
 
 FOLDER = "daemons"
 
-_ID = re.compile(r"[0-9a-f]{12}")
-
-_RETRY_SECONDS = 0.05
-"""How long :func:`roll` waits before reading again a record whose read failed."""
+REGISTRY = registry.Registry(FOLDER, stale_seconds=STALE_SECONDS)
+"""``<home>/daemons/``."""
 
 _log = logging.getLogger(__name__)
+
+__all__ = [
+    "HEARTBEAT_SECONDS",
+    "KINDS",
+    "REGISTRY",
+    "STALE_SECONDS",
+    "Daemon",
+    "Kind",
+    "Registration",
+    "Roll",
+    "Unreadable",
+    "describe_this_process",
+    "is_live",
+    "list_live",
+    "prune",
+    "register",
+    "registered",
+    "registry_dir",
+    "roll",
+    "valid_id",
+]
 
 
 @dataclass(frozen=True)
@@ -198,7 +164,7 @@ class Daemon:
                 return None
             if type(pid) is not int or pid <= 0:  # a bool is an int to isinstance
                 return None
-            if not (isinstance(argv, list) and all(isinstance(arg, str) for arg in argv)):
+            if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
                 return None
             if type(restartable) is not bool:
                 return None
@@ -210,12 +176,12 @@ class Daemon:
                 id=daemon_id,
                 kind=kind,
                 pid=pid,
-                since=_moment(data["since"]),
+                since=registry.moment(data["since"]),
                 argv=tuple(argv),
                 restartable=restartable,
                 host=host,
                 version=version,
-                heartbeat=_moment(data["heartbeat"]),
+                heartbeat=registry.moment(data["heartbeat"]),
                 cwd=cwd,
             )
         except (KeyError, TypeError, ValueError):
@@ -227,210 +193,53 @@ class Daemon:
         return f"{self.kind} (rlx {self.version}, pid {self.pid} on {self.host})"
 
 
-def _moment(text: object) -> datetime:
-    """A record's time: ISO 8601, read as UTC when it names no offset. Raises ``TypeError``
-    or ``ValueError`` for anything else."""
-    if not isinstance(text, str):
-        raise TypeError(f"not a time: {text!r}")
-    moment = datetime.fromisoformat(text)
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
-
-
-# --- where -----------------------------------------------------------------------------------
+Roll = registry.Roll
+"""The registry as one read found it (``core.registry.Roll`` of :class:`Daemon`)."""
 
 
 def registry_dir() -> Path:
     """``<home>/daemons``; made by the first daemon to register, never by a reader."""
-    return paths.aisquare_home() / FOLDER
+    return REGISTRY.folder
 
 
 def valid_id(text: str) -> bool:
-    """Whether ``text`` is a daemon id: twelve lower-case hex digits, so a path built from it
-    stays a file in the folder."""
-    return _ID.fullmatch(text) is not None
-
-
-def _named(daemon_id: str, suffix: str) -> Path:
-    if not valid_id(daemon_id):
-        raise ValueError(f"not an rlx daemon id: {daemon_id!r}")
-    return registry_dir() / f"{daemon_id}{suffix}"
-
-
-def _record(daemon_id: str) -> Path:
-    return _named(daemon_id, ".json")
-
-
-def _lock(daemon_id: str) -> Path:
-    return _named(daemon_id, ".lock")
-
-
-def _private_dir() -> Path:
-    """The registry folder, made ``0700`` (and narrowed to it, if it was made wider)."""
-    folder = registry_dir()
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if sys.platform != "win32":
-        os.chmod(folder, 0o700)
-    return folder
-
-
-def _write_private(path: Path, body: str) -> None:
-    """``body`` into ``path`` in one step, ``0600``. Not fsynced: a record lost to a crash is
-    one that would be stale anyway."""
-    atomic.write_replacing(path, body, durable=False, owner_only=sys.platform != "win32")
+    """Whether ``text`` is a daemon id (``core.registry.valid_id``)."""
+    return registry.valid_id(text)
 
 
 # --- reading -----------------------------------------------------------------------------------
 
 
-def _lock_held(daemon_id: str) -> bool | None:
-    """Whether a running process holds ``<id>.lock``: ``False`` too when there is no lock file
-    (every daemon keeps one); ``None`` when it cannot be told (a probe that failed otherwise
-    than on a holder)."""
-    try:
-        fd = locking.open_lock_file(_lock(daemon_id), create=False)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return None
-    try:
-        locking.acquire(fd, wait_s=0)
-    except TimeoutError:
-        return True
-    except OSError:
-        return None
-    else:
-        with contextlib.suppress(OSError):
-            locking.unlock(fd)
-        return False
-    finally:
-        os.close(fd)
-
-
 def is_live(daemon: Daemon, *, host: str | None = None, now: datetime | None = None) -> bool:
-    """Whether ``daemon`` runs, by the module's rule: its lock held, at once; else this host's
-    record is a crashed daemon's, and another host's lives while its heartbeat is fresh."""
-    return _live(daemon, _lock_held(daemon.id), host=host, now=now)
+    """Whether ``daemon`` runs, by the module's rule (its lock probed now)."""
+    return _live(daemon, REGISTRY.lock_held(daemon.id), here=host, now=now)
 
 
-def _live(daemon: Daemon, held: bool | None, *, host: str | None, now: datetime | None) -> bool:
-    """:func:`is_live`, its lock already probed (``held``)."""
-    if held:
-        return True
-    if daemon.host == (host_name() if host is None else host):
-        return held is None and procs.alive(daemon.pid)
-    age = (datetime.now(UTC) if now is None else now) - daemon.heartbeat
-    return age < timedelta(seconds=STALE_SECONDS)
+def _live(
+    daemon: Daemon, held: bool | None, *, here: str | None = None, now: datetime | None = None
+) -> bool:
+    return registry.live_by_lock_or_heartbeat(
+        held,
+        host=daemon.host,
+        pid=daemon.pid,
+        heartbeat=daemon.heartbeat,
+        stale_seconds=STALE_SECONDS,
+        here=here,
+        now=now,
+    )
 
 
-def _forget(daemon_id: str) -> None:
-    """Delete the record, then its lock: no reader finds a record whose lock is gone."""
-    for path in (_record(daemon_id), _lock(daemon_id)):
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
-
-
-Unloaded = Literal["gone", "failed", "unparsable"]
-"""Why a record was not read (:func:`_load`)."""
-
-
-def _load(path: Path, daemon_id: str) -> Daemon | Unloaded:
-    """The record at ``path``, or why not: ``gone``, its file no longer there (a daemon that
-    left between the folder's listing and this read); ``failed``, an ``OSError`` reading it
-    (a sharing violation during a beat on Windows, an NFS ``ESTALE``); ``unparsable``, its
-    content, which a release this one cannot read wrote."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return "gone"
-    except UnicodeDecodeError:
-        return "unparsable"
-    except OSError:
-        return "failed"
-    try:
-        daemon = Daemon.from_record(daemon_id, json.loads(text))
-    except (ValueError, RecursionError):
-        return "unparsable"
-    return "unparsable" if daemon is None else daemon
-
-
-@dataclass(frozen=True)
-class Unreadable:
-    """A record this release cannot read whose lock is held or whose file is fresh: a daemon
-    of an unknown release, most likely a later one; or one whose file would not be read twice
-    running."""
-
-    id: str
-    written_at: datetime
-    held: bool
-    """Whether its lock is held: a running process's, for sure."""
-    pid: int | None = None
-    """Its pid, where the record still says one as an integer."""
-    kind: str | None = None
-    """Its kind, where the record still says one as a string."""
-
-    @property
-    def path(self) -> Path:
-        return _record(self.id)
-
-
-class Roll(NamedTuple):
-    """The registry as one read found it."""
-
-    live: list[Daemon]
-    """Every live daemon, oldest first."""
-    unreadable: list[Unreadable]
-    """Records this release cannot read, with their lock held or fresh."""
-    pruned: list[str]
-    """The ids of the records this read deleted."""
-
-
-def roll(*, prune: bool = True) -> Roll:
-    """The live daemons on this home, and the records this release cannot read that have their
-    lock held or are fresh (the module's rules). With ``prune``, deletes what is not live, as
-    the module says; without, writes nothing. Reads only: no folder is made."""
-    folder = registry_dir()
-    try:
-        names = sorted(os.listdir(folder))
-    except OSError:
-        return Roll([], [], [])
-    here = host_name()
-    now = datetime.now(UTC)
-    live: list[Daemon] = []
-    unreadable: list[Unreadable] = []
-    pruned: list[str] = []
-    for name in names:
-        path = folder / name
-        stem = name.removesuffix(".json")
-        if stem == name or not valid_id(stem):
-            if prune and _owner(name) is not None and _old(path) and not _explained(name, names):
-                with contextlib.suppress(OSError):
-                    path.unlink()
-            continue  # no record: not <id>.json
-        loaded = _load(path, stem)
-        if loaded == "failed":  # once more, a moment later: the failures it means are brief
-            time.sleep(_RETRY_SECONDS)
-            loaded = _load(path, stem)
-        if loaded == "gone":
-            continue  # its daemon left since the listing
-        if isinstance(loaded, str):  # unparsable, or a read that failed twice running
-            written = _written(path)
-            if written is None:
-                continue  # gone since
-            locked = _lock_held(stem) is True
-            if locked or now - written < timedelta(seconds=STALE_SECONDS):
-                pid, kind = _said_in(path)
-                unreadable.append(Unreadable(stem, written, locked, pid, kind))
-            elif prune:
-                _forget(stem)
-                pruned.append(stem)
-            continue
-        lock = _lock_held(stem)
-        if _live(loaded, lock, host=here, now=now):
-            live.append(loaded)
-        elif prune:
-            _forget(stem)  # not live: its lock is not held
-            pruned.append(stem)
-    return Roll(sorted(live, key=lambda daemon: daemon.since), unreadable, pruned)
+def roll(*, prune: bool = True) -> registry.Roll[Daemon]:
+    """The live daemons on this home, oldest first, and the records this release cannot read
+    that have their lock held or are fresh. With ``prune``, deletes what is not live
+    (``core.registry``); without, writes nothing. Reads only: no folder is made."""
+    here, now = registry.host_name(), datetime.now(UTC)
+    found = REGISTRY.roll(
+        Daemon.from_record,
+        lambda daemon, held: _live(daemon, held, here=here, now=now),
+        prune=prune,
+    )
+    return replace(found, live=sorted(found.live, key=lambda daemon: daemon.since))
 
 
 def list_live(*, kind: str | None = None, prune: bool = True) -> list[Daemon]:
@@ -442,49 +251,6 @@ def prune() -> list[str]:
     """Delete every record that is not live, and what belonged to records gone; the ids of the
     records deleted (:func:`roll`)."""
     return roll(prune=True).pruned
-
-
-def _owner(name: str) -> str | None:
-    """The id whose file ``name`` is, beside its record (``<id>.lock``, a temp ``.<id>.…``);
-    ``None`` for a name this release gives no meaning."""
-    owner = name.removeprefix(".").split(".", 1)[0]
-    return owner if valid_id(owner) and owner != name.removeprefix(".") else None
-
-
-def _explained(name: str, names: list[str]) -> bool:
-    """Whether ``name`` (not a record) belongs to a record still there, or is a lock still held."""
-    owner = _owner(name)
-    if owner is None:
-        return False
-    return f"{owner}.json" in names or (name == f"{owner}.lock" and _lock_held(owner) is True)
-
-
-def _said_in(path: Path) -> tuple[int | None, str | None]:
-    """The ``pid`` (an integer) and ``kind`` (a string) a record holds, however else it fails to
-    read; ``None`` for each it does not."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return None, None
-    if not isinstance(data, dict):
-        return None, None
-    pid, kind = data.get("pid"), data.get("kind")
-    return (pid if type(pid) is int else None), (kind if isinstance(kind, str) else None)
-
-
-def _written(path: Path) -> datetime | None:
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime, UTC)
-    except OSError:
-        return None
-
-
-def _old(path: Path) -> bool:
-    """Whether ``path`` was last written as long ago as a stale heartbeat."""
-    try:
-        return time.time() - path.stat().st_mtime >= STALE_SECONDS
-    except OSError:
-        return False
 
 
 # --- this process's own record ---------------------------------------------------------------
@@ -506,16 +272,23 @@ class Registration:
     def daemon(self) -> Daemon:
         return self._daemon
 
+    def start(self) -> None:
+        """Start the heartbeat thread (:func:`register` does). Once."""
+        if not self._thread.is_alive() and not self._closed:
+            with contextlib.suppress(RuntimeError):  # started already
+                self._thread.start()
+
     def beat(self) -> None:
         """Rewrite the record with a heartbeat of now."""
         with self._guard:
             if self._closed:
                 return
             self._daemon = replace(self._daemon, heartbeat=datetime.now(UTC))
-            _write_private(_record(self._daemon.id), json.dumps(self._daemon.to_record()))
+            REGISTRY.write(self._daemon.id, self._daemon.to_record())
 
     def deregister(self) -> None:
-        """Stop the heartbeat and remove the record and its lock. Once; never raises."""
+        """Stop the heartbeat and leave the registry: the record, then the lock
+        (``core.registry``). Once; never raises."""
         with self._guard:
             if self._closed:
                 return
@@ -523,21 +296,8 @@ class Registration:
         self._stop.set()
         if self._thread.is_alive() and self._thread is not threading.current_thread():
             self._thread.join(2.0)
-        # The record first, so no reader finds it once the lock is let go; the lock file
-        # after its descriptor is closed, which Windows asks before a delete.
-        with contextlib.suppress(OSError):
-            _record(self._daemon.id).unlink(missing_ok=True)
         fd, self._lock_fd = self._lock_fd, None
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        _forget(self._daemon.id)
-
-    def start(self) -> None:
-        """Start the heartbeat thread (:func:`register` does). Once."""
-        if not self._thread.is_alive() and not self._closed:
-            with contextlib.suppress(RuntimeError):  # started already
-                self._thread.start()
+        REGISTRY.leave(self._daemon.id, fd)
 
     def _run(self) -> None:
         while not self._stop.wait(HEARTBEAT_SECONDS):
@@ -560,13 +320,13 @@ def describe_this_process(kind: Kind, *, argv: Sequence[str], restartable: bool)
 
     now = datetime.now(UTC)
     return Daemon(
-        id=uuid4().hex[:12],
+        id=registry.new_id(),
         kind=kind,
         pid=os.getpid(),
         since=now,
         argv=tuple(argv),
         restartable=restartable,
-        host=host_name(),
+        host=registry.host_name(),
         version=__version__,
         heartbeat=now,
         cwd=_cwd(),
@@ -584,17 +344,11 @@ def register(kind: Kind, *, argv: Sequence[str], restartable: bool) -> Registrat
     if not argv:
         raise ValueError("a daemon's argv names its program")
     me = describe_this_process(kind, argv=argv, restartable=restartable)
-    _private_dir()
-    fd = locking.open_lock_file(_lock(me.id), mode=0o600)
+    fd = REGISTRY.take(me.id)
     try:
-        try:
-            locking.acquire(fd, wait_s=LOCK_WAIT_SECONDS)
-        except TimeoutError as held:  # a new random id's lock, held past a probe: not ours
-            raise OSError(f"the daemon lock {_lock(me.id)} is held by another process") from held
-        _write_private(_record(me.id), json.dumps(me.to_record()))
+        REGISTRY.write(me.id, me.to_record())
     except BaseException:
-        os.close(fd)
-        _forget(me.id)
+        REGISTRY.leave(me.id, fd)
         raise
     registration = Registration(me, fd)
     registration.start()

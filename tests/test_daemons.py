@@ -30,7 +30,7 @@ from typer.testing import CliRunner
 from aisquare.cli import serve as serve_cli
 from aisquare.cli.app import app
 from aisquare.core import daemons, locking, orchestrator, selfcli, workspace
-from aisquare.core.instances import host_name
+from aisquare.core.registry import host_name
 from aisquare.core.version import __version__
 from aisquare.services import fleet as fleet_service
 from aisquare.services import mcp_server
@@ -216,7 +216,7 @@ def test_a_killed_daemon_is_pruned_by_the_next_reader() -> None:
 def test_a_recycled_pid_with_a_free_lock_is_not_live(registry: Path) -> None:
     # The pid runs (it is this test's), on this host: only the free lock says the daemon died.
     _write(registry, "0123456789ab", _record(pid=os.getpid()))
-    loaded = daemons._load(registry / "0123456789ab.json", "0123456789ab")
+    loaded = daemons.REGISTRY.load("0123456789ab", daemons.Daemon.from_record)
     assert isinstance(loaded, daemons.Daemon) and loaded.pid == os.getpid()
     assert daemons.is_live(loaded) is False
     assert daemons.list_live(prune=False) == []
@@ -369,8 +369,8 @@ def test_an_id_that_is_not_a_valid_file_name_is_ignored(registry: Path, name: st
     finally:
         os.close(fd)
     assert not daemons.valid_id(stem)
-    with pytest.raises(ValueError, match="not an rlx daemon id"):
-        daemons._record(stem)
+    with pytest.raises(ValueError, match="not an rlx daemons id"):
+        daemons.REGISTRY.record(stem)
 
 
 def test_the_id_is_the_file_names_never_the_contents(registry: Path) -> None:
