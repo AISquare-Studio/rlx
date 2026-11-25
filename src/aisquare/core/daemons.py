@@ -6,12 +6,18 @@ and new until it restarts, on Windows a file in use that fails the reinstall. So
 process registers here while it runs, with what an upgrade needs to count it, stop it and
 start it again (§4.2). rlxd, written in Rust, registers in this same folder, so what follows
 is the format, precisely, for any language; this module is its Python side. The record's
-JSON Schema is ``rlxd/schemas/v1/daemon-record.json``.
+JSON Schema is ``rlxd/schemas/v1/daemon-record.json`` (generated from rlxd-proto); a home's
+records are checked against it with ``uvx check-jsonschema --schemafile
+rlxd/schemas/v1/daemon-record.json "$AISQUARE_HOME"/daemons/*.json``, and
+``tests/test_daemons.py`` checks every record Python writes the same way.
 
 **The folder**, ``<home>/daemons/``, a sibling of ``instances/``: a registry by the rules of
 ``core.registry`` (its module docstring is the rest of this format), which says how the
 folder, ``<id>.json``, ``<id>.lock`` and ``.gate.lock`` are made, locked, written, read,
-deleted and pruned. What this registry adds:
+deleted and pruned. Its path has ONE definition, :func:`registry_dir` (``<home>`` and
+:data:`FOLDER`), so that a later home layout moves it in one place (0.10.2's, likely to
+``run/daemons/``): rlxd takes the folder from that same definition, never a path of its own,
+and its ``status`` reports the folder it uses. What this registry adds:
 
 - **Live is the lock.** A record is live while its ``<id>.lock`` is held, whatever host it
   names; a record whose lock is free, or which has no lock file, is a dead process's,

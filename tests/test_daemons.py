@@ -14,6 +14,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -60,37 +61,34 @@ def keep_sigterm() -> Iterator[None]:
         signal.signal(getattr(signal, name), handler)
 
 
-RECORD_SCHEMA: dict[str, Any] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "required": [
-        "id",
-        "kind",
-        "pid",
-        "host",
-        "version",
-        "started_at",
-        "heartbeat_at",
-        "argv",
-        "restartable",
-    ],
-    "properties": {
-        "id": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
-        "kind": {"type": "string", "minLength": 1},
-        "pid": {"type": "integer", "minimum": 1},
-        "host": {"type": "string"},
-        "version": {"type": "string"},
-        "started_at": {"type": "string", "format": "date-time"},
-        "heartbeat_at": {"type": "string", "format": "date-time"},
-        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-        "restartable": {"type": "boolean"},
-        "cwd": {"type": ["string", "null"]},
-    },
-}
-"""What a record written here holds, as JSON Schema: the module's list of keys, for a check that
-the Python side writes it. ``rlxd/schemas/v1/daemon-record.json`` (handoff §4.1, generated
-from rlxd-proto) is the published one; extra keys are allowed, as a later release may say
-more."""
+REPO = Path(__file__).resolve().parents[1]
+SCHEMA_PATH = REPO / "rlxd" / "schemas" / "v1" / "daemon-record.json"
+RECORD_SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+"""The record's published JSON Schema (handoff §4.1), generated from rlxd-proto (#575): what
+every record Python writes is checked against, as rlxd's are."""
+
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})")
+FORMATS = jsonschema.FormatChecker()
+"""jsonschema's own ``date-time`` check needs ``rfc3339-validator``, which the dev environment
+does not install, and passes anything without it: this one checks RFC 3339 itself."""
+
+
+@FORMATS.checks("date-time", raises=ValueError)
+def _date_time(value: object) -> bool:
+    if not isinstance(value, str) or not _RFC3339.fullmatch(value):
+        raise ValueError(f"not an RFC 3339 date-time: {value!r}")
+    datetime.fromisoformat(value.replace("z", "Z"))  # a real date and time, not 2026-13-45
+    return True
+
+
+def _conforms(record: object) -> None:
+    """``record`` validates against :data:`RECORD_SCHEMA`, formats included."""
+    jsonschema.validate(record, RECORD_SCHEMA, format_checker=FORMATS)
+
+
+def _records_on_disk() -> list[dict[str, Any]]:
+    folder = daemons.registry_dir()
+    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(folder.glob("*.json"))]
 
 
 def _files() -> list[str]:
@@ -169,9 +167,7 @@ def test_a_registered_daemon_is_listed_live_until_it_deregisters() -> None:
         # The record on disk is the module's list of keys (handoff §4.1), its id the file's name.
         on_disk = json.loads((daemons.registry_dir() / f"{daemon.id}.json").read_text("utf-8"))
         assert set(on_disk) == {*RECORD_SCHEMA["required"], "cwd"}
-        jsonschema.validate(
-            on_disk, RECORD_SCHEMA, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
-        )
+        _conforms(on_disk)
         assert on_disk["id"] == daemon.id and on_disk["argv"] == ARGV
         assert on_disk["pid"] == os.getpid()
         assert datetime.fromisoformat(on_disk["started_at"]).utcoffset() == timedelta(0)
@@ -181,6 +177,79 @@ def test_a_registered_daemon_is_listed_live_until_it_deregisters() -> None:
     assert daemons.list_live() == []
     assert _files() == [], "the record and its lock leave with the daemon"
     registration.deregister()  # once: a second call is nothing
+
+
+def test_the_schema_check_can_fail() -> None:
+    """The checks below are only as good as this one: a record off the schema is refused."""
+    registration = daemons.register("serve", argv=["rlx", "serve"], restartable=True)
+    try:
+        (good,) = _records_on_disk()
+    finally:
+        registration.deregister()
+    _conforms(good)
+    for bad in (
+        {**good, "pid": 0},
+        {**good, "id": "NOT-AN-ID"},
+        {**good, "argv": []},
+        {**good, "started_at": "yesterday"},
+        {**good, "heartbeat_at": "2026-13-45T25:61:00Z"},
+        {k: v for k, v in good.items() if k != "restartable"},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            _conforms(bad)
+
+
+@pytest.mark.parametrize("kind", daemons.KINDS)
+def test_every_kind_python_registers_writes_a_record_rlxds_schema_takes(kind: daemons.Kind) -> None:
+    registration = daemons.register(kind, argv=selfcli.argv_for([kind]), restartable=False)
+    try:
+        registration.beat()  # a rewritten record too
+        (record,) = _records_on_disk()
+        _conforms(record)
+        assert record["kind"] == kind
+    finally:
+        registration.deregister()
+
+
+def test_the_daemons_of_4_1a_write_records_rlxds_schema_takes(
+    monkeypatch: pytest.MonkeyPatch, stand_in_serve: list[Any]
+) -> None:
+    """``watch --detach``'s watcher, a foreground watcher and ``serve`` over HTTP and stdio, each
+    as it registers in production; every record read off the disk while it runs."""
+    written: list[dict[str, Any]] = []
+
+    def watcher() -> None:
+        written.extend(_records_on_disk())
+        stopping = signal.getsignal(signal.SIGTERM)
+        assert callable(stopping)
+        stopping(signal.SIGTERM, None)
+
+    monkeypatch.setattr(watch_service, "_sleep", lambda seconds: None)
+    for detached in (True, False):
+        if detached:
+            monkeypatch.setenv(watch_service.DETACHED_ENV, "1")
+        else:
+            monkeypatch.delenv(watch_service.DETACHED_ENV, raising=False)
+        monkeypatch.setattr(watch_service.Watcher, "tick", _one_tick(watcher))
+        watch_service.run(interval=5.0, on_tick=lambda report: None)
+
+    def transport(**_: Any) -> None:
+        written.extend(_records_on_disk())
+
+    monkeypatch.setattr(mcp_server, "run_http", transport)
+    monkeypatch.setattr(mcp_server, "run_stdio", transport)
+    for argv in (["serve", "--port", "9555"], ["serve", "--stdio", "--close-after", "0"]):
+        result = CliRunner().invoke(app, argv)
+        assert result.exit_code == 0, result.output
+    assert [(r["kind"], r["restartable"]) for r in written] == [
+        ("watch", True),
+        ("watch", False),
+        ("serve", True),
+        ("serve", False),
+    ]
+    for record in written:
+        _conforms(record)
+    assert _files() == []
 
 
 def test_the_heartbeat_rewrites_the_record() -> None:
