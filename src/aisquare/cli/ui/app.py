@@ -4688,6 +4688,7 @@ def _waited_reads() -> dict[str, str]:
         accounts.LOGIN_POLL_WORKER: "a Claude sign-in's check",
         agent.LABELS_WORKER: "an agent's account names",
         board.LABELS_WORKER: "a board's account names",
+        board.HISTORY_WORKER: "a board's task history",
         fleet_bulk.PLAN_WORKER: "Settings ▸ Fleet's read of the running agents",
         resources.SAMPLE_WORKER: "Agent resources' read of the agents",
         app_settings.ACCOUNTS_WORKER: "App settings' accounts",

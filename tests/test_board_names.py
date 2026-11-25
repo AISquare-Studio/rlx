@@ -493,8 +493,9 @@ def test_a_stop_with_the_board_open_renames_none_of_the_agent_s_lines(
 
     before, after = asyncio.run(go())
 
-    assert f" {label} 💬 noted: tests pass" in before
-    assert f" {label} 💬 noted: tests pass" in after, "the stop renamed the agent's lines"
+    # A Stream line's chips (B2): the agent's name, then the kind's, then the text.
+    assert f" {label}   💬 noted  tests pass" in before
+    assert f" {label}   💬 noted  tests pass" in after, "the stop renamed the agent's lines"
 
 
 def test_board_w_s_plain_frame_names_a_claim_and_an_ended_agent_s_lines(
@@ -556,8 +557,8 @@ def test_a_clear_keeps_the_name_of_the_session_it_leaves(
     assert started is not None and started.label is None, "the session records no label"
     stamp = f"{started.started_at.astimezone():%H:%M}"
 
-    assert f" {label} 💬 noted: eta: before clear" in before
-    assert f" {label} ({stamp}) 💬 noted: eta: before clear" in after, "redrawn as its role"
+    assert f" {label}   💬 noted  eta: before clear" in before
+    assert f" {label} ({stamp})   💬 noted  eta: before clear" in after, "redrawn as its role"
     assert cleared == {first: f"{label} ({stamp})", "sess-c2": label}
     assert twice["sess-c3"] == label
     assert twice[first].startswith(f"{label} (") and twice["sess-c2"].startswith(f"{label} (")
