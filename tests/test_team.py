@@ -2311,3 +2311,214 @@ def test_aisquare_board_names_each_session_as_the_left_pane_does(
     assert {s["id"] for s in shown["sessions"]} >= {CODER, PLANNER}, "--json keeps the ids"
     assert ended.exit_code == 0, ended.output
     assert "  - coder-auth note: PR ready" in ended.stdout, "ended, it keeps its name"
+
+
+# --- the board's two readers: the agents' text, byte for byte, and the human's (B1 #14) ---------
+
+BOARD_NOW = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
+"""The fixture board's clock: ``team._now`` is pinned to it, so every age reads the same."""
+
+
+def _board_fixture() -> tuple[Any, list[TeamSession], list[TeamTask], list[Any], datetime]:
+    """A board with every part an agent's text draws: live sessions (one stale, one with a
+    focus, a model and a persona), an ended one, tasks in each status (one waiting on another,
+    more open than the board lists), and events of several kinds, addressed and not."""
+    from aisquare.models import ProjectInfo, TeamEvent
+
+    project = ProjectInfo(id="prj_golden", root=Path("/nowhere/golden-repo"))
+
+    def session(sid: str, role: str, **extra: Any) -> TeamSession:
+        fields: dict[str, Any] = {
+            "started_at": BOARD_NOW - timedelta(hours=1),
+            "last_seen_at": BOARD_NOW - timedelta(minutes=2),
+        }
+        fields.update(extra)
+        return TeamSession(id=sid, project_id=project.id, role=role, **fields)
+
+    sessions = [
+        session("aaaa1111-golden", "manager", state="waiting", model="golden-model-x"),
+        session(
+            "bbbb2222-golden",
+            "coder",
+            label="coder-auth",
+            focus="wire the login",
+            persona="skeptic",
+            state="working",
+        ),
+        session(
+            "cccc3333-golden",
+            "tester",
+            label="tester-1",
+            state="attention",
+            last_seen_at=BOARD_NOW - timedelta(minutes=45),
+        ),
+        session(
+            "dddd4444-golden", "coder", label="coder-old", ended_at=BOARD_NOW - timedelta(hours=2)
+        ),
+    ]
+
+    def task(number: int, title: str, status: str, **extra: Any) -> TeamTask:
+        return TeamTask(
+            id=f"tsk_golden{number:04d}",
+            project_id=project.id,
+            number=number,
+            key=f"golden-{number}",
+            title=title,
+            status=status,  # type: ignore[arg-type]
+            created_at=BOARD_NOW - timedelta(hours=3),
+            updated_at=BOARD_NOW - timedelta(minutes=number),
+            **extra,
+        )
+
+    tasks = [
+        task(1, "wire auth", "doing", claimed_by="bbbb2222-golden"),
+        task(2, "fix the login race", "blocked"),
+        task(3, "add the retry", "review", claimed_by="cccc3333-golden"),
+        task(4, "write the docs", "todo", needs=["tsk_golden0002"]),
+        task(5, "ship it", "done"),
+        task(6, "old idea", "dropped"),
+        *(task(n, f"chore {n}", "todo") for n in range(7, 14)),
+    ]
+
+    def event(seq: int, kind: str, text: str, minutes: int, **extra: Any) -> TeamEvent:
+        return TeamEvent(
+            seq=seq,
+            id=f"evt_golden{seq}",
+            project_id=project.id,
+            kind=kind,
+            text=text,
+            created_at=BOARD_NOW - timedelta(minutes=minutes),
+            **extra,
+        )
+
+    events = [
+        event(
+            1,
+            "task_added",
+            "wire auth",
+            120,
+            session_id="aaaa1111-golden",
+            task_id="tsk_golden0001",
+            to_role="coder",
+        ),
+        event(
+            2,
+            "task_claimed",
+            "wire auth",
+            90,
+            session_id="bbbb2222-golden",
+            task_id="tsk_golden0001",
+        ),
+        event(3, "note", "ship it\nthen tell me", 60 * 26),
+        event(4, "question", "staging or prod first?", 30, session_id="aaaa1111-golden"),
+        event(
+            5,
+            "task_blocked",
+            "fix the login race — no API key",
+            20,
+            session_id="bbbb2222-golden",
+            task_id="tsk_golden0002",
+        ),
+        event(
+            6,
+            "result",
+            "PASS " + "x" * 200,
+            5,
+            session_id="cccc3333-golden",
+            task_id="tsk_golden0003",
+        ),
+    ]
+    return project, sessions, tasks, events, BOARD_NOW
+
+
+#: ``render_board``'s agent text for :func:`_board_fixture` as 0.10.1 printed it (the MCP
+#: ``team_board``), byte for byte: the human board changed in B1 (#14), this must not.
+GOLDEN_AGENT_BOARD = "\n".join(
+    [
+        "<aisquare-team>",
+        "sessions:",
+        "  - aaaa1111 manager [golden-model-x] ⚠ off-ladder — 2m ago",
+        "  - bbbb2222 coder persona:skeptic — focus: wire the login — 2m ago",
+        "  - cccc3333 tester — 45m ago (stale)",
+        "tasks (8 todo, 1 doing, 1 review, 1 blocked, 1 done):",
+        "  - #1 tsk_golden0001 [doing @bbbb2222] wire auth",
+        "  - #2 tsk_golden0002 [blocked] fix the login race",
+        "  - #3 tsk_golden0003 [review @cccc3333] add the retry",
+        "  - #4 tsk_golden0004 [todo] write the docs ⧗ waits on #2",
+        "  - #7 tsk_golden0007 [todo] chore 7",
+        "  - #8 tsk_golden0008 [todo] chore 8",
+        "  - #9 tsk_golden0009 [todo] chore 9",
+        "  - #10 tsk_golden0010 [todo] chore 10",
+        "  … 3 more — `rlx task list`",
+        "recent updates:",
+        "  - aaaa1111 (manager) added → coder: [#1 tsk_golden0001] wire auth",
+        "  - bbbb2222 (coder) claimed: [#1 tsk_golden0001] wire auth",
+        "  - cli note: ship it",
+        "then tell me",
+        "  - aaaa1111 (manager) question: staging or prod first?",
+        "  - bbbb2222 (coder) blocked: [#2 tsk_golden0002] fix the login race — no API key",
+        "  - cccc3333 (tester) result: [#3 tsk_golden0003] PASS " + "x" * 200,
+        "</aisquare-team>",
+    ]
+)
+
+#: The board part of an agent's injected text (a SessionStart's, a prompt's) for the same
+#: fixture, as 0.10.1 wrote it: up to the protocol, which other parts of the code own.
+GOLDEN_INJECTED_BOARD = "\n".join(
+    [
+        "<aisquare-team>",
+        "You are team session bbbb2222 (role: coder) in project golden-repo.",
+        "sessions:",
+        "  - aaaa1111 manager [golden-model-x] ⚠ off-ladder — 2m ago",
+        "  - bbbb2222 coder (you) persona:skeptic — focus: wire the login — 2m ago",
+        "  - cccc3333 tester — 45m ago (stale)",
+        "tasks (8 todo, 1 doing, 1 review, 1 blocked, 1 done):",
+        "  - #1 tsk_golden0001 [doing @bbbb2222] wire auth",
+        "  - #2 tsk_golden0002 [blocked] fix the login race",
+        "  - #3 tsk_golden0003 [review @cccc3333] add the retry",
+        "  - #4 tsk_golden0004 [todo] write the docs ⧗ waits on #2",
+        "  - #7 tsk_golden0007 [todo] chore 7",
+        "  - #8 tsk_golden0008 [todo] chore 8",
+        "  - #9 tsk_golden0009 [todo] chore 9",
+        "  - #10 tsk_golden0010 [todo] chore 10",
+        "  … 3 more — `aisquare task list`",
+        "recent updates:",
+        "  - #1 manager added → coder #1: wire auth",
+        "  - #2 coder-auth claimed #1: wire auth",
+        "  - #3 cli note: ship it … → aisquare team show 3",
+        "  - #4 manager question: staging or prod first?",
+        "  - #5 coder-auth blocked #2: fix the login race — no API key",
+        "  - #6 tester-1 result #3: PASS " + "x" * 155 + " … → aisquare team show 6",
+        "Protocol: ",
+    ]
+)
+
+
+@pytest.fixture
+def golden_board(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+    """:func:`_board_fixture` with the board's clock pinned (the command word is ``rlx`` in
+    every test: conftest's ``hints_print_rlx``)."""
+    project, sessions, tasks, events, now = _board_fixture()
+    monkeypatch.setattr(team_service, "_now", lambda: now)
+    return project, sessions, tasks, events
+
+
+def test_the_agents_board_text_is_byte_for_byte_what_it_was(golden_board: tuple[Any, ...]) -> None:
+    """B1 (#14) gave people a text board of their own; the MCP board an agent reads is the
+    same renderer's other branch, and must not move by a byte."""
+    project, sessions, tasks, events = golden_board
+
+    assert team_service.render_board(project, sessions, tasks, events) == GOLDEN_AGENT_BOARD
+
+
+def test_an_agents_injected_board_is_byte_for_byte_what_it_was(
+    golden_board: tuple[Any, ...],
+) -> None:
+    """The text a SessionStart or a prompt injects comes from the same renderer, with ``me``."""
+    project, sessions, tasks, events = golden_board
+
+    injected = team_service._render_board(project, sessions, tasks, events, me=sessions[1])
+
+    board, protocol, _rest = injected.partition("Protocol: ")
+    assert protocol, "the protocol still follows the board"
+    assert board + protocol == GOLDEN_INJECTED_BOARD
