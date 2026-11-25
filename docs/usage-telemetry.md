@@ -160,7 +160,7 @@ never prints anything about it. It is sent at most once a day:
 - if the server is not there yet (a 404, which is what happens until AISquare deploys the
   endpoint), nothing more goes that day, and it is tried again on the next day you use rlx;
 - if the server refuses it (another 4xx), it is not sent again that day;
-- if the server is busy (429 or 503, waiting at least its `Retry-After`), or rlx is offline,
+- if the server is busy (408, 425, 429 or 503, waiting at least its `Retry-After`), or rlx is offline,
   it is tried again later the same day, after 5 minutes and then twice as long each time;
 - a day it did not reach the server is never sent later.
 
@@ -350,7 +350,7 @@ handoff PR, #4004). A change to it is agreed by both sides first. This is the cl
   | 2xx (the BE answers 204) | Delivered: nothing more that local day |
   | 404 (not deployed yet) | Nothing more that day, silently. Tried again on a later day |
   | 400, and any other 4xx except 408, 425 and 429 | Refused: nothing more that day |
-  | 429, 503 | Waits the longer of `Retry-After` (capped at 24 h) and the backoff, then tries again the same day |
+  | 408, 425, 429, 503 | Waits the longer of `Retry-After` (capped at 24 h) and the backoff, then tries again the same day |
   | other 5xx, a 3xx, a timeout (5 s), no network | Tries again after the backoff (5 min, doubling), the same day |
 
 - **Once a day:** the state (`state.json`, key `active_ping`) keeps only:

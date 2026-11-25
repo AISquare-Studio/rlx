@@ -422,6 +422,64 @@ def test_a_429_sends_nothing_before_its_retry_after(
     assert len(stub.seen) == 2
 
 
+@pytest.mark.parametrize("code", [408, 425])
+def test_a_408_or_425_waits_for_its_retry_after_too(
+    stub: Stub, clock: Clock, inline: Starts, code: int
+) -> None:
+    """BE#4004's contract: a timeout (408) and too-early (425) are the server's moment, like a
+    throttle, and their ``Retry-After`` is honoured (tester of #22)."""
+    stub.answer(code, Retry_After="3600")
+    run()
+    stub.answer(204)
+
+    clock.advance(timedelta(minutes=59))
+    run()
+    assert len(stub.seen) == 1
+
+    clock.advance(timedelta(minutes=2))
+    run()
+    assert len(stub.seen) == 2 and active_ping.read().outcome == "sent"
+
+
+def test_a_huge_retry_after_waits_the_cap_and_never_overflows(
+    stub: Stub, clock: Clock, inline: Starts
+) -> None:
+    """10^14 s overflowed ``timedelta``: the error was swallowed, no wait was recorded, and the
+    next command pinged again 30 minutes later (tester of #22). It waits the 24 h cap."""
+    stub.answer(429, Retry_After="100000000000000")
+    run()
+    stub.answer(204)
+
+    state = active_ping.read()
+    assert state.not_before == (DAY_ONE + active_ping.RETRY_AFTER_CAP).isoformat(timespec="seconds")
+    clock.advance(timedelta(minutes=31))
+    run()
+    clock.advance(timedelta(hours=23))
+    run()
+    assert len(stub.seen) == 1, "nothing before the cap, the next local day included"
+
+    clock.advance(timedelta(minutes=30))  # just past 24 h
+    run()
+    assert len(stub.seen) == 2
+    assert stub.seen[1].body["date"] == "2026-11-26"
+
+
+def test_a_malformed_retry_after_keeps_the_backoff(
+    stub: Stub, clock: Clock, inline: Starts
+) -> None:
+    stub.answer(429, Retry_After="soon, maybe")
+    run()
+    stub.answer(204)
+
+    clock.advance(timedelta(minutes=4))
+    run()
+    assert len(stub.seen) == 1, "inside the 5 minutes' backoff"
+
+    clock.advance(timedelta(minutes=2))
+    run()
+    assert len(stub.seen) == 2
+
+
 def test_a_503_tries_again_later_the_same_day(stub: Stub, clock: Clock, inline: Starts) -> None:
     stub.answer(503, Retry_After="600")
     run()

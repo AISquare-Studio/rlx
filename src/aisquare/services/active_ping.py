@@ -16,9 +16,9 @@ keeps a counter per day and those four traits.
 **Once a day.** A ping settles its local day when the server answers 2xx (delivered), 404 (the
 endpoint is not deployed yet: silent, and tried again on a later day) or another 4xx (refused:
 not sent again that day). A throttle (429), a 503 and every other failure wait, for the longer
-of the backoff (5 minutes, doubling) and the server's ``Retry-After`` on a 429 or 503 (at most a
-day), and are tried again while the local day lasts. The body always carries the day it is sent
-on, so a missed day is never sent later.
+of the backoff (5 minutes, doubling) and the server's ``Retry-After`` on a 408, 425, 429 or
+503 (at most a day), and are tried again while the local day lasts. The body always carries
+the day it is sent on, so a missed day is never sent later.
 
 **Never on a hot path.** Every command that is a feature, once it is done, and a bare ``rlx``
 opening the app, call :func:`start_background`: an environment look, the config's switch and
@@ -55,6 +55,10 @@ SPAWN_EVERY = timedelta(minutes=30)
 clears its mark when it finishes, so this only holds back the commands that run meanwhile."""
 RETRY_AFTER_CAP = timedelta(hours=24)
 """The longest ``Retry-After`` a ping waits for."""
+SAYS_WHEN = frozenset({408, 425, 429, 503})
+"""The answers whose ``Retry-After`` a ping waits for, when it is longer than the backoff: a
+timeout (408), too early (425), a throttle (429) and unavailable (503), as AISquare-Studio-BE
+#4004's contract says. Any other failure keeps the backoff."""
 
 OSES = frozenset({"darwin", "linux", "windows"})
 """The OS names sent as they are; any other is ``other``."""
@@ -345,7 +349,7 @@ def _send(transport: Transport) -> PingResult:
         return _settle(ping["date"], "absent", status=code)
     if 400 <= code < 500 and code not in (408, 425, 429):
         return _settle(ping["date"], "refused", status=code)
-    said = result.said_retry_after() if code in (429, 503) else None
+    said = result.said_retry_after() if code in SAYS_WHEN else None
     return _failed(moment, status=code, retry_after=said, error=f"HTTP {code}")
 
 
@@ -377,7 +381,11 @@ def _failed(
         state.failures += 1
         wait = sharing.backoff(state.failures)
         if retry_after is not None:
-            wait = max(wait, min(timedelta(seconds=retry_after), RETRY_AFTER_CAP))
+            # Capped in whole seconds BEFORE a timedelta is made: a Retry-After of 10^14 s
+            # (a broken proxy) overflowed timedelta, the error was swallowed, no wait was
+            # recorded and the next command pinged again (tester of #22). As usage_share.
+            capped = min(retry_after, int(RETRY_AFTER_CAP.total_seconds()))
+            wait = max(wait, timedelta(seconds=capped))
         holder["at"] = (moment + wait).isoformat(timespec="seconds")
         state.not_before = holder["at"]
         state.spawned_at = None
