@@ -2703,7 +2703,7 @@ class AccountsView(Vertical):
         """``fleet adopt --list`` as a picker, then the adoption: the + menu's flow, the
         page's notice line saying each step (``adopt_picker.AdoptFlow``)."""
         event.stop()
-        self._adopt.start()
+        self._adopt.begin_adoption()
 
     # --- worker results -----------------------------------------------------------------------
 
@@ -2723,7 +2723,7 @@ class AccountsView(Vertical):
         elif worker.name == CREDITS_WORKER:
             if state is WorkerState.SUCCESS and isinstance(worker.result, tuple):
                 self._show_credits(*worker.result)
-        elif self._adopt.answered(worker, state):
+        elif self._adopt.adoption_answered(worker, state):
             pass  # the list read, or the adoption: said on the notice line
         elif worker.name == SESSIONS_WORKER:
             if state is WorkerState.SUCCESS and isinstance(worker.result, list):

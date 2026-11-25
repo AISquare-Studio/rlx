@@ -940,7 +940,9 @@ class AddButton(Activatable):
         super().__init__(Text(" + "), id="add-project")
         # The arrows highlight it like any row; once onboarding opens, no row is.
         self.selection_key = "add"
-        self._adopt = adopt_picker.AdoptFlow(self, self._say, adopted=self._adopted)
+        self._adopt = adopt_picker.AdoptFlow(
+            self, self._report_adoption_step, adopted=self._read_the_adopted_row
+        )
         """*Adopt a conversation…*: the Accounts page's flow, said in toasts."""
 
     def message(self) -> Message:
@@ -954,9 +956,9 @@ class AddButton(Activatable):
         if choice == adopt_picker.ADD_A_PROJECT:
             super().activate()  # AddProject, from this row, as the + posted it before
         elif choice == adopt_picker.ADOPT_A_CONVERSATION:
-            self._adopt.start()
+            self._adopt.begin_adoption()
 
-    def _say(self, text: str, tone: str) -> None:
+    def _report_adoption_step(self, text: str, tone: str) -> None:
         error = tone == "error"
         self.notify(
             text,
@@ -965,16 +967,17 @@ class AddButton(Activatable):
             markup=False,
         )
 
-    def _adopted(self, receipt: fleet_service.SpawnReceipt) -> None:
+    def _read_the_adopted_row(self, receipt: fleet_service.SpawnReceipt) -> None:
         """The frame read again, so the adopted agent's row shows on its project's card."""
         refresh = getattr(self.app, "refresh_data", None)
         if callable(refresh):
             refresh()
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        if event.state in (WorkerState.SUCCESS, WorkerState.ERROR) and self._adopt.answered(
-            event.worker, event.state
-        ):
+        if event.state in (
+            WorkerState.SUCCESS,
+            WorkerState.ERROR,
+        ) and self._adopt.adoption_answered(event.worker, event.state):
             event.stop()
 
 
