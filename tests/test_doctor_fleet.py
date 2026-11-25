@@ -2001,6 +2001,7 @@ def test_asqs_doctor_shows_no_tmux_words(
         diagnostics._check_fleet(lambda socket: FakeServer(sessions=(), panes={}, absent=True)),
         diagnostics._check_fleet_server_env(pinned, boards=[tmp_path / "repo"]),
         idle,
+        *_every_other_fleet_branch(tmp_path, monkeypatch),
     ]
 
     class Host(App[None]):
@@ -2028,11 +2029,18 @@ def test_asqs_doctor_shows_no_tmux_words(
 def test_a_ui_tester_is_wanted_when_one_runs_or_the_persons_own_config_names_it(
     home: Path, tmp_path: Path
 ) -> None:
-    """The built-in default role alone is not wanting one: every install has it (#15)."""
+    """The built-in default role alone is not wanting one: every install has it, and every
+    saved setting writes its table whole (the reviewer of #15)."""
+    from aisquare.services import settings as settings_service
+
     assert diagnostics._ui_tester_wanted() is False, "a fresh home: no file, no agent"
 
-    paths.config_path().write_text("[fleet.roles.ui-tester]\nworktree = false\n", "utf-8")
-    assert diagnostics._ui_tester_wanted() is True, "the person's own config names it"
+    settings_service.set_value("agents.mcp", "true")  # an unrelated setting saved
+    assert "ui-tester" in paths.config_path().read_text("utf-8"), "the premise: written whole"
+    assert diagnostics._ui_tester_wanted() is False, "the default table, written whole, is not"
+
+    settings_service.set_value("fleet.roles.ui-tester.deny_tools", '["Bash"]')
+    assert diagnostics._ui_tester_wanted() is True, "set up by the person: other than built in"
 
     paths.config_path().unlink()
     project = _seed(tmp_path / "repo")
@@ -2062,3 +2070,55 @@ def test_the_status_line_row_is_ok_with_a_quiet_install_offer(
     assert row.offer is not None and row.offer.endswith("accounts statusline --install")
     states[:] = ["ours", "wrapped", "foreign"]
     assert diagnostics._check_statusline() is None, "every account has one: no row"
+
+
+def _every_other_fleet_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[DoctorCheck]:
+    """``_check_fleet``'s other rows, each built in a home of its own (the reviewer of #15):
+    live agents, a server running with none, one whose socket file is gone, another server on
+    its socket, a server that does not answer. Each as the tests above set it up."""
+    monkeypatch.setattr(tmux_core, "boot_id", lambda: "this-boot")
+    then = datetime(2026, 10, 13, 9, 0, 7, tzinfo=UTC)
+    built: list[DoctorCheck] = []
+
+    def in_a_home(name: str) -> ProjectInfo:
+        monkeypatch.setenv(paths.HOME_ENV_VAR, str(tmp_path / f"home-{name}"))
+        paths.ensure_home()
+        with store_session():
+            pass
+        return _seed(tmp_path / f"repo-{name}")
+
+    project = in_a_home("live")
+    _seed(
+        tmp_path / "repo-live", _agent(project.id, "manager", "%1"), _agent(project.id, "c", "%2")
+    )
+    live = FakeServer(sessions=("asq-x",), panes={"%1": _facts("%1"), "%2": _facts("%2")})
+    built.append(diagnostics._check_fleet(lambda socket: live))
+
+    in_a_home("sessions")
+    built.append(diagnostics._check_fleet(lambda socket: FakeServer(sessions=("asq-x",), panes={})))
+
+    project = in_a_home("held")
+    held = _agent(project.id, "coder-1", "%2").model_copy(update={"boot_id": "this-boot"})
+    _seed(tmp_path / "repo-held", held)
+    gone = FakeServer(sessions=(), panes={}, absent=True, listened="gone")
+    built.append(diagnostics._check_fleet(lambda socket: gone))
+
+    project = in_a_home("taken")
+    taken = _agent(project.id, "coder-1", "%2").model_copy(
+        update={"boot_id": "this-boot", "server_started_at": then}
+    )
+    _seed(tmp_path / "repo-taken", taken)
+    other = FakeServer(
+        sessions=("asq-other",), panes={}, started=then + timedelta(minutes=5), listened="answers"
+    )
+    built.append(diagnostics._check_fleet(lambda socket: other))
+
+    project = in_a_home("silent")
+    _seed(tmp_path / "repo-silent", _agent(project.id, "coder-1", "%2"))
+    silent = FakeServer(sessions=(), panes={}, absent=False)
+    built.append(diagnostics._check_fleet(lambda socket: silent))
+
+    said = " | ".join(row.detail for row in built)
+    for branch in ("agent(s) running", "no agent is", "cannot reach", "another program", "answer"):
+        assert branch in said, f"the premise: the {branch!r} branch was built: {said}"
+    return built

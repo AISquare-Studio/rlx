@@ -3699,9 +3699,11 @@ BROWSER_TOOLS_ADD = "claude mcp add -s user chrome-devtools npx chrome-devtools-
 
 
 def _ui_tester_wanted() -> bool:
-    """Whether a ui-tester is wanted here: one runs on the fleet, or the person's own
-    ``config.toml`` names the role (the built-in default alone does not: every install has
-    it). Read-only and failing closed: no store, no file, or one that cannot be read is no."""
+    """Whether a ui-tester is wanted here: one runs on the fleet, or the person set the role
+    up themselves, its ``[fleet.roles.ui-tester]`` table in their ``config.toml`` other than
+    the built-in one. The table alone is not enough: ``save_config`` writes every role's table
+    whole (``config._with_whole_role_tables``), so any setting saved writes the default one
+    too (the reviewer of #15). Read-only, and no for anything that cannot be read."""
     try:
         if paths.db_path().exists():
             with store_session() as store:
@@ -3709,9 +3711,14 @@ def _ui_tester_wanted() -> bool:
                     return True
         import tomllib
 
+        from aisquare.core.config import FleetRoleSettings, _default_fleet_roles
+
         own = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
         roles = own.get("fleet", {}).get("roles", {})
-        return isinstance(roles, dict) and "ui-tester" in roles
+        table = roles.get("ui-tester") if isinstance(roles, dict) else None
+        if not isinstance(table, dict):
+            return False
+        return FleetRoleSettings.model_validate(table) != _default_fleet_roles()["ui-tester"]
     except Exception:
         return False
 

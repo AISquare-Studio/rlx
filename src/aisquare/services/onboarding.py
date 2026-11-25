@@ -740,7 +740,10 @@ def fix_commands(checks: Iterable[DoctorCheck]) -> list[FixCommand]:
                     interactive=known.interactive,
                 )
             )
+    panes = pane_available()
     for check in checks:
+        if not panes:  # no pane can open here: no button that would only fail
+            break
         hints = [(check.offer, True)] if check.offer else []
         if check.status is not CheckStatus.ok and check.fix:
             hints.append((check.fix, False))
@@ -763,6 +766,13 @@ def fix_commands(checks: Iterable[DoctorCheck]) -> list[FixCommand]:
                     )
                 )
     return fixes
+
+
+def pane_available() -> bool:
+    """Whether asq can open a pane of its own here (:data:`PANE_FIXES`): tmux on PATH, and a
+    host with a uid, as the fleet's tmux socket lives in ``tmux-<uid>`` (Windows outside WSL
+    has none). Where it cannot, a pane fix is no button (the reviewer of #15)."""
+    return getattr(os, "getuid", None) is not None and shutil.which("tmux") is not None
 
 
 def _names_whole(text: str, pane: _PaneFix) -> bool:

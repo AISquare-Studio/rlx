@@ -857,6 +857,7 @@ def test_the_three_pane_fixes_come_quiet_from_ok_rows_and_loud_from_a_warning(
     """The hub's one pattern (#15, seq 229): an OK row's offer is a quiet pane button, never a
     problem; the browser-tools warning (a ui-tester is wanted) has the same button as its fix."""
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
     add = "claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest"
     rows = [
         _offered("status line", "rlx accounts statusline --install"),
@@ -884,6 +885,31 @@ def test_a_pane_fix_is_offered_only_where_its_tool_is_installed_and_named_whole(
     assert fix_commands([_offered("gh", "gh auth login")]) == [], "no gh on PATH: no button"
 
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
     for not_it in ("gh auth login --with-token", "gh auth logins", "run gh auth status"):
         assert fix_commands([_offered("gh", not_it)]) == [], not_it
     assert fix_commands([_fix("status line", "rlx accounts statusline --install --wrap")]) == []
+
+
+def test_where_no_pane_can_open_no_pane_fix_is_offered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No tmux, or a host with no uid (Windows outside WSL): a pane button would only fail
+    (the reviewer of #15)."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(onboarding, "pane_available", lambda: False)
+
+    assert fix_commands([_offered("gh", "gh auth login")]) == []
+
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
+    assert [fix.title for fix in fix_commands([_offered("gh", "gh auth login")])] == [
+        "Sign in to GitHub"
+    ]
+
+
+def test_pane_available_wants_tmux_and_a_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert onboarding.pane_available() is False, "no tmux on PATH"
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tmux")
+    monkeypatch.delattr(os, "getuid", raising=False)
+    assert onboarding.pane_available() is False, "no uid: no tmux socket of the fleet's"

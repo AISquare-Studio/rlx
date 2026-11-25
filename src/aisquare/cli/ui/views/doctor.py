@@ -24,6 +24,7 @@ UI it replaces, and asq comes back after it.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -48,6 +49,7 @@ from aisquare.models import CheckStatus, DoctorCheck
 from aisquare.services import install_route, onboarding
 from aisquare.services.onboarding import FixCommand, FixResult, Runner
 
+log = logging.getLogger("aisquare.ui.doctor")
 _SYMBOL = {CheckStatus.ok: "✓", CheckStatus.warn: "⚠", CheckStatus.fail: "✗"}
 _STYLE = {CheckStatus.ok: "green", CheckStatus.warn: "yellow", CheckStatus.fail: "bold red"}
 FIX_WORKER = "doctor-fix"
@@ -264,6 +266,8 @@ class DoctorView(VerticalScroll):
     DoctorView #doctor-fixes Button { margin: 1 1 0 0; }
     DoctorView #doctor-passed { height: auto; margin-top: 1; }
     DoctorView #doctor-passed-list { height: auto; }
+    DoctorView #doctor-offers { height: auto; }
+    DoctorView #doctor-offers Button { margin: 1 1 0 0; }
     DoctorView #doctor-machine { height: auto; margin-top: 1; }
     DoctorView #doctor-machine Button { margin: 0 1 0 0; }
     """
@@ -334,6 +338,8 @@ class DoctorView(VerticalScroll):
         yield Static("", id="doctor-report")
         with Collapsible(title=passed_title(0), collapsed=True, id="doctor-passed"):
             yield Static("", id="doctor-passed-list")
+            # An OK row's quiet offer sits with its row, folded with it (#15, seq 212).
+            yield Vertical(id="doctor-offers")
         yield Static("", id="doctor-status")
         yield Vertical(id="doctor-fixes")
         if self.machine:
@@ -455,8 +461,11 @@ class DoctorView(VerticalScroll):
         """
         container = self.query_one("#doctor-fixes", Vertical)
         await container.remove_children()
+        offers = self.query_one("#doctor-offers", Vertical)
+        await offers.remove_children()
         fixes: dict[str, FixCommand] = {}
         buttons: list[Button] = []
+        quiet: list[Button] = []
         for index, fix in enumerate(onboarding.fix_commands(self.checks)):
             button_id = f"fix-{index}"
             fixes[button_id] = fix
@@ -477,7 +486,7 @@ class DoctorView(VerticalScroll):
                 button.disabled = True
                 tooltip.append("\n(select a project first — this runs in its root)")
             button.tooltip = tooltip
-            buttons.append(button)
+            (quiet if fix.quiet else buttons).append(button)
         self.fixes = fixes
         asks: dict[str, DoctorCheck] = {}
         manager = self._manager_name()
@@ -500,6 +509,8 @@ class DoctorView(VerticalScroll):
         self.asks = asks
         if buttons:
             await container.mount(*buttons)
+        if quiet:
+            await offers.mount(*quiet)
 
     def _set_status(self, text: Text) -> None:
         self.query_one("#doctor-status", Static).update(text)
@@ -684,7 +695,9 @@ class FixPaneScreen(ModalScreen[PaneOutcome]):
         try:
             self._server, self._pane = self._launch(self.fix)
         except (TmuxError, fleet_service.FleetError, OSError) as exc:
-            self.dismiss(f"no pane could be opened here ({exc})")
+            # Said plainly: tmux's own words (its stderr) are no answer for the person.
+            log.info("doctor: no pane for %s: %s", self.fix.title, exc)
+            self.dismiss("rlx could not open a pane for it here")
             return
         pane = self.query_one("#fix-pane", TerminalPane)
         pane.server = self._server
@@ -705,9 +718,11 @@ class FixPaneScreen(ModalScreen[PaneOutcome]):
             return
         if facts is not None and not facts.dead:
             return
-        status = facts.dead_status if facts is not None else None
         self._close_window()
-        self.dismiss(status if status is not None else 0)
+        if facts is None:  # vanished, not ended: what it did is not known
+            self.dismiss("its pane closed before it finished")
+            return
+        self.dismiss(facts.dead_status if facts.dead_status is not None else 0)
 
     def _close_window(self) -> None:
         from aisquare.core.tmux import TmuxError

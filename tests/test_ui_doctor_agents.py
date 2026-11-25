@@ -263,6 +263,8 @@ class PaneWorld:
     opened: list[dict[str, Any]] = field(default_factory=list)
     killed: list[str] = field(default_factory=list)
     status: int = 0
+    gone: bool = False
+    """The pane vanished rather than ended: tmux knows it no more."""
 
 
 @pytest.fixture
@@ -270,8 +272,12 @@ def pane_world(monkeypatch: pytest.MonkeyPatch) -> PaneWorld:
     from aisquare.core import tmux as tmux_core
     from aisquare.core.tmux import Completed, PaneFacts, TmuxServer, WindowInfo
     from aisquare.services import fleet as fleet_service
+    from aisquare.services import onboarding
 
     world = PaneWorld()
+    # A pane can open here whatever the runner (Windows has no uid, a runner may lack tmux):
+    # the window itself is the stand-in below.
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
     monkeypatch.setattr(
         tmux_core, "_tmux", lambda argv, stdin: Completed(1, "", "no server (a UI test)\n")
     )
@@ -290,7 +296,9 @@ def pane_world(monkeypatch: pytest.MonkeyPatch) -> PaneWorld:
             activity=False,
         )
 
-    def facts(server: Any, pane_id: str) -> PaneFacts:
+    def facts(server: Any, pane_id: str) -> PaneFacts | None:
+        if world.gone:
+            return None
         return PaneFacts(
             pane_id=pane_id,
             width=80,
@@ -317,28 +325,40 @@ def _offer(name: str, offer: str) -> DoctorCheck:
     return DoctorCheck(name=name, status=CheckStatus.ok, detail=f"{name} detail", offer=offer)
 
 
-def test_an_ok_rows_offer_is_a_quiet_button_beside_it_in_the_fold_and_no_problem() -> None:
+def test_an_ok_rows_offer_is_a_quiet_button_beside_it_in_the_fold_and_no_problem(
+    pane_world: PaneWorld,
+) -> None:
+    """In the fold with its row (#15, seq 212): hidden while the fold is, shown with it."""
     checks = [_offer("status line", "rlx accounts statusline --install")]
 
-    async def drive() -> tuple[str, str, dict[str, str], str]:
+    async def drive() -> tuple[str, str, list[str], str, bool, bool, list[str]]:
         view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
         host = Host(view)
         async with host.run_test(size=(120, 40)):
             view.show(checks)
             await settle_page(host)
             button = view.query_one("#fix-0", Button)
+            folded = button.region.height > 0
+            fold = view.query_one("#doctor-passed", Collapsible)
+            fold.collapsed = False
+            await settle_page(host)
             return (
                 str(view.query_one("#doctor-report", Static).render()),
                 str(view.query_one("#doctor-passed-list", Static).render()),
-                _labels(view),
+                [str(b.label) for b in view.query("#doctor-offers Button").results(Button)],
                 str(button.variant),
+                folded,
+                button.region.height > 0,
+                [str(b.label) for b in view.query("#doctor-fixes Button").results(Button)],
             )
 
-    report, passed, labels, variant = asyncio.run(drive())
+    report, passed, offers, variant, shown_folded, shown_open, loud = asyncio.run(drive())
 
     assert report == "No problems found.", "an offer is never a problem"
     assert "→ Install status line below, if you want it" in passed
-    assert labels == {"fix-0": "Install status line"} and variant == "default"
+    assert offers == ["Install status line"] and variant == "default"
+    assert loud == [], "not among the problems' buttons"
+    assert (shown_folded, shown_open) == (False, True), "folded with its row, then shown"
 
 
 @pytest.mark.parametrize(
@@ -374,6 +394,8 @@ def test_a_pane_fix_opens_its_command_in_a_pane_and_the_checks_run_again_when_it
         async with host.run_test(size=(120, 40)) as pilot:
             view.show([check])
             await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False  # its row's fold
+            await settle_page(host)
             await pilot.click("#fix-0")
             await settle_until(host, lambda: bool(refreshed))
             await settle_page(host)
@@ -408,6 +430,8 @@ def test_a_pane_that_cannot_open_says_why_and_runs_nothing(
         async with host.run_test(size=(120, 40)) as pilot:
             view.show([check])
             await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
             await pilot.click("#fix-0")
             await settle_until(host, lambda: type(host.screen).__name__ != "FixPaneScreen")
             await settle_page(host)
@@ -417,5 +441,34 @@ def test_a_pane_that_cannot_open_says_why_and_runs_nothing(
     screen, status = asyncio.run(drive())
 
     assert screen != "FixPaneScreen"
-    assert status.startswith("✗ Sign in to GitHub: no pane could be opened here")
-    assert "no tmux here" in status
+    assert status == "✗ Sign in to GitHub: rlx could not open a pane for it here"
+    assert "no tmux here" not in status, "tmux's own words are no answer for the person"
+
+
+def test_a_pane_that_vanishes_is_no_success(
+    pane_world: PaneWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gone, not ended (killed by hand, the server stopped): what it did is not known."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    pane_world.gone = True
+    check = _offer("gh", "gh auth login")
+    refreshed: list[Path | None] = []
+
+    def refresh(cwd: Path | None) -> list[DoctorCheck]:
+        refreshed.append(cwd)
+        return [check]
+
+    async def drive() -> str:
+        view = DoctorView(run=Spy(), refresh=refresh)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
+            await pilot.click("#fix-0")
+            await settle_until(host, lambda: bool(refreshed))
+            await settle_page(host)
+            return str(view.query_one("#doctor-status", Static).render())
+
+    assert asyncio.run(drive()) == "✗ Sign in to GitHub: its pane closed before it finished"
