@@ -517,12 +517,12 @@ class RemotePanel(ModalScreen[None]):
         """Ask ``asked`` (:class:`RemoteConfirm`), and once confirmed write the new passphrase,
         with a new link when ``new_link``. Cancel and Esc change nothing."""
 
-        def answered(confirmed: bool | None) -> None:
+        def remote_confirm_answered(confirmed: bool | None) -> None:
             if confirmed:
                 self.controller.regenerate_password(wait=False, new_link=new_link)
                 self.repaint()
 
-        self.app.push_screen(RemoteConfirm(*asked), answered)
+        self.app.push_screen(RemoteConfirm(*asked), remote_confirm_answered)
 
     def _revoke_selected(self) -> None:
         table = self.query_one("#remote-devices", DataTable)
