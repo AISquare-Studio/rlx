@@ -178,3 +178,184 @@ def test_each_mark_reads_at_three_to_one_on_the_surface_it_is_drawn_on(
         assert {glyph for glyph, _, _ in seen} == {"✻", ">_"}, (theme, where, seen)
     below = _below(page, "page") + _below(sidebar, "sidebar") + _below(picked, "picker")
     assert not below, f"{theme}: {below}"
+
+
+TEXT_FLOOR = 4.5
+"""WCAG 2's ratio for text (1.4.3): a state's mark, Spawn agent and an agent's buttons (M8)."""
+
+
+def text_cells(app: App[Any], widget: Any) -> list[tuple[str, float]]:
+    """Every character drawn in ``widget``'s region, with its ink's ratio to the ground under it."""
+    region = widget.region
+    seen = []
+    for y in range(region.y, region.bottom):
+        (strip,) = app.screen._compositor.render_full_update(simplify=True).strips[y]
+        x = 0
+        for segment in strip:
+            for char in segment.text:
+                style = segment.style
+                if region.x <= x < region.right and char.strip() and style is not None:
+                    ratio = contrast(_rgb(style, "color"), _rgb(style, "bgcolor"))
+                    seen.append((char, ratio))
+                x += 1
+    return seen
+
+
+def _every_state(project: str) -> list[FleetAgentStatus]:
+    from aisquare.cli.ui.sidebar import STATE_CHIP
+
+    return [
+        FleetAgentStatus(
+            agent=FleetAgent(
+                id=f"agt_{state}",
+                project_id=project,
+                label=f"coder-{place}",
+                role="coder",
+                pane_id=f"%{place + 1}",
+                cwd=Path("/tmp/proj"),
+                created_at=NOW,
+                tmux_socket="asq-test-mark-contrast",
+            ),
+            state=state,
+        )
+        for place, state in enumerate(STATE_CHIP)
+    ]
+
+
+@pytest.mark.parametrize("theme", THEMES)
+def test_each_state_mark_and_spawn_agent_read_at_four_and_a_half_to_one(
+    theme: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M8 (the UX audit) and 0.10.1's exploratory test: every theme the app offers draws each
+    state's mark, and *Spawn agent*, at 4.5:1 or more on the row under it. Rich's named colours
+    fell to 1.96:1 (yellow on textual-light), and Spawn agent's $accent to 1.49:1 there."""
+    from aisquare.cli.ui.sidebar import STATE_CHIP, ActionRow, AgentRow
+
+    monkeypatch.setattr(fleet_service, "list_agents", lambda project, **_: [])
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    project = team_project(tmp_path)
+
+    async def drawn() -> tuple[dict[str, list[float]], list[float]]:
+        app = FleetApp(refresh_seconds=3600, doctor=lambda: [])
+        async with app.run_test(size=(160, 50)):
+            await settle_page(app)
+            app.sidebar.show_projects([project], {project.id: _every_state(project.id)})
+            app.theme = theme  # after the paint: the repaint a theme change brings is measured
+            await settle_page(app)
+            marks: dict[str, list[float]] = {}
+            for row in app.sidebar.query(AgentRow):
+                glyph = STATE_CHIP[row.status.state][0]
+                marks[row.status.state] = [r for c, r in text_cells(app, row) if c == glyph]
+            spawn = [r for row in app.sidebar.query(ActionRow) for _, r in text_cells(app, row)]
+            return marks, spawn
+
+    marks, spawn = asyncio.run(drawn())
+    assert set(marks) == set(STATE_CHIP) and all(marks.values()), (theme, marks)
+    assert spawn, f"{theme}: no Spawn agent drawn: a measurement of nothing passes nothing"
+    below = {state: min(seen) for state, seen in marks.items() if min(seen) < TEXT_FLOOR}
+    assert not below, f"{theme}: state marks under {TEXT_FLOOR}:1: {below}"
+    assert min(spawn) >= TEXT_FLOOR, f"{theme}: Spawn agent at {min(spawn):.2f}:1"
+
+
+@pytest.mark.parametrize("theme", THEMES)
+def test_an_agents_bar_reads_at_four_and_a_half_to_one(
+    theme: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M8: Pause, Resume, Stop and Restart, every label on its fill at 4.5:1 or more, on every
+    theme (catppuccin-latte's Pause was 2.32:1, solarized's Restart 3.41:1). Under the shell's
+    own CSS (``RLX_CSS``), as ``FleetApp`` adds it."""
+    from textual.app import ComposeResult
+    from textual.widgets import Button
+
+    from aisquare.cli.ui.theme import RLX_CSS, theme_variable_defaults
+    from aisquare.cli.ui.views.agent import AgentView
+    from aisquare.core import tmux as tmux_core
+    from aisquare.core.tmux import Completed, TmuxServer
+
+    # No server answers: the pane says so and the bar is drawn all the same.
+    monkeypatch.setattr(tmux_core, "_tmux", lambda argv, stdin: Completed(1, "", "no server\n"))
+    socket = "asq-test-mark-contrast"
+    agent = FleetAgent(
+        id="agt_bar", project_id="prj_bar", label="coder-1", role="coder", pane_id="%1",
+        cwd=Path("/tmp/proj"), created_at=NOW, tmux_socket=socket,
+    )  # fmt: skip
+
+    class Host(App[None]):
+        CSS = RLX_CSS
+
+        def __init__(self, state: str) -> None:
+            super().__init__()
+            register_themes(self)
+            self.state = state
+
+        def get_theme_variable_defaults(self) -> dict[str, str]:
+            return {**super().get_theme_variable_defaults(), **theme_variable_defaults(self)}
+
+        def compose(self) -> ComposeResult:
+            status = FleetAgentStatus(agent=agent, state=self.state)
+            yield AgentView(status, server=TmuxServer(socket), escape_key="f12")
+
+    async def bar(state: str) -> dict[str, float]:
+        host = Host(state)
+        async with host.run_test(size=(120, 20)):
+            host.theme = theme
+            host.screen.set_focus(None)  # at rest: no button focused or hovered
+            await settle_page(host)
+            return {
+                f"{button.id} ({button.variant})": min(r for _, r in text_cells(host, button))
+                for button in host.query(Button)
+                if button.display and button.region.area
+            }
+
+    seen = {**asyncio.run(bar("working")), **asyncio.run(bar("paused"))}
+    assert {"agent-pause (warning)", "agent-resume (primary)", "agent-stop (default)"} <= set(
+        seen
+    ), seen
+    below = {name: round(ratio, 2) for name, ratio in seen.items() if ratio < TEXT_FLOOR}
+    assert not below, f"{theme}: agent bar labels under {TEXT_FLOOR}:1: {below}"
+
+
+@pytest.mark.parametrize("theme", ["rlx", "textual-dark", "textual-light", "solarized-light"])
+def test_paused_is_the_pause_mark_and_waiting_a_muted_one_not_yellow(
+    theme: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q4 (the UX audit): one meaning per mark. A paused row draws ⏸, as Pause's own button and
+    menu entry do; a waiting row, an agent at rest at its prompt, draws ``◦`` in the theme's
+    muted tone, where it drew a yellow ⏸ (and paused a ⏯)."""
+    from textual.color import Color
+
+    from aisquare.cli.ui.sidebar import AgentRow
+    from aisquare.cli.ui.theme import theme_tones
+
+    monkeypatch.setattr(fleet_service, "list_agents", lambda project, **_: [])
+    project = team_project(tmp_path)
+
+    async def drawn() -> dict[str, list[tuple[str, tuple[int, int, int]]]]:
+        app = FleetApp(refresh_seconds=3600, doctor=lambda: [])
+        async with app.run_test(size=(160, 50)):
+            await settle_page(app)
+            app.sidebar.show_projects([project], {project.id: _every_state(project.id)})
+            app.theme = theme
+            await settle_page(app)
+            tones = theme_tones(app.current_theme)
+            seen: dict[str, list[tuple[str, tuple[int, int, int]]]] = {"tones": []}
+            seen["tones"] = [(tone, Color.parse(tones[tone]).rgb) for tone in ("muted", "warning")]
+            strips = app.screen._compositor.render_full_update(simplify=True).strips
+            for row in app.sidebar.query(AgentRow):
+                if row.status.state not in ("waiting", "paused"):
+                    continue
+                (strip,) = strips[row.region.y]
+                cells = [(c, seg.style) for seg in strip for c in seg.text]
+                seen[row.status.state] = [
+                    (char, _rgb(style, "color"))
+                    for char, style in cells[row.region.x : row.region.right]
+                    if char in "◦⏸⏯" and style is not None
+                ]
+            return seen
+
+    seen = asyncio.run(drawn())
+    (muted, warning) = (rgb for _, rgb in seen["tones"])
+    assert [char for char, _ in seen["paused"]] == ["⏸"], seen["paused"]
+    assert [char for char, _ in seen["waiting"]] == ["◦"], seen["waiting"]
+    ((_, ink),) = seen["waiting"]
+    assert ink == muted and ink != warning, (theme, ink, muted, warning)

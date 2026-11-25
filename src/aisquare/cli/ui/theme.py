@@ -28,6 +28,7 @@ from textual.theme import Theme
 from textual.visual import VisualType
 from textual.widget import Widget
 from textual.widgets import OptionList, Static
+from textual.widgets._toggle_button import ToggleButton
 from textual.widgets.option_list import Option
 
 from aisquare.cli.ui.autosave import Autosave
@@ -150,9 +151,24 @@ App.-theme-rlx Panes > .-unfocused Button.-style-default {
     &.-error:hover { background: $error-darken-1; }
     &:disabled, &:disabled:hover { color: $text-muted; background: $surface; }
 }
+/* Every theme from here on (M8). An agent's bar (Pause, Resume, Stop, Restart): Textual's label
+   on a coloured fill is its text colour at 87-90%, which fell to 1.78:1 on catppuccin-latte's
+   amber and 3.41:1 on solarized's blue. Black or white, whichever the fill sets off better by
+   WCAG (label_colours), reads at 4.58:1 or more on any fill; the plain button takes Textual's
+   auto. Fewer classes than rlx's rules above, so those still win on the faded side. */
+AgentView Button { color: auto 100%; }
+/* The sidebar's Spawn agent and Start captain: its accent, readable on their $boost row
+   (action_colour); a light theme's accent was 1.49:1 to 2.74:1 there. */
+ActionRow { color: $rlx-action; }
+AgentView Button.-primary { color: $rlx-label-on-primary; }
+AgentView Button.-warning { color: $rlx-label-on-warning; }
+AgentView Button.-error { color: $rlx-label-on-error; }
+AgentView Button.-success { color: $rlx-label-on-success; }
 """
-"""The rules ``rlx`` needs beyond its colours. Both apps add them to their own CSS; they
-apply only while the theme is ``rlx`` (Textual puts ``-theme-rlx`` on the app)."""
+"""The rules our apps need beyond Textual's. Both add them to their own CSS. The first ones
+apply only while the theme is ``rlx`` (Textual puts ``-theme-rlx`` on the app), the rest under
+every theme; those read our own variables, so an app that adds this CSS merges
+:func:`theme_variable_defaults` into its ``get_theme_variable_defaults``, as both do."""
 
 FADE_RELABELLED = frozenset({"primary", "error"})
 """The button variants whose label :data:`RLX_CSS` changes on the faded side. The shell's fade
@@ -163,14 +179,28 @@ DEFAULT_THEME = RLX_THEME.name
 they can show (:func:`restore_theme`)."""
 
 
+CHECK_MARK = "✓"
+"""What a ticked checkbox shows (Q13); an unticked one shows nothing. Textual drew a dim ``X``
+in both states, told apart by its colour alone."""
+
+
+def _check_glyph(button: ToggleButton) -> str:
+    """A checkbox's glyph for its state (:data:`CHECK_MARK`, or blank)."""
+    return CHECK_MARK if button.value else " "
+
+
 def register_themes(app: App[Any]) -> None:
-    """Make ``rlx`` one of ``app``'s themes, beside Textual's built-in ones.
+    """Make ``rlx`` one of ``app``'s themes, beside Textual's built-in ones, and draw every
+    checkbox ✓ or blank (:data:`CHECK_MARK`, Q13).
 
     Call it in the app's ``__init__``, before :func:`restore_theme`, and in every app that
     offers or restores the saved theme. The fleet UI and ``board -w`` share that theme, and
     each must be able to show a pick made in the other.
     """
     app.register_theme(RLX_THEME)
+    # Textual's class-wide glyph, read per button as it is drawn: every checkbox in either app,
+    # whoever builds it. A radio button keeps its own (``RadioButton.BUTTON_INNER``).
+    setattr(ToggleButton, "BUTTON_INNER", property(_check_glyph))  # noqa: B010
 
 
 def _luminance(colour: Color) -> float:
@@ -243,13 +273,124 @@ def _terminal_bar(colours: dict[str, str]) -> tuple[str, str]:
     return (text, bar) if Color.parse(bar) == neutral else (bar, text)
 
 
+TONES: tuple[str, ...] = ("success", "warning", "error", "accent", "primary", "muted")
+"""The tones a state is drawn in (``sidebar.STATE_TONE``): the theme's own colour of each name,
+and ``muted``, its text colour toned down, read off the theme by :func:`tone_colours`."""
+
+TONE_PREFIX = "rlx-tone-"
+"""The theme variable of each tone in :data:`TONES`: ``$rlx-tone-success`` and so on."""
+
+ACTION_VARIABLE = "rlx-action"
+"""The ink of the sidebar's two actions, *Spawn agent* and *Start captain*, on their ``$boost``
+row (M8): the theme's ``accent``, as readable as :func:`readable` makes it. Light themes'
+accents were 1.49:1 (textual-light) to 2.74:1 (atom-one-light) there."""
+
+MUTED_SHARE = 0.6
+"""How much of the text colour ``muted`` keeps over the ground, before :func:`readable`."""
+
+_BLACK, _WHITE = Color(0, 0, 0), Color(255, 255, 255)
+
+
+def readable(ink: Color, *grounds: Color, floor: float = TEXT_CONTRAST) -> Color:
+    """``ink``, or the nearest colour of its hue toward black or white (whichever the first
+    ground sets off better) that reads at ``floor`` or more on every one of ``grounds`` (M8:
+    every offered theme's chips at 4.5:1). Moved in twentieths, so a theme's own colour is kept
+    where it reads, and changed as little as it must where it does not; the far end, pure black
+    or white, reads at 4.58:1 or more on any one ground."""
+
+    def reads(colour: Color) -> bool:
+        return all(contrast_ratio(colour, ground) >= floor for ground in grounds)
+
+    if reads(ink):
+        return ink
+    toward = max((_BLACK, _WHITE), key=lambda end: contrast_ratio(end, grounds[0]))
+    for step in range(1, 21):
+        moved = ink.blend(toward, step / 20)
+        if reads(moved):
+            return moved
+    return toward
+
+
+_TONES_BY_THEME: dict[str, dict[str, str]] = {}
+
+
+def theme_tones(theme: Theme) -> dict[str, str]:
+    """:func:`tone_colours` of ``theme`` on its background, worked out once per theme name:
+    the sidebar paints every row with it, and a theme's colours do not change under its name.
+    Read off the theme itself, never ``App.theme_variables``, which a row painted at a theme
+    change still found holding the last theme's."""
+    tones = _TONES_BY_THEME.get(theme.name)
+    if tones is None:
+        tones = _TONES_BY_THEME[theme.name] = tone_colours(theme)
+    return tones
+
+
+GROUNDS: tuple[str, ...] = ("background", "surface")
+"""What the sidebar's rows are drawn on: the screen's ground, and a card's ``$surface``."""
+
+
+def tone_colours(theme: Theme, grounds: tuple[str, ...] = GROUNDS) -> dict[str, str]:
+    """Each tone of :data:`TONES` under ``theme``, readable on each of its ``grounds``
+    variables: the theme's colour of that name, or for ``muted`` its foreground at
+    :data:`MUTED_SHARE` over the first ground, through :func:`readable`. A theme of the
+    terminal's own ANSI colours, whose ratios no one can know, keeps its own colours."""
+    colours = theme.to_color_system().generate()
+    under = [Color.parse(colours[ground]) for ground in grounds]
+    if theme.ansi or any(ground.ansi is not None for ground in under):
+        return {tone: colours.get(tone, colours["foreground"]) for tone in TONES}
+    out = {}
+    for tone in TONES:
+        if tone == "muted":
+            ink = under[0].blend(Color.parse(colours["foreground"]), MUTED_SHARE)
+        else:
+            ink = Color.parse(colours[tone])
+        out[tone] = readable(ink, *under).hex
+    return out
+
+
+FILLS: tuple[str, ...] = ("primary", "warning", "error", "success")
+"""The coloured fills a button takes (its variant), each with a label variable
+(:data:`LABEL_PREFIX`)."""
+
+LABEL_PREFIX = "rlx-label-on-"
+"""The label on a fill of :data:`FILLS`: ``$rlx-label-on-primary`` and so on (M8)."""
+
+
+def label_colours(theme: Theme) -> dict[str, str]:
+    """The label for each fill of :data:`FILLS` under ``theme``: black or white, whichever reads
+    better on it by WCAG's ratio, which is 4.58:1 or more on any fill. Textual's ``auto`` asks
+    the fill's brightness instead, and under rlx took white, 4.31:1 on its blue, where black is
+    4.87:1. An ANSI theme keeps Textual's own label."""
+    colours = theme.to_color_system().generate()
+    out = {}
+    for fill in FILLS:
+        under = Color.parse(colours[fill])
+        if theme.ansi or under.ansi is not None:
+            out[fill] = colours["button-color-foreground"]
+            continue
+        out[fill] = max((_BLACK, _WHITE), key=lambda end: contrast_ratio(end, under)).hex
+    return out
+
+
+def action_colour(theme: Theme) -> str:
+    """:data:`ACTION_VARIABLE` under ``theme``: its accent, readable on the ``$boost`` row."""
+    colours = theme.to_color_system().generate()
+    ground = Color.parse(colours["background"]) + Color.parse(colours["boost"])
+    accent = Color.parse(colours["accent"])
+    if theme.ansi or accent.ansi is not None:
+        return colours["accent"]
+    return readable(accent, ground).hex
+
+
 def theme_variable_defaults(app: App[Any]) -> dict[str, str]:
     """The variables our apps add to every theme: the mark's (:data:`MARK_VARIABLE`, as
-    :func:`mark_colour`) and the sidebar's highlight while it holds the keyboard
-    (:data:`HIGHLIGHT_VARIABLE`, :data:`HIGHLIGHT_TEXT_VARIABLE`, as :func:`highlight_colours`).
+    :func:`mark_colour`), the sidebar's highlight while it holds the keyboard
+    (:data:`HIGHLIGHT_VARIABLE`, :data:`HIGHLIGHT_TEXT_VARIABLE`, as :func:`highlight_colours`),
+    each state's tone (:data:`TONE_PREFIX`, as :func:`tone_colours`) and the sidebar actions'
+    ink (:data:`ACTION_VARIABLE`).
 
     Merge it into the app's ``get_theme_variable_defaults``, Textual's place for an app's
-    own variables. A theme that sets one (``rlx`` sets all three) overrides it there.
+    own variables. A theme that sets one (``rlx`` sets the first three) overrides it there.
     """
     theme = app.current_theme
     bar, text = highlight_colours(theme)
@@ -257,6 +398,9 @@ def theme_variable_defaults(app: App[Any]) -> dict[str, str]:
         MARK_VARIABLE: mark_colour(theme),
         HIGHLIGHT_VARIABLE: bar,
         HIGHLIGHT_TEXT_VARIABLE: text,
+        **{f"{TONE_PREFIX}{tone}": colour for tone, colour in theme_tones(theme).items()},
+        ACTION_VARIABLE: action_colour(theme),
+        **{f"{LABEL_PREFIX}{fill}": colour for fill, colour in label_colours(theme).items()},
     }
 
 

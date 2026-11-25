@@ -618,7 +618,7 @@ def test_fleet_ls_and_the_sidebar_show_a_paused_agent_as_paused(fleet: Fleet) ->
 
     listed = CliRunner().invoke(app, ["fleet", "ls", "--project", fleet.alpha.id])
     assert listed.exit_code == 0, listed.output
-    assert "⏯ paused" in listed.output and "exited" not in listed.output
+    assert "⏸ paused" in listed.output and "exited" not in listed.output
     [manager] = [s for s in fleet_service.list_agents(fleet.alpha) if s.agent.label == "manager"]
     row = agent_row_text(manager).plain
     assert STATE_CHIP["paused"][0] in row and "paused" in row and "exited" not in row

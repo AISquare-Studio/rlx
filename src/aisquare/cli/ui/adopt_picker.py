@@ -14,9 +14,10 @@ from datetime import datetime
 from typing import ClassVar
 
 from rich.text import Text
-from textual import on
+from textual import events, on
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.geometry import Region
 from textual.screen import ModalScreen
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
@@ -122,4 +123,64 @@ class AdoptPicker(ModalScreen[str | None]):
         self.dismiss(event.option.id)
 
     def action_close_picker(self) -> None:
+        self.dismiss(None)
+
+
+ADD_A_PROJECT = "add-a-project"
+ADOPT_A_CONVERSATION = "adopt-a-conversation"
+
+ADD_MENU_WIDTH = 28
+"""The ``+`` menu's columns, its border included: it fits the default sidebar beside it."""
+
+
+class AddMenu(ModalScreen[str | None]):
+    """The menu of the ``+`` beside Fleet (M6 of the UX audit): *Add a project…*, the onboarding
+    the ``+`` opened on its own, and *Adopt a conversation…*, this picker, which only the
+    Accounts page offered. Answers :data:`ADD_A_PROJECT` or :data:`ADOPT_A_CONVERSATION`; Esc
+    or a click off the menu answers ``None``."""
+
+    CSS = """
+    AddMenu { align: left top; background: $background 20%; }
+    AddMenu #add-menu { height: auto; border: round $accent; background: $surface; }
+    AddMenu OptionList { height: auto; border: none; padding: 0; }
+    """
+    BINDINGS: ClassVar = [("escape", "close_menu", "close")]
+
+    def __init__(self, anchor: Region) -> None:
+        super().__init__()
+        self.near = anchor
+        """Where the ``+`` is on screen: the menu opens under it."""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="add-menu"):
+            yield OptionList(
+                Option("+ Add a project…", id=ADD_A_PROJECT),
+                Option("⤵ Adopt a conversation…", id=ADOPT_A_CONVERSATION),
+                id="add-menu-options",
+            )
+
+    def on_mount(self) -> None:
+        box = self.query_one("#add-menu", Vertical)
+        options = self.query_one(OptionList)
+        width, rows = self.app.size
+        height = options.option_count + 2
+        box.styles.width = ADD_MENU_WIDTH
+        box.styles.offset = (
+            max(0, min(self.near.x, width - ADD_MENU_WIDTH)),
+            max(0, min(self.near.y + 1, rows - height)),
+        )
+        options.highlighted = 0
+        options.focus()
+
+    @on(OptionList.OptionSelected, "#add-menu-options")
+    def _chosen(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(event.option.id)
+
+    def on_click(self, event: events.Click) -> None:
+        # A click that reaches the screen itself fell outside the menu: close, as Esc does.
+        if event.widget is self:
+            self.dismiss(None)
+
+    def action_close_menu(self) -> None:
         self.dismiss(None)

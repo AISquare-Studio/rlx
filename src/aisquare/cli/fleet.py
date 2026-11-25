@@ -78,12 +78,13 @@ ManagersOnly = Annotated[
 
 _STATE_CHIP = {
     "working": "▶ working",
-    "waiting": "⏸ waiting",
+    # One meaning per mark, as the sidebar's (Q4): ⏸ is paused, and waiting a muted ◦.
+    "waiting": "◦ waiting",
     "attention": "🔔 NEEDS YOU",
     "limited": "⏳ limited",
     "exited": "💤 exited",
     "lost": "✗ lost",
-    "paused": "⏯ paused",
+    "paused": "⏸ paused",
     "unknown": "· unknown",
 }
 

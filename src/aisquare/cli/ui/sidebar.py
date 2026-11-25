@@ -54,6 +54,7 @@ from textual.geometry import Region
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Input, Static
+from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.groups import (
     DragState,
@@ -67,9 +68,8 @@ from aisquare.cli.ui.groups import (
 )
 from aisquare.cli.ui.instances_chip import InstancesChip
 from aisquare.cli.ui.terminal import InPlaceField
-from aisquare.cli.ui.theme import MARK_STYLE, MarkStatic
+from aisquare.cli.ui.theme import MARK_STYLE, MarkStatic, theme_tones
 from aisquare.cli.ui.views.accounts import agent_mark
-from aisquare.core import codenames
 from aisquare.core.agent_adapters import default_binary, recorded_adapter
 from aisquare.core.version import PRODUCT_LOGO
 from aisquare.models import (
@@ -101,14 +101,49 @@ ROLE_ICON: dict[str, str] = {
 }
 STATE_CHIP: dict[str, tuple[str, str]] = {
     "working": ("▶", "green"),
-    "waiting": ("⏸", "yellow"),
+    # One meaning per mark (Q4): ⏸ is paused, as Pause's own button and menu entry draw it, and
+    # waiting, an agent at rest at its prompt, is a muted mark, not a second yellow ⏸.
+    "waiting": ("◦", "dim"),
     "attention": ("🔔", "bold red"),
     "limited": ("⏳", "magenta"),
     "exited": ("💤", "dim"),
     "lost": ("✗", "red"),
-    "paused": ("⏯", "cyan"),
+    "paused": ("⏸", "cyan"),
     "unknown": ("·", "dim"),
 }
+"""Each state's mark, and a style for where no theme is at hand (a test's text, the help). The
+sidebar draws each mark in its theme's tone instead (:data:`STATE_TONE`)."""
+
+STATE_TONE: dict[str, str] = {
+    "working": "success",
+    "waiting": "muted",
+    "attention": "error",
+    "limited": "warning",
+    "exited": "muted",
+    "lost": "error",
+    "paused": "accent",
+    "unknown": "muted",
+}
+"""The tone (``theme.TONES``) each state's mark is drawn in on a theme, readable on its ground
+at 4.5:1 or more (M8: Rich's named colours fell to 1.96:1 on textual-light)."""
+
+BOLD_STATES = frozenset({"attention"})
+"""The states whose mark is bold as well: the one that needs the person."""
+
+
+def state_styles(tones: Mapping[str, str]) -> dict[str, str]:
+    """Each state's style from a theme's tones (``theme.theme_tones``): its tone's colour, bold
+    where :data:`BOLD_STATES` says. A state whose tone is missing keeps :data:`STATE_CHIP`'s."""
+    styles = {}
+    for state, (_mark, fallback) in STATE_CHIP.items():
+        colour = tones.get(STATE_TONE.get(state, "muted"))
+        if colour is None:
+            styles[state] = fallback
+        else:
+            styles[state] = f"bold {colour}" if state in BOLD_STATES else colour
+    return styles
+
+
 CUSTOM_ROLE_ICON = "🤖"
 """The icon for a role the table above does not know (a `team bind` role, say)."""
 
@@ -345,31 +380,16 @@ def short_path(path: Path, home: Path | None = None) -> str:
         return str(path)
 
 
-def codename_aside(project: ProjectInfo) -> str | None:
-    """The project's fleet codename when it is not the one its name gives
-    (:func:`codenames.codename_from_text` of :func:`project_name`), else ``None``.
-
-    A manager or a captain names a project by its codename (``--project earnest-hawk``), and
-    one never renamed has a generated one (``earnest-hawk``) its card does not otherwise
-    say; so does one set with ``fleet rename``, or one suffixed because another project
-    held the name's (``aisquare-cli-2``). One its name gives is said by the name itself."""
-    codename = project.codename
-    if codename is None or codename == codenames.codename_from_text(project_name(project)):
-        return None
-    return codename
-
-
 def project_subtitle(project: ProjectInfo, names: Counter[str], *, always: bool) -> str | None:
     """The dim line under a card's name: the project's directory (:func:`short_path`) when
     ``always`` — ``[ui] always_show_project_path`` — or when another listed project shares
-    its name (``names`` counts the listed projects by :func:`project_name`); then
-    `` · <codename>`` when its codename is not the one its name gives
-    (:func:`codename_aside`); ``None``, no line, when neither is said."""
-    path = short_path(project.root) if always or names[project_name(project)] > 1 else None
-    aside = codename_aside(project)
-    if aside is None:
-        return path
-    return f"{path} · {aside}" if path else f"· {aside}"
+    its name (``names`` counts the listed projects by :func:`project_name`); ``None``, no
+    line, otherwise.
+
+    Never the fleet codename (Q3 of the UX audit): it is tmux's and the command line's
+    spelling of the project, and the card named it beside a name that is the person's. The
+    title's tooltip still says it (:func:`project_title_tooltip`)."""
+    return short_path(project.root) if always or names[project_name(project)] > 1 else None
 
 
 def project_title_tooltip(project: ProjectInfo) -> str:
@@ -415,8 +435,9 @@ def agent_row_text(
     width: int | None = None,
     mark: Text | None = None,
     usage: bool = True,
+    styles: Mapping[str, str] | None = None,
 ) -> Text:
-    """``🧭 manager       ⏸ #1·42% · skeptic`` — icon, label, state chip, the account's slot
+    """``🧭 manager       ▶ #1·42% · skeptic`` — icon, label, state chip, the account's slot
     and the session use on it, exit status when exited, persona.
 
     ``#<slot>`` is ``FleetAgent.account_slot`` and ``percent`` that account's window that
@@ -451,6 +472,8 @@ def agent_row_text(
     """
     agent = status.agent
     chip, style = STATE_CHIP.get(status.state, STATE_CHIP["unknown"])
+    if styles is not None:
+        style = styles.get(status.state, styles.get("unknown", style))
     icon = f"{ROLE_ICON.get(agent.role, CUSTOM_ROLE_ICON)} "
     tail = Text()
     tail.append(chip, style=style)
@@ -537,30 +560,33 @@ def relabel_preview(typed: str, agent: FleetAgent, taken: Collection[str] = ()) 
 def project_title_text(project: ProjectInfo) -> Text:
     """``🗂 Auth rewrite`` — the name a person gave it (else the folder's), and nothing else.
 
-    The codename is not on this line: a rename gives the project the codename its name
-    gives, and one that is not is said under it (:func:`project_subtitle`) and in the
-    title's tooltip. The chips are their own widget (:func:`project_chips_text`), so a long
-    name is cut before them, not them.
+    The codename is not on the card (Q3), only in the title's tooltip. The chips are their own
+    widget (:func:`project_chips_text`), so a long name is cut before them, not them.
     """
     return Text(f"🗂 {project_name(project)}", no_wrap=True, overflow="ellipsis")
 
 
 def project_chips_text(project: ProjectInfo, statuses: list[FleetAgentStatus]) -> Text:
-    """``  captured  3 · 🔔1`` — what follows the name: captured, agents alive, 🔔 count."""
+    """``  captured  3 · 🔔1 · ⏳2`` — what follows the name: captured, agents alive, the 🔔
+    count, and the ⏳ count of agents at a usage limit (M1 of the UX audit: a limited agent is
+    alive and parked, and the card said nothing of it until its row was found)."""
     text = Text(no_wrap=True)
     if project.onboarded_at is None:
         # Listed only while the shell shows captured directories (#139).
         text.append("  captured", style="dim italic")
     alive = sum(1 for s in statuses if s.state in ALIVE_STATES)
     bells = sum(1 for s in statuses if s.state == "attention")
-    if alive or bells:
-        text.append("  ")
+    limited = sum(1 for s in statuses if s.state == "limited")
+    counts: list[tuple[str, str]] = []
     if alive:
-        text.append(str(alive), style="bold")
+        counts.append((str(alive), "bold"))
     if bells:
-        if alive:
-            text.append(" · ", style="dim")
-        text.append(f"🔔{bells}", style="bold red")
+        counts.append((f"🔔{bells}", "bold red"))
+    if limited:
+        counts.append((f"{STATE_CHIP['limited'][0]}{limited}", "bold"))
+    for place, (count, style) in enumerate(counts):
+        text.append("  " if place == 0 else " · ", style=None if place == 0 else "dim")
+        text.append(count, style=style)
     return text
 
 
@@ -653,7 +679,7 @@ def status_line_text(
     more: Sequence[AgentHeadroom] = (),
     width: int | None = None,
 ) -> Text:
-    """``● 3x claude 58%`` (the x a multiplication sign), under *⚙ Settings*.
+    """``● Claude: 3 accounts · 58% left``, under *⚙ Settings*: the state in words (Q8).
 
     No AISquare sign-in: that is on the Accounts page alone (owner, 2026-11-17). The
     Claude dot is :func:`headroom_dot`; the count is how many accounts are usable;
@@ -662,12 +688,12 @@ def status_line_text(
     needs a login. ``headroom`` is ``None`` until the first summary lands. ``name`` is
     what the first dot names its accounts by, the default agent's binary unless given.
     Each agent in ``more`` (Codex's accounts) has a line of its own under it, read the
-    same way: ``● 1x codex 58%``.
+    same way: ``● Codex: 1 account · 58% left``.
 
-    ``width``, the cells the line has: the figure is left out where the line would not
-    fit it, so the ellipsis never cuts the ``⚠`` (something to do) nor a number in two. In
-    16 cells, ``2x claude 3% ⚠`` fits and ``2x claude 58% ⚠`` does not (review of #357,
-    when the AISquare dot took 12 of the sidebar's 28).
+    ``width``, the cells the line has: `` left``, then the figure, are left out where the
+    line would not fit them, so the ellipsis never cuts the ``⚠`` (something to do) nor a
+    number in two (review of #357). In the sidebar's 28 cells, ``● Claude: 2 accounts ·
+    58% ⚠`` fits and `` left`` does not.
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     _append_agent(text, name or default_binary(), headroom, every_needs_login, width)
@@ -684,20 +710,31 @@ def _append_agent(
     every_needs_login: bool,
     room: int | None,
 ) -> None:
-    """One agent's dot, count, name, figure and ``⚠`` at the end of ``text``'s last line;
-    ``room`` is the cells that line has."""
+    """One agent's line in words (Q8 of the UX audit), at the end of ``text``'s last line:
+    ``● Claude: 2 accounts · 58% left ⚠``, its dot, the agent, its usable accounts, the room
+    LEFT across them in the dot's colour, and a ``⚠`` when one needs a login. ``room`` is the
+    cells the line has: `` left`` gives way first, then the figure, never the ``⚠`` (something to
+    do). Before the first reading, the agent's name alone."""
     line = Text()
     dot, colour = headroom_dot(headroom, every_needs_login=every_needs_login)
     line.append(f"{dot} ", style=colour)
-    if headroom is not None:
-        line.append(f"{headroom.usable}{TIMES} ", style="dim")
-    line.append(name, style="dim")
-    warning = " ⚠" if headroom is not None and headroom.needs_login else ""
-    if headroom is not None and headroom.percent_left is not None:
+    word = name[:1].upper() + name[1:]
+    if headroom is None:
+        line.append(word, style="dim")
+        text.append_text(line)
+        return
+    accounts = "account" if headroom.usable == 1 else "accounts"
+    line.append(f"{word}: {headroom.usable} {accounts}", style="dim")
+    warning = " ⚠" if headroom.needs_login else ""
+    if headroom.percent_left is not None:
         # The figure the dot's band stands for (#287): percent LEFT, in the dot's colour.
-        figure = f" {round(headroom.percent_left)}%"
-        if room is None or line.cell_len + cell_len(figure + warning) <= room:
-            line.append(figure, style=colour)
+        figure = f"{round(headroom.percent_left)}%"
+        for said in (" left", ""):
+            if room is None or line.cell_len + cell_len(f" · {figure}{said}{warning}") <= room:
+                line.append(" · ", style="dim")
+                line.append(figure, style=colour)
+                line.append(said, style="dim")
+                break
     if warning:
         line.append(warning, style="yellow")
     text.append_text(line)
@@ -808,8 +845,16 @@ class Activatable(Static):
         return None
 
 
+ADOPT_LIST_WORKER = "sidebar-adopt-list"
+"""Reads the conversations the ``+`` menu's *Adopt a conversation…* offers."""
+ADOPT_WORKER = "sidebar-adopt"
+"""Adopts the one picked (``services.adopt.adopt``): a fleet spawn, so a writer."""
+
+
 class AddButton(Activatable):
-    """The ``+`` beside Fleet: onboard a project."""
+    """The ``+`` beside Fleet: its menu (M6), *Add a project…* (onboard one, as the ``+`` did on
+    its own) or *Adopt a conversation…* (``adopt_picker.AdoptPicker``, as the Accounts page's
+    button opens it, which stays). The app's ``+`` key still onboards at once."""
 
     DEFAULT_CSS = """
     AddButton { width: 3; text-style: bold; color: $accent; }
@@ -822,6 +867,77 @@ class AddButton(Activatable):
 
     def message(self) -> Message:
         return AddProject()
+
+    def activate(self) -> None:
+        """A click on the ``+``, or Enter on it: its menu, under it."""
+        from aisquare.cli.ui.adopt_picker import AddMenu
+
+        self.app.push_screen(AddMenu(self.region), self._chosen)
+
+    def _chosen(self, choice: str | None) -> None:
+        from aisquare.cli.ui.adopt_picker import ADD_A_PROJECT, ADOPT_A_CONVERSATION
+        from aisquare.services import adopt as adopt_service
+
+        if choice == ADD_A_PROJECT:
+            super().activate()  # AddProject, from this row, as the + posted it before
+        elif choice == ADOPT_A_CONVERSATION:
+            # ``fleet adopt --list`` as a picker: read off the UI thread, then shown.
+            self.run_worker(
+                lambda: adopt_service.recent(),
+                name=ADOPT_LIST_WORKER,
+                group=ADOPT_LIST_WORKER,
+                exclusive=True,
+                thread=True,
+                exit_on_error=False,
+            )
+
+    def _adopt_chosen(self, session_id: str | None) -> None:
+        from aisquare.services import adopt as adopt_service
+
+        if session_id is None:
+            return
+        self.notify(f"adopting {session_id[:8]}…", timeout=4, markup=False)
+        self.run_worker(
+            lambda: adopt_service.adopt(session_id),
+            name=ADOPT_WORKER,
+            group=ADOPT_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """The list read: the picker. The adoption: said, and the frame read again so its row
+        shows on its project's card."""
+        from datetime import UTC, datetime
+
+        from aisquare.cli.ui.adopt_picker import AdoptPicker
+
+        worker, state = event.worker, event.state
+        if worker.name not in (ADOPT_LIST_WORKER, ADOPT_WORKER) or state not in (
+            WorkerState.SUCCESS,
+            WorkerState.ERROR,
+        ):
+            return
+        event.stop()
+        if state is WorkerState.ERROR:
+            what = "the conversations could not be read" if worker.name == ADOPT_LIST_WORKER else ""
+            said = f"{what}: {worker.error}" if what else str(worker.error)
+            self.notify(f"✗ {said}", severity="error", timeout=8, markup=False)
+        elif worker.name == ADOPT_LIST_WORKER and isinstance(worker.result, list):
+            picker = AdoptPicker(worker.result, datetime.now(tz=UTC))
+            self.app.push_screen(picker, self._adopt_chosen)
+        elif worker.name == ADOPT_WORKER and isinstance(worker.result, fleet_service.SpawnReceipt):
+            agent = worker.result.agent
+            self.notify(
+                f"✓ adopted {(agent.session_id or '')[:8]} as {agent.label}: it runs in the "
+                "fleet now, on its project's card",
+                timeout=6,
+                markup=False,
+            )
+            refresh = getattr(self.app, "refresh_data", None)
+            if callable(refresh):
+                refresh()
 
 
 ACTIVE_ONLY_EMPTY = "No active projects — press l to show all."
@@ -1200,7 +1316,7 @@ class AgentRow(Activatable):
         super().__init__(agent_row_text(status), id=f"agent-row-{status.agent.id}")
         self.status = status
         self.selection_key = f"agent:{status.agent.id}"
-        self._painted: tuple[FleetAgentStatus, float | None, int, bool, bool, bool, bool] | None = (
+        self._painted: tuple[FleetAgentStatus, float | None, int, bool, str, bool, bool] | None = (
             None
         )
         self.prefill = ""
@@ -1384,15 +1500,23 @@ class AgentRow(Activatable):
         marked = sidebar is not None and sidebar.agents_marked
         shown = sidebar is None or sidebar.usage_shown
         menu = self.menu_shown
-        # The mark takes the theme's darkness's colour (``AgentMark.colour``). A theme change
-        # renders every widget again, and :meth:`render` paints: the darkness is in the key.
+        # The mark takes the theme's darkness's colour (``AgentMark.colour``), the chip its
+        # theme's tone (:func:`state_styles`). A theme change renders every widget again, and
+        # :meth:`render` paints: the theme is in the key.
         dark = self.app.current_theme.dark
-        wanted = (self.status, percent, width, marked, dark, shown, menu)
+        wanted = (self.status, percent, width, marked, self.app.theme, shown, menu)
         if wanted != self._painted:
             self._painted = wanted
             mark = agent_mark(agent_kind(self.status), dark) if marked else None
             room = width - len(MENU_GLYPH) if menu and width else width
-            text = agent_row_text(self.status, percent, width=room or None, mark=mark, usage=shown)
+            text = agent_row_text(
+                self.status,
+                percent,
+                width=room or None,
+                mark=mark,
+                usage=shown,
+                styles=state_styles(theme_tones(self.app.current_theme)),
+            )
             if menu and width:
                 # The label gave way for it: the chip and ``#N·NN%`` stay whole.
                 text.truncate(room, pad=True)
