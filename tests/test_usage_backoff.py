@@ -312,8 +312,8 @@ def test_the_row_says_how_old_the_kept_reading_is_and_why() -> None:
 def test_a_backed_off_account_with_no_kept_reading_never_names_a_past_until() -> None:
     """Review of #401, m1: with no kept reading, a backed-off account's session cell printed
     the wait's reason as frozen at the read ('rate-limited until <a past time>') until the
-    page's next tick, a minute on. It reads from the wait's end as of the paint, on hover
-    over the row's '!' (#13)."""
+    page's next tick, a minute on. It reads from the wait's end as of the paint, on the row
+    (Q19 of 0.10.2: the '!' says why as text) and on hover over it (#13)."""
     from aisquare.models import ClaudeAccount
 
     status = ClaudeAccountStatus(
@@ -327,8 +327,11 @@ def test_a_backed_off_account_with_no_kept_reading_never_names_a_past_until() ->
     waiting = service.UsageBackoff(slot=2, until=until, attempts=1, since=NOW).reading(NOW)
     clock = until.astimezone().strftime("%H:%M")
 
-    # The row reads '!' (#13); the wait is on hover over it, as of the paint.
-    assert account_cells(status, waiting, now=NOW)["session"].plain == PROBLEM_MARK
+    # The row reads '!' and the wait as of the paint; the whole of it is on hover, as of it too.
+    later = until + timedelta(seconds=1)
+    row_during = account_cells(status, waiting, now=NOW)["session"].plain
+    assert row_during == f"{PROBLEM_MARK} rate-limited until {clock}"
+    assert account_cells(status, waiting, now=later)["session"].plain == "! rate limit ended"
     during = (problem_tooltip(status, waiting, now=NOW) or "").partition("\n")[0]
     after = (problem_tooltip(status, waiting, now=until + timedelta(seconds=1)) or "").partition(
         "\n"

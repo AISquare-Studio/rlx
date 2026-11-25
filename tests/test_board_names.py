@@ -249,11 +249,12 @@ def test_aisquare_board_s_text_names_sessions_claims_and_authors() -> None:
         PROJECT, [MANAGER, CODER], [_task(CODER.id)], events, names=names
     )
 
-    assert "  - manager — " in text and "  - coder-auth — " in text
-    assert "[doing @coder-auth] wire auth" in text
-    assert "  - coder-auth note: PR ready" in text
+    # The person's text board (B1 #14): a row per agent by its name, a task by who has it.
+    assert "\n  manager " in text and "\n  coder-auth " in text
+    assert "doing  wire auth — coder-auth" in text
+    assert "  coder-auth note: PR ready" in text
     # "owner", not "you": agents run aisquare board too, and would read "you" as their own.
-    assert "  - owner note: ship it" in text and "you note" not in text
+    assert "  owner note: ship it" in text and "you note" not in text
     assert "2222bbbb" not in text and "1111aaaa" not in text
 
 
@@ -570,3 +571,34 @@ def test_a_clear_keeps_the_name_of_the_session_it_leaves(
         left = store.list_meta(FLEET_HELD)
     assert kept == {f"{FLEET_HELD}{first}", f"{FLEET_HELD}sess-c2"}
     assert left == {}
+
+
+# --- B1 #13: one icon per role, and one mark per state, the sidebar's ------------------------
+
+
+def test_the_board_draws_each_role_and_state_as_the_sidebar_does() -> None:
+    """The board's own table gave the manager 🤖 and the reviewer 🤖, the sidebar 🧭 and 👀; the
+    team block and the feed take the sidebar's icons (and its marks for a state) now, so an
+    agent reads the same in both panes."""
+    from aisquare.cli.ui.sidebar import CUSTOM_ROLE_ICON, ROLE_ICON, STATE_CHIP
+
+    roles = [*ROLE_ICON, "translator"]
+    sessions = [
+        _session(f"{n:04d}aaaa-{role}", role, label=f"{role}-1", state=state)
+        for n, (role, state) in enumerate(
+            zip(roles, ["working", "waiting", "attention", "limited"] * 3, strict=False)
+        )
+    ]
+    names = {s.id: s.label or s.role for s in sessions}
+
+    block = watch._session_lines(sessions, {}, names=names).plain.splitlines()
+    feed = [
+        str(watch.feed_line(_event(n, s.id), {s.id: s.role}, names)) for n, s in enumerate(sessions)
+    ]
+
+    for session, row, line in zip(sessions, block, feed, strict=True):
+        icon = ROLE_ICON.get(session.role, CUSTOM_ROLE_ICON)
+        glyph, _style = STATE_CHIP[session.state]
+        assert row.startswith(f"{icon} {session.label}  {glyph} "), row
+        assert f" {icon} {session.label} " in line, line
+    assert block[-1].startswith(f"{CUSTOM_ROLE_ICON} translator-1"), "a role no table knows"

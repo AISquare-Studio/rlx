@@ -43,12 +43,12 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  # <0.29: typer 0.29.0 (2026-11-09) vendors click, dropped TyperPath (cli/common) and
-  # gave TyperOption's constructor a required type_descriptor (cli/global_flags.py builds
-  # the shared flags by hand), so every command of a fresh install raised, --version
-  # included. tests/test_dependency_bounds.py and tests/test_typer_is_capped_below_0_29.py
-  # fail if this cap goes.
-  "typer>=0.26.8,<0.29",
+  # <0.30: not yet checked. 0.29.0 (2026-11-09) was a rewrite in a minor release that
+  # broke every command (TyperPath, click_type= and hand-built TyperOptions went), and the
+  # CLI was ported to it; 0.30 may be another. Move the cap once the CLI tests pass on it.
+  # tests/test_dependency_bounds.py and tests/test_typer_is_capped_below_0_30.py fail if
+  # this cap goes.
+  "typer>=0.26.8,<0.30",
   "rich>=14.3",  # rich.cells.split_graphemes (cli/ui/terminal) exists from 14.3.0
   "pydantic>=2.13.4",
   "tomli-w>=1.2.0",

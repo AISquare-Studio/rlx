@@ -1025,3 +1025,320 @@ def test_c_copies_the_selected_feed_onto_the_native_clipboard_and_osc52(
     encoded = base64.b64encode(selected.encode("utf-8")).decode("ascii")
     assert osc52 == [f"\x1b]52;c;{encoded}\a"]
     assert told == [f"copied {len(selected)} chars"]
+
+
+# --- B1: the board audit's quick bundle and its "Next" list ------------------------------------
+
+
+def _board_w(size: tuple[int, int] = (120, 40)) -> Any:
+    """``board -w``'s app, its panel polling once an hour: each test refreshes when it means to."""
+    from aisquare.cli import watch as watch_mod
+
+    return watch_mod._build_app_class(interval=3600.0)(), size
+
+
+def test_a_narrow_board_says_its_tasks_are_hidden(runner: CliRunner, work_dir: Path) -> None:
+    """B1 #2: under ``COLLAPSE_BELOW`` columns the tasks went out of sight with no word; the
+    feed's title says so, and that ``b`` brings them back, until they are back."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    from textual.widgets import OptionList
+
+    from aisquare.cli.ui.board import TASKS_HIDDEN
+
+    team_service.activate()
+    _add(runner, "build the API")
+
+    async def drive() -> tuple[str, str, str]:
+        app, _size = _board_w()
+        async with app.run_test(size=(70, 30)) as pilot:
+            await pilot.pause()
+            feed = pilot.app.query_one("#feed", OptionList)
+            narrow = str(feed.border_title)
+            await pilot.press("b")
+            await pilot.pause()
+            shown = str(feed.border_title)
+            await pilot.resize_terminal(120, 30)
+            await pilot.pause()
+            return narrow, shown, str(feed.border_title)
+
+    narrow, shown, wide = asyncio.run(drive())
+    assert TASKS_HIDDEN in narrow, narrow
+    assert TASKS_HIDDEN not in shown, "b brought them back: the title says no more"
+    assert TASKS_HIDDEN not in wide
+
+
+def test_the_detail_says_why_a_task_is_blocked_done_or_back(
+    runner: CliRunner, work_dir: Path
+) -> None:
+    """B1 #3: the reason ``task block``, ``task done --note`` and ``task reopen`` left was in
+    the store and on the feed, never in the task's own detail."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    team_service.activate()
+    stuck = _add(runner, "fix the login race")
+    runner.invoke(app, ["task", "claim", stuck])
+    runner.invoke(app, ["task", "block", stuck, "--reason", "no API key yet"])
+    shipped = _add(runner, "ship the retry")
+    runner.invoke(app, ["task", "claim", shipped])
+    runner.invoke(app, ["task", "done", shipped, "--note", "merged as PR #12"])
+    bounced = _add(runner, "write the docs")
+    runner.invoke(app, ["task", "claim", bounced])
+    runner.invoke(app, ["task", "review", bounced])
+    runner.invoke(app, ["task", "reopen", bounced, "--reason", "the examples fail"])
+    plain = _add(runner, "plan the next one")
+
+    async def drive() -> dict[str, str]:
+        app, size = _board_w()
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            board = pilot.app.board
+            seen = {}
+            for task in (stuck, bounced, plain):
+                board._show_task_detail(task)
+                seen[task] = board.detail_text
+            board.action_toggle_done()
+            await pilot.pause()
+            board._show_task_detail(shipped)
+            seen[shipped] = board.detail_text
+            return seen
+
+    seen = asyncio.run(drive())
+    assert "\nblocked because: no API key yet" in seen[stuck], seen[stuck]
+    assert "\ndone: merged as PR #12" in seen[shipped], seen[shipped]
+    assert "\nreopened because: the examples fail" in seen[bounced], seen[bounced]
+    assert "because" not in seen[plain], "no reason given, none shown"
+
+
+def test_a_feed_line_is_one_row_whatever_its_text(runner: CliRunner, work_dir: Path) -> None:
+    """B1 #4: a note of several lines took a row per line, and a long one wrapped; every feed
+    line is one row now, its lines joined, its end cut. The detail keeps the text whole."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    from textual.widgets import OptionList
+
+    team_service.activate()
+    runner.invoke(app, ["note", "first line\nsecond line\n\nthird line"])
+    runner.invoke(app, ["note", "a long one " * 30])
+    [several] = [e for e in team_service.log_events() if e.text.startswith("first line")]
+    line = str(feed_line(several, {}))
+    assert "\n" not in line and "first line ⏎ second line ⏎ third line" in line
+
+    async def drive() -> tuple[int, int, str]:
+        app, _size = _board_w()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            feed = pilot.app.query_one("#feed", OptionList)
+            pilot.app.board.on_option_list_option_selected(
+                OptionList.OptionSelected(feed, feed.get_option(several.id), 0)
+            )
+            return feed.option_count, feed.virtual_size.height, pilot.app.board.detail_text
+
+    options, rows, detail = asyncio.run(drive())
+    assert rows == options, f"{options} feed lines took {rows} rows"
+    assert "first line\nsecond line\n\nthird line" in detail
+
+
+@pytest.mark.parametrize(
+    ("kind", "verb"),
+    [
+        ("stale", "went quiet"),
+        ("signal", "set a signal"),
+        ("persona_attached", "attached a persona"),
+        ("mcp_pull", "pulled context"),
+        ("captain_action", "had the captain act"),
+        ("capacity_freed", "freed capacity"),
+        ("brief_created", "wrote a brief"),
+        ("fleet", "acted on the fleet"),
+    ],
+)
+def test_the_eight_unlabelled_kinds_read_as_words(kind: str, verb: str) -> None:
+    """B1 #5: these eight showed as ``• persona_attached:``, the kind's own name."""
+    from datetime import UTC, datetime
+
+    from aisquare.cli.watch import _KIND_VERB
+    from aisquare.models import TeamEvent
+
+    event = TeamEvent(
+        id="evt_1",
+        project_id="prj_x",
+        session_id="ses_1",
+        kind=kind,
+        text="what happened",
+        created_at=datetime.now(UTC),
+    )
+    line = str(feed_line(event, {"ses_1": "coder"}, {"ses_1": "coder-auth"}))
+    emoji, said = _KIND_VERB[kind]
+    assert said == verb
+    assert f"coder-auth {emoji} {verb}: what happened" in line and "•" not in line
+
+
+def test_a_time_from_another_day_shows_its_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B1 #6: a feed line, a detail and the done archive wrote ``%H:%M`` alone, so yesterday's
+    ``14:05`` read as today's. Today's time stays bare; another day's is dated, another year's
+    gives the year. The clock is pinned mid-year: on the wall's, "yesterday" is last year
+    every 1 January (review of #554)."""
+    from datetime import UTC, datetime, timedelta
+
+    from aisquare.cli.watch import _event_detail, clock
+    from aisquare.core import event_time
+    from aisquare.models import TeamEvent
+
+    now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(event_time, "_now", lambda: now)
+    yesterday = now - timedelta(days=1)
+    local = yesterday.astimezone()
+    event = TeamEvent(
+        id="evt_1", project_id="prj_x", kind="note", text="from yesterday", created_at=yesterday
+    )
+    dated = f"{local:%b} {local.day} {local:%H:%M}"
+
+    assert str(feed_line(event, {})).startswith(f"{dated} ")
+    assert f" at {dated}:{local:%S} (seq " in str(_event_detail(event, {}))
+    assert clock(now) == f"{now.astimezone():%H:%M}"
+    last_year = now - timedelta(days=400)
+    assert clock(last_year, now=now) == f"{last_year.astimezone():%Y-%m-%d %H:%M}"
+
+
+def test_the_tasks_keep_their_scroll_across_a_refresh(runner: CliRunner, work_dir: Path) -> None:
+    """B1 #7: each refresh rebuilt the table and put it back at its top, under the person
+    reading further down."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    from datetime import UTC, datetime
+
+    from textual.widgets import DataTable
+
+    from aisquare.core.store import store_session
+    from aisquare.models import TeamTask
+
+    team = team_service.activate()
+    now = datetime.now(UTC)
+    with store_session() as store:
+        for n in range(40):
+            store.upsert_task(
+                TeamTask(
+                    id=f"tsk_scroll{n:04d}",
+                    project_id=team.id,
+                    key=f"scroll-{n}",
+                    title=f"task {n}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    async def drive() -> tuple[float, float, float]:
+        app, _size = _board_w()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            table = pilot.app.query_one("#tasks", DataTable)
+            table.scroll_to(y=12, animate=False)
+            await pilot.pause()
+            before = table.scroll_y
+            pilot.app.board.refresh_data()
+            await pilot.pause()
+            await pilot.pause()
+            return before, table.scroll_y, table.max_scroll_y
+
+    before, after, most = asyncio.run(drive())
+    assert most > 12 and before == 12, "the premise: the table scrolled down"
+    assert after == before
+
+
+def test_board_w_points_to_rlx_not_to_a_manager_tab_it_does_not_have(
+    runner: CliRunner, work_dir: Path
+) -> None:
+    """B1 #8: ``board -w`` said "talk to it on the Manager tab" and "give it a goal on the
+    Manager tab", which only asq has; and its help said to click an agent in a left pane."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    from textual.widgets import DataTable, Static
+
+    from aisquare.cli.ui import board as board_mod
+
+    team_service.activate()
+
+    async def drive() -> tuple[str, str, str]:
+        app, size = _board_w()
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            table = pilot.app.query_one("#tasks", DataTable)
+            body = " ".join(table.get_row(board_mod.EMPTY_ROW)[2].plain.split())
+            lead = str(pilot.app.query_one("#needs-you-lead", Static).render())
+            await pilot.press("question_mark")
+            await pilot.pause()
+            return body, lead, str(pilot.app.screen.query_one(Static).render())
+
+    body, lead, help_text = asyncio.run(drive())
+    assert body == board_mod.EMPTY_TASKS_ALONE
+    assert lead == board_mod.NOTHING_NEEDS_YOU_ALONE
+    assert board_mod.WHAT_TO_DO_ALONE[0][1] in help_text
+    assert board_mod.WHAT_TO_DO_HERE[0][1] not in help_text
+
+
+def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> None:
+    """B1 #9: at 90 columns the footer ran to 102 and cut ``o transcript`` and ``? help``;
+    every key it shows now ends inside the screen, with the tasks or the feed focused."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    from textual.widgets import Footer
+
+    team_service.activate()
+
+    wanted = {"b", "d", "a", "v", "o", "q", "t", "?"}
+
+    async def footer_of(pilot: Any, target: str, stale: list[Any]) -> list[tuple[str, int]]:
+        """The footer as it is for ``target``: rebuilt since ``stale`` (the keys it showed before
+        the focus moved, kept alive so none of them can pass for a new one), ``target`` holding
+        the focus, and every key laid out. Read at once, the footer was still the one before
+        (review of #573), or half rebuilt with no key at all on a slow Windows runner (rc gate
+        45659530340). Bounded: 10 s at most."""
+        keys: list[tuple[str, int]] = []
+        for _ in range(500):
+            shown = list(pilot.app.screen.query_one(Footer).query("FooterKey"))
+            keys = [(str(getattr(key, "key_display", "")), key.region.right) for key in shown]
+            rebuilt = not any(key is old for key in shown for old in stale)
+            focused = pilot.app.focused is pilot.app.query_one(target)
+            laid_out = bool(shown) and all(key.region.width for key in shown)
+            if rebuilt and focused and laid_out and wanted <= {key for key, _ in keys}:
+                break
+            await pilot.pause(0.02)
+        else:
+            # The bound ran out: fail, never hand back a footer composed for another widget
+            # (review of #573 / #582, #797: a withheld rebuild passed on the stale one).
+            pytest.fail(
+                f"the footer was never ready for {target}: rebuilt={rebuilt} "
+                f"focused={focused} laid_out={laid_out} keys={keys}"
+            )
+        return keys
+
+    async def drive() -> list[tuple[str, list[tuple[str, int]]]]:
+        app, _size = _board_w()
+        seen = []
+        async with app.run_test(size=(90, 30)) as pilot:
+            await pilot.pause()
+            footer = pilot.app.screen.query_one(Footer)
+            # The tasks have the focus from the start (B1): their footer, once composed.
+            seen.append(("#tasks", await footer_of(pilot, "#tasks", [])))
+            stale = list(footer.query("FooterKey"))
+            if not pilot.app.query_one("#feedpane").display:
+                pilot.app.board.action_toggle_board()  # 90 columns: one half at a time (B2)
+            pilot.app.query_one("#feed").focus()
+            seen.append(("#feed", await footer_of(pilot, "#feed", stale)))
+        return seen
+
+    for target, keys in asyncio.run(drive()):
+        assert wanted <= {key for key, _ in keys}, (target, keys)
+        assert all(right <= 90 for _, right in keys), (target, keys)
+
+
+def test_board_w_opens_with_the_tasks_focused(runner: CliRunner, work_dir: Path) -> None:
+    """Tester's note on #554: ``board -w`` opened with the focus on a needs-you button that hid
+    as the first count was read, so the arrows reached nothing until a Tab or a click."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    team_service.activate()
+    _add(runner, "build the API")
+
+    async def drive() -> str | None:
+        app, size = _board_w()
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            return pilot.app.focused.id if pilot.app.focused is not None else None
+
+    assert asyncio.run(drive()) == "tasks"

@@ -780,7 +780,7 @@ def test_the_team_strip_counts_each_role_by_state_and_hides_with_only_the_manage
         return (*team, strip.display)
 
     text, displayed, alone = drive(project, scenario)
-    assert text == "🔨 2▶  🧪 1⏸  👀 1🔔  · board for detail"
+    assert text == "🔨 2▶  🧪 1◦  👀 1🔔  · board for detail"
     assert displayed is True
     assert alone is False
 
@@ -796,7 +796,7 @@ def test_the_team_strip_shows_each_state_of_a_role_and_a_role_it_has_no_icon_for
     ]
     text = project_view_module.team_strip_text(frame)
     assert text is not None
-    assert text.plain == "🔨 1▶ 1⏸ 1⏳  🤖 docs-writer 1⏸  · board for detail"
+    assert text.plain == "🔨 1▶ 1◦ 1⏳  🤖 docs-writer 1◦  · board for detail"
     assert project_view_module.team_strip_text(frame[:0]) is None
 
 
@@ -1093,6 +1093,74 @@ def test_b_on_the_board_tab_hides_and_brings_back_the_column_every_time(
         return states
 
     assert drive(project, scenario) == [(False, "feed"), (True, "tasks"), (False, "feed")]
+
+
+def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInfo) -> None:
+    """B1 #1: a click on the Board tab left the focus on the tab row, outside the panel, and
+    ``d``, ``b`` or ``a`` did nothing until a second click inside the board."""
+
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, str]:
+        await pilot.click("#--content-tab-tab-board")
+        panel = host.query_one("#board-panel", BoardPanel)
+        table = panel.query_one("#tasks", DataTable)
+
+        def inside() -> bool:
+            focused = host.focused
+            return focused is not None and panel in focused.ancestors_with_self
+
+        # The click's chain (the tab activated, its pane shown, the panel's on_show taking the
+        # keys) is several messages long; one pause() guesses "idle" from CPU time and, on a
+        # loaded Windows runner, returned before its end (#29). Wait for the focus itself.
+        for _ in range(500):  # bounded: 10 s at most
+            if inside():
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"the tab's click left the focus outside the board: {host.focused!r}")
+        took = inside()
+        await pilot.press("d")  # no click inside the board first
+        for _ in range(500):
+            if str(table.border_title).startswith("done archive"):
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"d did not reach the board: the tasks read {table.border_title!r}")
+        return took, str(table.border_title)
+
+    inside, title = drive(project, scenario)
+    assert inside, "the tab's click left the focus outside the board"
+    assert title.startswith("done archive"), title
+
+
+class BesideAField(Host):
+    """The Project view beside a field: a focus outside its tabs, as the sidebar is in asq."""
+
+    def compose(self) -> ComposeResult:
+        yield Input(id="outside")
+        yield from super().compose()
+
+
+def test_a_board_shown_from_outside_its_tabs_leaves_the_focus_where_it_was(
+    project: ProjectInfo,
+) -> None:
+    """B1 #1's other half: the board takes the keys from its own tabs only. Shown because the
+    sidebar moved to its project, it left the focus in the sidebar, which the arrows walk."""
+
+    async def scenario(pilot: Pilot[None], host: Host) -> str | None:
+        host.query_one("#outside", Input).focus()
+        await pilot.pause()
+        host.query_one(ProjectView).active = "tab-board"
+        await pilot.pause()
+        await pilot.pause()
+        return host.focused.id if host.focused is not None else None
+
+    async def run() -> str | None:
+        host = BesideAField(project)
+        async with host.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            return await scenario(pilot, host)
+
+    assert asyncio.run(run()) == "outside"
 
 
 class TwoProjects(App[None]):
