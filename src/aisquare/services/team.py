@@ -33,6 +33,7 @@ from typing import Any, Final, Literal, NamedTuple, NoReturn
 
 from aisquare.core import (
     agent_sessions,
+    event_time,
     experimental,
     harness,
     insights,
@@ -4615,21 +4616,6 @@ def age_text(when: datetime, now: datetime) -> str:
     return minutes_text(max(0, int((now - when).total_seconds() // 60)))
 
 
-def when_text(when: datetime, *, seconds: bool = False, now: datetime | None = None) -> str:
-    """``when`` as a board writes a time for a person: ``14:05`` today, ``Nov 24 14:05``
-    another day of the year, ``2025-11-24 14:05`` another year — a bare ``14:05`` from
-    yesterday read as today's (B1 #6). In the user's local time, as every board time is;
-    ``now`` is the clock "today" is read from (:func:`_now`)."""
-    local = when.astimezone()
-    today = (now if now is not None else _now()).astimezone().date()
-    hours = f"{local:%H:%M:%S}" if seconds else f"{local:%H:%M}"
-    if local.date() == today:
-        return hours
-    if local.year == today.year:
-        return f"{local:%b} {local.day} {hours}"
-    return f"{local:%Y-%m-%d} {hours}"
-
-
 def _link_marks(project_id: str, store: ContextStore | None = None) -> dict[str, str]:
     """The board's linked-task marks (``parent.link_marks``); none when it cannot be read."""
     from aisquare.services import parent as parent_service  # lazy: it imports this module
@@ -4734,7 +4720,7 @@ def _human_board(
     One row per agent: its name (``names``), its state in words, its account once several are
     in play, its model, its persona, how long ago it was seen and its focus. A task by its
     number, its status in words, its title, who has it, what it waits on and its link mark.
-    An update by its time, dated when it is not today's (:func:`when_text`), then the line the
+    An update by its time, dated when it is not today's (``core.event_time``), then the line the
     agents' text writes for it, named (:func:`event_line`); a text of several lines keeps them,
     under the first.
     """
@@ -4806,7 +4792,7 @@ def _human_board(
     if events:
         lines += ["", "recent updates"]
         roles = {s.id: s.role for s in sessions}
-        stamps = [when_text(event.created_at, now=now) for event in events]
+        stamps = [event_time.stamp(event.created_at, now=now) for event in events]
         stamp_cells = max(len(stamp) for stamp in stamps)
         under = " " * (2 + stamp_cells + 2)
         for event, stamp in zip(events, stamps, strict=True):

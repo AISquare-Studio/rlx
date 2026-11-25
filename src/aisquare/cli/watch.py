@@ -34,7 +34,7 @@ from rich.text import Text
 
 from aisquare.cli import board_names
 from aisquare.cli.common import format_reset
-from aisquare.core import harness, paths
+from aisquare.core import event_time, harness, paths
 from aisquare.core import program as prog
 from aisquare.core.console import stderr_console, stdout_console
 from aisquare.core.state_file import read_state
@@ -98,9 +98,9 @@ and the kind itself."""
 
 def clock(when: datetime, *, seconds: bool = False, now: datetime | None = None) -> str:
     """``when`` as the board writes a time: ``14:05`` today, ``Nov 24 14:05`` another day,
-    ``2025-11-24 14:05`` another year (``team.when_text``, the text board's rule too): a bare
+    ``2025-11-24 14:05`` another year (``core.event_time``, the text board's rule too): a bare
     ``14:05`` from yesterday read as today's (B1 #6)."""
-    return team_service.when_text(when, seconds=seconds, now=now)
+    return event_time.stamp(when, seconds=seconds, now=now)
 
 
 def one_row(text: str) -> str:

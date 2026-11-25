@@ -14,7 +14,7 @@ import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
-from aisquare.core import harness
+from aisquare.core import event_time, harness
 from aisquare.core.ids import new_task_id
 from aisquare.core.orchestrator import team_project
 from aisquare.core.store import ContextStore, store_session
@@ -2552,7 +2552,7 @@ def test_a_persons_board_is_a_text_board_of_its_own(golden_board: tuple[Any, ...
     assert "  #4   to do      write the docs ⧗ waits on #2" in lines
     assert "  … 3 more — `rlx task list`" in lines
     recent = lines[lines.index("recent updates") + 1 :]
-    stamps = [team_service.when_text(e.created_at, now=BOARD_NOW) for e in events]
+    stamps = [event_time.stamp(e.created_at, now=BOARD_NOW) for e in events]
     note = BOARD_NOW - timedelta(hours=26)  # yesterday, in every timezone
     assert stamps[2] == f"{note.astimezone():%b} {note.astimezone().day} {note.astimezone():%H:%M}"
     width = max(len(stamp) for stamp in stamps)
