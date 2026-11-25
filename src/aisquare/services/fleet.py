@@ -10083,6 +10083,11 @@ def _statuses(
     if live_only:
         placements = _with_lingering_windows(placements, views, running, keep=paused)
     reached = {placement.row.id for placement in placements if _view(placement, views) is not None}
+    # A live row's session on another board, read by its id (`_listing`): a hub's, or the
+    # principal checkout's for a project rooted in a sub-folder or at a linked worktree,
+    # where its hooks register it. Its state, its limit and the task it claimed are that
+    # session's; without it such a row read as having none (#14, tester #1306).
+    sessions = {**{sid: s for sid, s in by_id.items() if s is not None}, **sessions}
     sessions = _record_failed_turns(
         [placement.agent for placement in placements], sessions, reached, records
     )

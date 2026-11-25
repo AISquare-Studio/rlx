@@ -291,7 +291,9 @@ def agent_task(status: FleetAgentStatus) -> TeamTask | None:
     under a hub, or for a project rooted in a sub-folder or at a linked worktree, that is not
     the fleet project's own."""
     agent = status.agent
-    session = status.session.id if status.session is not None else None
+    # The id its claims carry: the session's, else the row's own (minted before the launch),
+    # for a row listed before its session registered.
+    session = status.session.id if status.session is not None else agent.session_id
     try:
         with store_session() as store:
             tasks = store.team_tasks(fleet_service.board_of_row(agent))
