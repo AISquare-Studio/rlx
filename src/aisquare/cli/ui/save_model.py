@@ -30,6 +30,7 @@ from typing import Any
 
 from rich.text import Text
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Input, Static
@@ -76,21 +77,17 @@ class CommitInput(Input):
         def control(self) -> CommitInput:
             return self.field
 
-    def __init__(
-        self,
-        value: str = "",
-        *,
-        leaving: Callable[[CommitInput], object] | None = None,
-        **kwargs: object,
-    ) -> None:
+    def __init__(self, value: str = "", **kwargs: object) -> None:
         super().__init__(value, **kwargs)  # type: ignore[arg-type]
         self.kept = value
         """The value on disk: what Undo, or a refusal, comes back to."""
-        self.leaving = leaving
+        self.leaving: Callable[[CommitInput], object] | None = None
         """The owner's writer for a value typed and not left when the page goes (rlx quitting,
         its screen closed): called on the field's own last message, synchronously, to write
         the value showing nothing (there is nothing left to show it on); a value it would
-        refuse it does not write."""
+        refuse it does not write. The owner sets it as it mounts, never where the field is
+        composed: a name as common as ``compose`` is one tests/test_config_writes_stay_in_the_cli
+        sees the hooks reach, and a writer handed on there reads as a hook's config write."""
 
     def keep(self, value: str) -> None:
         """``value`` is on disk now (saved, or put back by Undo): shown, and not committed
@@ -183,13 +180,16 @@ class SavesAsYouGo:
         self._app.notify(f"Undone: {change.what}", timeout=3, markup=False)
 
     def refuse(self, field: Widget, why: str) -> None:
-        """``field``'s value is refused: said in a line under it, and nothing is written. The
-        field keeps what the person typed, to correct."""
+        """``field``'s value is refused: said in a line under it (under its row, when it sits
+        in one beside its label), and nothing is written. The field keeps what the person
+        typed, to correct."""
         problem = self._problem_of(field)
         if problem is None:
             problem = Static("", classes=PROBLEM_CLASS, id=f"{field.id}-problem")
-            if isinstance(field.parent, Widget):
-                field.parent.mount(problem, after=field)
+            problem.styles.height = "auto"
+            home, after = _under_its_row(field)
+            if home is not None:
+                home.mount(problem, after=after)
         problem.update(Text(why, style="bold red"))
         problem.display = True
 
@@ -207,7 +207,19 @@ class SavesAsYouGo:
         return str(getattr(problem.visual, "plain", ""))
 
     def _problem_of(self, field: Widget) -> Static | None:
-        if field.parent is None or field.id is None:
+        home, _after = _under_its_row(field)
+        if home is None or field.id is None:
             return None
-        found = field.parent.query_children(f"#{field.id}-problem")
+        found = home.query_children(f"#{field.id}-problem")
         return found.first(Static) if found else None
+
+
+def _under_its_row(field: Widget) -> tuple[Widget | None, Widget]:
+    """Where a field's refusal line goes, and what it follows: under the field's row when the
+    field sits in one beside its label (a ``Horizontal``), else under the field. Inside the
+    row it took the row's width from the label, drawn a letter a line at 80x24, and was cut
+    to two words itself (tester of #24, m1)."""
+    parent = field.parent
+    if isinstance(parent, Horizontal) and isinstance(parent.parent, Widget):
+        return parent.parent, parent
+    return (parent if isinstance(parent, Widget) else None), field

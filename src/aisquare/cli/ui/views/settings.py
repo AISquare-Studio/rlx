@@ -162,7 +162,6 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
                 placeholder=self.project.root.name or self.project.id,
                 max_length=project_service.NICKNAME_MAX,
                 id="nickname",
-                leaving=self.keep_leaving_field,
             )
         yield Static(fleet_id_line(self.project), id="fleet-id")
         can = applicable(self.agents, fleet_paused=self.fleet_paused)
@@ -227,11 +226,14 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         event.stop()
         self._save_nickname(event.value.strip())
 
-    def keep_leaving_field(self, field: CommitInput) -> None:
+    def on_mount(self) -> None:
+        # The nickname's writer as the page goes (M5): set here, not in compose (see
+        # AppSettingsView.on_mount).
+        self.query_one("#nickname", CommitInput).leaving = self._settings_keep_left_nickname
+
+    def _settings_keep_left_nickname(self, field: CommitInput) -> None:
         """rlx quitting with a nickname typed and not left: written now, on this thread, showing
         nothing (``CommitInput.leaving``). A name the store refuses is not written."""
-        if field.id != "nickname":
-            return
         # Anything: a traceback as rlx exits says nothing to anyone (reviewer of #24; the
         # service raises KeyError for a project gone, as the token's writer suppresses all).
         with contextlib.suppress(Exception):

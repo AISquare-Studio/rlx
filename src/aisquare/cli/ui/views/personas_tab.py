@@ -507,7 +507,7 @@ class PersonasTab(SavesAsYouGo, Vertical):
         persona = result.persona
         self.kept(
             f"the import of {persona.name}",
-            lambda: self._take_back(persona.name, persona.layer),
+            lambda: self._persona_take_back(persona.name, persona.layer),
             said=f"✓ imported {persona.name} ({result.engine})",
         )
         for warning in result.warnings:
@@ -516,7 +516,7 @@ class PersonasTab(SavesAsYouGo, Vertical):
 
     # --- ctrl+z (M5): an import, a new persona or an edit taken back -------------------------
 
-    def _take_back(self, name: str, layer: Layer) -> bool:
+    def _persona_take_back(self, name: str, layer: Layer) -> bool:
         """Undo of an import or a *New*: the persona it made, removed again; whether it was."""
         try:
             personas_service.remove(name, layer=layer, root=self.root)
@@ -543,9 +543,9 @@ class PersonasTab(SavesAsYouGo, Vertical):
         through the one writer (``services.personas.save``), when the text did change."""
         if before is None or self._skill_text(entry) in (None, before):
             return
-        self.kept(f"{entry.name}'s SKILL.md", lambda: self._put_text(entry, before))
+        self.kept(f"{entry.name}'s SKILL.md", lambda: self._persona_put_text(entry, before))
 
-    def _put_text(self, entry: Entry, text: str) -> bool:
+    def _persona_put_text(self, entry: Entry, text: str) -> bool:
         """Undo of an edit: ``text`` written back; whether it was."""
         try:
             personas_service.save(entry.name, text, root=self.root, layer=entry.layer)
@@ -558,14 +558,14 @@ class PersonasTab(SavesAsYouGo, Vertical):
 
     @on(Button.Pressed, "#persona-new")
     def _new(self) -> None:
-        self.app.push_screen(dialogs.NewPersonaScreen(self.root), callback=self._created)
+        self.app.push_screen(dialogs.NewPersonaScreen(self.root), callback=self._persona_created)
 
-    def _created(self, created: dialogs.NewPersona | None) -> None:
+    def _persona_created(self, created: dialogs.NewPersona | None) -> None:
         if created is None:
             return
         self.kept(
             f"the new persona {created.name}",
-            lambda: self._take_back(created.name, created.layer),
+            lambda: self._persona_take_back(created.name, created.layer),
         )
         self.reload(select=f"{created.layer}:{created.name}")
         made = Entry(created.name, created.layer, created.path)

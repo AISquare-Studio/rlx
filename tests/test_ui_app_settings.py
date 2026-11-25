@@ -18,6 +18,7 @@ from textual.app import App, ComposeResult
 from textual.content import Content
 from textual.notifications import SeverityLevel
 from textual.pilot import Pilot
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Checkbox,
@@ -2006,3 +2007,44 @@ def test_reset_all_undone_puts_a_nested_binding_back_whole() -> None:
     coder = load_config().team.profiles.get("coder")
     assert coder is not None, "ctrl+z: the binding back"
     assert (coder.agent, coder.env) == ("codex", {"A": "1"}), "whole: its agent and its env"
+
+
+def test_a_refusal_line_goes_under_its_row_and_leaves_the_label_whole_at_80x24() -> None:
+    """Tester of #24, m1: the line was mounted in the field's row, beside it; at 80x24 the
+    label ("max agents per project") was drawn a letter a line and the line cut to two words.
+    It goes under the row."""
+
+    async def run() -> dict[str, Any]:
+        host = AppHost()
+        async with host.run_test(size=(80, 24)) as pilot:
+            await settle(pilot)
+            host.query_one(f"#{AGENT_ADVANCED}", Collapsible).collapsed = False
+            await settle(pilot)
+            field = host.query_one("#max-agents", Input)
+            row = field.parent
+            assert isinstance(row, Widget)
+            label = row.query_one(Label)
+            field.scroll_visible(animate=False, immediate=True)
+            field.focus()
+            await settle(pilot)
+            before = label.region.height
+            field.value = "0"
+            await pilot.press("enter")
+            await settle(pilot)
+            line = host.query_one("#max-agents-problem", Static)
+            line.scroll_visible(animate=False, immediate=True)
+            await settle(pilot)
+            return {
+                "in the row": line.parent is row,
+                "label rows": (before, label.region.height),
+                "line": host.query_one(AppSettingsView).problem(field),
+                "line width": line.region.width,
+                "row width": row.region.width,
+            }
+
+    seen = asyncio.run(run())
+    assert seen["in the row"] is False, "under the row, not beside the field"
+    before, after = seen["label rows"]
+    assert after == before, "the label's rows as they were: not squeezed by the line"
+    assert seen["line"].startswith("not saved: ") and "at least 1" in seen["line"], seen
+    assert seen["line width"] >= seen["row width"] - 2, "as wide as the row it is under"

@@ -231,12 +231,13 @@ class TokenSlot(Vertical):
                 password=True,
                 id="settings-remote-token-field",
                 compact=True,
-                leaving=self.remote_keep_typed_token,
             )
             yield Button("Get one", id="settings-remote-token-open", compact=True)
         yield Static("", id="settings-remote-token-problem")
 
     def on_mount(self) -> None:
+        field = self.query_one("#settings-remote-token-field", CommitInput)
+        field.leaving = self.remote_keep_typed_token  # set here, as every page's (M5)
         self.query_one("#settings-remote-token-problem").display = False
         self.query_one("#settings-remote-token-env").display = False
 

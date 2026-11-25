@@ -1131,7 +1131,6 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 value=self.fleet.escape_key,
                 placeholder=DEFAULT_ESCAPE_KEY,
                 id="escape-key",
-                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("max agents per project")
@@ -1139,7 +1138,6 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 value=str(self.fleet.max_agents_per_project),
                 placeholder=f"{DEFAULT_MAX_AGENTS} (default) or a number",
                 id="max-agents",
-                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("worktree root")
@@ -1147,7 +1145,6 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 value=self.fleet.worktree_dir,
                 placeholder=DEFAULT_WORKTREE_DIR,
                 id="worktree-dir",
-                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("native agent teams off")
@@ -1177,7 +1174,6 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 value=str(self.accounts.switch_at),
                 type="integer",
                 id="accounts-switch-at",
-                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("under the line, prefer")
@@ -1190,7 +1186,6 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 value=str(self.accounts.wait_if_reset_within_minutes),
                 type="integer",
                 id="accounts-wait-minutes",
-                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             cross = Label("hand off across agents")
@@ -1324,6 +1319,10 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         )
 
     def on_mount(self) -> None:
+        # Each text field's writer as the page goes (M5): set here, not where the fields are
+        # composed, which code far from any page also has a function named for.
+        for text_field in self.query(CommitInput):
+            text_field.leaving = self._app_settings_keep_left_field
         self._shown = self._field_values()
         self._load_accounts()
         self._paint_launch_lines()
@@ -1868,9 +1867,10 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 control.value = bool(value)
         return self._save_fields({wid})
 
-    def keep_leaving_field(self, field: CommitInput) -> None:
+    def _app_settings_keep_left_field(self, field: CommitInput) -> None:
         """rlx quitting with ``field`` typed and not left: written now, alone, showing nothing
-        (``CommitInput.leaving``). A value the form would refuse is not written."""
+        (``CommitInput.leaving``, set in :meth:`on_mount`). A value the form would refuse is not
+        written."""
         if field.id is not None:
             self._save_fields({field.id}, shown=False)
 
@@ -2035,7 +2035,7 @@ class AppSettingsView(SavesAsYouGo, Vertical):
     # --- reset -------------------------------------------------------------------------
 
     @on(Button.Pressed, "#reset-settings")
-    def _reset(self) -> None:
+    def _reset_all_pressed(self) -> None:
         """Every setting back to its default — on the second press of *Reset all*, which the
         first armed in place with what it keeps (:func:`reset_note`). ctrl+z writes the
         settings it replaced back."""
@@ -2065,9 +2065,11 @@ class AppSettingsView(SavesAsYouGo, Vertical):
             )
             if before is not None:
                 after = load_config()
-                self.kept("every setting at its default", lambda: self._unreset(before, after))
+                self.kept(
+                    "every setting at its default", lambda: self._reset_all_undone(before, after)
+                )
 
-    def _unreset(self, before: AppConfig, after: AppConfig) -> bool:
+    def _reset_all_undone(self, before: AppConfig, after: AppConfig) -> bool:
         """Undo of *Reset all*: each setting it changed back as it was, onto the file as it is
         now, but one written since (a + New binding, a shell's ``config set``), which stands:
         the whole of ``before`` written back undid those (reviewer of #24). Whether it was."""

@@ -201,6 +201,9 @@ SETTINGS_MODULES = (
     "views/usage_sharing.py",
     "views/settings.py",  # a project's Settings tab
     "views/fleet_bulk.py",  # the hub's Fleet buttons' box
+    "fresh.py",  # a project's Settings tab: Start fresh…'s boxes
+    "spawn.py",  # Personas' Attach to new
+    "adopt_picker.py",  # Accounts' adopt flow
     "persona_dialogs.py",
     "attach.py",
 )
@@ -226,6 +229,9 @@ EXCEPTIONS = {
     ("views/remote.py", "RemoteConfirm", "Cancel"): "a new link or password breaks the old",
     ("views/app_settings.py", "UnsetKeyScreen", "Cancel"): "a binding's key, unset",
     ("views/fleet_bulk.py", "ConfirmBulk", "Cancel"): "the hub's Stop/Restart/Pause/Resume all",
+    ("fresh.py", "ConfirmFresh", "Cancel"): "Start fresh…: clears a project's board and fleet",
+    ("fresh.py", "ConfirmDiscard", "Cancel"): "Start fresh's second box: work it would discard",
+    ("spawn.py", "SpawnDialog", "Cancel"): "Personas' Attach to new: creates an agent",
     # Stopping a sign-in that is under way: nothing on the page is being edited.
     ("views/accounts.py", "AccountsView", "Cancel"): "stops the AISquare sign-in",
     ("views/accounts.py", "AccountsView", "Cancel sign-in"): "stops a coding agent's sign-in",
