@@ -6262,7 +6262,8 @@ def test_under_a_team_hub_a_projects_rows_are_derived_again_in_one_look_at_tmux(
     """Every row's session is the hub's, so every row was derived again by
     ``fleet.status_of``: a store session and a look at its tmux server for each agent, on
     top of the listing's one look, every 3 s (verifier of sweep 4's item 8 on #243). The
-    rows are derived again together, each with its own session."""
+    listing derives each row with its session itself now, the hub's read by its id (#14,
+    #1306): the listing's one look is the scan's only one."""
     now = datetime.now(UTC)
     hour_ago = now - timedelta(hours=1)
     hub = _rooted(tmp_path / "hub")
@@ -6297,7 +6298,7 @@ def test_under_a_team_hub_a_projects_rows_are_derived_again_in_one_look_at_tmux(
     monkeypatch.setattr(fleet_service, "server_for", lambda socket, config=None: tmux)
     monkeypatch.setattr(fleet_service, "_observe", looked)
     items = scan_needs_you(remote_needs.live_needs_sources(), now=now, dismissed=())
-    assert looks == [list(labels), list(labels)], "the listing's look, and one more"
+    assert looks == [list(labels)], "the listing's look, and no other"
     assert [(item.kind, item.agent) for item in items] == [("permission", "coder-2")]
     assert items[0].reason == "coder-2 shows a dialog that needs you"
 

@@ -23797,6 +23797,10 @@ def test_an_agent_whose_hooks_run_on_a_hubs_board_is_never_asked_for_its_screen(
                 started_at=now, last_seen_at=now,
             )
         )  # fmt: skip
+        # Its Stop hook fired: waiting, on the board. (A quiet row whose board says working
+        # is asked for its screen once, whatever board it is on: the idle box, not the trust
+        # question this is about.)
+        store.touch_session(agent.session_id, state="waiting")
     tmux.captured.clear()
     opens = 0
     real_open = core_store.open_store
@@ -23811,8 +23815,10 @@ def test_an_agent_whose_hooks_run_on_a_hubs_board_is_never_asked_for_its_screen(
 
     (status,) = fleet_service.list_agents(project, looked_up=looked_up)
 
-    assert status.session is None, "the premise: the listing joins its own board's sessions"
-    assert status.state != "attention" and tmux.captured == []
+    # The row's session, from the hub's board where its hooks registered it: the listing
+    # derives the row with it, as the header's claimed task and a limit need (#14, #1306).
+    assert status.session is not None and status.session.project_id == hub.id
+    assert status.state == "waiting" and tmux.captured == []
     assert opens == 1, "one store session for the listing, its lookups included"
     found = looked_up[agent.session_id]
     assert found is not None and found.project_id == hub.id
