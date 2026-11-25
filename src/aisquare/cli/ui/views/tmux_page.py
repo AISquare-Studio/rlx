@@ -37,6 +37,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Button, Collapsible, ContentSwitcher, DataTable, Static
@@ -44,7 +45,7 @@ from textual.worker import Worker, WorkerState
 
 from aisquare.cli.fleet_top_render import duration
 from aisquare.cli.ui.sidebar import AgentSelected
-from aisquare.cli.ui.terminal import TerminalPane
+from aisquare.cli.ui.terminal import EscapeToSidebar, TerminalPane
 from aisquare.cli.ui.ticks import while_running
 from aisquare.core.tmux import TmuxServer
 from aisquare.services import adopt as adopt_service
@@ -68,7 +69,9 @@ EMPTY = "No windows on rlx's tmux server: nothing is running there."
 OTHERS_TITLE = "Not started by rlx"
 OTHERS_ABOUT = "Read-only: rlx never types into, sends keys to or closes these."
 
-COLUMNS = ("Project", "Agent", "Command", "Age", "State", "Window")
+COLUMNS = ("Project", "Agent", "Command", "Age", "State")
+"""The table's columns; the highlighted window's own name is the hint line's, in full (at
+80x24 a sixth column was clipped to "Win")."""
 
 Reader = Callable[[], TmuxReport]
 
@@ -116,6 +119,18 @@ def show_page(app: App[Any], reader: Reader | None = None) -> None:
     else:
         page.focus_rows()
         page.tick()
+
+
+class WindowTable(DataTable[Text]):
+    """The windows' table: Enter opens the highlighted window (:class:`OpenAsked`); a click
+    only highlights. ``DataTable`` selects a row clicked while highlighted, so with one window
+    listed a single click opened its pane (the tester's E on #565)."""
+
+    class OpenAsked(Message):
+        """Enter on the highlighted row."""
+
+    def action_select_cursor(self) -> None:
+        self.post_message(self.OpenAsked())
 
 
 class ConfirmPaneScreen(ModalScreen[bool]):
@@ -246,6 +261,14 @@ class PaneScreen(ModalScreen[None]):
         event.stop()
         self.action_close()
 
+    def on_escape_to_sidebar(self, event: EscapeToSidebar) -> None:
+        """The pane's escape key: over the page there is no sidebar to go to, so Close takes
+        the keyboard, and Escape then shuts this. Left to the shell, the sidebar behind this
+        screen took it, and every key, Escape too, still went into the window (the tester's C
+        on #565)."""
+        event.stop()
+        self.query_one("#tmux-pane-close", Button).focus()
+
     def action_close(self) -> None:
         self.query_one("#tmux-pane-view", TerminalPane).attach(None)
         self.dismiss(None)
@@ -293,7 +316,7 @@ class TmuxView(VerticalScroll):
         yield Static(Text(ABOUT), id="tmux-about")
         yield Static(Text("Reading rlx's tmux server…"), id="tmux-status")
         yield Static("", id="tmux-unavailable")
-        yield DataTable(id="tmux-panes", cursor_type="row", zebra_stripes=True)
+        yield WindowTable(id="tmux-panes", cursor_type="row", zebra_stripes=True)
         with Horizontal(id="tmux-actions"):
             yield Button("Open", id="tmux-open", classes="tmux-act", compact=True)
             yield Button("Stop…", id="tmux-stop", classes="tmux-act", compact=True, variant="error")
@@ -450,7 +473,6 @@ class TmuxView(VerticalScroll):
             Text(pane.command),
             Text(age_text(pane, report)),
             state,
-            Text(pane.window_name, style="dim"),
         ]
 
     def _paint_others(self, report: TmuxReport) -> None:
@@ -497,6 +519,10 @@ class TmuxView(VerticalScroll):
     def _hint(pane: Pane | None) -> str:
         if pane is None:
             return ""
+        return f"{pane.where}. {TmuxView._offer(pane)}"
+
+    @staticmethod
+    def _offer(pane: Pane) -> str:
         if pane.agent is not None and not pane.dead:
             return f"{pane.label}'s pane: Open shows its agent view, where it is stopped."
         if pane.held is not None and not pane.dead:
@@ -514,8 +540,8 @@ class TmuxView(VerticalScroll):
     def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._paint_acts()
 
-    @on(DataTable.RowSelected, "#tmux-panes")
-    def _row_selected(self, event: DataTable.RowSelected) -> None:
+    @on(WindowTable.OpenAsked)
+    def _open_asked(self, event: WindowTable.OpenAsked) -> None:
         event.stop()
         self.action_open()
 
@@ -543,7 +569,7 @@ class TmuxView(VerticalScroll):
         if agent is not None and listed:
             self.post_message(AgentSelected(agent.project_id, agent.id))
             return
-        self.app.push_screen(PaneScreen(pane))
+        self.app.push_screen(PaneScreen(pane), lambda _closed: self.focus_rows())
 
     def action_stop(self) -> None:
         pane = self.highlighted
@@ -551,6 +577,7 @@ class TmuxView(VerticalScroll):
             return
 
         def answered(yes: bool | None) -> None:
+            self.focus_rows()  # back to the table, answered either way (the tester's E)
             if yes:
                 self._act(pane, lambda: tmux_panes.stop(pane))
 
@@ -566,6 +593,7 @@ class TmuxView(VerticalScroll):
 
     def _ask_to_adopt(self, pane: Pane, plan: adopt_service.PanePlan) -> None:
         def answered(yes: bool | None) -> None:
+            self.focus_rows()
             if yes:
                 self._act(pane, lambda: tmux_panes.adopt(pane, plan))
 

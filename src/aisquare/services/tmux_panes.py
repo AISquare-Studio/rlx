@@ -150,10 +150,15 @@ def _tree(pid: int | None, listed: Sequence[Process]) -> list[Process]:
 
 
 def _agent_in(tree: Sequence[Process], current: str) -> AgentAdapter | None:
-    """The coding agent that runs in a pane: a process of its tree whose executable is the
-    agent's binary (``types.process_executable``: an npm shim's script, never a word further
+    """The coding agent that runs in a pane, in its foreground: none while a shell is (its
+    ``pane_current_command``); else a process of its tree whose executable is the agent's
+    binary (``types.process_executable``: an npm shim's script, never a word further
     on, so a shell whose arguments mention ``claude`` runs none), else the pane's foreground
     command when it is one's name. ``None`` for a shell or any other program."""
+    if executable_name(current) in SHELLS:
+        # A shell in the foreground: a claude beneath it is stopped (Ctrl-Z) or in the
+        # background, and whatever is typed goes to the shell (the tester's D on #565).
+        return None
     known = {executable_name(each.binary): each for each in adapters()}
     for each in tree:
         image = process_executable(each.args.split())

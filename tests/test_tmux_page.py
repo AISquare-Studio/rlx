@@ -848,3 +848,107 @@ def test_stops_confirm_names_the_other_panes_its_window_takes_with_it(
     assert f"other pane ({beside}) closes with it" in said
     alone = tmux_page.stop_question(_by_pane(tmux_panes.read())[world.shell]).plain
     assert "other pane" not in alone, "control: a window of one pane"
+
+
+# --- the tester's note on #565 (board #351) -------------------------------------------------
+
+
+def test_f12_in_an_opened_window_gives_the_keyboard_to_close_and_escape_then_closes_it(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C: F12 left the keyboard on the pane, the sidebar behind the screen taking it, so Escape
+    went into the window, an orphan Claude's turn interrupted. F12 now gives it to Close, and
+    Escape shuts the screen; the keyboard is back on the table, and nothing reached the pane."""
+    harness = pane_harness.FakeTmux()
+    harness.panes[world.shell] = pane_harness.FakePane(screen=["$ "])
+    monkeypatch.setattr(tmux_page, "pane_server", lambda: harness.server(tmp_path))
+
+    async def go(pilot: Pilot[None], view: TmuxView) -> dict[str, Any]:
+        host = view.app
+        await _highlight(pilot, view, world.shell)
+        await pilot.press("o")
+        await settle_until(host, lambda: isinstance(host.screen, PaneScreen))
+        await settle_until(host, lambda: isinstance(host.focused, TerminalPane))
+        await pilot.press("f12")
+        await settle_page(host)
+        seen: dict[str, Any] = {"after_f12": getattr(host.focused, "id", None)}
+        await pilot.press("escape")
+        await settle_until(host, lambda: not isinstance(host.screen, PaneScreen))
+        seen["closed"] = not isinstance(host.screen, PaneScreen)
+        seen["keyboard"] = type(host.focused).__name__
+        seen["typed"] = [sent for sent in harness.sent() if "Escape" in sent]
+        return seen
+
+    seen = _drive(tmux_panes.read, go)
+    assert seen["after_f12"] == "tmux-pane-close"
+    assert seen["closed"] and seen["keyboard"] == "WindowTable"
+    assert seen["typed"] == [], "no Escape typed into the window"
+
+
+def test_a_shell_in_the_foreground_is_never_adopted_whatever_runs_beneath_it(
+    world: World, tmux: PagedTmux, ps: list[Process]
+) -> None:
+    """D: a zsh whose claude child is stopped (Ctrl-Z) or in the background read as claude, and
+    Adopt typed /exit and Enter into the zsh. A shell in the foreground is a plain shell."""
+    pane = tmux.window(f"asq-{_codename(world.project)}", "suspended", "zsh", pid=7600)
+    ps += [Process(7600, 1, 80, "-zsh"), Process(7601, 7600, 70, "claude --model opus")]
+    read = _by_pane(tmux_panes.read())[pane]
+
+    assert read.command == "shell" and read.runs is None and not read.adoptable
+    with pytest.raises(PaneRefused, match="not Claude Code or Codex"):
+        tmux_panes.plan_adopt(read)
+    assert tmux.typed == []
+
+
+def test_a_click_highlights_a_row_and_enter_opens_it_and_the_keyboard_comes_back(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E: a click on the highlighted row opened its window (``DataTable`` selects it); after a
+    confirm or the opened window, the keyboard was nowhere and o, s and a reached nothing."""
+    harness = pane_harness.FakeTmux()
+    harness.panes[world.shell] = pane_harness.FakePane(screen=["$ "])
+    monkeypatch.setattr(tmux_page, "pane_server", lambda: harness.server(tmp_path))
+
+    async def go(pilot: Pilot[None], view: TmuxView) -> dict[str, Any]:
+        host = view.app
+        await _highlight(pilot, view, world.shell)
+        table = view.query_one(DataTable)
+        row = next(i for i, pane in enumerate(view.panes) if pane.pane_id == world.shell)
+        await pilot.click(table, offset=(2, row + 1))  # the header is row 0 on screen
+        await settle_page(host)
+        seen: dict[str, Any] = {"clicked": type(host.screen).__name__}
+        await pilot.press("s")
+        await settle_until(host, lambda: isinstance(host.screen, ConfirmPaneScreen))
+        await pilot.click("#tmux-confirm-no")
+        await settle_until(host, lambda: not isinstance(host.screen, ConfirmPaneScreen))
+        seen["after_cancel"] = type(host.focused).__name__
+        await pilot.press("enter")
+        await settle_until(host, lambda: isinstance(host.screen, PaneScreen))
+        seen["enter"] = type(host.screen).__name__
+        return seen
+
+    seen = _drive(tmux_panes.read, go)
+    assert seen["clicked"] != "PaneScreen", "a click only highlights"
+    assert seen["after_cancel"] == "WindowTable", "the keyboard is back on the table"
+    assert seen["enter"] == "PaneScreen"
+
+
+def test_stop_refuses_a_window_that_has_become_an_agents_by_the_time_it_acts(
+    world: World, tmux: PagedTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F: read while no record placed it (nobody's, Stop offered), the window is the agent's
+    by the time the stop acts: asked again, it is refused and nothing is killed."""
+    real = tmux_panes._owners
+    monkeypatch.setattr(tmux_panes, "_owners", lambda *a: tmux_panes._Owners({}, {}, set()))
+    then = _by_pane(tmux_panes.read())[world.agent_pane]
+    monkeypatch.setattr(tmux_panes, "_owners", real)
+
+    assert then.orphan and then.stoppable
+    with pytest.raises(PaneRefused, match="stop it from its agent view"):
+        tmux_panes.stop(then)
+    assert tmux.killed == []
+
+
+def test_the_hint_names_the_highlighted_window_in_full() -> None:
+    """F: at 80x24 a Window column was clipped; the window's name is the hint line's."""
+    assert "Window" not in tmux_page.COLUMNS
