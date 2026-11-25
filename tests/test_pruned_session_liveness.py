@@ -175,8 +175,8 @@ def test_the_board_shows_a_restored_session_again(runner: CliRunner, work_dir: P
     after = runner.invoke(app, ["board"], catch_exceptions=False).output
 
     # Named as the left pane names its agent (#140): this one has no label, so by its role.
-    assert "  - coder — " not in before
-    assert "  - coder — " in after, after
+    assert "\n  coder " not in before  # a person's board (B1 #14): a row per live agent
+    assert "\n  coder " in after, after
 
 
 def test_prune_still_retires_a_session_that_has_gone_quiet(work_dir: Path) -> None:

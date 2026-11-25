@@ -277,6 +277,12 @@ AMBIENT_ENV_VARS = (
     # left set, every session start would resolve THEIR row and THEIR pid.
     "AISQUARE_FLEET_AGENT",
     "CLAUDE_PID",
+    # The marks an agent leaves on the processes it starts (Claude Code's on every one,
+    # Codex's on its tools' shells): with either set, `core.prompt_origin` reads this
+    # process as an agent's, and `aisquare board` prints the agents' block, not a
+    # person's board (B1 #14). CI has neither; a suite run inside an agent had both.
+    "CLAUDECODE",
+    "CODEX_THREAD_ID",
     "AISQUARE_MODEL_PLANNER",
     "AISQUARE_MODEL_CODER",
     "AISQUARE_MODEL_RUNNER",
@@ -926,10 +932,13 @@ def no_background_shipper(monkeypatch: pytest.MonkeyPatch) -> None:
     (``core.sharing.start_background_ship`` from the root callback); a real one is a process that
     outlives the test, minds the test's home and, under load, mints an identity mid-test (a test
     of "no identity yet" failed once in the full run, never alone). A test of the spawn itself
-    replaces ``_spawn`` with its own recorder."""
+    replaces ``_spawn`` with its own recorder. The same for the daily active ping's detached
+    ``aisquare metrics ping`` (``services.active_ping``), which is on unless turned off."""
     from aisquare.core import sharing
+    from aisquare.services import active_ping
 
     monkeypatch.setattr(sharing, "_spawn", lambda: None)
+    monkeypatch.setattr(active_ping, "_spawn", lambda: None)
 
 
 @pytest.fixture

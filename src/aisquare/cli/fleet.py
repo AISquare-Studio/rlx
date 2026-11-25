@@ -480,7 +480,7 @@ def restart(
             help="Permission for the replacement: WRITE:APPROVALS mapped per agent "
             "(workspace:auto, read_only:auto…) or the agent's own (Claude Code: auto, "
             "acceptEdits, …); default: the one the agent was launched with, or the role's "
-            "for an agent spawned before that was recorded (#144).",
+            "for an agent spawned before that was recorded.",
         ),
     ] = None,
     model: Annotated[
@@ -511,7 +511,7 @@ def restart(
     manager killed with ctrl+c comes back knowing its intake and its coders.
     A running agent is stopped first and handed over as `fleet switch` hands
     one over: its claims wait for the replacement and no exit is announced.
-    The replacement is launched as the agent was (#144) — binary, permission
+    The replacement is launched as the agent was — binary, permission
     mode, arguments — not as the role's config reads today; --permission-mode
     changes the mode, and later restarts keep it.
 

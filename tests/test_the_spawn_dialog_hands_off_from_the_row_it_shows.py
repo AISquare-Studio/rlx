@@ -2,7 +2,7 @@
 
 Review of #240, "also confirmed": hand-off by label (``spawn.py`` and ``fleet.py``). Two
 rows of a project can carry one label over time, an exited coder-1 and the coder-1 started
-since, and *Hand off from* lists the rows it read when the form opened: either, or both.
+since, and *Continue from* lists the rows it read when the form opened: either, or both.
 The picker's value was the label, so the form took the FIRST row under it for its prefill,
 and Fork or Take over sent the label alone, which the service resolves to the NEWEST row:
 the owner chose one teammate and the hand-off acted on another.

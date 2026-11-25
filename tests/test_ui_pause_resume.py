@@ -204,7 +204,7 @@ def test_confirming_pause_all_pauses_each_agent_with_a_toast_and_sets_the_signal
         "⏸ paused coder-1 (beta)",
     ]
     assert [t for t in toasts if t.startswith("paused ")] == [
-        "paused 4 · skipped 1 · failed 0\nfleet-paused: alpha, beta\n"
+        "paused 4 · skipped 1 · failed 0\nprojects paused: alpha, beta\n"
         "skipped: tester-1 (beta) — exited"
     ]
 
@@ -236,8 +236,8 @@ def test_a_partial_pause_pauses_the_agents_picked_and_fleet_pauses_only_a_whole_
     ]
     assert acting_on_running.signals == [("on", "prj_b")], "alpha's manager runs: no signal"
     assert [t for t in toasts if t.startswith("paused ")] == [
-        "paused 3 · skipped 2 · failed 0\nfleet-paused: beta\n"
-        f"skipped: manager (alpha) — {fleet_service.NOT_CHOSEN}; tester-1 (beta) — exited"
+        "paused 3 · skipped 1 · failed 0\nprojects paused: beta\n"
+        "skipped: tester-1 (beta) — exited"  # the unticked manager is not listed (0.10.2)
     ]
 
 
@@ -263,7 +263,7 @@ def test_a_partial_resume_resumes_the_agents_picked_and_keeps_the_project_paused
     ]
     assert ("off", "prj_a") not in acting_on_paused.signals, "alpha's manager is still paused"
     [summary] = [t for t in toasts if t.startswith("resumed ")]
-    assert "still fleet-paused: alpha (1 still paused)" in summary.splitlines(), summary
+    assert "projects still paused: alpha (1 still paused)" in summary.splitlines(), summary
 
 
 def test_resume_all_lists_the_paused_agents_and_leaves_the_rest(acting_on_paused: Paused) -> None:
