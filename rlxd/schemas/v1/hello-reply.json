@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HelloData",
-  "description": "`hello`'s reply: what this rlxd is and what it can do.\n\n```json\n{\"daemon_version\": \"0.10.3\", \"schema_versions\": [1], \"capabilities\": []}\n```",
+  "description": "`hello`'s reply: the protocol version the connection speaks, what this rlxd is, and\nwhat it can do.\n\n```json\n{\"protocol_version\": 1, \"protocol_versions\": [1], \"rlxd_version\": \"0.10.3\", \"capabilities\": []}\n```",
   "type": "object",
   "properties": {
     "capabilities": {
@@ -11,24 +11,32 @@
         "type": "string"
       }
     },
-    "daemon_version": {
-      "description": "rlxd's version, which is rlx's.",
-      "type": "string"
+    "protocol_version": {
+      "description": "The protocol version this connection speaks from here on.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1
     },
-    "schema_versions": {
-      "description": "Every schema version this rlxd serves.",
+    "protocol_versions": {
+      "description": "Every protocol version this rlxd serves.",
       "type": "array",
       "items": {
         "type": "integer",
         "format": "uint32",
-        "minimum": 0
+        "minimum": 1
       },
       "minItems": 1
+    },
+    "rlxd_version": {
+      "description": "rlxd's version, which is rlx's.",
+      "type": "string",
+      "minLength": 1
     }
   },
   "required": [
-    "daemon_version",
-    "schema_versions",
+    "protocol_version",
+    "protocol_versions",
+    "rlxd_version",
     "capabilities"
   ]
 }

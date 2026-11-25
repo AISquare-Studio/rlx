@@ -1,1 +1,1 @@
-{"daemon_version": "0.10.1", "schema_versions": [1], "capabilities": []}
+{"protocol_version": 1, "protocol_versions": [1], "rlxd_version": "0.10.1", "capabilities": []}

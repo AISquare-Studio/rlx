@@ -5,8 +5,11 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use schemars::Schema;
+use serde_json::{Value, json};
+
 use crate::marker::{False, True};
-use crate::{RequestId, SCHEMA_VERSION};
+use crate::{PROTOCOL_VERSIONS, RequestId, SCHEMA_VERSION};
 
 /// A response's or an event's `data`: always a JSON object, so a field can be added
 /// without raising the schema version.
@@ -60,7 +63,7 @@ pub enum Outcome {
 
 /// Why a request was refused or failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[schemars(rename = "Error", title = "Error")]
+#[schemars(rename = "Error", title = "Error", transform = incompatible_protocol_rule)]
 #[non_exhaustive]
 pub struct ErrorBody {
     /// A stable, machine-readable code, such as `unauthorized` or `not_a_tty`.
@@ -73,10 +76,38 @@ pub struct ErrorBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
     pub hint: Option<String>,
-    /// More about what went wrong, such as an underlying error's text.
+    /// More about what went wrong: an underlying error's text, or an object whose
+    /// fields the code defines (`incompatible_protocol` gives `{"supported": [1]}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "String")]
-    pub detail: Option<String>,
+    #[schemars(with = "Value")]
+    pub detail: Option<Value>,
+}
+
+/// The schema's half of `incompatible_protocol`: such an error must say, in
+/// `detail.supported`, which protocol versions rlxd does serve.
+fn incompatible_protocol_rule(schema: &mut Schema) {
+    schema.insert(
+        "if".to_owned(),
+        json!({
+            "properties": {"code": {"const": codes::INCOMPATIBLE_PROTOCOL}},
+            "required": ["code"],
+        }),
+    );
+    schema.insert(
+        "then".to_owned(),
+        json!({
+            "properties": {"detail": {
+                "type": "object",
+                "properties": {"supported": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "minItems": 1,
+                }},
+                "required": ["supported"],
+            }},
+            "required": ["detail"],
+        }),
+    );
 }
 
 /// The error codes the contract names. A client must also accept codes not listed here.
@@ -85,6 +116,9 @@ pub mod codes {
     pub const UNAUTHORIZED: &str = "unauthorized";
     /// No method of that name.
     pub const UNKNOWN_METHOD: &str = "unknown_method";
+    /// `hello` asked for a protocol version this rlxd does not serve. `detail.supported`
+    /// lists the ones it does, so the client can say "update" rather than misparse.
+    pub const INCOMPATIBLE_PROTOCOL: &str = "incompatible_protocol";
 }
 
 impl Envelope {
@@ -154,11 +188,21 @@ impl ErrorBody {
         self
     }
 
-    /// This error, with more about what went wrong.
+    /// This error, with more about what went wrong: a string, or an object.
     #[must_use]
-    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+    pub fn with_detail(mut self, detail: impl Into<Value>) -> Self {
         self.detail = Some(detail.into());
         self
+    }
+
+    /// The reply to a `hello` whose `protocol_version` this crate does not serve.
+    pub fn incompatible_protocol(requested: u32) -> Self {
+        Self::new(
+            codes::INCOMPATIBLE_PROTOCOL,
+            format!("protocol version {requested} is not one this rlxd serves"),
+        )
+        .with_hint("Update rlx or the app, so that both speak one protocol version.")
+        .with_detail(json!({ "supported": PROTOCOL_VERSIONS }))
     }
 }
 

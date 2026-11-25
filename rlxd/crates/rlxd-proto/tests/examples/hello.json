@@ -1,1 +1,1 @@
-{"token": "0123abcd", "client": "rlxapp", "client_version": "0.1.0", "role": "app", "env": {"CLAUDE_CONFIG_DIR": "cc-test"}}
+{"token": "0123abcd", "protocol_version": 1, "client": "rlxapp", "client_version": "0.1.0", "role": "app", "capabilities": [], "env": {"CLAUDE_CONFIG_DIR": "cc-test"}}

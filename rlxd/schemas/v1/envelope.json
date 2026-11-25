@@ -72,8 +72,7 @@
           "minLength": 1
         },
         "detail": {
-          "description": "More about what went wrong, such as an underlying error's text.",
-          "type": "string"
+          "description": "More about what went wrong: an underlying error's text, or an object whose\nfields the code defines (`incompatible_protocol` gives `{\"supported\": [1]}`)."
         },
         "hint": {
           "description": "What to do about it, for a person.",
@@ -85,10 +84,43 @@
           "minLength": 1
         }
       },
+      "if": {
+        "properties": {
+          "code": {
+            "const": "incompatible_protocol"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
       "required": [
         "code",
         "message"
-      ]
+      ],
+      "then": {
+        "properties": {
+          "detail": {
+            "type": "object",
+            "properties": {
+              "supported": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "minItems": 1
+              }
+            },
+            "required": [
+              "supported"
+            ]
+          }
+        },
+        "required": [
+          "detail"
+        ]
+      }
     }
   }
 }

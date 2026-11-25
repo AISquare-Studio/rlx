@@ -1,9 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HelloParams",
-  "description": "`hello`'s params: who is connecting, as what, and the token that lets them.\n\n```json\n{\"token\": \"…\", \"client\": \"rlxapp\", \"client_version\": \"0.1.0\", \"role\": \"app\", \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```",
+  "description": "`hello`'s params: who is connecting, as what, which protocol it speaks, and the\ntoken that lets it in.\n\n```json\n{\"token\": \"…\", \"protocol_version\": 1, \"client\": \"rlxapp\", \"client_version\": \"0.1.0\",\n \"role\": \"app\", \"capabilities\": [], \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```\n\nA `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,\nwhose `detail.supported` lists the versions it does.",
   "type": "object",
   "properties": {
+    "capabilities": {
+      "description": "What the client can do, by name. rlxd ignores names it does not know.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "client": {
       "description": "Which client this is, such as `rlxapp`, `rlx` or `remote`.",
       "type": "string",
@@ -20,6 +27,12 @@
         "type": "string"
       }
     },
+    "protocol_version": {
+      "description": "The protocol version the client speaks. It is the `schema_version` of every\nenvelope and event on the connection.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1
+    },
     "role": {
       "description": "What the client connects as. rlxd counts its clients by role.",
       "$ref": "#/$defs/Role"
@@ -32,9 +45,11 @@
   },
   "required": [
     "token",
+    "protocol_version",
     "client",
     "client_version",
-    "role"
+    "role",
+    "capabilities"
   ],
   "$defs": {
     "Role": {

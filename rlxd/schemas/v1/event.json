@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Event",
-  "description": "One event on the stream `events.subscribe` opens.\n\n```json\n{\"schema_version\": 1, \"seq\": 42, \"time\": \"2026-11-25T12:00:00.000Z\", \"topic\": \"run\", \"type\": \"run.text\", \"data\": {}}\n```",
+  "description": "One event on the stream `events.subscribe` opens.\n\n```json\n{\"schema_version\": 1, \"seq\": 42, \"time\": \"2026-11-25T12:00:00.000Z\", \"topic\": \"run\",\n \"type\": \"run.text\", \"data\": {\"run_id\": \"…\", \"run_seq\": 3, \"kind\": \"task\"}}\n```\n\nTwo sequences number events. `seq` is per home: every event has one, and\n`events.subscribe {since}` resumes after it. `data.run_seq` is per run: every event\nwhose topic is `run` has one, next to `data.run_id`, so a client can replay one run\nfrom a known point.",
   "type": "object",
   "properties": {
     "data": {
-      "description": "The type's own fields.",
+      "description": "The type's own fields. On the `run` topic, also `run_id` and `run_seq`.",
       "type": "object",
       "additionalProperties": true
     },
@@ -17,7 +17,7 @@
       "minimum": 0
     },
     "seq": {
-      "description": "Strictly increasing per home, from 1. `events.subscribe {since}` resumes after it.",
+      "description": "Strictly increasing per home, from 1, across every topic. `events.subscribe\n{since}` resumes after it.",
       "type": "integer",
       "format": "uint64",
       "minimum": 1
@@ -33,10 +33,20 @@
       "minLength": 1
     },
     "type": {
-      "description": "What happened, named under its topic: `run.text`, `daemon.gap`,\n`fleet.agent.spawned`. A client ignores types it does not know.",
+      "description": "What happened, as `<topic>.<event>` with the event in snake_case: `run.text`,\n`daemon.gap`, `fleet.agent_spawned`. A client ignores types it does not know.",
       "type": "string",
       "minLength": 1
     }
+  },
+  "if": {
+    "properties": {
+      "topic": {
+        "const": "run"
+      }
+    },
+    "required": [
+      "topic"
+    ]
   },
   "required": [
     "schema_version",
@@ -45,5 +55,27 @@
     "topic",
     "type",
     "data"
-  ]
+  ],
+  "then": {
+    "properties": {
+      "data": {
+        "properties": {
+          "run_id": {
+            "description": "The run this event belongs to.",
+            "type": "string",
+            "minLength": 1
+          },
+          "run_seq": {
+            "description": "Strictly increasing per run, from 1.",
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "run_id",
+          "run_seq"
+        ]
+      }
+    }
+  }
 }
