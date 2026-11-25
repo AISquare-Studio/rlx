@@ -999,17 +999,24 @@ def _yours(name: str) -> Path:
     core.check_name(name, name)
     directory = dict(core.layer_dirs(None))["user"] / name
     if not directory.is_dir():
-        new = f"`{prog.word()} persona new {name}`"
+        # In asq, the Personas page's buttons, not a command (R13; the full matrix of #21 r6).
         if (core.BUNDLED_DIR / name / core.SKILL_FILE).is_file():
-            said = f"you have no persona named '{name}', only rlx's bundled one"
-            how = f"; start yours with {new}, which then wins over the bundled one"
-        else:
-            said = f"you have no persona named '{name}'"
-            how = (
-                f"; copy a project's with `{prog.word()} persona import "
-                f"<project>/.aisquare/personas/{name} --user`, or start one with {new}"
+            said = (
+                f"you have no persona named '{name}', only rlx's bundled one"
+                + prog.shell_advice(
+                    f"; start yours with `{prog.word()} persona new {name}`, which then wins over "
+                    "the bundled one",
+                    app="; start yours with + New, which then wins over the bundled one",
+                )
             )
-        raise PersonaError(said + prog.shell_advice(how), code="unknown_persona")
+        else:
+            said = f"you have no persona named '{name}'" + prog.shell_advice(
+                f"; copy a project's with `{prog.word()} persona import "
+                f"<project>/.aisquare/personas/{name} --user`, or start one with "
+                f"`{prog.word()} persona new {name}`",
+                app="; copy a project's with + Import…, or start one with + New",
+            )
+        raise PersonaError(said, code="unknown_persona")
     return directory
 
 
