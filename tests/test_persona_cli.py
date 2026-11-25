@@ -24,6 +24,7 @@ from aisquare.core import personas as core
 from aisquare.core.personas import PersonaError
 from aisquare.services import personas as persona_service
 from tests import bundled_personas
+from tests.fsperms import can_symlink
 
 
 @pytest.fixture(autouse=True)
@@ -1124,3 +1125,113 @@ def test_a_destination_that_cannot_be_resolved_is_refused_not_let_through(
 
     assert refused.value.code == "project_layer_retired"
     assert not (layer / "mentor").exists()
+
+
+# --- round 6 of #21 (tester #974) -----------------------------------------------------------
+
+THEIRS = "---\nname: {name}\ndescription: The project's.\n---\nTHE PROJECT'S OWN {name}.\n"
+
+
+def _linked_layer(repo: Path) -> Path:
+    """``<repo>/.aisquare/personas -> ../../shared``, a shared folder holding the project's
+    own ``mentor``; returns that SKILL.md. Yours is in your own layer."""
+    shared = repo.parent / "shared"
+    theirs = shared / "mentor" / "SKILL.md"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text(THEIRS.format(name="mentor"), encoding="utf-8")
+    (repo / ".aisquare").mkdir()
+    (repo / ".aisquare" / "personas").symlink_to(
+        Path("..") / ".." / "shared", target_is_directory=True
+    )
+    _skill(_user_layer(), "mentor", description="MY mentor.")
+    return theirs
+
+
+@pytest.mark.skipif(not can_symlink(), reason="needs symlinks")
+@pytest.mark.parametrize(
+    ("to", "name", "force"),
+    [
+        ("repo/.aisquare/personas", "mentor", True),
+        ("repo/.aisquare/personas", "careful", False),
+        ("alias", "mentor", True),
+        ("linked-dot/personas", "mentor", True),
+    ],
+    ids=[
+        "linked layer, --force",
+        "linked layer, a new name",
+        "alias to it",
+        "via linked .aisquare",
+    ],
+)
+def test_an_export_into_a_projects_layer_that_is_a_link_is_refused(
+    runner: CliRunner,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    to: str,
+    name: str,
+    force: bool,
+) -> None:
+    """Judged by the resolved path's name alone, ``export mentor --to repo/.aisquare/personas
+    --force`` through a link to ``../../shared`` exited 0 and overwrote the project's mentor
+    with yours; without --force it wrote a new persona the project then reads (the tester of
+    #21, round 5). Any name the destination goes by counts: as written, or a link on the way."""
+    theirs = _linked_layer(repo)
+    (tmp_path / "alias").symlink_to(repo / ".aisquare" / "personas", target_is_directory=True)
+    (tmp_path / "linked-dot").symlink_to(repo / ".aisquare", target_is_directory=True)
+    before = theirs.read_bytes()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)  # from a folder outside the repository, as the tester ran it
+
+    result = runner.invoke(
+        app,
+        ["persona", "export", name, "--to", str(tmp_path / to), *(["--force"] if force else [])],
+    )
+
+    said = " ".join(result.stderr.split())
+    assert result.exit_code == 1, result.output
+    assert "export it to any other folder" in said
+    assert theirs.read_bytes() == before, "the project's persona is untouched"
+    assert sorted(path.name for path in theirs.parent.parent.iterdir()) == ["mentor"]
+
+
+def test_an_export_into_a_projects_real_layer_is_still_refused_with_force(
+    runner: CliRunner, repo: Path
+) -> None:
+    """The control for the linked case: the same folder as a real directory."""
+    theirs = repo / ".aisquare" / "personas" / "mentor" / "SKILL.md"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text(THEIRS.format(name="mentor"), encoding="utf-8")
+    _skill(_user_layer(), "mentor", description="MY mentor.")
+    before = theirs.read_bytes()
+
+    result = runner.invoke(
+        app, ["persona", "export", "mentor", "--to", str(theirs.parent.parent), "--force"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "export it to any other folder" in " ".join(result.stderr.split())
+    assert theirs.read_bytes() == before
+
+
+@pytest.mark.skipif(not can_symlink(), reason="needs symlinks")
+@pytest.mark.parametrize("via", ["the layer", "an alias"])
+def test_your_own_layer_named_dot_aisquare_personas_and_linked_to_dotfiles_still_exports(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, via: str
+) -> None:
+    """``~/.aisquare/personas`` is named like a project's layer; as a link to your dotfiles,
+    or reached by an alias, it is still yours, and an export there is allowed."""
+    home = tmp_path / "me" / ".aisquare"
+    home.mkdir(parents=True)
+    dotfiles = tmp_path / "dotfiles" / "personas"
+    dotfiles.mkdir(parents=True)
+    (home / "personas").symlink_to(dotfiles, target_is_directory=True)
+    monkeypatch.setenv("AISQUARE_HOME", str(home))
+    (tmp_path / "alias").symlink_to(home / "personas", target_is_directory=True)
+    to = home / "personas" if via == "the layer" else tmp_path / "alias"
+
+    result = runner.invoke(app, ["persona", "export", "careful", "--to", str(to)])
+
+    assert result.exit_code == 0, result.output
+    assert (dotfiles / "careful" / "SKILL.md").is_file()

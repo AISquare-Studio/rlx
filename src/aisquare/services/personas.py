@@ -45,7 +45,7 @@ from aisquare.core.atomic import write_replacing
 from aisquare.core.config import PersonaImportSettings, load_config
 from aisquare.core.editor import edit_text
 from aisquare.core.personas import Layer, Persona, PersonaError, Provenance
-from aisquare.core.workspace import _resolved_or_spelled
+from aisquare.core.workspace import _resolved_or_spelled, _spelled
 
 SkillScope = Literal["user", "project"]
 
@@ -1193,19 +1193,52 @@ def _layer_dir(layer: Layer, root: Path | None) -> Path:
     return dict(core.layer_dirs(root))["user"]
 
 
+_LINK_HOPS = 40
+"""Links followed one by one before a chain is called a loop (Linux's ``SYMLOOP_MAX``)."""
+
+
+def _names_a_project_layer(path: Path) -> bool:
+    """``…/.aisquare/personas`` by name, case-insensitively: macOS's and Windows' file systems
+    are, so ``.AISQUARE/Personas`` IS a project's layer there (the tester of #21, round 3)."""
+    return path.name.casefold() == "personas" and path.parent.name.casefold() == ".aisquare"
+
+
+def _spellings(base: Path) -> list[Path]:
+    """Every name the destination ``base`` goes by: as written (absolute, no link followed),
+    each symbolic link on the way to it, its folder resolved, and last what it resolves to.
+    A project's layer that is a link (``.aisquare/personas -> ../../shared``) resolves to a
+    folder named otherwise; by that name alone, an export overwrote the project's persona
+    (the tester of #21, round 5). A link to that link, or a written folder through a linked
+    ``.aisquare``, is named so on the way."""
+    here = _spelled(base)
+    names = [here]
+    for _ in range(_LINK_HOPS):
+        here = _resolved_or_spelled(here.parent) / here.name
+        names.append(here)
+        try:
+            if not here.is_symlink():
+                break
+            here = here.parent / os.readlink(here)  # not normalised: its ``..`` is resolved next
+        except OSError:  # gone or unreadable meanwhile: nothing more can be written through it
+            break
+        names.append(here)
+    names.append(_resolved_or_spelled(base))
+    return names
+
+
 def _refuse_a_project_layer(base: Path) -> None:
     """Refuse a destination that is a project's own persona layer (``<root>/.aisquare/personas``,
     the user layer aside): an export there wrote what ``_layer_dir`` refuses, by a path
-    (the review of #561: *Save as… into: project*)."""
+    (the review of #561: *Save as… into: project*). It is one when any name it goes by is
+    (:func:`_spellings`), and what it resolves to is not your own layer: yours may be named
+    ``~/.aisquare/personas`` and be a link to your dotfiles, or be reached by an alias."""
     user = dict(core.layer_dirs(None))["user"]
+    names = _spellings(base)
+    if not any(_names_a_project_layer(name) for name in names):
+        return
     # Through a symlink loop, judged by the path as written: the one rule for that fallback
     # (the review of #21, round 4: a second spelling of it failed the package's guard).
-    where = _resolved_or_spelled(base)
-    # By name, case-insensitively: macOS's and Windows' file systems are, so
-    # ``.AISQUARE/Personas`` IS the project's layer there (the tester of #21, round 3).
-    named = where.name.casefold() == "personas" and where.parent.name.casefold() == ".aisquare"
-    if not named:
-        return
+    where = names[-1]
     try:
         mine = user.resolve()
         both = where.exists() and mine.exists()
