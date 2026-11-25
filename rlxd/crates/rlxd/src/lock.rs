@@ -57,7 +57,8 @@ pub fn is_held(path: &Path) -> io::Result<bool> {
 }
 
 impl Held {
-    /// The lock file, open.
+    /// The lock file, open: POSIX asks it whether the path still names the file held.
+    #[cfg(unix)]
     pub fn file(&self) -> &File {
         &self.file
     }
