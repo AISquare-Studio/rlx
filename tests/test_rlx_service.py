@@ -518,3 +518,50 @@ def test_the_cli_every_hook_imports_does_not_import_the_service() -> None:
         [sys.executable, "-P", "-c", probe], capture_output=True, text=True, check=True
     ).stdout.split()
     assert out == ["False", "False"], out
+
+
+class _Child:
+    """A child process as ``subprocess.Popen`` gives it: running until ``ends``."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.ended = False
+
+    def poll(self) -> int | None:
+        return 0 if self.ended else None
+
+
+def test_the_sweep_runs_in_a_child_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sweep keeps what it read in the process that runs it (about 140 MB, measured for the
+    idle budget): the service runs ``metrics stats`` as a detached child instead, and starts
+    no second one while the first still sweeps."""
+    started: list[list[str]] = []
+
+    def detached(command: list[str]) -> _Child:
+        started.append(list(command))
+        return _Child(4000 + len(started))
+
+    monkeypatch.setattr(service_host, "_detached", detached)
+    part = service_host.SweepPart()
+
+    assert part.tick_part().detail == "started a sweep (pid 4001)"
+    assert part.tick_part().detail == "a sweep runs (pid 4001)"
+    part._child.ended = True  # type: ignore[union-attr]
+    assert part.tick_part().detail == "started a sweep (pid 4002)"
+    sweep = ["--json", "metrics", "stats", "--range", "today"]
+    assert [command[-len(sweep) :] for command in started] == [sweep, sweep]
+
+
+def test_the_shipment_is_the_clis_detached_one_and_nothing_while_sharing_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aisquare.core import sharing
+
+    calls: list[str] = []
+    monkeypatch.setattr(sharing, "start_background_ship", lambda: calls.append("ship") or True)
+    part = service_host.ShipPart()
+
+    monkeypatch.setattr(sharing, "enabled", lambda: False)
+    assert part.tick_part().state == "off" and calls == []
+    monkeypatch.setattr(sharing, "enabled", lambda: True)
+    assert part.tick_part().detail == "started a shipment" and calls == ["ship"]

@@ -292,8 +292,11 @@ class NudgePart:
 
 
 class SweepPart:
-    """The usage sweep the *Usage & stats* page reads (``usage_stats.maybe_sweep``), which runs
-    at most every ten minutes, in one process at a time."""
+    """The usage sweep the *Usage & stats* page reads, in a process of its own: ``metrics stats``
+    sweeps first (``usage_stats.maybe_sweep``, at most every ten minutes, one process at a
+    time). In this process it would keep what it read, about 140 MB, for as long as the
+    service runs (measured for #32's idle budget), and hold the other parts up for as long as
+    a first sweep takes."""
 
     name = "sweep"
     first = SWEEP_FIRST_SECONDS
@@ -303,23 +306,31 @@ class SweepPart:
 
         self.every = usage_stats.SWEEP_EVERY.total_seconds()
         self._sweep = sweep
+        self._child: subprocess.Popen[bytes] | None = None
 
     def start_part(self) -> None:
         return None
 
     def tick_part(self) -> PartHealth:
-        from aisquare.services import usage_stats
-
-        (self._sweep or usage_stats.maybe_sweep)()
-        return PartHealth("ok", "swept")
+        if self._sweep is not None:
+            self._sweep()
+            return PartHealth("ok", "swept")
+        child = self._child
+        if child is not None and child.poll() is None:
+            return PartHealth("ok", f"a sweep runs (pid {child.pid})")
+        self._child = _detached(
+            selfcli.argv_for(["--json", "metrics", "stats", "--range", "today"])
+        )
+        return PartHealth("ok", f"started a sweep (pid {self._child.pid})")
 
     def stop_part(self) -> None:
         return None
 
 
 class ShipPart:
-    """The anonymous usage shipment, when sharing is on and one is due (``usage_share.ship``:
-    due every 6 h, one at a time). Nothing at all while sharing is off."""
+    """The anonymous usage shipment, when sharing is on and one is due, as every feature command
+    starts it (``sharing.start_background_ship``: a detached ``metrics ship``, due every 6 h);
+    nothing at all while sharing is off."""
 
     name = "ship"
     every = SHIP_CHECK_SECONDS
@@ -333,15 +344,36 @@ class ShipPart:
 
     def tick_part(self) -> PartHealth:
         from aisquare.core import sharing
-        from aisquare.services import usage_share
 
         if not sharing.enabled():
             return PartHealth("off", "usage sharing is off")
-        (self._ship or usage_share.ship)()
-        return PartHealth("ok", "looked for a shipment due")
+        if self._ship is not None:
+            self._ship()
+            return PartHealth("ok", "looked for a shipment due")
+        started = sharing.start_background_ship()
+        return PartHealth("ok", "started a shipment" if started else "no shipment due")
 
     def stop_part(self) -> None:
         return None
+
+
+def _detached(command: Sequence[str]) -> subprocess.Popen[bytes]:
+    """``command`` in a session of its own, its output in the service's log, reaped when it ends
+    (a thread waits for it), so that it leaves no zombie in a process that lives on."""
+    log = log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "ab") as out:
+        child = subprocess.Popen(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=out,
+            start_new_session=True,
+            close_fds=True,
+        )
+    reaper = threading.Thread(target=child.wait, name="rlx-service-child", daemon=True)
+    reaper.start()
+    return child
 
 
 def default_parts() -> list[Part]:
