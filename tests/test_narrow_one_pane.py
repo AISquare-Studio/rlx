@@ -268,3 +268,88 @@ def test_the_remembered_sidebar_width_comes_back_and_narrow_keys_do_not_overwrit
         )
 
     assert drive(go, size=WIDE) == (34, NARROW[0], 34, 34)
+
+
+def test_at_60_columns_with_no_project_start_shows_welcome_not_the_sidebar(
+    tmp_path: Path, script: Script
+) -> None:
+    """L1 starts on Welcome while no project is listed, and at 60 columns the narrow layout
+    showed the sidebar ('No projects yet…'), Welcome hidden: the focus sat there, and only a
+    view a person asked for showed the content side (review of #585, #1247). Start shows the
+    content side when it lands on Welcome; 80 columns still shows both."""
+    seen: dict[str, Any] = {}
+
+    async def go(pilot: Pilot[None]) -> None:
+        app = fleet_app(pilot)
+        await settle(app)
+        seen.update(sides(app), current=app.content.current)
+
+    drive(go, size=NARROW)
+    assert seen["current"] == "welcome"
+    assert (seen["content"], seen["sidebar"]) == (True, False), seen
+
+    drive(go, size=WIDE)
+    assert (seen["content"], seen["sidebar"]) == (True, True), "80 columns: both, as ever"
+
+
+def _inside(widget: Widget, width: int) -> bool:
+    region = widget.region
+    return region.x >= 0 and region.right <= width and region.width > 0
+
+
+def test_at_60_columns_the_help_fits_the_screen(tmp_path: Path, script: Script) -> None:
+    """The ? help's box is 78 wide, and at 60 columns its every line was cut on the right
+    (#10's tester, #1248): it is the screen's width at most."""
+    from aisquare.cli.ui.app import HelpScreen
+
+    _one_project(tmp_path, script)
+
+    async def go(pilot: Pilot[None]) -> tuple[bool, bool]:
+        app = fleet_app(pilot)
+        await settle(app)
+        app.sidebar.focus()
+        app.push_screen(HelpScreen("f12"))
+        await settle(app)
+        box = app.screen.query_one("#helpbox")
+        return isinstance(app.screen, HelpScreen), _inside(box, NARROW[0])
+
+    assert drive(go, size=NARROW) == (True, True)
+
+
+def test_at_60_columns_the_sharing_question_fits_and_no_thanks_shows(
+    tmp_path: Path, script: Script
+) -> None:
+    """The usage-sharing question is 80 wide: at 60 columns its text was cut and No thanks was
+    off the screen (#10's tester, #1248). The box is the screen's width, and the three answers
+    stack, each whole on the screen; at 80 columns they share one row, as before."""
+    from textual.widgets import Button
+
+    from aisquare.cli.ui.views.usage_sharing import ConsentDialog
+    from tests.test_ui_usage_share import FakeSharing
+
+    _one_project(tmp_path, script)
+    seen: dict[str, Any] = {}
+
+    async def go(pilot: Pilot[None]) -> None:
+        app = fleet_app(pilot)
+        await settle(app)
+        app.push_screen(ConsentDialog(FakeSharing()))  # type: ignore[arg-type]
+        await settle(app)
+        dialog = app.screen
+        assert isinstance(dialog, ConsentDialog)
+        width = app.size.width
+        buttons = [
+            dialog.query_one(f"#{name}", Button)
+            for name in ("consent-see", "consent-share", "consent-no")
+        ]
+        seen.update(
+            box=_inside(dialog.query_one("#consent-box"), width),
+            buttons=[_inside(button, width) for button in buttons],
+            rows=len({button.region.y for button in buttons}),
+        )
+
+    drive(go, size=NARROW)
+    assert seen["box"] and seen["buttons"] == [True] * 3, seen
+    assert seen["rows"] == 3, "stacked, one answer per row"
+    drive(go, size=(90, 30))
+    assert seen["box"] and seen["buttons"] == [True] * 3 and seen["rows"] == 1, seen

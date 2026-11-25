@@ -758,7 +758,7 @@ class HelpScreen(ModalScreen[None]):
 
     CSS = """
     HelpScreen { align: center middle; }
-    #helpbox { width: 78; height: auto; max-height: 90%; border: heavy $accent;
+    #helpbox { width: 78; max-width: 100%; height: auto; max-height: 90%; border: heavy $accent;
                background: $surface; padding: 1 2; }
     #helpbox Static { height: auto; }
     """
@@ -1710,6 +1710,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if home is not None:
             self.doctor_scope = home
             self.call_later(self.go_home)
+        else:
+            # Start lands on Welcome, no project listed. While one side shows at a time (L2,
+            # under ONE_PANE_BELOW) it is the side shown, as any view a person asks for is: the
+            # focus sat in the sidebar, so the narrow layout showed that, with Welcome hidden
+            # (review of #585, #1247).
+            self.call_after_refresh(self.query_one(Panes).show_content)
         self.run_doctor()
         # After the first frame, off the UI thread: the reopen's look at the agents the press
         # recorded, and the release check, which asks PyPI at most once a day whatever the
