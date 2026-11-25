@@ -1,0 +1,737 @@
+"""Settings ▸ tmux (handoff E; the owner's decisions, Q2): every window on rlx's own tmux
+server and whose each one is; Stop and Adopt, on a window no agent owns; and the servers rlx
+did not start, under a fold, read and never written.
+
+Driven as the fleet's tests drive the fleet: the real store in an isolated home, a real spawn's
+row and launch record, and the fleet suite's in-memory ``FakeTmux`` (:class:`PagedTmux` adds the
+one listing the page asks that it lacks, every pane's pid). What ``ps`` lists is the test's. The
+page runs in a Textual app with that same fake behind it; the adopt service is spied on.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import socket
+import sys
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, TypeVar
+
+import pytest
+from textual.app import App, ComposeResult
+from textual.geometry import Region
+from textual.pilot import Pilot
+from textual.widgets import Button, Collapsible, ContentSwitcher, DataTable, Static
+
+from aisquare.cli.ui import persona_dialogs
+from aisquare.cli.ui.sidebar import AgentSelected
+from aisquare.cli.ui.terminal import TerminalPane
+from aisquare.cli.ui.views import tmux_page
+from aisquare.cli.ui.views.tmux_page import (
+    ACT_WORKER,
+    ConfirmPaneScreen,
+    PaneScreen,
+    TmuxView,
+)
+from aisquare.core import claude_accounts as accounts_core
+from aisquare.core import tmux as tmux_core
+from aisquare.core.tmux import Completed, ForeignServer, PanePids, WindowInfo
+from aisquare.models import AdoptableConversation, FleetAgent, ProjectInfo
+from aisquare.services import adopt as adopt_service
+from aisquare.services import fleet as fleet_service
+from aisquare.services import project as project_service
+from aisquare.services import tmux_panes
+from aisquare.services.claude_accounts import SIGN_IN_SESSION
+from aisquare.services.tmux_panes import Pane, PaneRefused, Process, TmuxReport
+from tests import pane_harness
+from tests import test_fleet_service as fleet_suite
+from tests.test_fleet_adopt import SESSION, _transcript
+from tests.test_fleet_service import FakeTmux, _codename, _facts
+from tests.ui_workers import settle_page, settle_until
+
+# The fleet suite's fixtures, bound here so pytest finds them for this module's tests.
+claude_on_path = fleet_suite.claude_on_path
+repo = fleet_suite.repo
+project = fleet_suite.project
+
+T = TypeVar("T")
+SIZE = (140, 40)
+CODEX = "/opt/codex/vendor/aarch64-apple-darwin/codex/codex"
+
+
+class PagedTmux(FakeTmux):
+    """The fleet suite's fake, with every pane's pid in one listing (``pane_pids``), and
+    windows no row names: what a hand-run ``tmux -L asq new-window`` leaves."""
+
+    def pane_pids(self) -> PanePids | None:
+        if not self._read():
+            return PanePids({})
+        pids: dict[str, int | None] = {}
+        for windows in self.sessions.values():
+            for window in windows:
+                facts = self.facts.get(window.pane_id)
+                dead = facts is None or facts.dead
+                pids[window.pane_id] = None if dead else self.pids.get(window.pane_id)
+        return PanePids(pids, self.started)
+
+    def window(self, session: str, name: str, command: str, *, pid: int | None = None) -> str:
+        """A window of no row's in ``session``, running ``command`` (its foreground name)."""
+        self._counter += 1
+        pane_id = f"%{self._counter}"
+        if session not in self.session_ids:
+            self.session_ids[session] = f"${self._sessions_made}"
+            self._sessions_made += 1
+        self.sessions.setdefault(session, []).append(
+            WindowInfo(
+                session=session,
+                window_id=f"@{self._counter}",
+                name=name,
+                pane_id=pane_id,
+                dead=False,
+                dead_status=None,
+                current_command=command,
+                activity=False,
+                session_id=self.session_ids[session],
+            )
+        )
+        self.facts[pane_id] = _facts(pane_id, current_command=command)
+        if pid is not None:
+            self.pids[pane_id] = pid
+        return pane_id
+
+
+@pytest.fixture
+def tmux(monkeypatch: pytest.MonkeyPatch) -> PagedTmux:
+    """The fake every socket answers with, as the fleet suite's ``tmux`` fixture wires it."""
+    fake = PagedTmux()
+    monkeypatch.setattr(fleet_service, "server", lambda config=None: fake)
+    monkeypatch.setattr(tmux_core, "desktop_environment", lambda environ=None: {})
+    monkeypatch.setattr(fleet_service, "_started_since", lambda session_id, launched: True)
+    monkeypatch.setattr(tmux_panes, "_sleep", lambda seconds: None)
+    return fake
+
+
+@pytest.fixture
+def ps(monkeypatch: pytest.MonkeyPatch) -> list[Process]:
+    """What ``ps`` lists: the processes a test says run, none else."""
+    running: list[Process] = []
+    monkeypatch.setattr(tmux_panes, "processes", lambda: list(running))
+    return running
+
+
+@dataclass
+class World:
+    """rlx's server as each test meets it: one agent, and five windows no row names."""
+
+    project: ProjectInfo
+    agent: FleetAgent
+    agent_pane: str
+    dead: str
+    shell: str
+    claude: str
+    codex: str
+    renamed: str
+    """A shell whose window was renamed to the agent's label."""
+
+
+@pytest.fixture
+def world(tmux: PagedTmux, claude_on_path: Path, project: ProjectInfo, ps: list[Process]) -> World:
+    agent = fleet_service.spawn(project, "coder", worktree=False).agent
+    tmux.set_command(agent.pane_id, "claude")
+    tmux.pids[agent.pane_id] = 6000
+    ps.append(Process(6000, 1, 30, "claude --session-id x"))
+    session = fleet_service.session_name(_codename(project))
+    dead = tmux.window(session, "old-run", "sh")
+    tmux.die(dead, 3)
+    shell = tmux.window(session, "scratch", "zsh", pid=7100)
+    ps.append(Process(7100, 1, 75, "-zsh"))
+    # Claude Code started from a shell, by hand: its native binary names itself by its version.
+    claude = tmux.window(session, "by-hand", "2.1.300", pid=7200)
+    ps += [Process(7200, 1, 600, "-zsh"), Process(7201, 7200, 590, "claude --model opus")]
+    codex = tmux.window(session, "codex-run", "codex", pid=7300)
+    ps.append(Process(7300, 1, 40, f"{CODEX} --yolo"))
+    renamed = tmux.window(session, agent.label, "zsh", pid=7400)
+    ps.append(Process(7400, 1, 20, "-zsh"))
+    return World(project, agent, agent.pane_id, dead, shell, claude, codex, renamed)
+
+
+def _by_pane(report: TmuxReport) -> dict[str, Pane]:
+    return {pane.pane_id: pane for pane in report.panes}
+
+
+# --- the rows -------------------------------------------------------------------------------
+
+
+def test_each_window_reads_its_project_its_agent_or_none_its_command_age_and_state(
+    world: World,
+) -> None:
+    report = tmux_panes.read()
+    panes = _by_pane(report)
+    name = project_service.display_name(world.project)
+
+    assert list(panes) == [
+        world.agent_pane,
+        world.dead,
+        world.shell,
+        world.claude,
+        world.codex,
+        world.renamed,
+    ], "every window on the server, an agent's or not"
+    assert {pane.project_name for pane in report.panes} == {name}, "the session's codename"
+    seen = {
+        pane_id: (pane.label, pane.command, pane.state)
+        for pane_id, pane in panes.items()
+    }  # fmt: skip
+    assert seen == {
+        world.agent_pane: (world.agent.label, "claude", "alive"),
+        world.dead: ("no agent", "shell", "dead (exit 3)"),
+        world.shell: ("no agent", "shell", "alive"),
+        world.claude: ("no agent", "claude", "alive"),
+        world.codex: ("no agent", "codex", "alive"),
+        world.renamed: ("no agent", "shell", "alive"),
+    }
+    assert panes[world.renamed].window_name == world.agent.label, (
+        "named for the agent, and still nobody's: the launch record says whose a pane is"
+    )
+    assert panes[world.agent_pane].agent is not None
+    assert panes[world.agent_pane].agent.id == world.agent.id  # type: ignore[union-attr]
+    assert tmux_page.age_text(panes[world.shell], report) == "1m", "75 s by ps"
+    assert tmux_page.age_text(panes[world.claude], report) == "10m"
+    assert tmux_page.age_text(panes[world.dead], report) == "—", "a dead pane has no process"
+    assert panes[world.agent_pane].age(report.read_at) is not None, "the row's own start"
+    assert panes[world.claude].tree == (7200, 7201)
+
+
+def test_a_window_of_rlxs_own_sessions_says_what_it_is_for(
+    tmux: PagedTmux, ps: list[Process]
+) -> None:
+    sign_in = tmux.window(SIGN_IN_SESSION, "account-3", "claude", pid=8100)
+    ps.append(Process(8100, 1, 5, "claude"))
+    editor = tmux.window(tmux_panes.PERSONA_EDITOR_SESSION, "persona-x", "vim", pid=8200)
+    ps.append(Process(8200, 1, 5, "vim draft.md"))
+
+    panes = _by_pane(tmux_panes.read())
+
+    assert panes[sign_in].project_name == "(sign-in)"
+    assert panes[editor].project_name == "(persona editor)" and panes[editor].command == "vim"
+    assert tmux_panes.PERSONA_EDITOR_SESSION == persona_dialogs.EDITOR_SESSION
+
+
+def test_no_tmux_says_so_plainly(tmux: PagedTmux, monkeypatch: pytest.MonkeyPatch) -> None:
+    tmux.installed = False
+    assert tmux_panes.read().unavailable == tmux_panes.NO_TMUX
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert tmux_panes.read().unavailable == tmux_panes.NO_TMUX_ON_WINDOWS
+    assert "tmux" in tmux_panes.NO_TMUX_ON_WINDOWS and "`" not in tmux_panes.NO_TMUX_ON_WINDOWS
+
+
+# --- Stop: a dead window, or a live one nobody's ----------------------------------------------
+
+
+def test_stop_is_offered_for_a_dead_window_and_a_live_orphan_and_never_an_agents_live_pane(
+    world: World, tmux: PagedTmux
+) -> None:
+    panes = _by_pane(tmux_panes.read())
+
+    stoppable = {pane_id for pane_id, pane in panes.items() if pane.stoppable}
+    assert stoppable == {world.dead, world.shell, world.claude, world.codex, world.renamed}
+    assert not tmux_page.offers(panes[world.agent_pane])["stop"]
+    with pytest.raises(PaneRefused, match="stop it from its agent view"):
+        tmux_panes.stop(panes[world.agent_pane])
+    assert tmux.killed == [], "an agent's live pane is its own Stop's"
+
+
+def test_stop_refuses_a_window_that_is_an_agents_by_the_time_it_acts(
+    world: World, tmux: PagedTmux
+) -> None:
+    """Asked again as it acts: the read on screen is seconds old."""
+    shell = _by_pane(tmux_panes.read())[world.shell]
+    tmux.vanish(world.shell)
+    with pytest.raises(PaneRefused, match="is gone"):
+        tmux_panes.stop(shell)
+    assert tmux.killed == []
+
+
+# --- Adopt: a live Claude Code or Codex nobody's ---------------------------------------------
+
+
+def test_adopt_is_offered_for_the_orphan_claude_and_codex_only_never_a_shell(
+    world: World,
+) -> None:
+    panes = _by_pane(tmux_panes.read())
+
+    adoptable = {pane_id for pane_id, pane in panes.items() if pane.adoptable}
+    assert adoptable == {world.claude, world.codex}
+    assert panes[world.claude].runs == "claude-code" and panes[world.codex].runs == "codex"
+    with pytest.raises(PaneRefused, match="not Claude Code or Codex"):
+        tmux_panes.plan_adopt(panes[world.shell])
+    with pytest.raises(PaneRefused, match="in the fleet"):
+        tmux_panes.plan_adopt(panes[world.agent_pane])
+
+
+def test_the_plan_finds_the_conversation_the_panes_claude_holds_before_anything_is_quit(
+    fake_home: Path, tmux: PagedTmux, claude_on_path: Path, project: ProjectInfo, tmp_path: Path
+) -> None:
+    """Claude Code's registry names the session the pane's process runs; every refusal of
+    adopt's is asked then, before anything is quit: here, a folder no project holds."""
+    slot = accounts_core.create_account()
+    path = _transcript(slot, SESSION, project.root)
+    me = os.getpid()  # a live pid, standing for the pane's claude
+    registry = slot.config_dir / "sessions" / f"{me}.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(f'{{"pid": {me}, "sessionId": "{SESSION}"}}', encoding="utf-8")
+
+    plan = adopt_service.plan_pane({me}, processes=[])
+
+    assert plan.conversation.session_id == SESSION and plan.transcript == path
+    assert plan.project.id == project.id and plan.holder == me
+    assert (plan.agent_label, plan.exit_command) == ("Claude Code", "/exit")
+    with pytest.raises(adopt_service.AdoptRefused) as none:
+        adopt_service.plan_pane({me + 1}, processes=[])
+    assert none.value.code == "no_conversation"
+    elsewhere = tmp_path / "not-a-project"
+    elsewhere.mkdir()
+    _transcript(slot, SESSION, elsewhere)
+    with pytest.raises(adopt_service.AdoptRefused) as refused:
+        adopt_service.plan_pane({me}, processes=[])
+    assert refused.value.code == "not_onboarded"
+    assert tmux.spawned == [], "nothing adopted, nothing quit"
+
+
+def _plan(world: World, pane: str) -> adopt_service.PanePlan:
+    return adopt_service.PanePlan(
+        conversation=AdoptableConversation(
+            session_id=SESSION,
+            agent="claude-code",
+            transcript_path=f"/home/me/.claude/projects/x/{SESSION}.jsonl",
+            slot=1,
+            account="main",
+            cwd=str(world.project.root),
+            project_id=world.project.id,
+            last_activity=datetime(2026, 11, 25, 9, 0, tzinfo=UTC),
+            first_prompt="fix the login bug",
+            held_by=7201,
+        ),
+        project=world.project,
+        transcript=Path(f"/home/me/.claude/projects/x/{SESSION}.jsonl"),
+        holder=7201,
+        agent_label="Claude Code",
+        exit_command="/exit",
+    )
+
+
+@dataclass
+class AdoptSpy:
+    planned: list[tuple[int, ...]]
+    adopted: list[tuple[str, str]]
+
+
+@pytest.fixture
+def adopt_spy(world: World, tmux: PagedTmux, monkeypatch: pytest.MonkeyPatch) -> AdoptSpy:
+    """The adopt service, spied on: its plan for the claude pane, and the adopt itself. Its
+    holder is alive until ``/exit`` was typed into that pane."""
+    spy = AdoptSpy([], [])
+
+    def plan_pane(pids: Sequence[int], *, processes: object = None) -> adopt_service.PanePlan:
+        spy.planned.append(tuple(pids))
+        return _plan(world, world.claude)
+
+    def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> Any:
+        spy.adopted.append((ref, role))
+        adopted = world.agent.model_copy(
+            update={"id": "agt_adopted", "label": "coder-2", "session_id": SESSION}
+        )
+        return fleet_service.SpawnReceipt(agent=adopted, asked_label=None, tmux_session="x")
+
+    def alive(pid: int) -> bool:
+        return (world.claude, "literal", "/exit") not in tmux.typed
+
+    monkeypatch.setattr(adopt_service, "plan_pane", plan_pane)
+    monkeypatch.setattr(adopt_service, "adopt", adopt)
+    monkeypatch.setattr(tmux_panes, "_alive", alive)
+    return spy
+
+
+def test_adopt_quits_the_agent_in_its_pane_then_resumes_its_conversation(
+    world: World, tmux: PagedTmux, adopt_spy: AdoptSpy
+) -> None:
+    claude = _by_pane(tmux_panes.read())[world.claude]
+    plan = tmux_panes.plan_adopt(claude)
+
+    receipt = tmux_panes.adopt(claude, plan)
+
+    assert adopt_spy.planned == [(7200, 7201), (7200, 7201)], "planned, and asked again"
+    typed = [entry for entry in tmux.typed if entry[0] == world.claude]
+    assert typed == [(world.claude, "literal", "/exit"), (world.claude, "key", "Enter")]
+    assert adopt_spy.adopted == [(str(plan.transcript), "coder")], "by its transcript"
+    assert receipt.closed and tmux.killed == [world.claude], "its dead window, alone"
+    assert all(entry[0] == world.claude for entry in tmux.typed), "no other pane typed into"
+
+
+def test_adopt_refuses_when_the_pane_holds_another_conversation_now_and_types_nothing(
+    world: World, tmux: PagedTmux, adopt_spy: AdoptSpy
+) -> None:
+    claude = _by_pane(tmux_panes.read())[world.claude]
+    shown = replace(_plan(world, world.claude), transcript=Path("/elsewhere/other.jsonl"))
+    with pytest.raises(PaneRefused, match="another conversation"):
+        tmux_panes.adopt(claude, shown)
+    assert tmux.typed == [] and adopt_spy.adopted == [] and tmux.killed == []
+
+
+def test_an_agent_that_does_not_quit_is_not_adopted(
+    world: World, tmux: PagedTmux, adopt_spy: AdoptSpy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = fleet_suite.FakeClock()
+    monkeypatch.setattr(tmux_panes, "_sleep", clock.sleep)
+    monkeypatch.setattr(tmux_panes, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(tmux_panes, "_alive", lambda pid: True)
+    claude = _by_pane(tmux_panes.read())[world.claude]
+    with pytest.raises(PaneRefused, match="did not quit"):
+        tmux_panes.adopt(claude, tmux_panes.plan_adopt(claude))
+    assert adopt_spy.adopted == [] and tmux.killed == []
+
+
+# --- the servers rlx did not start ------------------------------------------------------------
+
+
+@pytest.fixture
+def their_socket() -> Iterator[Path]:
+    """A tmux server's socket file in a folder of the user's: a unix socket, listening (short
+    path, under the test's private ``TMUX_TMPDIR``: an AF_UNIX path is capped near 100 bytes)."""
+    if sys.platform == "win32":
+        pytest.skip("no unix sockets for tmux on Windows")
+    folder = Path(os.environ["TMUX_TMPDIR"]) / "theirs"
+    folder.mkdir()
+    listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listening.bind(str(folder / "default"))
+    listening.listen()
+    for mine in ("asq", "asq-check"):  # rlx's own, by today's config: never listed
+        own = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        own.bind(str(folder / mine))
+        own.close()
+    (folder / "notes.txt").write_text("no socket", encoding="utf-8")
+    try:
+        yield folder / "default"
+    finally:
+        listening.close()
+
+
+class Logged:
+    """A ``Runner`` standing for the user's own tmux server: one session, two windows; every
+    command it is handed is logged."""
+
+    def __init__(self) -> None:
+        self.log: list[list[str]] = []
+
+    def __call__(self, argv: Sequence[str], stdin: bytes | None) -> Completed:
+        self.log.append(list(argv))
+        sep = "|~|"
+        lines = [
+            sep.join(("main", "0", "%0", "0", "", "vim", "notes")),
+            sep.join(("main", "1", "%1", "1", "130", "bash", "build")),
+        ]
+        return Completed(0, "\n".join(lines) + "\n", "")
+
+
+def _reader(folder: Path | None, runner: Logged | None) -> Callable[[], TmuxReport]:
+    def other(path: Path) -> ForeignServer:
+        return ForeignServer(path, binary=sys.executable, runner=runner)
+
+    return lambda: tmux_panes.read(folder=folder, other=other)
+
+
+def test_the_other_servers_are_read_with_list_panes_alone_and_rlxs_own_sockets_are_not_theirs(
+    world: World, tmux: PagedTmux, their_socket: Path
+) -> None:
+    runner = Logged()
+
+    report = _reader(their_socket.parent, runner)()
+
+    [theirs] = report.others
+    assert theirs.name == "default" and len(theirs.panes) == 2
+    assert [(p.session, p.window_name, p.dead, p.dead_status) for p in theirs.panes] == [
+        ("main", "notes", False, None),
+        ("main", "build", True, 130),
+    ]
+    assert runner.log == [[sys.executable, "-S", str(their_socket), *runner.log[0][3:]]]
+    assert runner.log[0][3:5] == ["list-panes", "-a"] and "-f" not in runner.log[0]
+
+
+# --- the page -------------------------------------------------------------------------------
+
+
+class Host(App[None]):
+    """The page as the app holds it: one of the pages of a ``ContentSwitcher``."""
+
+    def __init__(self, reader: Callable[[], TmuxReport], listed: set[str] | None = None):
+        super().__init__()
+        self.reader = reader
+        self.selected: list[tuple[str, str]] = []
+        self.snapshot = _Snapshot(listed or set())
+
+    def compose(self) -> ComposeResult:
+        with ContentSwitcher(initial="tmux", id="content"):
+            yield TmuxView(reader=self.reader, id="tmux")
+
+    def on_agent_selected(self, event: AgentSelected) -> None:
+        self.selected.append((event.project_id, event.agent_id))
+
+
+class _Snapshot:
+    """What the app lists: ``agent()`` answers for the agents ids named."""
+
+    def __init__(self, listed: set[str]) -> None:
+        self.listed = listed
+
+    def agent(self, project_id: str, agent_id: str) -> object | None:
+        return object() if agent_id in self.listed else None
+
+
+def _drive(
+    reader: Callable[[], TmuxReport],
+    fn: Callable[[Pilot[None], TmuxView], Awaitable[T]],
+    *,
+    listed: set[str] | None = None,
+    size: tuple[int, int] = SIZE,
+) -> T:
+    async def run() -> T:
+        app = Host(reader, listed)
+        async with app.run_test(size=size) as pilot:
+            view = app.query_one(TmuxView)
+            await settle_until(app, lambda: view.report is not None)
+            await settle_page(app)
+            return await fn(pilot, view)
+
+    return asyncio.run(run())
+
+
+def _text(widget: Static) -> str:
+    plain = getattr(widget.visual, "plain", None)
+    if isinstance(plain, str):
+        return plain.rstrip()
+    lines = widget.render_lines(Region(0, 0, max(widget.size.width, 1), max(widget.size.height, 1)))
+    return "\n".join(line.text.rstrip() for line in lines).rstrip()
+
+
+async def _highlight(pilot: Pilot[None], view: TmuxView, pane_id: str) -> None:
+    table = view.query_one(DataTable)
+    row = next(i for i, pane in enumerate(view.panes) if pane.pane_id == pane_id)
+    table.focus()
+    table.move_cursor(row=row)
+    await settle_page(view.app)
+    assert view.highlighted is not None and view.highlighted.pane_id == pane_id
+
+
+def _enabled(view: TmuxView) -> dict[str, bool]:
+    return {
+        act: not view.query_one(f"#tmux-{act}", Button).disabled for act in tmux_page.offers(None)
+    }
+
+
+def test_the_page_lists_every_window_and_offers_each_rows_acts(world: World) -> None:
+    async def go(pilot: Pilot[None], view: TmuxView) -> dict[str, Any]:
+        seen: dict[str, Any] = {"rows": view.query_one(DataTable).row_count}
+        seen["status"] = _text(view.query_one("#tmux-status", Static))
+        for pane_id in (world.agent_pane, world.dead, world.shell, world.claude):
+            await _highlight(pilot, view, pane_id)
+            seen[pane_id] = _enabled(view)
+        seen["fold"] = view.query_one("#tmux-others", Collapsible).display
+        return seen
+
+    seen = _drive(tmux_panes.read, go)
+    assert seen["rows"] == 6
+    assert seen["status"].startswith("6 windows on rlx's tmux server · 5 with no agent")
+    assert seen[world.agent_pane] == {"open": True, "stop": False, "adopt": False}
+    assert seen[world.dead] == {"open": True, "stop": True, "adopt": False}
+    assert seen[world.shell] == {"open": True, "stop": True, "adopt": False}
+    assert seen[world.claude] == {"open": True, "stop": True, "adopt": True}
+    assert seen["fold"] is False, "no other server: no fold at all"
+
+
+def test_the_stop_confirm_names_the_window_and_closes_that_window_alone(
+    world: World, tmux: PagedTmux
+) -> None:
+    async def go(pilot: Pilot[None], view: TmuxView) -> tuple[str, list[str]]:
+        await _highlight(pilot, view, world.agent_pane)
+        await pilot.press("s")
+        await settle_page(view.app)
+        assert not isinstance(view.app.screen, ConfirmPaneScreen), "an agent's: no Stop"
+        await _highlight(pilot, view, world.shell)
+        await pilot.press("s")
+        await settle_until(view.app, lambda: isinstance(view.app.screen, ConfirmPaneScreen))
+        question = _text(view.app.screen.query_one("#tmux-confirm-question", Static))
+        await pilot.click("#tmux-confirm-yes")
+        await settle_until(view.app, lambda: world.shell in tmux.killed, group=ACT_WORKER)
+        await settle_until(view.app, lambda: world.shell not in {p.pane_id for p in view.panes})
+        return question, [pane.pane_id for pane in view.panes]
+
+    question, left = _drive(tmux_panes.read, go)
+    shell = f"asq-{_codename(world.project)} ▸ scratch ({world.shell})"
+    assert shell in question, "the confirm names the window"
+    assert tmux.killed == [world.shell], "that window alone"
+    assert world.shell not in left and world.agent_pane in left
+
+
+def test_adopt_asks_first_naming_the_window_and_its_project_then_quits_and_resumes(
+    world: World, tmux: PagedTmux, adopt_spy: AdoptSpy
+) -> None:
+    async def go(pilot: Pilot[None], view: TmuxView) -> str:
+        await _highlight(pilot, view, world.shell)
+        await pilot.press("a")
+        await settle_page(view.app)
+        assert adopt_spy.planned == [], "a shell: no Adopt"
+        await _highlight(pilot, view, world.claude)
+        await pilot.press("a")
+        await settle_until(view.app, lambda: isinstance(view.app.screen, ConfirmPaneScreen))
+        question = _text(view.app.screen.query_one("#tmux-confirm-question", Static))
+        assert tmux.typed == [], "nothing typed before the confirm"
+        await pilot.click("#tmux-confirm-yes")
+        await settle_until(view.app, lambda: adopt_spy.adopted, group=ACT_WORKER)
+        await settle_page(view.app)
+        return question
+
+    question = _drive(tmux_panes.read, go)
+    assert f"({world.claude})" in question and "by-hand" in question
+    assert project_service.display_name(world.project) in question
+    assert "fix the login bug" in question and "/exit" in question
+    assert (world.claude, "literal", "/exit") in tmux.typed
+    assert adopt_spy.adopted == [(str(_plan(world, world.claude).transcript), "coder")]
+
+
+def test_open_shows_an_agents_view_and_any_other_window_in_a_terminal_pane(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = pane_harness.FakeTmux()
+    harness.panes[world.shell] = pane_harness.FakePane(screen=["$ ls", "notes.txt", "$ "])
+    monkeypatch.setattr(tmux_page, "pane_server", lambda: harness.server(tmp_path))
+
+    async def go(pilot: Pilot[None], view: TmuxView) -> tuple[list[tuple[str, str]], str | None]:
+        host = view.app
+        assert isinstance(host, Host)
+        await _highlight(pilot, view, world.agent_pane)
+        await pilot.press("enter")
+        await settle_page(host)
+        await _highlight(pilot, view, world.shell)
+        await pilot.press("o")
+        await settle_until(host, lambda: isinstance(host.screen, PaneScreen))
+        shown = host.screen.query_one(TerminalPane).pane_id
+        await pilot.press("escape")
+        return host.selected, shown
+
+    selected, shown = _drive(tmux_panes.read, go, listed={world.agent.id})
+    assert selected == [(world.project.id, world.agent.id)], "its agent view"
+    assert shown == world.shell, "the window itself, in a terminal pane"
+
+
+def test_the_fold_of_the_other_servers_is_there_collapsed_and_reads_list_panes_alone(
+    world: World, tmux: PagedTmux, their_socket: Path
+) -> None:
+    runner = Logged()
+
+    async def go(pilot: Pilot[None], view: TmuxView) -> dict[str, Any]:
+        fold = view.query_one("#tmux-others", Collapsible)
+        seen = {"shown": fold.display, "collapsed": fold.collapsed, "title": fold.title}
+        fold.collapsed = False
+        table = view.query_one("#tmux-others-table", Static)
+        await settle_until(view.app, lambda: table.size.height > 0)
+        seen["table"] = _text(table)
+        return seen
+
+    seen = _drive(_reader(their_socket.parent, runner), go)
+    assert seen["shown"] is True and seen["collapsed"] is True
+    assert seen["title"] == "Not started by rlx · 2 panes on 1 server"
+    assert "default" in seen["table"] and "notes" in seen["table"] and "exit 130" in seen["table"]
+    assert runner.log and all(
+        argv[1:3] == ["-S", str(their_socket)] and argv[3] in {"list-panes", "display-message"}
+        for argv in runner.log
+    ), "only reads, and only at that socket"
+    assert tmux.typed == [] and tmux.killed == []
+
+
+def test_with_no_tmux_the_page_says_so_and_shows_nothing_else() -> None:
+    report = TmuxReport(read_at=datetime.now(UTC), unavailable=tmux_panes.NO_TMUX_ON_WINDOWS)
+
+    async def go(pilot: Pilot[None], view: TmuxView) -> tuple[str, list[bool]]:
+        shown = [
+            view.query_one(selector).display
+            for selector in ("#tmux-panes", "#tmux-actions", "#tmux-others", "#tmux-status")
+        ]
+        return _text(view.query_one("#tmux-unavailable", Static)), shown
+
+    message, shown = _drive(lambda: report, go)
+    assert message == tmux_panes.NO_TMUX_ON_WINDOWS
+    assert shown == [False, False, False, False]
+
+
+def test_the_page_reads_only_while_it_shows(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tmux_page, "REFRESH_SECONDS", 0.05)
+    calls: list[int] = []
+
+    def counted() -> TmuxReport:
+        calls.append(1)
+        return tmux_panes.read()
+
+    async def go(pilot: Pilot[None], view: TmuxView) -> tuple[bool, bool, int, int, int]:
+        switcher = view.app.query_one(ContentSwitcher)
+        await settle_until(view.app, lambda: len(calls) >= 3)
+        reading = view.reading
+        await switcher.mount(Static("elsewhere", id="elsewhere"))
+        switcher.current = "elsewhere"
+        await settle_page(view.app)
+        hidden_at = len(calls)
+        await pilot.pause(0.3)
+        hidden_later = len(calls)
+        switcher.current = "tmux"
+        await settle_until(view.app, lambda: len(calls) > hidden_later)
+        return reading, view.reading, hidden_at, hidden_later, len(calls)
+
+    reading, again, hidden_at, hidden_later, shown_again = _drive(counted, go)
+    assert reading and again, "the timer runs while the page shows"
+    assert hidden_later == hidden_at, "nothing is read while it is hidden"
+    assert shown_again > hidden_later
+
+
+def test_the_hub_shows_the_page_in_the_apps_pages(world: World) -> None:
+    """``show_page``: built the first time among the ``#content`` pages, shown again later."""
+
+    class Pages(App[None]):
+        def compose(self) -> ComposeResult:
+            with ContentSwitcher(initial="hub", id="content"):
+                yield Static("hub", id="hub")
+
+    async def run() -> tuple[str | None, bool, str | None, bool, int]:
+        app = Pages()
+        async with app.run_test(size=SIZE):
+            tmux_page.show_page(app, tmux_panes.read)
+            switcher = app.query_one(ContentSwitcher)
+            await settle_until(app, lambda: isinstance(app.focused, DataTable))
+            first, keyboard = switcher.current, isinstance(app.focused, DataTable)
+            app.set_focus(None)
+            switcher.current = "hub"
+            await settle_page(app)
+            tmux_page.show_page(app)
+            await settle_until(app, lambda: isinstance(app.focused, DataTable))
+            again = isinstance(app.focused, DataTable)
+            return first, keyboard, switcher.current, again, len(app.query(TmuxView))
+
+    first, keyboard, current, again, pages = asyncio.run(run())
+    assert (first, current, pages) == ("tmux", "tmux", 1), "built once, shown again"
+    assert keyboard and again, "the keyboard on the table, each time it is shown"
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 30)])
+def test_the_page_fits_the_small_and_the_usual_terminal(
+    world: World, size: tuple[int, int]
+) -> None:
+    """At 80x24 and 120x30 the title, the line, the rows and the acts all show."""
+
+    async def go(pilot: Pilot[None], view: TmuxView) -> list[bool]:
+        return [
+            view.query_one(selector).region.height > 0
+            for selector in ("#tmux-title", "#tmux-status", "#tmux-panes", "#tmux-actions")
+        ]
+
+    assert all(_drive(tmux_panes.read, go, size=size))

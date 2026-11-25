@@ -7,7 +7,8 @@ may say where the fleet types, reads, probes or kills: not a row's ``pane_id``,
 (``core.launch_seal``). Rounds r5 to r8 of #113 each found one more path that handed one
 of them to tmux. So the rule is structural, and this test enumerates it over the fleet's
 service and the board's (``services/fleet.py``, ``services/team.py``), the doctor
-(``services/diagnostics.py``) and asq's views (``cli/ui``), keyed on the ``TmuxServer``
+(``services/diagnostics.py``), Settings ▸ tmux's (``services/tmux_panes.py``) and asq's views
+(``cli/ui``), keyed on the ``TmuxServer``
 handle itself (review r8 of #113, finding 11):
 
 1. Every place a ``TmuxServer`` is MADE — ``TmuxServer(…)``, ``.at(path)``, ``server_for``,
@@ -38,7 +39,8 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "aisquare"
 TMUX = SRC / "core" / "tmux.py"
 FLEET = "services/fleet.py"
 SERVICES = (FLEET, "services/team.py")
-MODULES = (*SERVICES, "services/diagnostics.py")
+TMUX_PAGE = "services/tmux_panes.py"
+MODULES = (*SERVICES, "services/diagnostics.py", TMUX_PAGE)
 UI = "cli/ui"
 
 #: The resolver's handles: the only classes whose methods put a target to tmux unlisted.
@@ -83,6 +85,12 @@ MADE: dict[str, dict[str, str]] = {
         "_check_fleet_terminal": "the fleet's socket from config: its terminal settings",
         "_fleet_server": "the doctor's factory: a socket's name from config or a record",
         "_check_fleet": "today's socket, and each address a launch record places",
+    },
+    TMUX_PAGE: {
+        "rlx_server": (
+            "today's socket (the config's): Settings ▸ tmux lists every window on rlx's own "
+            "server, and acts only there (handoff E)"
+        ),
     },
     f"{UI}/terminal.py": {"TerminalPane.attach": "today's socket, when a view gave none"},
     f"{UI}/persona_dialogs.py": {
@@ -179,12 +187,33 @@ ACTS: dict[str, dict[str, str]] = {
             "pinned-team-variable rows, 0.8.2's `fleet server env`)"
         ),
     },
+    TMUX_PAGE: {
+        # Each acts on a pane tmux itself listed on today's server, asked again as it acts
+        # (`_again`: the same pane id, on a server with the same start), and never on a row's
+        # word: a row's pane is told by its launch record (`resolve_place`) only to be LEFT
+        # alone. Handoff E, the owner's Q2.
+        "stop": (
+            "kills the window of a pane tmux listed on today's server that no launch record "
+            "places there, or that is dead: never a placed row's live pane"
+        ),
+        "adopt": (
+            "types the agent's exit command into a pane tmux listed on today's server that no "
+            "launch record places, which runs Claude Code or Codex, after the human's confirm"
+        ),
+        "_refuse_unless_at_its_prompt": "reads the screen of the pane `adopt` is about to type in",
+        "_close_if_dead": (
+            "kills the window `adopt` quit the agent in, once tmux says it is dead on the "
+            "server it was listed on"
+        ),
+    },
     f"{UI}/terminal.py": {
         "TerminalPane": (
             "the pane a view attached (`shown_pane`): a listed status's, placed by the "
-            "resolver, or a sign-in window the Accounts view made itself; its keys and frames "
-            "go down that pane's server's control client (`core.tmux_control`, 0.8.2's #272) "
-            "or are polled, for that pane alone"
+            "resolver, a sign-in window the Accounts view made itself, or a window no record "
+            "places that tmux listed on today's server, opened from Settings ▸ tmux "
+            "(`views.tmux_page.PaneScreen`); its keys and frames go down that pane's server's "
+            "control client (`core.tmux_control`, 0.8.2's #272) or are polled, for that pane "
+            "alone"
         )
     },
     f"{UI}/persona_dialogs.py": {

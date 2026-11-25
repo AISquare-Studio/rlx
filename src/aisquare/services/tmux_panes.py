@@ -1,0 +1,635 @@
+"""Settings ▸ tmux: every window on rlx's own tmux server, whose each one is, and the two things
+that can be done with one nobody's (handoff E; the owner's decisions, Q2).
+
+**rlx's server** is the fleet's private one (``tmux -L asq``, ``[fleet] tmux_socket``). Every
+window on it is listed, an agent's or not: a project's session is ``asq-<codename>``, and rlx's
+own sessions of no project are the sign-in windows (``asq-accounts``), the persona editor's
+(``asq-persona-edit``) and ``aisquare watch --detach``'s (``asq-watch``). A row's project is
+its session's codename; the agent is the fleet row whose LAUNCH RECORD places it in that pane
+(``fleet.resolve_place``), on this server (``PlacedPane.outlived``: a server numbers its panes
+from ``%0`` again after a restart), never the window's name, which anything can rename. A
+window no record places is nobody's: an orphan.
+
+**Two acts, each on an orphan only**, each asked again of tmux and the records at the moment
+it acts (a read on screen is seconds old):
+
+- :func:`stop` closes a dead window (the bundled config's ``remain-on-exit`` keeps an exited
+  agent's), or a live one no row names. Never a row's live pane: that is its agent's Stop.
+- :func:`adopt` brings a live Claude Code or Codex that runs in an orphan window into the
+  fleet: ``fleet adopt`` resumes a conversation, not a pane, and refuses one a live process
+  holds, so the agent in the pane is quit at its own exit command first and its conversation
+  then resumed in an rlx window. Every refusal of adopt's is asked before anything is quit
+  (``adopt.plan_pane``). Never a plain shell, which holds no conversation.
+
+**The servers rlx did not start** (the user's own ``default``, another tool's: every other
+socket in the user's ``tmux-<uid>`` folder) are read, never written: ``core.tmux.ForeignServer``
+has no method but its ``list-panes``.
+
+Windows has no tmux, and the page says so (:data:`NO_TMUX_ON_WINDOWS`).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+from aisquare.core import procs
+from aisquare.core import tmux as tmux_core
+from aisquare.core.agent_adapters import adapters, get_adapter, recorded_adapter
+from aisquare.core.agent_adapters.types import (
+    AgentAdapter,
+    executable_name,
+    process_executable,
+    screen_of,
+)
+from aisquare.core.config import FleetSettings
+from aisquare.core.store import store_session
+from aisquare.core.tmux import ForeignPane, ForeignServer, TmuxError, TmuxServer, TmuxUnavailable
+from aisquare.models import FleetAgent, ProjectInfo
+from aisquare.services import adopt as adopt_service
+from aisquare.services import fleet as fleet_service
+from aisquare.services import project as project_service
+from aisquare.services.claude_accounts import SIGN_IN_SESSION
+from aisquare.services.watch import DETACHED_SESSION
+
+PERSONA_EDITOR_SESSION = "asq-persona-edit"
+"""The persona editor's session (``cli.ui.persona_dialogs.EDITOR_SESSION``; a test keeps the two
+one): named here, as a service imports no view."""
+
+PURPOSES: Mapping[str, str] = {
+    SIGN_IN_SESSION: "sign-in",
+    PERSONA_EDITOR_SESSION: "persona editor",
+    DETACHED_SESSION: "watch",
+}
+"""rlx's own sessions of no project, and what each one's windows are for."""
+
+ADOPTABLE = frozenset({"claude-code", "codex"})
+"""The agents whose pane Adopt is offered for (the owner's Q2): Claude Code and Codex, whose
+conversations ``fleet adopt`` resumes. Never a plain shell."""
+
+NO_AGENT = "no agent"
+SHELL = "shell"
+SHELLS = frozenset({"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "ash", "nu"})
+
+NO_TMUX_ON_WINDOWS = (
+    "rlx's agents run in tmux, and Windows has no tmux, so there are no panes to show here."
+)
+NO_TMUX = "tmux is not installed on this computer, so there are no panes to show here."
+
+QUIT_WAIT = 20.0
+"""How long :func:`adopt` waits, after typing its agent's exit command, for the agent to quit."""
+_POLL = 0.2
+_KEY_GAP = 0.2
+"""Between the exit command and its Enter, as the fleet types one (``fleet._KEY_GAP``: Codex
+keeps an Enter that arrives in the same burst as text)."""
+
+_sleep = time.sleep
+_monotonic = time.monotonic
+_alive = procs.alive
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+class PaneRefused(fleet_service.FleetError):
+    """The page will not stop or adopt this window (any more): the message says why."""
+
+
+# --- processes: what runs in a pane, and since when -------------------------------------------
+
+
+@dataclass(frozen=True)
+class Process:
+    """One process as ``ps`` lists it."""
+
+    pid: int
+    parent: int
+    elapsed: int | None
+    """Seconds since it started (``etime``); ``None`` when ``ps`` did not say."""
+    args: str
+
+
+def _elapsed(text: str) -> int | None:
+    """``ps``'s ``etime``, ``[[dd-]hh:]mm:ss``, in seconds; ``None`` for anything else."""
+    days, _, clock = text.rpartition("-")
+    parts = clock.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts):
+        return None
+    if days and not days.isdigit():
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def processes() -> list[Process]:
+    """Every process this user can see, with how long each has run; none where ``ps`` cannot
+    run (Windows has none to ask, and no tmux)."""
+    if sys.platform == "win32":
+        return []
+    try:
+        done = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid=,etime=,args="],
+            capture_output=True,
+            text=True,
+            timeout=adopt_service.PS_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    listed: list[Process] = []
+    for line in done.stdout.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) >= 3 and fields[0].isdigit() and fields[1].isdigit():
+            args = fields[3] if len(fields) == 4 else ""
+            listed.append(Process(int(fields[0]), int(fields[1]), _elapsed(fields[2]), args))
+    return listed
+
+
+def _tree(pid: int | None, listed: Sequence[Process]) -> list[Process]:
+    """``pid``'s process and every one below it, the pane's own first."""
+    if pid is None:
+        return []
+    children: dict[int, list[Process]] = {}
+    by_pid: dict[int, Process] = {}
+    for each in listed:
+        children.setdefault(each.parent, []).append(each)
+        by_pid[each.pid] = each
+    found: list[Process] = [by_pid[pid]] if pid in by_pid else []
+    seen = {pid}
+    queue = [pid]
+    while queue:
+        for child in children.get(queue.pop(0), []):
+            if child.pid not in seen:
+                seen.add(child.pid)
+                found.append(child)
+                queue.append(child.pid)
+    return found
+
+
+def _agent_in(tree: Sequence[Process], current: str) -> AgentAdapter | None:
+    """The coding agent that runs in a pane: a process of its tree whose executable is the
+    agent's binary (``types.process_executable``: an npm shim's script, never a word further
+    on, so a shell whose arguments mention ``claude`` runs none), else the pane's foreground
+    command when it is one's name. ``None`` for a shell or any other program."""
+    known = {executable_name(each.binary): each for each in adapters()}
+    for each in tree:
+        image = process_executable(each.args.split())
+        if image is not None and (adapter := known.get(executable_name(image))) is not None:
+            return adapter
+    return known.get(executable_name(current)) if current else None
+
+
+# --- the listing ------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Pane:
+    """One window (its pane) on rlx's tmux server, and whose it is."""
+
+    session: str
+    window_id: str
+    window_name: str
+    """The window's name as tmux has it: shown, never read for who the pane is."""
+    pane_id: str
+    server_started: datetime | None
+    """When the server it is on started: its pane ids name its panes only."""
+    project: ProjectInfo | None
+    """The project whose codename its session is named for (``asq-<codename>``)."""
+    purpose: str | None
+    """For a window of one of rlx's own sessions of no project (:data:`PURPOSES`)."""
+    agent: FleetAgent | None
+    """The fleet row whose launch record places it here (``fleet.resolve_place``)."""
+    command: str
+    """``claude``, ``codex``, ``shell``, or the program's own name."""
+    runs: str | None
+    """The id of the coding agent that runs in it (``claude-code``, ``codex``), live only."""
+    started: datetime | None
+    dead: bool
+    dead_status: int | None
+    pid: int | None
+    tree: tuple[int, ...] = ()
+    """The pane's process and those below it: where its agent's conversation is held."""
+    shares_window: bool = False
+    """Another pane of its window is a row's live one: closing the window would end it."""
+
+    @property
+    def label(self) -> str:
+        return self.agent.label if self.agent is not None else NO_AGENT
+
+    @property
+    def orphan(self) -> bool:
+        """No row or launch record names it."""
+        return self.agent is None
+
+    @property
+    def stoppable(self) -> bool:
+        """A dead window, or a live one nobody's: Stop is offered. Never a row's live pane."""
+        return (self.dead or self.agent is None) and not self.shares_window
+
+    @property
+    def adoptable(self) -> bool:
+        """A live Claude Code or Codex nobody's: Adopt is offered. Never a shell."""
+        return not self.dead and self.agent is None and self.runs in ADOPTABLE
+
+    @property
+    def where(self) -> str:
+        """How a confirm names it: its session, its window's name and its pane."""
+        return f"{self.session} ▸ {self.window_name or '(unnamed)'} ({self.pane_id})"
+
+    @property
+    def project_name(self) -> str:
+        if self.project is not None:
+            return project_service.display_name(self.project)
+        if self.purpose is not None:
+            return f"({self.purpose})"
+        return "—"
+
+    @property
+    def state(self) -> str:
+        if not self.dead:
+            return "alive"
+        return "dead" if self.dead_status is None else f"dead (exit {self.dead_status})"
+
+    def age(self, now: datetime) -> timedelta | None:
+        return None if self.started is None else max(now - self.started, timedelta(0))
+
+
+@dataclass(frozen=True)
+class OtherServer:
+    """A tmux server in the user's socket folder that rlx did not start, and its panes."""
+
+    socket: Path
+    panes: list[ForeignPane] = field(default_factory=list)
+    error: str | None = None
+    """Why it could not be read, when it could not."""
+
+    @property
+    def name(self) -> str:
+        return self.socket.name
+
+
+@dataclass(frozen=True)
+class TmuxReport:
+    """One read of the page: rlx's windows, and the other servers' panes."""
+
+    read_at: datetime
+    panes: list[Pane] = field(default_factory=list)
+    others: list[OtherServer] = field(default_factory=list)
+    unavailable: str | None = None
+    """Why there is no tmux to read (Windows, none installed): the page's one line."""
+    error: str | None = None
+    """Why rlx's server could not be read this time."""
+
+    @property
+    def orphans(self) -> list[Pane]:
+        return [pane for pane in self.panes if pane.orphan]
+
+    @property
+    def other_panes(self) -> int:
+        return sum(len(other.panes) for other in self.others)
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def rlx_server(config: FleetSettings | None = None) -> TmuxServer:
+    """rlx's own tmux server: the one the fleet runs on (``[fleet] tmux_socket``)."""
+    return fleet_service.server(config)
+
+
+def _same_server(address: fleet_service._Address, srv: TmuxServer, config: FleetSettings) -> bool:
+    """Whether a launch record's address is where ``srv`` (today's socket) is asked."""
+    if address.path is None:
+        return address.name == config.tmux_socket
+    try:
+        here = srv.socket_path()
+    except TmuxUnavailable:
+        return False
+    return os.path.realpath(address.path) == os.path.realpath(here)
+
+
+def _owners(
+    srv: TmuxServer, started: datetime | None, config: FleetSettings
+) -> tuple[dict[str, FleetAgent], set[str]]:
+    """Pane id → the row whose launch record places it on ``srv``, the server that started at
+    ``started``; and every socket a record names (rlx's, whatever it is called now).
+
+    Only a row live, or ended since that server started, can have a window on it: one ended
+    before is of an earlier server's. A row no record places names no pane here (``Unplaced``).
+    """
+    since = started or _EPOCH
+    with store_session() as store:
+        projects = store.fleet_live_counts(since)
+        rows = [
+            row
+            for project_id in projects
+            for row in store.fleet_agents(project_id)
+            if row.ended_at is None or row.ended_at >= since
+        ]
+    owners: dict[str, FleetAgent] = {}
+    sockets: set[str] = set()
+    for row in sorted(rows, key=lambda row: row.created_at):
+        placement = fleet_service.resolve_place(row, config=config)
+        if not isinstance(placement, fleet_service.Placed):
+            continue
+        address = placement.pane.address
+        sockets.add(address.name if address.path is None else str(address.path))
+        if not _same_server(address, srv, config) or placement.pane.outlived(started):
+            continue
+        owners[placement.pane.pane_id] = placement.agent
+    return owners, sockets
+
+
+def _projects_by_codename() -> dict[str, ProjectInfo]:
+    with store_session() as store:
+        projects = store.list_projects(all=True)
+    return {project.codename: project for project in projects if project.codename}
+
+
+def _command(current: str, runs: AgentAdapter | None, agent: FleetAgent | None) -> str:
+    if runs is not None:
+        return executable_name(runs.binary)
+    if agent is not None and (adapter := recorded_adapter(agent.agent)) is not None:
+        return executable_name(adapter.binary)
+    name = executable_name(current) if current else ""
+    if name in SHELLS:
+        return SHELL
+    return name or "—"
+
+
+def read(
+    *,
+    config: FleetSettings | None = None,
+    listed: Callable[[], list[Process]] | None = None,
+    folder: Path | None = None,
+    other: Callable[[Path], ForeignServer] | None = None,
+    others: bool = True,
+) -> TmuxReport:
+    """Every window on rlx's tmux server and whose it is, and the panes of every other server
+    in the user's socket folder (``folder``, the one tmux keeps rlx's socket in unless given).
+
+    ``listed`` lists the processes (:func:`processes`) and ``other`` makes the handle on a
+    server rlx did not start: tests hand fakes. ``others=False`` reads rlx's server alone (an
+    act asking again). Raises nothing tmux says: a server that could not be asked is the
+    report's :attr:`~TmuxReport.error`."""
+    now = _now()
+    if sys.platform == "win32":
+        return TmuxReport(read_at=now, unavailable=NO_TMUX_ON_WINDOWS)
+    config = config or fleet_service.settings()
+    srv = rlx_server(config)
+    if not srv.available():
+        return TmuxReport(read_at=now, unavailable=NO_TMUX)
+    try:
+        windows, _output = srv.every_window()
+        pids = srv.pane_pids()
+    except TmuxError as exc:
+        return TmuxReport(read_at=now, error=f"rlx's tmux server could not be read: {exc}")
+    if pids is None:
+        return TmuxReport(read_at=now, error="rlx's tmux server did not answer")
+    found = [window for session in windows.values() for window in session]
+    started = next((w.server_started for w in found if w.server_started), None)
+    started = started or pids.server_started
+    owners, sockets = _owners(srv, started, config) if found else ({}, set())
+    codenames = _projects_by_codename() if found else {}
+    table = (listed or processes)() if any(not window.dead for window in found) else []
+    by_pid = {each.pid: each for each in table}
+    live_owned = {w.window_id for w in found if not w.dead and w.pane_id in owners}
+    panes: list[Pane] = []
+    for window in found:
+        agent = owners.get(window.pane_id)
+        pid = pids.pids.get(window.pane_id)
+        tree = _tree(pid, table) if not window.dead else []
+        runs = None if window.dead else _agent_in(tree, window.current_command)
+        codename = window.session.removeprefix(fleet_service.SESSION_PREFIX)
+        project = None
+        if window.session.startswith(fleet_service.SESSION_PREFIX):
+            project = codenames.get(codename)
+        if project is None and agent is not None:  # a codename since renamed: the row's own
+            project = next((p for p in codenames.values() if p.id == agent.project_id), None)
+        if agent is not None:
+            started_at: datetime | None = agent.created_at
+        elif pid is not None and pid in by_pid and by_pid[pid].elapsed is not None:
+            started_at = now - timedelta(seconds=by_pid[pid].elapsed or 0)
+        else:
+            started_at = None
+        siblings = window.window_id in live_owned and not (agent is not None and not window.dead)
+        panes.append(
+            Pane(
+                session=window.session,
+                window_id=window.window_id,
+                window_name=window.name,
+                pane_id=window.pane_id,
+                server_started=window.server_started or started,
+                project=project,
+                purpose=PURPOSES.get(window.session),
+                agent=agent,
+                command=_command(window.current_command, runs, agent),
+                runs=runs.id if runs is not None else None,
+                started=started_at,
+                dead=window.dead,
+                dead_status=window.dead_status,
+                pid=pid,
+                tree=tuple(each.pid for each in tree),
+                shares_window=siblings,
+            )
+        )
+    servers = _others(config, sockets, folder, other) if others else []
+    return TmuxReport(read_at=now, panes=panes, others=servers)
+
+
+def _others(
+    config: FleetSettings,
+    named: Collection[str],
+    folder: Path | None,
+    other: Callable[[Path], ForeignServer] | None,
+) -> list[OtherServer]:
+    """Every other server in the user's socket folder that has panes: read with one
+    ``list-panes`` each (``ForeignServer``), never written. rlx's own sockets are none of them:
+    today's, its throwaway conf check's, and every one a launch record names. A socket file
+    no server listens behind (tmux leaves its file) has none, and is left out."""
+    folder = folder if folder is not None else tmux_core.socket_folder(config.tmux_socket)
+    mine = {
+        config.tmux_socket,
+        f"{config.tmux_socket}{tmux_core.CHECK_SOCKET_SUFFIX}",
+        *named,
+    }
+    make = other or ForeignServer
+    servers: list[OtherServer] = []
+    for path in tmux_core.sockets_in(folder):
+        if path.name in mine or str(path) in mine:
+            continue
+        try:
+            panes = make(path).panes()
+        except TmuxError as exc:
+            servers.append(OtherServer(path, [], str(exc)))
+            continue
+        if panes:
+            servers.append(OtherServer(path, panes))
+    return servers
+
+
+# --- the acts: on an orphan only, asked again as they act --------------------------------------
+
+
+def _again(
+    pane: Pane, config: FleetSettings, listed: Callable[[], list[Process]] | None
+) -> tuple[Pane, TmuxServer]:
+    """``pane`` as tmux and the records say it is NOW, on the server it was read on; and that
+    server. :class:`PaneRefused` when it is gone, or the server has restarted since (its id
+    names another pane now)."""
+    report = read(config=config, listed=listed, others=False)
+    if report.unavailable or report.error:
+        raise PaneRefused(report.unavailable or report.error or "tmux could not be read")
+    now = next((each for each in report.panes if each.pane_id == pane.pane_id), None)
+    if now is None:
+        raise PaneRefused(f"{pane.where} is gone")
+    if pane.server_started is not None and now.server_started not in (None, pane.server_started):
+        raise PaneRefused(f"{pane.where} is gone: rlx's tmux server has restarted since")
+    return now, rlx_server(config)
+
+
+def stop(
+    pane: Pane,
+    *,
+    config: FleetSettings | None = None,
+    listed: Callable[[], list[Process]] | None = None,
+) -> str:
+    """Close ``pane``'s window, a dead one or a live one nobody's; what was closed. Never a
+    row's live pane, nor a window another of whose panes is one (:class:`PaneRefused`)."""
+    config = config or fleet_service.settings()
+    now, srv = _again(pane, config, listed)
+    if not now.stoppable:
+        raise PaneRefused(
+            f"{now.where} is {now.label}'s, alive: stop it from its agent view, not here"
+            if now.agent is not None
+            else f"{now.where} shares its window with an agent's pane: it is left as it is"
+        )
+    srv.kill_window(now.pane_id)
+    return f"closed {now.where}"
+
+
+def plan_adopt(
+    pane: Pane,
+    *,
+    config: FleetSettings | None = None,
+    listed: Callable[[], list[Process]] | None = None,
+) -> adopt_service.PanePlan:
+    """What adopting ``pane``'s agent would do (``adopt.plan_pane``), asked before the confirm:
+    its conversation and the project it goes into. :class:`PaneRefused` when it is no live
+    Claude Code or Codex nobody's; ``adopt.AdoptRefused`` for every refusal of adopt's."""
+    config = config or fleet_service.settings()
+    now, _srv = _again(pane, config, listed)
+    _require_adoptable(now)
+    return adopt_service.plan_pane(now.tree)
+
+
+def _require_adoptable(pane: Pane) -> None:
+    if pane.adoptable:
+        return
+    if pane.agent is not None:
+        raise PaneRefused(f"{pane.where} is {pane.label}'s already: it is in the fleet")
+    if pane.dead:
+        raise PaneRefused(f"{pane.where} has exited: there is no agent in it to adopt")
+    raise PaneRefused(
+        f"{pane.where} runs {pane.command}, not Claude Code or Codex: only an agent's "
+        "conversation can be adopted"
+    )
+
+
+@dataclass(frozen=True)
+class AdoptReceipt:
+    """What :func:`adopt` did."""
+
+    spawned: fleet_service.SpawnReceipt
+    plan: adopt_service.PanePlan
+    closed: bool
+    """Whether the window it quit was closed: dead once its agent quit (the agent was the
+    pane's own process), and nobody's. One whose shell runs on is left open."""
+
+
+def adopt(
+    pane: Pane,
+    plan: adopt_service.PanePlan,
+    *,
+    role: str = "coder",
+    config: FleetSettings | None = None,
+    listed: Callable[[], list[Process]] | None = None,
+) -> AdoptReceipt:
+    """Adopt ``pane``'s agent as ``plan`` (the one the confirm showed) says: quit it at its
+    exit command, wait for it to let its conversation go, and resume that conversation in an
+    rlx window (``adopt.adopt``), as ``fleet adopt`` does.
+
+    Everything is asked again first: the pane still a live agent nobody's, holding the same
+    conversation, with every refusal of adopt's still clear (``adopt.plan_pane``), and at its
+    empty prompt, where the exit command and its Enter answer nothing else (a dialog's
+    default, a draft the command would join). :class:`PaneRefused` or ``adopt.AdoptRefused``
+    otherwise, with nothing typed."""
+    config = config or fleet_service.settings()
+    now, srv = _again(pane, config, listed)
+    _require_adoptable(now)
+    fresh = adopt_service.plan_pane(now.tree)
+    if fresh.transcript != plan.transcript:
+        raise PaneRefused(
+            f"{now.where} holds another conversation now ({fresh.conversation.session_id}): "
+            "nothing was quit"
+        )
+    _refuse_unless_at_its_prompt(now, fresh, srv)
+    srv.send_literal(now.pane_id, fresh.exit_command)
+    _sleep(_KEY_GAP)
+    srv.send_keys(now.pane_id, "Enter")
+    deadline = _monotonic() + QUIT_WAIT
+    while _alive(fresh.holder):
+        if _monotonic() >= deadline:
+            raise PaneRefused(
+                f"{fresh.agent_label} in {now.where} did not quit within {QUIT_WAIT:g} s of "
+                f"its {fresh.exit_command}: nothing was adopted, and it is left running"
+            )
+        _sleep(_POLL)
+    spawned = adopt_service.adopt(str(fresh.transcript), role=role)
+    return AdoptReceipt(spawned, fresh, _close_if_dead(now, srv))
+
+
+def _refuse_unless_at_its_prompt(pane: Pane, plan: adopt_service.PanePlan, srv: TmuxServer) -> None:
+    """:class:`PaneRefused` when the pane's agent shows anything but its empty prompt, where
+    one reads it off its screen (``AgentScreen.reads_empty_prompt``): typed there, the exit
+    command and its Enter would pick a dialog's answer or join a draft (``fleet._exit_withheld``
+    kills the window instead; here it is the human's to finish)."""
+    adapter = get_adapter(plan.conversation.agent)
+    reader = screen_of(adapter)
+    if not reader.reads_empty_prompt:
+        return
+    try:
+        screen = srv.screen_text(pane.pane_id)
+    except TmuxError as exc:
+        raise PaneRefused(f"{pane.where}'s screen could not be read: {exc}") from exc
+    if not reader.at_empty_prompt(screen):
+        raise PaneRefused(
+            f"{pane.where} shows {adapter.label} at a dialog or a draft, not its empty prompt: "
+            "open it, finish there, then adopt"
+        )
+
+
+def _close_if_dead(pane: Pane, srv: TmuxServer) -> bool:
+    """Close ``pane``'s window once it is dead on the server it was read on, its agent having
+    quit: an orphan's dead window, which Stop would offer next. Fails open: a window that
+    could not be closed is left for Stop."""
+    with contextlib.suppress(TmuxError):
+        facts = srv.pane_facts_or_raise(pane.pane_id)
+        if facts is None or not facts.dead:
+            return False
+        if pane.server_started is not None and facts.server_started not in (
+            None,
+            pane.server_started,
+        ):
+            return False
+        srv.kill_window(pane.pane_id)
+        return True
+    return False

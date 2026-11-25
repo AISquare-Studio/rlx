@@ -43,7 +43,7 @@ from aisquare.cli.ui.sidebar import (
     headroom_dot,
     status_line_text,
 )
-from aisquare.cli.ui.views import personas_tab
+from aisquare.cli.ui.views import personas_tab, tmux_page
 from aisquare.cli.ui.views.app_settings import (
     AGENT_TAB,
     PREFERENCES_TAB,
@@ -54,6 +54,7 @@ from aisquare.cli.ui.views.personas_tab import PersonasTab
 from aisquare.cli.ui.views.settings_captain import CaptainToggle
 from aisquare.cli.ui.views.settings_hub import SettingsHubView
 from aisquare.cli.ui.views.settings_remote import RemoteSection
+from aisquare.cli.ui.views.tmux_page import TmuxView
 from aisquare.core import claude_accounts as core
 from aisquare.core.store import store_session
 from aisquare.models import (
@@ -68,6 +69,8 @@ from aisquare.models import (
     ProjectInfo,
 )
 from aisquare.services import claude_accounts as accounts_service
+from aisquare.services import tmux_panes
+from aisquare.services.tmux_panes import TmuxReport
 from tests.fleet_fakes import list_agents_as
 from tests.test_claude_accounts import _sign_in
 from tests.test_ui_accounts import _overview, _status
@@ -362,13 +365,46 @@ def test_the_hub_is_titled_settings_and_says_what_each_link_opens() -> None:
         "Personas",
         "Usage & stats",
         "Agent resources",
+        "tmux",
         "Doctor",
         "Restart all…",
         "Stop all…",
         "Pause all…",
         "Resume all…",
     ]
-    assert len(about) == 9 and all(about)  # the Fleet section's four share one line
+    assert len(about) == 10 and all(about)  # the Fleet section's four share one line
+
+
+def test_the_tmux_link_sits_after_agent_resources_and_opens_its_page_under_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handoff E (the owner's Q2): a page of the hub's, next to Agent resources. With no tmux
+    (Windows) the page says so in one plain line and shows nothing else."""
+    report = TmuxReport(read_at=datetime.now(UTC), unavailable=tmux_panes.NO_TMUX_ON_WINDOWS)
+    monkeypatch.setattr(tmux_page, "default_reader", lambda: lambda: report)
+
+    async def go(pilot: Pilot[None]) -> dict[str, object]:
+        app = _app(pilot)
+        await pilot.click(app.query_one(SettingsRow))
+        await settle_page(app)
+        hub = app.query_one(SettingsHubView)
+        ids = [button.id for button in hub.query(".hub-link").results(Button)]
+        await pilot.click("#hub-tmux")
+        page = app.query_one("#tmux", TmuxView)
+        await settle_until(app, lambda: page.report is not None)
+        await settle_page(app)
+        return {
+            "after": ids[ids.index("hub-resources") + 1],
+            "open": (app.content.current, app.sidebar.selected_key),
+            "said": _shown(page.query_one("#tmux-unavailable", Static)),
+            "table": page.query_one("#tmux-panes").display,
+        }
+
+    seen = _drive(go)
+    assert seen["after"] == "hub-tmux"
+    assert seen["open"] == ("tmux", SETTINGS_KEY)
+    assert seen["said"] == tmux_panes.NO_TMUX_ON_WINDOWS
+    assert seen["table"] is False
 
 
 def test_the_usage_link_names_no_agent() -> None:
