@@ -2573,7 +2573,7 @@ def composited_text(app: FleetApp, widget: Widget) -> str:
     return strip.text[region.x : region.right]
 
 
-@pytest.mark.parametrize("size", [(80, 24), (99, 24), SIZE])
+@pytest.mark.parametrize("size", [(80, 24), (99, 24), (100, 24), (101, 24), SIZE])
 def test_the_footer_starts_with_help_and_shows_welcome_and_add_project(
     tmp_path: Path, script: Script, size: tuple[int, int]
 ) -> None:

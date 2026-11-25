@@ -731,10 +731,12 @@ class ShellFooter(Footer):
     screen's bindings), so the help key is moved to the front after each.
     """
 
-    NARROW_BELOW = 100
+    NARROW_BELOW = 101
     """Columns under which the keys drop their padding and the palette's key, docked on the
     right, is left out (``F1`` still opens it, and the help says so): at 80 it covered
-    ``R remote`` and ``r refresh``, and help before ``?`` came first."""
+    ``R remote`` and ``r refresh``, and help before ``?`` came first. The padded row with the
+    palette's key is 101 cells, so at exactly 100 the key covered ``r refresh``'s padding (the
+    tester of #553, round 3): the footer is narrow up to and including 100 columns."""
 
     def on_resize(self, event: events.Resize) -> None:
         narrow = event.size.width < self.NARROW_BELOW
