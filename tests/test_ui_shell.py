@@ -370,6 +370,16 @@ def fleet_app(pilot: Pilot[None]) -> FleetApp:
     return app
 
 
+async def from_welcome(pilot: Pilot[None]) -> FleetApp:
+    """The shell on Welcome with nothing selected, where a test about something other than how
+    rlx starts begins. Start opens home since L1, the last-used project's Manager tab
+    (tests/test_manager_tab_is_home.py); ``w`` comes back here, as this does."""
+    app = fleet_app(pilot)
+    await app.action_welcome()
+    await settle(app)
+    return app
+
+
 _needs_tmux = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
 
 
@@ -1016,7 +1026,7 @@ def test_disclosure_collapses_the_agent_rows_without_selecting(
     script["prj_a"] = [status("prj_a", "manager", "manager", "waiting")]
 
     async def go(pilot: Pilot[None]) -> tuple[list[bool], list[str], str | None]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         card = card_for(app, "prj_a")
         rows = card.query_one("#agents")
         glyphs = [shown(card.query_one(Disclosure))]
@@ -1044,7 +1054,7 @@ def test_clicking_a_project_opens_its_project_view_once(tmp_path: Path, script: 
     seed(tmp_path, ("prj_a", "alpha", None), ("prj_b", "beta", None))
 
     async def go(pilot: Pilot[None]) -> tuple[str | None, list[str], int, bool]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         before = app.content.current
         await pilot.click(card_for(app, "prj_b").query_one(ProjectTitle))
         await settle(app)
@@ -1368,7 +1378,7 @@ def test_clicking_an_agent_opens_its_agent_view(tmp_path: Path, script: Script) 
     ]
 
     async def go(pilot: Pilot[None]) -> tuple[str | None, str, str | None, bool, bool]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         before = app.content.current
         await pilot.click(row_for(app, "agt_a_coder-auth"))
         await settle(app)
@@ -1398,7 +1408,7 @@ def test_plus_opens_its_menu_and_add_a_project_onboards(tmp_path: Path, script: 
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def go(pilot: Pilot[None]) -> dict[str, object]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)  # nothing open (start opens home since L1)
         seen: dict[str, object] = {"before": app.content.current}
         await pilot.click("#add-project")
         await settle(app)
@@ -1516,7 +1526,7 @@ def test_the_hubs_doctor_link_opens_the_doctor_page_and_runs_the_checks(
         ]
 
     async def go(pilot: Pilot[None]) -> tuple[int, str | None, str, str | None, str | None, int]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         await settle(app)
         await pilot.pause()
         calls_after_mount = len(calls)
@@ -1596,11 +1606,13 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
     """§0 item 4: a project fix is one click. Without a cwd every one renders disabled.
 
     ``DoctorView`` disables ``scope == "project"`` fixes when ``cwd is None``, so
-    the shell hands it the root its report was run in. Selecting a project runs
-    nothing and arms nothing — the report on the page is still the machine's —
-    and opening the page runs the checks for that project, armed in its root.
+    the shell hands it the root its report was run in. The one run at start is about home's
+    project (L1: start opens home), armed in its root. Selecting another project runs nothing
+    and arms nothing (the report on the page is still home's), and opening the page runs the
+    checks for the project selected, armed in its root.
     """
-    projects = seed(tmp_path, ("prj_a", "alpha", None))
+    projects = seed(tmp_path, ("prj_a", "alpha", None), ("prj_b", "beta", None))
+    ui_app._remember_ui_state(ui_app.LAST_PROJECT_KEY, "prj_a")
     Buttons = list[tuple[str, bool]]
 
     async def go(
@@ -1610,8 +1622,8 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
         await settle(app)
         await pilot.pause()
         shell_doctor = app.query_one("#doctor", DoctorView)
-        globally = (_fix_buttons(shell_doctor), shell_doctor.cwd)  # control: nothing selected yet
-        await pilot.click(card_for(app, "prj_a").query_one(ProjectTitle))
+        at_start = (_fix_buttons(shell_doctor), shell_doctor.cwd)  # control: home's report
+        await pilot.click(card_for(app, "prj_b").query_one(ProjectTitle))
         await pilot.pause()
         await settle(app)
         await pilot.pause()
@@ -1621,7 +1633,7 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
         await settle(app)
         await pilot.pause()
         return (
-            *globally,
+            *at_start,
             *selected,
             _fix_buttons(shell_doctor),
             shell_doctor.cwd,
@@ -1629,22 +1641,19 @@ def test_the_doctor_page_arms_project_fixes_for_the_project_it_ran_for(
         )
 
     checks = [FACTS_WARN, CONNECT_WARN]
-    global_buttons, global_cwd, selected_buttons, selected_cwd, page_buttons, page_cwd, views = (
-        drive(go, doctor=lambda: list(checks))
+    start_buttons, start_cwd, selected_buttons, selected_cwd, page_buttons, page_cwd, views = drive(
+        go, doctor=lambda: list(checks)
     )
-    refused = [
-        ("Refresh this project", True),  # no project: correctly refused
+    armed = [
+        ("Refresh this project", False),  # run for a project: armed
         ("Connect Claude Code", False),
     ]
-    assert global_cwd is None and global_buttons == refused
-    assert selected_cwd is None and selected_buttons == refused, (
-        "selecting a project leaves the machine's report — and its refusals — as they were"
+    assert start_cwd == projects[0].root and start_buttons == armed
+    assert selected_cwd == projects[0].root and selected_buttons == armed, (
+        "selecting a project leaves the report on the page, home's, as it was"
     )
-    assert page_cwd == projects[0].root
-    assert page_buttons == [
-        ("Refresh this project", False),  # run for the project: armed
-        ("Connect Claude Code", False),
-    ]
+    assert page_cwd == projects[1].root
+    assert page_buttons == armed
     assert views == 1, "the project page has no Doctor tab of its own"
 
 
@@ -1652,7 +1661,7 @@ def test_a_doctor_refreshed_message_updates_the_shells_report(
     tmp_path: Path, script: Script
 ) -> None:
     """A one-click fix re-runs the doctor inside the view; the shell must follow it."""
-    seed(tmp_path, ("prj_a", "alpha", None))
+    (home,) = seed(tmp_path, ("prj_a", "alpha", None))
     calls: list[int] = []
 
     def doctor() -> list[DoctorCheck]:
@@ -1670,11 +1679,12 @@ def test_a_doctor_refreshed_message_updates_the_shells_report(
         await settle(app)
         await pilot.pause()
         before = (counts(app), len(calls))
-        # The report the view was handed is about the scope on screen: adopt it.
+        # The report the view was handed is about the scope on screen, home's project (start
+        # opens home since L1): adopt it.
         app.post_message(
             DoctorRefreshed(
                 [DoctorCheck(name="facts", status=CheckStatus.ok, detail="seeded 2 minutes ago")],
-                None,
+                home.root,
             )
         )
         await pilot.pause()
@@ -1745,12 +1755,13 @@ def test_the_doctor_runs_at_start_and_then_only_when_asked(tmp_path: Path, scrip
 
 
 @pytest.mark.parametrize("remembered", ["project:prj_a", "doctor:prj_a"])
-def test_the_one_run_at_start_is_about_the_project_asq_reopens(
+def test_the_one_run_at_start_is_about_the_home_project(
     tmp_path: Path, script: Script, remembered: str
 ) -> None:
     """At start the doctor ran for the machine, then again for the project the restored view
-    selected: two runs, the first thrown away. Now one, about that project — and a reopened
-    Doctor page's own run is that one."""
+    selected: two runs, the first thrown away. Now one, about home's project. Start opens home
+    since L1, whatever was open last: a Doctor page last open is not reopened, and its one run
+    at start is still about the project."""
     projects = seed(tmp_path, ("prj_a", "alpha", None))
     ui_app._remember_ui_state(ui_app.SELECTED_KEY, remembered)
     calls: list[int] = []
@@ -1767,7 +1778,7 @@ def test_the_one_run_at_start_is_about_the_project_asq_reopens(
         return app.content.current, len(calls), app.query_one("#doctor", DoctorView).cwd
 
     current, count, cwd = drive(go, doctor=doctor)
-    assert current == ("project-prj_a" if remembered.startswith("project") else "doctor")
+    assert current == "project-prj_a", "home: the only project's view (its Manager tab)"
     assert count == 1
     assert cwd == projects[0].root
 
@@ -2840,10 +2851,10 @@ def test_the_arrows_walk_the_one_highlight_and_open_each_row_they_land_on(
         await pilot.pause()
         before = highlighted(app)
         walk: list[tuple[str, ...]] = []
-        # Up at the top already stays on the first row; then down past Spawn agent to the
-        # card, its agent row, back up to the title and down again (the captain's walk:
-        # test_sidebar_actions).
-        for key in ("up", "down", "down", "down", "up", "down"):
+        # From home's row (start opens home since L1): up past Spawn agent to the +, up at
+        # the top stays there; then down past Spawn agent to the card, its agent row, back up
+        # to the title and down again (the captain's walk: test_sidebar_actions).
+        for key in ("up", "up", "up", "down", "down", "down", "up", "down"):
             await pilot.press(key)
             await settle(app)
             (row,) = (row for row in app.sidebar.query(Activatable) if row.has_class("selected"))
@@ -2853,10 +2864,12 @@ def test_the_arrows_walk_the_one_highlight_and_open_each_row_they_land_on(
         return before, walk, str(app.content.current), type(app.focused).__name__
 
     before, walk, current, focused = drive(go)
-    assert before == []  # nothing highlighted until a row is chosen
+    assert before == ["project:prj_a"]  # home's row, its view open
     assert walk == [
-        ("AddButton", "welcome", "Sidebar"),  # highlighted, and the Onboard view not opened
-        ("SpawnButton", "welcome", "Sidebar"),  # highlighted, and no Spawn dialog
+        ("SpawnButton", "project-prj_a", "Sidebar"),  # highlighted, and no Spawn dialog
+        ("AddButton", "project-prj_a", "Sidebar"),  # highlighted, and the + menu not opened
+        ("AddButton", "project-prj_a", "Sidebar"),  # the top: up stays
+        ("SpawnButton", "project-prj_a", "Sidebar"),
         ("ProjectTitle", "project-prj_a", "Sidebar"),
         ("AgentRow", "agent-agt_a_manager", "Sidebar"),  # its pane did not take the keys
         ("ProjectTitle", "project-prj_a", "Sidebar"),
@@ -2933,9 +2946,9 @@ def test_collapsing_the_highlighted_rows_card_leaves_one_highlight_and_moves_bes
         app = fleet_app(pilot)
         app.sidebar.focus()
         await pilot.pause()
-        for _ in range(4):  # add → spawn-agent → project:prj_a → agent:agt_a_manager
-            await pilot.press("down")
-            await settle(app)
+        # From home's row, project:prj_a (start opens home since L1), down to its agent's.
+        await pilot.press("down")
+        await settle(app)
         walked = highlighted(app)
         await pilot.click(card_for(app, "prj_a").query_one(Disclosure))  # hides the lit row
         await pilot.pause()
@@ -2962,9 +2975,10 @@ def test_the_arrows_skip_the_rows_of_a_collapsed_card(
 
     def walk(*, collapse: bool) -> list[str]:
         # The rows the arrows open are remembered, as a click's are: each walk starts at
-        # launch with nothing to reopen, or it would start where the last one ended.
+        # launch with nothing remembered, or its home would be where the last one ended.
         with store_session() as store:
             store.set_ui_state("fleet.selected", None)
+            store.set_ui_state(ui_app.LAST_PROJECT_KEY, None)
 
         async def go(pilot: Pilot[None]) -> list[str]:
             app = fleet_app(pilot)
@@ -2975,8 +2989,14 @@ def test_the_arrows_skip_the_rows_of_a_collapsed_card(
             assert card.query_one("#agents").display is not collapse
             app.sidebar.focus()
             await pilot.pause()
-            keys: list[str] = []
-            for _ in range(5):
+            # Start opens home since L1, so the walk begins on its row: up to the top first
+            # (up at the top stays there), then down from the +.
+            for _ in range(6):
+                await pilot.press("up")
+                await settle(app)
+            (key,) = highlighted(app)
+            keys: list[str] = [key]
+            for _ in range(4):
                 await pilot.press("down")
                 await settle(app)
                 (key,) = highlighted(app)
@@ -6355,12 +6375,11 @@ def test_with_capture_off_no_captured_directory_is_listed_whatever_was_saved(
         assert [p.id for p in store.captured_projects()] == ["prj_scratch"], "nothing deleted"
 
 
-def test_the_shell_reopens_what_was_open_when_its_row_is_still_there(
-    tmp_path: Path, script: Script
-) -> None:
-    """#144: the UI restored exactly one thing at mount, the theme. What was open —
-    a project, an agent, a page — is remembered in the store's ui_state and comes
-    back; an agent whose row is gone falls back to its project."""
+def test_a_relaunch_opens_home_whatever_view_was_open(tmp_path: Path, script: Script) -> None:
+    """#144 remembered what was open (a project, an agent, a page) in the store's ui_state and
+    reopened it at start. Since L1 start opens home instead: the last-used project's Manager tab,
+    the agent's project when an agent's view was open last. The memory is still kept and
+    written; a stale one opens home all the same, and is replaced by home's."""
     seed(tmp_path, ("prj_a", "alpha", None))
     script["prj_a"] = [status("prj_a", "coder-auth", "coder", "working")]
 
@@ -6374,6 +6393,7 @@ def test_the_shell_reopens_what_was_open_when_its_row_is_still_there(
     assert drive(open_agent) == "agent-agt_a_coder-auth"
     with store_session() as store:
         assert store.ui_state("fleet.selected") == "agent:prj_a/agt_a_coder-auth"
+        assert store.ui_state(ui_app.LAST_PROJECT_KEY) == "prj_a"
 
     async def relaunch(pilot: Pilot[None]) -> tuple[str | None, str | None]:
         app = fleet_app(pilot)
@@ -6382,23 +6402,25 @@ def test_the_shell_reopens_what_was_open_when_its_row_is_still_there(
         view = app.current_view()
         return (view.id if view else None), app.sidebar.selected_key
 
-    assert drive(relaunch) == ("agent-agt_a_coder-auth", "agent:agt_a_coder-auth")
+    assert drive(relaunch) == ("project-prj_a", "project:prj_a"), "home, not the agent's view"
 
-    script["prj_a"] = []  # the agent's row is gone: its project is the fallback
+    script["prj_a"] = []  # the agent's row is gone: home is its project all the same
     assert drive(relaunch) == ("project-prj_a", "project:prj_a")
 
     with store_session() as store:
-        store.set_ui_state("fleet.selected", "project:prj_gone")  # nothing to reopen
-    assert drive(relaunch) == ("welcome", None)
+        store.set_ui_state("fleet.selected", "project:prj_gone")  # nothing of it is listed
+        store.set_ui_state(ui_app.LAST_PROJECT_KEY, "prj_gone")
+    assert drive(relaunch) == ("project-prj_a", "project:prj_a"), "the first listed project"
     with store_session() as store:
-        assert store.ui_state("fleet.selected") is None, "a stale memory is dropped, not retried"
+        assert store.ui_state("fleet.selected") == "project:prj_a", "the stale memory replaced"
 
 
-def test_the_shell_remembers_the_captured_toggle_and_reopens_a_page(
+def test_the_shell_remembers_the_captured_toggle_and_starts_home_whatever_page_was_open(
     tmp_path: Path, script: Script, project_capture: None
 ) -> None:
-    """Review of #169: what the shell remembers beyond a row came back untested —
-    the captured directories shown with `a`, and every page under ⚙ Settings."""
+    """Review of #169: what the shell remembers beyond a row came back untested: the captured
+    directories shown with `a`, and every page under ⚙ Settings. Since L1 a page last open
+    is not reopened at start: start opens home."""
     seed(tmp_path, ("prj_a", "alpha", None))
     with store_session() as store:
         store.ensure_project(ProjectInfo(id="prj_scratch", root=tmp_path / "scratch"))  # a hook
@@ -6425,17 +6447,12 @@ def test_the_shell_remembers_the_captured_toggle_and_reopens_a_page(
         assert store.ui_state("fleet.show_captured") is None, "hiding them again is remembered"
     assert drive(relaunch)[0] == ["prj_a"]
 
-    # Every page under ⚙ Settings reopens with Settings the highlighted row — the two
-    # remembered before the hub existed (`accounts`, `doctor:`) as much as the new ones.
-    for remembered, page in (
-        ("settings", "settings-hub"),
-        ("app-settings", "app-settings"),
-        ("accounts", "accounts"),
-        ("doctor:", "doctor"),
-    ):
+    # A page under ⚙ Settings last open is no longer reopened at start (L1: start opens home,
+    # the last-used project's Manager tab); it stays remembered for the session it is in.
+    for remembered in ("settings", "app-settings", "accounts", "doctor:"):
         with store_session() as store:
             store.set_ui_state("fleet.selected", remembered)
-        assert drive(relaunch)[1:] == (page, "settings"), remembered
+        assert drive(relaunch)[1:] == ("project-prj_a", "project:prj_a"), remembered
 
 
 # --- groups, pins and manual order (#140) ---------------------------------------------------
@@ -6797,7 +6814,7 @@ def test_m_marks_the_card_under_the_cursor_so_a_selection_needs_no_shift_click(
     script["prj_c"] = [status("prj_c", "coder-1", "coder", "working")]
 
     async def go(pilot: Pilot[None]) -> tuple[list[str], list[str], str | None, list[str]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         app.sidebar.focus()
         for key in ("project:prj_a", "project:prj_b", "agent:agt_c_coder-1", "project:prj_b"):
             app.sidebar.select(key)  # the highlight the keys act on
@@ -6945,7 +6962,7 @@ def test_a_click_on_a_group_header_folds_it_and_a_drag_back_onto_itself_opens_no
         groups_service.create_group(store, "tools", ["prj_b"])
 
     async def go(pilot: Pilot[None]) -> tuple[list[str], list[str], str | None, bool]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         await _click(pilot, app.sidebar.query_one(GroupHeader))
         folded = _cards(app)
         await _click(pilot, app.sidebar.query_one(GroupHeader))
@@ -7148,7 +7165,7 @@ def test_another_button_let_go_mid_drag_does_not_end_it(
         groups_service.create_group(store, "tools", ["prj_b"])
 
     async def go(pilot: Pilot[None]) -> tuple[list[str], list[str], str | None, list[str]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         before = _cards(app)
         header = app.sidebar.query_one(GroupHeader)
         await _as_the_terminal_sends(

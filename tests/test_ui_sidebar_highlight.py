@@ -25,6 +25,7 @@ from textual.css.query import NoMatches
 from textual.pilot import Pilot
 from textual.widgets import Button
 
+from aisquare.cli.ui import app as ui_app
 from aisquare.cli.ui.adopt_picker import AddMenu
 from aisquare.cli.ui.app import FleetApp
 from aisquare.cli.ui.sidebar import Disclosure, ProjectCard, ProjectTitle, Sidebar, StatusLine
@@ -79,7 +80,7 @@ def test_a_click_takes_the_one_highlight_and_the_arrows_go_on_from_the_clicked_r
 
         app.sidebar.focus()
         await pilot.pause()
-        for _ in range(5):  # add, Spawn agent, alpha, its manager, beta
+        for _ in range(2):  # from home, alpha (start opens home since L1): its manager, beta
             await pilot.press("down")
             await settle(app)
         look()
@@ -123,7 +124,7 @@ def test_the_arrows_open_an_agent_without_its_pane_taking_the_keys_and_x_stops_i
         app = fleet_app(pilot)
         app.sidebar.focus()
         await pilot.pause()
-        for _ in range(4):  # add, Spawn agent, alpha, its agent
+        for _ in range(1):  # from home, alpha (start opens home since L1): its agent
             await pilot.press("down")
             await settle(app)
         lit, current, focused = highlighted(app), str(app.content.current), type(app.focused)
@@ -160,7 +161,14 @@ def test_passing_over_add_spawn_and_a_group_header_only_highlights_them(
         await pilot.pause()
         base = app.screen
         walk: list[tuple[str, str, bool]] = []
-        for key in ["down"] * 6 + ["up"] * 4:  # down to alpha, back up to Spawn agent
+        # Start opens home since L1, beta (the first card the sidebar lists, in its group): up
+        # from its row to the top first, passing the group, Spawn agent and + as any walk does.
+        for _ in range(6):
+            await pilot.press("up")
+            await settle(app)
+        (lit,) = highlighted(app)
+        walk.append((lit, str(app.content.current), app.screen is not base))
+        for key in ["down"] * 5 + ["up"] * 4:  # down to alpha, back up to Spawn agent
             await pilot.press(key)
             await settle(app)
             (lit,) = highlighted(app)
@@ -183,9 +191,9 @@ def test_passing_over_add_spawn_and_a_group_header_only_highlights_them(
     walk, folded, dialog, after_add = drive(go)
     # (the row lit, the view shown, whether a dialog is up)
     assert walk == [
-        ("add", "welcome", False),  # highlighted; the Onboard view did not open
-        ("spawn-agent", "welcome", False),  # highlighted; no Spawn dialog
-        (f"group:{group.id}", "welcome", False),  # highlighted; nothing folded
+        ("add", "project-prj_b", False),  # highlighted; the Onboard view did not open
+        ("spawn-agent", "project-prj_b", False),  # highlighted; no Spawn dialog
+        (f"group:{group.id}", "project-prj_b", False),  # highlighted; nothing folded
         ("project:prj_b", "project-prj_b", False),
         ("agent:agt_b_manager", "agent-agt_b_manager", False),
         ("project:prj_a", "project-prj_a", False),
@@ -467,6 +475,9 @@ def test_an_arrow_onto_a_row_that_opens_nothing_mid_build_still_finishes_the_ope
     script["prj_b"] = [status("prj_b", "manager", "manager", "waiting")]
     with store_session() as store:
         group, _ = groups_service.create_group(store, "tools", ["prj_b"])
+        # Home is alpha (start opens home since L1): beta's view is built by nothing but this
+        # walk, which passes over its title.
+        store.set_ui_state(ui_app.LAST_PROJECT_KEY, "prj_a")
     real_show = FleetApp._show
 
     async def show_then_walk(
@@ -531,8 +542,10 @@ def test_rows_the_arrows_open_in_passing_are_not_counted_as_views_used(
         app.sidebar.focus()
         await pilot.pause()
         counted.clear()
-        for _ in range(4):  # add, Spawn agent, alpha (opens), its manager (opens)
-            await pilot.press("down")
+        # From home, alpha's row (start opens home since L1): up to the +, then down past Spawn
+        # agent, alpha (opens) and its manager (opens).
+        for key in ("up", "up", "down", "down", "down"):
+            await pilot.press(key)
             await settle(app)
         passing = [name for name in counted if name.startswith("tui.view.")]
         await pilot.press("enter")  # the manager's row: its click
@@ -571,16 +584,18 @@ def test_an_arrow_paints_the_highlight_once(
         app.sidebar.focus()
         await pilot.pause()
         per_key: list[list[str | None]] = []
-        for _ in range(4):  # add, Spawn agent, alpha (opens), its manager (opens)
+        # From home, alpha's row (start opens home since L1): its manager (opens), alpha
+        # (opens), Spawn agent, the +.
+        for key in ("down", "up", "up", "up"):
             passes.clear()
-            await pilot.press("down")
+            await pilot.press(key)
             await settle(app)
             per_key.append(list(passes))
         return per_key
 
     assert drive(go) == [
-        ["add"],
-        ["spawn-agent"],
-        ["project:prj_a"],
         ["agent:agt_a_manager"],
+        ["project:prj_a"],
+        ["spawn-agent"],
+        ["add"],
     ]
