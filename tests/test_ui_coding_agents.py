@@ -6,12 +6,13 @@ from pathlib import Path
 
 import pytest
 from textual.pilot import Pilot
-from textual.widgets import Button, Select
+from textual.widgets import Select
 
 from aisquare.cli.ui.views.app_settings import AppSettingsView
 from aisquare.core import paths
 from aisquare.core.agent_adapters import get_adapter
 from aisquare.core.config import RoleLaunchProfile, load_config, save_config
+from tests.settings_fields import leave_fields
 from tests.test_ui_app_settings import AppHost, drive
 
 
@@ -22,11 +23,11 @@ def test_ui_settings_persist_mixed_agents_and_native_permissions() -> None:
         host.query_one("#role-family-reviewer", Select).value = "claude-code"
         host.query_one("#role-sandbox-coder", Select).value = "workspace-write"
         host.query_one("#role-approval-coder", Select).value = "on-request"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await pilot.pause()
         return host.notices
 
-    assert any("saved" in message for message, _ in drive(scenario))
+    assert any(message.startswith("Saved ") for message, _ in drive(scenario))
     config = load_config()
     assert config.agents.default == "codex"
     assert config.team.profiles["reviewer"].agent == "claude-code"
@@ -46,7 +47,7 @@ def test_settings_render_reload_and_refuse_saving_a_damaged_config(tmp_path: Pat
         assert "Showing defaults" in view._config_error
         assert view.query_one("#default-agent", Select).value == ""
         view.reload_form()
-        view.query_one("#save-settings", Button).press()
+        leave_fields(view)
         await pilot.pause()
         assert any("nothing saved" in message for message, _ in host.notices)
         assert config_path.read_text() == broken
@@ -80,7 +81,7 @@ def test_settings_preserve_unknown_choices_on_mount_reload_and_save(tmp_path: Pa
         save_config(config)
         view.reload_form()
         await pilot.pause()
-        view.query_one("#save-settings", Button).press()
+        leave_fields(view)
         await pilot.pause()
         saved = load_config()
         assert saved.agents.default == "newer-agent"
@@ -132,7 +133,7 @@ def test_settings_never_persist_an_uninitialized_selection(
                 uninitialized[query] if query in uninitialized else lookup(query, expect_type)
             ),
         )
-        view._save_fleet_settings()
+        leave_fields(view)
         saved = load_config()
         assert saved.agents.default == "codex"
         assert saved.team.profiles["coder"].agent == "codex"
@@ -153,7 +154,7 @@ def test_settings_round_trip_the_empty_native_permission_mode(tmp_path: Path) ->
         view = host.query_one(AppSettingsView)
         control = view.query_one("#role-perm-coder", Select)
         assert control.value == "" and control.value is not Select.NULL
-        view.query_one("#save-settings", Button).press()
+        leave_fields(view)
         await pilot.pause()
         saved = load_config().fleet.roles["coder"].permission_mode
         assert saved == ""

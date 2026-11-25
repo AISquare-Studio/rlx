@@ -49,6 +49,7 @@ from textual.worker import Worker
 
 from aisquare.cli.ui.clipboard import copy_and_tell
 from aisquare.cli.ui.remote_control import AUTO_OFF_CHOICES, RemoteController
+from aisquare.cli.ui.save_model import UNDO_BINDING, SavesAsYouGo
 from aisquare.cli.ui.ticks import while_running
 from aisquare.cli.ui.views import settings_remote
 from aisquare.cli.ui.views.settings_remote import (
@@ -140,8 +141,13 @@ def qr_text(url: str) -> str:
     return buffer.getvalue().rstrip("\n")
 
 
-class RemotePanel(ModalScreen[None]):
-    """Remote on/off · password · allow write · auto-off · devices · link + QR. Esc closes."""
+class RemotePanel(SavesAsYouGo, ModalScreen[None]):
+    """Remote on/off · password · allow write · auto-off · devices · link + QR. Esc closes.
+
+    Its two settings, *Allow write actions* and *Auto-off*, are kept as they change, and
+    ctrl+z takes the last back (M5, ``cli.ui.save_model``). *Remote* itself, a new link or
+    password and a revoke are actions, not settings, with no Undo: a link given out cannot
+    be taken back."""
 
     CSS = """
     RemotePanel { align: center middle; }
@@ -166,7 +172,7 @@ class RemotePanel(ModalScreen[None]):
     #remote-devices { height: 8; }
     #remote-write-hint { color: $text-muted; }
     """
-    BINDINGS: ClassVar = [("escape", "close_panel", "close")]
+    BINDINGS: ClassVar = [("escape", "close_panel", "close"), UNDO_BINDING]
 
     def __init__(self, controller: RemoteController) -> None:
         super().__init__()
@@ -482,14 +488,34 @@ class RemotePanel(ModalScreen[None]):
             self.controller.set_allow_write(event.value, wait=False)
             if event.value:
                 self.notify("Write actions are ON for remote devices", severity="warning")
+            back = not event.value
+            self.kept(
+                f"allow write actions: {'on' if event.value else 'off'}",
+                lambda: self._put_write(back),
+            )
         self.repaint(heard=switch.id)
+
+    def _put_write(self, on: bool) -> None:
+        """Undo of *Allow write actions*: the switch as it was, written and shown."""
+        self.controller.set_allow_write(on, wait=False)
+        self.repaint(heard="remote-allow-write")
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "remote-auto-off" or event.value not in AUTO_OFF_CHOICES:
             return
-        if event.value == self.controller.state.auto_off_minutes:
+        before = self.controller.state.auto_off_minutes
+        if event.value == before:
             return  # the Select announcing its initial value at mount — not a change
         self.controller.set_auto_off(event.value, wait=False)
+        self.repaint()
+        self.kept(f"auto-off: {_auto_off_label(event.value)}", lambda: self._put_auto_off(before))
+
+    def _put_auto_off(self, minutes: int | None) -> None:
+        """Undo of *Auto-off*: the choice as it was, written and shown."""
+        select = self.query_one("#remote-auto-off", Select)
+        with self.prevent(Select.Changed):
+            select.value = minutes
+        self.controller.set_auto_off(minutes, wait=False)
         self.repaint()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:

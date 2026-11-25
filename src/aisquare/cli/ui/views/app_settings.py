@@ -91,7 +91,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from typing import ClassVar, Literal, NamedTuple, get_args
 
 from rich.text import Text
@@ -101,6 +101,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Checkbox,
@@ -119,6 +120,7 @@ from aisquare.cli.ui.attach import NewBindScreen
 from aisquare.cli.ui.click_guard import GuardedButton
 from aisquare.cli.ui.confirm_button import ConfirmButton
 from aisquare.cli.ui.dont_ask import ASK_AGAIN, EVERY_ACTION_ASKS, said_not_asking
+from aisquare.cli.ui.save_model import UNDO_BINDING, UNDO_SAID, CommitInput, SavesAsYouGo
 from aisquare.cli.ui.sidebar import short_path
 from aisquare.cli.ui.views.settings_captain import CaptainToggle
 from aisquare.cli.ui.views.settings_remote import RemoteLink
@@ -220,6 +222,35 @@ _INPUTS = (
     "accounts-wait-minutes",
 )
 _SELECTS = ("default-agent", "accounts-pick", "accounts-on-limit", "accounts-prefer")
+_SAID = {
+    "default-agent": "the fallback coding agent",
+    "escape-key": "the escape key",
+    "max-agents": "max agents per project",
+    "worktree-dir": "the worktree root",
+    "native-teams": "native agent teams off",
+    "accounts-pick": "how launches pick",
+    "accounts-on-limit": "what a usage limit does",
+    "accounts-switch-at": "switch at",
+    "accounts-prefer": "under the line, prefer",
+    "accounts-wait-minutes": "wait if reset within",
+    "accounts-cross-agent": "hand off across agents",
+    "accounts-share-trust": "share folder trust",
+    "accounts-share-settings": "share settings.json",
+    "updates-check": "the daily release check",
+}
+"""How "Saved <what> · Undo" names each of the form's fields beside the per-role rows (M5)."""
+_ROLE_SAID = {
+    "family": "agent",
+    "intent": "permission",
+    "worktree": "worktree",
+    "persona": "persona",
+    "acct": "account",
+    "perm": "permission mode",
+    "sandbox": "sandbox",
+    "approval": "approval",
+    "afm": "approve for me",
+}
+"""How it names a role's field, after the role's name: ``coder's permission``."""
 
 CROSS_AGENT_TIP = (
     "When every account of an agent is full, hand its work to another agent's account "
@@ -646,10 +677,16 @@ def section_title(title: str, about: str) -> Text:
     return Text.assemble((title, "bold"), ("  " + about, "dim"))
 
 
-class AppSettingsView(Vertical):
+class AppSettingsView(SavesAsYouGo, Vertical):
     """The machine-wide settings in four tabs — *Agent settings* (accounts, roles, fleet, and
     the captain last), *User preferences* (``[ui]``, ``[updates]``), *Display* and *Remote* —
-    and under the first two Save, Reload, Reset all."""
+    and under the first two Reset all.
+
+    Every control is kept as it is changed (M5, ``cli.ui.save_model``): a switch or a pick at
+    once, a text field on Enter or on leaving it, each alone, and ctrl+z takes the last one
+    back. A value the form refuses is said under its field and nothing is written."""
+
+    BINDINGS: ClassVar = [UNDO_BINDING]
 
     DEFAULT_CSS = """
     AppSettingsView { padding: 1 1 0 1; }
@@ -736,11 +773,12 @@ class AppSettingsView(Vertical):
     # One line: at 80x24, beside the sidebar, three pushed the tab's Advanced one scroll down.
     UPDATES_CHECK_ABOUT: ClassVar[str] = "Off: no PyPI lookup, no ⬆ row in the sidebar."
     PREFERENCES_FROM_OUTSIDE: ClassVar[str] = (
-        "A preference changed outside rlx shows after Reload here, or when rlx next starts; "
-        "not live."
+        "A preference changed outside rlx shows when you next open this page, or when rlx "
+        "next starts; not live."
     )
     """The tab's note: ``asq`` holds ``[ui]`` and takes it from this page, so a change made
-    elsewhere while it runs waits for one or the other. It names no command (R13)."""
+    elsewhere while it runs waits for one or the other (the page re-reads the file each time
+    it is opened, :meth:`AppSettingsView.on_show`). It names no command (R13)."""
 
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
@@ -760,7 +798,10 @@ class AppSettingsView(Vertical):
         self._accounts: list[ClaudeAccount] = []
         """The slots the account selects offer — filled by :meth:`_load_accounts`'s worker."""
         self._shown: dict[str, object] = {}
-        """What each field showed when the form was (re)read: Save writes only what differs."""
+        """What each field showed when the form was (re)read: what is on disk, so a field
+        showing anything else was changed by the person, and is kept alone (M5)."""
+        self._left = False
+        """The page was switched away from: shown again, it re-reads the file."""
         self._persona_names, self._personas_unavailable = self._read_persona_names()
 
     @staticmethod
@@ -919,9 +960,9 @@ class AppSettingsView(Vertical):
                 VerticalScroll(id="remote-settings", classes="tab-body"),
             ):
                 yield RemoteLink(id="settings-remote")
+        # No Save and no Reload (M5): each control is kept as it changes, and the page re-reads
+        # the file when it is opened. Reset all stays: it acts on every setting, armed twice.
         with Horizontal(id="settings-buttons"):
-            yield Button("Save", id="save-settings", variant="primary", compact=True)
-            yield Button("Reload", id="reload-settings", compact=True)
             yield ConfirmButton(
                 "Reset all settings to default",
                 armed_label="Reset all? click again",
@@ -932,8 +973,8 @@ class AppSettingsView(Vertical):
                 compact=True,
             )
         saved = (
-            f"Saved to {short_path(paths.config_path())} · only non-defaults · "
-            "a per-spawn flag still wins"
+            f"Saved to {short_path(paths.config_path())} as you change it · {UNDO_SAID} undoes "
+            "· only non-defaults · a per-spawn flag still wins"
         )
         note = Static(Text(saved), id="settings-note")
         note.tooltip = saved  # cut short with an ellipsis on a narrow terminal
@@ -1048,19 +1089,19 @@ class AppSettingsView(Vertical):
         yield Static(section_title(*self.FLEET_SECTION), classes="section")
         with Horizontal(classes="row"):
             yield Label("escape key")
-            yield Input(
+            yield CommitInput(
                 value=self.fleet.escape_key, placeholder=DEFAULT_ESCAPE_KEY, id="escape-key"
             )
         with Horizontal(classes="row"):
             yield Label("max agents per project")
-            yield Input(
+            yield CommitInput(
                 value=str(self.fleet.max_agents_per_project),
                 placeholder=f"{DEFAULT_MAX_AGENTS} (default) or a number",
                 id="max-agents",
             )
         with Horizontal(classes="row"):
             yield Label("worktree root")
-            yield Input(
+            yield CommitInput(
                 value=self.fleet.worktree_dir, placeholder=DEFAULT_WORKTREE_DIR, id="worktree-dir"
             )
         with Horizontal(classes="row"):
@@ -1087,7 +1128,9 @@ class AppSettingsView(Vertical):
         yield Static(section_title(*self.MORE_ACCOUNTS_SECTION), classes="section")
         with Horizontal(classes="row"):
             yield Label("switch at (% used)")
-            yield Input(value=str(self.accounts.switch_at), type="integer", id="accounts-switch-at")
+            yield CommitInput(
+                value=str(self.accounts.switch_at), type="integer", id="accounts-switch-at"
+            )
         with Horizontal(classes="row"):
             yield Label("under the line, prefer")
             yield Select(
@@ -1095,7 +1138,7 @@ class AppSettingsView(Vertical):
             )
         with Horizontal(classes="row"):
             yield Label("wait if reset within (min)")
-            yield Input(
+            yield CommitInput(
                 value=str(self.accounts.wait_if_reset_within_minutes),
                 type="integer",
                 id="accounts-wait-minutes",
@@ -1176,7 +1219,16 @@ class AppSettingsView(Vertical):
         await rows.remove_children()
         await rows.mount_all(list(self._binding_rows()))
 
+    def on_hide(self) -> None:
+        self._left = True
+
     async def on_show(self) -> None:
+        """Opened again, the whole form re-reads the file (there is no Reload, M5), so a change
+        made outside rlx meanwhile shows; its first showing is the form as just read."""
+        if self._left:
+            self._left = False
+            self.reload_form()  # the bindings with it, on this queue
+            return
         await self.reload_bindings()
 
     def _binding_role(self, button_id: str | None, kind: str) -> str | None:
@@ -1287,9 +1339,11 @@ class AppSettingsView(Vertical):
 
     @on(Select.Changed)
     def _form_changed(self, event: Select.Changed) -> None:
-        """A pick changes what a spawn passes; an agent pick changes whose accounts fit."""
+        """A pick is kept at once (M5); it changes what a spawn passes, and an agent pick
+        changes whose accounts fit."""
         if not self.is_mounted:
             return
+        self._keep_control(event.select)
         self._paint_launch_lines()
         control = event.select.id or ""
         if control == "default-agent" or control.startswith(f"{ROLE_ID_PREFIX}family-"):
@@ -1311,9 +1365,8 @@ class AppSettingsView(Vertical):
 
     @on(TabbedContent.TabActivated, "#app-settings-tabs")
     def _tab_shown(self, event: TabbedContent.TabActivated) -> None:
-        """Save, Reload and Reset all, and the note on what Save writes, are the first two
-        tabs': *Display* and *Remote* act as each control is used, and have nothing for them
-        to do."""
+        """Reset all, and the note on where a change is saved, are the first two tabs':
+        *Display* and *Remote* have their own words, and nothing for Reset to do."""
         forms = event.pane.id not in (REMOTE_TAB, DISPLAY_TAB)
         self.query_one("#settings-buttons").display = forms
         self.query_one("#settings-note").display = forms
@@ -1355,14 +1408,20 @@ class AppSettingsView(Vertical):
 
     # --- reading -----------------------------------------------------------------------
 
-    @on(Button.Pressed, "#reload-settings")
-    def reload_form(self) -> None:
-        """Discard edits on both tabs: show what the file holds (the roles list can change
-        with it), and tell the app what ``[ui]`` holds now (:class:`UiSettingsChanged`).
+    def reload_form(self, *, keep_pending: bool = True, saved: Collection[str] = ()) -> None:
+        """Show what the file holds (the roles list can change with it), and tell the app what
+        ``[ui]`` holds now (:class:`UiSettingsChanged`): after each change kept, Undo, Reset
+        all, and when the page is opened again.
+
+        A control showing what is not kept yet keeps showing it (its change is on its way, or
+        refused and said so under its field), unless ``keep_pending`` is off (Reset all): a
+        change kept elsewhere, or ctrl+z pressed in a field being typed, takes no change away.
+        ``saved`` are the fields just written, which show the file's value now.
 
         An unreadable file reads as the defaults, as at the first open, and the Captain off
         (``experimental.captain_enabled``'s rule) — said, since every field then resets
         (#274 delta review 2, n2), and on the form's first line (``_config_error``)."""
+        pending = self._pending(saved) if keep_pending else {}
         config = self._read_config()
         self._config = config
         if self._config_error:
@@ -1430,6 +1489,14 @@ class AppSettingsView(Vertical):
             row.account.set_options(account_options(self._accounts, bound, self._role_agent(role)))
             row.account.value = bound or NO_ACCOUNT
         self._shown = self._field_values()
+        for wid in _INPUTS:  # what each field shows is on disk now: no line under it
+            text_field = self.query_one(f"#{wid}", CommitInput)
+            text_field.kept = text_field.value
+            if wid not in pending:
+                self.accept(text_field)
+        for wid, held in pending.items():
+            for widget in self.query(f"#{wid}"):  # gone with its role: nothing to keep
+                self._put_shown(widget, held)
         self._paint_launch_lines()
         self._load_accounts()  # the slots as they are now, off the UI thread
         self.call_later(self.reload_bindings)
@@ -1471,20 +1538,38 @@ class AppSettingsView(Vertical):
         key = DISPLAY_CHOICES.get(event.checkbox.id or "")
         if key is None or getattr(self.ui, key) == event.value:
             return
-        try:
-            self.ui = settings_service.set_display_choice(key, event.value)
-        except Exception as exc:
-            with event.checkbox.prevent(Checkbox.Changed):
-                event.checkbox.value = not event.value
-            self.notify(f"not saved: {exc}", severity="warning", timeout=8, markup=False)
+        if not self._tick(event.checkbox, key, event.value):
             return
+        said = f"{event.checkbox.label}: {'on' if event.value else 'off'}"
+        box, back = event.checkbox, not event.value
+
+        def undo() -> None:
+            self._tick(box, key, back)
+
+        self.kept(said, undo)
+
+    def _tick(self, box: Checkbox, key: str, on: bool) -> bool:
+        """Save a *Display* switch (``key``) as ``on``, shown on ``box``, and apply it; said
+        and put back when the file would not take it."""
+        try:
+            self.ui = settings_service.set_display_choice(key, on)
+        except Exception as exc:
+            with box.prevent(Checkbox.Changed):
+                box.value = getattr(self.ui, key)
+            self.notify(f"not saved: {exc}", severity="warning", timeout=8, markup=False)
+            return False
+        if box.value != on:
+            with box.prevent(Checkbox.Changed):
+                box.value = on
         self.post_message(UiSettingsChanged(self.ui))
+        return True
 
     @on(Button.Pressed, f"#{ASK_AGAIN_BUTTON}")
     def _ask_again_pressed(self, event: Button.Pressed) -> None:
         """*Ask again before every action*: every kind leaves ``[ui] dont_ask`` at once, those
         a later release added too; the shell is told, and the line says every action asks."""
         event.stop()
+        quiet = list(self.ui.dont_ask)
         try:
             self.ui = settings_service.ask_first_again()
         except Exception as exc:
@@ -1493,6 +1578,18 @@ class AppSettingsView(Vertical):
         self._show_ui(self.ui)
         self.post_message(UiSettingsChanged(self.ui))
         self.notify(f"{EVERY_ACTION_ASKS} again.", timeout=6, markup=False)
+        self.kept("Ask again before every action", lambda: self._stop_asking(quiet))
+
+    def _stop_asking(self, kinds: list[str]) -> None:
+        """Undo of *Ask again*: each of ``kinds`` stops asking first again, as before."""
+        try:
+            for kind in kinds:
+                self.ui = settings_service.stop_asking_first(kind)
+        except Exception as exc:
+            self.notify(f"not undone: {exc}", severity="warning", timeout=8, markup=False)
+            return
+        self._show_ui(self.ui)
+        self.post_message(UiSettingsChanged(self.ui))
 
     # --- writing -----------------------------------------------------------------------
 
@@ -1621,8 +1718,9 @@ class AppSettingsView(Vertical):
         }
         return current.model_copy(update=update)
 
-    def _apply_account_bindings(self, config: AppConfig) -> None:
-        """Fold the account selects the operator CHANGED into ``config.team.profiles``.
+    def _apply_account_bindings(self, config: AppConfig, changed: set[str]) -> None:
+        """Fold the account selects the operator CHANGED, of those ``changed`` names, into
+        ``config.team.profiles``.
 
         A role whose select says "no binding" and whose profile holds nothing
         else has its profile REMOVED, not emptied: `team bind --clear` is one
@@ -1641,7 +1739,7 @@ class AppSettingsView(Vertical):
         """
         for role in self._roles:
             row = self._role_row(role)
-            if row is None:
+            if row is None or role_widget_id("acct", role) not in changed:
                 continue
             value = row.account.value
             chosen = value if isinstance(value, str) and value != NO_ACCOUNT else None
@@ -1660,10 +1758,74 @@ class AppSettingsView(Vertical):
                     profile = config.team.profiles.setdefault(role, RoleLaunchProfile())
                 profile.account = chosen
 
-    @on(Button.Pressed, "#save-settings")
-    def _save_fleet_settings(self) -> None:
-        """Write both tabs' changed fields through the one config writer, then show what
-        landed."""
+    # --- kept as it changes (M5) ----------------------------------------------------
+
+    @on(Switch.Changed)
+    def _switch_moved(self, event: Switch.Changed) -> None:
+        self._keep_control(event.switch)
+
+    @on(CommitInput.Committed)
+    def _field_committed(self, event: CommitInput.Committed) -> None:
+        self._keep_control(event.field)
+
+    def _shown_value(self, wid: str) -> object:
+        """What ``wid`` showed when the form was read: what the file holds. An account select's
+        is the binding it was read with (``_account_bindings``)."""
+        for role in self._roles:
+            if wid == role_widget_id("acct", role):
+                return self._account_bindings.get(role) or NO_ACCOUNT
+        return self._shown.get(wid)
+
+    def _said(self, wid: str, value: object) -> str:
+        """How "Saved <what> · Undo" names ``wid`` set to ``value``."""
+        what = _SAID.get(wid)
+        if what is None:
+            what = next(
+                (
+                    f"{role}'s {words}"
+                    for role in self._roles
+                    for kind, words in _ROLE_SAID.items()
+                    if wid == role_widget_id(kind, role)
+                ),
+                wid,
+            )
+        if isinstance(value, bool):
+            return f"{what}: {'on' if value else 'off'}"
+        return what
+
+    def _keep_control(self, control: Widget) -> None:
+        """A control the person changed, kept alone, with how to take it back. One that shows
+        what the file holds (a re-read's, or Undo's, value arriving) writes nothing."""
+        wid = control.id
+        if not self.is_mounted or wid is None:
+            return
+        if wid not in self._shown and not wid.startswith(f"{ROLE_ID_PREFIX}acct-"):
+            return  # not one of the form's fields: the Captain box's, a binding row's
+        now, before = getattr(control, "value", None), self._shown_value(wid)
+        if now == before:
+            return
+        if not self._save_fields({wid}):
+            return
+        self.kept(self._said(wid, now), lambda: self._put_back(wid, before))
+
+    def _put_back(self, wid: str, value: object) -> None:
+        """Undo: ``wid`` shows ``value`` again, and it is on disk again."""
+        control = self.query_one(f"#{wid}")
+        if isinstance(control, CommitInput):
+            control.value = str(value)
+        elif isinstance(control, Select):
+            with control.prevent(Select.Changed):
+                control.value = value
+        elif isinstance(control, Switch):
+            with control.prevent(Switch.Changed):
+                control.value = bool(value)
+        self._save_fields({wid})
+
+    def _save_fields(self, changed: set[str]) -> bool:
+        """Write the ``changed`` fields (each control is one) through the one config writer,
+        onto the file as it is NOW, then show what landed: whether it was written. A value the
+        form refuses is said under its field, and nothing is written; a control the file would
+        not take shows the file's value again."""
         try:
             config: AppConfig = load_config()
         except Exception as exc:  # a broken config.toml: say so, change nothing
@@ -1673,26 +1835,26 @@ class AppSettingsView(Vertical):
                 timeout=8,
                 markup=False,
             )
-            return
-        changed = self._changed()
+            self._show_file_value(changed)
+            return False
         result = self._form_fleet(config.fleet, changed)
         if isinstance(result, str):
-            self._refused(result)
-            return
+            self._refused(result, changed)
+            return False
         config.fleet = result
         self._apply_agents(config, changed)
-        self._apply_account_bindings(config)
+        self._apply_account_bindings(config, changed)
         accounts = self._form_accounts(config.accounts, changed)
         if isinstance(accounts, str):
-            self._refused(accounts)
-            return
+            self._refused(accounts, changed)
+            return False
         config.accounts = accounts
         if UPDATES_CHECK in changed:
             check = self.query_one(f"#{UPDATES_CHECK}", Switch).value
             config.updates = config.updates.model_copy(update={"check": check})
         config.ui = self._form_ui(config.ui, changed)
         try:
-            written = save_config(config)
+            save_config(config)
         except OSError as exc:  # the operator's filesystem saying no — the foreseeable failure
             self.notify(
                 f"could not write the config: {exc}",
@@ -1700,16 +1862,60 @@ class AppSettingsView(Vertical):
                 timeout=8,
                 markup=False,
             )
-            return
-        self.reload_form()
-        self.notify(f"✓ settings saved to {written}", timeout=5, markup=False)
+            self._show_file_value(changed)
+            return False
+        self.reload_form(saved=changed)
+        return True
 
-    def _refused(self, why: str) -> None:
-        """Save said no: say why, and unfold *Agent settings*' Advanced, where every field a
-        save can refuse is (the agent cap, switch at, wait-if-reset-within), on its tab."""
+    def _show_file_value(self, changed: set[str]) -> None:
+        """A switch or a pick the file did not take shows what it holds again; a text field
+        keeps what was typed, to try again."""
+        for wid in changed:
+            control = self.query_one(f"#{wid}")
+            if not isinstance(control, CommitInput):
+                self._put_shown(control, self._shown_value(wid))
+
+    @staticmethod
+    def _put_shown(control: Widget, value: object) -> None:
+        """``control`` shows ``value``, posting no change of its own."""
+        if isinstance(control, CommitInput):
+            with control.prevent(Input.Changed):
+                control.value = str(value)
+        elif isinstance(control, Select):
+            with control.prevent(Select.Changed):
+                control.value = value
+        elif isinstance(control, Switch):
+            with control.prevent(Switch.Changed):
+                control.value = bool(value)
+
+    def _pending(self, saved: Collection[str]) -> dict[str, object]:
+        """Each control showing what the file did not hold when the form was read, by id, but
+        those ``saved`` just now: the person's changes not kept yet."""
+        if not self._shown:
+            return {}
+        pending = {
+            wid: value
+            for wid, value in self._field_values().items()
+            if wid not in saved and value != self._shown.get(wid, value)
+        }
+        for role in self._roles:
+            wid = role_widget_id("acct", role)
+            row = self._role_row(role)
+            if row is not None and wid not in saved and row.account.value != self._shown_value(wid):
+                pending[wid] = row.account.value
+        return pending
+
+    def _refused(self, why: str, changed: set[str]) -> None:
+        """The form said no: why, in a line under the field (every field a save can refuse is
+        a text field in *Agent settings*' Advanced: the agent cap, switch at, wait-if-reset-
+        within), which keeps what was typed. Nothing was written."""
+        for wid in changed:
+            control = self.query_one(f"#{wid}")
+            if isinstance(control, CommitInput):
+                self.refuse(control, f"not saved: {why}")
+                return
         self.notify(why, severity="error", timeout=6, markup=False)
-        self.show_tab(AGENT_TAB)
-        self.query_one(f"#{AGENT_ADVANCED}", Collapsible).collapsed = False
+        self._show_file_value(changed)
 
     # --- role bindings (#98) -----------------------------------------------------------
 
@@ -1772,7 +1978,12 @@ class AppSettingsView(Vertical):
     @on(Button.Pressed, "#reset-settings")
     def _reset(self) -> None:
         """Every setting back to its default — on the second press of *Reset all*, which the
-        first armed in place with what it keeps (:func:`reset_note`)."""
+        first armed in place with what it keeps (:func:`reset_note`). ctrl+z writes the
+        settings it replaced back."""
+        try:
+            before: AppConfig | None = load_config()
+        except Exception:  # unreadable: nothing to put back but the backup Reset keeps
+            before = None
         try:
             backup = settings_service.reset_settings()
         except OSError as exc:  # the operator's filesystem saying no: nothing moved
@@ -1780,7 +1991,7 @@ class AppSettingsView(Vertical):
                 f"could not reset the settings: {exc}", severity="error", timeout=8, markup=False
             )
             return
-        self.reload_form()
+        self.reload_form(keep_pending=False)
         if backup is None:
             self.notify(
                 "nothing to reset: every setting was at its default already",
@@ -1793,3 +2004,14 @@ class AppSettingsView(Vertical):
                 timeout=8,
                 markup=False,
             )
+            if before is not None:
+                self.kept("every setting at its default", lambda: self._unreset(before))
+
+    def _unreset(self, before: AppConfig) -> None:
+        """Undo of *Reset all*: the settings it replaced, written back."""
+        try:
+            save_config(before)
+        except OSError as exc:
+            self.notify(f"not undone: {exc}", severity="error", timeout=8, markup=False)
+            return
+        self.reload_form()

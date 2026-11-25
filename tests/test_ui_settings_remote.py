@@ -171,9 +171,13 @@ def bundled_ngrok_with(
 
 
 async def paste(pilot: Pilot[None], section: RemotePanel, token: str) -> None:
-    """Paste ``token`` into the slot and Save, and let the save answer."""
-    section.query_one("#settings-remote-token-field", Input).value = token
-    section.query_one("#settings-remote-token-save", Button).press()
+    """Paste ``token`` into the slot and press Enter (M5: there is no *Save*), and let the save
+    answer."""
+    field = section.query_one("#settings-remote-token-field", Input)
+    field.focus()
+    await pilot.pause()
+    field.value = token
+    await pilot.press("enter")
     await pilot.pause()
     await settle_page(pilot.app)
     await pilot.pause()

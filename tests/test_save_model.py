@@ -155,3 +155,78 @@ def test_keep_shows_a_value_put_back_without_keeping_it_again() -> None:
         return page.writes
 
     assert drive(go) == []
+
+
+# --- no Save, Apply or Cancel on a settings page (M5 acceptance 2) -------------------------
+
+SETTINGS_MODULES = (
+    # The pages under ⚙ Settings, and the dialogs they open.
+    "views/settings_hub.py",
+    "views/app_settings.py",
+    "views/settings_captain.py",
+    "views/settings_remote.py",
+    "views/remote.py",
+    "views/accounts.py",
+    "views/personas_tab.py",
+    "views/usage_sharing.py",
+    "views/settings.py",  # a project's Settings tab
+    "persona_dialogs.py",
+    "attach.py",
+)
+"""Where a settings page or one of its dialogs is built (under ``cli/ui``)."""
+
+EXCEPTIONS = {
+    # A dialog that creates, imports, exports or picks something keeps its buttons:
+    ("attach.py", "NewBindScreen", "Save"): "App settings' + New binding: creates a binding",
+    ("attach.py", "NewBindScreen", "Cancel"): "the same dialog: nothing created",
+    ("attach.py", "AttachTargetScreen", "Cancel"): "Personas' attach: picks where it goes",
+    ("persona_dialogs.py", "NewPersonaScreen", "Cancel"): "Personas' + New: creates a persona",
+    ("persona_dialogs.py", "ImportPersonaScreen", "Cancel"): "Personas' + Import: creates one",
+    ("persona_dialogs.py", "ConfirmDraftScreen", "Save"): "the import's draft, kept as a new one",
+    ("persona_dialogs.py", "ExportPersonaScreen", "Cancel"): "Personas' Export: writes a copy",
+    # A SKILL.md is one document, held to the persona test whole (a half-typed one is
+    # refused), so it is written as an editor writes a file; ctrl+z on the page takes it back.
+    ("persona_dialogs.py", "EditPersonaScreen", "Save"): "the SKILL.md editor",
+    ("persona_dialogs.py", "EditPersonaScreen", "Save as…"): "a bundled one, copied into yours",
+    ("persona_dialogs.py", "EditPersonaScreen", "Cancel"): "the editor, closed unsaved",
+    ("persona_dialogs.py", "EditorPaneScreen", "Cancel"): "the $EDITOR pane, closed",
+    # A box that asks before an action that cannot be undone:
+    ("persona_dialogs.py", "ConfirmRemoveScreen", "Cancel"): "Remove deletes the folder",
+    ("views/remote.py", "RemoteConfirm", "Cancel"): "a new link or password breaks the old",
+    ("views/app_settings.py", "UnsetKeyScreen", "Cancel"): "a binding's key, unset",
+    # Stopping a sign-in that is under way: nothing on the page is being edited.
+    ("views/accounts.py", "AccountsView", "Cancel"): "stops the AISquare sign-in",
+    ("views/accounts.py", "AccountsView", "Cancel sign-in"): "stops a coding agent's sign-in",
+}
+"""Each Save, Apply or Cancel button left in :data:`SETTINGS_MODULES`, and why it stays."""
+
+_BUTTONS = ("Button", "GuardedButton", "ConfirmButton")
+
+
+def _commit_buttons() -> set[tuple[str, str, str]]:
+    import ast
+    from pathlib import Path
+
+    import aisquare.cli.ui as ui
+
+    base = Path(ui.__file__).parent
+    found: set[tuple[str, str, str]] = set()
+    for module in SETTINGS_MODULES:
+        tree = ast.parse((base / module).read_text(encoding="utf-8"))
+        for cls in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+            for call in (node for node in ast.walk(cls) if isinstance(node, ast.Call)):
+                name = getattr(call.func, "id", getattr(call.func, "attr", ""))
+                if name not in _BUTTONS or not call.args:
+                    continue
+                label = call.args[0]
+                if not (isinstance(label, ast.Constant) and isinstance(label.value, str)):
+                    continue
+                if label.value.strip().lower().startswith(("save", "apply", "cancel")):
+                    found.add((module, cls.name, label.value))
+    return found
+
+
+def test_no_settings_page_has_a_save_apply_or_cancel_button_but_the_listed_ones() -> None:
+    found = _commit_buttons()
+    assert found - EXCEPTIONS.keys() == set(), "a Save, Apply or Cancel button not listed"
+    assert EXCEPTIONS.keys() - found == set(), "listed, but gone: take it off the list"

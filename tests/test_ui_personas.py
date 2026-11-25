@@ -787,7 +787,7 @@ def test_an_import_result_dismisses_refreshes_selects_the_row_and_toasts(
     assert screen == "Screen"  # dismissed
     assert "imported-one" in names  # the tab re-read the disk
     assert selected == "user:imported-one"
-    assert ("✓ imported imported-one (copy)", "information") in notices
+    assert ("✓ imported imported-one (copy) · Undo: ctrl+z", "information") in notices
     assert len(importer.calls) == 1
 
 
@@ -1849,3 +1849,51 @@ def test_new_account_hands_over_to_the_accounts_page(
         return host.new_accounts
 
     assert drive(from_the_tab, project=project) == 1
+
+
+def test_ctrl_z_takes_back_an_edit_and_then_the_new_persona_itself(
+    project: ProjectInfo, repo: Path
+) -> None:
+    """M5: the Personas page has no setting of its own; what it changes is made in a dialog
+    (New, the editor: listed exceptions in tests/test_save_model.py). Each is said with its
+    Undo key, and ctrl+z on the page takes the last back on disk: the edit (the SKILL.md as
+    it was), then the new persona (removed again)."""
+    edited = skill_text("Pairs, two keyboards.")
+
+    async def scenario(pilot: Pilot[None], host: Host) -> dict[str, Any]:
+        await press(pilot, "#persona-new")
+        dialog = await wait_for(pilot, NewPersonaScreen)
+        dialog.query_one("#new-name", Input).value = "pair-programmer"
+        dialog.query_one("#new-description", Input).value = "Pairs, one keyboard."
+        await pilot.pause()
+        await press(pilot, "#new-create")
+        editor = await wait_for(pilot, EditPersonaScreen)
+        directory = editor.directory
+        skill = directory / "SKILL.md"
+        scaffold = skill.read_text(encoding="utf-8")
+        area = editor.query_one("#edit-text", TextArea)
+        area.clear()
+        area.insert(edited)
+        button = editor.query_one("#edit-save", Button)
+        await settle_until_held(
+            pilot.app, lambda: not button.disabled, what="Save enabled on the valid text"
+        )
+        await press(pilot, "#edit-save")
+        await settle(pilot)
+        seen: dict[str, Any] = {"saved": skill.read_text(encoding="utf-8"), "scaffold": scaffold}
+        tab(host).focus()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen["once"] = skill.read_text(encoding="utf-8")
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen["twice"] = directory.exists()
+        seen["notices"] = [m for m, _ in host.notices]
+        return seen
+
+    seen = drive(scenario, project=project)
+    assert seen["saved"] == edited, "the edit, on disk"
+    assert seen["once"] == seen["scaffold"], "ctrl+z: the SKILL.md as it was"
+    assert seen["twice"] is False, "ctrl+z again: the new persona removed"
+    assert "Saved the new persona pair-programmer · Undo: ctrl+z" in seen["notices"]
+    assert "Saved pair-programmer's SKILL.md · Undo: ctrl+z" in seen["notices"], seen["notices"]

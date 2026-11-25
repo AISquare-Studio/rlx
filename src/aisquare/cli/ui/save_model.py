@@ -51,7 +51,7 @@ class Change:
     the old value on disk again, and on screen."""
 
     what: str
-    undo: Callable[[], None]
+    undo: Callable[[], object]
 
 
 class CommitInput(Input):
@@ -101,6 +101,12 @@ class CommitInput(Input):
             self.commit()
 
 
+def page_of(widget: Widget) -> SavesAsYouGo | None:
+    """The settings page ``widget`` is on (the nearest :class:`SavesAsYouGo` above it), whose
+    :meth:`SavesAsYouGo.kept` a part of the page reports its own change to."""
+    return next((node for node in widget.ancestors if isinstance(node, SavesAsYouGo)), None)
+
+
 class SavesAsYouGo:
     """What a settings page (a widget) mixes in: its kept changes, the action :data:`UNDO_KEY`
     runs (the page lists :data:`UNDO_BINDING`), and the line under a field that refuses a value.
@@ -121,10 +127,13 @@ class SavesAsYouGo:
         assert isinstance(self, Widget), "SavesAsYouGo is mixed into a widget"
         return self.app
 
-    def kept(self, what: str, undo: Callable[[], None]) -> None:
-        """A change is on disk: say so, and remember how to take it back."""
+    def kept(self, what: str, undo: Callable[[], object], *, said: str | None = None) -> None:
+        """A change is on disk: say so (``Saved <what>``, or the page's own ``said``), with the
+        key that takes it back, and remember how."""
         self.changes.append(Change(what, undo))
-        self._app.notify(f"Saved {what} · Undo: {UNDO_SAID}", timeout=SAVED_SECONDS, markup=False)
+        self._app.notify(
+            f"{said or f'Saved {what}'} · Undo: {UNDO_SAID}", timeout=SAVED_SECONDS, markup=False
+        )
 
     def action_undo_change(self) -> None:
         """:data:`UNDO_KEY`: the page's last change taken back, on disk and on screen."""

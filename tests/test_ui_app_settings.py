@@ -48,6 +48,7 @@ from aisquare.cli.ui.views.app_settings import (
     PREFERENCES_ADVANCED,
     PREFERENCES_TAB,
     REMOTE_TAB,
+    UPDATES_CHECK,
     AppSettingsView,
     UiSettingsChanged,
     display_label,
@@ -57,6 +58,7 @@ from aisquare.core.agent_adapters import adapters
 from aisquare.core.config import AppConfig, UiSettings, load_config, overrides, save_config
 from aisquare.services import fleet as fleet_service
 from aisquare.services import settings as settings_service
+from tests.settings_fields import leave_fields, reopen
 from tests.ui_workers import settle_page
 
 T = TypeVar("T")
@@ -137,12 +139,12 @@ def test_settings_saves_a_changed_permission_mode_to_config_toml() -> None:
         await pilot.pause()
         host.query_one("#role-perm-coder", Select).value = "plan"
         host.query_one("#worktree-dir", Input).value = ".fleet-trees"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return host.notices
 
     notices = drive(scenario)
-    assert any(m.startswith("✓ settings saved") for m, _ in notices), notices
+    assert any(m.startswith("Saved ") for m, _ in notices), notices
     fleet_on_disk = _config_toml()["fleet"]
     on_disk = fleet_on_disk["roles"]
     assert on_disk["coder"]["permission_mode"] == "plan"  # the bytes, not the widget
@@ -179,7 +181,7 @@ def test_the_agent_cap_shows_auto_as_the_default_and_takes_it_back_from_a_number
         field = host.query_one("#max-agents", Input)
         shown, placeholder = field.value, field.placeholder
         field.value = "auto"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         errors = [m for m, severity in host.notices if severity == "error"]
         return shown, placeholder, errors
@@ -192,26 +194,39 @@ def test_the_agent_cap_shows_auto_as_the_default_and_takes_it_back_from_a_number
 
 
 def test_settings_rejects_a_bad_agent_cap_and_writes_nothing() -> None:
-    """And shows the field: Save pressed from *User preferences* brings *Agent settings* to the
-    front with its *Advanced* open, where the agent cap is folded (#41)."""
+    """M5: the agent cap typed as 0 and Enter is refused in a line under the field, which
+    keeps what was typed; nothing is written. A good value then clears the line."""
 
-    async def scenario(
-        pilot: Pilot[None], host: AppHost
-    ) -> tuple[list[tuple[str, str]], str, bool]:
+    async def scenario(pilot: Pilot[None], host: AppHost) -> dict[str, Any]:
         await pilot.pause()
-        host.query_one("#max-agents", Input).value = "0"
-        tabs = host.query_one("#app-settings-tabs", TabbedContent)
-        tabs.active = PREFERENCES_TAB
-        await settle(pilot)
-        host.query_one("#save-settings", Button).press()
+        view = host.query_one(AppSettingsView)
+        host.query_one(f"#{AGENT_ADVANCED}", Collapsible).collapsed = False
         await settle(pilot)
         field = host.query_one("#max-agents", Input)
-        return host.notices, tabs.active, field.region.area > 0
+        field.focus()
+        await settle(pilot)
+        field.value = "0"
+        await pilot.press("enter")
+        await settle(pilot)
+        seen: dict[str, Any] = {
+            "said": view.problem(field),
+            "typed": field.value,
+            "written": paths.config_path().exists(),
+            "toasts": [m for m, _ in host.notices],
+        }
+        field.value = "3"
+        await pilot.press("enter")
+        await settle(pilot)
+        seen["after"] = view.problem(field)
+        return seen
 
-    notices, active, field_shown = drive(scenario)
-    assert any("at least 1" in m and severity == "error" for m, severity in notices), notices
-    assert not paths.config_path().exists()  # a refused form never reaches the writer
-    assert (active, field_shown) == (AGENT_TAB, True), "the refused field, unfolded"
+    seen = drive(scenario)
+    assert seen["said"].startswith("not saved: ") and "at least 1" in seen["said"], seen
+    assert seen["typed"] == "0", "the field keeps what was typed, to correct"
+    assert seen["written"] is False, "a refused value never reaches the writer"
+    assert seen["toasts"] == [], "said beside the field, not in a toast"
+    assert seen["after"] == "", "a good value clears the line"
+    assert load_config().fleet.max_agents_per_project == 3
 
 
 def test_settings_binds_an_account_per_role_and_a_cleared_one_leaves_no_empty_profile() -> None:
@@ -227,12 +242,12 @@ def test_settings_binds_an_account_per_role_and_a_cleared_one_leaves_no_empty_pr
         select = host.query_one("#role-acct-coder", Select)
         labels = [str(label) for label, _value in select._options]
         select.value = "2"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return labels, host.notices
 
     labels, notices = drive(scenario)
-    assert any(m.startswith("✓ settings saved") for m, _ in notices), notices
+    assert any(m.startswith("Saved ") for m, _ in notices), notices
     assert labels[0] == "(no account binding)"
     assert any(label.startswith("2 · account 2") for label in labels), labels
     assert load_config().team.profiles["coder"].account == "2"  # the binding's one home
@@ -244,7 +259,7 @@ def test_settings_binds_an_account_per_role_and_a_cleared_one_leaves_no_empty_pr
         select = host.query_one("#role-acct-coder", Select)
         shown_value = select.value
         select.value = ""
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return str(shown_value)
 
@@ -270,7 +285,7 @@ def test_settings_clearing_an_account_keeps_a_binding_that_still_reads_a_file(
     async def clear(pilot: Pilot[None], host: AppHost) -> None:
         await settle(pilot)
         host.query_one("#role-acct-coder", Select).value = ""
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
 
     drive(clear)
@@ -302,12 +317,12 @@ def test_settings_save_leaves_the_bindings_it_did_not_change_as_the_file_has_the
         settings_service.bind_role("reviewer", account="3")  # `team bind` in another shell
         host.query_one("#role-acct-tester", Select).value = "3"  # the one change made here
         host.query_one("#max-agents", Input).value = "7"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return notes, host.notices
 
     notes, notices = drive(scenario)
-    assert any(m.startswith("✓ settings saved") for m, _ in notices), notices
+    assert any(m.startswith("Saved ") for m, _ in notices), notices
     assert any("role coder was bound to slot 2" in note for note in notes), notes
     profiles = load_config().team.profiles
     assert "coder" not in profiles or profiles["coder"].account is None  # the clear stands
@@ -380,7 +395,8 @@ def test_a_slot_removed_between_two_reads_falls_back_to_the_binding_on_the_form(
     async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[str, list[str]]:
         await settle(pilot)
         select = host.query_one("#role-acct-coder", Select)
-        select.value = "3"
+        with select.prevent(Select.Changed):  # held from an earlier read, not a pick (M5)
+            select.value = "3"
         shutil.rmtree(third.config_dir)
         host.query_one(AppSettingsView)._load_accounts()
         await settle(pilot)
@@ -401,12 +417,12 @@ def test_settings_saves_the_accounts_section_and_rejects_a_bad_line() -> None:
         host.query_one("#accounts-on-limit", Select).value = "wait"
         host.query_one("#accounts-wait-minutes", Input).value = "5"
         host.query_one("#accounts-prefer", Select).value = "reset-soonest"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return host.notices
 
     notices = drive(scenario)
-    assert any(m.startswith("✓ settings saved") for m, _ in notices), notices
+    assert any(m.startswith("Saved ") for m, _ in notices), notices
     on_disk = _config_toml()["accounts"]
     assert on_disk == {
         "pick": "default",
@@ -417,18 +433,19 @@ def test_settings_saves_the_accounts_section_and_rejects_a_bad_line() -> None:
     }
     assert load_config().accounts.pick == "default"
 
-    async def bad(pilot: Pilot[None], host: AppHost) -> tuple[str, list[tuple[str, str]]]:
+    async def bad(pilot: Pilot[None], host: AppHost) -> tuple[str, str]:
         await pilot.pause()
         shown_pick = str(host.query_one("#accounts-pick", Select).value)
-        host.query_one("#accounts-switch-at", Input).value = "250"
-        host.query_one("#save-settings", Button).press()
+        field = host.query_one("#accounts-switch-at", Input)
+        field.value = "250"
+        leave_fields(host)
         await settle(pilot)
-        return shown_pick, host.notices
+        return shown_pick, host.query_one(AppSettingsView).problem(field)
 
-    shown_pick, notices = drive(bad)
+    shown_pick, said = drive(bad)
     assert shown_pick == "default"  # the form opened on what the file holds
-    assert any("between 1 and 100" in m and sev == "error" for m, sev in notices), notices
-    assert load_config().accounts.switch_at == 70  # a refused form never reaches the writer
+    assert "between 1 and 100" in said, "said under the field (M5)"
+    assert load_config().accounts.switch_at == 70  # a refused value never reaches the writer
 
 
 def test_settings_switches_what_the_accounts_share() -> None:
@@ -442,7 +459,7 @@ def test_settings_switches_what_the_accounts_share() -> None:
             host.query_one("#accounts-share-settings", Switch).value,
         )
         host.query_one("#accounts-share-trust", Switch).value = False
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return shown
 
@@ -453,7 +470,7 @@ def test_settings_switches_what_the_accounts_share() -> None:
     async def reopened(pilot: Pilot[None], host: AppHost) -> bool:
         await pilot.pause()
         host.query_one("#accounts-share-settings", Switch).value = True
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return host.query_one("#accounts-share-trust", Switch).value
 
@@ -469,7 +486,7 @@ def test_settings_switches_the_hand_over_across_agents_off_and_on() -> None:
         await pilot.pause()
         shown = host.query_one("#accounts-cross-agent", Switch).value
         host.query_one("#accounts-cross-agent", Switch).value = False
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return shown
 
@@ -533,7 +550,7 @@ def test_settings_switch_the_daily_release_check_off_and_on() -> None:
         await pilot.pause()
         shown = host.query_one("#updates-check", Switch).value
         host.query_one("#updates-check", Switch).value = False
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return shown
 
@@ -545,7 +562,7 @@ def test_settings_switch_the_daily_release_check_off_and_on() -> None:
         await pilot.pause()
         shown = host.query_one("#updates-check", Switch).value
         host.query_one("#updates-check", Switch).value = True
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return shown
 
@@ -565,7 +582,7 @@ def test_one_save_writes_the_no_role_agents_row_and_the_release_check_together()
         await pilot.pause()
         host.query_one(f"#{role_widget_id('perm', PLAIN_ROLE)}", Select).value = "acceptEdits"
         host.query_one("#updates-check", Switch).value = False
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
 
     drive(scenario)
@@ -673,12 +690,12 @@ def test_a_form_left_open_saves_only_what_was_changed_on_it() -> None:
         seen: dict[str, object] = {}
         settings_service.set_value("accounts.pick", "default")  # a shell, while it is open
         host.query_one("#max-agents", Input).value = "5"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         seen["set"] = load_config()
         settings_service.reset_settings()  # a shell again: the form still shows f11, 70
         host.query_one("#max-agents", Input).value = "6"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         seen["reset"] = load_config()
         seen["form"] = host.query_one("#escape-key", Input).value
@@ -708,20 +725,20 @@ def test_a_role_added_by_hand_while_the_form_is_open_costs_nothing_on_save() -> 
         config = load_config()  # a hand edit, while the form is open
         config.fleet.roles["designer"] = FleetRoleSettings(permission_mode="plan")
         save_config(config)
-        host.query_one("#reload-settings", Button).press()
+        await reopen(pilot, host.query_one(AppSettingsView))
         await settle(pilot)
         host.query_one("#role-perm-coder", Select).value = "acceptEdits"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         host.query_one("#max-agents", Input).value = "4"
-        host.query_one("#save-settings", Button).press()  # and again, from the reloaded form
+        leave_fields(host)  # and again, from the reloaded form
         await settle(pilot)
         assert not host.query("#role-perm-designer")  # no row yet: a reopen shows it
         return host.notices
 
     notices = drive(scenario)
     assert [m for m, severity in notices if severity == "error"] == []
-    assert sum(m.startswith("✓ settings saved") for m, _ in notices) == 2, notices
+    assert sum(m.startswith("Saved ") for m, _ in notices) == 2, notices
     roles = _config_toml()["fleet"]["roles"]
     assert roles["coder"]["permission_mode"] == "acceptEdits"
     assert roles["designer"]["permission_mode"] == "plan"  # the hand edit stands
@@ -755,7 +772,7 @@ def test_two_roles_whose_names_differ_only_in_punctuation_keep_their_own_rows() 
         dotted, dashed = (f"#role-perm-{widget_suffix(role)}" for role in ("qa.ui", "qa-ui"))
         shown = [host.query_one(dotted, Select).value, host.query_one(dashed, Select).value]
         host.query_one(f"#role-worktree-{widget_suffix('qa-ui')}", Switch).value = False
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return shown
 
@@ -790,7 +807,7 @@ def test_a_role_named_like_a_fixed_field_neither_takes_its_id_nor_takes_the_form
 
         host.query_one(f"#{role_widget_id('worktree', 'dir')}", Switch).value = False
         host.query_one(f"#{role_widget_id('perm', 'qa-ui')}", Select).value = "acceptEdits"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return ids
 
@@ -834,7 +851,7 @@ def test_role_names_modes_and_bindings_written_by_hand_are_shown_as_text_not_mar
             str(prompt) for select in form.query(Select) for prompt, _value in select._options
         ]
         host.query_one("#max-agents", Input).value = "5"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return names, prompts
 
@@ -901,12 +918,12 @@ def test_a_roles_persona_is_saved_to_config_toml_and_read_back() -> None:
     async def scenario(pilot: Pilot[None], host: AppHost) -> list[tuple[str, str]]:
         await pilot.pause()
         host.query_one("#role-persona-coder", Select).value = "skeptic"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return host.notices
 
     notices = drive(scenario)
-    assert any(m.startswith("✓ settings saved") for m, _ in notices), notices
+    assert any(m.startswith("Saved ") for m, _ in notices), notices
     roles = _config_toml()["fleet"]["roles"]
     assert roles["coder"]["persona"] == "skeptic"  # the bytes, under the coder's own table
     assert "persona" not in roles.get("tester", {})
@@ -925,7 +942,7 @@ def test_choosing_none_removes_the_roles_persona_rather_than_writing_an_empty_on
         field = host.query_one("#role-persona-coder", Select)
         before = field.value
         field.value = ""
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return before
 
@@ -1219,11 +1236,11 @@ def test_reload_shows_the_bindings_a_shell_wrote_meanwhile() -> None:
     async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[str | None, str | None]:
         await settle(pilot)
         settings_service.bind_role("coder", env={"GH_TOKEN": "x"}, args=["-v"])
-        host.query_one("#reload-settings", Button).press()
+        await reopen(pilot, host.query_one(AppSettingsView))
         await settle(pilot)
         bound = _binding_shown(host, "coder")
         settings_service.bind_role("coder", unset=["GH_TOKEN"])
-        host.query_one("#reload-settings", Button).press()
+        await reopen(pilot, host.query_one(AppSettingsView))
         await settle(pilot)
         return bound, _binding_shown(host, "coder")
 
@@ -1382,12 +1399,11 @@ def test_the_form_opens_on_agent_settings_beside_preferences_display_and_remote(
         tabs.active = PREFERENCES_TAB
         await settle(pilot)
         seen["buttons shown"] = all(
-            host.query_one(wid, Button).region.area > 0
-            for wid in ("#save-settings", "#reload-settings", "#reset-settings")
+            host.query_one(wid, Button).region.area > 0 for wid in ("#reset-settings",)
         )
         tabs.active = DISPLAY_TAB
         await settle(pilot)
-        seen["buttons on display"] = host.query_one("#save-settings", Button).region.area > 0
+        seen["buttons on display"] = host.query_one("#reset-settings", Button).region.area > 0
         return seen
 
     seen = drive(scenario)
@@ -1404,11 +1420,11 @@ def test_the_form_opens_on_agent_settings_beside_preferences_display_and_remote(
         "Off: shown only when two projects share a name."
     )
     assert seen["from a shell"] == (
-        "A preference changed outside rlx shows after Reload here, or when rlx next starts; "
-        "not live."
+        "A preference changed outside rlx shows when you next open this page, or when rlx "
+        "next starts; not live."
     )
     assert seen["buttons shown"] is True
-    assert seen["buttons on display"] is False, "nothing on Display for Save to save"
+    assert seen["buttons on display"] is False, "nothing on Display for Reset all"
 
 
 def test_always_show_project_directory_saves_itself_alone_as_it_is_ticked() -> None:
@@ -1431,7 +1447,7 @@ def test_always_show_project_directory_saves_itself_alone_as_it_is_ticked() -> N
         await pilot.pause()
         shown = host.query_one("#ui-always-show-path", Checkbox).value
         host.query_one("#max-agents", Input).value = "6"  # a change on the other tab
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
         return shown
 
@@ -1516,7 +1532,7 @@ def test_reload_reads_the_preference_a_shell_set_meanwhile() -> None:
     async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[bool, list[bool]]:
         await pilot.pause()
         settings_service.set_value("ui.always_show_project_path", "true")  # from a shell
-        host.query_one("#reload-settings", Button).press()
+        await reopen(pilot, host.query_one(AppSettingsView))
         await settle(pilot)
         return host.query_one("#ui-always-show-path", Checkbox).value, host.ui_told
 
@@ -1532,7 +1548,7 @@ def test_reload_over_an_unreadable_config_says_so_as_it_shows_the_defaults() -> 
     async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[bool, list[tuple[str, str]]]:
         await pilot.pause()
         paths.config_path().write_text("[ui\nnot toml", encoding="utf-8")  # broken meanwhile
-        host.query_one("#reload-settings", Button).press()
+        await reopen(pilot, host.query_one(AppSettingsView))
         await settle(pilot)
         return host.query_one("#ui-always-show-path", Checkbox).value, host.notices
 
@@ -1603,7 +1619,7 @@ def test_reload_and_reset_all_read_the_confirmations() -> None:
     async def scenario(pilot: Pilot[None], host: AppHost) -> list[tuple[str, bool]]:
         await pilot.pause()
         settings_service.set_value("ui.confirm_stop", "false")  # from a shell, 0.10.0's key
-        host.query_one("#reload-settings", Button).press()
+        await reopen(pilot, host.query_one(AppSettingsView))
         await settle(pilot)
         reloaded = _confirmations(host)
         host.query_one("#reset-settings", Button).press()  # arms it
@@ -1691,7 +1707,7 @@ def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> 
             await settle(pilot)
             seen[f"{tab} in view"] = [wid for wid in IN_VIEW[tab] if area(host, wid) == 0]
             seen[f"{tab} folded"] = [wid for wid in FOLDED[tab] if area(host, wid) > 0]
-            seen[f"{tab} buttons"] = area(host, "#save-settings") > 0
+            seen[f"{tab} buttons"] = area(host, "#reset-settings") > 0
             if tab not in ADVANCED:  # Display and Remote have no fold: all in view
                 seen[f"{tab} unfolded"] = []
                 continue
@@ -1706,7 +1722,7 @@ def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> 
             seen[f"{tab} unfolded"] = hidden
         tabs.active = AGENT_TAB
         await settle(pilot)
-        seen["buttons back"] = area(host, "#save-settings") > 0
+        seen["buttons back"] = area(host, "#reset-settings") > 0
         return seen
 
     seen = drive(scenario)
@@ -1721,3 +1737,138 @@ def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> 
     assert seen[f"{REMOTE_TAB} buttons"] is False, "nothing on Remote for Save to save"
     assert seen[f"{DISPLAY_TAB} buttons"] is False, "nor on Display"
     assert seen["buttons back"] is True
+
+
+# --- M5: one save model ------------------------------------------------------------------
+
+
+def test_each_control_is_kept_as_it_changes_and_ctrl_z_puts_the_file_back() -> None:
+    """M5: no Save. A pick, a switch, a text field (on Enter) and a *Display* box are each on
+    disk as they change, each said with its Undo key; ctrl+z on the page takes them back, the
+    last first, on disk and on screen. (The Captain box's: tests/test_ui_settings_captain.py.)"""
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> dict[str, Any]:
+        await settle(pilot)
+        tabs = host.query_one("#app-settings-tabs", TabbedContent)
+        seen: dict[str, Any] = {}
+        pick = host.query_one("#accounts-pick", Select)
+        pick.focus()
+        pick.value = "default"
+        await settle(pilot)
+        seen["pick"] = load_config().accounts.pick
+        host.query_one(f"#{AGENT_ADVANCED}", Collapsible).collapsed = False
+        await settle(pilot)
+        escape = host.query_one("#escape-key", Input)
+        escape.focus()
+        await settle(pilot)
+        escape.value = "f11"
+        await pilot.press("enter")
+        await settle(pilot)
+        seen["escape"] = load_config().fleet.escape_key
+        tabs.active = PREFERENCES_TAB
+        await settle(pilot)
+        check = host.query_one(f"#{UPDATES_CHECK}", Switch)
+        check.focus()
+        check.value = False
+        await settle(pilot)
+        seen["check"] = load_config().updates.check
+        tabs.active = DISPLAY_TAB
+        await settle(pilot)
+        usage = host.query_one("#ui-show-usage", Checkbox)
+        usage.focus()
+        usage.value = False
+        await settle(pilot)
+        seen["usage"] = load_config().ui.show_usage
+        seen["saved"] = [m for m, _ in host.notices if m.startswith("Saved ")]
+        undone: list[tuple[str, object]] = []
+        reads: list[Callable[[AppConfig], object]] = [
+            lambda c: c.ui.show_usage,
+            lambda c: c.updates.check,
+            lambda c: c.fleet.escape_key,
+            lambda c: c.accounts.pick,
+        ]
+        for read in reads:
+            await pilot.press("ctrl+z")
+            await settle(pilot)
+            undone.append((host.notices[-1][0], read(load_config())))
+        seen["undone"] = undone
+        seen["shown"] = (usage.value, check.value, escape.value, pick.value)
+        return seen
+
+    seen = drive(scenario)
+    assert (seen["pick"], seen["escape"]) == ("default", "f11")
+    assert (seen["check"], seen["usage"]) == (False, False), "each on disk, no Save pressed"
+    assert seen["saved"] == [
+        "Saved how launches pick · Undo: ctrl+z",
+        "Saved the escape key · Undo: ctrl+z",
+        "Saved the daily release check: off · Undo: ctrl+z",
+        f"Saved {display_label('ui-show-usage')}: off · Undo: ctrl+z",
+    ]
+    assert [value for _, value in seen["undone"]] == [True, True, "f12", "headroom"]
+    assert seen["undone"][0][0] == f"Undone: {display_label('ui-show-usage')}: off"
+    assert seen["undone"][-1][0] == "Undone: how launches pick"
+    assert seen["shown"] == (True, True, "f12", "headroom"), "and shown as it was"
+    assert overrides(load_config()) == {}, "every value at its default again"
+
+
+def test_a_change_waiting_its_turn_survives_the_re_read_another_save_makes() -> None:
+    """Two changes before either is handled: the first one's save re-reads the form, which
+    leaves the second showing what the person chose, and then keeps it too."""
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[str, str]:
+        await settle(pilot)
+        host.query_one("#worktree-dir", Input).value = ".trees"
+        leave_fields(host)  # its save comes first…
+        host.query_one("#accounts-on-limit", Select).value = "wait"  # …and re-reads this
+        await settle(pilot)
+        config = load_config()
+        return config.fleet.worktree_dir, config.accounts.on_limit
+
+    assert drive(scenario) == (".trees", "wait")
+
+
+def test_opening_the_page_again_shows_what_a_shell_wrote_meanwhile() -> None:
+    """There is no Reload (M5): the page re-reads the file each time it is opened again."""
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[str, str]:
+        await settle(pilot)
+        field = host.query_one("#escape-key", Input)
+        before = field.value
+        settings_service.set_value("fleet.escape_key", "f10")  # from a shell
+        await reopen(pilot, host.query_one(AppSettingsView))
+        return before, field.value
+
+    assert drive(scenario) == ("f12", "f10")
+
+
+def test_reset_all_is_taken_back_by_ctrl_z() -> None:
+    config = load_config()
+    config.fleet.escape_key = "f9"
+    save_config(config)
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[str, str]:
+        await settle(pilot)
+        reset = host.query_one("#reset-settings", Button)
+        reset.focus()
+        reset.press()  # arms it
+        await settle(pilot)
+        reset.press()  # resets
+        await settle(pilot)
+        after_reset = load_config().fleet.escape_key
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        return after_reset, load_config().fleet.escape_key
+
+    assert drive(scenario) == ("f12", "f9")
+
+
+def test_the_page_holds_no_save_reload_apply_or_cancel_button() -> None:
+    async def scenario(pilot: Pilot[None], host: AppHost) -> list[str]:
+        await settle(pilot)
+        return [
+            str(button.label)
+            for button in host.query_one(AppSettingsView).query(Button)
+            if str(button.label).lower().startswith(("save", "reload", "apply", "cancel"))
+        ]
+
+    assert drive(scenario) == []
