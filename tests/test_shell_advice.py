@@ -60,7 +60,7 @@ DOCTOR_ROWS = frozenset({"_warn", "_fail", "degrade", "DoctorCheck"})
 
 ALLOWED: dict[str, str] = {
     "core/sandbox_roots.py::forget_argv": "data: returns the argv; its callers wrap it",
-    "services/adopt.py::adopt": (
+    "services/adopt.py::_held_note": (
         "data: the argv that runs an agent in its account, which server_note wraps"
     ),
     "services/diagnostics.py::_check_role_bindings": "doctor-fix: the connect its fix names",

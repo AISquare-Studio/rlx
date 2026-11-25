@@ -517,6 +517,15 @@ def _onboarded(
     return project
 
 
+def _held_note(found: _Found, holders: _Holders, pid: int, quit_note: str) -> str:
+    """How the process ``pid`` that holds ``found`` lets it go: Codex's managed daemon's own way
+    (``AgentTranscript.server_note``, given the argv that runs an agent in its account), or
+    ``quit_note`` for any other holder, which quitting releases."""
+    if holders.serving(pid):
+        return found.reader.server_note([prog.word(), "accounts", "run", str(found.account.slot)])
+    return quit_note
+
+
 def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> fleet_service.SpawnReceipt:
     """Bring the conversation ``ref`` names under the fleet: a row on its project, resumed
     by its own agent on its own account in its own directory, keeping its session."""
@@ -526,10 +535,11 @@ def adopt(ref: str, *, role: str = "coder", label: str | None = None) -> fleet_s
     projects = _refuse_owned(found)
     holders = _Holders(accounts, None)
     if (pid := holders.of(found.native, found.path, found.adapter)) is not None:
-        why = (
-            found.reader.server_note([prog.word(), "accounts", "run", str(found.account.slot)])
-            if holders.serving(pid)
-            else "quit it first, then adopt — two processes would write one conversation"
+        why = _held_note(
+            found,
+            holders,
+            pid,
+            "quit it first, then adopt — two processes would write one conversation",
         )
         raise AdoptRefused(
             "held", f"a live {found.adapter.label} (pid {pid}) still holds {found.native}: {why}"
@@ -658,10 +668,8 @@ def plan_pane(pids: Collection[int], *, processes: Sequence[Process] | None = No
     holders = _Holders(accounts, listed)
     pid = holders.of(found.native, found.path, found.adapter)
     if pid is not None and pid not in pids:
-        why = (
-            found.reader.server_note([prog.word(), "accounts", "run", str(found.account.slot)])
-            if holders.serving(pid)
-            else "quit it first — two processes would write one conversation"
+        why = _held_note(
+            found, holders, pid, "quit it first — two processes would write one conversation"
         )
         raise AdoptRefused(
             "held",
