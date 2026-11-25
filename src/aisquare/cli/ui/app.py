@@ -4064,7 +4064,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if self._sharing_asked or len(self.screen_stack) > 1:
             return
         snapshot = self.snapshot
-        if snapshot is None or not snapshot.projects or self.content.current == "welcome":
+        if snapshot is None or not snapshot.projects:
+            return
+        # Never mid-setup (Q6): while Welcome sets a first fleet up, or shows before one is up,
+        # the question waits for "Your fleet is up", then comes at the next page change.
+        shown = self.content.current == "welcome"
+        if any(view.holds_the_sharing_ask(shown) for view in self.query(WelcomeView)):
             return
         self._sharing_asked = True
         if usage_share_core.forced_off_reason() is not None:
@@ -4719,17 +4724,21 @@ def _cut_off_workers() -> frozenset[str]:
     The AISquare sign-in: it waits for the browser until a token arrives, a quit
     cancels that wait (``AccountsView.on_unmount``) and nothing is stored past a cancel.
     Waited for, it held Update and Uninstall for the device code's lifetime, 10 to 15
-    minutes (round 16 of #257). And the usage sweep and the Usage & stats page's read:
+    minutes (round 16 of #257). Welcome's wait for the manager's folder-trust answer, for the
+    same reason: it waits on a human for up to half an hour and writes nothing (the coders
+    then start in a worker of their own, which is waited for). And the usage sweep and the
+    Usage & stats page's read:
     the sweep records each session in a transaction of its own and resumes from where
     the record stopped, so a quit mid-way costs the sessions not yet read and nothing
     else, while a first sweep over a long history can take half a minute. Every other
     thread worker is waited for, a new one too.
     """
-    from aisquare.cli.ui.views import accounts, usage_stats
+    from aisquare.cli.ui.views import accounts, usage_stats, welcome
 
     return frozenset(
         {
             accounts.SIGN_IN_WORKER,
+            welcome.TRUST_WORKER,
             USAGE_SWEEP_WORKER,
             usage_stats.LOAD_WORKER,
             usage_stats.SWEEP_WORKER,

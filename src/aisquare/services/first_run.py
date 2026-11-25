@@ -45,10 +45,11 @@ import dataclasses
 import os
 import shutil
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from aisquare.core import agents as agent_core
 from aisquare.core import claude_accounts as accounts_core
@@ -1255,3 +1256,75 @@ def start_on_agent(
         return started
     first, *rest = started.steps
     return FleetStart((dataclasses.replace(first, notes=(*notes, *first.notes)), *rest))
+
+
+# --- the coders, once the manager's folder is trusted (M4/L3) -----------------------------
+
+TRUST_WAIT = 30 * 60.0
+"""How long :func:`coders_after_trust` waits for the manager's folder-trust answer, in
+seconds: past it, step 3's *Start the coders* is the user's."""
+
+TRUST_POLL = 1.0
+"""How often it asks, in seconds."""
+
+
+def trust_answered(manager: FleetAgent) -> bool:
+    """Whether ``manager`` has come past its folder-trust question: its ``SessionStart`` has
+    come since it was launched. An agent runs no hook in a folder nobody trusted, so its first
+    one is the answer (``fleet._started_since``, the one the fleet's own first message waits
+    on). Codex's, whose hooks run only once they are trusted too, comes once both are."""
+    return fleet_service._started_since(manager.session_id, manager.created_at)
+
+
+def _ended(manager: FleetAgent) -> bool:
+    """Whether ``manager``'s row has ended: stopped, or its window gone and reaped."""
+    try:
+        with store_session() as store:
+            row = store.get_fleet_agent(manager.id)
+    except Exception:  # a store that will not answer ends nothing: the next poll asks again
+        return False
+    return row is None or row.ended_at is not None
+
+
+def wait_for_trust(
+    manager: FleetAgent,
+    *,
+    answered: Callable[[FleetAgent], bool] = trust_answered,
+    ended: Callable[[FleetAgent], bool] = _ended,
+    cancelled: Callable[[], bool] = lambda: False,
+    wait: float = TRUST_WAIT,
+    poll: float = TRUST_POLL,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Whether ``manager`` answered its folder-trust question (:func:`trust_answered`) before
+    the wait ended: its row ended, the caller cancelled (``cancelled``: Welcome's worker, at a
+    quit), or ``wait`` seconds passed. Reads, and writes nothing: a quit may cut it off."""
+    deadline = clock() + wait
+    while not answered(manager):
+        if cancelled() or ended(manager) or clock() >= deadline:
+            return False
+        sleep(poll)
+    return not (cancelled() or ended(manager))
+
+
+def coders_after_trust(
+    project: ProjectInfo,
+    manager: FleetAgent,
+    *,
+    coders: int = CODERS,
+    start: Callable[..., FleetStart] = start_on_agent,
+    **waiting: Any,
+) -> FleetStart | None:
+    """Start the coders once ``manager`` has answered its folder-trust question, and not
+    before (:func:`wait_for_trust`, given ``waiting``): Welcome's *Start fleet* opens the
+    manager's pane for that answer, and the coders follow it on their own (M4/L3). Each coder,
+    started first, would ask the same question in a pane nobody is looking at.
+
+    ``None`` when the wait ended without an answer; step 3 then offers *Start the coders*.
+    :func:`start_on_agent` tops the coders up, so a press of that button meanwhile starts
+    none twice. Welcome runs the two halves as two workers: the wait, which a quit may cut
+    off, and the start, which a quit waits for."""
+    if not wait_for_trust(manager, **waiting):
+        return None
+    return start(project, manager=False, coders=coders)

@@ -141,6 +141,11 @@ class Machine:
     """Every agent a *Use …* pick saved as the user default."""
     sign_ins: list[ClaudeState] = field(default_factory=list)
     sign_in_slot: int = 0
+    trust: threading.Event | None = None
+    """The manager's folder-trust answer, which the coders wait on (``after_trust``): set, it
+    has come. ``None``: none comes, and step 3's *Start the coders* is the user's."""
+    waited: list[str] = field(default_factory=list)
+    """The manager each wait on its trust answer was for, by label."""
     after_choice: list[ClaudeState] = field(default_factory=list)
     """What the looks answer once a pick is saved; the current answers when empty."""
     starts: list[tuple[str, bool, int]] = field(default_factory=list)
@@ -212,6 +217,16 @@ class Machine:
             self.sign_ins.append(state)
             return self.sign_in_slot
 
+        def trust(manager: FleetAgent, cancelled: Callable[[], bool]) -> bool:
+            self.waited.append(manager.label)
+            answer = self.trust
+            if answer is None:
+                return False
+            while not answer.wait(0.05):  # a bounded poll on the answer itself
+                if cancelled():
+                    return False
+            return True
+
         def choose(agent: str) -> None:
             self.chosen.append(agent)
             # Saved: the next look is about that agent, now the user's default.
@@ -232,6 +247,7 @@ class Machine:
             sign_in=sign_in,
             choose=choose,
             start=start,
+            trust=trust,
             platform=platform,
         )
 
@@ -617,7 +633,7 @@ def test_a_listed_folder_asq_started_in_is_chosen_without_a_click(tmp_path: Path
 
     async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> tuple[str | None, str]:
         chosen = page.project.id if page.project is not None else None
-        return chosen, card(page, "project-status")
+        return chosen, card(page, "project-title")
 
     chosen, text = hosted(machine, go)
     assert chosen == "prj_demo" and "✓ demo-app" in text
@@ -681,7 +697,7 @@ def test_choosing_an_unlisted_folder_onboards_it_first(tmp_path: Path) -> None:
         buttons = candidate_buttons(page)
         first_candidate(page).press()
         await settle_page(host)
-        return buttons, card(page, "project-status")
+        return buttons, card(page, "project-title")
 
     buttons, text = hosted(machine, go)
     assert buttons == ["Use new-app"]
@@ -732,7 +748,7 @@ def test_a_typed_folder_is_judged_then_used(tmp_path: Path) -> None:
         await settle_page(host)
         enabled = visible(page, "welcome-path-use")
         await press(pilot, page, "welcome-path-use")
-        return before, enabled, card(page, "project-status")
+        return before, enabled, card(page, "project-title")
 
     before, enabled, text = hosted(machine, go)
     assert not before and enabled  # the verdict decides the button
@@ -2246,7 +2262,10 @@ def test_update_waits_for_welcomes_real_start_by_its_workers_name(
 
     refused, said, after = in_shell(machine, go)
     assert refused is None, "the manager start is still running"
-    assert said == ["a manager start is still running — try again when it ends"]
+    # Once it lands, the manager's pane opens in place (M4/L3): what it says of its pane is
+    # its own, not the hand-off's.
+    held = [line for line in said if "still running" in line]
+    assert held == ["a manager start is still running — try again when it ends"]
     assert after == ("upgrade", "--reopen"), "control: once it has landed, Update quits"
 
 
@@ -2388,3 +2407,122 @@ def test_the_page_hosted_alone_asks_the_store_itself() -> None:
 
     hosted(machine, go)
     assert machine.frames == [None]  # no shell, no frame: the service reads the store
+
+
+# ----------------------------------------------------- the first run's polish (0.10.2: Q7, Q16, M4)
+
+
+def test_claudes_sign_in_asks_for_the_managers_account_and_opens_its_login(tmp_path: Path) -> None:
+    """Q7: *Sign in* starts Claude Code's login itself, as Codex's does: the slot the manager
+    will use (``first_run.sign_in_slot``, the spy here), opened on the Accounts page, and the
+    way back to this page with it. It opened the Accounts page alone."""
+    signed_out = dataclasses.replace(READY, signed_in=False)
+    machine, _project = _ready_machine(tmp_path, claude=[signed_out], sign_in_slot=3)
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> tuple[str, list[Any]]:
+        await settle_until(
+            page.app, lambda: page.project is not None and visible(page, "claude-sign-in")
+        )
+        text = card(page, "claude-status")
+        await press(pilot, page, "claude-sign-in")
+        return text, list(host.received)
+
+    text, received = hosted(machine, go)
+    assert "Sign in opens Claude Code's sign-in on the Accounts page" in text
+    assert [state.agent for state in machine.sign_ins] == [signed_out.agent]
+    [opened] = [m for m in received if isinstance(m, AccountsSelected)]
+    assert opened.sign_in == 3
+    assert opened.return_to is not None and opened.return_to.kind == "welcome"
+
+
+def test_finished_steps_fold_to_one_line_each(tmp_path: Path) -> None:
+    """Q16: once step 1 has its project and step 2 its agent, each card is one line: its title,
+    with what it settled on (and step 1's *Choose another* beside it)."""
+    machine, _project = _ready_machine(tmp_path)
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> dict[str, Any]:
+        await settle_until(page.app, lambda: page.project is not None and page.claude is not None)
+        await settle_page(page.app)
+        seen: dict[str, Any] = {}
+        for card_id, title_id in (
+            ("step-project", "project-title"),
+            ("step-claude", "claude-title"),
+        ):
+            box = page.query_one(f"#{card_id}")
+            lines = [child for child in box.children if child.display and child.region.height]
+            seen[card_id] = (box.content_region.height, len(lines), card(page, title_id))
+        seen["change"] = visible(page, "welcome-change")
+        seen["fleet"] = page.query_one("#step-fleet").content_region.height
+        return seen
+
+    seen = hosted(machine, go)
+    height, children, title = seen["step-project"]
+    assert (height, children) == (1, 1) and "✓ demo-app" in title, seen
+    height, children, title = seen["step-claude"]
+    assert (height, children) == (1, 1) and "signed in · connected" in title, seen
+    assert seen["change"], "step 1's Choose another stays, on its line"
+    assert seen["fleet"] > 1, "step 3, not done, is not folded"
+
+
+def test_step_two_does_not_fold_while_it_still_offers_a_sign_in(tmp_path: Path) -> None:
+    signed_out = dataclasses.replace(READY, signed_in=False)
+    machine, _project = _ready_machine(tmp_path, claude=[signed_out])
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> tuple[int, bool]:
+        await settle_until(page.app, lambda: page.claude is not None and page.project is not None)
+        await settle_page(page.app)
+        return page.query_one("#step-claude").content_region.height, visible(page, "claude-sign-in")
+
+    height, sign_in = hosted(machine, go)
+    assert height > 1 and sign_in
+
+
+def test_step_three_says_in_plain_words_what_it_waits_for(tmp_path: Path) -> None:
+    """The fleet's card, before steps 1 and 2: what the user does, not "once there is"."""
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> str:
+        await settle_until(page.app, lambda: page.claude is not None)
+        await settle_page(page.app)
+        return card(page, "fleet-status")
+
+    said = hosted(Machine(claude=[MISSING]), go)
+    assert said.startswith("The fleet can start once you pick a project (step 1) and install ")
+    assert "once there is" not in said
+
+
+def test_start_fleet_opens_the_manager_in_place_and_the_coders_follow_its_trust_answer(
+    captain: str | None,
+    scripted: Callable[[Machine], None],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """M4/L3: one *Start fleet*. The manager starts, and its pane opens in place once the
+    shell lists it, where its folder-trust question is answered; the coders wait for that
+    answer and then start on their own: none before."""
+    machine, project = _ready_machine(tmp_path, trust=threading.Event())
+    listed_by(machine, project, monkeypatch)
+    scripted(machine)
+
+    async def go(pilot: Pilot[None], app: FleetApp, page: WelcomeView) -> dict[str, Any]:
+        seen: dict[str, Any] = {"label": str(page.query_one("#fleet-manager", Button).label)}
+        await settle_until(app, lambda: visible(page, "fleet-manager"))
+        page.query_one("#fleet-manager", Button).press()
+        # The wait on the trust answer is held on purpose: settle the page's other work only.
+        await settle_until(
+            app,
+            lambda: machine.waited and app.content.current != "welcome",
+            group=welcome.WORKER_GROUP,
+        )
+        manager = next(agent for agent in machine.live if agent.label == "manager")
+        seen["shown"] = app.content.current == f"agent-{manager.id}"
+        seen["before"] = list(machine.starts)
+        machine.trust.set()  # type: ignore[union-attr]  # answered in the manager's pane
+        await settle_until(app, lambda: len(machine.starts) > 1)
+        seen["after"] = list(machine.starts)
+        return seen
+
+    seen = in_shell(machine, go)
+    assert seen["label"] == "Start fleet"
+    assert seen["shown"], "the manager's own view, its pane taking the keyboard"
+    assert seen["before"] == [(project.id, True, 0)], "no coder before the trust answer"
+    assert seen["after"] == [(project.id, True, 0), (project.id, False, first_run.CODERS)]

@@ -41,7 +41,7 @@ from aisquare.models import (
 from aisquare.services import agents as agents_service
 from aisquare.services import first_run, onboarding
 from aisquare.services import fleet as fleet_service
-from aisquare.services.first_run import FleetStep
+from aisquare.services.first_run import FleetStart, FleetStep
 from aisquare.services.onboarding import PathVerdict
 from tests import fakebin
 from tests.fsperms import can_deny_reads, can_symlink
@@ -1140,3 +1140,123 @@ def test_no_tmux_server_is_addressed_by_a_probe(monkeypatch: pytest.MonkeyPatch)
     state = first_run.probe_tmux(TmuxServer("asq-test-first-run", binary=sys.executable))
     assert state.ok and state.version == (3, 4)
     assert [argv[1:] for argv in ran] == [["-V"]]
+
+
+# --------------------------------------------------------------- the coders, after trust (M4/L3)
+
+
+def test_start_fleet_starts_the_manager_alone_and_the_coders_only_once_trust_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Welcome's *Start fleet*: the manager, whose step carries the row the page opens in place,
+    then nothing until its folder-trust question is answered, then the coders. On a tmux kept
+    in memory, through ``fleet.spawn`` itself: every coder started earlier would ask the same
+    question in a pane nobody watches."""
+    tmux, project = _real_fleet(tmp_path, monkeypatch)
+    started = first_run.start_fleet(project, manager=True, coders=0)
+    [step] = started.steps
+    assert (step.label, step.outcome) == ("manager", "started") and step.agent is not None
+    manager = step.agent
+    spawned_by_then: list[int] = []
+    answers = iter([False, False, False, True])
+
+    def answered(agent: FleetAgent) -> bool:
+        assert agent.id == manager.id
+        spawned_by_then.append(len(tmux.spawned))
+        return next(answers)
+
+    naps: list[float] = []
+    coders = first_run.coders_after_trust(
+        project,
+        manager,
+        answered=answered,
+        sleep=naps.append,
+        ended=lambda agent: False,
+        start=lambda project, **kwargs: first_run.start_fleet(project, **kwargs),
+    )
+
+    assert spawned_by_then == [1, 1, 1, 1], "no coder before the answer"
+    assert naps == [first_run.TRUST_POLL] * 3
+    assert coders is not None
+    assert [(s.label, s.outcome) for s in coders.steps] == [
+        ("coder-1", "started"),
+        ("coder-2", "started"),
+    ], [s.detail for s in coders.steps]
+    assert len(tmux.spawned) == 3 and tmux.typed == [], "nothing typed into any of them"
+
+
+def test_no_answer_starts_no_coder_and_hands_the_start_back(tmp_path: Path) -> None:
+    """The wait ends without the answer: the manager's row ended, the page's worker was
+    cancelled, or the wait ran out. ``None``, and nothing started: *Start the coders* is
+    the user's then."""
+    project = ProjectInfo(id="prj_demo", root=_repo(tmp_path / "demo"))
+    manager = _agent("manager", "manager")
+    started: list[Any] = []
+
+    def start(*args: Any, **kwargs: Any) -> FleetStart:
+        started.append((args, kwargs))
+        return FleetStart(())
+
+    def never(agent: FleetAgent) -> bool:
+        return False
+
+    clock = iter([0.0, 1.0, 2.0, 99.0])
+    assert (
+        first_run.coders_after_trust(
+            project,
+            manager,
+            answered=never,
+            ended=lambda a: True,
+            start=start,
+            sleep=lambda s: None,
+        )
+        is None
+    )
+    assert (
+        first_run.coders_after_trust(
+            project,
+            manager,
+            answered=never,
+            ended=lambda a: False,
+            cancelled=lambda: True,
+            start=start,
+            sleep=lambda s: None,
+        )
+        is None
+    )
+    assert (
+        first_run.coders_after_trust(
+            project,
+            manager,
+            answered=never,
+            ended=lambda a: False,
+            start=start,
+            wait=10.0,
+            sleep=lambda s: None,
+            clock=lambda: next(clock),
+        )
+        is None
+    )
+    assert started == []
+    # Control: answered, the same call starts the coders, and only them.
+    assert first_run.coders_after_trust(
+        project, manager, answered=lambda a: True, ended=lambda a: False, start=start
+    ) == FleetStart(())
+    assert started == [((project,), {"manager": False, "coders": first_run.CODERS})]
+
+
+def test_the_answer_is_the_managers_first_hook_since_its_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent runs no hook in a folder nobody trusted: its ``SessionStart`` since this launch
+    is the answer, as the fleet's own first message waits on it."""
+    asked: list[tuple[str | None, datetime]] = []
+
+    def since(session_id: str | None, launched: datetime) -> bool:
+        asked.append((session_id, launched))
+        return True
+
+    monkeypatch.setattr(fleet_service, "_started_since", since)
+    manager = _agent("manager", "manager")
+    assert first_run.trust_answered(manager)
+    assert asked == [(manager.session_id, manager.created_at)]

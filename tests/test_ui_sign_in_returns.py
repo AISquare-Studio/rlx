@@ -46,7 +46,7 @@ from aisquare.services import iam
 from tests.test_ui_accounts import _script_claude_sign_in
 from tests.test_ui_spawn import register
 from tests.test_ui_welcome import READY, _ready_machine
-from tests.ui_workers import settle_page
+from tests.ui_workers import settle_page, settle_until
 
 T = TypeVar("T")
 SIZE = (140, 60)
@@ -141,19 +141,23 @@ def test_welcomes_sign_in_comes_back_to_step_three(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline: dict[str, Any]
 ) -> None:
     """On b26dd140 the content stayed on Accounts. Now Welcome is shown again, looks again,
-    and the keyboard is on step 3; from there the manager's pane is two keys away."""
+    and the keyboard is on step 3; from there the manager's pane is two keys away.
+
+    Step 2's *Sign in* starts Claude Code's login itself, on the account the manager will use,
+    as Codex's does (Q7): the Accounts page opens with its pane already up, no *Add* to press."""
     signed_out = dataclasses.replace(READY, signed_in=False)
     machine, _project = _ready_machine(tmp_path, claude=[signed_out])
+    machine.sign_in_slot = 2
     monkeypatch.setattr(welcome, "DEFAULT_SEAMS", machine.seams())
-    _script_claude_sign_in(monkeypatch, tmp_path, lands=True)
+    launched = _script_claude_sign_in(monkeypatch, tmp_path, lands=True)
 
     async def go(pilot: Pilot[None], app: Shell) -> dict[str, Any]:
         page = app.query_one(WelcomeView)
         page.query_one("#claude-sign-in", Button).press()
-        await settle_page(app)
+        await settle_until(app, lambda: launched["opened"])
         seen: dict[str, Any] = {"left_for": app.content.current}
-        await pilot.click("#claude-add")
-        await settle_page(app)
+        seen["asked"] = [state.agent for state in machine.sign_ins]
+        seen["begun"], seen["windows"] = launched.get("begin"), list(launched["opened"])
         machine.claude = [READY]  # signed in now: the next look reads it
         await sign_in_lands(pilot, app, offline)
         seen["back_on"] = app.content.current
@@ -168,6 +172,8 @@ def test_welcomes_sign_in_comes_back_to_step_three(
 
     seen = drive(go)
     assert seen["left_for"] == "accounts"
+    assert seen["asked"] == [signed_out.agent], "the manager's account, as Codex's is asked"
+    assert seen["begun"] == 2 and len(seen["windows"]) == 1, "its login started, once, by itself"
     assert seen["back_on"] == "welcome"
     assert seen["focused"] == "fleet-manager", "step 3's next button"
     assert seen["opened"] is not None and seen["presses"] <= 3, seen

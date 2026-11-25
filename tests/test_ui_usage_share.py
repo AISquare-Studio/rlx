@@ -607,3 +607,47 @@ def test_the_shell_does_not_look_at_the_shipper_before_a_minute_has_passed(
 
     assert asyncio.run(go()) == []
     assert usage_share.TIMEOUT_S == 5.0
+
+
+def test_the_question_waits_while_welcome_sets_a_fleet_up_and_comes_once_it_is_up(
+    tmp_path: Path, sharing_allowed: None
+) -> None:
+    """Q6: never mid-setup. While Welcome's first fleet is coming up (its manager started, its
+    coders not yet), a page change asks nothing, the manager's pane included; after "Your fleet
+    is up", the next page change asks."""
+    from aisquare.cli.ui.views.welcome import WelcomeView
+    from aisquare.services.first_run import CODERS, FleetStep
+    from tests.test_ui_welcome import _agent
+
+    add_project(tmp_path / "work")
+    (tmp_path / "work").mkdir(exist_ok=True)
+    fake = FakeSharing()
+
+    async def go() -> tuple[str, str, bool, bool]:
+        app = _fleet(fake)
+        async with app.run_test(size=(130, 50)) as pilot:
+            await settle_page(app)
+            page = app.query_one(WelcomeView)
+            assert app.snapshot is not None and app.snapshot.projects
+            project = app.snapshot.projects[0]
+            page.project = project
+            manager = _agent(project, "manager", "manager")
+            page.steps = {"manager": FleetStep("manager", "manager", "started", agent=manager)}
+            setting_up = page.setting_up
+            await _open_settings(app, pilot)
+            mid_setup = type(app.screen).__name__
+            for n in range(1, CODERS + 1):
+                coder = _agent(project, f"coder-{n}", "coder")
+                page.steps[coder.label] = FleetStep(coder.label, "coder", "started", agent=coder)
+            up = page.fleet_up
+            app.sidebar.focus()  # the app's keys are the sidebar's
+            await pilot.press("w")  # back to Welcome, a page change, now the fleet is up
+            await settle_page(app)
+            await settle_until(app, lambda: isinstance(app.screen, ConsentDialog))
+            return mid_setup, type(app.screen).__name__, setting_up, up
+
+    mid_setup, after, setting_up, up = asyncio.run(go())
+    assert setting_up and up
+    assert mid_setup != "ConsentDialog", "not asked while the fleet comes up"
+    assert after == "ConsentDialog", "asked once the fleet is up"
+    assert fake.calls.count("consent_due") == 1
