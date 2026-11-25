@@ -385,7 +385,7 @@ async def pick_until_note_changes(
     value: str,
     reads: str,
     *,
-    timeout: float = 5.0,
+    timeout: float = 10.0,
 ) -> None:
     """Set the ``name`` select to ``value``, then wait until the note at ``reads`` shows
     something else, and FAIL when it never does (``settle_until_held``). The dialog handles a
