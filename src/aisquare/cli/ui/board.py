@@ -348,7 +348,13 @@ class NeedsYouStrip(Horizontal):
     def compose(self) -> ComposeResult:
         yield Static("", id="needs-you-lead")
         for kind, *_rest in NEEDS_YOU:
-            yield Button("", id=f"needs-you-{kind}", compact=True)
+            # Focusable only while a count shows it (``_fit``). Textual's first focus takes a
+            # hidden widget too (``focusable`` reads visibility, not display): ``board -w``
+            # opened on a count no count showed, and the arrows reached nothing until a Tab or
+            # a click (tester's note on #554).
+            button = Button("", id=f"needs-you-{kind}", compact=True)
+            button.can_focus = False
+            yield button
         yield Static("", id="needs-you-tail")
 
     def show(self, needs: NeedsYou) -> None:
@@ -367,7 +373,8 @@ class NeedsYouStrip(Horizontal):
         ]
         shown = [entry for entry in counts if entry[4]]
         for kind, *_rest, count in counts:
-            self.query_one(f"#needs-you-{kind}", Button).display = bool(count)
+            button = self.query_one(f"#needs-you-{kind}", Button)
+            button.display = button.can_focus = bool(count)
         if not shown:
             fits = width <= 0 or cell_len(self.nothing) <= width
             lead.update(Text(self.nothing if fits else NOTHING_SHORT, style="dim"))
@@ -768,8 +775,8 @@ class BoardPanel(Vertical):
         """
         focused = self.app.focused
         if focused is not None:
-            if self in focused.ancestors_with_self:
-                return
+            if self in focused.ancestors_with_self and focused in self.screen.focus_chain:
+                return  # on something of the board's that shows: the keys are here
             tabs = next((node for node in self.ancestors if isinstance(node, TabbedContent)), None)
             if tabs is None or tabs not in focused.ancestors:
                 return
@@ -1015,7 +1022,11 @@ class BoardPanel(Vertical):
                     self._show_event_detail(event)
                     return
         detail = Text()
-        detail.append(f"🔔 {label} waits for you in its pane", style="bold")
+        if kind == "question":  # asked, but its line has left the feed this board keeps
+            detail.append(f"❓ {label} asked you a question", style="bold")
+            detail.append(" — it is no longer on this feed.", style="dim")
+        else:
+            detail.append(f"🔔 {label} waits for you in its pane", style="bold")
         detail.append("\nAnswer it in rlx: its row in the left pane opens the pane.", style="dim")
         self.detail_moment = None
         self._show_detail(detail)
@@ -1064,9 +1075,11 @@ class BoardPanel(Vertical):
             feed.scroll_end(animate=False)
         else:
             # Scrolled up (or autoscroll off): the view stays where the person put it, and the
-            # marker under the feed counts what came in below it (B1 #11).
+            # marker under the feed counts what came in below it (B1 #11) — while it is below
+            # it: once laid out, lines a feed that does not overflow shows are not unseen.
             self.unseen += len(fresh)
             self._show_unseen()
+            self.call_after_refresh(self._recount_unseen)
 
     def _feed_scrolled(self, _old: float, new: float) -> None:
         """The feed moved: following again once it is back at its last line, which clears the
@@ -1074,6 +1087,15 @@ class BoardPanel(Vertical):
         feed = self.query_one("#feed", OptionList)
         self._following = new >= feed.max_scroll_y
         if self._following and self.unseen:
+            self.unseen = 0
+            self._show_unseen()
+
+    def _recount_unseen(self) -> None:
+        """No ``↓ N new`` while the feed's last line is in view: a feed that does not overflow,
+        or one the view still ends at. Only a scroll used to clear it, which a short feed with
+        autoscroll off never has (review of #554)."""
+        feed = self.query_one("#feed", OptionList)
+        if self.unseen and feed.scroll_y >= feed.max_scroll_y:
             self.unseen = 0
             self._show_unseen()
 
@@ -1257,6 +1279,7 @@ class BoardPanel(Vertical):
         feed.border_title = self._feed_title()
         if self.autoscroll:
             feed.scroll_end(animate=False)
+            self.call_after_refresh(self._recount_unseen)  # at its end, nothing is unseen
 
     def action_toggle_select(self) -> None:
         """Swap the live feed for a frozen, mouse-selectable text view."""
@@ -1325,6 +1348,7 @@ class BoardPanel(Vertical):
         self._collapse(event.size.width < COLLAPSE_BELOW)
         if event.size.width > 0 and event.size.height > 0:
             self._fit(event.size.width, event.size.height)
+            self.call_after_refresh(self._recount_unseen)  # a taller feed may show them now
 
     def _fit(self, width: int, height: int) -> None:
         """Write the column's and the detail pane's ceilings from the panel's size.

@@ -549,3 +549,24 @@ def test_in_the_shell_at_90_columns_the_board_tab_answers_at_once_and_its_footer
     assert {"b", "d", "a", "v", "o", "?"} <= keys, seen["keys"]
     assert all(right <= 90 for _, right in seen["keys"]), seen["keys"]
     assert seen["shown"] and seen["table"].startswith("done archive"), seen
+
+
+def test_no_new_lines_marker_while_the_feed_shows_its_last_line(board: dict[str, Any]) -> None:
+    """Review of #554: with autoscroll off, a feed short enough to show every line counted the
+    lines that came in as unseen, and only a scroll cleared the count, which a feed that does
+    not overflow never has."""
+    from textual.widgets import OptionList
+
+    board["events"] = [_event(1, "ses_coder", "note", "line 1")]
+
+    async def go(app: Host, panel: BoardPanel) -> tuple[float, int, str]:
+        panel.action_toggle_autoscroll()  # off
+        board["events"] = [_event(seq, "ses_coder", "note", f"line {seq}") for seq in (2, 3, 4)]
+        panel.refresh_data()
+        await settle_page(app)
+        feed = panel.query_one("#feed", OptionList)
+        return feed.max_scroll_y, panel.unseen, str(feed.border_subtitle)
+
+    overflow, unseen, marker = drive(go)
+    assert overflow == 0, "the premise: four lines fit the feed"
+    assert (unseen, marker) == (0, "")

@@ -14,12 +14,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 
+def _now() -> datetime:
+    """The wall clock "today" is read from when the caller names none."""
+    return datetime.now(UTC)
+
+
 def stamp(when: datetime, *, seconds: bool = False, now: datetime | None = None) -> str:
     """``when`` in the user's local time: ``14:05`` today, ``Nov 24 14:05`` another day of
     the year, ``2025-11-24 14:05`` another year; ``seconds`` adds them (``14:05:09``).
     ``now`` is the clock "today" is read from (the wall clock when ``None``)."""
     local = when.astimezone()
-    today = (now if now is not None else datetime.now(UTC)).astimezone().date()
+    today = (now if now is not None else _now()).astimezone().date()
     hours = f"{local:%H:%M:%S}" if seconds else f"{local:%H:%M}"
     if local.date() == today:
         return hours

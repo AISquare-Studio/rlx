@@ -90,7 +90,7 @@ _KIND_VERB = {
     "captain_action": ("⚓", "had the captain act"),
     "capacity_freed": ("🟢", "freed capacity"),
     "brief_created": ("📝", "wrote a brief"),
-    "fleet": ("🚢", "fleet"),
+    "fleet": ("🚢", "acted on the fleet"),
 }
 """kind → (emoji, verb): how a feed line says what happened. A kind without one shows ``•``
 and the kind itself."""
@@ -249,27 +249,18 @@ def _task_detail(
     return text
 
 
-_STATE_WORDS = {
-    "working": "working",
-    "waiting": "waiting for input",
-    "attention": "NEEDS YOU",
-    # The two #146 states, so the one surface an operator leaves running does
-    # not print a bare dim word for a parked agent (review of #205, second round).
-    "limited": "limited",  # and the switch that moves it (`_session_lines`)
-    "switching": "switching accounts",
-}
-"""A session's state as the team block words it, beside the sidebar's mark for it."""
 _SWITCHING_CHIP = ("⇄", "magenta dim")
 """``switching``'s mark: a session state the sidebar's fleet rows never take."""
 
 
 def state_chip(state: str) -> tuple[str, str]:
     """(chip, style) for a session's state: the sidebar's mark and colour for it
-    (``cli.ui.sidebar.STATE_CHIP``) and the board's word, so one state reads one way in both
-    (B1 #13). A state neither knows is its bare word, dimmed."""
+    (``cli.ui.sidebar.STATE_CHIP``) and the board's word (``team.STATE_WORDS``, the text
+    board's too), so one state reads one way everywhere (B1 #13). A state neither knows is its
+    bare word, dimmed."""
     from aisquare.cli.ui.sidebar import STATE_CHIP
 
-    word = _STATE_WORDS.get(state)
+    word = team_service.STATE_WORDS.get(state)
     if word is None:
         return state, "dim"
     glyph, style = STATE_CHIP.get(state) or _SWITCHING_CHIP

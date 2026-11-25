@@ -1147,7 +1147,7 @@ def test_a_feed_line_is_one_row_whatever_its_text(runner: CliRunner, work_dir: P
         ("captain_action", "had the captain act"),
         ("capacity_freed", "freed capacity"),
         ("brief_created", "wrote a brief"),
-        ("fleet", "fleet"),
+        ("fleet", "acted on the fleet"),
     ],
 )
 def test_the_eight_unlabelled_kinds_read_as_words(kind: str, verb: str) -> None:
@@ -1171,16 +1171,19 @@ def test_the_eight_unlabelled_kinds_read_as_words(kind: str, verb: str) -> None:
     assert f"coder-auth {emoji} {verb}: what happened" in line and "•" not in line
 
 
-def test_a_time_from_another_day_shows_its_date() -> None:
+def test_a_time_from_another_day_shows_its_date(monkeypatch: pytest.MonkeyPatch) -> None:
     """B1 #6: a feed line, a detail and the done archive wrote ``%H:%M`` alone, so yesterday's
     ``14:05`` read as today's. Today's time stays bare; another day's is dated, another year's
-    gives the year."""
+    gives the year. The clock is pinned mid-year: on the wall's, "yesterday" is last year
+    every 1 January (review of #554)."""
     from datetime import UTC, datetime, timedelta
 
     from aisquare.cli.watch import _event_detail, clock
+    from aisquare.core import event_time
     from aisquare.models import TeamEvent
 
-    now = datetime.now(UTC)
+    now = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(event_time, "_now", lambda: now)
     yesterday = now - timedelta(days=1)
     local = yesterday.astimezone()
     event = TeamEvent(
@@ -1296,3 +1299,20 @@ def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> 
     for target, keys in asyncio.run(drive()):
         assert {"b", "d", "a", "v", "o", "q", "t", "?"} <= {key for key, _ in keys}, (target, keys)
         assert all(right <= 90 for _, right in keys), (target, keys)
+
+
+def test_board_w_opens_with_the_tasks_focused(runner: CliRunner, work_dir: Path) -> None:
+    """Tester's note on #554: ``board -w`` opened with the focus on a needs-you button that hid
+    as the first count was read, so the arrows reached nothing until a Tab or a click."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    team_service.activate()
+    _add(runner, "build the API")
+
+    async def drive() -> str | None:
+        app, size = _board_w()
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            return pilot.app.focused.id if pilot.app.focused is not None else None
+
+    assert asyncio.run(drive()) == "tasks"

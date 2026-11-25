@@ -2559,3 +2559,104 @@ def test_a_persons_board_is_a_text_board_of_its_own(golden_board: tuple[Any, ...
     assert recent[2] == f"  {stamps[2]:>{width}}  owner note: ship it"
     assert recent[3] == " " * (2 + width + 2) + "then tell me", "its next line, under it"
     assert recent[4] == f"  {stamps[3]:>{width}}  manager question: staging or prod first?"
+
+
+#: ``aisquare board``'s text for :func:`_board_fixture`, named (#140), as 0.10.1 printed it for
+#: everyone — what an agent that runs it reads, byte for byte (review of #554).
+GOLDEN_AGENT_NAMED_BOARD = "\n".join(
+    [
+        "<aisquare-team>",
+        "sessions:",
+        "  - manager [golden-model-x] ⚠ off-ladder — 2m ago",
+        "  - coder-auth persona:skeptic — focus: wire the login — 2m ago",
+        "  - tester-1 — 45m ago (stale)",
+        "tasks (8 todo, 1 doing, 1 review, 1 blocked, 1 done):",
+        "  - #1 tsk_golden0001 [doing @coder-auth] wire auth",
+        "  - #2 tsk_golden0002 [blocked] fix the login race",
+        "  - #3 tsk_golden0003 [review @tester-1] add the retry",
+        "  - #4 tsk_golden0004 [todo] write the docs ⧗ waits on #2",
+        "  - #7 tsk_golden0007 [todo] chore 7",
+        "  - #8 tsk_golden0008 [todo] chore 8",
+        "  - #9 tsk_golden0009 [todo] chore 9",
+        "  - #10 tsk_golden0010 [todo] chore 10",
+        "  … 3 more — `rlx task list`",
+        "recent updates:",
+        "  - manager added → coder: [#1 tsk_golden0001] wire auth",
+        "  - coder-auth claimed: [#1 tsk_golden0001] wire auth",
+        "  - owner note: ship it",
+        "then tell me",
+        "  - manager question: staging or prod first?",
+        "  - coder-auth blocked: [#2 tsk_golden0002] fix the login race — no API key",
+        "  - tester-1 result: [#3 tsk_golden0003] PASS " + "x" * 200,
+        "</aisquare-team>",
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("AISQUARE_FLEET_AGENT", "agt_golden"),  # a fleet window
+        ("CLAUDECODE", "1"),  # a process Claude Code started
+        ("CODEX_THREAD_ID", "thr_golden"),  # a Codex tool shell
+        ("AISQUARE_BROKERED", "1"),  # a sandboxed agent's broker runs it
+    ],
+    ids=["fleet-window", "claude-code", "codex-tool-shell", "broker"],
+)
+def test_an_agent_reading_aisquare_board_gets_its_block_byte_for_byte(
+    golden_board: tuple[Any, ...], monkeypatch: pytest.MonkeyPatch, variable: str, value: str
+) -> None:
+    """Review of #554: the protocol sends agents to ``aisquare board``, and what they read
+    there is the ``<aisquare-team>`` block as 0.10.1 printed it, fence and all. The person's
+    text board (B1 #14) is for a person alone."""
+    project, sessions, tasks, events = golden_board
+    names = {s.id: s.label or s.role for s in sessions}
+
+    person = team_service.render_board(project, sessions, tasks, events, names=names)
+    monkeypatch.setenv(variable, value)
+    agent = team_service.render_board(project, sessions, tasks, events, names=names)
+
+    assert agent == GOLDEN_AGENT_NAMED_BOARD
+    assert person.startswith("rlx board — golden-repo\n"), "without the mark, a person's"
+
+
+def test_aisquare_board_prints_an_agent_its_block_and_a_person_the_text_board(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the command: the same board, inside a fleet window and at a shell."""
+    team_service.activate()
+    runner.invoke(app, ["task", "add", "wire auth"])
+    runner.invoke(app, ["note", "ship it\nthen tell me"])
+
+    person = runner.invoke(app, ["board"])
+    monkeypatch.setenv("AISQUARE_FLEET_AGENT", "agt_cli")
+    agent = runner.invoke(app, ["board"])
+
+    assert person.exit_code == 0 and agent.exit_code == 0, (person.output, agent.output)
+    assert agent.stdout.startswith("<aisquare-team>\n") and agent.stdout.endswith(
+        "</aisquare-team>\n"
+    )
+    assert "  - owner note: ship it\nthen tell me\n" in agent.stdout
+    assert "<aisquare-team>" not in person.stdout and person.stdout.startswith("rlx board — ")
+
+
+def test_a_persons_board_lines_up_names_by_their_cells(golden_board: tuple[Any, ...]) -> None:
+    """A name with an emoji or a wide character in it takes two cells a character; padded by
+    ``len``, every column after it sat one cell off per such character (review of #554)."""
+    from rich.cells import cell_len
+
+    project, sessions, tasks, events = golden_board
+    names = {s.id: s.label or s.role for s in sessions}
+    names[sessions[1].id] = "coder-🚀"
+    names[sessions[2].id] = "テスター"
+
+    text = team_service.render_board(project, sessions, tasks, events, names=names)
+    lines = text.splitlines()
+    team = lines.index("team — 3 live")
+    rows = lines[team + 1 : team + 4]
+    starts = [
+        cell_len(row[: row.index(word)])
+        for row, word in zip(rows, ["waiting", "working", "NEEDS"], strict=True)
+    ]
+
+    assert len(set(starts)) == 1, f"the state column starts at {starts}"
