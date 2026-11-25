@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# One version number: rlxd's is rlx's (handoff 0.10.3, 1.2). It must equal
+# `version` in the repo's pyproject.toml; crates/rlxd/tests/version.rs fails when
+# they differ. A release bumps three files together: pyproject.toml, this file,
+# and Cargo.lock (`cargo update --workspace` from rlxd/ rewrites it).
+[workspace.package]
+version = "0.10.1"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+repository = "https://github.com/AISquare-Studio/rlx"
+publish = false
+
+[workspace.dependencies]
+rlxd-proto = { path = "crates/rlxd-proto" }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

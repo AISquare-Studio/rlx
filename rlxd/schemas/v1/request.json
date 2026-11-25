@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Request",
+  "description": "One request on rlxd's socket. Frames are newline-delimited JSON:\n\n```json\n{\"id\": 7, \"method\": \"run.start\", \"params\": {}}\n```\n\nThe response is an envelope with the same `id`. The first frame on a connection must\nbe `hello`; any other first frame gets the error `unauthorized`.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "Chosen by the client; the response carries it back.",
+      "type": "integer",
+      "maximum": 9007199254740991,
+      "minimum": 0
+    },
+    "method": {
+      "description": "The method to call, such as `hello`, `status` or `run.start`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "params": {
+      "description": "The method's parameters. Absent means `{}`.",
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "id",
+    "method"
+  ]
+}

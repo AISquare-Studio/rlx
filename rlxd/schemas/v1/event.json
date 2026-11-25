@@ -1,0 +1,331 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Event",
+  "description": "One event on the stream `events.subscribe` opens.\n\n```json\n{\"schema_version\": 1, \"seq\": 42, \"time\": \"2026-11-25T12:00:00.000Z\", \"topic\": \"run\",\n \"type\": \"run.text\", \"data\": {\"run_id\": \"…\", \"run_seq\": 3, \"kind\": \"task\", \"attempt\": 1}}\n```\n\nTwo sequences number events. `seq` is per home: every event has one, and\n`events.subscribe {since}` resumes after it. `data.run_seq` is per run: every event\nwhose topic is `run` has one, with the run's `run_id`, `kind`, `attempt` and\n`job_id?`, so a client can replay one run from a known point.",
+  "type": "object",
+  "properties": {
+    "data": {
+      "description": "The type's own fields. On the `run` topic, also `run_id`, `run_seq`, `kind`,\n`attempt` and `job_id?`.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "schema_version": {
+      "description": "The schema version this document follows.",
+      "type": "integer",
+      "const": 1
+    },
+    "seq": {
+      "description": "Strictly increasing per home, from 1, across every topic. `events.subscribe\n{since}` resumes after it.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 1
+    },
+    "time": {
+      "description": "When it happened: RFC 3339, in UTC, to the millisecond (`2026-11-25T12:00:00.000Z`).",
+      "type": "string",
+      "format": "date-time"
+    },
+    "topic": {
+      "description": "What it is about, in snake_case, such as `run` or `needs_you`. A client ignores\ntopics it does not know.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "type": {
+      "description": "What happened: `<topic>.<event>`, the event in snake_case, such as `run.text`,\n`fleet.agent_spawned` or `connector.login.open_url`. It starts with this event's\nown topic. A client ignores types it does not know.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "daemon"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^daemon\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "run"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^run\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "job"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^job\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "connector"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^connector\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "pty"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^pty\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "hook"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^hook\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "fleet"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^fleet\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "board"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^board\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "needs_you"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^needs_you\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "upgrade"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^upgrade\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "install"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^install\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "signin"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^signin\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
+            "const": "run"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "attempt": {
+                "description": "Which attempt of the run, from 1.",
+                "type": "integer",
+                "maximum": 18446744073709551615,
+                "minimum": 1
+              },
+              "job_id": {
+                "description": "The scheduler job that fired the run, if one did.",
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "description": "The run's kind, such as task or widget_refresh.",
+                "type": "string",
+                "minLength": 1
+              },
+              "run_id": {
+                "description": "The run this event belongs to.",
+                "type": "string",
+                "minLength": 1
+              },
+              "run_seq": {
+                "description": "Strictly increasing per run, from 1.",
+                "type": "integer",
+                "maximum": 18446744073709551615,
+                "minimum": 1
+              }
+            },
+            "required": [
+              "run_id",
+              "run_seq",
+              "kind",
+              "attempt"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "required": [
+    "schema_version",
+    "seq",
+    "time",
+    "topic",
+    "type",
+    "data"
+  ]
+}

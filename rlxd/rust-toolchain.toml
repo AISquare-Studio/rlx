@@ -1,0 +1,8 @@
+# The toolchain every rlxd build uses, locally and in CI (.github/workflows/rlxd.yml).
+# rustup reads this file from the directory cargo runs in, so run cargo from rlxd/
+# (CI does) to be sure of it; `--manifest-path rlxd/Cargo.toml` from the repo root
+# uses your default toolchain instead.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

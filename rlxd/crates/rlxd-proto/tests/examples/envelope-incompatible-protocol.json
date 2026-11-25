@@ -1,0 +1,1 @@
+{"schema_version": 1, "id": 1, "ok": false, "error": {"code": "incompatible_protocol", "message": "protocol version 99 is not one this rlxd serves", "hint": "Update rlx or the app, so that both speak one protocol version.", "detail": {"supported": [1]}}}

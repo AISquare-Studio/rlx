@@ -1,0 +1,15 @@
+[package]
+name = "rlxd-client"
+description = "The library rlxapp depends on to talk to rlxd: connect, call, subscribe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rlxd-proto.workspace = true
+
+[lints]
+workspace = true

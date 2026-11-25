@@ -1,0 +1,34 @@
+# cargo-deny's checks for the rlxd workspace: `cargo deny check`, run by
+# .github/workflows/rlxd.yml (handoff 0.10.3, 1.1). Every target counts, so a
+# Windows-only or macOS-only dependency is checked on whichever runner runs this.
+
+[advisories]
+# A RustSec advisory, or an unmaintained crate, fails the check; so does a yanked
+# version in Cargo.lock. To accept one, add its id to `ignore` with the reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# rlx is MIT. These are the licences of what rlxd's crates are built from today,
+# each permissive and compatible with shipping rlxd's binaries under MIT. A
+# dependency under anything else fails the check: add its licence here only after
+# reading it. The licence check leaves out dev-dependencies, which never ship
+# (`[licenses] include-dev` defaults to false). They stay in the graph for the
+# advisories, bans and sources checks.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+# A `*` version is refused, except a path dependency inside this workspace.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: a crate from another registry or a git repository fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"
