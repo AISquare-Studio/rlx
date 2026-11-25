@@ -1053,6 +1053,8 @@ def test_a_watcher_whose_window_closes_leaves_the_registry(
     # as a real one would end the suite) ends the loop the way SIGTERM does.
     def body() -> None:
         assert [d.kind for d in daemons.list_live()] == ["watch"]
+        if sys.platform == "win32":  # skipped there; and mypy --platform win32 reads this
+            raise AssertionError("no SIGHUP on Windows")
         hangup = signal.getsignal(signal.SIGHUP)
         assert callable(hangup), "run() takes SIGHUP"
         hangup(signal.SIGHUP, None)
