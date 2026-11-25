@@ -1301,24 +1301,37 @@ def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> 
 
     team_service.activate()
 
+    wanted = {"b", "d", "a", "o", "/", "q", "t", "?"}
+
+    async def bound_keys(pilot: Any) -> list[tuple[str, int]]:
+        """The footer's keys once those of the focused widget are bound and laid out. The
+        footer recomposes after a focus change, in a later message: read at once, a slow
+        Windows runner saw none of them (rc gate 45659530340). Bounded: 10 s at most."""
+        keys: list[tuple[str, int]] = []
+        for _ in range(500):
+            shown = list(pilot.app.screen.query_one(Footer).query("FooterKey"))
+            keys = [(str(getattr(key, "key_display", "")), key.region.right) for key in shown]
+            laid_out = all(key.region.width for key in shown)
+            if laid_out and wanted <= {key for key, _ in keys}:
+                break
+            await pilot.pause(0.02)
+        return keys
+
     async def drive() -> list[tuple[str, list[tuple[str, int]]]]:
         app, _size = _board_w()
         seen = []
         async with app.run_test(size=(90, 30)) as pilot:
             await pilot.pause()
             for target in ("#tasks", "#feed"):
+                pane = "#board-side" if target == "#tasks" else "#feedpane"
+                if not pilot.app.query_one(pane).display:
+                    pilot.app.board.action_toggle_board()  # 90 columns: one half at a time (B2)
                 pilot.app.query_one(target).focus()
-                await pilot.pause()
-                footer = pilot.app.screen.query_one(Footer)
-                keys = [
-                    (str(getattr(key, "key_display", "")), key.region.right)
-                    for key in footer.query("FooterKey")
-                ]
-                seen.append((target, keys))
+                seen.append((target, await bound_keys(pilot)))
         return seen
 
     for target, keys in asyncio.run(drive()):
-        assert {"b", "d", "a", "o", "/", "q", "t", "?"} <= {key for key, _ in keys}, (target, keys)
+        assert wanted <= {key for key, _ in keys}, (target, keys)
         assert all(right <= 90 for _, right in keys), (target, keys)
 
 
