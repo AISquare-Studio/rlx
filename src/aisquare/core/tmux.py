@@ -1883,6 +1883,12 @@ class TmuxServer:
         """Kill the window holding ``pane_id`` (a dead pane included)."""
         self.run("kill-window", "-t", pane_id)
 
+    def kill_pane(self, pane_id: str) -> None:
+        """Kill ``pane_id`` alone (a dead pane included): every other pane of its window stays,
+        and the window goes with it only when it held no other, as tmux closes one left
+        empty."""
+        self.run("kill-pane", "-t", pane_id)
+
     def kill_session(self, session: str) -> None:
         self.run("kill-session", "-t", _session_target(session))
 

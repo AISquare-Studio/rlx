@@ -38,7 +38,7 @@ from aisquare.cli.ui.views.tmux_page import (
 )
 from aisquare.core import claude_accounts as accounts_core
 from aisquare.core import tmux as tmux_core
-from aisquare.core.tmux import Completed, ForeignServer, PanePids, WindowInfo
+from aisquare.core.tmux import Completed, ForeignServer, PanePids, TmuxError, WindowInfo
 from aisquare.models import AdoptableConversation, FleetAgent, ProjectInfo
 from aisquare.services import adopt as adopt_service
 from aisquare.services import fleet as fleet_service
@@ -65,7 +65,44 @@ CODEX = "/opt/codex/vendor/aarch64-apple-darwin/codex/codex"
 
 class PagedTmux(FakeTmux):
     """The fleet suite's fake, with every pane's pid in one listing (``pane_pids``), and
-    windows no row names: what a hand-run ``tmux -L asq new-window`` leaves."""
+    windows no row names: what a hand-run ``tmux -L asq new-window`` leaves. Its kills are
+    tmux's own: ``kill-window`` ends every pane of the window (the suite's fake drops the one
+    pane), ``kill-pane`` that pane alone; ``kills`` says which was asked of which pane."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.kills: list[tuple[str, str]] = []
+
+    def _window_of(self, pane_id: str) -> list[str]:
+        """Every pane of the window holding ``pane_id``, ``pane_id`` first."""
+        window = next(w for ws in self.sessions.values() for w in ws if w.pane_id == pane_id)
+        others = [
+            w.pane_id
+            for w in self.sessions[window.session]
+            if w.window_id == window.window_id and w.pane_id != pane_id
+        ]
+        return [pane_id, *others]
+
+    def _kill(self, verb: str, pane_id: str, panes: Callable[[str], list[str]]) -> None:
+        self.binary()
+        self._require_server()
+        if self.refuse_kills:
+            raise TmuxError(f"kill-{verb} failed (fake)")
+        if pane_id not in self.facts:
+            raise TmuxError(f"can't find pane: {pane_id}")
+        self.kills.append((verb, pane_id))
+        for each in panes(pane_id):
+            self.vanish(each)
+            self.killed.append(each)
+        self._forget_empty_sessions()
+        if not self.sessions:
+            self.running = False
+
+    def kill_window(self, pane_id: str) -> None:
+        self._kill("window", pane_id, self._window_of)
+
+    def kill_pane(self, pane_id: str) -> None:
+        self._kill("pane", pane_id, lambda pane: [pane])
 
     def pane_pids(self) -> PanePids | None:
         if not self._read():
@@ -117,9 +154,19 @@ class PagedTmux(FakeTmux):
         return pane_id
 
 
+ON_WINDOWS = sys.platform == "win32"
+NO_TMUX_HERE = (
+    "Windows has no tmux: the page reads none there (test_windows_has_no_tmux_and_says_so), "
+    "so a fake tmux is never asked"
+)
+
+
 @pytest.fixture
 def tmux(monkeypatch: pytest.MonkeyPatch) -> PagedTmux:
-    """The fake every socket answers with, as the fleet suite's ``tmux`` fixture wires it."""
+    """The fake every socket answers with, as the fleet suite's ``tmux`` fixture wires it.
+    Skipped on Windows, where :func:`tmux_panes.read` asks no tmux at all."""
+    if ON_WINDOWS:
+        pytest.skip(NO_TMUX_HERE)
     fake = PagedTmux()
     monkeypatch.setattr(fleet_service, "server", lambda config=None: fake)
     monkeypatch.setattr(tmux_core, "desktop_environment", lambda environ=None: {})
@@ -243,6 +290,23 @@ def test_no_tmux_says_so_plainly(tmux: PagedTmux, monkeypatch: pytest.MonkeyPatc
     assert "tmux" in tmux_panes.NO_TMUX_ON_WINDOWS and "`" not in tmux_panes.NO_TMUX_ON_WINDOWS
 
 
+def test_windows_has_no_tmux_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no fake tmux, so it runs on Windows itself (where every test above is skipped):
+    the page's read says there is no tmux, in plain words, and asks nothing of tmux."""
+    if not ON_WINDOWS:
+        monkeypatch.setattr(sys, "platform", "win32")
+
+    def asked(*args: object, **kwargs: object) -> object:
+        raise AssertionError("tmux was asked on Windows")
+
+    monkeypatch.setattr(tmux_panes, "rlx_server", asked)
+    monkeypatch.setattr(fleet_service, "settings", asked)
+    report = tmux_panes.read()
+    assert report.unavailable == tmux_panes.NO_TMUX_ON_WINDOWS
+    assert report.panes == [] and report.others == [] and report.error is None
+    assert "`" not in tmux_panes.NO_TMUX_ON_WINDOWS
+
+
 # --- Stop: a dead window, or a live one nobody's ----------------------------------------------
 
 
@@ -361,8 +425,8 @@ def adopt_spy(world: World, tmux: PagedTmux, monkeypatch: pytest.MonkeyPatch) ->
         )
         return fleet_service.SpawnReceipt(agent=adopted, asked_label=None, tmux_session="x")
 
-    def alive(pid: int) -> bool:
-        return (world.claude, "literal", "/exit") not in tmux.typed
+    def alive(pid: int) -> bool:  # until /exit was typed, into whichever pane it adopts
+        return not any(entry[1:] == ("literal", "/exit") for entry in tmux.typed)
 
     monkeypatch.setattr(adopt_service, "plan_pane", plan_pane)
     monkeypatch.setattr(adopt_service, "adopt", adopt)
@@ -382,7 +446,8 @@ def test_adopt_quits_the_agent_in_its_pane_then_resumes_its_conversation(
     typed = [entry for entry in tmux.typed if entry[0] == world.claude]
     assert typed == [(world.claude, "literal", "/exit"), (world.claude, "key", "Enter")]
     assert adopt_spy.adopted == [(str(plan.transcript), "coder")], "by its transcript"
-    assert receipt.closed and tmux.killed == [world.claude], "its dead window, alone"
+    assert receipt.closed and tmux.kills == [("pane", world.claude)], "its dead pane, alone"
+    assert tmux.killed == [world.claude] and receipt.kept == ()
     assert all(entry[0] == world.claude for entry in tmux.typed), "no other pane typed into"
 
 
@@ -848,6 +913,8 @@ def test_stops_confirm_names_the_other_panes_its_window_takes_with_it(
     assert f"other pane ({beside}) closes with it" in said
     alone = tmux_page.stop_question(_by_pane(tmux_panes.read())[world.shell]).plain
     assert "other pane" not in alone, "control: a window of one pane"
+    tmux_panes.stop(dead)
+    assert tmux.kills == [("window", world.dead)] and tmux.killed == [world.dead, beside]
 
 
 # --- the tester's note on #565 (board #351) -------------------------------------------------
@@ -952,3 +1019,74 @@ def test_stop_refuses_a_window_that_has_become_an_agents_by_the_time_it_acts(
 def test_the_hint_names_the_highlighted_window_in_full() -> None:
     """F: at 80x24 a Window column was clipped; the window's name is the hint line's."""
     assert "Window" not in tmux_page.COLUMNS
+
+
+# --- the round-3 tester of #565 (board #1477) -----------------------------------------------
+
+
+@pytest.mark.parametrize("neighbour", ["placed", "held", "a human's editor"])
+def test_adopt_closes_its_dead_pane_alone_and_never_the_window_it_shares(
+    world: World,
+    tmux: PagedTmux,
+    ps: list[Process],
+    adopt_spy: AdoptSpy,
+    monkeypatch: pytest.MonkeyPatch,
+    neighbour: str,
+) -> None:
+    """MAJOR 1: an orphan Claude Code split beside a live pane was adopted, and its dead pane's
+    ``kill-window`` closed the whole window, the agent beside it (placed, or held by a row
+    whose record cannot place it) or a human's editor with it. The dead pane alone is closed
+    now, and the confirm names the pane that stays."""
+    session = fleet_service.session_name(_codename(world.project))
+    if neighbour == "a human's editor":
+        beside = tmux.window(session, "notes", "vim", pid=7800)
+        ps.append(Process(7800, 1, 300, "vim notes.md"))
+    else:
+        beside = world.agent_pane
+    if neighbour == "held":
+        real = fleet_service.resolve_place
+
+        def unplaced(row: FleetAgent, record: object = None, config: object = None) -> object:
+            if row.id == world.agent.id:
+                return fleet_service.Unplaced(row, "its launch record could not be read")
+            return real(row, record, config)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(fleet_service, "resolve_place", unplaced)
+    split = tmux.split(beside, "2.1.300", pid=7700)
+    ps.append(Process(7700, 1, 60, "claude --model opus"))
+    tmux.screens[split] = list(REAL_IDLE)
+    panes = _by_pane(tmux_panes.read())
+    pane = panes[split]
+    assert pane.orphan and pane.adoptable and pane.siblings == (beside,)
+    assert pane.shares_window == (neighbour != "a human's editor")
+    plan = tmux_panes.plan_adopt(pane)
+    said = tmux_page.adopt_question(pane, plan).plain
+    assert f"other pane ({beside}) stays open" in said and "window it leaves empty" not in said
+
+    receipt = tmux_panes.adopt(pane, plan)
+
+    assert [entry[0] for entry in tmux.typed] == [split, split], "typed into the split alone"
+    assert receipt.closed and receipt.kept == (beside,)
+    assert tmux.kills == [("pane", split)] and tmux.killed == [split]
+    assert beside in tmux.facts and not tmux.facts[beside].dead, "its neighbour runs on"
+    assert beside in _by_pane(tmux_panes.read())
+
+
+def test_adopts_confirm_of_a_window_of_one_pane_names_no_other(world: World) -> None:
+    """Control for the confirm above: a pane alone in its window says its window closes."""
+    pane = _by_pane(tmux_panes.read())[world.claude]
+    said = tmux_page.adopt_question(pane, _plan(world, world.claude)).plain
+    assert pane.siblings == ()
+    assert "A window it leaves empty is closed." in said and "other pane" not in said
+
+
+def test_which_agents_adopt_is_offered_for_is_the_adapters_to_say() -> None:
+    """MAJOR 2: a list of two agents' names in the service (test_no_agent_literals); now an
+    agent's conversation is adoptable when its adapter reads its transcript, as
+    ``adopt.plan_pane`` finds it."""
+    from aisquare.core.agent_adapters import adapters
+
+    for adapter in adapters():
+        assert tmux_panes.resumes(adapter.id) == (adapter.transcript_reader is not None)
+    assert tmux_panes.resumes("claude-code") and tmux_panes.resumes("codex")
+    assert not tmux_panes.resumes(None) and not tmux_panes.resumes("no-such-agent")

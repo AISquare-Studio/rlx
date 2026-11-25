@@ -19,7 +19,8 @@ it acts (a read on screen is seconds old):
   fleet: ``fleet adopt`` resumes a conversation, not a pane, and refuses one a live process
   holds, so the agent in the pane is quit at its own exit command first and its conversation
   then resumed in an rlx window. Every refusal of adopt's is asked before anything is quit
-  (``adopt.plan_pane``). Never a plain shell, which holds no conversation.
+  (``adopt.plan_pane``). Never a plain shell, which holds no conversation. The pane it leaves
+  dead is closed alone, never the window around it.
 
 **The servers rlx did not start** (the user's own ``default``, another tool's: every other
 socket in the user's ``tmux-<uid>`` folder) are read, never written: ``core.tmux.ForeignServer``
@@ -70,10 +71,6 @@ PURPOSES: Mapping[str, str] = {
     DETACHED_SESSION: "watch",
 }
 """rlx's own sessions of no project, and what each one's windows are for."""
-
-ADOPTABLE = frozenset({"claude-code", "codex"})
-"""The agents whose pane Adopt is offered for (the owner's Q2): Claude Code and Codex, whose
-conversations ``fleet adopt`` resumes. Never a plain shell."""
 
 NO_AGENT = "no agent"
 SHELL = "shell"
@@ -147,6 +144,19 @@ def _tree(pid: int | None, listed: Sequence[Process]) -> list[Process]:
                 found.append(child)
                 queue.append(child.pid)
     return found
+
+
+def resumes(agent_id: str | None) -> bool:
+    """Whether a conversation of that agent's is one ``fleet adopt`` resumes: it finds one by
+    the agent's transcript (``AgentAdapter.transcript_reader``, as ``adopt.plan_pane`` reads
+    it), so an agent rlx reads no transcript of has none to adopt. The adapter's to say, not a
+    list of names here."""
+    if agent_id is None:
+        return False
+    try:
+        return get_adapter(agent_id).transcript_reader is not None
+    except ValueError:  # no agent rlx knows
+        return False
 
 
 def _agent_in(tree: Sequence[Process], current: str) -> AgentAdapter | None:
@@ -232,8 +242,10 @@ class Pane:
 
     @property
     def adoptable(self) -> bool:
-        """A live Claude Code or Codex nobody's: Adopt is offered. Never a shell."""
-        return not self.dead and self.orphan and self.runs in ADOPTABLE
+        """A live coding agent nobody's, whose conversation ``fleet adopt`` resumes
+        (:func:`resumes`: Claude Code and Codex, the owner's Q2): Adopt is offered. Never a
+        shell."""
+        return not self.dead and self.orphan and resumes(self.runs)
 
     @property
     def where(self) -> str:
@@ -602,8 +614,11 @@ class AdoptReceipt:
     spawned: fleet_service.SpawnReceipt
     plan: adopt_service.PanePlan
     closed: bool
-    """Whether the window it quit was closed: dead once its agent quit (the agent was the
-    pane's own process), and nobody's. One whose shell runs on is left open."""
+    """Whether the pane it quit was closed: dead once its agent quit (the agent was the pane's
+    own process), and nobody's. That pane alone (``kill-pane``): its window goes with it only
+    when it held no other. One whose shell runs on is left open."""
+    kept: tuple[str, ...] = ()
+    """The other panes its window held as it acted, each left as it was."""
 
 
 def adopt(
@@ -645,7 +660,7 @@ def adopt(
             )
         _sleep(_POLL)
     spawned = adopt_service.adopt(str(fresh.transcript), role=role)
-    return AdoptReceipt(spawned, fresh, _close_if_dead(now, srv))
+    return AdoptReceipt(spawned, fresh, _close_if_dead(now, srv), now.siblings)
 
 
 def _refuse_unless_at_its_prompt(pane: Pane, plan: adopt_service.PanePlan, srv: TmuxServer) -> None:
@@ -694,9 +709,12 @@ def _refuse_unless_at_its_prompt(pane: Pane, plan: adopt_service.PanePlan, srv: 
 
 
 def _close_if_dead(pane: Pane, srv: TmuxServer) -> bool:
-    """Close ``pane``'s window once it is dead on the server it was read on, its agent having
-    quit: an orphan's dead window, which Stop would offer next. Fails open: a window that
-    could not be closed is left for Stop."""
+    """Close ``pane`` once it is dead on the server it was read on, its agent having quit: an
+    orphan's dead pane, which Stop would offer next. The pane alone (``kill-pane``), never its
+    window: a window split beside it may hold a live agent's pane or a human's editor, and
+    ``kill-window`` would end them with it (the round-3 tester of #565). A window of no other
+    pane closes with it, as tmux closes one left empty. Fails open: a pane that could not be
+    closed is left as it is."""
     with contextlib.suppress(TmuxError):
         facts = srv.pane_facts_or_raise(pane.pane_id)
         if facts is None or not facts.dead:
@@ -706,6 +724,6 @@ def _close_if_dead(pane: Pane, srv: TmuxServer) -> bool:
             pane.server_started,
         ):
             return False
-        srv.kill_window(pane.pane_id)
+        srv.kill_pane(pane.pane_id)
         return True
     return False

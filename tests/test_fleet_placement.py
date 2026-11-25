@@ -202,8 +202,8 @@ ACTS: dict[str, dict[str, str]] = {
         ),
         "_refuse_unless_at_its_prompt": "reads the screen of the pane `adopt` is about to type in",
         "_close_if_dead": (
-            "kills the window `adopt` quit the agent in, once tmux says it is dead on the "
-            "server it was listed on"
+            "kills the pane `adopt` quit the agent in, that pane alone (`kill-pane`, never its "
+            "window's others), once tmux says it is dead on the server it was listed on"
         ),
     },
     f"{UI}/terminal.py": {

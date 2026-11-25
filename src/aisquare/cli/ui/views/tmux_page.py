@@ -206,9 +206,22 @@ def adopt_question(pane: Pane, plan: adopt_service.PanePlan) -> Text:
     question.append(f"\non {conversation.account}, in {conversation.cwd or 'its folder'}\n\n")
     question.append(
         f"{plan.exit_command} is typed in its pane, so it quits, and its conversation is "
-        "resumed in a new rlx window, as a coder. A window it leaves empty is closed.",
+        "resumed in a new rlx window, as a coder. "
+        + (
+            "Its pane is closed if it ends."
+            if pane.siblings
+            else "A window it leaves empty is closed."
+        ),
         style="dim",
     )
+    if pane.siblings:
+        others = ", ".join(pane.siblings)
+        many = len(pane.siblings) > 1
+        question.append(
+            f"\nIts window's other pane{'s' if many else ''} ({others}) stay{'' if many else 's'} "
+            "open, and what runs there is not touched.",
+            style="bold",
+        )
     return question
 
 
@@ -617,9 +630,15 @@ class TmuxView(VerticalScroll):
                 self._ask_to_adopt(pane, result)
                 return
             if isinstance(result, tmux_panes.AdoptReceipt):
+                closed = ""
+                if result.closed:
+                    closed = (
+                        ": its old pane was closed"
+                        if result.kept
+                        else ": its old window was closed"
+                    )
                 self.notify(
-                    f"adopted into {_project(result.plan)} as {result.spawned.agent.label}"
-                    + (": its old window was closed" if result.closed else ""),
+                    f"adopted into {_project(result.plan)} as {result.spawned.agent.label}{closed}",
                     timeout=8,
                     markup=False,
                 )
