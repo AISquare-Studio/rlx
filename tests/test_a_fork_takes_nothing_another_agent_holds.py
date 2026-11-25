@@ -1,6 +1,6 @@
 """A fork takes nothing another agent holds: not its label, its worktree or its branch.
 
-Review of #240, finding 3. The Spawn dialog's *Hand off from* forks by default and sends
+Review of #240, finding 3. The Spawn dialog's *Continue from* forks by default and sends
 ``label=None``. ``next_label`` keeps only LIVE agents apart, so a fork of an EXITED
 teammate was handed that teammate's own label back, and ``_ensure_worktree`` then reused
 the tree or the branch that label already had, ignoring the commit the fork was to be cut

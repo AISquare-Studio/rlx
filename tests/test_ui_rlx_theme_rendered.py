@@ -21,6 +21,7 @@ under every theme, as a cue. Its text is measured here with the keyboard on its 
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,7 @@ from typing import Any
 
 import pytest
 from rich.style import Style
-from textual.app import ComposeResult
+from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.pilot import Pilot
 from textual.screen import Screen
@@ -329,3 +330,81 @@ def test_a_buttons_label_follows_the_fade_both_ways(tmp_path: Path, script: Scri
             side,
             f"{ratio:.2f}",
         )
+
+
+@pytest.mark.parametrize("theme", ["rlx", "textual-light"])
+def test_a_ticked_checkbox_shows_a_check_and_an_unticked_one_is_blank(theme: str) -> None:
+    """Q13 (the UX audit): a checkbox says its state by its glyph, not by colour alone. Textual
+    drew a dim ``X`` in both states; ticked is ✓ now, unticked blank, and a click flips it."""
+    from textual.widgets import Checkbox
+
+    from aisquare.cli.ui.theme import CHECK_MARK, register_themes
+
+    class Host(App[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            register_themes(self)  # as both of our apps do
+
+        def compose(self) -> ComposeResult:
+            yield Checkbox("ticked", True, id="on")
+            yield Checkbox("unticked", False, id="off")
+
+    def box(app: App[None], ident: str) -> str:
+        """The three cells between the box's sides, ``▐?▌``, as drawn."""
+        widget = app.query_one(f"#{ident}", Checkbox)
+        strips = app.screen._compositor.render_full_update(simplify=True).strips
+        (strip,) = strips[widget.region.y + widget.region.height // 2]
+        row = strip.text
+        return row[row.index("▐") : row.index("▌") + 1]
+
+    async def go() -> tuple[str, str, str]:
+        app = Host()
+        async with app.run_test(size=(40, 8)) as pilot:
+            app.theme = theme
+            await pilot.pause()
+            on, off = box(app, "on"), box(app, "off")
+            app.query_one("#off", Checkbox).toggle()
+            await pilot.pause()
+            return on, off, box(app, "off")
+
+    on, off, flipped = asyncio.run(go())
+    assert on == f"▐{CHECK_MARK}▌", on
+    assert off == "▐ ▌", off
+    assert flipped == f"▐{CHECK_MARK}▌", flipped
+
+
+def test_a_selection_list_still_draws_once_the_checkboxes_glyph_is_ours() -> None:
+    """Review of #563 (seq 463): the ✓-or-blank glyph was a property on ``ToggleButton``, and
+    Textual's ``SelectionList`` reads ``ToggleButton.BUTTON_INNER`` off the class as a string,
+    so any SelectionList raised ``TypeError`` (str + property) once ``register_themes`` ran.
+    The glyph is ``Checkbox``'s now: a SelectionList mounts and draws its boxes, and a checkbox
+    still shows ✓."""
+    from textual.widgets import Checkbox, SelectionList
+    from textual.widgets._toggle_button import ToggleButton
+
+    from aisquare.cli.ui.theme import CHECK_MARK, register_themes
+
+    class Host(App[None]):
+        def __init__(self) -> None:
+            super().__init__()
+            register_themes(self)  # as both of our apps do, before anything is drawn
+
+        def compose(self) -> ComposeResult:
+            yield SelectionList[str](("one", "one", True), ("two", "two"), id="choices")
+            yield Checkbox("ticked", True, id="box")
+
+    async def go() -> tuple[str, str]:
+        app = Host()
+        async with app.run_test(size=(40, 8)) as pilot:
+            await pilot.pause()
+            strips = app.screen._compositor.render_full_update(simplify=True).strips
+            listed = app.query_one("#choices", SelectionList)
+            (first,) = strips[listed.region.y + listed.styles.border.spacing.top]
+            box = app.query_one("#box", Checkbox)
+            (ticked,) = strips[box.region.y + box.region.height // 2]
+            return first.text, ticked.text
+
+    first, ticked = asyncio.run(go())
+    assert isinstance(ToggleButton.BUTTON_INNER, str), "SelectionList reads it as a string"
+    assert "one" in first, first
+    assert f"▐{CHECK_MARK}▌" in ticked, ticked
