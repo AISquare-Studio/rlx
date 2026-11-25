@@ -520,6 +520,9 @@ def test_the_spawn_button_with_nothing_selected_opens_on_the_first_project(
     register(tmp_path / "beta", project_id="prj_b", codename="ruby-fox")
 
     async def scenario(pilot: Pilot[None], app: RecordingFleetApp) -> tuple[str, str, str | None]:
+        # Nothing selected: Welcome, as `w` opens it (start opens home since L1, a project).
+        await app.action_welcome()
+        await pilot.pause()
         await pilot.click(spawn_button(app))
         await pilot.pause()
         dialog = app.screen
@@ -1517,10 +1520,13 @@ def test_a_receipt_dismisses_toasts_it_and_its_notes_refreshes_and_opens_the_new
     # The spawn's three, first and in order. What may follow is the new agent's
     # own pane saying `%9: (pane gone)` — no tmux server runs in this test.
     assert notices[:3] == [
-        (f"✓ spawned coder-1-2 ({agent.id}) → asq-amber-otter %9", "information"),
+        ("✓ spawned coder-1-2 (alpha)", "information"),
         (notes[0], "warning"),
         (notes[1], "warning"),
     ]
+    # Nothing of tmux's or the store's: no pane, no session, no agent id.
+    assert "%" not in notices[0][0] and agent.id not in notices[0][0], notices[0]
+    assert "asq-amber-otter" not in notices[0][0], notices[0]
     assert all(message.startswith("%9:") for message, _ in notices[3:]), notices[3:]
     assert refreshes >= 1
     assert current == f"agent-{agent.id}"  # the new agent's live pane is what shows next

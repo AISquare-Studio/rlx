@@ -179,6 +179,8 @@ def test_the_refresh_tick_never_reads_the_preference(
         return at_start, len(reads), ticked, _subtitles(app)["prj_u"]
 
     at_start, after_ticks, ticked, reloaded = drive(go)
-    assert at_start == 1 and after_ticks == 1, "read once, at the start"
+    # Read at the start, by the app and by home's Board tab as it is built (board.py reads its
+    # autoscroll; start opens home since L1), and never by a tick.
+    assert at_start == 2 and after_ticks == at_start, "read at the start only"
     assert ticked is None, "the ticks painted with the value the app holds"
     assert reloaded == _directory(tmp_path, "unique"), "Reload hands it over"
