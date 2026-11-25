@@ -862,8 +862,8 @@ class HelpScreen(ModalScreen[None]):
             # L1: home is the last-used project's Manager tab.
             (
                 "Home  r\\x",
-                "home, the last-used project's Manager tab: Home or Esc from the sidebar, or a "
-                "click on the logo",
+                "home, the last-used project's Manager tab: Home from the sidebar, Esc there "
+                "when nothing is marked, or a click on the logo",
             ),
             ("F1", "command palette"),
             ("q", "quit — from the sidebar; inside a pane every key goes to the agent"),
