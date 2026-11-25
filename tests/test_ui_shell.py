@@ -372,8 +372,9 @@ def fleet_app(pilot: Pilot[None]) -> FleetApp:
 
 async def to_the_sidebar(app: FleetApp) -> None:
     """The sidebar on screen, the keyboard in it, for a test that clicks one of its rows: below
-    ``Panes.ONE_PANE_BELOW`` columns one side shows at a time (L2), and start shows home's view.
-    From 70 columns up both sides show, and this changes nothing."""
+    ``Panes.ONE_PANE_BELOW`` columns one side shows at a time (L2), and start shows home's view,
+    or Welcome with no project listed. From 70 columns up both sides show, and this changes
+    nothing."""
     app.query_one(Panes).show_sidebar()
     await settle(app)
 
