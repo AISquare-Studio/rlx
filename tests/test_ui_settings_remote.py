@@ -1,14 +1,17 @@
-"""Settings' *Remote control* (#33): the checklist, on and off, the link it copies, Advanced.
+"""Remote from Settings (#33, Q17): the one Remote page, its ngrok token and every way in.
 
-On a fresh install the owner could not find Remote: it lived in the ``R`` modal alone. The
-section is the same Remote, over the app's one controller. Driven as ``test_ui_remote``
-drives the modal: the REAL ``services.remote_server`` on a free port, a scripted tunnel,
-and every claim read from what a widget shows.
+On a fresh install the owner could not find Remote: it lived in the ``R`` modal alone, so
+Settings got a Remote section of its own (#33), then App settings a *Remote* tab (#41): two
+pages over one controller. Remote is one page again (0.10.2, Q17), the ``R`` panel, and the
+Settings hub's *Remote control*, App settings' *Remote* tab, the sidebar's chip and ``R`` all
+open it. What only the Settings page had, the ngrok token's slot and the missing-ngrok line,
+is the panel's now, and is driven here as a person who looks in Settings reaches it. Driven
+as ``test_ui_remote`` drives the panel: the REAL ``services.remote_server`` on a free port, a
+scripted tunnel, and every claim read from what a widget shows.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import threading
@@ -19,30 +22,22 @@ from typing import Any
 
 import pytest
 from textual.pilot import Pilot
-from textual.widgets import (
-    Button,
-    Checkbox,
-    Collapsible,
-    DataTable,
-    Input,
-    Select,
-    Static,
-    Switch,
-)
-from textual.widgets._collapsible import CollapsibleTitle
+from textual.widgets import Button, Input, Static, Switch, TabbedContent
 
 from aisquare.cli.ui.app import FleetApp
-from aisquare.cli.ui.sidebar import SettingsRow
+from aisquare.cli.ui.sidebar import AppSettingsSelected, SettingsRow
 from aisquare.cli.ui.views import settings_remote
-from aisquare.cli.ui.views.remote import LOCAL_ONLY, RemotePanel, qr_text
+from aisquare.cli.ui.views.app_settings import REMOTE_TAB
+from aisquare.cli.ui.views.remote import RemotePanel
 from aisquare.cli.ui.views.settings_remote import (
     AUTHTOKEN_FROM,
     ENV_TOKEN,
     NGROK_MISSING,
+    OPEN_LABEL,
     REPLACE_TITLE,
     TOKEN_TITLE,
     RemoteChip,
-    RemoteSection,
+    RemoteLink,
     has_authtoken,
 )
 from aisquare.services import remote_server
@@ -53,7 +48,7 @@ from aisquare.services.ngrok_sdk import (
     save_token,
     saved_token,
 )
-from aisquare.services.ngrok_tunnel import AUTHTOKEN_HINT, NgrokTunnel, build_public_url
+from aisquare.services.ngrok_tunnel import AUTHTOKEN_HINT, NgrokTunnel
 from tests.fake_clipboard import NEEDS_POSIX
 from tests.fake_ngrok_sdk import Script, fake_sdk
 from tests.test_remote_control import FakeTunnel
@@ -65,13 +60,12 @@ from tests.test_ui_remote import (  # noqa: F401 — the autouse fixtures, appli
     missing_ngrok,
     no_agents,
     no_real_tmux,
+    panel,
     shown,
     written,
 )
 from tests.toast_log import record
 from tests.ui_workers import settle_page
-
-ON_IDS = ("settings-remote-link", "settings-remote-qr", "settings-remote-password")
 
 
 def path_with(tmp_path: Path, *tools: str) -> None:
@@ -104,13 +98,9 @@ def late(tunnels: list[FakeTunnel]) -> Any:
     return make
 
 
-def announce(tunnel: FakeTunnel, url: str = PUBLIC) -> None:
-    tunnel.handle_line(json.dumps({"lvl": "info", "msg": "started tunnel", "url": url}))
-
-
-async def opened(pilot: Pilot[None]) -> RemoteSection:
-    """Open Settings as a click on *⚙ Settings* does, then its *Remote control* link; App
-    settings' Remote tab, where it lands (#41).
+async def opened(pilot: Pilot[None]) -> RemotePanel:
+    """Open Settings as a click on *⚙ Settings* does, then its *Remote control* link: the
+    Remote page, where it lands (Q17).
 
     Activated and pressed, each once its target is there, not clicked: under load a click
     came before the hub could be hit-tested, and ``#hub-remote`` was not found (the local
@@ -120,27 +110,22 @@ async def opened(pilot: Pilot[None]) -> RemoteSection:
     app.query_one(SettingsRow).activate()  # what a click on the row calls
     await until(pilot, lambda: bool(app.screen.query("#hub-remote")), what="the settings hub")
     app.screen.query_one("#hub-remote", Button).press()
-    await settle_page(app)
-    await until(pilot, lambda: bool(app.query(RemoteSection)), what="the Remote tab")
-    return app.query_one(RemoteSection)
+    await until(pilot, lambda: isinstance(app.screen, RemotePanel), what="the Remote page")
+    await settle_page(app)  # its look at what Remote needs, answered
+    return panel(pilot)
 
 
-def displayed(section: RemoteSection, selector: str) -> bool:
+async def turn(pilot: Pilot[None], section: RemotePanel, on: bool) -> None:
+    """Remote on or off with the page's switch, and its writes landed."""
+    switch = section.query_one("#remote-on", Switch)
+    if switch.value is not on:
+        switch.toggle()
+    await written(pilot)
+
+
+def displayed(section: RemotePanel, selector: str) -> bool:
     widget = section.query_one(selector)
     return all(node.display for node in (widget, *widget.ancestors) if hasattr(node, "display"))
-
-
-def copies(app: FleetApp) -> list[str]:
-    """Every text the app is asked to copy from now on, each still copied."""
-    copied: list[str] = []
-    copy = app.copy_to_clipboard
-
-    def recorded(text: str, **options: Any) -> None:
-        copied.append(text)
-        copy(text, **options)
-
-    app.copy_to_clipboard = recorded  # type: ignore[method-assign]
-    return copied
 
 
 # --- Off: the token, and nothing to install --------------------------------------------------
@@ -149,8 +134,8 @@ NOT_ON_THE_NORMAL_PATH = ("pip install", "uv ", "[remote]", "not installed", "ng
 """What Settings' Remote never tells the owner to do (the owner, 2026-10-23, #34)."""
 
 
-def said_in(section: RemoteSection) -> str:
-    """Every sentence the section shows now, one per line."""
+def said_in(section: RemotePanel) -> str:
+    """Every sentence the page shows now, one per line."""
     return "\n".join(
         shown(static)
         for static in section.query(Static).results(Static)
@@ -185,7 +170,7 @@ def bundled_ngrok_with(
     return script
 
 
-async def paste(pilot: Pilot[None], section: RemoteSection, token: str) -> None:
+async def paste(pilot: Pilot[None], section: RemotePanel, token: str) -> None:
     """Paste ``token`` into the slot and Save, and let the save answer."""
     section.query_one("#settings-remote-token-field", Input).value = token
     section.query_one("#settings-remote-token-save", Button).press()
@@ -198,32 +183,33 @@ async def paste(pilot: Pilot[None], section: RemoteSection, token: str) -> None:
 def test_off_with_no_ngrok_token_shows_only_the_token_field_and_its_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No token yet: *Paste your ngrok token*, where a free one comes from, and *Save*, in the
-    place of *Turn on*; nothing to install and no command to run."""
+    """No token yet: *Paste your ngrok token*, where a free one comes from, and *Save*, on the
+    Remote page; no *Change* for a token there is not; nothing to install and no command to
+    run."""
     bundled_ngrok_with(tmp_path, monkeypatch)
 
     async def go(pilot: Pilot[None]) -> tuple[bool, bool, bool, str]:
         section = await opened(pilot)
         return (
             displayed(section, "#settings-remote-token-field"),
-            displayed(section, "#settings-remote-turn-on"),
+            displayed(section, "#remote-token-row"),
             displayed(section, "#settings-remote-ngrok-missing"),
             said_in(section),
         )
 
-    field, turn_on, missing, said = drive(go, tunnel=missing_ngrok)
-    assert field and not turn_on and not missing
+    field, change, missing, said = drive(go, tunnel=missing_ngrok)
+    assert field and not change and not missing
     assert TOKEN_TITLE in said and AUTHTOKEN_FROM in said, said
     assert not [hint for hint in NOT_ON_THE_NORMAL_PATH if hint in said], said
 
 
 @NEEDS_POSIX
-def test_a_saved_token_brings_turn_on_back_and_turn_on_reaches_the_tunnel(
+def test_a_saved_token_hides_the_slot_and_turning_remote_on_reaches_the_tunnel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Save checks the token with ngrok and keeps it, owner-only; the slot goes, *Turn on* is
-    there, and a press of it starts the bundled tunnel, signed in with that token (#34). The
-    token is in no toast."""
+    """Save checks the token with ngrok and keeps it, owner-only; the slot goes, *Change* is
+    there for it, and Remote turned on starts the bundled tunnel, signed in with that token
+    (#34). The token is in no toast."""
     script = bundled_ngrok_with(tmp_path, monkeypatch)
     token = "2abcDEF_0123456789abcdefghijklmnopqrstuvwxyzAB"
 
@@ -233,21 +219,20 @@ def test_a_saved_token_brings_turn_on_back_and_turn_on_reaches_the_tunnel(
         section = await opened(pilot)
         told = record(app)
         await paste(pilot, section, token)
-        slot, turn_on = (
+        slot, change = (
             displayed(section, "#settings-remote-token"),
-            displayed(section, "#settings-remote-turn-on"),
+            displayed(section, "#remote-token-row"),
         )
-        section.query_one("#settings-remote-turn-on", Button).press()
-        await written(pilot)
+        await turn(pilot, section, True)
         await settle_page(app)
-        return slot, turn_on, told
+        return slot, change, told
 
-    slot, turn_on, told = drive(go, tunnel=bundled_ngrok)
+    slot, change, told = drive(go, tunnel=bundled_ngrok)
     assert saved_token() == token
-    assert not slot and turn_on
+    assert not slot and change
     assert "✓ ngrok token saved" in told and not [line for line in told if token in line]
-    assert script.calls.tokens == [token, token], "checked on Save, then signed in on Turn on"
-    assert len(script.calls.forwards) == 1, "Turn on started the tunnel"
+    assert script.calls.tokens == [token, token], "checked on Save, then signed in at the on"
+    assert len(script.calls.forwards) == 1, "Remote on started the tunnel"
 
 
 def test_a_token_ngrok_refuses_is_said_beside_the_field_without_the_token(
@@ -284,7 +269,7 @@ async def until(pilot: Pilot[None], done: Callable[[], bool], *, what: str) -> N
     raise AssertionError(f"never: {what}")
 
 
-def slot_seen(section: RemoteSection) -> tuple[bool, str, bool]:
+def slot_seen(section: RemotePanel) -> tuple[bool, str, bool]:
     """The token field shown, its title, and the ``NGROK_AUTHTOKEN`` line shown."""
     return (
         displayed(section, "#settings-remote-token-field"),
@@ -310,29 +295,27 @@ def test_a_saved_token_ngrok_refuses_can_be_replaced_on_and_off(
         section = await opened(pilot)
         seen: dict[str, Any] = {"before": slot_seen(section)[0]}
         script.refuse = "ERR_NGROK_107"  # reset on ngrok's dashboard since it was saved
-        section.query_one("#settings-remote-turn-on", Button).press()
-        await written(pilot)
+        await turn(pilot, section, True)
         await until(pilot, lambda: app.remote.status_line() == BAD_TOKEN, what="ngrok refused")
         section.repaint()
         seen["on"] = slot_seen(section)
-        section.query_one("#settings-remote-turn-off", Button).press()
+        section.query_one("#remote-on", Switch).toggle()
         await pilot.pause()
         assert app.remote.wait_until_off(10)
         section.repaint()
-        await settle_page(app)  # the look again, back at Off
-        seen["off"] = (*slot_seen(section), displayed(section, "#settings-remote-turn-on"))
+        await settle_page(app)  # the look again, back at off
+        seen["off"] = (*slot_seen(section), displayed(section, "#remote-token-row"))
         script.refuse = None
         await paste(pilot, section, NEW_TOKEN)
         seen["saved"] = slot_seen(section)[0]
-        section.query_one("#settings-remote-turn-on", Button).press()
-        await written(pilot)
+        await turn(pilot, section, True)
         await until(pilot, lambda: app.remote.public_origin is not None, what="signed in")
         return seen
 
     seen = drive(go, tunnel=bundled_ngrok)
     assert seen["before"] is False, "a token ngrok took asks for nothing"
     assert seen["on"] == (True, REPLACE_TITLE, False)
-    assert seen["off"] == (True, REPLACE_TITLE, False, True), "Replace, and Turn on"
+    assert seen["off"] == (True, REPLACE_TITLE, False, True), "Replace, and Change"
     assert seen["saved"] is False
     assert saved_token() == NEW_TOKEN
     assert script.calls.tokens == [OLD_TOKEN, NEW_TOKEN, NEW_TOKEN], "on, Save's check, on"
@@ -343,8 +326,9 @@ def test_a_remote_turned_on_with_no_token_shows_the_field_and_a_save_brings_ngro
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Turned on with ``R`` and no token anywhere, Remote said to paste one in Settings →
-    Remote, which showed its On view with no field. The field is there, and the token saved
-    starts the tunnel at once, with no off and on (``RemoteController.token_saved``)."""
+    Remote, which showed its On view with no field. The field is there on the Remote page
+    Settings opens, and the token saved starts the tunnel at once, with no off and on
+    (``RemoteController.token_saved``)."""
     script = bundled_ngrok_with(tmp_path, monkeypatch)
 
     async def go(pilot: Pilot[None]) -> tuple[str, bool, tuple[bool, str, bool], bool]:
@@ -354,7 +338,7 @@ def test_a_remote_turned_on_with_no_token_shows_the_field_and_a_save_brings_ngro
         await written(pilot)
         said = app.remote.status_line()
         section = await opened(pilot)
-        on, slot = displayed(section, "#settings-remote-on"), slot_seen(section)
+        on, slot = section.query_one("#remote-on", Switch).value, slot_seen(section)
         await paste(pilot, section, NEW_TOKEN)
         await until(pilot, lambda: app.remote.public_origin is not None, what="ngrok up")
         section.repaint()
@@ -369,7 +353,7 @@ def test_a_remote_turned_on_with_no_token_shows_the_field_and_a_save_brings_ngro
 
 @NEEDS_POSIX
 @pytest.mark.parametrize("environment", [False, True], ids=["saved", "NGROK_AUTHTOKEN"])
-def test_change_ngrok_token_under_advanced_opens_the_field_and_says_when_the_env_wins(
+def test_change_beside_the_ngrok_token_opens_the_field_and_says_when_the_env_wins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment: bool
 ) -> None:
     bundled_ngrok_with(tmp_path, monkeypatch)
@@ -380,9 +364,7 @@ def test_change_ngrok_token_under_advanced_opens_the_field_and_says_when_the_env
     async def go(pilot: Pilot[None]) -> tuple[bool, tuple[bool, str, bool], str, bool]:
         section = await opened(pilot)
         before = slot_seen(section)[0]
-        section.query_one("#settings-remote-advanced", Collapsible).collapsed = False
-        await pilot.pause()
-        section.query_one("#settings-remote-change-token", Button).press()
+        section.query_one("#remote-change-token", Button).press()
         await pilot.pause()
         opened_up = slot_seen(section)
         env_line = shown(section.query_one("#settings-remote-token-env", Static))
@@ -400,7 +382,8 @@ def test_what_remote_needs_is_looked_at_off_the_ui_thread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Review of #274, m6: Settings' first open, and each turn-off, imported ngrok's native
-    library and parsed ngrok's configs on Textual's thread. A thread worker looks now."""
+    library and parsed ngrok's configs on Textual's thread. A thread worker looks now, on the
+    Remote page as it did in Settings."""
     bundled_ngrok_with(tmp_path, monkeypatch)
     looked_on: list[int] = []
     found, token = settings_remote.ngrok_found, settings_remote.has_authtoken
@@ -468,166 +451,91 @@ def test_a_missing_ngrok_is_one_line_with_a_fix_in_the_app_never_a_command(
     assert not after
 
 
-# --- On, and off again ----------------------------------------------------------------------
+# --- one Remote page, every way in (Q17) -----------------------------------------------------
 
 
-def test_turning_remote_on_shows_link_qr_password_and_copies_ngroks_link_once_it_arrives(
-    ready: None,
-) -> None:
-    """The local link first, which a phone cannot open: no QR of it and nothing copied. Once
-    ngrok announces its link, the next tick shows it with its QR and copies it, once, with
-    a toast. The password is the one the phone unlocks with."""
-    tunnels: list[FakeTunnel] = []
+async def back_out(pilot: Pilot[None]) -> None:
+    """Esc out of the Remote page, back to what was under it."""
+    await pilot.press("escape")
+    await until(pilot, lambda: not isinstance(pilot.app.screen, RemotePanel), what="closed")
+
+
+def test_r_the_hub_row_app_settings_and_the_chip_open_the_one_remote_page(ready: None) -> None:
+    """Q17: Remote lived in three places, the ``R`` modal, App settings' *Remote* tab and the
+    Settings hub's *Remote control* row (which led to that tab), two pages over one
+    controller. ``R``, the hub's row, App settings' tab and the sidebar's chip all open one
+    page, the same screen over the app's one controller, and never a second over the first."""
 
     async def go(pilot: Pilot[None]) -> dict[str, Any]:
         app = pilot.app
         assert isinstance(app, FleetApp)
-        section = await opened(pilot)
-        copied, told = copies(app), record(app)
-        section.query_one("#settings-remote-turn-on", Button).press()
-        await written(pilot)
-        section.repaint()
-        info = app.remote.info
-        assert info is not None and tunnels, "Remote is on, its ngrok started"
-        before = {
-            "on": displayed(section, "#settings-remote-on"),
-            "off": displayed(section, "#settings-remote-off"),
-            "link": shown(section.query_one("#settings-remote-link", Static)),
-            "qr": shown(section.query_one("#settings-remote-qr", Static)),
-            "copied": list(copied),
-        }
-        announce(tunnels[0])
-        section.remote_tick()
-        section.remote_tick()  # a second tick copies nothing more
-        await pilot.pause()
-        return {
-            "before": before,
-            "local": info.url_local,
-            "public": build_public_url(PUBLIC, info.token),
-            "link": shown(section.query_one("#settings-remote-link", Static)),
-            "qr": shown(section.query_one("#settings-remote-qr", Static)),
-            "password": shown(section.query_one("#settings-remote-password", Static)),
-            "copied": copied,
-            "told": told,
-        }
-
-    seen = drive(go, tunnel=late(tunnels))
-    before = seen["before"]
-    assert before["on"] and not before["off"]
-    assert before["link"] == f"{seen['local']}\n{LOCAL_ONLY}"
-    assert before["qr"] == "" and before["copied"] == []
-    assert seen["link"] == seen["public"]
-    assert seen["qr"] == qr_text(seen["public"])
-    assert seen["password"] == f"Password  {remote_server.runtime().password}"
-    assert seen["copied"] == [seen["public"]]
-    assert "Remote link copied" in seen["told"]
-
-
-def test_turn_off_returns_the_section_to_off(ready: None) -> None:
-    async def go(pilot: Pilot[None]) -> tuple[bool, bool, bool]:
-        app = pilot.app
-        assert isinstance(app, FleetApp)
-        section = await opened(pilot)
-        section.query_one("#settings-remote-turn-on", Button).press()
-        await written(pilot)
-        assert app.remote.running
-        section.query_one("#settings-remote-turn-off", Button).press()
-        await pilot.pause()
-        assert app.remote.wait_until_off(10)
-        return (
-            app.remote.running,
-            displayed(section, "#settings-remote-off"),
-            displayed(section, "#settings-remote-on"),
-        )
-
-    assert drive(go, tunnel=late([])) == (False, True, False)
-
-
-def test_the_section_and_the_r_panel_are_one_remote(ready: None) -> None:
-    """One controller: the section is a view over the app's own, and ``R`` still opens the
-    modal, which shows the Remote the section turned on, on the same link."""
-
-    async def go(pilot: Pilot[None]) -> tuple[bool, bool, str, str]:
-        app = pilot.app
-        assert isinstance(app, FleetApp)
-        section = await opened(pilot)
-        section.query_one("#settings-remote-turn-on", Button).press()
-        await written(pilot)
-        section.repaint()
-        link = shown(section.query_one("#settings-remote-link", Static))
+        seen: dict[str, Any] = {}
         app.sidebar.focus()
         await pilot.press("R")
+        seen["R"] = panel(pilot)
+        app.action_remote_panel()  # R again, or the palette's Remote control, over it
         await pilot.pause()
-        modal = app.screen
-        assert isinstance(modal, RemotePanel)
-        return (
-            section.controller is app.remote is modal.controller,
-            modal.query_one("#remote-on", Switch).value,
-            link,
-            shown(modal.query_one("#remote-link", Static)),
+        seen["stacked"] = sum(isinstance(screen, RemotePanel) for screen in app.screen_stack)
+        await back_out(pilot)
+        seen["hub"] = await opened(pilot)
+        await back_out(pilot)
+        app.post_message(AppSettingsSelected(REMOTE_TAB))
+        await until(pilot, lambda: bool(app.query(RemoteLink)), what="App settings' Remote tab")
+        await settle_page(app)
+        tab = app.query_one(RemoteLink)
+        seen["tab"] = (
+            app.query_one("#app-settings-tabs", TabbedContent).active,
+            str(tab.query_one("#settings-remote-open", Button).label),
+            [type(child).__name__ for child in tab.query("*")],
         )
-
-    same, on, link, modal_link = drive(go, tunnel=late([]))
-    assert same and on
-    assert link == modal_link
-
-
-# --- Advanced -------------------------------------------------------------------------------
-
-
-def test_advanced_starts_collapsed_and_opens_onto_its_four_controls(ready: None) -> None:
-    controls = (
-        ("#settings-remote-regen", Button),
-        ("#settings-remote-write", Checkbox),
-        ("#settings-remote-auto-off", Select),
-        ("#settings-remote-devices", DataTable),
-        ("#settings-remote-revoke", Button),
-    )
-
-    async def go(pilot: Pilot[None]) -> tuple[bool, list[bool], bool, list[bool]]:
-        section = await opened(pilot)
-        advanced = section.query_one("#settings-remote-advanced", Collapsible)
-        folded = [displayed(section, selector) for selector, _ in controls]
-        was = advanced.collapsed
-        title = advanced.query_one(CollapsibleTitle)
-        title.scroll_visible(animate=False)
-        await pilot.pause()
-        await pilot.click(title)
-        await pilot.pause()
-        opened_up = [
-            displayed(section, selector) and section.query_one(selector, kind).region.area > 0
-            for selector, kind in controls
-        ]
-        return was, folded, advanced.collapsed, opened_up
-
-    was, folded, now, opened_up = drive(go, tunnel=missing_ngrok)
-    assert was is True and not any(folded)
-    assert now is False and all(opened_up), opened_up
-
-
-# --- the sidebar's chip ---------------------------------------------------------------------
-
-
-def test_the_chip_shows_while_remote_is_on_and_a_click_opens_the_r_panel(ready: None) -> None:
-    async def go(pilot: Pilot[None]) -> tuple[bool, bool, str, bool]:
-        app = pilot.app
-        assert isinstance(app, FleetApp)
-        chip = app.query_one(RemoteChip)
-        off = chip.display
-        section = await opened(pilot)
-        section.query_one("#settings-remote-turn-on", Button).press()
+        tab.query_one("#settings-remote-open", Button).press()
+        await until(pilot, lambda: isinstance(app.screen, RemotePanel), what="the Remote page")
+        seen["App settings"] = panel(pilot)
+        await back_out(pilot)
+        app.remote.turn_on(wait=False)
         await written(pilot)
+        chip = app.query_one(RemoteChip)
         chip.remote_tick()
         await pilot.pause()
-        on, said = chip.display, shown(chip)
         await pilot.click(chip)
-        await pilot.pause()
-        return off, on, said, isinstance(app.screen, RemotePanel)
+        await until(pilot, lambda: isinstance(app.screen, RemotePanel), what="the Remote page")
+        seen["chip"] = panel(pilot)
+        seen["controller"] = app.remote
+        return seen
 
-    off, on, said, panel = drive(go, tunnel=late([]))
-    assert not off and on
-    assert said == "📡 remote · 0 devices"
-    assert panel
+    seen = drive(go, tunnel=late([]))
+    pages = [seen[way] for way in ("R", "hub", "App settings", "chip")]
+    assert all(type(page) is RemotePanel for page in pages), "one page, the same screen"
+    assert all(page.controller is seen["controller"] for page in pages), "over one controller"
+    assert seen["stacked"] == 1, "never a second page over the first"
+    active, label, kinds = seen["tab"]
+    assert (active, label) == (REMOTE_TAB, OPEN_LABEL)
+    assert "Switch" not in kinds and "TokenSlot" not in kinds, "no second Remote in the tab"
+
+
+def test_app_settings_remote_tab_says_whether_remote_is_on(ready: None) -> None:
+    """The tab is a way in, not a page of its own: what Remote is, whether it is on and how
+    many devices are in, as the sidebar's chip counts them."""
+
+    async def go(pilot: Pilot[None]) -> tuple[str, str]:
+        app = pilot.app
+        assert isinstance(app, FleetApp)
+        app.post_message(AppSettingsSelected(REMOTE_TAB))
+        await until(pilot, lambda: bool(app.query(RemoteLink)), what="App settings' Remote tab")
+        await settle_page(app)
+        tab = app.query_one(RemoteLink)
+        off = shown(tab.query_one("#settings-remote-state", Static))
+        app.remote.turn_on(wait=False)
+        await written(pilot)
+        runtime = remote_server.runtime()
+        assert runtime.unlock_device(runtime.password, "iPhone Safari") is not None
+        tab.remote_link_paint()
+        await pilot.pause()
+        return off, shown(tab.query_one("#settings-remote-state", Static))
+
+    off, on = drive(go, tunnel=late([]))
+    assert off == "Remote is off"
+    assert on == "● on  · 1 device signed in"
 
 
 # --- the authtoken check --------------------------------------------------------------------
