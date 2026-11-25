@@ -6151,8 +6151,8 @@ def test_stop_types_into_an_agent_this_install_does_not_know_what_its_dialog_say
 
     [(pane, how, typed), *_] = tmux.typed
     assert (pane, how) == (agent.pane_id, "literal"), tmux.typed
-    assert f"{typed}, then the window is killed after" in question, question
-    assert f"Force skips the {typed}." in question, question
+    assert f"asked to quit (rlx types {typed}) and closed" in question, question
+    assert "Force closes it at once." in question, question
 
 
 def test_stop_types_the_exit_and_its_enter_apart(
@@ -21631,7 +21631,7 @@ def test_a_restart_given_a_permission_mode_changes_the_mode_alone_and_records_it
     assert _flag(_command(tmux), "--permission-mode") == "acceptEdits", "the role says auto"
     assert (
         "launched as recorded — binary, permission mode and arguments come from its launch "
-        "record, not from today's config (#144)" in again.notes
+        "record, not from today's config" in again.notes
     )
 
 
@@ -21727,7 +21727,7 @@ def test_a_restart_whose_recorded_binary_left_the_path_resolves_it_again_and_say
     # Not beside it "the binary is the recorded one" (review of #169, F7): it was not.
     assert (
         "launched as recorded — permission mode and arguments come from its launch record, "
-        "not from today's config (#144)" in receipt.notes
+        "not from today's config" in receipt.notes
     ), receipt.notes
     assert receipt.started.launch_spec is not None
     assert receipt.started.launch_spec.binary == "claude", "the spec records what ran"
