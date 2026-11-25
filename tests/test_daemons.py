@@ -24,13 +24,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import jsonschema
 import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli import serve as serve_cli
 from aisquare.cli.app import app
 from aisquare.core import daemons, locking, orchestrator, selfcli, workspace
-from aisquare.core.registry import host_name
+from aisquare.core.registry import GATE_LOCK, Registry, host_name
 from aisquare.core.version import __version__
 from aisquare.services import fleet as fleet_service
 from aisquare.services import mcp_server
@@ -56,24 +57,61 @@ def keep_sigterm() -> Iterator[None]:
     signal.signal(signal.SIGTERM, before)
 
 
+RECORD_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": [
+        "id",
+        "kind",
+        "pid",
+        "host",
+        "version",
+        "started_at",
+        "heartbeat_at",
+        "argv",
+        "restartable",
+    ],
+    "properties": {
+        "id": {"type": "string", "pattern": "^[0-9a-f]{12}$"},
+        "kind": {"type": "string", "minLength": 1},
+        "pid": {"type": "integer", "minimum": 1},
+        "host": {"type": "string"},
+        "version": {"type": "string"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "heartbeat_at": {"type": "string", "format": "date-time"},
+        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "restartable": {"type": "boolean"},
+        "cwd": {"type": ["string", "null"]},
+    },
+}
+"""What a record written here holds, as JSON Schema: the module's table, for a check that
+the Python side writes it. ``rlxd/schemas/v1/daemon-record.json`` (handoff §4.1, generated
+from rlxd-proto) is the published one; extra keys are allowed, as a later release may say
+more."""
+
+
 def _files() -> list[str]:
+    """The folder's files but its gate, which stays (``core.GATE_LOCK``)."""
     try:
-        return sorted(os.listdir(daemons.registry_dir()))
+        names = os.listdir(daemons.registry_dir())
     except FileNotFoundError:
         return []
+    return sorted(name for name in names if name != GATE_LOCK)
 
 
 def _record(**overrides: Any) -> dict[str, Any]:
+    """A record by the module's table; its ``id`` is the file's :func:`_write` gives it,
+    unless ``overrides`` says one."""
     now = datetime.now(UTC).isoformat()
     body: dict[str, Any] = {
         "kind": "serve",
         "pid": os.getpid(),
-        "since": now,
-        "argv": ["rlx", "serve"],
-        "restartable": True,
         "host": host_name(),
         "version": "0.10.3",
-        "heartbeat": now,
+        "started_at": now,
+        "heartbeat_at": now,
+        "argv": ["rlx", "serve"],
+        "restartable": True,
         "cwd": "/somewhere",
     }
     body.update(overrides)
@@ -82,6 +120,8 @@ def _record(**overrides: Any) -> dict[str, Any]:
 
 def _write(folder: Path, daemon_id: str, body: object, *, lock: bool = True) -> Path:
     path = folder / f"{daemon_id}.json"
+    if isinstance(body, dict):
+        body = json.dumps({"id": daemon_id, **body})
     path.write_text(body if isinstance(body, str) else json.dumps(body), encoding="utf-8")
     if lock:
         (folder / f"{daemon_id}.lock").touch()
@@ -118,21 +158,15 @@ def test_a_registered_daemon_is_listed_live_until_it_deregisters() -> None:
         assert (daemon.host, daemon.version, daemon.cwd) == (host_name(), __version__, os.getcwd())
         assert daemons.valid_id(daemon.id)
         assert _files() == [f"{daemon.id}.json", f"{daemon.id}.lock"]
-        # The record on disk is the module's table, and carries no id: the file name is it.
+        # The record on disk is the module's table (handoff §4.1), its id the file's name.
         on_disk = json.loads((daemons.registry_dir() / f"{daemon.id}.json").read_text("utf-8"))
-        assert set(on_disk) == {
-            "kind",
-            "pid",
-            "since",
-            "argv",
-            "restartable",
-            "host",
-            "version",
-            "heartbeat",
-            "cwd",
-        }
-        assert on_disk["argv"] == ARGV and on_disk["pid"] == os.getpid()
-        assert datetime.fromisoformat(on_disk["since"]).utcoffset() == timedelta(0)
+        assert set(on_disk) == {*RECORD_SCHEMA["required"], "cwd"}
+        jsonschema.validate(
+            on_disk, RECORD_SCHEMA, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+        )
+        assert on_disk["id"] == daemon.id and on_disk["argv"] == ARGV
+        assert on_disk["pid"] == os.getpid()
+        assert datetime.fromisoformat(on_disk["started_at"]).utcoffset() == timedelta(0)
         assert daemons.list_live(kind="serve") == [] and daemons.list_live(kind="watch")
     finally:
         registration.deregister()
@@ -144,11 +178,13 @@ def test_a_registered_daemon_is_listed_live_until_it_deregisters() -> None:
 def test_the_heartbeat_rewrites_the_record() -> None:
     registration = daemons.register("serve", argv=["rlx", "serve"], restartable=True)
     try:
-        before = registration.daemon.heartbeat
+        before = registration.daemon.heartbeat_at
         time.sleep(0.01)
         registration.beat()
         (daemon,) = daemons.list_live()
-        assert daemon.heartbeat > before and daemon.since == registration.daemon.since
+        assert daemon.heartbeat_at > before
+        assert daemon.started_at == registration.daemon.started_at
+        assert daemons.HEARTBEAT_SECONDS == 5.0, "handoff §4.1: a heartbeat every 5 s"
     finally:
         registration.deregister()
 
@@ -245,14 +281,24 @@ def test_a_record_whose_lock_file_is_gone_is_not_live(registry: Path) -> None:
     assert daemons.roll().pruned == ["0123456789ab"] and _files() == []
 
 
-def test_another_hosts_record_lives_by_its_heartbeat(registry: Path) -> None:
-    fresh = datetime.now(UTC)
-    stale = fresh - timedelta(seconds=daemons.STALE_SECONDS + 5)
-    _write(registry, "aaaaaaaaaaaa", _record(host="elsewhere", heartbeat=fresh.isoformat()))
-    _write(registry, "bbbbbbbbbbbb", _record(host="elsewhere", heartbeat=stale.isoformat()))
+def test_a_free_lock_is_a_dead_daemon_whatever_its_host_or_heartbeat(registry: Path) -> None:
+    fresh = datetime.now(UTC).isoformat()
+    _write(registry, "aaaaaaaaaaaa", _record(host="elsewhere", heartbeat_at=fresh))
+    _write(registry, "bbbbbbbbbbbb", _record(heartbeat_at=fresh))
     found = daemons.roll()
-    assert [d.id for d in found.live] == ["aaaaaaaaaaaa"]
-    assert found.pruned == ["bbbbbbbbbbbb"]
+    assert found.live == [] and found.pruned == ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]
+
+
+def test_only_a_lock_that_cannot_be_probed_lets_the_record_speak(
+    registry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fresh = datetime.now(UTC)
+    stale = (fresh - timedelta(seconds=daemons.STALE_SECONDS + 5)).isoformat()
+    _write(registry, "aaaaaaaaaaaa", _record(host="elsewhere", heartbeat_at=fresh.isoformat()))
+    _write(registry, "bbbbbbbbbbbb", _record(host="elsewhere", heartbeat_at=stale))
+    _write(registry, "cccccccccccc", _record(pid=os.getpid()))  # this host, its pid runs
+    monkeypatch.setattr(daemons.REGISTRY, "lock_held", lambda record_id, missing=False: None)
+    assert [d.id for d in daemons.list_live(prune=False)] == ["aaaaaaaaaaaa", "cccccccccccc"]
 
 
 def test_live_daemons_come_oldest_first_and_a_later_releases_kind_is_kept(
@@ -261,7 +307,7 @@ def test_live_daemons_come_oldest_first_and_a_later_releases_kind_is_kept(
     older = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     later = _record(kind="scheduler", something_new={"a": 1})
     _write(registry, "bbbbbbbbbbbb", later)
-    _write(registry, "aaaaaaaaaaaa", _record(since=older, heartbeat="2026-11-25T12:00:00Z"))
+    _write(registry, "aaaaaaaaaaaa", _record(started_at=older, heartbeat_at="2026-11-25T12:00:00Z"))
     held = [_hold(registry / f"{name}.lock") for name in ("aaaaaaaaaaaa", "bbbbbbbbbbbb")]
     try:
         live = daemons.list_live()
@@ -272,7 +318,7 @@ def test_live_daemons_come_oldest_first_and_a_later_releases_kind_is_kept(
         ("aaaaaaaaaaaa", "serve"),
         ("bbbbbbbbbbbb", "scheduler"),
     ]
-    assert live[0].heartbeat == datetime(2026, 11, 25, 12, tzinfo=UTC), "Z is read as UTC"
+    assert live[0].heartbeat_at == datetime(2026, 11, 25, 12, tzinfo=UTC), "Z is read as UTC"
 
 
 # --- records this release cannot read ----------------------------------------------------------
@@ -287,9 +333,23 @@ def test_live_daemons_come_oldest_first_and_a_later_releases_kind_is_kept(
         json.dumps(_record(pid=True)),
         json.dumps(_record(argv="rlx serve")),
         json.dumps(_record(restartable="yes")),
-        json.dumps({k: v for k, v in _record().items() if k != "heartbeat"}),
+        json.dumps({k: v for k, v in _record().items() if k != "heartbeat_at"}),
+        json.dumps(_record()),  # no id
+        json.dumps(_record(id="fedcba987654")),  # another record's id
+        json.dumps(_record(argv=[])),
     ],
-    ids=["not-json", "not-an-object", "kind", "pid-bool", "argv-str", "restartable", "no-beat"],
+    ids=[
+        "not-json",
+        "not-an-object",
+        "kind",
+        "pid-bool",
+        "argv-str",
+        "restartable",
+        "no-beat",
+        "no-id",
+        "another-id",
+        "argv-empty",
+    ],
 )
 def test_an_unreadable_record_is_reported_and_kept_while_its_lock_is_held(
     registry: Path, body: str
@@ -311,7 +371,7 @@ def test_an_unreadable_record_is_reported_and_kept_while_its_lock_is_held(
 
 
 def test_a_fresh_unreadable_record_is_reported_with_what_it_still_says(registry: Path) -> None:
-    path = _write(registry, "0123456789ab", json.dumps(_record(pid=4242, since="soon")))
+    path = _write(registry, "0123456789ab", json.dumps(_record(pid=4242, started_at="soon")))
     found = daemons.roll()
     (unreadable,) = found.unreadable
     assert (unreadable.held, unreadable.pid, unreadable.kind) == (False, 4242, "serve")
@@ -347,6 +407,49 @@ def test_a_wider_folder_is_narrowed_as_a_daemon_registers() -> None:
         assert stat.S_IMODE(folder.stat().st_mode) == 0o700
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_the_gate_stays_0600_and_no_reader_deletes_it() -> None:
+    with daemons.registered("serve", argv=["x"], restartable=False):
+        pass
+    gate = daemons.registry_dir() / GATE_LOCK
+    assert stat.S_IMODE(gate.stat().st_mode) == 0o600
+    _age(gate, daemons.STALE_SECONDS * 10)
+    daemons.prune()
+    assert gate.exists()
+
+
+def test_a_daemon_registers_only_through_the_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = daemons.REGISTRY.private_folder()
+    fd = _hold(folder / GATE_LOCK)  # another daemon reading and writing, held long
+    monkeypatch.setattr(daemons.REGISTRY, "gate", _gate_with(0.05))
+    told: list[OSError] = []
+    try:
+        with pytest.raises(TimeoutError):
+            daemons.register("watch", argv=["x"], restartable=False)
+        with daemons.registered("watch", argv=["x"], restartable=False, on_error=told.append):
+            pass
+    finally:
+        os.close(fd)
+    assert len(told) == 1 and isinstance(told[0], TimeoutError)
+    assert _files() == [], "refused at the gate: no lock, no record"
+
+
+def _gate_with(wait_s: float) -> Any:
+    real = Registry.gate
+
+    def gate(**_: Any) -> Any:
+        return real(daemons.REGISTRY, wait_s=wait_s)
+
+    return gate
+
+
+def test_registering_prunes_the_dead_under_the_gate(registry: Path) -> None:
+    _write(registry, "0123456789ab", _record())  # its lock free: dead
+    with daemons.registered("serve", argv=["x"], restartable=False) as mine:
+        assert mine is not None
+        assert _files() == [f"{mine.daemon.id}.json", f"{mine.daemon.id}.lock"]
+
+
 def test_a_reader_makes_no_folder() -> None:
     assert daemons.roll() == daemons.Roll([], [], [])
     assert not daemons.registry_dir().exists()
@@ -373,14 +476,15 @@ def test_an_id_that_is_not_a_valid_file_name_is_ignored(registry: Path, name: st
         daemons.REGISTRY.record(stem)
 
 
-def test_the_id_is_the_file_names_never_the_contents(registry: Path) -> None:
+def test_a_record_naming_another_id_is_unreadable_and_names_no_path(registry: Path) -> None:
     _write(registry, "0123456789ab", _record(id="../../evil"))
     fd = _hold(registry / "0123456789ab.lock")
     try:
-        (daemon,) = daemons.list_live()
+        found = daemons.roll()
     finally:
         os.close(fd)
-    assert daemon.id == "0123456789ab"
+    assert found.live == [] and [u.id for u in found.unreadable] == ["0123456789ab"]
+    assert found.unreadable[0].path == registry / "0123456789ab.json"
 
 
 def test_a_gone_records_leftovers_are_deleted_once_old_and_nothing_else(registry: Path) -> None:

@@ -14,11 +14,17 @@ record, ``<id>`` being twelve lower-case hex digits (``[0-9a-f]{12}``, random, n
 process):
 
 - ``<id>.json`` — the record, UTF-8 JSON, replaced whole: written to a temp file in the
-  folder whose name is not ``<id>.json`` (this module writes ``.<id>.json.<pid>.<hex>.tmp``)
-  and renamed over it, so a reader sees the old record or the new one, never a part.
+  folder whose name is not ``<id>.json`` and renamed over it, so a reader sees the old record
+  or the new one, never a part. This module writes ``.<id>.json.<pid>.<hex>.tmp``; rlxd
+  writes ``<id>.json.tmp`` and fsyncs it first. A reader takes either for a file of ``<id>``.
 - ``<id>.lock`` — empty, locked by the process for as long as it runs. A pid is recycled; a
   lock is not: the OS drops it with the process, however the process ended, so a record
   whose lock is free is a crashed process's, whatever has its pid now.
+
+and ``.gate.lock`` (:data:`GATE_LOCK`), locked with the same primitive, created ``0600``, while
+a process reads the others and writes its own record (:meth:`Registry.gate`), waited on for
+at most :data:`GATE_WAIT_SECONDS`, so two processes starting at once each see the other. A
+reader never deletes it.
 
 A record's id is its FILE NAME's (:func:`valid_id`), never anything inside it: every path is
 built from a name the folder listing gave, so no record names a file outside the folder, and
@@ -44,8 +50,9 @@ free; refused (``EWOULDBLOCK``/``EAGAIN``/``EACCES``), it is held. So a writer t
 new lock with a short bounded retry (:data:`LOCK_WAIT_SECONDS`), as a reader may hold it for
 that instant.
 
-**Writing**, in this order: make the folder; create and lock ``<id>.lock``; write
-``<id>.json``. **Leaving**, on a clean exit: delete ``<id>.json``; close the lock file
+**Writing**, in this order: make the folder; take ``.gate.lock``; read the others (pruning
+what is dead); create and lock ``<id>.lock``; write ``<id>.json``; let ``.gate.lock`` go.
+**Leaving**, on a clean exit: delete ``<id>.json``; close the lock file
 (Windows deletes no open file); delete ``<id>.lock``. On Windows a delete is refused while
 any other process has the file open (``ERROR_SHARING_VIOLATION``, 32), and every reader opens
 each record for a moment: a delete refused so is tried again for up to
@@ -83,7 +90,7 @@ import re
 import socket
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -107,6 +114,13 @@ another host name, read as live by their heartbeat (#574, #28)."""
 READ_RETRY_SECONDS = 0.05
 """How long a reader waits before reading again a record whose read failed, and between two
 tries of a refused delete."""
+
+GATE_LOCK = ".gate.lock"
+"""The folder's gate (:meth:`Registry.gate`): held while a process reads the others and writes
+its own record. A reader never deletes it."""
+
+GATE_WAIT_SECONDS = 2.0
+"""How long :meth:`Registry.gate` waits for another process's read-and-write to end."""
 
 _ID = re.compile(r"[0-9a-f]{12}")
 
@@ -289,6 +303,17 @@ class Registry:
             raise
         return fd
 
+    @contextlib.contextmanager
+    def gate(self, *, wait_s: float = GATE_WAIT_SECONDS) -> Iterator[None]:
+        """Hold the folder's ``.gate.lock`` (:data:`GATE_LOCK`) for the block, made ``0600``,
+        so a process that reads the others and writes its own record inside it is read by, or
+        reads, another doing the same at the same moment. Makes the folder; raises
+        :class:`TimeoutError` (an ``OSError``) when another holds it past ``wait_s``, and
+        ``OSError`` when the folder or the lock cannot be had."""
+        folder = self.private_folder()
+        with locking.holding(folder / GATE_LOCK, wait_s=wait_s, mode=0o600):
+            yield
+
     def write(self, record_id: str, record: Mapping[str, Any]) -> None:
         """``record`` into ``<id>.json`` in one step, ``0600``. Not fsynced: a record lost to a
         crash is one that would be stale anyway."""
@@ -367,8 +392,8 @@ class Registry:
         """The live records (``live(record, held)``, ``held`` being :meth:`lock_held`'s
         answer with ``missing``), and the ones this release cannot read that have their lock
         held or are fresh. With ``prune``, deletes what is not live, as the module says, but
-        never a name in ``reserved`` (a registry's own folder-level files); without, writes
-        nothing. Reads only: no folder is made."""
+        never :data:`GATE_LOCK` nor a name in ``reserved`` (a registry's own folder-level
+        files); without, writes nothing. Reads only: no folder is made."""
         folder = self.folder
         try:
             names = sorted(os.listdir(folder))
@@ -383,7 +408,12 @@ class Registry:
             path = folder / name
             stem = name.removesuffix(".json")
             if stem == name or not valid_id(stem):
-                if prune and name not in reserved and self._leftover(name, names):
+                if (
+                    prune
+                    and name != GATE_LOCK
+                    and name not in reserved
+                    and self._leftover(name, names)
+                ):
                     unlink(path)
                 continue  # no record: not <id>.json
             loaded = self.load(stem, parse)

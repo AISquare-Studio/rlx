@@ -77,6 +77,17 @@ def test_a_reserved_name_is_never_pruned() -> None:
     assert sorted(os.listdir(folder)) == [".gate.lock"]
 
 
+def test_the_gate_is_one_holder_at_a_time_and_never_pruned() -> None:
+    with THINGS.gate(), pytest.raises(TimeoutError), THINGS.gate(wait_s=0.05):
+        pass
+    gate = THINGS.folder / registry.GATE_LOCK
+    _age(gate, 3600)
+    THINGS.roll(_thing, lambda thing, held: True)
+    assert gate.exists()
+    with THINGS.gate(wait_s=0):  # let go: taken at once
+        pass
+
+
 def test_a_second_writer_of_one_id_is_refused_and_keeps_nothing_open() -> None:
     fd = THINGS.take("0123456789ab")
     try:
@@ -160,7 +171,8 @@ def test_a_daemon_leaves_the_registry_while_a_reader_holds_its_record_open() -> 
     finally:
         letting_go.join()
         reading.close()
-    assert os.listdir(daemons.registry_dir()) == [], "the record and its lock both left"
+    left = os.listdir(daemons.registry_dir())
+    assert left == [registry.GATE_LOCK], "the record and its lock both left; the gate stays"
 
 
 def test_a_leftover_whose_lock_a_reader_holds_is_not_taken_for_a_gone_one() -> None:

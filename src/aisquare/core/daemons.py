@@ -5,59 +5,69 @@ An upgrade counted only the asq UIs (``core.instances``), yet a detached ``watch
 and new until it restarts, on Windows a file in use that fails the reinstall. So each such
 process registers here while it runs, with what an upgrade needs to count it, stop it and
 start it again (§4.2). rlxd, written in Rust, registers in this same folder, so what follows
-is the format, precisely, for any language; this module is its Python side.
+is the format, precisely, for any language; this module is its Python side. The record's
+JSON Schema is ``rlxd/schemas/v1/daemon-record.json``.
 
 **The folder**, ``<home>/daemons/``, a sibling of ``instances/``: a registry by the rules of
 ``core.registry`` (its module docstring is the rest of this format), which says how the
-folder, ``<id>.json`` and ``<id>.lock`` are made, locked, written, read, deleted and pruned.
-What this registry adds:
+folder, ``<id>.json``, ``<id>.lock`` and ``.gate.lock`` are made, locked, written, read,
+deleted and pruned. What this registry adds:
 
-- **Every daemon keeps a lock.** A record with no ``<id>.lock`` beside it is not live.
+- **Live is the lock.** A record is live while its ``<id>.lock`` is held, whatever host it
+  names; a record whose lock is free, or which has no lock file, is a dead process's,
+  whatever has its pid since. Only where the lock cannot be probed at all (an error other
+  than "held", ``ENOLCK`` on an NFS mount with no lock manager) does the record speak: this
+  host's is live while its pid runs, another host's while its ``heartbeat_at`` is under
+  :data:`STALE_SECONDS` old.
+- **Registering** is ``core.registry``'s order, under ``.gate.lock``: the others read (the
+  dead pruned), then this one's lock taken and its record written.
 - **The heartbeat.** A daemon rewrites its record every :data:`HEARTBEAT_SECONDS` with a new
-  ``heartbeat``; :data:`STALE_SECONDS` is the stale age.
-- **Live** is ``core.registry``'s rule by lock or heartbeat: its lock held, at once; with its
-  lock free, this host's record is a crashed daemon's, whatever has its pid now; another
-  host's (an NFS home) lives while its heartbeat is fresh.
+  ``heartbeat_at``.
 
 **The record**: one JSON object. Keys this release does not know are ignored, as a later
 release may say more; a record without one of the required keys, or with one of the wrong
-type, is one this release cannot read (reported, never crashed on: ``core.registry``).
+type, or whose ``id`` is not its file's, is one this release cannot read (reported, never
+crashed on: ``core.registry``).
 
-=============== ========== ===========================================================
-key             type       what
-=============== ========== ===========================================================
-``kind``        string     what the daemon is: one of :data:`KINDS` (``rlxd``,
-                           ``brain``, ``watch``, ``serve``, ``remote``,
-                           ``board_watch``). A kind this release does not know is
-                           read and kept as said: a later release's daemon is still a
-                           running rlx process.
-``pid``         integer    its process id, ``> 0``.
-``since``       string     when it registered: ISO 8601 / RFC 3339 with an offset, in
-                           UTC (``2026-11-25T12:03:00.123456+00:00``; ``Z`` is read
-                           too; a time without an offset is read as UTC).
-``argv``        [string]   the command that starts it again, ``argv[0]`` the program,
-                           never empty. To restart a daemon: run ``argv`` as a new
-                           process, detached from any terminal (no stdin; output to a
-                           null device or a log), in ``cwd``, with ``AISQUARE_HOME``
-                           naming this home, and do not wait for it to exit: it may BE
-                           the daemon (``serve``), or start it in a host and return
-                           (``watch --detach``, which opens its tmux window again).
-                           Options the daemon took from its environment are written
-                           out, so the command means what it meant. Recorded whether
-                           or not ``restartable``, for a person to read.
-``restartable`` boolean    whether an upgrade may stop the daemon and start ``argv``
-                           in its place. ``false`` for one a client owns (``serve
-                           --stdio``, whose client holds its stdin and stdout) or a
-                           person's terminal does (a ``watch`` run in the foreground).
-``host``        string     the host name it runs on (``socket.gethostname()``).
-``version``     string     the rlx release it runs (``aisquare-cli``'s version, or
-                           rlxd's).
-``heartbeat``   string     when the record was last written, as ``since``.
-``cwd``         string or  the directory it runs in, absolute; optional, ``null`` or
-                null       absent where none could be named.
-=============== ========== ===========================================================
-
-There is no id in the record: the id is the file's name (``core.registry``).
+================ ========== ==========================================================
+key              type       what
+================ ========== ==========================================================
+``id``           string     its file's name without ``.json``: twelve lower-case hex
+                            digits. Another id makes the record unreadable; no path is
+                            ever built from it.
+``kind``         string     what the daemon is: one of :data:`KINDS` (``rlxd``,
+                            ``brain``, ``watch``, ``serve``, ``remote``,
+                            ``board_watch``). A kind this release does not know is
+                            read and kept as said: a later release's daemon is still
+                            a running rlx process.
+``pid``          integer    its process id, ``> 0``.
+``host``         string     the host name it runs on (``socket.gethostname()``).
+``version``      string     the rlx release it runs (``aisquare-cli``'s version, or
+                            rlxd's).
+``started_at``   string     when it registered: RFC 3339 with an offset, in UTC
+                            (``2026-11-25T12:03:00.123456+00:00``; ``Z`` is read too;
+                            a time without an offset is read as UTC).
+``heartbeat_at`` string     when the record was last written, as ``started_at``.
+``argv``         [string]   the command that starts it again, ``argv[0]`` the program,
+                            never empty. To restart a daemon: run ``argv`` as a new
+                            process, detached from any terminal (no stdin; output to
+                            a null device or a log), in ``cwd`` when the record has
+                            one, with ``AISQUARE_HOME`` naming this home, and do not
+                            wait for it to exit: it may BE the daemon (``serve``), or
+                            start it in a host and return (``watch --detach``, which
+                            opens its tmux window again). Options the daemon took from
+                            its environment are written out, so the command means
+                            what it meant. Recorded whether or not ``restartable``,
+                            for a person to read.
+``restartable``  boolean    whether an upgrade may stop the daemon and start ``argv``
+                            in its place. ``false`` for one a client owns (``serve
+                            --stdio``, whose client holds its stdin and stdout) or a
+                            person's terminal does (a ``watch`` run in the
+                            foreground).
+``cwd``          string or  OPTIONAL: the directory it runs in, absolute, where its
+                 null       restart must run (``serve`` serves the project it was
+                            started in); ``null`` or absent where none could be named.
+================ ========== ==========================================================
 """
 
 from __future__ import annotations
@@ -82,14 +92,13 @@ KINDS: tuple[Kind, ...] = ("rlxd", "brain", "watch", "serve", "remote", "board_w
 """Every kind this release knows. 4.1a registers ``watch`` and ``serve``; ``remote`` and
 ``board_watch`` come with 4.1b, ``rlxd`` and ``brain`` with rlxd."""
 
-HEARTBEAT_SECONDS = 15.0
-"""How often a registered daemon rewrites its record: a quarter of :data:`STALE_SECONDS`, so
-a daemon on another host sharing the home reads as live through three missed beats."""
+HEARTBEAT_SECONDS = 5.0
+"""How often a registered daemon rewrites its record (handoff §4.1)."""
 
 STALE_SECONDS = 60.0
-"""How old the heartbeat of another host's record with no held lock may be before it is
-stale; and how old an unreadable record or a gone record's leftover must be before a reader
-deletes it (``core.registry``)."""
+"""How old an unreadable record or a gone record's leftover must be before a reader deletes it
+(``core.registry``); and, where a lock cannot be probed at all, how old another host's
+heartbeat may be before its record is dead."""
 
 FOLDER = "daemons"
 
@@ -128,35 +137,39 @@ class Daemon:
     kind: str
     """One of :data:`KINDS`, or a later release's kind, kept as said."""
     pid: int
-    since: datetime
-    argv: tuple[str, ...]
-    restartable: bool
     host: str
     version: str
-    heartbeat: datetime
+    started_at: datetime
+    heartbeat_at: datetime
+    argv: tuple[str, ...]
+    restartable: bool
     cwd: str | None = None
 
     def to_record(self) -> dict[str, Any]:
-        """The record as written: the id is the file's name, never in it."""
+        """The record as written (the module's table)."""
         return {
+            "id": self.id,
             "kind": self.kind,
             "pid": self.pid,
-            "since": self.since.isoformat(),
-            "argv": list(self.argv),
-            "restartable": self.restartable,
             "host": self.host,
             "version": self.version,
-            "heartbeat": self.heartbeat.isoformat(),
+            "started_at": self.started_at.isoformat(),
+            "heartbeat_at": self.heartbeat_at.isoformat(),
+            "argv": list(self.argv),
+            "restartable": self.restartable,
             "cwd": self.cwd,
         }
 
     @classmethod
     def from_record(cls, daemon_id: str, data: object) -> Daemon | None:
-        """The record ``data`` holds, as the daemon ``daemon_id``; ``None`` for one this
-        release cannot read (the module's table says what it must hold)."""
+        """The record ``data`` holds, as the daemon ``daemon_id`` (its file's name); ``None``
+        for one this release cannot read (the module's table says what it must hold), one
+        whose ``id`` is another than its file's included."""
         if not isinstance(data, dict):
             return None
         try:
+            if data["id"] != daemon_id:
+                return None
             kind, pid, argv = data["kind"], data["pid"], data["argv"]
             restartable, host, version = data["restartable"], data["host"], data["version"]
             cwd = data.get("cwd")
@@ -176,12 +189,12 @@ class Daemon:
                 id=daemon_id,
                 kind=kind,
                 pid=pid,
-                since=registry.moment(data["since"]),
-                argv=tuple(argv),
-                restartable=restartable,
                 host=host,
                 version=version,
-                heartbeat=registry.moment(data["heartbeat"]),
+                started_at=registry.moment(data["started_at"]),
+                heartbeat_at=registry.moment(data["heartbeat_at"]),
+                argv=tuple(argv),
+                restartable=restartable,
                 cwd=cwd,
             )
         except (KeyError, TypeError, ValueError):
@@ -218,11 +231,15 @@ def is_live(daemon: Daemon, *, host: str | None = None, now: datetime | None = N
 def _live(
     daemon: Daemon, held: bool | None, *, here: str | None = None, now: datetime | None = None
 ) -> bool:
+    """The module's rule, the lock probed already (``held``): the lock alone, and the record's
+    pid or heartbeat only where the lock could not be told (``None``)."""
+    if held is not None:
+        return held
     return registry.live_by_lock_or_heartbeat(
-        held,
+        None,
         host=daemon.host,
         pid=daemon.pid,
-        heartbeat=daemon.heartbeat,
+        heartbeat=daemon.heartbeat_at,
         stale_seconds=STALE_SECONDS,
         here=here,
         now=now,
@@ -239,7 +256,7 @@ def roll(*, prune: bool = True) -> registry.Roll[Daemon]:
         lambda daemon, held: _live(daemon, held, here=here, now=now),
         prune=prune,
     )
-    return replace(found, live=sorted(found.live, key=lambda daemon: daemon.since))
+    return replace(found, live=sorted(found.live, key=lambda daemon: daemon.started_at))
 
 
 def list_live(*, kind: str | None = None, prune: bool = True) -> list[Daemon]:
@@ -283,7 +300,7 @@ class Registration:
         with self._guard:
             if self._closed:
                 return
-            self._daemon = replace(self._daemon, heartbeat=datetime.now(UTC))
+            self._daemon = replace(self._daemon, heartbeat_at=datetime.now(UTC))
             REGISTRY.write(self._daemon.id, self._daemon.to_record())
 
     def deregister(self) -> None:
@@ -323,12 +340,12 @@ def describe_this_process(kind: Kind, *, argv: Sequence[str], restartable: bool)
         id=registry.new_id(),
         kind=kind,
         pid=os.getpid(),
-        since=now,
-        argv=tuple(argv),
-        restartable=restartable,
         host=registry.host_name(),
         version=__version__,
-        heartbeat=now,
+        started_at=now,
+        heartbeat_at=now,
+        argv=tuple(argv),
+        restartable=restartable,
         cwd=_cwd(),
     )
 
@@ -336,20 +353,24 @@ def describe_this_process(kind: Kind, *, argv: Sequence[str], restartable: bool)
 def register(kind: Kind, *, argv: Sequence[str], restartable: bool) -> Registration:
     """Register this process as a daemon of ``kind``, with the command that starts it again
     (``argv``, the module's table says how it is run) and whether an upgrade may
-    (``restartable``): its lock taken and held, its record written and its heartbeat started.
-    The caller calls :meth:`Registration.deregister` as it exits (or uses :func:`registered`).
-    Raises ``OSError`` when the folder, the lock or the record cannot be had."""
+    (``restartable``): under ``.gate.lock``, the others read (the dead pruned), its lock taken
+    and held and its record written; then its heartbeat started. The caller calls
+    :meth:`Registration.deregister` as it exits (or uses :func:`registered`). Raises
+    ``OSError`` when the folder, the gate, the lock or the record cannot be had (another
+    holding the gate past ``core.registry.GATE_WAIT_SECONDS`` included)."""
     if kind not in KINDS:
         raise ValueError(f"not a daemon kind: {kind!r}")
     if not argv:
         raise ValueError("a daemon's argv names its program")
-    me = describe_this_process(kind, argv=argv, restartable=restartable)
-    fd = REGISTRY.take(me.id)
-    try:
-        REGISTRY.write(me.id, me.to_record())
-    except BaseException:
-        REGISTRY.leave(me.id, fd)
-        raise
+    with REGISTRY.gate():
+        roll(prune=True)
+        me = describe_this_process(kind, argv=argv, restartable=restartable)
+        fd = REGISTRY.take(me.id)
+        try:
+            REGISTRY.write(me.id, me.to_record())
+        except BaseException:
+            REGISTRY.leave(me.id, fd)
+            raise
     registration = Registration(me, fd)
     registration.start()
     return registration
