@@ -80,7 +80,8 @@ def test_aisquare_short_options_keep_spaces_and_equals(
     )
     with command.make_context("launch", ["coder", *args]) as ctx:
         assert ctx.params["command"] == pairs[0][1]
-        assert ctx.params["env_pairs"] == (pairs[1][1],)
+        # A tuple from typer 0.28, a list from 0.29: the command is given a list either way.
+        assert list(ctx.params["env_pairs"]) == [pairs[1][1]]
         assert ctx.params["account"] == pairs[2][1]
         assert ctx.args == []
     execute = Mock()
@@ -677,7 +678,7 @@ def test_native_option_values_cannot_swallow_aisquare_options(native: list[str])
         assert ctx.params["command"] == "/wrapper"
         assert ctx.params["agent"] == "claude-code"
         assert ctx.params["account"] == "2"
-        assert ctx.params["env_pairs"] == ("SECRET=fixture",)
+        assert list(ctx.params["env_pairs"]) == ["SECRET=fixture"]
         assert ctx.args == native
     fleet_group = root.commands["fleet"]
     assert isinstance(fleet_group, TyperGroup)

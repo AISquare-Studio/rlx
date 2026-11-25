@@ -780,7 +780,7 @@ def test_the_team_strip_counts_each_role_by_state_and_hides_with_only_the_manage
         return (*team, strip.display)
 
     text, displayed, alone = drive(project, scenario)
-    assert text == "🔨 2▶  🧪 1⏸  👀 1🔔  · board for detail"
+    assert text == "🔨 2▶  🧪 1◦  👀 1🔔  · board for detail"
     assert displayed is True
     assert alone is False
 
@@ -796,7 +796,7 @@ def test_the_team_strip_shows_each_state_of_a_role_and_a_role_it_has_no_icon_for
     ]
     text = project_view_module.team_strip_text(frame)
     assert text is not None
-    assert text.plain == "🔨 1▶ 1⏸ 1⏳  🤖 docs-writer 1⏸  · board for detail"
+    assert text.plain == "🔨 1▶ 1◦ 1⏳  🤖 docs-writer 1◦  · board for detail"
     assert project_view_module.team_strip_text(frame[:0]) is None
 
 

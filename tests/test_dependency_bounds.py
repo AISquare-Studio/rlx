@@ -1,17 +1,18 @@
-"""typer stays below 0.29, so a fresh install gets a typer the CLI can build its flags on.
+"""typer stays below 0.30, so a fresh install gets a typer the CLI was checked on.
 
 typer 0.29.0 (PyPI, 2026-11-09) vendors click and gave ``TyperOption.__init__`` a required
-keyword-only ``type_descriptor``. ``cli/global_flags.py`` builds the five shared flags as
+keyword-only ``type_descriptor``. ``cli/global_flags.py`` built the five shared flags as
 ``TyperOption(...)`` by hand, so ``GlobalFlagsGroup`` raised while the command tree was
 built: every command of every fresh 0.9.2 install failed, ``aisquare --version``
 included. pyproject asked ``typer>=0.26.8`` with no ceiling, and pip, ``uv tool install``,
-install.sh and CI all resolved 0.29.0. Only ``uv.lock`` held 0.27.3.
+install.sh and CI all resolved 0.29.0. Only ``uv.lock`` held 0.27.3. 0.10.0 capped typer
+below 0.29; 0.10.2 ported the CLI to 0.29 and moved the cap to 0.30, which nobody has
+checked yet (0.29 was a rewrite in a minor release, so 0.30 may be another).
 
 The cap is what a wheel's metadata carries, so it is what every installer reads. These
 tests read it from pyproject, as written, so dropping it is a red test even while the
 environment still has an older typer. They also check the typer that runs: under a
-typer the cap excludes, the suite's own CLI tests fail as well (test_global_flags
-builds the tree), and this says why.
+typer the cap excludes, the suite's own CLI tests may fail as well, and this says why.
 """
 
 from __future__ import annotations
@@ -25,8 +26,8 @@ from packaging.version import Version
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
-#: The first typer the CLI cannot start on.
-BROKEN = Version("0.29.0")
+#: The first typer the CLI has not been checked on.
+UNCHECKED = Version("0.30.0")
 
 
 def _typer() -> Requirement:
@@ -36,17 +37,17 @@ def _typer() -> Requirement:
     return found[0]
 
 
-def test_pyproject_caps_typer_below_0_29() -> None:
+def test_pyproject_caps_typer_below_0_30() -> None:
     specifier = _typer().specifier
     ceilings = [Version(spec.version) for spec in specifier if spec.operator == "<"]
-    assert ceilings and min(ceilings) <= BROKEN, (
-        f"typer{specifier} has no ceiling at or below {BROKEN}: typer 0.29.0 breaks every "
-        "command (TyperOption's type_descriptor), so pyproject must say typer<0.29"
+    assert ceilings and min(ceilings) <= UNCHECKED, (
+        f"typer{specifier} has no ceiling at or below {UNCHECKED}: 0.29.0 was a rewrite that "
+        "broke every command, and 0.30 is unchecked, so pyproject must say typer<0.30"
     )
-    for later in ("0.29.0", "0.29.1", "0.30.0", "1.0.0"):
+    for later in ("0.30.0", "0.30.1", "1.0.0"):
         assert not specifier.contains(later, prereleases=True), f"typer{specifier} admits {later}"
-    # The release the fix was measured on, and the one uv.lock holds, stay in range.
-    for works in ("0.28.0", "0.27.3"):
+    # The releases the port was measured on, and the one uv.lock held before it, stay in range.
+    for works in ("0.29.2", "0.29.0", "0.28.0", "0.27.3"):
         assert specifier.contains(works), f"typer{specifier} excludes {works}, which works"
 
 

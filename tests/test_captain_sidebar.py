@@ -116,7 +116,7 @@ def test_the_captain_row_keeps_its_session_figure_beside_its_persona(
     script: Script,
 ) -> None:
     """Review of #267's merge, M-F1: the captain always runs as its persona, so its row read
-    ``🤖 captain       ⏸ #1·42…`` at the default width — the badge pushed the figure under
+    ``🤖 captain       ◦ #1·42…`` at the default width — the badge pushed the figure under
     the row's ellipsis. The chip and ``#<slot>·<pct>%`` stay whole and the badge shows."""
     seed(tmp_path, ("prj_aaa", "alpha", "amber-otter"))
     home = captain_state.home_project()
@@ -132,7 +132,7 @@ def test_the_captain_row_keeps_its_session_figure_beside_its_persona(
 
     row = drive(body, headroom=ui_suite.session_use((1, 42.0)))
     assert row.startswith("🤖 captain"), row
-    assert "⏸ #1·42% · ca" in row and "#1·42…" not in row, row
+    assert "◦ #1·42% · ca" in row and "#1·42…" not in row, row
 
 
 @pytest.mark.needs_captain
