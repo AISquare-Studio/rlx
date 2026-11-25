@@ -628,3 +628,46 @@ fn a_daemon_record_refuses_its_wrong_shapes() {
         schema_refuses("daemon-record.json", with(&record, field, value));
     }
 }
+
+#[test]
+fn only_an_app_hello_carries_the_gate_credential() {
+    let app = with(&hello_base(), "gate_credential", json!("gc-secret"));
+    assert_eq!(agrees::<HelloParams>("hello.json", &app), app);
+    let built = HelloParams::new("tok-secret", "rlxapp", "0.1.0", Role::App)
+        .with_gate_credential("gc-secret");
+    assert_eq!(
+        serde_json::to_value(&built).unwrap(),
+        with(&app, "token", json!("tok-secret"))
+    );
+
+    // Any other role carrying one is a client bug, a credential leaked: refused.
+    for role in ["tui", "remote", "cli"] {
+        schema_refuses("hello.json", with(&app, "role", json!(role)));
+    }
+    schema_refuses("hello.json", with(&app, "gate_credential", json!("")));
+    both_refuse::<HelloParams>("hello.json", with(&app, "gate_credential", json!(7)));
+    // Without one, every role's hello is well formed; refusing an app-role one is
+    // rlxd's, with not_gate.
+    for role in ["app", "tui", "remote", "cli"] {
+        assert_valid("hello.json", &with(&hello_base(), "role", json!(role)));
+    }
+
+    // Neither secret shows in a logged hello.
+    let shown = format!("{built:?}");
+    assert!(
+        !shown.contains("gc-secret") && !shown.contains("tok-secret"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("<redacted>") && shown.contains("rlxapp"),
+        "{shown}"
+    );
+
+    let refused = Envelope::err(ErrorBody::new(
+        codes::NOT_GATE,
+        "this connection is not the gate",
+    ))
+    .with_id(1);
+    let printed = agrees::<Envelope>("envelope.json", &serde_json::to_value(&refused).unwrap());
+    assert_eq!(printed["error"]["code"], "not_gate");
+}

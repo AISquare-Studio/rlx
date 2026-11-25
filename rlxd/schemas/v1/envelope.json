@@ -67,7 +67,7 @@
       "type": "object",
       "properties": {
         "code": {
-          "description": "A stable, machine-readable code, such as `unauthorized` or `not_a_tty`.",
+          "description": "A stable, machine-readable code, such as `unauthorized`, `unknown_method`,\n`incompatible_protocol`, `not_gate` or `not_a_tty`. A client also accepts codes it\ndoes not know.",
           "type": "string",
           "minLength": 1
         },

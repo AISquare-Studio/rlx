@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HelloParams",
-  "description": "`hello`'s params: who is connecting, as what, which protocol it speaks, and the\ntoken that lets it in.\n\n```json\n{\"token\": \"…\", \"protocol_version\": 1, \"client\": \"rlxapp\", \"client_version\": \"0.1.0\",\n \"role\": \"app\", \"capabilities\": [], \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```\n\nA `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,\nwhose `detail.supported` lists the versions it does.",
+  "description": "`hello`'s params: who is connecting, as what, which protocol it speaks, and the\ntoken that lets it in.\n\n```json\n{\"token\": \"…\", \"protocol_version\": 1, \"client\": \"rlxapp\", \"client_version\": \"0.1.0\",\n \"role\": \"app\", \"capabilities\": [], \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```\n\nA `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,\nwhose `detail.supported` lists the versions it does. A `role: app` hello without a\nvalid `gate_credential` gets the error `not_gate`. Only `role: app` may carry one.",
   "type": "object",
   "properties": {
     "capabilities": {
@@ -27,6 +27,11 @@
         "type": "string"
       }
     },
+    "gate_credential": {
+      "description": "The credential that makes this connection the tool-call gate, which rlxd mints\nwhen the app is paired. It is sent with `role: app` only, never by another role.\nThe shared token alone does not make a connection the gate.",
+      "type": "string",
+      "minLength": 1
+    },
     "protocol_version": {
       "description": "The protocol version the client speaks. It is the `schema_version` of every\nenvelope and event on the connection.",
       "type": "integer",
@@ -41,6 +46,15 @@
       "description": "The contents of `<home>/rlxd/token`.",
       "type": "string",
       "minLength": 1
+    }
+  },
+  "dependentSchemas": {
+    "gate_credential": {
+      "properties": {
+        "role": {
+          "const": "app"
+        }
+      }
     }
   },
   "required": [

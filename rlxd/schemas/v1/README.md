@@ -23,7 +23,7 @@ cargo run -p rlxd-proto --bin gen-schemas -- --check # what CI runs: exit 1 on d
 | `event.json` | One event: `{schema_version, seq, time, topic, type, data}`. On the `run` topic, `data` also carries `run_id` and `run_seq` |
 | `event-list.json` | A JSON array of events, as `jq -s .` makes of `rlxd events`' lines |
 | `request.json` | One socket request frame: `{id, method, params?}` |
-| `hello.json` | `hello`'s params: `{token, protocol_version, client, client_version, role, capabilities, env?}`, where `role` is `app`, `tui`, `remote` or `cli` |
+| `hello.json` | `hello`'s params: `{token, protocol_version, client, client_version, role, capabilities, gate_credential?, env?}`, where `role` is `app`, `tui`, `remote` or `cli`, and only `role: app` may carry `gate_credential` |
 | `hello-reply.json` | `hello`'s reply data: `{protocol_version, protocol_versions, rlxd_version, capabilities}` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
@@ -35,6 +35,11 @@ version the connection speaks, and every version rlxd serves. A version rlxd doe
 serve gets the error `incompatible_protocol`, whose `detail.supported` lists the ones it
 does, never a silent misparse. The protocol version is the `schema_version` of every
 envelope and event.
+
+The shared token lets a client in. It doesn't make the connection the tool-call gate:
+an app-role `hello` also carries `gate_credential`, minted when the app is paired, and
+no other role may carry one. A `role: app` hello without a valid credential gets the
+error `not_gate`, as does a tool-call decision from a connection that is not the gate.
 
 ## Two sequences
 

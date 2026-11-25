@@ -25,6 +25,15 @@
 //! does, and never a silent misparse ([`ErrorBody::incompatible_protocol`]). The
 //! protocol version is the `schema_version` of every envelope and event.
 //!
+//! # The gate credential
+//!
+//! The shared token lets any client in, but it does not make a connection the tool-call
+//! gate. An app-role `hello` also carries `gate_credential`, which rlxd mints when the
+//! app is paired. No other role sends one, and the schema refuses it on any other role.
+//! A `role: app` hello without a valid credential gets [`codes::NOT_GATE`]. So does a
+//! tool-call decision from a connection that is not the gate. This crate only carries
+//! the field and the code: minting, checking and refusing are the daemon's.
+//!
 //! # Two sequences
 //!
 //! - **`seq`**, on every event: strictly increasing per home, across every topic.

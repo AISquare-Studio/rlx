@@ -66,7 +66,9 @@ pub enum Outcome {
 #[schemars(rename = "Error", title = "Error", transform = incompatible_protocol_rule)]
 #[non_exhaustive]
 pub struct ErrorBody {
-    /// A stable, machine-readable code, such as `unauthorized` or `not_a_tty`.
+    /// A stable, machine-readable code, such as `unauthorized`, `unknown_method`,
+    /// `incompatible_protocol`, `not_gate` or `not_a_tty`. A client also accepts codes it
+    /// does not know.
     #[schemars(length(min = 1))]
     pub code: String,
     /// What went wrong, for a person.
@@ -119,6 +121,10 @@ pub mod codes {
     /// `hello` asked for a protocol version this rlxd does not serve. `detail.supported`
     /// lists the ones it does, so the client can say "update" rather than misparse.
     pub const INCOMPATIBLE_PROTOCOL: &str = "incompatible_protocol";
+    /// The connection may not act as the tool-call gate: a `role: app` hello without a
+    /// valid `gate_credential`, or a tool-call decision from a connection that is not
+    /// the gate.
+    pub const NOT_GATE: &str = "not_gate";
 }
 
 impl Envelope {
