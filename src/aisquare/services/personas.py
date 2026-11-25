@@ -1067,7 +1067,7 @@ def remove(name: str, *, layer: Layer, root: Path | None) -> Path:
     if layer == "bundled":
         raise _bundled_refusal(name, "removed")
     if layer == "project":
-        raise _project_refusal(dict(core.layer_dirs(root)).get("project", Path()) / name)
+        raise _project_refusal(dict(core.layer_dirs(root)).get("project", Path()) / name, "rm")
     directory = _layer_dir(layer, root) / name
     if not (_is_skill_name(name) and directory.is_dir()):
         raise PersonaError(
@@ -1179,20 +1179,30 @@ def _refuse_a_project_layer(base: Path) -> None:
     user = dict(core.layer_dirs(None))["user"]
     try:
         where, mine = base.resolve(), user.resolve()
+        both = where.exists() and mine.exists()
+        yours = where == mine or (both and os.path.samefile(where, mine))
     except OSError:
         return
-    if where != mine and where.name == "personas" and where.parent.name == ".aisquare":
+    # By name, case-insensitively: macOS's and Windows' file systems are, so
+    # ``.AISQUARE/Personas`` IS the project's layer there (the tester of #21, round 3).
+    named = where.name.casefold() == "personas" and where.parent.name.casefold() == ".aisquare"
+    if named and not yours:
         raise _project_refusal(base)
 
 
-def _project_refusal(directory: Path | None) -> PersonaError:
+def _project_refusal(directory: Path | None, verb: Literal["edit", "rm"] = "edit") -> PersonaError:
     """A write that would change a project's own persona layer. Personas are the user's since
     0.10.1, and a project's are copied to them once (:func:`migrate_once`); rlx leaves the
     project's files as they are."""
     where = "" if directory is None else f" ({directory})"
+    yours = (
+        prog.shell_advice(f": `{prog.word()} persona {verb} {directory.name} --user`")
+        if directory is not None
+        else ""
+    )
     return PersonaError(
         f"personas are yours (the user level) since 0.10.1: rlx no longer writes, edits or "
-        f"removes a project's persona{where}; change your own instead",
+        f"removes a project's persona{where}; change your own instead{yours}",
         code="project_layer_retired",
     )
 
@@ -1201,12 +1211,12 @@ def _bundled_refusal(name: str, verb: Literal["edited", "removed"]) -> PersonaEr
     if verb == "removed":
         rule = (
             f"'{name}' is a bundled persona — it ships with rlx and cannot be removed; a "
-            "user or project persona of the same name shadows it instead"
+            "persona of yours with the same name shadows it instead"
         )
     else:
         rule = (
-            f"'{name}' is a bundled persona and cannot be edited in place — copy it into a "
-            "layer you own first"
+            f"'{name}' is a bundled persona and cannot be edited in place — copy it into "
+            "your personas first"
             + prog.shell_advice(
                 f": `{prog.word()} persona export {name} --to DIR`, then "
                 f"`{prog.word()} persona import DIR/{name} --user` (or `persona new NAME`)"
@@ -1384,8 +1394,24 @@ class MigrationReport(BaseModel):
     def kept_yours(self) -> list[MigratedPersona]:
         return [item for item in self.personas if item.outcome == "kept_yours"]
 
+    def headline(self) -> str | None:
+        """The counts in a few words, for the line the Personas page folds the detail behind
+        (:meth:`summary`); ``None`` when there was nothing to say."""
+        if self.summary() is None:
+            return None
+        copied = len(self.copied)
+        kept = len(self.kept_yours)
+        missed = sum(1 for item in self.personas if item.outcome in ("name_taken", "skipped"))
+        parts = [
+            *([f"{copied} copied"] if copied else []),
+            *([f"{kept} kept yours"] if kept else []),
+            *([f"{missed} not copied"] if missed else []),
+        ]
+        return "Project personas: " + ", ".join(parts)
+
     def summary(self) -> str | None:
-        """One line for a person, or ``None`` when there was nothing to say."""
+        """What it did, each persona's line after the copied ones' names, for a person; or
+        ``None`` when there was nothing to say."""
         if not self.ran or not self.personas:
             return None
         said = [item for item in self.personas if item.outcome != "already_there"]
@@ -1400,7 +1426,7 @@ class MigrationReport(BaseModel):
                 sentence = item.sentence()
                 parts.append(sentence[:1].upper() + sentence[1:] + ".")
         parts.append("The project files are left where they were.")
-        return " ".join(parts)
+        return "\n".join(parts)
 
 
 def migrate_project_personas(roots: list[Path] | None = None) -> MigrationReport:

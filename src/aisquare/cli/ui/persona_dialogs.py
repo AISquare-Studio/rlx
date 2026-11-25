@@ -587,8 +587,8 @@ class NewPersonaScreen(_Dialog):
 class EditPersonaScreen(_Dialog):
     """The whole SKILL.md in a TextArea; *Save* only while it parses, and only through the service.
 
-    A bundled persona opens read-only: *Save as…* copies it into a layer the way
-    ``persona export --to <layer>`` does, and the copy shadows the bundled one.
+    A bundled persona opens read-only: *Save as…* copies it into your personas the way
+    ``persona export --to <your personas>`` does, and the copy shadows the bundled one.
     Dismisses with ``True`` when something was written.
     """
 

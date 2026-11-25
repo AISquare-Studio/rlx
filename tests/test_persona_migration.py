@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Static
+from textual.widgets import Collapsible, Static
 
 from aisquare.cli.ui.views.personas_tab import PersonasTab
 from aisquare.core import personas as core
@@ -161,21 +161,85 @@ def test_the_personas_page_says_what_was_copied_once(repo: Path) -> None:
         def compose(self) -> ComposeResult:
             yield PersonasTab(id="personas")
 
-    async def open_page() -> tuple[bool, str, list[str]]:
+    async def open_page() -> tuple[bool, str, bool, str, list[str]]:
         app = Page()
         async with app.run_test(size=(120, 40)):
             await settle_page(app)
-            line = app.query_one("#personas-migrated", Static)
-            plain = getattr(line.visual, "plain", "")
+            fold = app.query_one("#personas-migrated", Collapsible)
+            detail = app.query_one("#personas-migrated-detail", Static)
+            plain = getattr(detail.visual, "plain", "")
             names = [entry.name for entry in app.query_one(PersonasTab).entries]
-            return bool(line.display), str(plain), names
+            return bool(fold.display), str(fold.title), fold.collapsed, str(plain), names
 
-    shown, text, names = asyncio.run(open_page())
-    again, _text, _names = asyncio.run(open_page())
+    shown, title, folded, text, names = asyncio.run(open_page())
+    again, *_rest = asyncio.run(open_page())
 
-    assert shown and "Copied your project personas to your personas: tempo." in text
+    assert shown and title == "Project personas: 1 copied" and folded
+    assert "Copied your project personas to your personas: tempo." in text  # behind the fold
     assert "tempo" in names, "and the page lists it as yours"
     assert not again, "said once: the second opening has nothing to say"
+
+
+def test_at_80x24_a_long_migration_report_leaves_the_page_usable(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tester of #21, round 3: a report of several kept and skipped personas, each with its
+    whole path, filled the page at 80x24, and the search, the table and every button were
+    below the screen, out of reach. Folded behind its counts, the page is all there."""
+    from aisquare.cli.ui.app import FleetApp
+    from aisquare.cli.ui.sidebar import SettingsRow
+    from tests.test_ui_settings_hub import GOOD
+
+    _project_persona(repo, "tempo", "Tempo.")
+    for name in ("skeptic", "review", "pair", "scribe", "ops"):
+        _project_persona(repo, name, f"THE PROJECT'S {name}.")
+        _skill(_user() / name, f"YOUR {name}.")
+    (repo / ".aisquare" / "personas" / "notes").mkdir()  # no SKILL.md
+
+    async def drive() -> dict[str, tuple[int, int]]:
+        app = FleetApp(
+            refresh_seconds=3600,
+            doctor=lambda: [],
+            accounts=None,
+            headroom=lambda accounts: GOOD,
+            headroom_seconds=3600,
+        )
+        async with app.run_test(size=(80, 24)) as pilot:
+            await settle_page(app)
+            await pilot.click(app.query_one(SettingsRow))
+            await settle_page(app)
+            app.query_one("#hub-personas").scroll_visible(animate=False)
+            await settle_page(app)
+            await pilot.click("#hub-personas")
+            await settle_page(app)
+            page = app.query_one(PersonasTab)
+            regions = {
+                name: (
+                    page.query_one(f"#{name}").region.y,
+                    page.query_one(f"#{name}").region.bottom,
+                )
+                for name in (
+                    "personas-migrated",
+                    "persona-search",
+                    "persona-import",
+                    "persona-new",
+                    "persona-table",
+                    "persona-edit",
+                    "persona-export",
+                    "persona-remove",
+                    "persona-validate",
+                )
+            }
+            regions["table rows"] = (0, page.query_one("#persona-table").region.height)
+            return regions
+
+    regions = asyncio.run(drive())
+
+    for name, (_top, bottom) in regions.items():
+        if name != "table rows":
+            assert bottom <= 24, (name, regions)
+    assert regions["table rows"][1] >= 3, regions
+    assert regions["personas-migrated"][1] - regions["personas-migrated"][0] <= 3, regions
 
 
 def _outside(tmp_path: Path) -> Path:

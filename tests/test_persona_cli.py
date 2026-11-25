@@ -992,3 +992,54 @@ def test_export_refuses_a_projects_persona_layer_as_its_destination(
     assert not (layer / "skeptic").exists()
     exported = runner.invoke(app, ["persona", "export", "skeptic", "--to", str(repo / "out")])
     assert exported.exit_code == 0, exported.output  # any other directory is still fine
+
+
+def test_export_refuses_a_projects_layer_in_any_case(runner: CliRunner, repo: Path) -> None:
+    """The tester of #21, round 3: ``.AISQUARE/Personas`` is the project's layer on macOS and
+    Windows, whose file systems ignore case; it was written to. Refused by name, everywhere."""
+    layer = repo / ".AISQUARE" / "Personas"
+
+    with pytest.raises(PersonaError) as refused:
+        persona_service.export("skeptic", root=repo, to=layer, skill=None, force=False)
+
+    assert refused.value.code == "project_layer_retired"
+    assert not (layer / "skeptic").exists()
+    assert not (repo / ".aisquare" / "personas" / "skeptic").exists()
+
+
+def test_edit_user_edits_yours_where_the_repositorys_own_wins_and_the_refusal_says_so(
+    runner: CliRunner, repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In a repository whose own ``tempo`` wins there, ``persona edit tempo`` refuses, and
+    says how to edit yours; ``--user`` edits yours and leaves the repository's alone."""
+    theirs = repo / ".aisquare" / "personas" / "tempo" / "SKILL.md"
+    theirs.parent.mkdir(parents=True)
+    theirs.write_text("---\nname: tempo\ndescription: The repo's.\n---\nKeep tempo.\n")
+    mine = _user_layer() / "tempo" / "SKILL.md"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("---\nname: tempo\ndescription: Mine.\n---\nMy tempo.\n")
+    before = theirs.read_bytes()
+    monkeypatch.setenv(
+        "EDITOR",
+        _editor(
+            tmp_path,
+            "rewrite.py",
+            "text = open(path, encoding='utf-8').read().replace('My tempo.', 'My new tempo.')\n"
+            "open(path, 'w', encoding='utf-8').write(text)",
+        ),
+    )
+
+    refused = runner.invoke(app, ["persona", "edit", "tempo"])
+    edited = runner.invoke(app, ["persona", "edit", "tempo", "--user"])
+
+    assert refused.exit_code == 1
+    assert "rlx persona edit tempo --user" in " ".join(refused.stderr.split())
+    assert edited.exit_code == 0, edited.output
+    assert "My new tempo." in mine.read_text(encoding="utf-8")
+    assert theirs.read_bytes() == before, "the repository's file is untouched"
+
+
+def test_rm_of_a_repositorys_persona_names_rm_user() -> None:
+    error = persona_service._project_refusal(Path("/repo/.aisquare/personas/tempo"), "rm")
+
+    assert "persona rm tempo --user" in str(error)

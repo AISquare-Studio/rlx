@@ -233,17 +233,22 @@ def new(name: PersonaName, user: UserFlag = False, project: RetiredProjectFlag =
 
 
 @app.command("edit")
-def edit(name: PersonaName) -> None:
-    """Edit one of your personas' SKILL.md in $EDITOR; invalid text is not saved."""
+def edit(name: PersonaName, user: UserFlag = False) -> None:
+    """Edit one of your personas' SKILL.md in $EDITOR; invalid text is not saved. In a
+    repository whose own persona of that name wins there, --user edits yours."""
     root = _root()
     with _reported():
-        layer, directory = persona_service.locate(name, root)
+        if user:
+            layer: Layer = "user"
+            directory = dict(core.layer_dirs(None))["user"] / name
+        else:
+            layer, directory = persona_service.locate(name, root)
         if layer != "bundled" and not _editor_available():
             fail(
                 "no editor to open — set $EDITOR (or $VISUAL), or run this at a terminal",
                 error="no_editor",
             )
-        persona = persona_service.edit(name, root=root)
+        persona = persona_service.edit(name, root=root, layer="user" if user else None)
     if _json():
         warnings = [] if persona is None else core.warnings(persona)
         _emit(
