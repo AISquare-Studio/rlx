@@ -45,6 +45,7 @@ from aisquare.core.atomic import write_replacing
 from aisquare.core.config import PersonaImportSettings, load_config
 from aisquare.core.editor import edit_text
 from aisquare.core.personas import Layer, Persona, PersonaError, Provenance
+from aisquare.core.workspace import _resolved_or_spelled
 
 SkillScope = Literal["user", "project"]
 
@@ -993,19 +994,22 @@ def _target(name: str, root: Path | None, layer: Layer | None) -> tuple[Layer, P
 def _yours(name: str) -> Path:
     """Your persona ``name``'s directory, or a plain refusal: a name no persona can have (so
     nothing outside your personas folder is ever read, ``../x`` included), or one you have
-    none of, with how to get one (the review of #21, round 3)."""
+    none of, with how to get one (the review of #21, round 3). A bundled name is rlx's, not a
+    project's: yours of that name is started with ``persona new``, and wins over it (round 4)."""
     core.check_name(name, name)
     directory = dict(core.layer_dirs(None))["user"] / name
     if not directory.is_dir():
-        raise PersonaError(
-            f"you have no persona named '{name}'"
-            + prog.shell_advice(
+        new = f"`{prog.word()} persona new {name}`"
+        if (core.BUNDLED_DIR / name / core.SKILL_FILE).is_file():
+            said = f"you have no persona named '{name}', only rlx's bundled one"
+            how = f"; start yours with {new}, which then wins over the bundled one"
+        else:
+            said = f"you have no persona named '{name}'"
+            how = (
                 f"; copy a project's with `{prog.word()} persona import "
-                f"<project>/.aisquare/personas/{name} --user`, or start one with "
-                f"`{prog.word()} persona new {name}`"
-            ),
-            code="unknown_persona",
-        )
+                f"<project>/.aisquare/personas/{name} --user`, or start one with {new}"
+            )
+        raise PersonaError(said + prog.shell_advice(how), code="unknown_persona")
     return directory
 
 
@@ -1194,10 +1198,9 @@ def _refuse_a_project_layer(base: Path) -> None:
     the user layer aside): an export there wrote what ``_layer_dir`` refuses, by a path
     (the review of #561: *Save as… into: project*)."""
     user = dict(core.layer_dirs(None))["user"]
-    try:
-        where = base.resolve()
-    except OSError:  # cannot be resolved: judged by the path as written
-        where = Path(os.path.abspath(base))
+    # Through a symlink loop, judged by the path as written: the one rule for that fallback
+    # (the review of #21, round 4: a second spelling of it failed the package's guard).
+    where = _resolved_or_spelled(base)
     # By name, case-insensitively: macOS's and Windows' file systems are, so
     # ``.AISQUARE/Personas`` IS the project's layer there (the tester of #21, round 3).
     named = where.name.casefold() == "personas" and where.parent.name.casefold() == ".aisquare"
@@ -1222,11 +1225,17 @@ def _project_refusal(
     the layer an export was pointed at (``export``), which names no persona."""
     where = "" if directory is None else f" ({directory})"
     if verb == "export":
-        yours = "; export it to any other folder"
-    elif directory is not None:
-        yours = prog.shell_advice(f": `{prog.word()} persona {verb} {directory.name} --user`")
-    else:
-        yours = ""
+        # An export changes no persona: where else it can go is the advice (round 4).
+        return PersonaError(
+            f"personas are yours (the user level) since 0.10.1: rlx no longer writes into a "
+            f"project's personas folder{where}; export it to any other folder",
+            code="project_layer_retired",
+        )
+    yours = (
+        ""
+        if directory is None
+        else prog.shell_advice(f": `{prog.word()} persona {verb} {directory.name} --user`")
+    )
     return PersonaError(
         f"personas are yours (the user level) since 0.10.1: rlx no longer writes, edits or "
         f"removes a project's persona{where}; change your own instead{yours}",
@@ -1434,9 +1443,10 @@ class MigrationReport(BaseModel):
             *([f"{kept} kept"] if kept else []),
             *([f"{missed} skipped"] if missed else []),
         ]
-        # Short enough for the fold's title at 80 columns, where the page is 47 wide (the
-        # tester of #21, round 3): which were kept, and why, is the detail behind it.
-        return "From projects: " + ", ".join(parts)
+        # Short enough for the fold's title at 80 columns, where 43 columns of it are drawn
+        # (the tester of #21, rounds 3 and 4): 40 with a two-digit count of each, 43 with
+        # three. Which were kept, and why, is the detail behind it.
+        return "Projects: " + ", ".join(parts)
 
     def summary(self) -> str | None:
         """What it did, each persona's line after the copied ones' names, for a person; or

@@ -1061,6 +1061,7 @@ def test_an_export_refused_into_a_projects_layer_says_to_export_elsewhere(
     assert result.exit_code == 1
     assert "export it to any other folder" in said
     assert "persona edit" not in said and "Personas --user" not in said
+    assert "change your own" not in said, "an export changes no persona (round 4)"
 
 
 @pytest.mark.parametrize("command", ["edit", "rm"])
@@ -1075,7 +1076,11 @@ def test_edit_or_rm_user_of_a_persona_you_do_not_have_says_how_to_get_one(
     said = " ".join(result.stderr.split())
     assert result.exit_code == 1, result.output
     assert f"you have no persona named '{name}'" in said
-    assert "persona import" in said and f"persona new {name}" in said
+    assert f"persona new {name}" in said
+    if name == "skeptic":  # rlx's, not a project's: no project to import it from (round 4)
+        assert "bundled" in said and "persona import" not in said
+    else:
+        assert "persona import" in said
     assert "No such file or directory" not in result.output and "Traceback" not in result.output
 
 

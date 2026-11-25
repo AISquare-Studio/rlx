@@ -174,7 +174,7 @@ def test_the_personas_page_says_what_was_copied_once(repo: Path) -> None:
     shown, title, folded, text, names = asyncio.run(open_page())
     again, *_rest = asyncio.run(open_page())
 
-    assert shown and title == "From projects: 1 copied" and folded
+    assert shown and title == "Projects: 1 copied" and folded
     assert "Copied your project personas to your personas: tempo." in text  # behind the fold
     assert "tempo" in names, "and the page lists it as yours"
     assert not again, "said once: the second opening has nothing to say"
@@ -232,7 +232,7 @@ def test_at_80x24_a_long_migration_report_leaves_the_page_usable(
             }
             regions["table rows"] = (0, page.query_one("#persona-table").region.height)
             screen = "\n".join(s.text for s in app.screen._compositor.render_strips())
-            whole = "From projects: 1 copied, 5 kept, 1 skipped" in screen
+            whole = "Projects: 1 copied, 5 kept, 1 skipped" in screen
             regions["title whole"] = (0, int(whole))
             return regions
 
@@ -244,6 +244,60 @@ def test_at_80x24_a_long_migration_report_leaves_the_page_usable(
             assert bottom <= 24, (name, regions)
     assert regions["table rows"][1] >= 3, regions
     assert regions["personas-migrated"][1] - regions["personas-migrated"][0] <= 3, regions
+
+
+@pytest.mark.parametrize(
+    ("copied", "kept", "skipped"), [(12, 15, 10), (100, 100, 100)], ids=["two digits", "three"]
+)
+def test_at_80x24_the_folds_title_is_whole_with_many_digit_counts(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, copied: int, kept: int, skipped: int
+) -> None:
+    """The tester of #21, round 4: 12 copied, 15 kept and 10 skipped drew 'From projects: 12
+    copied, 15 kept, 10 skipp' at 80x24, 43 of its columns. The report is made up here: the
+    counts are what is drawn, not how they came about."""
+    from aisquare.cli.ui.app import FleetApp
+    from aisquare.cli.ui.sidebar import SettingsRow
+    from tests.test_ui_settings_hub import GOOD
+
+    def one(n: int, outcome: persona_service.MigrationOutcome) -> persona_service.MigratedPersona:
+        return persona_service.MigratedPersona(
+            name=f"{outcome.replace('_', '-')}-{n}",
+            source=repo / ".aisquare" / "personas" / f"p{n}",
+            outcome=outcome,
+        )
+
+    report = persona_service.MigrationReport(
+        personas=[
+            *(one(n, "copied") for n in range(copied)),
+            *(one(n, "kept_yours") for n in range(kept)),
+            *(one(n, "skipped") for n in range(skipped)),
+        ]
+    )
+    monkeypatch.setattr(persona_service, "migrate_once", lambda: report)
+    title = f"Projects: {copied} copied, {kept} kept, {skipped} skipped"
+    assert report.headline() == title
+
+    async def drive() -> str:
+        app = FleetApp(
+            refresh_seconds=3600,
+            doctor=lambda: [],
+            accounts=None,
+            headroom=lambda accounts: GOOD,
+            headroom_seconds=3600,
+        )
+        async with app.run_test(size=(80, 24)) as pilot:
+            await settle_page(app)
+            await pilot.click(app.query_one(SettingsRow))
+            await settle_page(app)
+            app.query_one("#hub-personas").scroll_visible(animate=False)
+            await settle_page(app)
+            await pilot.click("#hub-personas")
+            await settle_page(app)
+            return "\n".join(s.text for s in app.screen._compositor.render_strips())
+
+    screen = asyncio.run(drive())
+
+    assert title in screen, f"the fold's title is cut: {title!r} not drawn whole"
 
 
 def _outside(tmp_path: Path) -> Path:
