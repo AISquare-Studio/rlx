@@ -932,10 +932,13 @@ def no_background_shipper(monkeypatch: pytest.MonkeyPatch) -> None:
     (``core.sharing.start_background_ship`` from the root callback); a real one is a process that
     outlives the test, minds the test's home and, under load, mints an identity mid-test (a test
     of "no identity yet" failed once in the full run, never alone). A test of the spawn itself
-    replaces ``_spawn`` with its own recorder."""
+    replaces ``_spawn`` with its own recorder. The same for the daily active ping's detached
+    ``aisquare metrics ping`` (``services.active_ping``), which is on unless turned off."""
     from aisquare.core import sharing
+    from aisquare.services import active_ping
 
     monkeypatch.setattr(sharing, "_spawn", lambda: None)
+    monkeypatch.setattr(active_ping, "_spawn", lambda: None)
 
 
 @pytest.fixture

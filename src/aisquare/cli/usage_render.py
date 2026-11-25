@@ -137,7 +137,7 @@ def sharing_lines(status: SharingStatus) -> list[str]:
     elif status.enabled:
         head = "Sharing is ON: daily usage counts are sent to AISquare."
     else:
-        head = "Sharing is off. Nothing leaves this machine."
+        head = "Sharing is off. No usage leaves this machine."
     lines = [head]
     if status.install_id:
         lines.append(f"installation   {status.install_id[:8]}… (random; not derived from you)")
@@ -166,7 +166,7 @@ def emit_ship_report(report: ShipReport) -> None:
     shipment that went nowhere is silent here as everywhere (``--json`` has the whole report)."""
     console = stdout_console()
     if report.sent and report.opt_out:
-        console.print("Sent the opt-out notice. Nothing is sent from now on.")
+        console.print("Sent the opt-out notice. No usage is sent from now on.")
     elif report.sent:
         linked = "" if report.linked is None else f", linked: {'yes' if report.linked else 'no'}"
         console.print(f"Sent {report.days} day(s){linked}.")

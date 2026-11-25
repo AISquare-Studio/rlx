@@ -4638,6 +4638,7 @@ def _writing_workers() -> dict[str, str]:
         accounts.RENAME_WORKER: "an account's rename",
         accounts.ADOPT_WORKER: "a conversation's adoption",
         usage_sharing.SHARE_WORKER: "the usage-sharing switch",
+        usage_sharing.PING_WORKER: "the daily active ping's switch",
         CONSENT_WORKER: "the answer to the usage-sharing question",
         PROJECT_REMOVE_WORKER: "a project's removal",
         PROJECT_FRESH_WORKER: "a project's fresh start",
@@ -4735,6 +4736,7 @@ def _cut_off_workers() -> frozenset[str]:
             usage_stats.SWEEP_WORKER,
             usage_sharing.SHIP_WORKER,
             usage_sharing.PREVIEW_WORKER,
+            usage_sharing.USAGE_WORKER,
             CONSENT_DUE_WORKER,
         }
     )
