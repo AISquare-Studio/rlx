@@ -341,10 +341,35 @@ def _live(instance: Instance, held: bool | None, *, host: str | None, now: datet
     return age < timedelta(seconds=STALE_SECONDS)
 
 
+_DELETE_RETRY_SECONDS = 1.0
+"""How long a registry file's delete is tried again while it is refused with
+``PermissionError``: on Windows, a file another process has open cannot be deleted (WinError
+32, a sharing violation), and every reader of the registry opens each record for a moment,
+the quit gate's wait on it ten times a second. Refused once and given up, the record stayed,
+and a record naming another host name counted as live by its heartbeat for
+:data:`STALE_SECONDS`: the gate waited out its 15 s and refused the person's yes (#28)."""
+
+
+def _unlink(path: Path) -> bool:
+    """Delete ``path`` (gone already is fine), trying again for :data:`_DELETE_RETRY_SECONDS`
+    while it is refused with ``PermissionError``; whether it is gone. Never raises."""
+    deadline = time.monotonic() + _DELETE_RETRY_SECONDS
+    while True:
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_RETRY_SECONDS)
+        except OSError:
+            return False
+        else:
+            return True
+
+
 def _forget(instance_id: str) -> None:
     for path in (_record(instance_id), _quit(instance_id), _lock(instance_id)):
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        _unlink(path)
 
 
 Unloaded = Literal["gone", "failed", "unparsable"]
@@ -530,8 +555,9 @@ def wait_gone(
     held: bool = False,
     clock: Callable[[], float] = time.monotonic,
 ) -> bool:
-    """Wait at most ``timeout`` seconds for ``instance`` to quit (its record gone, or no
-    longer live, and on this machine its process ended); whether it did.
+    """Wait at most ``timeout`` seconds for ``instance`` to quit; whether it did. On this
+    machine, its process ended and its lock let go (:func:`_ended_here`), whatever a record it
+    left says; on another, its record gone or no longer live.
 
     The process too: an asq leaves the registry once its quit's waits are over, and runs a
     moment longer to its exit, in which the gate's look in ``ps`` (``core.instance_scan``)
@@ -545,13 +571,28 @@ def wait_gone(
     deadline = clock() + timeout
     here = instance.host == host_name() or held or _lock_held(instance.id) is True
     while True:
-        instance_now = _read(_record(instance.id))
-        left = instance_now is None or not is_live(instance_now)
-        if left and (not here or not procs.alive(instance.pid)):
-            return True
+        if here:
+            if _ended_here(instance):
+                return True
+        else:
+            instance_now = _read(_record(instance.id))
+            if instance_now is None or not is_live(instance_now):
+                return True
         if clock() >= deadline:
             return False
         time.sleep(0.1)
+
+
+def _ended_here(instance: Instance) -> bool:
+    """Whether ``instance``, an asq of this machine, has ended: its process gone and its lock
+    let go. Its record is not asked: one its asq could not delete as it quit (Windows refuses a
+    delete while a reader has the file open) named another host name and read as live by its
+    heartbeat for :data:`STALE_SECONDS` (#28). Once ended, such a leftover is removed, as the
+    gate's next read would take it for an asq still running and ask it to quit again."""
+    if procs.alive(instance.pid) or _lock_held(instance.id) is True:
+        return False
+    _forget(instance.id)
+    return True
 
 
 def _read_request(path: Path) -> QuitRequest | None:
@@ -644,9 +685,9 @@ class Registration:
         if thread is not None and thread is not threading.current_thread():
             thread.join(2.0)
         # The record first, so no reader finds it once the lock is let go; the lock file
-        # after its descriptor is closed, which Windows asks before a delete.
-        with contextlib.suppress(OSError):
-            _record(self._instance.id).unlink(missing_ok=True)
+        # after its descriptor is closed, which Windows asks before a delete. A delete a
+        # reader's open file refuses is tried again (``_unlink``, #28).
+        _unlink(_record(self._instance.id))
         fd, self._lock_fd = self._lock_fd, None
         if fd is not None:
             with contextlib.suppress(OSError):
