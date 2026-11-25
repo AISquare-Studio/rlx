@@ -44,7 +44,7 @@ from typing import Any, ClassVar
 
 from rich.cells import cell_len
 from rich.text import Text
-from textual import events
+from textual import events, on
 from textual.app import ComposeResult, ScreenStackError, SystemCommand, UnknownModeError
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
@@ -396,6 +396,22 @@ UNDO_DEPTH = 50
 SELECTED_KEY = "fleet.selected"
 """``ui_state`` key for what is open: ``project:<id>``, ``agent:<project>/<id>``, ``settings``
 (the hub), ``app-settings``, ``accounts`` or ``doctor:<project or ''>`` (#144)."""
+LAST_PROJECT_KEY = "fleet.last_project"
+"""``ui_state`` key for the project last opened, or whose agent was: home is its Manager tab
+(L1 of the UX audit). Apart from :data:`SELECTED_KEY`, which a Settings page overwrites."""
+
+
+def selected_project(selection: str | None) -> str | None:
+    """The project a :data:`SELECTED_KEY` value opens or sits in: ``project:<id>`` and
+    ``agent:<project>/<id>``'s; ``None`` for a page that is no project's."""
+    kind, _, ident = (selection or "").partition(":")
+    if kind == "project":
+        return ident or None
+    if kind == "agent":
+        return ident.partition("/")[0] or None
+    return None
+
+
 SHOW_CAPTURED_KEY = "fleet.show_captured"
 ACTIVE_ONLY_KEY = "fleet.active_only"
 """``ui_state`` key for the sidebar's active-only filter (the header's ○/●, ``l``): ``"1"``
@@ -1275,6 +1291,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         Binding("q", "quit", "quit"),
         Binding("ctrl+q", "quit", "quit", show=False),
         Binding("w", "welcome", "welcome"),
+        Binding("home", "home", "home", show=False),
         Binding("plus", "add_project", "add project", key_display="+"),
         Binding("t", "pick_theme", "theme"),
         # In the footer, where the owner looks for it (#33). The ? screen and the palette
@@ -1294,6 +1311,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             "toggle_captured",
             "add_project",
             "welcome",
+            "home",
         }
     )
     """Actions that are live only while focus is in the sidebar (§4.3)."""
@@ -1535,10 +1553,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if self._accounts is None:
             self.refresh_headroom()
         self.set_interval(self.headroom_seconds, self.refresh_headroom)
-        # The doctor runs ONCE at start, about the project the restored view shows;
-        # a restored Doctor page runs it itself, as opening it does.
-        if not self._restore_selection():
-            self.run_doctor()
+        # Home at start (L1 of the UX audit): the last-used project's Manager tab, or Welcome
+        # while no project is listed. The doctor runs ONCE at start, about that project.
+        home = self.home_project()
+        if home is not None:
+            self.doctor_scope = home
+            self.call_later(self.go_home)
+        self.run_doctor()
         # After the first frame, off the UI thread: the reopen's look at the agents the press
         # recorded, and the release check, which asks PyPI at most once a day whatever the
         # hourly ask (`services.updates`).
@@ -1579,68 +1600,50 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             stop_listening_for_ui(self)
         self.refresh_data()
 
-    # --- what was open (#144) ---------------------------------------------------------
-
-    def _restore_selection(self) -> bool:
-        """Reopen the view that was open when the UI last ran, if its row is still there.
-
-        Read from the store's ``ui_state`` (v18), never from a file the UI
-        keeps for itself: the theme stays in ``state.json`` because the board
-        shares it. A remembered agent whose row has left the frame falls back
-        to its project; a project that is gone falls back to the welcome view,
-        and the memory is dropped rather than retried every launch. So does a
-        captain whose row has left: its board is no project, and
-        ``FleetSnapshot.project`` never answers the home (T2).
-
-        The doctor's scope is set here, not when the posted selection lands, so
-        the one run at start is about the restored project. Whether the Doctor
-        page is the view reopened is the answer: opening it runs the checks.
-        """
-        remembered = _ui_state(SELECTED_KEY)
-        if not remembered or self.snapshot is None:
-            return False
-        kind, _, ident = remembered.partition(":")
-        if kind == "agent":
-            project_id, _, agent_id = ident.partition("/")
-            restored = self.snapshot.agent(project_id, agent_id)
-            if restored is not None:
-                self.doctor_scope = self._doctor_scope_of(restored.agent)
-                self.post_message(AgentSelected(project_id, agent_id))
-                return False
-            if self.snapshot.project(project_id) is not None:
-                self.doctor_scope = project_id
-                self.post_message(ProjectSelected(project_id))
-                return False
-        elif kind == "project" and self.snapshot.project(ident) is not None:
-            self.doctor_scope = ident
-            self.post_message(ProjectSelected(ident))
-            return False
-        elif kind == "settings":
-            self.post_message(SettingsSelected())
-            return False
-        elif kind == "app-settings":
-            self.post_message(AppSettingsSelected())
-            return False
-        elif kind == "accounts":
-            self.post_message(AccountsSelected())
-            return False
-        elif kind == "personas":
-            self.post_message(PersonasSelected())
-            return False
-        elif kind == "usage-stats":
-            self.post_message(UsageStatsSelected())
-            return False
-        elif kind == "resources":
-            self.post_message(ResourcesSelected())
-            return False
-        elif kind == "doctor":
-            self.post_message(DoctorSelected(ident or None))
-            return True
-        _remember_ui_state(SELECTED_KEY, None)
-        return False
+    # --- what was open (#144), and home (L1) ------------------------------------------
 
     def _remember_selection(self, value: str | None) -> None:
         _remember_ui_state(SELECTED_KEY, value)
+        project = selected_project(value)
+        if project is not None:
+            _remember_ui_state(LAST_PROJECT_KEY, project)
+
+    def home_project(self) -> str | None:
+        """The project home opens (L1): the last one used while it is still listed (its own
+        memory, else the project of the view last open), else the first the sidebar lists;
+        ``None`` with no project listed, when home is Welcome."""
+        snapshot = self.snapshot
+        if snapshot is None or not snapshot.projects:
+            return None
+        for remembered in (_ui_state(LAST_PROJECT_KEY), selected_project(_ui_state(SELECTED_KEY))):
+            if remembered and snapshot.project(remembered) is not None:
+                return remembered
+        return snapshot.projects[0].id
+
+    async def go_home(self) -> None:
+        """Home (L1 of the UX audit): the last-used project's Manager tab, its manager's view,
+        at start, on the logo and on the ``home`` key; Welcome while no project is listed, as
+        ``w`` opens it whenever asked."""
+        project_id = self.home_project()
+        if project_id is None:
+            await self.action_welcome()
+            return
+        await self.on_project_selected(ProjectSelected(project_id))
+        view = next(
+            (view for view in self.content.query(ProjectView) if view.project.id == project_id),
+            None,
+        )
+        if view is not None:
+            view.active = "tab-manager"
+
+    async def action_home(self) -> None:
+        await self.go_home()
+
+    @on(events.Click, "#fleet-title")
+    async def _logo_clicked(self, event: events.Click) -> None:
+        """The logo, ``r\\x``, at the sidebar's top: home, as a site's logo goes (L1)."""
+        event.stop()
+        await self.go_home()
 
     @property
     def sidebar(self) -> Sidebar:
