@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from aisquare.cli.common import fail
+from aisquare.core import daemons, selfcli
 from aisquare.core import program as prog
 from aisquare.core.console import stderr_console, stdout_console
 from aisquare.core.state import get_state
@@ -151,6 +155,52 @@ def _announce_open_bind(bind: str) -> None:
     )
 
 
+def _registered(args: list[str], *, restartable: bool) -> contextlib.AbstractContextManager[object]:
+    """This server in the daemon registry (``core.daemons``) while it serves, as a ``serve``
+    that ``serve <args>`` starts again: its options written out, an environment's
+    ``AISQUARE_SERVE_PORT`` or ``AISQUARE_SERVE_CLOSE_AFTER`` included, so the command means
+    what it meant. Unregistered it still serves, and says so on stderr (stdout is stdio's
+    protocol channel)."""
+
+    def unregistered(exc: OSError) -> None:
+        stderr_console().print(
+            f"{prog.word()} serve: not in the daemon registry, so an upgrade will not count "
+            f"this server: {exc}",
+            markup=False,
+        )
+
+    return daemons.registered(
+        "serve",
+        argv=selfcli.argv_for([*selfcli.global_flags(), "serve", *args]),
+        restartable=restartable,
+        on_error=unregistered,
+    )
+
+
+@contextlib.contextmanager
+def _terminated_as_an_exit() -> Iterator[None]:
+    """SIGTERM as ``SystemExit(143)`` for the block, so a stopped HTTP server unwinds through
+    its registration and leaves the registry, with the exit status a SIGTERM gives.
+
+    uvicorn takes SIGTERM while it serves, shuts down gracefully, gives back the handler it
+    found and raises the signal again: to the default handler, which ended the process before
+    any ``finally``, and left its record for the next reader to prune. Not for stdio, which
+    ends by ``os._exit`` on purpose (``mcp_server._serve_stdio_until_idle``)."""
+
+    def terminated(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    try:
+        before = signal.signal(signal.SIGTERM, terminated)
+    except ValueError:  # not the main thread: nothing to take
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
 def serve(
     stdio: Annotated[
         bool,
@@ -238,7 +288,9 @@ def serve(
         # stdout is the MCP protocol channel; announce on stderr so the
         # opt-in is never invisible.
         stderr_console().print(f"rlx agent orchestrator activated for {project.root} (stdio serve)")
-        mcp_server.run_stdio(close_after=close_after)
+        # Not restartable: its client holds its stdin and stdout, and starts it again itself.
+        with _registered(["--stdio", "--close-after", str(close_after)], restartable=False):
+            mcp_server.run_stdio(close_after=close_after)
         return
     try:
         project = team_service.activate()
@@ -250,4 +302,8 @@ def serve(
         f"(bearer token required — see `{prog.word()} serve --show-token`). Ctrl-C stops."
     )
     _announce_open_bind(bind)
-    mcp_server.run_http(bind=bind, port=port)
+    with (
+        _registered(["--port", str(port), "--bind", bind], restartable=True),
+        _terminated_as_an_exit(),
+    ):
+        mcp_server.run_http(bind=bind, port=port)

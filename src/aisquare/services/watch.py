@@ -47,7 +47,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from aisquare.core import atomic, locking, selfcli
+from aisquare.core import atomic, daemons, locking, selfcli
 from aisquare.core import program as prog
 from aisquare.core.config import WatchSettings, load_config
 from aisquare.core.spawn import untraced_env
@@ -61,6 +61,9 @@ SOURCE_TIMEOUT = 60.0
 """Seconds an operator's source command may run in one tick."""
 DETACHED_SESSION = "asq-watch"
 """The tmux session ``watch --detach`` runs the watcher in, on the fleet's own server."""
+DETACHED_ENV = "AISQUARE_WATCH_DETACHED"
+"""Set to ``1`` for the window :func:`detach` opens, so the watcher there registers in the
+daemon registry as ``watch --detach`` starts it again (:func:`_registration`)."""
 
 _sleep: Callable[[float], None] = time.sleep
 
@@ -690,8 +693,9 @@ def run(
     on_tick: Callable[[TickReport], None],
     on_error: Callable[[str], None] = lambda said: None,
 ) -> None:
-    """The watcher's loop, holding this home's lock for its whole life; returns on
-    SIGTERM or SIGINT. Raises :class:`AlreadyWatching`."""
+    """The watcher's loop, holding this home's lock for its whole life, and registered in the
+    daemon registry as a ``watch`` for as long (``core.daemons``, :func:`_registration`);
+    returns on SIGTERM or SIGINT. Raises :class:`AlreadyWatching`."""
     watch_dir().mkdir(parents=True, exist_ok=True)
     fd = locking.open_lock_file(lock_path())
     try:
@@ -713,21 +717,43 @@ def run(
         pid_path().write_text(str(os.getpid()), encoding="utf-8")
         with contextlib.suppress(ValueError):  # not the main thread (tests)
             signal.signal(signal.SIGTERM, stopping)
-        watcher = Watcher()
-        every = interval or watcher.settings.interval_seconds
-        while not stop:
-            try:
-                on_tick(watcher.tick())
-            except Exception as exc:  # one bad tick never ends the watcher (review of #377)
-                on_error(f"{type(exc).__name__}: {exc}")
-            waited = 0.0
-            while not stop and waited < every:
-                _sleep(min(1.0, every - waited))
-                waited += 1.0
+        argv, restartable = _registration(interval)
+        with daemons.registered(
+            "watch",
+            argv=argv,
+            restartable=restartable,
+            on_error=lambda exc: on_error(
+                f"not in the daemon registry, so an upgrade will not count this watcher: {exc}"
+            ),
+        ):
+            watcher = Watcher()
+            every = interval or watcher.settings.interval_seconds
+            while not stop:
+                try:
+                    on_tick(watcher.tick())
+                except Exception as exc:  # one bad tick never ends the watcher (review of #377)
+                    on_error(f"{type(exc).__name__}: {exc}")
+                waited = 0.0
+                while not stop and waited < every:
+                    _sleep(min(1.0, every - waited))
+                    waited += 1.0
     finally:
         with contextlib.suppress(OSError):
             pid_path().unlink()
         os.close(fd)
+
+
+def _registration(interval: float | None) -> tuple[list[str], bool]:
+    """The command that starts this watcher again, and whether an upgrade may (the daemon
+    registry's ``argv`` and ``restartable``, ``core.daemons``). The one :func:`detach` opened
+    is started again by ``watch --detach``, which opens its window again; one run in the
+    foreground is a person's terminal's, not the upgrade's to restart, and is recorded as that
+    terminal ran it."""
+    flags = selfcli.global_flags()
+    if os.environ.get(DETACHED_ENV) == "1":
+        return selfcli.argv_for([*flags, "watch", "--detach"]), True
+    every = ["--interval", str(interval)] if interval else []
+    return selfcli.argv_for([*flags, "watch", *every]), False
 
 
 def detach() -> int:
@@ -749,6 +775,7 @@ def detach() -> int:
         name="watch",
         cwd=Path.home(),
         command=selfcli.argv_for(["watch"]),
+        env={DETACHED_ENV: "1"},
         config=config,
     )
     for _ in range(50):  # up to 5 s for it to take the lock
