@@ -721,9 +721,9 @@ def run(
     try:
         pid_path().write_text(str(os.getpid()), encoding="utf-8")
         with contextlib.suppress(ValueError):  # not the main thread (tests)
-            signal.signal(signal.SIGTERM, stopping)
+            _stop_on(signal.SIGTERM, stopping)
             if sys.platform != "win32":  # no SIGHUP there
-                signal.signal(signal.SIGHUP, stopping)
+                _stop_on(signal.SIGHUP, stopping)
         argv, restartable = _registration(interval)
         with daemons.registered(
             "watch",
@@ -748,6 +748,14 @@ def run(
         with contextlib.suppress(OSError):
             pid_path().unlink()
         os.close(fd)
+
+
+def _stop_on(signum: int, stopping: Callable[[int, object], None]) -> None:
+    """End the loop on ``signum``, unless this process was started with it ignored: under
+    ``nohup rlx watch &`` SIGHUP is ``SIG_IGN``, and the watcher must outlive the logout it was
+    told to. Raises ``ValueError`` off the main thread."""
+    if signal.getsignal(signum) is not signal.SIG_IGN:
+        signal.signal(signum, stopping)
 
 
 def _registration(interval: float | None) -> tuple[list[str], bool]:
@@ -795,9 +803,11 @@ def detach() -> int:
 
 def stop_detached() -> int | None:
     """Stop the running watcher (SIGTERM) and its tmux session; the pid it had, or
-    ``None`` when none ran. The session is killed once the watcher has let its lock go, or
-    after :data:`STOP_WAIT_SECONDS`: killed at once, its SIGHUP ended the watcher inside its
-    sleep, before it left the daemon registry."""
+    ``None`` when none ran. The session is killed once the watcher has let its lock go (it
+    leaves the daemon registry first), or after :data:`STOP_WAIT_SECONDS` all the same. A
+    watcher in a long look (a source runs up to :data:`SOURCE_TIMEOUT`) takes SIGHUP like
+    SIGTERM, so it still finishes that look and leaves the registry as it exits:
+    :func:`running_pid` says whether it has, which ``watch --stop`` reports."""
     from aisquare.services import fleet as fleet_service
 
     pid = running_pid()

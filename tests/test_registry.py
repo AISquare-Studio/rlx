@@ -91,7 +91,8 @@ def test_a_record_the_registry_keeps_is_neither_listed_nor_pruned() -> None:
     assert found.live == [] and found.pruned == []
     assert sorted(os.listdir(THINGS.folder)) == ["0123456789ab.json", "0123456789ab.lock"]
     found = THINGS.roll(_thing, lambda thing, held: False, keep=lambda thing, held: False)
-    assert found.pruned == ["0123456789ab"] and os.listdir(THINGS.folder) == []
+    assert found.pruned == ["0123456789ab"]
+    assert os.listdir(THINGS.folder) == [registry.GATE_LOCK], "pruned under the gate"
 
 
 def test_keep_lock_keeps_the_descriptor_while_the_file_is_the_one_it_holds() -> None:
@@ -135,9 +136,34 @@ def test_keep_lock_says_so_when_another_holds_the_new_file_and_keeps_its_own() -
         THINGS.leave("0123456789ab", fd)
 
 
-def test_an_unreadable_record_whose_age_cannot_be_read_is_reported_never_dropped(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_keep_lock_takes_the_lock_again_when_its_own_descriptor_cannot_be_stat() -> None:
+    fd = THINGS.take("0123456789ab")
+    real_fstat = os.fstat
+
+    def fstat(target: int) -> os.stat_result:
+        if target == fd:
+            raise OSError(errno.ESTALE, "Stale NFS file handle")
+        return real_fstat(target)
+
+    if sys.platform != "win32":  # gone as on NFS (Windows deletes no file a process holds)
+        THINGS.lock("0123456789ab").unlink()
+    with pytest.MonkeyPatch.context() as stale:  # scoped: never undoes the test's home
+        stale.setattr(os, "fstat", fstat)
+        if sys.platform == "win32":
+            # Still there and still its own: the new handle's lock is refused, the old kept.
+            with pytest.raises(OSError):
+                THINGS.keep_lock("0123456789ab", fd, wait_s=0.05)
+            renewed = fd
+        else:
+            renewed = THINGS.keep_lock("0123456789ab", fd)
+            assert renewed != fd, "not taken for the file it holds"
+    try:
+        assert THINGS.lock_held("0123456789ab") is True
+    finally:
+        THINGS.leave("0123456789ab", renewed)
+
+
+def test_an_unreadable_record_whose_age_cannot_be_read_is_reported_never_dropped() -> None:
     THINGS.private_folder()
     THINGS.write("0123456789ab", {"pid": 7})
     record = THINGS.record("0123456789ab")
@@ -153,10 +179,10 @@ def test_an_unreadable_record_whose_age_cannot_be_read_is_reported_never_dropped
             raise OSError(errno.EIO, "input/output error")
         return real_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", read_text)
-    monkeypatch.setattr(Path, "stat", stat)
-    found = THINGS.roll(_thing, lambda thing, held: True)
-    monkeypatch.undo()
+    with pytest.MonkeyPatch.context() as failing:  # scoped: never undoes the test's home
+        failing.setattr(Path, "read_text", read_text)
+        failing.setattr(Path, "stat", stat)
+        found = THINGS.roll(_thing, lambda thing, held: True)
     assert found.live == [] and found.pruned == []
     (unreadable,) = found.unreadable
     assert (unreadable.id, unreadable.written_at, unreadable.held) == ("0123456789ab", None, False)
@@ -240,11 +266,11 @@ def test_a_delete_refused_past_the_retry_is_given_up_without_raising(
         raise PermissionError(32, "in use by another process")
 
     monkeypatch.setattr(registry, "DELETE_RETRY_SECONDS", 0.2)
-    monkeypatch.setattr(Path, "unlink", unlink)
-    started = time.monotonic()
-    assert registry.unlink(target) is False
-    assert 0.2 <= time.monotonic() - started < 5
-    monkeypatch.undo()
+    with pytest.MonkeyPatch.context() as refusing:  # scoped: never undoes the test's home
+        refusing.setattr(Path, "unlink", unlink)
+        started = time.monotonic()
+        assert registry.unlink(target) is False
+        assert 0.2 <= time.monotonic() - started < 5
     assert target.exists()
 
 

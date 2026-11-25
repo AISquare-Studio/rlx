@@ -11,6 +11,7 @@ again and leave as they exit, on stand-ins: no tmux and no MCP transport.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -101,9 +102,13 @@ def _files() -> list[str]:
     return sorted(name for name in names if name != GATE_LOCK)
 
 
-def _record(**overrides: Any) -> dict[str, Any]:
+def _record(extra: dict[str, Any] | None = None, **overrides: Any) -> dict[str, Any]:
     """A record by the module's list of keys; its ``id`` is the file's :func:`_write` gives it,
-    unless ``overrides`` says one."""
+    unless ``overrides`` says one. ``overrides`` takes only the record's own keys, so a typo
+    (``heartbeat=`` for ``heartbeat_at=``) fails here rather than passing silently; a key
+    this release does not know goes in ``extra``."""
+    unknown = set(overrides) - set(RECORD_SCHEMA["properties"])
+    assert not unknown, f"not a record key: {sorted(unknown)} (a later release's: extra=)"
     now = datetime.now(UTC).isoformat()
     body: dict[str, Any] = {
         "kind": "serve",
@@ -117,6 +122,7 @@ def _record(**overrides: Any) -> dict[str, Any]:
         "cwd": "/somewhere",
     }
     body.update(overrides)
+    body.update(extra or {})
     return body
 
 
@@ -355,7 +361,7 @@ def test_live_daemons_come_oldest_first_and_a_later_releases_kind_is_kept(
     registry: Path,
 ) -> None:
     older = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
-    later = _record(kind="scheduler", something_new={"a": 1})
+    later = _record(kind="scheduler", extra={"something_new": {"a": 1}})
     _write(registry, "bbbbbbbbbbbb", later)
     _write(registry, "aaaaaaaaaaaa", _record(started_at=older, heartbeat_at="2026-11-25T12:00:00Z"))
     held = [_hold(registry / f"{name}.lock") for name in ("aaaaaaaaaaaa", "bbbbbbbbbbbb")]
@@ -402,7 +408,7 @@ def test_a_pid_past_a_c_int_is_unreadable_and_never_stops_a_daemon(
     # Where the lock cannot be told, the record's pid is asked: os.kill(2**31, 0) overflows.
     monkeypatch.setattr(daemons.REGISTRY, "lock_held", lambda record_id, missing=False: None)
     found = daemons.roll(prune=False)
-    assert [u.id for u in found.unreadable] == ["0123456789ab"]
+    assert [(u.id, u.pid) for u in found.unreadable] == [("0123456789ab", None)]
     assert all(d.id != "0123456789ab" for d in found.live)
     with daemons.registered("watch", argv=["x"], restartable=False) as mine:
         assert mine is not None, "a daemon starts beside it"
@@ -414,6 +420,7 @@ def test_a_pid_past_a_c_int_is_unreadable_and_never_stops_a_daemon(
         ("2026-11-25T12:03:00Z", datetime(2026, 11, 25, 12, 3, tzinfo=UTC)),
         ("2026-11-25T12:03:00.123456789Z", datetime(2026, 11, 25, 12, 3, 0, 123456, tzinfo=UTC)),
         ("2026-11-25T07:03:00-05:00", datetime(2026, 11, 25, 12, 3, tzinfo=UTC)),
+        ("2026-11-25t12:03:00Z", datetime(2026, 11, 25, 12, 3, tzinfo=UTC)),
         ("2026-11-25t12:03:00z", None),
         ("2026-11-25T12:03:00z", None),
     ],
@@ -424,9 +431,142 @@ def test_times_are_read_as_the_contract_writes_them(
     _write(registry, "0123456789ab", _record(started_at=said, heartbeat_at=said))
     loaded = daemons.REGISTRY.load("0123456789ab", daemons.Daemon.from_record)
     if read is None:
-        assert loaded is Unloaded.UNPARSABLE, "a lower-case t or z: unreadable"
+        assert loaded is Unloaded.UNPARSABLE, "a lower-case z: unreadable"
     else:
         assert isinstance(loaded, daemons.Daemon) and loaded.started_at == read
+
+
+def test_an_unreadable_records_pid_outside_a_pids_range_is_no_pid(registry: Path) -> None:
+    # The records an upgrade's count reaches (held, unreadable): a stop by any of these pids
+    # would be kill(-1), kill(0) or an OverflowError.
+    says = {"aaaaaaaaaaaa": -1, "bbbbbbbbbbbb": 0, "cccccccccccc": 2**31, "dddddddddddd": True}
+    says["eeeeeeeeeeee"] = 4242
+    for daemon_id, pid in says.items():
+        _write(registry, daemon_id, json.dumps({"id": daemon_id, "pid": pid}))
+    held = [_hold(registry / f"{daemon_id}.lock") for daemon_id in says]
+    try:
+        found = daemons.roll()
+    finally:
+        for fd in held:
+            os.close(fd)
+    assert [(u.id, u.held, u.pid) for u in found.unreadable] == [
+        ("aaaaaaaaaaaa", True, None),
+        ("bbbbbbbbbbbb", True, None),
+        ("cccccccccccc", True, None),
+        ("dddddddddddd", True, None),
+        ("eeeeeeeeeeee", True, 4242),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ahead", "kept"),
+    [(50.0, True), (daemons.CLOCK_SKEW_SECONDS + 5, False)],
+    ids=["within-the-skew-bound", "past-it"],
+)
+def test_a_heartbeat_from_the_future_is_fresh_only_within_the_clock_skew_bound(
+    registry: Path, ahead: float, kept: bool
+) -> None:
+    future = (datetime.now(UTC) + timedelta(seconds=ahead)).isoformat()
+    _write(registry, "aaaaaaaaaaaa", _record(host="elsewhere", heartbeat_at=future))
+    found = daemons.roll()
+    assert found.live == []
+    assert found.pruned == ([] if kept else ["aaaaaaaaaaaa"])
+    assert (_files() == ["aaaaaaaaaaaa.json", "aaaaaaaaaaaa.lock"]) is kept
+
+
+def test_a_future_heartbeat_past_the_bound_is_not_live_where_the_lock_cannot_be_told(
+    registry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    future = datetime.now(UTC) + timedelta(seconds=daemons.CLOCK_SKEW_SECONDS + 5)
+    _write(registry, "aaaaaaaaaaaa", _record(host="elsewhere", heartbeat_at=future.isoformat()))
+    monkeypatch.setattr(daemons.REGISTRY, "lock_held", lambda record_id, missing=False: None)
+    assert daemons.list_live(prune=False) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows deletes no file its daemon holds")
+def test_a_prune_never_deletes_a_lock_a_beat_took_again_since_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = daemons.register("serve", argv=["rlx", "serve"], restartable=True)
+    daemon_id = registration.daemon.id
+    daemons.REGISTRY.lock(daemon_id).unlink()  # lost: the read below takes it for dead
+    real_gate = daemons.REGISTRY.gate
+    fired: list[bool] = []
+
+    def gate(**kwargs: Any) -> Any:
+        if not fired:  # the beat lands between the reader's read and its deletion
+            fired.append(True)
+            registration.beat()  # takes the lock again, under the gate itself
+        return real_gate(**kwargs)
+
+    monkeypatch.setattr(daemons.REGISTRY, "gate", gate)
+    try:
+        found = daemons.roll()
+        assert fired and found.pruned == [], "the second probe, under the gate, found it held"
+        assert daemons.REGISTRY.lock_held(daemon_id) is True
+        assert [d.id for d in daemons.list_live()] == [daemon_id]
+    finally:
+        registration.deregister()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows deletes no file its daemon holds")
+def test_a_beat_takes_its_lost_lock_again_only_under_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registration = daemons.register("serve", argv=["rlx", "serve"], restartable=True)
+    daemon_id = registration.daemon.id
+    try:
+        daemons.REGISTRY.lock(daemon_id).unlink()
+        fd = _hold(daemons.registry_dir() / GATE_LOCK)  # a pruning reader mid-deletion
+        monkeypatch.setattr(daemons.REGISTRY, "gate", _gate_with(0.05))
+        try:
+            registration.beat()
+            assert not daemons.REGISTRY.lock(daemon_id).exists(), "waits for the gate"
+        finally:
+            os.close(fd)
+        registration.beat()  # the gate free: taken again
+        assert daemons.REGISTRY.lock_held(daemon_id) is True
+    finally:
+        registration.deregister()
+
+
+def test_a_reader_that_cannot_have_the_gate_prunes_nothing_that_read(
+    registry: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(registry, "0123456789ab", _record())  # dead: its lock free
+    fd = _hold(registry / GATE_LOCK)  # a registration in progress, held long
+    monkeypatch.setattr(daemons.REGISTRY, "gate", _gate_with(0.05))
+    try:
+        found = daemons.roll()
+        assert found.pruned == [] and _files() == ["0123456789ab.json", "0123456789ab.lock"]
+    finally:
+        os.close(fd)
+    assert daemons.prune() == ["0123456789ab"], "a later read prunes it"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows deletes no file its daemon holds")
+def test_a_beat_whose_lock_descriptor_went_stale_takes_the_lock_again() -> None:
+    # NFSv3: once another client deleted the file this one holds, fstat on it fails ESTALE.
+    registration = daemons.register("serve", argv=["rlx", "serve"], restartable=True)
+    daemon_id = registration.daemon.id
+    try:
+        daemons.REGISTRY.forget(daemon_id)
+        stale_fd = registration._lock_fd
+        real_fstat = os.fstat
+
+        def fstat(fd: int) -> os.stat_result:
+            if fd == stale_fd:
+                raise OSError(errno.ESTALE, "Stale NFS file handle")
+            return real_fstat(fd)
+
+        with pytest.MonkeyPatch.context() as stale:  # scoped: never undoes the test's home
+            stale.setattr(os, "fstat", fstat)
+            registration.beat()
+        assert daemons.REGISTRY.lock_held(daemon_id) is True
+        assert [d.id for d in daemons.roll().live] == [daemon_id]
+    finally:
+        registration.deregister()
+    assert _files() == []
 
 
 # --- records this release cannot read ----------------------------------------------------------
@@ -569,15 +709,15 @@ def test_registering_prunes_the_dead_under_the_gate(
     _write(registry, "0123456789ab", _record())  # its lock free: dead
     real, under_gate = daemons.roll, []
 
-    def roll(*, prune: bool = True) -> Any:
-        under_gate.append((prune, _gate_held()))
-        return real(prune=prune)
+    def roll(*, prune: bool = True, gated: bool = False) -> Any:
+        under_gate.append((prune, gated, _gate_held()))
+        return real(prune=prune, gated=gated)
 
     monkeypatch.setattr(daemons, "roll", roll)
     with daemons.registered("serve", argv=["x"], restartable=False) as mine:
         assert mine is not None
         assert _files() == [f"{mine.daemon.id}.json", f"{mine.daemon.id}.lock"]
-    assert under_gate == [(True, True)], "the one pruning read, with the gate held"
+    assert under_gate == [(True, True, True)], "the one pruning read, with the gate held"
     assert not _gate_held(), "and the gate let go after"
 
 
@@ -758,6 +898,43 @@ def test_a_watcher_whose_window_closes_leaves_the_registry(
     monkeypatch.setattr(watch_service, "_sleep", lambda seconds: None)
     watch_service.run(interval=1, on_tick=lambda report: None)
     assert _files() == []
+
+
+@pytest.mark.parametrize("name", ["SIGTERM"] if sys.platform == "win32" else ["SIGTERM", "SIGHUP"])
+def test_a_watcher_started_with_a_signal_ignored_keeps_it_ignored(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # nohup rlx watch &: SIGHUP is SIG_IGN, and the watcher must outlive the logout.
+    signum = getattr(signal, name)
+    signal.signal(signum, signal.SIG_IGN)  # given back by keep_sigterm
+    seen: list[object] = []
+
+    class Stop(BaseException):
+        pass
+
+    def tick(self: watch_service.Watcher, now: datetime | None = None) -> None:
+        seen.append(signal.getsignal(signum))
+        raise Stop
+
+    monkeypatch.setattr(watch_service.Watcher, "tick", tick)
+    with pytest.raises(Stop):
+        watch_service.run(interval=1, on_tick=lambda report: None)
+    assert seen == [signal.SIG_IGN] and _files() == []
+
+
+def test_watch_stop_says_stopped_only_once_the_watcher_has_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(watch_service, "stop_detached", lambda: 4242)
+    monkeypatch.setattr(watch_service, "running_pid", lambda: 4242)  # still in its look
+    still = CliRunner().invoke(app, ["watch", "--stop"])
+    assert still.exit_code == 0 and "still stopping" in still.output
+    assert "stopped the watcher" not in still.output
+    said = CliRunner().invoke(app, ["--json", "watch", "--stop"])
+    assert json.loads(said.output) == {"stopped": 4242, "stopping": True}
+    monkeypatch.setattr(watch_service, "running_pid", lambda: None)
+    gone = CliRunner().invoke(app, ["watch", "--stop"])
+    assert "stopped the watcher (pid 4242)" in gone.output
 
 
 def test_watch_stop_kills_the_window_only_once_the_watcher_has_left(

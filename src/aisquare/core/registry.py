@@ -18,7 +18,10 @@ record's content and its liveness rule are each registry's own.
   Python's replace: ``paths.despite_windows_contention``, 10 tries, 0.9 s);
 - a reader's second read of a record whose read failed, :data:`READ_RETRY_SECONDS` (0.05 s)
   later;
-- the wait for ``.gate.lock``, :data:`GATE_WAIT_SECONDS` (2 s).
+- the wait for ``.gate.lock``, :data:`GATE_WAIT_SECONDS` (2 s);
+- a pid, ``1`` to :data:`PID_MAX` (``2**31 - 1``): a record's pid outside it is no pid at all
+  (``Unreadable.pid`` is ``None`` for it), so that no count or stop can reach ``kill(-1)``,
+  ``kill(0)`` or a pid ``os.kill`` cannot take.
 
 **The folder**, ``<home>/<name>/`` (``<home>`` is ``AISQUARE_HOME``, else ``~/.aisquare``):
 ``0700``, every file in it ``0600`` on POSIX, so only this user reads or writes them. The
@@ -35,9 +38,16 @@ process):
   whose lock is free is a crashed process's, whatever has its pid now.
 
 and ``.gate.lock`` (:data:`GATE_LOCK`), locked with the same primitive, created ``0600``, while
-a process reads the others and writes its own record (:meth:`Registry.gate`), waited on for
-at most :data:`GATE_WAIT_SECONDS`, so two processes starting at once each see the other. A
-reader never deletes it.
+a process reads the others and writes its own record (:meth:`Registry.gate`), while a reader
+deletes what it prunes, and while a writer takes its lock again (:meth:`Registry.keep_lock`);
+waited on for at most :data:`GATE_WAIT_SECONDS`, so two processes starting at once each see
+the other. A reader never deletes it. A writer that cannot have the gate within that wait
+writes nothing, no lock and no record: it runs unregistered and says so (Python's daemons run
+on, unregistered, and tell their ``on_error``; ``core.daemons.registered``). It may try the
+whole registration again later (Python's daemons do not); an unregistered process is one an
+upgrade cannot count. A reader that cannot have it prunes nothing that read (a later read
+does); a writer whose lock it would take again keeps the one it has and tries at its next
+rewrite.
 
 A record's id is its FILE NAME's (:func:`valid_id`), never anything inside it: every path is
 built from a name the folder listing gave, so no record names a file outside the folder, and
@@ -52,8 +62,13 @@ a file whose name is not ``<id>.json`` is no record, whatever it holds.
 - Windows: ``msvcrt.locking(fd, LK_NBLCK, 1)``, a byte-range lock of ONE byte at offset 0,
   past the end of the empty file. Any lock whose range covers byte 0 conflicts with it
   (Rust: ``LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)`` of byte 0, or
-  ``File::try_lock``, whose range is the whole file). Open the file sharing read and write
-  (Rust's default share mode does), as readers open it too, to probe it.
+  ``File::try_lock``, whose range is the whole file). The holder opens ``<id>.lock`` sharing
+  read and write and NEVER delete, as Python's ``os.open`` does (Rust:
+  ``OpenOptionsExt::share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)``; std's default also shares
+  delete, which is wrong here). So no one on Windows can delete or replace a held lock file,
+  and the "is it still the file I hold" check of :meth:`Registry.keep_lock` matters only on
+  POSIX; a lock file shared for delete could be deleted under its holder (on Windows 10 1903+
+  NTFS the name goes at once) and leave it unseen.
 - Both: the descriptor or handle is not inherited (``O_CLOEXEC``; a non-inheritable handle;
   Python's ``os.open`` and Rust's ``std::fs`` do so by default), or a child the process
   starts would hold its lock past it, and a crashed process would read as running.
@@ -71,7 +86,8 @@ open, and opened WITHOUT ``FILE_SHARE_DELETE``, can be neither renamed over nor 
 fail with ``ERROR_ACCESS_DENIED`` (5) or ``ERROR_SHARING_VIOLATION`` (32) until that handle
 closes. Python's ``open`` and ``os.open`` never share delete, so every Python reader of a
 record, and every process holding its own lock file, blocks both for as long as its handle is
-open (Rust's ``std::fs`` opens sharing delete, so rlxd's handles block no one). A reader holds a
+open. Rust's ``std::fs`` shares delete by default, so rlxd's reads block no one; its own lock
+file it opens without sharing delete (above). A reader holds a
 record for a moment, so a writer's replace of ``<id>.json`` and anyone's delete of a registry
 file refused with 5 or 32 is tried again for about 1 s before it is given up (Python: the
 replace through ``paths.despite_windows_contention``, the delete through :func:`unlink`, the
@@ -81,9 +97,10 @@ closing it.
 **Writing**, in this order: make the folder; take ``.gate.lock``; read the others (pruning
 what is dead); create and lock ``<id>.lock``; write ``<id>.json``; let ``.gate.lock`` go. A
 writer that keeps its record fresh checks, before each rewrite, that ``<id>.lock`` is still
-the file it holds (same device and inode; on Windows the same volume and file id), and when
-another process deleted or replaced it, creates and locks it again (:meth:`Registry.keep_lock`):
-a record with no lock beside it reads as dead.
+the file it holds (same device and inode; on Windows the same volume and file id; a ``stat``
+of its own descriptor that fails, ``ESTALE`` on NFS once another client deleted it, counts as
+not), and when another process deleted or replaced it, creates and locks it again under
+``.gate.lock`` (:meth:`Registry.keep_lock`): a record with no lock beside it reads as dead.
 
 **Leaving**, on a clean exit: delete ``<id>.json``; close the lock file; delete ``<id>.lock``.
 A process that cannot finish leaving (killed, or ended by a path that runs no cleanup) is a
@@ -94,7 +111,9 @@ crashed one: its lock is free, and the next reader prunes its record.
 Windows, an NFS ``ESTALE``); one gone since the listing is no record. The registry's own rule
 says whether a record it can read is live, and whether one that is not must be kept all the
 same (``keep``); with pruning, any other is deleted with its lock, and one whose lock is held
-never is. A record it cannot read (not JSON, or not what the registry's parser takes) is
+never is: the reader takes ``.gate.lock``, probes each such lock once more, and deletes only
+those still free, so a writer that took its lock again since the read (under the same gate)
+keeps it. A record it cannot read (not JSON, or not what the registry's parser takes) is
 reported (:class:`Unreadable`), never crashed on and never silently dropped: kept while its
 lock is held, its file is younger than the stale age (a later release's process, most likely),
 or its age cannot be read (a ``stat`` that fails otherwise than "not found"); deleted with its
@@ -155,6 +174,11 @@ its own record. A reader never deletes it."""
 GATE_WAIT_SECONDS = 2.0
 """How long :meth:`Registry.gate` waits for another process's read-and-write to end."""
 
+PID_MAX = 2**31 - 1
+"""The largest pid a record may say. ``os.kill`` takes a C ``int`` and raises ``OverflowError``
+(not ``OSError``) past it, as ``ctypes``' default conversion in ``core.procs`` does on Windows;
+no OS hands out a larger one."""
+
 _ID = re.compile(r"[0-9a-f]{12}")
 
 
@@ -204,6 +228,22 @@ def unlink(path: Path) -> bool:
             return True
 
 
+def heartbeat_fresh(
+    heartbeat: datetime,
+    *,
+    stale_seconds: float,
+    skew_seconds: float | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Whether ``heartbeat`` is under ``stale_seconds`` old; with ``skew_seconds``, one more
+    than that far in the future is stale too, as a writer's clock that far ahead is outside the
+    bound the hosts keep (a future heartbeat would otherwise read as fresh for ever)."""
+    age = (datetime.now(UTC) if now is None else now) - heartbeat
+    if skew_seconds is not None and age < -timedelta(seconds=skew_seconds):
+        return False
+    return age < timedelta(seconds=stale_seconds)
+
+
 def live_by_lock_or_heartbeat(
     held: bool | None,
     *,
@@ -211,6 +251,7 @@ def live_by_lock_or_heartbeat(
     pid: int,
     heartbeat: datetime,
     stale_seconds: float,
+    skew_seconds: float | None = None,
     here: str | None = None,
     now: datetime | None = None,
 ) -> bool:
@@ -220,9 +261,10 @@ def live_by_lock_or_heartbeat(
     if held:
         return True
     if host == (host_name() if here is None else here):
-        return held is None and procs.alive(pid)
-    age = (datetime.now(UTC) if now is None else now) - heartbeat
-    return age < timedelta(seconds=stale_seconds)
+        return held is None and 0 < pid <= PID_MAX and procs.alive(pid)
+    return heartbeat_fresh(
+        heartbeat, stale_seconds=stale_seconds, skew_seconds=skew_seconds, now=now
+    )
 
 
 @dataclass(frozen=True)
@@ -243,9 +285,10 @@ class Unreadable:
 
     @property
     def pid(self) -> int | None:
-        """The ``pid`` it still says, as an integer; ``None``."""
+        """The ``pid`` it still says, as an integer from ``1`` to :data:`PID_MAX`; ``None`` for
+        any other, so that ``-1``, ``0`` or ``2**31`` never reach a ``kill``."""
         pid = (self.said or {}).get("pid")
-        return pid if type(pid) is int else None
+        return pid if type(pid) is int and 0 < pid <= PID_MAX else None
 
     @property
     def kind(self) -> str | None:
@@ -360,21 +403,27 @@ class Registry:
         """The descriptor that holds ``<id>.lock`` from now on: ``fd`` while the file at that
         path is still the one ``fd`` holds (same device and inode, or volume and file id); else,
         another process having deleted or replaced it, the lock file created and locked again
-        (:meth:`take`) and ``fd`` closed. A record whose lock file is gone reads as dead, so a
-        writer that keeps its record fresh calls this before each rewrite. ``OSError`` when the
-        new lock cannot be had, ``fd`` then left as it was."""
-        mine = os.fstat(fd)
+        (:meth:`take`), under :meth:`gate`, and ``fd`` closed. A ``stat`` of ``fd`` that fails
+        (``ESTALE``) counts as "not the file it holds". A record whose lock file is gone reads
+        as dead, so a writer that keeps its record fresh calls this before each rewrite.
+        ``OSError`` when the gate or the new lock cannot be had, ``fd`` then left as it was."""
         try:
-            there = os.stat(self.lock(record_id))
+            mine: os.stat_result | None = os.fstat(fd)
+        except OSError:  # ESTALE on NFS once another client deleted it: not the file it holds
+            mine = None
+        try:
+            there: os.stat_result | None = os.stat(self.lock(record_id))
         except FileNotFoundError:
             there = None
         if (
-            there is not None
+            mine is not None
+            and there is not None
             and mine.st_nlink > 0
             and (there.st_dev, there.st_ino) == (mine.st_dev, mine.st_ino)
         ):
             return fd
-        renewed = self.take(record_id, wait_s=wait_s)
+        with self.gate():  # a pruning reader re-probes under it before it deletes a lock
+            renewed = self.take(record_id, wait_s=wait_s)
         with contextlib.suppress(OSError):
             os.close(fd)
         return renewed
@@ -447,13 +496,16 @@ class Registry:
         missing: bool | None = False,
         keep: Callable[[T, bool | None], bool] | None = None,
         reserved: frozenset[str] = frozenset(),
+        gated: bool = False,
     ) -> Roll[T]:
         """The live records (``live(record, held)``, ``held`` being :meth:`lock_held`'s
         answer with ``missing``), and the ones this release cannot read that have their lock
         held, are fresh, or whose age cannot be read. With ``prune``, deletes what is not live,
         as the module says, but never a record ``keep(record, held)`` keeps (nor its lock),
         :data:`GATE_LOCK`, or a name in ``reserved`` (a registry's own folder-level files);
-        without, writes nothing. Reads only: no folder is made."""
+        without, writes nothing. A record is deleted under :meth:`gate` (``gated``: the caller
+        holds it already), once a second probe finds its lock still free. Reads only: no
+        folder is made."""
         folder = self.folder
         try:
             names = sorted(os.listdir(folder))
@@ -462,7 +514,7 @@ class Registry:
         now = datetime.now(UTC)
         found: list[T] = []
         unreadable: list[Unreadable] = []
-        pruned: list[str] = []
+        doomed: list[str] = []
         held: set[str] = set()
         for name in names:
             path = folder / name
@@ -494,8 +546,7 @@ class Registry:
                 if locked or fresh:
                     unreadable.append(Unreadable(stem, path, written, locked, _object_in(path)))
                 elif prune:
-                    self.forget(stem)
-                    pruned.append(stem)
+                    doomed.append(stem)
                 continue
             lock = self.lock_held(stem, missing=missing)
             if live(loaded, lock):
@@ -503,9 +554,26 @@ class Registry:
                 if lock:
                     held.add(stem)
             elif prune and not (keep is not None and keep(loaded, lock)):
-                self.forget(stem)  # not live: its lock is not held
-                pruned.append(stem)
+                doomed.append(stem)  # not live: its lock is not held
+        pruned = self._prune(doomed, gated=gated) if doomed else []
         return Roll(found, unreadable, pruned, frozenset(held))
+
+    def _prune(self, doomed: list[str], *, gated: bool) -> list[str]:
+        """Delete the records ``doomed``, under :meth:`gate` (``gated``: held already), each
+        only once a second probe finds its lock still free: a writer that took its lock again
+        since the read (:meth:`keep_lock`, under the same gate) keeps it. The ids deleted; none
+        when the gate cannot be had (a later read prunes them)."""
+        pruned: list[str] = []
+        try:
+            with contextlib.nullcontext() if gated else self.gate():
+                for record_id in doomed:
+                    if self.lock_held(record_id) is not False:  # taken again, or untellable
+                        continue
+                    self.forget(record_id)
+                    pruned.append(record_id)
+        except OSError:  # the gate, held past its wait by another
+            return pruned
+        return pruned
 
     def _leftover(self, name: str, names: list[str]) -> bool:
         """Whether ``name`` (not a record) is a file of a record that is gone, as old as a stale

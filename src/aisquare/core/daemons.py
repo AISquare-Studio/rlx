@@ -24,7 +24,16 @@ deleted and pruned. What this registry adds:
   mount), so a reader reads another host's held lock as free. A record naming another host
   whose ``heartbeat_at`` is under :data:`STALE_SECONDS` old is therefore not live to this
   reader, and never pruned by it either: neither the record nor its lock file is deleted.
-  Once its heartbeat is stale, any reader prunes it.
+  Once its heartbeat is stale, any reader prunes it. The rule assumes, as ``core.instances``
+  does:
+
+  - **clocks within :data:`CLOCK_SKEW_SECONDS` (55 s)** across the hosts sharing a home (the
+    stale age less one heartbeat). A reader whose clock runs further ahead takes a live remote
+    record for stale and prunes it; a heartbeat more than that far in the FUTURE is stale too,
+    so a writer whose clock runs ahead never has its dead records kept for ever;
+  - **host names unique** per shared home. Two hosts that both say ``ubuntu`` or
+    ``localhost`` (cloned VMs; ``core.registry.host_name``'s fallback) take each other's
+    records for their own.
 - **Registering** is ``core.registry``'s order, under ``.gate.lock``: the others read (the
   dead pruned), then this one's lock taken and its record written.
 - **The heartbeat.** A daemon rewrites its record every :data:`HEARTBEAT_SECONDS` (5 s) with
@@ -49,15 +58,17 @@ crashed on: ``core.registry``).
 - ``kind`` (string): what the daemon is, one of :data:`KINDS` (``rlxd``, ``brain``,
   ``watch``, ``serve``, ``remote``, ``board_watch``). A kind this release does not know is
   read and kept as said: a later release's daemon is still a running rlx process.
-- ``pid`` (integer): its process id, ``1`` to ``2**31 - 1``. Outside that range the record is
-  unreadable (no OS hands out such a pid, and ``kill``/``OpenProcess`` take a C ``int``).
+- ``pid`` (integer): its process id, ``1`` to ``2**31 - 1`` (``core.registry.PID_MAX``).
+  Outside that range the record is unreadable: no OS hands out such a pid, and ``os.kill``
+  (and ``ctypes``' default conversion in ``core.procs`` on Windows) takes a C ``int``, though
+  ``OpenProcess`` itself takes a ``DWORD``.
 - ``host`` (string): the host name it runs on (``socket.gethostname()``).
 - ``version`` (string): the rlx release it runs (``aisquare-cli``'s version, or rlxd's).
 - ``started_at`` (string): when it registered, RFC 3339 in UTC, written with an upper-case
   ``T`` and ``Z`` or a numeric offset (``2026-11-25T12:03:00.123456+00:00``,
-  ``2026-11-25T12:03:00Z``), with up to nine fractional digits. A lower-case ``t`` or ``z``,
-  which RFC 3339 allows, makes the record unreadable here (Python's ``fromisoformat``
-  refuses them); a time without an offset is read as UTC.
+  ``2026-11-25T12:03:00Z``), with up to nine fractional digits. A lower-case ``z``, which RFC
+  3339 allows, makes the record unreadable here (Python's ``fromisoformat`` refuses it on 3.11
+  to 3.13; a lower-case ``t`` it reads); a time without an offset is read as UTC.
 - ``heartbeat_at`` (string): when the record was last written, as ``started_at``.
 - ``argv`` (array of strings, never empty): the command that starts it again. ``argv[0]`` is
   the absolute path of an executable: Python writes ``sys.executable``, rlxd
@@ -87,7 +98,7 @@ import os
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -109,9 +120,12 @@ STALE_SECONDS = 60.0
 (``core.registry``); and, where a lock cannot be probed at all, how old another host's
 heartbeat may be before its record is dead."""
 
-PID_MAX = 2**31 - 1
-"""The largest pid a record may say: ``os.kill`` (and so ``core.procs.alive``) raises
-``OverflowError``, not ``OSError``, past a C ``int``, which no OS hands out anyway."""
+PID_MAX = registry.PID_MAX
+"""The largest pid a record may say (``core.registry.PID_MAX``, ``2**31 - 1``)."""
+
+CLOCK_SKEW_SECONDS = STALE_SECONDS - HEARTBEAT_SECONDS
+"""How far apart the clocks of hosts sharing a home may run (55 s): a heartbeat more than this
+far in the future is stale (the module's keep rule)."""
 
 FOLDER = "daemons"
 
@@ -254,6 +268,7 @@ def _live(
         pid=daemon.pid,
         heartbeat=daemon.heartbeat_at,
         stale_seconds=STALE_SECONDS,
+        skew_seconds=CLOCK_SKEW_SECONDS,
         here=here,
         now=now,
     )
@@ -262,19 +277,26 @@ def _live(
 def _kept(daemon: Daemon, *, here: str, now: datetime) -> bool:
     """Whether a reader keeps a record that is not live to it: another host's whose heartbeat
     is fresh, as that host's held lock may not show here (the module's rule)."""
-    return daemon.host != here and now - daemon.heartbeat_at < timedelta(seconds=STALE_SECONDS)
+    return daemon.host != here and registry.heartbeat_fresh(
+        daemon.heartbeat_at,
+        stale_seconds=STALE_SECONDS,
+        skew_seconds=CLOCK_SKEW_SECONDS,
+        now=now,
+    )
 
 
-def roll(*, prune: bool = True) -> registry.Roll[Daemon]:
+def roll(*, prune: bool = True, gated: bool = False) -> registry.Roll[Daemon]:
     """The live daemons on this home, oldest first, and the records this release cannot read
     that have their lock held or are fresh. With ``prune``, deletes what is not live
-    (``core.registry``); without, writes nothing. Reads only: no folder is made."""
+    (``core.registry``, under ``.gate.lock``; ``gated``: the caller holds it, as
+    :func:`register` does); without, writes nothing. Reads only: no folder is made."""
     here, now = registry.host_name(), datetime.now(UTC)
     found = REGISTRY.roll(
         Daemon.from_record,
         lambda daemon, held: _live(daemon, held, here=here, now=now),
         prune=prune,
         keep=lambda daemon, held: _kept(daemon, here=here, now=now),
+        gated=gated,
     )
     return replace(found, live=sorted(found.live, key=lambda daemon: daemon.started_at))
 
@@ -396,7 +418,7 @@ def register(kind: Kind, *, argv: Sequence[str], restartable: bool) -> Registrat
     if not argv:
         raise ValueError("a daemon's argv names its program")
     with REGISTRY.gate():
-        roll(prune=True)
+        roll(prune=True, gated=True)
         me = describe_this_process(kind, argv=argv, restartable=restartable)
         fd = REGISTRY.take(me.id)
         try:
