@@ -52,6 +52,7 @@ class Change:
 
     what: str
     undo: Callable[[], object]
+    """Puts the old value back; returns ``False`` when it could not (having said why)."""
 
 
 class CommitInput(Input):
@@ -75,10 +76,21 @@ class CommitInput(Input):
         def control(self) -> CommitInput:
             return self.field
 
-    def __init__(self, value: str = "", **kwargs: object) -> None:
+    def __init__(
+        self,
+        value: str = "",
+        *,
+        leaving: Callable[[CommitInput], object] | None = None,
+        **kwargs: object,
+    ) -> None:
         super().__init__(value, **kwargs)  # type: ignore[arg-type]
         self.kept = value
         """The value on disk: what Undo, or a refusal, comes back to."""
+        self.leaving = leaving
+        """The owner's writer for a value typed and not left when the page goes (rlx quitting,
+        its screen closed): called on the field's own last message, synchronously, to write
+        the value showing nothing (there is nothing left to show it on); a value it would
+        refuse it does not write."""
 
     def keep(self, value: str) -> None:
         """``value`` is on disk now (saved, or put back by Undo): shown, and not committed
@@ -91,7 +103,16 @@ class CommitInput(Input):
     def commit(self) -> None:
         """Enter, or leaving the field: a changed value goes to the page to keep or refuse. One
         put back to what is on disk needs neither, and takes the refusal line under it away:
-        it said why a value no longer shown was not saved (tester of #24, F1)."""
+        it said why a value no longer shown was not saved (tester of #24, F1).
+
+        Left because its page is going (rlx quitting, its screen closed), the field hands its
+        value to its owner's :attr:`leaving` at once, which writes it showing nothing: a
+        :class:`Committed` would bubble into ancestors whose message loops have ended, and the
+        typed value went with it (reviewer of #24)."""
+        if self._pruning:
+            if self.value != self.kept and self.leaving is not None:
+                self.leaving(self)
+            return
         if self.value != self.kept:
             self.post_message(self.Committed(self, self.value, self.kept))
             return
@@ -143,12 +164,22 @@ class SavesAsYouGo:
         )
 
     def action_undo_change(self) -> None:
-        """:data:`UNDO_KEY`: the page's last change taken back, on disk and on screen."""
+        """:data:`UNDO_KEY`: the page's last change taken back, on disk and on screen. An undo
+        that says it failed (returns ``False``; it has said why) keeps the change, to try again,
+        and nothing says "Undone" (reviewer of #24)."""
         if not self.changes:
             self._app.notify("Nothing to undo here", timeout=3, markup=False)
             return
-        change = self.changes.pop()
-        change.undo()
+        change = self.changes[-1]
+        if change.undo() is False:
+            self._app.notify(
+                f"Not undone: {change.what} · {UNDO_SAID} tries again",
+                severity="warning",
+                timeout=SAVED_SECONDS,
+                markup=False,
+            )
+            return
+        self.changes.remove(change)
         self._app.notify(f"Undone: {change.what}", timeout=3, markup=False)
 
     def refuse(self, field: Widget, why: str) -> None:

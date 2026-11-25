@@ -516,13 +516,16 @@ class PersonasTab(SavesAsYouGo, Vertical):
 
     # --- ctrl+z (M5): an import, a new persona or an edit taken back -------------------------
 
-    def _take_back(self, name: str, layer: Layer) -> None:
-        """Undo of an import or a *New*: the persona it made, removed again."""
+    def _take_back(self, name: str, layer: Layer) -> bool:
+        """Undo of an import or a *New*: the persona it made, removed again; whether it was."""
         try:
             personas_service.remove(name, layer=layer, root=self.root)
         except (PersonaError, OSError) as exc:
             self.notify(dialogs.failure(exc), severity="error", timeout=8, markup=False)
-        self.reload()
+            return False
+        finally:
+            self.reload()
+        return True
 
     @staticmethod
     def _skill_text(entry: Entry) -> str | None:
@@ -542,12 +545,16 @@ class PersonasTab(SavesAsYouGo, Vertical):
             return
         self.kept(f"{entry.name}'s SKILL.md", lambda: self._put_text(entry, before))
 
-    def _put_text(self, entry: Entry, text: str) -> None:
+    def _put_text(self, entry: Entry, text: str) -> bool:
+        """Undo of an edit: ``text`` written back; whether it was."""
         try:
             personas_service.save(entry.name, text, root=self.root, layer=entry.layer)
         except (PersonaError, OSError) as exc:
             self.notify(dialogs.failure(exc), severity="error", timeout=8, markup=False)
-        self.reload(select=entry.key)
+            return False
+        finally:
+            self.reload(select=entry.key)
+        return True
 
     @on(Button.Pressed, "#persona-new")
     def _new(self) -> None:

@@ -2497,3 +2497,26 @@ def test_the_nickname_is_kept_on_leaving_the_field_and_ctrl_z_puts_the_old_one_b
     assert seen["undone"] == (None, ""), "ctrl+z: the name it replaced (none), on disk and shown"
     assert any(m.endswith("· Undo: ctrl+z") for m in seen["notices"]), seen["notices"]
     assert "Undone: repo's nickname" in seen["notices"]
+
+
+def test_a_nickname_typed_and_not_left_is_kept_when_rlx_quits(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #24: quitting before the field was left lost the name typed in it."""
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)  # a rename renames the project's sessions: none, faked
+
+    async def scenario(pilot: Pilot[None], host: Host) -> None:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        await pilot.click("#nickname")
+        await settle(pilot)
+        await pilot.press(*"Auth")
+        await pilot.pause()
+        host.exit()  # no Enter, the field never left
+
+    drive(project, scenario)
+    with store_session() as store:
+        assert store.get_project(project.id).nickname == "Auth"  # type: ignore[union-attr]

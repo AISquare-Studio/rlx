@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -230,6 +231,7 @@ class TokenSlot(Vertical):
                 password=True,
                 id="settings-remote-token-field",
                 compact=True,
+                leaving=self.remote_keep_typed_token,
             )
             yield Button("Get one", id="settings-remote-token-open", compact=True)
         yield Static("", id="settings-remote-token-problem")
@@ -257,6 +259,43 @@ class TokenSlot(Vertical):
         event.stop()
         if event.value:  # a field emptied is no token to save
             self.remote_save_token()
+
+    def remote_keep_typed_token(self, field: CommitInput) -> None:
+        """The page closed, or rlx quitting, with a token typed and not entered
+        (``CommitInput.leaving``): checked and saved as Enter would, showing nothing
+        here. While rlx runs, on a worker of the app's, which says how it went; quitting, before
+        rlx goes, for as long as ngrok's check may take (``ngrok_sdk.CHECK_SECONDS``) at most."""
+        token = field.value
+        if not token.strip():
+            return
+        app = self.app
+
+        def remote_store_typed() -> str:
+            try:
+                store_ngrok_token(token)
+            except TokenRefused as exc:
+                return f"the ngrok token was not saved: {exc}"
+            except Exception as exc:  # never the token: only what kind of failure
+                return f"the ngrok token could not be saved: {type(exc).__name__}"
+            return "✓ ngrok token saved"
+
+        if app._running:
+
+            def remote_store_and_say() -> None:
+                said = remote_store_typed()
+                app.call_from_thread(app.notify, said, timeout=6, markup=False)
+
+            app.run_worker(
+                remote_store_and_say,
+                name=TOKEN_WORKER,
+                group=TOKEN_WORKER,
+                thread=True,
+                exit_on_error=False,
+            )
+            return
+        quitting = threading.Thread(target=remote_store_typed, name=TOKEN_WORKER, daemon=True)
+        quitting.start()
+        quitting.join(ngrok_sdk.CHECK_SECONDS + 1)
 
     def remote_save_token(self) -> None:
         """Save what the field holds, off the UI thread; one save at a time."""

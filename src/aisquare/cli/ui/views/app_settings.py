@@ -92,7 +92,7 @@ from __future__ import annotations
 import re
 import shlex
 from collections.abc import Collection, Iterable
-from typing import ClassVar, Literal, NamedTuple, get_args
+from typing import Any, ClassVar, Literal, NamedTuple, get_args
 
 from rich.text import Text
 from textual import on
@@ -441,6 +441,38 @@ def parse_max_agents(raw: str) -> int | Literal["auto"]:
     if number < 1:
         raise ValueError("max agents per project must be auto or at least 1")
     return number
+
+
+_ABSENT = object()
+"""A setting a config does not hold (a role's profile that is not there)."""
+
+
+def _leaves(config: AppConfig) -> dict[tuple[str, ...], object]:
+    """Every setting in ``config`` by its path (``("fleet", "escape_key")``): what Reset all's
+    Undo compares, one setting at a time."""
+    found: dict[tuple[str, ...], object] = {}
+
+    def walk(node: object, path: tuple[str, ...]) -> None:
+        if isinstance(node, dict) and node:
+            for key, value in node.items():
+                walk(value, (*path, str(key)))
+        else:
+            found[path] = node
+
+    walk(config.model_dump(), ())
+    return found
+
+
+def _put_leaf(data: dict[str, Any], path: tuple[str, ...], value: object) -> None:
+    """``value`` at ``path`` in ``data`` (a config's dump); :data:`_ABSENT` takes it out."""
+    *parents, last = path
+    node = data
+    for key in parents:
+        node = node.setdefault(key, {})
+    if value is _ABSENT:
+        node.pop(last, None)
+    else:
+        node[last] = value
 
 
 def role_order(fleet: FleetSettings) -> list[str]:
@@ -1090,7 +1122,10 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         with Horizontal(classes="row"):
             yield Label("escape key")
             yield CommitInput(
-                value=self.fleet.escape_key, placeholder=DEFAULT_ESCAPE_KEY, id="escape-key"
+                value=self.fleet.escape_key,
+                placeholder=DEFAULT_ESCAPE_KEY,
+                id="escape-key",
+                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("max agents per project")
@@ -1098,11 +1133,15 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 value=str(self.fleet.max_agents_per_project),
                 placeholder=f"{DEFAULT_MAX_AGENTS} (default) or a number",
                 id="max-agents",
+                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("worktree root")
             yield CommitInput(
-                value=self.fleet.worktree_dir, placeholder=DEFAULT_WORKTREE_DIR, id="worktree-dir"
+                value=self.fleet.worktree_dir,
+                placeholder=DEFAULT_WORKTREE_DIR,
+                id="worktree-dir",
+                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("native agent teams off")
@@ -1129,7 +1168,10 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         with Horizontal(classes="row"):
             yield Label("switch at (% used)")
             yield CommitInput(
-                value=str(self.accounts.switch_at), type="integer", id="accounts-switch-at"
+                value=str(self.accounts.switch_at),
+                type="integer",
+                id="accounts-switch-at",
+                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             yield Label("under the line, prefer")
@@ -1142,6 +1184,7 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 value=str(self.accounts.wait_if_reset_within_minutes),
                 type="integer",
                 id="accounts-wait-minutes",
+                leaving=self.keep_leaving_field,
             )
         with Horizontal(classes="row"):
             cross = Label("hand off across agents")
@@ -1543,10 +1586,7 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         said = f"{event.checkbox.label}: {'on' if event.value else 'off'}"
         box, back = event.checkbox, not event.value
 
-        def undo() -> None:
-            self._tick(box, key, back)
-
-        self.kept(said, undo)
+        self.kept(said, lambda: self._tick(box, key, back))
 
     def _tick(self, box: Checkbox, key: str, on: bool) -> bool:
         """Save a *Display* switch (``key``) as ``on``, shown on ``box``, and apply it; said
@@ -1580,16 +1620,17 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         self.notify(f"{EVERY_ACTION_ASKS} again.", timeout=6, markup=False)
         self.kept("Ask again before every action", lambda: self._stop_asking(quiet))
 
-    def _stop_asking(self, kinds: list[str]) -> None:
+    def _stop_asking(self, kinds: list[str]) -> bool:
         """Undo of *Ask again*: each of ``kinds`` stops asking first again, as before."""
         try:
             for kind in kinds:
                 self.ui = settings_service.stop_asking_first(kind)
         except Exception as exc:
             self.notify(f"not undone: {exc}", severity="warning", timeout=8, markup=False)
-            return
+            return False
         self._show_ui(self.ui)
         self.post_message(UiSettingsChanged(self.ui))
+        return True
 
     # --- writing -----------------------------------------------------------------------
 
@@ -1808,8 +1849,8 @@ class AppSettingsView(SavesAsYouGo, Vertical):
             return
         self.kept(self._said(wid, now), lambda: self._put_back(wid, before))
 
-    def _put_back(self, wid: str, value: object) -> None:
-        """Undo: ``wid`` shows ``value`` again, and it is on disk again."""
+    def _put_back(self, wid: str, value: object) -> bool:
+        """Undo: ``wid`` shows ``value`` again, and it is on disk again; whether it is."""
         control = self.query_one(f"#{wid}")
         if isinstance(control, CommitInput):
             control.value = str(value)
@@ -1819,34 +1860,44 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         elif isinstance(control, Switch):
             with control.prevent(Switch.Changed):
                 control.value = bool(value)
-        self._save_fields({wid})
+        return self._save_fields({wid})
 
-    def _save_fields(self, changed: set[str]) -> bool:
+    def keep_leaving_field(self, field: CommitInput) -> None:
+        """rlx quitting with ``field`` typed and not left: written now, alone, showing nothing
+        (``CommitInput.leaving``). A value the form would refuse is not written."""
+        if field.id is not None:
+            self._save_fields({field.id}, shown=False)
+
+    def _save_fields(self, changed: set[str], *, shown: bool = True) -> bool:
         """Write the ``changed`` fields (each control is one) through the one config writer,
         onto the file as it is NOW, then show what landed: whether it was written. A value the
         form refuses is said under its field, and nothing is written; a control the file would
-        not take shows the file's value again."""
+        not take shows the file's value again. Not ``shown`` (the page going), nothing is said
+        or re-read: the write alone."""
         try:
             config: AppConfig = load_config()
         except Exception as exc:  # a broken config.toml: say so, change nothing
-            self.notify(
-                f"config unreadable — nothing saved: {exc}",
-                severity="error",
-                timeout=8,
-                markup=False,
-            )
-            self._show_file_value(changed)
+            if shown:
+                self.notify(
+                    f"config unreadable — nothing saved: {exc}",
+                    severity="error",
+                    timeout=8,
+                    markup=False,
+                )
+                self._show_file_value(changed)
             return False
         result = self._form_fleet(config.fleet, changed)
         if isinstance(result, str):
-            self._refused(result, changed)
+            if shown:
+                self._refused(result, changed)
             return False
         config.fleet = result
         self._apply_agents(config, changed)
         self._apply_account_bindings(config, changed)
         accounts = self._form_accounts(config.accounts, changed)
         if isinstance(accounts, str):
-            self._refused(accounts, changed)
+            if shown:
+                self._refused(accounts, changed)
             return False
         config.accounts = accounts
         if UPDATES_CHECK in changed:
@@ -1856,15 +1907,17 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         try:
             save_config(config)
         except OSError as exc:  # the operator's filesystem saying no — the foreseeable failure
-            self.notify(
-                f"could not write the config: {exc}",
-                severity="error",
-                timeout=8,
-                markup=False,
-            )
-            self._show_file_value(changed)
+            if shown:
+                self.notify(
+                    f"could not write the config: {exc}",
+                    severity="error",
+                    timeout=8,
+                    markup=False,
+                )
+                self._show_file_value(changed)
             return False
-        self.reload_form(saved=changed)
+        if shown:
+            self.reload_form(saved=changed)
         return True
 
     def _show_file_value(self, changed: set[str]) -> None:
@@ -2005,13 +2058,30 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 markup=False,
             )
             if before is not None:
-                self.kept("every setting at its default", lambda: self._unreset(before))
+                after = load_config()
+                self.kept("every setting at its default", lambda: self._unreset(before, after))
 
-    def _unreset(self, before: AppConfig) -> None:
-        """Undo of *Reset all*: the settings it replaced, written back."""
+    def _unreset(self, before: AppConfig, after: AppConfig) -> bool:
+        """Undo of *Reset all*: each setting it changed back as it was, onto the file as it is
+        now, but one written since (a + New binding, a shell's ``config set``), which stands:
+        the whole of ``before`` written back undid those (reviewer of #24). Whether it was."""
         try:
-            save_config(before)
-        except OSError as exc:
+            now = load_config()
+        except Exception as exc:
             self.notify(f"not undone: {exc}", severity="error", timeout=8, markup=False)
-            return
+            return False
+        was, reset, data = _leaves(before), _leaves(after), now.model_dump()
+        current = _leaves(now)
+        for path in was.keys() | reset.keys():
+            if was.get(path, _ABSENT) == reset.get(path, _ABSENT):
+                continue  # the reset did not change it
+            if current.get(path, _ABSENT) != reset.get(path, _ABSENT):
+                continue  # changed since the reset: that write stands
+            _put_leaf(data, path, was.get(path, _ABSENT))
+        try:
+            save_config(AppConfig.model_validate(data))
+        except (OSError, ValueError) as exc:
+            self.notify(f"not undone: {exc}", severity="error", timeout=8, markup=False)
+            return False
         self.reload_form()
+        return True

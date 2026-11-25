@@ -1887,3 +1887,93 @@ def test_the_page_holds_no_save_reload_apply_or_cancel_button() -> None:
         ]
 
     assert drive(scenario) == []
+
+
+def test_a_field_typed_and_not_left_is_kept_when_rlx_quits() -> None:
+    """Reviewer of #24: on quit, the field's last message (its blur) posted a Committed into
+    ancestors whose loops had ended, and the typed value was lost. It is written as rlx goes;
+    one the form refuses is not."""
+
+    async def typed_then_quit(pilot: Pilot[None], host: AppHost) -> None:
+        await settle(pilot)
+        host.query_one(f"#{AGENT_ADVANCED}", Collapsible).collapsed = False
+        await settle(pilot)
+        host.query_one("#escape-key", Input).value = "f9"
+        leave_fields(host)  # kept the usual way first
+        await settle(pilot)
+        field = host.query_one("#max-agents", Input)
+        field.focus()
+        await settle(pilot)
+        await pilot.press("end", *["backspace"] * 4, "4")
+        await pilot.pause()
+        host.exit()  # no Enter, the field never left
+
+    drive(typed_then_quit)
+    config = load_config()
+    assert (config.fleet.max_agents_per_project, config.fleet.escape_key) == (4, "f9")
+
+    async def refused_then_quit(pilot: Pilot[None], host: AppHost) -> None:
+        await settle(pilot)
+        field = host.query_one("#accounts-switch-at", Input)
+        field.focus()
+        await settle(pilot)
+        field.value = "250"
+        host.exit()
+
+    drive(refused_then_quit)
+    assert load_config().accounts.switch_at == 85, "a value the form refuses is not written"
+
+
+def test_reset_all_undone_puts_back_only_what_it_changed() -> None:
+    """Reviewer of #24: Reset all's ctrl+z wrote the whole pre-reset file back, which undid a
+    + New binding or a shell's config set made after the reset. Each setting it changed comes
+    back, unless written since."""
+    config = load_config()
+    config.fleet.escape_key = "f9"
+    config.accounts.switch_at = 70
+    save_config(config)
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> None:
+        await settle(pilot)
+        reset = host.query_one("#reset-settings", Button)
+        reset.focus()
+        reset.press()
+        await settle(pilot)
+        reset.press()
+        await settle(pilot)
+        settings_service.set_value("accounts.switch_at", "60")  # a shell, after the reset…
+        settings_service.bind_role("designer", env={"GH_TOKEN": "x"})  # …and a + New binding
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+
+    drive(scenario)
+    after = load_config()
+    assert after.fleet.escape_key == "f9", "what the reset changed, back"
+    assert after.accounts.switch_at == 60, "written since the reset: it stands, not 70"
+    assert "designer" in after.team.profiles, "the binding made since stands"
+
+
+def test_an_undo_that_fails_says_so_and_keeps_the_change_to_try_again() -> None:
+    """Reviewer of #24: "Undone" was said, and the change dropped, when the undo failed."""
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> dict[str, Any]:
+        await settle(pilot)
+        check = host.query_one(f"#{UPDATES_CHECK}", Switch)
+        check.focus()
+        check.value = False
+        await settle(pilot)
+        good = paths.config_path().read_text(encoding="utf-8")
+        paths.config_path().write_text("[updates\nnot toml", encoding="utf-8")  # broken meanwhile
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen: dict[str, Any] = {"failed": [m for m, _ in host.notices][-2:]}
+        paths.config_path().write_text(good, encoding="utf-8")
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen["retried"] = (host.notices[-1][0], load_config().updates.check, check.value)
+        return seen
+
+    seen = drive(scenario)
+    assert seen["failed"][-1] == "Not undone: the daily release check: off · ctrl+z tries again"
+    assert not any(m.startswith("Undone") for m in seen["failed"])
+    assert seen["retried"] == ("Undone: the daily release check: off", True, True)

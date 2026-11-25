@@ -188,16 +188,18 @@ class CaptainToggle(Vertical):
             if page is not None:
                 page.kept("the captain's agent", lambda: self._put_agent(before))
 
-    def _put_agent(self, agent: str) -> None:
-        """Undo of a pick: the captain's agent the file held before, shown and saved."""
+    def _put_agent(self, agent: str) -> bool:
+        """Undo of a pick: the captain's agent the file held before, shown and saved; whether
+        it was."""
         select = self.query_one("#captain-agent", Select)
-        with self.prevent(Select.Changed):
-            select.value = agent
         problem = self._save_agent(agent)
         if problem:
             self.notify(problem, severity="error", timeout=8, markup=False)
-            return
+            return False
+        with self.prevent(Select.Changed):
+            select.value = agent
         self._agent = agent
+        return True
 
     @staticmethod
     def _save_agent(agent: str) -> str | None:

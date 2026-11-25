@@ -162,6 +162,7 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
                 placeholder=self.project.root.name or self.project.id,
                 max_length=project_service.NICKNAME_MAX,
                 id="nickname",
+                leaving=self.keep_leaving_field,
             )
         yield Static(fleet_id_line(self.project), id="fleet-id")
         can = applicable(self.agents, fleet_paused=self.fleet_paused)
@@ -225,6 +226,16 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         """Enter, or leaving the field with a new value: keep it (M5)."""
         event.stop()
         self._save_nickname(event.value.strip())
+
+    def keep_leaving_field(self, field: CommitInput) -> None:
+        """rlx quitting with a nickname typed and not left: written now, on this thread, showing
+        nothing (``CommitInput.leaving``). A name the store refuses is not written."""
+        if field.id != "nickname":
+            return
+        with contextlib.suppress(ValueError, OSError):
+            fleet_service.rename_project(
+                self.project, field.value.strip() or None, notes=[], follow_unchanged=False
+            )
 
     def _save_nickname(self, wanted: str) -> None:
         """Write ``wanted`` as the nickname, off the UI thread; blank clears it.
