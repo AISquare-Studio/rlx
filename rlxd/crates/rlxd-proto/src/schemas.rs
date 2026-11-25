@@ -22,6 +22,11 @@ pub fn all() -> Vec<SchemaFile> {
     let mut files = vec![
         file::<Envelope>("envelope.json"),
         file::<Event>("event.json"),
+        list_of::<Event>(
+            "event-list.json",
+            "EventList",
+            "Events as a JSON array, such as `jq -s .` makes of `rlxd events`' lines.",
+        ),
         file::<HelloParams>("hello.json"),
         file::<HelloData>("hello-reply.json"),
         file::<Request>("request.json"),
@@ -38,9 +43,20 @@ pub fn schema_for<T: JsonSchema>() -> Schema {
 }
 
 fn file<T: JsonSchema>(name: &'static str) -> SchemaFile {
-    let schema = schema_for::<T>();
+    render(name, &schema_for::<T>())
+}
+
+/// The schema of a JSON array of `T`, under its own title.
+fn list_of<T: JsonSchema>(name: &'static str, title: &str, description: &str) -> SchemaFile {
+    let mut schema = schema_for::<Vec<T>>();
+    schema.insert("title".to_owned(), title.into());
+    schema.insert("description".to_owned(), description.into());
+    render(name, &schema)
+}
+
+fn render(name: &'static str, schema: &Schema) -> SchemaFile {
     let mut contents =
-        serde_json::to_string_pretty(&schema).expect("a schema is a JSON value, and prints");
+        serde_json::to_string_pretty(schema).expect("a schema is a JSON value, and prints");
     contents.push('\n');
     SchemaFile { name, contents }
 }

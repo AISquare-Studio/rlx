@@ -19,6 +19,7 @@ pub type Params = serde_json::Map<String, serde_json::Value>;
 /// be `hello`; any other first frame gets the error `unauthorized`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "Request")]
+#[non_exhaustive]
 pub struct Request {
     /// Chosen by the client; the response carries it back.
     pub id: RequestId,

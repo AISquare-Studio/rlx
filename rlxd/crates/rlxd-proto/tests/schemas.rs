@@ -2,12 +2,13 @@
 //! 2020-12 schemas, and in agreement with the types on the handoff's examples (0.10.3,
 //! 7.2 and 7.3) and on what each must refuse.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
-    Data, Envelope, ErrorBody, Event, HelloData, HelloParams, Request, SCHEMA_VERSION, codes,
-    schemas,
+    Data, Envelope, ErrorBody, Event, HelloData, HelloParams, Request, Role, SCHEMA_VERSION,
+    SCHEMA_VERSIONS, VERSION, codes, schemas,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -100,7 +101,7 @@ fn the_checked_in_schemas_are_the_generated_ones() {
 fn every_schema_is_a_valid_draft_2020_12_schema() {
     let files = schemas::all();
     let names: Vec<_> = files.iter().map(|file| file.name).collect();
-    for name in ["envelope.json", "event.json"] {
+    for name in ["envelope.json", "event.json", "event-list.json"] {
         assert!(names.contains(&name), "{name} is not generated");
     }
     for file in files {
@@ -136,6 +137,22 @@ fn the_handoffs_event_validates_and_prints_back_as_itself() {
 }
 
 #[test]
+fn a_list_of_events_validates_as_event_list() {
+    // 7.3's checks validate `jq -s .` of `rlxd events`' lines against event-list.json.
+    let event = example("event.json");
+    let mut later = event.clone();
+    later["seq"] = json!(43);
+    let list = json!([event, later]);
+    assert_eq!(agrees::<Vec<Event>>("event-list.json", &list), list);
+    assert_valid("event-list.json", &json!([]));
+
+    let mut broken = event.clone();
+    broken.as_object_mut().unwrap().remove("seq");
+    both_refuse::<Vec<Event>>("event-list.json", json!([event, broken]));
+    both_refuse::<Vec<Event>>("event-list.json", event);
+}
+
+#[test]
 fn request_frames_validate_and_absent_params_mean_empty_params() {
     let instance = example("request.json");
     assert_eq!(agrees::<Request>("request.json", &instance), instance);
@@ -152,11 +169,23 @@ fn hello_and_its_reply_validate_and_print_back_as_themselves() {
     let reply = example("hello-reply.json");
     assert_eq!(agrees::<HelloData>("hello-reply.json", &reply), reply);
 
-    let without_env = json!({"token": "t", "client": "rlx", "client_version": "0.10.1"});
+    let without_env =
+        json!({"token": "t", "client": "rlx", "client_version": "0.10.1", "role": "cli"});
     assert_eq!(
         agrees::<HelloParams>("hello.json", &without_env),
         without_env
     );
+
+    for (role, name) in [
+        (Role::App, "app"),
+        (Role::Tui, "tui"),
+        (Role::Remote, "remote"),
+        (Role::Cli, "cli"),
+    ] {
+        let printed = serde_json::to_value(HelloParams::new("t", "c", "1", role)).unwrap();
+        assert_eq!(printed["role"], name);
+        assert_eq!(agrees::<HelloParams>("hello.json", &printed), printed);
+    }
 }
 
 #[test]
@@ -214,6 +243,16 @@ fn the_builders_print_the_documented_shapes() {
         serde_json::to_value(&request).unwrap(),
         example("request.json")
     );
+
+    let env = BTreeMap::from([("CLAUDE_CONFIG_DIR".to_owned(), "cc-test".to_owned())]);
+    let hello = HelloParams::new("0123abcd", "rlxapp", "0.1.0", Role::App).with_env(env);
+    assert_eq!(serde_json::to_value(&hello).unwrap(), example("hello.json"));
+
+    let reply = HelloData::new(VERSION, SCHEMA_VERSIONS.to_vec(), Vec::new());
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap(),
+        example("hello-reply.json")
+    );
 }
 
 #[test]
@@ -229,6 +268,12 @@ fn what_a_client_does_not_know_is_ignored_not_refused() {
     agrees::<Event>("event.json", &event);
     let request = json!({"id": 1, "method": "status", "params": {}, "later": 1});
     agrees::<Request>("request.json", &request);
+    let hello = json!({"token": "t", "client": "rlxapp", "client_version": "0.1.0",
+        "role": "app", "later": 1});
+    agrees::<HelloParams>("hello.json", &hello);
+    let reply = json!({"daemon_version": "0.10.1", "schema_versions": [1],
+        "capabilities": [], "later": 1});
+    agrees::<HelloData>("hello-reply.json", &reply);
 }
 
 #[test]
@@ -286,12 +331,21 @@ fn requests_and_hello_refuse_their_wrong_shapes() {
     ] {
         both_refuse::<Request>("request.json", instance);
     }
-    for instance in [
-        json!({"client": "rlxapp", "client_version": "0.1.0"}),
-        json!({"token": "t", "client_version": "0.1.0"}),
-        json!({"token": "t", "client": "rlxapp"}),
-        json!({"token": "t", "client": "rlxapp", "client_version": "0.1.0", "env": {"A": 1}}),
+    let hello = json!({"token": "t", "client": "rlxapp", "client_version": "0.1.0",
+        "role": "app"});
+    for field in ["token", "client", "client_version", "role"] {
+        let mut instance = hello.clone();
+        instance.as_object_mut().unwrap().remove(field);
+        both_refuse::<HelloParams>("hello.json", instance);
+    }
+    for (field, value) in [
+        ("role", json!("robot")),
+        ("role", json!("App")),
+        ("role", json!(null)),
+        ("env", json!({"A": 1})),
     ] {
+        let mut instance = hello.clone();
+        instance[field] = value;
         both_refuse::<HelloParams>("hello.json", instance);
     }
     for instance in [
@@ -340,11 +394,12 @@ fn the_schemas_also_hold_what_the_types_leave_to_the_reader() {
         ("request.json", json!({"id": 1, "method": ""})),
         (
             "hello.json",
-            json!({"token": "", "client": "rlxapp", "client_version": "0.1.0"}),
+            json!({"token": "", "client": "rlxapp", "client_version": "0.1.0", "role": "app"}),
         ),
         (
             "hello.json",
-            json!({"token": "t", "client": "rlxapp", "client_version": "0.1.0", "env": null}),
+            json!({"token": "t", "client": "rlxapp", "client_version": "0.1.0", "role": "app",
+                "env": null}),
         ),
         (
             "envelope.json",

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EventList",
+  "description": "Events as a JSON array, such as `jq -s .` makes of `rlxd events`' lines.",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/Event"
+  },
+  "$defs": {
+    "Event": {
+      "title": "Event",
+      "description": "One event on the stream `events.subscribe` opens.\n\n```json\n{\"schema_version\": 1, \"seq\": 42, \"time\": \"2026-11-25T12:00:00.000Z\", \"topic\": \"run\", \"type\": \"run.text\", \"data\": {}}\n```",
+      "type": "object",
+      "properties": {
+        "data": {
+          "description": "The type's own fields.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "schema_version": {
+          "description": "The schema version this document follows.",
+          "type": "integer",
+          "format": "uint32",
+          "const": 1,
+          "minimum": 0
+        },
+        "seq": {
+          "description": "Strictly increasing per home, from 1. `events.subscribe {since}` resumes after it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "time": {
+          "description": "When it happened: RFC 3339, in UTC, to the millisecond (`2026-11-25T12:00:00.000Z`).",
+          "type": "string",
+          "format": "date-time"
+        },
+        "topic": {
+          "description": "What it is about, such as `run` or `daemon`. A client ignores topics it does not know.",
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "description": "What happened, named under its topic: `run.text`, `daemon.gap`,\n`fleet.agent.spawned`. A client ignores types it does not know.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "schema_version",
+        "seq",
+        "time",
+        "topic",
+        "type",
+        "data"
+      ]
+    }
+  }
+}

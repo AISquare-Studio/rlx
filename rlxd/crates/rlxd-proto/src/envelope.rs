@@ -23,6 +23,7 @@ pub type Data = serde_json::Map<String, serde_json::Value>;
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "Envelope")]
+#[non_exhaustive]
 pub struct Envelope {
     /// The schema version this document follows.
     #[schemars(extend("const" = 1))]
@@ -60,6 +61,7 @@ pub enum Outcome {
 /// Why a request was refused or failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(rename = "Error", title = "Error")]
+#[non_exhaustive]
 pub struct ErrorBody {
     /// A stable, machine-readable code, such as `unauthorized` or `not_a_tty`.
     #[schemars(length(min = 1))]

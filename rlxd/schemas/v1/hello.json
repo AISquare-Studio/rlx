@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HelloParams",
-  "description": "`hello`'s params: who is connecting, and the token that lets them.\n\n```json\n{\"token\": \"…\", \"client\": \"rlxapp\", \"client_version\": \"0.1.0\", \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```",
+  "description": "`hello`'s params: who is connecting, as what, and the token that lets them.\n\n```json\n{\"token\": \"…\", \"client\": \"rlxapp\", \"client_version\": \"0.1.0\", \"role\": \"app\", \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```",
   "type": "object",
   "properties": {
     "client": {
@@ -20,6 +20,10 @@
         "type": "string"
       }
     },
+    "role": {
+      "description": "What the client connects as. rlxd counts its clients by role.",
+      "$ref": "#/$defs/Role"
+    },
     "token": {
       "description": "The contents of `<home>/rlxd/token`.",
       "type": "string",
@@ -29,6 +33,34 @@
   "required": [
     "token",
     "client",
-    "client_version"
-  ]
+    "client_version",
+    "role"
+  ],
+  "$defs": {
+    "Role": {
+      "description": "What a client connects as.",
+      "oneOf": [
+        {
+          "description": "rlxapp. The tool-call gate and `client_connected` jobs need one connected.",
+          "type": "string",
+          "const": "app"
+        },
+        {
+          "description": "rlx's terminal UI.",
+          "type": "string",
+          "const": "tui"
+        },
+        {
+          "description": "rlx's Remote server.",
+          "type": "string",
+          "const": "remote"
+        },
+        {
+          "description": "A command-line client, such as `rlxd call`.",
+          "type": "string",
+          "const": "cli"
+        }
+      ]
+    }
+  }
 }

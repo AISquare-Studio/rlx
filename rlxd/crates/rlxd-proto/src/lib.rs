@@ -6,7 +6,7 @@
 //!   and from the socket, where it also carries the request's `id`;
 //! - [`Request`] (7.2): one newline-delimited request frame on the socket;
 //! - [`HelloParams`] and [`HelloData`] (7.2): the first frame on a connection, and its reply;
-//! - [`Event`] (7.3): one event on the event stream.
+//! - [`Event`] (7.3): one event on the event stream; `event-list.json` is an array of them.
 //!
 //! The checked-in `rlxd/schemas/v1/*.json` are generated from these types by the
 //! `gen-schemas` binary ([`schemas::all`]), and CI fails when they drift.
@@ -22,6 +22,18 @@
 //! [`SCHEMA_VERSION`] is an integer. New fields and new event types keep it, and
 //! clients ignore what they don't know: no type here denies unknown fields. Removing
 //! or renaming a field raises it, and rlxd serves the old version for one minor release.
+//!
+//! The wire structs are `#[non_exhaustive]`: build them with their constructors, and
+//! match them with `..`. A field added later then breaks neither the wire nor a
+//! caller's code.
+//!
+//! # v1 is a draft
+//!
+//! Version 1 is not frozen until the handoff's third revision. rlxapp's architecture
+//! review asks for engine changes that revision will carry. On the wire it is expected
+//! to add a protocol (handshake) version to `hello`, and per-stream sequence numbers
+//! to events alongside the per-home `seq`. Until then, v1 can still change in ways the
+//! rules above would otherwise forbid.
 
 mod envelope;
 mod event;
@@ -32,7 +44,7 @@ pub mod schemas;
 
 pub use envelope::{Data, Envelope, ErrorBody, Outcome, codes};
 pub use event::{Event, topics};
-pub use hello::{HelloData, HelloParams};
+pub use hello::{HelloData, HelloParams, Role};
 pub use marker::{False, True};
 pub use request::{Params, Request, RequestId, methods};
 

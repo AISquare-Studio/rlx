@@ -12,6 +12,7 @@ use crate::{Data, SCHEMA_VERSION};
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "Event")]
+#[non_exhaustive]
 pub struct Event {
     /// The schema version this document follows.
     #[schemars(extend("const" = 1))]
