@@ -30,7 +30,7 @@ class PassthroughCommand(TyperCommand):
             for item in value if isinstance(value, (list, tuple)) else (value,):
                 text = os.fspath(item) if isinstance(item, os.PathLike) else item
                 if isinstance(text, str) and not holds_utf8(text):
-                    raise UsageError(undecodable_said(param.human_readable_name, text), ctx)
+                    raise UsageError(undecodable_said(param.name or "", text), ctx)
         return remaining
 
 

@@ -103,7 +103,7 @@ def add(
         typer.Option(
             "--detail-file",
             help="Read the contract from this file instead of --detail.",
-            click_type=AgentPath(dir_okay=False),
+            parser=AgentPath(dir_okay=False),
         ),
     ] = None,
     rules: Annotated[
