@@ -29,45 +29,33 @@ release may say more; a record without one of the required keys, or with one of 
 type, or whose ``id`` is not its file's, is one this release cannot read (reported, never
 crashed on: ``core.registry``).
 
-================ ========== ==========================================================
-key              type       what
-================ ========== ==========================================================
-``id``           string     its file's name without ``.json``: twelve lower-case hex
-                            digits. Another id makes the record unreadable; no path is
-                            ever built from it.
-``kind``         string     what the daemon is: one of :data:`KINDS` (``rlxd``,
-                            ``brain``, ``watch``, ``serve``, ``remote``,
-                            ``board_watch``). A kind this release does not know is
-                            read and kept as said: a later release's daemon is still
-                            a running rlx process.
-``pid``          integer    its process id, ``> 0``.
-``host``         string     the host name it runs on (``socket.gethostname()``).
-``version``      string     the rlx release it runs (``aisquare-cli``'s version, or
-                            rlxd's).
-``started_at``   string     when it registered: RFC 3339 with an offset, in UTC
-                            (``2026-11-25T12:03:00.123456+00:00``; ``Z`` is read too;
-                            a time without an offset is read as UTC).
-``heartbeat_at`` string     when the record was last written, as ``started_at``.
-``argv``         [string]   the command that starts it again, ``argv[0]`` the program,
-                            never empty. To restart a daemon: run ``argv`` as a new
-                            process, detached from any terminal (no stdin; output to
-                            a null device or a log), in ``cwd`` when the record has
-                            one, with ``AISQUARE_HOME`` naming this home, and do not
-                            wait for it to exit: it may BE the daemon (``serve``), or
-                            start it in a host and return (``watch --detach``, which
-                            opens its tmux window again). Options the daemon took from
-                            its environment are written out, so the command means
-                            what it meant. Recorded whether or not ``restartable``,
-                            for a person to read.
-``restartable``  boolean    whether an upgrade may stop the daemon and start ``argv``
-                            in its place. ``false`` for one a client owns (``serve
-                            --stdio``, whose client holds its stdin and stdout) or a
-                            person's terminal does (a ``watch`` run in the
-                            foreground).
-``cwd``          string or  OPTIONAL: the directory it runs in, absolute, where its
-                 null       restart must run (``serve`` serves the project it was
-                            started in); ``null`` or absent where none could be named.
-================ ========== ==========================================================
+- ``id`` (string): its file's name without ``.json``, twelve lower-case hex digits. Another
+  id makes the record unreadable; no path is ever built from it.
+- ``kind`` (string): what the daemon is, one of :data:`KINDS` (``rlxd``, ``brain``,
+  ``watch``, ``serve``, ``remote``, ``board_watch``). A kind this release does not know is
+  read and kept as said: a later release's daemon is still a running rlx process.
+- ``pid`` (integer): its process id, ``> 0``.
+- ``host`` (string): the host name it runs on (``socket.gethostname()``).
+- ``version`` (string): the rlx release it runs (``aisquare-cli``'s version, or rlxd's).
+- ``started_at`` (string): when it registered, RFC 3339 with an offset, in UTC
+  (``2026-11-25T12:03:00.123456+00:00``; ``Z`` is read too; a time without an offset is read
+  as UTC).
+- ``heartbeat_at`` (string): when the record was last written, as ``started_at``.
+- ``argv`` (array of strings, never empty): the command that starts it again, ``argv[0]`` the
+  program. To restart a daemon: run ``argv`` as a new process, detached from any terminal (no
+  stdin; output to a null device or a log), in ``cwd`` when the record has one, with
+  ``AISQUARE_HOME`` naming this home, and do not wait for it to exit: it may BE the daemon
+  (``serve``), or start it in a host and return (``watch --detach``, which opens its tmux
+  window again). Options the daemon took from its environment are written out, so the
+  command means what it meant. Recorded whether or not ``restartable``, for a person to read.
+- ``restartable`` (boolean): whether an upgrade may stop the daemon and start ``argv`` in its
+  place. ``false`` for one a client owns (``serve --stdio``, whose client holds its stdin and
+  stdout) or a person's terminal does (a ``watch`` run in the foreground).
+- ``cwd`` (string or null), OPTIONAL: the directory it runs in, absolute, where its restart
+  must run (``serve`` serves the project it was started in); ``null`` or absent where none
+  could be named.
+
+Every key but ``cwd`` is required.
 """
 
 from __future__ import annotations
@@ -146,7 +134,7 @@ class Daemon:
     cwd: str | None = None
 
     def to_record(self) -> dict[str, Any]:
-        """The record as written (the module's table)."""
+        """The record as written (the module's list of keys)."""
         return {
             "id": self.id,
             "kind": self.kind,
@@ -163,7 +151,7 @@ class Daemon:
     @classmethod
     def from_record(cls, daemon_id: str, data: object) -> Daemon | None:
         """The record ``data`` holds, as the daemon ``daemon_id`` (its file's name); ``None``
-        for one this release cannot read (the module's table says what it must hold), one
+        for one this release cannot read (the module's list of keys says what it must hold), one
         whose ``id`` is another than its file's included."""
         if not isinstance(data, dict):
             return None
@@ -352,7 +340,7 @@ def describe_this_process(kind: Kind, *, argv: Sequence[str], restartable: bool)
 
 def register(kind: Kind, *, argv: Sequence[str], restartable: bool) -> Registration:
     """Register this process as a daemon of ``kind``, with the command that starts it again
-    (``argv``, the module's table says how it is run) and whether an upgrade may
+    (``argv``, the module's list of keys says how it is run) and whether an upgrade may
     (``restartable``): under ``.gate.lock``, the others read (the dead pruned), its lock taken
     and held and its record written; then its heartbeat started. The caller calls
     :meth:`Registration.deregister` as it exits (or uses :func:`registered`). Raises

@@ -84,7 +84,7 @@ RECORD_SCHEMA: dict[str, Any] = {
         "cwd": {"type": ["string", "null"]},
     },
 }
-"""What a record written here holds, as JSON Schema: the module's table, for a check that
+"""What a record written here holds, as JSON Schema: the module's list of keys, for a check that
 the Python side writes it. ``rlxd/schemas/v1/daemon-record.json`` (handoff §4.1, generated
 from rlxd-proto) is the published one; extra keys are allowed, as a later release may say
 more."""
@@ -100,7 +100,7 @@ def _files() -> list[str]:
 
 
 def _record(**overrides: Any) -> dict[str, Any]:
-    """A record by the module's table; its ``id`` is the file's :func:`_write` gives it,
+    """A record by the module's list of keys; its ``id`` is the file's :func:`_write` gives it,
     unless ``overrides`` says one."""
     now = datetime.now(UTC).isoformat()
     body: dict[str, Any] = {
@@ -158,7 +158,7 @@ def test_a_registered_daemon_is_listed_live_until_it_deregisters() -> None:
         assert (daemon.host, daemon.version, daemon.cwd) == (host_name(), __version__, os.getcwd())
         assert daemons.valid_id(daemon.id)
         assert _files() == [f"{daemon.id}.json", f"{daemon.id}.lock"]
-        # The record on disk is the module's table (handoff §4.1), its id the file's name.
+        # The record on disk is the module's list of keys (handoff §4.1), its id the file's name.
         on_disk = json.loads((daemons.registry_dir() / f"{daemon.id}.json").read_text("utf-8"))
         assert set(on_disk) == {*RECORD_SCHEMA["required"], "cwd"}
         jsonschema.validate(
