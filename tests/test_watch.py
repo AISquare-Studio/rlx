@@ -1356,3 +1356,46 @@ def test_board_w_opens_with_the_tasks_focused(runner: CliRunner, work_dir: Path)
             return pilot.app.focused.id if pilot.app.focused is not None else None
 
     assert asyncio.run(drive()) == "tasks"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "agent_exited",
+        "agent_paused",
+        "agent_renamed",
+        "restarted",
+        "switched",
+        "limited",
+        "limited_handing_over",
+        "handover_failed",
+        "before_limit",
+        "attention",
+        "notice",
+        "prompt_unsent",
+        "linked",
+        "linked_all_done",
+    ],
+)
+def test_the_fleets_own_lines_read_as_words_not_their_kind(kind: str) -> None:
+    """B2's tester (#695): a Stream line's kind chip showed these by their raw kind
+    (``• agent_paused``). Each has words now; a pause is ⏸ (Q4)."""
+    from datetime import UTC, datetime
+
+    from aisquare.cli.ui.board import stream_line
+    from aisquare.cli.watch import _KIND_VERB
+    from aisquare.models import TeamEvent
+
+    event = TeamEvent(
+        id="evt_1",
+        project_id="prj_x",
+        session_id="ses_1",
+        kind=kind,
+        text="what happened",
+        created_at=datetime.now(UTC),
+    )
+    emoji, verb = _KIND_VERB[kind]
+    line = str(stream_line(event, {"ses_1": "coder"}, {"ses_1": "coder-auth"}))
+    # The kind's words (some are the kind itself: "restarted"), never its bare id: "• <kind>".
+    assert f" {emoji} {verb} " in line and f"• {kind}" not in line and "•" not in line
+    assert _KIND_VERB["agent_paused"][0] == "⏸"

@@ -140,6 +140,13 @@ def drive(size: tuple[int, int], fn: Callable[[Any, Host, BoardPanel], Awaitable
     return asyncio.run(run())
 
 
+async def _stream_in_view(pilot: Any, app: Host, panel: BoardPanel) -> None:
+    """Below 120 columns the board opens on Work: ``b`` brings the Stream into view."""
+    if not panel.query_one("#feedpane").display:
+        await pilot.press("b")
+        await settle_page(app)
+
+
 def _row_keys(panel: BoardPanel) -> list[str]:
     table = panel.query_one("#tasks", DataTable)
     return [str(key.value) for key in table.rows]
@@ -248,12 +255,14 @@ def test_slash_filters_the_stream_to_the_lines_that_match(
     assert after == len(EVENTS), "Esc clears the filter"
 
 
+@SIZES
 def test_scrolled_up_the_stream_says_how_many_came_in_and_since_when(
-    board: dict[str, Any],
+    board: dict[str, Any], size: tuple[int, int]
 ) -> None:
     board["events"] = [_event(seq, CODER.id, "note", f"line {seq}") for seq in range(1, 61)]
 
     async def go(pilot: Any, app: Host, panel: BoardPanel) -> str:
+        await _stream_in_view(pilot, app, panel)
         feed = panel.query_one("#feed", OptionList)
         feed.scroll_to(y=0, animate=False)
         await settle_page(app)
@@ -263,7 +272,7 @@ def test_scrolled_up_the_stream_says_how_many_came_in_and_since_when(
         return str(feed.border_subtitle)
 
     since = watch.clock(_event(61, None, "note", "").created_at)
-    assert drive((140, 40), go) == f"↓ 1 new since {since} — End shows them"
+    assert drive(size, go) == f"↓ 1 new since {since} — End shows them"
 
 
 # --- the reader ---------------------------------------------------------------------------------
@@ -342,7 +351,10 @@ def _bound(panel: BoardPanel, widget: Widget, key: str) -> bool:
     return any(key in node._bindings.key_to_bindings for node in (widget, panel))
 
 
-def test_every_part_of_the_board_a_click_acts_on_has_a_key(board: dict[str, Any]) -> None:
+@SIZES
+def test_every_part_of_the_board_a_click_acts_on_has_a_key(
+    board: dict[str, Any], size: tuple[int, int]
+) -> None:
     async def go(pilot: Any, app: Host, panel: BoardPanel) -> list[tuple[str, str | None, bool]]:
         found = []
         for widget in panel.walk_children(Widget):
@@ -352,7 +364,7 @@ def test_every_part_of_the_board_a_click_acts_on_has_a_key(board: dict[str, Any]
                 found.append((f"{type(widget).__name__}#{widget.id}", key, bound))
         return found
 
-    found = drive((140, 40), go)
+    found = drive(size, go)
     assert {name.split("#")[0] for name, _key, _bound in found} >= {
         "PickableTable",
         "StreamList",
@@ -367,8 +379,9 @@ def test_every_part_of_the_board_a_click_acts_on_has_a_key(board: dict[str, Any]
 # --- remembered per project ---------------------------------------------------------------------
 
 
+@SIZES
 def test_a_fold_and_a_filter_survive_a_restart_and_stay_with_their_project(
-    tmp_path: Path,
+    tmp_path: Path, size: tuple[int, int]
 ) -> None:
     from aisquare.cli import watch as watch_mod
 
@@ -380,7 +393,7 @@ def test_a_fold_and_a_filter_survive_a_restart_and_stay_with_their_project(
 
     async def session(project: ProjectInfo, act: bool) -> tuple[list[str], str]:
         app = watch_mod._build_app_class(interval=3600.0, project=project)()
-        async with app.run_test(size=(140, 40)) as pilot:
+        async with app.run_test(size=size) as pilot:
             await pilot.pause()
             if act:
                 app.board.query_one("#tasks").focus()
@@ -427,7 +440,10 @@ def test_the_readers_keys_are_its_own_while_it_is_open(board: dict[str, Any]) ->
 # --- review of #573 -----------------------------------------------------------------------------
 
 
-def test_only_the_lanes_drawn_rows_act_and_more_opens_the_rest(board: dict[str, Any]) -> None:
+@SIZES
+def test_only_the_lanes_drawn_rows_act_and_more_opens_the_rest(
+    board: dict[str, Any], size: tuple[int, int]
+) -> None:
     """Major (1): with more items than rows, the keys past the drawn rows and a click on
     ``+ N more`` opened cards that were not on screen. Now only a drawn row acts, and ``+ N
     more`` (its key or a click) opens the lane to its nine rows."""
@@ -450,7 +466,7 @@ def test_only_the_lanes_drawn_rows_act_and_more_opens_the_rest(board: dict[str, 
         seen["opened"] = panel._reading
         return seen
 
-    seen = drive((140, 40), go)
+    seen = drive(size, go)
     lane = [f"tsk_{n:04d}" for n in range(1, 7)]
     assert len(seen["collapsed"]) == 5 and seen["collapsed"][4].startswith("5     + 4 more")
     assert seen["after_6"] is None, "a key past the drawn rows opens nothing"
@@ -499,7 +515,10 @@ def test_a_click_on_the_heading_under_the_cursor_folds_it_once(board: dict[str, 
     assert folded, "one click, one fold"
 
 
-def test_the_new_lines_marker_counts_only_what_the_filter_shows(board: dict[str, Any]) -> None:
+@SIZES
+def test_the_new_lines_marker_counts_only_what_the_filter_shows(
+    board: dict[str, Any], size: tuple[int, int]
+) -> None:
     """Minor (6): scrolled up under a filter, lines the filter hides were counted as new."""
     board["events"] = [_event(seq, CODER.id, "note", f"keep {seq}") for seq in range(1, 61)]
 
@@ -518,4 +537,83 @@ def test_the_new_lines_marker_counts_only_what_the_filter_shows(board: dict[str,
         await settle_page(app)
         return panel.unseen
 
-    assert drive((140, 40), go) == 1, "one line the filter shows came in below"
+    assert drive(size, go) == 1, "one line the filter shows came in below"
+
+
+# --- review of #573, round 2 (the tester's #695) -------------------------------------------------
+
+
+async def _hide_stream(pilot: Any, app: Host, panel: BoardPanel) -> None:
+    """The Stream out of sight: below 120 columns, Work takes the column (``b``); wide, the
+    reader covers it."""
+    if panel._wide():
+        panel.open_reader("tsk_0002")
+    else:
+        await pilot.press("b")
+    await settle_page(app)
+
+
+async def _show_stream(pilot: Any, app: Host, panel: BoardPanel) -> None:
+    await pilot.press("escape" if panel._reading is not None else "b")
+    await settle_page(app)
+    await pilot.pause()
+
+
+@SIZES
+@pytest.mark.parametrize("scrolled_up", [False, True], ids=["following", "scrolled-up"])
+def test_lines_that_come_in_while_the_stream_is_out_of_sight_are_shown_or_counted(
+    board: dict[str, Any], size: tuple[int, int], scrolled_up: bool
+) -> None:
+    """(1): lines that came in while Work had the column were below the view when the Stream
+    came back, with no "N new" — scroll_end on a hidden list does nothing. Following, the
+    Stream catches up as it shows; scrolled up, the marker counts them."""
+    board["events"] = [_event(seq, CODER.id, "note", f"line {seq}") for seq in range(1, 61)]
+
+    async def go(pilot: Any, app: Host, panel: BoardPanel) -> tuple[bool, int, str]:
+        await _stream_in_view(pilot, app, panel)
+        feed = panel.query_one("#feed", OptionList)
+        if scrolled_up:
+            feed.scroll_to(y=0, animate=False)
+            await settle_page(app)
+        await _hide_stream(pilot, app, panel)
+        board["events"] = [_event(seq, CODER.id, "note", f"line {seq}") for seq in range(61, 66)]
+        panel.refresh_data()
+        await settle_page(app)
+        await _show_stream(pilot, app, panel)
+        return feed.scroll_y == feed.max_scroll_y, panel.unseen, str(feed.border_subtitle or "")
+
+    at_end, unseen, marker = drive(size, go)
+    if scrolled_up:
+        assert not at_end and unseen == 5 and marker.startswith("↓ 5 new since ")
+    else:
+        assert at_end and unseen == 0 and not marker, "it caught up as it showed"
+
+
+@pytest.mark.parametrize("how", ["after-a-resize", "after-a-restart"])
+def test_work_alone_fills_the_column_however_the_stream_was_left(
+    board: dict[str, Any], how: str
+) -> None:
+    """(2): with the Stream showing, a resize wrote the side-by-side width cap (67 of 100), and
+    ``b`` back to Work left it there; a restart on the Stream (remembered) was the same."""
+    if how == "after-a-restart":
+        from aisquare.core.state_file import update_state
+
+        update_state(
+            board_mod.VIEW_KEY + PROJECT.id, {"folds": ["done"], "filter": "", "pane": "stream"}
+        )
+
+    async def go(pilot: Any, app: Host, panel: BoardPanel) -> tuple[bool, int, int]:
+        if how == "after-a-resize":
+            await pilot.press("b")  # the Stream
+            await settle_page(app)
+            await pilot.resize_terminal(101, 30)
+            await settle_page(app)
+        on_stream = panel.query_one("#feedpane").display
+        await pilot.press("b")  # back to Work
+        await settle_page(app)
+        await pilot.pause()
+        return on_stream, panel.query_one("#board-side").outer_size.width, panel.size.width
+
+    on_stream, side, room = drive((100, 30), go)
+    assert on_stream, "the premise: the Stream had the column"
+    assert side == room, f"Work {side} of {room}"

@@ -819,6 +819,8 @@ class BoardPanel(Vertical):
         self.unseen = 0
         """Feed lines that came in below the view while it was not following: the ``↓ N new``
         marker under the feed."""
+        self._catch_up = False
+        """The Stream followed its last line while out of sight: it scrolls there on showing."""
         self._unseen_since: datetime | None = None
         """When the first of :attr:`unseen` was written: the marker's "since"."""
         self.stream_filter = ""
@@ -1393,6 +1395,7 @@ class BoardPanel(Vertical):
         if not fresh:
             return
         following = self.autoscroll and self._following
+        hidden = self.query_one("#feedpane").has_class("collapsed") or self._reading is not None
         for event in fresh:
             self._events_by_id[event.id] = event
             self._feed_order.append(event.id)
@@ -1405,7 +1408,11 @@ class BoardPanel(Vertical):
                 self._terminal_by_task = {}
                 self._terminal_fetched = False
         self._evict_oldest(feed, len(self._feed_order) - self.FEED_LIMIT)
-        if following:
+        if following and hidden:
+            # Out of sight (Work has the column, or the reader is open), the Stream does not
+            # scroll: it catches up when it shows again (B2's tester, #695).
+            self._catch_up = True
+        elif following:
             feed.scroll_end(animate=False)
         else:
             # Scrolled up (or autoscroll off): the view stays where the person put it, and the
@@ -1735,7 +1742,7 @@ class BoardPanel(Vertical):
             )
 
     def _feed_title(self) -> str:
-        title = "live feed"
+        title = "stream"  # the switch's word for it (B2)
         if self._select_mode:
             return f"{title} — SELECT MODE (drag to select, c copies, v resumes)"
         said = []
@@ -1866,6 +1873,14 @@ class BoardPanel(Vertical):
             side.set_class(alone, "alone")
             side.styles.width = None if alone else self._side_width
         self._keep_alone()
+        if self.size.width > 0 and self.size.height > 0:
+            # The ceilings for the layout just set, not the last resize's: a cap from the
+            # side-by-side layout left Work at 67 of 100 alone (B2's tester, #695).
+            self._fit(self.size.width, self.size.height)
+        if stream and self._reading is None and self._catch_up:
+            self._catch_up = False
+            feed = self.query_one("#feed", OptionList)
+            self.call_after_refresh(feed.scroll_end, animate=False)
         self._retitle_feed()
         self._remember_view()  # the half shown, when b or a pick moved it
         focused = self.app.focused
