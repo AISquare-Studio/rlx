@@ -111,3 +111,18 @@ def test_the_logo_and_the_home_key_land_on_the_manager_tab_and_w_still_opens_wel
         ("welcome", None),  # w
         ("project-prj_b", "tab-manager"),  # the home key
     ]
+
+
+def test_the_first_listed_project_is_the_sidebars_first_card(
+    tmp_path: Path, script: Script
+) -> None:
+    """With nothing remembered, home is the first project as the sidebar lists it (its groups,
+    pins and order), not the first in the store: beta pinned above alpha is home."""
+    from aisquare.core.store import store_session
+    from aisquare.services import project_groups
+
+    _two_projects(tmp_path, script)
+    with store_session() as store:
+        project_groups.pin(store, "prj_b")
+
+    assert drive(_home_shown) == ("project-prj_b", "tab-manager")

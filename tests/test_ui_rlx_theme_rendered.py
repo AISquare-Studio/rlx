@@ -38,7 +38,7 @@ from textual.widgets import Button, Footer, Input, OptionList, Static, Tabs
 from aisquare.cli.ui.app import FleetApp
 from tests import test_ui_shell as ui_suite
 from tests.test_ui_agent_mark_contrast import contrast
-from tests.test_ui_shell import Script, drive, fleet_app, seed, settle
+from tests.test_ui_shell import Script, drive, fleet_app, from_welcome, seed, settle
 
 no_real_tmux = ui_suite.no_real_tmux
 script = ui_suite.script
@@ -205,8 +205,9 @@ coral can do no better, so it holds 3:1 (WCAG's floor for a control's marks), th
 
 
 async def _probe_buttons(pilot: Pilot[None], *, compact: bool = False) -> list[Button]:
-    """One button of each variant, and a disabled one of each, on the content side (Welcome)."""
-    app = fleet_app(pilot)
+    """One button of each variant, and a disabled one of each, on the content side (Welcome,
+    opened: start opens home since L1)."""
+    app = await from_welcome(pilot)
     page = app.query_one("#welcome")
     made = []
     for variant in VARIANTS:

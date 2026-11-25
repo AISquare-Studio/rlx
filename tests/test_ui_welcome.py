@@ -1683,7 +1683,8 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
     tmp_path: Path,
 ) -> None:
     """Step 2 answers for the project step 1 chose, and the Doctor answered for the folder
-    asq started in (since L1, the one run at start is about home's project). With a project-scope plugin in one and not the other, the Doctor warned
+    asq started in (since L1, the one run at start is about home's project). With a
+    project-scope plugin in one and not the other, the Doctor warned
     "hooks are missing" under a step 2 that said connected, and its Connect would have
     installed them for every repository (review of #257). While Welcome is shown the
     Doctor's scope is its project; once Choose another clears it, the folder asq started

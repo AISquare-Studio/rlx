@@ -507,6 +507,9 @@ def test_the_spawn_button_with_nothing_selected_opens_on_the_first_project(
     register(tmp_path / "beta", project_id="prj_b", codename="ruby-fox")
 
     async def scenario(pilot: Pilot[None], app: RecordingFleetApp) -> tuple[str, str, str | None]:
+        # Nothing selected: Welcome, as `w` opens it (start opens home since L1, a project).
+        await app.action_welcome()
+        await pilot.pause()
         await pilot.click(spawn_button(app))
         await pilot.pause()
         dialog = app.screen

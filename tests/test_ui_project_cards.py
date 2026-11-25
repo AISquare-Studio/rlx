@@ -53,6 +53,7 @@ from tests.test_ui_shell import (
     composited,
     drive,
     fleet_app,
+    from_welcome,
     refreshed,
     row_for,
     seed,
@@ -200,7 +201,7 @@ def test_an_emoji_nickname_shows_whole_and_keeps_the_cards_columns(
         script[project_id] = [status(project_id, "manager", "manager", "working")]
 
     async def go(pilot: Pilot[None]) -> tuple[str, int, tuple[int, int], tuple[int, int]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         a, b = card_for(app, "prj_a"), card_for(app, "prj_b")
         title = a.query_one(ProjectTitle)
         return (
@@ -523,7 +524,7 @@ def test_the_menu_opens_from_its_button_the_dot_key_and_a_right_click(
     seed(tmp_path, ("prj_a", "alpha", None), ("prj_b", "beta", None))
 
     async def go(pilot: Pilot[None]) -> dict[str, object]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         a, b = card_for(app, "prj_a"), card_for(app, "prj_b")
         hidden_before = not a.query_one(CardMenuButton).visible
         await _click(pilot, a.query_one(ProjectTitle))
