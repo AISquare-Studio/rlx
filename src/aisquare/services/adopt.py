@@ -151,6 +151,13 @@ def _process_args() -> list[Process]:
     return listed
 
 
+def process_args() -> list[Process]:
+    """Every process this user can see, ``(pid, parent pid, arguments)``: the one ``ps`` read
+    of this module (:func:`_process_args`), for a caller that reads a pane's processes as this
+    module does (``services.tmux_panes``)."""
+    return _process_args()
+
+
 def _ancestors(
     processes: Sequence[Process], pid: int, *, until: Callable[[str], bool] | None = None
 ) -> set[int]:

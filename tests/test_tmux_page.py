@@ -16,7 +16,7 @@ import socket
 import sys
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -48,6 +48,7 @@ from aisquare.services.claude_accounts import SIGN_IN_SESSION
 from aisquare.services.tmux_panes import Pane, PaneRefused, Process, TmuxReport
 from tests import pane_harness
 from tests import test_fleet_service as fleet_suite
+from tests.captain_screens import INPUT_BOX, MARK, REAL_CHOOSER, REAL_IDLE, RULE, TOP_RULE
 from tests.test_fleet_adopt import SESSION, _transcript
 from tests.test_fleet_service import FakeTmux, _codename, _facts
 from tests.ui_workers import settle_page, settle_until
@@ -96,6 +97,19 @@ class PagedTmux(FakeTmux):
                 activity=False,
                 session_id=self.session_ids[session],
             )
+        )
+        self.facts[pane_id] = _facts(pane_id, current_command=command)
+        if pid is not None:
+            self.pids[pane_id] = pid
+        return pane_id
+
+    def split(self, of: str, command: str, *, pid: int | None = None) -> str:
+        """A second pane in ``of``'s window, as ``split-window`` makes one."""
+        window = next(w for ws in self.sessions.values() for w in ws if w.pane_id == of)
+        self._counter += 1
+        pane_id = f"%{self._counter}"
+        self.sessions[window.session].append(
+            replace(window, pane_id=pane_id, current_command=command, name=window.name)
         )
         self.facts[pane_id] = _facts(pane_id, current_command=command)
         if pid is not None:
@@ -151,6 +165,7 @@ def world(tmux: PagedTmux, claude_on_path: Path, project: ProjectInfo, ps: list[
     # Claude Code started from a shell, by hand: its native binary names itself by its version.
     claude = tmux.window(session, "by-hand", "2.1.300", pid=7200)
     ps += [Process(7200, 1, 600, "-zsh"), Process(7201, 7200, 590, "claude --model opus")]
+    tmux.screens[claude] = list(REAL_IDLE)  # at its empty prompt: what Adopt types into
     codex = tmux.window(session, "codex-run", "codex", pid=7300)
     ps.append(Process(7300, 1, 40, f"{CODEX} --yolo"))
     renamed = tmux.window(session, agent.label, "zsh", pid=7400)
@@ -735,3 +750,101 @@ def test_the_page_fits_the_small_and_the_usual_terminal(
         ]
 
     assert all(_drive(tmux_panes.read, go, size=size))
+
+
+# --- the reviews of #565: what the page must never act on -------------------------------------
+
+
+def test_a_live_row_no_record_places_keeps_its_pane_from_stop_and_adopt(
+    world: World, tmux: PagedTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #565, finding 1: a live row whose launch record cannot place it (unreadable,
+    from a newer rlx, another project's) placed nothing, so its running agent read "no agent"
+    and Stop killed it. Its own row's word names the pane: never to act on, only to refuse."""
+    real = fleet_service.resolve_place
+
+    def unplaced(row: FleetAgent, record: object = None, config: object = None) -> object:
+        if row.id == world.agent.id:
+            return fleet_service.Unplaced(row, "its launch record could not be read")
+        return real(row, record, config)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fleet_service, "resolve_place", unplaced)
+    tmux.set_command(world.agent_pane, "claude")
+    pane = _by_pane(tmux_panes.read())[world.agent_pane]
+
+    assert pane.agent is None and pane.held is not None and pane.held.id == world.agent.id
+    assert pane.label == f"{world.agent.label} (unplaced)"
+    assert not pane.orphan and not pane.stoppable and not pane.adoptable
+    with pytest.raises(PaneRefused, match="could not be read"):
+        tmux_panes.stop(pane)
+    with pytest.raises(PaneRefused, match="could not be read"):
+        tmux_panes.plan_adopt(pane)
+    assert tmux.killed == [] and tmux.typed == []
+
+
+@pytest.mark.parametrize(
+    ("screen", "refusal"),
+    [
+        (REAL_CHOOSER, "asking: a numbered choice"),  # Enter would pick "1. Yes"
+        ([TOP_RULE, f"{MARK} half a thought", RULE, INPUT_BOX[3]], "a draft"),
+        ([], "busy, not at its empty prompt"),  # nothing drawn: no prompt to type at
+    ],
+    ids=["permission-chooser", "draft", "no-prompt"],
+)
+def test_adopt_types_nothing_into_a_dialog_a_draft_or_a_screen_with_no_prompt(
+    world: World, tmux: PagedTmux, adopt_spy: AdoptSpy, screen: list[str], refusal: str
+) -> None:
+    """Review of #565, finding 2: Claude Code reads no empty prompt off its screen, so Adopt
+    typed /exit and its Enter into whatever it showed. Its screen must read ready, with
+    nothing a line must not go into and no draft; anything else is the human's to finish."""
+    claude = _by_pane(tmux_panes.read())[world.claude]
+    plan = tmux_panes.plan_adopt(claude)
+    tmux.screens[world.claude] = list(screen)
+
+    with pytest.raises(PaneRefused, match=refusal):
+        tmux_panes.adopt(claude, plan)
+    assert tmux.typed == [] and adopt_spy.adopted == [] and tmux.killed == []
+
+
+def test_a_server_restarted_since_a_row_holds_none_of_its_panes(
+    world: World, tmux: PagedTmux
+) -> None:
+    """A server numbers its panes from %0 again: on one that started after the row, the pane
+    id its record names is another pane, nobody's (``PlacedPane.outlived``)."""
+    before = _by_pane(tmux_panes.read())[world.agent_pane]
+    tmux.started = datetime.now(UTC) + timedelta(minutes=1)
+    after = _by_pane(tmux_panes.read())[world.agent_pane]
+
+    assert before.agent is not None and not before.stoppable
+    assert after.agent is None and after.held is None and after.label == "no agent"
+
+
+def test_a_pane_that_shares_its_window_with_an_agents_pane_is_never_stopped(
+    world: World, tmux: PagedTmux, ps: list[Process]
+) -> None:
+    """Stop closes a window, every pane in it: a shell split beside a live agent's pane would
+    take the agent with it. Its row's pane lists the split as a sibling."""
+    beside = tmux.split(world.agent_pane, "zsh", pid=7500)
+    ps.append(Process(7500, 1, 9, "-zsh"))
+    panes = _by_pane(tmux_panes.read())
+
+    assert panes[beside].orphan and panes[beside].shares_window and not panes[beside].stoppable
+    assert panes[world.agent_pane].siblings == (beside,)
+    with pytest.raises(PaneRefused, match="shares its window"):
+        tmux_panes.stop(panes[beside])
+    assert tmux.killed == []
+
+
+def test_stops_confirm_names_the_other_panes_its_window_takes_with_it(
+    world: World, tmux: PagedTmux
+) -> None:
+    """Review of #565, nit: a window of two orphan panes closes whole; the confirm says so."""
+    beside = tmux.split(world.dead, "sh")
+    tmux.die(beside, 0)
+    dead = _by_pane(tmux_panes.read())[world.dead]
+
+    said = tmux_page.stop_question(dead).plain
+    assert dead.stoppable and dead.siblings == (beside,)
+    assert f"other pane ({beside}) closes with it" in said
+    alone = tmux_page.stop_question(_by_pane(tmux_panes.read())[world.shell]).plain
+    assert "other pane" not in alone, "control: a window of one pane"

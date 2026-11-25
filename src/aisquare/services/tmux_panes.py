@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -40,9 +39,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from aisquare.core import procs
+from aisquare.core import process_table, procs
 from aisquare.core import tmux as tmux_core
-from aisquare.core.agent_adapters import adapters, get_adapter, recorded_adapter
+from aisquare.core.agent_adapters import adapters, claude_screen, get_adapter, recorded_adapter
 from aisquare.core.agent_adapters.types import (
     AgentAdapter,
     executable_name,
@@ -54,8 +53,10 @@ from aisquare.core.store import store_session
 from aisquare.core.tmux import ForeignPane, ForeignServer, TmuxError, TmuxServer, TmuxUnavailable
 from aisquare.models import FleetAgent, ProjectInfo
 from aisquare.services import adopt as adopt_service
+from aisquare.services import delivery
 from aisquare.services import fleet as fleet_service
 from aisquare.services import project as project_service
+from aisquare.services.captain import screen as pane_screen
 from aisquare.services.claude_accounts import SIGN_IN_SESSION
 from aisquare.services.watch import DETACHED_SESSION
 
@@ -114,42 +115,17 @@ class Process:
     args: str
 
 
-def _elapsed(text: str) -> int | None:
-    """``ps``'s ``etime``, ``[[dd-]hh:]mm:ss``, in seconds; ``None`` for anything else."""
-    days, _, clock = text.rpartition("-")
-    parts = clock.split(":")
-    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts):
-        return None
-    if days and not days.isdigit():
-        return None
-    seconds = 0
-    for part in parts:
-        seconds = seconds * 60 + int(part)
-    return seconds + (int(days) * 86400 if days else 0)
-
-
 def processes() -> list[Process]:
-    """Every process this user can see, with how long each has run; none where ``ps`` cannot
-    run (Windows has none to ask, and no tmux)."""
-    if sys.platform == "win32":
-        return []
-    try:
-        done = subprocess.run(
-            ["ps", "-A", "-o", "pid=,ppid=,etime=,args="],
-            capture_output=True,
-            text=True,
-            timeout=adopt_service.PS_TIMEOUT,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    listed: list[Process] = []
-    for line in done.stdout.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) >= 3 and fields[0].isdigit() and fields[1].isdigit():
-            args = fields[3] if len(fields) == 4 else ""
-            listed.append(Process(int(fields[0]), int(fields[1]), _elapsed(fields[2]), args))
-    return listed
+    """Every process this user can see, with its arguments and how long it has run; none where
+    ``ps`` cannot run (Windows has none to ask, and no tmux). Two reads of the seams already
+    ruled for it (``core.spawn.SEAMS``): ``core.process_table`` (pid, parent, ``etime``, the one
+    Agent resources samples) and ``adopt.process_args`` (pid, parent, arguments), joined by
+    pid; a process in one read and not the other (it started or ended between them) has no
+    age, or no arguments."""
+    listed = adopt_service.process_args()
+    table = process_table.read()
+    ages = {pid: proc.elapsed for pid, proc in table.procs.items()} if table is not None else {}
+    return [Process(pid, parent, ages.get(pid), args) for pid, parent, args in listed]
 
 
 def _tree(pid: int | None, listed: Sequence[Process]) -> list[Process]:
@@ -217,26 +193,42 @@ class Pane:
     tree: tuple[int, ...] = ()
     """The pane's process and those below it: where its agent's conversation is held."""
     shares_window: bool = False
-    """Another pane of its window is a row's live one: closing the window would end it."""
+    """Another pane of its window is a row's live one (placed, or :attr:`held`): closing the
+    window would end it."""
+    siblings: tuple[str, ...] = ()
+    """The other panes of its window, which a Stop closes with it."""
+    held: FleetAgent | None = None
+    """A live fleet row whose own columns name this pane on rlx's socket while its launch
+    record does not place it (``fleet.Unplaced``: unreadable, from a newer rlx, another
+    project's, no window place). The row's word places nothing, so it is never acted on;
+    it only keeps Stop and Adopt off the pane, as its agent may be running there."""
+    held_why: str | None = None
+    """Why :attr:`held`'s record does not place it."""
 
     @property
     def label(self) -> str:
-        return self.agent.label if self.agent is not None else NO_AGENT
+        if self.agent is not None:
+            return self.agent.label
+        if self.held is not None:
+            return f"{self.held.label} (unplaced)"
+        return NO_AGENT
 
     @property
     def orphan(self) -> bool:
-        """No row or launch record names it."""
-        return self.agent is None
+        """No row names it: no launch record places one here, and no live row's own columns
+        name it either."""
+        return self.agent is None and self.held is None
 
     @property
     def stoppable(self) -> bool:
-        """A dead window, or a live one nobody's: Stop is offered. Never a row's live pane."""
-        return (self.dead or self.agent is None) and not self.shares_window
+        """A dead window, or a live one nobody's: Stop is offered. Never a row's live pane,
+        placed or not, nor a window that holds one."""
+        return (self.dead or self.orphan) and not self.shares_window
 
     @property
     def adoptable(self) -> bool:
         """A live Claude Code or Codex nobody's: Adopt is offered. Never a shell."""
-        return not self.dead and self.agent is None and self.runs in ADOPTABLE
+        return not self.dead and self.orphan and self.runs in ADOPTABLE
 
     @property
     def where(self) -> str:
@@ -316,14 +308,40 @@ def _same_server(address: fleet_service._Address, srv: TmuxServer, config: Fleet
     return os.path.realpath(address.path) == os.path.realpath(here)
 
 
-def _owners(
-    srv: TmuxServer, started: datetime | None, config: FleetSettings
-) -> tuple[dict[str, FleetAgent], set[str]]:
-    """Pane id → the row whose launch record places it on ``srv``, the server that started at
-    ``started``; and every socket a record names (rlx's, whatever it is called now).
+@dataclass(frozen=True)
+class _Owners:
+    """Who the panes of rlx's server are, as the fleet's rows and records say (:func:`_owners`)."""
+
+    placed: dict[str, FleetAgent]
+    """Pane id → the row whose launch record places it there."""
+    held: dict[str, tuple[FleetAgent, str]]
+    """Pane id → a LIVE row no record places whose own columns name it, and why it is not
+    placed: a word that only refuses (:attr:`Pane.held`)."""
+    sockets: set[str]
+    """Every socket a record names: rlx's, whatever it is called now."""
+
+
+def _could_be_here(row: FleetAgent, srv: TmuxServer, config: FleetSettings) -> bool:
+    """Whether ``row``'s own socket columns could name ``srv``, today's: its socket's name, or
+    the path it says its server listened at. Read only to refuse, never to act."""
+    if row.tmux_socket == config.tmux_socket:
+        return True
+    if row.socket_path is None:
+        return False
+    try:
+        here = srv.socket_path()
+    except TmuxUnavailable:
+        return False
+    return os.path.realpath(row.socket_path) == os.path.realpath(here)
+
+
+def _owners(srv: TmuxServer, started: datetime | None, config: FleetSettings) -> _Owners:
+    """Who each pane of ``srv`` (the server that started at ``started``) is (:class:`_Owners`).
 
     Only a row live, or ended since that server started, can have a window on it: one ended
-    before is of an earlier server's. A row no record places names no pane here (``Unplaced``).
+    before is of an earlier server's. A row no record places (``Unplaced``) names no pane
+    here; but while it is LIVE its agent may run in the pane its own columns name, so that
+    pane is held: never stopped or adopted on the page's word (review of #565, finding 1).
     """
     since = started or _EPOCH
     with store_session() as store:
@@ -335,17 +353,21 @@ def _owners(
             if row.ended_at is None or row.ended_at >= since
         ]
     owners: dict[str, FleetAgent] = {}
+    held: dict[str, tuple[FleetAgent, str]] = {}
     sockets: set[str] = set()
     for row in sorted(rows, key=lambda row: row.created_at):
         placement = fleet_service.resolve_place(row, config=config)
         if not isinstance(placement, fleet_service.Placed):
+            if row.ended_at is None and _could_be_here(row, srv, config):
+                why = getattr(placement, "why", "its launch record does not place it")
+                held[row.pane_id] = (row, why)
             continue
         address = placement.pane.address
         sockets.add(address.name if address.path is None else str(address.path))
         if not _same_server(address, srv, config) or placement.pane.outlived(started):
             continue
         owners[placement.pane.pane_id] = placement.agent
-    return owners, sockets
+    return _Owners(owners, held, sockets)
 
 
 def _projects_by_codename() -> dict[str, ProjectInfo]:
@@ -397,11 +419,19 @@ def read(
     found = [window for session in windows.values() for window in session]
     started = next((w.server_started for w in found if w.server_started), None)
     started = started or pids.server_started
-    owners, sockets = _owners(srv, started, config) if found else ({}, set())
+    known = _owners(srv, started, config) if found else _Owners({}, {}, set())
+    owners, sockets = known.placed, known.sockets
     codenames = _projects_by_codename() if found else {}
     table = (listed or processes)() if any(not window.dead for window in found) else []
     by_pid = {each.pid: each for each in table}
-    live_owned = {w.window_id for w in found if not w.dead and w.pane_id in owners}
+    # A live pane a row names, placed or held, by window: closing its window would end it.
+    claimed = set(owners) | set(known.held)
+    live_claimed: dict[str, set[str]] = {}
+    panes_of: dict[str, list[str]] = {}
+    for w in found:
+        panes_of.setdefault(w.window_id, []).append(w.pane_id)
+        if not w.dead and w.pane_id in claimed:
+            live_claimed.setdefault(w.window_id, set()).add(w.pane_id)
     panes: list[Pane] = []
     for window in found:
         agent = owners.get(window.pane_id)
@@ -420,7 +450,9 @@ def read(
             started_at = now - timedelta(seconds=by_pid[pid].elapsed or 0)
         else:
             started_at = None
-        siblings = window.window_id in live_owned and not (agent is not None and not window.dead)
+        alongside = tuple(p for p in panes_of[window.window_id] if p != window.pane_id)
+        shares = bool(live_claimed.get(window.window_id, set()) - {window.pane_id})
+        holder = known.held.get(window.pane_id) if agent is None and not window.dead else None
         panes.append(
             Pane(
                 session=window.session,
@@ -438,7 +470,10 @@ def read(
                 dead_status=window.dead_status,
                 pid=pid,
                 tree=tuple(each.pid for each in tree),
-                shares_window=siblings,
+                shares_window=shares,
+                siblings=alongside,
+                held=holder[0] if holder is not None else None,
+                held_why=holder[1] if holder is not None else None,
             )
         )
     servers = _others(config, sockets, folder, other) if others else []
@@ -507,11 +542,7 @@ def stop(
     config = config or fleet_service.settings()
     now, srv = _again(pane, config, listed)
     if not now.stoppable:
-        raise PaneRefused(
-            f"{now.where} is {now.label}'s, alive: stop it from its agent view, not here"
-            if now.agent is not None
-            else f"{now.where} shares its window with an agent's pane: it is left as it is"
-        )
+        raise PaneRefused(_kept(now))
     srv.kill_window(now.pane_id)
     return f"closed {now.where}"
 
@@ -531,9 +562,24 @@ def plan_adopt(
     return adopt_service.plan_pane(now.tree)
 
 
+def _kept(pane: Pane) -> str:
+    """Why Stop leaves ``pane`` alone."""
+    if pane.agent is not None:
+        return f"{pane.where} is {pane.label}'s, alive: stop it from its agent view, not here"
+    if pane.held is not None:
+        return (
+            f"{pane.where} may be {pane.held.label}'s, alive: its fleet row names this pane, "
+            f"but {pane.held_why or 'its launch record does not place it'}, so it is left as "
+            "it is"
+        )
+    return f"{pane.where} shares its window with an agent's pane: it is left as it is"
+
+
 def _require_adoptable(pane: Pane) -> None:
     if pane.adoptable:
         return
+    if pane.held is not None and not pane.dead:
+        raise PaneRefused(_kept(pane))
     if pane.agent is not None:
         raise PaneRefused(f"{pane.where} is {pane.label}'s already: it is in the fleet")
     if pane.dead:
@@ -598,22 +644,47 @@ def adopt(
 
 
 def _refuse_unless_at_its_prompt(pane: Pane, plan: adopt_service.PanePlan, srv: TmuxServer) -> None:
-    """:class:`PaneRefused` when the pane's agent shows anything but its empty prompt, where
-    one reads it off its screen (``AgentScreen.reads_empty_prompt``): typed there, the exit
-    command and its Enter would pick a dialog's answer or join a draft (``fleet._exit_withheld``
-    kills the window instead; here it is the human's to finish)."""
+    """:class:`PaneRefused` unless the pane's agent sits at its empty prompt, with nothing drawn
+    over it: its screen reads ready (``AgentScreen.ready``: its empty prompt, no turn running,
+    no draft in its composer) and shows nothing a typed line must not go into
+    (``AgentScreen.modal``: a dialog of its own, a permission chooser, a question). Typed
+    anywhere else, the exit command and its Enter answer for the human: an Enter at Claude
+    Code's permission chooser picks "1. Yes" (review of #565, finding 2), and at Codex's
+    ``Switch to …?`` its cheaper model. An agent whose screen reads neither, and a screen
+    tmux will not give, are refused too: nothing is typed on a guess. Here it is the human's
+    to finish (``fleet._exit_withheld`` kills the window instead)."""
     adapter = get_adapter(plan.conversation.agent)
     reader = screen_of(adapter)
-    if not reader.reads_empty_prompt:
-        return
+    if reader.ready_on_screen is None and not reader.reads_empty_prompt:
+        raise PaneRefused(
+            f"{adapter.label}'s screen is not one rlx can read for its prompt, so nothing is "
+            f"typed into {pane.where}: quit it there, then adopt its conversation"
+        )
     try:
-        screen = srv.screen_text(pane.pane_id)
+        lines = list(srv.capture(pane.pane_id).lines)  # with its escapes: a dim placeholder
     except TmuxError as exc:
         raise PaneRefused(f"{pane.where}'s screen could not be read: {exc}") from exc
-    if not reader.at_empty_prompt(screen):
+    screen = pane_screen.strip_escapes(lines)
+    asking = reader.modal(screen)
+    if asking is not None:
         raise PaneRefused(
-            f"{pane.where} shows {adapter.label} at a dialog or a draft, not its empty prompt: "
-            "open it, finish there, then adopt"
+            f"{pane.where} shows {adapter.label} asking: {asking}. Open it, answer there, "
+            "then adopt"
+        )
+    if not reader.ready(screen):
+        raise PaneRefused(
+            f"{pane.where} shows {adapter.label} busy, not at its empty prompt: open it, "
+            "finish there, then adopt"
+        )
+    # A draft: Claude Code's input box holding text (its dim placeholder is none), which its
+    # readiness reads past; or someone typing into the pane in asq just now. As the fleet's
+    # own typing asks (``fleet`` before a delivery, ``delivery.draft_guard``).
+    if claude_screen.composer_text(lines) or delivery.human_typing(
+        srv, pane.pane_id, quiet=fleet_service.settings().draft_quiet_seconds
+    ):
+        raise PaneRefused(
+            f"{pane.where} shows a draft in {adapter.label}'s input: open it, send or clear "
+            "it there, then adopt"
         )
 
 

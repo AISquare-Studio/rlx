@@ -163,11 +163,20 @@ def stop_question(pane: Pane) -> Text:
     question.append(pane.where, style="bold")
     question.append(f"\n{pane.project_name} · {pane.label} · {pane.command} · {pane.state}\n\n")
     question.append(
-        "Its window closes, with what runs in it; nothing else on the server is touched."
+        "Its window closes, with what runs in it."
         if not pane.dead
         else "It has exited: its window closes, and its last screen with it.",
         style="dim",
     )
+    if pane.siblings:
+        others = ", ".join(pane.siblings)
+        many = len(pane.siblings) > 1
+        question.append(
+            f"\nIts window's other pane{'s' if many else ''} ({others}) close{'' if many else 's'} "
+            "with it, and what runs there.",
+            style="bold",
+        )
+    question.append("\nNothing else on the server is touched.", style="dim")
     return question
 
 
@@ -490,6 +499,11 @@ class TmuxView(VerticalScroll):
             return ""
         if pane.agent is not None and not pane.dead:
             return f"{pane.label}'s pane: Open shows its agent view, where it is stopped."
+        if pane.held is not None and not pane.dead:
+            return (
+                f"{pane.held.label}'s fleet row names this pane, but "
+                f"{pane.held_why or 'its launch record does not place it'}: left as it is."
+            )
         if pane.adoptable:
             return f"{pane.command} with no agent: Adopt resumes its conversation in rlx."
         if pane.stoppable:
