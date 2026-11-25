@@ -58,11 +58,18 @@ TIMES = "\N{MULTIPLICATION SIGN}"
 
 
 def home() -> Path:
-    """The aisquare home, as ``core.paths.aisquare_home`` finds it, without importing it."""
-    override = os.environ.get("AISQUARE_HOME")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".aisquare"
+    """rlx's home, as ``core.paths.aisquare_home`` finds it, without importing it: ``$RLX_HOME``,
+    else ``$AISQUARE_HOME``, else ``~/.rlx`` if it is there, else ``~/.aisquare`` if it is,
+    else ``~/.rlx``. Its cache is ``cache/`` in either layout (``core.paths``)."""
+    for variable in ("RLX_HOME", "AISQUARE_HOME"):
+        override = os.environ.get(variable)
+        if override:
+            return Path(override).expanduser()
+    new = Path.home() / ".rlx"
+    if new.exists():
+        return new
+    old = Path.home() / ".aisquare"
+    return old if old.exists() else new
 
 
 def record_dir() -> Path:
@@ -162,7 +169,12 @@ def _account(record: dict[str, Any], fleet: dict[str, Any]) -> str:
             return named
     if config_dir:
         path = Path(config_dir)
-        if path.name.isdigit() and path.parent.name == "claude-accounts":
+        # A managed slot's folder: ``accounts/claude/<n>`` (``core.paths``), or
+        # ``claude-accounts/<n>`` in a home from before 0.10.2.
+        managed = path.parent.name == "claude-accounts" or (
+            path.parent.name == "claude" and path.parent.parent.name == "accounts"
+        )
+        if path.name.isdigit() and managed:
             return f"acct {int(path.name)}"
     if isinstance(labels, dict) and isinstance(labels.get(""), str):
         return str(labels[""])

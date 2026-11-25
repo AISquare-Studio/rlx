@@ -1501,7 +1501,7 @@ def _trusted(site: HookSite) -> bool:
 
 #: Files that make a directory an aisquare home: at least one must be there
 #: before --purge deletes anything.
-HOME_MARKERS = ("config.toml", "context.db", "agents.json")
+HOME_MARKERS = ("config.toml", "rlx.db", "context.db", "agents.json")
 
 
 def fleet_shutdown() -> str:
@@ -1894,10 +1894,12 @@ def _home_there(home: Path) -> tuple[bool, str | None]:
 
 
 def custom_home(home: Path) -> bool:
-    """Whether AISQUARE_HOME moved the home away from ``~/.aisquare``."""
-    if not os.environ.get(paths.HOME_ENV_VAR):
+    """Whether ``$RLX_HOME`` (or ``$AISQUARE_HOME``) moved the home away from where it is by
+    default (``~/.rlx``, or an existing ``~/.aisquare``)."""
+    if paths.named_home() is None:
         return False
-    return agent_core.dir_identity(home) != agent_core.dir_identity(_user_home() / ".aisquare")
+    default = paths.home_of({}, user_home=_user_home())[0]
+    return agent_core.dir_identity(home) != agent_core.dir_identity(default)
 
 
 def purge_refusal(home: Path, *, custom: bool) -> str | None:

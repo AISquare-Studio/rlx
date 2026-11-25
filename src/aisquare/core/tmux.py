@@ -1256,7 +1256,9 @@ class TmuxServer:
         when it starts."""
         wanted = bundled_conf(_pane_clipboard_on())
         try:
-            path = paths.ensure_home() / CONF_NAME
+            paths.ensure_home()
+            path = paths.tmux_conf_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return Path(os.devnull), (
                 f"could not create the rlx home ({exc.strerror or exc}) — the fleet's "

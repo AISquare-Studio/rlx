@@ -173,6 +173,9 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 #: was nothing to compare against. The per-role families, which no list of names
 #: can cover, are :data:`AMBIENT_ENV_PREFIXES` below.
 AMBIENT_ENV_VARS = (
+    # rlx's home by its own name (#30), which wins over the AISQUARE_HOME each test names:
+    # a developer's RLX_HOME left set would put every test's files in their own home.
+    "RLX_HOME",
     # Textual's start theme, which asq's restore ranks between a saved pick and rlx
     # (`cli.ui.theme.restore_theme`): left set, the tests of the default would start in
     # the developer's theme.
@@ -431,7 +434,7 @@ AMBIENT_ENV_PREFIXES = ("AISQUARE_BIN_", "AISQUARE_MODEL_", "AISQUARE_EFFORT_")
 
 #: The home the shell named, if it named one; ``None`` leaves the run to name its own
 #: for wherever no test's own home is in force (:func:`home_outside_a_test`).
-SHELL_HOME: str | None = os.environ.get(HOME_ENV_VAR) or None
+SHELL_HOME: str | None = os.environ.get("RLX_HOME") or os.environ.get(HOME_ENV_VAR) or None
 
 #: The developer's home directory as the run found it, and which project markers
 #: (``core.workspace.ROOT_MARKERS``) it held already: one that appears in it during the

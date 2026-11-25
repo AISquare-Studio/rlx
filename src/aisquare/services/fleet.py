@@ -6196,7 +6196,7 @@ def spawn(
         # `$HOME`, under `~/.aisquare`) as a project; the window's hub, the home's
         # root (`_spawn_board_and_hub`), lands the launcher on the home board, which
         # the store keeps captured (T2).
-        env["AISQUARE_HOME"] = str(paths.aisquare_home().resolve())
+        env["AISQUARE_HOME"] = env["RLX_HOME"] = str(paths.aisquare_home().resolve())
         # Nobody may be watching its pane, which is answered from a phone: a prompt of the
         # agent's own there holds it (`unattended_env`). Claude Code's session-rating survey
         # drew in the captain's pane mid-conversation, and send (rightly) never types into a

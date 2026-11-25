@@ -5266,14 +5266,14 @@ def sign_in_command(account: ClaudeAccount) -> list[str]:
     ]
 
 
-CARRIED_VARS = (paths.HOME_ENV_VAR, core.CONFIG_DIR_VAR, core.TMPDIR_VAR)
+CARRIED_VARS = (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR, core.CONFIG_DIR_VAR, core.TMPDIR_VAR)
 """What decides which directory a slot IS: the aisquare home, and the default's two variables."""
 
 
 def carried_vars(agent: str = AGENT) -> tuple[str, ...]:
     """:data:`CARRIED_VARS` for a window of ``agent``: the home, and that agent's variables."""
     accounts = core.kind(agent)
-    return (paths.HOME_ENV_VAR, accounts.home_env, *accounts.extra_env)
+    return (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR, accounts.home_env, *accounts.extra_env)
 
 
 def carry_environment(
@@ -5312,6 +5312,7 @@ def carry_environment(
     """
     source = os.environ if environ is None else environ
     view = {
+        paths.RLX_HOME_ENV: source.get(paths.RLX_HOME_ENV, ""),
         paths.HOME_ENV_VAR: source.get(paths.HOME_ENV_VAR, ""),
         **core.plain_environment(source, agent=agent),
     }
