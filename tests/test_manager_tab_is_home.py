@@ -12,6 +12,7 @@ Driven as ``test_ui_shell.py`` drives the shell: the real store in the isolated 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from textual.pilot import Pilot
@@ -217,14 +218,28 @@ def test_opening_the_captain_keeps_the_last_used_project(tmp_path: Path, script:
 
 
 def test_home_inside_an_agents_pane_is_the_agents_own_key(
-    tmp_path: Path, script: Script, no_real_tmux: list[tuple[str, ...]]
+    tmp_path: Path, script: Script, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The Home key goes home from the sidebar only (as ``w``): in an attached agent's pane it
-    is the agent's, sent to its pane (a shell's line start), and nothing moves. This catches a
-    later ``priority=True`` on the binding, which would take it from every pane."""
+    is the agent's, handed to the pane's input (a shell's line start), and nothing moves. It
+    fails for a binding that takes Home from the pane: a ``priority=True`` one with ``home`` out
+    of ``FleetApp.SIDEBAR_ACTIONS``, whose gate is what keeps it the sidebar's (checked by hand).
+
+    Read at the pane's own input (``TerminalPane._forward``), not at tmux's command line: with
+    no tmux binary (windows-py3.12, or tmux off PATH) the pane sends nothing to a server, and
+    the recorder read ``[]`` though the key was the pane's (#9's Windows failure)."""
+    from aisquare.cli.ui.terminal import TerminalPane
     from tests.test_ui_shell import row_for
 
     _two_projects(tmp_path, script)
+    handed: list[tuple[str, object]] = []
+    real = TerminalPane._forward
+
+    def forward(pane: TerminalPane, kind: Any, value: str | bytes) -> bool:
+        handed.append((str(kind), value))
+        return real(pane, kind, value)
+
+    monkeypatch.setattr(TerminalPane, "_forward", forward)
 
     async def go(pilot: Pilot[None]) -> tuple[str | None, str]:
         app = fleet_app(pilot)
@@ -232,14 +247,13 @@ def test_home_inside_an_agents_pane_is_the_agents_own_key(
         await pilot.click(row_for(app, "agt_a_manager"))  # a click on its row: the pane has keys
         await settle(app)
         assert type(app.focused).__name__ == "TerminalPane", type(app.focused).__name__
-        no_real_tmux.clear()
+        handed.clear()
         await pilot.press("home")
         await settle(app)
         return app.content.current, type(app.focused).__name__
 
     assert drive(go) == ("agent-agt_a_manager", "TerminalPane"), "the agent's view stays"
-    sent = [argv for argv in no_real_tmux if "send-keys" in argv]
-    assert any("Home" in argv for argv in sent), sent
+    assert ("key", "Home") in handed, handed
 
 
 @pytest.mark.parametrize("remembered", ["project:prj_b", "agent:prj_b/agt_b_manager"])
