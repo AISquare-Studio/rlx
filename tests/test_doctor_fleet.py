@@ -1316,8 +1316,10 @@ def test_the_fleet_terminal_row_says_the_agent_s_keys_in_asq_s_words_in_asq() ->
 
     assert "(every key reaches the agent in fleet attach; F12 detaches)" in shell
     assert shown == shell.replace(
-        "in fleet attach; F12 detaches)", "in its pane; F12 returns to the sidebar)"
+        "server prefix None (every key reaches the agent in fleet attach; F12 detaches)",
+        "every key you type reaches the agent in its pane (F12 returns to the sidebar)",
     )
+    assert "server prefix" not in shown, "no tmux word in asq's Doctor (0.10.2)"
 
 
 def test_the_fleet_terminal_row_names_the_running_servers_tmux_not_the_binary_on_path() -> None:
@@ -1965,3 +1967,59 @@ def test_doctor_says_a_role_on_another_agent_gets_no_deny_token(
     (reviewer,) = [c for c in diagnostics._check_role_tools() if c.name == "reviewer tools"]
     assert reviewer.status == CheckStatus.ok
     assert reviewer.detail.startswith("no deny token: 'aider' is not claude"), reviewer.detail
+
+
+def test_asqs_doctor_shows_no_tmux_words(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.10.2 (the exploratory test's cosmetics): asq's Doctor said "server prefix None",
+    "(-L asq)" and "the private tmux server 'asq'". Built as asq gets them (``doctor --json``
+    under ``IN_APP_ENV``) and shown in its Doctor, the rows say rlx's agent server, and what
+    a key does in the pane. The shell keeps its words (the tests above)."""
+    import asyncio
+
+    from textual.app import App, ComposeResult
+    from textual.widgets import Collapsible, Static
+
+    from aisquare.cli.ui.views.doctor import DoctorView
+    from aisquare.core import program
+    from tests.ui_workers import settle_page
+
+    monkeypatch.setenv(program.IN_APP_ENV, "1")
+    idle = diagnostics._check_fleet(lambda socket: FakeServer(socket=socket))  # no agents yet
+    terminal = FakeServer(version=(3, 7), absent=False)
+    terminal.scripted = {
+        ("show-options", "-gv", "prefix"): "None\n",
+        ("show-environment", "-g"): "",
+    }
+    project = _seed(tmp_path / "repo")
+    _seed(tmp_path / "repo", _agent(project.id, "manager", "%1"))
+    pinned = FakeServer(version=(3, 7), absent=False)
+    pinned.scripted = {("show-environment", "-g"): "AISQUARE_TEAM_HUB=/elsewhere\n"}
+    rows = [
+        _terminal_row(terminal, {}),
+        diagnostics._check_fleet(lambda socket: FakeServer(sessions=(), panes={}, absent=True)),
+        diagnostics._check_fleet_server_env(pinned, boards=[tmp_path / "repo"]),
+        idle,
+    ]
+
+    class Host(App[None]):
+        def compose(self) -> ComposeResult:
+            yield DoctorView(refresh=lambda cwd: rows, id="doctor")
+
+    async def drive() -> str:
+        host = Host()
+        async with host.run_test(size=(160, 50)):
+            view = host.query_one(DoctorView)
+            view.show(rows)
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
+            return "\n".join(str(s.render()) for s in view.query("Static").results(Static))
+
+    shown = asyncio.run(drive())
+
+    for word in ("server prefix", "(-L ", "tmux server '"):
+        assert word not in shown, (word, shown)
+    assert "rlx's agent server" in shown
+    assert "every key you type reaches the agent in its pane" in shown

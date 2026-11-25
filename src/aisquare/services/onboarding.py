@@ -477,6 +477,13 @@ class _KnownFix:
     interactive: bool = False
     """It hands the terminal to an agent's own sign-in: never run under ``--json``
     (:func:`apply_fix` refuses it); the UI opens it in the Accounts page's pane."""
+    label: bool = False
+    """The hint names an agent's label (``fleet switch … coder-1``), passed through verbatim
+    when it has a label's shape (:data:`_LABEL`); a hint without one is no button."""
+
+
+_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+"""A fleet label's shape, matched in full: nothing a shell or a flag could read otherwise."""
 
 
 #: The doctor hints that become buttons. ``init`` is deliberately absent — from
@@ -505,6 +512,15 @@ KNOWN_FIXES: tuple[_KnownFix, ...] = (
         sign_in=True,
         interactive=True,
     ),
+    # A usage-limited agent moved to an account with room (M1; the account-limits row,
+    # #146): `fleet switch --project <ref> <label>`, the account its agent's own default.
+    _KnownFix(
+        "fleet switch", ("fleet", "switch"), "machine", valued=frozenset({"--project"}), label=True
+    ),
+    # The watcher (the fleet-watcher row): stopped first when it stopped looking, then started
+    # in the fleet's own tmux, where it outlives asq.
+    _KnownFix("watch --stop", ("watch", "--stop"), "machine"),
+    _KnownFix("watch --detach", ("watch", "--detach"), "machine"),
 )
 
 _MENTION = re.compile(
@@ -570,6 +586,12 @@ class FixCommand:
             return "Refresh this project"
         if head == ("doctor", "--fix"):
             return "Fix what the checks can"
+        if head == ("fleet", "switch"):
+            return f"Move {self.argv[-1]} to an account with room"
+        if self.argv == ("watch", "--stop"):
+            return "Stop the watcher"
+        if self.argv == ("watch", "--detach"):
+            return "Start the watcher"
         if self.sign_in_slot is not None:
             return f"Sign in account {self.sign_in_slot}"
         return self.label
@@ -621,6 +643,7 @@ def _argv_for(known: _KnownFix, rest: str) -> tuple[str, ...] | None:
             return None
         argv.append(tokens[0])
         index = 1
+    labelled = False
     while index < len(tokens):
         token = tokens[index]
         if token in flags:
@@ -628,8 +651,14 @@ def _argv_for(known: _KnownFix, rest: str) -> tuple[str, ...] | None:
         elif token in known.valued and index + 1 < len(tokens):
             argv += [token, tokens[index + 1]]
             index += 2
+        elif known.label and not labelled and _LABEL.fullmatch(token):
+            argv.append(token)
+            labelled = True
+            index += 1
         else:
             return None
+    if known.label and not labelled:
+        return None
     return tuple(argv)
 
 

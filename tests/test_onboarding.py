@@ -495,6 +495,52 @@ def test_fix_commands_leaves_everything_that_is_not_our_command_as_text() -> Non
     assert fix_commands(not_buttons) == []
 
 
+def test_m3s_new_fixes_map_their_checks_to_an_action_that_runs() -> None:
+    """M3 (0.10.2): the usage-limit row moves each limited agent, one button each; the
+    watcher row stops it, then starts it. Each button says what it does, and its click runs
+    the command (a spy)."""
+    limited = _fix(
+        "claude-account-limits",
+        "Move one to an account with headroom: rlx fleet switch --project amber-otter coder-1; "
+        "rlx fleet switch --project amber-otter tester-2; or wait",
+    )
+    watcher = _fix("fleet watcher", "rlx watch --stop; then rlx watch --detach")
+
+    fixes = fix_commands([limited, watcher])
+
+    assert [(fix.check, fix.argv, fix.title) for fix in fixes] == [
+        (
+            "claude-account-limits",
+            ("fleet", "switch", "--project", "amber-otter", "coder-1"),
+            "Move coder-1 to an account with room",
+        ),
+        (
+            "claude-account-limits",
+            ("fleet", "switch", "--project", "amber-otter", "tester-2"),
+            "Move tester-2 to an account with room",
+        ),
+        ("fleet watcher", ("watch", "--stop"), "Stop the watcher"),
+        ("fleet watcher", ("watch", "--detach"), "Start the watcher"),
+    ]
+    for fix in fixes:
+        spy = Scripted({fix.argv[0]: _result("{}")})
+        assert apply_fix(fix, None, run=spy).ok
+        assert spy.calls == [(["--json", *fix.argv], None)]
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        "rlx fleet switch --project amber-otter",  # no label: nothing to move
+        "rlx fleet switch --project amber-otter coder-1 --to 3",  # a flag the entry does not take
+        "rlx fleet switch --project amber-otter $(whoami)",  # not a label's shape
+        "rlx fleet switch --project amber-otter coder-1 tester-2",  # two labels
+    ],
+)
+def test_a_fleet_switch_hint_that_is_not_one_label_is_no_button(fix: str) -> None:
+    assert fix_commands([_fix("claude-account-limits", fix)]) == []
+
+
 def test_fix_commands_ignores_ok_checks_and_deduplicates_by_command() -> None:
     passing = _fix(
         "claude-code", "(Re)connect it: aisquare agents connect claude-code", CheckStatus.ok

@@ -417,7 +417,10 @@ def _doctor_page(app: FleetApp) -> tuple[str, str, str]:
     """The Doctor page's header, report and status line, as they read."""
     return (
         _shown(app.query_one("#doctor-scope", Static)),
-        _shown(app.query_one("#doctor-report", Static)),
+        # The problems, then the passing rows behind their fold (Q5): the whole report.
+        _shown(app.query_one("#doctor-report", Static))
+        + "\n"
+        + _shown(app.query_one("#doctor-passed-list", Static)),
         _shown(app.query_one("#doctor-status", Static)),
     )
 

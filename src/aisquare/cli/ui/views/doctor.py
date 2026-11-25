@@ -33,7 +33,7 @@ from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Button, Static
+from textual.widgets import Button, Collapsible, Static
 
 from aisquare.cli.ui.sidebar import AccountsSelected
 from aisquare.core import program, selfcli
@@ -152,6 +152,25 @@ def render_checks(
     return text
 
 
+_ORDER = {CheckStatus.fail: 0, CheckStatus.warn: 1, CheckStatus.ok: 2}
+
+
+def problems_first(checks: Iterable[DoctorCheck]) -> tuple[list[DoctorCheck], list[DoctorCheck]]:
+    """``(problems, passed)``: the rows that fail, then those that warn, each in the order the
+    doctor gave them, and the rows that pass (Q5: the problems are what a person opens the
+    Doctor for; the passing checks fold behind one line)."""
+    rows = list(checks)
+    problems = sorted(
+        (c for c in rows if c.status is not CheckStatus.ok), key=lambda c: _ORDER[c.status]
+    )
+    return problems, [c for c in rows if c.status is CheckStatus.ok]
+
+
+def passed_title(count: int) -> str:
+    """The fold's one line for the passing checks."""
+    return f"{count} passed"
+
+
 def ask_text(check: DoctorCheck) -> str:
     """What a manager is handed when asked to fix ``check`` (ruling Q2): the row and its shell
     fix, which the manager, unlike asq's person, runs."""
@@ -235,6 +254,8 @@ class DoctorView(VerticalScroll):
     DoctorView #doctor-status { height: auto; margin-top: 1; }
     DoctorView #doctor-fixes { height: auto; }
     DoctorView #doctor-fixes Button { margin: 1 1 0 0; }
+    DoctorView #doctor-passed { height: auto; margin-top: 1; }
+    DoctorView #doctor-passed-list { height: auto; }
     DoctorView #doctor-machine { height: auto; margin-top: 1; }
     DoctorView #doctor-machine Button { margin: 0 1 0 0; }
     """
@@ -300,6 +321,8 @@ class DoctorView(VerticalScroll):
             rerun.tooltip = "Run every check again now"
             yield rerun
         yield Static("", id="doctor-report")
+        with Collapsible(title=passed_title(0), collapsed=True, id="doctor-passed"):
+            yield Static("", id="doctor-passed-list")
         yield Static("", id="doctor-status")
         yield Vertical(id="doctor-fixes")
         if self.machine:
@@ -395,8 +418,16 @@ class DoctorView(VerticalScroll):
         buttons: dict[str, str] = {}
         for fix in onboarding.fix_commands(self.checks):
             buttons.setdefault(fix.check, fix.title)
-        report = render_checks(self.checks, buttons, manager=self._manager_name())
+        problems, passed = problems_first(self.checks)
+        if problems or not passed:
+            report = render_checks(problems, buttons, manager=self._manager_name())
+        else:
+            report = Text("No problems found.", style="green")
         self.query_one("#doctor-report", Static).update(report)
+        fold = self.query_one("#doctor-passed", Collapsible)
+        fold.title = passed_title(len(passed))
+        fold.display = bool(passed)
+        self.query_one("#doctor-passed-list", Static).update(render_checks(passed))
         self.call_later(self._rebuild_fixes)
 
     def _show_about(self) -> None:

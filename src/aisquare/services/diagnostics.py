@@ -3016,7 +3016,13 @@ def _check_fleet_terminal(
                 "shell's values; agents already running keep the server's)"
             )
         if prefix and prefix != "None":
-            parts.append(f"the running server still has prefix {prefix}")
+            parts.append(
+                prog.detail_advice(
+                    f"the running server still has prefix {prefix}",
+                    app=f"rlx's agent server still runs with an old setting that keeps {prefix} "
+                    "from the agent",
+                )
+            )
             return _warn(
                 name,
                 "; ".join(parts),
@@ -3026,9 +3032,9 @@ def _check_fleet_terminal(
                 f"{fleet_service.settings().tmux_socket} kill-server",
             )
         parts.append(
-            "server prefix None (every key reaches the agent"
-            + prog.detail_advice(
-                " in fleet attach; F12 detaches)", app=" in its pane; F12 returns to the sidebar)"
+            prog.detail_advice(
+                "server prefix None (every key reaches the agent in fleet attach; F12 detaches)",
+                app="every key you type reaches the agent in its pane (F12 returns to the sidebar)",
             )
         )
         return _ok(name, "; ".join(parts))
@@ -3141,7 +3147,7 @@ def _check_watcher() -> DoctorCheck:
         return _warn(
             name,
             f"running (pid {found.pid}), {looked}",
-            f"{prog.word()} watch --stop, then {prog.word()} watch --detach",
+            f"{prog.word()} watch --stop; then {prog.word()} watch --detach",
         )
     return _ok(name, f"running (pid {found.pid}), {looked}")
 
@@ -3257,7 +3263,7 @@ def _check_fleet_server_env(
         # The home of an agent whose tool shell started the server is that spawner's too.
         watched = (*TEAM_ENV_VARS, *agent_identity_env_vars(), *tool_shell_homes(held))
         pinned = {var: held[var] for var in watched if var in held}
-        where = f"the fleet server (-L {srv.socket})"
+        where = prog.detail_advice(f"the fleet server (-L {srv.socket})", app="rlx's agent server")
         if not pinned:
             return _ok(name, f"{where} pins no team variable and no agent's process identity")
         wanted = list(boards) if boards is not None else _fleet_boards(srv.socket, cwd)
@@ -4244,10 +4250,15 @@ def _check_fleet(
                 if taken:
                     unreached.extend(taken)
                     problems.append(
-                        f"{len(taken)} recorded live but another tmux server answers on the "
-                        f"socket of the private tmux server '{sock}', not the one "
-                        f"{'it was' if len(taken) == 1 else 'they were'} started on, which may "
-                        f"still be running: {_fleet_labels(taken, names)}"
+                        prog.detail_advice(
+                            f"{len(taken)} recorded live but another tmux server answers on the "
+                            f"socket of the private tmux server '{sock}', not the one "
+                            f"{'it was' if len(taken) == 1 else 'they were'} started on, which "
+                            f"may still be running: {_fleet_labels(taken, names)}",
+                            app=f"{len(taken)} recorded running, but another program now answers "
+                            "in place of rlx's agent server, which may still be running: "
+                            f"{_fleet_labels(taken, names)}",
+                        )
                     )
             elif servers[sock].server_absent():
                 # tmux itself says there is no server — the one case reap's
@@ -4275,24 +4286,36 @@ def _check_fleet(
                 if down:
                     server_down = True
                     problems.append(
-                        f"{len(down)} recorded live but the private tmux server "
-                        f"'{sock}' is not running: {_fleet_labels(down, names)}"
+                        prog.detail_advice(
+                            f"{len(down)} recorded live but the private tmux server "
+                            f"'{sock}' is not running: {_fleet_labels(down, names)}",
+                            app=f"{len(down)} recorded running, but rlx's agent server is not "
+                            f"running: {_fleet_labels(down, names)}",
+                        )
                     )
                 if held:
                     unreached.extend(held)
                     problems.append(
-                        f"{len(held)} recorded live but no tmux client reaches the private "
-                        f"tmux server '{sock}', as its socket file is gone or could not be "
-                        f"asked, and it may still be running: {_fleet_labels(held, names)}"
+                        prog.detail_advice(
+                            f"{len(held)} recorded live but no tmux client reaches the private "
+                            f"tmux server '{sock}', as its socket file is gone or could not be "
+                            f"asked, and it may still be running: {_fleet_labels(held, names)}",
+                            app=f"{len(held)} recorded running, but rlx cannot reach its agent "
+                            f"server, which may still be running: {_fleet_labels(held, names)}",
+                        )
                     )
             else:
                 # Silent but not absent: a protocol mismatch after a tmux upgrade,
                 # a wedged server, a socket under another TMUX_TMPDIR. The agents
                 # may well be alive; nothing here should vouch otherwise.
                 problems.append(
-                    f"{len(agents)} recorded live but the private tmux server '{sock}' "
-                    f"does not answer (not a missing server — a version mismatch or a "
-                    f"different TMUX_TMPDIR?): {listed}"
+                    prog.detail_advice(
+                        f"{len(agents)} recorded live but the private tmux server '{sock}' "
+                        f"does not answer (not a missing server — a version mismatch or a "
+                        f"different TMUX_TMPDIR?): {listed}",
+                        app=f"{len(agents)} recorded running, but rlx's agent server does not "
+                        f"answer (it may be running after a tmux update): {listed}",
+                    )
                 )
         if exited:
             problems.append(
@@ -4329,16 +4352,28 @@ def _check_fleet(
         if live:
             return _ok(
                 name,
-                f"{len(live)} live agent(s) across {len(sessions)} session(s) on the private "
-                f"tmux server '{today}'",
+                prog.detail_advice(
+                    f"{len(live)} live agent(s) across {len(sessions)} session(s) on the private "
+                    f"tmux server '{today}'",
+                    app=f"{len(live)} agent(s) running in {len(sessions)} project(s)",
+                ),
             )
         if sessions:
             return _ok(
                 name,
-                f"private tmux server '{today}' running with {len(sessions)} session(s); "
-                "no agents recorded live",
+                prog.detail_advice(
+                    f"private tmux server '{today}' running with {len(sessions)} session(s); "
+                    "no agents recorded live",
+                    app="rlx's agent server is running; no agent is",
+                ),
             )
-        return _ok(name, f"no fleet agents; the private tmux server '{today}' is not running")
+        return _ok(
+            name,
+            prog.detail_advice(
+                f"no fleet agents; the private tmux server '{today}' is not running",
+                app="no agents running",
+            ),
+        )
     except Exception as exc:  # diagnostics must never crash
         # A store that will not open is the database check's verdict. Failing
         # open here costs the stale-row report — a label can stay taken and a

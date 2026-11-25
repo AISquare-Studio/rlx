@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from textual.app import App, ComposeResult
 from textual.message import Message
-from textual.widgets import Button, Static
+from textual.widgets import Button, Collapsible, Static
 
 from aisquare.cli.ui.views.doctor import DoctorRefreshed, DoctorView, FixApplied
 from aisquare.core.selfcli import CliResult
@@ -95,7 +95,12 @@ def test_connect_is_one_click_and_the_planned_agents_have_no_button(
             await settle_page(host)
             await pilot.click(f"#{button_id}")
             await settle_page(host)
-            report = str(view.query_one("#doctor-report", Static).render())
+            # The passing rows fold behind one line (Q5): read both, as the page holds them.
+            report = (
+                str(view.query_one("#doctor-report", Static).render())
+                + "\n"
+                + str(view.query_one("#doctor-passed-list", Static).render())
+            )
             return before, _labels(view), report, host.received
 
     before, after, report, received = asyncio.run(drive())
@@ -119,3 +124,123 @@ def test_connect_is_one_click_and_the_planned_agents_have_no_button(
     rows: dict[str, DoctorCheck] = {check.name: check for check in refreshed[0].checks}
     assert rows["claude-code"].status is CheckStatus.ok, rows["claude-code"]
     assert rows["cursor"].status is CheckStatus.ok and rows["cursor"].fix is None
+
+
+# --- Q5: problems first, the passing checks folded --------------------------------------
+
+
+@dataclass
+class Spy:
+    """Every ``aisquare`` call a fix makes, answered ok."""
+
+    calls: list[list[str]] = field(default_factory=list)
+
+    def __call__(self, args: Sequence[str], *, cwd: Path | None = None) -> CliResult:
+        self.calls.append(list(args))
+        return CliResult(argv=list(args), returncode=0, stdout="{}", stderr="")
+
+
+def _row(name: str, status: CheckStatus, fix: str | None = None) -> DoctorCheck:
+    return DoctorCheck(name=name, status=status, detail=f"{name} detail", fix=fix)
+
+
+def test_the_failing_check_comes_first_and_the_passing_ones_fold_behind_one_line() -> None:
+    checks = [
+        _row("python", CheckStatus.ok),
+        _row("git", CheckStatus.ok),
+        _row("database", CheckStatus.fail),
+        _row("tmux", CheckStatus.ok),
+    ]
+
+    async def drive() -> tuple[str, str, bool, bool, str]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)):
+            view.show(checks)
+            await settle_page(host)
+            report = str(view.query_one("#doctor-report", Static).render())
+            fold = view.query_one("#doctor-passed", Collapsible)
+            folded = fold.collapsed
+            title = str(fold.title)
+            fold.collapsed = False  # unfold it, as a click on its title does
+            await settle_page(host)
+            listed = view.query_one("#doctor-passed-list", Static)
+            return report, title, folded, listed.region.height > 0, str(listed.render())
+
+    report, title, folded, shown, listed = asyncio.run(drive())
+
+    assert report.splitlines()[0].startswith("✗ database:"), report
+    assert "python" not in report and "git" not in report and "tmux" not in report
+    assert (title, folded) == ("3 passed", True)
+    assert shown, "unfolded, the passing checks show"
+    assert [line.split(":")[0] for line in listed.splitlines() if line] == [
+        "✓ python",
+        "✓ git",
+        "✓ tmux",
+    ]
+
+
+def test_with_every_check_passing_the_report_says_so_and_folds_them() -> None:
+    checks = [_row("python", CheckStatus.ok), _row("git", CheckStatus.ok)]
+
+    async def drive() -> tuple[str, str]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 40)):
+            view.show(checks)
+            await settle_page(host)
+            return (
+                str(view.query_one("#doctor-report", Static).render()),
+                str(view.query_one("#doctor-passed", Collapsible).title),
+            )
+
+    assert asyncio.run(drive()) == ("No problems found.", "2 passed")
+
+
+# --- M3: the new one-click fixes ---------------------------------------------------------
+
+
+LIMITED = _row(
+    "claude-account-limits",
+    CheckStatus.warn,
+    "Move one to an account with headroom: rlx fleet switch --project amber-otter coder-1; "
+    "or wait — Claude Code continues by itself at the reset",
+)
+STALE_WATCHER = _row("fleet watcher", CheckStatus.warn, "rlx watch --stop; then rlx watch --detach")
+
+
+@pytest.mark.parametrize(
+    ("check", "label", "argv"),
+    [
+        (
+            LIMITED,
+            "Move coder-1 to an account with room",
+            ["fleet", "switch", "--project", "amber-otter", "coder-1"],
+        ),
+        (STALE_WATCHER, "Stop the watcher", ["watch", "--stop"]),
+        (STALE_WATCHER, "Start the watcher", ["watch", "--detach"]),
+    ],
+)
+def test_each_new_fix_is_one_click_that_runs_its_command(
+    check: DoctorCheck, label: str, argv: list[str]
+) -> None:
+    run = Spy()
+
+    async def drive() -> dict[str, str]:
+        view = DoctorView(run=run, refresh=lambda cwd: [check])
+        host = Host(view)
+        async with host.run_test(size=(160, 50)) as pilot:
+            view.show([check])
+            await settle_page(host)
+            labels = _labels(view)
+            button_id = next(key for key, shown in labels.items() if shown == label)
+            view.query_one(f"#{button_id}").scroll_visible(animate=False)
+            await settle_page(host)
+            await pilot.click(f"#{button_id}")
+            await settle_page(host)
+            return labels
+
+    labels = asyncio.run(drive())
+
+    assert label in labels.values(), labels
+    assert ["--json", *argv] in run.calls, run.calls
