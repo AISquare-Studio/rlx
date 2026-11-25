@@ -14482,10 +14482,15 @@ def switch(
                 raise _replaced(project, label, head, agent_id) from None
             if not _the_owners(spawned_by, store):
                 raise _paused_by_the_owner(project, label) from None
-            resume = project_service.fleet_command("resume", project)
+            # asq's Move reaches here (views.agent): it gets the sentence without the command.
             raise FleetError(
-                f"{label} is paused, with no process to move: `{resume}` brings it back, and "
-                "a switch then moves it; nothing was changed"
+                f"{label} is paused, with no process to move: "
+                + prog.shell_advice(
+                    f"`{project_service.fleet_command('resume', project)}` brings it back, and "
+                    "a switch then moves it",
+                    app="resume it, then move it",
+                )
+                + "; nothing was changed"
             ) from None
         # First: every refusal after this one reads the role, the agent and the account,
         # and they are the launch record's (`core.launch_seal`), never the row's.
@@ -14573,14 +14578,21 @@ def switch(
             )
             raise FleetError(
                 f"no account under the line for {label!r}{where} — every other account is "
-                f"over switch_at or unreadable; {stays}, or "
-                f"`{project_service.fleet_command('switch', project, label)}` moves it by "
-                f"hand{said}"
+                f"over switch_at or unreadable; {stays}"
+                + prog.shell_advice(
+                    f", or `{project_service.fleet_command('switch', project, label)}` moves it "
+                    "by hand"
+                )
+                + said
             )
         raise FleetError(
-            f"no other account with headroom for {label!r}{where}"
-            f" — add or enable one (`{prog.word()} accounts`), name one with --to, or wait for "
-            f"the reset{said}"
+            f"no other account with headroom for {label!r}{where} — "
+            + prog.shell_advice(
+                f"add or enable one (`{prog.word()} accounts`), name one with --to, or wait for "
+                "the reset",
+                app="add or enable one on the Accounts page, or wait for the reset",
+            )
+            + said
         )
     target = choice.account
     if crossing:
