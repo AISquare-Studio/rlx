@@ -274,7 +274,12 @@ def _short(path: object) -> str:
 
 
 def _overview_json(overview: AccountsOverview) -> str:
-    return json.dumps(overview.model_dump(mode="json"))
+    """``accounts list --json``: the overview, each slot with its ``keychain`` beside it
+    (``core.keychain_code``: ``none`` off macOS), for an app that never reads the Keychain."""
+    payload = overview.model_dump(mode="json")
+    for row, status in zip(payload["accounts"], overview.accounts, strict=True):
+        row["keychain"] = core.keychain_code(status.account)
+    return json.dumps(payload)
 
 
 def _emit_overview(overview: AccountsOverview, *, with_usage: bool) -> None:
