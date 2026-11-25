@@ -273,7 +273,7 @@ function deferred() {
 function bootPage(hash, answer, globals, base) {
   const address = base || BASE;
   const doc = {
-    title: "",
+    title: "rlx remote", // index.html's <title>
     visibilityState: "visible",
     listeners: {},
     createElement: (tag) => new FakeElement(doc, tag),
@@ -3192,6 +3192,54 @@ async function afterLeaving() {
   return { note: board.toast(), scrolled: transcript.run("UI.main.scrollTop"), back: { landed, left: landed.length < 6 } };
 }
 
+/* Why writes are off, in the machine's own words (0.10.1's final review): the page said
+ * `rlx remote allow-write on` whatever the machine's program is called. A machine whose GET
+ * api/remote says why (here an install whose command is aisquare): the card's note, the
+ * READ-ONLY pill's sheet and the devices' revoke note each say it. An older machine that does
+ * not: the page's own words, no command, until a 403 read_only says the machine's, which
+ * every place says from then on. */
+const THEIR_READ_ONLY = "writes are off — on the machine run `aisquare remote allow-write on`, or switch Allow write actions in the R panel";
+
+async function serverReadOnly() {
+  const notes = (page) => textsOf(page.main().querySelectorAll("p.ro-note"));
+  const devices = { "GET api/devices": () => ({ status: 200, json: TWO_DEVICES }) };
+  const told = bootPage("#/", signedIn(Object.assign({
+    "GET api/remote": () => ({ status: 200, json: { allow_write: false, auto_off_at: null, version: "test", read_only_reason: THEIR_READ_ONLY } }),
+    "GET api/needs": () => ({ status: 200, json: { items: [ITEM] } }),
+  }, devices)));
+  await settle();
+  told.acceptSockets();
+  await settle();
+  const card = notes(told);
+  click(told.run("UI.ro"));
+  await settle();
+  const sheet = told.run("UI.sheet").textContent;
+  told.run("closeSheet()");
+  told.location.hash = "#/devices";
+  await settle();
+  const older = await agentView(Object.assign({
+    "POST api/send-keys": () => ({ status: 403, json: { error: "read_only", message: THEIR_READ_ONLY } }),
+  }, devices));
+  const before = older.run("readOnlyText()");
+  click(buttonNamed(older.main(), "1"));
+  await settle();
+  const refused = { sheet: older.run("UI.sheet").textContent, said: older.run("readOnlyText()") };
+  older.run("closeSheet()");
+  older.location.hash = "#/devices";
+  await settle();
+  return {
+    told: { card, sheet, devices: notes(told) },
+    older: { before, refused, devices: notes(older) },
+  };
+}
+
+/* The strip's top-left, the logo as the app's own top-left has it (0.10.2, the owner's Q3). */
+async function topLeft() {
+  const page = bootPage("#/", signedIn());
+  await settle();
+  return page.run("UI.top.childNodes.map((node) => node.className + ': ' + node.textContent)[1]");
+}
+
 /* What the page says for each refusal and failure (SPEC §6.4), as failText words it; a 413
  * names the most the box takes. */
 async function refusalSentences() {
@@ -3995,6 +4043,8 @@ async function main() {
     crewReplies: await crewReplies(),
     afterLeaving: await afterLeaving(),
     refusalSentences: await refusalSentences(),
+    serverReadOnly: await serverReadOnly(),
+    topLeft: await topLeft(),
     reasonsGiven: await reasonsGiven(),
     socketCloses: await socketCloses(),
     offAndBack: await offAndBack(),

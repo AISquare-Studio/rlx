@@ -35,6 +35,7 @@ from aisquare.cli.ui.sidebar import (
     SETTINGS_KEY,
     YELLOW,
     AgentHeadroom,
+    AppSettingsSelected,
     OthersSection,
     SettingsRow,
     StatusLine,
@@ -46,13 +47,12 @@ from aisquare.cli.ui.views import personas_tab
 from aisquare.cli.ui.views.app_settings import (
     AGENT_TAB,
     PREFERENCES_TAB,
-    REMOTE_TAB,
     AppSettingsView,
 )
 from aisquare.cli.ui.views.personas_tab import PersonasTab
+from aisquare.cli.ui.views.remote import RemotePanel
 from aisquare.cli.ui.views.settings_captain import CaptainToggle
 from aisquare.cli.ui.views.settings_hub import SettingsHubView
-from aisquare.cli.ui.views.settings_remote import RemoteSection
 from aisquare.core import claude_accounts as core
 from aisquare.core.store import store_session
 from aisquare.models import (
@@ -296,18 +296,20 @@ def test_the_keyboard_reaches_settings_and_walks_the_hubs_links_but_never_the_st
         second = app.focused.id if app.focused is not None else None
         await pilot.press("enter")
         await settle_page(app)
-        return keys, first, second, app.content.current
+        return keys, first, second, type(app.screen).__name__
 
     keys, first, second, current = _drive(go)
     assert keys[-1] == SETTINGS_KEY and "" not in keys  # the status line is no row
     assert first == "hub-app-settings"  # opened from the keyboard: the first link has it
-    assert second == "hub-remote"  # Remote control, then Captain, under App settings (#41)
-    assert current == "app-settings"
+    assert second == "hub-remote"  # Remote control, then Captain (#41)
+    assert current == "RemotePanel", "Enter on Remote control: the Remote page (Q17)"
 
 
-def test_remote_control_and_captain_open_app_settings_on_their_own_tab_and_leave_the_hub() -> None:
-    """The owner's placement (#41): Remote in its own tab, the Captain box atop Agent
-    settings — and the hub still has one obvious way in to each, a link that lands there."""
+def test_remote_control_opens_the_remote_page_and_captain_app_settings_last_tab() -> None:
+    """The hub has one obvious way in to each (#41). Remote is one page (Q17), which the
+    hub's *Remote control* opens over the hub, as ``R`` does; the Captain box is the last
+    section of App settings' *Agent settings* (Q18), where the hub's *Captain* lands, scrolled
+    to it."""
 
     async def go(pilot: Pilot[None]) -> dict[str, object]:
         app = _app(pilot)
@@ -315,28 +317,41 @@ def test_remote_control_and_captain_open_app_settings_on_their_own_tab_and_leave
         await pilot.click(app.query_one(SettingsRow))
         await settle_page(app)
         hub = app.query_one(SettingsHubView)
-        seen["hub holds"] = (len(hub.query(RemoteSection)), len(hub.query(CaptainToggle)))
-        for stem in ("remote", "captain"):
-            # From the other tab each time, so the link is what brings its tab forward.
-            if app.query("#app-settings"):
-                app.query_one("#app-settings-tabs", TabbedContent).active = PREFERENCES_TAB
-            await pilot.click(app.query_one(SettingsRow))
-            await settle_page(app)
-            await pilot.click(f"#hub-{stem}")
-            await settle_page(app)
-            tabs = app.query_one("#app-settings-tabs", TabbedContent)
-            seen[stem] = (app.content.current, app.sidebar.selected_key, tabs.active)
+        seen["hub holds"] = (len(hub.query(RemotePanel)), len(hub.query(CaptainToggle)))
+        await pilot.click("#hub-remote")
+        await settle_page(app)
+        screen = app.screen
+        seen["remote"] = (
+            type(screen).__name__,
+            isinstance(screen, RemotePanel) and screen.controller is app.remote,
+            app.content.current,
+        )
+        await pilot.press("escape")
+        await settle_page(app)
+        seen["back"] = (app.screen is app.screen_stack[0], app.content.current)
+        app.post_message(AppSettingsSelected())  # from another tab, so the link brings its own
+        await settle_page(app)
+        app.query_one("#app-settings-tabs", TabbedContent).active = PREFERENCES_TAB
+        await pilot.click(app.query_one(SettingsRow))
+        await settle_page(app)
+        await pilot.click("#hub-captain")
+        await settle_page(app)
+        tabs = app.query_one("#app-settings-tabs", TabbedContent)
+        seen["captain"] = (app.content.current, app.sidebar.selected_key, tabs.active)
         view = app.query_one(AppSettingsView)
-        seen["remote in"] = [node.id for node in view.query_one(RemoteSection).ancestors]
-        seen["captain first"] = view.query_one("#agent-settings").children[0].id
+        box = view.query_one(CaptainToggle)
+        agent = view.query_one("#agent-settings")
+        seen["captain last"] = agent.children[-1] is box
+        seen["captain shown"] = box.region.area > 0 and agent.region.contains_region(box.region)
         return seen
 
     seen = _drive(go)
     assert seen["hub holds"] == (0, 0)
-    assert seen["remote"] == ("app-settings", SETTINGS_KEY, REMOTE_TAB)
+    assert seen["remote"] == ("RemotePanel", True, "settings-hub"), "over the hub, as R opens it"
+    assert seen["back"] == (True, "settings-hub"), "Esc: back on the hub"
     assert seen["captain"] == ("app-settings", SETTINGS_KEY, AGENT_TAB)
-    assert isinstance(seen["remote in"], list) and REMOTE_TAB in seen["remote in"]
-    assert seen["captain first"] == "settings-captain"
+    assert seen["captain last"] is True, "Q18: the tab's last section"
+    assert seen["captain shown"] is True, "scrolled to it, whole in the tab"
 
 
 def test_the_hub_is_titled_settings_and_says_what_each_link_opens() -> None:
