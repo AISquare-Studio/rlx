@@ -1454,9 +1454,17 @@ def test_the_plus_menus_adopt_opens_the_adopt_picker_and_adopts_the_one_picked(
 
     monkeypatch.setattr(adopt_service, "adopt", adopt)
 
-    async def go(pilot: Pilot[None]) -> tuple[str, list[str]]:
+    async def go(pilot: Pilot[None]) -> tuple[str, list[str], int]:
         app = fleet_app(pilot)
         told = toast_log.record(app)
+        refreshes: list[int] = []
+        read = app.refresh_data
+
+        def counted(**kwargs: Any) -> None:
+            refreshes.append(1)
+            read(**kwargs)
+
+        app.refresh_data = counted  # type: ignore[method-assign]
         await pilot.click("#add-project")
         await settle(app)
         menu = app.screen
@@ -1467,13 +1475,18 @@ def test_the_plus_menus_adopt_opens_the_adopt_picker_and_adopts_the_one_picked(
         await settle_until(app, lambda: isinstance(app.screen, AdoptPicker))
         picker = type(app.screen).__name__
         app.screen.query_one(OptionList).highlighted = 0  # the one conversation listed
+        before = len(refreshes)  # the adoption may end within the press itself
         await pilot.press("enter")
         await settle_until(app, lambda: any(t.startswith("✓ adopted") for t in told))
-        return picker, told
+        await settle_until(app, lambda: len(refreshes) > before)
+        return picker, told, len(refreshes) - before
 
-    picker, told = drive(go)
+    picker, told, read_after = drive(go)
     assert picker == "AdoptPicker"
     assert adopted == [conversation.session_id]
+    # What the + menu adds over the Accounts page's flow: the frame read again, so the adopted
+    # agent's row shows on its project's card (review of #563, seq 463).
+    assert read_after >= 1, "no frame was read after the adoption"
     assert any(
         t.startswith("✓ adopted 0a1b2c3d as coder-1: it runs in the fleet now") for t in told
     ), told

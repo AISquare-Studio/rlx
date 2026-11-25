@@ -31,8 +31,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.visual import VisualType
 from textual.widget import Widget
-from textual.widgets import OptionList, Static
-from textual.widgets._toggle_button import ToggleButton
+from textual.widgets import Checkbox, OptionList, Static
 from textual.widgets.option_list import Option
 
 from aisquare.cli.ui.autosave import Autosave
@@ -192,7 +191,7 @@ CHECK_MARK = "✓"
 in both states, told apart by its colour alone."""
 
 
-def _check_glyph(button: ToggleButton) -> str:
+def _check_glyph(button: Checkbox) -> str:
     """A checkbox's glyph for its state (:data:`CHECK_MARK`, or blank)."""
     return CHECK_MARK if button.value else " "
 
@@ -206,9 +205,11 @@ def register_themes(app: App[Any]) -> None:
     each must be able to show a pick made in the other.
     """
     app.register_theme(RLX_THEME)
-    # Textual's class-wide glyph, read per button as it is drawn: every checkbox in either app,
-    # whoever builds it. A radio button keeps its own (``RadioButton.BUTTON_INNER``).
-    setattr(ToggleButton, "BUTTON_INNER", property(_check_glyph))  # noqa: B010
+    # The public Checkbox's glyph, read per box as it is drawn: every checkbox in either app,
+    # whoever builds it. Never ToggleButton's own: SelectionList reads that one off the class
+    # as a string (Textual 8.2.8, ``_selection_list.py``), and a property there broke every
+    # SelectionList (review of #563, seq 463). A RadioButton keeps its own glyph as well.
+    setattr(Checkbox, "BUTTON_INNER", property(_check_glyph))  # noqa: B010
 
 
 def _luminance(colour: Color) -> float:
