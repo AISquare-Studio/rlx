@@ -60,9 +60,14 @@ from uuid import uuid4
 
 from aisquare.core import atomic, locking, paths, procs
 
-Kind = Literal["native", "ssh"]
+Kind = Literal["native", "ssh", "service"]
 """How the person at an asq reaches it: at the machine, or from another one (SSH, a tmux
-whose client attached over SSH, a Codespace)."""
+whose client attached over SSH, a Codespace); or ``service``, the headless rlx that hosts
+what a TUI would (``services.service_host``, #32), which nobody reaches."""
+
+KINDS: tuple[Kind, ...] = ("native", "ssh", "service")
+"""Every kind a record of this release may say; a release that knows fewer reads the rest as
+``native``, so its version gate still counts the service."""
 
 HEARTBEAT_SECONDS = 5.0
 """How often a live asq rewrites its record: well under :data:`STALE_SECONDS`, so an asq on
@@ -146,7 +151,7 @@ class Instance:
                 host=str(data["host"]),
                 version=str(data["version"]),
                 schema=int(data["schema"]),
-                kind=kind if kind in ("native", "ssh") else "native",
+                kind=kind if kind in KINDS else "native",
                 tty=tty if isinstance(tty, str) else None,
                 started_at=_zoned(datetime.fromisoformat(data["started_at"])),
                 heartbeat=_zoned(datetime.fromisoformat(data["heartbeat"])),
@@ -560,7 +565,7 @@ def _read_request(path: Path) -> QuitRequest | None:
         kind = data.get("kind")
         return QuitRequest(
             version=str(data["version"]),
-            kind=kind if kind in ("native", "ssh") else "native",
+            kind=kind if kind in KINDS else "native",
             host=str(data["host"]),
             pid=int(data["pid"]),
         )
@@ -665,6 +670,8 @@ class Registration:
                     kind: Kind | None = None
                     # Outside tmux the answer cannot change: asked once. Inside, a reattach
                     # changes it: asked again every KIND_SECONDS, not at every beat.
+                    if self._instance.kind == "service":
+                        next_kind = None  # nobody attaches to the service: it stays one
                     if next_kind is not None and time.monotonic() >= next_kind:
                         kind = attached_kind()
                         inside = bool(os.environ.get("TMUX"))

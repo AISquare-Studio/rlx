@@ -35,6 +35,7 @@ from aisquare.cli import (
     remote,
     root,
     serve,
+    service,
     task,
     team,
     watcher,
@@ -284,6 +285,7 @@ launch.register(app)  # needs context_settings to forward agent args
 command_reports.register(app)  # `exec` forwards everything after -- to the command
 app.command("serve")(serve.serve)
 app.add_typer(remote.app, name="remote")
+app.add_typer(service.app, name="service")
 app.add_typer(fleet.app, name="fleet")
 app.add_typer(watcher.app, name="watch")
 app.add_typer(code.app, name="code")
