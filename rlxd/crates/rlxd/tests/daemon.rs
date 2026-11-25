@@ -359,3 +359,112 @@ fn the_log_says_what_rlxd_did() {
     let token = std::fs::read_to_string(Home::at(home.root()).token()).unwrap();
     assert!(!log.contains(token.trim()), "the token is never logged");
 }
+
+// --- the daemon registry (4.1) ----------------------------------------------------------
+
+/// The registry's records: each `<id>.json` in `<home>/daemons/`, read.
+fn records(home: &TestHome) -> Vec<(String, Value)> {
+    let dir = Home::at(home.root()).daemons();
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&dir).into_iter().flatten() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if let Some(id) = name.strip_suffix(".json") {
+            let text = std::fs::read_to_string(dir.join(&name)).unwrap();
+            found.push((id.to_owned(), serde_json::from_str(&text).unwrap()));
+        }
+    }
+    found
+}
+
+/// Whether another process holds the lock file at `path`, probed as Python's registry
+/// probes it: taken without waiting, and let go at once.
+fn lock_held(path: &std::path::Path) -> bool {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    match file.try_lock() {
+        Ok(()) => {
+            file.unlock().unwrap();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(e)) => panic!("{}: {e}", path.display()),
+    }
+}
+
+#[test]
+fn while_rlxd_runs_its_record_is_in_the_registry_held_by_its_lock() {
+    let home = TestHome::new();
+    let pid = home.start()["pid"].clone();
+    let found = records(&home);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let (id, record) = &found[0];
+    assert_valid("daemon-record.json", record);
+    assert_eq!(&record["id"], id);
+    assert_eq!(record["kind"], "rlxd");
+    assert_eq!(record["pid"], pid);
+    assert_eq!(record["version"], VERSION);
+    assert_eq!(record["restartable"], true);
+    let argv: Vec<&str> = record["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert!(std::path::Path::new(argv[0]).is_absolute(), "{argv:?}");
+    assert_eq!(argv[1..], ["serve", "--detach"]);
+    let dir = Home::at(home.root()).daemons();
+    assert!(
+        lock_held(&dir.join(format!("{id}.lock"))),
+        "the record's lock is held"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        for name in [
+            format!("{id}.json"),
+            format!("{id}.lock"),
+            ".gate.lock".to_owned(),
+        ] {
+            assert_eq!(mode(&dir.join(&name)), 0o600, "{name}");
+        }
+    }
+
+    let run = home.rlxd(&["stop"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert!(records(&home).is_empty(), "the record is gone after a stop");
+    assert!(
+        !dir.join(format!("{id}.lock")).exists(),
+        "and its lock file"
+    );
+}
+
+#[test]
+fn the_heartbeat_rewrites_the_record() {
+    let home = TestHome::new();
+    home.start();
+    let first = records(&home)[0].1["heartbeat_at"].clone();
+    eventually("a heartbeat within 10 s", || {
+        records(&home)
+            .first()
+            .is_some_and(|(_, record)| record["heartbeat_at"] != first)
+    });
+    let (_, record) = &records(&home)[0];
+    assert_valid("daemon-record.json", record);
+    assert!(record["heartbeat_at"].as_str() > record["started_at"].as_str());
+}
+
+#[test]
+fn after_a_kill_the_record_stays_but_its_lock_is_free() {
+    let home = TestHome::new();
+    let pid = home.start()["pid"].as_u64().unwrap();
+    let (id, _) = records(&home).remove(0);
+    kill_hard(pid);
+    let lock = Home::at(home.root()).daemons().join(format!("{id}.lock"));
+    eventually("the OS freed the killed rlxd's lock", || !lock_held(&lock));
+    assert_eq!(records(&home).len(), 1, "nothing ran to remove the record");
+}

@@ -56,6 +56,13 @@ pub fn is_held(path: &Path) -> io::Result<bool> {
     Ok(!free)
 }
 
+impl Held {
+    /// The lock file, open.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}
+
 impl Drop for Held {
     fn drop(&mut self) {
         os::unlock(&self.file);

@@ -5,10 +5,12 @@
 //! 1. makes the home's `run/`, `rlxd/` and `rlxd/logs/` (each 0700);
 //! 2. takes `run/rlxd.lock`, or exits 1 with `already_running`;
 //! 3. opens the log, and makes the token once;
-//! 4. listens on the socket or pipe, and serves until `stop`, SIGTERM or Ctrl-C.
+//! 4. listens on the socket or pipe;
+//! 5. registers in `<home>/daemons/` (4.1), with a heartbeat every 5 s;
+//! 6. serves until `stop`, SIGTERM or Ctrl-C.
 //!
-//! A stop removes the socket, then lets the lock go, so once the lock is free everything
-//! else is done. `--detach` starts the same in the background and returns once it takes
+//! A stop removes the socket, leaves the registry, then lets the lock go, so once the lock
+//! is free everything else is done. `--detach` starts the same in the background and returns once it takes
 //! a connection, printing its `status`.
 
 use std::fs;
@@ -16,6 +18,7 @@ use std::io;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +28,7 @@ use tokio::task::JoinSet;
 
 use crate::listener::Listener;
 use crate::log::{error, info, warning};
+use crate::registry::{self, Registration};
 use crate::server::{self, Daemon};
 use crate::{cli, lock, log, out, token};
 
@@ -102,6 +106,21 @@ fn run(home: Home, token: String) -> Result<(), String> {
 async fn serve_until_stopped(home: Home, token: String) -> Result<(), String> {
     let mut listener = Listener::bind(&home).map_err(|e| e.to_string())?;
     let endpoint = home.endpoint();
+    let registration = match Registration::register(&home) {
+        Ok(registration) => {
+            info!(
+                "registered in {} as {}",
+                home.daemons().display(),
+                registration.id()
+            );
+            Some(registration)
+        }
+        Err(e) => {
+            warning!("running unregistered, trying again at each heartbeat: {e}");
+            None
+        }
+    };
+    let keeper = Keeper::start(home.clone(), registration);
     let daemon = Daemon::new(home, token, listener.acl());
     tokio::spawn(watch_signals(Arc::clone(&daemon)));
     info!("listening on {endpoint}");
@@ -130,7 +149,50 @@ async fn serve_until_stopped(home: Home, token: String) -> Result<(), String> {
         );
         connections.abort_all();
     }
+    keeper.stop();
     Ok(())
+}
+
+/// Keeps the registration fresh on a thread of its own, and leaves the registry when
+/// stopped.
+struct Keeper {
+    stop: mpsc::Sender<()>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Keeper {
+    fn start(home: Home, mut registration: Option<Registration>) -> Self {
+        let (stop, stopped) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(registry::HEARTBEAT) {
+                match registration.as_mut() {
+                    Some(registration) => {
+                        if let Err(e) = registration.beat() {
+                            warning!("the heartbeat could not be written: {e}");
+                        }
+                    }
+                    None => match Registration::register(&home) {
+                        Ok(registered) => {
+                            info!("registered as {}", registered.id());
+                            registration = Some(registered);
+                        }
+                        Err(e) => warning!("still unregistered: {e}"),
+                    },
+                }
+            }
+            if let Some(registration) = registration {
+                registration.leave();
+                info!("left the registry");
+            }
+        });
+        Self { stop, thread }
+    }
+
+    /// Leaves the registry, and waits until it has.
+    fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+    }
 }
 
 #[cfg(unix)]
@@ -283,7 +345,8 @@ fn prepare(home: &Home) -> io::Result<()> {
     Ok(())
 }
 
-fn private_dir(dir: &Path) -> io::Result<()> {
+/// Makes `dir`, 0700 on POSIX, narrowing a wider one.
+pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {

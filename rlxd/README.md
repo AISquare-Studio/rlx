@@ -41,6 +41,10 @@ rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T
   `\\.\pipe\rlxd-<hash of home>`, whose DACL holds one entry, for the user rlxd runs as.
   A client checks that the pipe's server runs as its own user before it sends the token.
 - **The token,** `<home>/rlxd/token` (0600), is made once. `hello` must carry it.
+- **The registry.** While it runs, rlxd has a `kind: "rlxd"` record in `<home>/daemons/`
+  (4.1), in the format of Python's `core.registry` and `core.daemons`: held by its
+  `<id>.lock`, rewritten every 5 s, removed on stop. After a kill its lock is free, so it
+  reads as dead.
 - **The gate.** No connection may be the gate yet: every `hello {role: "app"}` gets
   `not_gate` until gate pairing lands (5.1).
 - **Logs** are `<home>/rlxd/logs/rlxd.log`, rotated at 5 MiB, three kept.
