@@ -67,6 +67,44 @@ pub(crate) fn at_least(field: &str, value: u64, min: u64) -> Result<(), Invalid>
     Ok(())
 }
 
+/// One snake_case name: a lowercase letter, then lowercase letters, digits and `_`.
+pub(crate) const SNAKE: &str = "[a-z][a-z0-9_]*";
+
+fn is_snake(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// An event's topic: one snake_case name, such as `run` or `needs_you`.
+pub(crate) fn topic(field: &str, value: &str) -> Result<(), Invalid> {
+    if is_snake(value) {
+        return Ok(());
+    }
+    Err(Invalid::new(
+        field,
+        format!("{value:?} is not a snake_case topic, such as run or needs_you"),
+    ))
+}
+
+/// An event's type: `<topic>.<event>`, the event one or more snake_case names joined by
+/// `.`, such as `run.text` or `connector.login.open_url`.
+pub(crate) fn event_type(field: &str, value: &str, topic: &str) -> Result<(), Invalid> {
+    let event = value
+        .strip_prefix(topic)
+        .and_then(|rest| rest.strip_prefix('.'));
+    match event {
+        Some(event) if event.split('.').all(is_snake) => Ok(()),
+        _ => Err(Invalid::new(
+            field,
+            format!(
+                "{value:?} is not {topic}.<event>, with the event in snake_case, such as \
+                 {topic}.started"
+            ),
+        )),
+    }
+}
+
 /// RFC 3339's `date-time`, as JSON Schema's `format: date-time` takes it:
 /// `2026-11-25T12:00:00.000Z`, or with an offset such as `+00:00`.
 pub(crate) fn date_time(field: &str, value: &str) -> Result<(), Invalid> {

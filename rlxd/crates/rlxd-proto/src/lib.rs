@@ -21,14 +21,20 @@
 //!
 //! - **Parsing refuses** what the schema refuses: another `schema_version` ([`V1`]), a
 //!   missing or contradictory field, an empty code, a `time` that is not RFC 3339, a
-//!   `run` event without its run's sequence. The error names the field at fault.
+//!   type that is not `<topic>.<event>`, a `run` event without its run fields. The error
+//!   names the field at fault.
 //! - **The constructors refuse it too,** returning [`Invalid`], and printing a value
 //!   whose fields were changed into a broken shape fails rather than emit it.
 //! - **Each type's `validate()`** is that one set of rules, for code that builds a value
 //!   field by field.
 //!
-//! The one difference JSON Schema cannot avoid: it reads `1.0` as the integer `1`, which
-//! the types refuse. No producer of these documents writes integers that way.
+//! JSON Schema cannot express two of the rules, so the types are stricter there:
+//!
+//! - It reads `1.0` as the integer `1`, which the types refuse. No producer of these
+//!   documents writes integers that way.
+//! - It cannot compare one field with another. So the schema checks that an event's
+//!   `type` starts with its `topic` only for the topics v1 lists, while the types check
+//!   it for every topic.
 //!
 //! The doc comments of these types and their fields become the schemas' descriptions,
 //! so they are written for an app's developer and carry no rustdoc links.
@@ -81,9 +87,13 @@
 //!
 //! - **`seq`**, on every event: strictly increasing per home, across every topic.
 //!   `events.subscribe {since}` resumes after it.
-//! - **`data.run_seq`**, on every event of the `run` topic, next to `data.run_id`:
-//!   strictly increasing per run, from 1. Replaying one run from a known `run_seq` needs
-//!   it ([`Event::for_run`], [`Event::run_scope`]).
+//! - **`data.run_seq`**, on every event of the `run` topic: strictly increasing per run,
+//!   from 1. Replaying one run from a known `run_seq` needs it.
+//!
+//! Every run event's `data` also carries the run's other fields (7.5): `run_id`, `kind`
+//! and `attempt`, which starts at 1 and goes up by one with each `run.resume`, plus
+//! `job_id` when a scheduler job fired the run. [`Event::for_run`] sets them, and
+//! [`Event::run_scope`] reads them back.
 //!
 //! # Versioning
 //!

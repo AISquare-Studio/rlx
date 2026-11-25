@@ -344,8 +344,8 @@ fn every_builder_prints_what_its_schema_accepts() {
         42,
         TIME,
         "run.text",
-        RunScope::new("…", 3),
-        data(json!({"kind": "task"})),
+        RunScope::new("…", 3, "task", 1),
+        Data::new(),
     );
     let started = Event::new(
         41,
@@ -361,7 +361,23 @@ fn every_builder_prints_what_its_schema_accepts() {
         "later.thing",
         Data::new(),
     );
+    let fired = Event::for_run(
+        43,
+        TIME,
+        "run.started",
+        RunScope::new("r", 1, "widget_refresh", 2).with_job("job_1"),
+        Data::new(),
+    );
+    let login = Event::new(
+        44,
+        TIME,
+        topics::CONNECTOR,
+        "connector.login.open_url",
+        data(json!({"login_id": "l", "id": "claude.ai Slack", "url": "https://x"})),
+    );
     for (event, shape) in [
+        (fired, None),
+        (login, None),
         (run_text, Some("event.json")),
         (started, Some("event-daemon.json")),
         (offset, None),
@@ -466,15 +482,54 @@ fn the_builders_refuse_what_the_schemas_refuse() {
         refused(Event::new(1, TIME, run, "run.text", none())),
         "data.run_id"
     );
-    let no_id = RunScope::new("", 1);
+    let no_id = RunScope::new("", 1, "task", 1);
     assert_eq!(
         refused(Event::for_run(1, TIME, "run.text", no_id, none())),
         "data.run_id"
     );
-    let no_seq = RunScope::new("r", 0);
+    let no_seq = RunScope::new("r", 0, "task", 1);
     assert_eq!(
         refused(Event::for_run(1, TIME, "run.text", no_seq, none())),
         "data.run_seq"
+    );
+    let no_kind = RunScope::new("r", 1, "", 1);
+    assert_eq!(
+        refused(Event::for_run(1, TIME, "run.text", no_kind, none())),
+        "data.kind"
+    );
+    let no_attempt = RunScope::new("r", 1, "task", 0);
+    assert_eq!(
+        refused(Event::for_run(1, TIME, "run.text", no_attempt, none())),
+        "data.attempt"
+    );
+    let no_job = RunScope::new("r", 1, "task", 1).with_job("");
+    assert_eq!(
+        refused(Event::for_run(1, TIME, "run.text", no_job, none())),
+        "data.job_id"
+    );
+    // G3: the type is <topic>.<event>, the event in snake_case.
+    let scope = || RunScope::new("r", 1, "task", 1);
+    for wrong in [
+        "daemon.gap",
+        "run",
+        "run.",
+        "run.Text",
+        "run..text",
+        "run.text-x",
+    ] {
+        assert_eq!(
+            refused(Event::for_run(1, TIME, wrong, scope(), none())),
+            "type",
+            "{wrong}"
+        );
+    }
+    assert_eq!(
+        refused(Event::new(1, TIME, "Run", "Run.text", none())),
+        "topic"
+    );
+    assert_eq!(
+        refused(Event::new(1, TIME, "needs-you", "needs-you.raised", none())),
+        "topic"
     );
 
     assert_eq!(refused(Request::new(id(1), "", none())), "method");
@@ -506,7 +561,7 @@ fn a_value_broken_after_it_was_built_does_not_print() {
     error.code.clear();
     assert!(serde_json::to_value(Envelope::err(error)).is_err());
 
-    let scope = RunScope::new("r", 1);
+    let scope = RunScope::new("r", 1, "task", 1);
     let mut event = Event::for_run(1, TIME, "run.text", scope, Data::new()).unwrap();
     event.data.remove("run_seq");
     assert!(serde_json::to_value(&event).is_err());
@@ -689,18 +744,28 @@ fn an_event_has_every_field_and_a_run_event_its_run() {
 
     let run = example("event.json");
     let parsed: Event = serde_json::from_value(run.clone()).unwrap();
-    assert_eq!(parsed.run_scope(), Some(RunScope::new("…", 3)));
+    assert_eq!(parsed.run_scope(), Some(RunScope::new("…", 3, "task", 1)));
     // The handoff's rev 2 example, before the per-run sequence: valid no more.
     let error = both_refuse::<Event>("event.json", with(&run, "data", json!({})));
     assert!(error.contains("data.run_id"), "{error}");
+    // G2: §7.5's run fields, every one required but job_id.
     for (field, value) in [
         ("run_seq", None),
         ("run_id", None),
+        ("kind", None),
+        ("attempt", None),
         ("run_seq", Some(json!(0))),
         ("run_seq", Some(json!(-1))),
         ("run_seq", Some(json!("3"))),
         ("run_id", Some(json!(""))),
         ("run_id", Some(json!(7))),
+        ("kind", Some(json!(""))),
+        ("kind", Some(json!(1))),
+        ("attempt", Some(json!(0))),
+        ("attempt", Some(json!("1"))),
+        ("job_id", Some(json!(""))),
+        ("job_id", Some(json!(7))),
+        ("job_id", Some(json!(null))),
     ] {
         let mut instance = run.clone();
         match value {
@@ -712,9 +777,66 @@ fn an_event_has_every_field_and_a_run_event_its_run() {
         let error = both_refuse::<Event>("event.json", instance);
         assert!(error.contains(&format!("data.{field}")), "{error}");
     }
-    // Other topics need neither.
+    let mut fired = run.clone();
+    fired["data"]["job_id"] = json!("job_1");
+    let parsed = agrees::<Event>("event.json", &fired);
+    let scope = serde_json::from_value::<Event>(parsed).unwrap().run_scope();
+    assert_eq!(scope.and_then(|s| s.job_id), Some("job_1".to_owned()));
+    // Other topics need none of them.
     let gap = Event::new(1, TIME, "daemon", "daemon.gap", Data::new()).unwrap();
     assert_eq!(gap.run_scope(), None);
+}
+
+#[test]
+fn an_events_type_is_its_topic_then_a_snake_case_event() {
+    let run = example("event.json");
+    let daemon = example("event-daemon.json");
+    // G3: topic run with type daemon.gap, and every other shape the rule refuses.
+    for (base, wrong) in [
+        (&run, "daemon.gap"),
+        (&daemon, "run.text"),
+        (&run, "run"),
+        (&run, "run."),
+        (&run, "run.Text"),
+        (&run, "run..text"),
+        (&run, "run.text-x"),
+        (&run, "run.text."),
+        (&run, ".run.text"),
+    ] {
+        let error = both_refuse::<Event>("event.json", with(base, "type", json!(wrong)));
+        assert!(error.contains("type"), "{wrong}: {error}");
+    }
+    for topic in ["Run", "needs-you", "1run", ""] {
+        let instance = with(
+            &with(&daemon, "topic", json!(topic)),
+            "type",
+            json!(format!("{topic}.x")),
+        );
+        both_refuse::<Event>("event.json", instance);
+    }
+    // Rev 5's own names, dotted ones included (7.7).
+    for (topic, kind) in [
+        ("connector", "connector.login.open_url"),
+        ("fleet", "fleet.agent_spawned"),
+        ("needs_you", "needs_you.raised"),
+        ("hook", "hook.user_prompt_submit"),
+    ] {
+        let instance = with(&with(&daemon, "topic", json!(topic)), "type", json!(kind));
+        agrees::<Event>("event.json", &instance);
+    }
+    // A topic this version doesn't list keeps the rule's shape in both. JSON Schema
+    // can't compare one field with another, so only the type checks that the prefix is
+    // the topic there; for the listed topics, both do (above).
+    let later = with(
+        &with(&daemon, "topic", json!("later")),
+        "type",
+        json!("later.thing"),
+    );
+    agrees::<Event>("event.json", &later);
+    let mismatched = with(&later, "type", json!("other.thing"));
+    assert_valid("event.json", &mismatched);
+    assert!(serde_json::from_value::<Event>(mismatched).is_err());
+    both_refuse::<Event>("event.json", with(&later, "type", json!("later")));
 }
 
 #[test]

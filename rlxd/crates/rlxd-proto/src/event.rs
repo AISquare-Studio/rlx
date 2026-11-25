@@ -1,28 +1,28 @@
-//! The event envelope, and the per-run sequence that run events carry (handoff 0.10.3
-//! rev 5, 7.3).
+//! The event envelope, and the run fields that run events carry (handoff 0.10.3 rev 5,
+//! 7.3 and 7.5).
 
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 
 use crate::Data;
-use crate::check::{self, Invalid};
+use crate::check::{self, Invalid, SNAKE};
 use crate::marker::V1;
 
 /// One event on the stream `events.subscribe` opens.
 ///
 /// ```json
 /// {"schema_version": 1, "seq": 42, "time": "2026-11-25T12:00:00.000Z", "topic": "run",
-///  "type": "run.text", "data": {"run_id": "…", "run_seq": 3, "kind": "task"}}
+///  "type": "run.text", "data": {"run_id": "…", "run_seq": 3, "kind": "task", "attempt": 1}}
 /// ```
 ///
 /// Two sequences number events. `seq` is per home: every event has one, and
 /// `events.subscribe {since}` resumes after it. `data.run_seq` is per run: every event
-/// whose topic is `run` has one, next to `data.run_id`, so a client can replay one run
-/// from a known point.
+/// whose topic is `run` has one, with the run's `run_id`, `kind`, `attempt` and
+/// `job_id?`, so a client can replay one run from a known point.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(remote = "Self")]
-#[schemars(title = "Event", transform = run_scope_rule)]
+#[schemars(title = "Event", transform = event_rules)]
 #[non_exhaustive]
 pub struct Event {
     /// The schema version this document follows.
@@ -34,19 +34,22 @@ pub struct Event {
     /// When it happened: RFC 3339, in UTC, to the millisecond (`2026-11-25T12:00:00.000Z`).
     #[schemars(extend("format" = "date-time"))]
     pub time: String,
-    /// What it is about, such as `run` or `daemon`. A client ignores topics it does not know.
-    #[schemars(length(min = 1))]
+    /// What it is about, in snake_case, such as `run` or `needs_you`. A client ignores
+    /// topics it does not know.
+    #[schemars(regex(pattern = r"^[a-z][a-z0-9_]*$"))]
     pub topic: String,
-    /// What happened, as `<topic>.<event>` with the event in snake_case: `run.text`,
-    /// `daemon.gap`, `fleet.agent_spawned`. A client ignores types it does not know.
-    #[schemars(length(min = 1))]
+    /// What happened: `<topic>.<event>`, the event in snake_case, such as `run.text`,
+    /// `fleet.agent_spawned` or `connector.login.open_url`. It starts with this event's
+    /// own topic. A client ignores types it does not know.
+    #[schemars(regex(pattern = r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$"))]
     pub r#type: String,
-    /// The type's own fields. On the `run` topic, also `run_id` and `run_seq`.
+    /// The type's own fields. On the `run` topic, also `run_id`, `run_seq`, `kind`,
+    /// `attempt` and `job_id?`.
     pub data: Data,
 }
 
-/// Where a `run`-topic event sits in its run's own stream: `data.run_id` and
-/// `data.run_seq`.
+/// The run fields every `run`-topic event carries in its `data` (7.5): which run, its
+/// place in that run's own stream, and which attempt of it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct RunScope {
@@ -55,49 +58,78 @@ pub struct RunScope {
     /// Strictly increasing per run, from 1. Replaying a run from `run_seq` N gives every
     /// event of that run after N, in order.
     pub run_seq: u64,
+    /// The run's kind, such as `task` or `widget_refresh`.
+    pub kind: String,
+    /// Which attempt of the run, from 1. `run.resume` starts the next one.
+    pub attempt: u64,
+    /// The scheduler job that fired the run, if one did.
+    pub job_id: Option<String>,
 }
 
-/// The schema's half of the per-run sequence: an event on the `run` topic must carry
-/// `data.run_id` and `data.run_seq`.
-fn run_scope_rule(schema: &mut Schema) {
-    schema.insert(
-        "if".to_owned(),
-        json!({
-            "properties": {"topic": {"const": topics::RUN}},
-            "required": ["topic"],
-        }),
-    );
-    schema.insert(
-        "then".to_owned(),
-        json!({
-            "properties": {"data": {
-                "properties": {
-                    "run_id": {
-                        "description": "The run this event belongs to.",
-                        "type": "string",
-                        "minLength": 1,
-                    },
-                    "run_seq": {
-                        "description": "Strictly increasing per run, from 1.",
-                        "type": "integer",
-                        "minimum": 1,
-                    },
+/// The schema's half of the event rules:
+/// - on each topic this version lists, `type` starts with that topic;
+/// - an event on the `run` topic carries `run_id`, `run_seq`, `kind` and `attempt`, and
+///   may carry `job_id`.
+fn event_rules(schema: &mut Schema) {
+    let on =
+        |topic: &str| json!({"properties": {"topic": {"const": topic}}, "required": ["topic"]});
+    let mut rules: Vec<Value> = topics::ALL
+        .iter()
+        .map(|topic| {
+            json!({
+                "if": on(topic),
+                "then": {"properties": {"type": {
+                    "pattern": format!("^{topic}\\.{SNAKE}(\\.{SNAKE})*$"),
+                }}},
+            })
+        })
+        .collect();
+    rules.push(json!({
+        "if": on(topics::RUN),
+        "then": {"properties": {"data": {
+            "properties": {
+                "run_id": {
+                    "description": "The run this event belongs to.",
+                    "type": "string",
+                    "minLength": 1,
                 },
-                "required": ["run_id", "run_seq"],
-            }},
-        }),
-    );
+                "run_seq": {
+                    "description": "Strictly increasing per run, from 1.",
+                    "type": "integer",
+                    "minimum": 1,
+                },
+                "kind": {
+                    "description": "The run's kind, such as task or widget_refresh.",
+                    "type": "string",
+                    "minLength": 1,
+                },
+                "attempt": {
+                    "description": "Which attempt of the run, from 1.",
+                    "type": "integer",
+                    "minimum": 1,
+                },
+                "job_id": {
+                    "description": "The scheduler job that fired the run, if one did.",
+                    "type": "string",
+                    "minLength": 1,
+                },
+            },
+            "required": ["run_id", "run_seq", "kind", "attempt"],
+        }}},
+    }));
+    schema.insert("allOf".to_owned(), Value::Array(rules));
 }
 
 /// The topics of handoff 0.10.3's 7.3. A client must also accept topics not listed here.
 pub mod topics {
     /// The daemon itself: `daemon.started`, `daemon.stopping`, `daemon.gap`.
     pub const DAEMON: &str = "daemon";
-    /// Runs (7.5). Every event here carries `data.run_id` and `data.run_seq`.
+    /// Runs (7.5). Every event here carries `run_id`, `run_seq`, `kind`, `attempt` and
+    /// `job_id?` in its `data`.
     pub const RUN: &str = "run";
     /// Scheduler jobs (7.6).
     pub const JOB: &str = "job";
-    /// Connectors (7.7).
+    /// Connectors (7.7), such as `connector.changed` and `connector.login.open_url`.
     pub const CONNECTOR: &str = "connector";
     /// PTYs: `pty.output`, `pty.exited`.
     pub const PTY: &str = "pty";
@@ -120,8 +152,9 @@ pub mod topics {
 
 impl Event {
     /// An event of this schema version. For the `run` topic, use [`Event::for_run`].
-    /// Refuses what `event.json` refuses: `seq` 0, a `time` that is not RFC 3339, an
-    /// empty topic or type, and a `run` event without `run_id` and `run_seq`.
+    /// Refuses what `event.json` refuses: `seq` 0, a `time` that is not RFC 3339, a topic
+    /// that is not snake_case, a type that is not `<topic>.<event>`, and a `run` event
+    /// without its run fields.
     pub fn new(
         seq: u64,
         time: impl Into<String>,
@@ -141,7 +174,7 @@ impl Event {
         Ok(event)
     }
 
-    /// An event on the `run` topic: `data` with the run's `run_id` and `run_seq` set.
+    /// An event on the `run` topic: `data` with the run fields of `scope` set.
     pub fn for_run(
         seq: u64,
         time: impl Into<String>,
@@ -151,47 +184,79 @@ impl Event {
     ) -> Result<Self, Invalid> {
         data.insert("run_id".to_owned(), Value::String(scope.run_id));
         data.insert("run_seq".to_owned(), Value::from(scope.run_seq));
+        data.insert("kind".to_owned(), Value::String(scope.kind));
+        data.insert("attempt".to_owned(), Value::from(scope.attempt));
+        match scope.job_id {
+            Some(job_id) => data.insert("job_id".to_owned(), Value::String(job_id)),
+            None => data.remove("job_id"),
+        };
         Self::new(seq, time, topics::RUN, r#type, data)
     }
 
-    /// The run this event belongs to and its place in that run's stream, when it is on
-    /// the `run` topic.
+    /// The run fields of this event, when it is on the `run` topic.
     pub fn run_scope(&self) -> Option<RunScope> {
         if self.topic != topics::RUN {
             return None;
         }
-        let run_id = self.data.get("run_id")?.as_str()?.to_owned();
-        let run_seq = self.data.get("run_seq")?.as_u64()?;
-        Some(RunScope { run_id, run_seq })
+        let text = |field: &str| Some(self.data.get(field)?.as_str()?.to_owned());
+        let number = |field: &str| self.data.get(field)?.as_u64();
+        Some(RunScope {
+            run_id: text("run_id")?,
+            run_seq: number("run_seq")?,
+            kind: text("kind")?,
+            attempt: number("attempt")?,
+            job_id: text("job_id"),
+        })
     }
 
     /// Whether this event keeps every rule of `event.json`.
     pub fn validate(&self) -> Result<(), Invalid> {
         check::at_least("seq", self.seq, 1)?;
         check::date_time("time", &self.time)?;
-        check::non_empty("topic", &self.topic)?;
-        check::non_empty("type", &self.r#type)?;
+        check::topic("topic", &self.topic)?;
+        check::event_type("type", &self.r#type, &self.topic)?;
         if self.topic == topics::RUN {
-            match self.data.get("run_id") {
-                Some(Value::String(run_id)) => check::non_empty("data.run_id", run_id)?,
+            self.validate_run_fields()?;
+        }
+        Ok(())
+    }
+
+    fn validate_run_fields(&self) -> Result<(), Invalid> {
+        for (field, what) in [("run_id", "its run's id"), ("kind", "its run's kind")] {
+            let path = format!("data.{field}");
+            match self.data.get(field) {
+                Some(Value::String(value)) => check::non_empty(&path, value)?,
                 _ => {
                     return Err(Invalid::new(
-                        "data.run_id",
-                        "a run event needs its run's id, a string (see Event::for_run)",
-                    ));
-                }
-            }
-            match self.data.get("run_seq").and_then(Value::as_u64) {
-                Some(run_seq) => check::at_least("data.run_seq", run_seq, 1)?,
-                None => {
-                    return Err(Invalid::new(
-                        "data.run_seq",
-                        "a run event needs its place in the run, an integer of at least 1",
+                        path,
+                        format!("a run event needs {what}, a string (see Event::for_run)"),
                     ));
                 }
             }
         }
-        Ok(())
+        for (field, what) in [
+            ("run_seq", "its place in the run"),
+            ("attempt", "its attempt"),
+        ] {
+            let path = format!("data.{field}");
+            match self.data.get(field).and_then(Value::as_u64) {
+                Some(value) => check::at_least(&path, value, 1)?,
+                None => {
+                    return Err(Invalid::new(
+                        path,
+                        format!("a run event needs {what}, an integer of at least 1"),
+                    ));
+                }
+            }
+        }
+        match self.data.get("job_id") {
+            None => Ok(()),
+            Some(Value::String(job_id)) => check::non_empty("data.job_id", job_id),
+            Some(_) => Err(Invalid::new(
+                "data.job_id",
+                "must be a string, or absent when no job fired the run",
+            )),
+        }
     }
 }
 
@@ -211,11 +276,27 @@ impl<'de> Deserialize<'de> for Event {
 }
 
 impl RunScope {
-    /// Event `run_seq` of run `run_id`.
-    pub fn new(run_id: impl Into<String>, run_seq: u64) -> Self {
+    /// Event `run_seq` of attempt `attempt` of run `run_id`, of kind `kind`, fired by no
+    /// job.
+    pub fn new(
+        run_id: impl Into<String>,
+        run_seq: u64,
+        kind: impl Into<String>,
+        attempt: u64,
+    ) -> Self {
         Self {
             run_id: run_id.into(),
             run_seq,
+            kind: kind.into(),
+            attempt,
+            job_id: None,
         }
+    }
+
+    /// These run fields, for a run that job `job_id` fired.
+    #[must_use]
+    pub fn with_job(mut self, job_id: impl Into<String>) -> Self {
+        self.job_id = Some(job_id.into());
+        self
     }
 }

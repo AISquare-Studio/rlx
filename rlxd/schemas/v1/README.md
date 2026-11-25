@@ -17,15 +17,20 @@ cargo run -p rlxd-proto --bin gen-schemas -- --check # what CI runs: exit 1 on d
 ```
 
 The types hold every document to the same rules as its schema. A document the schema
-refuses also fails to parse, with an error naming the field. The one exception is a
-float with a zero fraction, such as `1.0` where an integer belongs: JSON Schema accepts
-it, and the types refuse it.
+refuses also fails to parse, with an error naming the field. The types are stricter in
+two places JSON Schema can't reach:
+
+- A float with a zero fraction, such as `1.0` where an integer belongs, passes the
+  schema and fails to parse.
+- An event's `type` must start with its `topic`. The schema checks that only for the
+  topics v1 lists, because it can't compare one field with another; the types check it
+  for every topic.
 
 | File | What it describes |
 |---|---|
 | `daemon-record.json` | One record in `<home>/daemons/` (4.1): `{id, kind, pid, host, version, started_at, heartbeat_at, argv, restartable, cwd?}`, which Python's registry and rlxd share |
 | `envelope.json` | Every response: `{schema_version, ok: true, data}` or `{schema_version, ok: false, error{code, message, hint?, detail?}}`, never both, plus `id` on the socket. `detail` is a string or an object. `incompatible_protocol` must carry `detail.supported` |
-| `event.json` | One event: `{schema_version, seq, time, topic, type, data}`. On the `run` topic, `data` also carries `run_id` and `run_seq` |
+| `event.json` | One event: `{schema_version, seq, time, topic, type, data}`. `topic` is snake_case. `type` is `<topic>.<event>`, the event one or more snake_case names joined by `.` (`run.text`, `connector.login.open_url`). On the `run` topic, `data` also carries `run_id`, `run_seq`, `kind`, `attempt` and `job_id?` (7.5) |
 | `event-list.json` | A JSON array of events, as `jq -s .` makes of `rlxd events`' lines |
 | `request.json` | One socket request frame: `{id, method, params?}`. `id` is at most 2^53 - 1 |
 | `hello.json` | `hello`'s params: `{token, protocol_version, client, client_version, role, gate_credential?, capabilities, env?}`, where `role` is `app`, `tui`, `remote` or `cli` |
@@ -61,8 +66,11 @@ make the connection the gate.
 
 - `seq`, on every event: strictly increasing per home. `events.subscribe {since}`
   resumes after it.
-- `data.run_seq`, on every `run`-topic event, next to `data.run_id`: strictly increasing
-  per run, from 1, so one run can be replayed from a known point.
+- `data.run_seq`, on every `run`-topic event: strictly increasing per run, from 1, so one
+  run can be replayed from a known point.
+
+  It comes with the run's other fields: `run_id`, `kind`, and `attempt` (from 1, one up
+  with each `run.resume`). `job_id` is added when a scheduler job fired the run.
 
 ## Versioning
 
