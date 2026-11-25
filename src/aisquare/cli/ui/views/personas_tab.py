@@ -6,7 +6,9 @@ in ``cli/ui/persona_dialogs.py``). asq shows it on Settings ▸ Personas with no
 dialog it opens writes the user layer. Built with a project (``PersonasTab(project)``, the
 Project view's tab until R27, which nothing in asq builds now), its project supplies the
 project layer (``core.project_root``), the one ``fleet spawn`` checks and ``aisquare
-persona`` reads from the project's directory; the CLI and the services keep that layer.
+persona`` reads from the project's directory. The CLI and the services still READ that
+layer, where an agent starts; since 0.10.2 nothing writes it (the owner's decision on #21),
+and every dialog writes yours.
 
 **The tab holds no state the disk does not.** Every action ends by re-reading
 ``core.personas.catalogue``, and the selection is kept by row key (``layer:name``),
@@ -25,7 +27,7 @@ the persona reaches the agent), a bind or an account opens the Spawn dialog pres
 persona, and *+ New account* hands over to the Accounts page. The message is not
 stopped, so the shell can see it.
 
-Bundled rows disable Edit and Remove ("bundled — export to a layer first"); the
+Bundled rows disable Edit and Remove ("bundled — open it and Save as… to make it yours"); the
 row itself still opens — ``Enter`` on any row opens the SKILL.md, and a bundled
 one opens read-only with *Save as…* (§4.4). Keys, live while focus is inside the
 tab (the search box keeps its letters): ``a`` attach to existing · ``n`` attach to
@@ -45,7 +47,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Button, Checkbox, DataTable, Input, Static
+from textual.widgets import Button, Collapsible, DataTable, Input, Static
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui import persona_dialogs as dialogs
@@ -67,9 +69,7 @@ from aisquare.services import personas as personas_service
 AttachIntent = Literal["existing", "new"]
 
 LAYERS: tuple[Layer, ...] = ("project", "user", "bundled")
-
-APP_LAYERS: tuple[Layer, ...] = ("user", "bundled")
-"""The layers the app-level page (no project, Settings ▸ Personas) shows a chip for."""
+"""The layers in precedence order: how rows of one name are sorted."""
 
 ATTACH_ACTIONS = frozenset({"attach_existing", "attach_new"})
 """The actions that need a project: the picker's agents are one project's, a spawn goes to one."""
@@ -77,7 +77,7 @@ ATTACH_ACTIONS = frozenset({"attach_existing", "attach_new"})
 ATTACH_WORKER = "persona-attach"
 """The worker that attaches a persona to a running agent."""
 
-BUNDLED_REASON = "bundled — export to a layer first"
+BUNDLED_REASON = "bundled — open it and Save as… to make it yours"
 
 
 class AttachRequested(Message):
@@ -127,10 +127,8 @@ def read_entries(root: Path | None) -> list[Entry]:
     return sorted(rows, key=lambda row: (row.name, LAYERS.index(row.layer)))
 
 
-def matches(entry: Entry, query: str, layers: set[Layer]) -> bool:
-    """The search: the layer chips, then a substring of the name, description or a tag."""
-    if entry.layer not in layers:
-        return False
+def matches(entry: Entry, query: str) -> bool:
+    """The search: a substring of the name, description or a tag."""
     needle = query.strip().lower()
     if not needle:
         return True
@@ -189,11 +187,13 @@ class PersonasTab(Vertical):
 
     DEFAULT_CSS = """
     PersonasTab { height: 1fr; padding: 0 1; }
+    PersonasTab #personas-title { height: 1; text-style: bold; margin-bottom: 1; }
+    PersonasTab #personas-migrated { height: auto; margin-bottom: 1; }
+    PersonasTab #personas-migrated-scroll { height: auto; max-height: 6; }
+    PersonasTab #personas-migrated-detail { height: auto; color: $text-muted; }
     PersonasTab #personas-top { height: auto; }
     PersonasTab #persona-search { width: 1fr; }
     PersonasTab #personas-top Button { margin-left: 1; }
-    PersonasTab #personas-layers { height: auto; }
-    PersonasTab #personas-layers Checkbox { width: auto; }
     PersonasTab #personas-body { height: 1fr; }
     PersonasTab #persona-table { width: 3fr; height: 1fr; }
     PersonasTab #persona-preview { width: 2fr; height: 1fr; border-left: tall $panel;
@@ -218,25 +218,32 @@ class PersonasTab(Vertical):
         self.project = project
         self.root: Path | None = core.project_root(project) if project is not None else None
         """The project layer's root: the project's own, as spawn checks it (review of #201,
-        R1-F6). Asked of git, it hid a project that is not a repository's personas, and it
-        cost every project view a subprocess on the UI thread (R1-F10). ``None`` with no
-        project: no project layer, and every dialog writes the user's."""
-        self.shown_layers: tuple[Layer, ...] = LAYERS if project is not None else APP_LAYERS
-        """The layers with a chip: the project's too only with a project."""
+        R1-F6). ``None`` with no project, which is how asq builds this page (Settings ▸
+        Personas): your personas and the bundled ones, never a project's layer (0.10.2, the
+        owner's decision on #21). Nothing writes a project's layer any more
+        (``services.personas._project_refusal``); its personas were copied to yours once."""
         self.entries: list[Entry] = []
         self.selected_key: str | None = None
         self.unavailable: str | None = None
+        self.migrated: str | None = None
+        """What the one-time copy of the project personas to yours did, when it ran here and
+        had something to say (``services.personas.migrate_once``)."""
 
     def compose(self) -> ComposeResult:
+        yield Static(Text("Personas"), id="personas-title")
+        # Folded, its title the counts alone: a report of several personas, each with its
+        # whole path, took the page at 80x24 (the tester of #21, round 3).
+        with (
+            Collapsible(title="", collapsed=True, id="personas-migrated"),
+            VerticalScroll(id="personas-migrated-scroll"),
+        ):
+            yield Static(id="personas-migrated-detail")
         # Two rows: one would need ~86 columns, and beside the sidebar an 80-column
         # terminal gives this tab 49, which left + Import… and + New off its edge.
         with Horizontal(id="personas-top"):
             yield Input(placeholder="search name, description or tag", id="persona-search")
             yield Button("+ Import…", id="persona-import")
             yield Button("+ New", id="persona-new")
-        with Horizontal(id="personas-layers"):
-            for layer in self.shown_layers:
-                yield Checkbox(layer, True, id=f"layer-{layer}")
         with Horizontal(id="personas-body"):
             yield DataTable(id="persona-table", cursor_type="row", zebra_stripes=True)
             with VerticalScroll(id="persona-preview"):
@@ -254,6 +261,13 @@ class PersonasTab(Vertical):
 
     def on_mount(self) -> None:
         self.query_one(DataTable).add_columns("persona", "layer", "description", "roles", "marks")
+        report = personas_service.migrate_once()
+        self.migrated = report.summary()
+        fold = self.query_one("#personas-migrated", Collapsible)
+        fold.title = report.headline() or ""
+        fold.display = self.migrated is not None
+        detail = self.query_one("#personas-migrated-detail", Static)
+        detail.update(Text(self.migrated) if self.migrated else "")
         self.reload()
 
     # --- reading and painting ---------------------------------------------------------
@@ -272,12 +286,7 @@ class PersonasTab(Vertical):
 
     def visible_entries(self) -> list[Entry]:
         query = self.query_one("#persona-search", Input).value
-        layers = {
-            layer
-            for layer in self.shown_layers
-            if self.query_one(f"#layer-{layer}", Checkbox).value
-        }
-        return [entry for entry in self.entries if matches(entry, query, layers)]
+        return [entry for entry in self.entries if matches(entry, query)]
 
     def _paint(self) -> None:
         table = self.query_one(DataTable)
@@ -325,7 +334,6 @@ class PersonasTab(Vertical):
             self._show_selected()
 
     @on(Input.Changed, "#persona-search")
-    @on(Checkbox.Changed)
     def _filter_changed(self) -> None:
         self._paint()
 

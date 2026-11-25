@@ -1889,7 +1889,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     # --- remote (R) ------------------------------------------------------------------
 
     def action_remote_panel(self) -> None:
-        self.push_screen(RemotePanel(self.remote))
+        """The one Remote page (Q17), as the hub's *Remote control* and App settings open it."""
+        from aisquare.cli.ui.views.remote import open_remote_page
+
+        open_remote_page(self)
 
     def _save_remote_switch(self, key: str, value: object) -> None:
         """A Remote switch's save, as the theme's: on a thread of its own, a refusal toasted
@@ -4958,6 +4961,7 @@ def _waited_reads() -> dict[str, str]:
         accounts.LOGIN_POLL_WORKER: "a Claude sign-in's check",
         agent.LABELS_WORKER: "an agent's account names",
         board.LABELS_WORKER: "a board's account names",
+        board.HISTORY_WORKER: "a board's task history",
         fleet_bulk.PLAN_WORKER: "Settings ▸ Fleet's read of the running agents",
         resources.SAMPLE_WORKER: "Agent resources' read of the agents",
         app_settings.ACCOUNTS_WORKER: "App settings' accounts",

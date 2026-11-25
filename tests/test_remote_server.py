@@ -405,11 +405,14 @@ def test_read_endpoints_return_the_sources_verbatim(
 
 
 def test_remote_endpoint_carries_the_switches_only(client: TestClient, runtime: Runtime) -> None:
+    """The switches, the version, and the sentence every 403 ``read_only`` says, which the
+    page shows in place of a command of its own (0.10.1's final review): nothing secret."""
     unlock(client, runtime)
     payload = client.get(f"{base(runtime)}/api/remote").json()
-    assert set(payload) == {"allow_write", "auto_off_at", "version"}
+    assert set(payload) == {"allow_write", "auto_off_at", "version", "read_only_reason"}
     assert payload["allow_write"] is False and payload["auto_off_at"] is None
     assert isinstance(payload["version"], str)
+    assert payload["read_only_reason"] == read_only_reason(), "the 403's own sentence"
 
 
 # --- rate limit -------------------------------------------------------------------------
