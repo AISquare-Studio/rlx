@@ -4361,7 +4361,9 @@ def test_a_long_detail_is_what_the_agent_view_cuts_never_the_account_or_its_use(
 
     shown, whole = run(drive())
     # The line itself is all there, its detail last: no pane id after it (Q2, 0.10.2).
-    assert whole.endswith("[archive]/repo'`") and "folder trust" in whole and "%1" not in whole
+    # The folder as this platform writes it: Windows draws [archive]\repo (#14's full matrix).
+    tail = f"{Path('[archive]', 'repo')}'`"
+    assert whole.endswith(tail) and "folder trust" in whole and "%1" not in whole
     assert "🔔 attention  dev · 87%  claude-opus-5-5 high  " in shown, shown  # all whole
     assert shown.rstrip().endswith("…"), shown  # the cut is said, and it falls in the detail
     detail_start = shown.index("claude-opus-5-5 high") + len("claude-opus-5-5 high  ")
