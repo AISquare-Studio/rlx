@@ -1105,14 +1105,31 @@ def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInf
 
     async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, bool, bool]:
         await pilot.click("#--content-tab-tab-board")
-        await pilot.pause()
         panel = host.query_one("#board-panel", BoardPanel)
-        focused = host.focused
-        inside = focused is not None and panel in focused.ancestors_with_self
+
+        def inside() -> bool:
+            focused = host.focused
+            return focused is not None and panel in focused.ancestors_with_self
+
+        # The click's chain (the tab activated, its pane shown, the panel's on_show taking the
+        # keys) is several messages long; one pause() guesses "idle" from CPU time and, on a
+        # loaded Windows runner, returned before its end (#29). Wait for the focus itself.
+        for _ in range(500):  # bounded: 10 s at most
+            if inside():
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"the tab's click left the focus outside the board: {host.focused!r}")
+        took = inside()
         folded = "done" in panel.folds
         await pilot.press("d")  # no click inside the board first: Done unfolds (B2)
-        await pilot.pause()
-        return inside, folded, "done" in panel.folds
+        for _ in range(500):
+            if "done" not in panel.folds:
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"d did not reach the board: its folds read {sorted(panel.folds)}")
+        return took, folded, "done" in panel.folds
 
     inside, folded, still = drive(project, scenario)
     assert inside, "the tab's click left the focus outside the board"
