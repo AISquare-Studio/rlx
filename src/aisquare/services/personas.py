@@ -979,7 +979,10 @@ def shadows(persona: Persona, root: Path | None) -> list[Layer]:
 def _target(name: str, root: Path | None, layer: Layer | None) -> tuple[Layer, Path]:
     """The directory an edit acts on: ``layer``'s copy, or by default the winner's."""
     if layer is None:
-        return locate(name, root)
+        found, directory = locate(name, root)
+        if found == "project":
+            raise _project_refusal(directory)
+        return found, directory
     if layer == "bundled":
         return layer, core.BUNDLED_DIR / name
     return layer, _layer_dir(layer, root) / name
@@ -1153,21 +1156,29 @@ def _layer_of(directory: Path) -> Layer:
 
 
 def _layer_dir(layer: Layer, root: Path | None) -> Path:
+    """The directory a write goes to: the user layer's. The bundled layer is read-only, and
+    since 0.10.2 nothing writes a persona into a project's layer (:func:`_project_refusal`)."""
     if layer == "bundled":
         raise PersonaError(
-            "the bundled layer ships with rlx and is read-only — use --user or --project",
+            "the bundled layer ships with rlx and is read-only — your personas are the ones "
+            "you can change",
             code="bundled_read_only",
         )
-    dirs = dict(core.layer_dirs(root))
-    if layer not in dirs:
-        # ``root`` is None (``core.project_root``: no project, or one that could not be
-        # read), or its project layer is the user layer (``core.layer_dirs``).
-        raise PersonaError(
-            "the project layer needs a project around the working directory: a git "
-            "repository, or a folder marked as one",
-            code="no_project",
-        )
-    return dirs[layer]
+    if layer == "project":
+        raise _project_refusal(None)
+    return dict(core.layer_dirs(root))["user"]
+
+
+def _project_refusal(directory: Path | None) -> PersonaError:
+    """A write that would change a project's own persona layer. Personas are the user's since
+    0.10.1, and a project's are copied to them once (:func:`migrate_once`); rlx leaves the
+    project's files as they are."""
+    where = "" if directory is None else f" ({directory})"
+    return PersonaError(
+        f"personas are yours (the user level) since 0.10.1: rlx no longer writes, edits or "
+        f"removes a project's persona{where}; change your own instead",
+        code="project_layer_retired",
+    )
 
 
 def _bundled_refusal(name: str, verb: Literal["edited", "removed"]) -> PersonaError:
@@ -1310,3 +1321,152 @@ def _discard(path: Path) -> None:
         path.unlink()
     else:
         shutil.rmtree(path)
+
+
+# --- the one-time move of project personas to the user layer -------------------------
+
+MIGRATION_KEY = "personas_project_layer_migrated"
+"""``state.json``: when the project personas were copied to the user layer, and what came of
+each. Its presence is what makes :func:`migrate_once` run once."""
+
+MigrationOutcome = Literal["copied", "kept_yours", "already_there", "name_taken", "skipped"]
+
+
+class MigratedPersona(BaseModel):
+    """One project persona directory, and what the move did with it. The directory itself is
+    always left where it was."""
+
+    name: str
+    source: Path
+    """The project persona's directory, left in place."""
+    outcome: MigrationOutcome
+    detail: str | None = None
+
+    def sentence(self) -> str:
+        where = f"{self.source} is left in place"
+        if self.outcome == "copied":
+            return f"copied {self.name} to your personas ({where})"
+        if self.outcome == "kept_yours":
+            return f"kept your own {self.name}; the project's differs and was not copied ({where})"
+        if self.outcome == "already_there":
+            return f"{self.name} is already in your personas, the same ({where})"
+        return f"not copied {self.name}: {self.detail} ({where})"  # name_taken, skipped
+
+
+class MigrationReport(BaseModel):
+    """What :func:`migrate_project_personas` did. ``ran`` is ``False`` when it had already run
+    (:func:`migrate_once`) and nothing was looked at."""
+
+    ran: bool = True
+    personas: list[MigratedPersona] = []
+
+    @property
+    def copied(self) -> list[MigratedPersona]:
+        return [item for item in self.personas if item.outcome == "copied"]
+
+    @property
+    def kept_yours(self) -> list[MigratedPersona]:
+        return [item for item in self.personas if item.outcome == "kept_yours"]
+
+    def summary(self) -> str | None:
+        """One line for a person, or ``None`` when there was nothing to say."""
+        if not self.ran or not self.personas:
+            return None
+        said = [item for item in self.personas if item.outcome != "already_there"]
+        if not said:
+            return None
+        parts = []
+        if self.copied:
+            names = ", ".join(item.name for item in self.copied)
+            parts.append(f"Copied your project personas to your personas: {names}.")
+        for item in said:
+            if item.outcome != "copied":
+                sentence = item.sentence()
+                parts.append(sentence[:1].upper() + sentence[1:] + ".")
+        parts.append("The project files are left where they were.")
+        return " ".join(parts)
+
+
+def migrate_project_personas(roots: list[Path] | None = None) -> MigrationReport:
+    """Copy the personas of every project's own layer (``<root>/.aisquare/personas``) into
+    the user layer, where 0.10.1 on keeps them. ``roots`` defaults to every project added to
+    rlx (``services.project.list_projects``).
+
+    Nothing is deleted: a project's persona directories stay where they are. A persona of
+    the same name already in the user layer is **kept**: an identical one is
+    ``already_there``, a different one ``kept_yours``, and the report says which. When two
+    projects hold the same name, the first one listed is copied and the other is
+    ``name_taken``. A directory with no SKILL.md, a SKILL.md that is a symbolic link, or a
+    name a persona cannot have is ``skipped`` and says why. Symbolic links inside a persona
+    are never followed or copied (:func:`_copy_without_links`)."""
+    if roots is None:
+        from aisquare.services import project as project_service
+
+        roots = [project.root for project in project_service.list_projects()]
+    user = dict(core.layer_dirs(None))["user"]
+    copied_from: dict[str, Path] = {}
+    report = MigrationReport()
+    seen: set[Path] = set()
+    for root in roots:
+        layer = root / ".aisquare" / "personas"
+        try:
+            if layer.resolve() == user.resolve() or layer.resolve() in seen:
+                continue
+            seen.add(layer.resolve())
+        except OSError:
+            continue
+        for directory in core._candidates(layer):
+            report.personas.append(_migrate_one(directory, user, copied_from))
+    return report
+
+
+def _migrate_one(directory: Path, user: Path, copied_from: dict[str, Path]) -> MigratedPersona:
+    name = directory.name
+
+    def outcome(kind: MigrationOutcome, detail: str | None = None) -> MigratedPersona:
+        return MigratedPersona(name=name, source=directory, outcome=kind, detail=detail)
+
+    if not _is_skill_name(name):
+        return outcome("skipped", "its name is not one a persona can have")
+    skill = directory / core.SKILL_FILE
+    if skill.is_symlink():
+        return outcome("skipped", f"its {core.SKILL_FILE} is a symbolic link")
+    if not skill.is_file():
+        return outcome("skipped", f"it has no {core.SKILL_FILE}")
+    dest = user / name
+    if name in copied_from:
+        return outcome("name_taken", f"the one from {copied_from[name]} was copied first")
+    if _occupied(dest):
+        try:
+            same = (dest / core.SKILL_FILE).read_bytes() == skill.read_bytes()
+        except OSError:
+            same = False
+        return outcome("already_there" if same else "kept_yours")
+    try:
+        _publish(dest, lambda staged: _copy_without_links(directory, staged))
+    except OSError as exc:
+        return outcome("skipped", f"it could not be copied ({exc.strerror or exc})")
+    copied_from[name] = directory
+    return outcome("copied")
+
+
+def migrate_once(roots: list[Path] | None = None) -> MigrationReport:
+    """:func:`migrate_project_personas`, the first time it is asked on this machine; a report
+    with ``ran=False`` every time after. What it did is kept in ``state.json``
+    (:data:`MIGRATION_KEY`). Never raises: a move that fails is tried again next time."""
+    from aisquare.core import state_file
+
+    try:
+        if state_file.read_state().get(MIGRATION_KEY) is not None:
+            return MigrationReport(ran=False)
+        report = migrate_project_personas(roots)
+        state_file.update_state(
+            MIGRATION_KEY,
+            {
+                "at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "personas": [item.model_dump(mode="json") for item in report.personas],
+            },
+        )
+        return report
+    except Exception:
+        return MigrationReport(ran=False)

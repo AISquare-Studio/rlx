@@ -659,9 +659,10 @@ def test_a_skill_imported_then_exported_is_byte_identical(
     assert (out / "reviewer-pro" / ".persona.json").is_file()
 
 
-def test_new_in_a_repository_scaffolds_the_project_layer_and_opens_the_editor(
+def test_new_in_a_repository_scaffolds_your_persona_and_opens_the_editor(
     runner: CliRunner, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """0.10.2: personas are yours wherever the command runs; nothing goes into the repository."""
     log = tmp_path / "opened.log"
     monkeypatch.setenv(
         "EDITOR",
@@ -672,13 +673,13 @@ def test_new_in_a_repository_scaffolds_the_project_layer_and_opens_the_editor(
         ),
     )
 
-    result = runner.invoke(app, ["persona", "new", "pair", "--project"])
+    result = runner.invoke(app, ["persona", "new", "pair"])
 
     assert result.exit_code == 0, result.output
-    assert (repo / ".aisquare" / "personas" / "pair" / "SKILL.md").is_file()
+    assert not (repo / ".aisquare" / "personas").exists()
     assert len(log.read_text(encoding="utf-8").splitlines()) == 1
     listed = runner.invoke(app, ["persona", "list"]).stdout.splitlines()
-    assert next(row for row in listed if row.startswith("pair")).split()[1] == "project"
+    assert next(row for row in listed if row.startswith("pair")).split()[1] == "user"
 
 
 def test_new_with_editor_true_leaves_the_valid_template(
@@ -686,17 +687,37 @@ def test_new_with_editor_true_leaves_the_valid_template(
 ) -> None:
     monkeypatch.setenv("EDITOR", "true")
 
-    result = runner.invoke(app, ["persona", "new", "pair", "--project"])
+    result = runner.invoke(app, ["persona", "new", "pair"])
 
     assert result.exit_code == 0, result.output
     persona = core.resolve("pair", repo)
-    assert (persona.layer, persona.frontmatter["name"]) == ("project", "pair")
+    assert (persona.layer, persona.frontmatter["name"]) == ("user", "pair")
 
 
-def test_new_refuses_the_project_layer_outside_a_repository(runner: CliRunner) -> None:
-    code, payload = _json(runner, "new", "pair", "--project")
+@pytest.mark.parametrize(
+    "command",
+    [["new", "pair"], ["rm", "pair"], ["import", "-"]],
+    ids=["new", "rm", "import"],
+)
+def test_project_is_retired_and_refused_in_plain_words(
+    runner: CliRunner, repo: Path, command: list[str]
+) -> None:
+    """In a repository or not, ``--project`` writes nothing and says why (0.10.2)."""
+    result = runner.invoke(app, ["persona", *command, "--project"], input="")
+    code, payload = _json(runner, *command, "--project")
 
-    assert (code, payload["error"]) == (1, "no_project")
+    assert result.exit_code == 1
+    said = " ".join(result.stderr.split())
+    assert "--project is retired: personas are yours (the user level) since 0.10.1" in said
+    assert "Traceback" not in result.output
+    assert (code, payload["error"]) == (1, "project_layer_retired")
+    assert not (repo / ".aisquare" / "personas").exists()
+
+
+def test_project_is_no_longer_offered_in_help(runner: CliRunner) -> None:
+    for command in ("new", "rm", "import"):
+        shown = runner.invoke(app, ["persona", command, "--help"]).stdout
+        assert "--project" not in shown, command
 
 
 def test_new_without_an_editor_scaffolds_and_says_how_to_edit(runner: CliRunner) -> None:

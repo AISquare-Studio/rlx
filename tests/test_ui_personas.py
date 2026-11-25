@@ -357,6 +357,7 @@ def test_the_app_level_page_shows_no_project_layer_and_attaches_nothing(
         page = tab(host)
         seen: dict[str, Any] = {
             "root": page.root,
+            "title": shown(page.query_one("#personas-title", Static)),
             "chips": [str(box.label) for box in page.query(Checkbox)],
             "rows": [(row[0], row[1]) for row in rows(host)],
             "buttons": [str(button.id) for button in page.query("#persona-actions Button")],
@@ -376,7 +377,8 @@ def test_the_app_level_page_shows_no_project_layer_and_attaches_nothing(
 
     seen = drive(scenario, app_level=True)
     assert seen["root"] is None
-    assert seen["chips"] == ["user", "bundled"]
+    assert seen["title"] == "Personas"  # the page names itself (0.10.1's exploratory test)
+    assert seen["chips"] == [], "no layer checkboxes: the page is yours and the bundled ones"
     assert ("skeptic", "bundled") in seen["rows"] and ("pair", "user") in seen["rows"]
     assert all(layer != "project" for _, layer in seen["rows"]), seen["rows"]
     assert seen["buttons"] == [
@@ -463,7 +465,7 @@ def test_the_catalogue_lists_layer_description_roles_and_marks(
     assert "description" in broken[2]  # the reason is the row's description
 
 
-def test_search_narrows_by_name_description_and_tag_and_the_chips_by_layer(
+def test_search_narrows_by_name_description_and_tag(
     project: ProjectInfo, catalogue: dict[str, Path]
 ) -> None:
     async def scenario(pilot: Pilot[None], host: Host) -> list[list[str]]:
@@ -473,13 +475,6 @@ def test_search_narrows_by_name_description_and_tag_and_the_chips_by_layer(
             search.value = query
             await pilot.pause()
             seen.append([row[0] for row in rows(host)])
-        search.value = ""
-        host.query_one("#layer-bundled", Checkbox).value = False
-        await pilot.pause()
-        seen.append([row[0] for row in rows(host)])
-        host.query_one("#layer-user", Checkbox).value = False
-        await pilot.pause()
-        seen.append([row[0] for row in rows(host)])
         return seen
 
     assert drive(scenario, project=project) == [
@@ -487,8 +482,6 @@ def test_search_narrows_by_name_description_and_tag_and_the_chips_by_layer(
         ["pair"],  # description
         ["pair"],  # tag
         ["skeptic"],  # case-insensitive
-        ["broken", "pair", "skeptic"],  # bundled chip off
-        ["skeptic"],  # user chip off too
     ]
 
 

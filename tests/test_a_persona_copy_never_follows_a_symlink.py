@@ -153,7 +153,7 @@ def _import(
     source: str,
     *,
     root: Path | None,
-    layer: Layer = "project",
+    layer: Layer = "user",
     force: bool = False,
     llm: Literal["auto", "always", "never"] = "auto",
     condense: bool = False,
@@ -248,11 +248,11 @@ def test_import_copies_everything_but_the_link_and_names_what_it_skipped(
     skill = _skill(repo / ".claude" / "skills")
     named = plant(skill, vault)
 
-    result = _import(str(skill), root=repo)  # the service, into the layer that is committed
-    by_cli = runner.invoke(app, ["persona", "import", str(skill), "--user"])
+    result = _import(str(skill), root=repo)  # the service, into your layer (0.10.2)
+    by_cli = runner.invoke(app, ["persona", "import", str(skill), "--user", "--force"])
 
     project, user = repo / ".aisquare", cli_suite._user_layer()
-    assert result.persona.path == project / "personas" / "helper"
+    assert result.persona.path == user / "helper"
     for layer in (project, user):
         assert _holding_the_secret(layer) == []
         assert _links(_snapshot(layer)) == []
@@ -310,16 +310,16 @@ def test_persona_import_of_the_reviews_helper_warns_in_one_line_and_json_lists_t
     _relative_and_out_of_the_repository(skill, vault)
 
     listed = runner.invoke(app, ["--json", "persona", "import", "--list"])
-    human = runner.invoke(app, ["persona", "import", "helper", "--project"])
-    machine = runner.invoke(app, ["--json", "persona", "import", "helper", "--project", "--force"])
+    human = runner.invoke(app, ["persona", "import", "helper"])
+    machine = runner.invoke(app, ["--json", "persona", "import", "helper", "--force"])
 
-    layer = repo / ".aisquare"
+    layer = cli_suite._user_layer().parent
     assert _holding_the_secret(layer) == []
     assert _links(_snapshot(layer)) == []
     assert listed.exit_code == 0, repr(listed.exception)
     assert [found["name"] for found in json.loads(listed.stdout)["skills"]] == ["helper"]
     assert human.exit_code == 0, repr(human.exception)
-    assert human.stdout.startswith("✓ imported helper (copy) into project: ")
+    assert human.stdout.startswith("✓ imported helper (copy) into user: ")
     assert [line for line in human.stderr.splitlines() if "symbolic link" in line] == [
         "⚠ skipped 2 symbolic links, never followed and not copied: env.txt, refs"
     ]
@@ -498,7 +498,7 @@ def test_a_tree_without_a_link_is_copied_whole_and_reports_nothing_skipped(
 
     imported = _import(str(skill), root=repo)
     exported = _export(repo, tmp_path / "out")
-    by_cli = runner.invoke(app, ["persona", "import", str(skill), "--user"])
+    by_cli = runner.invoke(app, ["persona", "import", str(skill), "--user", "--force"])
     as_json = runner.invoke(
         app, ["--json", "persona", "export", "helper", "--to", str(tmp_path / "again")]
     )

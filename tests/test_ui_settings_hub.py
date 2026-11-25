@@ -206,14 +206,14 @@ def test_settings_personas_opens_your_personas_with_no_project_and_reads_them_ea
             await settle_page(app)
         page = app.query_one("#personas", PersonasTab)
         seen["page"] = (app.content.current, app.sidebar.selected_key, page.project, page.root)
-        seen["chips"] = [str(box.id) for box in page.query("#personas-layers Checkbox")]
+        seen["chips"] = [str(box.id) for box in page.query("Checkbox")]
         seen["attach"] = len(page.query("#persona-attach-existing, #persona-attach-new"))
         seen["pages"] = len(app.query(PersonasTab))
         return seen
 
     seen = _drive(go)
     assert seen["page"] == ("personas", SETTINGS_KEY, None, None)
-    assert seen["chips"] == ["layer-user", "layer-bundled"]
+    assert seen["chips"] == [], "no layer checkboxes (0.10.2): yours and the bundled ones"
     assert seen["attach"] == 0
     assert seen["pages"] == 1, "one page, kept"
     assert reads == [None, None], "read at the first opening and again at the second"
