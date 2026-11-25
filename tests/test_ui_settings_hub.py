@@ -70,7 +70,7 @@ from aisquare.services import claude_accounts as accounts_service
 from tests.fleet_fakes import list_agents_as
 from tests.test_claude_accounts import _sign_in
 from tests.test_ui_accounts import _overview, _status
-from tests.test_ui_shell import composited
+from tests.test_ui_shell import composited, to_the_sidebar
 from tests.ui_workers import settle_page, settle_until
 
 T = TypeVar("T")
@@ -513,9 +513,13 @@ def test_the_doctor_page_names_the_project_its_checks_are_about(
     highlighted nothing on screen said which: the header names it, by its nickname."""
     root = tmp_path / "alpha"
     root.mkdir()
+    (tmp_path / "beta").mkdir()
     with store_session() as store:
         store.onboard_project(ProjectInfo(id="prj_a", root=root))
         store.set_project_nickname("prj_a", "Payments [v2]")
+        # Home is beta (start opens home since L1): the one run at start is about it.
+        store.onboard_project(ProjectInfo(id="prj_b", root=tmp_path / "beta"))
+        store.set_ui_state("fleet.last_project", "prj_b")
 
     def no_agents(project: ProjectInfo, *, live_only: bool = True) -> list[FleetAgentStatus]:
         return []
@@ -533,9 +537,7 @@ def test_the_doctor_page_names_the_project_its_checks_are_about(
         return during, _doctor_page(app)
 
     during, after = _drive(go, doctor=doctor)
-    assert during[0] == "checks for this machine", (
-        "the report on screen is still the one from start"
-    )
+    assert during[0] == "checks for beta", "the report on screen is still the one from start"
     assert during[2] == "… running the checks for Payments [v2]"
     assert after[0] == "checks for Payments [v2]" and after[2] == ""
 
@@ -631,6 +633,7 @@ def test_the_sidebar_names_no_aisquare_and_the_accounts_page_has_the_sign_in(
         )
         async with app.run_test(size=(width, 40)) as pilot:
             await settle_page(app)
+            await to_the_sidebar(app)  # below 70 columns, start on Welcome shows the other side
             return await go(pilot)
 
     sidebar, line, page = asyncio.run(run())
