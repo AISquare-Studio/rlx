@@ -32,6 +32,7 @@ from textual.widgets import OptionList
 
 from aisquare.cli.ui.app import FleetApp
 from aisquare.cli.ui.attach import AttachTargetScreen
+from aisquare.cli.ui.sidebar import STATE_CHIP
 from aisquare.cli.ui.theme import RLX_THEME, register_themes
 from aisquare.core.orchestrator import team_project
 from aisquare.models import FleetAgent, FleetAgentStatus
@@ -354,8 +355,176 @@ def test_paused_is_the_pause_mark_and_waiting_a_muted_one_not_yellow(
             return seen
 
     seen = asyncio.run(drawn())
-    (muted, warning) = (rgb for _, rgb in seen["tones"])
+    (_muted, warning) = (rgb for _, rgb in seen["tones"])
     assert [char for char, _ in seen["paused"]] == ["⏸"], seen["paused"]
     assert [char for char, _ in seen["waiting"]] == ["◦"], seen["waiting"]
     ((_, ink),) = seen["waiting"]
-    assert ink == muted and ink != warning, (theme, ink, muted, warning)
+    # A grey (the muted tone, lifted where it must read as well as 0.10.1's yellow did), never
+    # the theme's warning colour nor any yellow.
+    assert max(ink) - min(ink) <= 16 and ink != warning, (theme, ink, warning)
+
+
+Ratios = dict[str, float]
+"""What was measured, by name, at its worst ratio."""
+
+FADED_TEXT_FLOOR = 3.0
+"""Text on the side that does not hold the keyboard, drawn at ``FADE_OPACITY`` (the manager's
+call on #6): the fade marks it unfocused, and it stays clickable."""
+MARK_FLOOR = 3.0
+"""A state's mark anywhere, the selected row's highlight bar and the faded side included
+(WCAG 1.4.11, the manager's call on #6). Where the keyboard is, an unselected row's mark is
+held to text's 4.5:1 too, as the first test of the marks and Spawn agent measures it."""
+TEXT_MARKS = {mark for mark, _ in STATE_CHIP.values()} - {"🔔", "⏳", "💤"}
+"""The marks drawn as text, in a colour of ours: the emoji ones keep their own colours."""
+
+
+@pytest.mark.parametrize("theme", THEMES)
+def test_the_sidebar_and_the_agent_bar_read_where_the_keyboard_is_and_where_it_is_not(
+    theme: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M8 under the focus fade, and on the selected row (#6's tester, board #240): with an
+    agent's view open, measured with the keyboard on the sidebar and then on the agent's pane.
+
+    - Each text mark, on its row and on the highlight bar with that row selected: 3:1 or more
+      on either side (the bar drew catppuccin-latte's ▶ at 1.01:1).
+    - Spawn agent, the ``+`` beside Fleet and the line under ⚙ Settings: 4.5:1 or more where the
+      keyboard is, 3:1 on the faded side (the ``+`` was 2.65:1, the line's words 2.80:1).
+    - The agent's bar: 4.5:1 or more with the keyboard on its pane, 3:1 faded (Restart was
+      3.16:1 there on catppuccin-latte, Spawn agent 3.71:1 faded).
+    """
+    from textual.widgets import Button
+
+    from aisquare.cli.ui.sidebar import (
+        STATE_CHIP,
+        ActionRow,
+        AddButton,
+        AgentRow,
+        StatusLine,
+    )
+    from aisquare.cli.ui.views.agent import AgentView
+    from aisquare.core import tmux as tmux_core
+    from aisquare.core.store import store_session
+    from aisquare.core.tmux import Completed
+    from aisquare.models import ProjectInfo
+    from tests.fleet_fakes import list_agents_as
+
+    monkeypatch.setattr(tmux_core, "_tmux", lambda argv, stdin: Completed(1, "", "no server\n"))
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
+    with store_session() as store:
+        project = store.onboard_project(ProjectInfo(id="prj_c", root=tmp_path / "alpha"))
+    rows = _every_state(project.id)
+    list_agents_as(monkeypatch, lambda listed, **_: rows if listed.id == project.id else [])
+
+    async def side(app: FleetApp) -> Ratios:
+        """The sidebar as drawn now: each row's mark, then each mark on the bar, the texts."""
+        seen: Ratios = {}
+        agent_rows = list(app.sidebar.query(AgentRow))
+        for row in agent_rows:
+            glyph = STATE_CHIP[row.status.state][0]
+            if glyph in TEXT_MARKS and not row.has_class("selected"):
+                seen[f"mark {glyph}"] = min(r for c, r in text_cells(app, row) if c == glyph)
+        for row in agent_rows:
+            glyph = STATE_CHIP[row.status.state][0]
+            if glyph not in TEXT_MARKS:
+                continue
+            app.sidebar.select(row.selection_key)
+            await settle_page(app)
+            assert row.has_class("selected"), row.selection_key
+            on_bar = [r for c, r in text_cells(app, row) if c == glyph]
+            seen[f"selected mark {glyph}"] = min(on_bar)
+        for name, widgets in (
+            ("Spawn agent", app.sidebar.query(ActionRow)),
+            ("+", app.sidebar.query(AddButton)),
+            ("status line", app.sidebar.query(StatusLine)),
+        ):
+            # The line's words, figure and ⚠; a band's dot is its band's colour (ΔE 35 apart).
+            drawn = [
+                r
+                for widget in widgets
+                for char, r in text_cells(app, widget)
+                if not (name == "status line" and char == "●")
+            ]
+            assert drawn, f"{name} not drawn: a measurement of nothing passes nothing"
+            seen[name] = min(drawn)
+        return seen
+
+    def bar(app: FleetApp) -> Ratios:
+        view = app.query_one(AgentView)
+        return {
+            f"bar {button.id}": min(r for _, r in text_cells(app, button))
+            for button in view.query(Button)
+            if button.display and button.region.area
+        }
+
+    async def drawn() -> tuple[Ratios, Ratios]:
+        app = FleetApp(refresh_seconds=3600, doctor=lambda: [])
+        async with app.run_test(size=(160, 50)):
+            await settle_page(app)
+            app.theme = theme
+            await settle_page(app)
+            working = next(r for r in app.sidebar.query(AgentRow) if r.status.state == "working")
+            working.activate()  # its view, with its bar
+            await settle_until(app, lambda: bool(app.query(AgentView)))
+            app.sidebar.focus()
+            await settle_page(app)
+            assert app.content.has_class("-unfocused"), "the keyboard is on the sidebar"
+            on_sidebar = {**await side(app), **bar(app)}
+            app.query_one(AgentView).pane.focus()
+            await settle_page(app)
+            assert app.sidebar.has_class("-unfocused"), "the keyboard is on the pane"
+            on_pane = {**await side(app), **bar(app)}
+            return on_sidebar, on_pane
+
+    on_sidebar, on_pane = asyncio.run(drawn())
+
+    def floor(key: str, keyboard_here: bool) -> float:
+        if key.startswith("selected mark") or (key.startswith("mark") and not keyboard_here):
+            return MARK_FLOOR
+        return TEXT_FLOOR if keyboard_here else FADED_TEXT_FLOOR
+
+    below = [
+        f"{where}: {key} {ratio:.2f}:1 < {floor(key, here)}"
+        for where, seen, bar_here in (
+            ("keyboard on the sidebar", on_sidebar, False),
+            ("keyboard on the pane", on_pane, True),
+        )
+        for key, ratio in seen.items()
+        for here in [bar_here if key.startswith("bar") else not bar_here]
+        if ratio < floor(key, here)
+    ]
+    assert any(key.startswith("bar") for key in on_sidebar), on_sidebar
+    assert not below, f"{theme}: {below}"
+
+
+@pytest.mark.parametrize("theme", THEMES)
+def test_no_state_mark_reads_worse_than_0_10_1_drew_it(theme: str) -> None:
+    """The manager's call on #6: a state's mark never reads worse than base (0.10.1's style,
+    ``sidebar.DRAWN_BEFORE``, as Textual draws it through the app's ANSI theme), on either of
+    the sidebar's grounds; and at 4.5:1 or more there. Waiting's muted ◦ reads at least as well
+    as the yellow ⏸ it replaced (Q4)."""
+    from textual.color import Color
+
+    from aisquare.cli.ui.sidebar import DRAWN_BEFORE, STATE_CHIP, state_styles
+    from aisquare.cli.ui.theme import GROUNDS, contrast_ratio, drawn_ink
+
+    host = App[None]()
+    register_themes(host)
+    shown = host.get_theme(theme)
+    assert shown is not None
+    terminal = host.ansi_theme_dark if shown.dark else host.ansi_theme_light
+    colours = shown.to_color_system().generate()
+    grounds = [Color.parse(colours[ground]) for ground in GROUNDS]
+    foreground = Color.parse(colours["foreground"])
+    styles = state_styles(shown, terminal)
+    worse = []
+    for state in STATE_CHIP:
+        if STATE_CHIP[state][0] not in TEXT_MARKS:
+            continue  # an emoji keeps its own colours
+        for ground in grounds:
+            now = contrast_ratio(drawn_ink(styles[state], terminal, foreground, ground), ground)
+            then = contrast_ratio(
+                drawn_ink(DRAWN_BEFORE[state], terminal, foreground, ground), ground
+            )
+            if now < max(TEXT_FLOOR, then) - 0.01:
+                worse.append(f"{state} on {ground.hex}: {now:.2f} (0.10.1: {then:.2f})")
+    assert not worse, f"{theme}: {worse}"

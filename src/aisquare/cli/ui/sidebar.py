@@ -38,11 +38,12 @@ markup in data).
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 from rich.cells import cell_len
+from rich.terminal_theme import TerminalTheme
 from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult, RenderResult
@@ -52,6 +53,7 @@ from textual.content import Content
 from textual.css.query import NoMatches
 from textual.geometry import Region
 from textual.message import Message
+from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import Input, Static
 from textual.worker import Worker, WorkerState
@@ -68,7 +70,8 @@ from aisquare.cli.ui.groups import (
 )
 from aisquare.cli.ui.instances_chip import InstancesChip
 from aisquare.cli.ui.terminal import InPlaceField
-from aisquare.cli.ui.theme import MARK_STYLE, MarkStatic, theme_tones
+from aisquare.cli.ui.theme import MARK_STYLE, MarkStatic, readable_on, state_inks, theme_tones
+from aisquare.cli.ui.views import accounts as accounts_view
 from aisquare.cli.ui.views.accounts import agent_mark
 from aisquare.core.agent_adapters import default_binary, recorded_adapter
 from aisquare.core.version import PRODUCT_LOGO
@@ -131,12 +134,35 @@ BOLD_STATES = frozenset({"attention"})
 """The states whose mark is bold as well: the one that needs the person."""
 
 
-def state_styles(tones: Mapping[str, str]) -> dict[str, str]:
-    """Each state's style from a theme's tones (``theme.theme_tones``): its tone's colour, bold
-    where :data:`BOLD_STATES` says. A state whose tone is missing keeps :data:`STATE_CHIP`'s."""
-    styles = {}
+WORDS = "words"
+"""The key of :func:`state_styles`'s style for a row's words beside its mark (`` exited``,
+``#1·``): the theme's muted tone, where Rich's ``dim`` fell under 3:1 on light themes."""
+
+DRAWN_BEFORE: dict[str, str] = {**{state: style for state, (_, style) in STATE_CHIP.items()}}
+DRAWN_BEFORE["waiting"] = "yellow"
+"""How 0.10.1 drew each state's mark: no mark reads worse than that on any theme (the manager's
+call on #6), and where it read well enough it is drawn as it was (``theme.state_inks``)."""
+
+OWN_TONE_ONLY = frozenset({"waiting"})
+"""The states whose mark may not keep its 0.10.1 style however well it read: waiting's was a
+yellow ⏸ (Q4), and it is a muted mark now, as readable as that yellow."""
+
+
+def state_styles(theme: Theme, terminal: TerminalTheme) -> dict[str, str]:
+    """Each state's style under ``theme`` and the app's ANSI theme (``theme.state_inks``), bold
+    where :data:`BOLD_STATES` says, and the row's words (:data:`WORDS`) in the muted tone. Under
+    a theme of the terminal's own colours, :data:`STATE_CHIP`'s styles and ``dim``."""
+    inks = state_inks(
+        theme,
+        terminal,
+        {
+            state: (STATE_TONE.get(state, "muted"), DRAWN_BEFORE[state], state not in OWN_TONE_ONLY)
+            for state in STATE_CHIP
+        },
+    )
+    styles = {WORDS: theme_tones(theme).get("muted", "dim")}
     for state, (_mark, fallback) in STATE_CHIP.items():
-        colour = tones.get(STATE_TONE.get(state, "muted"))
+        colour = inks.get(state)
         if colour is None:
             styles[state] = fallback
         else:
@@ -436,6 +462,7 @@ def agent_row_text(
     mark: Text | None = None,
     usage: bool = True,
     styles: Mapping[str, str] | None = None,
+    selected: bool = False,
 ) -> Text:
     """``🧭 manager       ▶ #1·42% · skeptic`` — icon, label, state chip, the account's slot
     and the session use on it, exit status when exited, persona.
@@ -472,21 +499,28 @@ def agent_row_text(
     """
     agent = status.agent
     chip, style = STATE_CHIP.get(status.state, STATE_CHIP["unknown"])
+    words = "dim"
     if styles is not None:
         style = styles.get(status.state, styles.get("unknown", style))
+        words = styles.get(WORDS, words)
+        if selected:
+            # On the highlight bar the mark takes the bar's own text colour, which reads on it
+            # (``theme.highlight_colours``): a tone read on the sidebar's ground fell to 1.01:1
+            # on catppuccin-latte's bar (the manager's call on #6: marks at 3:1 everywhere).
+            style = "bold" if status.state in BOLD_STATES else ""
     icon = f"{ROLE_ICON.get(agent.role, CUSTOM_ROLE_ICON)} "
     tail = Text()
     tail.append(chip, style=style)
     if status.state == "exited":
         # 💤 alone read as "sleeping" (#138); the word says what happened.
-        tail.append(" exited", style="dim")
+        tail.append(" exited", style=words)
         if agent.exit_status is not None:
-            tail.append(f"({agent.exit_status})", style="dim")
+            tail.append(f"({agent.exit_status})", style=words)
     elif status.state == "paused":
         # Not exited: `fleet pause` stopped it, and `fleet resume` brings it back.
-        tail.append(" paused", style="dim")
+        tail.append(" paused", style=words)
     elif agent.account_slot is not None and usage:
-        tail.append(f" #{agent.account_slot}" + ("·" if percent is not None else ""), style="dim")
+        tail.append(f" #{agent.account_slot}" + ("·" if percent is not None else ""), style=words)
         if percent is not None:
             tail.append_text(used_percent_text(percent))
     badge = persona_badge(status)
@@ -671,6 +705,28 @@ class AgentHeadroom(NamedTuple):
     every_needs_login: bool = False
 
 
+class StatusPalette(NamedTuple):
+    """The status line's colours under a theme (M8): its words in the theme's muted tone, its
+    ``⚠`` in its warning tone, and each figure in its band's colour made readable (``ink``):
+    catppuccin-latte drew the words at 2.80:1 and the green figure at 2.25:1. A band's dot keeps
+    its colour, which tells the bands apart (ΔE 35, ``HEADROOM_DOT``); the grey of nothing read
+    takes the muted tone, where dracula drew it at 2.85:1."""
+
+    muted: str
+    warning: str
+    ink: Callable[[str], str]
+
+
+def status_palette(theme: Theme) -> StatusPalette:
+    """:class:`StatusPalette` under ``theme``."""
+    tones = theme_tones(theme)  # none under an ANSI theme: the line's own Rich styles
+    return StatusPalette(
+        muted=tones.get("muted", "dim"),
+        warning=tones.get("warning", "yellow"),
+        ink=lambda colour: readable_on(colour, theme),
+    )
+
+
 def status_line_text(
     headroom: HeadroomSummary | None,
     *,
@@ -678,6 +734,7 @@ def status_line_text(
     name: str | None = None,
     more: Sequence[AgentHeadroom] = (),
     width: int | None = None,
+    palette: StatusPalette | None = None,
 ) -> Text:
     """``● Claude: 3 accounts · 58% left``, under *⚙ Settings*: the state in words (Q8).
 
@@ -696,10 +753,10 @@ def status_line_text(
     58% ⚠`` fits and `` left`` does not.
     """
     text = Text(no_wrap=True, overflow="ellipsis")
-    _append_agent(text, name or default_binary(), headroom, every_needs_login, width)
+    _append_agent(text, name or default_binary(), headroom, every_needs_login, width, palette)
     for other in more:
         text.append("\n")
-        _append_agent(text, other.name, other.headroom, other.every_needs_login, width)
+        _append_agent(text, other.name, other.headroom, other.every_needs_login, width, palette)
     return text
 
 
@@ -709,6 +766,7 @@ def _append_agent(
     headroom: HeadroomSummary | None,
     every_needs_login: bool,
     room: int | None,
+    palette: StatusPalette | None = None,
 ) -> None:
     """One agent's line in words (Q8 of the UX audit), at the end of ``text``'s last line:
     ``● Claude: 2 accounts · 58% left ⚠``, its dot, the agent, its usable accounts, the room
@@ -717,26 +775,33 @@ def _append_agent(
     do). Before the first reading, the agent's name alone."""
     line = Text()
     dot, colour = headroom_dot(headroom, every_needs_login=every_needs_login)
-    line.append(f"{dot} ", style=colour)
+    words = palette.muted if palette is not None else "dim"
+    figured = palette.ink(colour) if palette is not None else colour
+    dotted = colour
+    if palette is not None and colour and not colour.startswith("#"):
+        # The grey of nothing read, no band of its own: the muted tone, which reads (dracula's
+        # grey was 2.85:1). A band's dot keeps its colour, ΔE 35 from the next band's.
+        dotted = figured = palette.muted
+    line.append(f"{dot} ", style=dotted)
     word = name[:1].upper() + name[1:]
     if headroom is None:
-        line.append(word, style="dim")
+        line.append(word, style=words)
         text.append_text(line)
         return
     accounts = "account" if headroom.usable == 1 else "accounts"
-    line.append(f"{word}: {headroom.usable} {accounts}", style="dim")
+    line.append(f"{word}: {headroom.usable} {accounts}", style=words)
     warning = " ⚠" if headroom.needs_login else ""
     if headroom.percent_left is not None:
         # The figure the dot's band stands for (#287): percent LEFT, in the dot's colour.
         figure = f"{round(headroom.percent_left)}%"
         for said in (" left", ""):
             if room is None or line.cell_len + cell_len(f" · {figure}{said}{warning}") <= room:
-                line.append(" · ", style="dim")
-                line.append(figure, style=colour)
-                line.append(said, style="dim")
+                line.append(" · ", style=words)
+                line.append(figure, style=figured)
+                line.append(said, style=words)
                 break
     if warning:
-        line.append(warning, style="yellow")
+        line.append(warning, style=palette.warning if palette is not None else "yellow")
     text.append_text(line)
 
 
@@ -845,10 +910,11 @@ class Activatable(Static):
         return None
 
 
-ADOPT_LIST_WORKER = "sidebar-adopt-list"
-"""Reads the conversations the ``+`` menu's *Adopt a conversation…* offers."""
-ADOPT_WORKER = "sidebar-adopt"
-"""Adopts the one picked (``services.adopt.adopt``): a fleet spawn, so a writer."""
+# The + menu's *Adopt a conversation…* runs the Accounts page's two workers, by their names:
+# the shell knows them, the list as a read a hand-over waits out (``app._waited_reads``) and
+# the adoption, a fleet spawn, as a writer a quit refuses beside (``app._writing_workers``).
+ADOPT_LIST_WORKER = accounts_view.ADOPT_LIST_WORKER
+ADOPT_WORKER = accounts_view.ADOPT_WORKER
 
 
 class AddButton(Activatable):
@@ -1316,9 +1382,9 @@ class AgentRow(Activatable):
         super().__init__(agent_row_text(status), id=f"agent-row-{status.agent.id}")
         self.status = status
         self.selection_key = f"agent:{status.agent.id}"
-        self._painted: tuple[FleetAgentStatus, float | None, int, bool, str, bool, bool] | None = (
-            None
-        )
+        self._painted: (
+            tuple[FleetAgentStatus, float | None, int, bool, str, bool, bool, bool] | None
+        ) = None
         self.prefill = ""
         """What the name field said when it opened: leaving it so is no change."""
         self._field: AgentLabelInput | None = None
@@ -1504,7 +1570,8 @@ class AgentRow(Activatable):
         # theme's tone (:func:`state_styles`). A theme change renders every widget again, and
         # :meth:`render` paints: the theme is in the key.
         dark = self.app.current_theme.dark
-        wanted = (self.status, percent, width, marked, self.app.theme, shown, menu)
+        selected = self.has_class("selected")
+        wanted = (self.status, percent, width, marked, self.app.theme, shown, menu, selected)
         if wanted != self._painted:
             self._painted = wanted
             mark = agent_mark(agent_kind(self.status), dark) if marked else None
@@ -1515,7 +1582,8 @@ class AgentRow(Activatable):
                 width=room or None,
                 mark=mark,
                 usage=shown,
-                styles=state_styles(theme_tones(self.app.current_theme)),
+                styles=state_styles(self.app.current_theme, self.app.ansi_theme),
+                selected=selected,
             )
             if menu and width:
                 # The label gave way for it: the chip and ``#N·NN%`` stay whole.
@@ -2142,8 +2210,20 @@ class StatusLine(Static):
                 name=name,
                 more=more,
                 width=self.content_size.width or None,
+                palette=status_palette(self.app.current_theme),
             )
         )
+        self._painted_in = self.app.theme
+
+    _painted_in: str | None = None
+    """The theme the line was last drawn in (:meth:`notify_style_update`)."""
+
+    def notify_style_update(self) -> None:
+        """A theme change restyles every widget: the line again, in the new theme's colours,
+        once per theme (its colours are not CSS, so nothing else redraws them)."""
+        super().notify_style_update()
+        if self.is_mounted and self.app.theme != self._painted_in:
+            self.fit_line()
 
     def on_click(self, event: events.Click) -> None:
         event.stop()

@@ -17,12 +17,16 @@ product mark's colour (:data:`MARK_VARIABLE`, :func:`theme_variable_defaults`).
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar
 
+from rich.color import Color as RichColor
+from rich.style import Style as RichStyle
+from rich.terminal_theme import TerminalTheme
 from textual.app import App, ComposeResult
 from textual.color import Color
 from textual.containers import Vertical
+from textual.filter import dim_color
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.visual import VisualType
@@ -157,9 +161,13 @@ App.-theme-rlx Panes > .-unfocused Button.-style-default {
    WCAG (label_colours), reads at 4.58:1 or more on any fill; the plain button takes Textual's
    auto. Fewer classes than rlx's rules above, so those still win on the faded side. */
 AgentView Button { color: auto 100%; }
-/* The sidebar's Spawn agent and Start captain: its accent, readable on their $boost row
-   (action_colour); a light theme's accent was 1.49:1 to 2.74:1 there. */
-ActionRow { color: $rlx-action; }
+/* The sidebar's Spawn agent and Start captain, and the + beside Fleet: its accent, readable
+   on their grounds (action_colour); a light theme's accent was 1.49:1 to 2.74:1 there. */
+ActionRow, AddButton { color: $rlx-action; }
+/* The sidebar's highlighted row on its neutral bar, the keyboard elsewhere (selected_text_colour),
+   and on the coloured bar while the sidebar holds it, as the shell's Panes draws that bar. */
+Activatable.selected { color: $rlx-selected-text; }
+Panes > .-keyboard Activatable.selected { color: $rlx-highlight-text; }
 AgentView Button.-primary { color: $rlx-label-on-primary; }
 AgentView Button.-warning { color: $rlx-label-on-warning; }
 AgentView Button.-error { color: $rlx-label-on-error; }
@@ -291,15 +299,34 @@ MUTED_SHARE = 0.6
 _BLACK, _WHITE = Color(0, 0, 0), Color(255, 255, 255)
 
 
-def readable(ink: Color, *grounds: Color, floor: float = TEXT_CONTRAST) -> Color:
+FADED_TEXT_CONTRAST = 3.0
+"""The floor for text on the side that does not hold the keyboard, drawn at
+:data:`FADE_OPACITY` (the manager's call on #6): the fade marks the side as not the one typed
+into, and it stays clickable, so its text keeps a readable floor."""
+
+
+def readable(
+    ink: Color,
+    *grounds: Color,
+    floor: float = TEXT_CONTRAST,
+    faded_floor: float = FADED_TEXT_CONTRAST,
+    at_least: Sequence[float] = (),
+) -> Color:
     """``ink``, or the nearest colour of its hue toward black or white (whichever the first
-    ground sets off better) that reads at ``floor`` or more on every one of ``grounds`` (M8:
-    every offered theme's chips at 4.5:1). Moved in twentieths, so a theme's own colour is kept
-    where it reads, and changed as little as it must where it does not; the far end, pure black
-    or white, reads at 4.58:1 or more on any one ground."""
+    ground sets off better) that reads at ``floor`` or more on every one of ``grounds``, and at
+    ``faded_floor`` or more on each once the side fades (:func:`faded`): M8, every offered
+    theme's text at 4.5:1 where the keyboard is and 3:1 on the faded side. Moved in twentieths,
+    so a theme's own colour is kept where it reads, and changed as little as it must where it
+    does not; the far end, pure black or white, is the most any ink can do. ``at_least``, ground
+    by ground, raises ``floor`` there: a mark never reads worse than it did (:func:`state_inks`)."""
+    floors = [max([floor, *at_least[place : place + 1]]) for place in range(len(grounds))]
 
     def reads(colour: Color) -> bool:
-        return all(contrast_ratio(colour, ground) >= floor for ground in grounds)
+        return all(
+            contrast_ratio(colour, ground) >= least
+            and contrast_ratio(faded(colour, ground), ground) >= faded_floor
+            for ground, least in zip(grounds, floors, strict=True)
+        )
 
     if reads(ink):
         return ink
@@ -309,6 +336,78 @@ def readable(ink: Color, *grounds: Color, floor: float = TEXT_CONTRAST) -> Color
         if reads(moved):
             return moved
     return toward
+
+
+_READABLE_BY_THEME: dict[tuple[str, str], str] = {}
+
+
+def readable_on(colour: str, theme: Theme) -> str:
+    """``colour`` (a ``#rrggbb``) made :func:`readable` on ``theme``'s sidebar grounds
+    (:data:`GROUNDS`), once per theme and colour: the status line's figure, in its dot's colour
+    (Q8). Anything else, a name or nothing, is handed back as it is, as is any colour under a
+    theme of the terminal's own ANSI colours."""
+    if not colour.startswith("#") or theme.ansi:
+        return colour
+    key = (theme.name, colour)
+    if key not in _READABLE_BY_THEME:
+        colours = theme.to_color_system().generate()
+        grounds = [Color.parse(colours[ground]) for ground in GROUNDS]
+        _READABLE_BY_THEME[key] = readable(Color.parse(colour), *grounds).hex
+    return _READABLE_BY_THEME[key]
+
+
+def drawn_ink(style: str, terminal: TerminalTheme, foreground: Color, ground: Color) -> Color:
+    """The ink Textual draws a Rich ``style`` in on ``ground``: a named colour through the app's
+    ANSI theme (``App.ansi_theme``, Textual's ``ANSIToTruecolor``), no colour as the
+    ``foreground``, and ``dim`` blended toward the ground (``textual.filter.dim_color``)."""
+    parsed = RichStyle.parse(style)
+    if parsed.color is None:
+        ink = foreground.rich_color
+    else:
+        ink = RichColor.from_triplet(parsed.color.get_truecolor(terminal, foreground=True))
+    if parsed.dim:
+        ink = dim_color(ground.rich_color, ink)
+    return Color.from_rich_color(ink)
+
+
+_INKS: dict[tuple[str, int], dict[str, str]] = {}
+
+
+def state_inks(
+    theme: Theme, terminal: TerminalTheme, states: Mapping[str, tuple[str, str, bool]]
+) -> dict[str, str]:
+    """Each state's style under ``theme`` (M8, the manager's call on #6): ``states`` gives, per
+    state, its tone (:data:`TONES`), the style 0.10.1 drew its mark in, and whether that style
+    may stand. Where that style reads, at 4.5:1 on each of :data:`GROUNDS` and 3:1 faded, it
+    stands, drawn as it was; else the tone, :func:`readable` and never under the old style's
+    own ratio on either ground. Worked out once per theme and ANSI theme. A theme of the
+    terminal's own ANSI colours has none: the old styles, which the terminal paints."""
+    key = (theme.name, id(terminal))
+    if key in _INKS:
+        return _INKS[key]
+    tones = theme_tones(theme)
+    if not tones:
+        _INKS[key] = {}
+        return _INKS[key]
+    colours = theme.to_color_system().generate()
+    grounds = [Color.parse(colours[ground]) for ground in GROUNDS]
+    foreground = Color.parse(colours["foreground"])
+    inks = {}
+    for state, (tone, old, may_stand) in states.items():
+        drawn = [drawn_ink(old, terminal, foreground, ground) for ground in grounds]
+        ratios = [contrast_ratio(ink, ground) for ink, ground in zip(drawn, grounds, strict=True)]
+        stands = may_stand and all(
+            ratio >= TEXT_CONTRAST
+            and contrast_ratio(faded(ink, ground), ground) >= FADED_TEXT_CONTRAST
+            for ink, ground, ratio in zip(drawn, grounds, ratios, strict=True)
+        )
+        if stands:
+            inks[state] = old
+        else:
+            ink = Color.parse(tones.get(tone, tones["muted"]))
+            inks[state] = readable(ink, *grounds, at_least=ratios).hex
+    _INKS[key] = inks
+    return inks
 
 
 _TONES_BY_THEME: dict[str, dict[str, str]] = {}
@@ -333,11 +432,13 @@ def tone_colours(theme: Theme, grounds: tuple[str, ...] = GROUNDS) -> dict[str, 
     """Each tone of :data:`TONES` under ``theme``, readable on each of its ``grounds``
     variables: the theme's colour of that name, or for ``muted`` its foreground at
     :data:`MUTED_SHARE` over the first ground, through :func:`readable`. A theme of the
-    terminal's own ANSI colours, whose ratios no one can know, keeps its own colours."""
+    terminal's own ANSI colours, whose ratios no one can know, has none."""
     colours = theme.to_color_system().generate()
     under = [Color.parse(colours[ground]) for ground in grounds]
     if theme.ansi or any(ground.ansi is not None for ground in under):
-        return {tone: colours.get(tone, colours["foreground"]) for tone in TONES}
+        # Textual's own ANSI names (``ansi_default``) are no Rich colour: none, and the sidebar
+        # keeps its Rich styles (``STATE_CHIP``, ``dim``), which the terminal paints.
+        return {}
     out = {}
     for tone in TONES:
         if tone == "muted":
@@ -357,29 +458,62 @@ LABEL_PREFIX = "rlx-label-on-"
 
 
 def label_colours(theme: Theme) -> dict[str, str]:
-    """The label for each fill of :data:`FILLS` under ``theme``: black or white, whichever reads
-    better on it by WCAG's ratio, which is 4.58:1 or more on any fill. Textual's ``auto`` asks
-    the fill's brightness instead, and under rlx took white, 4.31:1 on its blue, where black is
-    4.87:1. An ANSI theme keeps Textual's own label."""
+    """The label for each fill of :data:`FILLS` under ``theme``: black or white, the one that reads
+    at 4.5:1 on it and at 3:1 with its side faded (one always does, on every theme offered), else
+    whichever reads better at rest by WCAG's ratio, which is 4.58:1 or more on any fill.
+    Textual's ``auto`` asks the fill's brightness instead, and under rlx took white, 4.31:1 on
+    its blue, where black is 4.87:1. An ANSI theme keeps Textual's own label."""
     colours = theme.to_color_system().generate()
+    ground = Color.parse(colours["background"])
     out = {}
     for fill in FILLS:
         under = Color.parse(colours[fill])
         if theme.ansi or under.ansi is not None:
             out[fill] = colours["button-color-foreground"]
             continue
-        out[fill] = max((_BLACK, _WHITE), key=lambda end: contrast_ratio(end, under)).hex
+
+        def reads(end: Color, under: Color = under) -> tuple[bool, float]:
+            # Both floors first (4.5:1 at rest, 3:1 with the side faded: the manager's call on
+            # #6), then the better at rest: solarized-light's amber took white, 2.82:1 faded.
+            # Textual fades a button's fill twice and its label once (RLX_CSS), as measured.
+            rest = contrast_ratio(end, under)
+            dimmed = contrast_ratio(faded(end, ground), faded(faded(under, ground), ground))
+            return (rest >= TEXT_CONTRAST and dimmed >= FADED_TEXT_CONTRAST, rest)
+
+        out[fill] = max((_BLACK, _WHITE), key=reads).hex
     return out
 
 
 def action_colour(theme: Theme) -> str:
-    """:data:`ACTION_VARIABLE` under ``theme``: its accent, readable on the ``$boost`` row."""
+    """:data:`ACTION_VARIABLE` under ``theme``: its accent, readable on the ``$boost`` row of the
+    two actions and on the sidebar's own ground, where the ``+`` beside Fleet is drawn in it."""
     colours = theme.to_color_system().generate()
-    ground = Color.parse(colours["background"]) + Color.parse(colours["boost"])
+    background = Color.parse(colours["background"])
+    boosted = background + Color.parse(colours["boost"])
     accent = Color.parse(colours["accent"])
     if theme.ansi or accent.ansi is not None:
         return colours["accent"]
-    return readable(accent, ground).hex
+    return readable(accent, boosted, background).hex
+
+
+SELECTED_TEXT_VARIABLE = "rlx-selected-text"
+"""The text on the sidebar's neutral highlight (``$primary 35%``), the bar its highlighted row
+takes while the keyboard is elsewhere: the theme's text colour, made :func:`readable` there and
+faded (the selected row read 2.48:1 on solarized-dark's faded bar). Its marks take it too
+(``sidebar.agent_row_text``)."""
+
+NEUTRAL_BAR = 0.35
+"""How much of the theme's ``primary`` the neutral bar lays over the row's ground."""
+
+
+def selected_text_colour(theme: Theme) -> str:
+    """:data:`SELECTED_TEXT_VARIABLE` under ``theme``."""
+    colours = theme.to_color_system().generate()
+    primary = Color.parse(colours["primary"])
+    if theme.ansi or primary.ansi is not None:
+        return colours["foreground"]
+    bars = [Color.parse(colours[ground]).blend(primary, NEUTRAL_BAR) for ground in GROUNDS]
+    return readable(Color.parse(colours["foreground"]), *bars).hex
 
 
 def theme_variable_defaults(app: App[Any]) -> dict[str, str]:
@@ -401,6 +535,7 @@ def theme_variable_defaults(app: App[Any]) -> dict[str, str]:
         **{f"{TONE_PREFIX}{tone}": colour for tone, colour in theme_tones(theme).items()},
         ACTION_VARIABLE: action_colour(theme),
         **{f"{LABEL_PREFIX}{fill}": colour for fill, colour in label_colours(theme).items()},
+        SELECTED_TEXT_VARIABLE: selected_text_colour(theme),
     }
 
 
