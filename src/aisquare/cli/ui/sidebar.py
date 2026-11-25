@@ -192,6 +192,11 @@ class AddProject(Message):
     """The + beside Fleet."""
 
 
+class HomeRequested(Message):
+    """Esc in the sidebar with no marks to clear: home, as the logo and the Home key go (L1;
+    ``FleetApp.go_home``)."""
+
+
 class ToggleActiveOnly(Message):
     """The ○/● after the +, or ``l`` in the sidebar: list only the projects with a live agent,
     or every project again. The app flips it and remembers it."""
@@ -2669,6 +2674,11 @@ class Sidebar(Vertical):
             self.toggle_mark(target[1])
 
     def action_clear_marks(self) -> None:
+        """Esc in the sidebar: clear the cards' marks, or with none to clear, go home (L1: the
+        last-used project's Manager tab, as the logo and the Home key go; the shell decides)."""
+        if not self._marked:
+            self.post_message(HomeRequested())
+            return
         self._marked.clear()
         for card in self.query(ProjectCard):
             card.remove_class("marked")

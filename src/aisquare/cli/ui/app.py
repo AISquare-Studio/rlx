@@ -108,6 +108,7 @@ from aisquare.cli.ui.sidebar import (
     AppSettingsSelected,
     CaptainRequested,
     DoctorSelected,
+    HomeRequested,
     OpenAgentMenu,
     OpenProjectMenu,
     PersonasSelected,
@@ -853,6 +854,12 @@ class HelpScreen(ModalScreen[None]):
             ),
             ("l ○", "from the sidebar: list only the projects with a live agent, or all again"),
             ("+  w", "onboard a project · back to the Welcome page"),
+            # L1: home is the last-used project's Manager tab.
+            (
+                "Home  r\\x",
+                "home, the last-used project's Manager tab: Home or Esc from the sidebar, or a "
+                "click on the logo",
+            ),
             ("F1", "command palette"),
             ("q", "quit — from the sidebar; inside a pane every key goes to the agent"),
             ("?", "this help — from anywhere but an agent's pane"),
@@ -1644,6 +1651,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             view.active = "tab-manager"
 
     async def action_home(self) -> None:
+        await self.go_home()
+
+    async def on_home_requested(self, event: HomeRequested) -> None:
+        """Esc in the sidebar with no marks to clear (L1, seq 441's decision (2))."""
+        event.stop()
         await self.go_home()
 
     @on(events.Click, "Sidebar #fleet-title")

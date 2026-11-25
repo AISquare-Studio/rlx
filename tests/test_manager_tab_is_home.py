@@ -137,16 +137,26 @@ def test_at_100_by_30_with_two_projects_the_first_screen_is_the_manager_tab(
     _two_projects(tmp_path, script)
     ui_app._remember_ui_state(ui_app.LAST_PROJECT_KEY, "prj_b")
 
-    async def go(pilot: Pilot[None]) -> tuple[tuple[str | None, str | None], list[str]]:
+    async def go(
+        pilot: Pilot[None],
+    ) -> tuple[tuple[str | None, str | None], list[str], tuple[str, tuple[int, int]]]:
+        from textual.widgets import Tabs
+
         app = fleet_app(pilot)
         await settle(app)
         strips = app.screen._compositor.render_full_update(simplify=True).strips
-        return _shown(pilot), [strip.text.rstrip() for (strip,) in strips]
+        tab = app.current_view().query_one(Tabs).active_tab  # type: ignore[union-attr]
+        assert tab is not None
+        drawn = (str(tab.label.plain), (tab.region.x, tab.region.y))
+        return _shown(pilot), [strip.text.rstrip() for (strip,) in strips], drawn
 
-    shown, rows = drive(go, size=(100, 30))
+    shown, rows, active = drive(go, size=(100, 30))
     assert shown == ("project-prj_b", "tab-manager"), shown
     tab_row = next(row for row in rows if "Manager" in row and "Board" in row)
     assert tab_row.index("Manager") < tab_row.index("Board"), tab_row
+    label, (x, y) = active
+    assert label == "Manager", "the active tab on screen is the Manager's"
+    assert rows[y][x:].lstrip().startswith("Manager"), (rows[y], x)
 
 
 def test_a_click_on_welcomes_fleet_card_title_stays_on_welcome(
@@ -204,3 +214,86 @@ def test_opening_the_captain_keeps_the_last_used_project(tmp_path: Path, script:
     assert shown == ("project-prj_b", "tab-manager"), "the Home key: beta, not the first card"
     assert last == "prj_b", "the captain's board is no project: it is never the last-used one"
     assert drive(_home_shown) == ("project-prj_b", "tab-manager"), "a relaunch: beta too"
+
+
+def test_home_inside_an_agents_pane_is_the_agents_own_key(
+    tmp_path: Path, script: Script, no_real_tmux: list[tuple[str, ...]]
+) -> None:
+    """The Home key goes home from the sidebar only (as ``w``): in an attached agent's pane it
+    is the agent's, sent to its pane (a shell's line start), and nothing moves. This catches a
+    later ``priority=True`` on the binding, which would take it from every pane."""
+    from tests.test_ui_shell import row_for
+
+    _two_projects(tmp_path, script)
+
+    async def go(pilot: Pilot[None]) -> tuple[str | None, str]:
+        app = fleet_app(pilot)
+        await settle(app)
+        await pilot.click(row_for(app, "agt_a_manager"))  # a click on its row: the pane has keys
+        await settle(app)
+        assert type(app.focused).__name__ == "TerminalPane", type(app.focused).__name__
+        no_real_tmux.clear()
+        await pilot.press("home")
+        await settle(app)
+        return app.content.current, type(app.focused).__name__
+
+    assert drive(go) == ("agent-agt_a_manager", "TerminalPane"), "the agent's view stays"
+    sent = [argv for argv in no_real_tmux if "send-keys" in argv]
+    assert any("Home" in argv for argv in sent), sent
+
+
+@pytest.mark.parametrize("remembered", ["project:prj_b", "agent:prj_b/agt_b_manager"])
+def test_an_upgrade_with_only_the_last_view_remembered_opens_its_project(
+    tmp_path: Path, script: Script, remembered: str
+) -> None:
+    """The upgrade path: 0.10.1 remembered the last view (``fleet.selected``) and nothing of
+    ``fleet.last_project``. Two projects, the second remembered: home is its project, not the
+    first listed."""
+    _two_projects(tmp_path, script)
+    ui_app._remember_ui_state(ui_app.SELECTED_KEY, remembered)
+
+    assert drive(_home_shown) == ("project-prj_b", "tab-manager")
+
+
+def test_the_help_names_home_its_key_and_the_logo() -> None:
+    """The ? help says what home is and every way there: Home or Esc from the sidebar, the logo."""
+    from aisquare.cli.ui.app import HelpScreen
+
+    (line,) = [row for row in HelpScreen("f12").keys_text().plain.splitlines() if "r\\x" in row]
+    assert line.lstrip().startswith("Home  r\\x"), line
+    for said in ("last-used project's Manager tab", "Home or Esc from the sidebar", "logo"):
+        assert said in line, (said, line)
+
+
+def test_esc_in_the_sidebar_goes_home_once_no_mark_is_left(tmp_path: Path, script: Script) -> None:
+    """Seq 441's decision (2): Esc in the sidebar clears the cards' marks, and with none to
+    clear, goes home, the last-used project's Manager tab."""
+    _two_projects(tmp_path, script)
+    ui_app._remember_ui_state(ui_app.LAST_PROJECT_KEY, "prj_b")
+
+    async def go(pilot: Pilot[None]) -> list[tuple[str | None, str | None, int]]:
+        app = fleet_app(pilot)
+        await settle(app)
+        view = app.current_view()
+        assert isinstance(view, ProjectView)
+        view.active = "tab-board"  # away from the Manager tab
+        await app.action_welcome()  # and off the project: Welcome
+        await settle(app)
+        app.sidebar.focus()
+        app.sidebar.select("project:prj_a")
+        await pilot.press("m")  # a mark on alpha's card
+        await settle(app)
+        seen = [(*_shown(pilot), len(app.sidebar.query(".marked")))]
+        await pilot.press("escape")  # the mark goes, nothing else
+        await settle(app)
+        seen.append((*_shown(pilot), len(app.sidebar.query(".marked"))))
+        await pilot.press("escape")  # no mark left: home
+        await settle(app)
+        seen.append((*_shown(pilot), len(app.sidebar.query(".marked"))))
+        return seen
+
+    assert drive(go) == [
+        ("welcome", None, 1),
+        ("welcome", None, 0),
+        ("project-prj_b", "tab-manager", 0),
+    ]

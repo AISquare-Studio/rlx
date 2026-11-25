@@ -1696,6 +1696,8 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
         for project in (alpha, beta):
             project.root.mkdir()
             store.onboard_project(ProjectInfo(id=project.id, root=project.root))
+        # Home is beta (start opens home since L1), so its start run and step 1 differ.
+        store.set_ui_state("fleet.last_project", beta.id)
     listed = tuple(Candidate(root=p.root, is_git=True, project=p) for p in (alpha, beta))
     machine = Machine(claude=[READY], found=Candidates(items=listed))
     scripted(machine)
@@ -1730,14 +1732,14 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
     start, chosen, elsewhere, back, cleared, opened = in_shell(
         machine, go, doctor=diagnostics.doctor
     )
-    # The one run at start-up was about home's project, alpha (start opens home since L1);
+    # The one run at start-up was about home's project, beta (start opens home since L1);
     # back on Welcome with nothing chosen, the scope is the folder asq started in.
-    assert start == (None, [alpha.root]), "control: nothing chosen on Welcome"
-    assert chosen == (alpha.id, [alpha.root]), "the scope follows step 1; the checks do not run"
-    assert elsewhere == (beta.id, [alpha.root]), "another page's project, as before"
-    assert back == (alpha.id, [alpha.root]), "back on Welcome, the project step 2 is about"
-    assert cleared == (None, [alpha.root])
-    assert opened == (alpha.id, [alpha.root, alpha.root]), "the page runs them, for that project"
+    assert start == (None, [beta.root]), "control: nothing chosen on Welcome"
+    assert chosen == (alpha.id, [beta.root]), "the scope follows step 1; the checks do not run"
+    assert elsewhere == (beta.id, [beta.root]), "another page's project, as before"
+    assert back == (alpha.id, [beta.root]), "back on Welcome, the project step 2 is about"
+    assert cleared == (None, [beta.root])
+    assert opened == (alpha.id, [beta.root, alpha.root]), "the page runs them, for that project"
 
 
 def test_back_on_welcome_in_the_same_frame_the_doctor_still_takes_its_project(
