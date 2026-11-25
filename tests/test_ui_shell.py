@@ -495,7 +495,7 @@ def test_agent_rows_show_role_icon_state_chip_and_exit_status(
     rows, chips = drive(go)
     assert [r.split()[1] for r in rows] == ["manager", "coder-auth", "tester-1", "scout-1"]
     manager, coder, tester, scout = rows
-    assert manager.startswith("🧭") and manager.rstrip().endswith("⏸")
+    assert manager.startswith("🧭") and manager.rstrip().endswith("◦")  # waiting (Q4)
     assert coder.startswith("🔨") and coder.rstrip().endswith("▶")
     assert tester.startswith("🧪") and tester.rstrip().endswith("💤 exited(3)")  # #138: the word
     assert scout.startswith("🤖") and "🔔" in scout  # unknown role: the custom icon
@@ -554,7 +554,7 @@ def test_an_agent_row_gives_way_in_its_label_never_in_its_account_and_session_us
     width, rows = drive(go, headroom=session_use((1, 42.0), (3, 87.0)))
     assert width == 30
     manager, long, coder, scout, tester = (row.strip() for row in rows)
-    assert manager.startswith("🧭 manager") and manager.endswith("⏸ #1·42%")
+    assert manager.startswith("🧭 manager") and manager.endswith("◦ #1·42%")
     assert long.endswith("▶ #3·87%"), long  # the whole suffix…
     assert "…" in long and "coder-01k8zq7mab" not in long  # …and the label gave way
     assert long.startswith("🔨 coder-01k8")
@@ -594,7 +594,7 @@ def test_a_persona_badge_never_takes_the_session_figure_off_an_agent_row(
     width, rows = drive(go, headroom=session_use((1, 42.0), (3, 87.0)), size=size)
     assert width == 30
     manager, coder = (row.strip() for row in rows)
-    assert manager.startswith("🧭 manager") and "⏸ #1·42% · sk" in manager, manager
+    assert manager.startswith("🧭 manager") and "◦ #1·42% · sk" in manager, manager
     assert "#1·42…" not in manager
     assert coder.startswith("🔨 coder-auth"), coder
     assert coder.endswith("▶ #3·87%") or "▶ #3·87% · " in coder, coder
@@ -753,7 +753,7 @@ def test_in_a_90_column_terminal_the_agent_view_gives_way_in_its_label_first(
     assert seen["agt_a_coder-01k8zq7m"][1] == "🔨 coder-01…  ▶ working  max · 42%…"
     # Too narrow even at the label's floor: the floor, then the line cut at its end.
     assert seen["agt_b_coder-01m5d34v"][1] == "🔨 coder-…  🔔 attention  work · 4…"
-    assert seen["agt_a_tester-01m5d34v"][1] == "🧪 tester…  ⏸ waiting  account 4 ·…"
+    assert seen["agt_a_tester-01m5d34v"][1] == "🧪 tester…  ◦ waiting  account 4 ·…"
     assert seen["agt_a_coder-01m5d34v"][1] == "🔨 coder-…  ▶ working  plain claud…"
     width, wide = seen["wide"]
     assert width > 60 and wide.startswith("🔨 coder-01k8zq7m  ▶ working  max · 42%  claude"), wide
@@ -890,12 +890,12 @@ def test_the_headers_name_the_agent_only_beside_another_agents_accounts_and_afte
     named, agent_width, agent_line, manager_width, manager_line = alone
     # 37 cells before R17's Pause took 2: the account and its use whole all the same.
     assert (named, agent_width, manager_width) == (False, 35, 57)
-    assert agent_line == ["🧭 manager  ⏸ waiting  work · 42% …"], agent_line
-    assert manager_line == ["🧭 manager  ⏸ waiting  work · 42%  %1"], manager_line  # 0.9.2's
+    assert agent_line == ["🧭 manager  ◦ waiting  work · 42% …"], agent_line
+    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%  %1"], manager_line  # 0.9.2's
     named, _, agent_line, _, manager_line = mixed
     assert named is True
-    assert agent_line == ["🧭 manager  ⏸ waiting  work · 42% …"], agent_line
-    assert manager_line == ["🧭 manager  ⏸ waiting  work · 42%  claude-code  %1"], manager_line
+    assert agent_line == ["🧭 manager  ◦ waiting  work · 42% …"], agent_line
+    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%  claude-code  %1"], manager_line
     assert alone_again == alone
 
 
@@ -950,10 +950,10 @@ def test_the_card_names_the_project_not_its_codename_and_a_path_tells_twins_apar
         "🗂 api",
         "🗂 unique",
     ]
-    # The two `api` projects are told apart by their path, then their codename, which `api`
-    # does not give; the unique one, with no codename, is not decorated.
-    assert cards["prj_w"][1] and cards["prj_w"][2].endswith("work/api · amber-otter")
-    assert cards["prj_o"][1] and cards["prj_o"][2].endswith("oss/api · ruby-fox")
+    # The two `api` projects are told apart by their path alone: no codename on a card (Q3);
+    # the unique one is not decorated.
+    assert cards["prj_w"][1] and cards["prj_w"][2].endswith("work/api")
+    assert cards["prj_o"][1] and cards["prj_o"][2].endswith("oss/api")
     assert cards["prj_u"][1] is False and cards["prj_u"][2] == ""
 
 
@@ -1389,17 +1389,109 @@ def test_clicking_an_agent_opens_its_agent_view(tmp_path: Path, script: Script) 
     assert coder_selected and not manager_selected
 
 
-def test_plus_opens_onboarding(tmp_path: Path, script: Script) -> None:
+def test_plus_opens_its_menu_and_add_a_project_onboards(tmp_path: Path, script: Script) -> None:
+    """M6 (the UX audit): the ``+`` beside Fleet is a menu, *Add a project…* first, which onboards
+    as the ``+`` did on its own; Esc closes it with nothing done. The ``+`` key still onboards
+    at once."""
+    from aisquare.cli.ui.adopt_picker import ADD_A_PROJECT, ADOPT_A_CONVERSATION, AddMenu
+
     seed(tmp_path, ("prj_a", "alpha", None))
 
-    async def go(pilot: Pilot[None]) -> tuple[str | None, str | None]:
+    async def go(pilot: Pilot[None]) -> dict[str, object]:
         app = fleet_app(pilot)
-        before = app.content.current
+        seen: dict[str, object] = {"before": app.content.current}
         await pilot.click("#add-project")
         await settle(app)
-        return before, app.content.current
+        menu = app.screen
+        assert isinstance(menu, AddMenu)
+        options = menu.query_one(OptionList)
+        seen["entries"] = [
+            options.get_option_at_index(index).id for index in range(options.option_count)
+        ]
+        await pilot.press("escape")
+        await settle(app)
+        seen["after esc"] = (isinstance(app.screen, AddMenu), app.content.current)
+        await pilot.click("#add-project")
+        await settle(app)
+        await pilot.press("enter")
+        await settle(app)
+        seen["chosen"] = app.content.current
+        return seen
 
-    assert drive(go) == ("welcome", "onboard")
+    seen = drive(go)
+    assert seen["before"] == "welcome"
+    assert seen["entries"] == [ADD_A_PROJECT, ADOPT_A_CONVERSATION]
+    assert seen["after esc"] == (False, "welcome"), "Esc: the menu closed, nothing opened"
+    assert seen["chosen"] == "onboard"
+
+
+def test_the_plus_menus_adopt_opens_the_adopt_picker_and_adopts_the_one_picked(
+    tmp_path: Path, script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: *Adopt a conversation…* in the ``+`` menu is the Accounts page's button's picker, read
+    off the UI thread, and the conversation picked is adopted, said in a toast."""
+    from aisquare.cli.ui.adopt_picker import ADOPT_A_CONVERSATION, AddMenu, AdoptPicker
+    from aisquare.models import AdoptableConversation
+    from aisquare.services import adopt as adopt_service
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+    conversation = AdoptableConversation(
+        session_id="0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+        transcript_path=str(tmp_path / "t.jsonl"),
+        slot=1,
+        account="me@example.com",
+        cwd=str(tmp_path / "alpha"),
+        project_id="prj_a",
+        last_activity=datetime.now(tz=UTC),
+        first_prompt="fix the login",
+    )
+    adopted: list[str] = []
+    monkeypatch.setattr(adopt_service, "recent", lambda *a, **k: [conversation])
+
+    def adopt(ref: str, **kwargs: object) -> fleet_service.SpawnReceipt:
+        adopted.append(ref)
+        agent = status("prj_a", "coder-1", "coder", "working").agent
+        agent = agent.model_copy(update={"session_id": ref})
+        return fleet_service.SpawnReceipt(agent=agent, asked_label=None, tmux_session="asq-alpha")
+
+    monkeypatch.setattr(adopt_service, "adopt", adopt)
+
+    async def go(pilot: Pilot[None]) -> tuple[str, list[str], int]:
+        app = fleet_app(pilot)
+        told = toast_log.record(app)
+        refreshes: list[int] = []
+        read = app.refresh_data
+
+        def counted(**kwargs: Any) -> None:
+            refreshes.append(1)
+            read(**kwargs)
+
+        app.refresh_data = counted  # type: ignore[method-assign]
+        await pilot.click("#add-project")
+        await settle(app)
+        menu = app.screen
+        assert isinstance(menu, AddMenu)
+        options = menu.query_one(OptionList)
+        options.highlighted = options.get_option_index(ADOPT_A_CONVERSATION)
+        await pilot.press("enter")
+        await settle_until(app, lambda: isinstance(app.screen, AdoptPicker))
+        picker = type(app.screen).__name__
+        app.screen.query_one(OptionList).highlighted = 0  # the one conversation listed
+        before = len(refreshes)  # the adoption may end within the press itself
+        await pilot.press("enter")
+        await settle_until(app, lambda: any(t.startswith("✓ adopted") for t in told))
+        await settle_until(app, lambda: len(refreshes) > before)
+        return picker, told, len(refreshes) - before
+
+    picker, told, read_after = drive(go)
+    assert picker == "AdoptPicker"
+    assert adopted == [conversation.session_id]
+    # What the + menu adds over the Accounts page's flow: the frame read again, so the adopted
+    # agent's row shows on its project's card (review of #563, seq 463).
+    assert read_after >= 1, "no frame was read after the adoption"
+    assert any(
+        t.startswith("✓ adopted 0a1b2c3d as coder-1: it runs in the fleet now") for t in told
+    ), told
 
 
 def test_the_hubs_doctor_link_opens_the_doctor_page_and_runs_the_checks(
@@ -3000,7 +3092,7 @@ def test_rebuilds_update_in_place_and_keep_the_selection(tmp_path: Path, script:
     assert same_card and same_row  # updated in place — the widgets were not re-created
     assert still_selected
     # …yet the new state is painted, the highlighted row's ⋯ after it (R17)
-    assert coder_text.rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("⏸")
+    assert coder_text.rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("◦")
     assert labels == ["coder-auth", "tester-1"]  # the newcomer mounted, in order
     assert manager_gone
 
@@ -3199,7 +3291,7 @@ def test_ticks_while_a_fleet_read_is_in_flight_start_no_second_read_and_cost_one
     in_flight, while_held, after = drive(go)
     assert in_flight == 1, f"{in_flight} fleet reads in flight"
     assert peak[0] == 1, f"{peak[0]} reads at once"
-    assert while_held.rstrip().endswith("⏸")  # the frame shown is kept while the read waits
+    assert while_held.rstrip().endswith("◦")  # the frame shown is kept while the read waits
     assert reads == ["working", "attention"], reads  # the held read, then ONE owed read
     assert "🔔" in after  # …whose frame is the one painted last
 
@@ -3508,7 +3600,7 @@ def test_r_refreshes_from_the_sidebar_but_is_forwarded_from_a_pane(
         return first, from_sidebar, shown(row), list(pane.keys)
 
     first, from_sidebar, from_pane, keys = drive(go)
-    assert first.rstrip().endswith("⏸")
+    assert first.rstrip().endswith("◦")
     assert from_sidebar.rstrip().endswith("▶")  # r re-read the fleet
     assert from_pane.rstrip().endswith("▶") and "🔔" not in from_pane  # …and did not, here
     assert keys == ["r"]
@@ -5807,7 +5899,7 @@ def test_restart_from_the_agent_view_selects_the_new_row_in_the_shell(
         toasts
     )
     assert len(rows) == 1  # the old 💤 exited row is gone; the new one highlighted, its ⋯ last
-    assert rows[0].rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("⏸")
+    assert rows[0].rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("◦")
 
 
 def _replacement(old: FleetAgentStatus, agent_id: str) -> FleetAgentStatus:

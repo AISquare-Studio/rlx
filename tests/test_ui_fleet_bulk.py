@@ -295,12 +295,12 @@ def test_each_dialog_lists_its_agents_by_project_with_cancel_focused(
     if action == "stop":
         assert listed == [
             "alpha",
-            "  manager · manager · ⏸ waiting",
+            "  manager · manager · ◦ waiting",
             "  coder-1 · coder · ▶ working",
             "",
             "beta",
             "  manager · manager · ▶ working",
-            "  coder-1 · coder · ⏸ waiting",
+            "  coder-1 · coder · ◦ waiting",
             "  tester-1 · tester · 💤 exited — left: exited",
         ]
     else:
@@ -309,10 +309,10 @@ def test_each_dialog_lists_its_agents_by_project_with_cancel_focused(
         assert listed == [
             "alpha",
             "  coder-1 · coder · ▶ working",
-            "  manager · manager · ⏸ waiting",
+            "  manager · manager · ◦ waiting",
             "",
             "beta",
-            "  coder-1 · coder · ⏸ waiting",
+            "  coder-1 · coder · ◦ waiting",
             f"  tester-1 · tester · 💤 exited — left: {fleet_service.ENDED_CLEANLY}",
             "  manager · manager · ▶ working",
         ]
