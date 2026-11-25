@@ -1,0 +1,17 @@
+[package]
+name = "rlxd"
+description = "The rlx engine: a local daemon that hosts processes and pushes events to its clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+toml = "0.9"
+
+[lints]
+workspace = true

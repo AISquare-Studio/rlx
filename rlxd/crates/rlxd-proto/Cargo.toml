@@ -1,0 +1,24 @@
+[package]
+name = "rlxd-proto"
+description = "rlxd's wire types: the response envelope, request frames, hello, and the event envelope."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.63", default-features = false }
+
+[[bin]]
+name = "gen-schemas"
+path = "src/bin/gen-schemas.rs"
+
+[lints]
+workspace = true

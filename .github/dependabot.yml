@@ -15,3 +15,12 @@ updates:
       interval: weekly
     commit-message:
       prefix: deps
+
+  # Keep rlxd's Cargo dependencies current (rlxd/Cargo.lock). rlxd.yml's cargo deny
+  # job checks each update's licences and advisories.
+  - package-ecosystem: cargo
+    directory: "/rlxd"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: deps

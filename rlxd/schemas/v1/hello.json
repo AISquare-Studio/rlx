@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HelloParams",
+  "description": "`hello`'s params: who is connecting, as what, which protocol it speaks, and what lets\nit in.\n\n```json\n{\"token\": \"…\", \"protocol_version\": 1, \"client\": \"rlxapp\", \"client_version\": \"0.1.0\",\n \"role\": \"app\", \"gate_credential\": \"…\", \"capabilities\": [], \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```\n\nA `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,\nwhose `detail.supported` lists the versions it does. rlxd reads the version from the\nraw params first (`protocol_version_of`), so a hello this type refuses, such as one\nfrom a later protocol, still gets that answer. `role: app` also needs a valid\n`gate_credential` and a peer that passes rlxd's identity check (only the credential,\nin gate dev mode). Anything less gets the error `not_gate`, and a refused hello never\ncounts as an app client.",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "description": "What the client can do, by name. rlxd ignores names it does not know.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "client": {
+      "description": "Which client this is, such as `rlxapp`, `rlx-tui` or `rlxd-hook`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "client_version": {
+      "description": "The client's own version.",
+      "type": "string"
+    },
+    "env": {
+      "description": "Variables rlxd keeps and passes to the brain and to every Claude Code child, such\nas `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Absent leaves what\nrlxd already has.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "gate_credential": {
+      "description": "The app's gate credential, separate from the shared token, which `gate.pair` mints\nfor a peer that passes rlxd's identity check. A `role: app` hello needs it. Other\nroles have none to send.",
+      "type": "string",
+      "minLength": 1
+    },
+    "protocol_version": {
+      "description": "The protocol version the client speaks. It is the `schema_version` of every\nenvelope and event on the connection.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "role": {
+      "description": "What the client connects as. rlxd counts its clients by role.",
+      "$ref": "#/$defs/Role"
+    },
+    "token": {
+      "description": "The shared client token: the contents of `<home>/rlxd/token`. It lets a client\nin, but does not make it the gate.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "token",
+    "protocol_version",
+    "client",
+    "client_version",
+    "role",
+    "capabilities"
+  ],
+  "$defs": {
+    "Role": {
+      "description": "What a client connects as. A later protocol may add roles, so a `match` on this\nneeds a wildcard arm.",
+      "oneOf": [
+        {
+          "description": "rlxapp, and only rlxapp: the tool-call gate. It needs a valid `gate_credential`\nand a peer that passes rlxd's identity check.",
+          "type": "string",
+          "const": "app"
+        },
+        {
+          "description": "rlx's terminal UI.",
+          "type": "string",
+          "const": "tui"
+        },
+        {
+          "description": "rlx's Remote server.",
+          "type": "string",
+          "const": "remote"
+        },
+        {
+          "description": "A command-line client, such as `rlxd call`, and `rlxd-hook`.",
+          "type": "string",
+          "const": "cli"
+        }
+      ]
+    }
+  }
+}
