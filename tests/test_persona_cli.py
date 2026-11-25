@@ -949,3 +949,26 @@ def test_import_help_names_the_config_table_behind_both_defaults(runner: CliRunn
     page = " ".join(result.output.split())
     assert "(default: [persona.import] engine)" in page
     assert "(default: [persona.import] api_model)" in page
+
+
+@pytest.mark.parametrize("command", [["edit", "tempo"], ["rm", "tempo"]], ids=["edit", "rm"])
+def test_a_projects_own_persona_is_still_read_but_never_changed(
+    runner: CliRunner, repo: Path, monkeypatch: pytest.MonkeyPatch, command: list[str]
+) -> None:
+    """The owner's decision on #21 (B): a repository's committed persona is still what its
+    agents start as, and ``show`` reads it, but rlx neither edits nor removes it."""
+    skill = repo / ".aisquare" / "personas" / "tempo" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: tempo\ndescription: The repo's.\n---\nKeep tempo.\n")
+    before = skill.read_bytes()
+    monkeypatch.setenv("EDITOR", "true")
+
+    result = runner.invoke(app, ["persona", *command])
+    code, shown = _json(runner, "show", "tempo")
+
+    assert result.exit_code == 1, result.output
+    said = " ".join(result.stderr.split())
+    assert "rlx no longer writes, edits or removes a project's persona" in said
+    assert "Traceback" not in result.output
+    assert skill.read_bytes() == before, "the project's file is untouched"
+    assert (code, shown["layer"]) == (0, "project"), "and still read"

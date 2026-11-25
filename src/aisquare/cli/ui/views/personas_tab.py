@@ -214,9 +214,10 @@ class PersonasTab(Vertical):
         self.project = project
         self.root: Path | None = core.project_root(project) if project is not None else None
         """The project layer's root: the project's own, as spawn checks it (review of #201,
-        R1-F6). Asked of git, it hid a project that is not a repository's personas, and it
-        cost every project view a subprocess on the UI thread (R1-F10). ``None`` with no
-        project: no project layer, and every dialog writes the user's."""
+        R1-F6). ``None`` with no project, which is how asq builds this page (Settings ▸
+        Personas): your personas and the bundled ones, never a project's layer (0.10.2, the
+        owner's decision on #21). Nothing writes a project's layer any more
+        (``services.personas._project_refusal``); its personas were copied to yours once."""
         self.entries: list[Entry] = []
         self.selected_key: str | None = None
         self.unavailable: str | None = None

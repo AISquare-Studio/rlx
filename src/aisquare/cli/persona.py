@@ -2,9 +2,14 @@
 
 A persona is ``<name>/SKILL.md`` in one of three layers — project
 (``<project>/.aisquare/personas``), user (``$AISQUARE_HOME/personas``), bundled —
-and the same directory is ``/name`` in Claude Code. Guide: docs/personas.md.
-Every write goes through ``services.personas``; this module parses flags and
-reports.
+and the same directory is ``/name`` in Claude Code. Every write goes through
+``services.personas``; this module parses flags and reports.
+
+Personas are yours (the user layer) since 0.10.1. A project's own layer is still read, so a
+repository that commits personas starts its agents as them, but nothing here writes, edits or
+removes one (0.10.2, the owner's decision on #21): ``--project`` on ``new``, ``rm`` and
+``import`` is retired and refused in plain words, and a project's personas were copied to
+yours once (``services.personas.migrate_once``).
 """
 
 from __future__ import annotations
