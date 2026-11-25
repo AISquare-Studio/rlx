@@ -155,7 +155,9 @@ def _announce_open_bind(bind: str) -> None:
     )
 
 
-def _registered(args: list[str], *, restartable: bool) -> contextlib.AbstractContextManager[object]:
+def _registered(
+    args: list[str], *, restartable: bool
+) -> contextlib.AbstractContextManager[daemons.Registration | None]:
     """This server in the daemon registry (``core.daemons``) while it serves, as a ``serve``
     that ``serve <args>`` starts again: its options written out, an environment's
     ``AISQUARE_SERVE_PORT`` or ``AISQUARE_SERVE_CLOSE_AFTER`` included, so the command means
@@ -289,8 +291,12 @@ def serve(
         # opt-in is never invisible.
         stderr_console().print(f"rlx agent orchestrator activated for {project.root} (stdio serve)")
         # Not restartable: its client holds its stdin and stdout, and starts it again itself.
-        with _registered(["--stdio", "--close-after", str(close_after)], restartable=False):
-            mcp_server.run_stdio(close_after=close_after)
+        # Its idle deadline ends it with os._exit, so it leaves the registry just before.
+        with _registered(["--stdio", "--close-after", str(close_after)], restartable=False) as mine:
+            mcp_server.run_stdio(
+                close_after=close_after,
+                before_exit=None if mine is None else mine.deregister,
+            )
         return
     try:
         project = team_service.activate()

@@ -39,6 +39,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -61,6 +62,9 @@ SOURCE_TIMEOUT = 60.0
 """Seconds an operator's source command may run in one tick."""
 DETACHED_SESSION = "asq-watch"
 """The tmux session ``watch --detach`` runs the watcher in, on the fleet's own server."""
+STOP_WAIT_SECONDS = 3.0
+"""How long ``watch --stop`` waits for the watcher to leave (its sleep is up to 1 s) before it
+kills the watcher's tmux session (:func:`stop_detached`)."""
 DETACHED_ENV = "AISQUARE_WATCH_DETACHED"
 """Set to ``1`` for the window :func:`detach` opens, so the watcher there registers in the
 daemon registry as ``watch --detach`` starts it again (:func:`_registration`)."""
@@ -695,7 +699,8 @@ def run(
 ) -> None:
     """The watcher's loop, holding this home's lock for its whole life, and registered in the
     daemon registry as a ``watch`` for as long (``core.daemons``, :func:`_registration`);
-    returns on SIGTERM or SIGINT. Raises :class:`AlreadyWatching`."""
+    returns on SIGTERM, SIGHUP (its terminal or tmux window closed: ``watch --stop`` kills
+    the session) or SIGINT, leaving the registry. Raises :class:`AlreadyWatching`."""
     watch_dir().mkdir(parents=True, exist_ok=True)
     fd = locking.open_lock_file(lock_path())
     try:
@@ -717,6 +722,8 @@ def run(
         pid_path().write_text(str(os.getpid()), encoding="utf-8")
         with contextlib.suppress(ValueError):  # not the main thread (tests)
             signal.signal(signal.SIGTERM, stopping)
+            if sys.platform != "win32":  # no SIGHUP there
+                signal.signal(signal.SIGHUP, stopping)
         argv, restartable = _registration(interval)
         with daemons.registered(
             "watch",
@@ -788,13 +795,19 @@ def detach() -> int:
 
 def stop_detached() -> int | None:
     """Stop the running watcher (SIGTERM) and its tmux session; the pid it had, or
-    ``None`` when none ran."""
+    ``None`` when none ran. The session is killed once the watcher has let its lock go, or
+    after :data:`STOP_WAIT_SECONDS`: killed at once, its SIGHUP ended the watcher inside its
+    sleep, before it left the daemon registry."""
     from aisquare.services import fleet as fleet_service
 
     pid = running_pid()
     if pid is not None and pid > 0:
         with contextlib.suppress(OSError):
             os.kill(pid, signal.SIGTERM)
+        waited = 0.0
+        while running_pid() is not None and waited < STOP_WAIT_SECONDS:
+            _sleep(0.1)
+            waited += 0.1
     with contextlib.suppress(Exception):
         fleet_service.server(fleet_service.settings()).kill_session(DETACHED_SESSION)
     return pid

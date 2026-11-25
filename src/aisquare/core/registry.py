@@ -3,9 +3,22 @@ process registries share (0.10.3 §4.1a).
 
 ``core.daemons`` (``<home>/daemons/``) is the first built on it. ``core.instances`` and
 ``core.launchers`` keep their own copies of the same rules until 6.2 moves them onto this
-module, so their quirks are parameters here (:meth:`Registry.lock_held`'s ``missing``), not
-forks. rlxd, written in Rust, writes in such a folder too, so what follows is precise enough
-to implement in any language; the record's content is each registry's own.
+module, so their quirks are parameters here (:meth:`Registry.lock_held`'s ``missing``,
+:meth:`Registry.roll`'s ``keep`` and ``reserved``), not forks. rlxd, written in Rust, writes in
+such a folder too, so what follows is precise enough to implement in any language; the
+record's content and its liveness rule are each registry's own.
+
+**The numbers**, the same for every writer and reader, in any language:
+
+- the stale age, the registry's ``stale_seconds`` (``core.daemons``: 60 s). No reader uses
+  a shorter one: a reader deletes a gone record's lock file once it is that old, and a
+  shorter age could delete a writer's new lock file between its creation and its lock;
+- a writer's retry of its own new lock, :data:`LOCK_WAIT_SECONDS` (1 s);
+- the retry of a refused replace or delete on Windows, about 1 s (:data:`DELETE_RETRY_SECONDS`;
+  Python's replace: ``paths.despite_windows_contention``, 10 tries, 0.9 s);
+- a reader's second read of a record whose read failed, :data:`READ_RETRY_SECONDS` (0.05 s)
+  later;
+- the wait for ``.gate.lock``, :data:`GATE_WAIT_SECONDS` (2 s).
 
 **The folder**, ``<home>/<name>/`` (``<home>`` is ``AISQUARE_HOME``, else ``~/.aisquare``):
 ``0700``, every file in it ``0600`` on POSIX, so only this user reads or writes them. The
@@ -46,38 +59,57 @@ a file whose name is not ``<id>.json`` is no record, whatever it holds.
   starts would hold its lock past it, and a crashed process would read as running.
 
 A reader probes a lock by taking it without waiting and letting it go at once: taken, it was
-free; refused (``EWOULDBLOCK``/``EAGAIN``/``EACCES``), it is held. So a writer takes its own
-new lock with a short bounded retry (:data:`LOCK_WAIT_SECONDS`), as a reader may hold it for
-that instant.
+free; refused, it is held. "Refused" is ``EWOULDBLOCK``/``EAGAIN`` from ``flock``,
+``EACCES`` from ``msvcrt.locking``, and ``ERROR_LOCK_VIOLATION`` (33) from a raw
+``LockFileEx`` (Rust's ``try_lock`` reports it as ``WouldBlock``). So a writer takes its own new
+lock with a short bounded retry (:data:`LOCK_WAIT_SECONDS`), as a reader may hold it for that
+instant.
+
+**Windows: a replace or a delete may be refused for a moment.** A file another handle has
+open, and opened WITHOUT ``FILE_SHARE_DELETE``, can be neither renamed over nor deleted:
+``MoveFileEx``/``std::fs::rename`` over it and ``DeleteFile``/``std::fs::remove_file`` of it
+fail with ``ERROR_ACCESS_DENIED`` (5) or ``ERROR_SHARING_VIOLATION`` (32) until that handle
+closes. Python's ``open`` and ``os.open`` never share delete, so every Python reader of a
+record, and every process holding its own lock file, blocks both for as long as its handle is
+open (Rust's ``std::fs`` opens sharing delete, so rlxd's handles block no one). A reader holds a
+record for a moment, so a writer's replace of ``<id>.json`` and anyone's delete of a registry
+file refused with 5 or 32 is tried again for about 1 s before it is given up (Python: the
+replace through ``paths.despite_windows_contention``, the delete through :func:`unlink`, the
+rule ``core.instances`` took in #574, #28). A process deletes its own lock file only after
+closing it.
 
 **Writing**, in this order: make the folder; take ``.gate.lock``; read the others (pruning
-what is dead); create and lock ``<id>.lock``; write ``<id>.json``; let ``.gate.lock`` go.
-**Leaving**, on a clean exit: delete ``<id>.json``; close the lock file
-(Windows deletes no open file); delete ``<id>.lock``. On Windows a delete is refused while
-any other process has the file open (``ERROR_SHARING_VIOLATION``, 32), and every reader opens
-each record for a moment: a delete refused so is tried again for up to
-:data:`DELETE_RETRY_SECONDS` (:func:`unlink`; the rule ``core.instances`` took in #574, #28).
-A process that cannot finish leaving is a crashed one, which the next reader prunes.
+what is dead); create and lock ``<id>.lock``; write ``<id>.json``; let ``.gate.lock`` go. A
+writer that keeps its record fresh checks, before each rewrite, that ``<id>.lock`` is still
+the file it holds (same device and inode; on Windows the same volume and file id), and when
+another process deleted or replaced it, creates and locks it again (:meth:`Registry.keep_lock`):
+a record with no lock beside it reads as dead.
+
+**Leaving**, on a clean exit: delete ``<id>.json``; close the lock file; delete ``<id>.lock``.
+A process that cannot finish leaving (killed, or ended by a path that runs no cleanup) is a
+crashed one: its lock is free, and the next reader prunes its record.
 
 **Reading** (:meth:`Registry.roll`): each ``<id>.json`` is read once more, a moment later
 (:data:`READ_RETRY_SECONDS`), when the read fails (a sharing violation during a rewrite on
 Windows, an NFS ``ESTALE``); one gone since the listing is no record. The registry's own rule
-says whether a record it can read is live; with pruning, one that is not is deleted with its
-lock, and one whose lock is held never is. A record it cannot read (not JSON, or not what the
-registry's parser takes) is reported (:class:`Unreadable`), never crashed on: kept while its
-lock is held or its file is younger than the registry's stale age (a later release's process,
-most likely), deleted with its lock once neither holds. Beside the records, a reader deletes
-only a file of a record that is gone (``<id>.<anything>`` whose lock is free, a temp
-``.<id>.…``) once it is as old as a stale record; any other name is left alone, for a later
-release to give a meaning.
+says whether a record it can read is live, and whether one that is not must be kept all the
+same (``keep``); with pruning, any other is deleted with its lock, and one whose lock is held
+never is. A record it cannot read (not JSON, or not what the registry's parser takes) is
+reported (:class:`Unreadable`), never crashed on and never silently dropped: kept while its
+lock is held, its file is younger than the stale age (a later release's process, most likely),
+or its age cannot be read (a ``stat`` that fails otherwise than "not found"); deleted with its
+lock once none of these holds. Beside the records, a reader deletes only a file of a record
+that is gone (``<id>.<anything>`` whose lock is free, a temp ``.<id>.…``) once it is as old as
+the stale age; any other name is left alone, for a later release to give a meaning.
 
-**Live by lock or heartbeat** (:func:`live_by_lock_or_heartbeat`), the rule the home's
-registries share: a record whose lock is held is live, whatever host it names. With its lock
-free, a record naming THIS host is a crashed process's. One naming another host sharing the
-home (NFS) is live while its heartbeat is younger than the stale age: a lock taken on another
-machine may not show here. Where the lock cannot be told (an error other than "held",
+**Live by lock or heartbeat** (:func:`live_by_lock_or_heartbeat`), the rule
+``core.instances`` keeps: a record whose lock is held is live, whatever host it names. With its
+lock free, a record naming THIS host is a crashed process's. One naming another host sharing
+the home (NFS) is live while its heartbeat is younger than the stale age: a lock taken on
+another machine may not show here. Where the lock cannot be told (an error other than "held",
 ``ENOLCK`` on an NFS mount with no lock manager), this host's record is live while its pid
-runs, another host's while its heartbeat is fresh.
+runs, another host's while its heartbeat is fresh. ``core.daemons`` does NOT use it for a free
+lock: its rule is the lock alone (its module docstring says so, and what it keeps).
 """
 
 from __future__ import annotations
@@ -107,9 +139,10 @@ hold for an instant."""
 
 DELETE_RETRY_SECONDS = 1.0
 """How long a delete refused with ``PermissionError`` is tried again (:func:`unlink`): on
-Windows a file another process has open cannot be deleted, and readers open each record for a
-moment. Refused once and given up, ``core.instances``'s records stayed behind and, naming
-another host name, read as live by their heartbeat (#574, #28)."""
+Windows a file another handle has open without sharing delete cannot be deleted
+(``ERROR_ACCESS_DENIED``, 5, or ``ERROR_SHARING_VIOLATION``, 32), and readers open each record
+for a moment. Refused once and given up, ``core.instances``'s records stayed behind and,
+naming another host name, read as live by their heartbeat (#574, #28)."""
 
 READ_RETRY_SECONDS = 0.05
 """How long a reader waits before reading again a record whose read failed, and between two
@@ -200,7 +233,9 @@ class Unreadable:
 
     id: str
     path: Path
-    written_at: datetime
+    written_at: datetime | None
+    """When its file was last written; ``None`` where its ``stat`` failed otherwise than "not
+    found" (an NFS ``ESTALE``, ``EIO``, ``EACCES``), which reports it whatever its age."""
     held: bool
     """Whether its lock is held: a running process's, for sure."""
     said: Mapping[str, Any] | None = None
@@ -321,6 +356,29 @@ class Registry:
         owner_only = sys.platform != "win32"
         atomic.write_replacing(self.record(record_id), body, durable=False, owner_only=owner_only)
 
+    def keep_lock(self, record_id: str, fd: int, *, wait_s: float = LOCK_WAIT_SECONDS) -> int:
+        """The descriptor that holds ``<id>.lock`` from now on: ``fd`` while the file at that
+        path is still the one ``fd`` holds (same device and inode, or volume and file id); else,
+        another process having deleted or replaced it, the lock file created and locked again
+        (:meth:`take`) and ``fd`` closed. A record whose lock file is gone reads as dead, so a
+        writer that keeps its record fresh calls this before each rewrite. ``OSError`` when the
+        new lock cannot be had, ``fd`` then left as it was."""
+        mine = os.fstat(fd)
+        try:
+            there = os.stat(self.lock(record_id))
+        except FileNotFoundError:
+            there = None
+        if (
+            there is not None
+            and mine.st_nlink > 0
+            and (there.st_dev, there.st_ino) == (mine.st_dev, mine.st_ino)
+        ):
+            return fd
+        renewed = self.take(record_id, wait_s=wait_s)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        return renewed
+
     def leave(self, record_id: str, fd: int | None, *extra: str) -> None:
         """Leave the registry, in the module's order: the record, then the lock file once
         ``fd`` (its descriptor) is closed, and the record's ``extra`` files (suffixes) with it.
@@ -387,13 +445,15 @@ class Registry:
         *,
         prune: bool = True,
         missing: bool | None = False,
+        keep: Callable[[T, bool | None], bool] | None = None,
         reserved: frozenset[str] = frozenset(),
     ) -> Roll[T]:
         """The live records (``live(record, held)``, ``held`` being :meth:`lock_held`'s
         answer with ``missing``), and the ones this release cannot read that have their lock
-        held or are fresh. With ``prune``, deletes what is not live, as the module says, but
-        never :data:`GATE_LOCK` nor a name in ``reserved`` (a registry's own folder-level
-        files); without, writes nothing. Reads only: no folder is made."""
+        held, are fresh, or whose age cannot be read. With ``prune``, deletes what is not live,
+        as the module says, but never a record ``keep(record, held)`` keeps (nor its lock),
+        :data:`GATE_LOCK`, or a name in ``reserved`` (a registry's own folder-level files);
+        without, writes nothing. Reads only: no folder is made."""
         folder = self.folder
         try:
             names = sorted(os.listdir(folder))
@@ -423,11 +483,15 @@ class Registry:
             if loaded is Unloaded.GONE:
                 continue  # its process left since the listing
             if isinstance(loaded, Unloaded):  # unparsable, or a read that failed twice running
-                written = _written(path)
-                if written is None:
+                try:
+                    written: datetime | None = _written(path)
+                except FileNotFoundError:
                     continue  # gone since
+                except OSError:
+                    written = None  # its age cannot be told: reported, never dropped
                 locked = self.lock_held(stem) is True
-                if locked or now - written < timedelta(seconds=self.stale_seconds):
+                fresh = written is None or now - written < timedelta(seconds=self.stale_seconds)
+                if locked or fresh:
                     unreadable.append(Unreadable(stem, path, written, locked, _object_in(path)))
                 elif prune:
                     self.forget(stem)
@@ -438,7 +502,7 @@ class Registry:
                 found.append(loaded)
                 if lock:
                     held.add(stem)
-            elif prune:
+            elif prune and not (keep is not None and keep(loaded, lock)):
                 self.forget(stem)  # not live: its lock is not held
                 pruned.append(stem)
         return Roll(found, unreadable, pruned, frozenset(held))
@@ -476,8 +540,7 @@ def _object_in(path: Path) -> Mapping[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _written(path: Path) -> datetime | None:
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime, UTC)
-    except OSError:
-        return None
+def _written(path: Path) -> datetime:
+    """When ``path`` was last written. Raises ``FileNotFoundError`` when it is gone, and any
+    other ``OSError`` its ``stat`` raises."""
+    return datetime.fromtimestamp(path.stat().st_mtime, UTC)

@@ -18,11 +18,26 @@ deleted and pruned. What this registry adds:
   whatever has its pid since. Only where the lock cannot be probed at all (an error other
   than "held", ``ENOLCK`` on an NFS mount with no lock manager) does the record speak: this
   host's is live while its pid runs, another host's while its ``heartbeat_at`` is under
-  :data:`STALE_SECONDS` old.
+  :data:`STALE_SECONDS` (60 s) old.
+- **Another host's fresh record is kept.** Some shared homes carry no lock across machines
+  (NFS with ``local_lock=all`` or ``nolock``, macOS ``locallocks``, a container's bind
+  mount), so a reader reads another host's held lock as free. A record naming another host
+  whose ``heartbeat_at`` is under :data:`STALE_SECONDS` old is therefore not live to this
+  reader, and never pruned by it either: neither the record nor its lock file is deleted.
+  Once its heartbeat is stale, any reader prunes it.
 - **Registering** is ``core.registry``'s order, under ``.gate.lock``: the others read (the
   dead pruned), then this one's lock taken and its record written.
-- **The heartbeat.** A daemon rewrites its record every :data:`HEARTBEAT_SECONDS` with a new
-  ``heartbeat_at``.
+- **The heartbeat.** A daemon rewrites its record every :data:`HEARTBEAT_SECONDS` (5 s) with
+  a new ``heartbeat_at``, and before each rewrite checks that ``<id>.lock`` is still the file
+  it holds, taking it again when another process deleted or replaced it
+  (``core.registry.Registry.keep_lock``), so it never goes unseen.
+- **Leaving.** Each daemon leaves on its exits that run code: ``watch`` on SIGTERM, SIGHUP
+  and SIGINT; ``serve`` over HTTP on SIGTERM and Ctrl-C; ``serve --stdio`` at EOF and just
+  before its idle deadline's ``os._exit``. A record left behind by any other end (a kill,
+  a crash) has its lock free, and the next reader prunes it anyway.
+- **Counting.** :func:`list_live` is the live records. A daemon that runs but whose record
+  read failed twice (a rewrite on Windows) is in :func:`roll`'s ``unreadable`` with
+  ``held=True``: a count of running daemons (an upgrade's, §4.2) counts those too.
 
 **The record**: one JSON object. Keys this release does not know are ignored, as a later
 release may say more; a record without one of the required keys, or with one of the wrong
@@ -34,15 +49,21 @@ crashed on: ``core.registry``).
 - ``kind`` (string): what the daemon is, one of :data:`KINDS` (``rlxd``, ``brain``,
   ``watch``, ``serve``, ``remote``, ``board_watch``). A kind this release does not know is
   read and kept as said: a later release's daemon is still a running rlx process.
-- ``pid`` (integer): its process id, ``> 0``.
+- ``pid`` (integer): its process id, ``1`` to ``2**31 - 1``. Outside that range the record is
+  unreadable (no OS hands out such a pid, and ``kill``/``OpenProcess`` take a C ``int``).
 - ``host`` (string): the host name it runs on (``socket.gethostname()``).
 - ``version`` (string): the rlx release it runs (``aisquare-cli``'s version, or rlxd's).
-- ``started_at`` (string): when it registered, RFC 3339 with an offset, in UTC
-  (``2026-11-25T12:03:00.123456+00:00``; ``Z`` is read too; a time without an offset is read
-  as UTC).
+- ``started_at`` (string): when it registered, RFC 3339 in UTC, written with an upper-case
+  ``T`` and ``Z`` or a numeric offset (``2026-11-25T12:03:00.123456+00:00``,
+  ``2026-11-25T12:03:00Z``), with up to nine fractional digits. A lower-case ``t`` or ``z``,
+  which RFC 3339 allows, makes the record unreadable here (Python's ``fromisoformat``
+  refuses them); a time without an offset is read as UTC.
 - ``heartbeat_at`` (string): when the record was last written, as ``started_at``.
-- ``argv`` (array of strings, never empty): the command that starts it again, ``argv[0]`` the
-  program. To restart a daemon: run ``argv`` as a new process, detached from any terminal (no
+- ``argv`` (array of strings, never empty): the command that starts it again. ``argv[0]`` is
+  the absolute path of an executable: Python writes ``sys.executable``, rlxd
+  ``std::env::current_exe()``. Never a bare name nor, on Windows, a ``.cmd``/``.bat`` shim,
+  as neither ``CreateProcess`` nor Rust's ``Command`` resolves ``PATHEXT``. To restart a
+  daemon: run ``argv`` as a new process, detached from any terminal (no
   stdin; output to a null device or a log), in ``cwd`` when the record has one, with
   ``AISQUARE_HOME`` naming this home, and do not wait for it to exit: it may BE the daemon
   (``serve``), or start it in a host and return (``watch --detach``, which opens its tmux
@@ -66,7 +87,7 @@ import os
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -87,6 +108,10 @@ STALE_SECONDS = 60.0
 """How old an unreadable record or a gone record's leftover must be before a reader deletes it
 (``core.registry``); and, where a lock cannot be probed at all, how old another host's
 heartbeat may be before its record is dead."""
+
+PID_MAX = 2**31 - 1
+"""The largest pid a record may say: ``os.kill`` (and so ``core.procs.alive``) raises
+``OverflowError``, not ``OSError``, past a C ``int``, which no OS hands out anyway."""
 
 FOLDER = "daemons"
 
@@ -163,7 +188,7 @@ class Daemon:
             cwd = data.get("cwd")
             if not (isinstance(kind, str) and kind):
                 return None
-            if type(pid) is not int or pid <= 0:  # a bool is an int to isinstance
+            if type(pid) is not int or not 0 < pid <= PID_MAX:  # a bool is an int to isinstance
                 return None
             if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
                 return None
@@ -234,6 +259,12 @@ def _live(
     )
 
 
+def _kept(daemon: Daemon, *, here: str, now: datetime) -> bool:
+    """Whether a reader keeps a record that is not live to it: another host's whose heartbeat
+    is fresh, as that host's held lock may not show here (the module's rule)."""
+    return daemon.host != here and now - daemon.heartbeat_at < timedelta(seconds=STALE_SECONDS)
+
+
 def roll(*, prune: bool = True) -> registry.Roll[Daemon]:
     """The live daemons on this home, oldest first, and the records this release cannot read
     that have their lock held or are fresh. With ``prune``, deletes what is not live
@@ -243,12 +274,15 @@ def roll(*, prune: bool = True) -> registry.Roll[Daemon]:
         Daemon.from_record,
         lambda daemon, held: _live(daemon, held, here=here, now=now),
         prune=prune,
+        keep=lambda daemon, held: _kept(daemon, here=here, now=now),
     )
     return replace(found, live=sorted(found.live, key=lambda daemon: daemon.started_at))
 
 
 def list_live(*, kind: str | None = None, prune: bool = True) -> list[Daemon]:
-    """Every live daemon on this home (of ``kind``, when given), oldest first (:func:`roll`)."""
+    """Every live daemon on this home (of ``kind``, when given), oldest first (:func:`roll`).
+    A count of running daemons also counts :func:`roll`'s ``unreadable`` with ``held=True``
+    (the module's "Counting")."""
     return [d for d in roll(prune=prune).live if kind is None or d.kind == kind]
 
 
@@ -283,11 +317,22 @@ class Registration:
             with contextlib.suppress(RuntimeError):  # started already
                 self._thread.start()
 
+    @property
+    def beating(self) -> bool:
+        """Whether the heartbeat thread runs."""
+        return self._thread.is_alive()
+
     def beat(self) -> None:
-        """Rewrite the record with a heartbeat of now."""
+        """Rewrite the record with a heartbeat of now; first, take the lock file again if
+        another process deleted or replaced it (``core.registry.Registry.keep_lock``)."""
         with self._guard:
             if self._closed:
                 return
+            if self._lock_fd is not None:
+                try:
+                    self._lock_fd = REGISTRY.keep_lock(self._daemon.id, self._lock_fd)
+                except OSError:  # kept as it was: tried again at the next beat
+                    _log.debug("the rlx daemon lock could not be taken again", exc_info=True)
             self._daemon = replace(self._daemon, heartbeat_at=datetime.now(UTC))
             REGISTRY.write(self._daemon.id, self._daemon.to_record())
 

@@ -10,11 +10,14 @@ file open is tried again for a second.
 
 from __future__ import annotations
 
+import errno
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -68,13 +71,114 @@ def test_a_lock_file_a_registry_may_not_keep_can_not_be_told() -> None:
     assert seen == [None] and [t.id for t in found.live] == ["0123456789ab"]
 
 
-def test_a_reserved_name_is_never_pruned() -> None:
+def test_a_reserved_name_is_kept_only_while_it_is_reserved() -> None:
+    # An old file of a record that is gone: pruned, unless the registry reserves its name.
     folder = THINGS.private_folder()
-    for name in (".gate.lock", "0123456789ab.lock"):
-        (folder / name).touch()
-        _age(folder / name, 3600)
-    THINGS.roll(_thing, lambda thing, held: True, reserved=frozenset({".gate.lock"}))
-    assert sorted(os.listdir(folder)) == [".gate.lock"]
+    sock = folder / "0123456789ab.sock"
+    sock.touch()
+    _age(sock, 3600)
+    THINGS.roll(_thing, lambda thing, held: True, reserved=frozenset({sock.name}))
+    assert sock.exists(), "reserved: kept"
+    THINGS.roll(_thing, lambda thing, held: True)
+    assert not sock.exists(), "not reserved: a gone record's leftover, pruned"
+
+
+def test_a_record_the_registry_keeps_is_neither_listed_nor_pruned() -> None:
+    THINGS.private_folder()
+    THINGS.write("0123456789ab", {"pid": 7})
+    (THINGS.folder / "0123456789ab.lock").touch()
+    found = THINGS.roll(_thing, lambda thing, held: False, keep=lambda thing, held: True)
+    assert found.live == [] and found.pruned == []
+    assert sorted(os.listdir(THINGS.folder)) == ["0123456789ab.json", "0123456789ab.lock"]
+    found = THINGS.roll(_thing, lambda thing, held: False, keep=lambda thing, held: False)
+    assert found.pruned == ["0123456789ab"] and os.listdir(THINGS.folder) == []
+
+
+def test_keep_lock_keeps_the_descriptor_while_the_file_is_the_one_it_holds() -> None:
+    fd = THINGS.take("0123456789ab")
+    try:
+        assert THINGS.keep_lock("0123456789ab", fd) == fd
+    finally:
+        THINGS.leave("0123456789ab", fd)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows deletes no file a process holds")
+def test_keep_lock_takes_a_deleted_or_replaced_lock_file_again() -> None:
+    fd = THINGS.take("0123456789ab")
+    lock = THINGS.lock("0123456789ab")
+    lock.unlink()
+    fd = THINGS.keep_lock("0123456789ab", fd)
+    assert THINGS.lock_held("0123456789ab") is True, "deleted: created and locked again"
+    lock.unlink()
+    lock.touch()  # another file of that name, which nobody holds
+    renewed = THINGS.keep_lock("0123456789ab", fd)
+    try:
+        assert THINGS.lock_held("0123456789ab") is True, "replaced: taken again"
+        assert os.fstat(renewed).st_ino == lock.stat().st_ino
+    finally:
+        THINGS.leave("0123456789ab", renewed)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows deletes no file a process holds")
+def test_keep_lock_says_so_when_another_holds_the_new_file_and_keeps_its_own() -> None:
+    fd = THINGS.take("0123456789ab")
+    lock = THINGS.lock("0123456789ab")
+    lock.unlink()
+    theirs = locking.open_lock_file(lock, mode=0o600)  # another process took the name
+    locking.acquire(theirs, wait_s=0)
+    try:
+        with pytest.raises(OSError, match="held by another process"):
+            THINGS.keep_lock("0123456789ab", fd, wait_s=0.05)
+        os.fstat(fd)  # its own descriptor, left as it was: still open
+    finally:
+        os.close(theirs)
+        THINGS.leave("0123456789ab", fd)
+
+
+def test_an_unreadable_record_whose_age_cannot_be_read_is_reported_never_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    THINGS.private_folder()
+    THINGS.write("0123456789ab", {"pid": 7})
+    record = THINGS.record("0123456789ab")
+    real_read, real_stat = Path.read_text, Path.stat
+
+    def read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == record:
+            raise OSError(errno.ESTALE, "stale file handle")
+        return real_read(self, *args, **kwargs)
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if self == record:
+            raise OSError(errno.EIO, "input/output error")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "stat", stat)
+    found = THINGS.roll(_thing, lambda thing, held: True)
+    monkeypatch.undo()
+    assert found.live == [] and found.pruned == []
+    (unreadable,) = found.unreadable
+    assert (unreadable.id, unreadable.written_at, unreadable.held) == ("0123456789ab", None, False)
+    assert record.exists()
+
+
+def test_a_record_is_replaced_while_a_reader_holds_it_open() -> None:
+    """On Windows a rename over a file another handle holds without sharing delete is refused
+    (WinError 5 or 32) until it closes: the writer tries again for about a second
+    (``paths.despite_windows_contention``). Elsewhere the rename simply succeeds."""
+    THINGS.private_folder()
+    THINGS.write("0123456789ab", {"pid": 7})
+    reading = THINGS.record("0123456789ab").open("rb")
+    letting_go = threading.Timer(0.3, reading.close)
+    letting_go.start()
+    try:
+        THINGS.write("0123456789ab", {"pid": 8})
+    finally:
+        letting_go.join()
+        reading.close()
+    found = THINGS.roll(_thing, lambda thing, held: True, prune=False)
+    assert found.live == [Thing("0123456789ab", 8)]
 
 
 def test_the_gate_is_one_holder_at_a_time_and_never_pruned() -> None:
