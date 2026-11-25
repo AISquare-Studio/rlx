@@ -142,7 +142,9 @@ def test_inside_tmux_over_ssh_tmux_load_buffer_carries_the_copy_and_it_is_only_s
 ) -> None:
     """The gap 0.8.2 left: asq in the user's tmux over SSH. No native tool runs (the session
     is remote), and tmux keeps an app's own OSC 52 to itself by default; ``load-buffer -w``
-    hands it to tmux, which sends it to the terminal it is attached from."""
+    hands it to tmux, which sends it to the terminal it is attached from. Into the one named
+    buffer ``rlx-copy`` (``-b``), which the next copy replaces: unnamed, each copy, Remote's
+    link and token too, stayed on the user's paste-buffer stack (0.10.2, privacy)."""
     pbcopy = install(tmp_path, monkeypatch)
     tmux = install(tmp_path, monkeypatch, "tmux")
     monkeypatch.setenv("TMUX", "/tmp/tmux-1/default,1,0")
@@ -157,7 +159,9 @@ def test_inside_tmux_over_ssh_tmux_load_buffer_carries_the_copy_and_it_is_only_s
 
     assert told == [Written(True, "tmux", True, ("tmux",))]
     assert pbcopy.calls() == [], "remote: the Mac's own clipboard is not the user's"
-    assert tmux.calls()[0]["argv"] == ["load-buffer", "-w", "-"] and tmux.texts() == [TEXT]
+    argv = ["load-buffer", "-b", "rlx-copy", "-w", "-"]
+    assert tmux.calls()[0]["argv"] == argv and tmux.texts() == [TEXT]
+    assert clipboard.RELAY_BUFFER == "rlx-copy"
     said = verdict(told[0], osc52=True, fate="unknown")
     assert (said.verdict, said.route, said.tool) == ("sent", "tmux", "tmux")
 
