@@ -776,7 +776,9 @@ def test_r_remote_is_in_the_footer_and_the_footer_still_fits_80_columns() -> Non
     footer = drive(go, tunnel=missing_ngrok, size=(80, 24))
     assert "help" in footer, f"the last row is the footer: {footer!r}"
     assert "R remote" in footer and "↓↑ move" in footer, footer
-    assert footer.index("R remote") < footer.index("? help"), "nothing after it is cut off"
+    # ``?`` leads the row since Q9, so the key drawn last is the one that would be cut off.
+    assert footer.lstrip().startswith("? help"), footer
+    assert footer.rstrip().endswith("r refresh"), f"nothing after it is cut off: {footer!r}"
 
 
 # --- state survives a restart of the TUI ---------------------------------------------------------
