@@ -379,15 +379,28 @@ def select(dialog: SpawnDialog, name: str) -> Select[str]:
 
 
 async def pick_until_note_changes(
-    pilot: Pilot[Any], dialog: SpawnDialog, name: str, value: str, reads: str
+    pilot: Pilot[Any],
+    dialog: SpawnDialog,
+    name: str,
+    value: str,
+    reads: str,
+    *,
+    timeout: float = 5.0,
 ) -> None:
     """Set the ``name`` select to ``value``, then wait until the note at ``reads`` shows
-    something else (bounded: ``settle_until``). The dialog handles a select's change
-    in a later message, and one ``pilot.pause()`` did not always cover it: on a slow Windows
-    runner the rc/rlx gate at 97206baac read the persona line before the change (R29)."""
+    something else, and FAIL when it never does (``settle_until_held``). The dialog handles a
+    select's change in a later message, and one ``pilot.pause()`` did not always cover it: on
+    a slow Windows runner the rc/rlx gate at 97206baac read the persona line before the change
+    (R29). With ``settle_until`` alone, a note that never changed cost the whole bound and
+    passed (the reviewer of 0.10.1's release, board 14086)."""
     before = note(dialog, reads)
     select(dialog, name).value = value
-    await settle_until(pilot.app, lambda: note(dialog, reads) != before)
+    await settle_until_held(
+        pilot.app,
+        lambda: note(dialog, reads) != before,
+        what=f"the note at {reads} to change once {name} is {value!r} (it read {before!r})",
+        timeout=timeout,
+    )
 
 
 def advanced(dialog: SpawnDialog) -> Collapsible:
@@ -1477,13 +1490,25 @@ def test_a_receipt_dismisses_toasts_it_and_its_notes_refreshes_and_opens_the_new
             original(**kwargs)
 
         app.refresh_data = counted  # type: ignore[method-assign]
+        await _first_frame(app)
         await pilot.click(spawn_button(app))
         await pilot.pause()
         assert isinstance(app.screen, SpawnDialog)
         await pilot.click("#spawn-submit")
         await settle_workers(app)
-        for _ in range(3):
-            await pilot.pause()
+        # The dialog closes, the receipt is told and the new agent opens in messages that come
+        # AFTER the spawn's worker ends. Three pauses were a guess at how many, and on a loaded
+        # runner the SpawnDialog was still on screen: wait for each fact itself, bounded.
+        await settle_until_held(
+            app,
+            lambda: (
+                not isinstance(app.screen, SpawnDialog)
+                and len(app.notices) >= 3
+                and str(app.content.current).startswith("agent-")
+            ),
+            what="the dialog closed, the receipt's three notices and the new agent shown",
+            timeout=10,
+        )
         return [type(app.screen).__name__, app.notices, len(refreshes), app.content.current]
 
     screen, notices, refreshes, current = drive_app(scenario)
@@ -1502,8 +1527,21 @@ def test_a_receipt_dismisses_toasts_it_and_its_notes_refreshes_and_opens_the_new
     assert [call[1] for call in spawns.calls] == ["coder"]
 
 
+async def _first_frame(app: RecordingFleetApp) -> None:
+    """Wait until the app's first frame is painted and no read of it is still running.
+    ``drive_app`` pauses once, and on a loaded runner the mount's read could still be in
+    flight when a test went on: a read that opened the store before a test made it unreadable
+    then painted AFTER the failing read, and its success cleared ``store_error``."""
+    await settle_workers(app)
+    await settle_until_held(
+        app, lambda: app.snapshot is not None, what="the app's first frame", timeout=10
+    )
+    await settle_workers(app)
+
+
 async def _submit_spawn(pilot: Pilot[None], app: RecordingFleetApp) -> None:
-    """Open prj_a's spawn dialog from its row and press Spawn."""
+    """Open prj_a's spawn dialog from its row and press Spawn, once the first frame is in."""
+    await _first_frame(app)
     await pilot.click(spawn_button(app))
     await pilot.pause()
     assert isinstance(app.screen, SpawnDialog)
@@ -1522,8 +1560,10 @@ def test_a_spawn_whose_next_read_finds_the_store_unreadable_says_its_row_comes_n
     restart's does, and moves nothing."""
     (tmp_path / "alpha" / ".git").mkdir(parents=True)
     register(tmp_path / "alpha", project_id="prj_a", codename="amber-otter")
+    refused: list[int] = []
 
     def unreadable() -> Any:
+        refused.append(1)
         raise sqlite3.OperationalError("database is locked")
 
     def answer(target: ProjectInfo, role: str) -> fleet_service.SpawnReceipt:
@@ -1535,14 +1575,21 @@ def test_a_spawn_whose_next_read_finds_the_store_unreadable_says_its_row_comes_n
     spawns.answer = answer
 
     async def scenario(pilot: Pilot[None], app: RecordingFleetApp) -> list[Any]:
+        await _first_frame(app)  # no read of the store still in flight from before the spawn
         shown_before = app.content.current
         await _submit_spawn(pilot, app)
         await settle_workers(app)
-        # Each a fact the test waits for, bounded, as its siblings do (#75, #107): three
-        # pauses were not always enough on windows-latest for the read after the spawn
-        # (CI 43342268313, attempt 1, windows-py3.12 shard 1/10, store_error None).
-        await settle_until(app, lambda: app.store_error is not None, timeout=10)
-        assert app.store_error is not None, "the premise: the read after it found no store"
+        # Each a fact the test waits for, bounded, as its siblings do (#75, #107). The cause
+        # of the windows-py3.12 failures ("store_error None", CI 43342268313): the mount's
+        # read, begun before the store was made unreadable, painted after the failing read
+        # and cleared ``store_error``. ``_first_frame`` lets it finish first; every read from
+        # the spawn on is refused, and the test waits for that read, not for the flag alone.
+        await settle_until_held(
+            app,
+            lambda: refused and app.store_error is not None,
+            what="the read after the spawn to find no store",
+            timeout=10,
+        )
         # Then the select that waited for that read has said something of the agent: the
         # right notice, or the "no longer listed" the bug said.
         await settle_until(
@@ -1688,8 +1735,8 @@ def test_the_fields_read_role_hand_off_and_account_then_advanced_who_runs_it_the
     # The owner's three (tsk_01m5mm2sz23b): the role, the teammate it comes from with its
     # How row, the account. Then, folded, who runs it — the bind, the agent, the binary —
     # and as whom.
-    assert basic == ["Role", "Hand off from", "How", "Account"]
-    assert folded[:5] == ["Bind", "Agent", "Binary", "Persona", "Label"]
+    assert basic == ["Role", "Continue from", "How", "Account"]
+    assert folded[:5] == ["Preset", "Agent", "Binary", "Persona", "Label"]
 
 
 def test_the_persona_select_lists_none_and_the_catalogue_with_the_description_below(
@@ -1995,7 +2042,7 @@ def test_a_sidebar_agent_row_shows_the_persona_badge_only_when_there_is_one(
 
 @pytest.fixture(autouse=True)
 def teammates(monkeypatch: pytest.MonkeyPatch) -> list[FleetAgentStatus]:
-    """The teammates *Hand off from* offers: none, unless a test lists some."""
+    """The teammates *Continue from* offers: none, unless a test lists some."""
     listed: list[FleetAgentStatus] = []
     monkeypatch.setattr(fleet_service, "handoff_sources", lambda project: list(listed))
     return listed
@@ -3743,6 +3790,29 @@ def test_a_picked_persona_survives_a_project_switch_silently(
 
     seen = drive(git_project, scenario, projects=[git_project, other_project])
     assert seen == [["solo", None], "solo", ["mentor", None], "mentor"]
+
+
+def test_pick_until_note_changes_fails_fast_when_the_note_never_changes(
+    git_project: ProjectInfo,
+) -> None:
+    """R29's helper, held to its word: a pick that leaves the note as it was is a failure,
+    raised at the helper's own bound and naming what it waited for, never a pass that cost
+    the whole wait."""
+    configure_role("coder", persona="mentor")
+
+    async def scenario(pilot: Pilot[None], host: Host, dialog: SpawnDialog) -> float:
+        current = select(dialog, "persona").value
+        assert current == "mentor", "the premise: the role's persona is already picked"
+        started = time.monotonic()
+        with pytest.raises(AssertionError, match="the note at #spawn-persona-description"):
+            await pick_until_note_changes(  # the same value again: nothing to change
+                pilot, dialog, "persona", "mentor", "#spawn-persona-description", timeout=0.5
+            )
+        return time.monotonic() - started
+
+    elapsed = drive(git_project, scenario)
+
+    assert elapsed < 3.0, elapsed
 
 
 def test_the_project_field_takes_the_focus_when_it_is_shown_else_the_role(

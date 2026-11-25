@@ -11,7 +11,7 @@ prefilled label follows the same rule: sent only when the user changed it, so
 the service picks the free label under the store it is writing with.
 
 **Two tiers: three fields, then Advanced** (tsk_01m5mm2sz23b). Always on show,
-in this order: Role, *Hand off from* (its *How* row only once a teammate is
+in this order: Role, *Continue from* (its *How* row only once a teammate is
 picked) and Account, then the status line and the buttons. Above them, when the
 caller lists the projects (``projects=``: the sidebar's *Spawn agent* does), the
 **Project** field says where the agent goes; the persona-first flow and the
@@ -87,7 +87,7 @@ select opens the Personas page's import dialog and selects what it imports.
 
 **Changing Project** re-reads everything that hangs on the project, as the dialog does
 when it opens: the header, git (the worktree switch), whether a manager already runs (the
-Role prompt and its label lock), *Hand off from* and Task (reset to ``(none)``), the persona
+Role prompt and its label lock), *Continue from* and Task (reset to ``(none)``), the persona
 catalogue and the role's default persona (unless one was picked) and the prefilled label
 (unless it was edited). Account, Binary, Permission mode, Extra agent args and First prompt
 keep what was entered, but the label of Account's no-account option (what a spawn with no
@@ -271,7 +271,7 @@ DEFAULT_PENDING = "(default)"
 NO_PERSONA = ""
 """The Persona field's ``(none)`` — and what ``spawn`` reads as "no persona"."""
 NO_SOURCE = ""
-"""The Hand off from field's ``(none)``: the plain spawn, field for field (tsk_01m3ns5a736s)."""
+"""The Continue from field's ``(none)``: the plain spawn, field for field (tsk_01m3ns5a736s)."""
 
 NO_ROLE = fleet_service.PLAIN_ROLE
 """The Role field's ``(none)``: a plain session of the Agent field's agent, no standing cycle
@@ -464,7 +464,7 @@ def start_captain(kwargs: dict[str, Any]) -> fleet_service.SpawnReceipt:
 
 
 def source_choice(status: FleetAgentStatus) -> str:
-    """One teammate in *Hand off from*: its label, state, role, task and account."""
+    """One teammate in *Continue from*: its label, state, role, task and account."""
     agent = status.agent
     slot = f"slot {agent.account_slot}" if agent.account_slot is not None else "this shell's"
     return f"{agent.label} · {status.state} · {agent.role} · {agent.task_id or 'no task'} · {slot}"
@@ -487,7 +487,7 @@ def hand_off(
 class PlainFields:
     """Role, Account and Persona as the plain form held them before a teammate filled them.
 
-    What *Hand off from* gives back when it returns to ``(none)`` (review of #240, the
+    What *Continue from* gives back when it returns to ``(none)`` (review of #240, the
     stale slot).
     """
 
@@ -719,7 +719,7 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
         return found, None
 
     def _read_sources(self) -> tuple[list[FleetAgentStatus], str | None]:
-        """The teammates *Hand off from* offers (:func:`fleet_service.handoff_sources`)."""
+        """The teammates *Continue from* offers (:func:`fleet_service.handoff_sources`)."""
         try:
             return fleet_service.handoff_sources(self.project), None
         except Exception as exc:  # tmux or the store could not be asked: no list, still a dialog
@@ -912,7 +912,7 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
                     # the plain spawn, field for field. Each teammate is its ROW's
                     # id: two rows can carry one label (_source_changed).
                     with Horizontal(classes="spawn-row"):
-                        yield Label("Hand off from")
+                        yield Label("Continue from")
                         yield Select(
                             [
                                 ("(none)", NO_SOURCE),
@@ -945,11 +945,11 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
                     title="Advanced", collapsed=not self._advanced_preset, id="spawn-advanced"
                 ):
                     with Horizontal(classes="spawn-row"):
-                        yield Label("Bind")
+                        yield Label("Preset")
                         yield Button(
                             "Pick…",
                             id="spawn-pick",
-                            tooltip="choose a bind or an account",
+                            tooltip="choose a preset or an account",
                             disabled=self._captain,
                         )
                         yield Static(
@@ -1830,7 +1830,7 @@ class SpawnDialog(ModalScreen[fleet_service.SpawnReceipt | None]):
         self._note("#spawn-task-note", self._tasks_unavailable, style="dim")
 
     def _reset_source(self) -> None:
-        """*Hand off from* offers this project's teammates, on ``(none)``: the plain spawn."""
+        """*Continue from* offers this project's teammates, on ``(none)``: the plain spawn."""
         self._sources, self._sources_unavailable = self._read_sources()
         chosen, self._source = self._source, None
         field = self.query_one("#spawn-from", Select)

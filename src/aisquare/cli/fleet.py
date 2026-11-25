@@ -479,7 +479,7 @@ def restart(
             help="Permission for the replacement: WRITE:APPROVALS mapped per agent "
             "(workspace:auto, read_only:auto…) or the agent's own (Claude Code: auto, "
             "acceptEdits, …); default: the one the agent was launched with, or the role's "
-            "for an agent spawned before that was recorded (#144).",
+            "for an agent spawned before that was recorded.",
         ),
     ] = None,
     model: Annotated[
