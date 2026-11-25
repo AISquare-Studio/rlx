@@ -1259,6 +1259,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """
     #main { height: 1fr; }
     #content { width: 1fr; height: 1fr; }
+    /* The narrow footer (ShellFooter.NARROW_BELOW). Textual's compact footer draws a key
+       group's label with no margin, so "move" touched the "⏎ open" after it, and gives the
+       group a cell on its left, which doubled the gap after "? help" once help came first.
+       The cell moves from the group's left to its label's right: the row keeps its 80. */
+    ShellFooter.-compact FooterLabel { margin: 0 1 0 0; }
+    ShellFooter.-compact KeyGroup.-compact { padding-left: 0; }
     """
         + RLX_CSS
     )

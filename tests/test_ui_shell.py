@@ -21,6 +21,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -2536,26 +2537,49 @@ def test_help_opens_from_the_sidebar_and_closes(tmp_path: Path, script: Script) 
 
 def _footer(app: FleetApp) -> list[tuple[str, str]]:
     """The footer's keys as drawn, left to right: (key as shown, its word). Each one whole: on
-    the screen, and not under the next (the palette's key is docked on the right)."""
+    the screen, and a cell or more apart from the next entry the footer draws, whatever it is:
+    a key, a group of keys (``↓↑``), or a group's label (``move``), which the compact footer
+    drew touching the key after it (``move⏎ open``, the tester of #553). The palette's key is
+    docked on the right, an entry like the rest."""
     from textual.widgets import Footer
     from textual.widgets._footer import FooterKey
 
     footer = app.screen.query_one(Footer)
+    entries = sorted(
+        (entry for entry in footer.children if entry.display and entry.region.area),
+        key=lambda entry: entry.region.x,
+    )
+    assert all(entry.region.right <= footer.region.right for entry in entries), entries
+    # Each entry's ink, from its first drawn glyph to its last: a key's padding is inside its
+    # region, so the gap is the blank cells between one entry's ink and the next's.
+    inked = []
+    for entry in entries:
+        text = composited_text(app, entry)
+        if text.strip():
+            first = entry.region.x + len(text) - len(text.lstrip())
+            inked.append((text.strip(), first, entry.region.x + len(text.rstrip())))
+    touching = [(a[0], b[0]) for a, b in itertools.pairwise(inked) if b[1] - a[2] < 1]
+    assert not touching, f"footer entries with no cell between them: {touching} in {inked}"
     keys = sorted(
         (key for key in footer.query(FooterKey) if key.region.area), key=lambda k: k.region.x
     )
-    drawn = [(key.key_display, key.region.x, key.region.right) for key in keys]
-    assert all(right <= footer.region.right for _, _, right in drawn), drawn
-    assert all(a[2] <= b[1] for a, b in itertools.pairwise(drawn)), f"keys overlap: {drawn}"
     return [(key.key_display, key.description) for key in keys]
 
 
-@pytest.mark.parametrize("size", [(80, 24), SIZE])
+def composited_text(app: FleetApp, widget: Widget) -> str:
+    """The cells ``widget`` covers on the screen's composited frame, as drawn."""
+    region = widget.region
+    (strip,) = app.screen._compositor.render_full_update(simplify=True).strips[region.y]
+    return strip.text[region.x : region.right]
+
+
+@pytest.mark.parametrize("size", [(80, 24), (99, 24), SIZE])
 def test_the_footer_starts_with_help_and_shows_welcome_and_add_project(
     tmp_path: Path, script: Script, size: tuple[int, int]
 ) -> None:
     """Q9 (the UX audit): ``?`` first, where a newcomer looks, then ``w`` welcome and ``+``
-    add project, which were hidden. At 80x24 too: every key the footer lists is on screen."""
+    add project, which were hidden. At 80x24 too: every key the footer lists is on screen, each
+    entry a cell apart from the next (:func:`_footer`), at the narrow footer's widest too (99)."""
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def go(pilot: Pilot[None]) -> tuple[list[tuple[str, str]], str]:
@@ -2567,10 +2591,36 @@ def test_the_footer_starts_with_help_and_shows_welcome_and_add_project(
     footer, bottom = drive(go, size=size)
     assert footer[0] == ("?", "help"), footer
     assert bottom.lstrip().startswith("? help"), f"the screen's bottom row: {bottom!r}"
+    assert re.search(r"move +⏎", bottom), f"the screen's bottom row: {bottom!r}"
     assert ("w", "welcome") in footer and ("+", "add project") in footer, footer
     # Nothing the footer listed before is pushed off it to make room.
     for shown_before in (("q", "quit"), ("t", "theme"), ("R", "remote"), ("r", "refresh")):
         assert shown_before in footer, (shown_before, footer)
+
+
+def test_the_footer_keeps_its_gaps_after_a_resize_back_to_80_columns(
+    tmp_path: Path, script: Script
+) -> None:
+    """The narrow footer is chosen at each resize (``ShellFooter.on_resize``): wide, then 80
+    columns again, it is drawn as at 80 from the start, every entry a cell apart."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> list[tuple[list[tuple[str, str]], str]]:
+        app = fleet_app(pilot)
+        seen = []
+        for width in (140, 80):
+            await pilot.resize_terminal(width, 24)
+            await settle(app)
+            strips = app.screen._compositor.render_full_update(simplify=True).strips
+            (bottom,) = strips[23]
+            seen.append((_footer(app), bottom.text))
+        return seen
+
+    (wide, wide_row), (narrow, narrow_row) = drive(go, size=(80, 24))
+    assert wide[0] == narrow[0] == ("?", "help"), (wide, narrow)
+    assert "f1 palette" in wide_row and "f1 palette" not in narrow_row, (wide_row, narrow_row)
+    assert "move ⏎" in narrow_row and "move⏎" not in narrow_row, narrow_row
+    assert ("r", "refresh") in narrow, narrow
 
 
 def test_help_explains_every_agent_mark_and_the_agent_menu(tmp_path: Path, script: Script) -> None:
