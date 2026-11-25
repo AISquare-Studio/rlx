@@ -1101,13 +1101,27 @@ def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInf
 
     async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, str]:
         await pilot.click("#--content-tab-tab-board")
-        await pilot.pause()
         panel = host.query_one("#board-panel", BoardPanel)
-        focused = host.focused
-        inside = focused is not None and panel in focused.ancestors_with_self
+        table = panel.query_one("#tasks", DataTable)
+
+        def inside() -> bool:
+            focused = host.focused
+            return focused is not None and panel in focused.ancestors_with_self
+
+        # The click's chain (the tab activated, its pane shown, the panel's on_show taking the
+        # keys) is several messages long; one pause() guesses "idle" from CPU time and, on a
+        # loaded Windows runner, returned before its end (#29). Wait for the focus itself.
+        for _ in range(500):  # bounded: 10 s at most
+            if inside():
+                break
+            await pilot.pause(0.02)
+        took = inside()
         await pilot.press("d")  # no click inside the board first
-        await pilot.pause()
-        return inside, str(panel.query_one("#tasks", DataTable).border_title)
+        for _ in range(500):
+            if str(table.border_title).startswith("done archive"):
+                break
+            await pilot.pause(0.02)
+        return took, str(table.border_title)
 
     inside, title = drive(project, scenario)
     assert inside, "the tab's click left the focus outside the board"
