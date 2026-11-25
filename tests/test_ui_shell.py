@@ -7190,8 +7190,10 @@ def test_the_settings_tab_follows_a_rename_made_on_the_card_or_in_a_shell(
         app.refresh_data()
         await settle(app)
         out["typing"] = seen()
+        field.focus()
+        await settle(app)
         field.value = ""
-        tab.query_one("#save-nickname", Button).press()
+        field.blur()  # leaving the field keeps it: there is no Save (M5)
         await settle(app)
         out["cleared"] = (seen(), stored())
         return out
@@ -7204,7 +7206,7 @@ def test_the_settings_tab_follows_a_rename_made_on_the_card_or_in_a_shell(
         "what the operator is typing stays; the title says the stored name"
     )
     assert out["cleared"] == (("", "project settings — alpha"), None), (
-        "a blank Save clears a nickname set elsewhere"
+        "a blank field, left, clears a nickname set elsewhere"
     )
 
 
