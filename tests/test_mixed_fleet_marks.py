@@ -230,7 +230,10 @@ def test_a_real_problem_keeps_its_mark(
     status = _status(agent, **status_kwargs)
     assert not accounts_view.awaits_first_reading(status, usage)
     cells = accounts_view.account_cells(status, usage, now=NOW)
-    assert cells["session"].plain == accounts_view.PROBLEM_MARK
+    # The mark, and why in words after it (Q19 of the 0.10.2 UX audit), never the quiet line.
+    said = cells["session"].plain
+    assert said.startswith(f"{accounts_view.PROBLEM_MARK} ") and said != "! ", said
+    assert said == accounts_view.problem_words(status, usage, now=NOW).plain
 
 
 # --- R16-E verify (seq 11952): the mark gives way; old rows; the captain's row ---------------

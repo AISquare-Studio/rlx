@@ -757,7 +757,10 @@ def _starts_with_a_hand_over(
             accounts.session = SimpleNamespace(source="file")  # type: ignore[assignment]
             # label and disabled: what the fleet summary line reads (P3-W2a, #287).
             signed_in = SimpleNamespace(
-                signed_in=True, label="2", account=SimpleNamespace(slot=2, disabled=False)
+                signed_in=True,
+                label="2",
+                identity=None,
+                account=SimpleNamespace(slot=2, disabled=False, alias=None, agent="claude-code"),
             )
             accounts.overview = SimpleNamespace(accounts=[signed_in])  # type: ignore[assignment]
             accounts.refresh_readings()
