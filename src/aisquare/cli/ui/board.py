@@ -42,6 +42,7 @@ long as the session lives.
 from __future__ import annotations
 
 import contextlib
+import functools
 import textwrap
 import time
 from collections.abc import Mapping, Sequence
@@ -61,14 +62,17 @@ from textual.geometry import Size
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, DataTable, OptionList, Static, TabbedContent
+from textual.widgets import Button, DataTable, Input, OptionList, Static, TabbedContent
 from textual.widgets.option_list import Option, OptionDoesNotExist
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli import board_names, watch
+from aisquare.cli.ui.autosave import Autosave
+from aisquare.cli.ui.board_parts import STREAM, WORK, BoardSwitch, NeedsYouLane
 from aisquare.cli.ui.clipboard import copy_and_tell
 from aisquare.cli.ui.divider import Divider, floor_of
 from aisquare.cli.ui.ticks import while_running
+from aisquare.core.state_file import read_state
 from aisquare.core.store import unmet_needs
 from aisquare.core.terminal import mac_keyboard
 from aisquare.models import (
@@ -87,14 +91,14 @@ OPEN_STATUSES = ("todo", "doing", "review", "blocked")
 LABELS_TTL = 30.0
 """How long the sessions block keeps the slot labels before asking the registry again."""
 LABELS_WORKER = "board-account-labels"
-COLLAPSE_BELOW = 80
-"""Panel width (columns) under which the board column hides and the feed takes all:
-the board column is 48 wide and a feed narrower than ~32 shows nothing readable.
-Measured against the PANEL, not the terminal — inside the fleet UI a 30-column
-sidebar sits beside it, and at 92 a 120-column terminal never showed the tasks. The
-feed's title says so while the column is hidden (:data:`TASKS_HIDDEN`, B1 #2)."""
+HISTORY_WORKER = "board-task-history"
+"""The reader's history read, off the UI thread: one store query per task opened."""
 TASKS_HIDDEN = "tasks hidden — b shows them"
-"""What the feed's title adds while the board column is out of sight, by width or by ``b``."""
+"""What the feed's title adds while ``b`` has the Work column out of sight (wide)."""
+WIDE_FROM = 120
+"""Panel width (columns) from which Work and the Stream sit side by side (B2). Below it they
+share one column, and :class:`~aisquare.cli.ui.board_parts.BoardSwitch` says which shows.
+Measured against the PANEL, not the terminal: asq's sidebar takes about 31 beside it."""
 TRANSCRIPT_HINT = "\npress o to open the transcript at this moment"
 COLUMN_WIDTH_KEY = "board_column_width"
 """The ``state.json`` key of the board column's width (the line beside the live feed)."""
@@ -102,6 +106,18 @@ TEAM_HEIGHT_KEY = "board_team_height"
 """The ``state.json`` key of the team block's height (the line above the tasks)."""
 DETAIL_HEIGHT_KEY = "board_detail_height"
 """The ``state.json`` key of the detail pane's height (the line above it)."""
+DIVIDER_KEYS: dict[str, tuple[str, str]] = {
+    "side-divider": ("left_square_bracket", "right_square_bracket"),
+    "team-divider": ("left_parenthesis", "right_parenthesis"),
+    "detail-divider": ("left_curly_bracket", "right_curly_bracket"),
+}
+"""Each line's keys, (shrink, grow) its target by :data:`DIVIDER_STEP`: the keys a drag has
+(B2: every click has a key). ``=`` puts every line back, as a double-click puts one back."""
+DIVIDER_STEP = 4
+VIEW_KEY = "board_view:"
+"""The ``state.json`` key of a project's board view, before the project's id (B2): its folds,
+its Stream filter and, below :data:`WIDE_FROM`, the half it shows. One key per project, so two
+boards never write over each other's."""
 
 WAITING = "waiting"
 """Not a status: a ``todo`` whose ``needs`` are not all done yet, which gets its own icon."""
@@ -118,17 +134,38 @@ STATUS_ICONS: dict[str, tuple[str, str, str]] = {
 legend the help screens print from it. Each glyph is one or two cells wide."""
 ICON_CELLS = 2
 """The status column's width: the widest glyph, so every row's title starts at one column."""
-TASK_COLUMNS = ("#", "st", "title")
-"""The tasks table: the number on the board, the status icon, the title."""
+TASK_COLUMNS = ("#", "st", "title", "owner", "age")
+"""The Work table (B2): the number on the board, the status icon, the title, who has it, and how
+long it has been in its status."""
+WORK_GROUPS: tuple[tuple[str, str, frozenset[str]], ...] = (
+    ("doing", "Doing", frozenset({"doing"})),
+    ("blocked", "Blocked", frozenset({"blocked"})),
+    ("review", "Review", frozenset({"review"})),
+    ("todo", "To do", frozenset({"todo"})),
+    ("done", "Done", frozenset(CLOSED_STATUSES)),
+)
+"""Work's groups in order: (key, heading, the statuses it holds). Done holds the dropped too."""
+GROUP_ROW = "group:"
+"""The row key of a group's heading: ``group:done``. No task's id starts so."""
+DEFAULT_FOLDS: frozenset[str] = frozenset({"done"})
+"""The groups folded on a board that never had a fold changed: Done (B2)."""
+OWNER_CELLS = 14
+"""The widest the owner column grows; a longer name ends in ``…``."""
 BOARD_KEYS: tuple[tuple[str, str], ...] = (
-    ("click Enter", "a task or feed line: its full content below"),
-    ("d", "the done archive · back to the open tasks"),
+    ("click", "a task or stream line: its full content below"),
+    ("d", "unfold the done archive · fold it again"),
+    ("f", "fold or unfold the group at the cursor"),
     ("o", "the author's transcript at that moment"),
+    ("/", "filter the stream · Esc clears the filter"),
+    ("Enter", "a task: its reader, full height, with history"),
+    ("Esc", "back from the reader"),
     ("v  c", "freeze the feed to select text · copy it"),
     ("a", "feed autoscroll on or off"),
-    ("b", "hide or show the tasks column"),
+    ("b", "Work or Stream (narrow) · hide Work (wide)"),
     ("r", "refresh now"),
     ("lines", "drag a line to resize; double-click resets it"),
+    ("[ ] ( ) { }", "the same by key: Work, the team, the detail"),
+    ("=", "every line back to its first size"),
 )
 """The board's own keys, as the help screens list them."""
 MAC_COPY_KEY = ("v  c", "freeze the feed to select text · c copies (not ⌘C)")
@@ -413,6 +450,33 @@ class NeedsYouStrip(Horizontal):
         self.post_message(self.Picked(kind))
 
 
+def stream_line(
+    event: TeamEvent,
+    roles: dict[str, str],
+    names: Mapping[str, str] | None = None,
+    statuses: Mapping[str, str] | None = None,
+) -> Text:
+    """One Stream line (B2), on one row: its time, then a chip for the agent, one for the kind,
+    and — for a line about a task — one for that task's status now, then the text."""
+    emoji, name, style = watch._who(event, roles, names)
+    verb_emoji, verb = watch._KIND_VERB.get(event.kind, ("•", event.kind))
+    line = Text(no_wrap=True, overflow="ellipsis")
+    line.append(f"{watch.clock(event.created_at)} ", style="dim")
+    line.append(f" {emoji} {name} ", style=f"{style} reverse")
+    line.append(" ")
+    line.append(f" {verb_emoji} {verb} ", style="bold reverse")
+    status = (statuses or {}).get(event.task_id or "")
+    if status is not None:
+        glyph, chip_style, _meaning = STATUS_ICONS.get(status, ("?", "dim", ""))
+        line.append(" ")
+        line.append(f" {glyph} {status} ", style=f"{chip_style} reverse")
+    line.append(" ")
+    line.append(watch.one_row(watch.shown_text(event)))
+    if event.to_role:
+        line.append(f" → {event.to_role}", style="italic yellow")
+    return line
+
+
 def board_help(*, standalone: bool = False) -> Text:
     """The board's keys, what a human does here, and the icon legend, for a help screen;
     ``standalone`` for ``board -w``'s, which has no left pane beside it."""
@@ -431,6 +495,30 @@ def board_help(*, standalone: bool = False) -> Text:
         text.append(f"  {meaning}", style="dim" if state == "dropped" else "")
         text.append("\n")
     return text
+
+
+def click_key(widget: Widget) -> str | None:
+    """The key that does what a click on ``widget`` does (B2: every click has a key): its
+    ``board_key``, a line's grow key (:data:`DIVIDER_KEYS`), or ``None`` for one with none."""
+    key = getattr(widget, "board_key", None)
+    if isinstance(key, str):
+        return key
+    if isinstance(widget, Divider) and widget.id in DIVIDER_KEYS:
+        return DIVIDER_KEYS[widget.id][1]
+    return None
+
+
+class StreamList(OptionList):
+    """The Stream's lines: a click shows a line's detail, as Enter does."""
+
+    board_key: ClassVar[str] = "enter"
+
+
+class SearchField(Input, can_focus=False):
+    """The Stream's filter: ``/`` opens it, as a click on it does. Focusable only while open:
+    hidden, Textual's first focus would take it (``focusable`` reads visibility, not display)."""
+
+    board_key: ClassVar[str] = "slash"
 
 
 class PickableTable(DataTable[Text]):
@@ -456,6 +544,9 @@ class PickableTable(DataTable[Text]):
     Rebuilds never pass through here, so a rebuild can never touch the detail
     pane; ``RowSelected`` stays for Enter.
     """
+
+    board_key: ClassVar[str] = "enter"
+    """A click on a row does what Enter does: a heading folds, a task opens in the reader."""
 
     class RowPicked(Message):
         def __init__(self, row_key: Any) -> None:
@@ -586,31 +677,52 @@ class BoardPanel(Vertical):
     DEFAULT_CSS = """
     BoardPanel { height: 1fr; }
     BoardPanel #board-main { height: 1fr; min-height: 8; }
-    BoardPanel #board-side { width: 48; min-width: 32; }
+    BoardPanel #board-side { width: 58; min-width: 32; }
     BoardPanel #board-side.collapsed { display: none; }
     BoardPanel #side-divider.collapsed { display: none; }
     BoardPanel #sessions { height: auto; min-height: 3; border: round $primary;
                            padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
     BoardPanel #tasks { height: 1fr; min-height: 4; border: round $primary; }
     BoardPanel #feedpane { width: 1fr; min-width: 32; }
+    BoardPanel #feedpane.collapsed { display: none; }
     BoardPanel #feed { height: 1fr; border: round $secondary;
                        text-wrap: nowrap; text-overflow: ellipsis; }
     BoardPanel #feed.hidden { display: none; }
+    BoardPanel #stream-search { display: none; height: 1; border: none; padding: 0 1; }
+    BoardPanel #feedpane.searching #stream-search { display: block; }
     BoardPanel #feedtext { height: 1fr; border: round $success; display: none;
                            padding: 0 1; }
     BoardPanel #feedtext.active { display: block; }
     BoardPanel #detailwrap { height: 8; min-height: 3; border: heavy $warning;
                              padding: 0 1; }
+    BoardPanel #reader { display: none; height: 1fr; border: heavy $accent; padding: 0 1; }
+    BoardPanel.reading #reader { display: block; }
+    BoardPanel.reading #board-main, BoardPanel.reading #detail-divider,
+    BoardPanel.reading #detailwrap { display: none; }
     """
-    # The footer shows five, in words short enough that asq's footer and ``board -w``'s fit 90
-    # columns (B1 #9); ``r`` and ``c`` are on the ? screen (``BOARD_KEYS``), and ``c`` is named
-    # by the feed's title in select mode, the one time it copies anything.
+    # The footer shows five (b d a o /), in words short enough that asq's footer and
+    # ``board -w``'s fit 90 columns (B1 #9); ``f``, ``v``, ``r``, ``c`` and Esc are on the ?
+    # screen (``BOARD_KEYS``), and ``c`` is named by the feed's title in select mode, the one
+    # time it copies anything.
     BINDINGS: ClassVar = [
         Binding("b", "toggle_board", "tasks"),
         Binding("d", "toggle_done", "done"),
+        Binding("f", "fold_group", "fold", show=False),
         Binding("a", "toggle_autoscroll", "autoscroll"),
-        Binding("v", "toggle_select", "select"),
+        Binding("v", "toggle_select", "select", show=False),
         Binding("o", "open_transcript", "transcript"),
+        Binding("slash", "search", "search", key_display="/"),
+        *(
+            Binding(str(n), f"lane_item({n - 1})", f"needs you {n}", show=False)
+            for n in range(1, 10)
+        ),
+        Binding("escape", "back", "back", show=False),
+        *(
+            Binding(key, f"resize('{line}', {sign})", "resize", show=False)
+            for line, keys in DIVIDER_KEYS.items()
+            for key, sign in zip(keys, (-1, 1), strict=True)
+        ),
+        Binding("equals_sign", "reset_sizes", "sizes back", show=False),
         Binding("r", "refresh_now", "refresh", show=False),
         Binding("c", "copy_selection", "copy", show=False),
     ]
@@ -670,10 +782,15 @@ class BoardPanel(Vertical):
         self._terminal_fetched = False
         self._prev_states: dict[str, str] = {}
         self._select_mode = False
-        self._show_done = False
-        self._table_shows_done: bool | None = None
-        """Which list the table was last built as (``None``: not yet): a kept scroll is that
-        list's, never carried into the other."""
+        self.pane = WORK
+        """Which half shows while the panel is narrower than :data:`WIDE_FROM`."""
+        self.folds: set[str] = set(DEFAULT_FOLDS)
+        """Work's folded groups, by key (:data:`WORK_GROUPS`)."""
+        self._work_hidden = False
+        """``b`` hid the Work column while the panel is wide (B1's ``b``)."""
+        self._side_alone: Any = None
+        """While Work has the column to itself: the width it had beside the Stream (a drag's,
+        or the stylesheet's), put back when the Stream returns. ``None`` otherwise."""
         self._sessions: dict[str, TeamSession] = {}
         self._switches: dict[str, str] = {}
         """The ``fleet switch`` of each limited session the last refresh read, by its id."""
@@ -692,14 +809,27 @@ class BoardPanel(Vertical):
         self.unseen = 0
         """Feed lines that came in below the view while it was not following: the ``↓ N new``
         marker under the feed."""
+        self._unseen_since: datetime | None = None
+        """When the first of :attr:`unseen` was written: the marker's "since"."""
+        self.stream_filter = ""
+        """What ``/`` filters the Stream by (case-insensitive, over the line as shown)."""
+        self._view_saver: Autosave | None = None
+        """The debounced save of this project's view (:data:`VIEW_KEY`); ``None`` with no
+        project to keep it for."""
+        self.lane: list[tuple[str, str]] = []
+        """The needs-you lane's items in order, each (kind, task id or agent label)."""
         self.detail_text = ""
         """The plain text of the detail pane (what a test reads)."""
+        self.reader_text = ""
+        """The plain text of the reader, while a task is open in it (what a test reads)."""
+        self._reading: str | None = None
+        """The task the reader shows, by id; ``None`` while it is closed."""
         self.detail_moment: tuple[str | None, datetime] | None = None
         """(author session id, timestamp) of the selected item, for the transcript jump."""
 
     def compose(self) -> ComposeResult:
-        nothing = NOTHING_NEEDS_YOU_ALONE if self.standalone else NOTHING_NEEDS_YOU
-        yield NeedsYouStrip(id="needs-you", nothing=nothing)
+        yield NeedsYouLane(id="needs-you-lane")
+        yield BoardSwitch(id="board-switch")
         with Horizontal(id="board-main"):
             with BoardColumn(id="board-side"):
                 yield TeamBlock(id="sessions")
@@ -718,7 +848,11 @@ class BoardPanel(Vertical):
                 id="side-divider",
             )
             with Vertical(id="feedpane"):
-                yield OptionList(id="feed")
+                yield SearchField(
+                    placeholder="filter the stream — Enter keeps it, Esc clears it",
+                    id="stream-search",
+                )
+                yield StreamList(id="feed")
                 with VerticalScroll(id="feedtext"):
                     yield Static(id="feedstatic")
         yield Divider(
@@ -731,6 +865,8 @@ class BoardPanel(Vertical):
         )
         with VerticalScroll(id="detailwrap"):
             yield Static(id="detail")
+        with VerticalScroll(id="reader"):
+            yield Static(id="reader-text")
 
     def on_mount(self) -> None:
         table = self.query_one("#tasks", DataTable)
@@ -743,8 +879,38 @@ class BoardPanel(Vertical):
         self.query_one(
             "#detailwrap", VerticalScroll
         ).border_title = "detail — click a task or feed line"
+        self._restore_view()
         self.refresh_data()
         self.set_interval(self.interval, self._tick)
+
+    def _view(self) -> dict[str, object]:
+        return {"folds": sorted(self.folds), "filter": self.stream_filter, "pane": self.pane}
+
+    def _restore_view(self) -> None:
+        """This project's folds, filter and narrow half, as it last left them (B2). A value
+        that is not one of them is ignored, never an error: the file is the user's too."""
+        if self.project is None:
+            return
+        key = VIEW_KEY + self.project.id
+        saved = read_state().get(key)
+        if isinstance(saved, dict):
+            folds = saved.get("folds")
+            if isinstance(folds, list):
+                known = {group for group, _heading, _statuses in WORK_GROUPS}
+                self.folds = {str(group) for group in folds if group in known}
+            if isinstance(saved.get("filter"), str):
+                self.stream_filter = saved["filter"]
+            if saved.get("pane") in (WORK, STREAM):
+                self.pane = saved["pane"]
+        self._view_saver = Autosave(
+            self, key, what="the board's folds and filter", initial=self._view()
+        )
+
+    def _remember_view(self) -> None:
+        """Save the view when it changed: a resize lays the board out again and writes nothing."""
+        view = self._view()
+        if self._view_saver is not None and view != self._view_saver.latest:
+            self._view_saver.remember(view)
 
     @while_running
     def _tick(self) -> None:
@@ -786,6 +952,10 @@ class BoardPanel(Vertical):
         """What takes the focus in the panel: the tasks, else the feed as it shows."""
         if not self.query_one("#board-side").has_class("collapsed"):
             return self.query_one("#tasks")
+        return self._feed_shown()
+
+    def _feed_shown(self) -> Widget:
+        """The feed as it shows: the live list, or its frozen text in select mode."""
         feed = self.query_one("#feed")
         return self.query_one("#feedtext") if feed.has_class("hidden") else feed
 
@@ -821,7 +991,9 @@ class BoardPanel(Vertical):
             )
         )
         self._sessions = {s.id: s for s in sessions}
+        moved = {t.id for t in tasks if self._statuses.get(t.id, t.status) != t.status}
         self._statuses = {t.id: t.status for t in tasks}
+        self._restatus(moved)
         self._all_tasks = tasks
         self._refresh_labels(sessions)
         self._switches = switches
@@ -838,7 +1010,7 @@ class BoardPanel(Vertical):
         self.needs = needs_you(
             project, sessions, tasks, shown, seq=self._last_seq, fleet_labels=self._fleet_labels
         )
-        self.query_one(NeedsYouStrip).show(self.needs)
+        self._show_lane()
         self.post_message(self.Refreshed(project))
 
     def _refresh_labels(self, sessions: list[TeamSession]) -> None:
@@ -914,51 +1086,67 @@ class BoardPanel(Vertical):
         return self._terminal_by_task.get(task_id)
 
     def _refresh_tasks(self, tasks: list[TeamTask]) -> None:
-        """Rebuild the table: the task's number, its status as an icon, and its title.
+        """Rebuild Work (B2): Doing, Blocked, Review, To do, then Done, each under a heading row
+        that folds it (Done folded at first); a task's row is its number, its status as an icon,
+        its title, who has it and how long it has been so.
 
-        Who has it, its full id and the rest are one click away in the detail pane.
-        The title is cut, with an ellipsis, to the room the table has, so it takes
-        the rest of the width and the table never scrolls sideways; a resize
-        rebuilds (``PickableTable.Resized``).
+        The title is cut, with an ellipsis, to the room the table has, so it takes the rest of
+        the width and the table never scrolls sideways; a resize rebuilds
+        (``PickableTable.Resized``). The scroll and the cursor stay where they were (B1 #7).
         """
         table = self.query_one("#tasks", DataTable)
         selected = self._cursor_task_id(table)
-        scrolled = table.scroll_y if self._table_shows_done == self._show_done else 0
-        self._table_shows_done = self._show_done
+        scrolled = table.scroll_y
         # The columns too: a column keeps the widest cell it ever held, so a title cut
         # to a narrower table still scrolled sideways to the width of the uncut one.
         table.clear(columns=True)
         table.add_columns(*TASK_COLUMNS)
         self._tasks_by_id = {}
-        rows: list[tuple[TeamTask, Text, Text]] = []
-        if self._show_done:
-            closed = [t for t in tasks if t.status in CLOSED_STATUSES]
-            closed.sort(key=lambda t: t.updated_at, reverse=True)
-            table.border_title = f"done archive ({len(closed)}) — d for open tasks"
-            for task in closed:
-                when = watch.clock(task.updated_at)
-                rows.append((task, _number_cell(task), status_icon(task.status) + f" {when}"))
-        else:
-            table.border_title = "tasks — d for done archive"
-            for task in (t for t in tasks if t.status in OPEN_STATUSES):
+        now = datetime.now(UTC)
+        open_count = sum(1 for t in tasks if t.status in OPEN_STATUSES)
+        table.border_title = f"work — {open_count} open · f folds, d done"
+        rows: list[tuple[str, list[Text]]] = []
+        for key, heading, statuses in WORK_GROUPS:
+            members = [t for t in tasks if t.status in statuses]
+            if not members:
+                continue
+            if key == "done":
+                members.sort(key=lambda t: t.updated_at, reverse=True)
+            folded = key in self.folds
+            mark = Text("▸" if folded else "▾", style="bold")
+            label = Text(f"{heading} ({len(members)})", style="bold")
+            rows.append((GROUP_ROW + key, [Text(""), mark, label, Text(""), Text("")]))
+            if folded:
+                continue
+            for task in members:
+                self._tasks_by_id[task.id] = task
                 waiting = task.status == "todo" and bool(unmet_needs(task, self._statuses))
-                rows.append((task, _number_cell(task), status_icon(task.status, waiting=waiting)))
-            if not rows:
-                # The empty state: where tasks come from, wrapped to the room the table has.
-                empty = EMPTY_TASKS_ALONE if self.standalone else EMPTY_TASKS
-                width = self._title_room(table, rows) or len(empty)
-                lines = textwrap.wrap(empty, max(width, 16))
-                body = Text("\n".join(lines), style="dim")
-                table.add_row(Text(""), Text(""), body, key=EMPTY_ROW, height=len(lines))
-                return
+                holder = task.claimed_by
+                owner = (self._names.get(holder) or team_service.short_id(holder)) if holder else ""
+                cells = [
+                    _number_cell(task),
+                    status_icon(task.status, waiting=waiting),
+                    Text(task.title, no_wrap=True, overflow="ellipsis"),
+                    Text(owner, style="dim", no_wrap=True, overflow="ellipsis"),
+                    Text(team_service.age_text(task.updated_at, now), style="dim"),
+                ]
+                cells[3].truncate(OWNER_CELLS, overflow="ellipsis")
+                rows.append((task.id, cells))
+        if not open_count:
+            # The empty state: where tasks come from, wrapped to the room the table has.
+            empty = EMPTY_TASKS_ALONE if self.standalone else EMPTY_TASKS
+            width = self._title_room(table, rows) or len(empty)
+            lines = textwrap.wrap(empty, max(width, 16))
+            body = Text("\n".join(lines), style="dim")
+            blank = [Text(""), Text(""), body, Text(""), Text("")]
+            rows.insert(0, (EMPTY_ROW, blank))
         room = self._title_room(table, rows)
-        for task, number, icon in rows:
-            self._tasks_by_id[task.id] = task
-            title = Text(task.title, no_wrap=True, overflow="ellipsis")
-            if room is not None:
-                title.truncate(room, overflow="ellipsis")
-            table.add_row(number, icon, title, key=task.id)
-        if selected in self._tasks_by_id:
+        for key, cells in rows:
+            if room is not None and key != EMPTY_ROW:
+                cells[2].truncate(room, overflow="ellipsis")
+            height = len(cells[2].plain.splitlines()) if key == EMPTY_ROW else 1
+            table.add_row(*cells, key=key, height=height)
+        if selected is not None and selected in {key for key, _ in rows}:
             table.move_cursor(row=table.get_row_index(selected), scroll=False)
         # Where the person had scrolled to, once the rows are measured: a rebuild every tick
         # put the table back at its top (B1 #7).
@@ -966,42 +1154,138 @@ class BoardPanel(Vertical):
             self.call_after_refresh(table.scroll_to, y=scrolled, animate=False)
 
     @staticmethod
-    def _title_room(table: DataTable[Any], rows: list[tuple[TeamTask, Text, Text]]) -> int | None:
-        """The cells the title column may take: what the table has less the other two
-        columns and every column's padding — ``None`` before the table has a size."""
+    def _title_room(table: DataTable[Any], rows: list[tuple[str, list[Text]]]) -> int | None:
+        """The cells the title column may take: what the table has less the other columns and
+        every column's padding — ``None`` before the table has a size."""
         width = table.scrollable_content_region.width
         if width <= 0:
             return None
         pad = 2 * table.cell_padding
-        number = max([1, *(row[1].cell_len for row in rows)]) + pad
-        status = max([ICON_CELLS, *(row[2].cell_len for row in rows)]) + pad
-        return max(8, width - number - status - pad)
+        others = 0
+        for column in (0, 1, 3, 4):  # every column but the title's, its heading included
+            cells = [cells[column].cell_len for key, cells in rows if key != EMPTY_ROW]
+            floor = ICON_CELLS if column == 1 else 1
+            others += max([floor, cell_len(TASK_COLUMNS[column]), *cells]) + pad
+        return max(8, width - others - pad)
+
+    def _fold(self, group: str) -> None:
+        """Fold ``group`` (a :data:`WORK_GROUPS` key), or unfold it."""
+        self.folds.symmetric_difference_update({group})
+        self._refresh_tasks(self._all_tasks)
+        self._remember_view()
+
+    def action_fold_group(self) -> None:
+        """``f``: fold the group at the cursor — its heading's, or the task's — or unfold it."""
+        table = self.query_one("#tasks", DataTable)
+        key = self._cursor_task_id(table)
+        if key is None or key == EMPTY_ROW:
+            return
+        if key.startswith(GROUP_ROW):
+            self._fold(key.removeprefix(GROUP_ROW))
+            return
+        task = self._tasks_by_id.get(key)
+        group = next(
+            (g for g, _h, statuses in WORK_GROUPS if task and task.status in statuses), None
+        )
+        if group is not None:
+            self._fold(group)
+            with contextlib.suppress(Exception):  # the heading is where the cursor goes
+                table.move_cursor(row=table.get_row_index(GROUP_ROW + group))
 
     def on_pickable_table_resized(self, event: PickableTable.Resized) -> None:
         self._refresh_tasks(self._all_tasks)
 
-    def on_needs_you_strip_picked(self, event: NeedsYouStrip.Picked) -> None:
-        """A count was pressed: its first card selected in the table, or its first agent
-        asked for (:class:`AgentWanted`)."""
-        tasks = self.needs.tasks.get(event.kind)
-        if tasks:
-            self._collapse(False)  # the card it goes to is in the tasks, hidden or not
-            if self._show_done:
-                self._show_done = False
-                self._refresh_tasks(self._all_tasks)
+    def _show_lane(self) -> None:
+        """The needs-you lane (B2): one row per thing that needs the person, from what this
+        tick read (:func:`needs_you` and the panel's caches; no read of its own), each with its
+        text and what its key does."""
+        tasks = {t.id: t for t in self._all_tasks}
+        self.lane = []
+        rows: list[Text] = []
+        for kind, glyph, _one, _many in NEEDS_YOU:
+            targets = self.needs.agents.get(kind) or self.needs.tasks.get(kind) or []
+            for target in targets:
+                self.lane.append((kind, target))
+                rows.append(self._lane_text(kind, glyph, target, tasks.get(target)))
+        if rows:
+            lead = Text("needs you", style="bold")
+            lead.append(" — a number or a click acts on its row", style="dim")
+        else:
+            nothing = NOTHING_NEEDS_YOU_ALONE if self.standalone else NOTHING_NEEDS_YOU
+            lead = Text(nothing, style="dim")
+        self.query_one(NeedsYouLane).show(lead, rows)
+
+    def _lane_text(self, kind: str, glyph: str, target: str, task: TeamTask | None) -> Text:
+        text = Text(f"{glyph} ")
+        if kind in ("review", "blocked"):
+            text.append(f"#{task.number} " if task and task.number else "", style="bold")
+            text.append(task.title if task else target)
+            if kind == "blocked":
+                why = self._blocked_said(target)
+                text.append(f" — {why}" if why else " — blocked", style="red")
+            else:
+                text.append(" — in review", style="cyan")
+            text.append("   opens it", style="dim")
+            return text
+        if kind == "question":
+            asked = self._question_of(target)
+            text.append(f"{target} asks: ", style="bold")
+            text.append(watch.one_row(asked.text) if asked else "a question")
+        else:
+            text.append(f"{target} waits for you in its pane", style="bold")
+        text.append("   shows it" if self.standalone else "   selects it", style="dim")
+        return text
+
+    def _blocked_said(self, task_id: str) -> str | None:
+        """Why the card is blocked, from the newest block line the feed holds: its text past
+        the title (``team.stopped_because``'s shape), with no store read on a tick."""
+        for event_id in reversed(self._feed_order):
+            event = self._events_by_id[event_id]
+            if event.kind == "task_blocked" and event.task_id == task_id:
+                _title, said, why = event.text.partition(" — ")
+                return why if said else None
+        return None
+
+    def _question_of(self, label: str) -> TeamEvent | None:
+        """The newest question the agent named ``label`` asked, from the feed."""
+        asking = {
+            sid
+            for sid, session in self._sessions.items()
+            if team_service.board_name(session, self._fleet_labels) == label
+        }
+        for event_id in reversed(self._feed_order):
+            event = self._events_by_id[event_id]
+            if event.kind == "question" and event.session_id in asking:
+                return event
+        return None
+
+    def on_needs_you_lane_picked(self, event: NeedsYouLane.Picked) -> None:
+        self.action_lane_item(event.index)
+
+    def action_lane_item(self, index: int) -> None:
+        """``1`` to ``9``, or a click on the lane's row: act on that item. A card opens in the
+        reader; an agent is selected in asq's left pane (:class:`AgentWanted`), or in
+        ``board -w`` what it asks is shown."""
+        if not 0 <= index < len(self.lane):
+            return
+        kind, target = self.lane[index]
+        if kind in ("review", "blocked"):
+            self._show_work()
+            group = next(g for g, _h, statuses in WORK_GROUPS if kind in statuses)
+            if group in self.folds:
+                self._fold(group)
             table = self.query_one("#tasks", DataTable)
             with contextlib.suppress(Exception):  # the row went in a rebuild since
-                table.move_cursor(row=table.get_row_index(tasks[0]))
-            table.focus()
-            self._show_task_detail(tasks[0])
+                table.move_cursor(row=table.get_row_index(target))
+            self._show_task_detail(target)
+            self.open_reader(target)
             return
-        agents = self.needs.agents.get(event.kind)
-        if agents and self.standalone:
-            self._show_agent_need(event.kind, agents[0])
+        if self.standalone:
+            self._show_agent_need(kind, target)
             return
         project = self._read_project
-        if agents and project is not None:
-            self.post_message(self.AgentWanted(project.id, agents[0]))
+        if project is not None:
+            self.post_message(self.AgentWanted(project.id, target))
 
     def _show_agent_need(self, kind: str, label: str) -> None:
         """In ``board -w``, a 🔔 or ❓ count shows what it counts: the question itself, picked in
@@ -1050,7 +1334,41 @@ class BoardPanel(Vertical):
         for event_id in self._feed_order:
             event = self._events_by_id[event_id]
             if event.session_id in moved:
-                feed.replace_option_prompt(event_id, watch.feed_line(event, self._roles, names))
+                with contextlib.suppress(OptionDoesNotExist):  # filtered out of the Stream
+                    feed.replace_option_prompt(event_id, self._stream_prompt(event))
+
+    def _stream_prompt(self, event: TeamEvent) -> Text:
+        return stream_line(event, self._roles, self._names, self._statuses)
+
+    def _restatus(self, tasks: set[str]) -> None:
+        """Redraw the Stream lines about ``tasks``, whose status moved: a status chip says the
+        task's status now, not when the line was written."""
+        if not tasks or self._select_mode or not self.is_mounted:
+            return
+        feed = self.query_one("#feed", OptionList)
+        for event_id in self._feed_order:
+            event = self._events_by_id[event_id]
+            if event.task_id in tasks:
+                with contextlib.suppress(OptionDoesNotExist):
+                    feed.replace_option_prompt(event_id, self._stream_prompt(event))
+
+    def _shows(self, event: TeamEvent) -> bool:
+        """Whether the Stream's filter lets ``event`` through."""
+        wanted = self.stream_filter.casefold()
+        return not wanted or wanted in self._stream_prompt(event).plain.casefold()
+
+    def _refilter(self) -> None:
+        """Rebuild the Stream for the filter: the lines it lets through, in order."""
+        feed = self.query_one("#feed", OptionList)
+        feed.clear_options()
+        shown = [
+            Option(self._stream_prompt(event), id=event.id)
+            for event in (self._events_by_id[event_id] for event_id in self._feed_order)
+            if self._shows(event)
+        ]
+        feed.add_options(shown)
+        self._retitle_feed()
+        feed.scroll_end(animate=False)
 
     def _append_events(self, events: list[TeamEvent]) -> None:
         if self._select_mode:
@@ -1063,7 +1381,8 @@ class BoardPanel(Vertical):
         for event in fresh:
             self._events_by_id[event.id] = event
             self._feed_order.append(event.id)
-            feed.add_option(Option(watch.feed_line(event, self._roles, self._names), id=event.id))
+            if self._shows(event):
+                feed.add_option(Option(self._stream_prompt(event), id=event.id))
             self._last_seq = max(self._last_seq, event.seq)
             if event.kind in ("task_done", "task_dropped"):
                 # A close happened — attribution (positive AND negative entries)
@@ -1077,6 +1396,8 @@ class BoardPanel(Vertical):
             # Scrolled up (or autoscroll off): the view stays where the person put it, and the
             # marker under the feed counts what came in below it (B1 #11) — while it is below
             # it: once laid out, lines a feed that does not overflow shows are not unseen.
+            if not self.unseen:
+                self._unseen_since = fresh[0].created_at
             self.unseen += len(fresh)
             self._show_unseen()
             self.call_after_refresh(self._recount_unseen)
@@ -1101,7 +1422,10 @@ class BoardPanel(Vertical):
 
     def _show_unseen(self) -> None:
         feed = self.query_one("#feed", OptionList)
-        feed.border_subtitle = f"↓ {self.unseen} new — End shows them" if self.unseen else ""
+        since = (
+            f" since {watch.clock(self._unseen_since)}" if self._unseen_since is not None else ""
+        )
+        feed.border_subtitle = f"↓ {self.unseen} new{since} — End shows them" if self.unseen else ""
 
     def start_over(self) -> None:
         """The board was cleared under the panel (Start fresh): forget what the panel read
@@ -1199,9 +1523,10 @@ class BoardPanel(Vertical):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         # Enter (and click-when-cursor-already-there) post RowSelected. A
         # rebuild's clear/add_row/move_cursor posts RowHighlighted but never
-        # RowSelected, so no artifact can touch the detail pane.
+        # RowSelected, so no artifact can touch the detail pane. Enter on a task opens
+        # the reader (B2); a heading folds, as a click on it does.
         key = event.row_key.value if event.row_key else None
-        self._show_task_detail(str(key) if key is not None else None)
+        self._picked_row(str(key) if key is not None else None)
 
     def on_pickable_table_row_picked(self, event: PickableTable.RowPicked) -> None:
         # A real mouse click on a data row (posted from inside the widget's click
@@ -1209,7 +1534,17 @@ class BoardPanel(Vertical):
         # Header/blank clicks never post this, so they can't clobber a selected
         # feed event — and rebuilds can't reach it at all.
         key = event.row_key.value if event.row_key else None
-        self._show_task_detail(str(key) if key is not None else None)
+        self._picked_row(str(key) if key is not None else None)
+
+    def _picked_row(self, key: str | None) -> None:
+        """A Work row picked, by Enter or a click: a heading folds its group (``f``'s), a task
+        opens in the reader (B2: a click and its key do one thing)."""
+        if key is not None and key.startswith(GROUP_ROW):
+            self._fold(key.removeprefix(GROUP_ROW))
+            return
+        self._show_task_detail(key)
+        if key is not None and key in self._tasks_by_id:
+            self.open_reader(key)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         # OptionSelected (click / Enter) only, mirroring the task table: an
@@ -1228,14 +1563,141 @@ class BoardPanel(Vertical):
             detail.append(TRANSCRIPT_HINT, style="dim")
         self._show_detail(detail)
 
+    # --- the reader (B2) ----------------------------------------------------------------
+
+    READER_HIDES: ClassVar[frozenset[str]] = frozenset(
+        {
+            "toggle_board",
+            "toggle_done",
+            "fold_group",
+            "toggle_autoscroll",
+            "toggle_select",
+            "search",
+            "lane_item",
+            "resize",
+            "reset_sizes",
+        }
+    )
+    """The keys that act on what the reader covers: off, and out of the footer, while it is
+    open. ``o`` (the transcript at that moment) and Esc stay."""
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        return self._reading is None or action not in self.READER_HIDES
+
+    def open_reader(self, task_id: str) -> None:
+        """Show ``task_id`` full height: the task in full, then its history — every event that
+        names it, oldest first, read off the UI thread (``team.task_history``). Esc closes."""
+        task = self._tasks_by_id.get(task_id)
+        if task is None:
+            return
+        self._reading = task_id
+        self.add_class("reading")
+        self.refresh_bindings()
+        self._apply_layout()
+        self._render_reader(task, None)
+        reader = self.query_one("#reader", VerticalScroll)
+        reader.border_title = f"#{task.number} — Esc goes back" if task.number else "Esc goes back"
+        reader.scroll_home(animate=False)
+        reader.focus()
+        self.run_worker(
+            functools.partial(team_service.task_history, task),
+            name=HISTORY_WORKER,
+            group=HISTORY_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _render_reader(self, task: TeamTask, history: Sequence[TeamEvent] | None) -> None:
+        why = team_service.stopped_because(task) if task.status in watch.STOPPED_BECAUSE else None
+        text = watch._task_detail(task, self._statuses, self._names, why=why)
+        text.append("\n\nhistory", style="bold")
+        if history is None:
+            text.append("\nreading…", style="dim")
+        elif not history:
+            text.append("\nnothing on the board names it yet", style="dim")
+        for event in history or ():
+            emoji, name, style = watch._who(event, self._roles, self._names)
+            verb_emoji, verb = watch._KIND_VERB.get(event.kind, ("•", event.kind))
+            text.append(f"\n{watch.clock(event.created_at)}  ", style="dim")
+            text.append(f"{emoji} {name} ", style=style)
+            text.append(f"{verb_emoji} {verb}: ", style="bold")
+            first, *rest = watch.shown_text(event).split("\n")
+            text.append(first)
+            for line in rest:
+                text.append(f"\n    {line}")
+        self.reader_text = text.plain
+        self.query_one("#reader-text", Static).update(text)
+
+    @on(Worker.StateChanged)
+    def _history_answered(self, event: Worker.StateChanged) -> None:
+        if event.worker.group != HISTORY_WORKER or event.state is not WorkerState.SUCCESS:
+            return
+        task = self._tasks_by_id.get(self._reading or "")
+        if task is not None and isinstance(event.worker.result, list):
+            self._render_reader(task, event.worker.result)
+
+    def action_back(self) -> None:
+        """Esc: out of the reader, else off the Stream's filter (B2)."""
+        if self._reading is not None:
+            self.action_close_reader()
+        elif self.stream_filter or self.query_one("#feedpane").has_class("searching"):
+            self._end_search(keep=False)
+
+    def action_search(self) -> None:
+        """``/``: filter the Stream — the Stream shown first if Work had the column."""
+        if self._reading is not None:
+            return
+        if not self._wide():
+            self.pane = STREAM
+            self._apply_layout()
+        self.query_one("#feedpane").add_class("searching")
+        search = self.query_one("#stream-search", Input)
+        search.value = self.stream_filter
+        search.can_focus = True
+        search.focus()
+
+    @on(Input.Changed, "#stream-search")
+    def _search_typed(self, event: Input.Changed) -> None:
+        event.stop()
+        self.stream_filter = event.value.strip()
+        self._refilter()
+        self._remember_view()
+
+    @on(Input.Submitted, "#stream-search")
+    def _search_kept(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._end_search(keep=True)
+
+    def _end_search(self, *, keep: bool) -> None:
+        """Close the filter's field; ``keep`` the filter it holds, or clear it."""
+        self.query_one("#feedpane").remove_class("searching")
+        self.query_one("#stream-search", Input).can_focus = False
+        if not keep and self.stream_filter:
+            self.stream_filter = ""
+            self._refilter()
+            self._remember_view()
+        self._retitle_feed()
+        self.query_one("#feed").focus()
+
+    def action_close_reader(self) -> None:
+        """Back from the reader to the board, the task still under the cursor."""
+        if self._reading is None:
+            return
+        self._reading = None
+        self.reader_text = ""
+        self.remove_class("reading")
+        self.refresh_bindings()
+        self._apply_layout()
+        self.query_one("#tasks").focus()
+
     # --- actions -------------------------------------------------------------------
 
     def action_toggle_done(self) -> None:
-        """``d``: the done archive, or the open tasks again — the column shown first if it was
-        hidden, or the key flipped a table nobody could see (asq's board at 90 columns)."""
-        self._collapse(False)
-        self._show_done = not self._show_done
-        self._refresh_tasks(self._all_tasks)
+        """``d``: unfold Done, or fold it again — Work shown first if it was out of sight, or
+        the key changed a table nobody could see."""
+        self._show_work()
+        self._fold("done")
 
     def action_open_transcript(self) -> None:
         """Jump into the author session's transcript around the selected moment."""
@@ -1263,8 +1725,13 @@ class BoardPanel(Vertical):
         said = []
         if not self.autoscroll:
             said.append("autoscroll off")
-        if self.is_mounted and self.query_one("#board-side").has_class("collapsed"):
+        if self.is_mounted and self._wide() and self._work_hidden:
             said.append(TASKS_HIDDEN)
+        if self.stream_filter:
+            shown = self.query_one("#feed", OptionList).option_count if self.is_mounted else 0
+            said.append(
+                f"filter “{self.stream_filter}”: {shown} of {len(self._feed_order)} · Esc clears"
+            )
         return " — ".join([title, *said])
 
     def _retitle_feed(self) -> None:
@@ -1318,34 +1785,83 @@ class BoardPanel(Vertical):
         copy_and_tell(self.app, selected, f"copied {len(selected)} chars", timeout=3)
 
     def action_toggle_board(self) -> None:
-        """``b``: the board column off or on, and focus with it when it comes back."""
-        shown = self.query_one("#board-side").has_class("collapsed")
-        self._collapse(not shown)
-        if shown:
+        """``b``: below :data:`WIDE_FROM`, Work or the Stream (B2); wide, the Work column off
+        or on (B1). The focus goes with what comes into sight."""
+        if self._wide():
+            self._work_hidden = not self._work_hidden
+        else:
+            self.pane = STREAM if self.pane == WORK else WORK
+        self._apply_layout()
+        if not self.query_one("#board-side").has_class("collapsed"):
             self.query_one("#tasks").focus()
+        else:
+            self._feed_shown().focus()
+
+    def on_board_switch_picked(self, event: BoardSwitch.Picked) -> None:
+        if event.pane != self.pane:
+            self.action_toggle_board()
 
     def action_refresh_now(self) -> None:
         self.refresh_data()
 
-    def _collapse(self, collapsed: bool) -> None:
-        """Hide (or show) the board column and the line that resizes it, together.
+    def action_resize(self, line: str, sign: int) -> None:
+        """``[ ]`` Work's width, ``( )`` the team block's height, ``{ }`` the detail pane's: a
+        line's drag, by key, remembered as the drag is."""
+        divider = self.query_one(f"#{line}", Divider)
+        if divider.display:
+            divider.step(sign * DIVIDER_STEP)
 
-        Focus inside a column going out of sight moves to the feed beside it, as it is
-        shown (the live list, or its frozen text in select mode). Left on the hidden
-        tasks table it went to nothing, and with nothing focused no key reaches this
-        panel: the next ``b`` could not bring the column back.
+    def action_reset_sizes(self) -> None:
+        """``=``: every line back to the stylesheet's size, as a double-click puts one back."""
+        for line in DIVIDER_KEYS:
+            self.query_one(f"#{line}", Divider).reset()
+
+    def _wide(self) -> bool:
+        return self.size.width >= WIDE_FROM
+
+    def _show_work(self) -> None:
+        """Work into sight, whatever hid it: a card it is asked to go to is in it."""
+        self._work_hidden = False
+        self.pane = WORK
+        self._apply_layout()
+
+    def _apply_layout(self) -> None:
+        """Lay the halves out for the panel's width: side by side from :data:`WIDE_FROM`, one at
+        a time below it, under the switch that says which.
+
+        Focus inside a half going out of sight moves to the half that shows. Left on a hidden
+        table it went to nothing, and with nothing focused no key reaches this panel: the next
+        ``b`` could not bring it back.
         """
+        wide = self._wide()
+        work = not self._work_hidden if wide else self.pane == WORK
+        stream = wide or self.pane == STREAM
         side = self.query_one("#board-side")
-        side.set_class(collapsed, "collapsed")
-        self.query_one("#side-divider").set_class(collapsed, "collapsed")
+        side.set_class(not work, "collapsed")
+        self.query_one("#feedpane").set_class(not stream, "collapsed")
+        self.query_one("#side-divider").set_class(not (wide and work), "collapsed")
+        switch = self.query_one(BoardSwitch)
+        switch.display = not wide and self._reading is None
+        switch.show(self.pane)
+        alone = work and not stream
+        if alone and self._side_alone is None:
+            self._side_alone = side.styles.width or "stylesheet"
+            side.styles.width = "1fr"
+        elif not alone and self._side_alone is not None:
+            side.styles.width = None if self._side_alone == "stylesheet" else self._side_alone
+            self._side_alone = None
         self._retitle_feed()
+        self._remember_view()  # the half shown, when b or a pick moved it
         focused = self.app.focused
-        if collapsed and focused is not None and side in focused.ancestors_with_self:
-            feed = self.query_one("#feed")
-            (self.query_one("#feedtext") if feed.has_class("hidden") else feed).focus()
+        if focused is None or self not in focused.ancestors:
+            return
+        if not work and side in focused.ancestors_with_self:
+            self._feed_shown().focus()
+        elif not stream and self.query_one("#feedpane") in focused.ancestors_with_self:
+            self.query_one("#tasks").focus()
 
     def on_resize(self, event: events.Resize) -> None:
-        self._collapse(event.size.width < COLLAPSE_BELOW)
+        self._apply_layout()
         if event.size.width > 0 and event.size.height > 0:
             self._fit(event.size.width, event.size.height)
             self.call_after_refresh(self._recount_unseen)  # a taller feed may show them now
@@ -1360,15 +1876,18 @@ class BoardPanel(Vertical):
         minimums, the dragged part's floor wins.
         """
         side = self.query_one("#board-side")
-        side.styles.max_width = max(
-            floor_of(side), width - 1 - floor_of(self.query_one("#feedpane"))
+        side.styles.max_width = (
+            None
+            if self._side_alone is not None
+            else max(floor_of(side), width - 1 - floor_of(self.query_one("#feedpane")))
         )
         detail = self.query_one("#detailwrap")
-        strip = self.query_one(NeedsYouStrip)
+        strip = self.query_one(NeedsYouLane)
         detail.styles.max_height = max(
             floor_of(detail, "height"),
             height
             - 1
             - floor_of(strip, "height")
+            - (0 if self._wide() else 1)  # the switch's line
             - floor_of(self.query_one("#board-main"), "height"),
         )

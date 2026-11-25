@@ -86,13 +86,13 @@ def test_tui_smoke_click_task_shows_detail(runner: CliRunner, work_dir: Path) ->
             table = pilot.app.query_one("#tasks", DataTable)
             feed = pilot.app.query_one("#feed", OptionList)
             table.focus()
-            table.move_cursor(row=1)
+            table.move_cursor(row=2)  # under the "To do" heading (B2), the second task
             await pilot.press("enter")  # RowSelected shows the detail
             await pilot.pause()
             return table.row_count, feed.option_count, pilot.app.board.detail_text
 
     rows, options, detail = asyncio.run(drive())
-    assert rows == 2
+    assert rows == 3  # the "To do" heading and its two tasks (B2's groups)
     assert options >= 3  # activate + task_added x2 + decision
     assert "wire the UI" in detail and "hook Atlas chat to v3" in detail
     assert "⧗" in detail  # unmet dependency marked
@@ -265,17 +265,19 @@ def test_done_archive_view_shows_who_and_when(
         async with app_cls().run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             table = pilot.app.query_one("#tasks", DataTable)
-            # No open task: the one row is the empty state, keyed as no task is (#286).
+            # No open task: the empty state, keyed as no task is (#286), over Done, folded (B2).
             open_rows = [key.value for key in table.rows]
-            await pilot.press("d")  # flip to the done archive
+            await pilot.press("d")  # unfold the done archive
             await pilot.pause()
             table.focus()
-            await pilot.press("enter")  # select the (row 0) archived task
+            done = [key.value for key in table.rows][2:]
+            table.move_cursor(row=2)
+            await pilot.press("enter")  # select the archived task, under its heading
             await pilot.pause()
-            return open_rows, table.row_count, pilot.app.board.detail_text
+            return open_rows, len(done), pilot.app.board.detail_text
 
     open_rows, done_rows, detail = asyncio.run(drive())
-    assert open_rows == [board_mod.EMPTY_ROW] and done_rows == 1
+    assert open_rows == [board_mod.EMPTY_ROW, f"{board_mod.GROUP_ROW}done"] and done_rows == 1
     assert "finished thing" in detail
     assert "done by runner (ffff9999)" in detail  # who + when from the task_done event
 
@@ -439,10 +441,12 @@ def test_single_click_shows_task_detail(runner: CliRunner, work_dir: Path) -> No
             await pilot.pause()
             # (1) cursor is parked at row 0 by the initial rebuild; one real
             # click on row 2 must show row 2's detail.
-            await pilot.click("#tasks", offset=(6, 4))
+            await pilot.click("#tasks", offset=(6, 5))  # row 3: under the "To do" heading
             await pilot.pause()
             clicked_text = pilot.app.board.detail_text
             clicked_moment = pilot.app.board.detail_moment
+            await pilot.press("escape")  # a click on a task opens its reader too (B2)
+            await pilot.pause()
             # (2) select a feed line (keys), then click the table header and
             # the blank area below the rows: the feed detail must survive.
             feed = pilot.app.query_one("#feed", OptionList)
@@ -664,7 +668,7 @@ def test_every_board_line_drags_and_each_size_comes_back_at_the_next_launch(
             return _board_sizes(pilot.app)
 
     before, dragged = asyncio.run(drag_all())
-    assert before == (48, 8, 3), "the premise: the stylesheet's sizes"
+    assert before == (58, 8, 3), "the premise: the stylesheet's sizes"
     # 39 rows above the footer: a line at row 15 leaves the detail pane rows 16-38.
     assert dragged == (70, 23, 8)
     state = json.loads((isolated_home / "state.json").read_text())
@@ -712,7 +716,7 @@ def test_a_double_click_on_a_board_line_puts_the_stylesheet_size_back_and_forget
 
     dragged, reset = asyncio.run(drag_then_reset())
     assert dragged == (70, 23, 8), "the premise: every line moved"
-    assert reset == (48, 8, 3), "two clicks on each line: the stylesheet's sizes"
+    assert reset == (58, 8, 3), "two clicks on each line: the stylesheet's sizes"
     state = json.loads((isolated_home / "state.json").read_text())
     assert not {COLUMN_WIDTH_KEY, DETAIL_HEIGHT_KEY, TEAM_HEIGHT_KEY} & state.keys(), (
         "a reset forgets the size, so the next launch shows the stylesheet's"
@@ -800,7 +804,7 @@ def test_the_board_lines_keep_the_feed_and_the_tasks_on_screen_whatever_the_size
             seen: dict[str, object] = {}
             team = app.query_one("#team-divider").region
             # The team block to 20 rows: below the "needs you" line over the board (#286).
-            strip = app.query_one("#needs-you").outer_size.height
+            strip = app.query_one("#needs-you-lane").outer_size.height
             await _drag(pilot, (10, team.y), (10, 20 + strip))
             seen["team"] = app.query_one("#sessions").outer_size.height
             side = app.query_one("#side-divider").region
@@ -843,8 +847,11 @@ def test_the_board_lines_keep_the_feed_and_the_tasks_on_screen_whatever_the_size
     assert seen["pushed"] == (87, 32, 29, 8, 4), "the detail pane less the needs-you line"
     assert seen["team_squeezed"] == 3, "8 rows of board: the line and 4 rows of tasks left 3"
     # 100 x 30: 67 + 1 + 32 columns; 29 rows are 8 + 1 + 20.
-    assert seen["shrunk"] == (67, 32, 19, 8, 4)
-    assert seen["narrow"] == (False, False), "the column and the line that resizes it hide"
+    # 100 x 30 is under WIDE_FROM (B2): Work has the column to itself, the Stream waits behind
+    # the switch, whose line the detail pane gives up: 29 rows are 8 + 1 + 1 + 19 less the line.
+    shrunk = seen["shrunk"]
+    assert isinstance(shrunk, tuple) and shrunk[0] == 100 and shrunk[2:] == (18, 8, 4)
+    assert seen["narrow"] == (True, False), "Work alone: no line beside it to resize it by"
     assert seen["widened"], "the premise: 120 columns show the column again"
     assert seen["toggled"] == (False, False)
 
@@ -884,9 +891,11 @@ def test_the_tasks_table_is_the_number_an_icon_and_the_title(
     }
 
     def rows(table: Any) -> dict[str, tuple[str, str]]:
+        """Each task's row by title — not the group headings over them (B2)."""
         return {
             str(row[2].plain): (str(row[0].plain), str(row[1].plain).strip())
-            for row in (table.get_row_at(i) for i in range(table.row_count))
+            for row in (table.get_row(key) for key in table.rows)
+            if str(row[0].plain)  # a task has its number; a heading has none
         }
 
     async def drive() -> tuple[list[str], dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
@@ -902,7 +911,7 @@ def test_the_tasks_table_is_the_number_an_icon_and_the_title(
 
     labels, open_rows, archive = asyncio.run(drive())
     icon = {state: glyph for state, (glyph, _style, _meaning) in STATUS_ICONS.items()}
-    assert labels == ["#", "st", "title"]
+    assert labels == ["#", "st", "title", "owner", "age"]
     assert open_rows == {
         "plan it": (str(numbers["plan it"]), icon["todo"]),
         "build it": (str(numbers["build it"]), icon["doing"]),
@@ -911,9 +920,9 @@ def test_the_tasks_table_is_the_number_an_icon_and_the_title(
         "after it": (str(numbers["after it"]), icon["todo"]),
         "wait for it": (str(numbers["wait for it"]), icon["waiting"]),
     }
-    assert set(archive) == {"ship it", "forget it"}
+    assert set(archive) - set(open_rows) == {"ship it", "forget it"}, "Done unfolded (B2)"
     assert archive["ship it"][0] == str(numbers["ship it"])
-    assert archive["ship it"][1].startswith(icon["done"]) and ":" in archive["ship it"][1]
+    assert archive["ship it"][1].startswith(icon["done"])
     assert archive["forget it"][1].startswith(icon["dropped"])
 
 
@@ -937,12 +946,12 @@ def test_a_long_title_is_cut_to_the_table_and_the_detail_says_the_rest(
         async with app_cls().run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             table = pilot.app.query_one("#tasks")
-            wide = (str(table.get_row_at(0)[2].plain), int(table.max_scroll_x))
+            wide = (str(table.get_row_at(1)[2].plain), int(table.max_scroll_x))  # under Doing
             side = pilot.app.query_one("#side-divider").region
             await _drag(pilot, (side.x, 10), (36, 10))  # narrow the column
             await pilot.pause()
-            narrow = (str(table.get_row_at(0)[2].plain), int(table.max_scroll_x))
-            await pilot.click("#tasks", offset=(6, 2))
+            narrow = (str(table.get_row_at(1)[2].plain), int(table.max_scroll_x))
+            await pilot.click("#tasks", offset=(6, 3))
             await pilot.pause()
             detail = str(pilot.app.board.detail_text).splitlines()[1]
             return (*wide, *narrow, detail)
@@ -1037,9 +1046,10 @@ def _board_w(size: tuple[int, int] = (120, 40)) -> Any:
     return watch_mod._build_app_class(interval=3600.0)(), size
 
 
-def test_a_narrow_board_says_its_tasks_are_hidden(runner: CliRunner, work_dir: Path) -> None:
-    """B1 #2: under ``COLLAPSE_BELOW`` columns the tasks went out of sight with no word; the
-    feed's title says so, and that ``b`` brings them back, until they are back."""
+def test_the_board_says_when_the_tasks_are_hidden(runner: CliRunner, work_dir: Path) -> None:
+    """B1 #2: the tasks went out of sight with no word. Under B2's layout, narrow, the switch
+    says which half shows and ``b`` flips it; wide, the feed's title says so while ``b`` has
+    Work hidden, until it is back."""
     pytest.importorskip("textual", reason="the [tui] extra is not installed")
     from textual.widgets import OptionList
 
@@ -1048,23 +1058,34 @@ def test_a_narrow_board_says_its_tasks_are_hidden(runner: CliRunner, work_dir: P
     team_service.activate()
     _add(runner, "build the API")
 
-    async def drive() -> tuple[str, str, str]:
+    async def drive() -> tuple[list[bool], list[bool], str, str]:
         app, _size = _board_w()
-        async with app.run_test(size=(70, 30)) as pilot:
+        async with app.run_test(size=(90, 30)) as pilot:
             await pilot.pause()
-            feed = pilot.app.query_one("#feed", OptionList)
-            narrow = str(feed.border_title)
+
+            def switch() -> list[bool]:
+                return [
+                    pilot.app.query_one(f"#switch-{name}").has_class("-shown")
+                    for name in ("work", "stream")
+                ]
+
+            narrow = switch()
             await pilot.press("b")
             await pilot.pause()
-            shown = str(feed.border_title)
-            await pilot.resize_terminal(120, 30)
+            flipped = switch()
+            await pilot.resize_terminal(140, 30)
+            await pilot.press("b")  # wide: Work out of sight
             await pilot.pause()
-            return narrow, shown, str(feed.border_title)
+            feed = pilot.app.query_one("#feed", OptionList)
+            hidden = str(feed.border_title)
+            await pilot.press("b")
+            await pilot.pause()
+            return narrow, flipped, hidden, str(feed.border_title)
 
-    narrow, shown, wide = asyncio.run(drive())
-    assert TASKS_HIDDEN in narrow, narrow
-    assert TASKS_HIDDEN not in shown, "b brought them back: the title says no more"
-    assert TASKS_HIDDEN not in wide
+    narrow, flipped, hidden, back = asyncio.run(drive())
+    assert narrow == [True, False] and flipped == [False, True]
+    assert TASKS_HIDDEN in hidden, hidden
+    assert TASKS_HIDDEN not in back, "b brought them back: the title says no more"
 
 
 def test_the_detail_says_why_a_task_is_blocked_done_or_back(
@@ -1260,7 +1281,7 @@ def test_board_w_points_to_rlx_not_to_a_manager_tab_it_does_not_have(
             await pilot.pause()
             table = pilot.app.query_one("#tasks", DataTable)
             body = " ".join(table.get_row(board_mod.EMPTY_ROW)[2].plain.split())
-            lead = str(pilot.app.query_one("#needs-you-lead", Static).render())
+            lead = str(pilot.app.query_one("#lane-lead", Static).render())
             await pilot.press("question_mark")
             await pilot.pause()
             return body, lead, str(pilot.app.screen.query_one(Static).render())
@@ -1297,7 +1318,7 @@ def test_board_w_s_footer_fits_90_columns(runner: CliRunner, work_dir: Path) -> 
         return seen
 
     for target, keys in asyncio.run(drive()):
-        assert {"b", "d", "a", "v", "o", "q", "t", "?"} <= {key for key, _ in keys}, (target, keys)
+        assert {"b", "d", "a", "o", "/", "q", "t", "?"} <= {key for key, _ in keys}, (target, keys)
         assert all(right <= 90 for _, right in keys), (target, keys)
 
 

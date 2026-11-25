@@ -1023,7 +1023,11 @@ def test_board_tab_shows_this_projects_tasks_and_not_anothers(
 
     async def rows(pilot: Pilot[None], host: Host) -> int:
         """The task rows: with none open, the table's one row is the empty state (#286)."""
-        return sum(key.value != EMPTY_ROW for key in host.query_one("#tasks", DataTable).rows)
+        table = host.query_one("#tasks", DataTable)
+        # Not the empty state, nor a group's heading (B2): the tasks.
+        return sum(
+            key.value != EMPTY_ROW and not str(key.value).startswith("group:") for key in table.rows
+        )
 
     assert drive(project, rows) == 2
     assert drive(other, rows) == 0  # the panel reads the project it was given, not the cwd
@@ -1099,19 +1103,20 @@ def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInf
     """B1 #1: a click on the Board tab left the focus on the tab row, outside the panel, and
     ``d``, ``b`` or ``a`` did nothing until a second click inside the board."""
 
-    async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, str]:
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, bool, bool]:
         await pilot.click("#--content-tab-tab-board")
         await pilot.pause()
         panel = host.query_one("#board-panel", BoardPanel)
         focused = host.focused
         inside = focused is not None and panel in focused.ancestors_with_self
-        await pilot.press("d")  # no click inside the board first
+        folded = "done" in panel.folds
+        await pilot.press("d")  # no click inside the board first: Done unfolds (B2)
         await pilot.pause()
-        return inside, str(panel.query_one("#tasks", DataTable).border_title)
+        return inside, folded, "done" in panel.folds
 
-    inside, title = drive(project, scenario)
+    inside, folded, still = drive(project, scenario)
     assert inside, "the tab's click left the focus outside the board"
-    assert title.startswith("done archive"), title
+    assert folded and not still, "d answered with no click first"
 
 
 class BesideAField(Host):
