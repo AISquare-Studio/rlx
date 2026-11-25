@@ -36,7 +36,8 @@ from typing import Literal, Protocol
 from pydantic import TypeAdapter, ValidationError
 
 from aisquare.core import program, selfcli
-from aisquare.core.agent_adapters import adapters, get_adapter
+from aisquare.core.agent_adapters import adapters, default_adapter, get_adapter
+from aisquare.core.agent_adapters.mcp_servers import DEVTOOLS_COMMAND, DEVTOOLS_NAME
 from aisquare.core.selfcli import CliResult
 from aisquare.core.shell_line import command_line
 from aisquare.core.store import store_session
@@ -501,23 +502,28 @@ class _PaneFix:
     for one of ours, run as this install's own (``selfcli.argv_for``)."""
 
 
+def _browser_tools_add() -> tuple[str, ...]:
+    """The Chrome DevTools MCP's add in its agent's own words: the default agent's binary and
+    its ``mcp_registration`` (``core/agent_adapters/mcp_servers.py``), the command
+    ``install.sh --with chrome-devtools`` runs. The browser-tools row scans that agent's config
+    dirs (``diagnostics._check_browser_tools``); ``()`` were it to register none."""
+    adapter = default_adapter()
+    registration = adapter.mcp_registration
+    if registration is None:
+        return ()
+    return (adapter.binary, *registration.add_args(DEVTOOLS_NAME, DEVTOOLS_COMMAND))
+
+
+BROWSER_TOOLS_ARGV: tuple[str, ...] = _browser_tools_add()
+"""What the browser-tools row offers, and its pane fix runs (#15): built through the adapter,
+never spelled here (``tests/test_no_agent_literals.py``)."""
+
+
 #: The pane fixes, the one pattern for all three (the hub's decision on #15, seq 229): the row
 #: they come from stays OK, its button quiet, unless its own check says otherwise.
 PANE_FIXES: tuple[_PaneFix, ...] = (
     _PaneFix(("accounts", "statusline", "--install"), "Install status line", foreign=False),
-    _PaneFix(
-        (
-            "claude",
-            "mcp",
-            "add",
-            "-s",
-            "user",
-            "chrome-devtools",
-            "npx",
-            "chrome-devtools-mcp@latest",
-        ),
-        "Add browser tools",
-    ),
+    *([_PaneFix(BROWSER_TOOLS_ARGV, "Add browser tools")] if BROWSER_TOOLS_ARGV else []),
     _PaneFix(("gh", "auth", "login"), "Sign in to GitHub"),
 )
 

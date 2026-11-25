@@ -2049,6 +2049,50 @@ def test_a_ui_tester_is_wanted_when_one_runs_or_the_persons_own_config_names_it(
     assert diagnostics._ui_tester_wanted() is True, "one runs"
 
 
+@pytest.mark.parametrize("seat", ["ui-tester", "ui-tester2"])
+def test_a_team_profile_of_a_ui_tester_is_one_set_up(home: Path, seat: str) -> None:
+    """The tester of #15, round 3: ``team bind ui-tester --bin claude`` writes
+    ``[team.profiles.ui-tester]``, and the doctor still said none was wanted (hub #429: a team
+    profile that names a ui-tester counts). Another role's profile is not one."""
+    runner = CliRunner()
+
+    bound = runner.invoke(app, ["team", "bind", "coder", "--bin", "claude"])
+    assert bound.exit_code == 0, bound.output
+    assert diagnostics._ui_tester_wanted() is False, "a coder's profile is no ui-tester's"
+
+    bound = runner.invoke(app, ["team", "bind", seat, "--bin", "claude"])
+    assert bound.exit_code == 0, bound.output
+    assert f"[team.profiles.{seat}]" in paths.config_path().read_text("utf-8"), "the premise"
+    assert diagnostics._ui_tester_wanted() is True
+
+
+def test_a_numbered_ui_tester_seat_running_is_one_running(home: Path, tmp_path: Path) -> None:
+    """A launch stores the seat as given (``ui-tester2``); it is a ui-tester all the same
+    (``harness.base_role``; the tester of #15, round 3)."""
+    project = _seed(tmp_path / "repo")
+    seat = _agent(project.id, "ui-tester-2", "%4").model_copy(update={"role": "ui-tester2"})
+    _seed(tmp_path / "repo", seat)
+
+    assert diagnostics._ui_tester_wanted() is True
+
+
+def test_a_store_that_will_not_open_still_has_the_config_asked(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One try for both reads skipped the config whenever the store failed (round 3, nit)."""
+    from aisquare.services import settings as settings_service
+
+    _seed(tmp_path / "repo")  # a store on disk
+    settings_service.set_value("fleet.roles.ui-tester.deny_tools", '["Bash"]')
+
+    def refused() -> None:
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(diagnostics, "store_session", refused)
+
+    assert diagnostics._ui_tester_wanted() is True
+
+
 def test_the_status_line_row_is_ok_with_a_quiet_install_offer(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

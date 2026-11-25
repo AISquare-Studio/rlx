@@ -361,6 +361,40 @@ def test_an_ok_rows_offer_is_a_quiet_button_beside_it_in_the_fold_and_no_problem
     assert (shown_folded, shown_open) == (False, True), "folded with its row, then shown"
 
 
+def test_with_the_fold_open_a_problems_button_stays_above_the_passing_rows(
+    pane_world: PaneWorld,
+) -> None:
+    """The tester of #15, round 3: opened, the fold's passing rows pushed the problem's own
+    button (Add browser tools) below all of them. It sits with the problems now."""
+    add = diagnostics.BROWSER_TOOLS_ADD
+    checks = [
+        DoctorCheck(
+            name="browser tools",
+            status=CheckStatus.warn,
+            detail="no browser MCP",
+            fix=f"Add the Chrome DevTools MCP to Claude Code: {add}",
+        ),
+        *(DoctorCheck(name=f"check {n}", status=CheckStatus.ok, detail="fine") for n in range(12)),
+    ]
+
+    async def drive() -> tuple[list[str], int, int]:
+        view = DoctorView(run=Spy(), refresh=lambda cwd: checks)
+        host = Host(view)
+        async with host.run_test(size=(120, 60)):
+            view.show(checks)
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
+            loud = list(view.query("#doctor-fixes Button").results(Button))
+            fold = view.query_one("#doctor-passed", Collapsible)
+            return [str(b.label) for b in loud], loud[0].region.y, fold.region.y
+
+    labels, button_y, fold_y = asyncio.run(drive())
+
+    assert labels == ["Add browser tools"]
+    assert button_y < fold_y, (button_y, fold_y)
+
+
 @pytest.mark.parametrize(
     ("check", "title", "command"),
     [

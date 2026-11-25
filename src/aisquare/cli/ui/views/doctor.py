@@ -336,12 +336,14 @@ class DoctorView(VerticalScroll):
             rerun.tooltip = "Run every check again now"
             yield rerun
         yield Static("", id="doctor-report")
+        # The problems' buttons with the problems, above the fold: opened, the passing rows
+        # no longer push them below every row (the tester of #15, round 3).
+        yield Static("", id="doctor-status")
+        yield Vertical(id="doctor-fixes")
         with Collapsible(title=passed_title(0), collapsed=True, id="doctor-passed"):
             yield Static("", id="doctor-passed-list")
             # An OK row's quiet offer sits with its row, folded with it (#15, seq 212).
             yield Vertical(id="doctor-offers")
-        yield Static("", id="doctor-status")
-        yield Vertical(id="doctor-fixes")
         if self.machine:
             with Horizontal(id="doctor-machine"):
                 # Offered once the install route is known (_read_update_refusal).
@@ -718,13 +720,13 @@ class FixPaneScreen(ModalScreen[PaneOutcome]):
             return
         if facts is not None and not facts.dead:
             return
-        self._close_window()
+        self._close_fix_window()
         if facts is None:  # vanished, not ended: what it did is not known
             self.dismiss("its pane closed before it finished")
             return
         self.dismiss(facts.dead_status if facts.dead_status is not None else 0)
 
-    def _close_window(self) -> None:
+    def _close_fix_window(self) -> None:
         from aisquare.core.tmux import TmuxError
 
         if self._timer is not None:
@@ -747,5 +749,5 @@ class FixPaneScreen(ModalScreen[PaneOutcome]):
             self.action_close()
 
     def action_close(self) -> None:
-        self._close_window()
+        self._close_fix_window()
         self.dismiss(None)

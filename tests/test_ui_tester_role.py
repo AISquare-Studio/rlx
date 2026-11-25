@@ -470,7 +470,10 @@ def test_the_no_browser_tools_row_names_its_command_at_a_shell_and_none_in_the_a
     config_dirs(bare)
     monkeypatch.delenv(prog.IN_APP_ENV, raising=False)
     shell = diagnostics._check_browser_tools(tmp_path)
-    assert "`claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest`" in shell.detail
+    assert (
+        "`claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest`"
+        in shell.detail
+    )
     assert COMMAND.search(shell.detail), "COMMAND knows it for a command"
     monkeypatch.setenv(prog.IN_APP_ENV, "1")
     app = diagnostics._check_browser_tools(tmp_path)
@@ -878,7 +881,7 @@ def test_doctor_is_ok_not_amber_when_nothing_is_declared(
     assert check.fix is None, "an ok row carries no fix; the guidance is the detail"
     assert "not browser-verified" in check.detail
     assert (
-        "claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest" in check.detail
+        "claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest" in check.detail
     ), "settings.json is not where Claude Code reads mcpServers"
     assert "settings.json" not in check.detail, "the old fix line was a dead-end loop"
 

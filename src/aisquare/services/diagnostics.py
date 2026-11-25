@@ -76,6 +76,7 @@ from aisquare.services import fleet as fleet_service
 from aisquare.services import project as project_service
 from aisquare.services import settings as settings_service
 from aisquare.services import team as team_service
+from aisquare.services.onboarding import BROWSER_TOOLS_ARGV
 
 
 def status() -> StatusReport:
@@ -3694,33 +3695,72 @@ def _check_browser_tools(cwd: Path | None = None) -> DoctorCheck:
     return _ok(name, detail, offer=BROWSER_TOOLS_ADD)
 
 
-BROWSER_TOOLS_ADD = "claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest"
-"""What the browser-tools row offers (#15): the Chrome DevTools MCP, as install.sh adds it."""
+BROWSER_TOOLS_ADD = " ".join(BROWSER_TOOLS_ARGV)
+"""What the browser-tools row offers (#15): the Chrome DevTools MCP, as install.sh adds it,
+in its adapter's words (``onboarding.BROWSER_TOOLS_ARGV``), which its pane fix matches whole."""
 
 
 def _ui_tester_wanted() -> bool:
     """Whether a ui-tester is wanted here: one runs on the fleet, or the person set the role
-    up themselves, its ``[fleet.roles.ui-tester]`` table in their ``config.toml`` other than
-    the built-in one. The table alone is not enough: ``save_config`` writes every role's table
-    whole (``config._with_whole_role_tables``), so any setting saved writes the default one
-    too (the reviewer of #15). Read-only, and no for anything that cannot be read."""
+    up themselves (:func:`_ui_tester_set_up`). Read-only, and no for anything that cannot be
+    read; each read on its own, so a store that will not open still has the config asked
+    (the tester of #15, round 3)."""
+    return _ui_tester_running() or _ui_tester_set_up()
+
+
+def _ui_tester_running() -> bool:
+    """A live fleet row in a ui-tester's seat, numbered or not (``ui-tester2``): a launch
+    stores the seat as given, so it is read by its role (``harness.base_role``)."""
     try:
-        if paths.db_path().exists():
-            with store_session() as store:
-                if any(agent.role == "ui-tester" for agent in store.live_fleet_agents()):
-                    return True
-        import tomllib
-
-        from aisquare.core.config import FleetRoleSettings, _default_fleet_roles
-
-        own = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
-        roles = own.get("fleet", {}).get("roles", {})
-        table = roles.get("ui-tester") if isinstance(roles, dict) else None
-        if not isinstance(table, dict):
+        if not paths.db_path().exists():
             return False
-        return FleetRoleSettings.model_validate(table) != _default_fleet_roles()["ui-tester"]
+        with store_session() as store:
+            return any(
+                harness.base_role(agent.role or "") == "ui-tester"
+                for agent in store.live_fleet_agents()
+            )
     except Exception:
         return False
+
+
+def _ui_tester_set_up() -> bool:
+    """The role in the person's own ``config.toml``: its ``[fleet.roles.ui-tester]`` table
+    other than the built-in one, or a ``[team.profiles.<seat>]`` of a ui-tester's that sets
+    how it launches (``team bind ui-tester --bin …``; hub #429).
+
+    The fleet's table alone is not enough: ``save_config`` writes every role's table whole
+    (``config._with_whole_role_tables``), so any setting saved writes the default one too
+    (the reviewer of #15). Team profiles are written as set, none by default."""
+    import tomllib
+
+    from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, _default_fleet_roles
+
+    try:
+        own = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    fleet = own.get("fleet")
+    roles = fleet.get("roles") if isinstance(fleet, dict) else None
+    table = roles.get("ui-tester") if isinstance(roles, dict) else None
+    if isinstance(table, dict):
+        try:
+            if FleetRoleSettings.model_validate(table) != _default_fleet_roles()["ui-tester"]:
+                return True
+        except Exception:
+            pass  # a table that does not load is the config row's to report
+    team = own.get("team")
+    profiles = team.get("profiles") if isinstance(team, dict) else None
+    if not isinstance(profiles, dict):
+        return False
+    for seat, profile in profiles.items():
+        if harness.base_role(str(seat)) != "ui-tester" or not isinstance(profile, dict):
+            continue
+        try:
+            if RoleLaunchProfile.model_validate(profile).carries_launch:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _agents_own_browser(cwd: Path) -> DoctorCheck | None:

@@ -858,7 +858,7 @@ def test_the_three_pane_fixes_come_quiet_from_ok_rows_and_loud_from_a_warning(
     problem; the browser-tools warning (a ui-tester is wanted) has the same button as its fix."""
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(onboarding, "pane_available", lambda: True)
-    add = "claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest"
+    add = "claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest"
     rows = [
         _offered("status line", "rlx accounts statusline --install"),
         _offered("gh", "gh auth login"),
