@@ -1815,8 +1815,8 @@ def test_a_row_name_with_spaces_is_one_row(tmp_path: Path) -> None:
 def test_the_doctor_step_names_rlx_as_the_rest_of_the_output_does(
     tmp_path: Path, foreign: bool, word: str
 ) -> None:
-    """The production end-to-end test (board task #177): a new user's first screen read
-    "==> Verifying with aisquare doctor" while the rest said rlx ("rlx doctor here says",
+    """The production end-to-end test (board task #177): a new user's first screen named the
+    doctor step by the old word, aisquare, while the rest said rlx ("rlx doctor here says",
     "Open rlx with: rlx"). The step names the word every other line does (``program_word``):
     rlx, or aisquare where another program's rlx comes first on PATH."""
     cli = stub_dir(

@@ -60,7 +60,7 @@ NL='
 '
 CLAUDE_INSTALLER_URL="https://claude.ai/install.sh"
 # Codex's own standalone installer, the route its docs give for macOS and Linux
-# (learn.chatgpt.com/docs/codex/cli): it puts `codex` in ~/.local/bin, linked into
+# (developers.openai.com/codex/cli): it puts `codex` in ~/.local/bin, linked into
 # $CODEX_HOME/packages/standalone.
 CODEX_INSTALLER_URL="https://chatgpt.com/codex/install.sh"
 FNM_INSTALLER_URL="https://fnm.vercel.app/install"
