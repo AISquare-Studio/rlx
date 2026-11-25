@@ -28,6 +28,7 @@ from aisquare.cli.ui.board import (
 )
 from aisquare.cli.ui.board_parts import LaneRow
 from aisquare.cli.ui.divider import Divider
+from aisquare.core import event_time
 from aisquare.models import ProjectInfo, TaskStatus, TeamEvent, TeamSession, TeamTask
 from aisquare.services import team as team_service
 from tests.ui_workers import settle_page
@@ -108,6 +109,10 @@ def board(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
         return [event for event in frame["events"] if event.task_id == task.id]
 
     monkeypatch.setattr(team_service, "board_read", board_read)
+    # One clock for the whole test (#823): a card's age and "N new since HH:MM" read NOW, not
+    # the wall clock, which moved on between the module's import and the frame.
+    monkeypatch.setattr(board_mod, "_now", lambda: NOW)
+    monkeypatch.setattr(event_time, "_now", lambda: NOW)
     monkeypatch.setattr(team_service, "task_history", history)
     monkeypatch.setattr(team_service, "stopped_because", lambda task: None)
     yield frame

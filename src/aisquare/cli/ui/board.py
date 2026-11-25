@@ -88,6 +88,14 @@ from aisquare.services import settings as settings_service
 from aisquare.services import team as team_service
 
 OPEN_STATUSES = ("todo", "doing", "review", "blocked")
+
+
+def _now() -> datetime:
+    """The board's clock: what a card's age and a question's day are read against (one place,
+    so a test pins it rather than race the wall clock: #823)."""
+    return datetime.now(UTC)
+
+
 LABELS_TTL = 30.0
 """How long the sessions block keeps the slot labels before asking the registry again."""
 LABELS_WORKER = "board-account-labels"
@@ -312,7 +320,7 @@ def needs_you(
     from aisquare.services.captain import queue  # lazy: the captain's module, read on a tick
 
     sources = _TickSources(project, list(sessions), list(tasks), list(events), seq)
-    seen = queue.observe(sources, cursors={}, now=now or datetime.now(UTC))
+    seen = queue.observe(sources, cursors={}, now=now or _now())
     live_sessions = {session.id: session for session in sessions if session.ended_at is None}
     last_said: dict[str, int] = {}
     by_id = {event.id: event for event in events}
@@ -1114,7 +1122,7 @@ class BoardPanel(Vertical):
         table.clear(columns=True)
         table.add_columns(*TASK_COLUMNS)
         self._tasks_by_id = {}
-        now = datetime.now(UTC)
+        now = _now()
         open_count = sum(1 for t in tasks if t.status in OPEN_STATUSES)
         table.border_title = f"work — {open_count} open · f folds, d done"
         rows: list[tuple[str, list[Text]]] = []

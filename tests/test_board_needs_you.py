@@ -21,6 +21,7 @@ from aisquare.cli import watch
 from aisquare.cli.ui import board as board_mod
 from aisquare.cli.ui import board_parts
 from aisquare.cli.ui.board import EMPTY_ROW, NOTHING_NEEDS_YOU, BoardPanel, NeedsYou, needs_you
+from aisquare.core import event_time
 from aisquare.core import tmux as tmux_core
 from aisquare.models import ProjectInfo, TaskStatus, TeamEvent, TeamSession, TeamTask
 from aisquare.services import fleet as fleet_service
@@ -161,6 +162,10 @@ def board(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
         return read
 
     monkeypatch.setattr(team_service, "board_read", board_read)
+    # One clock for the whole test (#823): a card's age and "N new since HH:MM" read NOW, not
+    # the wall clock, which moved on between the module's import and the frame.
+    monkeypatch.setattr(board_mod, "_now", lambda: NOW)
+    monkeypatch.setattr(event_time, "_now", lambda: NOW)
     monkeypatch.setattr(team_service, "store_session", refused("team.store_session"))
     monkeypatch.setattr(queue, "store_session", refused("queue.store_session"))
     monkeypatch.setattr(fleet_service, "list_agents", refused("fleet.list_agents"))
