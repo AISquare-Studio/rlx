@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HelloParams",
+  "description": "`hello`'s params: who is connecting, and the token that lets them.\n\n```json\n{\"token\": \"…\", \"client\": \"rlxapp\", \"client_version\": \"0.1.0\", \"env\": {\"CLAUDE_CONFIG_DIR\": \"…\"}}\n```",
+  "type": "object",
+  "properties": {
+    "client": {
+      "description": "Which client this is, such as `rlxapp`, `rlx` or `remote`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "client_version": {
+      "description": "The client's own version.",
+      "type": "string"
+    },
+    "env": {
+      "description": "Variables rlxd keeps and passes to the brain and to every Claude Code child, such\nas `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Absent leaves what\nrlxd already has.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "token": {
+      "description": "The contents of `<home>/rlxd/token`.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "token",
+    "client",
+    "client_version"
+  ]
+}

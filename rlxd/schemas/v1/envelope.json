@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Envelope",
+  "description": "One response.\n\nUnder `--json --schema-version 1`, every rlx command prints exactly one of these.\nOn rlxd's socket, each response is one of these plus the request's `id`.\n\n```json\n{\"schema_version\": 1, \"ok\": true, \"data\": {}}\n{\"schema_version\": 1, \"ok\": false, \"error\": {\"code\": \"not_a_tty\", \"message\": \"…\", \"hint\": \"…\", \"detail\": \"…\"}}\n```",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "On the socket, the `id` of the request this answers. Absent from the CLI's output.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "schema_version": {
+      "description": "The schema version this document follows.",
+      "type": "integer",
+      "format": "uint32",
+      "const": 1,
+      "minimum": 0
+    }
+  },
+  "anyOf": [
+    {
+      "description": "It worked. The process exits 0.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "description": "What it returned.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "ok": {
+          "description": "`true`.",
+          "const": true
+        }
+      },
+      "required": [
+        "ok",
+        "data"
+      ]
+    },
+    {
+      "description": "It was refused or failed. The process exits 1, 2 on a usage error, or 70 when\nthe command is not implemented.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "description": "What went wrong.",
+          "$ref": "#/$defs/Error"
+        },
+        "ok": {
+          "description": "`false`.",
+          "const": false
+        }
+      },
+      "required": [
+        "ok",
+        "error"
+      ]
+    }
+  ],
+  "required": [
+    "schema_version"
+  ],
+  "$defs": {
+    "Error": {
+      "title": "Error",
+      "description": "Why a request was refused or failed.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "A stable, machine-readable code, such as `unauthorized` or `not_a_tty`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "description": "More about what went wrong, such as an underlying error's text.",
+          "type": "string"
+        },
+        "hint": {
+          "description": "What to do about it, for a person.",
+          "type": "string"
+        },
+        "message": {
+          "description": "What went wrong, for a person.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    }
+  }
+}

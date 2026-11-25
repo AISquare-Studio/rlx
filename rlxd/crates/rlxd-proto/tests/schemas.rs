@@ -1,0 +1,364 @@
+//! The checked-in schemas (`rlxd/schemas/v1/`): up to date with the types, valid draft
+//! 2020-12 schemas, and in agreement with the types on the handoff's examples (0.10.3,
+//! 7.2 and 7.3) and on what each must refuse.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use rlxd_proto::{
+    Data, Envelope, ErrorBody, Event, HelloData, HelloParams, Request, SCHEMA_VERSION, codes,
+    schemas,
+};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+
+fn schemas_dir() -> PathBuf {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir.parent().and_then(Path::parent).unwrap();
+    workspace.join("schemas").join("v1")
+}
+
+fn read_json(path: &Path) -> Value {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// A validator for a checked-in schema, with `format` asserted (`date-time`, above all).
+fn validator(schema: &str) -> jsonschema::Validator {
+    jsonschema::options()
+        .should_validate_formats(true)
+        .build(&read_json(&schemas_dir().join(schema)))
+        .unwrap_or_else(|e| panic!("{schema}: {e}"))
+}
+
+fn example(name: &str) -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("examples")
+        .join(name);
+    read_json(&path)
+}
+
+fn assert_valid(schema: &str, instance: &Value) {
+    if let Err(error) = validator(schema).validate(instance) {
+        panic!("{schema} refuses {instance}: {error}");
+    }
+}
+
+/// `instance` validates against `schema`, parses as `T`, and `T` prints a document that
+/// validates too and parses back to the same `T`. Returns what `T` prints.
+fn agrees<T>(schema: &str, instance: &Value) -> Value
+where
+    T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    assert_valid(schema, instance);
+    let parsed: T = serde_json::from_value(instance.clone())
+        .unwrap_or_else(|e| panic!("{instance} does not parse as {schema}'s type: {e}"));
+    let printed = serde_json::to_value(&parsed).unwrap();
+    assert_valid(schema, &printed);
+    assert_eq!(
+        serde_json::from_value::<T>(printed.clone()).unwrap(),
+        parsed
+    );
+    printed
+}
+
+/// Both the schema and the type refuse `instance`.
+fn both_refuse<T: DeserializeOwned + std::fmt::Debug>(schema: &str, instance: Value) {
+    assert!(
+        !validator(schema).is_valid(&instance),
+        "{schema} accepts {instance}"
+    );
+    if let Ok(parsed) = serde_json::from_value::<T>(instance.clone()) {
+        panic!("{instance} parses as {schema}'s type: {parsed:?}");
+    }
+}
+
+fn data(value: Value) -> Data {
+    match value {
+        Value::Object(map) => map,
+        other => panic!("not an object: {other}"),
+    }
+}
+
+#[test]
+fn the_checked_in_schemas_are_the_generated_ones() {
+    let dir = schemas_dir();
+    for file in schemas::all() {
+        let on_disk = fs::read_to_string(dir.join(file.name))
+            .unwrap_or_else(|e| panic!("{}: {e}", file.name));
+        assert!(
+            on_disk == file.contents,
+            "{} drifted from rlxd-proto: run `cargo run -p rlxd-proto --bin gen-schemas`",
+            file.name
+        );
+    }
+}
+
+#[test]
+fn every_schema_is_a_valid_draft_2020_12_schema() {
+    let files = schemas::all();
+    let names: Vec<_> = files.iter().map(|file| file.name).collect();
+    for name in ["envelope.json", "event.json"] {
+        assert!(names.contains(&name), "{name} is not generated");
+    }
+    for file in files {
+        let schema: Value = serde_json::from_str(&file.contents).unwrap();
+        assert_eq!(
+            schema["$schema"], "https://json-schema.org/draft/2020-12/schema",
+            "{}",
+            file.name
+        );
+        if let Err(error) = jsonschema::meta::validate(&schema) {
+            panic!("{} is not a valid schema: {error}", file.name);
+        }
+    }
+}
+
+#[test]
+fn the_handoffs_envelopes_validate_and_print_back_as_themselves() {
+    for name in [
+        "envelope-ok.json",
+        "envelope-error.json",
+        "envelope-socket.json",
+        "envelope-unauthorized.json",
+    ] {
+        let instance = example(name);
+        assert_eq!(agrees::<Envelope>("envelope.json", &instance), instance);
+    }
+}
+
+#[test]
+fn the_handoffs_event_validates_and_prints_back_as_itself() {
+    let instance = example("event.json");
+    assert_eq!(agrees::<Event>("event.json", &instance), instance);
+}
+
+#[test]
+fn request_frames_validate_and_absent_params_mean_empty_params() {
+    let instance = example("request.json");
+    assert_eq!(agrees::<Request>("request.json", &instance), instance);
+
+    let bare = example("request-no-params.json");
+    let printed = agrees::<Request>("request.json", &bare);
+    assert_eq!(printed, json!({"id": 1, "method": "status", "params": {}}));
+}
+
+#[test]
+fn hello_and_its_reply_validate_and_print_back_as_themselves() {
+    let hello = example("hello.json");
+    assert_eq!(agrees::<HelloParams>("hello.json", &hello), hello);
+    let reply = example("hello-reply.json");
+    assert_eq!(agrees::<HelloData>("hello-reply.json", &reply), reply);
+
+    let without_env = json!({"token": "t", "client": "rlx", "client_version": "0.10.1"});
+    assert_eq!(
+        agrees::<HelloParams>("hello.json", &without_env),
+        without_env
+    );
+}
+
+#[test]
+fn the_builders_print_the_documented_shapes() {
+    let ok = Envelope::ok(Data::new());
+    assert_eq!(
+        serde_json::to_value(&ok).unwrap(),
+        example("envelope-ok.json")
+    );
+    assert!(ok.is_ok());
+
+    let error = ErrorBody::new("not_a_tty", "…")
+        .with_hint("…")
+        .with_detail("…");
+    let refused = Envelope::err(error.clone());
+    assert_eq!(
+        serde_json::to_value(&refused).unwrap(),
+        example("envelope-error.json")
+    );
+    assert!(!refused.is_ok());
+    assert_eq!(refused.into_result(), Err(error));
+
+    let answer = Envelope::ok(data(json!({"run_id": "run_1"}))).with_id(7);
+    assert_eq!(
+        serde_json::to_value(&answer).unwrap(),
+        example("envelope-socket.json")
+    );
+    assert_eq!(
+        Envelope::from(answer.into_result()).with_id(7),
+        serde_json::from_value(example("envelope-socket.json")).unwrap()
+    );
+
+    let unauthorized = Envelope::err(ErrorBody::new(
+        codes::UNAUTHORIZED,
+        "the first frame must be hello",
+    ))
+    .with_id(1);
+    assert_eq!(
+        serde_json::to_value(&unauthorized).unwrap(),
+        example("envelope-unauthorized.json")
+    );
+
+    let event = Event::new(
+        42,
+        "2026-11-25T12:00:00.000Z",
+        "run",
+        "run.text",
+        Data::new(),
+    );
+    assert_eq!(event.schema_version, SCHEMA_VERSION);
+    assert_eq!(serde_json::to_value(&event).unwrap(), example("event.json"));
+
+    let request = Request::new(7, "run.start", Data::new());
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        example("request.json")
+    );
+}
+
+#[test]
+fn what_a_client_does_not_know_is_ignored_not_refused() {
+    // New fields keep the schema version (7.2), so neither side may refuse one.
+    let envelope = json!({"schema_version": 1, "ok": true, "data": {}, "later": 1});
+    agrees::<Envelope>("envelope.json", &envelope);
+    let error = json!({"schema_version": 1, "ok": false,
+        "error": {"code": "c", "message": "m", "later": 1}});
+    agrees::<Envelope>("envelope.json", &error);
+    let event = json!({"schema_version": 1, "seq": 1, "time": "2026-11-25T12:00:00.000Z",
+        "topic": "later", "type": "later.thing", "data": {}, "later": 1});
+    agrees::<Event>("event.json", &event);
+    let request = json!({"id": 1, "method": "status", "params": {}, "later": 1});
+    agrees::<Request>("request.json", &request);
+}
+
+#[test]
+fn an_envelope_is_ok_with_data_or_not_ok_with_an_error_and_nothing_else() {
+    for instance in [
+        json!({"schema_version": 1, "ok": true}),
+        json!({"schema_version": 1, "ok": false}),
+        json!({"schema_version": 1, "ok": true, "error": {"code": "c", "message": "m"}}),
+        json!({"schema_version": 1, "ok": false, "data": {}}),
+        json!({"schema_version": 1, "ok": "true", "data": {}}),
+        json!({"schema_version": 1, "data": {}}),
+        json!({"ok": true, "data": {}}),
+        json!({"schema_version": "1", "ok": true, "data": {}}),
+        json!({"schema_version": 1, "ok": true, "data": []}),
+        json!({"schema_version": 1, "ok": true, "data": null}),
+        json!({"schema_version": 1, "ok": false, "error": {"code": "c"}}),
+        json!({"schema_version": 1, "ok": false, "error": {"message": "m"}}),
+        json!({"schema_version": 1, "ok": false, "error": "not_a_tty"}),
+        json!({"schema_version": 1, "id": "7", "ok": true, "data": {}}),
+        json!({"schema_version": 1, "id": -1, "ok": true, "data": {}}),
+    ] {
+        both_refuse::<Envelope>("envelope.json", instance);
+    }
+}
+
+#[test]
+fn an_event_has_every_field() {
+    let whole = json!({"schema_version": 1, "seq": 42, "time": "2026-11-25T12:00:00.000Z",
+        "topic": "run", "type": "run.text", "data": {}});
+    for field in ["schema_version", "seq", "time", "topic", "type", "data"] {
+        let mut instance = whole.clone();
+        instance.as_object_mut().unwrap().remove(field);
+        both_refuse::<Event>("event.json", instance);
+    }
+    for (field, value) in [
+        ("seq", json!(-1)),
+        ("seq", json!("42")),
+        ("data", json!([])),
+        ("data", json!(null)),
+        ("topic", json!(1)),
+    ] {
+        let mut instance = whole.clone();
+        instance[field] = value;
+        both_refuse::<Event>("event.json", instance);
+    }
+}
+
+#[test]
+fn requests_and_hello_refuse_their_wrong_shapes() {
+    for instance in [
+        json!({"method": "status"}),
+        json!({"id": 1}),
+        json!({"id": "1", "method": "status"}),
+        json!({"id": 1, "method": "status", "params": []}),
+    ] {
+        both_refuse::<Request>("request.json", instance);
+    }
+    for instance in [
+        json!({"client": "rlxapp", "client_version": "0.1.0"}),
+        json!({"token": "t", "client_version": "0.1.0"}),
+        json!({"token": "t", "client": "rlxapp"}),
+        json!({"token": "t", "client": "rlxapp", "client_version": "0.1.0", "env": {"A": 1}}),
+    ] {
+        both_refuse::<HelloParams>("hello.json", instance);
+    }
+    for instance in [
+        json!({"schema_versions": [1], "capabilities": []}),
+        json!({"daemon_version": "0.10.1", "capabilities": []}),
+        json!({"daemon_version": "0.10.1", "schema_versions": [1]}),
+        json!({"daemon_version": "0.10.1", "schema_versions": ["1"], "capabilities": []}),
+    ] {
+        both_refuse::<HelloData>("hello-reply.json", instance);
+    }
+}
+
+#[test]
+fn the_schemas_also_hold_what_the_types_leave_to_the_reader() {
+    // The types parse these, so a client can read a newer or a malformed document and
+    // say what is wrong with it (and an optional field's `null` reads as absent); the v1
+    // schemas refuse them, and rlxd never prints them.
+    for (schema, instance) in [
+        (
+            "envelope.json",
+            json!({"schema_version": 2, "ok": true, "data": {}}),
+        ),
+        (
+            "envelope.json",
+            json!({"schema_version": 1, "ok": false, "error": {"code": "", "message": "m"}}),
+        ),
+        (
+            "envelope.json",
+            json!({"schema_version": 1, "ok": false, "error": {"code": "c", "message": ""}}),
+        ),
+        (
+            "event.json",
+            json!({"schema_version": 1, "seq": 0, "time": "2026-11-25T12:00:00.000Z",
+                "topic": "run", "type": "run.text", "data": {}}),
+        ),
+        (
+            "event.json",
+            json!({"schema_version": 1, "seq": 1, "time": "yesterday",
+                "topic": "run", "type": "run.text", "data": {}}),
+        ),
+        (
+            "event.json",
+            json!({"schema_version": 1, "seq": 1, "time": "2026-11-25T12:00:00.000Z",
+                "topic": "", "type": "run.text", "data": {}}),
+        ),
+        ("request.json", json!({"id": 1, "method": ""})),
+        (
+            "hello.json",
+            json!({"token": "", "client": "rlxapp", "client_version": "0.1.0"}),
+        ),
+        (
+            "hello.json",
+            json!({"token": "t", "client": "rlxapp", "client_version": "0.1.0", "env": null}),
+        ),
+        (
+            "envelope.json",
+            json!({"schema_version": 1, "ok": false,
+                "error": {"code": "c", "message": "m", "hint": null}}),
+        ),
+        (
+            "hello-reply.json",
+            json!({"daemon_version": "0.10.1", "schema_versions": [], "capabilities": []}),
+        ),
+    ] {
+        assert!(
+            !validator(schema).is_valid(&instance),
+            "{schema} accepts {instance}"
+        );
+    }
+}

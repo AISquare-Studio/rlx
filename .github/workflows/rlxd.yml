@@ -1,0 +1,97 @@
+name: rlxd
+
+# The rlxd Cargo workspace (rlxd/), on the three OSes it ships for (handoff 0.10.3,
+# 1.1). ci.yml runs the Python suite; this runs the Rust one. A sub-PR gets it only
+# when it touches rlxd/ or this file; every push to an rc/** branch runs it whatever
+# changed, as does a run by hand (`gh workflow run rlxd.yml --ref <branch>`).
+on:
+  pull_request:
+    paths:
+      - "rlxd/**"
+      - ".github/workflows/rlxd.yml"
+  push:
+    branches: ["rc/**"]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR, grouped by event as ci.yml's are, so a
+# run by hand never cancels a push's run or the other way round.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+# rustup picks the toolchain from rlxd/rust-toolchain.toml only when cargo runs inside
+# rlxd/, so every step does.
+defaults:
+  run:
+    shell: bash
+    working-directory: rlxd
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # rustup is on every hosted runner; with no argument it installs what
+      # rust-toolchain.toml pins, rustfmt and clippy included.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rlxd -> target
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: cargo build --release
+        run: cargo build --workspace --release --locked
+
+      - name: schemas/v1 matches rlxd-proto
+        run: cargo run --locked -p rlxd-proto --bin gen-schemas -- --check
+
+  # Licences and RustSec advisories, once: the dependency graph is the same on every
+  # OS, since cargo-deny reads every target's dependencies wherever it runs.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-deny@0.22.1
+
+      - name: cargo deny check
+        run: cargo deny --locked check
