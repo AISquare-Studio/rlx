@@ -37,11 +37,15 @@ def registered(monkeypatch: pytest.MonkeyPatch) -> Iterator[instances.Registrati
 
 
 def _beaten(registration: instances.Registration, pids: set[int]) -> None:
-    """Wait for a beat whose read of the others names exactly ``pids``."""
+    """Wait for a beat whose read of the others began after this call and names exactly
+    ``pids``: newer than any claim stamped before (``size_owner_runs``). Not a sleep of one
+    beat more: a starved beat thread outlasted it, and a claim stamped before the wait read as
+    newer than the registry's last read (py3.12 shard 2/4, run 44226472438)."""
+    asked = time.time_ns()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if {other.pid for other in registration.others} == pids:
-            time.sleep(0.05)  # and one beat more, so the read is newer than any claim before
+        fresh = registration.others_read_ns > asked  # first: the beat sets `others` before it
+        if fresh and {other.pid for other in registration.others} == pids:
             return
         time.sleep(0.01)
     pytest.fail(f"the beat read {registration.others}")
@@ -122,12 +126,18 @@ def test_an_owner_whose_pid_runs_but_is_no_live_asq_has_let_go(
 
 
 def test_a_claim_newer_than_the_last_read_of_the_registry_counts(
-    registered: instances.Registration, monkeypatch: pytest.MonkeyPatch
+    registered: instances.Registration,
 ) -> None:
     """An asq that started and claimed since the beat last read: the read could not know it."""
     _beaten(registered, set())
-    monkeypatch.setattr(instances, "HEARTBEAT_SECONDS", 60.0)  # no read after this one
-    time.sleep(0.05)
+    # No read after this one: the beat thread ends, and this process stays registered. A longer
+    # beat and a sleep left one beat already due at the old 20 ms, which a starved thread could
+    # take after the claim's stamp below.
+    registered._stop.set()
+    thread = registered._thread
+    assert thread is not None
+    thread.join(5)
+    assert not thread.is_alive(), "the beat thread did not end"
     fresh = SizeOwner(os.getppid(), "mini", "ssh", time.time_ns())
 
     assert fresh.stamp > registered.others_read_ns and size_owner_runs(fresh)
