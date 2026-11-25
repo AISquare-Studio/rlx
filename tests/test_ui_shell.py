@@ -17,9 +17,11 @@ ring on the first frame.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -2623,6 +2625,120 @@ def test_help_opens_from_the_sidebar_and_closes(tmp_path: Path, script: Script) 
     # What sits beside and under ⚙ Settings is explained here too (review of #261, m2/m9).
     assert "✗ 1  ⚠ 2" in keys and "what the doctor's last run found" in keys
     assert "usage could not be read" in keys and "accounts that need a login" in keys
+
+
+def _footer(app: FleetApp) -> list[tuple[str, str]]:
+    """The footer's keys as drawn, left to right: (key as shown, its word). Each one whole: on
+    the screen, and a cell or more apart from the next entry the footer draws, whatever it is:
+    a key, a group of keys (``↓↑``), or a group's label (``move``), which the compact footer
+    drew touching the key after it (``move⏎ open``, the tester of #553). The palette's key is
+    docked on the right, an entry like the rest."""
+    from textual.widgets import Footer
+    from textual.widgets._footer import FooterKey
+
+    footer = app.screen.query_one(Footer)
+    entries = sorted(
+        (entry for entry in footer.children if entry.display and entry.region.area),
+        key=lambda entry: entry.region.x,
+    )
+    assert all(entry.region.right <= footer.region.right for entry in entries), entries
+    # Each entry's ink, from its first drawn glyph to its last: a key's padding is inside its
+    # region, so the gap is the blank cells between one entry's ink and the next's.
+    inked = []
+    for entry in entries:
+        text = composited_text(app, entry)
+        if text.strip():
+            first = entry.region.x + len(text) - len(text.lstrip())
+            inked.append((text.strip(), first, entry.region.x + len(text.rstrip())))
+    touching = [(a[0], b[0]) for a, b in itertools.pairwise(inked) if b[1] - a[2] < 1]
+    assert not touching, f"footer entries with no cell between them: {touching} in {inked}"
+    keys = sorted(
+        (key for key in footer.query(FooterKey) if key.region.area), key=lambda k: k.region.x
+    )
+    return [(key.key_display, key.description) for key in keys]
+
+
+def composited_text(app: FleetApp, widget: Widget) -> str:
+    """The cells ``widget`` covers on the screen's composited frame, as drawn."""
+    region = widget.region
+    (strip,) = app.screen._compositor.render_full_update(simplify=True).strips[region.y]
+    return strip.text[region.x : region.right]
+
+
+@pytest.mark.parametrize("size", [(80, 24), (99, 24), (100, 24), (101, 24), SIZE])
+def test_the_footer_starts_with_help_and_shows_welcome_and_add_project(
+    tmp_path: Path, script: Script, size: tuple[int, int]
+) -> None:
+    """Q9 (the UX audit): ``?`` first, where a newcomer looks, then ``w`` welcome and ``+``
+    add project, which were hidden. At 80x24 too: every key the footer lists is on screen, each
+    entry a cell apart from the next (:func:`_footer`), at the narrow footer's widest too (99)."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[list[tuple[str, str]], str]:
+        app = fleet_app(pilot)
+        strips = app.screen._compositor.render_full_update(simplify=True).strips
+        (bottom,) = strips[size[1] - 1]
+        return _footer(app), bottom.text
+
+    footer, bottom = drive(go, size=size)
+    assert footer[0] == ("?", "help"), footer
+    assert bottom.lstrip().startswith("? help"), f"the screen's bottom row: {bottom!r}"
+    assert re.search(r"move +⏎", bottom), f"the screen's bottom row: {bottom!r}"
+    assert ("w", "welcome") in footer and ("+", "add project") in footer, footer
+    # Nothing the footer listed before is pushed off it to make room.
+    for shown_before in (("q", "quit"), ("t", "theme"), ("R", "remote"), ("r", "refresh")):
+        assert shown_before in footer, (shown_before, footer)
+
+
+def test_the_footer_keeps_its_gaps_after_a_resize_back_to_80_columns(
+    tmp_path: Path, script: Script
+) -> None:
+    """The narrow footer is chosen at each resize (``ShellFooter.on_resize``): wide, then 80
+    columns again, it is drawn as at 80 from the start, every entry a cell apart."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> list[tuple[list[tuple[str, str]], str]]:
+        app = fleet_app(pilot)
+        seen = []
+        for width in (140, 80):
+            await pilot.resize_terminal(width, 24)
+            await settle(app)
+            strips = app.screen._compositor.render_full_update(simplify=True).strips
+            (bottom,) = strips[23]
+            seen.append((_footer(app), bottom.text))
+        return seen
+
+    (wide, wide_row), (narrow, narrow_row) = drive(go, size=(80, 24))
+    assert wide[0] == narrow[0] == ("?", "help"), (wide, narrow)
+    assert "f1 palette" in wide_row and "f1 palette" not in narrow_row, (wide_row, narrow_row)
+    assert "move ⏎" in narrow_row and "move⏎" not in narrow_row, narrow_row
+    assert ("r", "refresh") in narrow, narrow
+
+
+def test_help_explains_every_agent_mark_and_the_agent_menu(tmp_path: Path, script: Script) -> None:
+    """Q10 (the UX audit): the help says what each mark on an agent means, a line per mark the
+    sidebar draws (its own table, read, so a mark changed there is the one explained); and the
+    agent's ⋯ menu has its line (0.10.1's exploratory test)."""
+    from aisquare.cli.ui.app import AGENT_STATE_WORDS
+    from aisquare.cli.ui.sidebar import STATE_CHIP
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> str:
+        app = fleet_app(pilot)
+        await pilot.press("question_mark")
+        await settle(app)
+        return shown(app.screen.query_one("#helpbox Static", Static))
+
+    lines = drive(go).splitlines()
+    for state, (mark, _style) in STATE_CHIP.items():
+        words = AGENT_STATE_WORDS.get(state, state)
+        assert [line for line in lines if line.split() == [mark, *words.split()]], (state, mark)
+    assert set(AGENT_STATE_WORDS) == set(STATE_CHIP), "a mark with no words, or words for none"
+    menu = [line for line in lines if "on an agent's row, its menu" in line]
+    assert len(menu) == 1, menu
+    for part in (". ⋯ r-click", "Pause", "Resume", "Stop", "Restart", "Rename"):
+        assert part in menu[0], part
 
 
 def test_help_opens_from_the_board_and_explains_every_task_icon(
@@ -5540,6 +5656,82 @@ def test_run_ui_says_what_the_quit_could_not_save(
     app_mod.run_ui()
     err = capsys.readouterr().err
     assert "⚠ the theme was not saved: state.json.lock is held by another process" in err
+
+
+def test_a_restart_from_an_agents_menu_owns_its_pane_going(tmp_path: Path, script: Script) -> None:
+    """The agent's menu restarts on the app when no view of the agent is open, and a project's
+    Manager tab may still show its pane: that pane says nothing of going while the restart of
+    that agent runs (``TerminalPane._replaced_by_restart``), and only for that agent's pane on
+    its own server."""
+    from aisquare.cli.ui.views.agent import PAUSE_WORKER, RESTART_WORKER
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+    manager = status("prj_a", "manager", "manager", "working").agent
+
+    class _Worker:
+        def __init__(self, name: str, *, finished: bool = False) -> None:
+            self.name, self.is_finished = name, finished
+
+    async def go(pilot: Pilot[None]) -> list[bool]:
+        app = fleet_app(pilot)
+        here, elsewhere = TmuxServer(PRIVATE_SOCKET), TmuxServer("someone-elses")
+        asked = []
+        for worker in (
+            _Worker(RESTART_WORKER),
+            _Worker(RESTART_WORKER, finished=True),
+            _Worker(PAUSE_WORKER),
+        ):
+            app._menu_actions = {worker: manager}  # type: ignore[dict-item]
+            asked.append(app.restarting_pane(here, manager.pane_id))
+        app._menu_actions = {_Worker(RESTART_WORKER): manager}  # type: ignore[dict-item]
+        asked += [app.restarting_pane(here, "%7"), app.restarting_pane(elsewhere, "%1")]
+        asked.append(app.restarting_pane(None, manager.pane_id))
+        app._menu_actions = {}
+        return asked
+
+    assert drive(go) == [True, False, False, False, False, False]
+
+
+def test_a_quit_says_how_many_agents_keep_running(
+    tmp_path: Path,
+    script: Script,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Q12 (the UX audit): ``q`` stops no agent, and the terminal is told so once the screen is
+    gone — "2 agents keep running", counted off the frame (an exited row is not one)."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+    script["prj_a"] = [
+        status("prj_a", "manager", "manager", "working"),
+        status("prj_a", "coder-1", "coder", "waiting", minute=1),
+        status("prj_a", "coder-2", "coder", "exited", minute=2, exit_status=0),
+    ]
+    apps: list[FleetApp] = []
+
+    async def go(pilot: Pilot[None]) -> None:
+        app = fleet_app(pilot)
+        apps.append(app)
+        app.sidebar.focus()
+        await pilot.press("q")
+
+    drive(go)
+    (app,) = apps
+    assert app.quit_line == "rlx quit: 2 agents keep running"
+
+    class _Quit:
+        def __init__(self, **options: object) -> None:
+            self.unsaved: list[str] = []
+            self.remote = RemoteController()  # off: nothing for run_ui to wait for
+            self.quit_line = app.quit_line
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(app_mod, "FleetApp", _Quit)
+    app_mod.run_ui()
+    assert "rlx quit: 2 agents keep running" in capsys.readouterr().err
+    assert app_mod.quit_line(1) == "rlx quit: 1 agent keeps running"
+    assert app_mod.quit_line(0) is None
 
 
 def test_a_quit_in_the_middle_of_a_drag_keeps_the_width_the_drag_reached(

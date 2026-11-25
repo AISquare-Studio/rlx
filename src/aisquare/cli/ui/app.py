@@ -42,6 +42,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.app import ComposeResult, ScreenStackError, SystemCommand, UnknownModeError
@@ -56,6 +57,7 @@ from textual.screen import ModalScreen, Screen
 from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Button, ContentSwitcher, Footer, Static, TextArea
+from textual.widgets._footer import FooterKey
 from textual.worker import Worker, WorkerState, WorkType
 from textual.worker_manager import WorkerManager
 
@@ -97,6 +99,7 @@ from aisquare.cli.ui.sidebar import (
     HEADROOM_DOT,
     RED,
     SETTINGS_KEY,
+    STATE_CHIP,
     AccountsSelected,
     AddProject,
     AgentHeadroom,
@@ -219,6 +222,7 @@ from aisquare.core.console import stderr_console
 from aisquare.core.feature_use import view_feature
 from aisquare.core.store import ContextStore, store_session
 from aisquare.core.terminal import mac_keyboard
+from aisquare.core.tmux import TmuxServer
 from aisquare.core.version import PRODUCT_NAME
 from aisquare.core.workspace import project_id_for
 from aisquare.models import (
@@ -687,6 +691,50 @@ class QuitAsked(Message):
         self.request = request
 
 
+AGENT_STATE_WORDS: dict[str, str] = {
+    "working": "working",
+    "waiting": "waiting for its next prompt",
+    "attention": "needs you: a question or a permission to answer",
+    "limited": "at its usage limit: it waits for the reset",
+    "exited": "ended; its last screen is kept until Stop or Restart",
+    "lost": "its tmux pane is gone",
+    "paused": "paused: Resume brings it back on the same task",
+    "unknown": "not read yet, or tmux could not be asked",
+}
+"""What each mark in ``sidebar.STATE_CHIP`` means, for the help (Q10). A state with no words
+here is named as itself, so a mark added there is still explained."""
+
+
+class ShellFooter(Footer):
+    """The footer, with ``?`` first wherever the focus is (Q9 of the UX audit).
+
+    Textual lists the focused widget's keys before the app's, so the sidebar's ``↓ ↑`` and
+    ``⏎`` came first and help sat near the end, past where a newcomer reads. Every compose
+    that has keys is a ``recompose`` (the first one has none: ``Footer`` waits for the
+    screen's bindings), so the help key is moved to the front after each.
+    """
+
+    NARROW_BELOW = 101
+    """Columns under which the keys drop their padding and the palette's key, docked on the
+    right, is left out (``F1`` still opens it, and the help says so): at 80 it covered
+    ``R remote`` and ``r refresh``, and help before ``?`` came first. The padded row with the
+    palette's key is 101 cells, so at exactly 100 the key covered ``r refresh``'s padding (the
+    tester of #553, round 3): the footer is narrow up to and including 100 columns."""
+
+    def on_resize(self, event: events.Resize) -> None:
+        narrow = event.size.width < self.NARROW_BELOW
+        self.compact = narrow
+        if self.show_command_palette == narrow:
+            self.show_command_palette = not narrow
+            self.call_after_refresh(self.recompose)
+
+    async def recompose(self) -> None:
+        await super().recompose()
+        helps = [key for key in self.query_children(FooterKey) if key.action == "help"]
+        if helps and self.children and self.children[0] is not helps[0]:
+            self.move_child(helps[0], before=0)
+
+
 class HelpScreen(ModalScreen[None]):
     """The keys, in one place. Esc, q or ? closes; opened from the board, it shows the
     Board section first — the icon legend sat ~45 lines down, below the fold."""
@@ -763,6 +811,10 @@ class HelpScreen(ModalScreen[None]):
                 ". ⋯ r-click",
                 "the card's menu: rename, pin, settings, start fresh, remove from the fleet",
             ),
+            (
+                ". ⋯ r-click",
+                "on an agent's row, its menu: Pause or Resume, Stop, Restart, Rename",
+            ),
             (self.escape_key.upper(), "hand focus from an agent's pane back to the sidebar"),
             ("wheel", "scroll an agent pane; shift/alt+PgUp/PgDn too, shift+Home/End"),
             ("drag", "select text in a pane (double-click: a word) — copied on release"),
@@ -791,6 +843,14 @@ class HelpScreen(ModalScreen[None]):
         ):
             text.append(f"  {key:<11}", style="bold cyan")
             text.append(f" {what}\n")
+        text.append("\nAn agent's mark (its row, its card, its header)\n", style="bold")
+        # The sidebar's own marks, read here, so a mark changed there is the one explained.
+        for state, (mark, style) in STATE_CHIP.items():
+            text.append("  ")
+            text.append(mark, style=style)
+            # By cells, as the keys above line up: 🔔 and 💤 take two.
+            text.append(" " * max(1, 11 - cell_len(mark)))
+            text.append(f" {AGENT_STATE_WORDS.get(state, state)}\n")
         text.append(f"\n{self.board_heading()}\n", style="bold")
         text.append_text(board_help())
         text.append("\nAccounts (⚙ Settings ▸ Accounts)\n", style="bold")
@@ -1199,21 +1259,29 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """
     #main { height: 1fr; }
     #content { width: 1fr; height: 1fr; }
+    /* The narrow footer (ShellFooter.NARROW_BELOW). Textual's compact footer draws a key
+       group's label with no margin, so "move" touched the "⏎ open" after it, and gives the
+       group a cell on its left, which doubled the gap after "? help" once help came first.
+       The cell moves from the group's left to its label's right: the row keeps its 80. */
+    ShellFooter.-compact FooterLabel { margin: 0 1 0 0; }
+    ShellFooter.-compact KeyGroup.-compact { padding-left: 0; }
     """
         + RLX_CSS
     )
     BINDINGS: ClassVar = [
+        # First, where a newcomer looks (Q9): ``ShellFooter`` keeps it first when a widget's
+        # own keys come before the app's.
+        Binding("question_mark", "help", "help", key_display="?"),
         Binding("q", "quit", "quit"),
         Binding("ctrl+q", "quit", "quit", show=False),
+        Binding("w", "welcome", "welcome"),
+        Binding("plus", "add_project", "add project", key_display="+"),
         Binding("t", "pick_theme", "theme"),
-        # In the footer, where the owner looks for it (#33): it fits 80 columns now that the
-        # sidebar's ↓ and ↑ share one entry. The ? screen and the palette list it too.
+        # In the footer, where the owner looks for it (#33). The ? screen and the palette
+        # list it too.
         Binding("R", "remote_panel", "remote"),
         Binding("r", "refresh_now", "refresh"),
         Binding("a", "toggle_captured", "captured", show=False),
-        Binding("plus", "add_project", "add project", show=False, key_display="+"),
-        Binding("w", "welcome", "welcome", show=False),
-        Binding("question_mark", "help", "help", key_display="?"),
     ]
     SIDEBAR_ACTIONS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -1445,7 +1513,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 # DirectoryTree scans the home directory and keeps a loader worker
                 # alive for its whole life — not a cost to pay at every start-up.
                 yield DoctorView(id="doctor", machine=True, manager=self._doctor_manager_name)
-        yield Footer()
+        yield ShellFooter()
 
     def on_mount(self) -> None:
         feature_use.record("tui.launch")
@@ -2662,7 +2730,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         started = event.agent
         project = self.snapshot.project(started.project_id) if self.snapshot else None
         named = agent_name(started.label, project)
-        self.notify(f"✓ restarted {named} — {receipt.how}", timeout=6, markup=False)
+        self.notify(f"✓ {restart_word(receipt)} {named} — {receipt.how}", timeout=6, markup=False)
         for note in receipt.notes:
             self.notify(note, severity="warning", timeout=8, markup=False)
         await self._show_restarted(event, read_again=True)
@@ -2678,7 +2746,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             return
         if status is None:
             self.notify(
-                f"{started.label} restarted — its row appears on the next refresh",
+                f"{started.label} {restart_word(event.receipt)} — its row appears on the next "
+                "refresh",
                 timeout=5,
                 markup=False,
             )
@@ -3051,6 +3120,19 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         )
         self._menu_actions[worker] = agent
 
+    def restarting_pane(self, server: TmuxServer | None, pane_id: str | None) -> bool:
+        """Whether a restart an agent's menu started here (no view of it open: a project's
+        Manager tab may show it) is replacing the agent at ``pane_id`` on ``server``: that pane
+        then says nothing of going (``TerminalPane._replaced_by_restart``)."""
+        return any(
+            worker.name == RESTART_WORKER
+            and not worker.is_finished
+            and agent.pane_id == pane_id
+            and server is not None
+            and agent.tmux_socket == server.socket
+            for worker, agent in self._menu_actions.items()
+        )
+
     def _menu_action_answered(self, event: Worker.StateChanged) -> None:
         """A pause or restart an agent's menu started here answered: toasted as the header's
         are, the restart through :class:`AgentRestarted`, and the frame read again."""
@@ -3417,11 +3499,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if receipt is None:
             return
         agent = receipt.agent
-        self.notify(
-            f"✓ spawned {agent.label} ({agent.id}) → {receipt.tmux_session} {agent.pane_id}",
-            timeout=6,
-            markup=False,
-        )
+        # Named as a restart's toast names it: no agent id, tmux session or pane, which are
+        # nobody's words but tmux's (0.10.1's exploratory test).
+        project = self.snapshot.project(agent.project_id) if self.snapshot else None
+        self.notify(f"✓ spawned {agent_name(agent.label, project)}", timeout=6, markup=False)
         for note in receipt.notes:
             self.notify(note, severity="warning", timeout=8, markup=False)
         # Selected off a frame read after the spawn (``refresh_data(then=)``): the read is
@@ -4341,7 +4422,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if running is not None:
             self.notify(f"{running} is still running — quit when it ends", severity="warning")
             return
+        self.quit_line = quit_line(len(self._live_agents()))
         await super().action_quit()
+
+    quit_line: str | None = None
+    """What the terminal is told once the screen is gone (Q12): the agents that go on running
+    without rlx, counted off the frame on screen; ``None`` when none does."""
 
     hand_off: tuple[str, ...] | None = None
     """The ``aisquare`` command this terminal goes to when asq quits (``run_ui``)."""
@@ -4773,6 +4859,23 @@ def _hand_off_undone(hand_off: tuple[str, ...]) -> str:
     return f"⚠ {button} did not run: rlx quit at the Ctrl-C — `{command}` runs it"
 
 
+def restart_word(receipt: fleet_service.RestartReceipt) -> str:
+    """``resumed`` when the row the restart replaced was a paused one (Resume, from its header,
+    its menu or Resume all), else ``restarted``: after Resume the toast read "✓ restarted"
+    (0.10.1's exploratory test). The service's own test of a paused row, on the receipt."""
+    replaced = receipt.replaced
+    paused = replaced.ended_at is not None and replaced.paused_at is not None
+    return "resumed" if paused else "restarted"
+
+
+def quit_line(live: int) -> str | None:
+    """The line a quit leaves in the terminal (Q12 of the UX audit): quitting rlx stops no
+    agent, and a person who quit to stop them was told nothing. ``None`` for none running."""
+    if live == 0:
+        return None
+    return f"rlx quit: {'1 agent keeps' if live == 1 else f'{live} agents keep'} running"
+
+
 def run_ui(**options: Any) -> None:
     """Run the fleet UI until the user quits; then say what its last saves could not land,
     see out a phone's write that still runs, saying so (a Ctrl-C there quits at once), and
@@ -4837,6 +4940,9 @@ def _run_registered(
                 markup=False,
                 highlight=False,
             )
+        said = getattr(app, "quit_line", None)
+        if said is not None:
+            stderr_console().print(said, markup=False, highlight=False)
         for line in app.unsaved:
             stderr_console().print(f"⚠ {line}", markup=False, highlight=False)
         try:

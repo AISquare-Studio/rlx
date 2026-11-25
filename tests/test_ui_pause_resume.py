@@ -264,6 +264,10 @@ def test_a_partial_resume_resumes_the_agents_picked_and_keeps_the_project_paused
     assert ("off", "prj_a") not in acting_on_paused.signals, "alpha's manager is still paused"
     [summary] = [t for t in toasts if t.startswith("resumed ")]
     assert "projects still paused: alpha (1 still paused)" in summary.splitlines(), summary
+    # The agent's own toast says what was done to it: a resume, not a restart (0.10.1's
+    # exploratory test read "✓ restarted manager" after Resume).
+    told = [t for t in toasts if t.startswith("✓ ")]
+    assert told == ["✓ resumed coder-1 (alpha) — resumed its session"], told
 
 
 def test_resume_all_lists_the_paused_agents_and_leaves_the_rest(acting_on_paused: Paused) -> None:
