@@ -49,10 +49,10 @@ pub struct DaemonRecord {
     pub cwd: Option<String>,
 }
 
-/// DaemonRecord's fields as serde reads and writes them, unchecked. It is private, so the only
-/// way in or out of a DaemonRecord is through DaemonRecord's own `Serialize` and `Deserialize`, which run
-/// `validate()`. (`remote = "Self"` on DaemonRecord itself would make these unchecked functions
-/// public, as `DaemonRecord::serialize` and `DaemonRecord::deserialize`.)
+/// The serde code of `DaemonRecord`'s fields, unchecked. It is private, so the only way in or out
+/// of the type is its own `Serialize` and `Deserialize`, which run `validate()`.
+/// (`remote = "Self"` would make these unchecked functions public, as
+/// `DaemonRecord::serialize` and `DaemonRecord::deserialize`.)
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "DaemonRecord")]
 struct UncheckedRecord {

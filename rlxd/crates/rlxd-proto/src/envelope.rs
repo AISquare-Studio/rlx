@@ -22,7 +22,8 @@ pub type Data = serde_json::Map<String, serde_json::Value>;
 ///
 /// ```json
 /// {"schema_version": 1, "ok": true, "data": {}}
-/// {"schema_version": 1, "ok": false, "error": {"code": "not_a_tty", "message": "…", "hint": "…", "detail": "…"}}
+/// {"schema_version": 1, "ok": false,
+///  "error": {"code": "not_a_tty", "message": "…", "hint": "…", "detail": "…"}}
 /// ```
 ///
 /// `ok` decides: `ok: true` carries `data` and no `error`, and `ok: false` carries
@@ -107,10 +108,10 @@ pub struct ErrorBody {
     pub detail: Option<Detail>,
 }
 
-/// ErrorBody's fields as serde reads and writes them, unchecked. It is private, so the only
-/// way in or out of a ErrorBody is through ErrorBody's own `Serialize` and `Deserialize`, which run
-/// `validate()`. (`remote = "Self"` on ErrorBody itself would make these unchecked functions
-/// public, as `ErrorBody::serialize` and `ErrorBody::deserialize`.)
+/// The serde code of `ErrorBody`'s fields, unchecked. It is private, so the only way in or out
+/// of the type is its own `Serialize` and `Deserialize`, which run `validate()`.
+/// (`remote = "Self"` would make these unchecked functions public, as
+/// `ErrorBody::serialize` and `ErrorBody::deserialize`.)
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "ErrorBody")]
 struct UncheckedError {
@@ -228,6 +229,26 @@ pub mod codes {
     /// - `gate.pair` from such a peer;
     /// - a tool-call decision from a connection that is not the gate.
     pub const NOT_GATE: &str = "not_gate";
+    /// A frame after `hello` that is not a request: not JSON, not an object, no `method`,
+    /// params that are not an object, or a second `hello`. A frame longer than rlxd
+    /// reads also gets it, and then the connection closes.
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    /// A method failed in a way its caller cannot fix, such as a file rlxd could not
+    /// read. The message says what.
+    pub const INTERNAL: &str = "internal";
+    /// `rlxd serve`: an rlxd already runs for this home, so this one does not start.
+    pub const ALREADY_RUNNING: &str = "already_running";
+    /// `rlxd serve`: rlxd could not start, such as when the socket could not be made, or
+    /// a detached rlxd exited before it took a connection.
+    pub const START_FAILED: &str = "start_failed";
+    /// A client command (`rlxd call`, `status`, `stop`): no rlxd runs for this home. Its
+    /// exit code is 3.
+    pub const NOT_RUNNING: &str = "not_running";
+    /// A client command: rlxd closed the connection, or failed to answer, before it sent
+    /// a reply.
+    pub const DISCONNECTED: &str = "disconnected";
+    /// `rlxd stop`: rlxd took the request but was still running when the wait ran out.
+    pub const STOP_TIMED_OUT: &str = "stop_timed_out";
 }
 
 impl Envelope {
@@ -357,10 +378,11 @@ impl ErrorBody {
         Ok(self)
     }
 
-    /// The reply to a `hello` whose `protocol_version` this crate does not serve. Takes a
-    /// `u64`, so a version too large for a `u32` can still be named in the message; read
-    /// it with [`protocol_version_of`](crate::protocol_version_of).
-    pub fn incompatible_protocol(requested: u64) -> Self {
+    /// The reply to a `hello` whose `protocol_version` this crate does not serve. Takes
+    /// the version as it was sent, so one that no [`HelloParams`](crate::HelloParams) can
+    /// hold, such as `2^32` or `-1`, is still named in the message. Read it with
+    /// [`protocol_version_of`](crate::protocol_version_of), or from the raw params.
+    pub fn incompatible_protocol(requested: impl fmt::Display) -> Self {
         let mut detail = Data::new();
         detail.insert("supported".to_owned(), json!(PROTOCOL_VERSIONS));
         Self {

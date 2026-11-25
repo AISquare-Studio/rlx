@@ -1,0 +1,17 @@
+#!/bin/sh
+# fake-claude/auth-status: Claude Code 2.1.314, signed in with claude.ai as
+# probe@example.com on the pro plan. It answers the two commands rlxd's status
+# runs (handoff 0.10.3, 7.4); anything else exits 2. auth-status.cmd is the same
+# for Windows.
+case "$*" in
+  "--version")
+    echo "2.1.314 (Claude Code)"
+    ;;
+  "auth status --json")
+    echo '{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "email": "probe@example.com", "orgId": "00000000-0000-4000-8000-000000000000", "orgName": "Probe Org", "subscriptionType": "pro"}'
+    ;;
+  *)
+    echo "fake-claude/auth-status: no reply recorded for: $*" >&2
+    exit 2
+    ;;
+esac

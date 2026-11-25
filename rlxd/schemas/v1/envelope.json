@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Envelope",
-  "description": "One response.\n\nUnder `--json --schema-version 1`, every rlx command prints exactly one of these.\nOn rlxd's socket, each response is one of these plus the request's `id`.\n\n```json\n{\"schema_version\": 1, \"ok\": true, \"data\": {}}\n{\"schema_version\": 1, \"ok\": false, \"error\": {\"code\": \"not_a_tty\", \"message\": \"…\", \"hint\": \"…\", \"detail\": \"…\"}}\n```\n\n`ok` decides: `ok: true` carries `data` and no `error`, and `ok: false` carries\n`error` and no `data`. A document with both, or with the wrong one, is refused.",
+  "description": "One response.\n\nUnder `--json --schema-version 1`, every rlx command prints exactly one of these.\nOn rlxd's socket, each response is one of these plus the request's `id`.\n\n```json\n{\"schema_version\": 1, \"ok\": true, \"data\": {}}\n{\"schema_version\": 1, \"ok\": false,\n \"error\": {\"code\": \"not_a_tty\", \"message\": \"…\", \"hint\": \"…\", \"detail\": \"…\"}}\n```\n\n`ok` decides: `ok: true` carries `data` and no `error`, and `ok: false` carries\n`error` and no `data`. A document with both, or with the wrong one, is refused.",
   "type": "object",
   "properties": {
     "id": {

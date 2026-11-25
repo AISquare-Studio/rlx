@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
     DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, Invalid,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Request, RequestId, Role, RunScope, SCHEMA_VERSION, codes,
-    daemon_kinds, protocol_version_of, schema_version_of, schemas, topics,
+    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, RunScope, SCHEMA_VERSION,
+    StatusData, codes, daemon_kinds, protocol_version_of, schema_version_of, schemas, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -175,17 +175,30 @@ fn every_schema_is_a_valid_draft_2020_12_schema() {
     }
 }
 
-/// The body of every `#[schemars(…)]` attribute in `text`, its parentheses balanced.
-fn schemars_attributes(text: &str) -> Vec<&str> {
+/// The body of every `#[<name>(…)]` attribute in `text`: what lies between its
+/// parentheses, balanced, with a parenthesis inside a string literal (`"("`, `"\")"`)
+/// taken as text.
+fn attribute_bodies<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let opener = format!("#[{name}(");
     let mut bodies = Vec::new();
     let mut rest = text;
-    while let Some(at) = rest.find("#[schemars(") {
-        let body = &rest[at + "#[schemars(".len()..];
-        let mut depth = 1;
+    while let Some(at) = rest.find(&opener) {
+        let body = &rest[at + opener.len()..];
+        let (mut depth, mut in_string, mut escaped) = (1, false, false);
         let end = body
             .char_indices()
             .find_map(|(i, c)| {
+                if in_string {
+                    match c {
+                        _ if escaped => escaped = false,
+                        '\\' => escaped = true,
+                        '"' => in_string = false,
+                        _ => {}
+                    }
+                    return None;
+                }
                 match c {
+                    '"' => in_string = true,
                     '(' => depth += 1,
                     ')' => depth -= 1,
                     _ => {}
@@ -199,21 +212,66 @@ fn schemars_attributes(text: &str) -> Vec<&str> {
     bodies
 }
 
-/// Whether an attribute body sets `with` or `schema_with`, the two schemars options that
-/// replace a field's schema.
-fn overrides_a_schema(body: &str) -> bool {
-    let words: Vec<&str> = body
+/// Whether an attribute body sets one of `options`, outside a string literal.
+fn sets_an_option(body: &str, options: &[&str]) -> bool {
+    let mut outside = String::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for c in body.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+            outside.push(' ');
+        } else {
+            outside.push(c);
+        }
+    }
+    let words: Vec<&str> = outside
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '='))
         .filter(|w| !w.is_empty())
         .collect();
-    let set = |name: &str| {
+    options.iter().any(|name| {
         words.iter().enumerate().any(|(i, w)| {
-            *w == name && words.get(i + 1).is_some_and(|next| next.starts_with('='))
+            *w == *name && words.get(i + 1).is_some_and(|next| next.starts_with('='))
                 || w.strip_prefix(name)
                     .is_some_and(|tail| tail.starts_with('='))
         })
+    })
+}
+
+/// Whether `source` replaces a field's schema with another type's or a function's: the
+/// options schemars reads to do it are `with` and `schema_with` in `#[schemars(…)]`, and
+/// `with` in `#[serde(…)]` (serde's `deserialize_with` and `serialize_with` it leaves
+/// alone).
+fn overrides_a_schema(source: &str) -> Option<String> {
+    let schemars = attribute_bodies(source, "schemars")
+        .into_iter()
+        .find(|body| sets_an_option(body, &["with", "schema_with"]))
+        .map(|body| format!("#[schemars({body})]"));
+    let serde = || {
+        attribute_bodies(source, "serde")
+            .into_iter()
+            .find(|body| sets_an_option(body, &["with"]))
+            .map(|body| format!("#[serde({body})]"))
     };
-    set("with") || set("schema_with")
+    schemars.or_else(serde)
+}
+
+/// Every `.rs` file under `dir`, in its subdirectories too.
+fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, found);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            found.push(path);
+        }
+    }
 }
 
 #[test]
@@ -222,38 +280,44 @@ fn every_schema_comes_from_the_fields_real_types() {
     // gen-schemas --check, so there are none: optional fields drop `null` with a
     // transform on the schema derived from their own type instead.
     for probe in [
-        "with = \"String\"",
-        "length(min = 1), with = \"String\"",
-        "title = \"x\", with=\"Value\"",
-        "schema_with = \"f\"",
-        "transform = drop_null, schema_with = \"f\"",
+        "#[schemars(with = \"String\")]",
+        "#[schemars(length(min = 1), with = \"String\")]",
+        "#[schemars(title = \"x\", with=\"Value\")]",
+        "#[schemars(schema_with = \"f\")]",
+        "#[schemars(transform = drop_null, schema_with = \"f\")]",
+        "#[schemars(regex(pattern = \"^(a\"), with = \"String\")]",
+        "#[schemars(description = \"a \\\")\", with = \"String\")]",
+        "#[serde(with = \"module\")]",
+        "#[serde(default, with = \"module\")]",
     ] {
-        assert!(overrides_a_schema(probe), "{probe}");
+        assert!(overrides_a_schema(probe).is_some(), "{probe}");
     }
     for fine in [
-        "transform = drop_null",
-        "length(min = 1)",
-        "title = \"Error\"",
+        "#[schemars(transform = drop_null)]",
+        "#[schemars(length(min = 1))]",
+        "#[schemars(title = \"Error\")]",
+        "#[schemars(description = \"with = x\")]",
+        "#[schemars(regex(pattern = \"^(with=)$\"))]",
+        "#[serde(default, deserialize_with = \"present\")]",
+        "#[serde(serialize_with = \"f\", rename = \"with\")]",
     ] {
-        assert!(!overrides_a_schema(fine), "{fine}");
+        assert_eq!(overrides_a_schema(fine), None, "{fine}");
     }
-    let src = crate_dir().join("src");
+    let mut files = Vec::new();
+    rust_files(&crate_dir().join("src"), &mut files);
     let mut seen = 0;
-    for entry in fs::read_dir(&src).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "rs") {
-            let text = fs::read_to_string(&path).unwrap();
-            for body in schemars_attributes(&text) {
-                seen += 1;
-                assert!(
-                    !overrides_a_schema(body),
-                    "{} overrides a field's schema: #[schemars({body})]",
-                    path.display()
-                );
-            }
+    for path in &files {
+        let text = fs::read_to_string(path).unwrap();
+        seen += attribute_bodies(&text, "schemars").len();
+        if let Some(attribute) = overrides_a_schema(&text) {
+            panic!("{} overrides a field's schema: {attribute}", path.display());
         }
     }
     assert!(seen > 10, "found only {seen} schemars attributes");
+    assert!(
+        files.iter().any(|p| p.ends_with("bin/gen-schemas.rs")),
+        "the scan reaches src/bin: {files:?}"
+    );
 }
 
 // --- the contract's examples ----------------------------------------------------------------
@@ -1212,5 +1276,142 @@ fn the_cli_json_lines_topics_have_their_prefix_checked_too() {
         ("upgrade", "install.done"),
     ] {
         both_refuse::<Event>("event.json", on(topic, kind));
+    }
+}
+
+// --- status ---------------------------------------------------------------------------------
+
+fn status_paths() -> Paths {
+    Paths::new(
+        "/h",
+        "/h/run/rlxd.sock",
+        "/h/run/rlxd.lock",
+        "/h/rlxd/token",
+        "/h/rlxd/logs",
+    )
+}
+
+#[test]
+fn a_status_validates_and_prints_back_as_itself() {
+    let status = example("status-reply.json");
+    assert_eq!(agrees::<StatusData>("status-reply.json", &status), status);
+    let windows = with(&status, "pipe_acl", json!("current_user"));
+    assert_eq!(agrees::<StatusData>("status-reply.json", &windows), windows);
+    let mut brain = status.clone();
+    brain["brain"]["pid"] = json!(77);
+    assert_eq!(agrees::<StatusData>("status-reply.json", &brain), brain);
+    let mut signed_out = status.clone();
+    signed_out["claude"] = json!({"installed": false, "signed_in": false});
+    assert_eq!(
+        agrees::<StatusData>("status-reply.json", &signed_out),
+        signed_out
+    );
+    // What a later rlxd adds, at the top or inside, is ignored.
+    let mut later = with(&status, "later", json!({"x": 1}));
+    later["clients"]["kiosk"] = json!(2);
+    later["claude"]["model"] = json!("x");
+    assert_eq!(agrees::<StatusData>("status-reply.json", &later), status);
+}
+
+#[test]
+fn the_status_builder_prints_what_its_schema_accepts() {
+    let status = StatusData::new("0.10.1", 42, "linux", status_paths()).unwrap();
+    let printed =
+        agrees::<StatusData>("status-reply.json", &serde_json::to_value(&status).unwrap());
+    assert_eq!(printed["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(printed["gate"], StatusData::GATE_SIGNED_APP_ONLY);
+    assert_eq!(printed["seq"], 0);
+    assert_eq!(
+        printed["clients"],
+        json!({"app": 0, "tui": 0, "remote": 0, "cli": 0})
+    );
+    assert_eq!(printed["brain"], json!({"restarts": 0, "handled": 0}));
+    assert_eq!(
+        printed["claude"],
+        json!({"installed": false, "signed_in": false})
+    );
+    assert_eq!(printed["runs"], json!({"live": 0, "queued": 0}));
+    assert_eq!(printed["jobs"], json!({"count": 0}));
+    assert_eq!(printed.get("pipe_acl"), None);
+
+    assert_eq!(
+        refused(StatusData::new("", 42, "linux", status_paths())),
+        "version"
+    );
+    assert_eq!(
+        refused(StatusData::new("0.10.1", 0, "linux", status_paths())),
+        "pid"
+    );
+    assert_eq!(
+        refused(StatusData::new("0.10.1", 42, "", status_paths())),
+        "platform"
+    );
+
+    let mut broken = status.clone();
+    broken.gate.clear();
+    assert!(
+        serde_json::to_value(&broken).is_err(),
+        "an empty gate does not print"
+    );
+    let mut broken = status;
+    broken.pipe_acl = Some(String::new());
+    assert!(
+        serde_json::to_value(&broken).is_err(),
+        "an empty pipe_acl does not print"
+    );
+}
+
+#[test]
+fn a_status_refuses_its_wrong_shapes() {
+    let status = example("status-reply.json");
+    for field in [
+        "version",
+        "pid",
+        "platform",
+        "protocol_version",
+        "capabilities",
+        "seq",
+        "clients",
+        "gate",
+        "brain",
+        "claude",
+        "runs",
+        "jobs",
+        "paths",
+    ] {
+        both_refuse::<StatusData>("status-reply.json", without(&status, field));
+    }
+    let u32_over = json!(u64::from(u32::MAX) + 1);
+    for (field, value) in [
+        ("version", json!("")),
+        ("pid", json!(0)),
+        ("pid", u32_over.clone()),
+        ("platform", json!("")),
+        ("protocol_version", json!(0)),
+        ("protocol_version", u32_over.clone()),
+        ("seq", json!(-1)),
+        ("gate", json!("")),
+        ("pipe_acl", json!("")),
+        ("pipe_acl", Value::Null),
+        ("clients", json!({"app": 0, "tui": 0, "remote": 0})),
+        (
+            "clients",
+            json!({"app": -1, "tui": 0, "remote": 0, "cli": 0}),
+        ),
+    ] {
+        both_refuse::<StatusData>("status-reply.json", with(&status, field, value));
+    }
+    for (inner, field, value) in [
+        ("claude", "version", Value::Null),
+        ("claude", "account", json!(1)),
+        ("claude", "installed", json!("yes")),
+        ("brain", "pid", Value::Null),
+        ("brain", "pid", u32_over),
+        ("runs", "live", json!(-1)),
+        ("paths", "home", Value::Null),
+    ] {
+        let mut broken = status.clone();
+        broken[inner][field] = value;
+        both_refuse::<StatusData>("status-reply.json", broken);
     }
 }
