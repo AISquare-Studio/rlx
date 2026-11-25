@@ -3725,8 +3725,10 @@ def _ui_tester_running() -> bool:
 
 def _ui_tester_set_up() -> bool:
     """The role in the person's own ``config.toml``: its ``[fleet.roles.ui-tester]`` table
-    other than the built-in one, or a ``[team.profiles.<seat>]`` of a ui-tester's that sets
-    how it launches (``team bind ui-tester --bin …``; hub #429).
+    other than the built-in one, or a ``[team.profiles.<seat>]`` of a ui-tester's that binds
+    anything: how it launches (``team bind ui-tester --bin …``) or only its account (``team
+    bind ui-tester --account 1``, ``accounts default 1 --role ui-tester``, App settings' role
+    row; the tester of #15, round 4). Hub #429: a team profile that names a ui-tester.
 
     The fleet's table alone is not enough: ``save_config`` writes every role's table whole
     (``config._with_whole_role_tables``), so any setting saved writes the default one too
@@ -3756,10 +3758,11 @@ def _ui_tester_set_up() -> bool:
         if harness.base_role(str(seat)) != "ui-tester" or not isinstance(profile, dict):
             continue
         try:
-            if RoleLaunchProfile.model_validate(profile).carries_launch:
-                return True
+            bound = RoleLaunchProfile.model_validate(profile)
         except Exception:
             continue
+        if bound.carries_launch or bound.account:
+            return True
     return False
 
 

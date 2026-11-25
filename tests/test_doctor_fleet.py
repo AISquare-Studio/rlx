@@ -2066,6 +2066,51 @@ def test_a_team_profile_of_a_ui_tester_is_one_set_up(home: Path, seat: str) -> N
     assert diagnostics._ui_tester_wanted() is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["team", "bind", "ui-tester", "--account", "1"],
+        ["accounts", "default", "1", "--role", "ui-tester"],
+    ],
+    ids=["team bind --account", "accounts default --role"],
+)
+def test_a_ui_tester_bound_to_an_account_alone_is_one_set_up(
+    home: Path, command: list[str]
+) -> None:
+    """The tester of #15, round 4: ``team bind ui-tester --account 1`` writes a profile of
+    its account alone (no ``carries_launch``), and the doctor still said none was wanted."""
+    bound = CliRunner().invoke(app, command)
+    assert bound.exit_code == 0, bound.output
+    from aisquare.core.config import load_config
+
+    profile = load_config().team.profiles["ui-tester"]
+    assert profile.account == "1" and not profile.carries_launch, "the premise"
+
+    assert diagnostics._ui_tester_wanted() is True
+
+
+def test_a_ui_tester_account_picked_in_app_settings_is_one_set_up(home: Path) -> None:
+    """The same binding from App settings' ui-tester row (its account select, saved)."""
+    from textual.widgets import Button, Select
+
+    from aisquare.core import claude_accounts as accounts_core
+    from tests.test_ui_app_settings import drive, settle
+
+    accounts_core.create_account()  # slot 2, under the isolated AISQUARE_HOME
+    assert diagnostics._ui_tester_wanted() is False
+
+    async def pick(pilot: Any, host: Any) -> None:
+        await settle(pilot)  # the slots arrive from a worker
+        host.query_one("#role-acct-ui-tester", Select).value = "2"
+        host.query_one("#save-settings", Button).press()
+        await settle(pilot)
+
+    drive(pick)
+
+    assert paths.config_path().read_text("utf-8").count("[team.profiles.ui-tester]") == 1
+    assert diagnostics._ui_tester_wanted() is True
+
+
 def test_a_numbered_ui_tester_seat_running_is_one_running(home: Path, tmp_path: Path) -> None:
     """A launch stores the seat as given (``ui-tester2``); it is a ui-tester all the same
     (``harness.base_role``; the tester of #15, round 3)."""
