@@ -1,7 +1,7 @@
 """What the Spawn dialog takes from a teammate goes when that teammate is no longer chosen.
 
 Review of #240, "also confirmed": the Spawn dialog's account (``spawn.py`` L792). Choosing
-a teammate under *Hand off from* fills Role, Account and Persona from it. The Account was
+a teammate under *Continue from* fills Role, Account and Persona from it. The Account was
 filled only from a teammate that HAS a slot, so after coder-1 (slot 2) a teammate on this
 shell's account kept showing "2", and its fork or take-over was sent ``account="2"``: the
 previous teammate's slot, which nobody chose. Back on *(none)* all three stayed too, and the
@@ -48,7 +48,7 @@ git_project = spawn_suite.git_project
 
 
 async def choose(pilot: Pilot[None], dialog: SpawnDialog, label: str | None) -> None:
-    """Choose the teammate whose row starts with ``label`` under *Hand off from*; ``None``
+    """Choose the teammate whose row starts with ``label`` under *Continue from*; ``None``
     is *(none)*. By what the row shows, as a click does, not by the select's own value."""
     field = select(dialog, "from")
     if label is None:

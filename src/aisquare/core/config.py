@@ -1205,17 +1205,24 @@ DONT_ASK_STOP = "stop"
 class SharingSettings(BaseModel):
     """``[sharing]`` — opt-in anonymous usage sharing (docs/usage-telemetry.md).
 
-    ``enabled`` is the switch, **off by default**: nothing leaves this machine until it is
+    ``enabled`` is the switch, **off by default**: no usage leaves this machine until it is
     turned on (Settings ▸ Usage & stats, or ``aisquare metrics share on``). Turned on, daily
     counts of usage (tokens, sessions, which commands) are sent to AISquare, never names, paths,
     remotes, prompts or arguments. ``DO_NOT_TRACK=1``, ``AISQUARE_NO_TELEMETRY=1`` and ``CI``
     force it off whatever this says (``core.sharing.forced_off_reason``).
+
+    ``active_ping`` is the switch of the daily active ping (``services.active_ping``), which is
+    separate from sharing and sent whether sharing is on or off: on each local day rlx is used,
+    one anonymous POST of the date, the version, the OS, the architecture and the install
+    method, with no identifier. On unless turned off (Settings ▸ Usage & stats, or
+    ``aisquare config set sharing.active_ping false``); the same three variables stop it.
 
     The installation's random id, its salt for the repository hashes and what has been sent
     are kept beside the other runtime state (``state.json``), not here.
     """
 
     enabled: bool = False
+    active_ping: bool = True
 
 
 class AppConfig(BaseModel):
