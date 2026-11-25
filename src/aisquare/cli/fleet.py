@@ -1713,7 +1713,7 @@ def adopt(
         int, typer.Option("--limit", help="With --list: how many.", min=1, max=50)
     ] = adopt_service.LIST_LIMIT,
 ) -> None:
-    """Bring a coding-agent conversation you started by hand under the fleet (#290).
+    """Bring a coding-agent conversation you started by hand under the fleet.
 
     It resumes on its own agent (a Claude Code session, a Codex thread), on the account whose
     directory holds its transcript (a slot, or the agent's plain home) and in the directory

@@ -500,14 +500,18 @@ def agent_row_text(
     agent = status.agent
     chip, style = STATE_CHIP.get(status.state, STATE_CHIP["unknown"])
     words = "dim"
+    on_bar = styles is not None and selected
     if styles is not None:
         style = styles.get(status.state, styles.get("unknown", style))
         words = styles.get(WORDS, words)
-        if selected:
-            # On the highlight bar the mark takes the bar's own text colour, which reads on it
-            # (``theme.highlight_colours``): a tone read on the sidebar's ground fell to 1.01:1
-            # on catppuccin-latte's bar (the manager's call on #6: marks at 3:1 everywhere).
-            style = "bold" if status.state in BOLD_STATES else ""
+    if on_bar:
+        # On the highlight bar the whole row takes the bar's own text colour, which reads on
+        # it (``theme.highlight_colours``): the mark, and its words, ``#1·42%`` and the persona
+        # too. A tone read on the sidebar's ground fell to 1.01:1 for the mark and 1.02 for
+        # the words on catppuccin-latte's bar (the manager's call on #6: text at 4.5:1 on the
+        # keyboard's side, 3:1 faded; marks at 3:1 everywhere).
+        style = "bold" if status.state in BOLD_STATES else ""
+        words = ""
     icon = f"{ROLE_ICON.get(agent.role, CUSTOM_ROLE_ICON)} "
     tail = Text()
     tail.append(chip, style=style)
@@ -522,8 +526,13 @@ def agent_row_text(
     elif agent.account_slot is not None and usage:
         tail.append(f" #{agent.account_slot}" + ("·" if percent is not None else ""), style=words)
         if percent is not None:
-            tail.append_text(used_percent_text(percent))
+            used = used_percent_text(percent)
+            if on_bar:  # the figure, in the bar's colour; its own colour off the bar
+                used = Text(used.plain)
+            tail.append_text(used)
     badge = persona_badge(status)
+    if on_bar:
+        badge = Text(badge.plain)
     label = Text(agent.label)
     if (
         mark is not None

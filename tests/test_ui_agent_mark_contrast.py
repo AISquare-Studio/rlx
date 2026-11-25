@@ -32,7 +32,7 @@ from textual.widgets import OptionList
 
 from aisquare.cli.ui.app import FleetApp
 from aisquare.cli.ui.attach import AttachTargetScreen
-from aisquare.cli.ui.sidebar import STATE_CHIP
+from aisquare.cli.ui.sidebar import CUSTOM_ROLE_ICON, ROLE_ICON, STATE_CHIP
 from aisquare.cli.ui.theme import RLX_THEME, register_themes
 from aisquare.core.orchestrator import team_project
 from aisquare.models import FleetAgent, FleetAgentStatus
@@ -186,7 +186,12 @@ TEXT_FLOOR = 4.5
 
 
 def text_cells(app: App[Any], widget: Any) -> list[tuple[str, float]]:
-    """Every character drawn in ``widget``'s region, with its ink's ratio to the ground under it."""
+    """Every character drawn in ``widget``'s region, with its ink's ratio to the ground under it.
+
+    The column moves by each character's cells: an emoji takes two, and counted as one it
+    shifted the rest of the line left, the sidebar's divider into a row with two of them."""
+    from rich.cells import cell_len
+
     region = widget.region
     seen = []
     for y in range(region.y, region.bottom):
@@ -198,11 +203,13 @@ def text_cells(app: App[Any], widget: Any) -> list[tuple[str, float]]:
                 if region.x <= x < region.right and char.strip() and style is not None:
                     ratio = contrast(_rgb(style, "color"), _rgb(style, "bgcolor"))
                     seen.append((char, ratio))
-                x += 1
+                x += cell_len(char)
     return seen
 
 
-def _every_state(project: str) -> list[FleetAgentStatus]:
+def _every_state(project: str, *, worded: bool = False) -> list[FleetAgentStatus]:
+    """An agent in each state; ``worded``: each on account slot 1 and the exited one with its
+    status, so the rows say ``#1``, ``paused`` and ``exited(0)`` beside their marks."""
     from aisquare.cli.ui.sidebar import STATE_CHIP
 
     return [
@@ -216,6 +223,8 @@ def _every_state(project: str) -> list[FleetAgentStatus]:
                 cwd=Path("/tmp/proj"),
                 created_at=NOW,
                 tmux_socket="asq-test-mark-contrast",
+                account_slot=1 if worded else None,
+                exit_status=0 if worded and state == "exited" else None,
             ),
             state=state,
         )
@@ -376,6 +385,8 @@ MARK_FLOOR = 3.0
 held to text's 4.5:1 too, as the first test of the marks and Spawn agent measures it."""
 TEXT_MARKS = {mark for mark, _ in STATE_CHIP.values()} - {"🔔", "⏳", "💤"}
 """The marks drawn as text, in a colour of ours: the emoji ones keep their own colours."""
+EMOJI = {"🔔", "⏳", "💤", *ROLE_ICON.values(), CUSTOM_ROLE_ICON}
+"""What a row draws in the emoji's own colours: every other cell is ink of ours."""
 
 
 @pytest.mark.parametrize("theme", THEMES)
@@ -387,6 +398,9 @@ def test_the_sidebar_and_the_agent_bar_read_where_the_keyboard_is_and_where_it_i
 
     - Each text mark, on its row and on the highlight bar with that row selected: 3:1 or more
       on either side (the bar drew catppuccin-latte's ▶ at 1.01:1).
+    - Every other cell of a selected row but its emoji, its words beside the mark included
+      (``#1``, ``paused``, ``exited(0)``): text's 4.5:1 where the keyboard is, 3:1 faded (the
+      bar drew the words muted, 1.02:1 to 1.81:1, #6's tester, round 2).
     - Spawn agent, the ``+`` beside Fleet and the line under ⚙ Settings: 4.5:1 or more where the
       keyboard is, 3:1 on the faded side (the ``+`` was 2.65:1, the line's words 2.80:1).
     - The agent's bar: 4.5:1 or more with the keyboard on its pane, 3:1 faded (Restart was
@@ -412,7 +426,7 @@ def test_the_sidebar_and_the_agent_bar_read_where_the_keyboard_is_and_where_it_i
     monkeypatch.setattr(shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")
     with store_session() as store:
         project = store.onboard_project(ProjectInfo(id="prj_c", root=tmp_path / "alpha"))
-    rows = _every_state(project.id)
+    rows = _every_state(project.id, worded=True)
     list_agents_as(monkeypatch, lambda listed, **_: rows if listed.id == project.id else [])
 
     async def side(app: FleetApp) -> Ratios:
@@ -424,14 +438,17 @@ def test_the_sidebar_and_the_agent_bar_read_where_the_keyboard_is_and_where_it_i
             if glyph in TEXT_MARKS and not row.has_class("selected"):
                 seen[f"mark {glyph}"] = min(r for c, r in text_cells(app, row) if c == glyph)
         for row in agent_rows:
-            glyph = STATE_CHIP[row.status.state][0]
-            if glyph not in TEXT_MARKS:
-                continue
+            state = row.status.state
+            glyph = STATE_CHIP[state][0]
             app.sidebar.select(row.selection_key)
             await settle_page(app)
             assert row.has_class("selected"), row.selection_key
-            on_bar = [r for c, r in text_cells(app, row) if c == glyph]
-            seen[f"selected mark {glyph}"] = min(on_bar)
+            cells = text_cells(app, row)
+            if glyph in TEXT_MARKS:
+                seen[f"selected mark {glyph}"] = min(r for c, r in cells if c == glyph)
+            words = [r for c, r in cells if c != glyph and c not in EMOJI]
+            assert words, f"the {state} row drew no words: a measurement of nothing"
+            seen[f"selected words {state}"] = min(words)
         for name, widgets in (
             ("Spawn agent", app.sidebar.query(ActionRow)),
             ("+", app.sidebar.query(AddButton)),
