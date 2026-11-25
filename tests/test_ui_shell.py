@@ -4098,7 +4098,9 @@ def test_stop_on_an_exited_row_removes_its_dead_window_through_the_same_dialog(
         return question, force_offered, x_opens, not isinstance(app.screen, StopAgentScreen)
 
     question, force_offered, x_opens, closed = drive(go)
-    assert "dead window" in question and "/exit" not in question  # nothing to /exit
+    # The Stop box's plain words (#12): it removes the exited agent's row, nothing to /exit.
+    assert "Remove coder-auth from the list?" in question and "has exited" in question
+    assert "/exit" not in question
     assert force_offered is False
     assert x_opens, "x asks the same rule as the button: an exited row is offered"
     assert closed and recorder.calls == [("prj_a", "coder-auth", False, "agt_a_coder-auth")]

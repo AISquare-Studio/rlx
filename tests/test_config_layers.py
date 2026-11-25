@@ -364,8 +364,9 @@ def test_the_v1_snapshot_differs_from_today_only_by_the_headroom_defaults_and_th
             "auto_stop": True,
             "sources": {},
         },
-        # Opt-in usage sharing (docs/usage-telemetry.md): off, the default.
-        "sharing": {"enabled": False},
+        # Opt-in usage sharing (docs/usage-telemetry.md): off, the default. The daily active
+        # ping beside it (0.10.2, its own switch): on unless turned off.
+        "sharing": {"enabled": False, "active_ping": True},
     }
     then = _overlay(_V1_DEFAULTS, changed)
     assert set(RETIRED_SECTIONS) <= set(then)

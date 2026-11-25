@@ -769,11 +769,9 @@ def test_a_restart_of_all_is_told_per_agent_and_never_moves_the_view(acted: Acte
     assert "✓ restarted manager (beta) — resumed its session" in toasts
     [summary] = [t for t in toasts if t.startswith("restarted ")]
     assert summary.splitlines() == [
-        "restarted 2 · skipped 3 · failed 0",
-        f"skipped: coder-1 (alpha) — {fleet_service.NOT_CHOSEN}; "
-        f"coder-1 (beta) — {fleet_service.NOT_CHOSEN}; "
-        f"tester-1 (beta) — {fleet_service.ENDED_CLEANLY}",
-    ], "the unticked coders are named, never restarted"
+        "restarted 2 · skipped 1 · failed 0",
+        f"skipped: tester-1 (beta) — {fleet_service.ENDED_CLEANLY}",
+    ], "the unticked coders are never restarted, and not listed: leaving them was a choice"
 
 
 def test_confirm_acts_on_the_agents_shown_and_skips_one_that_ended_since(

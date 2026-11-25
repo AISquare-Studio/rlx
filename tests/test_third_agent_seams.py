@@ -2626,8 +2626,8 @@ def test_its_stop_dialog_says_its_own_exit_command(third: AgentAdapter) -> None:
 
     question = StopAgentScreen(where, FleetAgentStatus(agent=row, state="waiting")).question()
 
-    assert f"{third.exit_command}, then the window is killed after" in question.plain
-    assert f"Force skips the {third.exit_command}." in question.plain
+    assert f"asked to quit (rlx types {third.exit_command}) and closed" in question.plain
+    assert "Force closes it at once." in question.plain
     assert "/exit" not in question.plain
 
 
@@ -2747,9 +2747,9 @@ def test_its_bulk_stop_and_pause_say_its_own_exit_command(
     every, managers = _bulk_about(monkeypatch, action, rows)
     reading = about_text(action, None)  # type: ignore[arg-type]
 
-    assert f"Each one is sent {third.exit_command}" in every, every
-    assert f"Each one is sent {third.exit_command}" in managers, managers
-    assert f"Each one is sent {OWN_EXIT}" in reading, reading
+    assert f"Each one is asked to quit (rlx types {third.exit_command})" in every, every
+    assert f"Each one is asked to quit (rlx types {third.exit_command})" in managers, managers
+    assert f"Each one is asked to quit (rlx types {OWN_EXIT})" in reading, reading
     assert "/exit" not in every + managers + reading
 
 
@@ -2770,9 +2770,9 @@ def test_a_bulk_of_agents_whose_exit_commands_differ_spells_none(
 
     every, managers = _bulk_about(monkeypatch, action, rows)
 
-    assert f"Each one is sent {OWN_EXIT}" in every, every
+    assert f"Each one is asked to quit (rlx types {OWN_EXIT})" in every, every
     assert claude.exit_command not in every and third.exit_command not in every, every
-    assert f"Each one is sent {third.exit_command}" in managers, managers
+    assert f"Each one is asked to quit (rlx types {third.exit_command})" in managers, managers
 
 
 def test_no_string_of_the_cli_spells_an_agents_exit_command() -> None:
@@ -2882,7 +2882,7 @@ def test_a_bulk_names_the_command_of_the_agents_it_acts_on_not_of_one_it_leaves(
 
     said = about_text("stop", plan)
 
-    assert f"Each one is sent {claude.exit_command}," in said, said
+    assert f"Each one is asked to quit (rlx types {claude.exit_command})" in said, said
 
 
 def test_a_bulk_receipt_says_the_exit_command_its_stop_sent(
