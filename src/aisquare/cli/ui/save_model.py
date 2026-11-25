@@ -89,8 +89,15 @@ class CommitInput(Input):
                 self.value = value
 
     def commit(self) -> None:
+        """Enter, or leaving the field: a changed value goes to the page to keep or refuse. One
+        put back to what is on disk needs neither, and takes the refusal line under it away:
+        it said why a value no longer shown was not saved (tester of #24, F1)."""
         if self.value != self.kept:
             self.post_message(self.Committed(self, self.value, self.kept))
+            return
+        page = page_of(self)
+        if page is not None:
+            page.accept(self)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input is self:

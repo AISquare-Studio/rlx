@@ -214,6 +214,19 @@ def test_settings_rejects_a_bad_agent_cap_and_writes_nothing() -> None:
             "written": paths.config_path().exists(),
             "toasts": [m for m, _ in host.notices],
         }
+        field.value = "auto"  # what the file holds, typed back (tester of #24, F1)
+        await pilot.press("enter")
+        await settle(pilot)
+        seen["put back"] = (view.problem(field), paths.config_path().exists())
+        field.value = "0"
+        await pilot.press("enter")
+        await settle(pilot)
+        field.value = "auto"
+        field.blur()  # and left, this time
+        await settle(pilot)
+        seen["left"] = view.problem(field)
+        field.focus()
+        await settle(pilot)
         field.value = "3"
         await pilot.press("enter")
         await settle(pilot)
@@ -225,6 +238,8 @@ def test_settings_rejects_a_bad_agent_cap_and_writes_nothing() -> None:
     assert seen["typed"] == "0", "the field keeps what was typed, to correct"
     assert seen["written"] is False, "a refused value never reaches the writer"
     assert seen["toasts"] == [], "said beside the field, not in a toast"
+    assert seen["put back"] == ("", False), "the value on disk typed back: the line goes"
+    assert seen["left"] == "", "and on leaving the field"
     assert seen["after"] == "", "a good value clears the line"
     assert load_config().fleet.max_agents_per_project == 3
 

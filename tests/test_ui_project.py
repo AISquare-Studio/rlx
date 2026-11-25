@@ -1491,7 +1491,7 @@ def test_a_nickname_the_store_refuses_is_said_and_nothing_is_written(
     keeps what was typed, to correct."""
     from aisquare.core.store import store_session
 
-    async def scenario(pilot: Pilot[None], host: Host) -> tuple[str, str]:
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[str, str, str]:
         host.query_one(ProjectView).active = "tab-settings"
         await settle(pilot)
         field = host.query_one("#nickname", Input)
@@ -1499,11 +1499,16 @@ def test_a_nickname_the_store_refuses_is_said_and_nothing_is_written(
         await pilot.click("#nickname")
         await pilot.press("enter")
         await settle(pilot)
-        return host.query_one(SettingsView).problem(field), field.value
+        said, typed = host.query_one(SettingsView).problem(field), field.value
+        field.value = ""  # what the store holds (no nickname), typed back
+        await pilot.press("enter")
+        await settle(pilot)
+        return said, typed, host.query_one(SettingsView).problem(field)
 
-    said, typed = drive(project, scenario)
+    said, typed, after = drive(project, scenario)
     assert said.startswith("not saved: a nickname is one line"), said
     assert typed == "two\tparts", "the field keeps what was typed"
+    assert after == "", "the stored name typed back: the line goes (tester of #24, F1)"
     with store_session() as store:
         assert store.get_project(project.id).nickname is None  # type: ignore[union-attr]
 

@@ -1190,8 +1190,8 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                         id=binding_widget_id("unset", role),
                         disabled=not (profile.env or profile.env_files),
                     ),
-                    # Its note in the line under Save and Reset all, as Reset all's: always in
-                    # sight, where a line under the row could be scrolled out of it.
+                    # Its note in the line under Reset all, as Reset all's: always in sight,
+                    # where a line under the row could be scrolled out of it.
                     ConfirmButton(
                         "Clear",
                         armed_label="Clear? click again",

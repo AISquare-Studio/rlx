@@ -110,6 +110,36 @@ def test_a_refused_value_is_said_beside_its_field_and_nothing_is_written() -> No
     assert writes == ["good"], "the refused value was never written"
 
 
+def test_the_value_on_disk_put_back_takes_the_refusal_line_away() -> None:
+    """Tester of #24, F1: refused, then the value on disk typed back, Enter or leaving the field
+    posts no change (nothing to keep), and the line saying why the other value was refused
+    goes, with nothing written."""
+
+    async def go(pilot: Any, app: Host, page: Page) -> tuple[str, str, str, list[str]]:
+        field = page.query_one(CommitInput)
+        field.focus()
+        field.value = "bad"
+        await pilot.press("enter")
+        await pilot.pause()
+        refused = page.problem(field)
+        field.value = "old"  # what is on disk
+        await pilot.press("enter")
+        await pilot.pause()
+        on_enter = page.problem(field)
+        field.value = "bad"
+        await pilot.press("enter")
+        await pilot.pause()
+        field.value = "old"
+        app.query_one("#elsewhere").focus()  # leaving it, this time
+        await pilot.pause()
+        return refused, on_enter, page.problem(field), page.writes
+
+    refused, on_enter, on_leaving, writes = drive(go)
+    assert refused.startswith("not saved")
+    assert (on_enter, on_leaving) == ("", ""), "the line goes on Enter and on leaving the field"
+    assert writes == [], "nothing to write: the value on disk"
+
+
 def test_ctrl_z_takes_the_page_s_changes_back_last_first() -> None:
     async def go(pilot: Any, app: Host, page: Page) -> dict[str, Any]:
         field = page.query_one(CommitInput)
@@ -170,6 +200,7 @@ SETTINGS_MODULES = (
     "views/personas_tab.py",
     "views/usage_sharing.py",
     "views/settings.py",  # a project's Settings tab
+    "views/fleet_bulk.py",  # the hub's Fleet buttons' box
     "persona_dialogs.py",
     "attach.py",
 )
@@ -194,6 +225,7 @@ EXCEPTIONS = {
     ("persona_dialogs.py", "ConfirmRemoveScreen", "Cancel"): "Remove deletes the folder",
     ("views/remote.py", "RemoteConfirm", "Cancel"): "a new link or password breaks the old",
     ("views/app_settings.py", "UnsetKeyScreen", "Cancel"): "a binding's key, unset",
+    ("views/fleet_bulk.py", "ConfirmBulk", "Cancel"): "the hub's Stop/Restart/Pause/Resume all",
     # Stopping a sign-in that is under way: nothing on the page is being edited.
     ("views/accounts.py", "AccountsView", "Cancel"): "stops the AISquare sign-in",
     ("views/accounts.py", "AccountsView", "Cancel sign-in"): "stops a coding agent's sign-in",
