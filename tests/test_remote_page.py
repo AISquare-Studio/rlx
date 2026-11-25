@@ -1007,21 +1007,38 @@ _RGB = re.compile(r"rgb\((\d{1,3}), (\d{1,3}), (\d{1,3})\)")
 _BIDI = "؜‎‏‪‫‬‭‮⁦⁧⁨⁩"
 
 
+NODE_TIMEOUT_S = 120
+"""Each harness runs in well under a second; this is the ceiling for a runner that is slow."""
+
+
 def _node_report(harness: Path, cards: list[dict[str, object]] | None = None) -> dict[str, Any]:
-    """The harness's report; ``cards``, items the server built, go to it as ``ASQ_CARDS``."""
+    """The harness's report; ``cards``, items the server built, go to it as ``ASQ_CARDS``.
+
+    node's stdin is the null device, never this process's: under pytest-xdist on Windows that
+    is the worker's execnet channel, a pipe the worker keeps a blocking read on. Windows
+    serves one call at a time on such a pipe, so node, which inherited it, could wait at
+    start for the controller's next message to the worker, and a busy shard sends none for
+    minutes. Both harnesses, on one worker, ran out their 120 s with no output (run
+    44072523971, windows-py3.12 shard 10/10, attempt 1), where each takes under a second.
+    ``test_mcp_own_row_processes`` (#397) detached its children the same way."""
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not on PATH; the page's runtime checks need it")
     # node writes UTF-8 to a pipe whatever the locale; Windows' cp1252 would garble it.
-    result = subprocess.run(
-        [node, str(harness)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=120,
-        check=False,
-        env=None if cards is None else {**os.environ, "ASQ_CARDS": json.dumps(cards)},
-    )
+    try:
+        result = subprocess.run(
+            [node, str(harness)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=NODE_TIMEOUT_S,
+            check=False,
+            env=None if cards is None else {**os.environ, "ASQ_CARDS": json.dumps(cards)},
+        )
+    except subprocess.TimeoutExpired as exc:  # what it said before it stopped, if anything
+        said = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode()
+        pytest.fail(f"{harness.name} ran {NODE_TIMEOUT_S} s; its stderr: {said!r}")
     assert result.returncode == 0, result.stderr
     report: dict[str, Any] = json.loads(result.stdout)
     return report
@@ -3094,6 +3111,46 @@ def test_each_refusal_is_said_in_the_sentence_the_spec_gives_it(
         ),
         "notJson": "Remote is off on the machine, or the link changed.",
     }
+
+
+THEIR_READ_ONLY = (
+    "writes are off — on the machine run `aisquare remote allow-write on`, or switch Allow write"
+    " actions in the R panel"
+)
+"""The machine's own refusal, for an install whose command is ``aisquare``: what the page
+says, not ``rlx remote …`` of its own (the harness's ``THEIR_READ_ONLY``)."""
+
+
+def test_writes_off_is_said_in_the_machines_own_words_wherever_the_page_says_it(
+    boot_report: dict[str, Any],
+) -> None:
+    """0.10.1's final review: the page hard-coded ``rlx remote allow-write on`` where the
+    server words its 403 with its own program's name (``read_only_reason``, ``prog.word()``):
+    a card's note, and the note under another device's Revoke, said it before any refusal.
+    GET api/remote says the server's sentence now, and a 403 ``read_only``'s own text is kept
+    for every place that says it; an older machine that gives neither gets words that name no
+    command."""
+    told, older = boot_report["serverReadOnly"]["told"], boot_report["serverReadOnly"]["older"]
+    assert told["card"] == [f"Read-only: {THEIR_READ_ONLY}"]
+    assert told["sheet"] == f"Read-onlyThis page can watch but not act: {THEIR_READ_ONLY}.Close"
+    assert told["devices"] == [f"Revoking another device is a write: {THEIR_READ_ONLY}."]
+    assert older["before"] == "writes are off on the machine", "no command of the page's own"
+    assert older["refused"] == {
+        "sheet": f"Read-onlyThis page can watch but not act: {THEIR_READ_ONLY}.Close",
+        "said": THEIR_READ_ONLY,
+    }
+    assert older["devices"] == [f"Revoking another device is a write: {THEIR_READ_ONLY}."]
+
+
+def test_the_page_names_no_command_of_its_own() -> None:
+    """The page says what the machine says, in its program's name; ``rlx remote …`` of its own
+    was wrong for an install whose command is ``aisquare`` (0.10.1's final review)."""
+    assert "rlx remote" not in _text("app.js")
+
+
+def test_the_top_left_is_the_rlx_logo(boot_report: dict[str, Any]) -> None:
+    """The owner's Q3 (0.10.2): the phone page's top-left is ``r\\x``, as the app's is."""
+    assert boot_report["topLeft"] == "where: r\\x"
 
 
 def test_a_503_says_the_machines_reason_and_a_revoke_it_holds_unsaved_leaves_the_list(

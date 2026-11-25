@@ -1639,7 +1639,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     # --- remote (R) ------------------------------------------------------------------
 
     def action_remote_panel(self) -> None:
-        self.push_screen(RemotePanel(self.remote))
+        """The one Remote page (Q17), as the hub's *Remote control* and App settings open it."""
+        from aisquare.cli.ui.views.remote import open_remote_page
+
+        open_remote_page(self)
 
     def _save_remote_switch(self, key: str, value: object) -> None:
         """A Remote switch's save, as the theme's: on a thread of its own, a refusal toasted

@@ -63,8 +63,7 @@ const TOAST_LINES = 4;
 /* A card's detail text this short shows whole in its box, on any phone. */
 const SHORT_TEXT = 280;
 const TEXT_MAX = { keys: 2048, tell: 8000, note: 8000 };
-const READ_ONLY = "writes are off — on the machine run `rlx remote allow-write on`, " +
-  "or switch Allow write actions in the R panel";
+const READ_ONLY = "writes are off on the machine";
 const OFF_OR_MOVED = "Remote is off on the machine, or the link changed";
 const UNKEPT_SIGN_IN = "The machine took the passphrase, but this browser did not keep the sign-in — " +
   "allow cookies for this page, then unlock again.";
@@ -552,7 +551,7 @@ function renderNeedsCard(item, doc, opts) {
   }
   if (bar.firstChild) card.appendChild(bar);
   // Shown by the stylesheet only while writes are off, so a flip needs no redraw.
-  card.appendChild(mk(doc, "p", "ro-note", "Read-only: " + READ_ONLY));
+  card.appendChild(mk(doc, "p", "ro-note", "Read-only: " + (o.readOnly || READ_ONLY)));
   return card;
 }
 
@@ -625,7 +624,7 @@ const S = {
   opened: false, backoff: 0, retryTimer: 0, lastFrameAt: 0, stale: false, offline: false, away: null,
   off: null, locked: false, booting: false, view: null, route: null, pending: new Map(), orphans: new Map(),
   gone: new Map(), since: new Set(), push: null, padOnOpen: false, lastWake: 0, lastConnect: 0, me: null, names: new Map(), scannedBehind: "",
-  heard: { remote: 0, needs: 0 },
+  heard: { remote: 0, needs: 0 }, readOnly: "", title: "",
 };
 const UI = {};
 const paneWatchers = new Map();
@@ -657,6 +656,10 @@ function checkbox(text, checked) {
 
 function writable() {
   return !!(S.remote && S.remote.allow_write === true);
+}
+
+function readOnlyText() {
+  return S.readOnly || READ_ONLY;
 }
 
 function clampInt(value, low, high) {
@@ -955,7 +958,7 @@ function failText(res, max) {
   if (res.notJson) return OFF_OR_MOVED + ".";
   const message = plainText(res.message);
   if (res.status === 401) return "Unlock again to do that.";
-  if (res.status === 403) return res.error === "bad_origin" ? "Open this page from the link the machine shows." : "Read-only: " + (message || READ_ONLY);
+  if (res.status === 403) return res.error === "bad_origin" ? "Open this page from the link the machine shows." : "Read-only: " + (message || readOnlyText());
   if (res.status === 404 && res.error === "no_such_agent") return "That agent is gone.";
   if (res.status === 409 && (res.error === "busy" || res.error === "in_progress")) return "Still running — " + (message || "the result shows here when it finishes.");
   if (res.status === 413) return "Too long (max " + (max || "the limit") + " characters).";
@@ -970,6 +973,7 @@ function failText(res, max) {
  * one opened since (sheet sent it); a gone agent's screen goes to its fleet. */
 function afterFailure(res, route, sheet) {
   if (res.status === 403 && res.error === "read_only") {
+    S.readOnly = plainText(res.message) || S.readOnly;
     if (writable()) {
       S.remote = Object.assign({}, S.remote, { allow_write: false });
       drawStatus();
@@ -1191,6 +1195,7 @@ function setRemote(payload) {
   if (!payload || typeof payload !== "object") return;
   const before = S.remote;
   S.remote = payload;
+  S.readOnly = plainText(payload.read_only_reason) || S.readOnly;
   if (before && before.allow_write !== payload.allow_write) {
     toast(payload.allow_write === true ? "Writes are on" : "Writes are off — read-only");
   }
@@ -1282,7 +1287,7 @@ function buildShell() {
   UI.top = el("header", "top");
   UI.dot = el("span", "dot");
   UI.dot.setAttribute("role", "img");
-  UI.where = el("span", "where", "rlx");
+  UI.where = el("span", "where", "r\\x");
   UI.ro = button("pill ro-pill", "READ-ONLY", () => readOnlySheet());
   UI.off = el("span", "autooff");
   UI.extend = button("pill w extend", "Extend 1 h", extendAutoOff);
@@ -1359,7 +1364,7 @@ function drawNav() {
   const count = (S.needs || []).length;
   UI.badge.textContent = count ? String(count) : "";
   // Off or locked, the count is from before.
-  document.title = (count && !S.off && !S.locked ? "(" + count + ") " : "") + "rlx remote";
+  document.title = (count && !S.off && !S.locked ? "(" + count + ") " : "") + S.title;
   const here = [
     [UI.navNeeds, name === "home" || name === "card"], [UI.navProjects, name === "projects" || name === "project" || name === "agent"],
     [UI.navDevices, name === "devices"], [UI.navSettings, name === "settings"],
@@ -1507,7 +1512,7 @@ function confirmSheet(title, sentence, verb, onYes) {
 
 function readOnlySheet(message) {
   openSheet("Read-only", (sheet) => {
-    sheet.body.appendChild(el("p", "lead", "This page can watch but not act: " + (plainText(message) || READ_ONLY) + "."));
+    sheet.body.appendChild(el("p", "lead", "This page can watch but not act: " + (plainText(message) || readOnlyText()) + "."));
   });
 }
 
@@ -1614,7 +1619,7 @@ function offScreen(kind) {
 }
 
 const OFF_SCREENS = {
-  off: ["Remote is off on the machine", "Turn it on again in rlx's R panel, or with rlx remote serve, then retry."],
+  off: ["Remote is off on the machine", "Turn Remote on again on the machine, then retry."],
   gone: [OFF_OR_MOVED, "Turn it on again, or open the link the machine shows now: the link changes when ngrok " +
     "restarts without a static domain, and with regenerate-password --new-link."],
   link: ["This link is no longer valid", "Open the link the machine shows now."],
@@ -1796,7 +1801,7 @@ function drawStrip(pre, payload) {
 function cardEntry(item, withStrip) {
   let unwatch = null;
   const node = renderNeedsCard(item, document, {
-    now: Date.now(), writable: writable(), stale: S.stale, onAnswer: answerCard, onAction: actOnCard, onSince: trackSince,
+    now: Date.now(), writable: writable(), stale: S.stale, readOnly: readOnlyText(), onAnswer: answerCard, onAction: actOnCard, onSince: trackSince,
     onStrip: withStrip ? (pre) => { unwatch = paneWatch(contextOf(item).pid, item.agent, (payload) => drawStrip(pre, payload)); } : null,
   });
   // keepFocus finds a button by these when the card is drawn anew.
@@ -2824,7 +2829,7 @@ VIEWS.devices = (route, main) => {
         });
         revoke.rowKey = id;
         line.appendChild(revoke);
-        line.appendChild(el("p", "ro-note", "Revoking another device is a write: " + READ_ONLY + "."));
+        line.appendChild(el("p", "ro-note", "Revoking another device is a write: " + readOnlyText() + "."));
       }
       list.appendChild(line);
     }
@@ -3095,6 +3100,7 @@ function onSecond() {
 }
 
 function boot() {
+  S.title = document.title || "rlx";
   buildShell();
   loadPending();
   trackViewport();
