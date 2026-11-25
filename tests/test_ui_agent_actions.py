@@ -61,6 +61,7 @@ from tests.test_ui_shell import (
     session_use,
     settle,
     status,
+    to_the_sidebar,
 )
 from tests.test_ui_shell import no_real_tmux as _no_real_tmux
 from tests.test_ui_shell import script as _script
@@ -193,6 +194,7 @@ def one_coder(tmp_path: Path, script: Script, state: str = "working") -> FleetAg
 
 
 async def open_view(pilot: Pilot[None], app: FleetApp, agent_id: str) -> AgentView:
+    await to_the_sidebar(app)  # below 70 columns, the side its rows are on (L2)
     await pilot.click(row_for(app, agent_id))
     await pilot.pause()
     await settle(app)
@@ -236,13 +238,16 @@ def test_the_header_offers_pause_before_stop_and_resume_in_its_place_on_a_paused
     assert drive(go) == buttons
 
 
-@pytest.mark.parametrize(("size", "tight"), [((45, 30), True), ((120, 40), False)])
+@pytest.mark.parametrize(
+    ("size", "tight"), [((36, 30), True), ((45, 30), None), ((120, 40), False)]
+)
 @pytest.mark.parametrize("state", ["working", "exited", "paused"])
 def test_every_header_button_is_whole_in_a_45_column_terminal(
-    tmp_path: Path, script: Script, size: tuple[int, int], tight: bool, state: str
+    tmp_path: Path, script: Script, size: tuple[int, int], tight: bool | None, state: str
 ) -> None:
-    """Beside a 45-column terminal's sidebar the bar has 21 cells: three padded buttons took 22
-    and Restart read ``Rest``. Tight there, each label whole inside the bar; padded at 120."""
+    """Beside a 45-column terminal's sidebar the bar had 21 cells: three padded buttons took 22
+    and Restart read ``Rest``. Below 70 columns the view has the whole row now (L2), so at 45
+    each label is whole, tight or not, and a 36-column phone's bar is tight; padded at 120."""
     one_coder(tmp_path, script, state)
 
     async def go(pilot: Pilot[None]) -> tuple[bool, list[tuple[str, bool]]]:
@@ -259,7 +264,7 @@ def test_every_header_button_is_whole_in_a_45_column_terminal(
         return bar.has_class("-tight"), whole
 
     is_tight, buttons = drive(go, size=size)
-    assert is_tight is tight
+    assert tight is None or is_tight is tight
     assert buttons and all(inside for _, inside in buttons), buttons
 
 

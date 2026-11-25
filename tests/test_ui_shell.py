@@ -370,6 +370,14 @@ def fleet_app(pilot: Pilot[None]) -> FleetApp:
     return app
 
 
+async def to_the_sidebar(app: FleetApp) -> None:
+    """The sidebar on screen, the keyboard in it, for a test that clicks one of its rows: below
+    ``Panes.ONE_PANE_BELOW`` columns one side shows at a time (L2), and start shows home's view.
+    From 70 columns up both sides show, and this changes nothing."""
+    app.query_one(Panes).show_sidebar()
+    await settle(app)
+
+
 async def from_welcome(pilot: Pilot[None]) -> FleetApp:
     """The shell on Welcome with nothing selected, where a test about something other than how
     rlx starts begins. Start opens home since L1, the last-used project's Manager tab
@@ -5487,13 +5495,11 @@ def test_a_min_width_of_zero_is_a_floor_of_zero(tmp_path: Path, script: Script) 
     )
     assert collapsed == 0
 
-    async def ceiling(pilot: Pilot[None]) -> int | None:
-        app = fleet_app(pilot)
-        app.sidebar.styles.min_width = 0
-        await _resized(pilot, 1 + Panes.MIN_CONTENT, SIZE[1])  # room for the content alone
-        return cells(app.sidebar.styles.max_width)
-
-    assert drive(ceiling) == 0, "the container's ceiling honours a floor of 0 too"
+    # Room for the content alone. The app is one side at a time there (L2), with no ceiling,
+    # so the rule is read where the container keeps it.
+    assert Panes.sidebar_ceiling(1 + Panes.MIN_CONTENT, 0) == 0, (
+        "the container's ceiling honours a floor of 0 too"
+    )
 
 
 def test_a_gesture_at_the_ceiling_with_a_huge_width_on_file_does_not_reach_the_style_setter(
