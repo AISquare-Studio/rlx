@@ -276,3 +276,35 @@ def test_at_60_columns_the_bar_shows_and_its_key_opens_the_board_in_the_one_pane
     assert seen["region"] == (0, 0, 60, 1), "the top line, the whole width, one row"
     assert seen["line"].startswith("needs you: 1"), seen["line"]
     assert not seen["sidebar shown"], "the board is the one pane shown"
+
+
+def test_the_key_opens_a_blocked_card_on_a_board_built_before(projects: dict[str, Any]) -> None:
+    """The tester of #11: alpha's board was built (visited) while it had nothing, then a card
+    was blocked. Its lane was the one it last read (a hidden board's ticks are skipped), so
+    F6 found no card on it and only focused the work list; the reader stayed empty."""
+    from aisquare.cli.ui.sidebar import ProjectSelected
+
+    alpha, beta = projects["alpha"], projects["beta"]
+
+    async def go(pilot: Any, app: Any) -> tuple[str, str]:
+        app.post_message(ProjectSelected(alpha.id))  # visited while nothing needed anyone
+        await settle_page(app)
+        assert _alphas_board(app, alpha) is not None, "the premise: alpha's board is built"
+        await _on_betas_settings(pilot, app, beta)
+        projects["frames"][alpha.id] = ([], [_task(alpha, 2, "fix the login race", "blocked")], [])
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        line = bar.line().plain
+        await pilot.press(needs_you_bar.OPEN_KEY)
+        await _until(
+            pilot,
+            lambda: bool((board := _alphas_board(app, alpha)) and board.reader_text),
+            what="the card in alpha's reader",
+        )
+        panel = _alphas_board(app, alpha)
+        return line, panel.reader_text if panel is not None else ""
+
+    line, reader = drive((100, 30), go)
+    assert "#2 fix the login race — blocked" in line
+    assert reader.startswith("fix the login race\n#2 · blocked"), "opened in the board's reader"

@@ -228,8 +228,14 @@ class NeedsYouBar(Static):
             return
         self._landing = None
         panel = view.query_one(BoardPanel)
-        if need.kind in ("blocked", "review") and (need.kind, need.target) in panel.lane:
-            panel.action_lane_item(panel.lane.index((need.kind, need.target)))
+        card = (need.kind, need.target)
+        if need.kind in ("blocked", "review") and card not in panel.lane:
+            # A view built earlier holds the lane it last read: its ticks skip a hidden board,
+            # and its on_show catches up only after this has run (the tester of #11). Read it
+            # now, as its tick does, so the card is there to open.
+            panel.refresh_data()
+        if need.kind in ("blocked", "review") and card in panel.lane:
+            panel.action_lane_item(panel.lane.index(card))
             return
         target: Widget = panel.query_one("#tasks")
         if target.display:
