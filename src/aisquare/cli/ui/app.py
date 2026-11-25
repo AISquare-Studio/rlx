@@ -3003,6 +3003,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 self.post_message(StopAgent(project_id, agent_id))
             elif choice in (AGENT_PAUSE, AGENT_RESUME, RESTART):
                 self._agent_action(status, choice)
+            elif choice is not None:  # a limited agent's Move or Wait (#14)
+                from aisquare.cli.ui.views.agent import from_menu
+
+                from_menu(self, status, choice, menu.offer)
 
         menu = AgentMenu(status, event.anchor, pausable=pausable(status), rename_refusal=refusal)
         self.push_screen(menu, chosen)
@@ -4627,6 +4631,7 @@ def _writing_workers() -> dict[str, str]:
         settings_remote.TOKEN_WORKER: "Settings ▸ Remote's save of the ngrok token",
         agent.RESTART_WORKER: "an agent's restart",
         agent.PAUSE_WORKER: "an agent's pause",
+        agent.MOVE_WORKER: "an agent's move to another account",
         fleet_bulk.BULK_WORKER: "a restart, stop, pause or resume of many agents",
         accounts.SIGN_OUT_WORKER: "an AISquare sign-out",
         accounts.COMPLETE_WORKER: "a Claude sign-in",
@@ -4683,6 +4688,8 @@ def _waited_reads() -> dict[str, str]:
         accounts.LOGIN_OPEN_WORKER: "a Claude log-in's stored login",
         accounts.LOGIN_POLL_WORKER: "a Claude sign-in's check",
         agent.LABELS_WORKER: "an agent's account names",
+        agent.TASK_WORKER: "an agent's task",
+        agent.OFFER_WORKER: "the account a limited agent can move to",
         board.LABELS_WORKER: "a board's account names",
         fleet_bulk.PLAN_WORKER: "Settings ▸ Fleet's read of the running agents",
         resources.SAMPLE_WORKER: "Agent resources' read of the agents",

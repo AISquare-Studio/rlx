@@ -2099,6 +2099,46 @@ def test_the_board_injected_into_agents_names_accounts_as_before_never_by_email(
     assert service.display_labels(statuses) == service.display_labels()
 
 
+def test_a_limited_agents_move_offer_is_the_account_with_the_most_room(
+    fake_home: Path, work: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#14 (the 0.10.2 UX audit's M1): a limited agent's header and menu offer "Move to
+    <account> (N% left)". The account is the switch's own pick (``choose_for_handover``:
+    headroom first, the one the agent is on left out), named as the Accounts page names it,
+    by its email, or its alias once it has one; the room is that account's, left. *Move*
+    passes it to the switch as ``to``, so the account offered is the one moved to. A row that
+    is not limited is offered nothing."""
+    from aisquare.cli.ui.views.agent import MoveOffer, move_offer
+
+    _slot("work@example.com", "tok-work")  # slot 2: the agent's, at its limit
+    _slot("personal@example.com", "tok-personal")  # slot 3: 20% used
+    _slot("third@example.com", "tok-third")  # slot 4: 60% used
+    fetch = _Usage(
+        {"tok-work": _payload(100), "tok-personal": _payload(20), "tok-third": _payload(60)}
+    )
+    monkeypatch.setattr(service, "_http_get", fetch)
+    agent = FleetAgent(
+        id="agt_1",
+        project_id=work.id,
+        label="coder-1",
+        role="coder",
+        pane_id="%1",
+        cwd=work.root,
+        created_at=datetime.now(tz=UTC),
+        account_slot=2,
+    )
+    limited = FleetAgentStatus(agent=agent, state="limited")
+
+    offer = move_offer(limited)
+
+    assert offer == MoveOffer(ref="claude-code:3", name="personal@example.com", left=80.0)
+    assert offer.words() == "Move to personal@example.com (80% left)"
+    assert move_offer(limited.model_copy(update={"state": "working"})) is None
+    service.set_alias("3", "personal")
+    named = move_offer(limited)
+    assert named is not None and (named.ref, named.name) == ("claude-code:3", "personal")
+
+
 def test_a_removed_slots_readings_do_not_rate_the_next_occupant(fake_home: Path) -> None:
     """``forget_arrangement`` drops the slot's ``claude_usage`` rows too (third round)."""
     account = _slot("work@example.com", "tok-work")

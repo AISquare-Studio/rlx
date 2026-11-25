@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from rich.cells import cell_len
@@ -64,9 +65,12 @@ from aisquare.cli.ui.sidebar import (
     used_percent_text,
 )
 from aisquare.cli.ui.terminal import PANE_GONE, TerminalPane
+from aisquare.core import claude_accounts as accounts_core
+from aisquare.core import harness
 from aisquare.core.agent_adapters import recorded_adapter
+from aisquare.core.store import store_session
 from aisquare.core.tmux import TmuxServer
-from aisquare.models import FleetAgent, FleetAgentStatus
+from aisquare.models import FleetAgent, FleetAgentStatus, TeamTask
 from aisquare.services import claude_accounts as accounts_service
 from aisquare.services import fleet as fleet_service
 from aisquare.services import team as team_service
@@ -75,6 +79,15 @@ SEPARATOR = "  "
 LABELS_TTL = 30.0
 """How long a view keeps the slot labels before asking the registry again."""
 LABELS_WORKER = "agent-account-labels"
+TASK_WORKER = "agent-task"
+"""Reads the task the agent is on (:func:`agent_task`): a store read, off the UI thread."""
+OFFER_WORKER = "agent-move-offer"
+"""Reads where Move would take a limited agent (:func:`move_offer`): usage reads."""
+MOVE_WORKER = "agent-move"
+"""Moves a limited agent to the account offered (``fleet_service.switch``)."""
+OFFER_TTL = 60.0
+"""How long a view keeps a limited agent's offer before asking again: the accounts' room
+moves, and the usage cache it reads through is five minutes deep."""
 
 
 def account_text(status: FleetAgentStatus, labels: Mapping[int, str] | None = None) -> str:
@@ -85,10 +98,11 @@ def account_text(status: FleetAgentStatus, labels: Mapping[int, str] | None = No
     operator chose. Failing that, the config directory the session's first
     hook reported (``TeamSession.account``) — the right answer for an agent
     started by hand or before #145 — through the same label the board uses.
-    ``labels`` (``services.claude_accounts.slot_labels``) names the slot the
-    way the launch line and the Accounts page do — the alias, ``plain claude``
-    for slot 1 — so one account is not ``work`` there and ``account 2`` here
-    (review of #205, finding 10); without them the built-in name is used.
+    ``labels`` (``services.claude_accounts.display_labels``) names the slot the
+    way the Accounts page does — the alias, else the email it is signed in as
+    (the 0.10.2 UX audit's Q1) — so one account is not ``me@example.com`` there
+    and ``account 2`` here (review of #205, finding 10); without them the
+    built-in name is used.
     """
     slot = status.agent.account_slot
     if slot is not None:
@@ -100,14 +114,17 @@ def account_text(status: FleetAgentStatus, labels: Mapping[int, str] | None = No
 
 LABEL_STYLE = "bold"
 DETAIL_STYLE = "italic"
-"""Not dim: the pane id after it is, and so are the ``💤`` and ``·`` chips it can follow."""
+"""Not dim: the ``💤`` and ``·`` chips it can follow are."""
+TASK_STYLE = "magenta"
+"""The agent's task, ``#14 Agent view…``: a colour no neighbour has."""
 MODEL_STYLE = "dim cyan"
 EFFORT_STYLE = "cyan"
 ACCOUNT_STYLE = "blue"
 AGENT_STYLE = "dim"
 """The agent's name, shown beside another agent's accounts (``info_line``'s ``named``)."""
-PANE_STYLE = "dim italic"
-"""Dim, and italic so it never runs into a dim ``💤`` or ``·`` chip with nothing between."""
+TASK_KEEP = 32
+"""The cells the task keeps at most, ``#14 Agent view: move a limited…``: the rest is cut
+with ``…``, so the model and its effort after it still show on a row with room for them."""
 
 
 LABEL_KEEP = 6
@@ -122,26 +139,28 @@ def info_line(
     *,
     width: int | None = None,
     named: bool = False,
+    task: str | None = None,
 ) -> Text:
-    """``🔨 coder-auth  ▶ working  dev · 87%  claude-opus-5-5 high  %4 · skeptic`` — one agent
-    at a glance.
+    """``🔨 coder-auth  ▶ working  dev · 87%  #14 Agent view…  claude-opus-5-5 high · skeptic``
+    — one agent at a glance.
 
     The Agent view's header and the Manager tab's first line, both:
-    ``<icon> <label>  <chip> <state>[(exit)]  <account> · <pct>%  <model> <effort>  [detail]
-    [<pane id>][ · <persona>]``. The role icon and the label; the state chip (``💤 exited(N)``
+    ``<icon> <label>  <chip> <state>[(exit)]  <account> · <pct>%  [#N title]  <model> <effort>
+    [detail][ · <persona>]``. The role icon and the label; the state chip (``💤 exited(N)``
     once it ended); the account (:func:`account_text`, its NAME alone — no ``#slot``) with its
     five-hour window percent USED from ``usage`` (slot → percent, the slow headroom read's
-    ``limit_by_slot``); the model and the effort the session reported
-    (``TeamSession.effort``, left out while unknown); the state's detail; and the pane id,
-    while the row has a pane of its own (:func:`shown_pane`: none paused, lost or held).
-    No role word, task, working directory or tmux command: the sidebar row says the role,
-    and the attach command is the Settings tab's.
+    ``limit_by_slot``); the agent's ``task`` (:func:`task_words`, ``#14`` and its title, cut
+    to :data:`TASK_KEEP` cells: the 0.10.2 UX audit's M2); the model and the effort the
+    session reported (``TeamSession.effort``, left out while unknown); and the state's
+    detail. No role word, working directory, tmux command or pane id: the sidebar row says
+    the role, and a ``%4`` is tmux's name for the pane, nobody's (the audit's Q2).
 
     The order is the owner's, ruled on #267: a line too long for its row is cut at its end,
     so what matters most at a glance comes first. The account and its use right after the
     state — in a 90-column terminal the Agent view's line gets about 38 cells, and a model
-    name before them pushed them off. The detail last but the pane id: it has no bound (the
-    folder-trust prompt's names a command and a path), so it is what gives way first.
+    name before them pushed them off. The task after them: what the agent is on, before what
+    it runs on. The detail last: it has no bound (the folder-trust prompt's names a command
+    and a path), so it is what gives way first.
 
     ``named``: the agent (``claude-code``, ``codex``) follows its account and use, and only
     while accounts of more than one agent are listed (``views.accounts.marks_shown``, the
@@ -169,7 +188,7 @@ def info_line(
     at a glance; every one is appended as data.
     """
     label = Text(status.agent.label, style=LABEL_STYLE)
-    text, essential = _info_line(status, label, labels, usage, named)
+    text, essential = _info_line(status, label, labels, usage, named, task)
     badge = persona_badge(status)
     if width is None or text.cell_len + badge.cell_len <= width:
         text.append_text(badge)
@@ -182,12 +201,12 @@ def info_line(
         return text
     # Too wide without the persona too: it is gone already, and the label gives way next.
     # The label's room: the row, less what must stay whole after it, less one cell for the
-    # ``…`` that cuts the rest when there is a rest (the pane id, while the row has a pane).
+    # ``…`` that cuts the rest when there is a rest (the task, the model, the detail).
     rest = 1 if text.cell_len > essential else 0
     room = width - rest - (essential - label.cell_len)
     if label.cell_len > room:
         label.truncate(max(room, LABEL_KEEP + 1), overflow="ellipsis")
-        text, _ = _info_line(status, label, labels, usage, named)
+        text, _ = _info_line(status, label, labels, usage, named, task)
     return text
 
 
@@ -197,10 +216,11 @@ def _info_line(
     labels: Mapping[int, str] | None,
     usage: Mapping[int, float] | None,
     named: bool = False,
+    task: str | None = None,
 ) -> tuple[Text, int]:
     """:func:`info_line` with ``label`` as given, and the cells up to the end of what a narrow
-    row keeps whole: the label, the state, and the account with its use. The agent's name,
-    when ``named``, comes after them and is not counted in them."""
+    row keeps whole: the label, the state, and the account with its use. The task, and the
+    agent's name when ``named``, come after them and are not counted in them."""
     agent = status.agent
     session = status.session
     chip, chip_style = STATE_CHIP.get(status.state, ("·", "dim"))
@@ -221,6 +241,11 @@ def _info_line(
             text.append(" · ", style="dim")
             text.append_text(used_percent_text(percent))
     essential = text.cell_len
+    if task:
+        said = Text(task, style=TASK_STYLE)
+        said.truncate(TASK_KEEP, overflow="ellipsis")
+        text.append(SEPARATOR)
+        text.append_text(said)
     if named and agent.agent:
         text.append(SEPARATOR)
         text.append(agent.agent, style=AGENT_STYLE)
@@ -241,14 +266,227 @@ def _info_line(
     ):
         text.append(SEPARATOR)
         text.append(status.detail, style=DETAIL_STYLE)
-    # The pane id only while the row has a pane of its own (:func:`shown_pane`). A paused or
-    # lost row's id was its killed window's, and a held row's is the next server's: tmux hands
-    # it to the next agent, so it named someone else's pane (brief 233's ruling).
-    pane = shown_pane(status)
-    if pane is not None:
-        text.append(SEPARATOR)
-        text.append(pane, style=PANE_STYLE)
     return text, essential
+
+
+def task_words(task: TeamTask | None) -> str | None:
+    """``#14 Agent view: move a limited agent`` — the task as the header says it: its number
+    on the board and its title (never its id, which is the agents'), or ``None`` for none."""
+    if task is None:
+        return None
+    return f"#{task.number} {task.title}" if task.number is not None else task.title
+
+
+_HELD_ORDER: tuple[str, ...] = ("doing", "blocked", "review")
+"""The claimed tasks a header names, the first found first: the one being worked on."""
+
+
+def agent_task(status: FleetAgentStatus) -> TeamTask | None:
+    """The task ``status``'s agent is on (the 0.10.2 UX audit's M2): the one its session has
+    claimed and is doing, else one it holds blocked or in review, else the task it was spawned
+    for (``FleetAgent.task_id``). ``None`` with none, or a store that cannot be read: a header
+    is a courtesy. A store read, so off the UI thread (:class:`AgentTask`)."""
+    agent = status.agent
+    session = status.session.id if status.session is not None else None
+    try:
+        with store_session() as store:
+            tasks = store.team_tasks(agent.project_id)
+    except Exception:
+        return None
+    held = [
+        task
+        for task in tasks
+        if session is not None and task.claimed_by == session and task.status in _HELD_ORDER
+    ]
+    if held:
+        return min(held, key=lambda task: _HELD_ORDER.index(task.status))
+    return next((task for task in tasks if task.id == agent.task_id), None)
+
+
+class AgentTask:
+    """The task a view's header names, read OFF the UI thread as :class:`SlotLabels` reads the
+    labels: at most one read per :data:`LABELS_TTL` for the same row and session, at once for
+    another."""
+
+    def __init__(self) -> None:
+        self.words: str | None = None
+        self._asked: tuple[str, str | None, float] | None = None
+
+    def ask(self, node: Widget, status: FleetAgentStatus) -> None:
+        """Read ``status``'s task in a thread worker of ``node``'s, unless one was asked lately."""
+        session = status.session.id if status.session is not None else None
+        now = time.monotonic()
+        if self._asked is not None:
+            row, said, at = self._asked
+            if (row, said) == (status.agent.id, session) and now - at < LABELS_TTL:
+                return
+        self._asked = (status.agent.id, session, now)
+        node.run_worker(
+            lambda: agent_task(status),
+            name=TASK_WORKER,
+            group=TASK_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def answered(self, event: Worker.StateChanged) -> bool:
+        """Take what a read of :meth:`ask`'s answered; whether the words changed."""
+        if event.worker.group != TASK_WORKER or event.state is not WorkerState.SUCCESS:
+            return False
+        result = event.worker.result
+        words = task_words(result if isinstance(result, TeamTask) else None)
+        if words == self.words:
+            return False
+        self.words = words
+        return True
+
+
+@dataclass(frozen=True)
+class MoveOffer:
+    """Where *Move* takes a limited agent (the 0.10.2 UX audit's M1): the account of its own
+    agent with the most room, as ``fleet switch`` picks it (:func:`move_offer`), named as a
+    person reads it, and the room it has left."""
+
+    ref: str
+    """How ``fleet_service.switch`` names it (``to``): ``<agent>:<slot>``, that account alone."""
+    name: str
+    """Its alias, else its email (``accounts_service.display_name``)."""
+    left: float | None
+    """Percent left in the window that limits it, ``None`` when it could not be read."""
+
+    def words(self) -> str:
+        """``Move to me@example.com (80% left)``."""
+        room = f" ({self.left:.0f}% left)" if self.left is not None else ""
+        return f"Move to {self.name}{room}"
+
+
+def move_offer(status: FleetAgentStatus) -> MoveOffer | None:
+    """Where *Move* would take ``status``'s agent, or ``None``: it is not limited, or no other
+    account of its agent has room. Off the UI thread: the accounts' usage is read, through the
+    five-minute cache.
+
+    The pick is the switch's own (``accounts_service.choose_for_handover``: headroom first,
+    the account it is on left out, its session's model family counted where the agent's
+    models are laddered), so the account named is the one *Move* passes to the switch as
+    ``to``, and the switch takes no other. Reading through the cache, and not live as the
+    switch reads without ``to``, is what keeps a header from asking every account every
+    minute."""
+    agent = status.agent
+    if status.state != "limited":
+        return None
+    kind = agent.agent or accounts_core.AGENT
+    adapter = recorded_adapter(agent.agent)
+    session = status.session
+    family = (
+        harness.model_family(session.model if session is not None else None)
+        if adapter is not None and adapter.capabilities.model_ladders
+        else None
+    )
+    try:
+        choice = accounts_service.choose_for_handover(
+            role=agent.role,
+            project=fleet_service.project_of(agent),
+            exclude=[agent.account_slot] if agent.account_slot is not None else [],
+            agent=kind,
+            family=family,
+            max_age=accounts_service.USAGE_MAX_AGE_SECONDS,
+        )
+    except Exception:
+        return None
+    account = choice.account
+    if account is None:
+        return None
+    reading = accounts_service.cached_usage([account]).get(account.slot)
+    used = (
+        accounts_service.headroom_percent(reading, family)
+        if reading is not None and reading.available
+        else None
+    )
+    try:
+        identity = accounts_core.identity(account)
+    except Exception:
+        identity = None
+    return MoveOffer(
+        ref=accounts_core.qualified_ref(account),
+        name=accounts_service.display_name(account, identity),
+        left=None if used is None else max(0.0, 100.0 - used),
+    )
+
+
+def move_agent(agent: FleetAgent, offer: MoveOffer) -> fleet_service.SwitchReceipt:
+    """*Move*: ``agent`` onto ``offer``'s account, the switch ``fleet switch --to`` runs,
+    pinned to THIS row (``agent_id``) as Stop and Restart are. It stops and starts the agent,
+    so it runs on a thread worker (:func:`start_move`)."""
+    return fleet_service.switch(
+        fleet_service.project_of(agent), agent.label, to=offer.ref, agent_id=agent.id
+    )
+
+
+def start_move(node: Widget | App[Any], agent: FleetAgent, offer: MoveOffer) -> Worker[Any]:
+    """Run :func:`move_agent` on a thread worker of ``node``."""
+    return node.run_worker(
+        lambda: move_agent(agent, offer),
+        name=MOVE_WORKER,
+        group=f"{MOVE_WORKER}-{agent.id}",
+        exclusive=True,
+        thread=True,
+        exit_on_error=False,  # a refusal is an answer to show, not a crash
+    )
+
+
+def said_moved(
+    node: Widget | App[Any], agent: FleetAgent, offer: MoveOffer, event: Worker.StateChanged
+) -> None:
+    """A move that finished, toasted from ``node``: where it went, or why not in the switch's
+    own words."""
+    if event.state is WorkerState.SUCCESS:
+        node.notify(f"⇄ {agent.label} moved to {offer.name}", timeout=6, markup=False)
+    elif event.state is WorkerState.ERROR:
+        error = event.worker.error
+        why = str(error) if isinstance(error, fleet_service.FleetError) else repr(error)
+        node.notify(f"{agent.label} not moved: {why}", severity="error", timeout=8, markup=False)
+
+
+def from_menu(
+    app: App[Any], status: FleetAgentStatus, choice: str, offer: MoveOffer | None
+) -> None:
+    """An agent ⋯ menu's *Move* or *Wait* on a limited agent (``agent_menu``), handed over by
+    the shell's menu answer: the open view's own press when the agent's view is open
+    (:meth:`AgentView.act`, to the menu's ``offer``); with none, *Move* runs here, on a
+    worker of the app's, and says how it went itself. *Wait* calls nothing either way."""
+    if choice not in (MOVE, WAIT):
+        return
+    view = next((v for v in app.query(AgentView) if v.status.agent.id == status.agent.id), None)
+    if view is not None:
+        view.act(choice, offer)
+        return
+    if choice != MOVE or offer is None:
+        return
+    agent = status.agent
+
+    def move_and_say() -> None:
+        try:
+            move_agent(agent, offer)
+        except Exception as exc:
+            why = str(exc) if isinstance(exc, fleet_service.FleetError) else repr(exc)
+            said = f"{agent.label} not moved: {why}"
+            app.call_from_thread(app.notify, said, severity="error", timeout=8, markup=False)
+            return
+        said = f"⇄ {agent.label} moved to {offer.name}"
+        app.call_from_thread(app.notify, said, timeout=6, markup=False)
+        refresh = getattr(app, "refresh_data", None)
+        if callable(refresh):
+            app.call_from_thread(refresh)
+
+    app.run_worker(
+        move_and_say,
+        name=MOVE_WORKER,
+        group=f"{MOVE_WORKER}-{agent.id}",
+        exclusive=True,
+        thread=True,
+        exit_on_error=False,
+    )
 
 
 class InfoLine(Static):
@@ -261,9 +499,9 @@ class InfoLine(Static):
 
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
-        self._line: tuple[FleetAgentStatus, Mapping[int, str], Mapping[int, float], bool] | None = (
-            None
-        )
+        self._line: (
+            tuple[FleetAgentStatus, Mapping[int, str], Mapping[int, float], bool, str | None] | None
+        ) = None
         self._painted: tuple[object, ...] | None = None
 
     def show_line(
@@ -273,10 +511,11 @@ class InfoLine(Static):
         usage: Mapping[int, float],
         *,
         named: bool = False,
+        task: str | None = None,
     ) -> None:
         """Paint ``status``'s info line, and keep it fitted to the width from here on;
-        ``named`` as :func:`info_line` takes it."""
-        self._line = (status, labels, usage, named)
+        ``named`` and ``task`` as :func:`info_line` takes them."""
+        self._line = (status, labels, usage, named, task)
         self._paint()
 
     def show_text(self, text: Text) -> None:
@@ -294,12 +533,16 @@ class InfoLine(Static):
         wanted = (*self._line, width)
         if wanted != self._painted:
             self._painted = wanted
-            status, labels, usage, named = self._line
-            self.update(info_line(status, labels, usage, width=width, named=named), layout=layout)
+            status, labels, usage, named, task = self._line
+            self.update(
+                info_line(status, labels, usage, width=width, named=named, task=task),
+                layout=layout,
+            )
 
 
 class SlotLabels:
-    """The slot labels a view names accounts by, asked of the registry OFF the UI thread.
+    """The names a view gives accounts (``accounts_service.display_labels``: the alias, else
+    the email, the 0.10.2 UX audit's Q1), asked of the registry OFF the UI thread.
 
     A store open is a blocking call with a busy timeout of seconds — the Accounts page
     runs its writes as thread workers for exactly that reason — so a view never opens it
@@ -319,7 +562,7 @@ class SlotLabels:
             return
         self._asked_at = now
         node.run_worker(
-            accounts_service.slot_labels,
+            accounts_service.display_labels,  # by email, as the Accounts page names them (Q1)
             name=LABELS_WORKER,
             group=LABELS_WORKER,
             exclusive=True,
@@ -373,6 +616,10 @@ def shown_pane(status: FleetAgentStatus) -> str | None:
 
 RESTART_WORKER = "agent-restart"
 PAUSE_WORKER = "agent-pause"
+MOVE = "move"
+"""The header's and the ⋯ menu's *Move* (:meth:`AgentView.act`)."""
+WAIT = "wait"
+"""The header's and the ⋯ menu's *Wait*: nothing is called."""
 #: States in which there is a process to stop; anything else is a row to restart. The
 #: service's own set, which `fleet restart|stop --all` acts on.
 _STOPPABLE: frozenset[str] = fleet_service.PROCESS_STATES
@@ -532,6 +779,8 @@ class AgentView(Vertical):
     }
     AgentView #agent-bar Button { min-width: 0; margin: 0; }
     AgentView #agent-bar.-tight Button { padding: 0; height: 1; }
+    AgentView #agent-offer { height: 1; padding: 0 1; }
+    AgentView #agent-offer Button { min-width: 0; margin: 0 1 0 0; }
     AgentView #agent-pane { height: 1fr; }
     """
 
@@ -558,16 +807,34 @@ class AgentView(Vertical):
         self.named = named
         """Whether the header names the agent: :attr:`FleetApp.agents_named`, as the shell's
         accounts read last handed it."""
+        self.current_task = AgentTask()
+        """The task the header names (:func:`agent_task`), read off the UI thread."""
+        self.offer: MoveOffer | None = None
+        """Where *Move* takes the agent while it is limited (:func:`move_offer`)."""
+        self._offer_for: tuple[str, float] | None = None
+        """The row the offer was last asked for, and when."""
+        self._waited: str | None = None
+        """The row whose limit *Wait* chose to sit out: no offer for it while it stays limited."""
 
     def _paint_info(self) -> None:
         if self.is_mounted:
             header = self.query_one("#agent-header", InfoLine)
-            header.show_line(self.status, self.labels.labels, self.usage, named=self.named)
+            header.show_line(
+                self.status,
+                self.labels.labels,
+                self.usage,
+                named=self.named,
+                task=self.current_task.words,
+            )
 
     @on(Worker.StateChanged)
     def _labels_answered(self, event: Worker.StateChanged) -> None:
-        if self.labels.answered(event):
+        if self.labels.answered(event) or self.current_task.answered(event):
             self._paint_info()
+        if event.worker.group == OFFER_WORKER and event.state is WorkerState.SUCCESS:
+            result = event.worker.result
+            self.offer = result if isinstance(result, MoveOffer) else None
+            self._paint_offer()
 
     def show_usage(self, usage: Mapping[int, float]) -> None:
         """The accounts' session use from the shell's headroom read — never the 2 s tick."""
@@ -584,7 +851,13 @@ class AgentView(Vertical):
     def compose(self) -> ComposeResult:
         with Horizontal(id="agent-bar"):
             header = InfoLine(id="agent-header")
-            header.show_line(self.status, self.labels.labels, self.usage, named=self.named)
+            header.show_line(
+                self.status,
+                self.labels.labels,
+                self.usage,
+                named=self.named,
+                task=self.current_task.words,
+            )
             yield header
             # Guarded (``click_guard``): a click that was aimed at what this view replaced,
             # made before the view was painted, must not stop or restart the agent it shows
@@ -593,6 +866,10 @@ class AgentView(Vertical):
             yield GuardedButton("Resume", id="agent-resume", compact=True, variant="primary")
             yield GuardedButton("Stop", id="agent-stop", compact=True)
             yield GuardedButton("Restart", id="agent-restart", compact=True, variant="primary")
+        with Horizontal(id="agent-offer") as offer:
+            offer.display = False  # until there is an account to offer (``_paint_offer``)
+            yield GuardedButton("Move", id="agent-move", compact=True, variant="primary")
+            yield GuardedButton("Wait", id="agent-wait", compact=True)
         yield from self.compose_bars()
         yield TerminalPane(
             shown_pane(self.status),
@@ -611,7 +888,62 @@ class AgentView(Vertical):
 
     def on_mount(self) -> None:
         self._paint_actions()
+        self._paint_offer()
         self.labels.ask(self)
+        self.current_task.ask(self, self.status)
+        self._ask_offer()
+
+    def _ask_offer(self) -> None:
+        """Ask where *Move* would take the agent, in a thread worker, while it is limited: at
+        once for a row newly limited, then at most once per :data:`OFFER_TTL`."""
+        status = self.status
+        if status.state != "limited" or self._waited == status.agent.id:
+            return
+        now = time.monotonic()
+        if self._offer_for is not None:
+            row, at = self._offer_for
+            if row == status.agent.id and now - at < OFFER_TTL:
+                return
+        self._offer_for = (status.agent.id, now)
+        self.run_worker(
+            lambda: move_offer(status),
+            name=OFFER_WORKER,
+            group=OFFER_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _paint_offer(self) -> None:
+        """The bar under the header while the agent is limited (the 0.10.2 UX audit's M1):
+        *Move to me@example.com (80% left)*, the account with the most room, and *Wait*, which
+        hides the bar until this limit is over and calls nothing. Hidden with no account to
+        offer, and while a move runs. Called once composed, from ``on_mount`` on (where
+        ``is_mounted`` is not yet true)."""
+        status = self.status
+        bar = self.query_one("#agent-offer", Horizontal)
+        offer = self.offer
+        if status.state != "limited":
+            self._waited = None  # the limit is over: the next one offers again
+            self._offer_for = None
+        shown = (
+            status.state == "limited"
+            and offer is not None
+            and self._waited != status.agent.id
+            and not self._busy()
+        )
+        bar.display = shown
+        if offer is None:
+            return
+        move = self.query_one("#agent-move", Button)
+        move.label = offer.words()
+        move.tooltip = (
+            "Stop it here and start it again on that account, its session resumed: the "
+            "account with the most room of its agent's"
+        )
+        self.query_one(
+            "#agent-wait", Button
+        ).tooltip = "Leave it where it is: it carries on when its account's limit resets"
 
     @property
     def pane(self) -> TerminalPane:
@@ -629,8 +961,11 @@ class AgentView(Vertical):
             return
         self._paint_info()
         self._paint_actions()
+        self._paint_offer()
         self.pane.key_spellings = key_spellings(status)
         self.labels.ask(self)
+        self.current_task.ask(self, status)
+        self._ask_offer()
         self.pane.label = status.agent.label
         if (words := pane_words(status)) != self.pane.placeholder:
             self.pane.placeholder = words
@@ -733,10 +1068,15 @@ class AgentView(Vertical):
             self._captains = (agent.id, fleet_service.is_the_captains_row(agent))
         return self.status.state in _STOPPABLE and not self._captains[1]
 
-    def act(self, kind: str) -> None:
-        """What the header's button for ``kind`` does — ``pause``, ``resume``, ``stop`` or
-        ``restart`` — as an agent's ⋯ menu asks it of the view that is open."""
-        if kind == PAUSE:
+    def act(self, kind: str, offer: MoveOffer | None = None) -> None:
+        """What the header's button for ``kind`` does — ``pause``, ``resume``, ``stop``,
+        ``restart``, ``move`` (to ``offer``, the menu's, else the view's own) or ``wait`` — as
+        an agent's ⋯ menu asks it of the view that is open."""
+        if kind == MOVE:
+            self._start_move(offer or self.offer)
+        elif kind == WAIT:
+            self._wait()
+        elif kind == PAUSE:
             self._ask_pause()
         elif kind == "resume":
             self._start_restart(self.status.agent)
@@ -768,6 +1108,34 @@ class AgentView(Vertical):
     def _restart(self, event: Button.Pressed) -> None:
         event.stop()
         self._ask_restart()
+
+    @on(Button.Pressed, "#agent-move")
+    def _move(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._start_move(self.offer)
+
+    @on(Button.Pressed, "#agent-wait")
+    def _wait_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._wait()
+
+    def _wait(self) -> None:
+        """*Wait*: nothing is called; the offer is put away until this limit is over."""
+        self._waited = self.status.agent.id
+        self._paint_offer()
+
+    def _start_move(self, offer: MoveOffer | None) -> None:
+        """*Move* to ``offer``'s account, the row the one shown at the press; nothing with no
+        offer, or while this view's move, restart or pause runs."""
+        if offer is None or self._busy() or self.status.state != "limited":
+            return
+        self._moving = (self.status.agent, offer)
+        start_move(self, self.status.agent, offer)
+        self._paint_actions()
+        self._paint_offer()
+
+    _moving: tuple[FleetAgent, MoveOffer] | None = None
+    """The move this view started last: the row and where to, for its toast."""
 
     def _ask_pause(self) -> None:
         """The Pause box, or the pause at once when it does not ask; the row is the one shown at
@@ -804,18 +1172,26 @@ class AgentView(Vertical):
         """Whether this view's restart or pause still runs: a second press does nothing."""
         return any(
             worker.node is self
-            and worker.name in (RESTART_WORKER, PAUSE_WORKER)
+            and worker.name in (RESTART_WORKER, PAUSE_WORKER, MOVE_WORKER)
             and not worker.is_finished
             for worker in self.workers
         )
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        if event.worker.name not in (RESTART_WORKER, PAUSE_WORKER):
+        if event.worker.name not in (RESTART_WORKER, PAUSE_WORKER, MOVE_WORKER):
             return
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
             return
         label = self.status.agent.label
-        if event.worker.name == PAUSE_WORKER:
+        if event.worker.name == MOVE_WORKER and self._moving is not None:
+            agent, offer = self._moving
+            said_moved(self, agent, offer, event)
+            receipt = event.worker.result
+            if event.state is WorkerState.SUCCESS and isinstance(
+                receipt, fleet_service.SwitchReceipt
+            ):
+                self.post_message(AgentRestarted(receipt))  # its new row, as a restart's
+        elif event.worker.name == PAUSE_WORKER:
             said_paused(self, self.status.agent, event)
         elif event.state is WorkerState.ERROR:
             self.notify(
@@ -831,6 +1207,7 @@ class AgentView(Vertical):
                 # is still the one on screen by now (:class:`AgentRestarted`).
                 self.post_message(AgentRestarted(receipt))
         self._paint_actions()
+        self._paint_offer()
         refresh = getattr(self.app, "refresh_data", None)
         if callable(refresh):
             refresh()
@@ -846,9 +1223,11 @@ class AgentRestarted(Message):
     pane (user feedback, 2026-10-19: a manager destroyed that way more than once).
     """
 
-    def __init__(self, receipt: fleet_service.RestartReceipt) -> None:
+    def __init__(self, receipt: fleet_service.RestartReceipt | fleet_service.SwitchReceipt) -> None:
         super().__init__()
         self.receipt = receipt
+        """A restart's, or a *Move*'s switch (#14): a restart onto another account, whose
+        new row the view follows the same way."""
 
     @property
     def agent(self) -> FleetAgent:
@@ -858,4 +1237,6 @@ class AgentRestarted(Message):
     @property
     def replaced(self) -> FleetAgent:
         """The row it replaced: the one whose view, if shown, follows to the new row."""
+        if isinstance(self.receipt, fleet_service.SwitchReceipt):
+            return self.receipt.stopped
         return self.receipt.replaced
