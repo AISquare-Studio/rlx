@@ -244,6 +244,10 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
 - **A PTY outlives every client,** and one any connection spawned is in every
   connection's `pty.list`. A process that ends keeps its screen and exit status until
   `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `rlxd stop` ends them all.
+- **`rlxd attach <pty_id> [--read-only]`** puts a PTY in this terminal, as `tmux -L asq
+  attach` did: its screen, then its output; this terminal's keys sent by name and its
+  pastes as pastes, so rlxd sends them as the program's modes need; the PTY sized to
+  this terminal. Ctrl-] detaches. `--read-only` sends nothing and leaves the size alone.
 - **`pty.kill`** ends the process's whole group: SIGHUP and SIGTERM, then SIGKILL after
   two seconds. It replies once the group is gone.
 - **Who may do what:** `cli` and `tui` every method; `remote` the reads and

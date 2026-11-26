@@ -879,3 +879,133 @@ fn pty_exited_comes_after_every_byte_the_process_wrote() {
         );
     }
 }
+
+/// `rlxd attach` in a PTY of its own, as a user's terminal: it shows the PTY it attaches
+/// to, types into it, sizes it to its own terminal, and Ctrl-] detaches.
+#[cfg(unix)]
+#[test]
+fn rlxd_attach_puts_a_pty_in_a_terminal_and_types_into_it() {
+    let home = TestHome::new();
+    home.start();
+    let inner = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "echo INNER; cat"], "cols": 80, "rows": 24}),
+    );
+    eventually("the inner PTY starts", || {
+        screen(&home, &inner)["text"]
+            .as_str()
+            .unwrap()
+            .contains("INNER")
+    });
+    let rlxd = env!("CARGO_BIN_EXE_rlxd");
+    let root = home.root().to_string_lossy().to_string();
+    let attach = |extra: &[&str]| {
+        let mut argv = vec![rlxd, "attach"];
+        argv.extend(extra);
+        argv.push(&inner);
+        spawn(
+            &home,
+            json!({"argv": argv, "cols": 100, "rows": 30, "env": {"RLX_HOME": root}}),
+        )
+    };
+    let outer = attach(&[]);
+    eventually("attach shows the inner screen", || {
+        screen(&home, &outer)["text"]
+            .as_str()
+            .unwrap()
+            .contains("INNER")
+    });
+    eventually("the inner PTY takes attach's size", || {
+        list(&home)["ptys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["pty_id"] == inner.as_str() && p["cols"] == 100 && p["rows"] == 30)
+    });
+    for params in [
+        json!({"pty_id": outer, "text": "hello"}),
+        json!({"pty_id": outer, "keys": ["Enter"]}),
+    ] {
+        assert_eq!(call(&home, "pty.write", &params).code(), Some(0));
+    }
+    eventually("cat gets the line, and attach shows it", || {
+        let inside = screen(&home, &inner)["text"]
+            .as_str()
+            .unwrap()
+            .matches("hello")
+            .count();
+        let shown = screen(&home, &outer)["text"]
+            .as_str()
+            .unwrap()
+            .matches("hello")
+            .count();
+        inside >= 2 && shown >= 2
+    });
+    assert_eq!(
+        call(
+            &home,
+            "pty.write",
+            &json!({"pty_id": outer, "text": "\u{1d}"})
+        )
+        .code(),
+        Some(0)
+    );
+    eventually("Ctrl-] detaches", || {
+        screen(&home, &outer)["exited"] == true
+    });
+    let ended = screen(&home, &outer);
+    assert_eq!(ended["status"], 0, "{ended}");
+    assert!(
+        ended["text"].as_str().unwrap().contains("[detached]"),
+        "{ended}"
+    );
+    assert_eq!(
+        screen(&home, &inner)["exited"],
+        false,
+        "detaching leaves the PTY running"
+    );
+
+    // Read-only, it watches and types nothing.
+    let watcher = attach(&["--read-only"]);
+    eventually("the watcher shows the screen", || {
+        screen(&home, &watcher)["text"]
+            .as_str()
+            .unwrap()
+            .contains("INNER")
+    });
+    let before = screen(&home, &inner)["text"]
+        .as_str()
+        .unwrap()
+        .matches("typed")
+        .count();
+    assert_eq!(
+        call(
+            &home,
+            "pty.write",
+            &json!({"pty_id": watcher, "text": "typed\r"})
+        )
+        .code(),
+        Some(0)
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        screen(&home, &inner)["text"]
+            .as_str()
+            .unwrap()
+            .matches("typed")
+            .count(),
+        before
+    );
+    assert_eq!(
+        call(
+            &home,
+            "pty.write",
+            &json!({"pty_id": watcher, "text": "\u{1d}"})
+        )
+        .code(),
+        Some(0)
+    );
+    eventually("the watcher detaches", || {
+        screen(&home, &watcher)["exited"] == true
+    });
+}

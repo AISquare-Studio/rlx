@@ -86,9 +86,15 @@ pub fn ask_with(home: &Home, method: &str, params: Data) -> Result<Reply, AskErr
 /// A connection to `home`'s rlxd that has said `hello` with the token file's token: as
 /// `cli`, or with `as_app` as `app`, with the test gate credential when there is one.
 pub fn open(home: &Home, as_app: bool) -> Result<Connection, AskError> {
+    open_as(home, if as_app { "app" } else { "cli" })
+}
+
+/// Says `hello` as `role` to `home`'s rlxd, with the token file's token, and with the test
+/// gate credential when the role is `app` and there is one.
+pub fn open_as(home: &Home, role: &str) -> Result<Connection, AskError> {
+    let as_app = role == "app";
     let mut connection = Connection::open(home).map_err(|e| connect_error(home, e))?;
     let token = read_token(home).map_err(AskError::Failed)?;
-    let role = if as_app { "app" } else { "cli" };
     let mut hello = hello_params(&token, &json!(PROTOCOL_VERSION), CLIENT, role);
     if let Some(credential) = as_app.then(|| test_gate_credential(home)).flatten() {
         hello.insert("gate_credential".to_owned(), Value::String(credential));

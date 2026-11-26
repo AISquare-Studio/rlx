@@ -33,6 +33,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+mod attach;
 pub mod bus;
 mod claude;
 mod cli;
@@ -121,6 +122,14 @@ enum Action {
     /// Print the home's events as JSON lines: those rlxd holds after --since, then with
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
     Events(EventsOptions),
+    /// Put a PTY in this terminal, as `tmux attach` puts a pane in it. Ctrl-] detaches.
+    Attach {
+        /// The PTY, as `pty.spawn` named it and `pty.list` lists it.
+        pty_id: String,
+        /// Watch only: send no keys, and leave its size alone.
+        #[arg(long)]
+        read_only: bool,
+    },
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -270,6 +279,9 @@ pub fn main() -> ExitCode {
             force,
         }) => cli::gate_pair(request_id, !deny, force),
         Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
+        Action::Attach { pty_id, read_only } => {
+            attach::attach(attach::AttachArgs { pty_id, read_only })
+        }
         Action::Events(options) => events::events(events::EventsArgs {
             as_app: options.as_app,
             topics: options.topics,

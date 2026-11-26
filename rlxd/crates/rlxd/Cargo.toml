@@ -54,6 +54,8 @@ unicode-security = "0.1"
 unicode-width = "0.2"
 # The PTY host (handoff 0.10.3, 1.4): pseudo-terminals, ConPTY on Windows.
 portable-pty = "0.9"
+# `rlxd attach`: the user's terminal in raw mode, its keys, pastes and size.
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste", "windows"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
