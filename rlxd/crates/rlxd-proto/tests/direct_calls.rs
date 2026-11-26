@@ -9,8 +9,8 @@
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
     InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope, Setting,
-    SettingsChanged, SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams,
-    StatusData, SubscribeParams,
+    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
+    SettingsSetParams, StatusData, SubscribeParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,6 +73,7 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
     assert!(Setting::deserialize(json!({"key": "theme", "version": 0, "value": "x"})).is_err());
     assert!(SettingsList::deserialize(json!({"settings": [{"key": "", "version": 0}]})).is_err());
     assert!(SettingsChanged::deserialize(json!({"key": "theme", "version": 0})).is_err());
+    assert!(SettingsDeleteParams::deserialize(json!({"key": ""})).is_err());
     assert!(ErrorBody::deserialize(json!({"code": "since_ahead", "message": "m"})).is_err());
 
     // And they still read what is valid.
@@ -155,6 +156,10 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
     assert!(printed(&settings).is_ok());
     settings.settings.push(setting);
     assert!(printed(&settings).is_err());
+    let mut delete = SettingsDeleteParams::new("theme").unwrap();
+    assert!(printed(&delete).is_ok());
+    delete.key.clear();
+    assert!(printed(&delete).is_err());
     let mut changed = SettingsChanged::new("theme", 1, None).unwrap();
     assert!(printed(&changed).is_ok());
     changed.version = 0;

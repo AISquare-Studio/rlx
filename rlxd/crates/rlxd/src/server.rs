@@ -41,9 +41,9 @@ use std::time::{Duration, Instant};
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, SettingsGetParams,
-    SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, VERSION, codes,
-    event_types, methods, setting_keys, topics,
+    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, SettingsDeleteParams,
+    SettingsGetParams, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, VERSION,
+    codes, event_types, methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -416,6 +416,7 @@ impl Daemon {
             methods::SETTINGS_GET => self.settings_get(request.params),
             methods::SETTINGS_SET => self.settings_set(session, request.params),
             methods::SETTINGS_LIST => self.settings_list(request.params),
+            methods::SETTINGS_DELETE => self.settings_delete(session, request.params),
             methods::GATE_PAIR => match self.gate_pair(session, &request.params).await {
                 Ok((data, minted)) => {
                     return Answer::Paired(Envelope::ok(data).with_id(id), minted);
@@ -481,20 +482,26 @@ impl Daemon {
     }
 
     /// `settings.set {key, value, expected_version?}`: only an app-role connection that
-    /// holds the gate, a paired device, sets a gated key such as `send_safety_mode`. One
-    /// whose device was unpaired, or whose credential was replaced, no longer does.
+    /// holds the gate, a paired device, sets a protected key, `send_safety_mode` or one
+    /// under `policy.`. One whose device was unpaired, or whose credential was replaced,
+    /// no longer does.
     fn settings_set(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
         let params = params_of::<SettingsSetParams>(methods::SETTINGS_SET, params)?;
         let who = format!("{} {}", role_name(session.role), session.client);
-        let hold = session.app.as_ref().filter(|hold| !hold.is_kicked());
-        let writer = settings::Writer {
-            app: hold.is_some(),
-            device: hold.map(Hold::device),
-            who: &who,
-        };
         let setting = self
             .settings
-            .set(params, writer, &self.bus)
+            .set(params, writer(session, &who), &self.bus)
+            .map_err(refused)?;
+        printed(&setting)
+    }
+
+    /// `settings.delete {key, expected_version?}`, by the same rules as `settings.set`.
+    fn settings_delete(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let params = params_of::<SettingsDeleteParams>(methods::SETTINGS_DELETE, params)?;
+        let who = format!("{} {}", role_name(session.role), session.client);
+        let setting = self
+            .settings
+            .delete(params, writer(session, &who), &self.bus)
             .map_err(refused)?;
         printed(&setting)
     }
@@ -1401,6 +1408,16 @@ fn capabilities() -> Vec<String> {
     CAPABILITIES.iter().map(|&c| c.to_owned()).collect()
 }
 
+/// Who a connection is, to the settings: app-role only while it holds the gate.
+fn writer<'a>(session: &'a Session, who: &'a str) -> settings::Writer<'a> {
+    let hold = session.app.as_ref().filter(|hold| !hold.is_kicked());
+    settings::Writer {
+        app: hold.is_some(),
+        device: hold.map(Hold::device),
+        who,
+    }
+}
+
 /// A method's params, read as its wire type: `invalid_params` naming the field when not.
 fn params_of<T: serde::de::DeserializeOwned>(method: &str, params: Params) -> Result<T, ErrorBody> {
     serde_json::from_value(Value::Object(params)).map_err(|e| {
@@ -1439,8 +1456,12 @@ fn refused(refused: settings::Refused) -> ErrorBody {
         )),
         settings::Refused::NotGate(key) => error(
             codes::NOT_GATE,
-            &format!("only an app-role connection, a paired device, may set {key}"),
-        ),
+            &format!(
+                "only an app-role connection holding the gate, a paired device, may change \
+                 {key}"
+            ),
+        )
+        .with_hint("send_safety_mode and every key under policy. are protected."),
         settings::Refused::Conflict(version) => {
             let mut detail = Data::new();
             detail.insert("version".to_owned(), Value::from(version));
@@ -1466,6 +1487,7 @@ fn served() -> Vec<&'static str> {
         methods::SETTINGS_GET,
         methods::SETTINGS_SET,
         methods::SETTINGS_LIST,
+        methods::SETTINGS_DELETE,
         methods::GATE_PAIR,
         methods::GATE_PAIR_REQUESTS,
         methods::GATE_PAIR_ANSWER,

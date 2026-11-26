@@ -48,7 +48,8 @@ bound both validators agree on.
 | `settings-list.json` | `settings.list`'s params: `{prefix?}` |
 | `setting.json` | One setting, `settings.get`'s and `settings.set`'s reply: `{key, version, value?, updated_at?, by_device?}`. Version 0, with nothing else, is a key never set |
 | `settings-list-reply.json` | `settings.list`'s reply: `{settings: [setting]}`, in key order |
-| `settings-changed.json` | `settings.changed`'s data, on the `settings` topic: `{key, version, by_device?}` |
+| `settings-changed.json` | `settings.changed`'s and `settings.deleted`'s data, on the `settings` topic: `{key, version, by_device?}` |
+| `settings-delete.json` | `settings.delete`'s params: `{key, expected_version?}`. The reply is the setting at version 0 |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 
@@ -128,24 +129,42 @@ For a client:
 ## Settings
 
 App settings live in the rlx home, so every device that connects sees the same values
-(the owner's multi-device brief, §4). Device-local state stays on the device: SSH
-profiles, the window's size and position, per-device notifications, caches.
+(the owner's multi-device brief, §4). They are not for secrets: every client with the
+token reads every one. Device-local state stays on the device: SSH profiles, the window's
+size and position, per-device notifications, caches.
 
-- **The keys.** rlxd knows four, each with a shape: `theme` (a name of 1 to 64
-  characters), `layout` (an object), `agent_sign_off` (a string of at most 512
-  characters) and `send_safety_mode`. Any dotted key, `<namespace>.<name>`, holds any JSON
-  value but `null`, up to 64 KiB. Another key without a dot gets `unknown_setting`.
-- **`send_safety_mode`** is `{default, connectors?}`. Each mode is `draft`,
-  `standing_approval` or `auto`, safest first, and `connectors` maps a connector's name to
-  its mode. A key never set means `draft`. Only an app-role connection, a paired device,
-  may set it; any other gets `not_gate`. Every change is logged, and its event names the
-  device.
-- **Versions.** Each key counts its writes from 1. `settings.set` with `expected_version`
-  writes only when that is the version now, else it gets `conflict` with
-  `detail.version`; read again and write from that. Without it, the last write wins.
-- **Events.** Every write, once on disk, is a `settings.changed {key, version,
-  by_device?}` on the `settings` topic, one key's in version order. Read the value with
-  `settings.get`.
+- **The keys.** rlxd knows four, each with a shape:
+  - `theme`, a name of 1 to 64 characters;
+  - `layout`, an object;
+  - `agent_sign_off`, a string of at most 512 characters;
+  - `send_safety_mode`.
+
+  Any dotted key, `<namespace>.<name>`, holds any JSON value but `null`. Another key
+  without a dot gets `unknown_setting`.
+- **Limits.** Every value is at most 64 KiB of JSON and 32 arrays or objects deep; the
+  schemas can't count depth, so only the types check it. A home holds at most 512 settings
+  and 8 MiB of keys and values.
+- **Protected keys:** `send_safety_mode` and every key under `policy.`, such as the
+  app-absent policy or a connector's write policy.
+  - Only an app-role connection holding the gate, a paired device, may set or delete
+    them; any other gets `not_gate`. Every change is logged, and its event names the
+    device.
+  - Any client may change every other key, agents included.
+- **`send_safety_mode`** is `{default, connectors?}`.
+  - Each mode is `draft`, `standing_approval` or `auto`, safest first, and `connectors`
+    maps a connector's name to its mode.
+  - A key never set means `draft`.
+  - A change lowers send safety when any connector's mode, its own or else the default,
+    becomes less safe.
+- **Versions.** Each key counts its writes from 1.
+  - `settings.set` and `settings.delete` with `expected_version` act only when that is
+    the version now, else they get `conflict` with `detail.version`; read again and act
+    from that.
+  - Without `expected_version`, the last change wins.
+  - A deleted key is back to never set, at version 0, and its numbering starts again.
+- **Events.** Every change, once on disk, is a `settings.changed {key, version,
+  by_device?}`, or a `settings.deleted` with the version deleted, on the `settings`
+  topic. One key's events come in version order. Read the new value with `settings.get`.
 
 ## Versioning
 

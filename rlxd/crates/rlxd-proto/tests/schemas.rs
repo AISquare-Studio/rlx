@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
     InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request,
-    RequestId, Role, RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsGetParams,
-    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, codes,
-    daemon_kinds, event_types, methods, protocol_version_of, schema_version_of, schemas,
-    send_safety_floor, send_safety_modes, setting_keys, topics,
+    RequestId, Role, RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsDeleteParams,
+    SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, StatusData,
+    SubscribeParams, codes, daemon_kinds, event_types, methods, protocol_version_of,
+    schema_version_of, schemas, send_safety_lowers, send_safety_modes, setting_is_protected,
+    setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2054,7 +2055,25 @@ fn the_settings_api_names_its_methods_codes_and_gated_keys() {
     assert_eq!(methods::SETTINGS_SET, "settings.set");
     assert_eq!(methods::SETTINGS_LIST, "settings.list");
     assert!(topics::ALL.contains(&topics::SETTINGS));
-    assert_eq!(setting_keys::GATED, [setting_keys::SEND_SAFETY_MODE]);
+    assert_eq!(methods::SETTINGS_DELETE, "settings.delete");
+    assert_eq!(event_types::SETTINGS_DELETED, "settings.deleted");
+    for key in [
+        "send_safety_mode",
+        "policy.app_absent",
+        "policy.connectors.slack",
+    ] {
+        assert!(setting_is_protected(key), "{key}");
+    }
+    for key in [
+        "theme",
+        "layout",
+        "agents.ava",
+        "rlxapp.policy",
+        "policyx.y",
+        "policy",
+    ] {
+        assert!(!setting_is_protected(key), "{key}");
+    }
     for key in setting_keys::KNOWN {
         assert!(
             !key.contains('.'),
@@ -2068,22 +2087,90 @@ fn the_settings_api_names_its_methods_codes_and_gated_keys() {
 }
 
 #[test]
-fn send_safety_floor_ranks_the_least_safe_mode_set() {
-    let floor = |v: Value| send_safety_floor(&v);
-    assert_eq!(floor(json!({"default": "draft"})), Some(0));
-    assert_eq!(floor(json!({"default": "auto"})), Some(2));
-    assert_eq!(
-        floor(json!({"default": "draft", "connectors": {"s": "standing_approval"}})),
-        Some(1)
+fn send_safety_lowers_compares_every_connectors_mode() {
+    let lowers = |before: Option<Value>, after: Value| send_safety_lowers(before.as_ref(), &after);
+    assert!(
+        lowers(None, json!({"default": "auto"})),
+        "never set reads as draft"
     );
-    assert_eq!(
-        floor(json!({"default": "standing_approval", "connectors": {"s": "draft", "t": "auto"}})),
-        Some(2)
-    );
-    assert_eq!(floor(json!({"default": "nope"})), None);
-    assert_eq!(floor(json!("draft")), None);
+    assert!(!lowers(None, json!({"default": "draft"})));
+    assert!(!lowers(
+        Some(json!({"default": "auto"})),
+        json!({"default": "draft"})
+    ));
+    // The floor stays auto, but gmail goes from draft (the default) to auto.
+    assert!(lowers(
+        Some(json!({"default": "draft", "connectors": {"slack": "auto"}})),
+        json!({"default": "draft", "connectors": {"slack": "auto", "gmail": "auto"}})
+    ));
+    // A connector's own mode removed: it falls back to a less safe default.
+    assert!(lowers(
+        Some(json!({"default": "auto", "connectors": {"slack": "draft"}})),
+        json!({"default": "auto"})
+    ));
+    // Raised for one, the same for the rest.
+    assert!(!lowers(
+        Some(json!({"default": "standing_approval", "connectors": {"slack": "auto"}})),
+        json!({"default": "standing_approval", "connectors": {"slack": "draft"}})
+    ));
+    assert!(!lowers(
+        Some(json!({"default": "draft"})),
+        json!("not a mode")
+    ));
     assert_eq!(
         send_safety_modes::ALL,
         ["draft", "standing_approval", "auto"]
     );
+}
+
+#[test]
+fn a_setting_value_nests_at_most_32_deep_and_the_types_say_so() {
+    let nested = |depth: usize| -> Value {
+        serde_json::from_str(&format!("{}1{}", "[".repeat(depth), "]".repeat(depth))).unwrap()
+    };
+    let ok = SettingsSetParams::new("rlxapp.deep", nested(32));
+    assert!(ok.is_ok(), "{ok:?}");
+    assert_eq!(
+        refused(SettingsSetParams::new("rlxapp.deep", nested(33))),
+        "value"
+    );
+    let objects = |depth: usize| (0..depth).fold(json!(1), |inner, _| json!({ "a": inner }));
+    assert!(SettingsSetParams::new("layout", objects(32)).is_ok());
+    assert_eq!(
+        refused(SettingsSetParams::new("layout", objects(33))),
+        "value"
+    );
+    // The schema can't count depth: it takes what the type refuses, as documented.
+    let deep = json!({"key": "rlxapp.deep", "value": nested(40)});
+    assert_valid("settings-set.json", &deep);
+    assert!(serde_json::from_value::<SettingsSetParams>(deep).is_err());
+    let stored = json!({"key": "rlxapp.deep", "version": 1, "value": nested(40),
+        "updated_at": TIME});
+    assert!(serde_json::from_value::<Setting>(stored).is_err());
+}
+
+#[test]
+fn settings_delete_params_validate_and_refuse_their_wrong_shapes() {
+    let whole = json!({"key": "rlxapp.sidebar", "expected_version": 3});
+    assert_eq!(
+        agrees::<SettingsDeleteParams>("settings-delete.json", &whole),
+        whole
+    );
+    agrees::<SettingsDeleteParams>("settings-delete.json", &json!({"key": "policy.app_absent"}));
+    for wrong in [
+        json!({}),
+        json!({"key": ""}),
+        json!({"key": "A"}),
+        json!({"key": "theme", "expected_version": -1}),
+        json!({"key": "theme", "expected_version": null}),
+        json!([]),
+    ] {
+        both_refuse::<SettingsDeleteParams>("settings-delete.json", wrong);
+    }
+    let built = SettingsDeleteParams::new("theme").unwrap().expecting(2);
+    assert_eq!(
+        serde_json::to_value(&built).unwrap(),
+        json!({"key": "theme", "expected_version": 2})
+    );
+    assert_eq!(refused(SettingsDeleteParams::new("a..b")), "key");
 }

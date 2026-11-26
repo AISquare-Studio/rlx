@@ -11,8 +11,9 @@
 //!   them;
 //! - [`SubscribeParams`] (7.3): `events.subscribe`'s params, which open the stream;
 //! - the settings API (the multi-device brief, §4): [`SettingsGetParams`],
-//!   [`SettingsSetParams`], [`SettingsListParams`], [`Setting`], [`SettingsList`] and
-//!   [`SettingsChanged`], app settings every device shares;
+//!   [`SettingsSetParams`], [`SettingsDeleteParams`], [`SettingsListParams`],
+//!   [`Setting`], [`SettingsList`] and [`SettingsChanged`], app settings every device
+//!   shares;
 //! - [`StatusData`] (7.4): `status`'s reply, what rlxd is and whether Claude Code is
 //!   installed and signed in;
 //! - [`HereData`]: `rlxd here`'s reply, the probe rlx.app runs over SSH: what rlx is
@@ -36,10 +37,12 @@
 //! - **Each type's `validate()`** is that one set of rules, for code that builds a value
 //!   field by field.
 //!
-//! JSON Schema cannot express two of the rules, so the types are stricter there:
+//! JSON Schema cannot express three of the rules, so the types are stricter there:
 //!
 //! - It reads `1.0` as the integer `1`, which the types refuse. No producer of these
 //!   documents writes integers that way.
+//! - It cannot count how deep a value nests: a setting's value is at most 32 arrays or
+//!   objects deep ([`MAX_SETTING_DEPTH`]).
 //! - It cannot compare one field with another. So the schema checks that an event's
 //!   `type` starts with its `topic` only for the topics v1 lists (7.3's and 7.8's), while
 //!   the types check it for every topic.
@@ -192,9 +195,11 @@ pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
 pub use settings::{
-    MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged, SettingsGetParams, SettingsList,
-    SettingsListParams, SettingsSetParams, check_key as check_setting_key,
-    check_value as check_setting_value, keys as setting_keys, send_safety_floor, send_safety_modes,
+    MAX_DEPTH as MAX_SETTING_DEPTH, MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged,
+    SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams,
+    check_key as check_setting_key, check_value as check_setting_value,
+    is_protected as setting_is_protected, keys as setting_keys, send_safety_lowers,
+    send_safety_modes,
 };
 pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
 pub use subscribe::SubscribeParams;

@@ -196,6 +196,9 @@ pub mod types {
     /// `{key, version, by_device?}` ([`SettingsChanged`](crate::SettingsChanged)): a
     /// setting was set. Read its value with `settings.get`.
     pub const SETTINGS_CHANGED: &str = "settings.changed";
+    /// `{key, version, by_device?}`: a setting was deleted, from `version`; it is back to
+    /// never set, and its default applies.
+    pub const SETTINGS_DELETED: &str = "settings.deleted";
 }
 
 impl Event {

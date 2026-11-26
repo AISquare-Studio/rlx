@@ -437,9 +437,212 @@ fn an_unreadable_settings_file_is_set_aside_and_rlxd_still_starts() {
     std::fs::write(dir.join("settings.json"), "{not json").unwrap();
     home.start();
     assert_eq!(get(&home, "theme")["version"], 0);
-    assert_eq!(
-        std::fs::read_to_string(dir.join("settings.json.unreadable")).unwrap(),
-        "{not json"
-    );
+    let aside = set_aside(&home);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), "{not json");
     assert!(log(&home).contains("cannot be read, so rlxd starts with no settings"));
+}
+
+/// The files rlxd set aside, `settings.json.unreadable-<time>`.
+fn set_aside(home: &TestHome) -> Vec<std::path::PathBuf> {
+    let dir = Home::at(home.root()).rlxd_dir();
+    let mut found: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("settings.json.unreadable-"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn nested(depth: usize) -> String {
+    format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+#[test]
+fn a_value_125_deep_is_refused_at_set_and_one_on_disk_costs_no_other_setting() {
+    // The review's repro: a 253-byte dotted value, 125 deep.
+    let home = TestHome::new();
+    home.start();
+    let deep = format!(r#"{{"key":"rlxapp.deep","value":{}}}"#, nested(125));
+    assert!(deep.len() < 300);
+    let run = home.rlxd(&["call", "settings.set", &deep]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "invalid_params");
+    assert!(run.stdout.contains("more than 32"), "{run:?}");
+    set(&home, false, json!({"key": "theme", "value": "rlx"}));
+    set(&home, false, json!({"key": "rlxapp.fine", "value": [1, 2]}));
+    let list = home.rlxd(&["call", "settings.list"]);
+    assert_eq!(list.code(), Some(0), "every client still lists: {list:?}");
+
+    // The same value on disk, put there by hand: at the next start it alone is set aside.
+    assert_eq!(home.rlxd(&["stop"]).code(), Some(0));
+    let file = Home::at(home.root()).rlxd_dir().join("settings.json");
+    let mut stored: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    stored["settings"]["rlxapp.ok_too"] = json!({"version": 1, "value": 3,
+        "updated_at": "2026-11-26T12:00:00.000Z"});
+    let text = stored.to_string().replacen(
+        r#""settings":{"#,
+        &format!(
+            r#""settings":{{"rlxapp.deep":{{"version":1,"value":{},"updated_at":"2026-11-26T12:00:00.000Z"}},"#,
+            nested(125)
+        ),
+        1,
+    );
+    std::fs::write(&file, text).unwrap();
+    home.start();
+    let keys: Vec<String> = home.rlxd(&["call", "settings.list"]).data()["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["key"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        keys,
+        ["rlxapp.fine", "rlxapp.ok_too", "theme"],
+        "the rest survive"
+    );
+    let aside = set_aside(&home);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(
+        std::fs::read_to_string(&aside[0])
+            .unwrap()
+            .contains("rlxapp.deep")
+    );
+    assert!(
+        log(&home).contains("rlxapp.deep can't be held"),
+        "{}",
+        log(&home)
+    );
+}
+
+#[test]
+fn three_hundred_64_kib_values_stop_at_the_total_cap_and_list_still_answers() {
+    // The review's repro, on connections of the test's own: argv can't carry 64 KiB on
+    // Windows. A value is 64 KiB of JSON with its quotes.
+    let home = TestHome::new();
+    home.start();
+    let mut connection = connect(&home);
+    let value = "x".repeat(64 * 1024 - 2);
+    let mut refusal = None;
+    for n in 0..300 {
+        let params = json!({"key": format!("rlxapp.k{n}"), "value": value});
+        let reply = connection
+            .request("settings.set", params.as_object().unwrap().clone())
+            .unwrap();
+        if let Some(error) = reply.error() {
+            refusal = Some((n, error.code.clone(), error.message.clone()));
+            break;
+        }
+    }
+    let (n, code, message) = refusal.expect("refused before 300");
+    assert_eq!(code, "invalid_params");
+    assert!(
+        message.contains("8 MiB") && message.contains("delete some first"),
+        "{message}"
+    );
+    assert!((120..=130).contains(&n), "refused at {n}");
+    // settings.list answers in one line a client reads: no disconnect.
+    let list = connect(&home)
+        .request("settings.list", Default::default())
+        .unwrap();
+    assert!(list.is_ok(), "{}", &list.line[..200.min(list.line.len())]);
+    assert!(list.line.len() < rlxd_client::MAX_LINE);
+    assert_eq!(
+        list.data().unwrap()["settings"].as_array().unwrap().len(),
+        n
+    );
+    let file = Home::at(home.root()).rlxd_dir().join("settings.json");
+    let size = std::fs::metadata(file).unwrap().len();
+    assert!(size < 9 << 20, "compact on disk: {size} bytes");
+}
+
+#[test]
+fn check_6_policy_keys_are_protected_and_delete_follows_the_same_rules() {
+    let home = paired_home("Sam MacBook");
+    let policy = json!({"key": "policy.app_absent", "value": "queue_writes"});
+    let cli = set(&home, false, policy.clone());
+    assert_eq!(cli.error_code(), "not_gate", "{cli:?}");
+    assert!(
+        cli.json()["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("policy.")
+    );
+    let app = set(&home, true, policy);
+    assert_eq!(app.code(), Some(0), "{app:?}");
+    assert_eq!(app.data()["by_device"], "Sam MacBook");
+    // Agents and preferences any client defines: a CLI or TUI user has no app.
+    let agent = json!({"key": "agents.ava", "value": {"name": "Ava", "persona": "concise"}});
+    assert_eq!(set(&home, false, agent).code(), Some(0));
+    let tui = home.rlxd(&[
+        "call",
+        "--role",
+        "tui",
+        "settings.set",
+        r#"{"key":"rlxapp.sidebar","value":240}"#,
+    ]);
+    assert_eq!(tui.code(), Some(0), "{tui:?}");
+
+    // settings.delete, by the same rules.
+    let since = home.status()["seq"].as_u64().unwrap().to_string();
+    let delete = |as_app: bool, params: &str| {
+        let mut args = vec!["call"];
+        if as_app {
+            args.push("--as-app");
+        }
+        args.extend(["settings.delete", params]);
+        home.rlxd(&args)
+    };
+    let refused = delete(false, r#"{"key":"policy.app_absent"}"#);
+    assert_eq!(refused.error_code(), "not_gate");
+    let stale = delete(true, r#"{"key":"policy.app_absent","expected_version":7}"#);
+    assert_eq!(stale.error_code(), "conflict");
+    let gone = delete(true, r#"{"key":"policy.app_absent","expected_version":1}"#);
+    assert_eq!(
+        gone.data(),
+        json!({"key": "policy.app_absent", "version": 0})
+    );
+    assert_valid("setting.json", &gone.data());
+    assert_eq!(delete(false, r#"{"key":"agents.ava"}"#).code(), Some(0));
+    assert_eq!(get(&home, "agents.ava")["version"], 0);
+    let events = home
+        .rlxd(&["events", "--topics", "settings", "--since", &since])
+        .lines();
+    let deleted: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "settings.deleted")
+        .collect();
+    assert_eq!(deleted.len(), 2, "{events:?}");
+    assert_eq!(
+        deleted[0]["data"],
+        json!({"key": "policy.app_absent", "version": 1, "by_device": "Sam MacBook"})
+    );
+    assert_valid("settings-changed.json", &deleted[1]["data"]);
+    let unknown = delete(false, r#"{"key":"nope"}"#);
+    assert_eq!(unknown.error_code(), "unknown_setting");
+}
+
+#[test]
+fn a_lowering_for_one_connector_is_logged_as_one_even_with_the_floor_unchanged() {
+    let home = paired_home("Sam MacBook");
+    let first = json!({"key": "send_safety_mode",
+        "value": {"default": "draft", "connectors": {"slack": "auto"}}});
+    assert_eq!(set(&home, true, first).code(), Some(0));
+    let second = json!({"key": "send_safety_mode",
+        "value": {"default": "draft", "connectors": {"slack": "auto", "gmail": "auto"}}});
+    assert_eq!(set(&home, true, second).code(), Some(0));
+    let log = log(&home);
+    let line = log
+        .lines()
+        .find(|l| l.contains("send_safety_mode set, version 2"))
+        .unwrap();
+    assert!(
+        line.contains(" warn ") && line.contains("(lowers send safety)"),
+        "{line}"
+    );
 }

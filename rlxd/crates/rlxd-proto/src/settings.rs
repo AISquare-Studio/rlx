@@ -6,12 +6,23 @@
 //! - `settings.set {key, value, expected_version?}` → [`Setting`]: a write whose
 //!   `expected_version` is not the key's version now gets `conflict`.
 //! - `settings.list {prefix?}` → [`SettingsList`]
-//! - the `settings` topic carries `settings.changed` ([`SettingsChanged`]).
+//! - `settings.delete {key, expected_version?}` → [`Setting`], back at version 0
+//! - the `settings` topic carries `settings.changed` and `settings.deleted`
+//!   ([`SettingsChanged`]).
 //!
 //! Keys are rlxd's known keys ([`keys`]), whose values have a shape, and dotted keys,
 //! `<namespace>.<name>` such as `rlxapp.sidebar`, which hold any JSON value but `null`
-//! for later needs. Device-local state (SSH profiles, window size and position,
-//! per-device notifications, caches) does not belong here: it stays on the device.
+//! for later needs. Every value is at most [`MAX_DEPTH`] arrays or objects deep.
+//!
+//! **Protected keys** ([`is_protected`]): `send_safety_mode` and every key under `policy.`,
+//! such as the app-absent policy or a connector's write policy. Only an app-role
+//! connection that holds the gate, a paired device, may set or delete them. Any client may
+//! set or delete any other key, so a user with the CLI or the TUI and no app can still
+//! define agents and preferences.
+//!
+//! Settings are not for secrets: every client with the token reads every one. Device-local
+//! state (SSH profiles, window size and position, per-device notifications, caches) does
+//! not belong here either: it stays on the device.
 
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -32,15 +43,16 @@ pub mod keys {
     /// `— Ava, Sam's AI Agent`: a string of at most 512 characters.
     pub const AGENT_SIGN_OFF: &str = "agent_sign_off";
     /// How much the app lets an agent send unasked: `{default, connectors?}`, each a
-    /// [`send_safety_modes`] name, `connectors` by connector name. Only an app-role
-    /// connection may set it, and every change is logged.
+    /// [`send_safety_modes`] name, `connectors` by connector name. It is protected, and
+    /// every change is logged.
     pub const SEND_SAFETY_MODE: &str = "send_safety_mode";
 
     /// Every key above.
     pub const KNOWN: &[&str] = &[THEME, LAYOUT, AGENT_SIGN_OFF, SEND_SAFETY_MODE];
 
-    /// The keys only an app-role (paired) connection may set: other roles get `not_gate`.
-    pub const GATED: &[&str] = &[SEND_SAFETY_MODE];
+    /// The protected namespace: every key under it, such as `policy.app_absent`, only an
+    /// app-role connection holding the gate may set or delete.
+    pub const PROTECTED_PREFIX: &str = "policy.";
 }
 
 /// The send-safety modes, safest first. A key's absence means [`DRAFT`].
@@ -58,6 +70,32 @@ pub mod send_safety_modes {
 
 /// The longest key, in bytes.
 pub const MAX_KEY: usize = 128;
+
+/// The most arrays or objects a value nests: 32. A scalar is 0 deep, `{"a": 1}` 1.
+/// JSON Schema cannot count depth, so the types alone check it.
+pub const MAX_DEPTH: usize = 32;
+
+/// Whether only an app-role connection that holds the gate may set or delete `key`:
+/// `send_safety_mode`, and every key under [`keys::PROTECTED_PREFIX`].
+pub fn is_protected(key: &str) -> bool {
+    key == keys::SEND_SAFETY_MODE || key.starts_with(keys::PROTECTED_PREFIX)
+}
+
+/// How many arrays or objects `value` nests, counted without recursion.
+fn depth(value: &Value) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(value, 0)];
+    while let Some((value, at)) = stack.pop() {
+        let children: Box<dyn Iterator<Item = &Value>> = match value {
+            Value::Array(items) => Box::new(items.iter()),
+            Value::Object(fields) => Box::new(fields.values()),
+            _ => continue,
+        };
+        deepest = deepest.max(at + 1);
+        stack.extend(children.map(|child| (child, at + 1)));
+    }
+    deepest
+}
 
 /// `settings.get`'s params.
 ///
@@ -114,6 +152,43 @@ pub struct SettingsSetParams {
 struct UncheckedSet {
     key: String,
     value: Value,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    expected_version: Option<u64>,
+}
+
+/// `settings.delete`'s params: the key to set back to never set, and, for a delete that
+/// must not undo another device's write, the version it was made from.
+///
+/// ```json
+/// {"key": "rlxapp.sidebar", "expected_version": 3}
+/// ```
+///
+/// The key's numbering starts again: its next write is version 1.
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[schemars(title = "SettingsDeleteParams")]
+#[non_exhaustive]
+pub struct SettingsDeleteParams {
+    /// The setting's key, such as `theme` or `rlxapp.sidebar`.
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
+    )]
+    pub key: String,
+    /// Delete only if the key's version is this now, else get `conflict`. Absent deletes
+    /// whatever the version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub expected_version: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "SettingsDeleteParams")]
+struct UncheckedDelete {
+    key: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -230,8 +305,8 @@ struct UncheckedSettingsList {
     settings: Vec<Setting>,
 }
 
-/// `settings.changed`'s data, on the `settings` topic: a setting was set. Read its value
-/// with `settings.get`.
+/// `settings.changed`'s and `settings.deleted`'s data, on the `settings` topic: a setting
+/// was set, at `version`, or deleted, from `version`. Read a new value with `settings.get`.
 ///
 /// ```json
 /// {"key": "theme", "version": 4, "by_device": "Sam MacBook"}
@@ -246,10 +321,10 @@ pub struct SettingsChanged {
         regex(pattern = r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
     )]
     pub key: String,
-    /// Its version now, from 1.
+    /// Its version now, from 1; for `settings.deleted`, the version it was deleted at.
     #[schemars(range(min = 1))]
     pub version: u64,
-    /// The paired device that set it, when an app-role connection did.
+    /// The paired device that set or deleted it, when an app-role connection did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, length(min = 1))]
     pub by_device: Option<String>,
@@ -291,6 +366,13 @@ pub fn check_key(field: &str, key: &str) -> Result<(), Invalid> {
 /// `null`.
 pub fn check_value(field: &str, key: &str, value: &Value) -> Result<(), Invalid> {
     let wrong = |shape: &str| Err(Invalid::new(field, format!("{key} takes {shape}")));
+    let deep = depth(value);
+    if deep > MAX_DEPTH {
+        return Err(Invalid::new(
+            field,
+            format!("nests {deep} arrays or objects deep, more than {MAX_DEPTH}"),
+        ));
+    }
     match key {
         keys::THEME => match value.as_str() {
             Some(name) if (1..=64).contains(&name.chars().count()) => Ok(()),
@@ -338,28 +420,42 @@ fn check_send_safety(value: &Value) -> Result<(), ()> {
     }
 }
 
-/// How safe a `send_safety_mode` value is at its least: the index in
-/// [`send_safety_modes::ALL`] of its least safe mode, the default or any connector's. A
-/// higher number is less safe, so a change to a higher one lowers send safety. `None`
-/// for a value that is not one.
-pub fn send_safety_floor(value: &Value) -> Option<usize> {
-    check_send_safety(value).ok()?;
-    let rank = |v: &Value| {
-        let mode = v.as_str()?;
+/// Whether changing `send_safety_mode` from `before` to `after` lowers send safety for any
+/// connector: the default, or a connector named in either, whose mode in `after` (its own,
+/// else the default) is later in [`send_safety_modes::ALL`] than in `before`. `before` is
+/// `None` for a key never set, which means `draft` everywhere. False when `after` is not
+/// a send-safety value.
+pub fn send_safety_lowers(before: Option<&Value>, after: &Value) -> bool {
+    let draft = json!({ "default": send_safety_modes::DRAFT });
+    let before = before.unwrap_or(&draft);
+    if check_send_safety(after).is_err() {
+        return false;
+    }
+    let rank = |mode: Option<&Value>| {
+        let mode = mode?.as_str()?;
         send_safety_modes::ALL.iter().position(|m| *m == mode)
     };
-    let fields = value.as_object()?;
-    let connectors = fields
-        .get("connectors")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|c| c.values());
-    std::iter::once(fields.get("default")?)
-        .chain(connectors)
-        .map(rank)
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .max()
+    let connectors = |value: &Value| -> Vec<String> {
+        value
+            .get("connectors")
+            .and_then(Value::as_object)
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    // A connector's mode: its own, else the default.
+    let mode_of = |value: &Value, name: Option<&str>| {
+        let own = name.and_then(|n| value.get("connectors")?.get(n));
+        rank(own.or_else(|| value.get("default")))
+    };
+    let mut names: Vec<String> = connectors(before);
+    names.extend(connectors(after));
+    std::iter::once(None)
+        .chain(names.iter().map(|n| Some(n.as_str())))
+        .any(|name| {
+            let (was, is) = (mode_of(before, name), mode_of(after, name));
+            // A `before` that is no send-safety value reads as draft, the safest.
+            is > Some(was.unwrap_or(0))
+        })
 }
 
 impl SettingsGetParams {
@@ -400,6 +496,30 @@ impl SettingsSetParams {
     pub fn validate(&self) -> Result<(), Invalid> {
         check_key("key", &self.key)?;
         check_value("value", &self.key, &self.value)
+    }
+}
+
+impl SettingsDeleteParams {
+    /// `settings.delete` of `key`, whatever its version. Refuses what is not a key's shape.
+    pub fn new(key: impl Into<String>) -> Result<Self, Invalid> {
+        let params = Self {
+            key: key.into(),
+            expected_version: None,
+        };
+        params.validate()?;
+        Ok(params)
+    }
+
+    /// These params, deleting only if the key's version is `version` now.
+    #[must_use]
+    pub fn expecting(mut self, version: u64) -> Self {
+        self.expected_version = Some(version);
+        self
+    }
+
+    /// Whether these params keep every rule of `settings-delete.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        check_key("key", &self.key)
     }
 }
 
@@ -637,6 +757,7 @@ macro_rules! checked_serde {
 
 checked_serde!(SettingsGetParams, UncheckedGet);
 checked_serde!(SettingsSetParams, UncheckedSet);
+checked_serde!(SettingsDeleteParams, UncheckedDelete);
 checked_serde!(SettingsListParams, UncheckedList);
 checked_serde!(Setting, UncheckedSetting);
 checked_serde!(SettingsList, UncheckedSettingsList);
