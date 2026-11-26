@@ -19,6 +19,11 @@
       "description": "The cursor.",
       "$ref": "#/$defs/PtyCursor"
     },
+    "error": {
+      "description": "Why rlxd is ending, or has ended, the process itself, when it is: `screen_failed`\nwhen the screen model failed on the program's output. That PTY alone ends, and its\nscreen is blank from then on. Absent otherwise.",
+      "type": "string",
+      "pattern": "^[a-z_]{1,64}$"
+    },
     "exited": {
       "description": "Whether the process has ended.",
       "type": "boolean"
@@ -124,7 +129,7 @@
           "type": "boolean"
         },
         "x": {
-          "description": "The column, from 0. It is `cols` while a line's last cell is written and the next\ncharacter would wrap.",
+          "description": "The column, from 0. It is `cols` while a line's last cell is written and the next\ncharacter would wrap, and can be past `cols` after a resize that didn't rewrap the\nscreen (the alternate screen), until the next character, as in tmux.",
           "type": "integer",
           "format": "uint16",
           "maximum": 65535,

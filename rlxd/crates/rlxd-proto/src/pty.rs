@@ -56,6 +56,17 @@ pub const MAX_SIGNAL: u32 = 127;
 /// A `pty_id`'s length: 128 bits as lowercase hex.
 pub const ID_LENGTH: usize = 32;
 
+/// The most characters an `error` name has.
+pub const MAX_ERROR: usize = 64;
+
+/// Why rlxd ends a PTY's process itself, as a screen's, a list's or `pty.exited`'s
+/// `error` names it.
+pub mod errors {
+    /// The screen model failed on the program's output: rlxd ends that PTY's process,
+    /// and no other.
+    pub const SCREEN_FAILED: &str = "screen_failed";
+}
+
 /// `pty.spawn`'s params: what to run, where, and on how big a terminal.
 ///
 /// ```json
@@ -335,7 +346,8 @@ struct UncheckedSubscribe {
 #[non_exhaustive]
 pub struct PtyCursor {
     /// The column, from 0. It is `cols` while a line's last cell is written and the next
-    /// character would wrap.
+    /// character would wrap, and can be past `cols` after a resize that didn't rewrap the
+    /// screen (the alternate screen), until the next character, as in tmux.
     pub x: u16,
     /// The row, from 0.
     pub y: u16,
@@ -392,6 +404,12 @@ pub struct PtyScreen {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, range(min = 1, max = 127))]
     pub signal: Option<u32>,
+    /// Why rlxd is ending, or has ended, the process itself, when it is: `screen_failed`
+    /// when the screen model failed on the program's output. That PTY alone ends, and its
+    /// screen is blank from then on. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, regex(pattern = "^[a-z_]{1,64}$"))]
+    pub error: Option<String>,
     /// The last event `seq` this screen takes in: a stream goes on from the event after
     /// it.
     pub seq: u64,
@@ -420,6 +438,12 @@ struct UncheckedScreen {
         deserialize_with = "present"
     )]
     signal: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    error: Option<String>,
     seq: u64,
 }
 
@@ -474,6 +498,14 @@ pub struct PtyInfo {
     )]
     #[schemars(transform = drop_null, range(min = 1, max = 127))]
     pub signal: Option<u32>,
+    /// Why rlxd is ending, or has ended, the process itself, as [`PtyScreen`]'s says.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null, regex(pattern = "^[a-z_]{1,64}$"))]
+    pub error: Option<String>,
 }
 
 /// `pty.list`'s reply: every PTY of the home, whichever connection spawned it, in the
@@ -548,6 +580,10 @@ pub struct PtyExited {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, range(min = 1, max = 127))]
     pub signal: Option<u32>,
+    /// Why rlxd ended the process itself, when it did, as [`PtyScreen`]'s says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, regex(pattern = "^[a-z_]{1,64}$"))]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -561,6 +597,12 @@ struct UncheckedExited {
         deserialize_with = "present"
     )]
     signal: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    error: Option<String>,
 }
 
 /// Whether `id` is a `pty_id`'s shape: 32 lowercase hex digits.
@@ -595,6 +637,23 @@ fn check_label(field: &str, label: &str) -> Result<(), Invalid> {
         return Err(Invalid::new(field, "holds a control character"));
     }
     Ok(())
+}
+
+/// An `error` is a name: 1 to 64 lowercase letters and underscores.
+fn check_error(field: &str, error: Option<&str>) -> Result<(), Invalid> {
+    match error {
+        Some(error)
+            if error.is_empty()
+                || error.len() > MAX_ERROR
+                || !error.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+        {
+            Err(Invalid::new(
+                field,
+                "is not 1 to 64 lowercase letters and underscores",
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn check_signal(field: &str, signal: Option<u32>) -> Result<(), Invalid> {
@@ -921,10 +980,18 @@ impl PtyScreen {
             exited: false,
             status: None,
             signal: None,
+            error: None,
             seq,
         };
         screen.validate()?;
         Ok(screen)
+    }
+
+    /// This screen, whose process rlxd is ending or has ended itself, for `error`.
+    pub fn with_error(mut self, error: Option<String>) -> Result<Self, Invalid> {
+        self.error = error;
+        self.validate()?;
+        Ok(self)
     }
 
     /// This screen, on the alternate screen when `alternate`, with `history` lines above.
@@ -959,7 +1026,8 @@ impl PtyScreen {
             u64::from(self.history),
             u64::from(MAX_SCROLLBACK),
         )?;
-        exit_fields(self.exited, self.status, self.signal)
+        exit_fields(self.exited, self.status, self.signal)?;
+        check_error("error", self.error.as_deref())
     }
 }
 
@@ -1001,9 +1069,17 @@ impl PtyInfo {
             exited: false,
             status: None,
             signal: None,
+            error: None,
         };
         info.validate()?;
         Ok(info)
+    }
+
+    /// This PTY, whose process rlxd is ending or has ended itself, for `error`.
+    pub fn with_error(mut self, error: Option<String>) -> Result<Self, Invalid> {
+        self.error = error;
+        self.validate()?;
+        Ok(self)
     }
 
     /// This PTY, labelled `label`.
@@ -1034,7 +1110,8 @@ impl PtyInfo {
         check::pid("pid", self.pid)?;
         check_size(self.cols, self.rows)?;
         check::date_time("started_at", &self.started_at)?;
-        exit_fields(self.exited, self.status, self.signal)
+        exit_fields(self.exited, self.status, self.signal)?;
+        check_error("error", self.error.as_deref())
     }
 }
 
@@ -1091,9 +1168,17 @@ impl PtyExited {
             pty_id: pty_id.into(),
             status,
             signal,
+            error: None,
         };
         exited.validate()?;
         Ok(exited)
+    }
+
+    /// This end, whose process rlxd ended itself, for `error`.
+    pub fn with_error(mut self, error: Option<String>) -> Result<Self, Invalid> {
+        self.error = error;
+        self.validate()?;
+        Ok(self)
     }
 
     /// This end as an event's `data`.
@@ -1105,7 +1190,8 @@ impl PtyExited {
     /// Whether this keeps every rule of `pty-exited.json`.
     pub fn validate(&self) -> Result<(), Invalid> {
         check_id("pty_id", &self.pty_id)?;
-        check_signal("signal", self.signal)
+        check_signal("signal", self.signal)?;
+        check_error("error", self.error.as_deref())
     }
 }
 

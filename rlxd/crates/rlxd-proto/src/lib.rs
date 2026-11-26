@@ -206,7 +206,7 @@ pub use pty::{
     MAX_WRITE as MAX_PTY_WRITE, PtyCursor, PtyExited, PtyInfo, PtyInput, PtyKillParams, PtyList,
     PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
     PtySubscribeParams, PtyWriteParams, check_id as check_pty_id,
-    check_key_name as check_pty_key_name,
+    check_key_name as check_pty_key_name, errors as pty_errors,
 };
 pub use request::{Params, Request, RequestId, methods};
 pub use settings::{

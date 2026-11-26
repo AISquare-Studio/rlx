@@ -120,6 +120,13 @@ pub struct Screen {
 }
 
 impl Screen {
+    /// The bytes it holds: both grids' cells, the history and the hyperlinks.
+    pub fn bytes(&self) -> usize {
+        self.grid.bytes()
+            + self.saved_grid.as_ref().map_or(0, Grid::bytes)
+            + self.hyperlinks.bytes()
+    }
+
     /// A screen `sx` by `sy`, keeping `hlimit` lines of history.
     pub fn new(sx: u32, sy: u32, hlimit: u32) -> Self {
         let mut screen = Self {

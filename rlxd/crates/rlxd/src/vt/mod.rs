@@ -40,6 +40,22 @@ pub struct InputModes {
 pub struct Terminal {
     screen: Screen,
     input: Input,
+    #[cfg(feature = "debug-methods")]
+    test_panic: Option<TestPanic>,
+}
+
+/// Where a test build's screen model panics on purpose, as a bug in it would, so a test
+/// can show the panic ends that PTY alone (`debug.pty_panic`). Test builds only: the
+/// `debug-methods` feature.
+#[cfg(feature = "debug-methods")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestPanic {
+    /// In the parser, halfway through the program's next output.
+    Output,
+    /// As it prints the screen.
+    Screen,
+    /// As it resizes.
+    Resize,
 }
 
 impl Terminal {
@@ -49,13 +65,29 @@ impl Terminal {
         Self {
             screen: Screen::new(u32::from(cols.max(1)), u32::from(rows.max(1)), history),
             input: Input::new(version),
+            #[cfg(feature = "debug-methods")]
+            test_panic: None,
         }
+    }
+
+    /// Test builds only: panics the next time the model is called `at`.
+    #[cfg(feature = "debug-methods")]
+    pub fn panic_next(&mut self, at: TestPanic) {
+        self.test_panic = Some(at);
     }
 
     /// Takes in `bytes` the program wrote. What it returns goes back to the program: its
     /// queries' replies, such as the cursor's position.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut replies = Vec::new();
+        #[cfg(feature = "debug-methods")]
+        if self.test_panic == Some(TestPanic::Output) {
+            // Half the bytes in, so the screen is left half-changed, as by a real bug.
+            let half = bytes.len() / 2;
+            self.input
+                .parse(&mut self.screen, &bytes[..half], &mut replies);
+            panic!("debug.pty_panic: the screen model panics on the program's output");
+        }
         self.input.parse(&mut self.screen, bytes, &mut replies);
         replies
     }
@@ -64,6 +96,10 @@ impl Terminal {
     /// lines of history first, as many as there are, then every row, each with its SGR
     /// codes and a newline.
     pub fn capture(&self, scrollback: u32) -> String {
+        #[cfg(feature = "debug-methods")]
+        if self.test_panic == Some(TestPanic::Screen) {
+            panic!("debug.pty_panic: the screen model panics printing the screen");
+        }
         let grid = &self.screen.grid;
         let top = grid.hsize - scrollback.min(grid.hsize);
         let bottom = grid.hsize + grid.sy - 1;
@@ -134,14 +170,19 @@ impl Terminal {
     /// Resizes to `cols` by `rows`, rewrapping lines off the alternate screen, as tmux
     /// resizes a pane.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        #[cfg(feature = "debug-methods")]
+        if self.test_panic == Some(TestPanic::Resize) {
+            panic!("debug.pty_panic: the screen model panics resizing");
+        }
         let reflow = !self.screen.is_alternate();
         self.screen
             .resize(u32::from(cols.max(1)), u32::from(rows.max(1)), reflow);
     }
 
-    /// The bytes the screen's cells take, history included, for the memory bound.
+    /// About the bytes the model holds, for the memory bound: both screens' cells, the
+    /// history, the hyperlinks, and the parser's buffers.
     pub fn memory(&self) -> usize {
-        self.screen.grid.bytes()
+        self.screen.bytes() + self.input.bytes()
     }
 }
 
@@ -264,6 +305,182 @@ mod tests {
             saved.abs_diff(expected) * 20 < expected,
             "10-cell lines saved {saved} bytes, not about {expected}"
         );
+    }
+
+    /// A small deterministic generator, so a failure names the seed that made it.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len() as u64) as usize]
+        }
+    }
+
+    /// Bytes no program should send, and some a broken one would: random bytes, sequences
+    /// with huge counts and many parameters, strings that never end, bad UTF-8.
+    fn hostile(rng: &mut Rng) -> Vec<u8> {
+        let huge = [
+            "0",
+            "1",
+            "65535",
+            "2147483647",
+            "2147483648",
+            "99999999999999999999",
+        ];
+        let finals = b"@ABCDEFGHJKLMPSTXZ`bcdfghlmnpqrstu";
+        match rng.below(12) {
+            0 => (0..rng.below(4096)).map(|_| rng.next() as u8).collect(),
+            1 => {
+                let n = rng.pick(&huge);
+                let f = *rng.pick(finals) as char;
+                format!("\x1b[{n};{n}{f}").into_bytes()
+            }
+            2 => {
+                let params: Vec<String> = (0..rng.below(200))
+                    .map(|_| rng.pick(&huge).to_string())
+                    .collect();
+                format!("\x1b[{}m", params.join(";")).into_bytes()
+            }
+            3 => format!("\x1b[38:2::{0}:{0}:{0}:{0}:{0}:{0}:{0}m", rng.pick(&huge)).into_bytes(),
+            4 => {
+                let mut osc = b"\x1b]".to_vec();
+                osc.extend(std::iter::repeat_n(b'x', rng.below(3 << 20) as usize));
+                if rng.below(2) == 0 {
+                    osc.push(0x07);
+                }
+                osc
+            }
+            5 => {
+                let mut dcs = b"\x1bP$q".to_vec();
+                dcs.extend(std::iter::repeat_n(b'q', rng.below(1 << 16) as usize));
+                dcs.extend_from_slice(b"\x1b\\");
+                dcs
+            }
+            6 => vec![
+                0xe4, 0xff, 0xc3, 0x28, 0xf0, 0x90, 0xed, 0xa0, 0x80, 0xc0, 0x80, 0xf4, 0x90,
+            ],
+            7 => format!(
+                "\x1b]8;id={0};http://{0}\x1b\\link\x1b]8;;\x07",
+                "y".repeat(rng.below(5000) as usize)
+            )
+            .into_bytes(),
+            8 => format!(
+                "\x1b[?{}h\x1b[?{}l",
+                rng.pick(&["1049", "47", "1047", "6", "7", "2004", "1"]),
+                rng.pick(&["1049", "47", "6", "7"])
+            )
+            .into_bytes(),
+            9 => "中e\u{301}👍🏽🇬🇧\u{200d}\u{fe0f}\t"
+                .repeat(rng.below(200) as usize)
+                .into_bytes(),
+            10 => format!(
+                "\x1b[{};{}r\x1b[{}L\x1b[{}M\x1bM\x1bD\x1b[{}S\x1b[{}T",
+                rng.below(60),
+                rng.below(60),
+                rng.below(100),
+                rng.below(100),
+                rng.below(100),
+                rng.below(100)
+            )
+            .into_bytes(),
+            _ => format!("x\x1b[{}b\x1b#8\x1bc\x1b[3J\x1b[2J", rng.pick(&huge)).into_bytes(),
+        }
+    }
+
+    #[test]
+    fn hostile_output_never_panics_and_memory_stays_bounded() {
+        for seed in 1..=40u64 {
+            let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ seed);
+            let (mut cols, mut rows) = (80u16, 24u16);
+            let (mut widest, mut tallest) = (cols, rows);
+            let mut terminal = Terminal::new(cols, rows, 500, "test");
+            for step in 0..60 {
+                let bytes = hostile(&mut rng);
+                // Cut anywhere, so a sequence spans writes, and a resize lands inside one.
+                let cut = rng.below(bytes.len() as u64 + 1) as usize;
+                terminal.feed(&bytes[..cut]);
+                if rng.below(4) == 0 {
+                    cols = 1 + rng.below(300) as u16;
+                    rows = 1 + rng.below(100) as u16;
+                    (widest, tallest) = (widest.max(cols), tallest.max(rows));
+                    terminal.resize(cols, rows);
+                }
+                terminal.feed(&bytes[cut..]);
+                let (_, y, _) = terminal.cursor();
+                assert!(y < rows, "seed {seed} step {step}: row {y} of {rows}");
+                // A narrower screen keeps the column as it was, as tmux's does when it
+                // doesn't rewrap (the alternate screen), and with autowrap off a character
+                // past the edge is dropped: only a move brings it back. A carriage return
+                // always does.
+                terminal.feed(b"\x1b\\\r");
+                let (x, y, _) = terminal.cursor();
+                assert!(
+                    x == 0 && y < rows,
+                    "seed {seed} step {step}: cursor {x},{y} in {cols}x{rows}"
+                );
+                assert_eq!(terminal.size(), (cols, rows));
+                // Every line as wide as the screen has been (a line keeps its cells), on
+                // both screens; then the parser's string, up to 1 MiB and its doubling, and
+                // the hyperlinks, at most 5000 of a 1 KiB URI and id each, held twice.
+                let lines = 500 + 2 * usize::from(tallest);
+                let bound = lines * (usize::from(widest) * 16 + 256) + (2 << 20) + (21 << 20);
+                assert!(
+                    terminal.memory() < bound,
+                    "seed {seed} step {step}: {} bytes",
+                    terminal.memory()
+                );
+                let text = terminal.capture(1000);
+                assert!(text.matches('\n').count() >= usize::from(rows));
+            }
+        }
+    }
+
+    #[test]
+    fn a_string_that_never_ends_holds_at_most_a_mebibyte() {
+        let mut terminal = Terminal::new(80, 24, 100, "test");
+        terminal.feed(b"\x1b]0;");
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..8 {
+            terminal.feed(&chunk);
+        }
+        let held = terminal.memory();
+        assert!(held < 3 << 20, "{held} bytes");
+        // Once it ends, the screen takes what follows.
+        terminal.feed(b"\x07after");
+        assert!(terminal.capture(0).starts_with("after\n"));
+    }
+
+    #[test]
+    fn a_flood_of_hyperlinks_stays_bounded() {
+        let mut terminal = Terminal::new(80, 24, 100, "test");
+        let uri = format!("http://{}", "u".repeat(1000));
+        for i in 0..5200 {
+            // Named links, each with an id as long as a link may keep, and one longer,
+            // which is dropped.
+            let kept = format!("{i:0>1000}");
+            let dropped = format!("{i:0>4000}");
+            terminal.feed(
+                format!(
+                    "\x1b]8;id={kept};{uri}\x1b\\a\x1b]8;id={dropped};{uri}\x1b\\b\x1b]8;;\x1b\\"
+                )
+                .as_bytes(),
+            );
+        }
+        // At most 5000 links of a 1 KiB URI and id, each held twice: about 20 MB.
+        let held = terminal.memory();
+        assert!(held < 21 << 20, "{held} bytes");
+        assert!(held > 19 << 20, "{held} bytes: the links are counted");
     }
 
     #[test]

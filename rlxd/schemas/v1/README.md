@@ -57,12 +57,12 @@ bound both validators agree on.
 | `pty-write.json` | `pty.write`'s params: `{pty_id}` and exactly one of `text`, `keys` (tmux's key names) and `paste` (a bracketed paste) |
 | `pty-resize.json` | `pty.resize`'s params: `{pty_id, cols, rows}` |
 | `pty-screen.json` | `pty.screen`'s params: `{pty_id, scrollback?}`, at most 50,000 lines of history |
-| `pty-screen-reply.json` | `pty.screen`'s reply, and a `pty.snapshot`'s data: `{pty_id, text, cursor{x, y, visible}, cols, rows, alternate, history, exited, status?, signal?, seq}`. `text` is byte for byte what `tmux capture-pane -e -p` prints. `status` comes exactly when `exited` |
+| `pty-screen-reply.json` | `pty.screen`'s reply, and a `pty.snapshot`'s data: `{pty_id, text, cursor{x, y, visible}, cols, rows, alternate, history, exited, status?, signal?, error?, seq}`. `text` is byte for byte what `tmux capture-pane -e -p` prints. `status` comes exactly when `exited` |
 | `pty-subscribe.json` | `pty.subscribe`'s params: `{pty_id, read_only}` |
 | `pty-kill.json` | `pty.kill`'s params: `{pty_id}` |
-| `pty-list-reply.json` | `pty.list`'s reply: `{ptys: [{pty_id, label?, argv, cwd, pid, cols, rows, started_at, exited, status?, signal?}]}`, in the order they started |
+| `pty-list-reply.json` | `pty.list`'s reply: `{ptys: [{pty_id, label?, argv, cwd, pid, cols, rows, started_at, exited, status?, signal?, error?}]}`, in the order they started |
 | `pty-output.json` | `pty.output`'s data, on the `pty` topic: `{pty_id, bytes_b64}`, the process's bytes in standard base64 |
-| `pty-exited.json` | `pty.exited`'s data, on the `pty` topic: `{pty_id, status, signal?}` |
+| `pty-exited.json` | `pty.exited`'s data, on the `pty` topic: `{pty_id, status, signal?, error?}` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 
@@ -205,6 +205,12 @@ every connection's `pty.list`.
   until `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `status` is the exit
   code, or 128 plus the signal that ended it, with `signal` too. `pty.write` and
   `pty.resize` to it get `pty_exited`.
+- **`error`** names why rlxd is ending, or has ended, a process itself, on its screen,
+  its list entry and its `pty.exited`: `screen_failed` when the screen model failed on
+  the program's output. That PTY alone ends, its screen is blank from then on, and
+  `pty.write` and `pty.resize` to it get `pty_exited`. It is a name, 1 to 64 lowercase
+  letters and underscores, and a client should take one it doesn't know as "ended by
+  rlxd".
 - **`pty.kill`** ends the process and every process in its group (on Windows, its job),
   and frees the PTY. A process that left the group itself is not ended, as under tmux.
 - **The stream.** `pty.subscribe {pty_id, read_only}` first sends a `pty.snapshot`, the

@@ -3,7 +3,7 @@
 //! itself turns on, and checks against the test build the other tests run:
 //!
 //! - check 7 of task #22 (handoff 0.10.3, 7.3): no test-only methods, so `debug.emit` is
-//!   `unknown_method`;
+//!   `unknown_method`, and so is `debug.pty_panic` (#2479);
 //! - handoff 0.10.3 rev 7, 5.1, "No dev mode in a release build": no `--gate-dev-mode`
 //!   flag, `gate.dev_mode` in the config ignored, no marker in `rlxd --version` or in
 //!   status, and not even the feature's name in the binary.
@@ -19,6 +19,9 @@ fn check_7_a_release_build_has_no_debug_methods() {
     let run = release.rlxd(&["call", "debug.emit", r#"{"count":1}"#]);
     assert_eq!(run.code(), Some(1), "{run:?}");
     assert_eq!(run.error_code(), "unknown_method");
+    // Nor the method that makes a PTY's screen model panic.
+    let panic = release.rlxd(&["call", "debug.pty_panic", r#"{"pty_id":"0","at":"output"}"#]);
+    assert_eq!(panic.error_code(), "unknown_method", "{panic:?}");
     let hint = run.json()["error"]["hint"].as_str().unwrap().to_owned();
     assert!(
         hint.contains("events.subscribe") && !hint.contains("debug"),
@@ -34,6 +37,12 @@ fn check_7_a_release_build_has_no_debug_methods() {
     test_build.start();
     let run = test_build.rlxd(&["call", "debug.emit", r#"{"count":1}"#]);
     assert_eq!(run.code(), Some(0), "the test build has it: {run:?}");
+    let run = test_build.rlxd(&["call", "debug.pty_panic", r#"{"pty_id":"0","at":"output"}"#]);
+    assert_eq!(
+        run.error_code(),
+        "unknown_pty",
+        "the test build has it: {run:?}"
+    );
 }
 
 #[test]

@@ -2273,6 +2273,20 @@ fn pty_documents_validate_and_print_back_as_themselves() {
         "cols": 80, "rows": 24, "alternate": false, "history": 0, "exited": true,
         "status": 137, "signal": 9, "seq": 41});
     assert_eq!(agrees::<PtyScreen>("pty-screen-reply.json", &ended), ended);
+    // A PTY whose screen model failed: named while rlxd ends it, and after.
+    for (exited, status) in [(false, None), (true, Some(129))] {
+        let mut failed = json!({"pty_id": PTY, "text": "\n", "cursor": {"x": 0, "y": 0,
+            "visible": true}, "cols": 80, "rows": 1, "alternate": false, "history": 0,
+            "exited": exited, "error": "screen_failed", "seq": 9});
+        if let Some(status) = status {
+            failed["status"] = json!(status);
+            failed["signal"] = json!(1);
+        }
+        assert_eq!(
+            agrees::<PtyScreen>("pty-screen-reply.json", &failed),
+            failed
+        );
+    }
 
     let list = json!({"ptys": [
         {"pty_id": PTY, "label": "coder", "argv": ["sh"], "cwd": "/Users/sam", "pid": 4242,
@@ -2280,6 +2294,9 @@ fn pty_documents_validate_and_print_back_as_themselves() {
         {"pty_id": "0".repeat(32), "argv": ["cmd", "/c", "exit 3"], "cwd": "C:\\Users\\sam",
          "pid": 1, "cols": 80, "rows": 24, "started_at": TIME, "exited": true,
          "status": 4_294_967_295_u32},
+        {"pty_id": "1".repeat(32), "argv": ["sh"], "cwd": "/", "pid": 7, "cols": 80,
+         "rows": 24, "started_at": TIME, "exited": true, "status": 129, "signal": 1,
+         "error": "screen_failed"},
     ]});
     assert_eq!(agrees::<PtyList>("pty-list-reply.json", &list), list);
     agrees::<PtyList>("pty-list-reply.json", &json!({"ptys": []}));
@@ -2295,6 +2312,8 @@ fn pty_documents_validate_and_print_back_as_themselves() {
     for exited in [
         json!({"pty_id": PTY, "status": 3}),
         json!({"pty_id": PTY, "status": 143, "signal": 15}),
+        json!({"pty_id": PTY, "status": 129, "signal": 1, "error": "screen_failed"}),
+        json!({"pty_id": PTY, "status": 1, "error": "a_later_reason"}),
     ] {
         assert_eq!(agrees::<PtyExited>("pty-exited.json", &exited), exited);
     }
@@ -2397,6 +2416,23 @@ fn pty_documents_refuse_their_wrong_shapes() {
         info(json!({"label": "a\u{7}"})),
     ] {
         both_refuse::<PtyList>("pty-list-reply.json", wrong);
+    }
+    // An error is a name: 1 to 64 lowercase letters and underscores, never null.
+    let long = "e".repeat(65);
+    for error in [
+        json!(""),
+        json!("Screen_Failed"),
+        json!("screen failed"),
+        json!(long),
+        json!(null),
+        json!(1),
+    ] {
+        both_refuse::<PtyScreen>("pty-screen-reply.json", screen(json!({ "error": error })));
+        both_refuse::<PtyList>("pty-list-reply.json", info(json!({ "error": error })));
+        both_refuse::<PtyExited>(
+            "pty-exited.json",
+            json!({"pty_id": PTY, "status": 1, "error": error}),
+        );
     }
     for bytes in ["", "abc", "ab=c", "a===", "ab c", "é123"] {
         both_refuse::<PtyOutput>(

@@ -1176,6 +1176,11 @@ const MAX_HYPERLINKS: usize = 5000;
 /// The longest URI kept, once escaped.
 const MAX_HYPERLINK_URI: usize = 1024;
 
+/// The longest id kept, once escaped. rlxd's, not tmux's, which keeps an id of any
+/// length: with no cap, a program could make it hold [`MAX_HYPERLINKS`] ids as long as
+/// an OSC may be, gigabytes. A link whose id is longer is dropped, as one whose URI is.
+const MAX_HYPERLINK_ID: usize = MAX_HYPERLINK_URI;
+
 impl Hyperlinks {
     /// The number for `uri` with `id`: the same one again for a named link already
     /// held, a new one for an anonymous one. 0 when the URI is too long.
@@ -1184,7 +1189,14 @@ impl Hyperlinks {
         if uri.len() > MAX_HYPERLINK_URI {
             return 0;
         }
-        let id = vis(id.unwrap_or(""));
+        let mut id = vis(id.unwrap_or(""));
+        if id.len() > MAX_HYPERLINK_ID {
+            return 0;
+        }
+        // Held for as long as the link is: no more than it takes.
+        let mut uri = uri;
+        uri.shrink_to_fit();
+        id.shrink_to_fit();
         if !id.is_empty()
             && let Some(&number) = self.by_uri.get(&(uri.clone(), id.clone()))
         {
@@ -1204,6 +1216,20 @@ impl Hyperlinks {
             self.by_uri.remove(&key);
         }
         number
+    }
+
+    /// About the bytes the links take: each URI and id, twice for a named link, which is
+    /// found by both.
+    pub fn bytes(&self) -> usize {
+        let entry = 2 * std::mem::size_of::<(String, String)>() + 4 * std::mem::size_of::<u32>();
+        self.by_number
+            .values()
+            .map(|(uri, id)| {
+                let held = uri.capacity() + id.capacity();
+                entry + if id.is_empty() { held } else { 2 * held }
+            })
+            .sum::<usize>()
+            + self.order.capacity() * std::mem::size_of::<u32>()
     }
 
     /// `number`'s URI and id.

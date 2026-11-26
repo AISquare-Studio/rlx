@@ -4,6 +4,11 @@
   "description": "`pty.exited`'s data, on the `pty` topic: the process ended. The PTY keeps its last\nscreen until `pty.kill`.\n\n```json\n{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\", \"status\": 3}\n```",
   "type": "object",
   "properties": {
+    "error": {
+      "description": "Why rlxd ended the process itself, when it did, as [`PtyScreen`]'s says.",
+      "type": "string",
+      "pattern": "^[a-z_]{1,64}$"
+    },
     "pty_id": {
       "description": "The PTY.",
       "type": "string",

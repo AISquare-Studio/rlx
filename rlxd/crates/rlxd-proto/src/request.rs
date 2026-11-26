@@ -149,6 +149,11 @@ pub mod methods {
     /// seqs) out, so a test can fill the event buffer. A release build has no such method
     /// and answers `unknown_method`.
     pub const DEBUG_EMIT: &str = "debug.emit";
+    /// Test builds only: makes a PTY's screen model panic the next time rlxd calls it,
+    /// `{pty_id, at}` in with `at` one of `output`, `screen` and `resize`, `{pty_id}` out,
+    /// so a test can show a panic there ends that PTY alone. A release build has no such
+    /// method and answers `unknown_method`.
+    pub const DEBUG_PTY_PANIC: &str = "debug.pty_panic";
     /// One app setting: [`SettingsGetParams`](crate::SettingsGetParams) in,
     /// [`Setting`](crate::Setting) out.
     pub const SETTINGS_GET: &str = "settings.get";

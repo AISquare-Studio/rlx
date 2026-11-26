@@ -244,6 +244,14 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
   writes and input parser, ported. Each ported file keeps tmux's ISC notice.
   `tests/vt_tmux.rs` checks it against tmux itself on 41 screens, and `tests/pty.rs`
   runs the handoff's own `cmp`.
+- **A program's output can't take rlxd down.** The model parses what a program writes,
+  so it takes hostile bytes too; a seeded random test feeds it such bytes, with resizes
+  in the middle of sequences, and checks it never panics and its memory stays bounded.
+  Should it panic anyway, that PTY alone ends: rlxd catches the panic, ends the
+  process's group, and the PTY's screen (blank from then on), list entry and
+  `pty.exited` say `error: "screen_failed"`. rlxd, its other PTYs and every connection
+  go on. Unlike tmux, a hyperlink whose id is over 1 KiB is dropped, as one whose URI is:
+  tmux keeps up to 5,000 ids of any length.
 - **A PTY outlives every client,** and one any connection spawned is in every
   connection's `pty.list`. A process that ends keeps its screen and exit status until
   `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `rlxd stop` ends them all.
@@ -259,7 +267,8 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
   it starts the program, so nothing the program starts escapes it, and exits with the
   program's exit code, all 32 bits. The shim lives through Ctrl-C and Ctrl-Break, which
   the console sends the program too, and turns Ctrl-C back on for the program first: a
-  detached rlxd's process group ignores it, and every process would inherit that. `pty.list`'s `pid` there is the shim's.
+  detached rlxd's process group ignores it, and every process would inherit that.
+  `pty.list`'s `pid` there is the shim's.
 - **Who may do what:** `cli` and `tui` every method; `remote` the reads and
   `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
 - **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;

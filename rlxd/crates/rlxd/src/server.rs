@@ -434,6 +434,8 @@ impl Daemon {
             },
             #[cfg(feature = "debug-methods")]
             methods::DEBUG_EMIT => self.debug_emit(&request.params).await,
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_PTY_PANIC => self.debug_pty_panic(&request.params),
             methods::SETTINGS_GET => self.settings_get(request.params),
             methods::SETTINGS_SET => self.settings_set(session, request.params),
             methods::SETTINGS_LIST => self.settings_list(request.params),
@@ -682,6 +684,27 @@ impl Daemon {
             }
         }
         Ok(object(&json!({"first": first, "last": last})))
+    }
+
+    /// `debug.pty_panic {pty_id, at}`: the PTY's screen model panics the next time rlxd
+    /// calls it `at` (`output`, `screen` or `resize`), as a bug there would, to show the
+    /// panic ends that PTY alone. Test builds only.
+    #[cfg(feature = "debug-methods")]
+    fn debug_pty_panic(&self, params: &Params) -> Result<Data, ErrorBody> {
+        use crate::vt::TestPanic;
+        let at = match params.get("at").and_then(Value::as_str) {
+            Some("output") => Some(TestPanic::Output),
+            Some("screen") => Some(TestPanic::Screen),
+            Some("resize") => Some(TestPanic::Resize),
+            _ => None,
+        };
+        let (Some(pty_id), Some(at)) = (params.get("pty_id").and_then(Value::as_str), at) else {
+            return Err(error(
+                codes::INVALID_PARAMS,
+                "debug.pty_panic takes {\"pty_id\": ID, \"at\": \"output\"|\"screen\"|\"resize\"}",
+            ));
+        };
+        printed(&off_worker(|| self.ptys.panic_next(pty_id, at)).map_err(pty_refused)?)
     }
 
     /// `status`'s reply data (7.4).
@@ -1781,6 +1804,11 @@ fn pty_refused(refused: pty::Refused) -> ErrorBody {
         pty::Refused::SpawnFailed(why) => error(codes::SPAWN_FAILED, &why),
         pty::Refused::Invalid(why) => error(codes::INVALID_PARAMS, &why),
         pty::Refused::Busy(why) => error(codes::INTERNAL, &why),
+        pty::Refused::ScreenFailed(id) => error(
+            codes::PTY_EXITED,
+            &format!("pty {id}'s screen model failed, so rlxd is ending its process"),
+        )
+        .with_hint("Its screen says error: screen_failed, and stays, blank, until pty.kill."),
     }
 }
 
@@ -1809,6 +1837,7 @@ fn served() -> Vec<&'static str> {
     ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);
+        served.push(methods::DEBUG_PTY_PANIC);
     }
     served
 }

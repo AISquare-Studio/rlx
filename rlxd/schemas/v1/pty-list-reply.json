@@ -39,6 +39,11 @@
           "description": "The directory it started in.",
           "type": "string"
         },
+        "error": {
+          "description": "Why rlxd is ending, or has ended, the process itself, as [`PtyScreen`]'s says.",
+          "type": "string",
+          "pattern": "^[a-z_]{1,64}$"
+        },
         "exited": {
           "description": "Whether the process has ended.",
           "type": "boolean"

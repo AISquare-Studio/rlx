@@ -198,6 +198,136 @@ fn the_pty_topic_carries_pty_exited() {
     assert_valid("pty-exited.json", &exited[0]["data"]);
 }
 
+/// A program that counts, a line every 200 ms, for as long as it runs.
+fn counter_argv() -> Value {
+    if cfg!(windows) {
+        json!([
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "$i = 0; while ($true) { $i++; \"tick $i\"; Start-Sleep -Milliseconds 200 }"
+        ])
+    } else {
+        json!([
+            "sh",
+            "-c",
+            "i=0; while :; do i=$((i+1)); echo \"tick $i\"; sleep 0.2; done"
+        ])
+    }
+}
+
+/// The highest count on `id`'s screen, 0 before the first.
+fn count(home: &TestHome, id: &str) -> u64 {
+    let shown = screen(home, id);
+    shown["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("tick ")?.parse().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// #2479: a panic in a PTY's screen model, which parses what a program writes, ends that
+/// PTY, `error: screen_failed`, and neither rlxd nor its other PTYs. A test-only method
+/// plants the panic: in the parser on the program's next output, in printing the screen,
+/// or in a resize.
+#[test]
+fn a_panic_in_one_ptys_screen_model_ends_that_pty_alone() {
+    let home = TestHome::new();
+    home.start();
+    let pid = home.status()["pid"].clone();
+    let since = home.status()["seq"].as_u64().unwrap().to_string();
+    let bystander = spawn(
+        &home,
+        json!({"argv": counter_argv(), "cols": 80, "rows": 24}),
+    );
+    let mut failed = Vec::new();
+    for at in ["output", "screen", "resize"] {
+        let id = spawn(
+            &home,
+            json!({"argv": counter_argv(), "cols": 80, "rows": 24}),
+        );
+        eventually("it counts", || count(&home, &id) > 0);
+        let run = call(&home, "debug.pty_panic", &json!({"pty_id": id, "at": at}));
+        assert_eq!(run.code(), Some(0), "{at}: {run:?}");
+        match at {
+            // The call that panics is answered, from the blank screen in its place.
+            "screen" => assert_eq!(screen(&home, &id)["error"], "screen_failed", "{at}"),
+            "resize" => {
+                let resize = json!({"pty_id": id, "cols": 100, "rows": 30});
+                let run = call(&home, "pty.resize", &resize);
+                assert_eq!(run.error_code(), "pty_exited", "{at}: {run:?}");
+            }
+            _ => {}
+        }
+        eventually("rlxd ends the pty", || screen(&home, &id)["exited"] == true);
+        let shown = screen(&home, &id);
+        assert_eq!(shown["error"], "screen_failed", "{at}: {shown}");
+        assert!(
+            !shown["text"].as_str().unwrap().contains("tick"),
+            "{at}: {shown}"
+        );
+        let run = call(&home, "pty.write", &json!({"pty_id": id, "text": "x"}));
+        assert_eq!(run.error_code(), "pty_exited", "{at}: {run:?}");
+        #[cfg(unix)]
+        {
+            let pgid = list(&home)["ptys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|pty| pty["pty_id"] == id.as_str())
+                .unwrap()["pid"]
+                .as_u64()
+                .unwrap();
+            eventually("its processes are gone", || group(pgid).is_empty());
+        }
+
+        // The same rlxd goes on, and so does the other PTY: its output, screen and size.
+        assert_eq!(home.status()["pid"], pid, "{at}");
+        let before = count(&home, &bystander);
+        eventually("the other pty counts on", || {
+            count(&home, &bystander) > before
+        });
+        let resize = json!({"pty_id": bystander, "cols": 81, "rows": 24});
+        assert_eq!(call(&home, "pty.resize", &resize).code(), Some(0), "{at}");
+        assert!(screen(&home, &bystander)["error"].is_null(), "{at}");
+        failed.push(id);
+    }
+
+    let ptys = list(&home)["ptys"].as_array().unwrap().clone();
+    assert_eq!(ptys.len(), 4);
+    for pty in &ptys {
+        let id = pty["pty_id"].as_str().unwrap();
+        if id == bystander {
+            assert_eq!(
+                (&pty["exited"], &pty["error"]),
+                (&json!(false), &Value::Null)
+            );
+        } else {
+            assert_eq!(
+                (&pty["exited"], &pty["error"]),
+                (&json!(true), &json!("screen_failed"))
+            );
+        }
+    }
+    let events = home.rlxd(&["events", "--topics", "pty", "--since", &since]);
+    let exited: Vec<Value> = events
+        .lines()
+        .into_iter()
+        .filter(|e| e["type"] == "pty.exited")
+        .collect();
+    assert_eq!(exited.len(), 3, "{events:?}");
+    for (event, id) in exited.iter().zip(&failed) {
+        assert_eq!(event["data"]["pty_id"], id.as_str());
+        assert_eq!(event["data"]["error"], "screen_failed");
+        assert_valid("pty-exited.json", &event["data"]);
+    }
+    let log = home.log();
+    assert_eq!(log.matches("the screen model failed").count(), 3, "{log}");
+    assert!(log.contains("debug.pty_panic: the screen model panics on the program's output"));
+}
+
 #[test]
 fn text_goes_to_the_program_as_typed() {
     let home = TestHome::new();

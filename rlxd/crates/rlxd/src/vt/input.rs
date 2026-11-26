@@ -257,6 +257,24 @@ pub struct Input {
 }
 
 impl Input {
+    /// The bytes its buffers hold: a sequence's parameters, and a string's, up to
+    /// [`INPUT_BUFFER_SIZE`].
+    pub fn bytes(&self) -> usize {
+        let texts: usize = self
+            .list
+            .iter()
+            .map(|param| match param {
+                Param::Text(text) => text.capacity(),
+                _ => 0,
+            })
+            .sum();
+        self.string.capacity()
+            + self.params.capacity()
+            + self.interm.capacity()
+            + self.list.capacity() * std::mem::size_of::<Param>()
+            + texts
+    }
+
     /// A parser in the ground state, with the default pen. `version` answers XTVERSION.
     pub fn new(version: &str) -> Self {
         Self {

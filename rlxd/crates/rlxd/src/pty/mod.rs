@@ -29,6 +29,7 @@ mod windows;
 pub use windows::shim;
 
 use std::io::{Read, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
@@ -38,7 +39,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rlxd_proto::{
     MAX_PTY_SCROLLBACK, PtyCursor, PtyExited, PtyInfo, PtyInput, PtyKillParams, PtyList, PtyOutput,
     PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams, PtyWriteParams, VERSION,
-    event_types, topics,
+    event_types, pty_errors, topics,
 };
 
 use crate::bus::Bus;
@@ -79,6 +80,8 @@ pub enum Refused {
     Invalid(String),
     /// The program is not reading its input, and the queue is full.
     Busy(String),
+    /// The PTY's screen model failed, and rlxd is ending it, or has.
+    ScreenFailed(String),
 }
 
 /// How a PTY's process ended.
@@ -94,6 +97,41 @@ struct State {
     exit: Option<Exit>,
     /// The output is read to its end: the terminal closed.
     drained: bool,
+    /// Why rlxd is ending the process itself, once it is: [`pty_errors`].
+    error: Option<&'static str>,
+}
+
+impl State {
+    /// Runs `work` on the screen model, which is `doing` it, for the PTY `id`.
+    ///
+    /// A panic there, a bug that a program's output found, stays this PTY's: the model,
+    /// which may be half-changed, is set aside for a blank one the same size, `error`
+    /// says why, and `None` tells the caller to end the PTY with [`ending`]. Neither rlxd
+    /// nor its other PTYs see it. The PTY's lock is not poisoned either, as the panic
+    /// never unwinds past its guard. (rlxd is built to unwind on a panic, cargo's
+    /// default: with `panic = "abort"` there would be nothing to catch.)
+    fn on_screen<R>(
+        &mut self,
+        id: &str,
+        doing: &str,
+        work: impl FnOnce(&mut Terminal) -> R,
+    ) -> Option<R> {
+        let terminal = &mut self.terminal;
+        let payload = match panic::catch_unwind(AssertUnwindSafe(|| work(terminal))) {
+            Ok(done) => return Some(done),
+            Err(payload) => payload,
+        };
+        let why = payload
+            .downcast_ref::<&str>()
+            .map(|why| (*why).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic with no message".to_owned());
+        let (cols, rows) = self.terminal.size();
+        self.terminal = Terminal::new(cols, rows, SCROLLBACK, VERSION);
+        self.error = Some(pty_errors::SCREEN_FAILED);
+        error!("pty {id}: the screen model failed {doing}: {why}. Ending this pty alone");
+        None
+    }
 }
 
 /// One PTY.
@@ -159,7 +197,8 @@ impl Pty {
             Some(exit) => info.and_then(|info| info.with_exit(exit.status, exit.signal)),
             None => info,
         };
-        info.map_err(|e| Refused::Invalid(e.to_string()))
+        info.and_then(|info| info.with_error(state.error.map(str::to_owned)))
+            .map_err(|e| Refused::Invalid(e.to_string()))
     }
 }
 
@@ -308,6 +347,7 @@ impl Host {
                 terminal: Terminal::new(params.cols, params.rows, SCROLLBACK, VERSION),
                 exit: None,
                 drained: false,
+                error: None,
             }),
             changed: Condvar::new(),
             master: Mutex::new(Some(pair.master)),
@@ -355,6 +395,9 @@ impl Host {
             if state.exit.is_some() {
                 return Err(Refused::Exited(pty.id.clone()));
             }
+            if state.error.is_some() {
+                return Err(Refused::ScreenFailed(pty.id.clone()));
+            }
             let modes = state.terminal.input_modes();
             match params.input() {
                 PtyInput::Text(text) => text.as_bytes().to_vec(),
@@ -374,8 +417,15 @@ impl Host {
         if state.exit.is_some() {
             return Err(Refused::Exited(pty.id.clone()));
         }
-        let master = pty.master.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(master) = master.as_ref() {
+        if state.error.is_some() {
+            return Err(Refused::ScreenFailed(pty.id.clone()));
+        }
+        if let Some(master) = pty
+            .master
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
             let size = PtySize {
                 rows: params.rows,
                 cols: params.cols,
@@ -386,18 +436,42 @@ impl Host {
                 .resize(size)
                 .map_err(|e| Refused::Invalid(format!("cannot resize pty {}: {e}", pty.id)))?;
         }
-        state.terminal.resize(params.cols, params.rows);
+        let (cols, rows) = (params.cols, params.rows);
+        if state
+            .on_screen(&pty.id, "resizing", |terminal| terminal.resize(cols, rows))
+            .is_none()
+        {
+            drop(state);
+            ending(&pty);
+            return Err(Refused::ScreenFailed(pty.id.clone()));
+        }
         PtyRef::new(&pty.id).map_err(|e| Refused::Invalid(e.to_string()))
     }
 
     /// `params`' PTY's screen, as tmux's `capture-pane -e -p` prints it.
     pub fn screen(&self, params: &PtyScreenParams) -> Result<PtyScreen, Refused> {
         let pty = self.find(&params.pty_id)?;
-        let state = pty.state();
-        let terminal = &state.terminal;
-        let (x, y, visible) = terminal.cursor();
-        let (cols, rows) = terminal.size();
-        let text = terminal.capture(params.scrollback.unwrap_or(0));
+        let scrollback = params.scrollback.unwrap_or(0);
+        let print = |terminal: &mut Terminal| {
+            let text = terminal.capture(scrollback);
+            let (cols, rows) = terminal.size();
+            let state = (terminal.alternate(), terminal.history());
+            (text, terminal.cursor(), cols, rows, state)
+        };
+        let mut state = pty.state();
+        let printed = match state.on_screen(&pty.id, "printing the screen", print) {
+            Some(printed) => printed,
+            None => {
+                drop(state);
+                ending(&pty);
+                // The blank screen in the failed one's place.
+                state = pty.state();
+                state
+                    .on_screen(&pty.id, "printing the screen", print)
+                    .ok_or_else(|| Refused::ScreenFailed(pty.id.clone()))?
+            }
+        };
+        let (text, (x, y, visible), cols, rows, (alternate, history)) = printed;
         let screen = PtyScreen::new(
             &pty.id,
             text,
@@ -406,12 +480,14 @@ impl Host {
             rows,
             self.bus.head(),
         )
-        .and_then(|screen| screen.with_state(terminal.alternate(), terminal.history()));
+        .and_then(|screen| screen.with_state(alternate, history));
         let screen = match state.exit {
             Some(exit) => screen.and_then(|screen| screen.with_exit(exit.status, exit.signal)),
             None => screen,
         };
-        screen.map_err(|e| Refused::Invalid(e.to_string()))
+        screen
+            .and_then(|screen| screen.with_error(state.error.map(str::to_owned)))
+            .map_err(|e| Refused::Invalid(e.to_string()))
     }
 
     /// Every PTY of the home, in the order they started.
@@ -433,6 +509,15 @@ impl Host {
         self.ptys().retain(|held| !Arc::ptr_eq(held, &pty));
         self.gone.send_modify(|n| *n += 1);
         info!("pty {} killed, by {who}", pty.id);
+        PtyRef::new(&pty.id).map_err(|e| Refused::Invalid(e.to_string()))
+    }
+
+    /// Test builds only: `debug.pty_panic`, which makes `id`'s screen model panic the next
+    /// time rlxd calls it `at`.
+    #[cfg(feature = "debug-methods")]
+    pub fn panic_next(&self, id: &str, at: crate::vt::TestPanic) -> Result<PtyRef, Refused> {
+        let pty = self.find(id)?;
+        pty.state().terminal.panic_next(at);
         PtyRef::new(&pty.id).map_err(|e| Refused::Invalid(e.to_string()))
     }
 
@@ -499,6 +584,20 @@ fn end(pty: &Pty) {
     }
 }
 
+/// Ends `pty`, whose screen model failed, on a thread of its own: the caller is its
+/// reader, which must go on draining the output meanwhile, or a call on one of rlxd's
+/// workers, which must not wait. The caller holds none of `pty`'s locks.
+fn ending(pty: &Arc<Pty>) {
+    let held = Arc::clone(pty);
+    if let Err(e) = spawn_thread(format!("pty-{}-end", &pty.id[..8]), move || end(&held)) {
+        error!(
+            "pty {}: no thread to end it on ({e}): ending it here",
+            pty.id
+        );
+        end(pty);
+    }
+}
+
 /// Waits up to `timeout` for `done` to hold of `pty`'s state.
 fn wait_until(pty: &Pty, timeout: Duration, done: impl Fn(&State) -> bool) {
     let deadline = Instant::now() + timeout;
@@ -539,7 +638,7 @@ fn write_input(
 }
 
 /// Reads the program's output into the screen, and sends its queries' replies back.
-fn read_output(pty: &Pty, mut reader: Box<dyn Read + Send>, bus: &Bus) {
+fn read_output(pty: &Arc<Pty>, mut reader: Box<dyn Read + Send>, bus: &Bus) {
     let mut buf = vec![0u8; READ_CHUNK];
     let mut warned = false;
     loop {
@@ -552,7 +651,17 @@ fn read_output(pty: &Pty, mut reader: Box<dyn Read + Send>, bus: &Bus) {
             // The screen takes the bytes and the bus numbers them under one lock, so a
             // snapshot taken under it holds exactly the output up to the bus's head.
             let mut state = pty.state();
-            let replies = state.terminal.feed(chunk);
+            if state.error.is_some() {
+                // The screen failed and the PTY is ending: the rest is drained, unread.
+                continue;
+            }
+            let Some(replies) =
+                state.on_screen(&pty.id, "on the program's output", |t| t.feed(chunk))
+            else {
+                drop(state);
+                ending(pty);
+                continue;
+            };
             let data = PtyOutput::new(&pty.id, base64(chunk)).and_then(|o| o.to_data());
             let published = match data {
                 Ok(data) => bus
@@ -586,7 +695,10 @@ fn wait_for_end(pty: &Pty, child: Box<dyn portable_pty::Child + Send + Sync>, bu
     state.exit = Some(exit);
     // Published under the lock, as output is: a snapshot either shows the end, or comes
     // before its event.
-    let data = PtyExited::new(&pty.id, exit.status, exit.signal).and_then(|e| e.to_data());
+    let data = PtyExited::new(&pty.id, exit.status, exit.signal)
+        .and_then(|e| e.with_error(state.error.map(str::to_owned)))
+        .and_then(|e| e.to_data());
+    let error = state.error;
     let published = match data {
         Ok(data) => bus
             .publish(topics::PTY, event_types::PTY_EXITED, data)
@@ -597,12 +709,15 @@ fn wait_for_end(pty: &Pty, child: Box<dyn portable_pty::Child + Send + Sync>, bu
     drop(state);
     pty.changed.notify_all();
     info!(
-        "pty {}: pid {} ended, status {}{}",
+        "pty {}: pid {} ended, status {}{}{}",
         pty.id,
         pty.pid,
         exit.status,
         exit.signal
             .map(|s| format!(" (signal {s})"))
+            .unwrap_or_default(),
+        error
+            .map(|e| format!(", ended by rlxd: {e}"))
             .unwrap_or_default()
     );
     if let Err(why) = published {
