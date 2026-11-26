@@ -62,8 +62,9 @@ it was started at login, where a refusal (one runs already) is no crash to resta
 (``cli.service``)."""
 RESTART_SECONDS = 5
 """systemd's RestartSec: the wait before a failed service is started again."""
-STDERR_NAME = "launchd.log"
-"""``<home>/service/launchd.log``: what the service says before its own log opens."""
+STDERR_FOLDER = ("Library", "Logs", "rlx")
+"""``~/Library/Logs/rlx/<label>.log``: what the service says before its own log opens. Not in
+the home, which the home's move to ``~/.rlx`` (H2, #31) takes from under a loaded agent."""
 OS_SECONDS = 15.0
 """How long one call of the OS's tools may take."""
 
@@ -335,7 +336,7 @@ def unit_text(argv: Sequence[str], env: Mapping[str, str]) -> str:
 
 
 def _stderr_path() -> Path:
-    return paths.aisquare_home() / "service" / STDERR_NAME
+    return launch_agents_dir().parent.parent.joinpath(*STDERR_FOLDER) / f"{label()}.log"
 
 
 def item_body(how: How) -> bytes:
@@ -495,7 +496,7 @@ def _add_launch_agent(body: bytes) -> list[str]:
     domain, target, item = _domain(), _target(), item_path("launchd")
     loaded = _service_manager(["launchctl", "print", target]).ok
     _write_item(item, body)
-    _stderr_path().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _stderr_path().parent.mkdir(parents=True, exist_ok=True)
     notes: list[str] = []
     enabled = _service_manager(["launchctl", "enable", target])
     if not enabled.ok:

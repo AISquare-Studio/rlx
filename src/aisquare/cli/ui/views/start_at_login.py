@@ -24,7 +24,11 @@ from aisquare.services import service_login
 SWITCH = "start-at-login"
 ABOUT = "start-at-login-about"
 WORKER = "settings-start-at-login"
-"""The group of its workers, and their names' stem: reads, and the writes the switch asks for."""
+"""The group of its workers: reads, and the writes the switch asks for."""
+READ_WORKER = "settings-start-at-login-read"
+WRITE_WORKER = "settings-start-at-login-write"
+"""Their names: a read Update and Uninstall wait out, and a write they refuse under
+(``ui.app._waited_reads``, ``_writing_workers``)."""
 
 TITLE = ("Login", f"whether {PRODUCT_NAME} starts when you log in")
 LABEL = f"Start {PRODUCT_NAME} at login"
@@ -71,7 +75,7 @@ class StartAtLogin(Vertical):
         """How it stands, read off the UI thread; painted when it answers."""
         self.run_worker(
             service_login.at_login_state,
-            name="settings-start-at-login-read",
+            name=READ_WORKER,
             group=WORKER,
             thread=True,
             exit_on_error=False,
@@ -92,10 +96,10 @@ class StartAtLogin(Vertical):
     def _switch_moved(self, event: Switch.Changed) -> None:
         # Its own: the page keeps config.toml's switches, and this is none of them.
         event.stop()
-        self._put(event.value, undo=False)
+        self._start_at_login_set(event.value, undo=False)
 
-    def _put(self, on: bool, *, undo: bool) -> None:
-        def put() -> tuple[bool, bool, service_login.AtLogin | str]:
+    def _start_at_login_set(self, on: bool, *, undo: bool) -> None:
+        def start_at_login_written() -> tuple[bool, bool, service_login.AtLogin | str]:
             try:
                 if on:
                     return on, undo, service_login.register_at_login().state
@@ -106,20 +110,20 @@ class StartAtLogin(Vertical):
                 return on, undo, f"could not save the choice: {exc.strerror or exc}"
 
         self.run_worker(
-            put,
-            name="settings-start-at-login-write",
+            start_at_login_written,
+            name=WRITE_WORKER,
             group=WORKER,
             thread=True,
             exit_on_error=False,
         )
 
-    def _take_back(self, on: bool) -> bool:
+    def _start_at_login_take_back(self, on: bool) -> bool:
         """ctrl+z: the switch back where it was, on screen now and in the OS as the worker
         answers."""
         switch = self.query_one(f"#{SWITCH}", Switch)
         with switch.prevent(Switch.Changed):
             switch.value = on
-        self._put(on, undo=True)
+        self._start_at_login_set(on, undo=True)
         return True
 
     @on(Worker.StateChanged)
@@ -152,7 +156,7 @@ class StartAtLogin(Vertical):
             return
         page.kept(
             LABEL,
-            lambda: self._take_back(not on),
+            lambda: self._start_at_login_take_back(not on),
             said=TURNED_ON if on else TURNED_OFF,
         )
 

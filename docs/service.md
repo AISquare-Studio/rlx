@@ -90,7 +90,7 @@ Claude Code logins answers only inside your login session, and the usage reads n
   It is not a LaunchDaemon, which would start at boot, outside any login session, where the
   Keychain does not answer. Its end never takes the fleet's tmux server with it
   (`AbandonProcessGroup`), and what it says before its own log opens goes to
-  `~/.aisquare/service/launchd.log`.
+  `~/Library/Logs/rlx/studio.aisquare.rlx.service.log`.
 - **Linux:** a systemd user unit, `~/.config/systemd/user/rlx.service`, enabled for your user's
   `default.target`, and started again 5 seconds after a failure. A stop ends the service alone,
   never the fleet's tmux server and its agents (`KillMode=process`). It runs while you are logged

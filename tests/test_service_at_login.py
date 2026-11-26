@@ -94,7 +94,7 @@ def _choice() -> bool | None:
 def test_the_launch_agent_loads_at_an_aqua_login_and_is_kept_alive_only_on_a_crash() -> None:
     argv = ["/Users/u/.local/bin/rlx", "service", "run", "--at-login"]
     env = {"PATH": "/opt/homebrew/bin:/usr/bin:/bin"}
-    stderr = Path("/Users/u/.rlx/service/launchd.log")
+    stderr = Path("/Users/u/Library/Logs/rlx/studio.aisquare.rlx.service.log")
 
     body = service_login.plist_bytes(argv, env, stderr=stderr)
 
