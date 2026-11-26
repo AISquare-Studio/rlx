@@ -1431,7 +1431,10 @@ def test_choose_uses_headroom_only_when_configured_and_falls_back_to_rank_1(
     spread = service.choose(role="coder", project=work, fetch=fetch)
     assert spread.source == "headroom" and spread.account is not None
     assert spread.account.slot == 3
-    assert spread.describe() == "account 3 · headroom"
+    # The balanced pick (#35) says why: the launch line names the account and its reason.
+    assert spread.describe() == f"account 3 ({spread.why})"
+    assert spread.why.startswith("fair share 1/1 · resets in ")
+    assert spread.why.endswith(" · normal tier")
 
     # A binding still outranks headroom: explicit beats automatic.
     from aisquare.services import settings as settings_service
@@ -2062,6 +2065,41 @@ def test_a_board_on_one_account_reads_no_labels(
         "sess-work", work.root, "startup", transcript_path=transcript(two.config_dir, "w")
     )
     assert reads == [1] and "[plain claude]" in both and "[account 2]" in both
+
+
+def test_the_board_injected_into_agents_names_accounts_as_before_never_by_email(
+    fake_home: Path, work: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.10.2's Q1 names accounts by their email where a person reads them (the Accounts page,
+    and the agent header after it): ``display_name``. The board the SessionStart hook injects
+    into every agent is not one of those: its account tags stay ``slot_labels``' built-in
+    names and aliases, which an agent names an account by in its commands (``--to "account
+    3"``), and no person's address goes into an agent's prompt. Driven through the hook, as
+    an agent on each slot starts."""
+    two = _slot("work@example.com", "tok-work")
+    three = _slot("personal@example.com", "tok-personal")
+    service.set_alias("3", "personal")
+
+    def transcript(config_dir: Path, session_id: str) -> str:
+        return str(config_dir / "projects" / "-repo" / f"{session_id}.jsonl")
+
+    monkeypatch.setenv("AISQUARE_ROLE", "coder")
+    monkeypatch.setenv(core.CONFIG_DIR_VAR, str(two.config_dir))
+    team_service.hook_session_start(
+        "sess-two", work.root, "startup", transcript_path=transcript(two.config_dir, "two")
+    )
+    monkeypatch.setenv(core.CONFIG_DIR_VAR, str(three.config_dir))
+    board = team_service.hook_session_start(
+        "sess-three", work.root, "startup", transcript_path=transcript(three.config_dir, "three")
+    )
+
+    assert "[account 2]" in board and "[personal]" in board
+    assert "@example.com" not in board  # no email reaches an agent's prompt
+    assert service.slot_labels() == {1: "plain claude", 2: "account 2", 3: "personal"}
+    # What a person reads instead: the email, the alias where one was given.
+    assert service.display_labels() == {1: "plain claude", 2: "work@example.com", 3: "personal"}
+    statuses = service.describe_all(service.list_accounts())  # the page's frame holds these
+    assert service.display_labels(statuses) == service.display_labels()
 
 
 def test_a_removed_slots_readings_do_not_rate_the_next_occupant(fake_home: Path) -> None:

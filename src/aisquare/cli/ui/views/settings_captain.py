@@ -12,10 +12,10 @@ could not find.
 set, the box shows the state it forces, greyed, and one line says why: a tick would save
 a setting the variable overrides.
 
-It tops App settings' *Agent settings* tab (the owner's placement, #41), in that form's
-format: a section heading, the box as a row, a dim help line, styled by the form's own
-``.section``/``.row``/``.about`` rules. It saves at once, as it did, not with the form's
-*Save*; the form's Reload and Reset all re-read the file under it
+It ends App settings' *Agent settings* tab, under its *Advanced* (Q18: it topped the tab,
+#41), in that form's format: a section heading, the box as a row, a dim help line, styled by
+the form's own ``.section``/``.row``/``.about`` rules. It saves at once, as it did, not with
+the form's *Save*; the form's Reload and Reset all re-read the file under it
 (:meth:`CaptainToggle.reread`), so the box and the shell follow what the file holds.
 
 Under the box, *captain's agent*: the coding agent the captain runs on, ``[team.profiles.

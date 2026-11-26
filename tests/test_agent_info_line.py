@@ -142,7 +142,7 @@ def test_the_info_line_reads_in_the_owners_order_with_effort_and_account() -> No
     manager = _status(label="manager", role="manager", state="waiting", effort="xhigh", slot=2)
     coder = _status()
     assert info_line(manager, LABELS, {2: 42.0}).plain == (
-        "🧭 manager  ⏸ waiting  work · 42%  claude-opus-5-5 xhigh  %4"
+        "🧭 manager  ◦ waiting  work · 42%  claude-opus-5-5 xhigh  %4"
     )
     assert info_line(coder, LABELS, {3: 87.0}).plain == (
         "🔨 coder-auth  ▶ working  dev · 87%  claude-opus-5-5 high  %4"
@@ -196,14 +196,14 @@ def test_the_label_keeps_six_characters_and_a_narrower_row_is_cut_at_its_end() -
 
     assert at_37(label="coder-01m5d34v", slot=1) == "🔨 coder-…  ▶ working  plain claude …"
     assert at_37(label="tester-01m5d34v", role="tester", state="waiting", slot=4) == (
-        "🧪 tester…  ⏸ waiting  account 4 · 4…"
+        "🧪 tester…  ◦ waiting  account 4 · 4…"
     )
     assert at_37(label="coder-01m5d34v", state="attention", slot=2) == (
         "🔨 coder-…  🔔 attention  work · 42%…"
     )
     # The manager's label is shorter than the floor: never cut.
     manager = _status(label="manager", role="manager", state="waiting", slot=1)
-    assert info_line(manager, labels, usage, width=37).plain.startswith("🧭 manager  ⏸")
+    assert info_line(manager, labels, usage, width=37).plain.startswith("🧭 manager  ◦")
 
 
 def test_the_effort_follows_the_model_and_is_left_out_while_unknown() -> None:
@@ -289,7 +289,7 @@ def test_a_persona_badge_gives_way_before_the_session_figure_never_after() -> No
             assert row.cell_len <= width, (width, plain)
             # Every width here has room for a badge of BADGE_KEEP cells (review of #267's
             # delta, n1: a branch for a row without one could never be taken).
-            assert "⏸ #1·42% · " in plain, (width, plain)
+            assert "◦ #1·42% · " in plain, (width, plain)
             badge = plain.partition("#1·42%")[2]
             assert badge.startswith(" · ") and len(badge) >= BADGE_KEEP, (width, plain)
             if persona in badge:
@@ -654,11 +654,11 @@ def test_a_codex_account_with_a_week_alone_counts_by_it_and_reads_limited_when_s
     tmp_path: Path,
 ) -> None:
     """A Codex plan with one weekly window and no five-hour one (measured on a business plan)
-    is usable in the sidebar's Codex headroom by its week: counted in ``● Nx codex``, in the
-    dot's colour and as ``#slot·NN%`` (skipped before S6, as the CHANGELOG now says: review
+    is usable in the sidebar's Codex headroom by its week: counted in ``● Codex: N accounts``,
+    in the dot's colour and as ``#slot·NN%`` (skipped before S6, as the CHANGELOG now says: review
     r18 of #113, finding 8). A week it has spent is no room: the dot is the empty one and
     its figure is 100 %, red."""
-    from aisquare.cli.ui.sidebar import TIMES, AgentHeadroom, headroom_dot, status_line_text
+    from aisquare.cli.ui.sidebar import AgentHeadroom, headroom_dot, status_line_text
     from aisquare.models import WEEK_WINDOW
 
     week = 7 * 24 * 60
@@ -671,7 +671,7 @@ def test_a_codex_account_with_a_week_alone_counts_by_it_and_reads_limited_when_s
     assert (both.usable, both.limit_by_slot) == (2, {room.slot: 30.0, spent.slot: 100.0})
     assert both.percent_left == 35.0 and both.level == "fair"
     line = status_line_text(None, more=[AgentHeadroom("codex", both)]).plain
-    assert f"● 2{TIMES} codex" in line, line
+    assert "● Codex: 2 accounts" in line, line
     assert agent_row_text(_codex_status(_codex_turn(tmp_path)), 30.0).plain.endswith("#5·30%")
 
     limited = accounts_service.fleet_headroom([spent], {spent.slot: readings[spent.slot]})
@@ -732,7 +732,7 @@ def test_the_sidebar_and_the_info_line_show_a_codex_rows_figure_beside_claudes(
             )
 
     manager, coder, header = asyncio.run(run())
-    assert manager.rstrip().endswith("⏸ #2·87%"), manager
+    assert manager.rstrip().endswith("◦ #2·87%"), manager
     # The highlighted row ends in its ⋯ (R17's agent menu), after the figure it shows.
     assert coder.rstrip().removesuffix(MENU_GLYPH.strip()).rstrip().endswith("▶ #5·42%"), coder
     assert coder.rstrip().endswith(MENU_GLYPH), coder

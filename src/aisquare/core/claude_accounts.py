@@ -84,6 +84,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -1378,6 +1379,11 @@ def _claude_signed_in(account: ClaudeAccount, *, fresh: bool = False) -> bool:
     return login.credentials is not None or login.unreadable is not None
 
 
+PLAN_UNITS: Mapping[str, float] = MappingProxyType({"max 20x": 4.0, "max 5x": 1.0, "pro": 0.2})
+"""Capacity units per Claude Code plan, as :func:`subscription_label` names it: a Max 5x is one
+unit, a Max 20x four, a Pro about a fifth (``AgentAccounts.plan_units``)."""
+
+
 def subscription_label(creds: ClaudeCredentials | None) -> str | None:
     """``max 5x`` from ``default_claude_max_5x``; the plain subscription type otherwise."""
     if creds is None:
@@ -2105,6 +2111,8 @@ class ClaudeCodeAccounts:
     sign_out = "inside Claude Code (/logout)"
     shares_settings = True
     keychain_login = True  # on macOS: the login Keychain's item (`stored_login`)
+    plan_units: Mapping[str, float] = PLAN_UNITS
+    reserves_for_person = True  # its sessions report to the status line (`asq-statusline`)
 
     def __init__(
         self, share_parts: tuple[SharePart, ...] = (), memory: SharedMemory | None = None

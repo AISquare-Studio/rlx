@@ -3,7 +3,7 @@ question, and the dialog that shows exactly what would be sent.
 
 **The switch** (:class:`SharingBox`) fills the slot at the top of the Usage & stats page. It is
 one button, *Turn sharing on* / *Turn sharing off*, under a line saying what is and is never
-shared, and the state beneath: off ("Nothing leaves this machine"), on (when it was last sent,
+shared, and the state beneath: off ("No usage leaves this machine"), on (when it was last sent,
 and whether the server linked it to the signed-in AISquare account), or forced off by the
 environment (``DO_NOT_TRACK``, ``AISQUARE_NO_TELEMETRY``, ``CI``) with the button greyed and the
 reason named. A :class:`~aisquare.cli.ui.click_guard.GuardedButton`, not a ``Switch``: a click
@@ -11,9 +11,15 @@ that reaches it before the page is painted must not be how someone agrees to sha
 is. Turning it on sends the first shipment at once; turning it off purges what was kept and
 sends the one opt-out notice. Both run off the UI thread (:data:`SHARE_WORKER`).
 
+**The daily active ping** has its own switch in the same box, below sharing's, under a title
+that says it is separate (``services.active_ping``): *Turn the daily ping off* / *on*, what it
+sends, and its state. It is read and flipped off the UI thread (:data:`PING_WORKER`).
+
 **The question** (:class:`ConsentDialog`) is asked once, by the shell, after onboarding and only
 where nothing forces sharing off: *Share anonymous usage* / *No thanks* / *See what would be
-sent*. *No thanks* has the focus; Escape is *No thanks*. Either answer is recorded, and it is not
+sent*. Above the question it shows the person's own usage of the last 30 days, read off the UI
+thread (:data:`USAGE_WORKER`), and the question names the daily ping and that it is separate.
+*No thanks* has the focus; Escape is *No thanks*. Either answer is recorded, and it is not
 asked again; so is an explicit *Turn sharing off* elsewhere.
 
 **What is sent** (:class:`PreviewDialog`) is the body the next shipment would post, built by the
@@ -40,7 +46,8 @@ from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.click_guard import GuardedButton
 from aisquare.models import SharingStatus, ShipReport
-from aisquare.services import usage_share
+from aisquare.services import active_ping, usage_share
+from aisquare.services.active_ping import PingStatus
 
 SHARE_WORKER = "usage-share"
 """The worker that reads the sharing's state and turns it on or off: it writes the config and
@@ -50,6 +57,27 @@ SHIP_WORKER = "usage-share-ship"
 a day not acknowledged being sent again."""
 PREVIEW_WORKER = "usage-share-preview"
 """The worker that builds the preview: it reads, and nothing is lost by cutting it off."""
+PING_WORKER = "active-ping"
+"""The worker that reads the daily ping's switch and flips it (a config write)."""
+USAGE_WORKER = "consent-usage"
+"""The worker that reads the person's own usage for the question: it reads, nothing else."""
+CONSENT_CHROME = 10
+"""The question's rows that are not its text: border 2, padding 2, title and its margin 2,
+the buttons' margin and the buttons 4."""
+
+CONSENT_ROW_COLUMNS = 80
+"""The columns the three answers need on one row, the box's own width: under it they stack
+(``ConsentDialog.-narrow``), and the box is the screen's width (a 60-column phone or SSH, L2)."""
+
+STACKED_BUTTON_ROWS = 6
+"""What stacking adds to :data:`CONSENT_CHROME`: two more buttons of three rows each."""
+
+PING_TITLE = "Daily active ping (separate from usage sharing)"
+PING_ABOUT = (
+    "Sent whether usage sharing is on or off: on each day you use rlx, one anonymous ping with "
+    "the date, rlx's version, your OS, CPU type and how rlx was installed, so we can count "
+    "active installs. No id, no account, nothing about your work."
+)
 
 ABOUT = (
     "Counts only: tokens, sessions, which commands and pages you use, and a salted hash per "
@@ -62,7 +90,7 @@ ABOUT_PREVIEW = (
 )
 ABOUT_SAMPLE = (
     "This is a SAMPLE, not a shipment: your last 31 days, with placeholder ids, to show what "
-    "would be sent. Nothing is sent while sharing is off, and once it is on only days from then "
+    "would be sent. No usage is sent while sharing is off, and once it is on only days from then "
     "on are sent. Repositories are salted hashes."
 )
 
@@ -78,7 +106,31 @@ def consent_text() -> str:
         "We never collect repository names, paths or remotes, prompts, file names, emails, account "
         "aliases or command arguments. If you are signed in to AISquare, it is linked to your "
         "account; if not, it is anonymous. Only days from the moment you say yes are sent, nothing "
-        "from before. Turn it off at any time: Settings ▸ Usage & stats."
+        "from before. Turn it off at any time: Settings ▸ Usage & stats.\n\n"
+        "Separate from this, whatever you answer: a daily active ping, one anonymous ping on each "
+        "day you use rlx (the date, rlx's version, OS, CPU type and install method; no id) to "
+        "count active installs. It has its own switch there."
+    )
+
+
+def your_usage() -> str:
+    """The person's own usage of the last 30 days on this machine, in one line: what the question
+    shows before it asks (Q14). Read from what is recorded here; nothing is sent by reading."""
+    from aisquare.cli import usage_format
+    from aisquare.services import usage_stats
+
+    stats = usage_stats.stats("30d")
+    if not stats.turns:
+        return "Your usage here, the last 30 days: nothing recorded yet."
+
+    def count(number: int, one: str, many: str) -> str:
+        return f"{number} {one if number == 1 else many}"
+
+    return (
+        f"Your usage here, the last 30 days: {usage_format.tokens(stats.tokens.total)} tokens in "
+        f"{count(stats.sessions, 'session', 'sessions')} across "
+        f"{count(stats.repos.active, 'repository', 'repositories')}, on "
+        f"{count(stats.active_days, 'day', 'days')}. It stays on this machine unless you share it."
     )
 
 
@@ -107,6 +159,11 @@ class Sharing:
     """Whether the preview is a SAMPLE (sharing never on) and not the next POST."""
     consent_due: Callable[[], bool] = usage_share.consent_due
     answer: Callable[[bool], ShipReport | None] = _answer_the_sharing_question
+    ping_status: Callable[[], PingStatus] = active_ping.status
+    """Where the daily active ping stands (its own switch, separate from sharing)."""
+    set_ping: Callable[[bool], PingStatus] = active_ping.set_enabled
+    usage: Callable[[], str] = your_usage
+    """The person's own usage, which the question shows before it asks."""
 
 
 def status_text(status: SharingStatus) -> str:
@@ -114,7 +171,7 @@ def status_text(status: SharingStatus) -> str:
     if status.forced_off:
         return f"Off — forced: {status.forced_off}. Nothing leaves this machine."
     if not status.enabled:
-        return "Off — nothing leaves this machine."
+        return "Off — no usage leaves this machine."
     head = "On"
     if status.last_sent_at is None:
         head += " — nothing sent yet"
@@ -132,6 +189,17 @@ def status_text(status: SharingStatus) -> str:
     return f"{head} · {link}"
 
 
+def ping_status_text(status: PingStatus) -> str:
+    """The line under the daily ping's switch."""
+    if status.forced_off:
+        return f"Off — forced: {status.forced_off}. No ping is sent."
+    if not status.switch:
+        return "Off — no ping is sent."
+    if status.last_sent:
+        return f"On — last sent for {status.last_sent}."
+    return "On — sent once on each day you use rlx."
+
+
 class SharingBox(Vertical):
     """The switch, its line of explanation, its state, and *What's shared*."""
 
@@ -142,6 +210,10 @@ class SharingBox(Vertical):
     SharingBox #usage-share-row { height: auto; margin-top: 1; }
     SharingBox #usage-share-row Button { margin-right: 2; }
     SharingBox #usage-share-status { height: auto; margin-top: 1; }
+    SharingBox #active-ping-title { height: auto; text-style: bold; margin-top: 1; }
+    SharingBox #active-ping-about { height: auto; color: $text-muted; }
+    SharingBox #active-ping-row { height: auto; margin-top: 1; }
+    SharingBox #active-ping-status { height: auto; }
     """
 
     def __init__(self, *, sharing: Sharing | None = None, id: str | None = None) -> None:
@@ -149,6 +221,8 @@ class SharingBox(Vertical):
         self._sharing = sharing or Sharing()
         self.status: SharingStatus | None = None
         """The state last read: what the button and the line show."""
+        self.ping: PingStatus | None = None
+        """The daily ping's state last read: what its button and line show."""
 
     def compose(self) -> ComposeResult:
         yield Static(Text("Share anonymous usage"), id="usage-share-title")
@@ -159,6 +233,13 @@ class SharingBox(Vertical):
             )
             yield Button("What's shared", id="usage-share-preview", compact=True)
         yield Static(Text("reading…", style="dim"), id="usage-share-status")
+        yield Static(Text(PING_TITLE), id="active-ping-title")
+        yield Static(Text(PING_ABOUT), id="active-ping-about")
+        with Horizontal(id="active-ping-row"):
+            yield GuardedButton(
+                "Turn the daily ping off", id="active-ping-toggle", compact=True, disabled=True
+            )
+        yield Static(Text("reading…", style="dim"), id="active-ping-status")
 
     def on_mount(self) -> None:
         self.refresh_status()
@@ -169,10 +250,33 @@ class SharingBox(Vertical):
     def busy(self) -> bool:
         return any(w.name == SHARE_WORKER and not w.is_finished for w in self.workers)
 
+    @property
+    def ping_busy(self) -> bool:
+        return any(w.name == PING_WORKER and not w.is_finished for w in self.workers)
+
     def refresh_status(self) -> None:
-        """Read where sharing stands, off the UI thread (a no-op while a switch is flipping)."""
+        """Read where sharing and the daily ping stand, off the UI thread (each a no-op while its
+        switch is flipping)."""
         if not self.busy:
             self._flip_sharing("status")
+        if not self.ping_busy:
+            self._flip_ping(None)
+
+    def _flip_ping(self, on: bool | None) -> None:
+        """Read the daily ping's state (``None``), or turn it on or off, off the UI thread."""
+        sharing = self._sharing
+
+        def flip_ping_job() -> PingStatus:
+            return sharing.ping_status() if on is None else sharing.set_ping(on)
+
+        self.query_one("#active-ping-toggle", Button).disabled = True
+        self.run_worker(
+            flip_ping_job,
+            name=PING_WORKER,
+            group=PING_WORKER,
+            thread=True,
+            exit_on_error=False,
+        )
 
     def _flip_sharing(self, action: str) -> None:
         sharing = self._sharing
@@ -198,6 +302,9 @@ class SharingBox(Vertical):
 
     @on(Worker.StateChanged)
     def _share_worker_done(self, event: Worker.StateChanged) -> None:
+        if event.worker.name == PING_WORKER:
+            self._ping_worker_done(event)
+            return
         if event.worker.name != SHARE_WORKER:
             return
         status_line = self.query_one("#usage-share-status", Static)
@@ -222,6 +329,34 @@ class SharingBox(Vertical):
         toggle.disabled = status.forced_off is not None
         toggle.refresh(layout=True)
         self.query_one("#usage-share-status", Static).update(Text(status_text(status)))
+
+    def _ping_worker_done(self, event: Worker.StateChanged) -> None:
+        line = self.query_one("#active-ping-status", Static)
+        if event.state is WorkerState.ERROR:
+            line.update(Text(f"Could not change the ping: {event.worker.error}", style="red"))
+            self.query_one("#active-ping-toggle", Button).disabled = (
+                self.ping is None or self.ping.forced_off is not None
+            )
+            return
+        if event.state is WorkerState.SUCCESS and isinstance(event.worker.result, PingStatus):
+            self.show_ping(event.worker.result)
+
+    def show_ping(self, status: PingStatus) -> None:
+        """Draw the daily ping's ``status``: its button's label, whether it can be pressed, and
+        its line."""
+        self.ping = status
+        toggle = self.query_one("#active-ping-toggle", Button)
+        toggle.label = "Turn the daily ping off" if status.switch else "Turn the daily ping on"
+        toggle.disabled = status.forced_off is not None
+        toggle.refresh(layout=True)
+        self.query_one("#active-ping-status", Static).update(Text(ping_status_text(status)))
+
+    @on(Button.Pressed, "#active-ping-toggle")
+    def _toggle_ping(self, event: Button.Pressed) -> None:
+        event.stop()
+        if self.ping is None or self.ping_busy:
+            return
+        self._flip_ping(not self.ping.switch)
 
     @on(Button.Pressed, "#usage-share-toggle")
     def _toggle(self, event: Button.Pressed) -> None:
@@ -315,13 +450,19 @@ class ConsentDialog(ModalScreen[str]):
     CSS = """
     ConsentDialog { align: center middle; }
     ConsentDialog #consent-box {
-        width: 80; height: auto; max-height: 90%; border: heavy $primary; background: $surface;
-        padding: 1 2;
+        width: 80; max-width: 100%; height: auto; max-height: 90%; border: heavy $primary;
+        background: $surface; padding: 1 2;
     }
     ConsentDialog #consent-title { height: 1; text-style: bold; margin-bottom: 1; }
+    ConsentDialog #consent-scroll { height: auto; }
+    ConsentDialog #consent-usage { height: auto; margin-bottom: 1; }
     ConsentDialog #consent-text { height: auto; }
     ConsentDialog #consent-buttons { height: auto; margin-top: 1; align: right middle; }
     ConsentDialog #consent-buttons Button { margin-left: 2; }
+    /* Under CONSENT_ROW_COLUMNS (a phone, SSH: L2) the three answers do not fit one row: one
+       per row, the whole box's width, so No thanks is never off the screen. */
+    ConsentDialog.-narrow #consent-buttons { layout: vertical; align: left top; }
+    ConsentDialog.-narrow #consent-buttons Button { margin-left: 0; width: 100%; }
     """
     BINDINGS: ClassVar = [("escape", "decline", "no thanks")]
 
@@ -332,14 +473,49 @@ class ConsentDialog(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="consent-box"):
             yield Static(Text("Help improve rlx?"), id="consent-title")
-            yield Static(Text(consent_text()), id="consent-text")
+            with VerticalScroll(id="consent-scroll"):
+                yield Static(Text("Reading your usage…", style="dim"), id="consent-usage")
+                yield Static(Text(consent_text()), id="consent-text")
             with Horizontal(id="consent-buttons"):
                 yield Button("See what would be sent", id="consent-see")
                 yield GuardedButton("Share anonymous usage", id="consent-share", variant="primary")
                 yield Button("No thanks", id="consent-no")
 
+    def on_resize(self) -> None:
+        self._fit()
+
+    def _fit(self) -> None:
+        """The text scrolls in whatever room the box leaves it, so the answers always show: at
+        80x24 the question is taller than the screen (border, padding, title and buttons take
+        :data:`CONSENT_CHROME` rows of the box's 90%)."""
+        narrow = self.size.width < CONSENT_ROW_COLUMNS
+        self.set_class(narrow, "-narrow")
+        chrome = CONSENT_CHROME + (STACKED_BUTTON_ROWS if narrow else 0)
+        room = int(self.size.height * 0.9) - chrome
+        self.query_one("#consent-scroll", VerticalScroll).styles.max_height = max(3, room)
+
     def on_mount(self) -> None:
+        self._fit()
         self.query_one("#consent-no", Button).focus()
+        self.run_worker(
+            self._sharing.usage,
+            name=USAGE_WORKER,
+            group=USAGE_WORKER,
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    @on(Worker.StateChanged)
+    def _usage_read(self, event: Worker.StateChanged) -> None:
+        """The person's own usage came back: shown above the question, before it asks."""
+        if event.worker.name != USAGE_WORKER:
+            return
+        usage = self.query_one("#consent-usage", Static)
+        if event.state is WorkerState.SUCCESS and isinstance(event.worker.result, str):
+            usage.update(Text(event.worker.result))
+        elif event.state is WorkerState.ERROR:
+            usage.update(Text("Your usage here could not be read just now.", style="dim"))
 
     @on(Button.Pressed, "#consent-share")
     def _share(self, event: Button.Pressed) -> None:
@@ -361,13 +537,17 @@ class ConsentDialog(ModalScreen[str]):
 
 
 __all__ = [
+    "PING_WORKER",
     "PREVIEW_WORKER",
     "SHARE_WORKER",
     "SHIP_WORKER",
+    "USAGE_WORKER",
     "ConsentDialog",
     "PreviewDialog",
     "Sharing",
     "SharingBox",
     "consent_text",
+    "ping_status_text",
     "status_text",
+    "your_usage",
 ]

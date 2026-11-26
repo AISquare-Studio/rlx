@@ -2440,6 +2440,16 @@ class AgentAccounts(Protocol):
     :meth:`keychain_item`'s, asked only when this is ``True``. ``False`` for an agent whose
     login is a file in its home (Codex's ``auth.json``): it starts the server from SSH, and
     that server is marked as one an SSH login started."""
+    plan_units: Mapping[str, float]
+    """Capacity units per plan, as :meth:`subscription` names it (lower case), which the
+    balanced account pick weighs (``services.claude_accounts.balanced_pick``): Claude Code's
+    ``max 20x`` four, ``max 5x`` one, ``pro`` a fifth. A plan it does not name counts one
+    unit; empty for an agent whose plans are not weighed, every account of it one unit."""
+    reserves_for_person: bool
+    """The balanced pick keeps part of the week of the account the person uses for their own
+    sessions (the status line's, else the agent's first account): Claude Code's, whose
+    sessions ``asq-statusline`` reports. ``False`` for an agent whose accounts are all the
+    fleet's to spend."""
 
     def keychain_item(self, account: ClaudeAccount) -> str | None:
         """The service name of the login Keychain item ``account``'s login is kept in on macOS,

@@ -261,7 +261,7 @@ def test_a_pause_of_the_agents_picked_fleet_pauses_only_a_project_picked_whole(
     """R17, Q-E1: alpha's manager unticked, the pause exits alpha's coder alone, its claim
     kept, and leaves alpha's ``fleet-paused`` signal off, so the manager still running can
     spawn; beta, picked whole, is fleet-paused as a pause of all sets it. The unticked manager
-    is reported skipped, ``not chosen``, and is never touched."""
+    is skipped as unticked (never reported in the toast), and is never touched."""
     shown = _picked(fleet_service.bulk_plan("pause"), "alpha/manager")
 
     report = fleet_service.bulk("pause", shown=shown)
@@ -293,7 +293,7 @@ def test_a_pause_with_every_agent_picked_fleet_pauses_as_a_pause_of_all_does(
 def test_a_resume_of_the_agents_picked_keeps_the_project_fleet_paused(fleet: Fleet) -> None:
     """A resume that leaves alpha's manager paused brings back its coder alone, and alpha
     stays fleet-paused beside the agent still paused (``_resumes_clear``), on the report's
-    ``kept``; the manager is reported ``not chosen``."""
+    ``kept``; the manager is skipped as unticked."""
     fleet_service.bulk("pause", projects=[fleet.alpha])
     plan = fleet_service.bulk_plan("resume", projects=[fleet.alpha])
 
@@ -618,7 +618,7 @@ def test_fleet_ls_and_the_sidebar_show_a_paused_agent_as_paused(fleet: Fleet) ->
 
     listed = CliRunner().invoke(app, ["fleet", "ls", "--project", fleet.alpha.id])
     assert listed.exit_code == 0, listed.output
-    assert "⏯ paused" in listed.output and "exited" not in listed.output
+    assert "⏸ paused" in listed.output and "exited" not in listed.output
     [manager] = [s for s in fleet_service.list_agents(fleet.alpha) if s.agent.label == "manager"]
     row = agent_row_text(manager).plain
     assert STATE_CHIP["paused"][0] in row and "paused" in row and "exited" not in row

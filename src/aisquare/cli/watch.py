@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from rich.text import Text
 
 from aisquare.cli import board_names
-from aisquare.cli.common import format_reset, local_time
-from aisquare.core import harness, paths
+from aisquare.cli.common import format_reset
+from aisquare.core import event_time, harness, paths
 from aisquare.core import program as prog
 from aisquare.core.console import stderr_console, stdout_console
 from aisquare.core.state_file import read_state
@@ -47,14 +47,16 @@ from aisquare.services import team as team_service
 if TYPE_CHECKING:
     from textual.app import App
 
-_ROLE_EMOJI = {
-    "planner": "🧭",
-    "coder": "🔨",
-    "runner": "🧪",
-    "tester": "🧪",
-    "debugger": "🐞",
-    "remote": "📡",
-}
+
+def role_icon(role: str) -> str:
+    """The role's icon as asq's left pane draws it (``cli.ui.sidebar.ROLE_ICON``), so a board
+    line and the agent's row in the sidebar show one icon for one role (B1 #13). Imported on
+    first use: the sidebar's module imports ``cli.ui.theme``, which imports this one."""
+    from aisquare.cli.ui.sidebar import CUSTOM_ROLE_ICON, ROLE_ICON
+
+    return ROLE_ICON.get(role, CUSTOM_ROLE_ICON)
+
+
 _ROLE_STYLE = {
     "planner": "cyan",
     "coder": "magenta",
@@ -80,7 +82,46 @@ _KIND_VERB = {
     "task_reopened": ("↩️", "bounced back"),
     "task_released": ("🔓", "released"),
     "task_dropped": ("🗑️", "dropped"),
+    # The eight a feed line named by their bare kind (the board audit, B1 #5).
+    "stale": ("🔕", "went quiet"),
+    "signal": ("🚦", "set a signal"),
+    "persona_attached": ("🎭", "attached a persona"),
+    "mcp_pull": ("📥", "pulled context"),
+    "captain_action": ("⚓", "had the captain act"),
+    "capacity_freed": ("🟢", "freed capacity"),
+    "brief_created": ("📝", "wrote a brief"),
+    "fleet": ("🚢", "acted on the fleet"),
+    # The fleet's own lines, which a Stream chip showed by their raw kind (B2's tester, #695).
+    "agent_exited": ("💤", "exited"),
+    "agent_paused": ("⏸", "paused"),  # Q4: ⏸ means paused everywhere
+    "agent_renamed": ("🏷", "was renamed"),
+    "restarted": ("🔁", "restarted"),
+    "switched": ("⇄", "switched accounts"),
+    "limited": ("⏳", "hit a usage limit"),
+    "limited_handing_over": ("⏳", "hit a usage limit, moving"),
+    "handover_failed": ("🚫", "could not be moved"),
+    "before_limit": ("⏳", "nears a usage limit"),
+    "attention": ("🔔", "needs you"),
+    "notice": ("📣", "said"),
+    "prompt_unsent": ("📭", "did not start its prompt"),
+    "linked": ("🔗", "linked"),
+    "linked_all_done": ("🔗", "finished its linked tasks"),
 }
+"""kind → (emoji, verb): how a feed line says what happened. A kind without one shows ``•``
+and the kind itself."""
+
+
+def clock(when: datetime, *, seconds: bool = False, now: datetime | None = None) -> str:
+    """``when`` as the board writes a time: ``14:05`` today, ``Nov 24 14:05`` another day,
+    ``2025-11-24 14:05`` another year (``core.event_time``, the text board's rule too): a bare
+    ``14:05`` from yesterday read as today's (B1 #6)."""
+    return event_time.stamp(when, seconds=seconds, now=now)
+
+
+def one_row(text: str) -> str:
+    """``text`` on one row: its lines joined by ``⏎`` (blank ones dropped), so a feed line is
+    never taller than one row (B1 #4). The detail pane shows it whole."""
+    return " ⏎ ".join(line.strip() for line in text.splitlines() if line.strip())
 
 
 def _who(
@@ -94,7 +135,7 @@ def _who(
         return "⌨️", team_service.PERSON, "dim"
     role = roles.get(event.session_id, "unassigned")
     name = (names or {}).get(event.session_id) or team_service.short_id(event.session_id)
-    return _ROLE_EMOJI.get(role, "🤖"), name, _ROLE_STYLE.get(role, "white")
+    return role_icon(role), name, _ROLE_STYLE.get(role, "white")
 
 
 def _named(session_id: str, names: Mapping[str, str] | None) -> str:
@@ -141,14 +182,15 @@ def shown_text(event: TeamEvent) -> str:
 def feed_line(
     event: TeamEvent, roles: dict[str, str], names: Mapping[str, str] | None = None
 ) -> Text:
-    """One bot-style feed line: ``🔨 coder-auth 🤝 claimed: wire auth``."""
+    """One bot-style feed line: ``🔨 coder-auth 🤝 claimed: wire auth``, on one row (its text's
+    lines joined, :func:`one_row`), its time dated when it is not today's (:func:`clock`)."""
     emoji, name, style = _who(event, roles, names)
     verb_emoji, verb = _KIND_VERB.get(event.kind, ("•", event.kind))
     line = Text(no_wrap=True, overflow="ellipsis")
-    line.append(f"{local_time(event.created_at):%H:%M} ", style="dim")
+    line.append(f"{clock(event.created_at)} ", style="dim")
     line.append(f"{emoji} {name} ", style=style)
     line.append(f"{verb_emoji} {verb}: ", style="bold")
-    line.append(shown_text(event))
+    line.append(one_row(shown_text(event)))
     if event.to_role:
         line.append(f" → {event.to_role}", style="italic yellow")
     return line
@@ -163,7 +205,7 @@ def _event_detail(
     text = Text()
     text.append(f"{event.kind}", style="bold")
     text.append(f" by {name}", style=style)
-    text.append(f" at {local_time(event.created_at):%H:%M:%S} (seq {event.seq})\n", style="dim")
+    text.append(f" at {clock(event.created_at, seconds=True)} (seq {event.seq})\n", style="dim")
     text.append(shown_text(event))
     if event.task_id:
         text.append(f"\ntask: {event.task_id}", style="dim")
@@ -172,11 +214,25 @@ def _event_detail(
     return text
 
 
+STOPPED_BECAUSE: dict[str, tuple[str, str]] = {
+    "blocked": ("blocked because", "red"),
+    "done": ("done", "green"),
+    "todo": ("reopened because", "yellow"),
+}
+"""status → (how the detail introduces the note that put the task there, its style): the reason
+``task block``, ``task done --note`` and ``task reopen`` left (``team.stopped_because``)."""
+
+
 def _task_detail(
-    task: TeamTask, statuses: dict[str, str], names: Mapping[str, str] | None = None
+    task: TeamTask,
+    statuses: dict[str, str],
+    names: Mapping[str, str] | None = None,
+    *,
+    why: str | None = None,
 ) -> Text:
     """A task in full: its title, then ``#12 · doing · tsk_… · claimed by …`` — what the
-    board's table leaves out (the number and an icon are all a row shows) — then the rest."""
+    board's table leaves out (the number and an icon are all a row shows) — then ``why``, the
+    note that put it in its status (B1 #3, :data:`STOPPED_BECAUSE`), then the rest."""
     text = Text()
     text.append(f"{task.title}\n", style="bold")
     if task.number is not None:
@@ -186,10 +242,15 @@ def _task_detail(
     if task.claimed_by:
         text.append(f" · claimed by {_named(task.claimed_by, names)}")
         if task.claim_expires_at:
-            text.append(f" (lease until {local_time(task.claim_expires_at):%H:%M})", style="dim")
+            text.append(f" (lease until {clock(task.claim_expires_at)})", style="dim")
     if task.role:
         text.append(f" · for {task.role}", style="dim")
     text.append(f" · key={task.key}", style="dim")
+    said = STOPPED_BECAUSE.get(task.status)
+    if why and said is not None:
+        lead, style = said
+        text.append(f"\n{lead}: ", style=f"bold {style}")
+        text.append(why)
     if task.needs:
         waiting = set(unmet_needs(task, statuses))
         text.append("\nneeds: ")
@@ -203,15 +264,22 @@ def _task_detail(
     return text
 
 
-_STATE_CHIP = {
-    "working": ("▶ working", "green"),
-    "waiting": ("⏸ waiting for input", "yellow"),
-    "attention": ("🔔 NEEDS YOU", "bold red"),
-    # The two #146 states, so the one surface an operator leaves running does
-    # not print a bare dim word for a parked agent (review of #205, second round).
-    "limited": ("⏳ limited", "magenta"),  # and the switch that moves it (`_session_lines`)
-    "switching": ("⇄ switching accounts", "magenta dim"),
-}
+_SWITCHING_CHIP = ("⇄", "magenta dim")
+"""``switching``'s mark: a session state the sidebar's fleet rows never take."""
+
+
+def state_chip(state: str) -> tuple[str, str]:
+    """(chip, style) for a session's state: the sidebar's mark and colour for it
+    (``cli.ui.sidebar.STATE_CHIP``) and the board's word (``team.STATE_WORDS``, the text
+    board's too), so one state reads one way everywhere (B1 #13). A state neither knows is its
+    bare word, dimmed."""
+    from aisquare.cli.ui.sidebar import STATE_CHIP
+
+    word = team_service.STATE_WORDS.get(state)
+    if word is None:
+        return state, "dim"
+    glyph, style = STATE_CHIP.get(state) or _SWITCHING_CHIP
+    return f"{glyph} {word}", style
 
 
 def _session_lines(
@@ -221,8 +289,9 @@ def _session_lines(
     switches: Mapping[str, str] | None = None,
     names: Mapping[str, str] | None = None,
 ) -> Text:
-    """The sessions block: who is here, in what state, on which account, how long ago. Each
-    by the name asq's left pane gives its agent (``names``, ``cli.board_names``, #140).
+    """The sessions block: who is here, in what state, on which account, how long ago — one row
+    each, its focus last on it (B1 #12). Each by the name asq's left pane gives its agent
+    (``names``, ``cli.board_names``, #140), with the icon that pane gives its role (#13).
 
     A ``limited`` session is told the ``fleet switch`` that moves it, from ``switches``
     (``team_service.fleet_switches``): its own fleet row's project and label. Alone, the
@@ -248,12 +317,12 @@ def _session_lines(
     if labels is None:
         labels = accounts_service.slot_labels() if accounts > 1 else {}
     for session in live:
-        emoji = _ROLE_EMOJI.get(session.role, "🤖")
+        emoji = role_icon(session.role)
         style = _ROLE_STYLE.get(session.role, "white")
         minutes = max(0, int((now - session.last_seen_at).total_seconds() // 60))
         name = (names or {}).get(session.id) or team_service.board_name(session)
         text.append(f"{emoji} {name}", style=style)
-        chip, chip_style = _STATE_CHIP.get(session.state, (session.state, "dim"))
+        chip, chip_style = state_chip(session.state)
         text.append(f"  {chip}", style=chip_style)
         switch = (switches or {}).get(session.id) if session.state == "limited" else None
         if switch is not None and (said := prog.shell_advice(f" — `{switch}`")):
@@ -282,7 +351,7 @@ def _session_lines(
         if minutes > 30:
             text.append("  (stale)", style="red dim")
         if session.focus:
-            text.append(f"\n   🎯 {session.focus}", style="italic")
+            text.append(f"  🎯 {one_row(session.focus)}", style="italic")
         text.append("\n")
     return text
 
@@ -441,10 +510,12 @@ def _build_app_class(interval: float, project: ProjectInfo | None = None) -> Any
     class BoardApp(ClipboardApp[None]):
         TITLE = "rlx board"
         CSS = RLX_CSS
+        # The footer fits 90 columns with the board's own keys before these (B1 #9): the
+        # screenshot is on the ? screen, and in the palette, not in the footer.
         BINDINGS: ClassVar = [
             ("q", "quit", "quit"),
-            ("t", "pick_theme", "themes"),
-            ("s", "screenshot", "screenshot"),
+            ("t", "pick_theme", "theme"),
+            Binding("s", "screenshot", "screenshot", show=False),
             Binding("question_mark", "help", "help", key_display="?"),
         ]
 
@@ -467,7 +538,8 @@ def _build_app_class(interval: float, project: ProjectInfo | None = None) -> Any
                     shown = team_service.resolve_project(None)
                 except Exception:
                     shown = None
-            yield BoardPanel(shown, interval=interval, id="board-panel")
+            # Standalone: no Manager tab to point at, and no left pane to select an agent in.
+            yield BoardPanel(shown, interval=interval, id="board-panel", standalone=True)
             yield Footer()
 
         def on_mount(self) -> None:
@@ -495,7 +567,8 @@ def _build_app_class(interval: float, project: ProjectInfo | None = None) -> Any
                         ("t", "themes (applied live, autosaved)"),
                         ("s", "save a screenshot of the board"),
                         ("q", "quit"),
-                    )
+                    ),
+                    standalone=True,
                 )
             )
 
