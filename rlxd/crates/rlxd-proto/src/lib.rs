@@ -1,6 +1,6 @@
 //! rlxd's wire types, and the JSON Schemas generated from them.
 //!
-//! These are the shapes of handoff 0.10.3's app contract (rev 5):
+//! These are the shapes of handoff 0.10.3's app contract (rev 6):
 //!
 //! - [`Envelope`] (7.2): every response, from the CLI under `--json --schema-version 1`
 //!   and from the socket, where it also carries the request's `id`;
@@ -9,6 +9,8 @@
 //!   frame on a connection and its reply;
 //! - [`Event`] (7.3): one event on the event stream; `event-list.json` is an array of
 //!   them;
+//! - [`StatusData`] (7.4): `status`'s reply, what rlxd is and whether Claude Code is
+//!   installed and signed in;
 //! - [`DaemonRecord`] (4.1): one non-UI rlx process in `<home>/daemons/`, a file that
 //!   Python's registry and rlxd both write and read.
 //!
@@ -142,6 +144,7 @@ mod hello;
 mod marker;
 mod request;
 pub mod schemas;
+mod status;
 
 pub use check::Invalid;
 pub use daemon::{DaemonRecord, kinds as daemon_kinds};
@@ -150,6 +153,7 @@ pub use event::{Event, RunScope, topics};
 pub use hello::{HelloData, HelloParams, Role};
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
+pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
 
 /// The protocol version this crate speaks: `hello`'s `protocol_version`.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -160,6 +164,12 @@ pub const PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
 /// The `schema_version` of every document this crate reads and writes, which is the
 /// protocol version.
 pub const SCHEMA_VERSION: u32 = PROTOCOL_VERSION;
+
+/// The largest process id any document here may carry: 2^31 - 1, `i32::MAX`. A pid
+/// goes to `kill`, whose `pid_t` is a C `int`, so a larger one would wrap to a negative
+/// pid, and `-1` signals every process the caller may signal. Python's registry reads a
+/// larger pid as no pid at all (`aisquare.core.registry.PID_MAX`).
+pub const PID_MAX: u32 = 2_147_483_647;
 
 /// rlxd's version, which is rlx's version: one number (handoff 0.10.3, 1.2).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -175,7 +185,12 @@ pub fn schema_version_of(document: &serde_json::Value) -> Option<u64> {
 /// rlxd reads this first. [`HelloParams`] refuses version 0, a version above `u32`, and a
 /// later protocol's hello whose other fields have moved. Each of those must still get
 /// [`codes::INCOMPATIBLE_PROTOCOL`] ([`ErrorBody::incompatible_protocol`]), not a parse
-/// error. `None` means the params have no integer `protocol_version` at all.
+/// error.
+///
+/// `None` when the params have no `protocol_version`, and also when it is not a whole
+/// number from 0 to `u64::MAX` as JSON writes one: a string, `-1`, `2.0`, or `2^64` and
+/// above. A caller that must answer those with `incompatible_protocol` too reads the
+/// raw value itself.
 pub fn protocol_version_of(params: &serde_json::Value) -> Option<u64> {
     params.get("protocol_version")?.as_u64()
 }

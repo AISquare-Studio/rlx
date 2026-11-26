@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StatusData",
+  "description": "`status`'s reply data.\n\n```json\n{\"version\": \"0.10.3\", \"pid\": 4242, \"platform\": \"macos\", \"protocol_version\": 1,\n \"capabilities\": [], \"seq\": 0, \"clients\": {\"app\": 0, \"tui\": 0, \"remote\": 0, \"cli\": 1},\n \"gate\": \"signed app only\", \"brain\": {\"restarts\": 0, \"handled\": 0},\n \"claude\": {\"installed\": true, \"version\": \"2.1.314\", \"signed_in\": true,\n            \"auth_method\": \"claude.ai\", \"account\": \"…\", \"plan\": \"pro\"},\n \"runs\": {\"live\": 0, \"queued\": 0}, \"jobs\": {\"count\": 0},\n \"paths\": {\"home\": \"…\", \"socket\": \"…\", \"lock\": \"…\", \"token\": \"…\", \"logs\": \"…\"}}\n```\n\n`brain`, `runs` and `jobs` hold zeros until the brain, the runner and the scheduler\nfill them, and `seq` is 0 until the event bus does.",
+  "type": "object",
+  "properties": {
+    "brain": {
+      "description": "The resident Python brain (1.6).",
+      "$ref": "#/$defs/Brain"
+    },
+    "capabilities": {
+      "description": "What this rlxd can do, by name, as `hello`'s reply lists it. A client ignores names\nit does not know.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "claude": {
+      "description": "The Claude Code rlxd runs: `RLXD_CLAUDE_BIN`, or `claude` on `PATH`.",
+      "$ref": "#/$defs/Claude"
+    },
+    "clients": {
+      "description": "The connections open now, by the role their `hello` was let in as. A refused\n`hello` is never counted.",
+      "$ref": "#/$defs/Clients"
+    },
+    "gate": {
+      "description": "Who may be the tool-call gate (5.1): `signed app only`, or `dev mode (unsigned\napp accepted)` while rlxd runs in gate dev mode.",
+      "type": "string",
+      "minLength": 1
+    },
+    "jobs": {
+      "description": "Scheduler jobs (7.6).",
+      "$ref": "#/$defs/Jobs"
+    },
+    "paths": {
+      "description": "Where this rlxd keeps what it serves and writes.",
+      "$ref": "#/$defs/Paths"
+    },
+    "pid": {
+      "description": "rlxd's process id, from 1 to 2147483647 (2^31 - 1), so a client's `kill` of it, a\nC `int`, can never be `kill(-1)`.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 2147483647,
+      "minimum": 1
+    },
+    "pipe_acl": {
+      "description": "Windows only: whom the named pipe's DACL admits. `current_user` says it holds one\nentry, for the user rlxd runs as, which rlxd read back from the live pipe. Absent\non macOS and Linux, where the socket's mode, 0600, does that.",
+      "type": "string",
+      "minLength": 1
+    },
+    "platform": {
+      "description": "The OS rlxd runs on: `macos`, `linux` or `windows`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "protocol_version": {
+      "description": "The protocol version of the connection that asked.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "runs": {
+      "description": "Headless runs (7.5).",
+      "$ref": "#/$defs/Runs"
+    },
+    "seq": {
+      "description": "The `seq` of the latest event on this home's event stream, or 0 before the first.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "version": {
+      "description": "rlxd's version, which is rlx's.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "version",
+    "pid",
+    "platform",
+    "protocol_version",
+    "capabilities",
+    "seq",
+    "clients",
+    "gate",
+    "brain",
+    "claude",
+    "runs",
+    "jobs",
+    "paths"
+  ],
+  "$defs": {
+    "Brain": {
+      "description": "The resident Python brain.",
+      "type": "object",
+      "properties": {
+        "handled": {
+          "description": "How many requests it handled.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "pid": {
+          "description": "Its process id, while one runs: from 1 to 2147483647 (2^31 - 1), as rlxd's.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2147483647,
+          "minimum": 1
+        },
+        "restarts": {
+          "description": "How many times rlxd started it again.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "restarts",
+        "handled"
+      ]
+    },
+    "Claude": {
+      "description": "The Claude Code rlxd runs, and its sign-in, as `claude --version` and\n`claude auth status --json` report them. rlxd reads no credential store itself.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account it is signed in as: its email address.",
+          "type": "string"
+        },
+        "auth_method": {
+          "description": "How it is signed in, such as `claude.ai`.",
+          "type": "string"
+        },
+        "installed": {
+          "description": "Whether rlxd found the program: `RLXD_CLAUDE_BIN` when it is set, else `claude`\non `PATH`.",
+          "type": "boolean"
+        },
+        "plan": {
+          "description": "The account's plan, such as `pro` or `max`.",
+          "type": "string"
+        },
+        "signed_in": {
+          "description": "Whether it is signed in. False when it is not installed, or would not say.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "Its version, such as `2.1.314`, when `claude --version` said one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "installed",
+        "signed_in"
+      ]
+    },
+    "Clients": {
+      "description": "The connections open now, by `hello` role.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "rlxapp, the gate: connections whose `hello {role: \"app\"}` passed the gate checks.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        },
+        "cli": {
+          "description": "Command-line clients, such as `rlxd call` and `rlxd-hook`, the one asking included.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        },
+        "remote": {
+          "description": "rlx's Remote server.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        },
+        "tui": {
+          "description": "rlx's terminal UI.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "app",
+        "tui",
+        "remote",
+        "cli"
+      ]
+    },
+    "Jobs": {
+      "description": "Scheduler jobs.",
+      "type": "object",
+      "properties": {
+        "count": {
+          "description": "Jobs defined.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "count"
+      ]
+    },
+    "Paths": {
+      "description": "Where this rlxd keeps what it serves and writes, as it resolved them from the home.",
+      "type": "object",
+      "properties": {
+        "home": {
+          "description": "The home: `RLX_HOME`, else `AISQUARE_HOME`, else `~/.aisquare`.",
+          "type": "string"
+        },
+        "lock": {
+          "description": "The lock file rlxd holds while it runs, one rlxd per home.",
+          "type": "string"
+        },
+        "logs": {
+          "description": "The directory of rlxd's logs.",
+          "type": "string"
+        },
+        "socket": {
+          "description": "Where clients connect: the socket's path on macOS and Linux, the named pipe's\nname on Windows.",
+          "type": "string"
+        },
+        "token": {
+          "description": "The file holding the shared client token.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "home",
+        "socket",
+        "lock",
+        "token",
+        "logs"
+      ]
+    },
+    "Runs": {
+      "description": "Headless runs.",
+      "type": "object",
+      "properties": {
+        "live": {
+          "description": "Runs going now.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "queued": {
+          "description": "Runs waiting to start.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "live",
+        "queued"
+      ]
+    }
+  }
+}

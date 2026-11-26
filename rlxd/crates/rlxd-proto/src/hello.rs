@@ -15,7 +15,8 @@ use crate::{PROTOCOL_VERSION, PROTOCOL_VERSIONS};
 ///
 /// ```json
 /// {"token": "…", "protocol_version": 1, "client": "rlxapp", "client_version": "0.1.0",
-///  "role": "app", "gate_credential": "…", "capabilities": [], "env": {"CLAUDE_CONFIG_DIR": "…"}}
+///  "role": "app", "gate_credential": "…", "capabilities": [],
+///  "env": {"CLAUDE_CONFIG_DIR": "…"}}
 /// ```
 ///
 /// A `protocol_version` this rlxd does not serve gets the error `incompatible_protocol`,
@@ -60,10 +61,10 @@ pub struct HelloParams {
     pub env: Option<BTreeMap<String, String>>,
 }
 
-/// HelloParams's fields as serde reads and writes them, unchecked. It is private, so the only
-/// way in or out of a HelloParams is through HelloParams's own `Serialize` and `Deserialize`, which run
-/// `validate()`. (`remote = "Self"` on HelloParams itself would make these unchecked functions
-/// public, as `HelloParams::serialize` and `HelloParams::deserialize`.)
+/// The serde code of `HelloParams`'s fields, unchecked. It is private, so the only way in or out
+/// of the type is its own `Serialize` and `Deserialize`, which run `validate()`.
+/// (`remote = "Self"` would make these unchecked functions public, as
+/// `HelloParams::serialize` and `HelloParams::deserialize`.)
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "HelloParams")]
 struct UncheckedHello {
@@ -127,10 +128,10 @@ pub struct HelloData {
     pub capabilities: Vec<String>,
 }
 
-/// HelloData's fields as serde reads and writes them, unchecked. It is private, so the only
-/// way in or out of a HelloData is through HelloData's own `Serialize` and `Deserialize`, which run
-/// `validate()`. (`remote = "Self"` on HelloData itself would make these unchecked functions
-/// public, as `HelloData::serialize` and `HelloData::deserialize`.)
+/// The serde code of `HelloData`'s fields, unchecked. It is private, so the only way in or out
+/// of the type is its own `Serialize` and `Deserialize`, which run `validate()`.
+/// (`remote = "Self"` would make these unchecked functions public, as
+/// `HelloData::serialize` and `HelloData::deserialize`.)
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "HelloData")]
 struct UncheckedReply {

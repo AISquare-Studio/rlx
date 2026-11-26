@@ -67,6 +67,22 @@ pub(crate) fn at_least(field: &str, value: u64, min: u64) -> Result<(), Invalid>
     Ok(())
 }
 
+pub(crate) fn at_most(field: &str, value: u64, max: u64) -> Result<(), Invalid> {
+    if value > max {
+        return Err(Invalid::new(
+            field,
+            format!("must be at most {max}, not {value}"),
+        ));
+    }
+    Ok(())
+}
+
+/// A process id: 1 to [`PID_MAX`](crate::PID_MAX).
+pub(crate) fn pid(field: &str, value: u32) -> Result<(), Invalid> {
+    at_least(field, u64::from(value), 1)?;
+    at_most(field, u64::from(value), u64::from(crate::PID_MAX))
+}
+
 /// One snake_case name: a lowercase letter, then lowercase letters, digits and `_`.
 pub(crate) const SNAKE: &str = "[a-z][a-z0-9_]*";
 

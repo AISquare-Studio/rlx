@@ -26,8 +26,10 @@ pub struct DaemonRecord {
     /// What the process is, such as `rlxd` or `watch`. A reader keeps kinds it does not know.
     #[schemars(length(min = 1))]
     pub kind: String,
-    /// Its process id.
-    #[schemars(range(min = 1))]
+    /// Its process id, from 1 to 2147483647 (2^31 - 1), as Python's
+    /// `core.registry.PID_MAX` bounds it: `os.kill` takes a C `int`, so a reader takes a
+    /// record with a larger pid for no pid at all.
+    #[schemars(range(min = 1, max = 2147483647))]
     pub pid: u32,
     /// The host it runs on.
     pub host: String,
@@ -49,10 +51,10 @@ pub struct DaemonRecord {
     pub cwd: Option<String>,
 }
 
-/// DaemonRecord's fields as serde reads and writes them, unchecked. It is private, so the only
-/// way in or out of a DaemonRecord is through DaemonRecord's own `Serialize` and `Deserialize`, which run
-/// `validate()`. (`remote = "Self"` on DaemonRecord itself would make these unchecked functions
-/// public, as `DaemonRecord::serialize` and `DaemonRecord::deserialize`.)
+/// The serde code of `DaemonRecord`'s fields, unchecked. It is private, so the only way in or out
+/// of the type is its own `Serialize` and `Deserialize`, which run `validate()`.
+/// (`remote = "Self"` would make these unchecked functions public, as
+/// `DaemonRecord::serialize` and `DaemonRecord::deserialize`.)
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "DaemonRecord")]
 struct UncheckedRecord {
@@ -89,9 +91,13 @@ pub mod kinds {
 }
 
 impl DaemonRecord {
+    /// The largest pid a record may say: [`PID_MAX`](crate::PID_MAX), which is Python's
+    /// `core.registry.PID_MAX`.
+    pub const PID_MAX: u32 = crate::PID_MAX;
+
     /// A record with no `cwd`. Refuses what `daemon-record.json` refuses: an `id` that is
-    /// not 12 lowercase hex characters, an empty kind, pid 0, times that are not RFC
-    /// 3339, and an empty `argv`.
+    /// not 12 lowercase hex characters, an empty kind, a pid outside 1 to
+    /// [`PID_MAX`](Self::PID_MAX), times that are not RFC 3339, and an empty `argv`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<String>,
@@ -139,7 +145,7 @@ impl DaemonRecord {
             ));
         }
         check::non_empty("kind", &self.kind)?;
-        check::at_least("pid", u64::from(self.pid), 1)?;
+        check::pid("pid", self.pid)?;
         check::date_time("started_at", &self.started_at)?;
         check::date_time("heartbeat_at", &self.heartbeat_at)?;
         if self.argv.is_empty() {

@@ -47,10 +47,10 @@ pub struct Event {
     pub data: Data,
 }
 
-/// Event's fields as serde reads and writes them, unchecked. It is private, so the only
-/// way in or out of a Event is through Event's own `Serialize` and `Deserialize`, which run
-/// `validate()`. (`remote = "Self"` on Event itself would make these unchecked functions
-/// public, as `Event::serialize` and `Event::deserialize`.)
+/// The serde code of `Event`'s fields, unchecked. It is private, so the only way in or out
+/// of the type is its own `Serialize` and `Deserialize`, which run `validate()`.
+/// (`remote = "Self"` would make these unchecked functions public, as
+/// `Event::serialize` and `Event::deserialize`.)
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Event")]
 struct UncheckedEvent {

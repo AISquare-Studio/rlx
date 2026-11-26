@@ -8,7 +8,7 @@ use schemars::transform::RecursiveTransform;
 use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
-use crate::{DaemonRecord, Envelope, Event, HelloData, HelloParams, Request};
+use crate::{DaemonRecord, Envelope, Event, HelloData, HelloParams, Request, StatusData};
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +33,7 @@ pub fn all() -> Vec<SchemaFile> {
         file::<HelloParams>("hello.json"),
         file::<HelloData>("hello-reply.json"),
         file::<Request>("request.json"),
+        file::<StatusData>("status-reply.json"),
     ];
     files.sort_by_key(|file| file.name);
     files
