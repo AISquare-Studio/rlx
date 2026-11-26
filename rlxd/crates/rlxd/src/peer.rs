@@ -20,13 +20,18 @@
 //!   on being alive and on its binary's file name being [`LINUX_APP_NAME`]: Linux's weaker
 //!   guarantee, which is not dev mode. The name keeps out other clients that hold the
 //!   token, such as rlx's TUI or a script, by mistake; it does not keep out same-user code
-//!   that means to pass.
+//!   that means to pass. **Pending rlxapp:** the packaged paths, the AppImage's inner
+//!   binary name, and Flatpak, whose binary rlxd sees through the sandbox's own mount
+//!   namespace, so it has no host path here yet.
 //! - **Windows:** `GetNamedPipeClientProcessId` as soon as the pipe connects, then
 //!   `OpenProcess` at once, and the process's creation time must not be later than the
-//!   connection, so a reused pid can't pass. Through that held handle the process must
-//!   still run, its image must be one of [`WINDOWS_BINARIES`], and that file's
-//!   Authenticode signature must verify (`WinVerifyTrust`) with [`WINDOWS_PUBLISHER`] as
-//!   its signer.
+//!   connection, so a reused pid can't pass. The connection's time is taken when the
+//!   pipe's waker fires, before the accept loop runs; a pid freed and reused within that
+//!   instant would still pass, a window too short to aim at. Through the held handle the
+//!   process must still run, its image must be one of [`WINDOWS_BINARIES`], and the
+//!   Authenticode signature of the very file that image is mapped from must verify
+//!   (`WinVerifyTrust`, revocation checked) with [`WINDOWS_PUBLISHER`]'s full subject as
+//!   its signer (`peer::windows` says how the file is bound to the image).
 //!
 //! **On Linux and Windows the peer check is best-effort against code running as the same
 //! user.** Such code can connect, hand the connection on and exec rlx's app, or inject into
@@ -34,13 +39,16 @@
 //! real boundary. On macOS the code-signing check, with the hardened runtime and no
 //! injection entitlements, holds against same-user code too.
 //!
-//! **A device paired over SSH** is checked by its credential alone: its connection's peer
-//! is sshd, not the app, so the SSH-authenticated pairing plus that device's own
-//! credential is the boundary there.
+//! **A device paired over SSH** would be checked by its credential alone: its
+//! connection's peer is sshd, not the app, so the SSH-authenticated pairing plus that
+//! device's own credential would be the boundary. SSH pairing isn't built yet (hub q1),
+//! so rlxd mints no ssh-route credential, and an ssh-route device in gate.json is refused
+//! (`gate::ssh_refused`): it fails closed until SSH pairing lands.
 //!
 //! **Tests only.** With the cargo feature `gate-test-requirement`, one environment
 //! variable replaces what the peer must match: the macOS requirement, the Linux binary, or
-//! the Windows publisher and binary (`<publisher>|<path>`). Release builds never enable
+//! the Windows publisher's full subject and binary (`<subject>|<path>`, the subject as
+//! `CertNameToStrW` writes it with `CERT_X500_NAME_STR`). Release builds never enable
 //! the feature, and in them no config key, variable or flag changes any of it.
 
 use std::fmt;
@@ -92,11 +100,13 @@ pub const MACOS_REFUSED_ENTITLEMENTS: &[&str] = &[
     "com.apple.security.cs.allow-dyld-environment-variables",
 ];
 
-/// The file name of rlx's app's Linux binary, in a package or an AppImage.
+/// The file name of rlx's app's Linux binary, in a package or an AppImage. Pending
+/// rlxapp's packaging.
 pub const LINUX_APP_NAME: &str = "rlx-app";
 
 /// Where rlx's app's Linux packages (.deb, .rpm) install its binary. When one of these
-/// exists, a Linux gate peer must be it. rlxapp's packaging confirms the names.
+/// exists, a Linux gate peer must be it. Pending rlxapp's packaging, as is a Flatpak
+/// path (see the module's doc).
 pub const LINUX_PACKAGED_BINARIES: &[&str] = &["/usr/bin/rlx-app", "/usr/lib/rlx-app/rlx-app"];
 
 /// Where rlx's app's Windows installers put its executable: per user, then per machine.
@@ -106,8 +116,11 @@ pub const WINDOWS_BINARIES: &[&str] = &[
     r"%ProgramFiles%\rlx\rlx.exe",
 ];
 
-/// The subject name of the certificate rlx's app's Windows executable is signed with.
-pub const WINDOWS_PUBLISHER: &str = "AISquare Studio";
+/// The full subject of the certificate rlx's app's Windows executable is signed with,
+/// as `CertNameToStrW` writes it with `CERT_X500_NAME_STR` (such as `CN=…, O=…, C=…`).
+/// `None` until rlxapp's certificate exists: then no Windows peer passes outside dev
+/// mode, whatever certificate it carries.
+pub const WINDOWS_PUBLISHER: Option<&str> = None;
 
 /// The process at the other end of one connection, pinned when rlxd accepted it.
 pub struct Peer {
@@ -140,9 +153,22 @@ impl Peer {
 
     /// Whether the peer is rlx's app, as this OS can tell (see the module's doc). `Ok`
     /// says how it passed, for the log; `Err` says why not. It can take a few
-    /// milliseconds: call it off the async runtime.
+    /// milliseconds: call it off the async runtime. Each call checks afresh, so a check
+    /// made again after a wait sees the peer as it is then.
     pub fn verify_identity(&self) -> Result<String, String> {
         self.inner.verify_identity(&expected())
+    }
+
+    /// The peer's pid, as pinned, when the OS gave one. For people to read: the identity
+    /// check never trusts a bare pid.
+    pub fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    /// The binary the peer runs, as the OS names it now, when it can. For people to
+    /// read, as [`Peer::pid`].
+    pub fn image(&self) -> Option<String> {
+        self.inner.image()
     }
 }
 
@@ -168,9 +194,9 @@ pub(crate) struct Expected {
     /// not installed from a package, so that only the binary's file name is checked.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub binaries: Option<Vec<std::path::PathBuf>>,
-    /// Windows: the signer's subject name.
+    /// Windows: the signer's full subject, or `None` when none is pinned.
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub publisher: String,
+    pub publisher: Option<String>,
 }
 
 #[cfg(feature = "gate-test-requirement")]
@@ -209,9 +235,9 @@ fn expected() -> Expected {
     };
     let (publisher, binaries) = if cfg!(windows) {
         match test.as_deref().and_then(|v| v.split_once('|')) {
-            Some((publisher, path)) => (publisher.to_owned(), Some(vec![path.into()])),
+            Some((publisher, path)) => (Some(publisher.to_owned()), Some(vec![path.into()])),
             None => (
-                WINDOWS_PUBLISHER.to_owned(),
+                WINDOWS_PUBLISHER.map(str::to_owned),
                 Some(WINDOWS_BINARIES.iter().filter_map(|p| expand(p)).collect()),
             ),
         }
@@ -227,9 +253,9 @@ fn expected() -> Expected {
                 (!installed.is_empty()).then_some(installed)
             }
         };
-        (WINDOWS_PUBLISHER.to_owned(), binaries)
+        (None, binaries)
     } else {
-        (WINDOWS_PUBLISHER.to_owned(), None)
+        (None, None)
     };
     Expected {
         requirement,

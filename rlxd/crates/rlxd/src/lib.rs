@@ -86,14 +86,19 @@ enum Action {
 enum GateAction {
     /// List the paired devices, with each one's route and when it was last seen.
     Devices,
-    /// Approve a device's waiting pairing request, on this host.
+    /// List the waiting pairing requests, or answer one, on this host. Without
+    /// --request-id it lists them (id, device, the asking process and its binary) and
+    /// approves nothing.
     Pair {
-        /// The device whose request to approve. Needed when several wait.
-        #[arg(long, value_name = "NAME")]
-        device: Option<String>,
+        /// The request to approve, as the list names it.
+        #[arg(long, value_name = "ID")]
+        request_id: Option<String>,
         /// Deny the request instead.
-        #[arg(long)]
+        #[arg(long, requires = "request_id")]
         deny: bool,
+        /// Approve a request for the name of a device you unpaired.
+        #[arg(long, requires = "request_id", conflicts_with = "deny")]
+        force: bool,
     },
     /// Unpair a device, or every device, and drop its app connections.
     Unpair {
@@ -164,7 +169,11 @@ pub fn main() -> ExitCode {
             params: options.params,
         }),
         Action::Gate(GateAction::Devices) => cli::gate_devices(),
-        Action::Gate(GateAction::Pair { device, deny }) => cli::gate_pair(device, !deny),
+        Action::Gate(GateAction::Pair {
+            request_id,
+            deny,
+            force,
+        }) => cli::gate_pair(request_id, !deny, force),
         Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
     }
 }

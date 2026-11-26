@@ -5,7 +5,7 @@
 use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::mem;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::ptr;
 
 use super::{Expected, MACOS_REFUSED_ENTITLEMENTS};
@@ -139,38 +139,52 @@ impl Drop for Owned {
     }
 }
 
-/// An `audit_token_t`: eight 32-bit words, the pid at index 5.
+/// An `audit_token_t`: eight 32-bit words, the pid at index 5 and the pid version at 7.
 type AuditToken = [u32; 8];
+
+/// The audit token's pid word.
+const PID: usize = 5;
+/// The audit token's pid version word, which changes when the pid names a new process
+/// (and on exec).
+const PID_VERSION: usize = 7;
 
 /// The peer of one Unix socket connection.
 pub struct Peer {
     token: Result<AuditToken, String>,
     uid: Result<u32, String>,
+    /// The socket, kept open to read its peer token again at each check.
+    socket: Option<OwnedFd>,
+}
+
+/// The socket's `LOCAL_PEERTOKEN`.
+fn peer_token(fd: RawFd) -> Result<AuditToken, String> {
+    let mut token: AuditToken = [0; 8];
+    let mut length = mem::size_of::<AuditToken>() as libc::socklen_t;
+    // SAFETY: `fd` is an open socket, and `token` is as large as `length` says.
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
+            token.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if read == 0 && length as usize == mem::size_of::<AuditToken>() {
+        Ok(token)
+    } else {
+        Err(format!(
+            "LOCAL_PEERTOKEN: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
 }
 
 impl Peer {
     pub fn of_socket(fd: BorrowedFd<'_>) -> Self {
+        let socket = fd.try_clone_to_owned().ok();
         let fd = fd.as_raw_fd();
-        let mut token: AuditToken = [0; 8];
-        let mut length = mem::size_of::<AuditToken>() as libc::socklen_t;
-        // SAFETY: `fd` is an open socket, and `token` is as large as `length` says.
-        let read = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_LOCAL,
-                libc::LOCAL_PEERTOKEN,
-                token.as_mut_ptr().cast(),
-                &mut length,
-            )
-        };
-        let token = if read == 0 && length as usize == mem::size_of::<AuditToken>() {
-            Ok(token)
-        } else {
-            Err(format!(
-                "LOCAL_PEERTOKEN: {}",
-                std::io::Error::last_os_error()
-            ))
-        };
+        let token = peer_token(fd);
         let (mut uid, mut gid) = (0, 0);
         // SAFETY: `fd` is an open socket, and both pointers are to live integers.
         let uid = if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0 {
@@ -178,7 +192,40 @@ impl Peer {
         } else {
             Err(format!("getpeereid: {}", std::io::Error::last_os_error()))
         };
-        Self { token, uid }
+        Self { token, uid, socket }
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.token.as_ref().ok().map(|token| token[PID])
+    }
+
+    pub fn image(&self) -> Option<String> {
+        let pid = i32::try_from(self.pid()?).ok()?;
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: `buffer` holds as many bytes as the call is told.
+        let length =
+            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        let length = usize::try_from(length).ok().filter(|n| *n > 0)?;
+        Some(String::from_utf8_lossy(&buffer[..length]).into_owned())
+    }
+
+    /// The token pinned at accept, after checking the socket still names that very
+    /// process: the same pid and pid version.
+    fn pinned_token(&self) -> Result<AuditToken, String> {
+        let pinned = self.token.clone()?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or("LOCAL_PEERTOKEN: the socket could not be kept to check again")?;
+        let now = peer_token(socket.as_raw_fd())?;
+        if now[PID] != pinned[PID] || now[PID_VERSION] != pinned[PID_VERSION] {
+            return Err(format!(
+                "LOCAL_PEERTOKEN: the socket's peer changed since it connected (pid {} \
+                 version {}, now pid {} version {})",
+                pinned[PID], pinned[PID_VERSION], now[PID], now[PID_VERSION]
+            ));
+        }
+        Ok(pinned)
     }
 
     pub fn same_user(&self) -> Result<(), String> {
@@ -193,8 +240,8 @@ impl Peer {
     }
 
     pub fn verify_identity(&self, expected: &Expected) -> Result<String, String> {
-        let token = self.token.clone()?;
-        let pid = token[5];
+        let token = self.pinned_token()?;
+        let pid = token[PID];
         let requirement = requirement(&expected.requirement)?;
         let guest = guest_of(&token)
             .map_err(|e| format!("LOCAL_PEERTOKEN of pid {pid}: no code for it: {e}"))?;
@@ -218,7 +265,7 @@ impl Peer {
 impl fmt::Display for Peer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.token {
-            Ok(token) => write!(f, "pid {}", token[5]),
+            Ok(token) => write!(f, "pid {}", token[PID]),
             Err(_) => f.write_str("an unknown pid"),
         }
     }

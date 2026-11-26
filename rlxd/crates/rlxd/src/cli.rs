@@ -211,18 +211,24 @@ pub fn gate_devices() -> ExitCode {
     }
 }
 
-/// `rlxd gate pair [--device NAME] [--deny]`: answers a waiting pairing request, as the
-/// user on this host.
-pub fn gate_pair(device: Option<String>, approve: bool) -> ExitCode {
+/// `rlxd gate pair [--request-id ID [--deny | --force]]`, as the user on this host:
+/// without an id, the waiting requests, each with the process that asked; with one, its
+/// answer. A request is never approved without its id.
+pub fn gate_pair(request_id: Option<String>, approve: bool, force: bool) -> ExitCode {
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => return report(AskError::NotRunning(e.to_string())),
     };
+    let Some(request_id) = request_id else {
+        return match ask(&home, methods::GATE_PAIR_REQUESTS) {
+            Ok(reply) => out::print_reply(&reply),
+            Err(error) => report(error),
+        };
+    };
     let mut params = Data::new();
-    if let Some(device) = device {
-        params.insert("device".to_owned(), Value::String(device));
-    }
+    params.insert("request_id".to_owned(), Value::String(request_id));
     params.insert("approve".to_owned(), Value::Bool(approve));
+    params.insert("force".to_owned(), Value::Bool(force));
     match ask_with(&home, methods::GATE_PAIR_ANSWER, params) {
         Ok(reply) => out::print_reply(&reply),
         Err(error) => report(error),

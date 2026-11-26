@@ -13,7 +13,9 @@
 //!   dropped. Anything else gets `not_gate` and changes nothing.
 //! - **A new device, once one is paired,** needs an approval: its `gate.pair` waits up to
 //!   [`PAIR_WAIT`] for a paired device's app (`gate.pair_answer`) or the user on the host
-//!   (`rlxd gate pair`) to approve it. A denial or no answer gets `not_gate`.
+//!   (`rlxd gate pair --request-id`) to approve it. A denial or no answer gets `not_gate`.
+//!   A request whose client leaves is withdrawn, and a new device may take the name of
+//!   one the user unpaired only when its approver says `force`.
 //! - **Unpairing** is the user's, in a terminal (`rlxd gate unpair [<device>]`). It
 //!   removes one device, or every device, and drops their connections. Unpairing one
 //!   never touches another. With none left, `gate.json` is gone and the next `gate.pair`
@@ -65,7 +67,8 @@ pub enum Route {
     /// Over the local socket, from a peer that passed the identity check.
     Local,
     /// Inside an authenticated SSH session, as the host's user. Its connections' peer is
-    /// sshd, so the credential alone admits them.
+    /// sshd, so the credential alone would admit them. SSH pairing isn't built yet, so
+    /// such a device is refused (see [`ssh_refused`]).
     Ssh,
 }
 
@@ -97,6 +100,11 @@ struct Device {
 struct Stored {
     version: u32,
     devices: Vec<Device>,
+    /// Names of devices the user unpaired while others stayed paired. A new device may
+    /// take one only when its approver says `force`, so no request can pass itself off
+    /// as a device the user revoked. Forgotten with the file, when the last device goes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked: Vec<String>,
 }
 
 /// The gate's state: the paired devices, and the app connections holding the gate now.
@@ -109,6 +117,7 @@ pub struct Gate {
 #[derive(Default)]
 struct State {
     devices: Vec<Device>,
+    revoked: Vec<String>,
     holders: HashMap<u64, Holder>,
     pending: Vec<Pending>,
     next: u64,
@@ -127,7 +136,8 @@ struct Holder {
 struct Pending {
     request_id: String,
     device: String,
-    peer: String,
+    peer_pid: Option<u32>,
+    peer_image: Option<String>,
     requested_at: String,
     expires_at: String,
     answer: oneshot::Sender<Answer>,
@@ -164,6 +174,8 @@ pub struct Paired {
     /// Whether the caller's own app connection used it, and so is dropped after the
     /// reply.
     pub drop_caller: bool,
+    /// The new credential's SHA-256, to revoke it if the reply can't be delivered.
+    pub sha256: String,
 }
 
 /// Why `gate.pair` did not pair.
@@ -175,6 +187,16 @@ pub enum Refused {
     NeedsApproval(String),
     /// gate.json could not be written.
     Failed(String),
+}
+
+/// Why `gate.pair_answer` answered nothing.
+#[derive(Debug)]
+pub enum AnswerError {
+    /// No request of that id waits.
+    NoRequest,
+    /// Approving it would give a revoked device's name to a new device, and the
+    /// approver did not say `force`.
+    Revoked(String),
 }
 
 /// What `gate.unpair` could not do.
@@ -197,14 +219,20 @@ pub struct Request {
 impl Gate {
     /// The gate as `path` (gate.json) says, in dev mode or not. A missing file is no
     /// device paired. A file that is there but not valid fails the start: rlxd never
-    /// reads a broken file as "nothing paired", which would let anyone pair first.
+    /// reads a broken file as "nothing paired", which would let anyone pair first. A
+    /// device with route `ssh` is kept, so the user sees and unpairs it, but refused
+    /// (see [`ssh_refused`]), and logged.
     pub fn load(path: &Path, dev_mode: bool) -> Result<Self, String> {
-        let devices = read(path)?;
+        let (devices, revoked) = read(path)?;
+        for device in devices.iter().filter(|d| d.route == Route::Ssh) {
+            warning!("gate: {}", ssh_refused(&device.device));
+        }
         Ok(Self {
             path: path.to_path_buf(),
             dev_mode,
             state: Mutex::new(State {
                 devices,
+                revoked,
                 ..State::default()
             }),
         })
@@ -281,6 +309,9 @@ impl Gate {
                 ));
             };
             let paired = state.devices[index].device.clone();
+            if state.devices[index].route == Route::Ssh {
+                return Err(Refused::NotGate(ssh_refused(&paired)));
+            }
             if let Some(device) = device
                 && device != paired
             {
@@ -292,7 +323,8 @@ impl Gate {
             let mut devices = state.devices.clone();
             let old = std::mem::replace(&mut devices[index].sha256, sha256);
             devices[index].created = clock::now();
-            self.save(&devices)
+            let sha256 = devices[index].sha256.clone();
+            self.save(&devices, &state.revoked)
                 .map_err(|e| Refused::Failed(format!("cannot write gate.json: {e}")))?;
             let route = devices[index].route;
             state.devices = devices;
@@ -312,6 +344,7 @@ impl Gate {
                 route,
                 dropped: dropped + usize::from(drop_caller),
                 drop_caller,
+                sha256,
             });
         }
         let device = device.unwrap_or(DEFAULT_DEVICE);
@@ -345,25 +378,70 @@ impl Gate {
         devices.push(Device {
             device: device.to_owned(),
             route,
-            sha256,
+            sha256: sha256.clone(),
             created: clock::now(),
             last_seen: None,
         });
-        self.save(&devices)
+        // An approver who said `force` let the new device take a revoked name.
+        let revoked: Vec<String> = state
+            .revoked
+            .iter()
+            .filter(|name| *name != device)
+            .cloned()
+            .collect();
+        self.save(&devices, &revoked)
             .map_err(|e| Refused::Failed(format!("cannot write gate.json: {e}")))?;
         state.devices = devices;
+        state.revoked = revoked;
         Ok(Paired {
             credential,
             device: device.to_owned(),
             route,
             dropped: 0,
             drop_caller: false,
+            sha256,
         })
     }
 
-    /// Makes a pairing request for the new `device`, from `peer`, which waits for an
-    /// answer. One request per device name waits at a time.
-    pub fn request(&self, device: &str, peer: &str) -> Result<Request, Refused> {
+    /// Unpairs `device` if its credential is still the one whose SHA-256 is `sha256`: a
+    /// credential minted for a reply that never reached its client, which nobody holds.
+    /// So no device is ever left paired with a credential nobody received.
+    pub fn revoke_undelivered(&self, device: &str, sha256: &str) {
+        let mut state = self.state();
+        let Some(index) = state
+            .devices
+            .iter()
+            .position(|d| d.device == device && d.sha256 == sha256)
+        else {
+            return;
+        };
+        let mut devices = state.devices.clone();
+        devices.remove(index);
+        match self.save(&devices, &state.revoked) {
+            Ok(()) => {
+                state.devices = devices;
+                let dropped = kick(&mut state, |holder| holder.sha256 == sha256, None);
+                warning!(
+                    "gate: device {device:?}'s new credential never reached its client, so \
+                     the device is unpaired ({dropped} app connection(s) dropped)"
+                );
+            }
+            Err(e) => warning!(
+                "gate: device {device:?}'s new credential never reached its client, and \
+                 gate.json could not be written to unpair it: {e}"
+            ),
+        }
+    }
+
+    /// Makes a pairing request for the new `device`, from the peer `peer_pid` running
+    /// `peer_image`, which waits for an answer. One request per device name waits at a
+    /// time.
+    pub fn request(
+        &self,
+        device: &str,
+        peer_pid: Option<u32>,
+        peer_image: Option<String>,
+    ) -> Result<Request, Refused> {
         let mut state = self.state();
         if state.pending.iter().any(|p| p.device == device) {
             return Err(Refused::NotGate(format!(
@@ -385,7 +463,8 @@ impl Gate {
         state.pending.push(Pending {
             request_id: request_id.clone(),
             device: device.to_owned(),
-            peer: peer.to_owned(),
+            peer_pid,
+            peer_image,
             requested_at: clock::format(now),
             expires_at: clock::format(now + PAIR_WAIT),
             answer,
@@ -401,9 +480,11 @@ impl Gate {
         self.state().pending.retain(|p| p.request_id != request_id);
     }
 
-    /// The requests waiting for an answer.
+    /// The requests waiting for an answer: each one's id, device name, route, the peer
+    /// that asked (pid and binary), and whether the name is one the user revoked.
     pub fn requests(&self) -> Vec<Value> {
-        self.state()
+        let state = self.state();
+        state
             .pending
             .iter()
             .map(|p| {
@@ -411,7 +492,8 @@ impl Gate {
                     "request_id": p.request_id,
                     "device": p.device,
                     "route": Route::Local.name(),
-                    "peer": p.peer,
+                    "peer": {"pid": p.peer_pid, "image": p.peer_image},
+                    "revoked": state.revoked.contains(&p.device),
                     "requested_at": p.requested_at,
                     "expires_at": p.expires_at,
                 })
@@ -419,22 +501,25 @@ impl Gate {
             .collect()
     }
 
-    /// Answers the waiting request named by `request_id`, else the one for `device`,
-    /// else the only one. `None` when no such request waits. Returns its id and device.
+    /// Answers the waiting request `request_id`. Approving one for a name the user
+    /// revoked needs `force`. Returns its device.
     pub fn answer(
         &self,
-        request_id: Option<&str>,
-        device: Option<&str>,
+        request_id: &str,
         approve: bool,
+        force: bool,
         by: &str,
-    ) -> Option<(String, String)> {
+    ) -> Result<String, AnswerError> {
         let mut state = self.state();
-        let index = match (request_id, device) {
-            (Some(id), _) => state.pending.iter().position(|p| p.request_id == id)?,
-            (None, Some(device)) => state.pending.iter().position(|p| p.device == device)?,
-            (None, None) if state.pending.len() == 1 => 0,
-            (None, None) => return None,
-        };
+        let index = state
+            .pending
+            .iter()
+            .position(|p| p.request_id == request_id)
+            .ok_or(AnswerError::NoRequest)?;
+        let device = &state.pending[index].device;
+        if approve && !force && state.revoked.contains(device) {
+            return Err(AnswerError::Revoked(device.clone()));
+        }
         let pending = state.pending.remove(index);
         let answer = if approve {
             Answer::Approved(by.to_owned())
@@ -443,7 +528,7 @@ impl Gate {
         };
         // A requester that gave up has dropped its receiver: nothing to tell.
         let _ = pending.answer.send(answer);
-        Some((pending.request_id, pending.device))
+        Ok(pending.device)
     }
 
     /// The paired devices, each with its open app connections.
@@ -486,10 +571,21 @@ impl Gate {
             }
             None => (Vec::new(), state.devices.clone()),
         };
-        self.save(&kept)
+        let names: Vec<String> = gone.into_iter().map(|d| d.device).collect();
+        // While other devices stay paired, a revoked name stays taken (see `Stored`).
+        let mut revoked = Vec::new();
+        if !kept.is_empty() {
+            revoked.clone_from(&state.revoked);
+            for name in &names {
+                if !revoked.contains(name) {
+                    revoked.push(name.clone());
+                }
+            }
+        }
+        self.save(&kept, &revoked)
             .map_err(|e| UnpairError::Failed(format!("cannot write gate.json: {e}")))?;
         state.devices = kept;
-        let names: Vec<String> = gone.into_iter().map(|d| d.device).collect();
+        state.revoked = revoked;
         let dropped = match device {
             Some(name) => kick(&mut state, |holder| holder.device == name, None),
             None => kick(&mut state, |_| true, None),
@@ -503,20 +599,21 @@ impl Gate {
         if !state.unsaved || state.devices.is_empty() {
             return;
         }
-        match self.save(&state.devices) {
+        match self.save(&state.devices, &state.revoked) {
             Ok(()) => state.unsaved = false,
             Err(e) => warning!("gate: cannot write when each device was last seen: {e}"),
         }
     }
 
-    /// Writes `devices` to gate.json, or removes it when there are none.
-    fn save(&self, devices: &[Device]) -> io::Result<()> {
+    /// Writes `devices` and `revoked` to gate.json, or removes it when no device is left.
+    fn save(&self, devices: &[Device], revoked: &[String]) -> io::Result<()> {
         if devices.is_empty() {
             return files::remove(&self.path);
         }
         let stored = Stored {
             version: FILE_VERSION,
             devices: devices.to_vec(),
+            revoked: revoked.to_vec(),
         };
         let text = serde_json::to_string_pretty(&stored).map_err(io::Error::other)?;
         files::write_private(&self.path, &text)
@@ -601,11 +698,11 @@ fn hash(credential: &str) -> String {
         .collect()
 }
 
-/// The devices gate.json at `path` holds: none when it is missing.
-fn read(path: &Path) -> Result<Vec<Device>, String> {
+/// The devices and revoked names gate.json at `path` holds: none when it is missing.
+fn read(path: &Path) -> Result<(Vec<Device>, Vec<String>), String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
     let broken = |why: String| {
@@ -619,7 +716,19 @@ fn read(path: &Path) -> Result<Vec<Device>, String> {
     if stored.version != FILE_VERSION {
         return Err(broken(format!("version {}", stored.version)));
     }
-    Ok(stored.devices)
+    Ok((stored.devices, stored.revoked))
+}
+
+/// Why a device with route `ssh` is refused. SSH pairing isn't built yet (hub q1), so
+/// this rlxd never minted an ssh-route credential: such an entry in gate.json was written
+/// by something else, and admitting it on its credential alone, as an SSH device would
+/// be, would let an unsigned client hold the gate. It fails closed until SSH pairing
+/// lands.
+pub fn ssh_refused(device: &str) -> String {
+    format!(
+        "device {device:?} has route ssh, which this rlxd refuses: SSH pairing is not \
+         available yet, so rlxd never paired it (`rlxd gate unpair {device:?}` removes it)"
+    )
 }
 
 /// Whether `name` may name a device: 1 to 64 characters, none of them control
@@ -640,8 +749,8 @@ pub fn valid_device(name: &str) -> Result<(), String> {
 /// Unpairs with rlxd stopped: edits gate.json at `path` directly. The caller holds
 /// rlxd's lock, so no rlxd starts meanwhile.
 pub fn unpair_offline(path: &Path, device: Option<&str>) -> Result<Vec<String>, UnpairError> {
-    let devices = match (read(path), device) {
-        (Ok(devices), _) => devices,
+    let (devices, revoked) = match (read(path), device) {
+        (Ok(read), _) => read,
         // A broken file can still be removed whole.
         (Err(_), None) => {
             files::remove(path).map_err(|e| UnpairError::Failed(e.to_string()))?;
@@ -654,6 +763,7 @@ pub fn unpair_offline(path: &Path, device: Option<&str>) -> Result<Vec<String>, 
         dev_mode: false,
         state: Mutex::new(State {
             devices,
+            revoked,
             ..State::default()
         }),
     };
@@ -725,8 +835,9 @@ mod tests {
     fn re_pairing_replaces_the_credential_and_drops_its_connections_only() {
         let gate = gate("repair");
         let a = gate.pair(None, None, None).unwrap();
-        gate.request("b", "pid 1").unwrap();
-        gate.answer(None, Some("b"), true, "test").unwrap();
+        let request = gate.request("b", Some(1), None).unwrap();
+        gate.answer(&request.request_id, true, false, "test")
+            .unwrap();
         let b = gate.pair_approved("b").unwrap();
         let hold_a = gate.attach(&a.credential).unwrap();
         let hold_b = gate.attach(&b.credential).unwrap();
@@ -764,8 +875,9 @@ mod tests {
     fn unpairing_one_device_leaves_the_other_and_the_last_removes_the_file() {
         let gate = gate("unpair");
         let a = gate.pair(None, None, None).unwrap();
-        gate.request("b", "pid 1").unwrap();
-        gate.answer(None, None, true, "test").unwrap();
+        let request = gate.request("b", Some(1), None).unwrap();
+        gate.answer(&request.request_id, true, false, "test")
+            .unwrap();
         let b = gate.pair_approved("b").unwrap();
         let hold_a = gate.attach(&a.credential).unwrap();
         let hold_b = gate.attach(&b.credential).unwrap();
@@ -797,20 +909,95 @@ mod tests {
     fn requests_wait_one_per_device_and_a_few_at_once() {
         let gate = gate("pending");
         gate.pair(None, None, None).unwrap();
-        let _first = gate.request("a", "pid 1").unwrap();
+        let first = gate.request("a", Some(1), None).unwrap();
         assert!(matches!(
-            gate.request("a", "pid 2"),
+            gate.request("a", Some(2), None),
             Err(Refused::NotGate(_))
         ));
         let _rest: Vec<Request> = (1..PENDING_MAX)
-            .map(|n| gate.request(&format!("d{n}"), "pid 3").unwrap())
+            .map(|n| gate.request(&format!("d{n}"), Some(3), None).unwrap())
             .collect();
         assert!(matches!(
-            gate.request("one more", "pid 4"),
+            gate.request("one more", Some(4), None),
             Err(Refused::NotGate(_))
         ));
-        gate.withdraw(&_first.request_id);
-        assert!(gate.request("one more", "pid 4").is_ok());
+        gate.withdraw(&first.request_id);
+        assert!(gate.request("one more", Some(4), None).is_ok());
+        assert!(matches!(
+            gate.answer("no such id", true, false, "test"),
+            Err(AnswerError::NoRequest)
+        ));
+    }
+
+    #[test]
+    fn a_revoked_name_needs_force_while_other_devices_stay_paired() {
+        let gate = gate("revoked");
+        let a = gate.pair(None, None, None).unwrap();
+        let request = gate.request("laptop", None, None).unwrap();
+        gate.answer(&request.request_id, true, false, "test")
+            .unwrap();
+        gate.pair_approved("laptop").unwrap();
+        gate.unpair(Some("laptop")).unwrap();
+        let again = gate.request("laptop", Some(7), Some("/x".into())).unwrap();
+        assert_eq!(gate.requests()[0]["revoked"], true);
+        assert_eq!(gate.requests()[0]["peer"]["pid"], 7);
+        assert!(matches!(
+            gate.answer(&again.request_id, true, false, "test"),
+            Err(AnswerError::Revoked(_))
+        ));
+        assert_eq!(gate.requests().len(), 1, "it still waits");
+        gate.answer(&again.request_id, true, true, "test").unwrap();
+        gate.pair_approved("laptop").unwrap();
+        let reloaded = Gate::load(&gate.path, false).unwrap();
+        assert!(
+            reloaded.state().revoked.is_empty(),
+            "force took the name back"
+        );
+        // Unpaired again while "default" stays, the name is recorded; unpairing every
+        // device forgets it with gate.json.
+        gate.unpair(Some("laptop")).unwrap();
+        assert_eq!(
+            Gate::load(&gate.path, false).unwrap().state().revoked,
+            ["laptop"]
+        );
+        assert!(gate.attach(&a.credential).is_some(), "default is untouched");
+        gate.unpair(None).unwrap();
+        assert!(!gate.path.exists());
+    }
+
+    #[test]
+    fn an_undelivered_credential_unpairs_its_device() {
+        let gate = gate("undelivered");
+        let a = gate.pair(None, None, None).unwrap();
+        let again = gate.pair(None, Some(&a.credential), None).unwrap();
+        gate.revoke_undelivered(&again.device, &a.sha256);
+        assert_eq!(
+            gate.devices().len(),
+            1,
+            "an older credential's hash changes nothing"
+        );
+        gate.revoke_undelivered(&again.device, &again.sha256);
+        assert!(gate.devices().is_empty());
+        assert!(!gate.path.exists());
+    }
+
+    #[test]
+    fn a_device_with_route_ssh_is_kept_but_never_re_paired() {
+        let gate = gate("ssh");
+        let credential = "planted";
+        let planted = format!(
+            "{{\"version\":1,\"devices\":[{{\"device\":\"x\",\"route\":\"ssh\",\
+             \"sha256\":\"{}\",\"created\":\"2026-11-26T00:00:00.000Z\"}}]}}",
+            hash(credential)
+        );
+        fs::write(&gate.path, planted).unwrap();
+        let loaded = Gate::load(&gate.path, false).unwrap();
+        assert_eq!(loaded.device_of(credential).unwrap().1, Route::Ssh);
+        assert!(matches!(
+            loaded.pair(None, Some(credential), None),
+            Err(Refused::NotGate(_))
+        ));
+        assert_eq!(loaded.devices().len(), 1);
     }
 
     #[test]

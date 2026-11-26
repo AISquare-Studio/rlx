@@ -141,10 +141,11 @@ mod windows {
         /// one too. The peer is pinned before anything else, so its pid can't be reused
         /// meanwhile.
         pub async fn accept(&mut self) -> io::Result<(NamedPipeServer, Peer)> {
-            let connected = self.next.connect().await;
+            let connected = connect_stamped(&self.next).await;
             let peer = connected
-                .is_ok()
-                .then(|| Peer::of_pipe(self.next.as_handle(), peer::connected_now()));
+                .as_ref()
+                .ok()
+                .map(|at| Peer::of_pipe(self.next.as_handle(), *at));
             let fresh = self.security.create(&self.name, false)?;
             let used = mem::replace(&mut self.next, fresh);
             connected?;
@@ -157,6 +158,59 @@ mod windows {
         pub fn acl(&self) -> Option<&'static str> {
             Some(StatusData::PIPE_ACL_CURRENT_USER)
         }
+    }
+
+    /// Waits for a client to connect to `pipe`, and returns when it did, as a `FILETIME`
+    /// count: when the connection's waker last fired, before this task ran again, or
+    /// when it was found connected at once. The peer check refuses a process created
+    /// after this time (a reused pid), so it is the latest wake: never before the
+    /// connection, and as close to it as the runtime lets rlxd see.
+    async fn connect_stamped(pipe: &NamedPipeServer) -> io::Result<u64> {
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Stamp {
+            at: Arc<AtomicU64>,
+            inner: Waker,
+        }
+
+        impl Wake for Stamp {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.at.store(peer::connected_now(), Ordering::SeqCst);
+                self.inner.wake_by_ref();
+            }
+        }
+
+        let at = Arc::new(AtomicU64::new(0));
+        let connect = pipe.connect();
+        tokio::pin!(connect);
+        std::future::poll_fn(|cx| {
+            let waker = Waker::from(Arc::new(Stamp {
+                at: Arc::clone(&at),
+                inner: cx.waker().clone(),
+            }));
+            match connect.as_mut().poll(&mut Context::from_waker(&waker)) {
+                Poll::Ready(result) => {
+                    let stamped = match at.load(Ordering::SeqCst) {
+                        0 => peer::connected_now(),
+                        stamped => stamped,
+                    };
+                    Poll::Ready(result.map(|()| stamped))
+                }
+                Poll::Pending => {
+                    // A wake that left it pending was not the connection.
+                    at.store(0, Ordering::SeqCst);
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     /// A security descriptor whose DACL admits one user, and the attributes that carry

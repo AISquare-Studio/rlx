@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
-use crate::gate::{self, Answer, Gate, Hold, Refused, Route, UnpairError};
+use crate::gate::{self, Answer, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::log::{info, warning};
 use crate::peer::Peer;
 use crate::{claude, token};
@@ -85,8 +85,15 @@ struct Counted {
 enum Then {
     GoOn,
     Stop,
-    /// Close this connection: its own gate credential was just replaced.
-    Close,
+    /// The reply carries a new gate credential for `device`, whose SHA-256 is `sha256`.
+    /// If it can't be delivered, the device is unpaired, so nobody is left paired with a
+    /// credential nobody received. With `close`, the connection's own credential was the
+    /// one replaced: it closes after the reply.
+    Paired {
+        device: String,
+        sha256: String,
+        close: bool,
+    },
 }
 
 /// One frame, as read.
@@ -172,7 +179,13 @@ impl Daemon {
                 return Err(Envelope::err(error).with_optional_id(id));
             }
         }
-        let hello = match HelloParams::deserialize(Value::Object(request.params)) {
+        let mut params = request.params;
+        // An empty gate_credential presents no credential: role app then gets not_gate,
+        // as with none, rather than a parse error's unauthorized.
+        if params.get("gate_credential") == Some(&Value::String(String::new())) {
+            params.remove("gate_credential");
+        }
+        let hello = match HelloParams::deserialize(Value::Object(params)) {
             Ok(hello) => hello,
             Err(e) => return refuse(id, format!("hello's params are not valid: {e}")),
         };
@@ -239,10 +252,10 @@ impl Daemon {
         };
         peer.same_user()?;
         match route {
-            Route::Ssh => info!(
-                "gate: device {device:?} paired over SSH: its peer is sshd, so its \
-                 credential alone admits it"
-            ),
+            // A device paired over SSH would be admitted on its credential alone, its peer
+            // being sshd. SSH pairing isn't built (hub q1), so rlxd never minted one, and
+            // such an entry in gate.json was written by something else: fail closed.
+            Route::Ssh => return Err(gate::ssh_refused(&device)),
             Route::Local if self.gate.dev_mode() => warning!(
                 "gate dev mode: hello role app from device {device:?} ({peer}) let in \
                  without the peer identity check"
@@ -368,11 +381,23 @@ struct PairParams {
 
 #[derive(Deserialize)]
 struct AnswerParams {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    device: Option<String>,
+    request_id: String,
     approve: bool,
+    /// Approve a request for a name the user revoked.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Withdraws a pairing request when dropped: when its wait ends, however it ends.
+struct Withdraw<'a> {
+    gate: &'a Gate,
+    request_id: &'a str,
+}
+
+impl Drop for Withdraw<'_> {
+    fn drop(&mut self) {
+        self.gate.withdraw(self.request_id);
+    }
 }
 
 #[derive(Deserialize)]
@@ -436,9 +461,23 @@ impl Daemon {
         let paired = match result {
             Ok(paired) => paired,
             Err(Refused::NeedsApproval(device)) => {
-                match self.await_approval(&device, &session.peer).await {
+                if let Err(message) = self.await_approval(&device, &session.peer).await {
+                    return refuse(message);
+                }
+                // The wait can be long: check the peer again before minting.
+                if !self.gate.dev_mode()
+                    && let Err(message) = verify(&session.peer).await
+                {
+                    return refuse(format!("after the approval, {message}"));
+                }
+                match self.gate.pair_approved(&device) {
                     Ok(paired) => paired,
-                    Err(message) => return refuse(message),
+                    Err(Refused::NotGate(message) | Refused::Failed(message)) => {
+                        return refuse(message);
+                    }
+                    Err(Refused::NeedsApproval(_)) => {
+                        return refuse("it needs another approval".to_owned());
+                    }
                 }
             }
             Err(Refused::NotGate(message)) => return refuse(message),
@@ -466,25 +505,31 @@ impl Daemon {
             "device": paired.device,
             "route": paired.route.name(),
         });
-        let then = if paired.drop_caller {
-            Then::Close
-        } else {
-            Then::GoOn
+        let then = Then::Paired {
+            device: paired.device,
+            sha256: paired.sha256,
+            close: paired.drop_caller,
         };
         (Ok(object(&data)), then)
     }
 
-    /// Waits for a paired device or the user to approve a new device's pairing.
-    async fn await_approval(&self, device: &str, peer: &Peer) -> Result<gate::Paired, String> {
-        let request = match self.gate.request(device, &peer.to_string()) {
+    /// Waits for a paired device or the user to approve a new device's pairing. The
+    /// request is withdrawn however the wait ends, also when this future is dropped
+    /// because the requester left.
+    async fn await_approval(&self, device: &str, peer: &Peer) -> Result<(), String> {
+        let request = match self.gate.request(device, peer.pid(), peer.image()) {
             Ok(request) => request,
             Err(Refused::NotGate(message) | Refused::Failed(message)) => return Err(message),
             Err(Refused::NeedsApproval(_)) => unreachable!("a request never needs another"),
         };
         let id = request.request_id.clone();
+        let _withdraw = Withdraw {
+            gate: &self.gate,
+            request_id: &id,
+        };
         warning!(
             "gate: device {device:?} ({peer}) asks to pair as request {id}; a paired device \
-             approves it, or the user runs `rlxd gate pair --device {device:?}` on this host, \
+             approves it, or the user runs `rlxd gate pair --request-id {id}` on this host, \
              within {} s",
             gate::PAIR_WAIT.as_secs()
         );
@@ -492,16 +537,10 @@ impl Daemon {
             answered = tokio::time::timeout(gate::PAIR_WAIT, request.answer) => Some(answered),
             () = self.stopped() => None,
         };
-        self.gate.withdraw(&id);
         match answered {
             Some(Ok(Ok(Answer::Approved(by)))) => {
                 info!("gate: pairing request {id} for {device:?} approved by {by}");
-                self.gate
-                    .pair_approved(device)
-                    .map_err(|refused| match refused {
-                        Refused::NotGate(message) | Refused::Failed(message) => message,
-                        Refused::NeedsApproval(_) => "it needs another approval".to_owned(),
-                    })
+                Ok(())
             }
             Some(Ok(Ok(Answer::Denied(by)))) => {
                 Err(format!("pairing device {device:?} was denied by {by}"))
@@ -509,7 +548,7 @@ impl Daemon {
             Some(Ok(Err(_))) | None => Err("rlxd is stopping".to_owned()),
             Some(Err(_)) => Err(format!(
                 "pairing device {device:?} needs an approval: a paired device, or `rlxd gate \
-                 pair --device {device:?}` on this host, within {} s, and none came",
+                 pair --request-id {id}` on this host, within {} s, and none came",
                 gate::PAIR_WAIT.as_secs()
             )),
         }
@@ -526,21 +565,32 @@ impl Daemon {
     fn gate_pair_answer(&self, session: &Session, params: &Data) -> Result<Data, ErrorBody> {
         let by = self.may_answer(session)?;
         let params: AnswerParams = parse(params)?;
-        let (request_id, device) = self
+        let request_id = params.request_id;
+        let device = self
             .gate
-            .answer(
-                params.request_id.as_deref(),
-                params.device.as_deref(),
-                params.approve,
-                &by,
-            )
-            .ok_or_else(|| {
-                let waiting = self.gate.requests().len();
-                error(
-                    codes::NO_PAIR_REQUEST,
-                    &format!("no pairing request of that id or device waits ({waiting} wait)"),
+            .answer(&request_id, params.approve, params.force, &by)
+            .map_err(|e| match e {
+                AnswerError::NoRequest => {
+                    let waiting = self.gate.requests().len();
+                    error(
+                        codes::NO_PAIR_REQUEST,
+                        &format!("no pairing request {request_id:?} waits ({waiting} wait)"),
+                    )
+                    .with_hint("`rlxd gate pair` lists the waiting requests.")
+                }
+                AnswerError::Revoked(device) => error(
+                    codes::REVOKED_DEVICE,
+                    &format!(
+                        "the user unpaired a device named {device:?}: approving a new device \
+                         under that name needs force"
+                    ),
                 )
+                .with_hint("If this is that device, approve it with `--force`."),
             })?;
+        info!(
+            "gate: pairing request {request_id} for {device:?} {} by {by}",
+            if params.approve { "approved" } else { "denied" }
+        );
         Ok(object(&json!({
             "request_id": request_id,
             "device": device,
@@ -656,6 +706,7 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut frames = Frames {
         reader: BufReader::new(reader),
+        line: Vec::new(),
     };
     let first = tokio::select! {
         first = tokio::time::timeout(HELLO_TIMEOUT, frames.next()) => first,
@@ -684,11 +735,16 @@ where
         }
         Err(reply) => return refuse(&mut frames, &mut writer, &reply).await,
     };
+    // A frame the client sent while its last request was still being answered.
+    let mut early = None;
     loop {
-        let frame = tokio::select! {
-            frame = frames.next() => frame,
-            () = daemon.stopped() => return linger(&mut frames).await,
-            () = kicked(&session) => return dropped(&session, &mut frames, &mut writer).await,
+        let frame = match early.take() {
+            Some(frame) => frame,
+            None => tokio::select! {
+                frame = frames.next() => frame,
+                () = daemon.stopped() => return linger(&mut frames).await,
+                () = kicked(&session) => return dropped(&session, &mut frames, &mut writer).await,
+            },
         };
         let frame = match frame {
             Ok(Some(Frame::Line(frame))) => frame,
@@ -715,16 +771,57 @@ where
         if session.app.as_ref().is_some_and(Hold::is_kicked) {
             return dropped(&session, &mut frames, &mut writer).await;
         }
-        let (reply, then) = daemon.answer(&session, &frame).await;
+        // While the request is answered, which for a new device's gate.pair can take two
+        // minutes, the connection is still watched. A kick aborts the request: anything
+        // that acts as the gate (the gate task's run.decide) must still check its hold
+        // when it acts. A client that leaves aborts it too, so a waiting pairing request
+        // is withdrawn and never pairs a device nobody is there to receive.
+        let outcome = {
+            let answering = daemon.answer(&session, &frame);
+            tokio::pin!(answering);
+            loop {
+                tokio::select! {
+                    answered = &mut answering => break Outcome::Answered(answered),
+                    () = kicked(&session) => break Outcome::Kicked,
+                    next = frames.next(), if early.is_none() => match next {
+                        Ok(None) | Err(_) => break Outcome::Left,
+                        next => early = Some(next),
+                    },
+                }
+            }
+        };
+        let (reply, then) = match outcome {
+            Outcome::Answered(answered) => answered,
+            Outcome::Kicked => return dropped(&session, &mut frames, &mut writer).await,
+            Outcome::Left => {
+                info!("a client left before its request was answered; the request is dropped");
+                return;
+            }
+        };
         if send(&mut writer, &reply).await.is_err() {
+            if let Then::Paired { device, sha256, .. } = &then {
+                daemon.gate.revoke_undelivered(device, sha256);
+            }
             return;
         }
         match then {
-            Then::GoOn => {}
+            Then::GoOn | Then::Paired { close: false, .. } => {}
             Then::Stop => daemon.stop("a client asked"),
-            Then::Close => return dropped(&session, &mut frames, &mut writer).await,
+            Then::Paired { close: true, .. } => {
+                return dropped(&session, &mut frames, &mut writer).await;
+            }
         }
     }
+}
+
+/// How an in-flight request ended.
+enum Outcome {
+    /// It was answered: the reply, and what then.
+    Answered((Envelope, Then)),
+    /// The connection was dropped from the gate meanwhile.
+    Kicked,
+    /// The client closed the connection meanwhile.
+    Left,
 }
 
 /// Resolves once an app connection is dropped from the gate; never for another.
@@ -789,15 +886,20 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, reply: &Envelope) -> std::i
 
 struct Frames<R> {
     reader: BufReader<R>,
+    /// The frame read so far, kept here so that `next` can be cancelled and called again
+    /// without losing it.
+    line: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> Frames<R> {
     /// The next frame, skipping blank lines, or `None` once the client has closed.
+    /// Cancel-safe: a frame read in part is kept for the next call.
     async fn next(&mut self) -> std::io::Result<Option<Frame>> {
-        let mut line = Vec::new();
+        let line = &mut self.line;
         loop {
             let chunk = self.reader.fill_buf().await?;
             if chunk.is_empty() {
+                let line = std::mem::take(line);
                 return Ok((!is_blank(&line)).then(|| text(line)));
             }
             let (part, used, ended) = match chunk.iter().position(|&b| b == b'\n') {
@@ -806,16 +908,17 @@ impl<R: AsyncRead + Unpin> Frames<R> {
             };
             if line.len() + part.len() > MAX_FRAME {
                 self.reader.consume(used);
+                line.clear();
                 return Ok(Some(Frame::TooLong));
             }
             line.extend_from_slice(part);
             self.reader.consume(used);
             if ended {
-                if is_blank(&line) {
+                if is_blank(line) {
                     line.clear();
                     continue;
                 }
-                return Ok(Some(text(line)));
+                return Ok(Some(text(std::mem::take(line))));
             }
         }
     }

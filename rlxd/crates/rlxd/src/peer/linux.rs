@@ -51,6 +51,20 @@ impl Peer {
         Self { credentials, pin }
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        let pid = match &self.pin {
+            Pin::PeerPidfd(pidfd) | Pin::PidfdOpen(pidfd) => pid_of(pidfd.as_raw_fd()),
+            Pin::None(_) => None,
+        };
+        pid.or_else(|| self.credentials.as_ref().ok().map(|c| c.pid))
+            .and_then(|pid| u32::try_from(pid).ok())
+    }
+
+    pub fn image(&self) -> Option<String> {
+        let exe = fs::read_link(format!("/proc/{}/exe", self.pid()?)).ok()?;
+        Some(exe.display().to_string())
+    }
+
     pub fn same_user(&self) -> Result<(), String> {
         let credentials = self.credentials.as_ref().map_err(Clone::clone)?;
         // SAFETY: geteuid cannot fail.

@@ -13,6 +13,7 @@ use common::{TestHome, assert_valid, eventually};
 use rlxd_client::proto::{HelloParams, Role};
 use rlxd_client::{Connection, Home};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// One app-role connection, held open.
 struct App {
@@ -86,16 +87,30 @@ fn finish(child: Child) -> (Option<i32>, Value) {
 }
 
 /// Waits until a pairing request for `device` waits.
-fn until_requested(home: &TestHome, device: &str) {
+/// Waits until a pairing request for `device` waits, as `rlxd gate pair` lists it: the
+/// request.
+fn until_requested(home: &TestHome, device: &str) -> Value {
+    let mut found = Value::Null;
     eventually(&format!("a pairing request for {device}"), || {
-        let run = home.rlxd(&["call", "gate.pair_requests"]);
-        run.code() == Some(0)
-            && run.data()["requests"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|r| r["device"] == device)
+        let run = home.rlxd(&["gate", "pair"]);
+        if run.code() != Some(0) {
+            return false;
+        }
+        let requests = run.data()["requests"].as_array().unwrap().clone();
+        match requests.into_iter().find(|r| r["device"] == device) {
+            Some(request) => {
+                found = request;
+                true
+            }
+            None => false,
+        }
     });
+    found
+}
+
+/// The id of a waiting request.
+fn id(request: &Value) -> String {
+    request["request_id"].as_str().unwrap().to_owned()
 }
 
 fn devices(home: &TestHome) -> Vec<Value> {
@@ -379,8 +394,20 @@ fn two_devices_pair_and_unpairing_one_leaves_the_other_working() {
 
     // A second local device waits for an approval; the user on the host approves it.
     let waiting = pair_in_background(&home, r#"{"device":"desktop"}"#);
-    until_requested(&home, "desktop");
-    let run = home.rlxd(&["gate", "pair", "--device", "desktop"]);
+    let request = until_requested(&home, "desktop");
+    assert_eq!(request["route"], "local");
+    assert!(
+        request["peer"]["pid"].as_u64().is_some_and(|pid| pid > 0),
+        "{request}"
+    );
+    assert!(
+        request["peer"]["image"]
+            .as_str()
+            .is_some_and(|image| image.contains("rlxd")),
+        "the asking process's binary: {request}"
+    );
+    assert_eq!(request["revoked"], false);
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
     assert_eq!(run.code(), Some(0), "{run:?}");
     assert_eq!(run.data()["approved"], true);
     let (code, envelope) = finish(waiting);
@@ -457,10 +484,10 @@ fn a_paired_app_approves_or_the_user_denies_a_new_device() {
     let request = &requests["data"]["requests"][0];
     assert_eq!(request["device"], "phone", "{requests}");
     assert_eq!(request["route"], "local");
-    let id = request["request_id"].as_str().unwrap().to_owned();
+    let phone = request["request_id"].as_str().unwrap().to_owned();
     let answer = app.call(
         "gate.pair_answer",
-        json!({"request_id": id, "approve": true}),
+        json!({"request_id": phone, "approve": true}),
     );
     assert_eq!(answer["ok"], true, "{answer}");
     let (code, envelope) = finish(waiting);
@@ -469,8 +496,8 @@ fn a_paired_app_approves_or_the_user_denies_a_new_device() {
     assert!(home.log().contains("approved by device \"default\""));
 
     let waiting = pair_in_background(&home, r#"{"device":"tablet"}"#);
-    until_requested(&home, "tablet");
-    let run = home.rlxd(&["gate", "pair", "--device", "tablet", "--deny"]);
+    let request = until_requested(&home, "tablet");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request), "--deny"]);
     assert_eq!(run.code(), Some(0), "{run:?}");
     let (code, envelope) = finish(waiting);
     assert_eq!(code, Some(1), "{envelope}");
@@ -478,7 +505,14 @@ fn a_paired_app_approves_or_the_user_denies_a_new_device() {
     assert_eq!(devices(&home).len(), 2, "default and phone");
 
     let run = home.rlxd(&["gate", "pair"]);
-    assert_eq!(run.code(), Some(1), "nothing waits: {run:?}");
+    assert_eq!(run.code(), Some(0), "nothing waits: {run:?}");
+    assert_eq!(
+        run.data()["requests"],
+        json!([]),
+        "it lists, and approves nothing"
+    );
+    let run = home.rlxd(&["gate", "pair", "--request-id", "no-such-request"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
     assert_eq!(run.error_code(), "no_pair_request");
     let run = home.rlxd(&[
         "call",
@@ -577,4 +611,167 @@ fn a_dev_mode_start_keeps_its_flag_in_the_registry_for_a_restart() {
         .map(|a| a.as_str().unwrap())
         .collect();
     assert_eq!(argv[1..], ["serve", "--detach", "--gate-dev-mode"]);
+}
+
+/// Writes a gate.json holding one device, `route`, whose credential is `credential`: as
+/// any process of the user's could.
+fn plant(home: &TestHome, route: &str, credential: &str) {
+    let sha256: String = Sha256::digest(credential.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let gate = json!({"version": 1, "devices": [{
+        "device": "planted", "route": route, "sha256": sha256,
+        "created": "2026-11-26T00:00:00.000Z",
+    }]});
+    std::fs::create_dir_all(home.root().join("rlxd")).unwrap();
+    std::fs::write(home.gate_json(), gate.to_string()).unwrap();
+}
+
+#[test]
+fn a_planted_ssh_route_device_is_refused_until_ssh_pairing_lands() {
+    // Review #1991, major 1: SSH pairing isn't built, so rlxd never minted an ssh-route
+    // credential; one in gate.json is refused, outside dev mode and in it, and logged.
+    for dev_mode in [false, true] {
+        let home = TestHome::new();
+        plant(&home, "ssh", "planted-credential");
+        if dev_mode {
+            home.start_dev();
+        } else {
+            home.start();
+        }
+        let hello = [
+            "call",
+            "--role",
+            "app",
+            "--gate-credential",
+            "planted-credential",
+            "status",
+        ];
+        let run = home.rlxd(&hello);
+        assert_eq!(run.code(), Some(1), "dev mode {dev_mode}: {run:?}");
+        assert_eq!(run.error_code(), "not_gate");
+        let run = home.rlxd(&[
+            "call",
+            "gate.pair",
+            r#"{"gate_credential":"planted-credential"}"#,
+        ]);
+        assert_eq!(run.error_code(), "not_gate", "nor re-paired: {run:?}");
+        assert_eq!(home.app_clients(), 0);
+        let log = home.log();
+        // At load and at the hello; and at the re-pairing in dev mode, where no peer
+        // check refuses this unsigned client first.
+        assert_eq!(
+            count(&log, "has route ssh, which this rlxd refuses"),
+            if dev_mode { 3 } else { 2 },
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .any(|l| l.contains("hello refused: role app") && l.contains("has route ssh")),
+            "{log}"
+        );
+        assert_eq!(devices(&home)[0]["route"], "ssh", "the user still sees it");
+        let run = home.rlxd(&["gate", "unpair", "planted"]);
+        assert_eq!(run.code(), Some(0), "and can remove it: {run:?}");
+    }
+    // The control: the same entry with route local passes in dev mode, where only the
+    // credential is checked.
+    let home = TestHome::new();
+    plant(&home, "local", "planted-credential");
+    home.start_dev();
+    let run = home.rlxd(&[
+        "call",
+        "--role",
+        "app",
+        "--gate-credential",
+        "planted-credential",
+        "status",
+    ]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+}
+
+#[test]
+fn an_empty_gate_credential_is_not_gate() {
+    // Review #1991, item 13.
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let run = home.rlxd(&["call", "--role", "app", "--gate-credential", "", "status"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "not_gate");
+    assert_eq!(home.app_clients(), 0);
+}
+
+#[test]
+fn a_requester_that_leaves_withdraws_its_request_and_nothing_is_paired() {
+    // Review #1991, item 7, and the tester's finding 1.
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let mut waiting = pair_in_background(&home, r#"{"device":"orphan"}"#);
+    let request = until_requested(&home, "orphan");
+    waiting.kill().unwrap();
+    waiting.wait().unwrap();
+    eventually("the request is withdrawn", || {
+        home.rlxd(&["gate", "pair"]).data()["requests"] == json!([])
+    });
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+    assert_eq!(run.error_code(), "no_pair_request", "{run:?}");
+    assert_eq!(devices(&home).len(), 1, "no orphan device");
+    assert!(
+        home.log()
+            .contains("a client left before its request was answered")
+    );
+}
+
+#[test]
+fn approving_a_revoked_devices_name_needs_force() {
+    // Review #1991, item 6: no request can pass itself off as a device the user revoked.
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let waiting = pair_in_background(&home, r#"{"device":"laptop"}"#);
+    let request = until_requested(&home, "laptop");
+    assert_eq!(
+        home.rlxd(&["gate", "pair", "--request-id", &id(&request)])
+            .code(),
+        Some(0)
+    );
+    assert_eq!(finish(waiting).0, Some(0));
+    assert_eq!(home.rlxd(&["gate", "unpair", "laptop"]).code(), Some(0));
+
+    let waiting = pair_in_background(&home, r#"{"device":"laptop"}"#);
+    let request = until_requested(&home, "laptop");
+    assert_eq!(request["revoked"], true, "{request}");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "revoked_device");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request), "--force"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let (code, envelope) = finish(waiting);
+    assert_eq!(code, Some(0), "{envelope}");
+    assert_eq!(envelope["data"]["device"], "laptop");
+}
+
+#[test]
+fn a_kicked_connection_aborts_the_request_it_is_in() {
+    // Review #1991, item 10: an app connection waiting on a new device's pairing is
+    // unpaired meanwhile; its request ends with the kick, and is withdrawn.
+    let home = TestHome::new();
+    home.start_dev();
+    let credential = pair_test_client(&home);
+    let mut app = App::connect(&home, &credential).unwrap();
+    let asking = std::thread::spawn(move || app.call("gate.pair", json!({"device": "newdev"})));
+    until_requested(&home, "newdev");
+    assert_eq!(home.rlxd(&["gate", "unpair", "default"]).code(), Some(0));
+    let reply = asking.join().unwrap();
+    assert_eq!(reply["error"]["code"], "not_gate", "{reply}");
+    assert!(
+        reply.get("id").is_none(),
+        "the drop's notice, not a reply: {reply}"
+    );
+    eventually("the request is withdrawn", || {
+        home.rlxd(&["gate", "pair"]).data()["requests"] == json!([])
+    });
 }

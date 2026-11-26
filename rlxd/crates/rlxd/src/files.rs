@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 /// Writes `text` and a newline to `path` whole: a 0600 sibling, flushed to disk, renamed
-/// over it.
+/// over it, and the folder flushed too, so the rename itself survives a crash.
 pub fn write_private(path: &Path, text: &str) -> io::Result<()> {
     let temporary = path.with_extension("tmp");
     let mut options = fs::OpenOptions::new();
@@ -21,7 +21,23 @@ pub fn write_private(path: &Path, text: &str) -> io::Result<()> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&temporary, path)
+    fs::rename(&temporary, path)?;
+    sync_dir(path)
+}
+
+/// Flushes the folder holding `path`, so a rename or removal in it is on disk.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
+}
+
+/// Windows has no folder flush that std offers; NTFS journals the rename.
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Narrows `path` to 0600 when it is looser.
@@ -41,10 +57,11 @@ pub fn restrict(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes `path`; a missing file is already removed.
+/// Removes `path`, and flushes its folder; a missing file is already removed.
 pub fn remove(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
+        Ok(()) => sync_dir(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }

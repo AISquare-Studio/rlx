@@ -233,8 +233,11 @@ pub mod codes {
     pub const NOT_GATE: &str = "not_gate";
     /// `gate.unpair`: no device of that name is paired.
     pub const UNKNOWN_DEVICE: &str = "unknown_device";
-    /// `gate.pair_answer`: no pairing request of that id or device is waiting.
+    /// `gate.pair_answer`: no pairing request of that id is waiting.
     pub const NO_PAIR_REQUEST: &str = "no_pair_request";
+    /// `gate.pair_answer`: the request is for the name of a device the user unpaired,
+    /// and the approver did not say `force`.
+    pub const REVOKED_DEVICE: &str = "revoked_device";
     /// A frame after `hello` that is not a request: not JSON, not an object, no `method`,
     /// params that are not an object, or a second `hello`. A frame longer than rlxd
     /// reads also gets it, and then the connection closes.

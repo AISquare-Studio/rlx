@@ -30,8 +30,11 @@ use rlxd_client::proto::{HelloParams, Role};
 use rlxd_client::{Connection, Home};
 use serde_json::{Value, json};
 
-/// The test signer's subject name, the expected publisher.
+/// The test signer's common name.
 const SIGNER: &str = "rlxd gate test";
+
+/// The expected publisher: the test signer's full subject, as rlxd reads it.
+const SUBJECT: &str = "CN=rlxd gate test";
 
 /// Set in the helper process: the parent's pid, to hand the pipe to.
 const HELPER_PARENT: &str = "RLXD_GATE_HELPER_PARENT";
@@ -130,7 +133,7 @@ fn powershell(script: &str) -> Result<String, String> {
 fn home_expecting(binary: &Path) -> TestHome {
     TestHome::new().with_env(
         "RLXD_TEST_GATE_REQUIREMENT",
-        &format!("{SIGNER}|{}", binary.display()),
+        &format!("{SUBJECT}|{}", binary.display()),
     )
 }
 
@@ -188,6 +191,70 @@ fn a_signed_helper_at_the_expected_path_passes_and_still_needs_the_credential() 
         "{}",
         home.log()
     );
+    drop(home);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_image_renamed_away_while_it_runs_is_refused() {
+    // Review #1991, item 4: an unsigned image runs from the expected path, is renamed
+    // away, and the signed file is put back there before the check. The check reads the
+    // file the process runs, not the one now at its path.
+    let Some(signer) = TestSigner::new() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("rlxd-gate-win-swap-{}", std::process::id()));
+    let rlxd = Path::new(env!("CARGO_BIN_EXE_rlxd"));
+    let helper = copy(rlxd, &dir, "rlx.exe");
+    signer.sign(&helper);
+    let home = home_expecting(&helper);
+    home.start();
+    let run = home.run_of(&helper, &["call", "gate.pair"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let credential = run.data()["gate_credential"].as_str().unwrap().to_owned();
+
+    let signed = dir.join("rlx-signed.exe");
+    std::fs::rename(&helper, &signed).unwrap();
+    std::fs::copy(rlxd, &helper).unwrap();
+    let mut unsigned = home
+        .command_of(&helper, &["call", "--raw"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::rename(&helper, dir.join("rlx-unsigned-running.exe")).unwrap();
+    std::fs::rename(&signed, &helper).unwrap();
+    let hello = json!({"id": 1, "method": "hello", "params": {
+        "token": home.token(), "protocol_version": 1, "client": "gate-peer-windows",
+        "client_version": "0", "role": "app", "gate_credential": credential,
+        "capabilities": [],
+    }});
+    let mut stdin = unsigned.stdin.take().unwrap();
+    stdin.write_all(format!("{hello}\n").as_bytes()).unwrap();
+    drop(stdin);
+    let out = unsigned.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let reply: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("{e}: {stdout}{}", String::from_utf8_lossy(&out.stderr)));
+    assert_eq!(reply["error"]["code"], "not_gate", "{reply}");
+    assert!(
+        home.log().contains("its image was moved or replaced"),
+        "{}",
+        home.log()
+    );
+    // The control: the signed file, now back at the path, still passes when it runs.
+    let app = [
+        "call",
+        "--role",
+        "app",
+        "--gate-credential",
+        &credential,
+        "status",
+    ];
+    let run = home.run_of(&helper, &app);
+    assert_eq!(run.code(), Some(0), "{run:?}");
     drop(home);
     let _ = std::fs::remove_dir_all(&dir);
 }

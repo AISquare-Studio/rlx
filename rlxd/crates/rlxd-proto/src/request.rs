@@ -128,12 +128,13 @@ pub mod methods {
     /// `{gate_credential, device, route}` out. The credential is shown this once.
     pub const GATE_PAIR: &str = "gate.pair";
     /// The pairing requests waiting for a paired device or the user to answer them: no
-    /// params in, `{requests: [{request_id, device, route, peer, requested_at,
-    /// expires_at}]}` out.
+    /// params in, `{requests: [{request_id, device, route, peer: {pid, image}, revoked,
+    /// requested_at, expires_at}]}` out.
     pub const GATE_PAIR_REQUESTS: &str = "gate.pair_requests";
-    /// Answers a waiting pairing request: `{request_id? | device?, approve}` in,
-    /// `{request_id, device, approved}` out. Only a paired app, or a command-line client
-    /// on the host (`rlxd gate pair`), may answer.
+    /// Answers a waiting pairing request: `{request_id, approve, force?}` in,
+    /// `{request_id, device, approved}` out. Approving a request for a revoked device's
+    /// name needs `force`. Only a paired app, or a command-line client on the host
+    /// (`rlxd gate pair`), may answer.
     pub const GATE_PAIR_ANSWER: &str = "gate.pair_answer";
     /// The paired devices: no params in, `{devices: [{device, route, created, last_seen,
     /// connections}]}` out.

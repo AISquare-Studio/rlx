@@ -30,7 +30,7 @@ rlxd stop               # stop it, and wait until it has
 rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T]
           [--protocol-version N] [--env JSON] [--raw] <method> [<params-json>]
 rlxd gate devices       # the devices paired as the app gate: route, created, last seen
-rlxd gate pair [--device NAME] [--deny]  # approve (or deny) a device's waiting pairing
+rlxd gate pair [--request-id ID [--deny | --force]]  # list waiting pairings, or answer one
 rlxd gate unpair [<device>]              # unpair one device, or every device
 ```
 
@@ -57,10 +57,15 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     on first use. Re-pairing a device needs its current credential, and drops every
     connection that used the old one. A new device, once one is paired, waits up to
     120 s for an approval: a paired app answers `gate.pair_answer` (it lists them with
-    `gate.pair_requests`), or the user runs `rlxd gate pair --device NAME` on the host.
+    `gate.pair_requests`), or the user does on the host. `rlxd gate pair` lists each
+    waiting request with its id, device name, route and the process that asked (pid and
+    binary), and approves only the one `--request-id` names. A request whose client
+    leaves is withdrawn, and a credential whose reply can't be delivered is revoked, so
+    no device is left paired with a credential nobody received. Device names are unique;
+    a new device may take the name of one the user unpaired only with `--force`.
     `rlxd gate unpair [<device>]` is the only reset; unpairing one device never touches
-    another. A `hello {role: "app"}` without a paired device's credential gets
-    `not_gate`, and so does anything else the gate refuses.
+    another. A `hello {role: "app"}` without a paired device's credential (an empty one
+    included) gets `not_gate`, and so does anything else the gate refuses.
   - **The peer's identity**, checked for a device paired locally, on every gate hello
     and every `gate.pair`. macOS: the `LOCAL_PEERTOKEN` audit token, checked by
     Security.framework against a requirement compiled into rlxd (Apple's anchor, the
@@ -68,14 +73,18 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     injection entitlements. Linux: `SO_PEERCRED`'s uid, the process pinned with
     `SO_PEERPIDFD`, and, where rlx's app is installed from a package, its binary.
     Windows: the pipe client's process, opened at once and held, its creation time,
-    its image path and that file's Authenticode signer. **On Linux and Windows this is
+    its image path, and the Authenticode signature (revocation checked) of the file that
+    image is mapped from, whose signer's full subject must be rlx's publisher. **On
+    Linux and Windows this is
     best-effort against code running as the same user; there the credential is the
     real boundary.** `crates/rlxd/src/peer.rs` says why, and holds the expected
     identity's constants.
   - **SSH.** Over SSH, a connection's peer is sshd, not the app, so a device paired
-    inside an authenticated SSH session is admitted by its credential alone: the SSH
-    pairing plus the per-device credential is the boundary. A connection that only
-    reaches the socket never pairs that route. (SSH pairing itself is a later item.)
+    inside an authenticated SSH session will be admitted by its credential alone: the
+    SSH pairing plus the per-device credential is the boundary. SSH pairing is a later
+    item (hub q1). Until it lands, rlxd mints no ssh-route credential, and refuses and
+    logs any ssh-route device it finds in gate.json. A connection that only reaches the
+    socket never pairs that route.
   - **Gate dev mode** (`--gate-dev-mode`, or `gate.dev_mode = true` in
     `<home>/rlxd/config.toml`) is for unsigned dev and CI builds of the app, and never
     the default. It skips only the peer identity check; the credential and every
