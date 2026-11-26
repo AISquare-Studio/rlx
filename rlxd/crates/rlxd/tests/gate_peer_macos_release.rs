@@ -16,7 +16,7 @@ mod macos_signing;
 use std::path::Path;
 
 use common::TestHome;
-use macos_signing::{SelfSigned, Signing, TEST_IDENTIFIER, helper, test_requirement};
+use macos_signing::{SelfSigned, Signing, TEST_IDENTIFIER, helper, test_requirement, try_helper};
 use rlxd::peer::{MACOS_REQUIREMENT, MACOS_TEAM_ID, static_code_satisfies};
 
 /// A credential minted in dev mode. rlxd is then restarted outside dev mode, so a hello
@@ -64,8 +64,12 @@ fn refused(home: &TestHome, helper: &Path, credential: &str, why: &str) {
 fn a_self_signed_helper_with_the_identifier_and_team_is_refused_for_want_of_apples_anchor() {
     let home = TestHome::new();
     let dir = home.root().join("helpers");
-    let identity = SelfSigned::new(&dir.join("keychain"), MACOS_TEAM_ID);
-    let self_signed = helper(
+    let list = macos_signing::search_list();
+    let identity = match SelfSigned::new(&dir.join("keychain"), MACOS_TEAM_ID) {
+        Ok(identity) => identity,
+        Err(why) => return macos_signing::skip_or_fail(&why),
+    };
+    let signed = try_helper(
         &dir,
         "self-signed",
         &Signing {
@@ -75,6 +79,14 @@ fn a_self_signed_helper_with_the_identifier_and_team_is_refused_for_want_of_appl
             identity: Some(&identity),
         },
     );
+    let self_signed = match signed {
+        Ok(path) => path,
+        Err(why) => {
+            return macos_signing::skip_or_fail(&format!(
+                "codesign can't sign from a keychain off the search list here: {why}"
+            ));
+        }
+    };
     // The control: it satisfies the very same requirement without the anchor, so the
     // anchor alone refuses it.
     let without_anchor = MACOS_REQUIREMENT
@@ -88,6 +100,12 @@ fn a_self_signed_helper_with_the_identifier_and_team_is_refused_for_want_of_appl
     let credential = dev_mode_credential(&home);
     home.start();
     refused(&home, &self_signed, &credential, "self-signed");
+    drop(identity);
+    assert_eq!(
+        macos_signing::search_list(),
+        list,
+        "the keychain search list is never written"
+    );
 }
 
 #[test]

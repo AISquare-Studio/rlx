@@ -3,6 +3,12 @@
 //!
 //! The tests sign with Apple's `codesign` tool. rlxd itself never runs it: the tests
 //! assert that too.
+//!
+//! **The user's keychain search list is never written.** A self-signed identity lives
+//! in a throwaway keychain file that each signing names with `--keychain`. If this macOS
+//! can't sign from a keychain off the search list, or `security create-keychain` puts
+//! the new keychain on the list, the test that needs the identity is skipped (and fails
+//! in CI, where `RLXD_GATE_PEER_REQUIRED` is set). Ad-hoc signing needs no keychain.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -36,8 +42,13 @@ pub struct Signing<'a> {
     pub identity: Option<&'a SelfSigned>,
 }
 
-/// A copy of `rlxd` at `dir/name`, signed as `signing` says.
+/// A copy of `rlxd` at `dir/name`, signed as `signing` says, which must succeed.
 pub fn helper(dir: &Path, name: &str, signing: &Signing<'_>) -> PathBuf {
+    try_helper(dir, name, signing).unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// [`helper`], or why `codesign` could not sign it.
+pub fn try_helper(dir: &Path, name: &str, signing: &Signing<'_>) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join(name);
     std::fs::copy(env!("CARGO_BIN_EXE_rlxd"), &path).unwrap();
@@ -78,41 +89,51 @@ pub fn helper(dir: &Path, name: &str, signing: &Signing<'_>) -> PathBuf {
         command.arg("--entitlements").arg(&plist);
     }
     command.arg(&path).stdin(Stdio::null());
-    let mut out = command.output().unwrap();
-    if let Some(identity) = signing.identity
-        && !out.status.success()
-        && String::from_utf8_lossy(&out.stderr).contains("no identity found")
-    {
-        // Some macOS releases search only the keychains on the user's search list, even
-        // with --keychain: list it for this one signing, then put the list back.
-        let _listed = identity.listed();
-        out = command.output().unwrap();
-    }
-    assert!(
-        out.status.success(),
-        "codesign {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&out.stderr)
+    let before = search_list();
+    let out = command.output().unwrap();
+    assert_eq!(
+        search_list(),
+        before,
+        "codesign changed the keychain search list"
     );
-    path
+    if out.status.success() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "codesign {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
 }
 
-/// A throwaway keychain holding a self-signed code-signing identity whose certificate's
-/// OU is `ou`. Dropping it deletes the keychain. The user's keychain search list is not
-/// touched: signing names this keychain.
+/// The user's keychain search list, as `security` prints it: read only.
+pub fn search_list() -> String {
+    output("security", |c| c.args(["list-keychains", "-d", "user"]))
+}
+
+/// Skips the calling test with `why`, or fails it where the gate peer tests are
+/// required (CI).
+pub fn skip_or_fail(why: &str) {
+    assert!(
+        std::env::var_os("RLXD_GATE_PEER_REQUIRED").is_none(),
+        "required here: {why}"
+    );
+    eprintln!("skipped: {why}");
+}
+
+/// A throwaway keychain file holding a self-signed code-signing identity whose
+/// certificate's OU is `ou`. Dropping it deletes the keychain. It is never put on the
+/// user's keychain search list: signing names its file.
 pub struct SelfSigned {
     pub keychain: PathBuf,
     /// The certificate's SHA-1 fingerprint, which names the identity to `codesign`.
     pub sha1: String,
 }
 
-/// The user's keychain search list with a throwaway keychain added, until dropped.
-pub struct Listed {
-    before: Vec<String>,
-}
-
 impl SelfSigned {
-    pub fn new(dir: &Path, ou: &str) -> Self {
+    /// The identity, or why this macOS can't have one without the search list.
+    pub fn new(dir: &Path, ou: &str) -> Result<Self, String> {
         const NAME: &str = "rlxd gate test self-signed";
         std::fs::create_dir_all(dir).unwrap();
         let config = dir.join("cert.cnf");
@@ -157,6 +178,7 @@ impl SelfSigned {
             .unwrap_or_default();
         assert_eq!(sha1.len(), 40, "{fingerprint}");
         let keychain = dir.join("gate-test.keychain-db");
+        let before = search_list();
         run("security", |c| {
             c.args(["create-keychain", "-p", "kpw"]).arg(&keychain)
         });
@@ -164,6 +186,20 @@ impl SelfSigned {
             keychain: keychain.clone(),
             sha1,
         };
+        if search_list() != before {
+            // This macOS lists a new keychain: deleting it unlists it again.
+            drop(made);
+            assert_eq!(
+                search_list(),
+                before,
+                "the keychain search list stayed changed"
+            );
+            return Err(
+                "`security create-keychain` puts a new keychain on the user's \
+                        search list here"
+                    .to_owned(),
+            );
+        }
         run("security", |c| {
             c.args(["unlock-keychain", "-p", "kpw"]).arg(&keychain)
         });
@@ -186,35 +222,8 @@ impl SelfSigned {
             ])
             .arg(&keychain)
         });
-        made
-    }
-}
-
-impl SelfSigned {
-    /// Adds this keychain to the user's search list until the guard drops.
-    pub fn listed(&self) -> Listed {
-        let before: Vec<String> = output("security", |c| c.args(["list-keychains", "-d", "user"]))
-            .lines()
-            .map(|line| line.trim().trim_matches('"').to_owned())
-            .filter(|line| !line.is_empty())
-            .collect();
-        run("security", |c| {
-            c.args(["list-keychains", "-d", "user", "-s"])
-                .arg(&self.keychain)
-                .args(&before)
-        });
-        Listed { before }
-    }
-}
-
-impl Drop for Listed {
-    fn drop(&mut self) {
-        let _ = Command::new("security")
-            .args(["list-keychains", "-d", "user", "-s"])
-            .args(&self.before)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        assert_eq!(search_list(), before, "the keychain search list changed");
+        Ok(made)
     }
 }
 
