@@ -150,9 +150,10 @@ def test_clicking_one_spot_closes_toast_after_toast_whatever_their_heights(
     waiting: four clicks at one spot close all four, and a fifth reaches nothing."""
     # The guard's 0.6 s is wall time from the fourth click, and its timer, not the fifth click,
     # was what a loaded runner's pauses raced: the guard was gone first, and the fifth click
-    # reached the pane (py3.13-ambient-proxy-up shard 4/4, run 44222511058). Its timer is the
-    # test's here, as in the guard's own test below; this one is about the fifth click.
-    monkeypatch.setattr(toasts, "GUARD_SECONDS", 60.0)
+    # reached the pane (py3.13-ambient-proxy-up shard 4/4, run 44222511058). Its timer drops
+    # nothing here, whenever it fires: the guard's going is its own test's (below); this one is
+    # about the fifth click.
+    monkeypatch.setattr(toasts, "_drop_guard", lambda rack, guard: None)
     spot = (width - 1 - DISMISS // 2, 1)
 
     async def go(app: Host, pilot: Pilot[None]) -> tuple[list[list[int]], list[int], int, int]:

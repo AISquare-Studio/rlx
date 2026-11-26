@@ -126,19 +126,23 @@ def test_an_owner_whose_pid_runs_but_is_no_live_asq_has_let_go(
 
 
 def test_a_claim_newer_than_the_last_read_of_the_registry_counts(
-    registered: instances.Registration,
+    registered: instances.Registration, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An asq that started and claimed since the beat last read: the read could not know it."""
     _beaten(registered, set())
-    # No read after this one: the beat thread ends, and this process stays registered. A longer
-    # beat and a sleep left one beat already due at the old 20 ms, which a starved thread could
-    # take after the claim's stamp below.
-    registered._stop.set()
-    thread = registered._thread
-    assert thread is not None
-    thread.join(5)
-    assert not thread.is_alive(), "the beat thread did not end"
-    fresh = SizeOwner(os.getppid(), "mini", "ssh", time.time_ns())
+
+    # No read lands after this one. The beat goes on and this process stays registered, but a
+    # read that looks the registry up from now on fails before it lands; one already under way
+    # took its time before `since`. A longer beat and a sleep left one beat due at the old 20 ms,
+    # which a starved thread took after the claim's stamp.
+    def no_read_lands(*, prune: bool = True) -> list[instances.Instance]:
+        raise OSError("no read lands after the test's (test_multi_instance_combined)")
+
+    monkeypatch.setattr(instances, "live_instances", no_read_lands)
+    since = time.time_ns()
+    # Stamped past `since`, not at `time.time_ns()`: Windows' clock moves in 15.6 ms steps, and a
+    # claim stamped just after the read tied it (windows-py3.12; review #1782 of #20).
+    fresh = SizeOwner(os.getppid(), "mini", "ssh", since + 1)
 
     assert fresh.stamp > registered.others_read_ns and size_owner_runs(fresh)
 

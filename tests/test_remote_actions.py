@@ -3364,6 +3364,8 @@ def test_send_keys_with_the_dialog_guard_types_nothing_into_a_pane_not_at_rest(
     # refused 409 `busy`) is not this test's: a loaded windows-py3.12 runner took longer than
     # that to bring the request to the lock, and the guard was never asked (CI 44189275429,
     # shard 8/10: `busy` for `agent_busy`), as for the test at the late-tmux sweep above.
+    # Nothing else holds the lock here, so the 60 s bounds only a hang (a request a minute
+    # from the lock); it is not a race the test waits out.
     monkeypatch.setattr(remote_server, "SEND_KEYS_LOCK_WAIT_SECONDS", 60.0)
     needs.state, needs.pane_quiet = state, False
 
