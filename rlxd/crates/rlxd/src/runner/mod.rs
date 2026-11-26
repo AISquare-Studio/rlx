@@ -66,6 +66,7 @@ mod argv;
 #[cfg(unix)]
 pub(crate) mod guard;
 mod process;
+mod remove;
 mod store;
 mod stream;
 
@@ -112,7 +113,7 @@ struct Runs {
     by_id: HashMap<RunId, Arc<Run>>,
     pools: HashMap<RunKind, Pool>,
     /// Run ids taken by a `run.start` whose record is being written, outside this lock.
-    reserved: std::collections::HashSet<RunId>,
+    reserved: HashMap<RunId, String>,
     /// Spaces being erased, outside this lock: no run starts or resumes in one.
     erasing: std::collections::HashSet<String>,
 }
@@ -279,13 +280,16 @@ impl Runner {
             // A record written in another boot: its processes are gone, and its last
             // unsynced events may be too.
             let rebooted = matches!((&record.boot, &boot), (Some(then), Some(now)) if !process::same_boot(then, now));
+            // On Linux a start time counts from boot, so another boot's can't be compared;
+            // macOS's is absolute, and needs no boot to be the same.
+            let comparable = !rebooted || !cfg!(target_os = "linux");
             if record.state.is_live()
-                && !rebooted
+                && comparable
                 && let Some(process) = &record.process
                 && let Some(started) = &process.started
-                && process::kill_recorded(process.pid, started)
+                && process::sweep(process.pid, started)
             {
-                info!("run {id}: ended the guard an earlier rlxd left running");
+                info!("run {id}: ended what an earlier rlxd left of its process group");
             }
             if let Err(e) = store::repair(&dir.events()) {
                 warning!("run {id}: its log could not be repaired: {e}");
@@ -324,10 +328,16 @@ impl Runner {
                 Some(event) => event["run_seq"].as_u64().unwrap_or(1) - 1,
                 None => record.last_run_seq.max(tail.last_run_seq),
             };
-            if live && rebooted {
-                // Up to UNSYNCED_MAX events a client saw may be gone with the old boot:
-                // number past them, so no run_seq is given twice.
-                last_run_seq += u64::from(UNSYNCED_MAX);
+            // Up to UNSYNCED_MAX events a client saw may be gone with the old boot: what
+            // comes next is numbered past them, so no run_seq is given twice. A lost state
+            // event is put back at its own run_seq first.
+            let skip = if live && rebooted {
+                u64::from(UNSYNCED_MAX)
+            } else {
+                0
+            };
+            if lost.is_none() {
+                last_run_seq += skip;
             }
             let needs_you = (record.state == RunState::NeedsYou)
                 .then(|| format!("run:{id}:{}", record.attempt));
@@ -362,14 +372,14 @@ impl Runner {
                 params: record.params,
             });
             if let Some(event) = lost {
-                put_back.push((Arc::clone(&run), event));
+                put_back.push((Arc::clone(&run), event, skip));
             }
             if live {
                 restarted.push(Arc::clone(&run));
             }
             self.runs().by_id.insert(id, run);
         }
-        for (run, event) in put_back {
+        for (run, event, skip) in put_back {
             let mut inner = run.inner();
             let r#type = event["type"].as_str().unwrap_or_default().to_owned();
             let Some(Value::Object(data)) = event.get("data").cloned() else {
@@ -380,6 +390,7 @@ impl Runner {
                 run.params.run_id
             );
             let _ = self.publish(&run, &mut inner, &r#type, data, Durability::Logged);
+            inner.last_run_seq += skip;
         }
         for run in restarted {
             let mut inner = run.inner();
@@ -481,13 +492,13 @@ impl Runner {
                     ),
                 ));
             }
-            if runs.by_id.contains_key(&id) || runs.reserved.contains(&id) || dir.exists() {
+            if runs.by_id.contains_key(&id) || runs.reserved.contains_key(&id) || dir.exists() {
                 return Err(refusal(
                     codes::RUN_EXISTS,
                     format!("rlxd already knows a run {id}: pick a new run_id"),
                 ));
             }
-            runs.reserved.insert(id.clone());
+            runs.reserved.insert(id.clone(), params.space.clone());
         }
         let run = Arc::new(Run {
             job_id,
@@ -535,6 +546,18 @@ impl Runner {
         }
         let mut runs = self.runs();
         runs.reserved.remove(&id);
+        if runs.erasing.contains(&run.params.space) {
+            // The space began to be erased while the record was written: back out.
+            drop(runs);
+            let _ = std::fs::remove_dir_all(run.dir.path());
+            return Err(refusal(
+                codes::RUN_START_FAILED,
+                format!(
+                    "the space {:?} is being erased: start the run once it is",
+                    run.params.space
+                ),
+            ));
+        }
         runs.by_id.insert(id.clone(), Arc::clone(&run));
         let kind = run.params.kind;
         let pool = runs.pools.entry(kind).or_default();
@@ -569,14 +592,17 @@ impl Runner {
         let run = self.find(id)?;
         let mut changes = run.state.subscribe();
         {
-            // Out of its queue first, under the runner's lock, so no place goes to it.
+            // Out of its queue first, under the runner's lock, so no place goes to it. No
+            // run's lock is taken under it: a run's may be held over a slow disk. (A run
+            // not waiting is not in the queue, and stays out of it.)
             let mut runs = self.runs();
-            let queued = run.inner().state == RunState::Queued;
-            if queued && let Some(pool) = runs.pools.get_mut(&run.params.kind) {
+            if let Some(pool) = runs.pools.get_mut(&run.params.kind) {
                 pool.waiting.retain(|waiting| !Arc::ptr_eq(waiting, &run));
             }
         }
-        let running = {
+        // The run's lock may be held over a slow disk: wait for it as blocking work, so no
+        // other task waits behind this one on its worker.
+        let decided = blocking(|| {
             let mut inner = run.inner();
             match inner.state {
                 state @ (RunState::Queued | RunState::NeedsYou) => {
@@ -590,7 +616,7 @@ impl Runner {
                     let placed = self.end(&run, &mut inner, End::Failed(failed));
                     drop(inner);
                     self.release_if(placed, run.params.kind);
-                    false
+                    Ok(false)
                 }
                 RunState::Running => {
                     inner.ending.get_or_insert(FailReason::Cancelled);
@@ -598,17 +624,19 @@ impl Runner {
                     if let Some(tree) = &inner.tree {
                         tree.kill();
                     }
-                    true
+                    Ok(true)
                 }
-                state @ (RunState::Done | RunState::Failed) => {
-                    return Ok(RunCancelData::new(id.clone(), false, state));
-                }
+                state @ (RunState::Done | RunState::Failed) => Err(state),
             }
-        };
-        if running {
-            let _ = tokio::time::timeout(CANCEL_WAIT, changes.wait_for(|s| !s.is_live())).await;
+        });
+        match decided {
+            Err(state) => return Ok(RunCancelData::new(id.clone(), false, state)),
+            Ok(true) => {
+                let _ = tokio::time::timeout(CANCEL_WAIT, changes.wait_for(|s| !s.is_live())).await;
+            }
+            Ok(false) => {}
         }
-        let now = run.inner().state;
+        let now = *run.state.borrow();
         Ok(RunCancelData::new(id.clone(), now == RunState::Failed, now))
     }
 
@@ -824,11 +852,18 @@ impl Runner {
                 .filter(|run| run.params.space == name)
                 .cloned()
                 .collect();
-            let live: Vec<String> = ours
+            let mut live: Vec<String> = ours
                 .iter()
                 .filter(|run| run.state.borrow().is_live())
                 .map(|run| run.params.run_id.to_string())
                 .collect();
+            // A run being started in the space counts as live.
+            live.extend(
+                runs.reserved
+                    .iter()
+                    .filter(|(_, space)| *space == name)
+                    .map(|(id, _)| id.to_string()),
+            );
             if !live.is_empty() {
                 let message = format!(
                     "the space {name:?} has runs in flight ({}): cancel them, or wait for \
@@ -871,7 +906,12 @@ impl Runner {
     }
 
     /// The removals of `space.erase`, with no lock held: what it removed, the links inside
-    /// the space it removed as links, what failed, and the runs now gone.
+    /// the space it removed as links, what failed, and the runs now gone. Every folder on
+    /// the way is opened once without following a link, and checked and removed through
+    /// what was opened ([`remove`]): `<home>` and each config directory are roots, taken
+    /// as they resolve; `spaces/`, the space, `projects/` and the space's project folder
+    /// must not be links. The config directories are only gone into when the space has
+    /// runs, whose sessions there are removed.
     #[allow(clippy::type_complexity)]
     fn erase_files(
         &self,
@@ -879,30 +919,59 @@ impl Runner {
         space: &std::path::Path,
         ours: &[Arc<Run>],
     ) -> Result<(Vec<String>, Vec<String>, Vec<Value>, Vec<Arc<Run>>), ErrorBody> {
+        use std::ffi::OsStr;
+        let name = remove::name_of(space).to_owned();
         // The space as Claude Code saw it: resolved, before anything is removed.
         let resolved = spaces::resolved(space)
-            .or_else(|_| {
-                spaces::resolved(root).map(|root| root.join(space.file_name().unwrap_or_default()))
-            })
+            .or_else(|_| spaces::resolved(root).map(|root| root.join(&name)))
             .unwrap_or_else(|_| space.to_path_buf());
         let mut folders = vec![project_folder(&resolved)];
         let given = project_folder(space);
         if !folders.contains(&given) {
             folders.push(given);
         }
-        // A link on the way to what erase removes: refused, and nothing removed.
-        let mut on_path: Vec<std::path::PathBuf> = vec![root.to_path_buf(), space.to_path_buf()];
-        for config in config_dirs() {
-            let projects = config.join("projects");
-            on_path.extend(folders.iter().map(|folder| projects.join(folder)));
-            on_path.push(projects);
-            on_path.push(config);
+        let internal = |e: std::io::Error| {
+            refusal(
+                codes::INTERNAL,
+                format!("the space could not be erased: {e}"),
+            )
+        };
+        let mut linked: Vec<String> = Vec::new();
+        // The way to the space: <home> (a root), then spaces/, held.
+        let spaces_held = match remove::walk(self.home.root(), &[OsStr::new("spaces")]) {
+            Ok(Ok(held)) => held,
+            Ok(Err(link)) => {
+                linked.push(link.display().to_string());
+                None
+            }
+            Err(e) => return Err(internal(e)),
+        };
+        if let Some(held) = &spaces_held
+            && let Some(spaces_dir) = held.last()
+            && matches!(
+                spaces_dir.child(&name).map_err(internal)?,
+                remove::Opened::Link
+            )
+        {
+            linked.push(spaces_dir.path().join(&name).display().to_string());
         }
-        let linked: Vec<String> = on_path
-            .iter()
-            .filter(|path| spaces::is_link(path))
-            .map(|path| path.display().to_string())
-            .collect();
+        // The space's project folder in each config directory, held: only when the space
+        // has runs, whose session files are there.
+        let mut projects_held: Vec<Vec<remove::Dir>> = Vec::new();
+        if !ours.is_empty() {
+            for config in config_dirs() {
+                for folder in &folders {
+                    match remove::walk(&config, &[OsStr::new("projects"), OsStr::new(folder)]) {
+                        Ok(Ok(Some(held))) => projects_held.push(held),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(link)) => linked.push(link.display().to_string()),
+                        Err(e) => return Err(internal(e)),
+                    }
+                }
+            }
+        }
+        linked.sort();
+        linked.dedup();
         if !linked.is_empty() {
             let message = format!(
                 "erasing the space would go through links, which rlxd does not follow ({}); \
@@ -914,45 +983,48 @@ impl Runner {
                 json!({"paths": linked}),
             ));
         }
-        // Links inside the space go as links: their targets are never touched.
-        let links: Vec<String> = spaces::links_in(space)
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect();
         let mut removed = Vec::new();
+        let mut links: Vec<String> = Vec::new();
         let mut failed: Vec<Value> = Vec::new();
         let fail = |failed: &mut Vec<Value>, path: &std::path::Path, e: &std::io::Error| {
             failed.push(json!({"path": path.display().to_string(), "error": e.to_string()}));
         };
-        if space.exists() {
-            // As given, never canonicalized: a link swapped in now is removed, not
-            // followed (std's remove_dir_all follows no link).
-            match std::fs::remove_dir_all(space) {
-                Ok(()) => removed.push(resolved.display().to_string()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => fail(&mut failed, space, &e),
-            }
-        }
-        let mut gone = Vec::new();
+        // Each run's session files, through the held project folders.
+        let mut kept: Vec<&Arc<Run>> = Vec::new();
         for run in ours {
-            let id = run.params.run_id.as_str();
+            let file = std::ffi::OsString::from(format!("{}.jsonl", run.params.run_id));
             let before = failed.len();
-            for config in config_dirs() {
-                let projects = config.join("projects");
-                for folder in &folders {
-                    let session = projects.join(folder).join(format!("{id}.jsonl"));
-                    if std::fs::symlink_metadata(&session).is_ok() {
-                        // A session file that is itself a link: the link goes, not what
-                        // it names.
-                        match std::fs::remove_file(&session) {
-                            Ok(()) => removed.push(session.display().to_string()),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => fail(&mut failed, &session, &e),
-                        }
-                    }
+            for held in &projects_held {
+                let Some(project) = held.last() else {
+                    continue;
+                };
+                let path = project.path().join(&file);
+                match project.remove_file(&file) {
+                    Ok(true) => removed.push(path.display().to_string()),
+                    Ok(false) => {}
+                    Err(e) => fail(&mut failed, &path, &e),
                 }
             }
             if failed.len() > before {
+                kept.push(run);
+            }
+        }
+        // The space, through the held spaces/ folder.
+        if let Some(held) = &spaces_held
+            && let Some(spaces_dir) = held.last()
+            && !matches!(spaces_dir.child(&name), Ok(remove::Opened::Missing))
+        {
+            let mut found = Vec::new();
+            match spaces_dir.remove_tree(&name, &mut found) {
+                Ok(()) => removed.push(resolved.display().to_string()),
+                Err(e) => fail(&mut failed, space, &e),
+            }
+            links.extend(found.iter().map(|path| path.display().to_string()));
+        }
+        // rlxd's records of its runs: its own folder.
+        let mut gone = Vec::new();
+        for run in ours {
+            if kept.iter().any(|k| Arc::ptr_eq(k, run)) {
                 // Its record stays, so erasing again finds the run and finishes.
                 continue;
             }
@@ -965,6 +1037,8 @@ impl Runner {
                 Err(e) => fail(&mut failed, run.dir.path(), &e),
             }
         }
+        drop(projects_held);
+        drop(spaces_held);
         Ok((removed, links, failed, gone))
     }
 
@@ -1095,7 +1169,10 @@ impl Runner {
             other => Err(format!("it did not print as an object: {other:?}")),
         };
         if let Err(why) = published {
-            // A run always gets its end: a small one, when its own can't be published.
+            // A run always gets its end: a small one, when its own can't be published. What
+            // the unpublished end said is not kept.
+            inner.session = None;
+            inner.structured_output = None;
             warning!(
                 "run {}: {type} was not published ({why}); it ends failed",
                 run.params.run_id
@@ -1217,11 +1294,14 @@ impl Runner {
         if let Some(reason) = ending {
             return ended_early(run, reason);
         }
+        let status_path = run.dir.status(attempt);
+        let _ = std::fs::remove_file(&status_path);
         let launch = Launch {
             program: program.clone(),
             args: argv::args(params, attempt, &settings),
             cwd: space,
             env: run_env(),
+            status: status_path.clone(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -1292,10 +1372,7 @@ impl Runner {
                     return ended_early(run, reason);
                 }
                 let said = stderr.await.unwrap_or_default();
-                let how = match status {
-                    Some(status) => format!("exited ({status})"),
-                    None => "closed its output".to_owned(),
-                };
+                let how = how_it_ended(status, &status_path);
                 let mut message = format!("Claude Code {how} before its result");
                 if !said.trim().is_empty() {
                     message.push_str(": ");
@@ -1615,31 +1692,41 @@ pub struct Replay {
 impl Replay {
     /// The next lines to send, a few MiB at a time: none once it has caught up with the
     /// log.
+    ///
+    /// A batch of lines all before `from_run_seq` is read past, not returned empty: an empty
+    /// answer always means the log has been read to its end.
     pub fn read(&mut self) -> Vec<bus::Line> {
-        let lines = match self.reader.read() {
-            Ok(lines) => lines,
-            Err(e) => {
-                warning!(
-                    "run {}: its log could not be read: {e}",
-                    self.run.params.run_id
-                );
+        loop {
+            let lines = match self.reader.read() {
+                Ok(lines) => lines,
+                Err(e) => {
+                    warning!(
+                        "run {}: its log could not be read: {e}",
+                        self.run.params.run_id
+                    );
+                    return Vec::new();
+                }
+            };
+            if lines.is_empty() {
                 return Vec::new();
             }
-        };
-        let mut sent = Vec::new();
-        for line in lines {
-            let Some(run_seq) = serde_json::from_slice::<Value>(&line)
-                .ok()
-                .and_then(|event| event["data"]["run_seq"].as_u64())
-            else {
-                continue;
-            };
-            self.through = self.through.max(run_seq);
-            if run_seq >= self.from {
-                sent.push(bus::Line::from(line));
+            let mut sent = Vec::new();
+            for line in lines {
+                let Some(run_seq) = serde_json::from_slice::<Value>(&line)
+                    .ok()
+                    .and_then(|event| event["data"]["run_seq"].as_u64())
+                else {
+                    continue;
+                };
+                self.through = self.through.max(run_seq);
+                if run_seq >= self.from {
+                    sent.push(bus::Line::from(line));
+                }
+            }
+            if !sent.is_empty() {
+                return sent;
             }
         }
-        sent
     }
 
     /// Whether the stream is over: the run has no live process, and every event in its
@@ -1681,6 +1768,28 @@ fn config_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// How Claude Code ended, for `run.failed`'s message: as its guard wrote it (macOS and
+/// Linux), else as the exit status of rlxd's child says.
+fn how_it_ended(status: Option<std::process::ExitStatus>, file: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        let written = std::fs::read_to_string(file).ok();
+        if let Some(ended) = written.as_deref().and_then(guard::read_status) {
+            return format!("exited ({ended})");
+        }
+        if let Some(status) = status {
+            // The guard ended before Claude Code did, and took the run's group with it.
+            return format!("was ended with its guard ({status})");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    match status {
+        Some(status) => format!("exited ({status})"),
+        None => "closed its output".to_owned(),
+    }
 }
 
 /// The end of an attempt rlxd ended itself, for `reason`.

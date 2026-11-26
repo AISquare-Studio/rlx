@@ -1428,7 +1428,19 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
         of(&events, &a, Some("run.started")).is_empty(),
         "B ended while A's run.started was still being made durable: {events:#?}"
     );
-    // A goes on once its disk does.
+    // A cancel of the slow run waits for that run, and holds up nothing else meanwhile.
+    thread::scope(|scope| {
+        let cancel =
+            scope.spawn(|| home.rlxd(&["call", "run.cancel", &json!({"run_id": a}).to_string()]));
+        thread::sleep(Duration::from_millis(300));
+        quick("status during a cancel", &["call", "status"]);
+        quick(
+            "run.start during a cancel",
+            &["call", "run.start", &with_id(&task("hi"), &run_id())],
+        );
+        assert_eq!(cancel.join().unwrap().code(), Some(0));
+    });
+    // A ends, cancelled, once its disk lets it.
     wait_until(&home, since, 30, "A ends", |e| ended(e, &a));
 }
 
@@ -1694,13 +1706,11 @@ fn space_erase_refuses_a_link_on_the_way_and_removes_nothing() {
         "done"
     );
     // <home>/spaces itself a link: refused too.
-    let other = TestHome::new();
+    let other = home_with("hello", &[]);
     let target = other.root().join("real-spaces");
     std::fs::create_dir_all(target.join("default")).unwrap();
-    let claude = link(other.root(), "hello");
-    let other = other.with_claude(claude);
+    let _ = std::fs::remove_dir_all(other.root().join("spaces"));
     std::os::unix::fs::symlink(&target, other.root().join("spaces")).unwrap();
-    other.start();
     let run = other.rlxd(&["call", "space.erase", r#"{"name":"default"}"#]);
     assert_eq!(run.error_code(), "link_refused", "{run:?}");
     assert!(target.join("default").exists());
@@ -1823,4 +1833,214 @@ fn seventy_runs_at_once_get_one_seq_per_event_on_replay_and_on_follow() {
         let seen: Vec<Value> = mine.into_iter().cloned().collect();
         assert_eq!(logged, seen, "{id}");
     }
+}
+
+/// The run's guard, as its record names it (macOS and Linux).
+#[cfg(unix)]
+fn guard_of(home: &TestHome, r: &str) -> u64 {
+    let path = home
+        .root()
+        .join("rlxd")
+        .join("runs")
+        .join(r)
+        .join("run.json");
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    record["process"]["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no process: {record:#}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_guard_killed_alone_takes_its_run_with_it_and_a_cancel_still_answers() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    common::kill_hard(guard_of(&home, &r));
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+    let events = wait_until(&home, since, 10, "the run ends", |e| ended(e, &r));
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert!(
+        last["data"]["message"].as_str().unwrap().contains("guard"),
+        "{last:#}"
+    );
+    let began = Instant::now();
+    let cancelled = home.rlxd(&["call", "run.cancel", &json!({"run_id": r}).to_string()]);
+    assert_eq!(cancelled.code(), Some(0), "{cancelled:?}");
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    // Its place in the pool was given back.
+    let next = run_id();
+    start(&home, &task("quick"), &next);
+    wait_until(&home, since, 20, "the next run ends", |e| ended(e, &next));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_with_a_timeout_whose_guard_dies_leaves_nothing_running() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    let mut params = task("take your time");
+    params["timeout_s"] = json!(3);
+    start(&home, &params, &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    common::kill_hard(guard_of(&home, &r));
+    wait_until(&home, since, 10, "the run ends", |e| ended(e, &r));
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+}
+
+#[test]
+fn rlxd_killed_alone_leaves_no_run_running() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    common::kill_hard(home.status()["pid"].as_u64().unwrap());
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+}
+
+#[test]
+fn a_structured_output_too_large_for_run_done_still_ends_the_run() {
+    let home = home("huge");
+    let mut params = task("go");
+    params["output_schema"] = json!({"type": "object"});
+    let (r, _, events) = gated_start(&home, &params).wait();
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert!(
+        last["data"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("output_too_large"),
+        "{last:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_config_dir_that_is_a_link_is_taken_as_it_resolves() {
+    // A dotfiles setup: ~/.claude is a link. It is a root, so it is followed, and only
+    // links below it are refused.
+    let home = home("persist");
+    let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut params = task("hi");
+    params["persist_session"] = json!(true);
+    let (r, _, _) = gated_start(&home, &params).wait();
+    let dotfiles = home.root().join("dotfiles-claude");
+    let folder: String = p
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let planted = dotfiles.join("projects").join(&folder);
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join(format!("{r}.jsonl")), "{}\n").unwrap();
+    std::os::unix::fs::symlink(&dotfiles, home.root().join("user-home").join(".claude")).unwrap();
+    let erased = call(&home, "space.erase", &json!({"name": "default"}));
+    assert!(!planted.join(format!("{r}.jsonl")).exists(), "{erased:#}");
+    // An empty space erases too.
+    call(&home, "space.ensure", &json!({"name": "empty"}));
+    call(&home, "space.erase", &json!({"name": "empty"}));
+}
+
+#[test]
+fn run_events_replays_a_log_past_four_mebibytes_from_any_run_seq() {
+    let home = home("big");
+    let (r, _, _) = gated_start(&home, &task("go")).wait();
+    let n = call(&home, "run.get", &json!({"run_id": r}))["last_run_seq"]
+        .as_u64()
+        .unwrap();
+    let size = std::fs::metadata(log_path(&home, &r)).unwrap().len();
+    assert!(size > 4 << 20, "the log is {size} bytes");
+    for from in [2, n - 1, n] {
+        let replayed = home.rlxd(&[
+            "call",
+            "run.events",
+            &json!({"run_id": r, "from_run_seq": from}).to_string(),
+        ]);
+        assert_eq!(replayed.code(), Some(0), "from {from}: {replayed:?}");
+        let run_seqs: Vec<u64> = replayed
+            .lines()
+            .iter()
+            .map(|e| e["data"]["run_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(run_seqs, (from..=n).collect::<Vec<_>>(), "from {from}");
+    }
+}
+
+#[test]
+fn run_events_follows_a_live_run_with_a_long_log_from_a_late_run_seq() {
+    let home = home_with("big", &[("FAKE_CLAUDE_SLOW_MS", "2000")]);
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("go"), &r);
+    let events = wait_until(&home, since, 30, "six answers", |e| {
+        of(e, &r, Some("run.text")).len() >= 6
+    });
+    let late = of(&events, &r, None).last().unwrap()["data"]["run_seq"]
+        .as_u64()
+        .unwrap();
+    let followed = home.rlxd(&[
+        "call",
+        "run.events",
+        &json!({"run_id": r, "from_run_seq": late}).to_string(),
+    ]);
+    assert_eq!(followed.code(), Some(0), "{followed:?}");
+    let events = followed.lines();
+    assert_eq!(events[0]["data"]["run_seq"], late);
+    assert_eq!(events.last().unwrap()["type"], "run.done", "{events:#?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn rlxd_and_its_guards_killed_together_leave_nothing_after_a_restart() {
+    // `killall -9 rlxd` kills the guards too, which are rlxds.
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    let rlxd = home.status()["pid"].as_u64().unwrap();
+    let guard = guard_of(&home, &r);
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &rlxd.to_string(), &guard.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    common::eventually("rlxd is gone", || {
+        home.rlxd(&["call", "status"]).code() == Some(3)
+    });
+    home.start_dev();
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+    let got = call(&home, "run.get", &json!({"run_id": r}));
+    assert_eq!(
+        got["last_event"]["data"]["reason"], "engine_restarted",
+        "{got:#}"
+    );
 }

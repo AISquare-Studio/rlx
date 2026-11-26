@@ -635,7 +635,9 @@ impl Daemon {
             }
         };
         let params = params_of::<RunStartParams>(methods::DEBUG_RUN_START, params)?;
-        printed(&self.runner.start(params, &session.client, Some(job_id))?)
+        printed(&off_worker(|| {
+            self.runner.start(params, &session.client, Some(job_id))
+        })?)
     }
 
     /// The runner's methods (handoff 0.10.3, 5.4 and 7.5) and spaces' (2.5): `run.start`,
@@ -650,7 +652,10 @@ impl Daemon {
         match method {
             methods::RUN_START => {
                 let params = params_of::<RunStartParams>(method, params)?;
-                printed(&self.runner.start(params, &session.client, None)?)
+                // Blocking work: it may wait on a run's lock, or write the run's record.
+                printed(&off_worker(|| {
+                    self.runner.start(params, &session.client, None)
+                })?)
             }
             methods::RUN_CANCEL => {
                 let params = params_of::<RunRef>(method, params)?;
@@ -658,19 +663,19 @@ impl Daemon {
             }
             methods::RUN_RESUME => {
                 let params = params_of::<RunResumeParams>(method, params)?;
-                printed(&self.runner.resume(params)?)
+                printed(&off_worker(|| self.runner.resume(params))?)
             }
             methods::RUN_GET => {
                 let params = params_of::<RunRef>(method, params)?;
-                printed(&self.runner.get(&params.run_id)?)
+                printed(&off_worker(|| self.runner.get(&params.run_id))?)
             }
             methods::RUN_LIST => {
                 let params = params_of::<RunListParams>(method, params)?;
-                printed(&self.runner.list(&params))
+                printed(&off_worker(|| self.runner.list(&params)))
             }
             methods::SPACE_ERASE => {
                 let params = params_of::<SpaceParams>(method, params)?;
-                printed(&self.runner.erase(&params.name)?)
+                printed(&off_worker(|| self.runner.erase(&params.name))?)
             }
             _ => {
                 let params = params_of::<SpaceParams>(method, params)?;
@@ -1366,7 +1371,7 @@ where
                 return Flow::Close;
             }
         }
-        if stopping || replay.done() {
+        if stopping || off_worker(|| replay.done()) {
             let reply = match printed(&replay.reply()) {
                 Ok(data) => Envelope::ok(data).with_id(id),
                 Err(error) => Envelope::err(error).with_id(id),

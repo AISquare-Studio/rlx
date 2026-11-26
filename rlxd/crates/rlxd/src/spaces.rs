@@ -69,7 +69,9 @@ fn linked(path: &Path) -> io::Error {
 }
 
 /// The links inside `space`, found without following any: a symlink, or on Windows a
-/// junction. At most the first 100.
+/// junction. At most the first 100. (Windows' erase lists them before std removes them;
+/// elsewhere the erase finds them as it removes.)
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn links_in(space: &Path) -> Vec<PathBuf> {
     const MOST: usize = 100;
     let mut links = Vec::new();
@@ -80,7 +82,7 @@ pub fn links_in(space: &Path) -> Vec<PathBuf> {
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if meta.file_type().is_symlink() || is_junction(&meta) {
+        if meta.file_type().is_symlink() {
             links.push(path);
             if links.len() >= MOST {
                 break;
@@ -94,26 +96,6 @@ pub fn links_in(space: &Path) -> Vec<PathBuf> {
         }
     }
     links
-}
-
-/// Whether `path` is a link (a symlink, or a junction on Windows), without following it.
-pub fn is_link(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink() || is_junction(&meta))
-}
-
-/// Whether `meta` is a Windows reparse point standing for another path (a junction,
-/// which `is_symlink` may not say).
-#[cfg(windows)]
-fn is_junction(meta: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    /// FILE_ATTRIBUTE_REPARSE_POINT
-    const REPARSE_POINT: u32 = 0x400;
-    meta.file_attributes() & REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_junction(_meta: &fs::Metadata) -> bool {
-    false
 }
 
 /// `path` resolved, without Windows' verbatim prefix (`\\?\C:\x` is `C:\x`).

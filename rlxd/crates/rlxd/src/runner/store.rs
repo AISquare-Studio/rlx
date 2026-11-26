@@ -114,6 +114,11 @@ impl RunDir {
         self.dir.join(attempt.to_string()).join("settings.json")
     }
 
+    /// `<attempt>/exit`: how the attempt's Claude Code ended, as its guard writes it.
+    pub fn status(&self, attempt: u64) -> PathBuf {
+        self.dir.join(attempt.to_string()).join("exit")
+    }
+
     /// Writes `attempt`'s settings durably, and returns their path.
     pub fn write_settings(&self, attempt: u64, settings: &Value) -> io::Result<PathBuf> {
         let path = self.settings(attempt);
@@ -366,8 +371,14 @@ impl Reader {
 }
 
 /// Appends `line`, one event and its newline, in one write, then fsyncs it when `sync`.
+/// A write that fails part way is cut back off, so no torn line is left in the log.
 pub fn append(file: &mut File, line: &[u8], sync: bool) -> io::Result<()> {
-    file.write_all(line)?;
+    let before = file.metadata()?.len();
+    if let Err(e) = file.write_all(line) {
+        // Whatever of the line was written goes: the next append starts a line of its own.
+        let _ = file.set_len(before);
+        return Err(e);
+    }
     if sync {
         file.sync_data()?;
     }

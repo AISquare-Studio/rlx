@@ -97,8 +97,9 @@ fn quoted(path: &Path) -> String {
 }
 
 /// [`quoted`], for Windows when `windows`: there the path is written with forward slashes,
-/// which Windows takes and a POSIX shell (Claude Code runs hooks through Git Bash there)
-/// leaves alone, and it is always quoted.
+/// which Windows takes, always in double quotes, and with nothing escaped:
+/// [`hook_beside`] refuses a path holding a character that Git Bash or `cmd` would read in
+/// double quotes, so the command reads the same in either.
 fn quoted_for(path: &str, windows: bool) -> String {
     let text = if windows {
         path.replace('\\', "/")
@@ -116,7 +117,7 @@ fn quoted_for(path: &str, windows: bool) -> String {
     let mut quoted = String::with_capacity(text.len() + 2);
     quoted.push('"');
     for c in text.chars() {
-        if matches!(c, '"' | '\\' | '$' | '`') {
+        if !windows && matches!(c, '"' | '\\' | '$' | '`') {
             quoted.push('\\');
         }
         quoted.push(c);
@@ -124,6 +125,10 @@ fn quoted_for(path: &str, windows: bool) -> String {
     quoted.push('"');
     quoted
 }
+
+/// The characters a Windows hook path may not hold: what Git Bash or `cmd` reads inside
+/// double quotes.
+const WINDOWS_SHELL_CHARACTERS: &[char] = &['"', '$', '`', '%', '!'];
 
 /// `rlxd-hook` beside this rlxd, `rlxd` being this rlxd's own path: its absolute path,
 /// whether or not it is there yet. Never a bare name looked up on `PATH` (rev 7, 4.3 and
@@ -135,6 +140,15 @@ pub fn hook_beside(rlxd: Option<&Path>) -> Result<PathBuf, String> {
         "rlxd-hook"
     };
     match rlxd.and_then(Path::parent) {
+        Some(dir) if cfg!(windows) && dir.to_string_lossy().contains(WINDOWS_SHELL_CHARACTERS) => {
+            Err(format!(
+                "rlxd's own folder, {}, holds a character a hook's shell would read ({}), so \
+                 the rlxd-hook beside it can't be named in a hook command: install rlx in a \
+                 folder without one",
+                dir.display(),
+                WINDOWS_SHELL_CHARACTERS.iter().collect::<String>()
+            ))
+        }
         Some(dir) if dir.is_absolute() => Ok(dir.join(name)),
         Some(dir) => Err(format!(
             "rlxd's own folder, {}, is not an absolute path, so the path of the rlxd-hook \
@@ -268,11 +282,11 @@ mod tests {
             quoted_for("/opt/bin/rlxd-hook", false),
             "/opt/bin/rlxd-hook"
         );
-        // Windows: forward slashes, always quoted, and a `$` after a separator escaped
-        // rather than read as a variable.
+        // Windows: forward slashes, always quoted, nothing escaped (hook_beside refuses a
+        // path a shell would read).
         assert_eq!(
-            quoted_for(r"C:\Users\a b\$x\rlxd-hook.exe", true),
-            r#""C:/Users/a b/\$x/rlxd-hook.exe""#
+            quoted_for(r"C:\Users\a b\rlxd-hook.exe", true),
+            r#""C:/Users/a b/rlxd-hook.exe""#
         );
         assert_eq!(
             quoted_for(r"C:\bin\rlxd-hook.exe", true),

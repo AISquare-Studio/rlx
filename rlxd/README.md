@@ -304,12 +304,18 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
   (every account's config directory once the brain serves rlx's list), the space dir
   encoded as Claude Code does: no other project folder is touched.
-  It refuses `runs_live` while a run in the space is queued or running, and
-  `link_refused` (`detail.paths`) when a link or a junction is on the way: `<home>/spaces`,
-  the space itself, a config directory, its `projects`, or the space's folder there;
-  nothing is removed then. A link inside the space goes as a link, never followed, and is
-  named in `links`. Paths it can't remove fail it `erase_incomplete` (`detail {removed,
-  failed}`), the runs concerned keep their records, and erasing again finishes.
+  It refuses `runs_live` while a run in the space is queued or running (or being
+  started), and `link_refused` (`detail.paths`) when a link or a junction is below a root
+  on the way: `spaces/`, the space itself, a config directory's `projects/`, or the
+  space's folder there; nothing is removed then. `<home>` and each config directory are
+  roots, taken as they resolve (a `~/.claude` kept in dotfiles is fine), and the config
+  directories are only gone into when the space has runs. Every folder on the way is
+  opened once without following a link, and checked and removed through what was opened
+  (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
+  from being renamed meanwhile), so a link put there after the check is never followed.
+  A link inside the space goes as a link and is named in `links`. Paths it can't remove
+  fail it `erase_incomplete` (`detail {removed, failed}`), the runs concerned keep their
+  records, and erasing again finishes.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 
