@@ -568,6 +568,53 @@ def test_a_running_rlxd_exe_is_renamed_aside_and_swept_by_the_next_install(
     assert sorted(p.name for p in bin_dir.iterdir()) == ["rlxd-hook.exe", "rlxd.exe"]
 
 
+@pytest.mark.skipif(WINDOWS, reason="a symlink on Windows needs a privilege CI lacks")
+def test_a_dangling_link_where_rlxd_goes_is_replaced(stub: Stub, tmp_path: Path) -> None:
+    """Tester r2's nit: a broken ``rlxd`` link there gave ``install_failed``, because the
+    aside followed it. It is set aside as the link itself, and replaced like a file."""
+    bin_dir = tmp_path / "linked"
+    _old_pair(bin_dir, HOST)
+    rlxd = bin_dir / "rlxd"
+    rlxd.unlink()
+    rlxd.symlink_to(tmp_path / "gone" / "rlxd")
+    done = rlxd_install.install(target=HOST, bin_dir=bin_dir)
+    for path in done.binaries:
+        assert not path.is_symlink()
+        assert path.read_bytes() == _stand_in(path.name, __version__)
+    assert sorted(p.name for p in bin_dir.iterdir()) == ["rlxd", "rlxd-hook"]
+
+
+@pytest.mark.skipif(WINDOWS, reason="a symlink on Windows needs a privilege CI lacks")
+@pytest.mark.parametrize("dangling", [True, False], ids=["dangling", "to-a-file"])
+def test_a_failure_puts_a_link_back_as_the_link_it_was(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dangling: bool
+) -> None:
+    bin_dir = tmp_path / "linked"
+    old = _old_pair(bin_dir, HOST)
+    rlxd = bin_dir / "rlxd"
+    rlxd.unlink()
+    pointee = tmp_path / "elsewhere" / "rlxd"
+    if not dangling:
+        pointee.parent.mkdir()
+        pointee.write_bytes(b"the linked rlxd")
+    rlxd.symlink_to(pointee)
+    real_replace = os.replace
+
+    def replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst) == rlxd and str(src).endswith(".tmp"):
+            raise PermissionError(13, "Access is denied", str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises(rlxd_install.InstallError) as refused:
+        rlxd_install.install(target=HOST, bin_dir=bin_dir)
+    assert refused.value.code == "install_failed"
+    assert "as they were" in refused.value.message
+    assert rlxd.is_symlink() and os.readlink(rlxd) == str(pointee)
+    assert (bin_dir / "rlxd-hook").read_bytes() == old["rlxd-hook"]
+    assert sorted(p.name for p in bin_dir.iterdir()) == ["rlxd", "rlxd-hook"]
+
+
 # --- the names, the target, the bin directory --------------------------------------------
 
 

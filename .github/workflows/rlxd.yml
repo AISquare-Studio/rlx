@@ -46,9 +46,13 @@ on:
 # run by hand never cancels a push's run or the other way round.
 # A newer run of a ref cancels the older, but never a dispatch with a release_tag: its
 # attach may be part-way through `gh release upload --clobber`, and one cut off can leave
-# the release with some archives replaced and the sums not. Such a run waits instead.
+# the release with some archives replaced and the sums not. The release_tag is in the
+# group, so such a run shares it only with dispatches attaching the same tag, which wait
+# rather than cancel. A plain dispatch on the tag's ref (no release_tag) is in another
+# group: it can neither cancel a running attach nor replace a pending one, as GitHub
+# replaces a group's pending run with any newer one.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.release_tag }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.release_tag == '' }}
 
 permissions:

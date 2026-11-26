@@ -8,14 +8,17 @@ to be ``refs/tags/$TAG`` and the tag, at origin, to still name the commit the ru
 That step is RUN here, as the runner runs it (``bash --noprofile --norc -eo pipefail``, the
 job's ``shell: bash``), in a git clone of a throwaway origin, for a branch, the tag
 (lightweight and annotated), a tag moved since, and none. From the tag, the dry run then
-says what it would upload. The rest of the review's workflow items are pinned as text: the
-build image by digest, ``GH_TOKEN`` on the gh steps alone, and no cancel of a dispatch that
-attaches.
+says what it would upload. rlxd.yml's concurrency group and cancel-in-progress are
+evaluated for the runs that could meet an attaching dispatch, with GitHub's rule for what
+a newer run cancels, so none can cut its upload off. The rest of the review's workflow
+items are pinned as text: the build image by digest, and ``GH_TOKEN`` on the gh steps
+alone.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from tests.ci_matrix import ROOT, workflow
+from tests.ci_matrix import workflow
 
 RELEASE = workflow("rlxd-release.yml")
 REF_CHECK = "The run is the tag's, and built the tag's commit"
@@ -212,16 +215,196 @@ def test_gh_token_is_given_to_the_gh_steps_alone() -> None:
             assert step.get("name") in with_token, f"{step.get('name')} runs gh without it"
 
 
-def test_a_dispatch_that_attaches_is_never_cancelled() -> None:
-    """rlxd.yml's workflow-level group cancels a superseded run, but not a dispatch with a
-    release_tag, whose upload may be part-way (review, minor 5); attach's own group doesn't
-    cancel either."""
-    text = (ROOT / ".github" / "workflows" / "rlxd.yml").read_text(encoding="utf-8")
-    assert (
-        "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' "
-        "|| inputs.release_tag == '' }}" in text
+# --- no run cancels an attaching dispatch (review, minor 5; round 2's #2407) --------------
+#
+# GitHub's rule, applied below to rlxd.yml's own expressions: a run entering a concurrency
+# group cancels the group's running run if ITS cancel-in-progress is true, and always
+# replaces the group's pending run. So an attaching dispatch is safe when every run that
+# can share its group attaches the same tag (and so has cancel-in-progress false).
+
+_TOKEN = re.compile(r"\s*(?:(\|\||&&|==|!=|!|\(|\))|'((?:[^']|'')*)'|([A-Za-z_][\w.-]*))")
+
+
+def _evaluate(expression: str, contexts: dict[str, Any]) -> Any:
+    """The part of GitHub's expression language rlxd.yml's group and cancel-in-progress
+    use: context paths, '…' strings, true/false/null, ==, !=, !, && and || (loose ==: null
+    is '', strings compare case-insensitively). Anything else raises, so a new form in
+    the workflow fails here rather than being misread."""
+    tokens: list[tuple[str, Any]] = []
+    at = 0
+    while expression[at:].strip():
+        match = _TOKEN.match(expression, at)
+        assert match, f"unsupported expression at {expression[at:]!r}"
+        op, literal, path = match.groups()
+        if op:
+            tokens.append(("op", op))
+        elif literal is not None:
+            tokens.append(("value", literal.replace("''", "'")))
+        elif path in ("true", "false", "null"):
+            tokens.append(("value", {"true": True, "false": False, "null": None}[path]))
+        else:
+            value: Any = contexts
+            for part in path.split("."):
+                value = value.get(part) if isinstance(value, dict) else None
+            tokens.append(("value", value))
+        at = match.end()
+
+    def take(op: str) -> bool:
+        if tokens and tokens[0] == ("op", op):
+            tokens.pop(0)
+            return True
+        return False
+
+    def same(a: Any, b: Any) -> bool:
+        a, b = ("" if a is None else a), ("" if b is None else b)
+        return a.lower() == b.lower() if isinstance(a, str) and isinstance(b, str) else a == b
+
+    def primary() -> Any:
+        if take("!"):
+            return not primary()
+        if take("("):
+            value = either()
+            assert take(")"), "unbalanced ("
+            return value
+        kind, value = tokens.pop(0)
+        assert kind == "value", f"unexpected {value!r}"
+        return value
+
+    def compared() -> Any:
+        value = primary()
+        if take("=="):
+            return same(value, primary())
+        if take("!="):
+            return not same(value, primary())
+        return value
+
+    def both() -> Any:
+        value = compared()
+        while take("&&"):
+            right = compared()
+            value = right if value else value
+        return value
+
+    def either() -> Any:
+        value = both()
+        while take("||"):
+            right = both()
+            value = value if value else right
+        return value
+
+    result = either()
+    assert not tokens, f"left over: {tokens}"
+    return result
+
+
+_EXPRESSION = re.compile(r"\$\{\{((?:(?!\}\}).)*)\}\}")
+
+
+def _expand(template: str, contexts: dict[str, Any]) -> Any:
+    """A workflow value: one whole ``${{ … }}`` gives its value; otherwise text."""
+    whole = _EXPRESSION.fullmatch(template.strip())
+    if whole:
+        return _evaluate(whole.group(1), contexts)
+
+    def text(match: re.Match[str]) -> str:
+        value = _evaluate(match.group(1), contexts)
+        if isinstance(value, bool):
+            return str(value).lower()
+        return "" if value is None else str(value)
+
+    return _EXPRESSION.sub(text, template)
+
+
+RLXD = workflow("rlxd.yml")
+
+
+def _run_of_rlxd(event: str, ref: str, release_tag: str | None = None) -> tuple[str, bool]:
+    """(group, cancel-in-progress) of an rlxd.yml run. ``inputs`` exists for a dispatch
+    only, with the defaults GitHub fills in."""
+    inputs = (
+        {"release_tag": release_tag or "", "dry_run": True} if event == "workflow_dispatch" else {}
     )
+    contexts = {
+        "github": {"workflow": RLXD["name"], "event_name": event, "ref": ref},
+        "inputs": inputs,
+    }
+    concurrency = RLXD["concurrency"]
+    group = _expand(str(concurrency["group"]), contexts)
+    cancel = _expand(str(concurrency["cancel-in-progress"]), contexts)
+    assert isinstance(cancel, bool), f"cancel-in-progress is {cancel!r}"
+    return str(group), cancel
+
+
+ATTACHING = ("workflow_dispatch", f"refs/tags/{TAG}", TAG)
+
+
+@pytest.mark.parametrize(
+    "newer",
+    [
+        pytest.param(("workflow_dispatch", f"refs/tags/{TAG}", ""), id="plain-dispatch-on-tag"),
+        pytest.param(("workflow_dispatch", f"refs/tags/{TAG}", "v9.9.8"), id="other-tag"),
+        pytest.param(("workflow_dispatch", "refs/heads/main", TAG), id="same-tag-from-branch"),
+        pytest.param(("push", "refs/heads/main", None), id="push"),
+        pytest.param(("pull_request", "refs/pull/1/merge", None), id="pull-request"),
+    ],
+)
+def test_no_other_run_shares_an_attaching_dispatchs_group(
+    newer: tuple[str, str, str | None],
+) -> None:
+    """#2407's case first: ``gh workflow run rlxd.yml --ref vX.Y.Z`` with no release_tag,
+    while an attaching dispatch of vX.Y.Z runs. Its cancel-in-progress is true, so in the
+    same group it would cut the upload off. It is in another group; so is every other run,
+    which also means none can replace an attach still waiting to start."""
+    attaching_group, _ = _run_of_rlxd(*ATTACHING)
+    group, _ = _run_of_rlxd(*newer)
+    assert group != attaching_group
+
+
+def test_a_second_dispatch_attaching_the_same_tag_waits() -> None:
+    """The one run that shares the group: it waits for the first (cancel-in-progress
+    false), and the first waits for it, so neither upload is cut off."""
+    first, first_cancels = _run_of_rlxd(*ATTACHING)
+    second, second_cancels = _run_of_rlxd(*ATTACHING)
+    assert first == second
+    assert first_cancels is False and second_cancels is False
     assert RELEASE["jobs"]["attach"]["concurrency"]["cancel-in-progress"] is False
+
+
+@pytest.mark.parametrize(
+    ("event", "ref"),
+    [
+        ("push", "refs/heads/rc/0.10.3"),
+        ("pull_request", "refs/pull/1/merge"),
+        ("workflow_dispatch", "refs/heads/feat/x"),
+        ("workflow_dispatch", f"refs/tags/{TAG}"),
+    ],
+)
+def test_other_runs_still_cancel_the_run_they_supersede(event: str, ref: str) -> None:
+    older, _ = _run_of_rlxd(event, ref)
+    newer, cancels = _run_of_rlxd(event, ref)
+    assert older == newer and cancels is True
+
+
+def test_runs_by_hand_and_pushes_never_share_a_group() -> None:
+    assert (
+        _run_of_rlxd("workflow_dispatch", "refs/heads/main")[0]
+        != _run_of_rlxd("push", "refs/heads/main")[0]
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("inputs.release_tag == ''", True),  # absent input: null is ''
+        ("github.event_name != 'workflow_dispatch' || inputs.release_tag == ''", True),
+        ("github.event_name == 'PUSH'", True),  # strings compare case-insensitively
+        ("!(github.event_name == 'push') && 'x'", False),
+        ("'it''s' == 'IT''S'", True),
+    ],
+)
+def test_the_evaluator_reads_these_forms_as_github_does(expression: str, expected: bool) -> None:
+    contexts = {"github": {"event_name": "push"}, "inputs": {}}
+    assert _evaluate(expression, contexts) == expected
 
 
 def test_the_linux_build_image_is_pinned_by_digest_and_logs_its_packages() -> None:

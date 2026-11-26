@@ -473,16 +473,25 @@ def _set_aside(final: Path, *, windows: bool) -> Path:
     """Keep the binary at ``final`` beside it, as ``.<name>.<random>.old``, so it can be put
     back. On Windows it is renamed: a running ``rlxd.exe`` can be renamed but not replaced.
     Elsewhere it is hard-linked (copied where links are not allowed), so the rename of the
-    new one over ``final`` stays atomic."""
+    new one over ``final`` stays atomic. A symlink there is kept as the link itself, so a
+    dangling one is replaced like any other, and put back as it was."""
     old = final.with_name(f".{final.name}.{os.urandom(4).hex()}.old")
     if windows:
         os.replace(final, old)
         return old
     try:
-        os.link(final, old)
-    except OSError:
-        shutil.copy2(final, old)
+        os.link(final, old, follow_symlinks=False)
+    except (OSError, NotImplementedError):
+        shutil.copy2(final, old, follow_symlinks=False)
     return old
+
+
+def _same_entry(a: Path, b: Path) -> bool:
+    """Whether ``a`` and ``b`` are links to one file, symlinks not followed."""
+    if not os.path.lexists(b):
+        return False
+    sa, sb = os.lstat(a), os.lstat(b)
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
 
 
 def _put_back(bin_dir: Path, placed: list[str], aside: Mapping[str, Path]) -> list[str]:
@@ -492,7 +501,7 @@ def _put_back(bin_dir: Path, placed: list[str], aside: Mapping[str, Path]) -> li
     for name, old in aside.items():
         final = bin_dir / name
         try:
-            if os.path.lexists(final) and os.path.samefile(old, final):
+            if _same_entry(old, final):
                 # Never replaced: ``old`` is a link to it, and a rename between two links
                 # to one file does nothing (POSIX), so the link is removed instead.
                 os.unlink(old)
