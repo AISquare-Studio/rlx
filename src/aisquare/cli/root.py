@@ -68,6 +68,14 @@ def init(
             "explainability gateway. Off unless you ask for it.",
         ),
     ] = None,
+    no_service: Annotated[
+        bool,
+        typer.Option(
+            "--no-service",
+            help="Do not set the rlx service to start at login. The first init of the default "
+            "home does, unless CI is set; `rlx service install` does it later.",
+        ),
+    ] = False,
 ) -> None:
     """Set up rlx on this machine and connect your agents."""
     try:
@@ -100,6 +108,14 @@ def init(
             error="reinit_would_discard_explainability",
             hint=f"{prog.word()} init --reinit --yes",
         )
+    if not no_service:
+        # On by default (S2, #33): the first init of the default home adds the login item, not
+        # under CI; a choice on record, a removal in the OS's own settings with it, is left as
+        # it is, the item only refreshed.
+        from aisquare.services import service_login
+
+        with expected_config_write_errors():
+            report.notes.append(service_login.register_by_default())
     emit_setup(report)
 
 

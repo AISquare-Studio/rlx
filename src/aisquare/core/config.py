@@ -1202,6 +1202,20 @@ DONT_ASK_STOP = "stop"
 """The kind ``[ui] confirm_stop`` stands for in ``dont_ask``: the Stop box's."""
 
 
+class ServiceSettings(BaseModel):
+    """``[service]`` — the rlx service (``rlx service``, S1) and its start at login (S2, #33).
+
+    ``start_at_login`` is the person's choice, absent until one is made: ``rlx init`` and the
+    installers add the login item only while it is absent (and for the default home alone),
+    and write ``true``; ``rlx service install`` and App settings' *Start rlx at login* write
+    ``true``, ``rlx service uninstall`` and the switch turned off ``false``. A login item
+    removed in the OS's own settings is never added back while it says ``true``: only an
+    explicit install adds it (``services.service_login``).
+    """
+
+    start_at_login: bool | None = None
+
+
 class SharingSettings(BaseModel):
     """``[sharing]`` — opt-in anonymous usage sharing (docs/usage-telemetry.md).
 
@@ -1247,6 +1261,7 @@ class AppConfig(BaseModel):
     code: CodeSettings = Field(default_factory=CodeSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
+    service: ServiceSettings = Field(default_factory=ServiceSettings)
 
 
 #: Sections an older build read and this one does not, each with why. An unknown section

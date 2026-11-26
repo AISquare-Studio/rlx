@@ -143,6 +143,9 @@ ASSUME_YES=${AISQUARE_INSTALL_YES:-0}
 WANT_AGENT=1
 WANT_SYSTEM_DEPS=1
 WANT_PROJECT=1
+# The rlx service at each login (S2): `aisquare init` adds its login item, the first time,
+# unless --no-service (WANT_SERVICE=0) says not to.
+WANT_SERVICE=1
 PROJECT_DIR=""
 # THE RELEASE STAMP. Empty in the repository, so the copy on `main` installs the
 # latest release. A release asset (releases/download/vX.Y.Z/install.sh) has this
@@ -1397,6 +1400,11 @@ banner() {
     # Its own line: init connects the hooks with or without a project, and not
     # at all under --no-agent.
     [ "$WANT_AGENT" = 1 ] && _plan="$_plan$_bn_nl  connect  $(agents_connected_shown) hooks"
+    if [ "$WANT_SERVICE" = 1 ]; then
+        _plan="$_plan$_bn_nl  start    the rlx service, now and at each login (unless turned off before)"
+    else
+        _plan="$_plan$_bn_nl  skip     the rlx service at login (--no-service)"
+    fi
 
     # As text: as the format a % in a path was a conversion, and under %b a \c
     # ended the banner there and \t or \0NNN were rewritten (review of #257).
@@ -2526,6 +2534,12 @@ codex_installer_sh() {
 # being described, so the rule is switched off for the printing functions only
 # (never file-wide, where a real `cd "~/x"` bug would then hide).
 # shellcheck disable=SC2088
+# Whether the installed aisquare has the rlx service's login item (0.10.2 on): its init
+# has --no-service, and `service install` its --if-undecided.
+has_the_login_item() {
+    aisquare init --help 2>/dev/null | grep -q -e '--no-service'
+}
+
 init_home() {
     step "Setting up $(aisquare_home_shown)"
 
@@ -2541,6 +2555,11 @@ init_home() {
     set -- init --local --yes
     wants_claude && set -- "$@" --agent claude-code
     wants_codex && set -- "$@" --agent codex
+    # --no-service only to a release whose init has it (0.10.2 on): one before it adds no
+    # login item to leave out, and would refuse the option it does not know.
+    if [ "$WANT_SERVICE" = 0 ] && { [ "$DRY_RUN" = 1 ] || has_the_login_item; }; then
+        set -- "$@" --no-service
+    fi
     if [ "$WANT_PROJECT" = 1 ] && [ -n "$PROJECT_DIR" ]; then
         set -- "$@" "$PROJECT_DIR"
     else
@@ -2554,6 +2573,9 @@ init_home() {
         fi
         if wants_codex && ! wants_claude; then
             printf '  %swould run:%s aisquare agents use codex\n' "$C_DIM" "$C_RESET"
+        fi
+        if [ "$WANT_SERVICE" = 1 ]; then
+            printf '  %swould run:%s aisquare service install --if-undecided\n' "$C_DIM" "$C_RESET"
         fi
         return 0
     fi
@@ -2575,6 +2597,14 @@ init_home() {
     # (the account order, `core.agent_adapters`). With both, Claude Code stays it.
     if wants_codex && ! wants_claude; then
         run aisquare agents use codex || die "\`aisquare agents use codex\` failed. Rerun with --verbose to see its output."
+    fi
+    # The rlx service at each login (S2): installing is the person's act, so this registers an
+    # undecided default home even under CI, where init alone does not. A choice on record, and
+    # a home a variable names, are left as they are. Said, never fatal.
+    if [ "$WANT_SERVICE" = 1 ] && has_the_login_item; then
+        if ! run aisquare service install --if-undecided; then
+            warn "\`aisquare service install --if-undecided\` failed: the rlx service may not start at login. Rerun with --verbose to see its output."
+        fi
     fi
     if [ "$WANT_PROJECT" = 1 ] && [ -n "$PROJECT_DIR" ]; then
         good "$(aisquare_home_shown) set up, $PROJECT_DIR registered"
@@ -3244,6 +3274,10 @@ Options
                        no; --yes asks nothing.
       --project DIR    Register DIR as the project (default: $PWD if a git repo).
       --no-project     Machine setup only; register nothing.
+      --no-service     Do not start the rlx service at each login. It does by
+                       default: a LaunchAgent on macOS, a systemd user unit on
+                       Linux and in WSL (turn it off later in App settings,
+                       or with: rlx service uninstall).
       --version V      Pin aisquare-cli to V, or `latest` (default: latest, or
                        the release a release asset was downloaded from).
       --python V       Interpreter uv resolves for the tool env (default: 3.13).
@@ -3302,6 +3336,7 @@ parse_args() {
             --no-agent) WANT_AGENT=0 ;;
             --no-system-deps) WANT_SYSTEM_DEPS=0 ;;
             --no-project) WANT_PROJECT=0 ;;
+            --no-service) WANT_SERVICE=0 ;;
             --with)
                 [ $# -ge 2 ] || die "--with needs an extra (there is: $OPTIONAL_EXTRAS)"
                 choose_extra "$2"

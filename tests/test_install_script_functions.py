@@ -3941,7 +3941,8 @@ def test_the_refresh_runs_after_init_only_with_an_agent(
     result = sh(f"parse_args {flags}; DRY_RUN=0; init_home", path=f"{cli}:{base_path(tmp_path)}")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    ran = calls.read_text(encoding="utf-8").splitlines()
+    # Less the probe of whether this release has the rlx service's login item (S2, #33).
+    ran = [line for line in calls.read_text(encoding="utf-8").splitlines() if line != "init --help"]
     assert ran[0].startswith("init --local --yes"), ran
     assert (ran[1:] == ["agents refresh-hooks --recorded"]) is refreshed, ran
     assert any("refresh-hooks" in line for line in ran) is refreshed, ran
@@ -4768,3 +4769,76 @@ def test_the_word_a_line_tells_a_person_to_type_is_rlx_while_rlx_is_ours(
     )
     ps1_word = "rlx" if not found or found == f"{bin_dir}/rlx" else "aisquare"  # its `if`
     assert ps1_word == word, (found, bin_dir)
+
+
+# ---------------------------------------------------------------------------
+# The rlx service at login (S2, #33): init adds it by default; --no-service
+# ---------------------------------------------------------------------------
+
+
+def _an_init(tmp_path: Path, *, has_no_service: bool) -> tuple[Path, Path]:
+    """An ``aisquare`` that logs what it is asked, and whose init does or does not have
+    --no-service (0.10.2's, or a release before it)."""
+    calls = tmp_path / "calls.log"
+    helped = "  --no-service  Do not set the rlx service to start at login"
+    body = (
+        f'printf "%s\\n" "$*" >> "{calls}"\n'
+        f'[ "$*" = "init --help" ] && printf "%s\\n" "{helped if has_no_service else ""}"\n'
+        "exit 0"
+    )
+    return stub_dir(tmp_path, "cli", "aisquare", body=body), calls
+
+
+@pytest.mark.parametrize(
+    ("flags", "has_it", "passed", "asked"),
+    [
+        ("--yes --no-project --no-agent", True, False, True),
+        ("--yes --no-project --no-agent --no-service", True, True, False),
+        ("--yes --no-project --no-agent --no-service", False, False, False),
+        ("--yes --no-project --no-agent", False, False, False),
+    ],
+    ids=["by-default", "no-service", "no-service-to-a-release-without-it", "a-release-without-it"],
+)
+def test_the_installer_sets_the_service_at_login_unless_no_service_says_not_to(
+    tmp_path: Path, flags: str, has_it: bool, passed: bool, asked: bool
+) -> None:
+    """The installer registers the login item on an undecided default home: init does, and
+    `service install --if-undecided` after it, which does so under CI too (installing is the
+    person's act; init alone does not there). --no-service reaches an init that has it and asks
+    nothing more; a release before 0.10.2 is asked neither, for options it does not know."""
+    cli, calls = _an_init(tmp_path, has_no_service=has_it)
+    result = sh(f"parse_args {flags}; DRY_RUN=0; init_home", path=f"{cli}:{base_path(tmp_path)}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    ran = calls.read_text(encoding="utf-8").splitlines()
+    init = next(line for line in ran if line.startswith("init --local"))
+    assert init.startswith("init --local --yes"), init
+    assert ("--no-service" in init.split()) is passed, init
+    assert ("service install --if-undecided" in ran) is asked, ran
+    if asked:
+        assert ran.index("service install --if-undecided") > ran.index(init), ran
+
+
+@pytest.mark.parametrize(
+    ("flags", "line"),
+    [
+        ("", "  start    the rlx service, now and at each login (unless turned off before)\n"),
+        (" --no-service", "  skip     the rlx service at login (--no-service)\n"),
+    ],
+    ids=["by-default", "no-service"],
+)
+def test_the_plan_says_the_service_starts_at_login(tmp_path: Path, flags: str, line: str) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    result = sh(
+        f"main --dry-run --yes --no-project --offline --no-agent --no-system-deps{flags}",
+        env={"AISQUARE_INSTALL_VERSION": "", "HOME": str(home), "AISQUARE_HOME": ""},
+        path=f"{_machine(tmp_path, _ABSENT)}:{base_path(tmp_path)}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert line in result.stdout, result.stdout
+    init = next(text for text in result.stdout.splitlines() if "would run: aisquare init" in text)
+    assert ("--no-service" in init.split()) is bool(flags), init
+    step = "would run: aisquare service install --if-undecided\n"
+    assert (step in result.stdout) is not bool(flags), result.stdout

@@ -2630,14 +2630,19 @@ def _uninstall_plan(purge: bool) -> UninstallPlan:
 
 
 def _stop_the_service_for_good() -> None:
-    """Stop the rlx service before the uninstall removes what it runs (#32);
-    :class:`UninstallRefused` when it will not stop."""
-    from aisquare.services import service_host
+    """Stop the rlx service before the uninstall removes what it runs (#32), and take its
+    login item away (#33), or the OS would start a program that is gone at every login;
+    :class:`UninstallRefused` when either stays."""
+    from aisquare.services import service_host, service_login
 
     try:
         service_host.stop_service()
     except service_host.ServiceError as exc:
         raise UninstallRefused(f"{exc}: nothing was removed", "service_running") from exc
+    try:
+        service_login.forget_at_login()
+    except service_login.LoginError as exc:
+        raise UninstallRefused(f"{exc}: nothing else was removed", "service_at_login") from exc
 
 
 def uninstall(plan: UninstallPlan) -> UninstallReport:

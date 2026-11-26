@@ -380,6 +380,12 @@ SEAMS: dict[str, Seam] = {
         "shipment (when sharing is on); aisquare's work for the home, not an agent session (#32)",
         strips_identity=True,
     ),
+    "aisquare/services/service_login.py::_service_manager": Seam(
+        EXCLUDED,
+        "`launchctl`, `systemctl --user` and `loginctl`: the rlx service's login item added, "
+        "read and taken away (#33); the OS's own tools, never a model process",
+        strips_identity=True,
+    ),
     "aisquare/services/active_ping.py::_spawn": Seam(
         EXCLUDED,
         "a detached `aisquare metrics ping` of ours — the anonymous daily active ping, started "
