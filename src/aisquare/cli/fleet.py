@@ -439,7 +439,8 @@ def manager_policy(
         bool, typer.Option("--clear", help="Restore the selected key's default.")
     ] = False,
     read_through: Annotated[
-        int | None, typer.Option("--read-through", min=0, help="Verified last manual pass sequence.")
+        int | None,
+        typer.Option("--read-through", min=0, help="Verified last manual pass sequence."),
     ] = None,
 ) -> None:
     """Read, set, or clear the project's manager scheduling policy."""
@@ -474,6 +475,14 @@ def manager_policy(
                 raise typer.BadParameter(str(exc)) from exc
             store.set_project_setting(target.id, key, validated)
         policy = manager_seat.policy(store, target.id)
+    if get_state().json_output:
+        typer.echo(json.dumps({
+            "project_id": target.id,
+            "manager_wake": policy.wake,
+            "manager_pass_minutes": policy.pass_minutes,
+            "invalid": policy.invalid,
+        }))
+        return
     typer.echo(f"{target.id} manager_wake={policy.wake} manager_pass_minutes={policy.pass_minutes}")
     if policy.invalid:
         typer.echo(f"Using defaults for invalid settings: {', '.join(policy.invalid)}", err=True)
@@ -489,7 +498,10 @@ def requeue_manager_pass(
         fleet_service.requeue_manager_pass(_project(project).id, pass_id)
     except (ValueError, TimeoutError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    typer.echo(f"Requeued manager pass {pass_id}.")
+    if get_state().json_output:
+        typer.echo(json.dumps({"pass_id": pass_id}))
+    else:
+        typer.echo(f"Requeued manager pass {pass_id}.")
 
 
 @app.command("ls")

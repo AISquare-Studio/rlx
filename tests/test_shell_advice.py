@@ -59,6 +59,7 @@ DOCTOR_ROWS = frozenset({"_warn", "_fail", "degrade", "DoctorCheck"})
 """Their row builders: the ``fix`` (third, or ``fix=``) is the doctor's fix, the shell's."""
 
 ALLOWED: dict[str, str] = {
+    "services/manager_pass.py::prompt": "agent: the bounded pass commands typed to the manager",
     "core/sandbox_roots.py::forget_argv": "data: returns the argv; its callers wrap it",
     "services/adopt.py::adopt": (
         "data: the argv that runs an agent in its account, which server_note wraps"

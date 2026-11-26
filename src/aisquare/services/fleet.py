@@ -19554,11 +19554,14 @@ def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str |
             return None, None
         if pending is not None and not manager_pass.retryable(pending, session):
             delivery_state = "acknowledged" if pending.acknowledged_at else "submission uncertain"
-            return None, (
-                f"{project}: pass {pending.id} {delivery_state}. "
-                f"If idle and recovery is needed, use {prog.word()} fleet requeue-manager-pass "
-                f"{pending.id} --project {project}"
-            )
+            target_project = store.get_project(project)
+            detail = f"{project}: pass {pending.id} {delivery_state}."
+            if target_project is not None:
+                detail += prog.shell_advice(
+                    " If idle and recovery is needed, use "
+                    + project_service.fleet_command("requeue-manager-pass", target_project, pending.id)
+                )
+            return None, detail
         if _team().standby_of(store, session) is not None or _team().wake_pending(store, session):
             return None, None
         target = _manager_placement(store, project, board)

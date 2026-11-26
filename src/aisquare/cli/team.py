@@ -1441,7 +1441,10 @@ def complete_pass(pass_id: str, as_session: SessionRef = None) -> None:
         fail(str(exc), error="invalid_pass")
     except STORE_ERRORS as exc:
         _fail_team(exc, as_session)
-    typer.echo(f"Completed manager pass {pass_id}.")
+    if get_state().json_output:
+        typer.echo(json.dumps({"pass_id": pass_id}))
+    else:
+        typer.echo(f"Completed manager pass {pass_id}.")
 
 
 @app.command("verify")

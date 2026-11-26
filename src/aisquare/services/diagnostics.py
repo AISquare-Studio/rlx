@@ -3137,11 +3137,14 @@ def _manager_policy_rows(store: ContextStore) -> list[DoctorCheck]:
         name = f"manager policy {project}"
         settings = manager_seat.policy(store, project)
         if settings.invalid:
+            target = store.get_project(project)
             rows.append(
                 _warn(
                     name,
                     f"using defaults for {', '.join(settings.invalid)}",
-                    f"{prog.word()} fleet manager-policy --project {project}",
+                    project_service.fleet_command("manager-policy", target)
+                    if target is not None
+                    else "Check the fleet project's policy.",
                 )
             )
         row = store.fleet_agent_by_label(project, manager_seat.LABEL, live_only=True)

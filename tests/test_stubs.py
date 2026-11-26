@@ -86,6 +86,8 @@ IMPLEMENTED: set[tuple[str, ...]] = {
             "top",
             "gate",
             "adopt",
+            "manager-policy",
+            "requeue-manager-pass",
         )
     ),
     ("code", "find"),
@@ -134,6 +136,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
             "log",
             "prune",
             "verify",
+            "complete-pass",
             "show",
             "signal",
             "signals",

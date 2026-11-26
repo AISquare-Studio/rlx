@@ -96,15 +96,18 @@ def template(project: str) -> tuple[str, str | None]:
 def prompt(project: str, board: str, pending: Pass) -> tuple[str, str | None]:
     """Attach commands for the exact range to the project template."""
     body, why = template(project)
-    cli = program.word()
+    read = program.words(
+        "--json", "team", "log", "--pass-id", pending.id, "--since-seq", str(pending.lower),
+        "--through-seq", str(pending.upper), "--as", pending.session,
+    )
+    complete = program.words("team", "complete-pass", pending.id, "--as", pending.session)
     return (
         f"{_PREFIX}{pending.id}\n{body}\n\n"
         f"Board {board}. Read after #{pending.lower} through #{pending.upper}:\n"
-        f"{cli} --json team log --pass-id {pending.id} --since-seq {pending.lower} "
-        f"--through-seq {pending.upper} --as {pending.session}\n"
+        f"{read}\n"
         "Continue paging from the last seq until the range is exhausted. "
         "After reading and acting, run:\n"
-        f"{cli} team complete-pass {pending.id} --as {pending.session}",
+        f"{complete}",
         why,
     )
 

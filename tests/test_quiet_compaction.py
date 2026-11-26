@@ -554,7 +554,9 @@ def test_scheduled_compaction_uses_the_completed_pass_decision_watermark(manager
         store.touch_session(manager.sid, state="waiting")
         session = manager.session()
         settings = load_config().fleet
-        assert quiet_compact.refusal(store, session, manager.agent, session.cursor, settings) is None
+        assert (
+            quiet_compact.refusal(store, session, manager.agent, session.cursor, settings) is None
+        )
         progress = manager_pass.Progress(
             pending=manager_pass.Pass(
                 id="verified", lower=0, upper=decision.seq, session=manager.sid,
