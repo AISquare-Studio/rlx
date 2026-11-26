@@ -19,7 +19,7 @@ launcher: it mints the id, hands it to the agent as ``--session-id``, and
 traces under that same id. ``plan_session_identity`` decides whether that is
 possible for a given launch, and ``record_join`` writes down the result.
 
-The join log is JSON Lines at ``~/.aisquare/explainability/joins.jsonl``
+The join log is JSON Lines at ``~/.rlx/explainability/joins.jsonl``
 (``AISQUARE_HOME`` relocates it), one object per traced launch::
 
     {"started_at": "2026-08-17T02:31:07+00:00",  # UTC, ISO 8601
@@ -50,7 +50,7 @@ Everything here fails open by design. Tracing is an observer — the moment it
 would break a launch (proxy down, wrong proxy mode, an ANTHROPIC_* var the
 user already owns, a config typo, an unwritable join log) we launch the
 session untraced and say why, we never block. The only hard opt-in is
-``explainability.enabled`` in ``~/.aisquare/config.toml``, which defaults to
+``explainability.enabled`` in ``~/.rlx/config.toml``, which defaults to
 off.
 """
 
@@ -1757,7 +1757,7 @@ def _init_sdk(gateway_url: str, api_key: str) -> Any:
     # our own home unless the operator chose a location themselves — and the
     # directory is CREATED here, because the SDK's `InboxWriter.ensure_schema()`
     # calls `sqlite3.connect()` without making parents: on a fresh install, or
-    # an upgrade that has only ever run plain sessions, `~/.aisquare/
+    # an upgrade that has only ever run plain sessions, `~/.rlx/
     # explainability/` does not exist yet (configuration writes the home and
     # the key file; only a traced join used to create this subdirectory), and
     # the pin alone turned every drain into `unable to open database file`,

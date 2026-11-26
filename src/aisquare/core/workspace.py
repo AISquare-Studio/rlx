@@ -41,7 +41,7 @@ def _is_aisquare_home(candidate: Path) -> bool:
 
     Matched structurally rather than by path, because the home that matters is
     not always the configured one: the test suite redirects ``AISQUARE_HOME``
-    into a temp tree while the developer's real ``~/.aisquare`` is still
+    into a temp tree while the developer's real ``~/.rlx`` is still
     sitting above ``tempfile.gettempdir()``, and only a structural check sees
     both for what they are.
     """
@@ -99,7 +99,7 @@ def marks_project_root(directory: Path) -> bool:
     """Whether ``directory`` carries a project marker.
 
     ``.aisquare`` is overloaded: ``<project>/.aisquare`` is the opt-in project
-    marker, but ``~/.aisquare`` is *our own state directory*. Counting the
+    marker, but ``~/.rlx`` is *our own state directory*. Counting the
     latter makes the home directory a project root, so every markerless
     directory beneath it silently resolves to ``$HOME`` and shares one context
     pool — and ``serve --stdio``'s "refusing to activate: not a project root"

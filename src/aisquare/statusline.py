@@ -59,7 +59,7 @@ TIMES = "\N{MULTIPLICATION SIGN}"
 
 def home() -> Path:
     """rlx's home, as ``core.paths.aisquare_home`` finds it, without importing it: ``$RLX_HOME``,
-    else ``$AISQUARE_HOME``, else ``~/.rlx`` if it is there, else ``~/.aisquare`` if it is,
+    else ``$AISQUARE_HOME``, else ``~/.rlx`` if it is there, else ``~/.rlx`` if it is,
     else ``~/.rlx``. Its cache is ``cache/`` in either layout (``core.paths``)."""
     for variable in ("RLX_HOME", "AISQUARE_HOME"):
         override = os.environ.get(variable)

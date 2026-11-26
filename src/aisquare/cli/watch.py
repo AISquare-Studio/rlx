@@ -578,7 +578,7 @@ def _build_app_class(interval: float, project: ProjectInfo | None = None) -> Any
             self.action_pick_theme()
 
         def action_screenshot(self, filename: str | None = None, path: str | None = None) -> None:
-            """Save an SVG of the board to ~/.aisquare/screenshots (always local —
+            """Save an SVG of the board to ~/.rlx/screenshots (always local —
             textual's own palette screenshot 'delivers' and can fail in plain
             terminals)."""
             try:

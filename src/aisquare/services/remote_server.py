@@ -52,7 +52,7 @@ that fails is logged and the server runs without it, and a stream seam that
 fails skips its frame for that tick.
 
 State (token, password, ``allow_write``, ``auto_off_at``, devices) lives in
-``~/.aisquare/remote.json``, owner-only (0600; on Windows, a DACL for this
+``~/.rlx/remote/remote.json``, owner-only (0600; on Windows, a DACL for this
 account alone), and a serving process re-reads it when its bytes change, so
 ``aisquare remote allow-write on`` from another shell reaches the running
 server within a second (:meth:`Runtime.reload_if_changed`). Everything that
@@ -2605,7 +2605,7 @@ def check_project_add_root(raw: object) -> Path:
     read: ``~/.ssh`` was one request away. So the path must be absolute (``~``
     allowed) and exist, and the project root it resolves to must be inside the
     home directory but not the home itself, below no hidden directory
-    (``~/.ssh``, ``~/.aisquare``, ``~/.claude*``, ``~/.config``), and a project in
+    (``~/.ssh``, ``~/.rlx``, ``~/.claude*``, ``~/.config``), and a project in
     fact: a git checkout, or a directory holding repos. Symlinks are resolved
     before any check, so a link into a hidden directory is judged where it points.
     A path the system refuses to look up is refused as such: a NUL byte's
@@ -4838,7 +4838,7 @@ WRONG_PASSWORD = "that is not the passphrase"
 NOT_TEXT = "the body holds a lone surrogate (an unpaired \\ud800-\\udfff escape), which is not text"
 """400 ``invalid`` for a body string no UTF-8 can hold (:meth:`RemoteKit.kit_json_object`)."""
 STATE_UNWRITABLE = (
-    "the machine could not save that: its ~/.aisquare/remote.json would not write (a full disk, "
+    "the machine could not save that: its ~/.rlx/remote/remote.json would not write (a full disk, "
     "or a home it may not write) — nothing was changed; fix that on the machine, then try again"
 )
 """503 ``remote_state_unwritable``, as ``asq remote``'s own commands say it, but without the
@@ -4852,7 +4852,8 @@ def revoke_unsaved() -> str:
     before then is read by this one (``reload_if_changed``) with the device still in it, so the
     sentence names the command that makes the revoke hold (review of #243, round 4)."""
     return (
-        "revoked on the running Remote, but the machine's ~/.aisquare/remote.json would not write "
+        "revoked on the running Remote, but the machine's ~/.rlx/remote/remote.json would not "
+        "write "
         f"(a full disk, or a home it may not write): once it can, run  {prog.word()} remote "
         "revoke {device}  "
         "on the machine, as until it is saved a change to that file from a shell, or a Remote "
@@ -4861,7 +4862,7 @@ def revoke_unsaved() -> str:
 
 
 STATE_LATER = (
-    "the machine could not save that: its ~/.aisquare/remote.json was upgraded by a later "
+    "the machine could not save that: its ~/.rlx/remote/remote.json was upgraded by a later "
     "rlx while this Remote ran, and is never written over — nothing was changed; turn "
     "Remote off and on again on the machine, with that rlx"
 )
@@ -4873,7 +4874,8 @@ freed space to no end (review of #259, round 8, 7/9): no write of this Remote's 
 def revoke_later() -> str:
     """503 ``remote_state_unwritable`` for a revoke refused as :class:`LaterRemoteState`."""
     return (
-        "revoked on the running Remote, but the machine's ~/.aisquare/remote.json was upgraded by "
+        "revoked on the running Remote, but the machine's ~/.rlx/remote/remote.json was upgraded "
+        "by "
         f"a later rlx while this Remote ran, and is never written over: run  {prog.word()} "
         "remote "
         "revoke {device}  on the machine with that rlx, or the next Remote it starts takes "
@@ -7247,7 +7249,7 @@ make a real claim fail. A Remote that is on holds it for as long as it serves.""
 def remote_already_on() -> str:
     """Why Remote will not start while another process serves this home."""
     return (
-        "another Remote is on for this ~/.aisquare (the rlx UI's R panel"
+        "another Remote is on for this ~/.rlx (the rlx UI's R panel"
         + prog.shell_advice(f", or `{prog.word()} remote serve` in another shell")
         + ") — turn it off first: two would share "
         "one link, one passphrase, one auto-off and one list of phones"
@@ -8016,7 +8018,7 @@ def _page_copy_loops(source: Path, directory: Path, target: Path) -> bool:
     ..`` copied the whole build into itself at every level, some 40 deep, until the path
     was one the system could not look up: a 1 MB build wrote 82 directories, a 100 MB one
     about 4 GB, before the clean-up; and the ``shutil.Error`` it raised, an ``OSError``, was
-    told to make ``~/.aisquare`` writable or free some space (review of #259, remote focus,
+    told to make ``~/.rlx`` writable or free some space (review of #259, remote focus,
     5/12). Two links leading into each other (``a/x -> b``, ``b/y -> a``) loop as well:
     each is copied once, and stops where it would come round again.
     """
@@ -8523,14 +8525,14 @@ def _remote_serve_off(state: Runtime, server: Any) -> str | None:
             failure = (
                 f"its devices could not be revoked ({exc}), so their cookies would open the "
                 f"next Remote: run `{prog.word()} remote revoke --all` once "
-                "~/.aisquare/remote.json "
+                "~/.rlx/remote/remote.json "
                 "can be written"
             )
         try:
             state.set_auto_off(None)
         except Exception as exc:
             log.warning("remote: auto-off could not clear its deadline: %s", exc)
-            failure = failure or f"its deadline is still in ~/.aisquare/remote.json ({exc})"
+            failure = failure or f"its deadline is still in ~/.rlx/remote/remote.json ({exc})"
     finally:
         server.should_exit = True
         _remote_writes_announced("Ctrl-C")

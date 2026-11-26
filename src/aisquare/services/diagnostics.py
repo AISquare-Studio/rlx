@@ -701,7 +701,7 @@ def _check_home_filesystem() -> DoctorCheck:
 
     ``save_config`` publishes changes with write-temp/fsync/rename/fsync-parent,
     and the atomicity of that rename is a property of the FILESYSTEM. It was
-    measured on a native disk, which is where the default ``~/.aisquare`` sits.
+    measured on a native disk, which is where the default ``~/.rlx`` sits.
     ``AISQUARE_HOME`` is taken verbatim, so a Windows-backed path is one export
     away — and until now nothing in the code could tell an operator which kind of
     path they were on.

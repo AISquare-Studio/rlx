@@ -6193,7 +6193,7 @@ def spawn(
         # The launcher activates a board BEFORE it hands the agent its `-e` pairs,
         # from its cwd — the brain folder, where `.aisquare` above it is a project
         # marker. With the hub only in `-e`, it onboarded the brain folder (or
-        # `$HOME`, under `~/.aisquare`) as a project; the window's hub, the home's
+        # `$HOME`, under `~/.rlx`) as a project; the window's hub, the home's
         # root (`_spawn_board_and_hub`), lands the launcher on the home board, which
         # the store keeps captured (T2).
         env["AISQUARE_HOME"] = env["RLX_HOME"] = str(paths.aisquare_home().resolve())
@@ -8253,7 +8253,7 @@ def _admit(config: FleetSettings) -> list[str]:
     memory refusal the floor is ``min_free_mb + 512`` for five minutes, so admission
     does not flap on a box hovering at the line. Unknown headroom admits, with a note.
     Each refusal, and each admission that fills the budget, is one line in
-    ``~/.aisquare/fleet/admission.jsonl``.
+    ``~/.rlx/fleet/admission.jsonl``.
     """
     notes: list[str] = []
     counts = _live_per_project() if config.max_agents_total > 0 else {}

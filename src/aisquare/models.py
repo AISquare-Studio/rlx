@@ -2322,9 +2322,9 @@ class FreshCounts(BaseModel):
     briefs: int = 0
     """Work briefs, with their numbered requirements: the board's, as its tasks are."""
     evidence: int = 0
-    """Files of the briefs' kept evidence, under ``~/.aisquare/briefs/<id>/``."""
+    """Files of the briefs' kept evidence, under ``~/.rlx/briefs/<id>/``."""
     manager_state: int = 0
-    """Files of the manager's own state (``~/.aisquare/projects/<id>/manager/``: its
+    """Files of the manager's own state (``~/.rlx/projects/<id>/manager/``: its
     ``state.md``, goal, decisions, open items, next step), which a blank manager must not
     read back."""
     entries: int | None = None

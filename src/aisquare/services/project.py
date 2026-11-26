@@ -449,7 +449,7 @@ def forget(ref: str, *, purge: bool = False) -> ProjectForgetReport:
     Without ``purge`` the registration is tombstoned and the project's
     context entries, prompt history, board rows and ended fleet-agent rows stay
     in the store, hidden — reachable again only by registering the root again.
-    With ``purge`` they are deleted, and so is ``~/.aisquare/projects/<id>/``
+    With ``purge`` they are deleted, and so is ``~/.rlx/projects/<id>/``
     (its key and symbol index), and a key the CLI minted for it is revoked — or,
     when it cannot be yet, kept owed and named in the report
     (:func:`_revoke_owed`).
@@ -961,10 +961,10 @@ def _clear_pin() -> str | None:
 
 
 def _remove_data_dir(project_id: str) -> bool:
-    """Delete ``~/.aisquare/projects/<id>/`` (its key and symbol index, ``code/``);
+    """Delete ``~/.rlx/projects/<id>/`` (its key and symbol index, ``code/``);
     False if there was none.
 
-    The project's kept brief artifacts (``~/.aisquare/briefs/<id>/``) go too: the purge
+    The project's kept brief artifacts (``~/.rlx/briefs/<id>/``) go too: the purge
     has deleted the briefs that cite them.
     """
     shutil.rmtree(paths.project_briefs_dir(project_id), ignore_errors=True)

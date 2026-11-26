@@ -12,7 +12,7 @@ no rate limit (GitHub's REST best practices) and makes no further call. Requests
 serial. Per pull request, the reviews are read again only when its ``updated_at`` moved (a
 review moves it; an approval does not move the head), and its check runs only until they
 have all completed for its head. The ETags and the answers they stand for are kept in
-``~/.aisquare/watch/gh-etags.json``.
+``~/.rlx/watch/gh-etags.json``.
 """
 
 from __future__ import annotations

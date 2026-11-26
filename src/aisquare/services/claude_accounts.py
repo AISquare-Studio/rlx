@@ -284,7 +284,7 @@ def overview() -> AccountsOverview:
 
 # --- the registry: alias, priority order, default, disabled (#145) ------------------------------
 #
-# The directories under ~/.aisquare/claude-accounts say WHICH accounts exist and
+# The directories under ~/.rlx/accounts/claude say WHICH accounts exist and
 # who is signed in (core.claude_accounts). What no directory can say is how the
 # operator ARRANGED them — which one a launch should pick when nothing more
 # specific says, in what order to try them, what to call them — and that lives

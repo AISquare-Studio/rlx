@@ -225,7 +225,7 @@ def deployment_target(
     proxy set by hand stays. Otherwise a target of its own. Either way it names
     a key variable of its own (:func:`key_env_for`) unless it already names
     one other than the default. With the default one, the unlabelled machine
-    key — ``~/.aisquare/explainability-key`` or ``$EXPLAINABILITY_API_KEY`` —
+    key — ``~/.rlx/explainability-key`` or ``$EXPLAINABILITY_API_KEY`` —
     would answer for every deployment anyone signs in to, and ``use`` would
     bind the roster and every launch would authenticate with a key issued for
     somewhere else: the hazard ``tests/test_key_never_crosses_deployments.py``

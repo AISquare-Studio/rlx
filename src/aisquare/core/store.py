@@ -5,7 +5,7 @@ This is the single home of all persisted context. The public surface is the
 SQLite implementation. Services depend on the protocol, never on SQLite
 directly, so the backend can evolve without touching the service layer.
 
-On-disk shape (``~/.aisquare/context.db``):
+On-disk shape (``~/.rlx/rlx.db``):
 
 - ``entry``      — one row per remembered fact, in the ``user`` or ``project`` pool;
 - ``entry_fts``  — an FTS5 mirror of entry text/tags kept current by triggers;
@@ -960,7 +960,7 @@ ALTER TABLE project ADD COLUMN forgotten_at TEXT;
 #
 # ``claude_account`` is the operator's arrangement of the account slots — an
 # alias, a priority order, the machine default, a disabled flag — and nothing
-# else. The slots themselves stay directories under ``~/.aisquare/claude-accounts``
+# else. The slots themselves stay directories under ``~/.rlx/accounts/claude``
 # (docs/plans/claude-accounts.md §2: "the directories are the record"); this table
 # holds only what a directory cannot: a name and a rank. ``slot`` is the join,
 # ``config_dir`` is recorded for the launch record and never consulted, and a row

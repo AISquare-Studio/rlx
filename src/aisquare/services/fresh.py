@@ -8,14 +8,14 @@ it. ``project fresh`` and the UI's Start fresh… call these two.
 What goes, scoped to the one project: its board (tasks, events, sessions, its signals, the
 gone sessions' marks and its labels' before-limit rows, counted together as signals and
 marks, its work briefs, ``store.reset_project``; the briefs' kept evidence under
-``~/.aisquare/briefs/<id>/``), the manager's own state (``~/.aisquare/projects/<id>/
+``~/.rlx/briefs/<id>/``), the manager's own state (``~/.rlx/projects/<id>/
 manager/``, which a blank manager must not read back), its fleet (each live agent stopped as
 ``fleet shutdown`` stops it, each agent's worktree removed, then its rows), and with the
 extras asked for, its context entries (``memory``), its prompt log and turn
 metrics (``prompts``) and its local ``fleet/<codename>/…`` branches (``branches``). What
 stays: the checkout and every other branch, the registration (name, nickname, group, pin,
-settings, codename), its symbol index (``~/.aisquare/projects/<id>/code``), the accounts, the
-captain, and every other project. No command report (``~/.aisquare/reports/``) is deleted,
+settings, codename), its symbol index (``~/.rlx/projects/<id>/code``), the accounts, the
+captain, and every other project. No command report (``~/.rlx/reports/``) is deleted,
 but with their briefs gone the reports they cited are no longer pinned as evidence, and
 normal retention takes them (unless another board's brief cites one).
 """
@@ -626,12 +626,12 @@ def _counts(
 
 
 def _evidence_root(project_id: str) -> Path:
-    """``~/.aisquare/briefs/<id>/``: every brief's kept evidence (``paths.brief_evidence_dir``)."""
+    """``~/.rlx/briefs/<id>/``: every brief's kept evidence (``paths.brief_evidence_dir``)."""
     return paths.project_briefs_dir(project_id)
 
 
 def _manager_dir(project_id: str) -> Path:
-    """``~/.aisquare/projects/<id>/manager/``: the manager's ``state.md``, and whatever else
+    """``~/.rlx/projects/<id>/manager/``: the manager's ``state.md``, and whatever else
     it keeps beside it, all of which a blank manager must start without."""
     return paths.manager_state_file(project_id).parent
 

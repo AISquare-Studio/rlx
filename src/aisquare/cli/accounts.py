@@ -1573,7 +1573,7 @@ def _share_help() -> str:
     for name, root in merged:
         paragraphs.append(
             f"`{name}` gives every launch one auto-memory directory per project, under "
-            f"~/.aisquare/{root}/memory (merged from every account the first time)."
+            f"~/.rlx/{root}/memory (merged from every account the first time)."
         )
     paragraphs.append(
         "The others make each managed account's entry a link to the plain home's, its own "
