@@ -19,7 +19,8 @@ A home from before it (``~/.aisquare``) keeps the layout it was made in until H2
 WHERE the home is: ``$RLX_HOME``, else ``$AISQUARE_HOME`` (the name before it, still honoured),
 else ``~/.rlx`` if it exists, else ``~/.aisquare`` if it exists, else ``~/.rlx`` (a new user).
 HOW it is laid out: a home a variable names is laid out by what is in it (``rlx.db``: the new
-layout; ``context.db``, ``launch-seals/`` or ``instances/``: the old one;
+layout; ``context.db``, ``launch-seals/``, ``instances/``, ``log/``, an agent's ``*-accounts/`` and
+the old layout's other top-level names: the old one;
 nothing yet: the new one), so the fleet's agents, which are handed the home as
 ``AISQUARE_HOME``, read it as the rlx that started them does. ``~/.aisquare`` with no ``~/.rlx``
 is the old layout. Every path under the home is built by a helper here, named for what it holds.
@@ -56,10 +57,23 @@ NEW: Layout = "rlx"
 OLD: Layout = "aisquare"
 NEW_LAYOUT_MARKERS = ("rlx.db",)
 """What only a home in the new layout has at its top."""
-OLD_LAYOUT_MARKERS = ("context.db", "launch-seals", "instances")
-"""What only a home in the old layout has at its top: one of them makes a home old. (Its
-accounts' folders are an agent's name, which only its adapter says; a home used at all has
-its store, ``context.db``, at the top anyway.)"""
+OLD_LAYOUT_MARKERS = (
+    "context.db",
+    "launch-seals",
+    "instances",
+    "log",
+    "fleet-tmux.conf",
+    "remote.json",
+    "credentials",
+)
+"""What only a home in the old layout has at its top: one of them makes a home old, and so
+does an agent's accounts folder (:data:`OLD_ACCOUNTS_SUFFIX`). Not the store alone: a home only
+the CLI used has no ``instances/`` or ``launch-seals/``, and the damaged store's advice moves
+``context.db`` aside; read as new then, it would get the new layout beside its old files (the
+tester's blocker on #30)."""
+OLD_ACCOUNTS_SUFFIX = "-accounts"
+"""An agent's accounts folder at an old home's top (``<agent>-accounts``): the agent's name is
+its adapter's to say (``AgentAccounts.dir_name``), the suffix is the old layout's."""
 
 
 def restrict_to_owner(path: Path) -> bool:
@@ -431,9 +445,9 @@ def home_of(
 
 
 _LAYOUTS: dict[tuple[str, int], Layout] = {}
-"""Each home's layout as last found, keyed by its folder and the folder's modification time,
-which an entry made or removed at its top moves: one ``stat`` per question, the markers looked
-for again only when the top of the home changed."""
+"""Each home's layout as its markers decided it, keyed by its folder and the folder's
+modification time, which an entry made or removed at its top moves: one ``stat`` per question
+once a marker is there. A home with no marker yet is looked at again every time."""
 
 
 def layout_of(root: Path) -> Layout:
@@ -446,17 +460,32 @@ def layout_of(root: Path) -> Layout:
         return NEW  # nothing there yet: a new home
     key = (str(root), stamp)
     found = _LAYOUTS.get(key)
-    if found is None:
-        if any((root / marker).exists() for marker in NEW_LAYOUT_MARKERS):
-            found = NEW
-        elif any((root / marker).exists() for marker in OLD_LAYOUT_MARKERS):
-            found = OLD
-        else:
-            found = NEW
-        if len(_LAYOUTS) > 64:  # a test suite's many homes: keep it small
-            _LAYOUTS.clear()
-        _LAYOUTS[key] = found
+    if found is not None:
+        return found
+    if any((root / marker).exists() for marker in NEW_LAYOUT_MARKERS):
+        found = NEW
+    elif any((root / marker).exists() for marker in OLD_LAYOUT_MARKERS) or _has_old_accounts(root):
+        found = OLD
+    else:
+        # Not kept: a marker made within the folder's timestamp's resolution (a jiffy on
+        # Linux, about 15.6 ms on NTFS) leaves its modification time as it was, and a kept
+        # "nothing yet" would outlive it. A home's markers, once there, stay.
+        return NEW
+    if len(_LAYOUTS) > 64:  # a test suite's many homes: keep it small
+        _LAYOUTS.clear()
+    _LAYOUTS[key] = found
     return found
+
+
+def _has_old_accounts(root: Path) -> bool:
+    """Whether ``root`` has an agent's accounts folder at its top, as the old layout keeps them."""
+    try:
+        with os.scandir(root) as entries:
+            return any(
+                entry.name.endswith(OLD_ACCOUNTS_SUFFIX) and entry.is_dir() for entry in entries
+            )
+    except OSError:
+        return False
 
 
 def home_layout() -> Layout:
@@ -905,6 +934,14 @@ def truncation_marker_path() -> Path:
 # ``aisquare_home()`` with a name of its own.
 
 
+def shown(path: Path) -> str:
+    """``path`` as a person reads it: ``~/…`` under their home directory, else whole."""
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def projects_dir() -> Path:
     """Every project's own folder (:func:`project_data_dir`), one per project id."""
     return aisquare_home() / "projects"
@@ -956,7 +993,7 @@ def fleet_dir() -> Path:
 
 
 def tmux_conf_path() -> Path:
-    """The tmux config the fleet's server starts with (``core.tmux.CONF_NAME``)."""
+    """The tmux config the fleet's server starts with (``core.tmux.bundled_conf``'s)."""
     return _in_layout(("fleet", "tmux.conf"), ("fleet-tmux.conf",))
 
 
@@ -1003,6 +1040,12 @@ def usage_share_lock_path() -> Path:
 def active_ping_lock_path() -> Path:
     """The lock one daily active ping at a time holds (``services.active_ping``)."""
     return _in_layout(("run", "locks", "active-ping.lock"), ("active-ping.lock",))
+
+
+def broker_dir(home: Path) -> Path:
+    """The launches' broker folders under the home ``home``, as a sandbox's launch names it
+    (``services.store_broker``): ``broker`` in either layout."""
+    return home / "broker"
 
 
 def ngrok_token_path() -> Path:

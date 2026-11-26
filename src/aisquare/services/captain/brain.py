@@ -10,7 +10,7 @@ Claude Code's, or, experimentally, Codex's, with four things of its own:
   repository, so no project's CLAUDE.md or hooks brief it as a worker. Its
   window carries ``AISQUARE_HOME`` and ``AISQUARE_TEAM_HUB=<home>``: ``.aisquare``
   is itself a project-root marker, and without the hub a brain under
-  ``~/.rlx`` would resolve its board to ``$HOME``.
+  ``~/.aisquare`` would resolve its board to ``$HOME``.
 - **One server and no other tool.** The fleet asks the captain's agent, at every
   launch and a restart's too, for a session with no tool but the Actions server
   (:func:`server`, through the module entry: 0.8 s to its first answer against 1.0 s

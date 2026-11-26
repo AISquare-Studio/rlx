@@ -100,6 +100,7 @@ from aisquare.core.paths import (
     remote_dist_dir,
     remote_state_path,
     restrict_to_owner,
+    shown,
 )
 from aisquare.core.version import __version__
 from aisquare.models import (
@@ -4838,7 +4839,7 @@ WRONG_PASSWORD = "that is not the passphrase"
 NOT_TEXT = "the body holds a lone surrogate (an unpaired \\ud800-\\udfff escape), which is not text"
 """400 ``invalid`` for a body string no UTF-8 can hold (:meth:`RemoteKit.kit_json_object`)."""
 STATE_UNWRITABLE = (
-    "the machine could not save that: its ~/.rlx/remote/remote.json would not write (a full disk, "
+    "the machine could not save that: its remote.json would not write (a full disk, "
     "or a home it may not write) — nothing was changed; fix that on the machine, then try again"
 )
 """503 ``remote_state_unwritable``, as ``asq remote``'s own commands say it, but without the
@@ -4852,8 +4853,7 @@ def revoke_unsaved() -> str:
     before then is read by this one (``reload_if_changed``) with the device still in it, so the
     sentence names the command that makes the revoke hold (review of #243, round 4)."""
     return (
-        "revoked on the running Remote, but the machine's ~/.rlx/remote/remote.json would not "
-        "write "
+        "revoked on the running Remote, but the machine's remote.json would not write "
         f"(a full disk, or a home it may not write): once it can, run  {prog.word()} remote "
         "revoke {device}  "
         "on the machine, as until it is saved a change to that file from a shell, or a Remote "
@@ -4862,7 +4862,7 @@ def revoke_unsaved() -> str:
 
 
 STATE_LATER = (
-    "the machine could not save that: its ~/.rlx/remote/remote.json was upgraded by a later "
+    "the machine could not save that: its remote.json was upgraded by a later "
     "rlx while this Remote ran, and is never written over — nothing was changed; turn "
     "Remote off and on again on the machine, with that rlx"
 )
@@ -4874,8 +4874,7 @@ freed space to no end (review of #259, round 8, 7/9): no write of this Remote's 
 def revoke_later() -> str:
     """503 ``remote_state_unwritable`` for a revoke refused as :class:`LaterRemoteState`."""
     return (
-        "revoked on the running Remote, but the machine's ~/.rlx/remote/remote.json was upgraded "
-        "by "
+        "revoked on the running Remote, but the machine's remote.json was upgraded by "
         f"a later rlx while this Remote ran, and is never written over: run  {prog.word()} "
         "remote "
         "revoke {device}  on the machine with that rlx, or the next Remote it starts takes "
@@ -8525,14 +8524,13 @@ def _remote_serve_off(state: Runtime, server: Any) -> str | None:
             failure = (
                 f"its devices could not be revoked ({exc}), so their cookies would open the "
                 f"next Remote: run `{prog.word()} remote revoke --all` once "
-                "~/.rlx/remote/remote.json "
-                "can be written"
+                f"{shown(remote_state_path())} can be written"
             )
         try:
             state.set_auto_off(None)
         except Exception as exc:
             log.warning("remote: auto-off could not clear its deadline: %s", exc)
-            failure = failure or f"its deadline is still in ~/.rlx/remote/remote.json ({exc})"
+            failure = failure or (f"its deadline is still in {shown(remote_state_path())} ({exc})")
     finally:
         server.should_exit = True
         _remote_writes_announced("Ctrl-C")

@@ -90,7 +90,6 @@ KIND_SECONDS = 60.0
 
 _ID = re.compile(r"[0-9a-f]{12}")
 
-FOLDER = "instances"
 GATE_LOCK = ".gate.lock"
 
 _log = logging.getLogger(__name__)

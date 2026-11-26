@@ -914,7 +914,8 @@ def test_fleet_check_fails_open_on_a_damaged_store(home: Path) -> None:
 
 def test_fleet_check_does_not_write_the_tmux_conf(home: Path) -> None:
     """Read-only in the fleet's own terms: ``argv`` would create the bundled conf; we do not."""
-    conf = home / tmux_core.CONF_NAME
+    conf = paths.tmux_conf_path()  # in the home's own layout (#30)
+    assert conf.is_relative_to(home)
     assert not conf.exists()
 
     diagnostics._check_fleet(lambda socket: FakeServer(socket=socket))
@@ -966,7 +967,7 @@ def test_real_tmux_reports_available_and_sees_a_pane_come_and_go(
     assert "1 live agent(s)" in healthy.detail
     assert stale.status is CheckStatus.warn, stale.detail
     assert "coder-1" in stale.detail and stale.fix and "fleet reap" in stale.fix
-    assert not (home / tmux_core.CONF_NAME).exists(), "doctor wrote the fleet's conf"
+    assert not paths.tmux_conf_path().exists(), "doctor wrote the fleet's conf"
 
 
 # --- doctor(cwd=…) ----------------------------------------------------------------------------

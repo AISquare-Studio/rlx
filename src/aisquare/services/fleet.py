@@ -6193,7 +6193,7 @@ def spawn(
         # The launcher activates a board BEFORE it hands the agent its `-e` pairs,
         # from its cwd — the brain folder, where `.aisquare` above it is a project
         # marker. With the hub only in `-e`, it onboarded the brain folder (or
-        # `$HOME`, under `~/.rlx`) as a project; the window's hub, the home's
+        # `$HOME`, under `~/.aisquare`) as a project; the window's hub, the home's
         # root (`_spawn_board_and_hub`), lands the launcher on the home board, which
         # the store keeps captured (T2).
         env["AISQUARE_HOME"] = env["RLX_HOME"] = str(paths.aisquare_home().resolve())

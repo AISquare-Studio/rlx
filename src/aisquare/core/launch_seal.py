@@ -135,7 +135,6 @@ from aisquare.core.locking import holding
 from aisquare.models import LaunchSpec
 
 _log = logging.getLogger(__name__)
-DIR_NAME = "launch-seals"
 VERSION = 1
 """The version of :class:`LaunchRecord` this aisquare writes; a newer one is refused."""
 

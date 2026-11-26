@@ -1025,7 +1025,7 @@ def test_real_codex_reaches_the_store_from_its_sandbox_and_rings_only_for_a_huma
             until(lambda: answered(seen), 30, "the sandboxed claim ran", pane)
             assert "claimed" in outputs()[-1], outputs()[-1]
             # Through the coder's own broker, which its launch runs outside the sandbox.
-            assert [d.name for d in (store / store_broker.DIR_NAME).iterdir()], "a broker"
+            assert [d.name for d in paths.broker_dir(store).iterdir()], "a broker"
 
             def sandboxed_calls(commands: list[str], what: str) -> list[str]:
                 """Each of ``commands`` (aisquare's arguments) run in the coder's sandbox,
@@ -1656,7 +1656,7 @@ def test_real_codex_reads_the_code_index_and_records_evidence_from_its_sandbox(
             found = re.findall(r"asq report ([0-9a-f]{32})", ran)
             assert found and "checked" in ran and "not sealed" not in ran, ran
             report_id = found[-1]
-            [launch] = [d for d in (store / store_broker.DIR_NAME).iterdir() if d.is_dir()]
+            [launch] = [d for d in paths.broker_dir(store).iterdir() if d.is_dir()]
             assert (launch / store_broker.REPORTS / report_id).is_dir(), "saved in the sandbox"
             assert (launch / store_broker.SEALS / report_id).is_file(), "sealed by the broker"
             assert not (store / "reports" / report_id).exists(), "the home's reports are not its"

@@ -132,7 +132,6 @@ shows the window sizes it, as before there was an owner."""
 #: it). A pid is reused only after its process is gone, and ``load-buffer``
 #: overwrites, so a leftover from a crashed paste cannot be delivered.
 _PASTE_SEQUENCE = itertools.count()
-CONF_NAME = "fleet-tmux.conf"
 _CLIPBOARD_OFF = "set -g set-clipboard off\n"
 CHECK_SOCKET_SUFFIX = "-check"
 """Where :meth:`TmuxServer.check_conf` starts its throwaway server: ``<socket>-check``."""

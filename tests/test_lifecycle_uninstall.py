@@ -1097,7 +1097,8 @@ def test_the_plans_ask_a_server_its_start_writing_nothing_and_waiting_seconds(
     monkeypatch.setattr(tmux_core, "_tmux", tmux)
     _initialised(runner, tmp_path)
     _live_agent(tmp_path / "repo", socket_path=tmp_path / "asq", server_started_at=then)
-    conf = paths.aisquare_home() / tmux_core.CONF_NAME
+    conf = paths.tmux_conf_path()
+    conf.parent.mkdir(parents=True, exist_ok=True)
     conf.write_text("# an older aisquare's conf\n", encoding="utf-8")
 
     if plan == "uninstall":

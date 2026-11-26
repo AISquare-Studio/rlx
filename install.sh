@@ -298,12 +298,22 @@ home_store_shown() {
     _hs_dir=$(aisquare_home_dir)
     if [ -e "$_hs_dir/rlx.db" ]; then
         printf 'rlx.db'
-    elif [ "$_hs_dir" = "$HOME/.aisquare" ] || [ -e "$_hs_dir/context.db" ] \
-        || [ -e "$_hs_dir/launch-seals" ] || [ -e "$_hs_dir/instances" ]; then
+    elif [ "$_hs_dir" = "$HOME/.aisquare" ] || old_layout_at "$_hs_dir"; then
         printf 'context.db'
     else
         printf 'rlx.db'
     fi
+}
+# Whether $1 holds the old layout's files at its top (core/paths.py OLD_LAYOUT_MARKERS, and
+# an agent's *-accounts/ folder).
+old_layout_at() {
+    for _ol_name in context.db launch-seals instances log fleet-tmux.conf remote.json credentials; do
+        [ -e "$1/$_ol_name" ] && return 0
+    done
+    for _ol_dir in "$1"/*-accounts; do
+        [ -d "$_ol_dir" ] && return 0
+    done
+    return 1
 }
 claude_settings_shown() {
     _cs_dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}

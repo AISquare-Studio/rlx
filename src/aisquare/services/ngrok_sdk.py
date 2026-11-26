@@ -54,8 +54,6 @@ from aisquare.services.ngrok_tunnel import (
 
 log = logging.getLogger(__name__)
 
-TOKEN_FILE_NAME = "ngrok-authtoken"
-"""The token pasted in Settings → Remote, in the aisquare home, owner-only."""
 BAD_TOKEN = (
     "ngrok did not take your token — paste a new one in Settings → Remote "
     f"(yours: {AUTHTOKEN_FROM})"

@@ -8,7 +8,6 @@ so nothing reads or writes this machine's ``~/.aisquare`` or ``~/.rlx``.
 from __future__ import annotations
 
 import ast
-import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -97,6 +96,35 @@ def test_no_module_and_no_test_joins_an_old_layout_name_to_the_home() -> None:
     assert found == []
 
 
+#: The old-layout names a module may hold as they are, each for what it is.
+NAMED_ON_PURPOSE = {
+    ("core/claude_accounts.py", "claude-accounts"),  # the adapter's dir_name: paths maps it
+    ("core/codex_accounts.py", "codex-accounts"),  # likewise
+    ("core/workspace.py", "context.db"),  # telling a home from before 0.10.2 by its store
+    ("services/lifecycle.py", "context.db"),  # the purge's home markers, either layout
+    ("services/diagnostics.py", "claude-accounts"),  # a doctor row's name, not a path
+}
+
+
+def test_no_module_names_an_old_layout_file_but_the_few_on_purpose() -> None:
+    """A constant holding an old-layout name (``CONF_NAME = "fleet-tmux.conf"``) let a test
+    join it to a new home and check a file that can never be there (the review of #592, 2):
+    the join guard above sees only literals. Such a name lives in core/paths.py, or here."""
+    found = []
+    for module in sorted((REPO / "src").rglob("*.py")):
+        if module.resolve() in ALLOWED:
+            continue
+        rel = module.relative_to(REPO / "src" / "aisquare").as_posix()
+        for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Constant)
+                and node.value in OLD_NAMES
+                and (rel, node.value) not in NAMED_ON_PURPOSE
+            ):
+                found.append(f"{rel}:{node.lineno} {node.value}")
+    assert found == []
+
+
 # --- where the home is, and how it is laid out ---------------------------------------------------
 
 
@@ -168,8 +196,12 @@ def test_a_new_users_first_commands_make_rlx_and_never_aisquare(user_home: Path)
     bare = runner.invoke(app, [])
     assert bare.exit_code == 2
     assert not (user_home / ".aisquare").exists()
+    # The doctor fails its home row until a command makes the home (`init` does); the rest
+    # run on the home they make.
+    codes = {"doctor": 1, "fleet ls": 0, "accounts list": 0}
     for command in COMMANDS:
-        runner.invoke(app, command)
+        result = runner.invoke(app, command)
+        assert result.exit_code == codes[" ".join(command)], (command, result.output)
         assert not (user_home / ".aisquare").exists(), command
     with store_session():
         pass
@@ -188,7 +220,7 @@ def test_an_old_home_runs_every_command_as_before_on_its_own_files(user_home: Pa
     runner = CliRunner()
     for command in COMMANDS:
         result = runner.invoke(app, command)
-        assert "Traceback" not in result.output, (command, result.output)
+        assert result.exit_code == 0, (command, result.output)
     with store_session():
         pass
     assert (old / "context.db").is_file() and not (old / "rlx.db").exists()
@@ -196,9 +228,21 @@ def test_an_old_home_runs_every_command_as_before_on_its_own_files(user_home: Pa
     for name in OLD_FILES:
         assert (old / name).exists(), name
     assert claude_accounts_core.accounts_root().parent == old
+    # Nothing of the new layout appears in it (the review of #592, 4): no half-move.
+    new_only = [
+        ("rlx.db",),
+        ("logs",),
+        ("accounts",),
+        ("fleet", "launch-seals"),
+        ("fleet", "tmux.conf"),
+        ("run", "instances"),
+        ("run", "locks"),
+        ("remote",),
+    ]
+    made = [parts for parts in new_only if old.joinpath(*parts).exists()]
+    assert made == [], made
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX homes")
 def test_statusline_finds_the_home_by_the_same_rule(
     user_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -209,3 +253,35 @@ def test_statusline_finds_the_home_by_the_same_rule(
     assert statusline.home() == user_home / ".aisquare"
     monkeypatch.setenv(paths.RLX_HOME_ENV, str(user_home / "elsewhere"))
     assert statusline.home() == user_home / "elsewhere"
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        # Its store moved aside, as the damaged store's advice says (the tester's blocker on #30).
+        ("config.toml", "log/capture.log", "fleet-tmux.conf", "claude-accounts/2/.keep"),
+        # One only the CLI used, with no store yet, a sign-in and a managed slot.
+        ("config.toml", "credentials", "claude-accounts/2/.keep"),
+        # An agent's accounts folder alone tells it.
+        ("config.toml", "codex-accounts/3/.keep"),
+    ],
+    ids=["store-moved-aside", "cli-only", "accounts-alone"],
+)
+def test_a_named_old_home_with_no_store_is_still_old_and_never_half_moved(
+    user_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: tuple[str, ...]
+) -> None:
+    named = tmp_path / "named"
+    for name in files:
+        path = named / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    monkeypatch.setenv(paths.HOME_ENV_VAR, str(named))
+
+    assert paths.home_of() == (named, paths.OLD)
+    for command in COMMANDS:
+        CliRunner().invoke(app, command)
+    with store_session():
+        pass
+    assert (named / "context.db").is_file() and not (named / "rlx.db").exists()
+    made = [p for p in ("logs", "accounts", "remote", "fleet") if (named / p).exists()]
+    assert made == [], made

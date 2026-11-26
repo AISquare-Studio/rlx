@@ -179,7 +179,7 @@ def initialize(
         # prefix: the two paths cannot drift into saying different things about
         # where the key landed.
         notes.append(
-            "Stored API key in ~/.rlx/accounts/aisquare/credentials"
+            f"Stored API key in {paths.shown(paths.credentials_path())}"
             + (
                 "."
                 if restricted
@@ -1895,7 +1895,7 @@ def _home_there(home: Path) -> tuple[bool, str | None]:
 
 def custom_home(home: Path) -> bool:
     """Whether ``$RLX_HOME`` (or ``$AISQUARE_HOME``) moved the home away from where it is by
-    default (``~/.rlx``, or an existing ``~/.rlx``)."""
+    default (``~/.rlx``, or an existing ``~/.aisquare``)."""
     if paths.named_home() is None:
         return False
     user = _user_home()

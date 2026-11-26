@@ -72,7 +72,10 @@ both names.
 The variable says **where** the home is. The folder says **how** it is laid out:
 
 - A home a variable names is in the new layout if it has `rlx.db` at its top.
-- It is in the old layout if it has any of `context.db`, `launch-seals/` or `instances/` there.
+- It is in the old layout if it has any of the old layout's own names there: `context.db`,
+  `launch-seals/`, `instances/`, `log/`, `fleet-tmux.conf`, `remote.json`, `credentials`, or an
+  agent's accounts folder (`claude-accounts/`, `codex-accounts/`). A home whose store was moved
+  aside is still read as old.
 - A home with neither, an empty or new folder, gets the new layout.
 - `~/.aisquare`, when there is no `~/.rlx`, is in the old layout.
 
@@ -92,7 +95,7 @@ The old layout keeps everything at the top of the home:
 | The fleet's tmux options | `fleet-tmux.conf` | `fleet/tmux.conf` |
 | Running instances | `instances/` | `run/instances/` |
 | Locks | `usage-sweep.lock`, `usage-share.lock`, `active-ping.lock` | `run/locks/` |
-| Remote | `remote.json`, `remote-audit.log`, `remote-dist/`, `remote-needs.json`, `remote-push.json`, `ngrok-authtoken`, `remote-ngrok-v*.yml` | `remote/remote.json`, `remote/audit.log`, `remote/dist/`, `remote/needs.json`, `remote/push.json`, `remote/ngrok-authtoken`, `remote/ngrok-v*.yml` |
+| Remote | `remote.json`, `remote-audit.log`, `remote-dist/`, `remote-needs.json`, `remote-push.json`, `ngrok-authtoken`, `remote-ngrok-v*.yml` | `remote/remote.json`, `remote/audit.log`, `remote/dist/`, `remote/needs.json`, `remote/push.json`, `remote/ngrok-authtoken`, `remote/remote-ngrok-v*.yml` |
 
 Everything else has the same name in both.
 
