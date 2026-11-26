@@ -128,6 +128,10 @@ The move refuses, and names each thing it found, while any of these run on the h
 
 Stop them, then run `rlx upgrade` again. Nothing is touched until the home is quiet.
 
+The rlx service (`rlx service`, [service.md](service.md)) is not one of them: the move stops it
+first and starts it again afterwards, on the home where it then is. A service that does not stop
+refuses the move.
+
 ### What it does
 
 Each step is written down first in a journal, `backups/home-migration/journal.json` in the home,
