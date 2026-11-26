@@ -292,3 +292,47 @@ fn the_brains_queue_is_bounded_and_status_shows_its_depth() {
     assert!(answers.iter().all(|(_, ping)| ping.code() == Some(1)));
     eventually("the queue empties", || brain(&home)["queued"] == 0);
 }
+
+#[test]
+fn stop_ends_what_the_brain_started_too() {
+    let home = TestHome::new().with_rlx(fake_brain("spawns-child"));
+    home.start();
+    brain_pid(&home);
+    let file = home.root().join("fake-brain-child.pid");
+    let mut child = 0;
+    eventually("the brain's child is started", || {
+        child = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0);
+        child > 0
+    });
+    assert!(alive(child), "the child {child} runs");
+    home.stop();
+    eventually("the brain's child is gone with it", || !alive(child));
+}
+
+#[test]
+fn a_brain_ends_when_rlxd_is_killed() {
+    let Some(rlx) = real_rlx() else { return };
+    let home = TestHome::new().with_rlx(rlx);
+    let started = home.start();
+    let rlxd = started["pid"].as_u64().unwrap();
+    brain_pid(&home);
+    let pids = logged_brain_pids(&home);
+    assert!(!pids.is_empty(), "{}", home.log());
+    // POSIX: the brain reads its stdin's end and exits. Windows: rlxd's end closes the
+    // brain's job.
+    kill_hard(rlxd);
+    for pid in pids {
+        eventually("the brain exits after rlxd is killed", || !alive(pid));
+    }
+    let roll = rlxd::registry::read(&Home::at(home.root())).unwrap();
+    assert!(
+        !roll
+            .live
+            .iter()
+            .any(|record| record.kind == daemon_kinds::BRAIN),
+        "{roll:?}"
+    );
+}

@@ -16,6 +16,7 @@ variables, is longer.
 | `skewed` | Answers rlxd's hello with brain protocol 99, a release this rlxd does not speak: `brain_incompatible` |
 | `mute` | Says a good hello, then never accepts a request: rlxd kills it, starts it again, and the request was never delivered |
 | `accepts-then-dies` | Accepts its first request, then dies before it answers: the request failed, and was not "never delivered" |
+| `spawns-child` | Starts a child that would run five minutes (its pid in `$AISQUARE_HOME/fake-brain-child.pid`), then says a good hello: rlxd's stop must end the child with it |
 
 The checks that need a brain that works run the real `rlx brain --stdio` of the checkout
 (`uv run`), as `tests/brain.rs` says.

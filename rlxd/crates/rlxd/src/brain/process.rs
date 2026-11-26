@@ -6,14 +6,20 @@
 //!   a session of its own, as it does under `rlx hook`, and outlives the hook on purpose).
 //!   On Windows a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is made first, and
 //!   the brain is started suspended, put in it, then let run, so nothing it starts escapes
-//!   the job: the job's end, or rlxd's, ends the whole tree.
+//!   the job unless it asks to: the job allows breakaway (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`),
+//!   and the brain asks it (`CREATE_BREAKAWAY_FROM_JOB`) for the workers a hook detaches,
+//!   which outlive the hook under `rlx hook` too. The job's end, or rlxd's, ends the rest.
 //! - **Its output.** Each line on its stdout is a frame ([`BrainOutput`]), read by a task
-//!   of its own into a channel, so waiting for one is cancel safe. Its stderr goes, line by
-//!   line and stamped with the time, to `<home>/rlxd/logs/brain.log`, which rotates at 1
-//!   MiB and keeps one old log.
-//! - **Its end.** A thread waits for it; on POSIX it then kills what is left of its group.
-//!   [`Process::exit`] says when it has ended, and how.
+//!   of its own into a channel, so waiting for one is cancel safe. A line is at most
+//!   `rlxd_client::MAX_LINE`, the most a reply to rlxd-hook can carry. Its stderr goes,
+//!   line by line, cut at 64 KiB and stamped with the time, to
+//!   `<home>/rlxd/logs/brain.log`, which rotates at 1 MiB and keeps one old log.
+//! - **Its end.** A thread waits for it. On POSIX it waits without reaping it
+//!   (`waitid(WNOWAIT)`), so its pid and its group stay its own while what is left of the
+//!   group is killed, then reaps it; nothing signals the group after that, as its id may
+//!   be another's by then. [`Process::exit`] says when it has ended, and how.
 
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -27,21 +33,31 @@ use tokio::sync::{mpsc, watch};
 use crate::clock;
 use crate::log::LogFile;
 
-/// The longest line the brain may write: 32 MiB. A hook's reply carries its output, at most
-/// what rlxd's own frames carry, base64 and all.
-const MAX_LINE: usize = 32 << 20;
+/// The longest line the brain may write: what one reply to rlxd-hook can carry, base64 and
+/// all.
+const MAX_LINE: usize = rlxd_client::MAX_LINE;
 
-/// The longest stderr line kept in the brain's log; the rest of a longer one is dropped.
+/// The longest stderr line kept in the brain's log; the rest of a longer one is dropped,
+/// as it is read.
 const MAX_LOG_LINE: usize = 64 << 10;
 
-/// One frame from the brain, or the text of a line that is not one.
-pub type Frame = Result<BrainOutput, String>;
+/// One frame from the brain, or a line that is not one.
+pub type Frame = Result<BrainOutput, Unread>;
 
-/// Held while rlxd starts a brain. On macOS a pipe is made close-on-exec only after it is
-/// made, so a program another thread starts in between inherits it: a brain holding the
-/// pipe of a probe would keep that probe waiting, and a program holding the brain's stdin
-/// would keep the brain from seeing rlxd go.
-static SPAWNING: Mutex<()> = Mutex::new(());
+/// A line from the brain that is not a frame of this protocol.
+#[derive(Debug)]
+pub struct Unread {
+    /// What it was, for the log and `status`.
+    pub said: String,
+    /// Whether it was JSON at all: a line that is not is no frame of any release.
+    pub json: bool,
+}
+
+impl fmt::Display for Unread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.said)
+    }
+}
 
 /// A running brain.
 pub struct Process {
@@ -74,7 +90,7 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let (mut child, tree) = {
-            let _alone = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+            let _alone = crate::spawn::alone();
             os::spawn(&mut command)?
         };
         let pid = child.id();
@@ -89,13 +105,9 @@ impl Process {
             tokio::spawn(log_lines(stderr, log));
         }
         let (exited, exit) = watch::channel(None);
-        let group = tree.group();
+        let waiting = tree.clone();
         std::thread::spawn(move || {
-            let said = match child.wait() {
-                Ok(status) => status.to_string(),
-                Err(e) => format!("its end could not be read: {e}"),
-            };
-            os::kill_group(group);
+            let said = os::wait(child, &waiting);
             exited.send_replace(Some(said));
         });
         Ok(Self {
@@ -118,20 +130,14 @@ impl Process {
         self.exit_watch().wait().await
     }
 
-    /// Whether it has ended.
-    pub fn ended(&self) -> bool {
-        self.exit.borrow().is_some()
-    }
-
     /// Asks the tree to end: SIGTERM to its group on POSIX. Windows has no such ask, and
-    /// ends it as [`Process::kill`] does.
+    /// ends it as [`Process::kill`] does. Nothing once the brain is reaped.
     pub fn terminate(&self) {
-        if !self.ended() {
-            self.tree.terminate();
-        }
+        self.tree.terminate();
     }
 
-    /// Kills the tree: SIGKILL to its group on POSIX, the job ended on Windows.
+    /// Kills the tree: SIGKILL to its group on POSIX, the job ended on Windows. Nothing
+    /// once the brain is reaped: its end killed the rest of its group already.
     pub fn kill(&self) {
         self.tree.kill();
     }
@@ -165,12 +171,18 @@ async fn read_frames(stdout: impl AsyncRead + Unpin, frames: mpsc::Sender<Frame>
             Ok(_) => {}
         }
         let frame = if line.len() > MAX_LINE {
-            Err(format!("a line longer than {MAX_LINE} bytes"))
+            Err(Unread {
+                said: format!("a line longer than {MAX_LINE} bytes"),
+                json: true,
+            })
         } else {
             serde_json::from_slice::<BrainOutput>(&line).map_err(|e| {
                 let text = String::from_utf8_lossy(&line);
                 let shown: String = text.trim_end().chars().take(200).collect();
-                format!("{shown:?}, which is not a frame of this protocol ({e})")
+                Unread {
+                    said: format!("{shown:?}, which is not a frame of this protocol ({e})"),
+                    json: serde_json::from_slice::<serde_json::Value>(&line).is_ok(),
+                }
             })
         };
         let too_long = line.len() > MAX_LINE;
@@ -184,17 +196,26 @@ async fn read_frames(stdout: impl AsyncRead + Unpin, frames: mpsc::Sender<Frame>
 async fn log_lines(stderr: impl AsyncRead + Unpin, log: Arc<Mutex<LogFile>>) {
     let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
+    let mut cut = false;
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line).await {
+        match (&mut reader)
+            .take(MAX_LOG_LINE as u64)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
-        let text = String::from_utf8_lossy(&line[..line.len().min(MAX_LOG_LINE)]);
-        let entry = format!("{} {}\n", clock::now(), text.trim_end());
-        log.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .write_line(&entry);
+        let whole = line.last() == Some(&b'\n');
+        // The rest of a line already cut is dropped as it comes.
+        if !std::mem::replace(&mut cut, !whole) {
+            let text = String::from_utf8_lossy(&line);
+            let entry = format!("{} {}\n", clock::now(), text.trim_end());
+            log.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .write_line(&entry);
+        }
     }
 }
 
@@ -206,43 +227,79 @@ mod os {
     use std::io;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
+    use std::sync::{Arc, Mutex, PoisonError};
 
-    /// The brain's process group.
+    /// The brain's process group, and whether the brain is reaped: once it is, its group
+    /// id may be another's, and nothing signals it.
+    #[derive(Clone)]
     pub struct Tree {
         group: i32,
+        reaped: Arc<Mutex<bool>>,
     }
 
     pub fn spawn(command: &mut Command) -> io::Result<(Child, Tree)> {
         command.process_group(0);
         let child = command.spawn()?;
         let group = i32::try_from(child.id()).map_err(|e| io::Error::other(e.to_string()))?;
-        Ok((child, Tree { group }))
+        let reaped = Arc::new(Mutex::new(false));
+        Ok((child, Tree { group, reaped }))
+    }
+
+    /// Waits for the brain's end without reaping it, kills what is left of its group
+    /// while the group's id is still its own, then reaps it: how it ended.
+    pub fn wait(mut child: Child, tree: &Tree) -> String {
+        wait_unreaped(tree.group);
+        let mut reaped = tree.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+        signal(tree.group, libc::SIGKILL);
+        let said = match child.wait() {
+            Ok(status) => status.to_string(),
+            Err(e) => format!("its end could not be read: {e}"),
+        };
+        *reaped = true;
+        said
+    }
+
+    /// Returns once process `pid` has ended, leaving it to be reaped.
+    fn wait_unreaped(pid: i32) {
+        loop {
+            // SAFETY: an all-zero siginfo_t is valid, and `info` outlives the call.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `pid` is this process's own child, not yet reaped.
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if waited == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return;
+            }
+        }
     }
 
     impl Tree {
-        pub fn group(&self) -> i32 {
-            self.group
-        }
-
         pub fn terminate(&self) {
-            signal(self.group, libc::SIGTERM);
+            self.signal_unreaped(libc::SIGTERM);
         }
 
         pub fn kill(&self) {
-            kill_group(self.group);
+            self.signal_unreaped(libc::SIGKILL);
         }
-    }
 
-    /// SIGKILL to the group, as soon as its leader is reaped: whatever it started and left
-    /// in its group goes with it.
-    pub fn kill_group(group: i32) {
-        signal(group, libc::SIGKILL);
+        fn signal_unreaped(&self, signal_number: i32) {
+            let reaped = self.reaped.lock().unwrap_or_else(PoisonError::into_inner);
+            if !*reaped {
+                signal(self.group, signal_number);
+            }
+        }
     }
 
     fn signal(group: i32, signal: i32) {
         if group > 1 {
-            // SAFETY: a negative pid names a process group; the group is the brain's own,
-            // made with it, and a group with nobody left in it makes this fail harmlessly.
+            // SAFETY: a negative pid names a process group: the brain's own, whose leader
+            // is not reaped yet (the callers hold `reaped`), so the id is still its.
             unsafe { libc::kill(-group, signal) };
         }
     }
@@ -261,15 +318,27 @@ mod os {
 
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, ResumeThread};
 
-    /// The brain's job. Closing its last handle ends every process in it.
+    /// The brain's job. Closing its last handle ends every process in it. A job's handle
+    /// is rlxd's own, so ending it after the brain's end reaches no one else.
+    #[derive(Clone)]
     pub struct Tree {
         job: Arc<OwnedHandle>,
+    }
+
+    /// Waits for the brain's end, then ends what is left in its job: how it ended.
+    pub fn wait(mut child: Child, tree: &Tree) -> String {
+        let said = match child.wait() {
+            Ok(status) => status.to_string(),
+            Err(e) => format!("its end could not be read: {e}"),
+        };
+        tree.kill();
+        said
     }
 
     pub fn spawn(command: &mut Command) -> io::Result<(Child, Tree)> {
@@ -307,7 +376,10 @@ mod os {
         // SAFETY: `raw` is a handle this process just opened, and owns from here on.
         let job = unsafe { OwnedHandle::from_raw_handle(raw as _) };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // A process started with CREATE_BREAKAWAY_FROM_JOB leaves the job: the brain asks it
+        // for the workers a hook detaches, and for nothing else.
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         // SAFETY: `limits` is the structure the class names, and outlives the call.
         let set = unsafe {
             SetInformationJobObject(
@@ -324,24 +396,15 @@ mod os {
     }
 
     impl Tree {
-        /// Windows has no process group: the job stands for it.
-        pub fn group(&self) -> Arc<OwnedHandle> {
-            Arc::clone(&self.job)
-        }
-
         pub fn terminate(&self) {
             self.kill();
         }
 
+        /// Ends every process in the job.
         pub fn kill(&self) {
-            kill_group(Arc::clone(&self.job));
+            // SAFETY: the job's handle is open while `self` holds it.
+            unsafe { TerminateJobObject(self.job.as_raw_handle() as HANDLE, 1) };
         }
-    }
-
-    /// Ends every process in the job.
-    pub fn kill_group(job: Arc<OwnedHandle>) {
-        // SAFETY: the job's handle is open while `job` is held.
-        unsafe { TerminateJobObject(job.as_raw_handle() as HANDLE, 1) };
     }
 }
 

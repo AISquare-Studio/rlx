@@ -43,6 +43,9 @@ The brain moves the protocol off fds 0 and 1 before it reads anything: it reads 
 writes private duplicates of them, points fd 0 at the null device, and points fd 1 at
 fd 2, its log. So nothing the brain runs, and no process it starts, can read a frame
 meant for it or write into its replies: a stray print lands in rlxd's log of the brain.
+What the process writes to stdout before that (as it imports and starts) reaches rlxd
+before the hello: rlxd logs a line that is not JSON and passes over it, and takes any
+JSON line that is not a hello of its protocol for a brain of another release.
 
 Hooks (1.5)
 -----------

@@ -133,7 +133,13 @@ async fn output(program: &Path, args: &[&str]) -> Option<String> {
         // starts would open a window of its own.
         command.creation_flags(0x0800_0000);
     }
-    let output = tokio::time::timeout(TIMEOUT, command.output())
+    // Started as no other program of rlxd's starts (`crate::spawn`): the brain must not
+    // inherit this probe's stdout, nor this probe the brain's stdin.
+    let child = {
+        let _alone = crate::spawn::alone();
+        command.spawn().ok()?
+    };
+    let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
         .await
         .ok()?
         .ok()?;

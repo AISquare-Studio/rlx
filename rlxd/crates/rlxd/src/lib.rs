@@ -58,6 +58,7 @@ pub mod registry;
 mod serve;
 mod server;
 mod settings;
+mod spawn;
 mod token;
 #[cfg(windows)]
 mod windows;
