@@ -258,21 +258,28 @@ impl Connection {
 
     /// Connects to `endpoint`. On macOS and Linux, the process listening there must run
     /// as this user, read from the connected socket itself (`getpeereid`, `SO_PEERCRED`),
-    /// so no swap of the path between a check and the connect gets the token.
+    /// so no swap of the path between a check and the connect gets the token. Root, which
+    /// may reach any user's rlxd, needs the socket's owner instead: whoever rlxd runs as.
     fn from_endpoint(endpoint: &Path) -> Result<Self, ConnectError> {
         let stream = open_stream(endpoint)?;
         #[cfg(unix)]
         {
             use std::os::fd::AsFd;
-            let peer =
-                crate::unix::peer_uid(stream.as_fd()).map_err(|source| ConnectError::Io {
-                    endpoint: endpoint.display().to_string(),
-                    source,
-                })?;
-            if peer != crate::unix::uid() {
-                return Err(ConnectError::NotOurs {
-                    endpoint: endpoint.display().to_string(),
-                });
+            use std::os::unix::fs::MetadataExt;
+            let shown = || endpoint.display().to_string();
+            let io = |source| ConnectError::Io {
+                endpoint: shown(),
+                source,
+            };
+            let peer = crate::unix::peer_uid(stream.as_fd()).map_err(io)?;
+            let me = crate::unix::uid();
+            let expected = if me == 0 {
+                std::fs::symlink_metadata(endpoint).map_err(io)?.uid()
+            } else {
+                me
+            };
+            if peer != expected {
+                return Err(ConnectError::NotOurs { endpoint: shown() });
             }
         }
         let writer = stream.try_clone().map_err(|source| ConnectError::Io {
