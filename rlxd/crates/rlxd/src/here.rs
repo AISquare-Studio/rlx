@@ -26,7 +26,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc;
@@ -52,6 +52,9 @@ const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
 /// How long `rlx --version` may take.
 const RLX_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a finished `rlx --version`'s first line may still take to be read.
+const LINE_GRACE: Duration = Duration::from_millis(200);
 
 /// The folders every system has, last on the `PATH` of an rlxd `--start` starts.
 const SYSTEM_DIRS: &[&str] = if cfg!(windows) {
@@ -116,6 +119,9 @@ enum Asked {
     Running(Running),
     /// Nothing listens: no socket, or one nobody serves.
     Absent,
+    /// The socket could not be opened, such as a file there that is not a socket. Not
+    /// running when the lock is free: a start replaces it.
+    Unreachable(Failure),
     /// Something answered, or failed, in a way the probe cannot report as an answer.
     Failed(Failure),
 }
@@ -131,6 +137,13 @@ pub fn here(args: HereArgs) -> ExitCode {
         Ok(home) => home,
         Err(e) => return out::fail(codes::INTERNAL, &e.to_string(), None),
     };
+    // Every path in the answer is one the app can use as it is: absolute, and UTF-8.
+    if home.root().to_str().is_none() {
+        let message = format!("the home's path is not UTF-8: {}", home.root().display());
+        let hint = "Name a home whose path is UTF-8 with RLX_HOME.";
+        return out::fail(codes::INTERNAL, &message, Some(hint));
+    }
+    let home = std::path::absolute(home.root()).map_or(home, Home::at);
     let exe = env::current_exe().ok();
     let beside = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
     let rlxd_path = exe.as_deref().map_or_else(|| "rlxd".to_owned(), shown);
@@ -239,39 +252,48 @@ fn fill(here: &mut HereData, running: Running) {
         here.protocol_versions = running.protocol_versions;
     }
     here.pid = running.pid;
-    if let Some(socket) = running.socket {
+    // An rlxd started with a relative home reports a relative socket: ours is absolute.
+    if let Some(socket) = running.socket.filter(|s| Path::new(s).is_absolute()) {
         here.socket = socket;
     }
 }
 
-/// Whether rlxd runs for `home`, and what it says of itself. An rlxd that holds the lock
-/// but takes no connections yet is starting or stopping: asked again until
-/// [`ANSWER_WAIT`] has passed.
+/// Whether rlxd runs for `home`, and what it says of itself. With the lock free, rlxd
+/// does not run, whatever is at the socket's path: a start replaces it. An rlxd that
+/// holds the lock but takes no connections yet is starting or stopping: asked again
+/// until [`ANSWER_WAIT`] has passed.
 fn probe(home: &Home) -> Result<Option<Running>, Failure> {
     let deadline = Instant::now() + ANSWER_WAIT;
     loop {
-        match ask(home) {
+        let unreachable = match ask(home) {
             Asked::Running(running) => return Ok(Some(running)),
             Asked::Failed(failure) => return Err(failure),
-            Asked::Absent => match lock::is_held(&home.lock()) {
-                Ok(false) => return Ok(None),
-                Ok(true) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                Ok(true) => {
-                    let message = format!(
-                        "rlxd holds {} but takes no connections on {}",
-                        home.lock().display(),
-                        home.endpoint()
-                    );
-                    return Err(Failure {
-                        hint: Some(format!("Its log is {}.", home.log_file().display())),
-                        ..Failure::new(codes::DISCONNECTED, message)
-                    });
-                }
-                Err(e) => {
-                    let message = format!("cannot read {}: {e}", home.lock().display());
-                    return Err(Failure::new(codes::INTERNAL, message));
-                }
-            },
+            Asked::Absent => None,
+            Asked::Unreachable(failure) => Some(failure),
+        };
+        match lock::is_held(&home.lock()) {
+            Ok(false) => return Ok(None),
+            Ok(true) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(true) => {
+                let message = unreachable.map_or_else(
+                    || {
+                        format!(
+                            "rlxd holds {} but takes no connections on {}",
+                            home.lock().display(),
+                            home.endpoint()
+                        )
+                    },
+                    |failure| failure.message,
+                );
+                return Err(Failure {
+                    hint: Some(format!("Its log is {}.", home.log_file().display())),
+                    ..Failure::new(codes::DISCONNECTED, message)
+                });
+            }
+            Err(e) => {
+                let message = format!("cannot read {}: {e}", home.lock().display());
+                return Err(Failure::new(codes::INTERNAL, message));
+            }
         }
     }
 }
@@ -299,6 +321,9 @@ fn ask_now(home: &Home) -> Asked {
     let mut connection = match Connection::open(home) {
         Ok(connection) => connection,
         Err(ConnectError::NotRunning { .. }) => return Asked::Absent,
+        Err(e @ ConnectError::Io { .. }) => {
+            return Asked::Unreachable(Failure::new(codes::DISCONNECTED, e.to_string()));
+        }
         Err(e) => return Asked::Failed(Failure::new(codes::DISCONNECTED, e.to_string())),
     };
     let token = match fs::read_to_string(home.token()) {
@@ -436,7 +461,9 @@ fn find_rlx(beside: Option<&Path>) -> InstalledRlx {
     }
 }
 
-/// What `<rlx> --version` says, `rlx 0.10.3`, as its last word.
+/// What `<rlx> --version` says, `rlx 0.10.3`, as its last word. Only its first line is
+/// read, and all of it within [`RLX_WAIT`], even when a process it started still holds
+/// its output open.
 fn rlx_version(rlx: &Path) -> Option<String> {
     let mut child = Command::new(rlx)
         .arg("--version")
@@ -445,11 +472,12 @@ fn rlx_version(rlx: &Path) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
+    let stdout = child.stdout.take()?;
+    let (said, first_line) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = said.send(line);
     });
     let deadline = Instant::now() + RLX_WAIT;
     loop {
@@ -464,9 +492,14 @@ fn rlx_version(rlx: &Path) -> Option<String> {
             }
         }
     }
-    let said = reader.join().ok()?;
-    let word = said.lines().next()?.split_whitespace().last()?;
-    Some(word.to_owned())
+    let line = first_line
+        .recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(LINE_GRACE),
+        )
+        .ok()?;
+    line.split_whitespace().last().map(str::to_owned)
 }
 
 /// The `PATH` for the rlxd `--start` starts: this session's, then this rlxd's folder,

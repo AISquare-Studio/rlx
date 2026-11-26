@@ -123,7 +123,7 @@ sh -c 'set -- "${UV_TOOL_BIN_DIR:-}" "${XDG_BIN_HOME:-}" "${XDG_DATA_HOME:+$XDG_
 | 0 | 1: rlxd runs and speaks one of the caller's protocol versions | `ok`, `running: true`, `supported: true` |
 | 3 | 3: installed, not running (without `--start`) | `ok`, `running: false` |
 | 4 | 2: unsupported. rlxd serves none of the caller's versions; `--start` starts nothing | `ok`, `supported: false` |
-| 1 | the probe failed: an rlxd that holds its lock but takes no connections, or a start that failed | `ok: false` (`disconnected`, `start_failed`, …) |
+| 1 | the probe failed: an rlxd that holds its lock but takes no connections, a start that failed, or a home whose path is not UTF-8 | `ok: false` (`disconnected`, `start_failed`, …) |
 | 2 | a usage error | none; the message is on stderr |
 | 5 | 2: rlx with no rlxd. The command above says it, not rlxd | none; stdout is `rlx --version`'s line |
 | 127 | 4: nothing installed. The command above, or the shell, says it | none |
@@ -152,6 +152,9 @@ also exits 3, with `ok: false` and `not_running`.)
   started, and there is no `pid`. A running rlxd that refuses this one's protocol is
   still `running`. Its versions come from its `incompatible_protocol` refusal, and its pid
   and version from the daemon registry when it is registered.
+- **Paths** (`home`, `socket`, `auth.token_file`) are absolute, as the app can use them:
+  a relative `RLX_HOME` is read from the directory the probe runs in. While rlxd's lock is
+  free, it is not running, whatever sits at the socket's path, and `--start` replaces it.
 - **`rlxd`** is the program that answered. It can differ from the running one after an
   upgrade that has not restarted it.
 - **`socket`** is where to connect. Over SSH, the app forwards a direct-streamlocal

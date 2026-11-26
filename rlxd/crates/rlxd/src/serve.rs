@@ -16,7 +16,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -306,6 +306,7 @@ pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, St
             }
             if child.try_wait().ok().flatten().is_some() || pid.is_some() {
                 // Another rlxd took the home first; this one exits on its own.
+                wait_for_loser(&mut child);
                 return Err(StartError::AlreadyRunning);
             }
         }
@@ -319,6 +320,23 @@ pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, St
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Waits for `child`, a start that lost the home to another rlxd, to give up, which it
+/// does once its [`LOCK_WAIT`] ends. So when [`start`] returns, no rlxd it started is
+/// still waiting for the lock. One that still runs after that took the home after all,
+/// from an rlxd that stopped meanwhile, and is stopped: nothing runs that the caller was
+/// told it did not start.
+fn wait_for_loser(child: &mut Child) {
+    let deadline = Instant::now() + LOCK_WAIT + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// `rlxd serve` in the background: no stdin, its output to nowhere (it logs to its file),

@@ -226,7 +226,10 @@ fn rlx_beside_rlxd_is_found_and_asked_its_version() {
     for (script, version) in [
         ("#!/bin/sh\necho 'rlx 9.9.9'\n", json!("9.9.9")),
         ("#!/bin/sh\nexit 1\n", Value::Null),
+        // A process it started keeps its output open for 20 s: the first line is enough.
+        ("#!/bin/sh\necho 'rlx 9.9.8'\nsleep 20 &\n", json!("9.9.8")),
     ] {
+        let began = std::time::Instant::now();
         std::fs::write(&rlx, script).unwrap();
         std::fs::set_permissions(&rlx, std::fs::Permissions::from_mode(0o755)).unwrap();
         let data = probe();
@@ -234,6 +237,11 @@ fn rlx_beside_rlxd_is_found_and_asked_its_version() {
         assert_eq!(real(data["rlx"]["path"].as_str().unwrap()), real(&rlx));
         let said = data["rlx"].get("version").cloned().unwrap_or(Value::Null);
         assert_eq!(said, version, "{data}");
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(8),
+            "{script:?} took {:?}",
+            began.elapsed()
+        );
         assert_eq!(
             real(data["rlxd"]["path"].as_str().unwrap()),
             real(bin.join("rlxd"))
@@ -419,4 +427,82 @@ fn the_readme_command_runs_rlxd_else_says_rlx_else_nothing() {
     assert_eq!(real(started["rlx"]["path"].as_str().unwrap()), real(&rlx));
     assert_eq!(started["rlx"]["version"], "0.10.1");
     assert_eq!(session.rlxd(&["stop"]).code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_at_the_sockets_path_with_the_lock_free_is_not_running_and_start_replaces_it() {
+    let home = TestHome::new();
+    let layout = Home::at(home.root());
+    std::fs::create_dir_all(layout.run_dir()).unwrap();
+    std::fs::write(layout.socket(), "not a socket").unwrap();
+    let (code, stopped) = here(&home, &[]);
+    assert_eq!(code, Some(3), "{stopped}");
+    assert_eq!(stopped["running"], false);
+    let (code, started) = here(&home, &["--start"]);
+    assert_eq!(code, Some(0), "{started}");
+    assert_eq!(started["started"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_home_whose_path_is_not_utf8_fails_rather_than_print_another_path() {
+    use std::os::unix::ffi::OsStrExt;
+    let home = TestHome::new();
+    let mut not_utf8 = home.root().as_os_str().as_bytes().to_vec();
+    not_utf8.extend_from_slice(b"/h\xff");
+    let mut command = home.command(&["here", "--json"]);
+    command.env("AISQUARE_HOME", std::ffi::OsStr::from_bytes(&not_utf8));
+    let run = common::run(command, None);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_valid("envelope.json", &run.json());
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("not UTF-8"), "{message}");
+}
+
+#[test]
+fn a_relative_home_is_answered_with_absolute_paths() {
+    let home = TestHome::new();
+    let mut command = home.command(&["here", "--json"]);
+    command.env("AISQUARE_HOME", "rel").current_dir(home.root());
+    let (code, data) = answer(&common::run(command, None));
+    assert_eq!(code, Some(3), "{data}");
+    for field in ["home", "socket"] {
+        let path = data[field].as_str().unwrap();
+        assert!(Path::new(path).is_absolute(), "{field}: {path}");
+    }
+    let token_file = data["auth"]["token_file"].as_str().unwrap();
+    assert!(Path::new(token_file).is_absolute(), "{token_file}");
+    assert!(
+        Path::new(data["home"].as_str().unwrap()).ends_with("rel"),
+        "{data}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn after_a_start_race_no_losing_rlxd_outlives_a_stop() {
+    // Every start that lost has given up by the time its `here --start` returns, so a
+    // stop right after leaves no rlxd: none was left waiting to take the home.
+    let home = TestHome::new();
+    let racers: Vec<_> = (0..4)
+        .map(|_| {
+            let command = home.command(&["here", "--json", "--start"]);
+            std::thread::spawn(move || answer(&common::run(command, None)))
+        })
+        .collect();
+    let answers: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+    let started = answers.iter().filter(|(_, d)| d["started"] == true).count();
+    assert_eq!(started, 1, "{answers:?}");
+    for (code, data) in &answers {
+        assert_eq!(*code, Some(0), "{data}");
+        assert_eq!(data["pid"], answers[0].1["pid"], "one rlxd");
+    }
+    assert_eq!(home.rlxd(&["stop"]).code(), Some(0));
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(
+        home.rlxd(&["status", "--json"]).code(),
+        Some(3),
+        "a losing rlxd took the home after the stop"
+    );
 }
