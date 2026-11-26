@@ -1055,7 +1055,7 @@ def test_ngroks_api_is_turned_off_in_a_config_merged_over_the_humans_own(
     assert configs is not None
     first, ours = configs
     assert first == own
-    assert ours == paths.aisquare_home() / f"remote-ngrok-v{version}.yml"
+    assert ours == paths.ngrok_config_path(f"remote-ngrok-v{version}.yml")
     assert ours.read_text().endswith(f'version: "{version}"\n{api}\n')
     assert api_off_configs(own=own) == configs, "written once, the same each start"
     command = ngrok_command(8750, configs=configs)
@@ -1071,7 +1071,7 @@ def test_without_a_config_of_the_humans_ngrok_starts_as_it_always_did(tmp_path: 
     missing = tmp_path / "nowhere" / "ngrok.yml"
     assert api_off_configs(own=missing, environ={}) is None
     signed_in = api_off_configs(own=missing, environ={"NGROK_AUTHTOKEN": "tok_123"})
-    assert signed_in == [paths.aisquare_home() / "remote-ngrok-v2.yml"]
+    assert signed_in == [paths.ngrok_config_path("remote-ngrok-v2.yml")]
     own = write_ngrok_config(tmp_path, "authtoken: tok_123\n")
     assert api_off_configs(own=own, environ={}) is None, "a config with no version"
     own = write_ngrok_config(tmp_path / "v1", 'version: "1"\n')
@@ -1115,7 +1115,7 @@ def test_a_config_of_ours_that_is_no_utf8_is_written_again_not_raised_into_the_u
     fleet UI (sweep of #243, as ngrok's log was)."""
     own = write_ngrok_config(tmp_path, 'version: "2"\nauthtoken: tok_123\n')
     paths.ensure_home()
-    ours = paths.aisquare_home() / "remote-ngrok-v2.yml"
+    ours = paths.ngrok_config_path("remote-ngrok-v2.yml")
     ours.write_bytes(b"web_addr: \xff\n")
     assert api_off_configs(own=own) == [own, ours]
     assert ours.read_text(encoding="utf-8").endswith('version: "2"\nweb_addr: false\n')
@@ -1142,7 +1142,7 @@ def test_a_config_of_the_humans_saved_with_a_byte_order_mark_still_turns_the_api
     own.write_bytes(raw)
     assert api_off_configs(own=own, environ={}) == [
         own,
-        paths.aisquare_home() / "remote-ngrok-v3.yml",
+        paths.ngrok_config_path("remote-ngrok-v3.yml"),
     ]
 
 
@@ -1283,7 +1283,7 @@ def test_the_panels_ngrok_runs_with_its_agent_api_off(tmp_path: Path) -> None:
     try:
         assert tunnel.wait_for_url(10) == OURS["url"]
         (run,) = runs
-        assert run[-1] == f"--config={own},{paths.aisquare_home() / OUR_CONFIG}"
+        assert run[-1] == f"--config={own},{paths.ngrok_config_path(OUR_CONFIG)}"
         assert "--inspect=false" in run
         assert tunnel.api_warning is None and tunnel.api_refused is None
     finally:

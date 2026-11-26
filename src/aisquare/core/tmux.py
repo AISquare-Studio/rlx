@@ -133,7 +133,6 @@ shows the window sizes it, as before there was an owner."""
 #: it). A pid is reused only after its process is gone, and ``load-buffer``
 #: overwrites, so a leftover from a crashed paste cannot be delivered.
 _PASTE_SEQUENCE = itertools.count()
-CONF_NAME = "fleet-tmux.conf"
 _CLIPBOARD_OFF = "set -g set-clipboard off\n"
 CHECK_SOCKET_SUFFIX = "-check"
 """Where :meth:`TmuxServer.check_conf` starts its throwaway server: ``<socket>-check``."""
@@ -1257,7 +1256,9 @@ class TmuxServer:
         when it starts."""
         wanted = bundled_conf(_pane_clipboard_on())
         try:
-            path = paths.ensure_home() / CONF_NAME
+            paths.ensure_home()
+            path = paths.tmux_conf_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return Path(os.devnull), (
                 f"could not create the rlx home ({exc.strerror or exc}) — the fleet's "

@@ -874,15 +874,16 @@ def test_dry_run_still_reports_what_it_would_do(tmp_path: Path) -> None:
     """A dry run that printed nothing useful would be worse than none."""
     cli = stub_dir(tmp_path, "cli", "aisquare", body='printf "aisquare 0.1.0\\n"')
     curl = stub_dir(tmp_path, "bin", "curl")
+    (tmp_path / "user").mkdir()
     result = sh(
         "main --dry-run --yes --no-project --offline --no-agent --no-system-deps",
         # The suite's own home is in AISQUARE_HOME, and the banner names the home this
         # run resolves; the default is the one asserted here.
-        env={"AISQUARE_HOME": ""},
+        env={"AISQUARE_HOME": "", "HOME": str(tmp_path / "user")},
         path=f"{cli}:{curl}:{base_path(tmp_path)}",
     )
     assert "rlx installer" in result.stdout
-    assert "~/.aisquare/" in result.stdout, "the banner must list what gets written (§3.7)"
+    assert "~/.rlx/" in result.stdout, "the banner must list what gets written (§3.7)"
     assert "nothing above was actually run" in result.stdout
 
 
@@ -3703,15 +3704,18 @@ def test_the_banner_lists_only_what_the_run_writes(
             "CLAUDE_ACTION=update; CLAUDE_VERSION=2.1.294"
         ),
     }[machine]
+    (tmp_path / "user").mkdir()
     result = sh(
         f"WANT_AGENT={want_agent}; WANT_PROJECT=1; PROJECT_DIR=/p; {decided}; banner",
-        env={"AISQUARE_HOME": ""},  # the default home, not the suite's (see below)
+        # The default home, not the suite's (see below), in a user home of the test's own: the
+        # developer's may hold a ~/.aisquare, which the banner would name.
+        env={"AISQUARE_HOME": "", "HOME": str(tmp_path / "user")},
         path=base_path(tmp_path),
     )
 
     written = result.stdout.split("Written to:\n", 1)[1]
     assert "register /p as a project" in result.stdout, result.stdout + result.stderr
-    assert "  ~/.aisquare/  " in written, written
+    assert "  ~/.rlx/  " in written, written
     if bin_line is None:
         assert "~/.local/bin/" not in written, written
     else:
@@ -4184,7 +4188,7 @@ def test_a_path_in_the_plan_prints_as_written(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("environment", "home_shown", "settings_shown"),
     [
-        ({}, "~/.aisquare/", "~/.claude/settings.json"),
+        ({}, "~/.rlx/", "~/.claude/settings.json"),
         (
             {"AISQUARE_HOME": "{home}/aq-home/", "CLAUDE_CONFIG_DIR": "{home}/.claude-work"},
             "~/aq-home/",
@@ -4218,7 +4222,7 @@ def test_the_banner_and_the_steps_name_the_paths_this_run_resolves(
     )
 
     written = result.stdout.split("Written to:\n", 1)[1]
-    assert f"  {home_shown:<33} config.toml, context.db, projects/\n" in written, written
+    assert f"  {home_shown:<33} config.toml, rlx.db, projects/\n" in written, written
     assert f"  {settings_shown:<33} MERGED" in written, written
     assert f"  set up   {home_shown.rstrip('/')} (no project registered)\n" in result.stdout
     assert f"==> Setting up {home_shown.rstrip('/')}\n" in result.stdout, result.stdout

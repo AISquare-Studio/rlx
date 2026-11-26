@@ -1,6 +1,6 @@
 """App settings: the machine-wide settings, whatever project is open.
 
-Four tabs. *Agent settings* (shown first) is everything ``~/.aisquare/config.toml``
+Four tabs. *Agent settings* (shown first) is everything ``~/.rlx/config.toml``
 holds that is not about one project: the user's coding agent, then the agent,
 permission, worktree, persona and account per role, the fleet's escape key, agent cap,
 worktree root and native-teams switch, how launches pick an account, what a usage limit

@@ -33,7 +33,7 @@ _PIN_KEY = "active_project_id"
 # Entries that only ever exist inside OUR home directory, never inside a
 # hand-made ``<project>/.aisquare`` opt-in marker (nothing in the codebase
 # creates that one — a user makes it by hand, the way they would ``.git``).
-_HOME_LAYOUT = ("config.toml", "context.db", "agents.json")
+_HOME_LAYOUT = ("config.toml", "rlx.db", "context.db", "agents.json")
 
 
 def _is_aisquare_home(candidate: Path) -> bool:

@@ -6197,7 +6197,7 @@ def spawn(
         # `$HOME`, under `~/.aisquare`) as a project; the window's hub, the home's
         # root (`_spawn_board_and_hub`), lands the launcher on the home board, which
         # the store keeps captured (T2).
-        env["AISQUARE_HOME"] = str(paths.aisquare_home().resolve())
+        env["AISQUARE_HOME"] = env["RLX_HOME"] = str(paths.aisquare_home().resolve())
         # Nobody may be watching its pane, which is answered from a phone: a prompt of the
         # agent's own there holds it (`unattended_env`). Claude Code's session-rating survey
         # drew in the captain's pane mid-conversation, and send (rightly) never types into a
@@ -8254,7 +8254,7 @@ def _admit(config: FleetSettings) -> list[str]:
     memory refusal the floor is ``min_free_mb + 512`` for five minutes, so admission
     does not flap on a box hovering at the line. Unknown headroom admits, with a note.
     Each refusal, and each admission that fills the budget, is one line in
-    ``~/.aisquare/fleet/admission.jsonl``.
+    ``~/.rlx/fleet/admission.jsonl``.
     """
     notes: list[str] = []
     counts = _live_per_project() if config.max_agents_total > 0 else {}
@@ -8945,7 +8945,7 @@ def _memory_refused(record: Mapping[str, object], why: str) -> NoReturn:
 def _log_admission(outcome: str, record: Mapping[str, object]) -> None:
     """One JSON line per refusal and per admission at the budget; never fails a spawn."""
     with contextlib.suppress(OSError):
-        log = paths.aisquare_home() / "fleet" / "admission.jsonl"
+        log = paths.fleet_dir() / "admission.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
         if log.is_file() and log.stat().st_size > _ADMISSION_LOG_MAX:
             log.replace(log.with_name(log.name + ".1"))

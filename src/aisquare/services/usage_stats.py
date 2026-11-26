@@ -391,8 +391,8 @@ def _ephemeral_roots() -> tuple[Path, ...]:
         Path(tempfile.gettempdir()),
         Path("/tmp"),
         Path("/var/tmp"),
-        paths.aisquare_home() / "cache",
-        paths.aisquare_home() / "bench",
+        paths.cache_dir(),
+        paths.bench_dir(),
     }
     roots: set[Path] = set()
     for candidate in candidates:

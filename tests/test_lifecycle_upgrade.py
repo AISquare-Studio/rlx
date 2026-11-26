@@ -4053,7 +4053,7 @@ def _codex_commands(home: Path) -> list[str]:
 
 def _codex_account(slot: str) -> Path:
     """Where the Codex account home of ``slot`` lives: under this home's codex-accounts."""
-    return paths.aisquare_home() / "codex-accounts" / slot
+    return paths.agent_accounts_dir("codex-accounts") / slot
 
 
 @pytest.fixture

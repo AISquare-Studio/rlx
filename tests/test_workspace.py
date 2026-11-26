@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from aisquare.core import workspace
+from aisquare.core import paths, workspace
 from aisquare.core.ids import PROJECT_PREFIX
 from aisquare.core.state_file import StateUnwritableError
 from aisquare.core.store import store_session
@@ -276,11 +276,13 @@ def test_our_own_home_is_not_a_project_root(tmp_path: Path) -> None:
     assert find_project_root(bare) == bare.resolve()
 
 
-def test_a_git_marker_beats_an_aisquare_home(tmp_path: Path) -> None:
-    """Skipping our home must not skip a real marker in the same directory."""
+@pytest.mark.parametrize("store", [*paths.NEW_LAYOUT_MARKERS, *paths.OLD_LAYOUT_MARKERS[:1]])
+def test_a_git_marker_beats_an_aisquare_home(tmp_path: Path, store: str) -> None:
+    """Skipping our home must not skip a real marker in the same directory: a home of either
+    layout (its store: ``rlx.db``, or ``context.db`` before 0.10.2)."""
     home = tmp_path / ".aisquare"
     home.mkdir()
-    (home / "context.db").write_text("", encoding="utf-8")
+    (home / store).write_text("", encoding="utf-8")
     (tmp_path / ".git").mkdir()
     nested = tmp_path / "src"
     nested.mkdir()

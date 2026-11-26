@@ -705,7 +705,7 @@ def _check_home_filesystem() -> DoctorCheck:
 
     ``save_config`` publishes changes with write-temp/fsync/rename/fsync-parent,
     and the atomicity of that rename is a property of the FILESYSTEM. It was
-    measured on a native disk, which is where the default ``~/.aisquare`` sits.
+    measured on a native disk, which is where the default ``~/.rlx`` sits.
     ``AISQUARE_HOME`` is taken verbatim, so a Windows-backed path is one export
     away — and until now nothing in the code could tell an operator which kind of
     path they were on.
@@ -4139,7 +4139,7 @@ def _fleet_conf() -> Path:
     the path up front skips both. tmux only reads ``-f`` when it STARTS a
     server, and nothing here starts one, so a missing file costs nothing.
     """
-    return paths.aisquare_home() / tmux_core.CONF_NAME
+    return paths.tmux_conf_path()
 
 
 def _fleet_server(socket: str) -> tmux_core.TmuxServer:

@@ -10,10 +10,10 @@ without anyone writing an alias.
 
 Layout (:func:`accounts_root` / :func:`tmp_root`, each under the accounts' ``dir_name``)::
 
-    ~/.aisquare/claude-accounts/<n>/                    CLAUDE_CONFIG_DIR of slot n (n ≥ 2)
-    ~/.aisquare/claude-accounts/<n>/.aisquare-account.json   the marker: slot, created_at
-    ~/.aisquare/claude-accounts/<n>.removed-<stamp>/    a removed slot, kept but never listed
-    ~/.aisquare/cache/claude-accounts/<n>/              CLAUDE_CODE_TMPDIR of slot n
+    ~/.rlx/accounts/claude/<n>/                    CLAUDE_CONFIG_DIR of slot n (n ≥ 2)
+    ~/.rlx/accounts/claude/<n>/.aisquare-account.json   the marker: slot, created_at
+    ~/.rlx/accounts/claude/<n>.removed-<stamp>/    a removed slot, kept but never listed
+    ~/.rlx/cache/claude-accounts/<n>/              CLAUDE_CODE_TMPDIR of slot n
 
 **Slot 1 is never a directory of ours.** It is whatever a plain ``claude`` in
 this shell is — ``CLAUDE_CONFIG_DIR`` when the environment sets it,
@@ -53,7 +53,7 @@ copied from another account under Claude Code's own lock, and nothing else.
 
 **Codex logins are slots too.** Every agent whose adapter has an accounts
 slot (``core.agent_adapters.types.AgentAccounts``) keeps its managed homes the
-same way, under its own directory (``~/.aisquare/codex-accounts/<n>``, whose
+same way, under its own directory (``~/.rlx/accounts/codex/<n>``, whose
 marker also names ``"agent": "codex"``), and the per-agent facts — the
 variables, the plain home, the identity, the usage — are the adapter's. ONE
 LADDER numbers the managed slots of every agent: a new slot takes the lowest

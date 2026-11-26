@@ -287,7 +287,7 @@ def overview() -> AccountsOverview:
 
 # --- the registry: alias, priority order, default, disabled (#145) ------------------------------
 #
-# The directories under ~/.aisquare/claude-accounts say WHICH accounts exist and
+# The directories under ~/.rlx/accounts/claude say WHICH accounts exist and
 # who is signed in (core.claude_accounts). What no directory can say is how the
 # operator ARRANGED them — which one a launch should pick when nothing more
 # specific says, in what order to try them, what to call them — and that lives
@@ -5725,14 +5725,14 @@ def sign_in_command(account: ClaudeAccount) -> list[str]:
     ]
 
 
-CARRIED_VARS = (paths.HOME_ENV_VAR, core.CONFIG_DIR_VAR, core.TMPDIR_VAR)
+CARRIED_VARS = (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR, core.CONFIG_DIR_VAR, core.TMPDIR_VAR)
 """What decides which directory a slot IS: the aisquare home, and the default's two variables."""
 
 
 def carried_vars(agent: str = AGENT) -> tuple[str, ...]:
     """:data:`CARRIED_VARS` for a window of ``agent``: the home, and that agent's variables."""
     accounts = core.kind(agent)
-    return (paths.HOME_ENV_VAR, accounts.home_env, *accounts.extra_env)
+    return (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR, accounts.home_env, *accounts.extra_env)
 
 
 def carry_environment(
@@ -5771,6 +5771,7 @@ def carry_environment(
     """
     source = os.environ if environ is None else environ
     view = {
+        paths.RLX_HOME_ENV: source.get(paths.RLX_HOME_ENV, ""),
         paths.HOME_ENV_VAR: source.get(paths.HOME_ENV_VAR, ""),
         **core.plain_environment(source, agent=agent),
     }
@@ -6582,7 +6583,7 @@ def shared_memory_root(agent: str | None = None) -> Path:
     memory = core.kind(whose).memory if whose is not None else None
     if memory is None:
         raise ValueError("no agent here shares its memory")
-    return paths.aisquare_home() / memory.root_name / "memory"
+    return paths.shared_memory_dir(memory.root_name)
 
 
 def shared_memory_directory(agent: str, cwd: Path) -> Path | None:

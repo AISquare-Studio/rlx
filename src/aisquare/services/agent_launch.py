@@ -576,6 +576,7 @@ def mcp_args(selected: ResolvedAgent) -> LaunchPart:
         sorted(
             {
                 "AISQUARE_HOME",
+                "RLX_HOME",
                 "AISQUARE_TEAM_HUB",
                 "AISQUARE_ROLE",
                 ACTIVE_AGENT_ENV,

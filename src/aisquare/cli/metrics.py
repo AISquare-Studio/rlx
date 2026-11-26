@@ -223,7 +223,7 @@ def _json(payload: object) -> None:
 
 
 def _state_file() -> str:
-    """Where the sharing's state lives, as a person would type it (``~/.aisquare/state.json``)."""
+    """Where the sharing's state lives, as a person would type it (``~/.rlx/state.json``)."""
     path = paths.state_path()
     try:
         return "~/" + path.relative_to(Path.home()).as_posix()

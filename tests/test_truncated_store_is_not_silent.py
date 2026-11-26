@@ -70,7 +70,7 @@ def test_a_truncated_store_says_so_on_stderr(
     open_store().close()
 
     message = capsys.readouterr().err
-    assert "context.db" in message, f"nothing named the file: {message!r}"
+    assert paths.db_path().name in message, f"nothing named the file: {message!r}"
     assert "empty" in message or "truncated" in message, (
         f"nothing said the file had been emptied: {message!r}"
     )

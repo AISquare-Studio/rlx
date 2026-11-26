@@ -87,7 +87,8 @@ def _hub() -> str:
 
 
 def _pairs() -> list[str]:
-    return [f"AISQUARE_HOME={paths.aisquare_home().resolve()}", f"{TEAM_HUB_ENV_VAR}={_hub()}"]
+    home = paths.aisquare_home().resolve()
+    return [f"AISQUARE_HOME={home}", f"RLX_HOME={home}", f"{TEAM_HUB_ENV_VAR}={_hub()}"]
 
 
 @pytest.mark.needs_captain

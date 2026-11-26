@@ -19,12 +19,20 @@ from typing import Any, cast
 
 import pytest
 
-from aisquare.core import credentials, locking, state_file
+from aisquare.core import credentials, locking, paths, state_file
 from aisquare.services import remote_server
 
 
 def _state(home: Path) -> None:
     state_file.update_state("board_theme", "nord")
+
+
+def _serve_lock() -> Path:
+    """The home's ``remote-serve.lock``, beside ``remote.json`` as the server keeps it, in the
+    home's own layout (``core.paths``)."""
+    lock = paths.remote_state_path().with_name(remote_server.SERVE_LOCK_NAME)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    return lock
 
 
 def _credentials(home: Path) -> None:
@@ -33,7 +41,7 @@ def _credentials(home: Path) -> None:
 
 
 def _remote_json(home: Path) -> None:
-    fd = remote_server._lock_state_file(home / "remote.json")
+    fd = remote_server._lock_state_file(home / "remote-state.json")
     assert fd is not None, "taken"
     locking.unlock(fd)
     os.close(fd)
@@ -41,7 +49,7 @@ def _remote_json(home: Path) -> None:
 
 def _remote_claim(home: Path) -> None:
     """Remote's claim of its home, whose patience (50 ms) two "held" answers fit in."""
-    state = cast(Any, SimpleNamespace(_state_path=home / "remote.json"))
+    state = cast(Any, SimpleNamespace(_state_path=home / "remote-state.json"))
     try:
         assert remote_server._claim_remote_home(state, by="serve", port=8750) is True
     finally:
@@ -120,7 +128,7 @@ def test_whether_another_process_serves_remote_is_asked_once_through_the_one_loo
     is another Remote; any other answer is no evidence of one."""
     isolated_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(remote_server, "_home_claim", None)
-    (isolated_home / "remote-serve.lock").touch()
+    _serve_lock().touch()
     answers = [OSError(errno.EACCES, "held"), OSError(errno.ENOLCK, "No locks available")]
     asked: list[int] = []
 
@@ -148,7 +156,7 @@ def test_a_lock_file_this_user_may_not_write_still_says_another_process_serves(
         raise OSError(errno.EACCES, "held")
 
     monkeypatch.setattr(locking, "lock_exclusive", held)
-    lock = isolated_home / "remote-serve.lock"
+    lock = _serve_lock()
     assert remote_server.remote_served_elsewhere() is False
     assert not lock.exists(), "the look made a lock file"
     lock.touch()

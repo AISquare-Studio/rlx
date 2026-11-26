@@ -1238,7 +1238,7 @@ def _refuse_a_project_layer(base: Path) -> None:
     the user layer aside): an export there wrote what ``_layer_dir`` refuses, by a path
     (the review of #561: *Save as… into: project*). It is one when any name it goes by is
     (:func:`_spellings`), and what it resolves to is not your own layer: yours may be named
-    ``~/.aisquare/personas`` and be a link to your dotfiles, or be reached by an alias."""
+    ``~/.rlx/personas`` and be a link to your dotfiles, or be reached by an alias."""
     user = dict(core.layer_dirs(None))["user"]
     names = _spellings(base)
     if not any(_names_a_project_layer(name) for name in names):

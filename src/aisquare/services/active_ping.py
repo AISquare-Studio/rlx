@@ -211,7 +211,7 @@ def due(state: PingState, now: datetime) -> bool:
 
 
 def lock_path() -> Path:
-    return paths.aisquare_home() / "active-ping.lock"
+    return paths.active_ping_lock_path()
 
 
 # --- the body ----------
