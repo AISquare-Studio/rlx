@@ -225,6 +225,22 @@ impl TestHome {
             .unwrap_or_default()
     }
 
+    /// Writes a gate.json holding one device, "planted", of `route`, whose credential is
+    /// `credential`: as any process of the user's could.
+    pub fn plant(&self, route: &str, credential: &str) {
+        use sha2::{Digest, Sha256};
+        let sha256: String = Sha256::digest(credential.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let gate = serde_json::json!({"version": 1, "devices": [{
+            "device": "planted", "route": route, "sha256": sha256,
+            "created": "2026-11-26T00:00:00.000Z",
+        }]});
+        std::fs::create_dir_all(self.root.join("rlxd")).unwrap();
+        std::fs::write(self.gate_json(), gate.to_string()).unwrap();
+    }
+
     /// `<home>/rlxd/gate.json`.
     pub fn gate_json(&self) -> PathBuf {
         self.root.join("rlxd").join("gate.json")
@@ -379,4 +395,40 @@ pub fn kill_hard(pid: u64) {
         Command::new("kill").args(["-9", &pid.to_string()]).status()
     };
     assert!(status.unwrap().success(), "kill {pid}");
+}
+
+/// rlxd, built as a release is (`cargo build --release`): without the features that only
+/// rlxd's dev-dependency on itself turns on for the tests, `debug-methods` and
+/// `gate-dev-mode`. The executable cargo reports, in the workspace's own target folder,
+/// so rlxd.yml's later `cargo build --release` finds it done. Set `CARGO_BUILD_JOBS` to
+/// bound it.
+///
+/// Under `cargo test --release` that is the path of this test build's rlxd too, which it
+/// then replaces: a test calls this before it runs or copies `CARGO_BIN_EXE_rlxd`.
+pub fn release_rlxd() -> PathBuf {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--package",
+            "rlxd",
+            "--bin",
+            "rlxd",
+            "--message-format=json-render-diagnostics",
+        ])
+        .current_dir(workspace())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("cargo runs");
+    assert!(output.status.success(), "cargo build --release failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact")
+        .filter(|message| message["target"]["name"] == "rlxd")
+        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+        .expect("cargo names the rlxd executable it built")
 }

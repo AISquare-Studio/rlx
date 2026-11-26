@@ -26,7 +26,7 @@ rlxd/
 ## The daemon
 
 ```sh
-rlxd serve [--detach] [--gate-dev-mode]  # run rlxd for this home; --detach returns once it takes connections
+rlxd serve [--detach] [--gate-dev-mode]  # run rlxd for this home; --detach returns once it takes connections (--gate-dev-mode: dev builds only)
 rlxd status [--json]    # what it is, who is connected, the gate's mode, and Claude Code's sign-in
 rlxd stop               # stop it, and wait until it has
 rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T]
@@ -106,10 +106,17 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     socket never pairs that route.
   - **Gate dev mode** (`--gate-dev-mode`, or `gate.dev_mode = true` in
     `<home>/rlxd/config.toml`) is for unsigned dev and CI builds of the app, and never
-    the default. It skips only the peer identity check; the credential and every
-    pairing rule still hold. rlxd logs it at start and on each gate hello, and `status`
-    says `gate: "dev mode (unsigned app accepted)"` instead of `"signed app only"`. No
-    config key, variable or flag changes the identity a release build expects.
+    the default. It exists only in an rlxd built with the cargo feature
+    `gate-dev-mode`, which only rlxd's dev-dependency on itself turns on, as
+    `debug-methods`: a release build has no `--gate-dev-mode` flag (a usage error),
+    ignores `gate.dev_mode` in its config, with a warning, and says its version alone,
+    while a feature build's `rlxd --version` ends in `(dev: gate-dev-mode)` and its
+    `status` lists `dev_features: ["gate-dev-mode"]`. Otherwise any process of the
+    user's could restart rlxd in dev mode and pair. In dev mode it skips only the peer
+    identity check; the credential and every pairing rule still hold. rlxd logs it at
+    start and on each gate hello, and `status` says `gate: "dev mode (unsigned app
+    accepted)"` instead of `"signed app only"`. No config key, variable or flag changes
+    the identity a release build expects.
 - **Logs** are `<home>/rlxd/logs/rlxd.log`, rotated at 5 MiB, three kept.
 - **Exit codes:** 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage
   error, 3 when rlxd is not running for the home. `rlxd here` also exits 3, and 4, with
@@ -160,8 +167,9 @@ One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
   `crates/rlxd/tests/release_build.rs` builds a release rlxd to check.
 - **Packaging a release** builds `cargo build --release` (`-p rlxd` or `--workspace`),
   and nothing else. `--all-targets`, `--tests`, or a binary left behind by
-  `cargo test --release` would carry `debug-methods`, because cargo then builds the
-  dev-dependency.
+  `cargo test --release` would carry `debug-methods` and `gate-dev-mode`, because cargo
+  then builds the dev-dependency. `rlxd --version` says which: a release build's is
+  `rlxd <version>` alone.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 

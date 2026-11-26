@@ -131,7 +131,13 @@ pub fn call(args: CallArgs) -> ExitCode {
     };
     let token = match args.token.clone().map_or_else(|| read_token(&home), Ok) {
         Ok(token) => token,
-        Err(message) => return out::fail(codes::UNAUTHORIZED, &message, None),
+        // No token file, most likely as no rlxd ever ran here: not running, if it isn't.
+        Err(message) => {
+            return match Connection::open(&home) {
+                Err(e) => report(connect_error(&home, e)),
+                Ok(_) => out::fail(codes::UNAUTHORIZED, &message, None),
+            };
+        }
     };
     let credential = match (args.gate_credential.clone(), args.as_app) {
         (Some(credential), _) => Some(credential),

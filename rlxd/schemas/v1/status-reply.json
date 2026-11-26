@@ -23,6 +23,14 @@
       "description": "The connections open now, by the role their `hello` was let in as. A refused\n`hello` is never counted.",
       "$ref": "#/$defs/Clients"
     },
+    "dev_features": {
+      "description": "The development-only cargo features this rlxd was built with, by name, such as\nthe one that lets it run in gate dev mode (5.1): a build for development and CI.\nAbsent from a release build, which has none.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "gate": {
       "description": "Who may be the tool-call gate (5.1): `signed app only`, or `dev mode (unsigned\napp accepted)` while rlxd runs in gate dev mode.",
       "type": "string",

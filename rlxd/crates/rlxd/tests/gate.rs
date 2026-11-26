@@ -613,28 +613,13 @@ fn a_dev_mode_start_keeps_its_flag_in_the_registry_for_a_restart() {
     assert_eq!(argv[1..], ["serve", "--detach", "--gate-dev-mode"]);
 }
 
-/// Writes a gate.json holding one device, `route`, whose credential is `credential`: as
-/// any process of the user's could.
-fn plant(home: &TestHome, route: &str, credential: &str) {
-    let sha256: String = Sha256::digest(credential.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let gate = json!({"version": 1, "devices": [{
-        "device": "planted", "route": route, "sha256": sha256,
-        "created": "2026-11-26T00:00:00.000Z",
-    }]});
-    std::fs::create_dir_all(home.root().join("rlxd")).unwrap();
-    std::fs::write(home.gate_json(), gate.to_string()).unwrap();
-}
-
 #[test]
 fn a_planted_ssh_route_device_is_refused_until_ssh_pairing_lands() {
     // Review #1991, major 1: SSH pairing isn't built, so rlxd never minted an ssh-route
     // credential; one in gate.json is refused, outside dev mode and in it, and logged.
     for dev_mode in [false, true] {
         let home = TestHome::new();
-        plant(&home, "ssh", "planted-credential");
+        home.plant("ssh", "planted-credential");
         if dev_mode {
             home.start_dev();
         } else {
@@ -678,7 +663,7 @@ fn a_planted_ssh_route_device_is_refused_until_ssh_pairing_lands() {
     // The control: the same entry with route local passes in dev mode, where only the
     // credential is checked.
     let home = TestHome::new();
-    plant(&home, "local", "planted-credential");
+    home.plant("local", "planted-credential");
     home.start_dev();
     let run = home.rlxd(&[
         "call",

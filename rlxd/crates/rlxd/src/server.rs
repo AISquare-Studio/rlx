@@ -500,6 +500,7 @@ impl Daemon {
         if self.gate.dev_mode() {
             StatusData::GATE_DEV_MODE.clone_into(&mut status.gate);
         }
+        status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {

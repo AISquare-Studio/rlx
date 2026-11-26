@@ -8,25 +8,40 @@
 //! Built without the `gate-test-requirement` feature, so nothing can replace the
 //! requirement: not `RLXD_TEST_GATE_REQUIREMENT`, and not `gate.requirement` in rlxd's
 //! config. A build with the feature skips this file.
+//!
+//! The rlxd under test is a release build ([`release_rlxd`]), which has no gate dev mode
+//! (handoff rev 7): the test build every `cargo test` makes has it, through rlxd's
+//! dev-dependency on itself. So no credential here is minted in dev mode; each is planted
+//! in gate.json, as any process of the user's could.
 #![cfg(all(target_os = "macos", not(feature = "gate-test-requirement")))]
 
 mod common;
 mod macos_signing;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use common::TestHome;
+use common::{TestHome, release_rlxd};
 use macos_signing::{SelfSigned, Signing, TEST_IDENTIFIER, helper, test_requirement, try_helper};
 use rlxd::peer::{MACOS_REQUIREMENT, MACOS_TEAM_ID, static_code_satisfies};
 
-/// A credential minted in dev mode. rlxd is then restarted outside dev mode, so a hello
-/// carrying it is refused only by the peer check.
-fn dev_mode_credential(home: &TestHome) -> String {
-    home.start_dev();
-    let run = home.rlxd(&["call", "gate.pair"]);
-    assert_eq!(run.code(), Some(0), "{run:?}");
-    let credential = run.data()["gate_credential"].as_str().unwrap().to_owned();
-    home.stop();
+/// The release build, built once. Every test asks for it first: under `cargo test
+/// --release` the build replaces `CARGO_BIN_EXE_rlxd`, which the helpers are copies of.
+fn release() -> PathBuf {
+    static RELEASE: OnceLock<PathBuf> = OnceLock::new();
+    RELEASE.get_or_init(release_rlxd).clone()
+}
+
+/// A fresh home that the release build serves.
+fn release_home() -> TestHome {
+    TestHome::new().with_binary(release())
+}
+
+/// A credential paired in gate.json, so a hello carrying it is refused only by the peer
+/// check.
+fn planted_credential(home: &TestHome) -> String {
+    let credential = "a".repeat(64);
+    home.plant("local", &credential);
     credential
 }
 
@@ -62,7 +77,7 @@ fn refused(home: &TestHome, helper: &Path, credential: &str, why: &str) {
 
 #[test]
 fn a_self_signed_helper_with_the_identifier_and_team_is_refused_for_want_of_apples_anchor() {
-    let home = TestHome::new();
+    let home = release_home();
     let dir = home.root().join("helpers");
     let list = macos_signing::search_list();
     let identity = match SelfSigned::new(&dir.join("keychain"), MACOS_TEAM_ID) {
@@ -97,9 +112,23 @@ fn a_self_signed_helper_with_the_identifier_and_team_is_refused_for_want_of_appl
     assert!(static_code_satisfies(&self_signed, MACOS_REQUIREMENT).is_err());
 
     // Refused on the gate's first pairing and on a hello with a valid credential.
-    let credential = dev_mode_credential(&home);
+    let credential = planted_credential(&home);
     home.start();
     refused(&home, &self_signed, &credential, "self-signed");
+
+    // Rev 7: gate.dev_mode in the config changes nothing in a release build.
+    home.stop();
+    std::fs::write(
+        home.root().join("rlxd").join("config.toml"),
+        "[gate]\ndev_mode = true\n",
+    )
+    .unwrap();
+    home.start();
+    assert_eq!(home.rlxd(&["gate", "unpair"]).code(), Some(0));
+    let run = home.run_of(&self_signed, &["call", "gate.pair"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "not_gate");
+    assert!(home.log().contains("ignoring gate.dev_mode"));
     drop(identity);
     assert_eq!(
         macos_signing::search_list(),
@@ -110,7 +139,7 @@ fn a_self_signed_helper_with_the_identifier_and_team_is_refused_for_want_of_appl
 
 #[test]
 fn neither_the_test_variable_nor_the_config_changes_the_requirement() {
-    let home = TestHome::new().with_env("RLXD_TEST_GATE_REQUIREMENT", &test_requirement());
+    let home = release_home().with_env("RLXD_TEST_GATE_REQUIREMENT", &test_requirement());
     let test_identity = helper(
         &home.root().join("helpers"),
         "test-identity",
@@ -121,7 +150,7 @@ fn neither_the_test_variable_nor_the_config_changes_the_requirement() {
             identity: None,
         },
     );
-    let credential = dev_mode_credential(&home);
+    let credential = planted_credential(&home);
     std::fs::write(
         home.root().join("rlxd").join("config.toml"),
         format!("[gate]\nrequirement = '{}'\n", test_requirement()),
@@ -134,7 +163,7 @@ fn neither_the_test_variable_nor_the_config_changes_the_requirement() {
 
 #[test]
 fn the_shipped_binary_holds_the_requirement_and_no_test_override() {
-    let binary = std::fs::read(env!("CARGO_BIN_EXE_rlxd")).unwrap();
+    let binary = std::fs::read(release()).unwrap();
     let holds = |needle: &[u8]| {
         binary
             .windows(needle.len())
@@ -143,4 +172,5 @@ fn the_shipped_binary_holds_the_requirement_and_no_test_override() {
     };
     assert!(holds(br#"anchor apple generic and identifier "studio.aisquare.rlx""#) >= 1);
     assert_eq!(holds(b"RLXD_TEST_GATE_REQUIREMENT"), 0);
+    assert_eq!(holds(b"gate-dev-mode"), 0);
 }

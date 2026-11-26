@@ -241,9 +241,10 @@ impl Gate {
         })
     }
 
-    /// Whether rlxd runs in gate dev mode.
+    /// Whether rlxd runs in gate dev mode: never in a build without the `gate-dev-mode`
+    /// feature, whatever it was loaded with.
     pub fn dev_mode(&self) -> bool {
-        self.dev_mode
+        cfg!(feature = "gate-dev-mode") && self.dev_mode
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
