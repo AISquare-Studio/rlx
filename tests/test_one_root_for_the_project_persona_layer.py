@@ -140,13 +140,14 @@ def test_persona_list_and_show_read_a_marked_folders_layer(runner: CliRunner, fo
     assert (code, shown["layer"]) == (0, "project")
 
 
-def test_persona_new_project_writes_the_marked_folders_layer(
+def test_persona_new_project_writes_nothing_into_the_marked_folders_layer(
     runner: CliRunner, folder: Path
 ) -> None:
+    """0.10.2: ``--project`` is retired; a project's layer is never written to."""
     code, made = _cli(runner, "new", "pair", "--project")
 
-    assert code == 0, made
-    assert Path(made["path"]) == folder / ".aisquare" / "personas" / "pair"
+    assert (code, made["error"]) == (1, "project_layer_retired")
+    assert not (folder / ".aisquare" / "personas" / "pair").exists()
 
 
 def test_the_tab_shows_a_marked_folders_personas(folder: Path) -> None:

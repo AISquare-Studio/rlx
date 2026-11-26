@@ -638,7 +638,9 @@ def test_an_aisquare_whose_version_fails_is_broken_not_absent(tmp_path: Path, bo
         path=f"{cli}:{base_path(tmp_path)}",
     )
     assert "ACTION=repair" in result.stdout, result.stdout + result.stderr
-    assert "aisquare — broken: `aisquare --version` fails" in result.stdout, result.stdout
+    # The product is rlx (0.10.1's rebrand); the command that failed is named as it ran.
+    assert "rlx — broken: `aisquare --version` fails" in result.stdout, result.stdout
+    assert "aisquare — broken" not in result.stdout, result.stdout
 
 
 @pytest.mark.parametrize(
@@ -1805,6 +1807,30 @@ def test_a_row_name_with_spaces_is_one_row(tmp_path: Path) -> None:
     assert "  manager board context\n  python\n" in result.stdout, result.stdout
     assert "  manager\n" not in result.stdout and "  board\n" not in result.stdout
     assert result.returncode == 2
+
+
+@pytest.mark.parametrize(
+    ("foreign", "word"), [(False, "rlx"), (True, "aisquare")], ids=["ours", "another-programs"]
+)
+def test_the_doctor_step_names_rlx_as_the_rest_of_the_output_does(
+    tmp_path: Path, foreign: bool, word: str
+) -> None:
+    """The production end-to-end test (board task #177): a new user's first screen named the
+    doctor step by the old word, aisquare, while the rest said rlx ("rlx doctor here says",
+    "Open rlx with: rlx"). The step names the word every other line does (``program_word``):
+    rlx, or aisquare where another program's rlx comes first on PATH."""
+    cli = stub_dir(
+        tmp_path,
+        "cli",
+        "aisquare",
+        body=f"case \"$1\" in --json) printf '%s' '{_SPACED_ROWS}' ;; esac\nexit 0",
+    )
+    dirs = [stub_dir(tmp_path, "other-bin", "rlx")] if foreign else []
+    path = ":".join([*map(str, dirs), str(cli), base_path(tmp_path)])
+    ran = sh("DRY_RUN=0; run_doctor", path=path)
+    assert f"Verifying with {word} doctor" in ran.stdout, ran.stdout + ran.stderr
+    if not foreign:
+        assert "aisquare doctor" not in ran.stdout, ran.stdout
 
 
 def test_exit_2_is_documented_for_an_extra_that_did_not_install(tmp_path: Path) -> None:
@@ -4710,10 +4736,31 @@ def test_the_word_a_line_tells_a_person_to_type_is_rlx_while_rlx_is_ours(
 ) -> None:
     """install.sh names a command by core/program.py's rule (#135): `rlx` while the rlx a shell
     finds first is uv's own (refuse_taken_commands keeps another program's out of uv's
-    directory), or while none is on PATH yet; `aisquare` while another program's comes first."""
+    directory), or while none is on PATH yet; `aisquare` while another program's comes first.
+
+    install.ps1's last line names the same word, where it said `wsl -d <distro> -- rlx`
+    whatever the install found: it asks WSL the two facts the rule reads (the rlx a login
+    shell finds first, and uv's tool directory) and compares them. Its two questions are run
+    here as WSL runs them, with a `uv` that answers as uv does, and must reach install.sh's
+    word."""
     uv_bin = stub_dir(tmp_path, "uv-bin", "aisquare", "rlx")
     other = stub_dir(tmp_path, "other-bin", "rlx")
+    uv = stub_dir(tmp_path, "uv", "uv", body='printf "%s\\n" "$UV_TOOL_BIN_DIR"')
     dirs = {"none": [], "ours": [uv_bin], "foreign-first": [other, uv_bin]}[on_path]
-    path = ":".join([*map(str, dirs), base_path(tmp_path)])
+    path = ":".join([*map(str, dirs), str(uv), base_path(tmp_path)])
     said = sh("program_word", env={"UV_TOOL_BIN_DIR": str(uv_bin)}, path=path)
     assert said.stdout == word, (said.stdout, said.stderr)
+
+    ps1 = (REPO / "install.ps1").read_text(encoding="ascii")
+    assert 'Write-Note "Open it with:  wsl -d $target -- $word"' in ps1
+    asked = re.findall(r"bash -lc '([^']*)'", ps1)
+    assert asked == ["command -v rlx 2>/dev/null", "uv tool dir --bin 2>/dev/null"], asked
+    environment = {**os.environ, "PATH": path, "UV_TOOL_BIN_DIR": str(uv_bin)}
+    found, bin_dir = (
+        subprocess.run(
+            [SH, "-c", command], capture_output=True, text=True, env=environment, timeout=60
+        ).stdout.strip()
+        for command in asked
+    )
+    ps1_word = "rlx" if not found or found == f"{bin_dir}/rlx" else "aisquare"  # its `if`
+    assert ps1_word == word, (found, bin_dir)
