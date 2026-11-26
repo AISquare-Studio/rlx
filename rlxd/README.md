@@ -265,9 +265,10 @@ rlxd call env.get
   `path_source`, where rlxd looked: `app` (the app's `PATH`), `rlxd` (its own, as the
   app set none) or `rlxd_claude_bin`.
   - **Windows** tries `claude` with each of `PATHEXT`'s extensions, so `claude.exe`. A
-    batch file found first, such as npm's `claude.cmd` shim, isn't run: Rust starts one
-    through `cmd`, whose rules no escaping makes safe for a prompt. `status` then says
-    Claude Code isn't installed.
+    batch file found first on a `PATH`, such as npm's `claude.cmd` shim, isn't run: Rust
+    starts one through `cmd`, whose rules no escaping makes safe for a prompt. `status`
+    then says Claude Code isn't installed. `RLXD_CLAUDE_BIN`, the tests' override, is
+    taken as it names, as the `auth-status.cmd` fixture needs.
 - **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
   links no Keychain crate: `rlxd.yml`'s `deny` job fails when `cargo tree --target all
   -e normal` holds `security-framework` or `keyring`.

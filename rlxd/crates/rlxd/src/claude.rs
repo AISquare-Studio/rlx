@@ -78,28 +78,29 @@ impl Resolved {
 }
 
 /// Resolves `claude` now: `RLXD_CLAUDE_BIN` from rlxd's own environment when it is set,
-/// else the first `claude` on `path` (the app's `PATH`), or on rlxd's own `PATH` when the
-/// app set none. Entries that are empty or relative are skipped: a relative one would
-/// depend on rlxd's working directory. The path is kept as found, never canonicalized.
+/// taken as it names, else the first `claude` on `path` (the app's `PATH`), or on rlxd's
+/// own `PATH` when the app set none. Entries that are empty or relative are skipped: a
+/// relative one would depend on rlxd's working directory. The path is kept as found,
+/// never canonicalized. A batch file found on a `PATH`, such as npm's `claude.cmd` shim,
+/// is [`Resolved::NotRunnable`].
 pub fn resolve_on(path: Option<&OsStr>) -> (Resolved, Source) {
     let pathext = env::var_os("PATHEXT");
-    let (found, source) =
-        if let Some(named) = env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
-            let found = program_at(Path::new(&named), pathext.as_deref())
-                .and_then(|program| std::path::absolute(program).ok());
-            (found, Source::RlxdClaudeBin)
-        } else {
-            let own = env::var_os("PATH");
-            let source = if path.is_some() {
-                Source::App
-            } else {
-                Source::Rlxd
-            };
-            let found = path
-                .or(own.as_deref())
-                .and_then(|path| find_on(path, pathext.as_deref()));
-            (found, source)
-        };
+    if let Some(named) = env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
+        // The tests' override, taken as it names: a fixture may be a batch file on Windows.
+        let found = program_at(Path::new(&named), pathext.as_deref())
+            .and_then(|program| std::path::absolute(program).ok());
+        let resolved = found.map_or(Resolved::NotFound, Resolved::Found);
+        return (resolved, Source::RlxdClaudeBin);
+    }
+    let source = if path.is_some() {
+        Source::App
+    } else {
+        Source::Rlxd
+    };
+    let own = env::var_os("PATH");
+    let found = path
+        .or(own.as_deref())
+        .and_then(|path| find_on(path, pathext.as_deref()));
     let resolved = match found {
         Some(program) if is_batch_file(&program) => Resolved::NotRunnable(program),
         Some(program) => Resolved::Found(program),
