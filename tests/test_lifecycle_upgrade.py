@@ -4554,6 +4554,10 @@ def test_a_service_that_does_not_stop_refuses_the_upgrade_before_uv_runs(
     assert "the rlx service (pid 7) did not stop within 15 s" in result.stderr, result.stderr
     assert machine.installs == [], "nothing replaced under a running service"
 
+    as_json = runner.invoke(app, ["--json", "upgrade", "--yes"])  # #1743: as uninstall's says it
+    said = _one_object(as_json.stdout or as_json.stderr)
+    assert said["error"] == "service_running" and "did not stop within 15 s" in said["detail"]
+
 
 def test_no_service_running_the_upgrade_neither_stops_nor_starts_one(
     runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch

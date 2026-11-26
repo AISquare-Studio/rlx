@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import IO, TYPE_CHECKING, Any, Literal, Protocol
 
 from aisquare.core import atomic, instances, locking, paths, selfcli
 from aisquare.core.version import PRODUCT_NAME
@@ -448,6 +448,8 @@ def _detached(command: Sequence[str]) -> subprocess.Popen[bytes]:
     (a thread waits for it), so that it leaves no zombie in a process that lives on."""
     log = log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
+    from aisquare.core import spawn
+
     with open(log, "ab") as out:
         child = subprocess.Popen(
             list(command),
@@ -456,6 +458,7 @@ def _detached(command: Sequence[str]) -> subprocess.Popen[bytes]:
             stderr=out,
             start_new_session=True,
             close_fds=True,
+            env=spawn.untraced_env(),
         )
     reaper = threading.Thread(target=child.wait, name="rlx-service-child", daemon=True)
     reaper.start()
@@ -847,14 +850,8 @@ def start_service(
     log.parent.mkdir(parents=True, exist_ok=True)
     command = list(argv) if argv is not None else selfcli.argv_for(["service", "run"])
     with open(log, "ab") as out:
-        child = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-        )
+        said_from = out.tell()  # what the log held before: an earlier run's lines, not this one's
+        child = _spawn_service(command, out)
     # Reaped once it ends, so that a caller that lives on (a TUI's restart) leaves no zombie,
     # which reads as alive to :func:`stop`'s wait; a CLI caller exits first and hands it on.
     reaper = threading.Thread(target=child.wait, name="rlx-service-reaper", daemon=True)
@@ -865,10 +862,30 @@ def start_service(
         if found is not None:
             return found
         if child.poll() is not None:
-            raise ServiceError(f"the {SERVICE} did not start: {_log_tail(log)}")
+            raise ServiceError(f"the {SERVICE} did not start: {_log_tail(log, since=said_from)}")
         time.sleep(0.1)
+    said = _log_tail(log, since=said_from)
     raise ServiceError(
-        f"the {SERVICE} did not start within {timeout:.0f} s (pid {child.pid}): {_log_tail(log)}"
+        f"the {SERVICE} did not start within {timeout:.0f} s (pid {child.pid}): {said}"
+    )
+
+
+def _spawn_service(command: Sequence[str], out: IO[bytes]) -> subprocess.Popen[bytes]:
+    """The one place an rlx service process is started (``core.spawn.SEAMS``): ``command`` in
+    a session of its own, so the terminal that started it can close, its output appended to
+    ``out`` (``service.log``), and without any agent's tracing identity: a service started from
+    an agent's pane hosts the home's work, not that agent's. The suite replaces this
+    (``tests/conftest.py::no_real_service``): a real one outlives the test that started it."""
+    from aisquare.core import spawn
+
+    return subprocess.Popen(
+        list(command),
+        stdin=subprocess.DEVNULL,
+        stdout=out,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+        env=spawn.untraced_env(),
     )
 
 
@@ -897,12 +914,17 @@ def restart_service(*, timeout: float = STOP_WAIT_SECONDS) -> instances.Instance
     return start_service()
 
 
-def _log_tail(path: Path, lines: int = 3) -> str:
+def _log_tail(path: Path, lines: int = 3, *, since: int = 0) -> str:
+    """The last ``lines`` of ``path`` from byte ``since`` on: what one run wrote, not the lines
+    an earlier run left above it, which a failed start quoted before its own reason (#1743)."""
     try:
-        tail = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-lines:]
+        with path.open("rb") as log:
+            log.seek(since)
+            text = log.read().decode("utf-8", errors="replace")
     except OSError:
         return "its log cannot be read"
-    return " / ".join(tail) if tail else "its log is empty"
+    tail = text.strip().splitlines()[-lines:]
+    return " / ".join(tail) if tail else "it wrote nothing in its log"
 
 
 def log_to_file() -> None:

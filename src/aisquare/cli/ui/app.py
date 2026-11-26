@@ -4581,7 +4581,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # The others as the registration's beat thread last read them: the UI thread reads no
         # folder (review of #462). An asq that started since is the command's to refuse.
         registration = instances.this_registration()
-        others = () if registration is None else tuple(i.label for i in registration.others)
+        others = (
+            ()
+            if registration is None
+            # Not the rlx service: the command stops it, and the upgrade starts it again, itself
+            # (``lifecycle.running_asqs`` leaves it out the same way; #32, #1743).
+            else tuple(i.label for i in registration.others if i.kind != "service")
+        )
         refusal = lifecycle_service.asqs_refusal(
             event.args[0], others, again=f"press {button} again"
         )

@@ -364,6 +364,23 @@ def test_hooks_and_the_detached_senders_never_start_a_ping(
     assert inline.count == 0 and stub.seen == []
 
 
+def test_the_rlx_service_never_starts_a_ping(
+    stub: Stub, clock: Clock, inline: Starts, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ruling on #32 (Q2): the daily active ping stays out of the rlx service, which is up
+    every day whether anyone opened rlx or not. `rlx service run` counted itself as a feature
+    and started the ping at its exit (#1743): it is not a feature, as `serve` is not."""
+    from aisquare.services import service_host
+
+    monkeypatch.setattr(service_host, "log_to_file", lambda: None)
+    monkeypatch.setattr(service_host, "run_service", lambda **_: None)  # the process, ended
+    runner = CliRunner()
+    runner.invoke(app, ["service", "run"])
+    runner.invoke(app, ["service", "status"])
+
+    assert inline.count == 0 and stub.seen == []
+
+
 def test_the_cli_loads_the_ping_module_only_when_it_runs_it() -> None:
     """Every hook imports ``cli/app.py``; the ping costs them no import."""
     result = subprocess.run(

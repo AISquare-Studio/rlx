@@ -81,6 +81,12 @@ POLL_SECONDS = 0.5
 """How often the beat thread looks for a quit request: a newcomer waiting for this asq to
 quit waits at most this long for it to start."""
 
+SERVICE_POLL_SECONDS = 2.0
+""":data:`POLL_SECONDS` for the rlx service (kind ``service``), which runs for weeks with
+nobody at it: the 0.5 s look was 120 of its wakeups a minute, most of its idle cost (#32,
+#1717). A quit request to it (``rlx service stop``, a TUI's version gate) waits at most this
+long to begin, and ``stop_service`` waits 15 s for the whole."""
+
 QUIT_CHANNEL = 1
 """The quit-request channel this release reads (``<id>.quit``). A record without one is an
 asq that cannot be asked to quit (:attr:`Instance.channel`)."""
@@ -732,7 +738,9 @@ class Registration:
                 self._look_for_quit()
             except Exception:
                 _log.debug("a quit request could not be read", exc_info=True)
-            if self._stop.wait(POLL_SECONDS):
+            if self._stop.wait(
+                SERVICE_POLL_SECONDS if self._instance.kind == "service" else POLL_SECONDS
+            ):
                 return
 
     def _look_for_quit(self) -> None:

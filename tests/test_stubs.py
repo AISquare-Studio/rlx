@@ -37,6 +37,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("reports", "stats"),
     ("reports", "seal"),
     ("serve",),
+    ("service",),  # tests/test_rlx_service.py; `run` runs until stopped, `start` a real process
     ("captain", "serve"),
     ("captain",),
     ("captain", "say"),

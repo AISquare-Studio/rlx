@@ -394,7 +394,9 @@ def test_status_with_no_service_says_so_and_exits_3() -> None:
     assert "the rlx service is not running" in result.stdout
 
 
-def test_start_and_stop_run_it_in_the_background_and_wind_it_down(tmp_path: Path) -> None:
+def test_start_and_stop_run_it_in_the_background_and_wind_it_down(
+    tmp_path: Path, real_service: list[Any]
+) -> None:
     """``start`` and ``stop`` are what the home migration and the upgrade call: a child in a
     session of its own, live in the registry when ``start`` returns, gone when ``stop`` does.
     The child hosts no parts (it inherits no test stub)."""
@@ -686,6 +688,82 @@ def test_a_take_back_honours_a_switch_another_window_turned_on(server: FakeServe
     finally:
         controller.shutdown_for_exit()
         controller.wait_until_off(5.0)
+
+
+@pytest.mark.parametrize("command", ["upgrade", "uninstall"])
+def test_the_tuis_update_and_uninstall_hand_over_beside_the_service(
+    command: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1743 MAJOR 2: a TUI's Update and Uninstall refused beside the service, which the
+    registry lists as one more rlx; the command they hand over to stops it itself (and the
+    upgrade starts it again), as `lifecycle.running_asqs` already says. Beside a second rlx a
+    person must quit, they are still refused, and the refusal names that one only."""
+    from aisquare.cli.ui.views.doctor import DoctorView
+    from tests.asq_elsewhere import asq_running
+
+    monkeypatch.setattr(instances, "HEARTBEAT_SECONDS", 0.05)
+    with instances.gate():
+        me = instances.register(instances.describe_this_process())
+    me.start()
+
+    async def beaten(count: int) -> None:
+        for _ in range(500):
+            if len(me.others) == count:
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail(f"the beat thread read {me.others}")
+
+    async def run() -> tuple[tuple[str, ...] | None, str, tuple[str, ...] | None]:
+        app = FleetApp(refresh_seconds=3600, doctor=lambda: [])
+        async with app.run_test(size=(120, 40), notifications=True) as pilot:
+            await pilot.pause()
+            with asq_running(kind="service") as service:
+                with asq_running(version="0.0.1") as other:
+                    await beaten(2)
+                    app.on_doctor_view_hand_off(DoctorView.HandOff((command, "--reopen")))
+                    await pilot.pause()
+                    refused = app.hand_off
+                    said = " ".join(str(note.message) for note in app._notifications)
+                    assert f"({other.label})" in said and service.label not in said, said
+                await beaten(1)
+                app.on_doctor_view_hand_off(DoctorView.HandOff((command, "--reopen")))
+                return refused, said, app.hand_off
+
+    try:
+        refused, said, handed = asyncio.run(run())
+    finally:
+        me.deregister()
+    assert refused is None and "another rlx runs on this home" in said, "a second rlx: refused"
+    assert handed == (command, "--reopen"), "beside the service alone: it hands over"
+
+
+def test_no_test_starts_a_real_service_unless_it_asks_for_one() -> None:
+    """#1743: tests/test_stubs.py ran `service start` with no arguments, and real services
+    were left running after pytest. The suite refuses the one place a service is started
+    (tests/conftest.py::no_real_service) unless a test asks for real_service."""
+    with pytest.raises(ServiceError, match="a test may not start a real rlx service"):
+        service_host.start_service(argv=[sys.executable, "-c", "pass"])
+    result = CliRunner().invoke(app, ["service", "start"])
+    assert result.exit_code != 0 and "may not start a real rlx service" in result.output
+    assert service_host.running_service() is None
+
+
+def test_a_start_that_fails_quotes_what_that_run_wrote_not_an_earlier_ones(
+    real_service: list[Any],
+) -> None:
+    """#1743 nit: a failed start quoted the log's last lines, an earlier run's included, before
+    its own reason. It quotes what the child it started wrote."""
+    log = service_host.log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("2026-11-20 09:00:00 INFO an earlier run's last line\n", encoding="utf-8")
+    child = [sys.executable, "-c", "import sys; print('the real reason'); sys.exit(1)"]
+
+    with pytest.raises(ServiceError) as raised:
+        service_host.start_service(argv=child)
+
+    said = str(raised.value)
+    assert said.endswith("the real reason") and "earlier run" not in said, said
+    assert len(real_service) == 1 and real_service[0].wait(timeout=5) == 1
 
 
 def test_the_cli_every_hook_imports_does_not_import_the_service() -> None:

@@ -689,7 +689,7 @@ def _upgrade(
     except lifecycle_service.UpgradeRefused as refused:
         # Refused at the last moment, before uv ran: the rlx service would not stop (#32).
         _reopen(reopen)
-        fail(refused.reason, error="service_running")
+        fail(refused.reason, error="service_running", detail=refused.reason)
     if not report.installed:
         # A run uv could not resolve (a cutoff in its settings that excludes even the release
         # that runs) leaves that release in place. The one-liner's own upgrade asks uv for
