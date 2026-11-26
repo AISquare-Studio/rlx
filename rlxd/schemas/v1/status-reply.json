@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "StatusData",
-  "description": "`status`'s reply data.\n\n```json\n{\"version\": \"0.10.3\", \"pid\": 4242, \"platform\": \"macos\", \"protocol_version\": 1,\n \"capabilities\": [], \"seq\": 0, \"clients\": {\"app\": 0, \"tui\": 0, \"remote\": 0, \"cli\": 1},\n \"gate\": \"signed app only\", \"brain\": {\"pid\": 4243, \"restarts\": 0, \"handled\": 12},\n \"claude\": {\"installed\": true, \"version\": \"2.1.314\", \"signed_in\": true,\n            \"auth_method\": \"claude.ai\", \"account\": \"…\", \"plan\": \"pro\"},\n \"runs\": {\"live\": 0, \"queued\": 0}, \"jobs\": {\"count\": 0},\n \"paths\": {\"home\": \"…\", \"socket\": \"…\", \"lock\": \"…\", \"token\": \"…\", \"logs\": \"…\"}}\n```\n\n`runs` and `jobs` hold zeros until the runner and the scheduler fill them, and `seq` is\n0 until the event bus does.",
+  "description": "`status`'s reply data.\n\n```json\n{\"version\": \"0.10.3\", \"pid\": 4242, \"platform\": \"macos\", \"protocol_version\": 1,\n \"capabilities\": [], \"seq\": 0, \"clients\": {\"app\": 0, \"tui\": 0, \"remote\": 0, \"cli\": 1},\n \"gate\": \"signed app only\", \"brain\": {\"pid\": 4243, \"restarts\": 0, \"handled\": 12, \"queued\": 0},\n \"claude\": {\"installed\": true, \"version\": \"2.1.314\", \"signed_in\": true,\n            \"auth_method\": \"claude.ai\", \"account\": \"…\", \"plan\": \"pro\"},\n \"runs\": {\"live\": 0, \"queued\": 0}, \"jobs\": {\"count\": 0},\n \"paths\": {\"home\": \"…\", \"socket\": \"…\", \"lock\": \"…\", \"token\": \"…\", \"logs\": \"…\"}}\n```\n\n`runs` and `jobs` hold zeros until the runner and the scheduler fill them, and `seq` is\n0 until the event bus does.",
   "type": "object",
   "properties": {
     "brain": {
@@ -129,6 +129,14 @@
           "format": "uint32",
           "maximum": 2147483647,
           "minimum": 1
+        },
+        "queued": {
+          "description": "How many requests wait for it now, in its queue: at most 64, after which a request\nis refused at once. Absent from a status before the queue had a bound reads as 0.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "maximum": 18446744073709551615,
+          "minimum": 0
         },
         "restarts": {
           "description": "How many times rlxd started it again after it ended: 0 for the first brain.",

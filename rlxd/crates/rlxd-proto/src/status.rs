@@ -12,7 +12,7 @@ use crate::{ErrorBody, PROTOCOL_VERSION};
 /// ```json
 /// {"version": "0.10.3", "pid": 4242, "platform": "macos", "protocol_version": 1,
 ///  "capabilities": [], "seq": 0, "clients": {"app": 0, "tui": 0, "remote": 0, "cli": 1},
-///  "gate": "signed app only", "brain": {"pid": 4243, "restarts": 0, "handled": 12},
+///  "gate": "signed app only", "brain": {"pid": 4243, "restarts": 0, "handled": 12, "queued": 0},
 ///  "claude": {"installed": true, "version": "2.1.314", "signed_in": true,
 ///             "auth_method": "claude.ai", "account": "…", "plan": "pro"},
 ///  "runs": {"live": 0, "queued": 0}, "jobs": {"count": 0},
@@ -136,6 +136,10 @@ pub struct Brain {
     pub restarts: u64,
     /// How many requests it answered.
     pub handled: u64,
+    /// How many requests wait for it now, in its queue: at most 64, after which a request
+    /// is refused at once. Absent from a status before the queue had a bound reads as 0.
+    #[serde(default)]
+    pub queued: u64,
     /// Why no brain runs now, or why the last one ended: `brain_not_found`,
     /// `brain_start_failed`, `brain_incompatible` (rlx and rlxd are of releases that share
     /// no brain protocol), `brain_exited` or `brain_unresponsive`. Absent once a brain

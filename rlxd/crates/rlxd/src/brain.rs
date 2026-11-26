@@ -26,7 +26,8 @@
 //!   again.
 //! - **Supervision.** A brain that ends is started again after a backoff that doubles
 //!   from 250 ms to [`BACKOFF_CAP`] with each start that fails, and starts over once a
-//!   brain has run [`HEALTHY`]. `status.brain` says its pid, `restarts`, `handled`, and
+//!   brain has run [`HEALTHY`]. `status.brain` says its pid, `restarts`, `handled`, how
+//!   many requests wait (`queued`, at most [`QUEUE_MOST`]: one more is not delivered), and
 //!   while none runs, why (`error`) and how long until the next start (`backoff_ms`).
 //! - **Its tree** (`process`): a process group on POSIX, a Job Object on Windows. When
 //!   rlxd stops, the brain's stdin closes, which ends it; after [`STOP_GRACE`] its tree
@@ -47,7 +48,7 @@
 mod process;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -97,6 +98,10 @@ const LASTING: [&str; 3] = [
     brain_codes::BRAIN_INCOMPATIBLE,
 ];
 
+/// The most requests that wait for the brain at once. One more is refused at once, never
+/// delivered, so a wedged brain cannot gather every hook of every session behind it.
+pub const QUEUE_MOST: usize = 64;
+
 /// Where a queued request stands, which its caller and the supervisor race to change.
 const QUEUED: u8 = 0;
 const TAKEN: u8 = 1;
@@ -117,6 +122,7 @@ pub enum CallError {
 /// The brain, as rlxd keeps it: its state for `status`, and the queue its requests wait in.
 pub struct Brain {
     shared: Arc<Shared>,
+    queued: Arc<AtomicUsize>,
     jobs: mpsc::UnboundedSender<Job>,
     stop: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -134,10 +140,35 @@ struct Shared {
 struct Job {
     method: String,
     params: Data,
-    claim: Arc<AtomicU8>,
+    claim: Arc<Claim>,
     accept_by: Instant,
     deadline: Instant,
     reply: oneshot::Sender<Result<Data, CallError>>,
+}
+
+/// Where a request stands, and the count of requests still waiting, which whoever moves it
+/// out of [`QUEUED`] lowers, once.
+struct Claim {
+    state: AtomicU8,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Claim {
+    /// Moves the request from [`QUEUED`] to `to`: whether this call did.
+    fn leave_queue(&self, to: u8) -> bool {
+        let moved = self
+            .state
+            .compare_exchange(QUEUED, to, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if moved {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+        }
+        moved
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::SeqCst)
+    }
 }
 
 impl Job {
@@ -149,10 +180,7 @@ impl Job {
         } else {
             TAKEN
         };
-        let swapped = self
-            .claim
-            .compare_exchange(QUEUED, next, Ordering::SeqCst, Ordering::SeqCst);
-        swapped.is_ok() && next == TAKEN
+        self.claim.leave_queue(next) && next == TAKEN
     }
 
     fn answer(self, outcome: Result<Data, CallError>) {
@@ -186,6 +214,7 @@ impl Brain {
         let task = tokio::spawn(supervise(Arc::clone(&shared), queue, stopping));
         Ok(Arc::new(Self {
             shared,
+            queued: Arc::new(AtomicUsize::new(0)),
             jobs,
             stop,
             task: Mutex::new(Some(task)),
@@ -194,7 +223,9 @@ impl Brain {
 
     /// `status.brain`.
     pub fn status(&self) -> rlxd_proto::Brain {
-        self.shared.state().clone()
+        let mut status = self.shared.state().clone();
+        status.queued = self.queued.load(Ordering::SeqCst) as u64;
+        status
     }
 
     /// Asks the brain `method` with `params`. The brain must accept it within
@@ -213,10 +244,20 @@ impl Brain {
             // No brain will run before rlx is installed or upgraded: do not wait for one.
             return Err(CallError::NotDelivered(error));
         }
+        let waiting = self.queued.fetch_add(1, Ordering::SeqCst);
+        let claim = Arc::new(Claim {
+            state: AtomicU8::new(QUEUED),
+            queued: Arc::clone(&self.queued),
+        });
+        if waiting >= QUEUE_MOST {
+            claim.leave_queue(WITHDRAWN);
+            return Err(not_delivered(&format!(
+                "the brain's queue already holds {QUEUE_MOST} requests"
+            )));
+        }
         let now = Instant::now();
         let accept_by = now + accept_within;
         let deadline = now + run_within.max(accept_within);
-        let claim = Arc::new(AtomicU8::new(QUEUED));
         let (reply, mut answer) = oneshot::channel();
         let job = Job {
             method: method.to_owned(),
@@ -227,6 +268,7 @@ impl Brain {
             reply,
         };
         if self.jobs.send(job).is_err() {
+            claim.leave_queue(WITHDRAWN);
             return Err(not_delivered("rlxd is stopping, and its brain with it"));
         }
         match timeout_at(accept_by, &mut answer).await {
@@ -234,10 +276,7 @@ impl Brain {
             Ok(Err(_)) => return Err(dropped(&claim)),
             Err(_) => {}
         }
-        if claim
-            .compare_exchange(QUEUED, WITHDRAWN, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
+        if claim.leave_queue(WITHDRAWN) {
             let why = match self.shared.state().error.clone() {
                 Some(error) => format!("no brain took it in time: {}", error.message),
                 None => "no brain took it in time".to_owned(),
@@ -267,11 +306,11 @@ impl Brain {
     }
 }
 
-/// How long `brain.ping` waits for the brain to take it, and to answer.
+/// How long `hook.ping` waits for the brain to take it, and to answer.
 const PING_ACCEPT: Duration = Duration::from_secs(5);
 const PING_RUN: Duration = Duration::from_secs(10);
 
-/// `brain.ping`: the brain's `{pid}`, or why it did not answer.
+/// `hook.ping`: the brain's `{pid}`, or why it did not answer.
 pub async fn ping(brain: &Brain) -> Result<Data, ErrorBody> {
     match brain.call("ping", Data::new(), PING_ACCEPT, PING_RUN).await {
         Ok(data) => Ok(data),
@@ -284,8 +323,8 @@ pub async fn ping(brain: &Brain) -> Result<Data, ErrorBody> {
 }
 
 /// A job dropped unanswered: never taken means never run.
-fn dropped(claim: &AtomicU8) -> CallError {
-    if claim.load(Ordering::SeqCst) == TAKEN {
+fn dropped(claim: &Claim) -> CallError {
+    if claim.state() == TAKEN {
         CallError::Failed(failure(
             codes::INTERNAL,
             "the brain's supervisor dropped a request it had taken",

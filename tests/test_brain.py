@@ -208,6 +208,27 @@ def test_nothing_the_brain_runs_writes_into_its_replies_or_reads_its_requests() 
         assert noise in stderr, f"{noise!r} belongs in the brain's log: {stderr}"
 
 
+def test_the_protocols_channel_is_inherited_by_no_child() -> None:
+    """Its fds (and so, on Windows, their handles) are not inheritable, and fds 0 and 1,
+    which a child does inherit, are no longer the protocol's pipes."""
+    probe = """
+        import json, os, sys
+        from aisquare.services import brain
+
+        channel = brain.private_channel()
+        fds = [channel._reader.fileno(), channel._writer.fileno()]
+        said = {
+            "inheritable": [os.get_inheritable(fd) for fd in fds],
+            "stdin_is_null": os.read(0, 1) == b"",
+        }
+        channel.write(said)
+    """
+    done = _brain_process(probe, [HELLO])
+    assert done.returncode == 0, done.stderr.decode()
+    said = json.loads(done.stdout.decode("ascii"))
+    assert said == {"inheritable": [False, False], "stdin_is_null": True}
+
+
 def test_rlx_brain_stdio_speaks_the_protocol_as_a_process() -> None:
     done = subprocess.run(
         [sys.executable, "-m", "aisquare", "brain", "--stdio"],

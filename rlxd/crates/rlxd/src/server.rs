@@ -412,7 +412,10 @@ impl Daemon {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
             }
-            methods::BRAIN_PING => crate::brain::ping(&self.brain).await,
+            methods::HOOK_PING => match cli_only(session, methods::HOOK_PING) {
+                Ok(()) => crate::brain::ping(&self.brain).await,
+                Err(refused) => Err(refused),
+            },
             methods::EVENTS_SUBSCRIBE if streaming => Err(error(
                 codes::INVALID_REQUEST,
                 "this connection carries an event stream already: open another for a second",
@@ -868,6 +871,21 @@ impl Daemon {
         warning!("gate unpaired: {which}, by the user; {dropped} app connection(s) dropped");
         Ok(object(&json!({"unpaired": names, "dropped": dropped})))
     }
+}
+
+/// `role_not_allowed {role, method}` unless `session` is a `cli` client: the hook methods
+/// are rlxd-hook's, a command-line client (1.5).
+fn cli_only(session: &Session, method: &str) -> Result<(), ErrorBody> {
+    if session.role == Role::Cli && session.app.is_none() {
+        return Ok(());
+    }
+    let role = role_name(session.role);
+    let refused = error(
+        codes::ROLE_NOT_ALLOWED,
+        &format!("{method} is for command-line clients, such as rlxd-hook, not role {role}"),
+    );
+    let detail = object(&json!({"role": role, "method": method}));
+    Err(refused.clone().with_detail(detail).unwrap_or(refused))
 }
 
 /// Checks `peer`'s identity off the async runtime.
@@ -1533,7 +1551,7 @@ fn served() -> Vec<&'static str> {
     let mut served = vec![
         methods::STATUS,
         methods::STOP,
-        methods::BRAIN_PING,
+        methods::HOOK_PING,
         methods::EVENTS_SUBSCRIBE,
         methods::SETTINGS_GET,
         methods::SETTINGS_SET,
