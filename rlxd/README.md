@@ -5,16 +5,18 @@ headless Claude Code runs), receives hooks, runs the user's scheduler, and pushe
 events to its clients: the TUI, rlxapp and Remote. Python stays the orchestration
 brain and the TUI. The plan is `docs/plans/0.10.3-handoff.md`, section 1.
 
-This is the daemon's core (1.3, 7.2, 7.4): one rlxd per home, on a local socket or a
-named pipe, a token `hello`, the envelope on every reply, and `status`. The event bus,
-the PTY host, the runner and the rest arrive with later items, each a method on this
-socket. `rlxd-hook` answers `--version` only for now.
+This is the daemon's core (1.3, 7.2, 7.4) and its event bus (1.7, 7.3): one rlxd per
+home, on a local socket or a named pipe, a token `hello`, the envelope on every reply,
+`status`, and `events.subscribe`. The PTY host, the runner and the rest arrive with
+later items, each a method on this socket that publishes on the bus. `rlxd-hook`
+answers `--version` only for now.
 
 ```
 rlxd/
   crates/rlxd-proto/   wire types, schema_version, JSON Schemas (schemars); no I/O
-  crates/rlxd-client/  the library rlxapp depends on: the home's paths, connect, hello, call
-  crates/rlxd/         the daemon: serve, status, stop, call
+  crates/rlxd-client/  the library rlxapp depends on: the home's paths, connect, hello,
+                       call, subscribe
+  crates/rlxd/         the daemon: serve, status, stop, call, events, and the bus
   crates/rlxd-hook/    the tiny hook client (`--version` only for now)
   schemas/v1/          generated from rlxd-proto and checked in; CI fails on drift
   tests/fixtures/      fake-claude scenarios
@@ -28,6 +30,8 @@ rlxd status [--json]    # what it is, who is connected, and Claude Code's sign-i
 rlxd stop               # stop it, and wait until it has
 rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T]
           [--protocol-version N] [--env JSON] [--socket PATH] [--raw] <method> [<params-json>]
+rlxd events [--as-app] [--topics a,b] [--since SEQ] [--follow] [--until TYPE[,TYPE…]]
+            [--limit N] [--timeout S] [--socket PATH] [--token T]
 rlxd here [--json] [--start] [--show-token] [--protocols VERSIONS]
                         # what is installed and running here: rlx.app's probe over SSH
 ```
@@ -53,10 +57,54 @@ rlxd here [--json] [--start] [--show-token] [--protocols VERSIONS]
 - **Logs** are `<home>/rlxd/logs/rlxd.log`, rotated at 5 MiB, three kept.
 - **Exit codes:** 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage
   error, 3 when rlxd is not running for the home. `rlxd here` also exits 3, and 4, with
-  an `ok` envelope: see below.
+  an `ok` envelope: see below. `rlxd events` exits 4 when its `--timeout` runs out.
 
 The `status` reply's shape is `schemas/v1/status-reply.json`. `RLXD_CLAUDE_BIN` names the
 program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/`.
+
+## The event bus
+
+One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
+
+- **`seq`** numbers every event from 1, across topics and across restarts. rlxd keeps a
+  mark at or above every seq it has given out in `<home>/rlxd/seq`. It is written 1,000
+  seqs ahead, off the bus lock, before half of them are used, made durable (fsync, then
+  rename, then the folder fsynced, or write-through on Windows), and written exactly on
+  a clean stop. rlxd gives out no seq the mark on disk doesn't cover: when the mark can't
+  be written, it retries every second, and once the mark is used up, a publish is
+  refused rather than risk a repeat.
+- **Gaps.** A client resuming from a seq the buffer no longer holds, a previous rlxd's
+  included, first gets `daemon.gap {from, to}`, whose own seq is `to`. A client that reads
+  so slowly that the buffer drops events it hasn't read gets one mid-stream. Gaps come
+  whatever the topics.
+- **Runs.** Run events also carry `run_seq`, per run. The bus indexes them by run, and
+  a run's replay from the buffer says the home seq to follow on from.
+- **The buffer** holds the last 10,000 events, at most 64 MiB of them, none older than
+  24 hours. One event may be at most 16 MiB, the longest line a client reads.
+- **`events.subscribe {topics?, since?, follow?}`** replays what the buffer holds after
+  `since`, then, while `follow` (the default), live events. Without `follow` it ends at
+  the last event published when it was asked. Its reply `{seq}` comes last and ends the
+  stream. A connection carries one stream, so event frames carry no `id`. An unknown topic
+  gets `unknown_topic`, and a `since` past the last event gets `since_ahead` with
+  `detail.head`.
+- **A slow client holds up no one.** A subscriber is a place in the buffer, not a
+  queue. It is written at its own pace, at most 256 events or 1 MiB at a time, straight
+  from the buffer, and when the buffer drops events it hasn't read, it gets a
+  `daemon.gap` for them and goes on.
+- **`rlxd events`** prints the stream as JSON lines, events only (`jq -s .` makes an
+  `event-list.json`). It exits 0 at `--until` or `--limit`, or when the stream ends, and
+  4 at `--timeout`. `--until` implies `--follow`. A refusal goes to stderr as its
+  envelope.
+- **The `daemon` topic:** `daemon.started {version, pid}`, `daemon.stopping {reason}`
+  and `daemon.gap {from, to}`.
+- **`debug.emit {count}`** publishes `count` events, for tests. It exists only with the
+  cargo feature `debug-methods`, which only rlxd's dev-dependency on itself turns on:
+  `cargo test` has it, `cargo build --release` never does, and
+  `crates/rlxd/tests/release_build.rs` builds a release rlxd to check.
+- **Packaging a release** builds `cargo build --release` (`-p rlxd` or `--workspace`),
+  and nothing else. `--all-targets`, `--tests`, or a binary left behind by
+  `cargo test --release` would carry `debug-methods`, because cargo then builds the
+  dev-dependency.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 
@@ -214,10 +262,11 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
    itself. With OpenSSH, `ssh -N -L <local socket>:<socket> host` makes a local socket
    whose every connection is one such channel.
 3. Speak the protocol on the channel as on the socket: `hello` with the token, then
-   requests. From a shell, through OpenSSH's local socket:
+   requests and event streams. From a shell, through OpenSSH's local socket:
 
    ```sh
    rlxd call --socket <local socket> --token <token> status
+   rlxd events --socket <local socket> --token <token> --follow
    ```
 
    `--socket` connects there instead of to the home's socket. The home's token file is
@@ -234,9 +283,14 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
 
 `.github/workflows/rlxd.yml`'s `ssh` job runs it on ubuntu through a real `ssh -N -L` to
 localhost, for `~/.aisquare` and for a home too deep for its own socket. The client side
-is a home with no rlxd and no token. `status` must answer through the forward, naming the
-host's socket and home, and neither rlxd nor ssh may listen on TCP or UDP. Once the
-forward is gone, the same call exits 3.
+is a home with no rlxd and no token. Through the forward:
+
+- `status` must answer, naming the host's socket and home;
+- an `rlxd events --since 0 --until daemon.stopping` stream must replay this rlxd's
+  `daemon.started`, stay open through 60 quiet seconds, and take `daemon.stopping` live
+  when rlxd stops over ssh;
+- neither rlxd nor ssh may listen on TCP or UDP;
+- once the forward is gone, the same call exits 3.
 
 ### Long homes: the short socket
 
@@ -270,7 +324,7 @@ runs in, so run cargo from here:
 cd rlxd
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
+cargo test --workspace --locked   # also builds a release rlxd (tests/release_build.rs)
 cargo build --release
 cargo run -p rlxd-proto --bin gen-schemas -- --check
 cargo deny check            # licences and advisories (deny.toml)

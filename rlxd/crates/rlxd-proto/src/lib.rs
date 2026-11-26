@@ -9,6 +9,7 @@
 //!   frame on a connection and its reply;
 //! - [`Event`] (7.3): one event on the event stream; `event-list.json` is an array of
 //!   them;
+//! - [`SubscribeParams`] (7.3): `events.subscribe`'s params, which open the stream;
 //! - [`StatusData`] (7.4): `status`'s reply, what rlxd is and whether Claude Code is
 //!   installed and signed in;
 //! - [`HereData`]: `rlxd here`'s reply, the probe rlx.app runs over SSH: what rlx is
@@ -110,6 +111,20 @@
 //! `job_id` when a scheduler job fired the run. [`Event::for_run`] sets them, and
 //! [`Event::run_scope`] reads them back.
 //!
+//! # The stream
+//!
+//! `events.subscribe` ([`SubscribeParams`]) turns its connection into a stream. A
+//! connection carries at most one, so event frames carry no `id`: a frame with `ok` is a
+//! reply, and any other is an event. The subscribe's own reply comes last and ends the
+//! stream, `{seq}`, the last seq the stream covered. Replies to other requests sent on
+//! the connection meanwhile come between the events, each with its `id`.
+//!
+//! A `daemon.gap {from, to}` ([`event_types::DAEMON_GAP`]) says the events numbered
+//! `from` to `to` are gone. It starts the stream when `since` is older than the oldest
+//! event rlxd holds, and can also come anywhere later, for a client so slow that rlxd
+//! drops events it has not read. It comes whatever the topics, and its own `seq` is `to`.
+//! A `since` past the last event gets [`codes::SINCE_AHEAD`], with `detail.head`.
+//!
 //! # Versioning
 //!
 //! [`SCHEMA_VERSION`], the protocol version, is an integer. New fields and new event
@@ -131,9 +146,15 @@
 //!
 //! These are noted here, and are not part of v1 yet:
 //!
-//! - **A stream id on event frames.** Event frames carry no request or subscription id,
-//!   so a client can't tell two streams on one connection apart. Adding an optional `id`
-//!   is additive. The name is reserved for 1.7's event bus to settle.
+//! - **A stream id on event frames.** 1.7 settled on one stream per connection, so event
+//!   frames carry no `id`. Should a connection ever carry more than one, an optional `id`
+//!   on event frames, the subscribe's, is additive. The name stays reserved for it.
+//! - **The `daemon` events' `data`** is not checked by `event.json` yet: `daemon.gap`'s
+//!   `{from, to}` and the others are described in [`event_types`] only.
+//! - **A numbering epoch.** A `since` from a home whose numbering started again (its
+//!   mark deleted) gets `since_ahead` only until the new numbering passes it. An id made
+//!   with the numbering, carried in `status` and `daemon.started`, would let a client
+//!   always tell.
 //! - **The daemon record's strings** may still be empty: `host`, `version` and the items
 //!   of `argv`. `cwd` isn't required to be absolute. Python's registry (#576) and this
 //!   schema tighten them together, or not at all.
@@ -148,16 +169,18 @@ mod marker;
 mod request;
 pub mod schemas;
 mod status;
+mod subscribe;
 
 pub use check::Invalid;
 pub use daemon::{DaemonRecord, kinds as daemon_kinds};
 pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};
-pub use event::{Event, RunScope, topics};
+pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};
 pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
 pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
+pub use subscribe::SubscribeParams;
 
 /// The protocol version this crate speaks: `hello`'s `protocol_version`.
 pub const PROTOCOL_VERSION: u32 = 1;

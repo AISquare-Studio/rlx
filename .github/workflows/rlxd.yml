@@ -267,9 +267,10 @@ jobs:
       # rlxd's socket as rlx.app reaches it: a direct-streamlocal channel, here OpenSSH's
       # `ssh -N -L <local socket>:<host's socket>`, so nothing listens on TCP. The client
       # side is a home with no rlxd and no token: `socket` and the token come from `rlxd
-      # here --start --show-token`, run inside the session. Two homes: ~/.aisquare, whose
-      # socket is its run/rlxd.sock, and one too deep for that, served on its short socket
-      # in /tmp/rlxd-<uid>/.
+      # here --start --show-token`, run inside the session. Through the forward: `status`,
+      # then an `rlxd events` stream that must live through a quiet wait and take rlxd's
+      # stop live. Two homes: ~/.aisquare, whose socket is its run/rlxd.sock, waiting 60 s,
+      # and one too deep for that, served on its short socket in /tmp/rlxd-<uid>/.
       - name: rlxd's socket through an ssh direct-streamlocal forward
         working-directory: .
         run: |
@@ -282,7 +283,8 @@ jobs:
           fail() { echo "::error::$*"; exit 1; }
 
           through_a_forward() {
-            local name=$1 home=$2 here remote token local_sock forward code
+            local name=$1 home=$2 hold=$3 here remote token local_sock forward code
+            local pid events began elapsed
             here="$name-here.json"
             code=0
             ssh localhost "RLX_HOME='$home' '$rlxd' here --json --start --show-token" > "$here" \
@@ -313,21 +315,45 @@ jobs:
               fail "$name: rlxd or ssh listens on a port"
             fi
 
+            # A stream through the forward: this rlxd's daemon.started, replayed, then $hold
+            # quiet seconds, then daemon.stopping, live, when rlxd stops over ssh. The
+            # buffer is this rlxd's own, so no earlier rlxd's daemon.stopping is in it.
+            pid=$(jq .data.pid "$name-status.json")
+            began=$(date +%s)
+            RLX_HOME="$client_home" "$rlxd" events --socket "$local_sock" --token "$token" \
+              --since 0 --until daemon.stopping --timeout $((hold + 60)) \
+              > "$name-events.jsonl" 2> "$name-events.err" &
+            events=$!
+            sleep "$hold"
+            kill -0 "$events" 2> /dev/null \
+              || fail "$name: the stream ended within $hold s: $(cat "$name-events.err")"
+            ssh localhost "RLX_HOME='$home' '$rlxd' stop" > /dev/null
+            code=0
+            wait "$events" || code=$?
+            elapsed=$(( $(date +%s) - began ))
+            [ "$code" = 0 ] || fail "$name: rlxd events exits $code: $(cat "$name-events.err")"
+            [ "$elapsed" -ge "$hold" ] || fail "$name: the stream ended after $elapsed s"
+            jq -s -e --argjson pid "$pid" '
+              (map(.type == "daemon.started" and .data.pid == $pid) | index(true)) as $start
+              | $start != null and .[-1].type == "daemon.stopping" and .[-1].seq > .[$start].seq' \
+              "$name-events.jsonl" > /dev/null \
+              || fail "$name: the stream through the forward: $(jq -s -c 'map([.seq, .type])' "$name-events.jsonl")"
+            echo "$name: the stream lived $elapsed s: $(jq -s -c 'map(.type)' "$name-events.jsonl")"
+
             kill "$forward"
             wait "$forward" || true
             code=0
             RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token "$token" status \
               > /dev/null || code=$?
             [ "$code" = 3 ] || fail "$name: with the forward gone the call exits $code, not 3"
-            ssh localhost "RLX_HOME='$home' '$rlxd' stop" > /dev/null
             rm "$here"
           }
 
-          through_a_forward default "$HOME/.aisquare"
+          through_a_forward default "$HOME/.aisquare" 60
           [ "$(jq -r .data.paths.socket default-status.json)" = "$HOME/.aisquare/run/rlxd.sock" ] \
             || fail "the default home is not served on its run/rlxd.sock"
 
-          through_a_forward deep "$deep"
+          through_a_forward deep "$deep" 2
           short=$(jq -r .data.paths.socket deep-status.json)
           case "$short" in
             "/tmp/rlxd-$uid/"?*.sock) ;;
@@ -337,3 +363,5 @@ jobs:
             || fail "/tmp/rlxd-$uid is $(stat -c '%a %u' "/tmp/rlxd-$uid"), not 700 $uid"
           [ ! -e "$deep/run/rlxd.sock" ] || fail "the deep home has a socket of its own"
           uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/envelope.json -- *-status.json
+          for stream in *-events.jsonl; do jq -s . "$stream" > "${stream%.jsonl}.json"; done
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/event-list.json -- *-events.json

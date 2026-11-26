@@ -1,28 +1,36 @@
 //! rlxd, the rlx engine: one local daemon per home that hosts processes and pushes events
 //! to its clients (handoff 0.10.3, section 1).
 //!
-//! This is its core (1.3, 7.2, 7.4): `rlxd serve [--detach]`, `rlxd status [--json]`,
-//! `rlxd stop` and `rlxd call`. One rlxd runs per home, on a local socket or named pipe,
-//! and a client gets in with the shared token through `hello`. Every reply is the 7.2
-//! envelope. The event bus, the PTY host, the runner and the rest are later items,
-//! each a method on this socket. `rlxd here [--start]` is the probe rlx.app runs over
-//! SSH: what is installed, whether rlxd runs, and the protocol versions it serves.
+//! This is its core (1.3, 7.2, 7.4) and its event bus (1.7, 7.3): `rlxd serve
+//! [--detach]`, `rlxd status [--json]`, `rlxd stop`, `rlxd call` and `rlxd events`. One
+//! rlxd runs per home, on a local socket or named pipe, and a client gets in with the
+//! shared token through `hello`. Every reply is the 7.2 envelope, and `events.subscribe`
+//! streams the home's events. The PTY host, the runner and the rest are later items,
+//! each a method on this socket, publishing on the bus. `rlxd here [--start]` is the
+//! probe rlx.app runs over SSH: what is installed, whether rlxd runs, and the protocol
+//! versions it serves.
 //!
 //! Exit codes: 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage error,
 //! 3 when rlxd is not running. `rlxd here` exits 3 and 4 (unsupported) with an `ok`
-//! envelope: see its module.
+//! envelope: see its module. `rlxd events` exits 4 when its `--timeout` runs out.
 //!
-//! The binary is [`main`]. The library exists for rlxd's own tests: [`registry`], rlxd's
+//! The binary is [`main`]. The library exists for rlxd's own tests. [`registry`], rlxd's
 //! side of the daemon registry, is what `tests/registry_interop.rs` reads Python's
-//! records with. Nothing else is public.
+//! records with. [`bus`] is the event bus the later items publish on, run events
+//! included. Nothing else is public.
+//!
+//! The cargo feature `debug-methods` adds the socket's test-only methods, such as
+//! `debug.emit`. Only rlxd's own tests turn it on; no release build has it.
 
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+pub mod bus;
 mod claude;
 mod cli;
 mod clock;
+mod events;
 mod here;
 mod host;
 mod listener;
@@ -65,8 +73,12 @@ enum Action {
     Stop,
     // Boxed: its options are the largest variant, more so on Windows, whose paths are
     // wider (clippy::large_enum_variant).
-    /// Send one request on a new connection, and print the reply envelope.
+    /// Send one request on a new connection, and print the reply envelope. A stream's
+    /// events print one per line instead, and it exits 0 when the stream ends.
     Call(Box<CallOptions>),
+    /// Print the home's events as JSON lines: those rlxd holds after --since, then with
+    /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
+    Events(EventsOptions),
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -84,6 +96,39 @@ enum Action {
         #[arg(long, value_name = "VERSIONS")]
         protocols: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+struct EventsOptions {
+    /// Say hello as the app (role app), with the test gate credential when there is one.
+    #[arg(long)]
+    as_app: bool,
+    /// Only these topics, comma-separated, such as run,needs_you. Every topic otherwise.
+    #[arg(long, value_name = "A,B")]
+    topics: Option<String>,
+    /// First print every event rlxd holds after this seq: 0 for all of them.
+    #[arg(long, value_name = "SEQ")]
+    since: Option<u64>,
+    /// Then go on printing events as they happen, until rlxd stops.
+    #[arg(long)]
+    follow: bool,
+    /// Exit 0 once an event of one of these types has printed, comma-separated. It
+    /// implies --follow.
+    #[arg(long, value_name = "TYPE[,TYPE...]")]
+    until: Option<String>,
+    /// Exit 0 once this many events have printed.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    limit: Option<u64>,
+    /// Exit 4 when this many seconds have passed first.
+    #[arg(long, value_name = "S")]
+    timeout: Option<f64>,
+    /// Connect to this socket (a named pipe on Windows) instead of the home's, such as
+    /// the local end of `ssh -N -L <PATH>:<host's socket> host`.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
+    /// The token to send, instead of the one in <home>/rlxd/token.
+    #[arg(long, value_name = "T")]
+    token: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -154,6 +199,19 @@ pub fn main() -> ExitCode {
             raw: options.raw,
             method: options.method,
             params: options.params,
+        }),
+        Action::Events(options) => events::events(events::EventsArgs {
+            as_app: options.as_app,
+            topics: options.topics,
+            since: options.since,
+            follow: options.follow,
+            until: options.until,
+            limit: options.limit,
+            timeout: options.timeout,
+            target: cli::Target {
+                socket: options.socket,
+                token: options.token,
+            },
         }),
     }
 }

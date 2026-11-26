@@ -43,6 +43,39 @@ fn call_socket_reaches_an_rlxd_from_another_home_with_its_token() {
 }
 
 #[test]
+fn events_socket_streams_from_an_rlxd_of_another_home() {
+    let served = TestHome::new();
+    let pid = served.start()["pid"].clone();
+    let endpoint = Home::at(served.root()).endpoint();
+    let token = std::fs::read_to_string(Home::at(served.root()).token()).unwrap();
+    let client = TestHome::new();
+    let run = client.rlxd(&[
+        "events",
+        "--socket",
+        &endpoint,
+        "--token",
+        token.trim(),
+        "--since",
+        "0",
+        "--until",
+        "daemon.started",
+        "--timeout",
+        "30",
+    ]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let lines = run.lines();
+    let started = lines.last().unwrap();
+    common::assert_valid("event.json", started);
+    assert_eq!(started["type"], "daemon.started", "{run:?}");
+    assert_eq!(started["data"]["pid"], pid);
+
+    let run = client.rlxd(&["events", "--socket", &endpoint, "--since", "0"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert!(run.stdout.is_empty(), "{run:?}");
+    assert!(run.stderr.contains("cannot read the token"), "{run:?}");
+}
+
+#[test]
 fn call_socket_where_nothing_listens_is_not_running() {
     let home = TestHome::new();
     let nowhere = if cfg!(windows) {

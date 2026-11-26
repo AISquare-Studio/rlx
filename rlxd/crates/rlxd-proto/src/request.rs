@@ -124,6 +124,13 @@ pub mod methods {
     /// Stops rlxd: no params in, `{pid}` out. rlxd answers, then stops taking connections,
     /// cleans up and exits.
     pub const STOP: &str = "stop";
+    /// Opens the event stream (7.3): [`SubscribeParams`](crate::SubscribeParams) in, then
+    /// event frames, then the reply `{seq}`, which ends the stream.
+    pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    /// Test builds only: publishes `count` events, `{count}` in and `{first, last}` (their
+    /// seqs) out, so a test can fill the event buffer. A release build has no such method
+    /// and answers `unknown_method`.
+    pub const DEBUG_EMIT: &str = "debug.emit";
 }
 
 impl Request {

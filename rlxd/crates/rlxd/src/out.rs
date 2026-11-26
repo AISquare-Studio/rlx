@@ -1,6 +1,8 @@
 //! What rlxd's commands print, and their exit codes (handoff 0.10.3, "How to read the
 //! checks" and 7.2): one envelope on stdout, and 0 when it is `ok`, 1 when it is not, 2
 //! on a usage error and 3 when rlxd is not running. `rlxd here` adds 4, unsupported.
+//! `rlxd events` prints events on stdout and any envelope on stderr, and exits 4 when its
+//! timeout runs out.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -16,6 +18,9 @@ pub const USAGE: u8 = 2;
 pub const NOT_RUNNING: u8 = 3;
 /// `rlxd here`: rlxd serves none of the protocol versions the caller speaks.
 pub const UNSUPPORTED: u8 = 4;
+/// `rlxd events`: the timeout ran out first. The same number as [`UNSUPPORTED`], for
+/// another command.
+pub const TIMED_OUT: u8 = 4;
 
 /// Prints `line` and a newline on stdout. False when stdout is closed.
 pub fn print_line(line: &str) -> bool {
@@ -50,6 +55,20 @@ pub fn fail(code: &str, message: &str, hint: Option<&str>) -> ExitCode {
 /// Prints an `ok: false` envelope, exiting `status`.
 pub fn fail_with(status: u8, code: &str, message: &str, hint: Option<&str>) -> ExitCode {
     print_envelope(&failure(code, message, hint), status)
+}
+
+/// Prints an `ok: false` envelope on stderr, exiting `status`.
+pub fn fail_on_stderr(status: u8, code: &str, message: &str, hint: Option<&str>) -> ExitCode {
+    if let Ok(line) = serde_json::to_string(&failure(code, message, hint)) {
+        let _ = writeln!(io::stderr(), "{line}");
+    }
+    ExitCode::from(status)
+}
+
+/// Prints a reply as it came on stderr, exiting 0 when it is `ok` and 1 when it is not.
+pub fn print_reply_on_stderr(reply: &Reply) -> ExitCode {
+    let printed = writeln!(io::stderr(), "{}", reply.line).is_ok();
+    exit(printed, reply.is_ok())
 }
 
 /// An `ok: false` envelope. `code` and `message` are never empty.

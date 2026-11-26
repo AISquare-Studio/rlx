@@ -178,6 +178,21 @@ pub mod topics {
     pub const CLI: &[&str] = &[INSTALL, SIGNIN];
 }
 
+/// The types rlxd itself sends on the `daemon` topic (7.3). A client must also accept
+/// types not listed here.
+pub mod types {
+    /// `{version, pid}`: rlxd started. The first event of each rlxd's life.
+    pub const DAEMON_STARTED: &str = "daemon.started";
+    /// `{reason}`: rlxd is stopping, such as `stop` (asked to) or `sigterm`. The last event
+    /// of its life, unless it was killed.
+    pub const DAEMON_STOPPING: &str = "daemon.stopping";
+    /// `{from, to}`: the stream skipped the events numbered `from` to `to`, which rlxd no
+    /// longer holds. The client re-reads what it shows. It can come first or anywhere
+    /// later in a stream, whatever its topics. The gap's own `seq` is `to`, so the
+    /// stream's seqs still increase and resuming from it skips nothing more.
+    pub const DAEMON_GAP: &str = "daemon.gap";
+}
+
 impl Event {
     /// An event of this schema version. For the `run` topic, use [`Event::for_run`].
     /// Refuses what `event.json` refuses: `seq` 0, a `time` that is not RFC 3339, a topic
