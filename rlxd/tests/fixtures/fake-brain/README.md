@@ -5,7 +5,10 @@ Stand-ins for `rlx brain --stdio`, the resident Python brain rlxd supervises (ha
 
 `RLXD_RLX_BIN=<absolute path>` makes rlxd run one in place of the `rlx` it would find.
 Each scenario is a POSIX shell script (`<scenario>`, executable) beside a batch file
-(`<scenario>.cmd`, CRLF); the tests name the one for their OS.
+(`<scenario>.cmd`, CRLF); the tests name the one for their OS. A scenario that reads
+rlxd's frames runs a PowerShell script (`<scenario>.ps1`) from its batch file, since cmd's
+`set /p` reads at most 1023 characters of a line, and rlxd's hello, naming the hook
+variables, is longer.
 
 | Scenario | What it is |
 |---|---|
