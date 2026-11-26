@@ -46,7 +46,6 @@ import io
 import os
 import platform as platform_module
 import re
-import secrets
 import shutil
 import sys
 import tempfile
@@ -475,7 +474,7 @@ def _set_aside(final: Path, *, windows: bool) -> Path:
     back. On Windows it is renamed: a running ``rlxd.exe`` can be renamed but not replaced.
     Elsewhere it is hard-linked (copied where links are not allowed), so the rename of the
     new one over ``final`` stays atomic."""
-    old = final.with_name(f".{final.name}.{secrets.token_hex(4)}.old")
+    old = final.with_name(f".{final.name}.{os.urandom(4).hex()}.old")
     if windows:
         os.replace(final, old)
         return old
