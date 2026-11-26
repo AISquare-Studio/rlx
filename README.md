@@ -140,7 +140,7 @@ rlx doctor                           # is everything wired? (and how to fix anyt
 - macOS, Linux, or Windows through WSL2.
 - Python 3.11+ if you install by hand (the one-liner brings its own 3.13).
 - [Claude Code](https://claude.com/claude-code) or
-  [Codex](https://learn.chatgpt.com/docs/codex/cli) (0.164.0 or newer, tested
+  [Codex](https://developers.openai.com/codex/cli) (0.164.0 or newer, tested
   on 0.164.0, 0.166.0 and 0.167.0) for the agents, either or both, and
   tmux 3.2+ for the fleet.
 - Node 22.12+, optional, for browser tools like the Chrome DevTools MCP; the one-liner

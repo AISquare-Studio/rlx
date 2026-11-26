@@ -60,7 +60,7 @@ NL='
 '
 CLAUDE_INSTALLER_URL="https://claude.ai/install.sh"
 # Codex's own standalone installer, the route its docs give for macOS and Linux
-# (learn.chatgpt.com/docs/codex/cli): it puts `codex` in ~/.local/bin, linked into
+# (developers.openai.com/codex/cli): it puts `codex` in ~/.local/bin, linked into
 # $CODEX_HOME/packages/standalone.
 CODEX_INSTALLER_URL="https://chatgpt.com/codex/install.sh"
 FNM_INSTALLER_URL="https://fnm.vercel.app/install"
@@ -995,7 +995,7 @@ survey() {
 
     _report uv "$UV_VERSION"
     if [ "$CLI_BROKEN" = 1 ]; then
-        note "aisquare — broken: \`aisquare --version\` fails"
+        note "rlx — broken: \`aisquare --version\` fails"
     else
         _report rlx "$CLI_VERSION"
     fi
@@ -2483,7 +2483,7 @@ install_codex() {
     fi
     if ! fetch_into_shell "$CODEX_INSTALLER_URL" codex_installer_sh >/dev/null 2>&1; then
         warn "the Codex installer failed. rlx works; Codex is not installed. Install it
-         with: curl -fsSL $CODEX_INSTALLER_URL | sh  (https://learn.chatgpt.com/docs/codex/cli)"
+         with: curl -fsSL $CODEX_INSTALLER_URL | sh  (https://developers.openai.com/codex/cli)"
         return 0
     fi
     PATH="$HOME/.local/bin:$PATH"
@@ -2781,7 +2781,7 @@ doctor_count() {
 }
 
 run_doctor() {
-    step "Verifying with aisquare doctor"
+    step "Verifying with $(program_word) doctor"
     if [ "$DRY_RUN" = 1 ]; then
         printf '  %swould run:%s aisquare --json doctor\n' "$C_DIM" "$C_RESET"
         return 0
