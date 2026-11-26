@@ -3117,7 +3117,7 @@ def _heals(session: TeamSession, transcript_path: str | None) -> bool:
 
 
 def _briefing_events(
-    store: ContextStore, project_id: str, session: TeamSession | None = None
+    store: ContextStore, project_id: str, session: TeamSession
 ) -> list[TeamEvent]:
     """The recent updates an agent is briefed with: the board's last :data:`_BOARD_EVENTS`
     that are an agent's to read, :data:`HUMAN_BOARD_KINDS` left out in the query.
@@ -3128,10 +3128,10 @@ def _briefing_events(
     ``session``'s board context (:func:`_board_reading`) applies: ``none`` reads none, so a
     reviewer meant to judge a change cold is not briefed with the others' verdicts first.
     """
-    reads, relevant = (True, None) if session is None else _board_reading(store, session)
+    reads, relevant = _board_reading(store, session)
     if not reads:
         return []
-    if session is not None and session.role == MANAGER_ROLE:
+    if session.role == MANAGER_ROLE:
         mode, project = manager_seat.mode(store, session)
         if mode == "blocked":
             return []
@@ -3594,56 +3594,60 @@ def hook_prompt_heartbeat(
         lease = _now() + timedelta(minutes=orchestrator.lease_minutes())
         store.renew_leases(session.id, lease)
         store.mark_prompted(session.id, _now(), agent_id=orchestrator.env_fleet_agent())
-        # The board's newest seq, read BEFORE the delta: with nothing to deliver the
-        # cursor moves there, past the rows the query left out. Read first, it cannot
-        # pass an event the delta did not see — whatever is written after has a later seq.
-        newest = store.latest_seq(session.project_id)
-        # Bells, notification lines and the captain's audit are for the human, not
-        # teammate context — left out IN the query, so the limit counts what is
-        # delivered: dropped after it, a run of audit lines was the whole page, prompt
-        # after prompt, with a coder's result behind it (review of #240, finding 11).
-        reads, relevant = _board_reading(store, session)
-        mode, project = (
-            manager_seat.mode(store, session)
-            if session.role == MANAGER_ROLE
-            else ("every_write", None)
-        )
-        scheduled = mode == "schedule" and project is not None
-        if scheduled and project is not None:
-            events = _scheduled_wake_candidates(store, session, project, head=newest)
-        elif mode == "blocked":
-            events = []
-        else:
-            events = _wake_candidates(store, session, relevant)
-        if not events or not orchestrator.delta_enabled() or not reads:
-            if scheduled and project is not None and not events:
-                manager_seat.advance_urgent(store, project, session.project_id, newest)
-            # Nothing delivered is still something read: the cursor moves past it, the
-            # left-out rows included, rather than stay in front of them for every later
-            # prompt to scan again.
-            read_to = events[-1].seq if events else newest
-            cursor = read_to if read_to > session.cursor else None
-            store.touch_session(session.id, cursor=cursor, state="working")
-            return collision + briefing
-        truncated = len(events) > _DELTA_LIMIT
-        shown = events[:_DELTA_LIMIT]
-        authors = authors_of(store.team_sessions(session.project_id))
-        board = _board_of(store, session.project_id).name
-        # One read, and only when a line names a task: this runs on every prompt.
-        numbers = store.task_numbers(session.project_id) if any(e.task_id for e in shown) else {}
-        rendered = _render_delta(shown, authors, truncated=truncated, board=board, numbers=numbers)
-        if scheduled and project is not None:
-            rendered += "\n" + _held_pointer(store, project, session.project_id)
-            manager_seat.advance_urgent(store, project, session.project_id, shown[-1].seq)
-        store.touch_session(session.id, cursor=max(session.cursor, shown[-1].seq), state="working")
-        return collision + briefing + rendered
+        return collision + briefing + _prompt_delta(store, session)
+
+
+def _prompt_delta(
+    store: ContextStore, session: TeamSession, *, briefed_through: int | None = None
+) -> str:
+    """Render a prompt page before advancing its read positions."""
+    # The board's newest seq, read BEFORE the delta: with nothing to deliver the
+    # cursor moves there, past the rows the query left out. Read first, it cannot
+    # pass an event the delta did not see — whatever is written after has a later seq.
+    newest = store.latest_seq(session.project_id) if briefed_through is None else briefed_through
+    # Bells, notification lines and the captain's audit are for the human, not
+    # teammate context — left out IN the query, so the limit counts what is
+    # delivered: dropped after it, a run of audit lines was the whole page, prompt
+    # after prompt, with a coder's result behind it (review of #240, finding 11).
+    reads, relevant = _board_reading(store, session)
+    mode, project = (
+        manager_seat.mode(store, session)
+        if session.role == MANAGER_ROLE
+        else ("every_write", None)
+    )
+    scheduled = mode == "schedule" and project is not None
+    if scheduled and project is not None:
+        events = _scheduled_wake_candidates(store, session, project, head=newest)
+    elif mode == "blocked" or briefed_through is not None:
+        events = []
+    else:
+        events = _wake_candidates(store, session, relevant)
+    if not events or not orchestrator.delta_enabled() or not reads:
+        if scheduled and project is not None and not events:
+            manager_seat.advance_urgent(store, project, session.project_id, newest)
+        # Nothing delivered is still something read: the cursor moves past it, the
+        # left-out rows included, rather than stay in front of them for every later
+        # prompt to scan again.
+        read_to = events[-1].seq if events else newest
+        cursor = read_to if read_to > session.cursor else None
+        store.touch_session(session.id, cursor=cursor, state="working")
+        return ""
+    truncated = len(events) > _DELTA_LIMIT
+    shown = events[:_DELTA_LIMIT]
+    authors = authors_of(store.team_sessions(session.project_id))
+    board = _board_of(store, session.project_id).name
+    # One read, and only when a line names a task: this runs on every prompt.
+    numbers = store.task_numbers(session.project_id) if any(e.task_id for e in shown) else {}
+    rendered = _render_delta(shown, authors, truncated=truncated, board=board, numbers=numbers)
+    if scheduled and project is not None:
+        rendered += "\n" + _held_pointer(store, project, session.project_id)
+        manager_seat.advance_urgent(store, project, session.project_id, shown[-1].seq)
+    store.touch_session(session.id, cursor=max(session.cursor, shown[-1].seq), state="working")
+    return rendered
 
 
 def _brief_when_a_team_forms(store: ContextStore, session: TeamSession, cwd: Path | None) -> str:
-    """An unbriefed session's prompt: nothing while it is still solo, the full board and
-    protocol, once, when a team has formed around it. Its cursor moves to the head of
-    the pipe either way, so what happened while it was alone is not replayed as a delta.
-    Fail-open: a read that fails is a team, so the board comes."""
+    """Brief a formerly solo session once a team forms, honoring its current policy."""
     lease = _now() + timedelta(minutes=orchestrator.lease_minutes())
     store.renew_leases(session.id, lease)
     head = store.latest_seq(session.project_id)
@@ -3652,23 +3656,25 @@ def _brief_when_a_team_forms(store: ContextStore, session: TeamSession, cwd: Pat
     except Exception:
         _log.debug("could not tell whether session %s has a team", session.id, exc_info=True)
         alone = False
-    store.touch_session(session.id, cursor=head, state="working")
     if alone:
+        store.touch_session(session.id, cursor=head, state="working")
         return ""
-    store.delete_meta(_unbriefed(session.id))
     project = store.get_project(session.project_id) or orchestrator.team_project(cwd)
     named = _hook_named_row(store)
     assigned = _assignment(store, session.id, session.project_id, named=named)
-    return _render_board(
+    briefing = _render_board(
         project,
         store.team_sessions(session.project_id),
         store.team_tasks(session.project_id),
-        _briefing_events(store, session.project_id),
+        _briefing_events(store, session.project_id, session),
         me=session,
         assigned=assigned,
         labels=lambda: slot_labels_via(store),
         fleet=_cycle_project(store, project, cwd, session.id, named=named),
     )
+    delta = _prompt_delta(store, session, briefed_through=head)
+    store.delete_meta(_unbriefed(session.id))
+    return briefing + delta
 
 
 def hook_stop(

@@ -15964,6 +15964,52 @@ def test_failed_scheduled_render_leaves_urgent_progress_unread(
     assert wake is not None and "urgent after render failure" in wake.reason
 
 
+def test_solo_session_receives_only_scoped_urgency_when_briefed_as_scheduled_manager(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Promotion of a solo session honors the schedule on its first board briefing."""
+    from aisquare.services import manager_seat
+
+    sid = "b10d3ae1-1234-4123-8123-abcdef123456"
+    team_service.activate(project.root)
+    assert team_service.hook_session_start(sid, project.root, "startup") == ""
+    manager = fleet_service.spawn(project, "manager").agent
+    coder = fleet_service.spawn(project, "coder").agent
+    _board_session(coder, "working")
+    with store_session() as store:
+        assert store.get_meta(team_service._unbriefed(sid)) is not None
+        assert store.adopt_fleet_agent_session(
+            manager.id, manager.session_id, sid, datetime.now(UTC)
+        )
+        store.set_project_setting(project.id, "manager_wake", "schedule")
+    team_service.set_role("manager", sid)
+    ask = team_service.add_note(
+        "urgent for this manager", kind="question", to_role=sid, session_ref=coder.session_id
+    )
+    team_service.add_note("held result for the pass", kind="result", session_ref=coder.session_id)
+    team_service.add_note("question for the coder", kind="question", to_role="coder",
+                          board_id=project.id)
+
+    def broken(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("could not render urgent page")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(team_service, "_render_delta", broken)
+        with pytest.raises(RuntimeError, match="could not render urgent page"):
+            team_service.hook_prompt_heartbeat(sid, project.root)
+    with store_session() as store:
+        assert store.get_meta(team_service._unbriefed(sid)) is not None
+        assert manager_seat.urgent_position(store, project.id, project.id) == 0
+    briefing = team_service.hook_prompt_heartbeat(sid, project.root)
+    assert "<aisquare-team>" in briefing
+    assert "urgent for this manager" in briefing
+    assert "held result for the pass" not in briefing
+    assert "question for the coder" not in briefing
+    with store_session() as store:
+        assert manager_seat.urgent_position(store, project.id, project.id) == ask.seq
+    assert team_service.hook_prompt_heartbeat(sid, project.root) == ""
+
+
 def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
