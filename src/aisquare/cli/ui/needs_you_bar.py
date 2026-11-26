@@ -59,6 +59,8 @@ GLYPHS: dict[str, str] = {kind: glyph for kind, glyph, _one, _many in NEEDS_YOU}
 BOARD_TAB = "--content-tab-tab-board"
 """The Board tab's id in a project view's tab row (Textual's ``ContentTab`` prefix on the pane's
 id): there, once the row is filled."""
+KEEP_CHECKS = 20
+"""How many short waits (a second in all) the bar keeps the keys on the item it opened."""
 LAND_TRIES = 40
 """How many short waits the bar gives a project's view to be built before it gives up."""
 
@@ -172,6 +174,9 @@ class NeedsYouBar(Static):
         super().__init__("", id=id)
         self.needs: list[Need] = []
         self._landing: tuple[Need, int] | None = None
+        self._keeping: tuple[ProjectView, BoardPanel, int] | None = None
+        """After an item opened: its view, its board, and the checks made that the keys are on
+        it (:meth:`_keep_the_keys`)."""
 
     def on_mount(self) -> None:
         self.set_interval(BAR_SECONDS, self._tick)
@@ -285,8 +290,47 @@ class NeedsYouBar(Static):
             shown = False
         if shown:
             self._landing = None
+            self._keeping = (view, panel, 0)
+            self.call_after_refresh(self._keep_the_keys)
         else:
             self._try_again(need, tries, self._open_on_board)
+
+    def _keep_the_keys(self) -> None:
+        """The keys on what was opened, checked a short wait at a time for :data:`KEEP_CHECKS`.
+
+        The board may handle its own Show only after the item opened: it hands the keys to
+        its work list, which the reader covers below the wide layout, and the focus fell to
+        nothing; the card showed and no key reached it (tester of #11, #1672). Put back while
+        a card is open: on the reader; else anywhere of the board's on screen. Focus the
+        person put outside the project's view is theirs, and left."""
+        if self._keeping is None:
+            return
+        view, panel, checks = self._keeping
+        focused = self.app.focused
+        try:
+            reader = panel.query_one("#reader")
+            reading = panel.has_class("reading")
+            if reading:
+                kept = focused is reader
+            else:
+                kept = bool(
+                    focused is not None
+                    and focused.is_on_screen
+                    and panel in focused.ancestors_with_self
+                )
+            stray = focused is None or not focused.is_on_screen or view in focused.ancestors
+            if not kept and stray:
+                target = reader if reading else panel.query_one("#tasks")
+                if target.display:
+                    target.focus()
+        except NoMatches:  # the view went meanwhile
+            self._keeping = None
+            return
+        if checks < KEEP_CHECKS:
+            self._keeping = (view, panel, checks + 1)
+            self.set_timer(0.05, self._keep_the_keys)
+        else:
+            self._keeping = None
 
     def _try_again(self, need: Need, tries: int, step: Callable[[], None]) -> None:
         if tries < LAND_TRIES:
