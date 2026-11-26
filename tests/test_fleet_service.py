@@ -15516,7 +15516,7 @@ def test_a_holder_of_the_branch_lock_moves_on_only_as_its_git_steps_finish(
     monkeypatch.setattr(fleet_service, "_HOLDER_LOOK", 0.01)
     common = fleet_service._git_common_dir(repo)
     real_look = fleet_service._lock_holder
-    holding, step, stepped, let_go = (threading.Event() for _ in range(4))
+    holding, step, stepped, let_go, released = (threading.Event() for _ in range(5))
     steps: list[str] = []
     looks: list[str] = []
 
@@ -15525,6 +15525,8 @@ def test_a_holder_of_the_branch_lock_moves_on_only_as_its_git_steps_finish(
             stepped.clear()
             step.set()
             assert stepped.wait(30)
+            if len(steps) == 10:  # its last step: it lets go before the waiter looks again
+                assert released.wait(30)
         looks.append(real_look(at))
         return looks[-1]
 
@@ -15539,6 +15541,7 @@ def test_a_holder_of_the_branch_lock_moves_on_only_as_its_git_steps_finish(
                 step.clear()
                 steps.append(fleet_service._git(repo, "rev-parse", "HEAD").stdout)
                 stepped.set()
+        released.set()
 
     monkeypatch.setattr(fleet_service, "_lock_holder", look)
     holder = threading.Thread(target=a_holder)
@@ -15569,34 +15572,50 @@ def test_a_spawn_waits_through_a_queue_of_holders_of_the_branch_lock(
     was stuck. The wait is per holder now: each says who it is, and another holder than the
     last one seen starts the wait again.
 
-    Each holder keeps it 0.6 s less than the wait and the queue 0.6 s more, so a loaded
-    runner's late wake-up is not read as a stuck holder (a 0.15 s hold against a 0.2 s
-    wait was, on CI), and one wait for the whole queue is still refused."""
-    monkeypatch.setattr(fleet_service, "_BRANCHES_LOCK_WAIT", 1.0)
+    Driven by events, not by sleeps against the waiter's patience, as rounds 18 and 20's
+    tests are: the next spawn in the queue holds it each time the waiter looks, eight in all,
+    and the last lets go before the waiter looks again. Each look comes a full
+    ``_HOLDER_LOOK`` after the last, so the queue holds it for more than one wait on any
+    runner, and one wait for the whole queue is still refused; a slow runner only makes each
+    look later."""
+    monkeypatch.setattr(fleet_service, "_BRANCHES_LOCK_WAIT", 0.1)
     monkeypatch.setattr(fleet_service, "_HOLDER_LOOK", 0.05)
     common = fleet_service._git_common_dir(repo)
-    first_in = threading.Event()
-    released = threading.Event()
+    real_look = fleet_service._lock_holder
+    holding, let_go, released = (threading.Event() for _ in range(3))
+    looks: list[str] = []
+
+    def look(at: Path) -> str:
+        if holding.is_set() and not let_go.is_set():
+            # The next spawn in the queue has taken it, and says so with a word of its own.
+            fleet_service._holder_file(at).write_text(f"spawn {len(looks)}\n")
+            if len(looks) == 8:
+                let_go.set()
+                assert released.wait(30), "the last spawn let go before the waiter looks again"
+        looks.append(real_look(at))
+        return looks[-1]
 
     def a_queue() -> None:
-        """Four holders, each for less than the wait and all of them for more: what a
-        waiter that loses each hand-over sees of four spawns' `git worktree add`. One
-        hold, and a new holder announced every 0.4 s, so no hand-over is the waiter's."""
         with locking.holding(common / "aisquare-fleet-branches.lock", wait_s=5):
-            for _turn in range(4):
-                fleet_service._announce_holder(common)
-                first_in.set()
-                time.sleep(0.4)
+            fleet_service._announce_holder(common)
+            holding.set()
+            let_go.wait(30)
         released.set()
 
+    monkeypatch.setattr(fleet_service, "_lock_holder", look)
     queue = threading.Thread(target=a_queue)
     queue.start()
     try:
-        first_in.wait(5)
+        assert holding.wait(30)
+        started = time.monotonic()
         with fleet_service._branches_locked(common, wait=fleet_service._BRANCHES_LOCK_WAIT):
-            assert released.is_set(), "taken once the queue let go, 1.6 s on"
+            assert released.is_set(), "taken once the queue let go"
+        assert time.monotonic() - started > fleet_service._BRANCHES_LOCK_WAIT, (
+            "the queue held it for more than one wait"
+        )
     finally:
-        queue.join()
+        let_go.set()
+        queue.join(30)
 
 
 def test_a_holder_of_the_branch_lock_that_never_lets_go_is_called_stuck(
@@ -18287,9 +18306,8 @@ def test_a_switch_picks_by_headroom_before_the_binding_and_the_automatic_one_ref
     receipt = fleet_service.switch(project, agent.label)
 
     assert receipt.to_slot == 4  # headroom, not the binding
-    assert any(
-        "headroom:" in note and "account 4 is first under the 85%-used line" in note
-        for note in receipt.notes
+    assert any(  # the balanced pick's reason (#35): the only account under the line
+        "headroom:" in note and " — account 4 (fair share 1/1 · " in note for note in receipt.notes
     )
     assert "--to" not in _command(tmux) and _flag(_command(tmux), "--account") == "4"
 
@@ -23291,7 +23309,9 @@ def test_a_fork_on_this_shells_account_runs_where_a_plain_spawn_runs(
     """runner2-1's reopen of #234: Account edited to (this shell's) was dropped, because the
     dialog sent None, and None keeps the teammate's own slot. THIS_SHELL_ACCOUNT says it
     explicitly: no --account, the ladder a plain spawn runs, never the teammate's slot."""
-    _two_slots_with_usage(monkeypatch, work=10, personal=10)
+    # Slot 3's five hours busier: the balanced pick (#35) sends a plain spawn to slot 2
+    # whatever the live agents, rank 1's reserve for the person included.
+    _two_slots_with_usage(monkeypatch, work=10, personal=75)
     # Slot 3: since 0.8.1 a plain spawn here lands on slot 2, the first one signed in.
     source = fleet_service.spawn(project, "coder", worktree=False, account="3").agent
     plain = fleet_service.spawn(project, "coder", worktree=False).agent
@@ -23310,7 +23330,9 @@ def test_a_take_over_on_this_shells_account_runs_where_a_plain_spawn_runs(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same through Take over, which is the teammate's restart."""
-    _two_slots_with_usage(monkeypatch, work=10, personal=10)
+    # Slot 3's five hours busier: the balanced pick (#35) sends a plain spawn to slot 2
+    # whatever the live agents, rank 1's reserve for the person included.
+    _two_slots_with_usage(monkeypatch, work=10, personal=75)
     # Slot 3: since 0.8.1 a plain spawn here lands on slot 2, the first one signed in.
     source = fleet_service.spawn(project, "coder", worktree=False, account="3").agent
     plain = fleet_service.spawn(project, "coder", worktree=False).agent
@@ -23797,6 +23819,10 @@ def test_an_agent_whose_hooks_run_on_a_hubs_board_is_never_asked_for_its_screen(
                 started_at=now, last_seen_at=now,
             )
         )  # fmt: skip
+        # Its Stop hook fired: waiting, on the board. (A quiet row whose board says working
+        # is asked for its screen once, whatever board it is on: the idle box, not the trust
+        # question this is about.)
+        store.touch_session(agent.session_id, state="waiting")
     tmux.captured.clear()
     opens = 0
     real_open = core_store.open_store
@@ -23811,8 +23837,10 @@ def test_an_agent_whose_hooks_run_on_a_hubs_board_is_never_asked_for_its_screen(
 
     (status,) = fleet_service.list_agents(project, looked_up=looked_up)
 
-    assert status.session is None, "the premise: the listing joins its own board's sessions"
-    assert status.state != "attention" and tmux.captured == []
+    # The row's session, from the hub's board where its hooks registered it: the listing
+    # derives the row with it, as the header's claimed task and a limit need (#14, #1306).
+    assert status.session is not None and status.session.project_id == hub.id
+    assert status.state == "waiting" and tmux.captured == []
     assert opens == 1, "one store session for the listing, its lookups included"
     found = looked_up[agent.session_id]
     assert found is not None and found.project_id == hub.id

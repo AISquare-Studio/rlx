@@ -538,7 +538,9 @@ def test_a_slow_endpoint_returns_within_the_ceiling_and_records_the_breach(
     # Every POST to the stub waits out its delay, so this is what keeps the hook as a
     # whole from waiting on the slow server without timing it (review of #252): the
     # one exchange ended at the ceiling, and there was no other.
-    assert wired.call_count == 1, "the hook made one exchange with the slow endpoint, no other"
+    assert wired.wait_for_calls(1) == 1, (
+        "the hook made one exchange with the slow endpoint, no other"
+    )
     assert took[0] < delay_s, (
         f"the exchange took {took[0]:.2f} s: it waited for the server's {delay_s} s answer "
         "instead of ending at the 300 ms ceiling"

@@ -544,7 +544,14 @@ class CalmToast(Toast):
         at = column - crop.x
         first = lines[0]
         under = next(iter(first.crop(at, at + 1)), Segment(" "))
-        style = (under.style or Style()) + self.get_component_rich_style(part, partial=True)
+        # No component style to be had for this frame: a toast just taken from its rack
+        # (Textual's ``Widget._remove`` empties its component styles) and refreshed, which
+        # empties the cached ones too, that a frame draws once more from the screen's last
+        # map. The glyph takes the cell's own style this once, where the lookup raised
+        # KeyError mid-frame (#36). ``default`` is not cached: once the stylesheet fills the
+        # styles again (and refreshes the toast), the glyph has its colour back.
+        ink = self.get_component_rich_style(part, partial=True, default=Style())
+        style = (under.style or Style()) + ink
         lines[0] = Strip.join(
             [first.crop(0, at), Strip([Segment(glyph, style)], 1), first.crop(at + 1, crop.width)]
         )

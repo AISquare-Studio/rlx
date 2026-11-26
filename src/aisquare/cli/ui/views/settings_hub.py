@@ -1,6 +1,6 @@
 """The Settings hub: what *⚙ Settings* in the sidebar opens.
 
-Eight links, each a button with one line saying what is behind it — *App
+Nine links, each a button with one line saying what is behind it — *App
 settings* (the machine-wide settings, ``views.app_settings``), *Remote control* (the one
 Remote page, which ``R`` opens too: ``views.remote``, Q17), *Captain* (App settings again,
 its *Agent settings* scrolled to the captain's box, its last section, Q18: one obvious way
@@ -8,10 +8,11 @@ in, #41), *Accounts* (the AISquare sign-in
 and the Claude Code and Codex accounts, ``views.accounts``), *Personas* (yours and the
 bundled ones, for every project: ``views.personas_tab`` with no project, R27), *Usage &
 stats* (what all your agents' sessions on this machine spent, ``views.usage_stats``), *Agent
-resources* (what each live agent consumes, ``views.resources``) and *Doctor* (the checks,
-which opening it runs). A link posts the message the app routes; the pages it opens keep
-*⚙ Settings* highlighted in the sidebar. ↑/↓ move between the links, Enter or a click opens
-one.
+resources* (what each live agent consumes, ``views.resources``), *tmux* (every window on rlx's
+tmux server, ``views.tmux_page``) and *Doctor* (the checks, which opening it runs). A link posts
+the message the app routes (*Remote control* and *tmux* show their pages themselves); the pages
+it opens keep *⚙ Settings* highlighted in the sidebar. ↑/↓ move between the links, Enter or a
+click opens one.
 
 Under them, *Fleet*: *Restart all…* and *Stop all…*, for every running agent of every
 project, and *Pause all…* and *Resume all…*, ``fleet pause --all`` and ``fleet resume --all``
@@ -49,6 +50,7 @@ from aisquare.cli.ui.sidebar import (
     UsageStatsSelected,
     doctor_badge,
 )
+from aisquare.cli.ui.views import tmux_page
 from aisquare.cli.ui.views.app_settings import CAPTAIN
 from aisquare.cli.ui.views.fleet_bulk import (
     BULK_WORKER,
@@ -79,6 +81,11 @@ LINKS: tuple[tuple[str, str, str], ...] = (
         "resources",
         "Agent resources",
         "CPU, memory, processes and tokens of every running agent, live while open",
+    ),
+    (
+        "tmux",
+        "tmux",
+        "every window on rlx's tmux server: open one, close or adopt what no agent owns",
     ),
     ("doctor", "Doctor", "the checks — they run when the page opens"),
 )
@@ -155,6 +162,10 @@ class SettingsHubView(VerticalScroll, can_focus=False):
         if stem == "remote":  # the one Remote page, as R opens it (Q17)
             event.stop()
             open_remote_page(self.app)
+            return
+        if stem == "tmux":  # a page of its own, shown among the app's (``views.tmux_page``)
+            event.stop()
+            tmux_page.show_page(self.app)
             return
         message: Message | None = {
             "app-settings": AppSettingsSelected(),

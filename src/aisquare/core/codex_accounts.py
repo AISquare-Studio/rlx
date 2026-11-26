@@ -46,6 +46,7 @@ import os
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from aisquare.core import paths
@@ -633,6 +634,8 @@ class CodexAccounts:
     shares_settings = False
     memory: SharedMemory | None = None  # no Codex setting points its memory anywhere
     keychain_login = False  # its login is auth.json in its home: SSH starts a server for it
+    plan_units: Mapping[str, float] = MappingProxyType({})  # its plans are not weighed
+    reserves_for_person = False
 
     def __init__(self, share_parts: tuple[SharePart, ...] = ()) -> None:
         # What it shares is its adapter's to say (``agent_adapters.codex_shared``), handed in.

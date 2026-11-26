@@ -87,9 +87,16 @@ def _naming(model: str) -> PriceTable:
 
 
 def _claude_first_with_room(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """The tester's home with room everywhere: work, a Claude Code slot, first in the order."""
+    """The tester's home with room everywhere: work, a Claude Code slot, first in the order,
+    and spare fuller, so work is the pick even keeping 20% of its week for the person (#35)."""
     home = _home()
-    _scripted(monkeypatch, {account.slot: _reading() for account in home.values()})
+    _scripted(
+        monkeypatch,
+        {
+            account.slot: _reading(week=40.0 if name == "spare" else 10.0)
+            for name, account in home.items()
+        },
+    )
     return home
 
 

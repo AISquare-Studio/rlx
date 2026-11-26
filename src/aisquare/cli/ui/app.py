@@ -2924,7 +2924,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         started = event.agent
         project = self.snapshot.project(started.project_id) if self.snapshot else None
         named = agent_name(started.label, project)
-        self.notify(f"✓ {restart_word(receipt)} {named} — {receipt.how}", timeout=6, markup=False)
+        if event.moved_to is None and isinstance(receipt, fleet_service.RestartReceipt):
+            said = f"✓ {restart_word(receipt)} {named} — {receipt.how}"
+        else:
+            said = event.headline(named)  # a Move's, said once (#14)
+        self.notify(said, timeout=6, markup=False)
         for note in receipt.notes:
             self.notify(note, severity="warning", timeout=8, markup=False)
         await self._show_restarted(event, read_again=True)
@@ -2939,9 +2943,14 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.refresh_data(then=lambda: self._show_restarted(event, read_again=False))
             return
         if status is None:
+            receipt = event.receipt
+            done = (
+                restart_word(receipt)
+                if isinstance(receipt, fleet_service.RestartReceipt)
+                else "moved"  # a Move's switch (#14)
+            )
             self.notify(
-                f"{started.label} {restart_word(event.receipt)} — its row appears on the next "
-                "refresh",
+                f"{started.label} {done} — its row appears on the next refresh",
                 timeout=5,
                 markup=False,
             )
@@ -3269,6 +3278,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 self.post_message(StopAgent(project_id, agent_id))
             elif choice in (AGENT_PAUSE, AGENT_RESUME, RESTART):
                 self._agent_action(status, choice)
+            elif choice is not None:  # a limited agent's Move or Wait (#14)
+                from aisquare.cli.ui.views.agent import from_menu
+
+                from_menu(self, status, choice, menu.offer)
 
         menu = AgentMenu(status, event.anchor, pausable=pausable(status), rename_refusal=refusal)
         self.push_screen(menu, chosen)
@@ -4886,6 +4899,7 @@ def _writing_workers() -> dict[str, str]:
         project,
         settings,
         settings_remote,
+        tmux_page,
         welcome,
     )
 
@@ -4910,7 +4924,9 @@ def _writing_workers() -> dict[str, str]:
         settings_remote.TOKEN_WORKER: "Settings ▸ Remote's save of the ngrok token",
         agent.RESTART_WORKER: "an agent's restart",
         agent.PAUSE_WORKER: "an agent's pause",
+        agent.MOVE_WORKER: "an agent's move to another account",
         fleet_bulk.BULK_WORKER: "a restart, stop, pause or resume of many agents",
+        tmux_page.ACT_WORKER: "Settings ▸ tmux's close or adopt of a window",
         accounts.SIGN_OUT_WORKER: "an AISquare sign-out",
         accounts.COMPLETE_WORKER: "a Claude sign-in",
         accounts.ABANDON_WORKER: "a Claude sign-in's discard",
@@ -4948,6 +4964,7 @@ def _waited_reads() -> dict[str, str]:
         fleet_bulk,
         resources,
         settings_remote,
+        tmux_page,
         welcome,
     )
 
@@ -4967,11 +4984,14 @@ def _waited_reads() -> dict[str, str]:
         accounts.LOGIN_OPEN_WORKER: "a Claude log-in's stored login",
         accounts.LOGIN_POLL_WORKER: "a Claude sign-in's check",
         agent.LABELS_WORKER: "an agent's account names",
+        agent.TASK_WORKER: "an agent's task",
+        agent.OFFER_WORKER: "the account a limited agent can move to",
         board.LABELS_WORKER: "a board's account names",
         BAR_WORKER: "the needs-you bar's read of the boards",
         board.HISTORY_WORKER: "a board's task history",
         fleet_bulk.PLAN_WORKER: "Settings ▸ Fleet's read of the running agents",
         resources.SAMPLE_WORKER: "Agent resources' read of the agents",
+        tmux_page.READ_WORKER: "Settings ▸ tmux's read of the windows",
         app_settings.ACCOUNTS_WORKER: "App settings' accounts",
         welcome.worker_name("look"): "Welcome's checks",
         welcome.worker_name("candidates"): "Welcome's folder list",
