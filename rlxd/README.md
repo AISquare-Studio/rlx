@@ -349,9 +349,16 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
    - the socket must be a socket, not a link, that this user owns, as ssh makes it:
      otherwise nothing is sent.
 
-- **sshd must allow it.** OpenSSH's default does (`AllowStreamLocalForwarding yes`). A host
-  set to `AllowStreamLocalForwarding no` or `remote`, or `DisableForwarding yes`, refuses
-  the channel, and ssh says `administratively prohibited`.
+- **sshd must allow it,** as OpenSSH's defaults do. The channel needs local forwarding
+  allowed twice: `AllowStreamLocalForwarding` `yes` or `local`, and
+  `AllowTcpForwarding` `yes` or `local` with `PermitOpen any` (the default), because
+  OpenSSH applies its local TCP forwarding permission to direct-streamlocal channels too
+  (`session.c` disables all local forwarding for `AllowTcpForwarding no`, and
+  `channel_connect_to_path` checks it). So a host hardened with `AllowTcpForwarding no`,
+  a `PermitOpen` list, `AllowStreamLocalForwarding no` or `remote`, or
+  `DisableForwarding yes` refuses the channel, and ssh says `open failed`. The narrowest
+  setting that works is `AllowStreamLocalForwarding local` with `AllowTcpForwarding
+  local`: no remote forwards of either kind, and no listening.
 - **An rlxd that does not run** shows through the channel as a connection that closes
   before `hello`'s reply: sshd could not connect to the socket, and ssh says `connect
   failed`. Run `rlxd here --start` first, and again when a connection closes.
@@ -366,12 +373,14 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
   not a socket. This is built and checked for macOS and Linux hosts.
 
 `.github/workflows/rlxd.yml`'s `ssh` job runs it on ubuntu through a real `ssh -N -L` to
-localhost, for `~/.aisquare` and for a home too deep for its own socket. Its sshd allows
-nothing but this: `AllowStreamLocalForwarding local`, `AllowTcpForwarding no`, and no
-agent, X11 or tunnel forwarding, which `sshd -T` must show in effect. A remote (`-R`)
-streamlocal forward must be refused, and so must a TCP `-L`'s channel. The client side
-is a home with no rlxd and no token, and the host's token goes in a 0600 file for
-`--token-file`. Through the forward:
+localhost, for `~/.aisquare` and for a home too deep for its own socket. Its sshd is that
+narrowest setting, `AllowStreamLocalForwarding local`, `AllowTcpForwarding local` and
+`PermitListen none`, with no agent, X11 or tunnel forwarding, which `sshd -T` must show
+in effect. A remote (`-R`) forward of a Unix socket and of a TCP port must each be
+refused. A second sshd with `AllowTcpForwarding no` must refuse the very `-L` to a
+Unix socket that the first one serves, which shows the constraint above and fails if
+OpenSSH ever drops it. The client side is a home with no rlxd and no token, and the
+host's token goes in a 0600 file for `--token-file`. Through the forward:
 
 - `--socket` with no token is a usage error;
 - `status` must answer, naming the host's socket and home;

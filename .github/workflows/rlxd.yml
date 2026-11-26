@@ -204,19 +204,22 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq openssh-server
           fi
-          # The server takes public keys only, and forwards nothing but Unix sockets,
-          # locally (-L), as rlx.app needs: no TCP forwarding, no remote (-R) one, no agent,
-          # X11 or tunnel. OpenSSH's defaults allow TCP and both streamlocal directions.
-          # sshd keeps the first value it reads for an option, and Ubuntu's sshd_config
-          # includes sshd_config.d/*.conf first; sshd -T checks what took effect.
+          # The server takes public keys only, and forwards as little as rlx.app's channel
+          # allows: local (-L) only, no remote (-R) forward of either kind, no listening, and
+          # no agent, X11 or tunnel. OpenSSH's defaults allow both directions. Local TCP
+          # forwarding can't be refused: OpenSSH applies its local TCP forwarding permission
+          # to direct-streamlocal channels too, so AllowTcpForwarding no refuses rlx.app's
+          # channel as well (the next step shows it). sshd keeps the first value it reads for
+          # an option, and Ubuntu's sshd_config includes sshd_config.d/*.conf first; sshd -T
+          # checks what took effect.
           printf '%s\n' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' \
-            'AllowStreamLocalForwarding local' 'AllowTcpForwarding no' \
+            'AllowStreamLocalForwarding local' 'AllowTcpForwarding local' 'PermitListen none' \
             'AllowAgentForwarding no' 'X11Forwarding no' 'PermitTunnel no' \
             | sudo tee /etc/ssh/sshd_config.d/10-rlxd-ci.conf >/dev/null
           sudo systemctl restart ssh || sudo service ssh restart
           effective=$(sudo sshd -T)
           for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' \
-            'allowstreamlocalforwarding local' 'allowtcpforwarding no' \
+            'allowstreamlocalforwarding local' 'allowtcpforwarding local' 'permitlisten none' \
             'allowagentforwarding no' 'x11forwarding no' 'permittunnel no'; do
             if ! grep -Fxq "$want" <<< "$effective"; then
               echo "::error::sshd -T: not '$want' but '$(grep -i "^${want%% *} " <<< "$effective")'"
@@ -241,38 +244,62 @@ jobs:
           ssh localhost true
           echo "a non-login session's PATH: $(ssh localhost 'echo $PATH')"
 
-      # What sshd refuses, beside what the forward step uses: a remote (-R) streamlocal
-      # forward, refused when it is asked for, and a TCP -L, whose channel sshd refuses on
-      # the first connection to ssh's local port.
-      - name: sshd forwards nothing but local Unix sockets
+      # What sshd refuses, beside what the forward step uses. Every remote (-R) forward,
+      # of a Unix socket or a TCP port. And, on a second sshd with AllowTcpForwarding no,
+      # the very -L to a Unix socket that port 22 serves: OpenSSH's session.c disables all
+      # local forwarding then, and channel_connect_to_path (direct-streamlocal) checks
+      # that permission too. So rlx.app's host must allow local TCP forwarding, and this
+      # fails, to say so, if OpenSSH ever stops tying the two together.
+      - name: sshd refuses every remote forward, and streamlocal needs local TCP forwarding
         run: |
           fail() { echo "::error::$*"; exit 1; }
           probe=$(mktemp -d)
-          code=0
-          timeout 20 ssh -N -o ExitOnForwardFailure=yes \
-            -R "$probe/remote.sock:$probe/none.sock" localhost 2> "$probe/remote.err" || code=$?
-          cat "$probe/remote.err"
-          [ "$code" != 0 ] && [ "$code" != 124 ] || fail "ssh -R was not refused (exit $code)"
-          grep -q "remote port forwarding failed" "$probe/remote.err" \
-            || fail "ssh -R failed, but not as a refused forward"
+          refused_r() {
+            local what=$1 spec=$2 code=0
+            timeout 20 ssh -N -o ExitOnForwardFailure=yes -R "$spec" localhost \
+              2> "$probe/r.err" || code=$?
+            cat "$probe/r.err"
+            [ "$code" != 0 ] && [ "$code" != 124 ] || fail "ssh -R ($what) was not refused (exit $code)"
+            grep -q "remote port forwarding failed" "$probe/r.err" \
+              || fail "ssh -R ($what) failed, but not as a refused forward"
+          }
+          refused_r "a Unix socket" "$probe/remote.sock:$probe/none.sock"
           [ ! -e "$probe/remote.sock" ] || fail "sshd made the -R socket"
+          refused_r "a TCP port" "127.0.0.1:47614:127.0.0.1:22"
+          ! ss -Htln "sport = :47614" | grep -q . || fail "sshd listens on the -R port"
 
-          port=47613
-          ssh -N -o ExitOnForwardFailure=yes -L "127.0.0.1:$port:127.0.0.1:22" localhost \
-            2> "$probe/tcp.err" &
-          forward=$!
-          for _ in $(seq 100); do ss -Htln "sport = :$port" | grep -q . && break; sleep 0.1; done
-          timeout 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port && cat <&3" > /dev/null || true
-          for _ in $(seq 100); do
-            grep -q "administratively prohibited" "$probe/tcp.err" && break
-            sleep 0.1
-          done
-          kill "$forward"
-          wait "$forward" || true
-          cat "$probe/tcp.err"
-          grep -q "administratively prohibited" "$probe/tcp.err" \
-            || fail "sshd did not refuse a TCP -L channel"
-          rm -r "$probe"
+          # A Unix socket that answers "ok", and an -L to it through each sshd.
+          python3 -c 'import socket, sys, time
+          s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(4)
+          while True:
+              c, _ = s.accept(); c.sendall(b"ok\n"); c.close()' "$probe/target.sock" &
+          target=$!
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -p 2222 -o AllowTcpForwarding=no -o PidFile="$probe/sshd.pid"
+          printf '[localhost]:2222 %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" \
+            >> ~/.ssh/known_hosts
+          through() {
+            local port=$1 local_sock="$probe/via-$1.sock" forward said
+            ssh -p "$port" -N -o ExitOnForwardFailure=yes -L "$local_sock:$probe/target.sock" \
+              localhost 2> "$probe/via-$port.err" &
+            forward=$!
+            for _ in $(seq 100); do [ -S "$local_sock" ] && break; sleep 0.1; done
+            said=$(timeout 10 python3 -c 'import socket, sys
+          c = socket.socket(socket.AF_UNIX); c.connect(sys.argv[1]); print(c.recv(16).decode().strip())' \
+              "$local_sock" || true)
+            sleep 0.5
+            kill "$forward"
+            wait "$forward" || true
+            echo "through port $port: '$said'; ssh said: $(tr '\n' ' ' < "$probe/via-$port.err")" >&2
+            printf '%s' "$said"
+          }
+          [ "$(through 22)" = ok ] || fail "the -L through port 22 got no answer"
+          [ -z "$(through 2222)" ] || fail "AllowTcpForwarding no let a streamlocal -L through"
+          grep -q "open failed" "$probe/via-2222.err" \
+            || fail "the -L through port 2222 failed, but not as a refused channel"
+          sudo kill "$(sudo cat "$probe/sshd.pid")"
+          kill "$target"
+          rm -rf "$probe"
 
       # The step's shell is `bash -e`: an exit the check expects, 3, 5 or 127, is caught
       # with `|| code=$?`.
