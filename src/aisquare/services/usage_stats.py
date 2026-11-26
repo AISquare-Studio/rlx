@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import tempfile
 import time
 from collections import Counter
@@ -459,10 +460,12 @@ def account_types(store: ContextStore, *, refresh: bool = True) -> dict[int, str
         return cached
     types: dict[int, str] = {}
     for account in accounts_core.list_accounts():
-        if not account.config_dir.exists():
+        if not os.path.isdir(account.config_dir):
             # A home its agent never ran in (Claude Code's plain ~/.claude before its first
             # run) keeps no login: none is asked for, of the Keychain or a file (#1891), as
-            # the usage read asks none for an account with no login recorded.
+            # the usage read asks none for an account with no login recorded. os.path, never
+            # Path.exists: that raises for a folder it cannot stat (EACCES), and one such
+            # account cost the whole sweep, nothing recorded (review of #32, #1918).
             types[account.slot] = cached.get(account.slot, UNKNOWN_TYPE)
             continue
         try:

@@ -879,10 +879,88 @@ def test_the_service_sweep_asks_each_login_once_in_six_hours_whatever_the_keycha
     assert reads == [item], "one read of the one login"
 
     machine.session(1, repo, "s2", prompt(NOW, cwd=repo), request(NOW, "m2", cwd=repo))
-    usage_stats.maybe_sweep(now=datetime.now(UTC) + timedelta(minutes=11))  # the next sweep
+    again = usage_stats.maybe_sweep(now=datetime.now(UTC) + timedelta(minutes=11))  # the next
+    assert again.skipped is None and again.transcripts == 2, again  # it ran, over both
     assert reads == [item], "within six hours the cached type is used, locked or not"
     with store_session() as store:
         assert usage_stats.account_types(store, refresh=False) == {1: kind}
+
+
+@pytest.mark.parametrize(
+    "home", ["a ~/.claude, no transcripts", "a slot's transcript, no ~/.claude"]
+)
+def test_the_service_sweep_asks_the_keychain_only_for_a_login_it_has_a_use_for(
+    machine: Any, monkeypatch: pytest.MonkeyPatch, home: str
+) -> None:
+    """Each of #1891's two hunks pinned on its own (review of #32, #1918 MINOR 2), the Keychain
+    ON and every read recorded:
+    - a home with Claude Code's ~/.claude and no transcript: nothing to attribute, so no
+      account's login is read (_sweep's hunk);
+    - a managed slot's transcript and no ~/.claude: that slot's login is read, the plain
+      slot, which never ran here, is not (account_types' hunk)."""
+    import shutil
+
+    from aisquare.core import claude_accounts as accounts_core
+    from tests.usage_stats_support import NOW, prompt, request
+
+    reads: list[tuple[str, str]] = []
+
+    def keychain(service: str, account: str, *, fresh: bool = False) -> Any:
+        reads.append((service, account))
+        return accounts_core.KeychainRead(found=False)
+
+    monkeypatch.setattr(accounts_core, "read_keychain", keychain)
+    monkeypatch.setattr(accounts_core, "keychain_platform", lambda: True)
+    expected: list[tuple[str, str]] = []
+    if home == "a ~/.claude, no transcripts":
+        assert accounts_core.default_config_dir().is_dir()  # fake_home's
+    else:
+        machine.account(2, "pro")
+        repo = machine.repo("slot-two")
+        machine.session(2, repo, "s1", prompt(NOW, cwd=repo), request(NOW, "m1", cwd=repo))
+        shutil.rmtree(accounts_core.default_config_dir())
+        two = next(a for a in accounts_core.list_accounts() if a.slot == 2)
+        expected = [(accounts_core.keychain_service(two), accounts_core.keychain_account())]
+
+    ran = CliRunner().invoke(app, ["service", "sweep"])
+
+    assert ran.exit_code == 0, ran.output
+    assert reads == expected, reads
+
+
+def test_one_account_folder_that_cannot_be_read_costs_the_sweep_nothing(
+    machine: Any, tmp_path: Path
+) -> None:
+    """Review of #32 (#1918) MINOR 1: account_types asked Path.exists of each account's folder
+    outside its per-account try, and Path.exists raises for one it cannot stat (EACCES), so
+    ONE such account made the whole sweep return 'skipped' with nothing recorded, in the TUI,
+    the shipper, metrics and the service alike. Claude Code's plain slot is listed whether its
+    folder exists or not; here its ~/.claude is a link into a folder this user cannot enter,
+    and a managed slot holds the transcript. That plain slot is skipped; the sweep records."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root enters any folder")
+    import shutil
+
+    from aisquare.core import claude_accounts as accounts_core
+    from aisquare.services import usage_stats
+    from tests.usage_stats_support import NOW, prompt, request
+
+    machine.account(2, "pro")
+    repo = machine.repo("readable")
+    machine.session(2, repo, "s1", prompt(NOW, cwd=repo), request(NOW, "m1", cwd=repo))
+    plain = accounts_core.default_config_dir()
+    shutil.rmtree(plain)
+    locked = tmp_path / "locked"
+    (locked / ".claude").mkdir(parents=True)
+    plain.symlink_to(locked / ".claude")
+    locked.chmod(0o000)  # the plain slot's folder cannot be stat'ed
+    try:
+        report = usage_stats.sweep()
+    finally:
+        locked.chmod(0o700)
+
+    assert report.skipped is None, report
+    assert report.sessions_new == 1, report
 
 
 def test_a_log_folder_it_cannot_write_does_not_end_the_service_at_a_roll(
