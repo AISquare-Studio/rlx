@@ -415,19 +415,53 @@ def test_native_windows_does_nothing_and_records_no_choice(
 # --- who registers by default ---------------------------------------------------------------------
 
 
-def test_the_first_init_of_the_default_home_adds_it_and_no_service_leaves_it_off(
-    tmp_path: Path, login_os: LoginOs
-) -> None:
-    left_off = _init(tmp_path / "left-off", "--no-service")
-    assert left_off.exit_code == 0, left_off.output
-    assert not _plist().exists() and login_os.calls == [] and _choice() is None
-
+def test_the_first_init_of_the_default_home_adds_it(tmp_path: Path, login_os: LoginOs) -> None:
     first = _init(tmp_path / "project")
 
     assert first.exit_code == 0, first.output
     assert _plist().is_file()
     assert "the rlx service starts at login" in first.output, first.output
     assert _choice() is True
+
+
+def test_no_service_is_kept_so_no_later_init_or_installer_adds_it(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """The manager's ruling on #33 (tester m4): --no-service records the no. A later plain init,
+    the installer's step or another --no-service adds nothing and calls no OS tool; only an
+    explicit install turns it on."""
+    left_off = _init(tmp_path / "left-off", "--no-service")
+
+    assert left_off.exit_code == 0, left_off.output
+    assert "--no-service, kept for later runs" in left_off.output, left_off.output
+    assert _choice() is False
+
+    later = _init(tmp_path / "project")
+    by_installer = _rlx("service", "install", "--if-undecided")
+    again = _init(tmp_path / "project", "--no-service")
+
+    for result in (later, by_installer, again):
+        assert result.exit_code == 0, result.output
+    assert f"does not start at login: {service_login.OFF_IN_RLX}" in later.output, later.output
+    assert not _plist().exists() and login_os.calls == []
+    assert _choice() is False
+
+    assert _rlx("service", "install").exit_code == 0
+    assert _plist().is_file() and _choice() is True
+
+
+def test_no_service_leaves_a_choice_already_made(tmp_path: Path, login_os: LoginOs) -> None:
+    """A login item already on stays on: --no-service is about not adding one; the switch and
+    `rlx service uninstall` turn one off."""
+    _init(tmp_path / "project")
+    login_os.calls.clear()
+
+    again = _init(tmp_path / "project", "--no-service")
+
+    assert again.exit_code == 0, again.output
+    assert _plist().is_file() and _choice() is True
+    assert login_os.changes() == []
+    assert "the rlx service starts at login" in again.output, again.output
 
 
 def test_a_named_homes_init_never_adds_one_only_an_explicit_install_does(

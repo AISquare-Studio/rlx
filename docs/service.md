@@ -140,7 +140,8 @@ been chosen, and otherwise only refresh a login item that is there (a new path t
 PATH), never make one. So a removal in the OS's settings stays removed. Only `rlx service
 install`, or the switch in App settings, adds it back; on macOS, an item turned off under Login
 Items has to be turned on there, and `rlx service install` says so. `rlx init --no-service`, and
-the installers' `--no-service`, leave it off from the start. App settings' *Reset all settings*
+the installers' `--no-service`, leave it off and keep that: later runs of `rlx init` and the
+installers never add it (a choice made before stays as it is). App settings' *Reset all settings*
 and `rlx init --reinit` keep this choice: it is about a login item, not a setting of rlx's.
 While `config.toml` cannot be read, rlx leaves the login item as it is (it adds none, refreshes
 none and takes none away) and says why. `rlx uninstall` takes the

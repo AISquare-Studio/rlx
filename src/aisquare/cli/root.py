@@ -72,8 +72,9 @@ def init(
         bool,
         typer.Option(
             "--no-service",
-            help="Do not set the rlx service to start at login. The first init of the default "
-            "home does, unless CI is set; `rlx service install` does it later.",
+            help="Do not set the rlx service to start at login, and keep that: later inits and "
+            "installer runs leave it off (a choice already made stays as it is). The first init "
+            "of the default home sets it, unless CI is set; `rlx service install` turns it on.",
         ),
     ] = False,
 ) -> None:
@@ -108,13 +109,15 @@ def init(
             error="reinit_would_discard_explainability",
             hint=f"{prog.word()} init --reinit --yes",
         )
-    if not no_service:
-        # On by default (S2, #33): the first init of the default home adds the login item, not
-        # under CI; a choice on record, a removal in the OS's own settings with it, is left as
-        # it is, the item only refreshed.
-        from aisquare.services import service_login
+    # On by default (S2, #33): the first init of the default home adds the login item, not
+    # under CI; a choice on record, a removal in the OS's own settings with it, is left as it
+    # is, the item only refreshed. --no-service records the no, for every later init.
+    from aisquare.services import service_login
 
-        with expected_config_write_errors():
+    with expected_config_write_errors():
+        if no_service:
+            report.notes.append(service_login.decline_by_default())
+        else:
             report.notes.append(service_login.register_by_default())
     emit_setup(report)
 

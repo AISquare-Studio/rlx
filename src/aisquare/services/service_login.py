@@ -693,6 +693,30 @@ def register_by_default(*, by_installer: bool = False) -> str:
     return "; ".join((state_line(done.state), *done.notes))
 
 
+def decline_by_default() -> str:
+    """``rlx init --no-service``'s step, and so the installers' ``--no-service``: record that the
+    person said no while nothing was chosen, so a later init, installer or ``--if-undecided``
+    never adds the item (the manager's ruling on #33). A choice already made is left as it is:
+    the switch and ``rlx service uninstall`` turn it off. Native Windows and an unreadable
+    ``config.toml`` record nothing. What to say of it. Raises only what ``save_config`` raises."""
+    try:
+        login_how()
+    except NotHere as exc:
+        return f"the {PRODUCT_NAME} service does not start at login: {exc}"
+    except LoginError:
+        pass  # said below, from how it stands
+    unreadable = config_unreadable()
+    if unreadable is not None:
+        return f"the {PRODUCT_NAME} service's login item was left as it is: {unreadable}"
+    if read_choice() is None:
+        _keep_the_choice(False)
+        return (
+            f"the {PRODUCT_NAME} service does not start at login: --no-service, kept for later "
+            "runs" + prog.shell_advice(f" (`{prog.words('service', 'install')}` turns it on)")
+        )
+    return state_line(at_login_state())
+
+
 def state_line(state: AtLogin) -> str:
     """How it stands, in one line for a person."""
     if state.on and state.item is not None:
@@ -773,6 +797,7 @@ __all__ = [
     "Registered",
     "at_login_state",
     "config_unreadable",
+    "decline_by_default",
     "entry_point",
     "forget_at_login",
     "home_tag",

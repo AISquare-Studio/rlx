@@ -3287,10 +3287,11 @@ Options
                        no; --yes asks nothing.
       --project DIR    Register DIR as the project (default: $PWD if a git repo).
       --no-project     Machine setup only; register nothing.
-      --no-service     Do not start the rlx service at each login. It does by
-                       default: a LaunchAgent on macOS, a systemd user unit on
-                       Linux and in WSL (turn it off later in App settings,
-                       or with: rlx service uninstall).
+      --no-service     Do not start the rlx service at each login, and keep
+                       that for later runs. It does by default: a LaunchAgent
+                       on macOS, a systemd user unit on Linux and in WSL
+                       (turn it on later in App settings, or with: rlx
+                       service install).
       --version V      Pin aisquare-cli to V, or `latest` (default: latest, or
                        the release a release asset was downloaded from).
       --python V       Interpreter uv resolves for the tool env (default: 3.13).
