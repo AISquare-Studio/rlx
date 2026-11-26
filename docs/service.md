@@ -110,8 +110,9 @@ A running service follows a change within half a minute.
   with the AppIndicator extension. Without one there's no icon, and `rlx service status` says so.
 - Not on Windows in this release, native or in WSL.
 
-**What it needs:** the `tray` extra, which the installer adds on macOS and Linux (with uv:
-`uv tool install 'aisquare-cli[tray]'`). Without it, the service runs as before, and `rlx service
+**What it needs:** the `tray` extra. On macOS and Linux the installer adds it, and so does an
+upgrade (`rlx upgrade`, or Update in the app) of an install made before it. With uv by hand:
+`uv tool install 'aisquare-cli[tray]'`. Without it, the service runs as before, and `rlx service
 status` says the tray needs the extra.
 
 **How it runs:** in a process of its own, which the service starts, restarts after a crash (at
@@ -132,7 +133,18 @@ wakeups and context switches are `top`'s.
 | The service, tray on | 0.43 s = 0.072% | 84 MB | 0 | 141/min |
 | The tray's process (drawing nothing) | 0.00 s | 27 MB | 0 | 2/min |
 
-- The service is unchanged by the tray: its part runs every 30 s and adds nothing measurable.
+With a fleet: eight live agents on two tmux servers, in each home (also 600 s, side by side):
+
+| | CPU | RSS | idle wakeups | context switches |
+|---|---|---|---|---|
+| The service, tray off | 0.41 s = 0.068% | 84 MB | 0 | 127/min |
+| The service, tray on | 0.53 s = 0.088% | 83 MB | 0 | 159/min |
+| The tray's process (drawing nothing) | 0.00 s | 27 MB | 0 | 2/min |
+
+- Without a fleet, the service is unchanged by the tray. With one, the tray's part lists the
+  running agents every 30 s, for the menu: one read-only `tmux display-message` for each server,
+  40 in the 600 s here. That costs about 0.02% CPU and 30 context switches a minute, and no idle
+  wakeup.
 - The tray's process is about 27 MB before the OS's part. Importing AppKit (macOS) takes it to
   about 49 MB; jeepney (Linux) adds almost nothing.
 - The real menu bar's and tray's numbers are the manual check's (step 7).

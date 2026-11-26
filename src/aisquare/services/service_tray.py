@@ -26,7 +26,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from aisquare.core import selfcli
@@ -89,7 +89,7 @@ def why_no_tray(
         out_of_reach = remote_session or _remote_session
         if out_of_reach():
             return "the menu bar is in the Mac's login session; this service was started over SSH"
-    elif platform.startswith("linux") and not source.get("WSL_DISTRO_NAME"):
+    elif platform.startswith("linux") and not _in_wsl(source):
         if not (source.get("WAYLAND_DISPLAY") or source.get("DISPLAY")):
             return "no desktop session here"
         if not source.get("DBUS_SESSION_BUS_ADDRESS") and not source.get("XDG_RUNTIME_DIR"):
@@ -101,6 +101,12 @@ def why_no_tray(
     if not found(module):
         return NO_TRAY_EXITS[EXIT_NO_EXTRA]
     return None
+
+
+def _in_wsl(env: Mapping[str, str]) -> bool:
+    from aisquare.core.clipboard import in_wsl
+
+    return in_wsl(env)
 
 
 def _enabled() -> bool:
@@ -216,6 +222,7 @@ class TrayPart:
         args = ["--icon", icon, "--terminal", terminal]
         args += ["--status", str(service_host.status_path())]
         args += ["--folder", str(service_host.service_dir())]
+        args += ["--service-pid", str(os.getpid())]  # the parent it ends with, passed (m2)
         spawn = self._spawn or _detached
         return spawn(selfcli.argv_for(args, module=TRAY_MODULE))
 

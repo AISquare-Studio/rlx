@@ -1146,7 +1146,8 @@ class TraySettings(BaseModel):
 
     ``enabled`` on, the default: a running service shows it, where the OS has a place for
     one (macOS's menu bar in the login session; a StatusNotifierItem host on Linux) and the
-    ``tray`` extra is installed. Off, the service shows none, from its next start.
+    ``tray`` extra is installed. Off, the running service takes it down within half a minute
+    (``service_tray.TrayPart`` follows the file).
 
     ``icon``: ``backslash`` (rlx's ``\\`` in its blue, the default), ``mark`` (the whole
     ``r\\x``) or ``template`` (the backslash painted by macOS as its other menu bar icons).

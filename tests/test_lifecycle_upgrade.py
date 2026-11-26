@@ -107,6 +107,14 @@ def _uv_cache(root: Path) -> Path:
     return root
 
 
+@pytest.fixture(autouse=True)
+def an_os_without_the_tray(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pins here are an upgrade's own command on an OS with no tray: on macOS and Linux an
+    upgrade of a PyPI install also adds the ``tray`` extra (#34, M2), which
+    ``tests/test_tray.py`` pins for each platform."""
+    monkeypatch.setattr(install_route, "tray_extra_here", lambda *_args, **_kwargs: False)
+
+
 def _facts(prefix: Path, **overrides: Any) -> Facts:
     values: dict[str, Any] = {
         "prefix": prefix,

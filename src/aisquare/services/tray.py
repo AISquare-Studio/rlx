@@ -88,8 +88,15 @@ class Summary:
 
     running: bool
     agents: tuple[str, ...] = ()
+    """The running agents' names, as many as the service keeps (``service_tray.AGENTS_KEPT``)."""
     room: int | None = None
     accounts: int | None = None
+    running_count: int | None = None
+    """How many run, all of them (``agents_running``): more than :attr:`agents` names."""
+
+    @property
+    def count(self) -> int:
+        return max(self.running_count or 0, len(self.agents))
 
 
 def summary_of(record: Mapping[str, Any] | None) -> Summary:
@@ -105,20 +112,27 @@ def summary_of(record: Mapping[str, Any] | None) -> Summary:
     names = tuple(str(name) for name in agents) if isinstance(agents, list) else ()
     room = usage.get("room") if isinstance(usage, Mapping) else None
     accounts = usage.get("accounts") if isinstance(usage, Mapping) else None
+    total = tray.get("agents_running") if isinstance(tray, Mapping) else None
     return Summary(
         running=True,
         agents=names,
-        room=room if isinstance(room, int) and not isinstance(room, bool) else None,
-        accounts=accounts if isinstance(accounts, int) and not isinstance(accounts, bool) else None,
+        room=_whole(room),
+        accounts=_whole(accounts),
+        running_count=_whole(total),
     )
 
 
-def named(agents: Sequence[str]) -> str:
-    """``agents`` as one phrase: ``coder-1``, ``coder-1 and reviewer``, ``a, b, c and 2 more``."""
+def _whole(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def named(agents: Sequence[str], count: int | None = None) -> str:
+    """``agents`` as one phrase: ``coder-1``, ``coder-1 and reviewer``, ``a, b, c and 2 more``;
+    ``count`` the whole number when it is more than the names (the service keeps 20)."""
     if not agents:
         return ""
     shown = list(agents[:NAMED_AT_MOST])
-    rest = len(agents) - len(shown)
+    rest = max(count or 0, len(agents)) - len(shown)
     if rest:
         return f"{', '.join(shown)} and {rest} more"
     if len(shown) == 1:
@@ -130,7 +144,7 @@ def status_lines(summary: Summary) -> list[str]:
     """The menu's top lines, which do nothing when clicked."""
     if not summary.running:
         return [f"The {PRODUCT_NAME} service is not running"]
-    count = len(summary.agents)
+    count = summary.count
     lines = [
         "No agents running" if count == 0 else f"{count} agent{'s' if count != 1 else ''} running"
     ]
@@ -139,16 +153,17 @@ def status_lines(summary: Summary) -> list[str]:
     return lines
 
 
-def quit_question(agents: Sequence[str]) -> tuple[str, str]:
+def quit_question(agents: Sequence[str], count: int | None = None) -> tuple[str, str]:
     """*Quit rlx*'s question: its title and what quitting costs. Quitting stops the service
-    only (the ruling on #34, Q1): agents run on in tmux, without what it did for them."""
+    only (the ruling on #34, Q1): agents run on in tmux, without what it did for them.
+    ``count``: how many run, when more than ``agents`` names."""
     title = f"Quit {PRODUCT_NAME}?"
     if not agents:
         return title, "Remote and the usage reads stop until rlx starts again."
-    verb = "keeps" if len(agents) == 1 else "keep"
+    verb = "keeps" if max(count or 0, len(agents)) == 1 else "keep"
     return title, (
-        f"{named(agents)} {verb} running in tmux, without rlx: no handovers at their limits, "
-        "and no Remote."
+        f"{named(agents, count)} {verb} running in tmux, without rlx: no handovers at their "
+        "limits, and no Remote."
     )
 
 
@@ -180,7 +195,7 @@ def menu_items(summary: Summary, *, error: str | None = None, ask_in_menu: bool)
         MenuItem(f"Restart {PRODUCT_NAME}", RESTART),
     ]
     if ask_in_menu:
-        _, detail = quit_question(summary.agents)
+        _, detail = quit_question(summary.agents, summary.count)
         rows.append(
             MenuItem(
                 f"Quit {PRODUCT_NAME}…",
@@ -298,7 +313,15 @@ class Tray:
     terminal: str = ""
     status: Path | None = None
     folder: Path | None = None
+    service_pid: int | None = None
+    """The service's pid, as it passed it (``--service-pid``): the parent the tray ends with.
+    Passed, not read with ``getppid`` once the OS's half has loaded: a service that died during
+    those imports would leave a tray whose parent is already another process."""
     error: str | None = field(default=None)
+
+    def service_gone(self) -> bool:
+        """Whether the service that started this tray has ended (its child's parent changed)."""
+        return self.service_pid is not None and os.getppid() != self.service_pid
 
     def summary(self) -> Summary:
         try:
@@ -325,7 +348,8 @@ class Tray:
 
     def question(self) -> tuple[str, str]:
         """What macOS's alert asks before :data:`QUIT_NOW`."""
-        return quit_question(self.summary().agents)
+        summary = self.summary()
+        return quit_question(summary.agents, summary.count)
 
     def act(self, action: str) -> None:
         """Do what a row's ``action`` names; what went wrong is the menu's next line."""
@@ -339,7 +363,7 @@ class Tray:
                 _spawn_rlx(["service", "stop"])
             elif action != QUIT:  # QUIT is the backend's to ask
                 raise TrayError(f"nothing to do for {action!r}")
-        except (OSError, TrayError) as exc:
+        except (OSError, TrayError, ValueError) as exc:  # ValueError: a quote left open
             _log.warning("the tray's %s failed: %s", action, exc)
             self.error = f"Could not {action.replace('-', ' ')}: {exc}"
 
@@ -365,6 +389,12 @@ class Backend(Protocol):
     def run(self, tray: Tray, *, icon: str) -> int: ...
 
 
+def _in_wsl() -> bool:
+    from aisquare.core.clipboard import in_wsl
+
+    return in_wsl(os.environ)
+
+
 def backend_for(platform: str = sys.platform) -> Backend | int:
     """The OS's half, or the exit that says why there is none (:data:`NO_TRAY_EXITS`). The
     extra's modules are imported here, the only place: never by the CLI, a hook or the
@@ -375,7 +405,7 @@ def backend_for(platform: str = sys.platform) -> Backend | int:
         except ImportError:
             return EXIT_NO_EXTRA
         return tray_macos.MacTray()
-    if platform.startswith("linux") and not os.environ.get("WSL_DISTRO_NAME"):
+    if platform.startswith("linux") and not _in_wsl():
         try:
             from aisquare.services import tray_linux
         except ImportError:
@@ -390,6 +420,7 @@ def run_tray(
     terminal: str = "",
     status: Path | None = None,
     folder: Path | None = None,
+    service_pid: int | None = None,
     backend: Backend | int | None = None,
 ) -> int:
     """Draw the tray until the service stops it; the exit status, one of
@@ -398,7 +429,11 @@ def run_tray(
     if isinstance(chosen, int):
         _log.info("no tray: %s", NO_TRAY_EXITS.get(chosen, chosen))
         return chosen
-    return chosen.run(Tray(terminal=terminal, status=status, folder=folder), icon=icon)
+    shown = Tray(terminal=terminal, status=status, folder=folder, service_pid=service_pid)
+    if shown.service_gone():  # the service ended while the OS's half loaded: nothing to show
+        _log.info("no tray: the service that started it has ended")
+        return 0
+    return chosen.run(shown, icon=icon)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -415,8 +450,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--terminal", default="")
     parser.add_argument("--status", type=Path)
     parser.add_argument("--folder", type=Path)
+    parser.add_argument("--service-pid", type=int)
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    return run_tray(icon=args.icon, terminal=args.terminal, status=args.status, folder=args.folder)
+    return run_tray(
+        icon=args.icon,
+        terminal=args.terminal,
+        status=args.status,
+        folder=args.folder,
+        service_pid=args.service_pid,
+    )

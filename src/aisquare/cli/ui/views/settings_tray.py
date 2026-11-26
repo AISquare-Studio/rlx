@@ -4,7 +4,7 @@ preferences.
 Three rows, each saved at once through ``core.config.save_config`` (the one writer) and taken
 back by its page's ctrl+z (M5, ``cli.ui.save_model``):
 
-- *Show rlx's icon in the menu bar* (``[tray] enabled``);
+- *Show rlx's icon in the menu bar* (the tray, on Linux) (``[tray] enabled``);
 - *Icon*: rlx's backslash, the whole r\\x mark, or the backslash as a template (macOS paints
   it as its other menu bar icons);
 - *Open rlx in*: the person's own terminal app, or one named.
@@ -40,6 +40,10 @@ ICON_OPTIONS = (
     ("Template", "template"),
 )
 """Short, so the select fits the tab at 80x24: the about line says what a template is."""
+SHOW_LABEL = (
+    f"Show {PRODUCT_NAME}'s icon in the {'menu bar' if sys.platform == 'darwin' else 'tray'}"
+)
+"""Where the icon goes on this OS: macOS's menu bar, Linux's tray."""
 DEFAULT_TERMINAL = "Your default terminal"
 MAC_TERMINALS = ("Terminal", "iTerm", "Ghostty", "WezTerm", "kitty", "Alacritty", "Warp")
 """Apps macOS can open rlx's ``.command`` in (``open -a``)."""
@@ -86,7 +90,7 @@ class TrayToggle(Vertical):
         self._shown = settings
         yield Static(section_title(*TITLE), id="tray-title", classes="section")
         with Horizontal(classes="row preference"):
-            yield Label(f"Show {PRODUCT_NAME}'s icon in the menu bar", classes="preference-label")
+            yield Label(SHOW_LABEL, classes="preference-label")
             yield Switch(settings.enabled, id="tray-enabled")
         with Horizontal(classes="row preference"):
             # A row's plain label, as the captain's agent's: it gives the select its 26 columns

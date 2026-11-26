@@ -251,9 +251,10 @@ def _introspection(path: str) -> str:
     )
 
 
-def _die_with_the_service() -> int:
-    """The service's pid, and the kernel told to end this process when it dies."""
-    parent = os.getppid()
+def _die_with_the_service(tray: Tray) -> int:
+    """The service's pid (as it passed it, else this process's parent), and the kernel told to
+    end this process when it dies."""
+    parent = tray.service_pid or os.getppid()
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
@@ -278,7 +279,9 @@ class LinuxTray:
     """The item on the session bus until the service ends this process."""
 
     def run(self, tray: Tray, *, icon: str) -> int:
-        parent = _die_with_the_service()
+        parent = _die_with_the_service(tray)
+        if os.getppid() != parent:  # it died before the kernel was told: nothing to show
+            return 0
         try:
             conn = open_dbus_connection("SESSION")
         except (OSError, KeyError, ValueError) as exc:

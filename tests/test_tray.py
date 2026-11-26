@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import stat
 import sys
 from collections.abc import Mapping
@@ -25,6 +27,7 @@ from textual.widgets import Select, Switch, TabbedContent
 from aisquare.cli.ui.sidebar import AppSettingsSelected
 from aisquare.cli.ui.views.app_settings import PREFERENCES_TAB
 from aisquare.cli.ui.views.settings_tray import TrayToggle, terminal_options
+from aisquare.core import selfcli
 from aisquare.core.config import AppConfig, TraySettings, load_config, save_config
 from aisquare.services import service_host, service_tray, tray, tray_linux
 from aisquare.services.service_tray import TrayPart, why_no_tray
@@ -211,6 +214,20 @@ def test_the_command_file_runs_rlx_on_this_services_home() -> None:
     assert text == "#!/bin/sh\nexport RLX_HOME='/h/my home'\nexec '/a b/rlx'\n"
 
 
+def test_every_running_agent_is_counted_though_twenty_are_named() -> None:
+    """The service keeps 20 names (``AGENTS_KEPT``) and the count of all: with 25 agents the
+    menu said "20 agents running" and Quit "and 17 more" (review of #602, m1)."""
+    names = [f"coder-{n}" for n in range(1, 21)]
+    record = {"parts": {"tray": {"agents": names, "agents_running": 25}}}
+    summary = summary_of(record)
+    assert status_lines(summary)[0] == "25 agents running"
+    assert quit_question(summary.agents, summary.count)[1].startswith(
+        "coder-1, coder-2, coder-3 and 22 more keep running"
+    )
+    rows = menu_items(summary, ask_in_menu=True)
+    assert rows[2].children[0].label == quit_question(summary.agents, summary.count)[1]
+
+
 # --- the actions ----------------------------------------------------------------------------------
 
 
@@ -220,7 +237,7 @@ def spawned(tray_seams: None, monkeypatch: pytest.MonkeyPatch) -> dict[str, list
     seen: dict[str, list[list[str]]] = {"rlx": [], "terminal": []}
     monkeypatch.setattr(tray, "_spawn_rlx", lambda args: seen["rlx"].append(list(args)))
     monkeypatch.setattr(tray, "_spawn_terminal", lambda argv: seen["terminal"].append(list(argv)))
-    monkeypatch.setattr(tray.selfcli, "argv_for", lambda args: [*RLX, *args])
+    monkeypatch.setattr(selfcli, "argv_for", lambda args: [*RLX, *args])
     return seen
 
 
@@ -238,7 +255,7 @@ def test_restart_and_quit_hand_their_command_to_a_detached_rlx(
 def test_open_on_linux_starts_the_terminal(
     spawned: dict[str, list[list[str]]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(tray.shutil, "which", _which("konsole"))
+    monkeypatch.setattr(shutil, "which", _which("konsole"))
     monkeypatch.delenv("TERMINAL", raising=False)
     Tray(platform="linux", read_status=dict).act(OPEN)
     assert spawned["terminal"] == [["konsole", "-e", *RLX]]
@@ -253,7 +270,8 @@ def test_open_on_macos_writes_an_owner_only_script_for_this_home(
     script_file = service_host.service_dir() / tray.COMMAND_FILE
     assert spawned["terminal"] == [["open", "-a", "Ghostty", str(script_file)]]
     assert script_file.read_text(encoding="utf-8").endswith(f"exec {RLX[0]}\n")
-    assert f"export AISQUARE_HOME={home}" in script_file.read_text(encoding="utf-8")
+    export = f"export AISQUARE_HOME={shlex.quote(str(home))}"  # quoted where a path needs it
+    assert export in script_file.read_text(encoding="utf-8")
     if sys.platform != "win32":
         assert stat.S_IMODE(script_file.stat().st_mode) == 0o700
 
@@ -271,6 +289,17 @@ def test_a_failed_action_is_the_menus_next_line(
     assert item.items()[-1].label == "Could not restart: no such file"
     item.act("nonsense")
     assert item.error == "Could not nonsense: nothing to do for 'nonsense'"
+
+
+def test_a_terminal_setting_that_will_not_split_is_said_not_raised(
+    spawned: dict[str, list[list[str]]],
+) -> None:
+    """``[tray] terminal`` with a quote left open: ``shlex.split`` raises ValueError, which the
+    menu says (review of #602, m4)."""
+    item = Tray(platform="linux", read_status=dict, terminal='konsole --title "rlx')
+    item.act(OPEN)
+    assert item.error == "Could not open: No closing quotation"
+    assert spawned["terminal"] == []
 
 
 def test_an_unreadable_status_is_a_menu_that_says_so() -> None:
@@ -339,6 +368,20 @@ def test_rlx_service_tray_draws_it_here_with_the_settings(
     assert result.exit_code == 0, result.output
     ((shown, icon),) = backend.ran
     assert (icon, shown.terminal) == ("template", "foot")
+
+
+def test_a_tray_whose_service_has_ended_shows_nothing(
+    tray_seams: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The service passes its pid (``--service-pid``): a service that ended while the OS's half
+    loaded leaves no tray behind, whose parent would be another process (review of #602, m2)."""
+    backend = Backend()
+    monkeypatch.setattr(tray, "backend_for", lambda platform=None: backend)
+    assert tray.main(["--service-pid", str(os.getppid() + 1)]) == 0
+    assert backend.ran == [], "never drawn"
+    assert tray.main(["--service-pid", str(os.getppid())]) == 0
+    ((shown, _icon),) = backend.ran
+    assert shown.service_pid == os.getppid() and not shown.service_gone()
 
 
 def test_each_os_gets_its_half_or_the_exit_that_says_why_not(
@@ -412,6 +455,7 @@ def test_the_part_starts_the_tray_and_says_which_agents_run() -> None:
     assert argv[argv.index("-m") + 1] == service_tray.TRAY_MODULE, "not the CLI: a lean process"
     assert argv[argv.index("--icon") + 1] == "backslash"
     assert argv[argv.index("--status") + 1] == str(service_host.status_path())
+    assert argv[argv.index("--service-pid") + 1] == str(os.getpid()), "its parent, passed"
     assert health.state == "ok"
     assert health.extra == {"agents": AGENTS, "agents_running": 5}
     part.tick_part()
@@ -582,9 +626,9 @@ def _call(
 class Recorder(Tray):
     """A tray whose actions are recorded."""
 
-    def __init__(self, status: dict[str, Any]) -> None:
-        super().__init__(platform="linux", read_status=lambda: self.status)
-        self.status = status
+    def __init__(self, given: dict[str, Any]) -> None:
+        super().__init__(platform="linux", read_status=lambda: self.given)
+        self.given = given
         self.acted: list[str] = []
 
     def act(self, action: str) -> None:
@@ -714,7 +758,7 @@ def test_the_menu_is_rebuilt_as_it_is_about_to_show() -> None:
         item, tray_linux.MENU_PATH, tray_linux.MENU_INTERFACE, "AboutToShow", "i", (0,)
     )
     assert same.body == (False,)
-    recorder.status = _status(AGENTS)
+    recorder.given = _status(AGENTS)
     reply, signal = _replies(
         item, tray_linux.MENU_PATH, tray_linux.MENU_INTERFACE, "AboutToShow", "i", (0,)
     )
@@ -774,7 +818,8 @@ def test_the_tray_switches_are_kept_as_they_change_and_ctrl_z_takes_them_back() 
     assert seen["icon"] == "template"
     assert seen["undone"] == "backslash", "ctrl+z put the icon back"
     assert seen["reset"] == (True, "backslash")
-    assert any("the tray's icon" in str(toast) for toast in seen["toasts"]), seen["toasts"]  # type: ignore[union-attr]
+    toasts = seen["toasts"]
+    assert isinstance(toasts, list) and any("the tray's icon" in str(t) for t in toasts), toasts
 
 
 def test_the_part_follows_the_file(tmp_path: Path) -> None:
@@ -783,7 +828,6 @@ def test_the_part_follows_the_file(tmp_path: Path) -> None:
     save_config(config)
     assert service_tray.tray_settings() == (False, "mark", "foot")
     assert why_no_tray(platform="linux", env={"DISPLAY": ":0"}) == "off in App settings"
-    assert os.environ.get("DISPLAY", "") or True  # the file decided, not this machine
 
 
 # --- macOS: its half defines, and draws its image, with no status item ----------------------------

@@ -1095,11 +1095,30 @@ def runs_from_uv_cache() -> bool:
 # --- what upgrades it -------------------------------------------------------------------
 
 
+TRAY_EXTRA = "tray"
+"""The extra the rlx service's tray needs (#34). An upgrade of a PyPI install adds it where there
+is a tray, to every extra the receipt had: an install made before the tray (0.10.1) gets it as
+one made by install.sh does (``cli_package``). The ruling on #34, M2."""
+
+
+def tray_extra_here(platform: str | None = None, env: Mapping[str, str] | None = None) -> bool:
+    """Whether this OS has the tray: macOS, and Linux outside WSL (none on Windows in 0.10.2)."""
+    from aisquare.core.clipboard import in_wsl
+
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        return True
+    return platform.startswith("linux") and not in_wsl(os.environ if env is None else env)
+
+
 def _uv_spec(route: InstallRoute, target: str | None, current: str) -> list[str]:
     """The package argument(s) for ``uv tool install``: ``name[extras]@target``, the latest
     release no older than ``current`` (``name[extras]>=current``), or a source."""
     receipt = route.receipt or UvReceipt()
-    extras = f"[{','.join(receipt.extras)}]" if receipt.extras else ""
+    names = list(receipt.extras)
+    if receipt.source is None and TRAY_EXTRA not in names and tray_extra_here():
+        names.append(TRAY_EXTRA)  # a PyPI install gets the tray (#34); a source keeps its own
+    extras = f"[{','.join(names)}]" if names else ""
     if receipt.source is None:
         floor = _floor(current) if target is None else None
         if floor is not None:

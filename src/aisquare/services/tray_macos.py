@@ -121,7 +121,7 @@ def delegate_for(tray: Tray) -> Any:
     ``init`` would join every ``run`` to the CLI's ``init``, which writes the config."""
     delegate = _Menu.new()
     delegate.tray = tray
-    delegate.parent = os.getppid()
+    delegate.parent = tray.service_pid or os.getppid()
     return delegate
 
 
