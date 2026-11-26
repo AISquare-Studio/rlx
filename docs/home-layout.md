@@ -107,7 +107,10 @@ other command, no hook and no start of rlx does.
 
 A variable that names `~/.aisquare` itself (`RLX_HOME` or `AISQUARE_HOME`; every window the fleet
 opens has both) still means the default home: it moves to `~/.rlx` and is linked, as without the
-variable.
+variable. After the move, a variable that still names `~/.aisquare` (a shell's startup file, a
+shell started from a fleet window) means `~/.rlx`, with every account's folder spelled from it,
+so each account reads signed in. It does so by any spelling of `~/.aisquare`: a link to it, a
+trailing slash, or resolved.
 
 In the app, the ⬆ row under Settings offers **Move rlx's home** while the home is old, even when
 no newer release is out. Its *Restart & move* closes rlx, moves the home and reopens rlx. An
@@ -128,7 +131,8 @@ The move refuses, and names each thing it found, while any of these run on the h
 - a window on rlx's tmux server, or on a server a launch record names;
 - the watcher;
 - Remote, served from another process;
-- an agent started with `rlx launch`, on any account.
+- an agent started with `rlx launch` by rlx 0.10.2 or later, on any account. An `rlx launch`
+  started by 0.10.1 left no record of itself, so the move cannot see it: stop such agents first.
 
 Stop them, then run `rlx upgrade` again. Nothing is touched until the home is quiet. The app's
 Move rlx's home says what runs before it closes rlx.
@@ -178,7 +182,16 @@ run. From step 8 on, the move can only be finished.
 
 The cache moves with the home, as a rename costs nothing. After the move, `rlx upgrade` at a
 terminal offers to drop it, saying its size; off a terminal it says how. `rlx move-home
---drop-cache` drops it, after the move as well: rlx makes it again as it needs it.
+--drop-cache` drops it, after the move as well: rlx makes it again as it needs it. The cache holds
+each account's scratch (a live session's files, a background task's output), so it is dropped
+only while nothing runs on the home, the rlx service stopped and started again around it.
+Otherwise it is refused, naming what runs.
+
+`asq-statusline`, which Claude Code runs to draw its status line, is not a command of rlx's. It
+may write a file under `cache/statusline/` while a move is unfinished, which is harmless:
+`cache/` has that name in both layouts. If something makes `~/.aisquare` again before the move
+links it, what was made is kept beside it (`~/.aisquare-made-during-the-move-<when>`), and the
+link is made.
 
 While a move is unfinished (a crash stopped it), no other rlx command runs: each says how to
 finish it (`rlx move-home`) or put the home back (`rlx move-home --rollback`). An agent's hook
