@@ -458,12 +458,13 @@ def home_of(
 def _names_the_old_default(named: Path, base: Path) -> bool:
     """Whether ``named`` is ``base``'s ``~/.aisquare``: the same folder (two stats, links
     followed, so a link to it, an alias or a trailing slash is it, and so is ``~/.rlx`` once
-    ``~/.aisquare`` links to it), or, when either is not there, the same spelling resolved."""
+    ``~/.aisquare`` links to it), or, when either is not there, the same spelling resolved
+    (``os.path.realpath``: each link that is there followed, the rest as spelled)."""
     old = base / OLD_HOME_NAME
     try:
         one, other = os.stat(named), os.stat(old)
     except OSError:
-        return os.path.abspath(named) == os.path.abspath(old)
+        return os.path.realpath(named) == os.path.realpath(old)
     return (one.st_dev, one.st_ino) == (other.st_dev, other.st_ino)
 
 
