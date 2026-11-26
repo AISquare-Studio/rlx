@@ -56,6 +56,7 @@ from aisquare.services.service_host import (
 from aisquare.statusline import read_fleet
 from tests import test_delivery_guards as guards
 from tests import test_fleet_service as fleet_suite
+from tests.fsperms import can_deny_reads, can_deny_writes, can_symlink
 from tests.test_fleet_service import FakeTmux
 from tests.test_remote_control import FakeServer, fake_server, fake_tunnel_factory
 from tests.test_ui_shell import no_real_tmux as _no_real_tmux
@@ -928,6 +929,10 @@ def test_the_service_sweep_asks_the_keychain_only_for_a_login_it_has_a_use_for(
     assert reads == expected, reads
 
 
+@pytest.mark.skipif(
+    not can_deny_reads() or not can_symlink(),
+    reason="chmod(0) denies nothing here (root, or NTFS where it is advice), or no symlinks",
+)
 def test_one_account_folder_that_cannot_be_read_costs_the_sweep_nothing(
     machine: Any, tmp_path: Path
 ) -> None:
@@ -937,8 +942,6 @@ def test_one_account_folder_that_cannot_be_read_costs_the_sweep_nothing(
     the shipper, metrics and the service alike. Claude Code's plain slot is listed whether its
     folder exists or not; here its ~/.claude is a link into a folder this user cannot enter,
     and a managed slot holds the transcript. That plain slot is skipped; the sweep records."""
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("root enters any folder")
     import shutil
 
     from aisquare.core import claude_accounts as accounts_core
@@ -953,8 +956,10 @@ def test_one_account_folder_that_cannot_be_read_costs_the_sweep_nothing(
     locked = tmp_path / "locked"
     (locked / ".claude").mkdir(parents=True)
     plain.symlink_to(locked / ".claude")
-    locked.chmod(0o000)  # the plain slot's folder cannot be stat'ed
+    locked.chmod(0o000)
     try:
+        with pytest.raises(PermissionError):
+            plain.stat()  # the premise: the plain slot's folder cannot be stat'ed
         report = usage_stats.sweep()
     finally:
         locked.chmod(0o700)
@@ -963,6 +968,9 @@ def test_one_account_folder_that_cannot_be_read_costs_the_sweep_nothing(
     assert report.sessions_new == 1, report
 
 
+@pytest.mark.skipif(
+    not can_deny_writes(), reason="the mode bits deny no write here (root, or advice only)"
+)
 def test_a_log_folder_it_cannot_write_does_not_end_the_service_at_a_roll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -970,8 +978,6 @@ def test_a_log_folder_it_cannot_write_does_not_end_the_service_at_a_roll(
     the service within 5 s (roll_if_due -> doRollover -> PermissionError), its stream closed
     by the failed roll; under S2's KeepAlive, a crash loop. It goes on logging to the file it
     has, says once that it cannot roll, and tries no more."""
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("root renames in any folder")
     monkeypatch.setattr(service_host, "LOG_BYTES", 300)
     root = logging.getLogger()
     level = root.level
@@ -984,6 +990,8 @@ def test_a_log_folder_it_cannot_write_does_not_end_the_service_at_a_roll(
             other.write("y" * 400 + "\n")  # a roll is due
         log.parent.chmod(0o500)
         try:
+            with pytest.raises(PermissionError):
+                (log.parent / "premise").touch()  # the premise: the folder takes no new name
             service_host.roll_log_if_due()  # raised PermissionError: the service ended
             logging.getLogger("rlx-test-roll").warning("still logging after the failed roll")
             service_host.roll_log_if_due()  # tried no more
