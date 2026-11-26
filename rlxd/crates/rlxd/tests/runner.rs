@@ -655,18 +655,31 @@ fn cancel_ends_a_running_run_and_its_tree_and_a_queued_one() {
         "an ended run stays as it ended"
     );
 
-    // A queued run: two refreshes, the second waits; cancel it.
+    // A queued run: refreshes, one at a time; w2 and w3 wait; cancel w2. It leaves its
+    // queue: the next run to wait is second, after w3, not third.
     let since = seq(&home);
     let refresh = json!({"kind": "widget_refresh", "prompt": "x", "mount": {"kind": "no_tools"}});
-    let (w1, w2) = (run_id(), run_id());
+    let (w1, w2, w3, w4) = (run_id(), run_id(), run_id(), run_id());
     start(&home, &refresh, &w1);
     start(&home, &refresh, &w2);
+    start(&home, &refresh, &w3);
     let cancelled = home.rlxd(&["call", "run.cancel", &json!({"run_id": w2}).to_string()]);
     assert_eq!(cancelled.data()["cancelled"], true, "{cancelled:?}");
     let events = wait_until(&home, since, 10, "the queued run fails", |e| ended(e, &w2));
     let failed = of(&events, &w2, Some("run.failed"));
     assert_eq!(failed[0]["data"]["reason"], "cancelled");
     assert!(of(&events, &w2, Some("run.started")).is_empty());
+    start(&home, &refresh, &w4);
+    let events = wait_until(&home, since, 10, "w4 waits", |e| {
+        !of(e, &w4, Some("run.queued")).is_empty()
+    });
+    assert_eq!(
+        of(&events, &w4, Some("run.queued"))[0]["data"]["position"],
+        2
+    );
+    for w in [&w3, &w4] {
+        home.rlxd(&["call", "run.cancel", &json!({"run_id": w}).to_string()]);
+    }
     let unknown = home.rlxd(&[
         "call",
         "run.cancel",
@@ -973,4 +986,63 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
     );
     // A goes on once its disk does.
     wait_until(&home, since, 30, "A ends", |e| ended(e, &a));
+}
+
+#[test]
+fn many_runs_at_once_get_one_seq_per_event_in_order() {
+    let home = home("hello");
+    let since = seq(&home);
+    let kinds = [
+        "task",
+        "check",
+        "widget_refresh",
+        "parse_instruction",
+        "widget_author",
+    ];
+    let ids: Vec<String> = (0..15).map(|_| run_id()).collect();
+    thread::scope(|scope| {
+        for (n, id) in ids.iter().enumerate() {
+            let home = &home;
+            scope.spawn(move || {
+                let params = json!({"kind": kinds[n % kinds.len()], "prompt": "hi",
+                    "mount": {"kind": "no_tools"}, "partial": true});
+                start(home, &params, id);
+            });
+        }
+    });
+    let events = wait_until(&home, since, 60, "every run ends", |e| {
+        ids.iter().all(|id| ended(e, id))
+    });
+    let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seqs repeat or go back: {seqs:?}"
+    );
+    for id in &ids {
+        let mine = of(&events, id, None);
+        let run_seqs: Vec<u64> = mine
+            .iter()
+            .map(|e| e["data"]["run_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            run_seqs,
+            (1..=run_seqs.len() as u64).collect::<Vec<_>>(),
+            "{id}"
+        );
+        // The run's log holds exactly the events subscribers got, the same seqs.
+        let log = std::fs::read_to_string(
+            home.root()
+                .join("rlxd")
+                .join("runs")
+                .join(id)
+                .join("events.jsonl"),
+        )
+        .unwrap();
+        let logged: Vec<Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let seen: Vec<Value> = mine.into_iter().cloned().collect();
+        assert_eq!(logged, seen, "{id}");
+    }
 }
