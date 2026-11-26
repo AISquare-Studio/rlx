@@ -6,6 +6,8 @@
 //!   derives every path rlxd and its clients use from it.
 //! - [`Connection`] opens the home's socket, or named pipe on Windows, and sends requests
 //!   and reads their replies, one at a time.
+//! - [`install`] lists the folders rlx and rlxd install to, where a session whose `PATH`
+//!   lacks them still finds them.
 //!
 //! ```no_run
 //! use rlxd_client::{Connection, Home};
@@ -25,6 +27,7 @@
 
 mod connection;
 mod home;
+pub mod install;
 #[cfg(windows)]
 pub mod windows;
 

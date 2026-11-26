@@ -8,9 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
-    DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, Invalid,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, RunScope, SCHEMA_VERSION,
-    StatusData, codes, daemon_kinds, protocol_version_of, schema_version_of, schemas, topics,
+    Auth, DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
+    InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request,
+    RequestId, Role, RunScope, SCHEMA_VERSION, StatusData, codes, daemon_kinds,
+    protocol_version_of, schema_version_of, schemas, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -159,6 +160,7 @@ fn every_schema_is_a_valid_draft_2020_12_schema() {
         "event.json",
         "event-list.json",
         "daemon-record.json",
+        "here-reply.json",
     ] {
         assert!(names.contains(&name), "{name} is not generated");
     }
@@ -1474,6 +1476,12 @@ fn every_pid_is_one_kill_can_take() {
             assert!(error.contains("brain.pid"), "{error}");
         }
     }
+    let here = example("here-reply.json");
+    agrees::<HereData>("here-reply.json", &with(&here, "pid", max.clone()));
+    for pid in [over.clone(), json!(0)] {
+        let error = both_refuse::<HereData>("here-reply.json", with(&here, "pid", pid));
+        assert!(error.contains("pid"), "{error}");
+    }
     let paths = || Paths::new("h", "s", "l", "t", "g");
     let built = StatusData::new("0.10.1", rlxd_proto::PID_MAX + 1, "linux", paths());
     assert_eq!(refused(built), "pid");
@@ -1487,9 +1495,188 @@ fn every_pid_is_one_kill_can_take() {
         ("status-reply.json", "/properties/pid/maximum"),
         ("status-reply.json", "/$defs/Brain/properties/pid/maximum"),
         ("daemon-record.json", "/properties/pid/maximum"),
+        ("here-reply.json", "/properties/pid/maximum"),
     ] {
         let text = fs::read_to_string(schemas_dir().join(schema)).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value.pointer(pointer), Some(&max), "{schema}{pointer}");
+    }
+}
+
+// --- here -----------------------------------------------------------------------------------
+
+fn here_built() -> HereData {
+    HereData::new(
+        InstalledRlxd::new("0.10.3", "/u/.local/bin/rlxd"),
+        InstalledRlx::found("/u/.local/bin/rlx", Some("0.10.3".to_owned())),
+        "/u/.aisquare",
+        "/u/.aisquare/run/rlxd.sock",
+        "macos",
+        Auth::new("/u/.aisquare/rlxd/token"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_here_reply_validates_and_prints_back_as_itself() {
+    let running = example("here-reply.json");
+    assert_eq!(agrees::<HereData>("here-reply.json", &running), running);
+    // Not running: no pid. Running but silent: no version either.
+    let stopped = with(&without(&running, "pid"), "running", json!(false));
+    assert_eq!(agrees::<HereData>("here-reply.json", &stopped), stopped);
+    let silent = without(&running, "version");
+    assert_eq!(agrees::<HereData>("here-reply.json", &silent), silent);
+    let mut shown = running.clone();
+    shown["auth"]["token"] = json!("0123abcd");
+    assert_eq!(agrees::<HereData>("here-reply.json", &shown), shown);
+    let unsupported = with(&running, "supported", json!(false));
+    let unsupported = with(&unsupported, "protocol_versions", json!([2, 3]));
+    assert_eq!(
+        agrees::<HereData>("here-reply.json", &unsupported),
+        unsupported
+    );
+    let mut no_rlx = running.clone();
+    no_rlx["rlx"] = json!({"installed": false});
+    assert_eq!(agrees::<HereData>("here-reply.json", &no_rlx), no_rlx);
+    // What a later rlxd adds, at the top or inside, is ignored.
+    let mut later = with(&running, "later", json!({"x": 1}));
+    later["auth"]["pair"] = json!("rlxd gate pair");
+    later["rlxd"]["signed"] = json!(true);
+    assert_eq!(agrees::<HereData>("here-reply.json", &later), running);
+}
+
+#[test]
+fn the_here_builder_prints_what_its_schema_accepts() {
+    let built = here_built();
+    let printed = agrees::<HereData>("here-reply.json", &serde_json::to_value(&built).unwrap());
+    assert_eq!(printed["installed"], true);
+    assert_eq!(printed["running"], false);
+    assert_eq!(printed["started"], false);
+    assert_eq!(printed["supported"], true);
+    assert_eq!(printed["version"], "0.10.3");
+    assert_eq!(printed["protocol_versions"], json!(PROTOCOL_VERSIONS));
+    assert_eq!(
+        printed["rlxd"]["protocol_versions"],
+        json!(PROTOCOL_VERSIONS)
+    );
+    assert_eq!(printed.get("pid"), None);
+    assert_eq!(
+        printed["auth"],
+        json!({"token_file": "/u/.aisquare/rlxd/token"})
+    );
+    assert_eq!(
+        serde_json::to_value(InstalledRlx::missing()).unwrap(),
+        json!({"installed": false})
+    );
+
+    let new = |rlxd: InstalledRlxd, home: &str, socket: &str, platform: &str, auth: Auth| {
+        HereData::new(rlxd, InstalledRlx::missing(), home, socket, platform, auth)
+    };
+    let rlxd = || InstalledRlxd::new("0.10.3", "/b/rlxd");
+    let auth = || Auth::new("/h/rlxd/token");
+    assert_eq!(refused(new(rlxd(), "", "/s", "linux", auth())), "home");
+    assert_eq!(refused(new(rlxd(), "/h", "", "linux", auth())), "socket");
+    assert_eq!(refused(new(rlxd(), "/h", "/s", "", auth())), "platform");
+    assert_eq!(
+        refused(new(rlxd(), "/h", "/s", "linux", Auth::new(""))),
+        "auth.token_file"
+    );
+    assert_eq!(
+        refused(new(
+            InstalledRlxd::new("", "/b/rlxd"),
+            "/h",
+            "/s",
+            "linux",
+            auth()
+        )),
+        "version"
+    );
+    assert_eq!(
+        refused(new(
+            InstalledRlxd::new("1", ""),
+            "/h",
+            "/s",
+            "linux",
+            auth()
+        )),
+        "rlxd.path"
+    );
+
+    type Break = fn(&mut HereData);
+    let breaks: [(Break, &str); 4] = [
+        (|h| h.pid = Some(0), "pid"),
+        (|h| h.protocol_versions.clear(), "protocol_versions"),
+        (|h| h.protocol_versions = vec![0], "protocol_versions"),
+        (|h| h.version = Some(String::new()), "version"),
+    ];
+    for (break_it, field) in breaks {
+        let mut broken = here_built();
+        break_it(&mut broken);
+        let error = serde_json::to_value(&broken).unwrap_err().to_string();
+        assert!(error.contains(field), "{field}: {error}");
+    }
+    let mut broken = here_built();
+    broken.auth.token = Some(String::new());
+    assert!(
+        serde_json::to_value(&broken).is_err(),
+        "an empty token does not print"
+    );
+    let mut broken = here_built();
+    broken.rlx.version = Some(String::new());
+    assert!(
+        serde_json::to_value(&broken).is_err(),
+        "an empty rlx version does not print"
+    );
+}
+
+#[test]
+fn a_here_reply_refuses_its_wrong_shapes() {
+    let here = example("here-reply.json");
+    for field in [
+        "installed",
+        "running",
+        "started",
+        "supported",
+        "protocol_versions",
+        "socket",
+        "home",
+        "platform",
+        "auth",
+        "rlxd",
+        "rlx",
+    ] {
+        both_refuse::<HereData>("here-reply.json", without(&here, field));
+    }
+    let u32_over = json!(u64::from(u32::MAX) + 1);
+    for (field, value) in [
+        ("installed", json!(false)),
+        ("running", json!("yes")),
+        ("version", json!("")),
+        ("version", Value::Null),
+        ("pid", Value::Null),
+        ("protocol_versions", json!([])),
+        ("protocol_versions", json!([0])),
+        ("protocol_versions", json!([u32_over])),
+        ("socket", json!("")),
+        ("home", json!("")),
+        ("platform", json!("")),
+    ] {
+        both_refuse::<HereData>("here-reply.json", with(&here, field, value));
+    }
+    for (inner, field, value) in [
+        ("auth", "token_file", json!("")),
+        ("auth", "token", json!("")),
+        ("auth", "token", Value::Null),
+        ("rlxd", "version", json!("")),
+        ("rlxd", "path", json!("")),
+        ("rlxd", "protocol_versions", json!([])),
+        ("rlx", "installed", json!("yes")),
+        ("rlx", "version", json!("")),
+        ("rlx", "version", Value::Null),
+        ("rlx", "path", Value::Null),
+    ] {
+        let mut broken = here.clone();
+        broken[inner][field] = value;
+        both_refuse::<HereData>("here-reply.json", broken);
     }
 }

@@ -33,7 +33,7 @@ fn help_names_every_command() {
     assert!(output.status.success(), "{output:?}");
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("Usage: rlxd"), "{help}");
-    for command in ["serve", "status", "stop", "call"] {
+    for command in ["serve", "status", "stop", "call", "here"] {
         assert!(help.contains(&format!("  {command} ")), "{command}: {help}");
     }
 }
@@ -52,6 +52,9 @@ fn a_usage_error_exits_2_and_prints_nothing_on_stdout() {
         &["call", "--env", "{", "status"],
         &["call", "--protocol-version", "one", "status"],
         &["status", "--bogus"],
+        &["here", "--protocols", "0"],
+        &["here", "--protocols", "1-"],
+        &["here", "--bogus"],
     ] {
         let output = run(args);
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
