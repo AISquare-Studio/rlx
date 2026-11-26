@@ -709,7 +709,8 @@ fn socket_call_error(error: CallError, socket: Option<&Path>) -> AskError {
     }
 }
 
-/// The hint for a connection through `--socket` that closed before rlxd replied.
+/// The hint for a connection through `--socket` that closed without a whole reply to
+/// `hello`.
 const FORWARD_CLOSED_HINT: &str = "Through an SSH forward, this most likely means the \
                                    host's rlxd isn't running (start it there with `rlxd here \
                                    --start`, over ssh), or the host's sshd doesn't allow socket \

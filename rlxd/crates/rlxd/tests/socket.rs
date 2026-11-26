@@ -276,6 +276,11 @@ fn a_forward_whose_host_runs_no_rlxd_says_to_start_it_there() {
     let run = client.rlxd(&["call", "--socket", &forward, "--token", "t", "status"]);
     assert_eq!(run.code(), Some(1), "{run:?}");
     assert_eq!(run.error_code(), "disconnected");
+    let message = text(&run.json()["error"]["message"]).to_owned();
+    assert_eq!(
+        message,
+        format!("the connection through {forward} closed without a whole reply to hello")
+    );
     let hint = text(&run.json()["error"]["hint"]).to_owned();
     for cause in [
         "host's rlxd",
@@ -326,11 +331,36 @@ fn a_close_after_hello_was_answered_is_no_forward_hint() {
         run.json()["error"].get("hint").is_none(),
         "no forward hint: {run:?}"
     );
+    let message = text(&run.json()["error"]["message"]).to_owned();
+    assert!(!message.contains("reply to hello"), "{message}");
     let run = client.rlxd(&[
         "events", "--socket", &forward, "--token", "t", "--since", "0",
     ]);
     assert_eq!(run.code(), Some(1), "{run:?}");
     assert!(!run.stderr.contains("rlxd here --start"), "{run:?}");
+
+    // --as-app pairs first: its hello is answered, then gate.pair's connection closes.
+    // That is rlxd's own close too, and no credential is kept.
+    let kept = client.root().join("kept-credential");
+    let kept_arg = kept.display().to_string();
+    let run = client.rlxd(&[
+        "call",
+        "--socket",
+        &forward,
+        "--token",
+        "t",
+        "--as-app",
+        "--gate-credential-file",
+        &kept_arg,
+        "status",
+    ]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "disconnected");
+    assert!(
+        run.json()["error"].get("hint").is_none(),
+        "no forward hint after gate.pair's hello: {run:?}"
+    );
+    assert!(!kept.exists());
 }
 
 #[cfg(target_os = "linux")]
