@@ -81,6 +81,7 @@ from aisquare.cli.ui.groups import (
     TogglePin,
     UndoLayout,
 )
+from aisquare.cli.ui.needs_you_bar import BAR_WORKER, OPEN_KEY, NeedsYouBar
 from aisquare.cli.ui.project_menu import (
     FRESH,
     PAUSE,
@@ -1446,6 +1447,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         Binding("R", "remote_panel", "remote"),
         Binding("r", "refresh_now", "refresh"),
         Binding("a", "toggle_captured", "captured", show=False),
+        Binding(OPEN_KEY, "open_need", "needs you", show=False),  # M7: the bar's first item
     ]
     SIDEBAR_ACTIONS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -1668,6 +1670,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     # --- layout -------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        yield NeedsYouBar(id="needs-you-bar")  # M7: what needs you, in any project
         yield PaneSwitch(self.escape_key, id="pane-switch")
         with Panes(id="main"):
             yield Sidebar(id="sidebar", captain=self.captain_on)
@@ -1988,6 +1991,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.unsaved = Autosave.flush_all(self)
 
     # --- help / refresh ---------------------------------------------------------------
+
+    def action_open_need(self) -> None:
+        """F6: the needs-you bar's first item, on its project's board (M7)."""
+        self.query_one(NeedsYouBar).open_first()
 
     def action_help(self) -> None:
         self.push_screen(
@@ -4992,6 +4999,7 @@ def _waited_reads() -> dict[str, str]:
         agent.TASK_WORKER: "an agent's task",
         agent.OFFER_WORKER: "the account a limited agent can move to",
         board.LABELS_WORKER: "a board's account names",
+        BAR_WORKER: "the needs-you bar's read of the boards",
         board.HISTORY_WORKER: "a board's task history",
         fleet_bulk.PLAN_WORKER: "Settings ▸ Fleet's read of the running agents",
         resources.SAMPLE_WORKER: "Agent resources' read of the agents",
