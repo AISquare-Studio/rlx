@@ -179,7 +179,7 @@ def _last_wake(store: ContextStore, session: TeamSession, cursor: int) -> dateti
     if mode == "schedule" and project is not None:
         return manager_pass.read(store, project, session.project_id)[1].decision_at
     for event in store.recent_events(session.project_id, limit=100):
-        if event.seq <= cursor and team_service.manager_wakes(store, event, session, None):
+        if event.seq <= cursor and team_service.wake_class(event, session) == "wake":
             return event.created_at
     return None
 
@@ -343,9 +343,10 @@ def _check_reserved(session_id: str, cursor: int, token: str, settings: FleetSet
         waited += ACK_POLL
     if settings.quiet_compact_resume and fleet_service.quiet_prompt_refusal(agent) is None:
         with store_session() as store:
-            current = store.get_session(session.id)
-            if current is None or team_service.wake_pending(store, current):
-                return "compacted"
+            if manager_seat.policy(store, agent.project_id).configured:
+                current = store.get_session(session.id)
+                if current is None or team_service.wake_pending(store, current):
+                    return "compacted"
         since = _now()
 
         def prompted() -> bool:  # its UserPromptSubmit stamps prompted_at (P0-W1a)

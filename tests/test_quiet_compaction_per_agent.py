@@ -328,6 +328,37 @@ def test_a_compacted_codex_manager_gets_its_start_pack_with_the_line_typed_after
     assert live.session().prompted_at is not None
 
 
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_compaction_resume_honors_policy_when_a_wake_arrives_during_compaction(
+    live: LiveQuietManager, clock: FakeClock, monkeypatch: pytest.MonkeyPatch, scheduled: bool
+) -> None:
+    """Default resume still runs while scheduled urgency gets its own delivery."""
+    if scheduled:
+        with store_session() as store:
+            store.set_project_setting(live.agent.project_id, "manager_wake", "schedule")
+    type_line = fleet_service.type_line
+
+    def with_news(*args: Any, **kwargs: Any) -> Any:
+        result = type_line(*args, **kwargs)
+        if args[1] == "/compact":
+            team_service.add_note(
+                "work arrived during compaction",
+                kind="question" if scheduled else "result",
+                to_role=live.sid if scheduled else None,
+                board_id=live.session().project_id,
+            )
+        return result
+
+    monkeypatch.setattr(fleet_service, "type_line", with_news)
+    assert _check(live, clock) == "compacted"
+    if scheduled:
+        assert live.pane.prompts == ["/compact"]
+        with store_session() as store:
+            assert team_service.wake_pending(store, live.session())
+    else:
+        assert live.pane.prompts == ["/compact", quiet_compact.RESUME_LINE]
+
+
 def test_codexs_compact_start_comes_with_a_turn_so_it_neither_acknowledges_nor_rests_the_row(
     live: LiveQuietManager, clock: FakeClock
 ) -> None:
