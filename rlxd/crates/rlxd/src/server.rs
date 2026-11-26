@@ -41,7 +41,8 @@ use std::time::{Duration, Instant};
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, SettingsDeleteParams,
+    PROTOCOL_VERSIONS, Params, Paths, PtyKillParams, PtyResizeParams, PtyScreenParams,
+    PtySpawnParams, PtyWriteParams, Request, RequestId, Role, SettingsDeleteParams,
     SettingsGetParams, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, VERSION,
     codes, event_types, methods, setting_keys, topics,
 };
@@ -55,6 +56,7 @@ use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
+use crate::pty::{self, Host};
 use crate::settings::{self, Settings};
 use crate::{claude, token};
 
@@ -88,8 +90,9 @@ pub struct Daemon {
     pipe_acl: Option<&'static str>,
     clients: Mutex<Clients>,
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
-    bus: Bus,
+    bus: Arc<Bus>,
     settings: Settings,
+    ptys: Host,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
@@ -176,6 +179,7 @@ impl Daemon {
         bus: Bus,
         settings: Settings,
     ) -> Arc<Self> {
+        let bus = Arc::new(bus);
         Arc::new(Self {
             home,
             token,
@@ -183,6 +187,7 @@ impl Daemon {
             pipe_acl,
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
+            ptys: Host::new(Arc::clone(&bus)),
             bus,
             settings,
             stopping: AtomicBool::new(false),
@@ -194,6 +199,11 @@ impl Daemon {
     /// The home's event bus.
     pub fn bus(&self) -> &Bus {
         &self.bus
+    }
+
+    /// Ends every PTY's process, as rlxd stops: none outlives it.
+    pub fn end_ptys(&self) {
+        self.ptys.kill_all();
     }
 
     /// Publishes `daemon.started {version, pid}`, the first event of this rlxd's life.
@@ -417,6 +427,12 @@ impl Daemon {
             methods::SETTINGS_SET => self.settings_set(session, request.params),
             methods::SETTINGS_LIST => self.settings_list(request.params),
             methods::SETTINGS_DELETE => self.settings_delete(session, request.params),
+            methods::PTY_SPAWN
+            | methods::PTY_WRITE
+            | methods::PTY_RESIZE
+            | methods::PTY_SCREEN
+            | methods::PTY_KILL
+            | methods::PTY_LIST => self.pty_call(session, &request.method, request.params),
             methods::GATE_PAIR => match self.gate_pair(session, &request.params).await {
                 Ok((data, minted)) => {
                     return Answer::Paired(Envelope::ok(data).with_id(id), minted);
@@ -512,6 +528,39 @@ impl Daemon {
         let params = params_of::<SettingsListParams>(methods::SETTINGS_LIST, params)?;
         let list = off_worker(|| self.settings.list(params.prefix.as_deref())).map_err(refused)?;
         printed(&list)
+    }
+
+    /// A `pty.*` call, if the connection's role may make it (`pty_allowed`). Each runs
+    /// as blocking work: a spawn forks, a kill waits for the process group to go.
+    fn pty_call(&self, session: &Session, method: &str, params: Params) -> Result<Data, ErrorBody> {
+        if !pty_allowed(session.role, method) {
+            return Err(role_not_allowed(session.role, method));
+        }
+        let who = format!("{} {}", role_name(session.role), session.client);
+        match method {
+            methods::PTY_SPAWN => {
+                let params = params_of::<PtySpawnParams>(method, params)?;
+                let spawned = off_worker(|| self.ptys.spawn(&params, &who));
+                printed(&spawned.map_err(pty_refused)?)
+            }
+            methods::PTY_WRITE => {
+                let params = params_of::<PtyWriteParams>(method, params)?;
+                printed(&off_worker(|| self.ptys.write(&params)).map_err(pty_refused)?)
+            }
+            methods::PTY_RESIZE => {
+                let params = params_of::<PtyResizeParams>(method, params)?;
+                printed(&off_worker(|| self.ptys.resize(&params)).map_err(pty_refused)?)
+            }
+            methods::PTY_SCREEN => {
+                let params = params_of::<PtyScreenParams>(method, params)?;
+                printed(&off_worker(|| self.ptys.screen(&params)).map_err(pty_refused)?)
+            }
+            methods::PTY_KILL => {
+                let params = params_of::<PtyKillParams>(method, params)?;
+                printed(&off_worker(|| self.ptys.kill(&params, &who)).map_err(pty_refused)?)
+            }
+            _ => printed(&off_worker(|| self.ptys.list()).map_err(pty_refused)?),
+        }
     }
 
     /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
@@ -1517,6 +1566,65 @@ fn refused(refused: settings::Refused) -> ErrorBody {
     }
 }
 
+/// Whether a connection of `role` may call the PTY `method` (1.4): `cli` and `tui`, the
+/// fleet and the user, every one; `remote` the reads and `pty.write`, as the phone answers
+/// prompts; `app` the reads only, its panes being read-only.
+fn pty_allowed(role: Role, method: &str) -> bool {
+    let read = matches!(
+        method,
+        methods::PTY_LIST | methods::PTY_SCREEN | methods::PTY_SUBSCRIBE
+    );
+    match role {
+        Role::Cli | Role::Tui => true,
+        Role::Remote => read || method == methods::PTY_WRITE,
+        Role::App => read,
+        _ => false,
+    }
+}
+
+fn role_not_allowed(role: Role, method: &str) -> ErrorBody {
+    let name = role_name(role);
+    let mut detail = Data::new();
+    detail.insert("role".to_owned(), Value::from(name.clone()));
+    detail.insert("method".to_owned(), Value::from(method));
+    error(
+        codes::ROLE_NOT_ALLOWED,
+        &format!("a {name} connection may not call {method}"),
+    )
+    .with_hint(
+        "cli and tui may use every pty method; remote may list, read, subscribe read-only \
+         and write; app may list, read and subscribe read-only.",
+    )
+    .with_detail(detail)
+    .expect("role_not_allowed's detail is an object")
+}
+
+/// The error a refused PTY call gets.
+fn pty_refused(refused: pty::Refused) -> ErrorBody {
+    match refused {
+        pty::Refused::TooMany => {
+            let mut detail = Data::new();
+            detail.insert("max".to_owned(), Value::from(pty::MAX_PTYS));
+            error(
+                codes::TOO_MANY_PTYS,
+                &format!("the home holds {} ptys, the most it may", pty::MAX_PTYS),
+            )
+            .with_hint("pty.kill one first: an exited pty counts until it is killed.")
+            .with_detail(detail)
+            .expect("too_many_ptys' detail is an object")
+        }
+        pty::Refused::Unknown(id) => error(codes::UNKNOWN_PTY, &format!("no pty {id}"))
+            .with_hint("pty.list names every pty of the home."),
+        pty::Refused::Exited(id) => {
+            error(codes::PTY_EXITED, &format!("pty {id}'s process has ended"))
+                .with_hint("Its screen stays until pty.kill.")
+        }
+        pty::Refused::SpawnFailed(why) => error(codes::SPAWN_FAILED, &why),
+        pty::Refused::Invalid(why) => error(codes::INVALID_PARAMS, &why),
+        pty::Refused::Busy(why) => error(codes::INTERNAL, &why),
+    }
+}
+
 /// The methods this rlxd serves after `hello`.
 fn served() -> Vec<&'static str> {
     let mut served = vec![
@@ -1532,6 +1640,12 @@ fn served() -> Vec<&'static str> {
         methods::GATE_PAIR_ANSWER,
         methods::GATE_DEVICES,
         methods::GATE_UNPAIR,
+        methods::PTY_SPAWN,
+        methods::PTY_WRITE,
+        methods::PTY_RESIZE,
+        methods::PTY_SCREEN,
+        methods::PTY_KILL,
+        methods::PTY_LIST,
     ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);

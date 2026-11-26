@@ -52,6 +52,8 @@ unicode-normalization = "0.1"
 unicode-security = "0.1"
 # The PTY screen model's character widths (handoff 0.10.3, 1.4).
 unicode-width = "0.2"
+# The PTY host (handoff 0.10.3, 1.4): pseudo-terminals, ConPTY on Windows.
+portable-pty = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

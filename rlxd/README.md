@@ -222,6 +222,32 @@ token reads every one.
   credential is replaced, can no longer change a protected key.
   `crates/rlxd/tests/settings.rs` pairs a device for real, in gate dev mode.
 
+## PTYs
+
+rlxd holds processes on pseudo-terminals (handoff 1.4), as tmux held the fleet's panes:
+ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the screen.
+
+- **The methods:** `pty.spawn {argv, cols, rows, cwd?, env?, label?}`, `pty.write
+  {pty_id, text | keys | paste}`, `pty.resize`, `pty.screen {pty_id, scrollback?}`,
+  `pty.kill` and `pty.list`, each through `rlxd call`. Their shapes are in
+  `schemas/v1/README.md`.
+- **The screen is tmux's.** `pty.screen`'s `text` is what `tmux capture-pane -e -p`
+  prints for the same screen, byte for byte. `crate::vt` is tmux 3.8's own grid, screen
+  writes and input parser, ported. Each ported file keeps tmux's ISC notice.
+  `tests/vt_tmux.rs` checks it against tmux itself on 41 screens, and `tests/pty.rs`
+  runs the handoff's own `cmp`.
+- **A PTY outlives every client,** and one any connection spawned is in every
+  connection's `pty.list`. A process that ends keeps its screen and exit status until
+  `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `rlxd stop` ends them all.
+- **`pty.kill`** ends the process's whole group: SIGHUP and SIGTERM, then SIGKILL after
+  two seconds. It replies once the group is gone.
+- **Who may do what:** `cli` and `tui` every method; `remote` the reads and
+  `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
+- **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;
+  1 MiB a write.
+- **The terminal** is `TERM=xterm-256color`, `COLORTERM=truecolor`, unless `env` says
+  otherwise.
+
 ## `rlxd here`: what rlx.app asks a host before it connects
 
 rlx.app runs `rlxd here --json --start` on a host over SSH, inside the authenticated
@@ -483,3 +509,7 @@ is renamed aside, and the next install removes it.
 ## Licence
 
 MIT, as rlx is (`../LICENSE`).
+
+`crates/rlxd/src/vt/` is ported from tmux 3.8 (its grid, screen writes, input parser
+and UTF-8 handling), and stays under tmux's ISC licence: its copyright and permission
+notice heads each of those files.
