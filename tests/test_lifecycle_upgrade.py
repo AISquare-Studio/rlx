@@ -4596,3 +4596,57 @@ def test_a_service_that_does_not_stop_refuses_the_uninstall_before_anything_goes
         lifecycle._stop_the_service_for_good()
     assert refused.value.error == "service_running"
     assert "nothing was removed" in str(refused.value)
+
+
+def test_the_service_starts_again_on_the_new_installs_interpreter_not_this_ones(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The installer has replaced what this process runs: the service starts again on the
+    interpreter of the install now in place, the one the version check asks (review of #32,
+    #1717), and only once that install says it has an rlx service."""
+    from aisquare.services import service_host
+
+    started: list[list[str]] = []
+
+    def start_service(*, argv: list[str], **_: Any) -> Any:
+        started.append(list(argv))
+        return _a_service(4242, machine.new_version)
+
+    monkeypatch.setattr(service_host, "stop_service", lambda **_: True)
+    monkeypatch.setattr(service_host, "start_service", start_service)
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    python = str(tool.facts.executable)
+    assert python != sys.executable
+    assert [python, "-P", "-m", "aisquare", "service", "--help"] in machine.captured
+    assert started == [[python, "-P", "-m", "aisquare", "service", "run"]], started
+
+
+def test_a_move_to_a_release_with_no_service_leaves_it_stopped_and_says_so(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A move back to 0.10.1, which has no `rlx service`: started again, the service exited at
+    once on "No such command" (#1717). It stays stopped, and the upgrade says why."""
+    from aisquare.services import service_host
+
+    answer = install_route.run_captured
+
+    def run_captured(argv: Any, *, timeout: float) -> Captured:
+        if list(argv[-2:]) == ["service", "--help"]:
+            return Captured(2, "", "Error: No such command 'service'.\n")
+        return answer(argv, timeout=timeout)
+
+    started: list[object] = []
+    monkeypatch.setattr(install_route, "run_captured", run_captured)
+    monkeypatch.setattr(service_host, "stop_service", lambda **_: True)
+    monkeypatch.setattr(service_host, "start_service", lambda **kw: started.append(kw))
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert started == [], "nothing started into a release that has no service"
+    notes = _one_object(result.stdout)["notes"]
+    said = f"the rlx service stays stopped: {machine.new_version} has no rlx service"
+    assert said in notes, notes

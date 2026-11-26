@@ -1260,12 +1260,12 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
 
     service_ran = _stop_the_service(plan.command)
     code = install_route.run_installer(plan.argv, env=plan.env, to_stderr=to_stderr)
-    service_said = _start_the_service_again(service_host) if service_ran else None
     if code != 0:
         # Asked too: uv resolves before it replaces anything (measured, uv 0.12.19), so a
         # run it could not resolve, as under a cutoff that excludes even the release that
         # runs, leaves that release installed, and no reinstall from nothing is needed.
         kept, _ = _installed_version(plan)
+        service_said = _start_the_service_again(service_host, plan, kept) if service_ran else None
         return UpgradeReport(
             plan,
             exit_code=code,
@@ -1275,6 +1275,7 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         )
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
+    service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
     if problem is not None:
         said = (service_said,) if service_said else ()
         return UpgradeReport(plan, exit_code=code, version=version, problem=problem, notes=said)
@@ -1318,11 +1319,25 @@ def _stop_the_service(command: str) -> bool:
         raise UpgradeRefused(f"{exc}: the upgrade replaces nothing under it", command) from exc
 
 
-def _start_the_service_again(service_host: ModuleType) -> str:
+def _start_the_service_again(
+    service_host: ModuleType, plan: UpgradePlan, version: str | None
+) -> str:
     """Start the rlx service that :func:`_stop_the_service` stopped, as a new process of the
-    install now in place: what the upgrade says of it."""
+    install now in place: what the upgrade says of it.
+
+    On that install's interpreter (``plan.route.facts.executable``, the one the version check
+    asks), never this process's: the installer has replaced what this one runs. And only into
+    a release that has the service, which that interpreter is asked first: a move back to
+    0.10.1 restarted into "No such command" (review of #32, #1717); it stays stopped, said."""
+    command = [str(plan.route.facts.executable), "-P", "-m", "aisquare", "service"]
+    asked = install_route.run_captured([*command, "--help"], timeout=VERSION_CHECK_TIMEOUT_SECONDS)
+    release, stopped = version or "the release now installed", f"the {service_host.SERVICE}"
+    if asked.error is not None:
+        return f"{stopped} stays stopped: {release} could not be asked ({asked.error})"
+    if asked.returncode != 0:
+        return f"{stopped} stays stopped: {release} has no {service_host.SERVICE}"
     try:
-        service = service_host.start_service()
+        service = service_host.start_service(argv=[*command, "run"])
     except service_host.ServiceError as exc:
         return f"the {service_host.SERVICE} did not start again: {exc}"
     return f"the {service_host.SERVICE} runs again (pid {service.pid}), on {service.version}"

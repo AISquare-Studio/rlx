@@ -221,6 +221,55 @@ def test_usage_reads_go_on_with_no_tui_and_the_before_limit_hook_reads_them(
     assert fetch.calls == ["tok-work"], "a minute later the cache answers"
 
 
+@pytest.mark.parametrize("over_ssh", [False, True])
+def test_the_usage_part_says_the_keychain_is_locked_in_an_ssh_logins_session(
+    monkeypatch: pytest.MonkeyPatch, over_ssh: bool
+) -> None:
+    """Design A.3 of #32, which docs/service.md promises (#1717): on macOS a service started
+    from an SSH login keeps that login's security session, where the Keychain does not answer;
+    its usage part's health says so. At the Mac, it reads as before."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(accounts_service, "list_accounts", lambda: [])
+    reading = SimpleNamespace(level="good", usable=0, needs_login=0)
+    part = UsagePart(read=lambda **_: reading, out_of_reach=lambda: over_ssh)  # type: ignore[arg-type]
+    part.start_part()
+
+    health = part.tick_part()
+
+    if over_ssh:
+        assert health.state == "error" and health.detail is not None
+        assert health.detail.startswith("Keychain locked"), health.detail
+    else:
+        assert health.state == "ok" and "Keychain" not in (health.detail or "")
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_service_start_from_an_ssh_login_warns_it_reads_no_keychain(
+    monkeypatch: pytest.MonkeyPatch, json_output: bool
+) -> None:
+    """Design A.3: `rlx service start` run over SSH on macOS starts the service, as asked, and
+    warns that it reads no usage there. Nothing really starts here: start_service is a stub."""
+    me = instances.describe_this_process(kind="service")
+    monkeypatch.setattr(service_host, "running_service", lambda **_: None)
+    monkeypatch.setattr(service_host, "start_service", lambda **_: me)
+    monkeypatch.setattr(service_host, "keychain_out_of_reach", lambda: True)
+
+    args = ["--json", "service", "start"] if json_output else ["service", "start"]
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    if json_output:
+        said = json.loads(result.output)
+        assert said["started"] is True and said["warning"] == service_host.KEYCHAIN_OUT_OF_REACH
+    else:
+        assert f"warning: {service_host.KEYCHAIN_OUT_OF_REACH}" in result.output.replace("\n", " ")
+
+    monkeypatch.setattr(service_host, "keychain_out_of_reach", lambda: False)
+    quiet = CliRunner().invoke(app, ["--json", "service", "start"])
+    assert "warning" not in json.loads(quiet.output), "at the Mac: no warning"
+
+
 def test_a_nudge_a_draft_held_back_goes_out_with_no_tui(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
 ) -> None:

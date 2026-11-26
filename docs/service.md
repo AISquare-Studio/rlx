@@ -29,8 +29,8 @@ rlx service run        # run it in this terminal instead (Ctrl-C stops it)
 part with its `state` (`ok`, `off`, `waiting` or `error`), a `detail` line and `last_run`. It
 exits 3 when no service runs.
 
-There is one service per home (`~/.rlx`). Its status is in `~/.rlx/service/`, and its log in
-`~/.rlx/logs/service.log` (`log/` in a home from before 0.10.2).
+There is one service per home (`~/.aisquare`). Its status is in `~/.aisquare/service/`, and
+its log in `~/.aisquare/log/service.log`, which rolls over at 1 MB with one old file kept.
 
 `rlx upgrade` stops the service before it replaces rlx and starts it again on the new release.
 `rlx uninstall` stops it. Neither refuses to run beside it, as they do beside an rlx window.
@@ -46,7 +46,11 @@ An rlx window that finds the service running leaves those parts to it:
 - The chip under the status line counts the service: `2 rlx · Mac (here) + service`.
 
 If the service stops while a window is open, that window takes the parts back within 30
-seconds: Remote comes back on there if its switch is on. The window says so once.
+seconds: Remote comes back on there if its switch is on, as it is saved then. The window says
+so once.
+
+If Remote can't start in the service (its port is taken, say), the service tries again a few
+times over about a minute, then turns Remote's switch off. The window's Remote panel says why.
 
 With no service, rlx windows work as they always have.
 
@@ -64,8 +68,8 @@ The service is one more rlx on the home ([Running more than one rlx](multi-insta
 
 On macOS, Claude Code keeps each login in the login Keychain, which only answers inside your
 login session. Start the service from a terminal at the Mac. A service started from an SSH
-session can't read the Keychain, so its usage reads come back empty, and its `usage` part
-says so in `rlx service status`.
+session can't read the Keychain, so its usage reads come back empty. `rlx service start` warns
+when you run it over SSH, and the `usage` part says `Keychain locked` in `rlx service status`.
 
 Starting the service at login, and a menu bar icon, come in a later release.
 

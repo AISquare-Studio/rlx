@@ -71,7 +71,12 @@ def service_start() -> None:
         if started
         else f"the {SERVICE} already runs (pid {service.pid})"
     )
-    _say({"started": started, "pid": service.pid, "version": service.version}, line)
+    data: dict[str, Any] = {"started": started, "pid": service.pid, "version": service.version}
+    if started and service_host.keychain_out_of_reach():
+        # Design A.3 of #32: it starts, as asked, but in this login's session for good.
+        data["warning"] = service_host.KEYCHAIN_OUT_OF_REACH
+        line = f"{line}\nwarning: {service_host.KEYCHAIN_OUT_OF_REACH}"
+    _say(data, line)
 
 
 @app.command("stop")

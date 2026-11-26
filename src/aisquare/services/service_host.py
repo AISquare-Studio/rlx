@@ -287,6 +287,25 @@ class RemotePart:
 ReadHeadroom = Callable[..., "HeadroomSummary"]
 
 
+KEYCHAIN_OUT_OF_REACH = (
+    "Keychain locked: this service was started from an SSH login, and macOS keeps the login "
+    "Keychain from that session, so Claude Code's usage reads come back empty; start it from "
+    "a terminal at the Mac"
+)
+"""The usage part's health, and ``rlx service start``'s warning, for a service in an SSH
+login's session on macOS (design A.3 of #32)."""
+
+
+def keychain_out_of_reach() -> bool:
+    """Whether this process runs in a macOS security session an SSH login established
+    (``core.login_session``), where the login Keychain does not answer: every process started
+    from it, a detached service included, inherits that session. ``False`` off macOS, or when
+    macOS cannot be asked."""
+    from aisquare.core import login_session
+
+    return login_session.remote_session() is True
+
+
 class UsagePart:
     """The accounts' usage, every :data:`USAGE_SECONDS`, through the cache a TUI reads
     (``claude_accounts.read_fleet_headroom``): the network is asked only for a reading over
@@ -299,11 +318,18 @@ class UsagePart:
     every = USAGE_SECONDS
     first = 0.0
 
-    def __init__(self, read: ReadHeadroom | None = None) -> None:
+    def __init__(
+        self,
+        read: ReadHeadroom | None = None,
+        *,
+        out_of_reach: Callable[[], bool] = keychain_out_of_reach,
+    ) -> None:
         self._read = read
+        self._out_of_reach = out_of_reach
+        self._locked = False
 
     def start_part(self) -> None:
-        return None
+        self._locked = self._out_of_reach()  # a process's session is its own for good
 
     def tick_part(self) -> PartHealth:
         from aisquare.services import claude_accounts as accounts_service
@@ -317,6 +343,8 @@ class UsagePart:
             if summary.needs_login:
                 line += f", {summary.needs_login} to sign in"
             said.append(line)
+        if self._locked:
+            return PartHealth("error", f"{KEYCHAIN_OUT_OF_REACH} ({'; '.join(said)})")
         return PartHealth("ok", "; ".join(said))
 
     def stop_part(self) -> None:
@@ -893,6 +921,7 @@ def log_to_file() -> None:
 
 
 __all__ = [
+    "KEYCHAIN_OUT_OF_REACH",
     "KIND",
     "NOT_HERE",
     "Hosting",
@@ -909,6 +938,7 @@ __all__ = [
     "UsagePart",
     "default_parts",
     "hosting",
+    "keychain_out_of_reach",
     "read_status",
     "restart_service",
     "run_service",
