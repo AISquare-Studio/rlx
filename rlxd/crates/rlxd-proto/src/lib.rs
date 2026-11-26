@@ -165,6 +165,12 @@ pub const PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
 /// protocol version.
 pub const SCHEMA_VERSION: u32 = PROTOCOL_VERSION;
 
+/// The largest process id any document here may carry: 2^31 - 1, `i32::MAX`. A pid
+/// goes to `kill`, whose `pid_t` is a C `int`, so a larger one would wrap to a negative
+/// pid, and `-1` signals every process the caller may signal. Python's registry reads a
+/// larger pid as no pid at all (`aisquare.core.registry.PID_MAX`).
+pub const PID_MAX: u32 = 2_147_483_647;
+
 /// rlxd's version, which is rlx's version: one number (handoff 0.10.3, 1.2).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

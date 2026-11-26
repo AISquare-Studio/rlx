@@ -91,8 +91,9 @@ pub mod kinds {
 }
 
 impl DaemonRecord {
-    /// The largest pid a record may say: 2^31 - 1, Python's `core.registry.PID_MAX`.
-    pub const PID_MAX: u32 = 2_147_483_647;
+    /// The largest pid a record may say: [`PID_MAX`](crate::PID_MAX), which is Python's
+    /// `core.registry.PID_MAX`.
+    pub const PID_MAX: u32 = crate::PID_MAX;
 
     /// A record with no `cwd`. Refuses what `daemon-record.json` refuses: an `id` that is
     /// not 12 lowercase hex characters, an empty kind, a pid outside 1 to
@@ -144,8 +145,7 @@ impl DaemonRecord {
             ));
         }
         check::non_empty("kind", &self.kind)?;
-        check::at_least("pid", u64::from(self.pid), 1)?;
-        check::at_most("pid", u64::from(self.pid), u64::from(Self::PID_MAX))?;
+        check::pid("pid", self.pid)?;
         check::date_time("started_at", &self.started_at)?;
         check::date_time("heartbeat_at", &self.heartbeat_at)?;
         if self.argv.is_empty() {

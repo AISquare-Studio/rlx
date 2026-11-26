@@ -37,10 +37,10 @@
       "$ref": "#/$defs/Paths"
     },
     "pid": {
-      "description": "rlxd's process id.",
+      "description": "rlxd's process id, from 1 to 2147483647 (2^31 - 1), so a client's `kill` of it, a\nC `int`, can never be `kill(-1)`.",
       "type": "integer",
       "format": "uint32",
-      "maximum": 4294967295,
+      "maximum": 2147483647,
       "minimum": 1
     },
     "pipe_acl": {
@@ -105,11 +105,11 @@
           "minimum": 0
         },
         "pid": {
-          "description": "Its process id, while one runs.",
+          "description": "Its process id, while one runs: from 1 to 2147483647 (2^31 - 1), as rlxd's.",
           "type": "integer",
           "format": "uint32",
-          "maximum": 4294967295,
-          "minimum": 0
+          "maximum": 2147483647,
+          "minimum": 1
         },
         "restarts": {
           "description": "How many times rlxd started it again.",

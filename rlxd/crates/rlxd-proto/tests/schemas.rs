@@ -1454,3 +1454,42 @@ fn a_daemon_records_pid_is_one_python_can_signal() {
         json!(DaemonRecord::PID_MAX)
     );
 }
+
+#[test]
+fn every_pid_is_one_kill_can_take() {
+    // PID_MAX is i32::MAX: a pid goes to kill(), and a larger one wraps negative.
+    assert_eq!(rlxd_proto::PID_MAX, i32::MAX as u32);
+    let over = json!(u64::from(rlxd_proto::PID_MAX) + 1);
+    let max = json!(rlxd_proto::PID_MAX);
+    let status = example("status-reply.json");
+    agrees::<StatusData>("status-reply.json", &with(&status, "pid", max.clone()));
+    both_refuse::<StatusData>("status-reply.json", with(&status, "pid", over.clone()));
+    for pid in [max.clone(), over.clone(), json!(0)] {
+        let mut brain = status.clone();
+        brain["brain"]["pid"] = pid.clone();
+        if pid == max {
+            agrees::<StatusData>("status-reply.json", &brain);
+        } else {
+            let error = both_refuse::<StatusData>("status-reply.json", brain);
+            assert!(error.contains("brain.pid"), "{error}");
+        }
+    }
+    let paths = || Paths::new("h", "s", "l", "t", "g");
+    let built = StatusData::new("0.10.1", rlxd_proto::PID_MAX + 1, "linux", paths());
+    assert_eq!(refused(built), "pid");
+    let mut status = StatusData::new("0.10.1", rlxd_proto::PID_MAX, "linux", paths()).unwrap();
+    status.brain.pid = Some(rlxd_proto::PID_MAX + 1);
+    assert!(
+        serde_json::to_value(&status).is_err(),
+        "a brain pid over PID_MAX does not print"
+    );
+    for (schema, pointer) in [
+        ("status-reply.json", "/properties/pid/maximum"),
+        ("status-reply.json", "/$defs/Brain/properties/pid/maximum"),
+        ("daemon-record.json", "/properties/pid/maximum"),
+    ] {
+        let text = fs::read_to_string(schemas_dir().join(schema)).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value.pointer(pointer), Some(&max), "{schema}{pointer}");
+    }
+}

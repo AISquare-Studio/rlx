@@ -28,8 +28,9 @@ pub struct StatusData {
     /// rlxd's version, which is rlx's.
     #[schemars(length(min = 1))]
     pub version: String,
-    /// rlxd's process id.
-    #[schemars(range(min = 1))]
+    /// rlxd's process id, from 1 to 2147483647 (2^31 - 1), so a client's `kill` of it, a
+    /// C `int`, can never be `kill(-1)`.
+    #[schemars(range(min = 1, max = 2147483647))]
     pub pid: u32,
     /// The OS rlxd runs on: `macos`, `linux` or `windows`.
     #[schemars(length(min = 1))]
@@ -113,13 +114,13 @@ pub struct Clients {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
 pub struct Brain {
-    /// Its process id, while one runs.
+    /// Its process id, while one runs: from 1 to 2147483647 (2^31 - 1), as rlxd's.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    #[schemars(transform = drop_null)]
+    #[schemars(transform = drop_null, range(min = 1, max = 2147483647))]
     pub pid: Option<u32>,
     /// How many times rlxd started it again.
     pub restarts: u64,
@@ -216,7 +217,8 @@ impl StatusData {
 
     /// A status speaking this crate's [`PROTOCOL_VERSION`], with no capabilities, no
     /// clients, nothing running, Claude Code not found and the gate for signed apps
-    /// only. Refuses an empty version or platform, and pid 0.
+    /// only. Refuses an empty version or platform, and a pid outside 1 to
+    /// [`PID_MAX`](crate::PID_MAX).
     pub fn new(
         version: impl Into<String>,
         pid: u32,
@@ -246,7 +248,10 @@ impl StatusData {
     /// Whether this status keeps every rule of `status-reply.json`.
     pub fn validate(&self) -> Result<(), Invalid> {
         check::non_empty("version", &self.version)?;
-        check::at_least("pid", u64::from(self.pid), 1)?;
+        check::pid("pid", self.pid)?;
+        if let Some(pid) = self.brain.pid {
+            check::pid("brain.pid", pid)?;
+        }
         check::non_empty("platform", &self.platform)?;
         check::at_least("protocol_version", u64::from(self.protocol_version), 1)?;
         check::non_empty("gate", &self.gate)?;
