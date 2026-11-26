@@ -295,7 +295,15 @@ impl Bus {
     pub fn open_at(path: PathBuf, limits: Limits) -> Result<Self, String> {
         let mark = Mark::new(path);
         let last = mark.read()?;
-        let reserved = last.saturating_add(RESERVE);
+        if last > u64::MAX - RESERVE {
+            return Err(format!(
+                "{} holds {last}: so few seqs are left that rlxd will not start. Remove the \
+                 file to number events from 1 again, and clients may miss events numbered \
+                 before",
+                mark.path.display()
+            ));
+        }
+        let reserved = last + RESERVE;
         mark.write(reserved)
             .map_err(|e| format!("cannot write {}: {e}", mark.path.display()))?;
         Ok(Self {
@@ -514,7 +522,10 @@ impl Bus {
     /// the lock. Refused when the mark cannot be written.
     fn lock_for_a_seq(&self) -> Result<MutexGuard<'_, State>, Refused> {
         let mut state = self.state();
-        while state.head + 1 > state.reserved {
+        if state.head == u64::MAX {
+            return Err(Refused::Unnumbered("every seq is used".to_owned()));
+        }
+        while state.head >= state.reserved {
             if state.writing {
                 state = self.wait(state);
                 continue;
@@ -1336,6 +1347,25 @@ mod tests {
         );
         fs::write(dir.mark(), "12\n").unwrap();
         assert_eq!(dir.bus(CAPACITY).head(), 12);
+    }
+
+    #[test]
+    fn a_used_up_numbering_refuses_rather_than_overflow() {
+        let dir = Dir::new();
+        for nearly in [u64::MAX - RESERVE + 1, u64::MAX - 3, u64::MAX] {
+            fs::write(dir.mark(), format!("{nearly}\n")).unwrap();
+            let error = Bus::open_at(dir.mark(), Limits::DEFAULT).err().unwrap();
+            assert!(error.contains("so few seqs are left"), "{nearly}: {error}");
+        }
+        fs::write(dir.mark(), format!("{}\n", u64::MAX - RESERVE)).unwrap();
+        let bus = dir.bus(CAPACITY);
+        assert_eq!(emit(&bus, RESERVE), u64::MAX, "the last seq is given out");
+        let refused = bus.publish(topics::DAEMON, "daemon.debug", Data::new());
+        assert!(
+            matches!(&refused, Err(Refused::Unnumbered(why)) if why.contains("every seq")),
+            "{refused:?}"
+        );
+        assert_eq!(bus.head(), u64::MAX);
     }
 
     #[cfg(unix)]

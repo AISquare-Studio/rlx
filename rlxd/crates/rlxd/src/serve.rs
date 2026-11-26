@@ -74,6 +74,7 @@ pub fn serve(background: bool) -> ExitCode {
         let message = format!("cannot open {}: {e}", home.log_file().display());
         return out::fail(codes::START_FAILED, &message, None);
     }
+    log::log_panics();
     info!(
         "rlxd {VERSION} starting: pid {}, home {}",
         std::process::id(),
@@ -281,6 +282,8 @@ pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, St
             return Err(failed(message, None));
         }
     }
+    // Only what this start writes to the log can say why it failed.
+    let logged_before = fs::metadata(home.log_file()).map_or(0, |m| m.len());
     let command = background_command().map(|mut command| {
         adjust(&mut command);
         command
@@ -299,7 +302,7 @@ pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, St
                 return Err(StartError::AlreadyRunning);
             }
             let mut message = format!("rlxd exited ({status}) before it took a connection");
-            if let Some(said) = last_error(home) {
+            if let Some(said) = last_error(home, logged_before) {
                 message = format!("{message}: {said}");
             }
             return Err(failed(message, Some(see_the_log(home))));
@@ -382,9 +385,14 @@ fn already_running(home: &Home) -> ExitCode {
 }
 
 /// The message of the log's last `error` entry, which says why a start failed.
-fn last_error(home: &Home) -> Option<String> {
-    let log = fs::read_to_string(home.log_file()).ok()?;
-    log.lines()
+/// The message of the last `error` entry written to the log past its first `since` bytes:
+/// what this start said. A log that rotated meanwhile is read whole.
+fn last_error(home: &Home, since: u64) -> Option<String> {
+    let log = fs::read(home.log_file()).ok()?;
+    let start = usize::try_from(since).unwrap_or(0);
+    let new = log.get(start..).unwrap_or(&log);
+    String::from_utf8_lossy(new)
+        .lines()
         .rev()
         .find_map(|line| line.split_once(" error ").map(|(_, said)| said.to_owned()))
 }
@@ -413,4 +421,45 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_error_reads_only_what_this_start_wrote() {
+        let root = std::env::temp_dir().join(format!("rlxd-serve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = Home::at(&root);
+        fs::create_dir_all(home.logs()).unwrap();
+        let earlier = "2026-11-26T12:00:00.000Z error rlxd could not run: an earlier start\n";
+        fs::write(home.log_file(), earlier).unwrap();
+        let since = fs::metadata(home.log_file()).unwrap().len();
+        assert_eq!(
+            last_error(&home, 0).as_deref(),
+            Some("rlxd could not run: an earlier start")
+        );
+        assert_eq!(
+            last_error(&home, since),
+            None,
+            "this start has said nothing yet"
+        );
+        let mut log = fs::read_to_string(home.log_file()).unwrap();
+        log.push_str("2026-11-26T12:00:01.000Z info rlxd 0.10.1 starting\n");
+        log.push_str("2026-11-26T12:00:01.100Z error rlxd panicked: at bus.rs\n");
+        fs::write(home.log_file(), log).unwrap();
+        assert_eq!(
+            last_error(&home, since).as_deref(),
+            Some("rlxd panicked: at bus.rs")
+        );
+        // A log that rotated meanwhile is shorter than where this start began: read whole.
+        fs::write(
+            home.log_file(),
+            "2026-11-26T12:00:02.000Z error after rotation\n",
+        )
+        .unwrap();
+        assert_eq!(last_error(&home, since).as_deref(), Some("after rotation"));
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

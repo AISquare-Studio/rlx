@@ -190,6 +190,15 @@ impl Daemon {
             return;
         }
         info!("stopping: {reason}");
+        // The stop is signalled when this goes, even if publishing panics: an rlxd that
+        // was asked to stop always does.
+        struct Signal<'a>(&'a watch::Sender<bool>);
+        impl Drop for Signal<'_> {
+            fn drop(&mut self) {
+                self.0.send_replace(true);
+            }
+        }
+        let _signal = Signal(&self.stop);
         let data = object(&json!({ "reason": reason }));
         if let Err(e) = self
             .bus
@@ -197,7 +206,6 @@ impl Daemon {
         {
             warning!("daemon.stopping was not published: {e}");
         }
-        self.stop.send_replace(true);
     }
 
     /// Resolves once [`Daemon::stop`] was called.
@@ -347,7 +355,7 @@ impl Daemon {
                 Err(error) => Err(error),
             },
             #[cfg(feature = "debug-methods")]
-            methods::DEBUG_EMIT => self.debug_emit(&request.params),
+            methods::DEBUG_EMIT => self.debug_emit(&request.params).await,
             methods::SETTINGS_GET => self.settings_get(request.params),
             methods::SETTINGS_SET => self.settings_set(session, request.params),
             methods::SETTINGS_LIST => self.settings_list(request.params),
@@ -433,9 +441,10 @@ impl Daemon {
     }
 
     /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
-    /// at a time. Test builds only.
+    /// at a time, letting other tasks run every [`bus::BATCH`] of them, as any publisher
+    /// that loops must, or its followers starve on rlxd's two workers. Test builds only.
     #[cfg(feature = "debug-methods")]
-    fn debug_emit(&self, params: &Params) -> Result<Data, ErrorBody> {
+    async fn debug_emit(&self, params: &Params) -> Result<Data, ErrorBody> {
         const MOST: u64 = 100_000;
         let count = params
             .get("count")
@@ -456,6 +465,9 @@ impl Daemon {
                 .publish(topics::DAEMON, "daemon.debug", data)
                 .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
             first.get_or_insert(last);
+            if index % bus::BATCH as u64 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
         Ok(object(&json!({"first": first, "last": last})))
     }

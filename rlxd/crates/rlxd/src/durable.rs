@@ -9,14 +9,19 @@ use std::path::{Path, PathBuf};
 
 use crate::registry::private_file;
 
-/// Writes `text` to `path` whole and durably.
+/// Writes `text` to `path` whole and durably. An error says which file it was about,
+/// `path` or its `.tmp` sibling.
 pub fn write(path: &Path, text: &[u8]) -> io::Result<()> {
     let temporary = sibling(path, "tmp");
-    let mut file = private_file(&temporary)?;
-    file.write_all(text)?;
-    file.sync_all()?;
+    let about = |file: &Path| {
+        let file = file.display().to_string();
+        move |e: io::Error| io::Error::new(e.kind(), format!("{file}: {e}"))
+    };
+    let mut file = private_file(&temporary).map_err(about(&temporary))?;
+    file.write_all(text).map_err(about(&temporary))?;
+    file.sync_all().map_err(about(&temporary))?;
     drop(file);
-    replace(&temporary, path)
+    replace(&temporary, path).map_err(about(path))
 }
 
 /// Renames `from` over `to`, and returns once the rename is on disk: POSIX fsyncs the
@@ -41,4 +46,19 @@ pub fn sibling(path: &Path, extension: &str) -> PathBuf {
     name.push(".");
     name.push(extension);
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_write_names_the_file_it_failed_on() {
+        let dir = std::env::temp_dir().join(format!("rlxd-durable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("seq.tmp")).unwrap();
+        let error = write(&dir.join("seq"), b"1\n").unwrap_err().to_string();
+        assert!(error.contains("seq.tmp"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
