@@ -1668,6 +1668,11 @@ fn space_erase_removes_links_inside_the_space_as_links_and_names_them() {
     assert_valid("space-erase-reply.json", &erased);
     let links = erased["links"].as_array().unwrap();
     assert_eq!(links.len(), 2, "{erased:#}");
+    for link in links {
+        // Named under the resolved space, as removed[] and space.ensure name it.
+        assert!(link.as_str().unwrap().starts_with(&p), "{link} under {p}");
+    }
+    assert_eq!(erased["removed"][0], p.as_str());
     assert!(!Path::new(&p).exists());
     assert!(elsewhere.join("keep").exists(), "no link was followed");
     assert_eq!(
@@ -1974,7 +1979,9 @@ fn run_events_replays_a_log_past_four_mebibytes_from_any_run_seq() {
         .unwrap();
     let size = std::fs::metadata(log_path(&home, &r)).unwrap().len();
     assert!(size > 4 << 20, "the log is {size} bytes");
-    for from in [2, n - 1, n] {
+    // From early, and from past the log's first 4 MiB (run_seq 6 to 8 of 8).
+    assert_eq!(n, 8, "the started event, six answers and the end");
+    for from in [2, 6, 7, 8] {
         let replayed = home.rlxd(&[
             "call",
             "run.events",

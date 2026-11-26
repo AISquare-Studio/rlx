@@ -356,6 +356,8 @@ pub mod codes {
     /// `detail.failed[{path, error}]` say which; the runs whose files remain keep their
     /// records, so erasing again finishes the job.
     pub const ERASE_INCOMPLETE: &str = "erase_incomplete";
+    /// `space.erase`: the space is being erased already, by another call; wait for it.
+    pub const ERASE_IN_PROGRESS: &str = "erase_in_progress";
     /// `run.start`: rlxd can't name the absolute path of the `rlxd-hook` beside it, which
     /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
     /// why.

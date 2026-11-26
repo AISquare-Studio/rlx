@@ -68,12 +68,11 @@ fn linked(path: &Path) -> io::Error {
     )
 }
 
-/// The links inside `space`, found without following any: a symlink, or on Windows a
-/// junction. At most the first 100. (Windows' erase lists them before std removes them;
-/// elsewhere the erase finds them as it removes.)
+/// Every link inside `space`, found without following any: a symlink, or on Windows a
+/// junction. (Windows' erase lists them before std removes them; elsewhere the erase
+/// finds them as it removes.)
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn links_in(space: &Path) -> Vec<PathBuf> {
-    const MOST: usize = 100;
     let mut links = Vec::new();
     let mut pending: Vec<PathBuf> = fs::read_dir(space)
         .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
@@ -84,9 +83,6 @@ pub fn links_in(space: &Path) -> Vec<PathBuf> {
         };
         if meta.file_type().is_symlink() {
             links.push(path);
-            if links.len() >= MOST {
-                break;
-            }
             continue;
         }
         if meta.is_dir()

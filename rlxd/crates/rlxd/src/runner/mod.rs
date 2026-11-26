@@ -842,8 +842,8 @@ impl Runner {
             let mut runs = self.runs();
             if runs.erasing.contains(name) {
                 return Err(refusal(
-                    codes::RUNS_LIVE,
-                    format!("the space {name:?} is being erased already"),
+                    codes::ERASE_IN_PROGRESS,
+                    format!("the space {name:?} is being erased already: wait for that erase"),
                 ));
             }
             let ours: Vec<Arc<Run>> = runs
@@ -1019,7 +1019,14 @@ impl Runner {
                 Ok(()) => removed.push(resolved.display().to_string()),
                 Err(e) => fail(&mut failed, space, &e),
             }
-            links.extend(found.iter().map(|path| path.display().to_string()));
+            // Named under the space's resolved path, as removed[] and space.ensure name it.
+            let held_space = spaces_dir.path().join(&name);
+            links.extend(found.iter().map(|path| {
+                path.strip_prefix(&held_space)
+                    .map_or_else(|_| path.clone(), |rest| resolved.join(rest))
+                    .display()
+                    .to_string()
+            }));
         }
         // rlxd's records of its runs: its own folder.
         let mut gone = Vec::new();

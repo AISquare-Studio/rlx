@@ -64,7 +64,7 @@ bound both validators agree on.
 | `run-event-list.json` | A JSON array of them, as `jq -s .` makes of a capture of the `run` and `needs_you` topics |
 | `space.json` | `space.ensure`'s and `space.erase`'s params: `{name}`, 1 to 64 lower-case letters, digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, no `.` at the end, not a Windows device name |
 | `space-ensure-reply.json` | `space.ensure`'s reply: `{name, path}`, the space's folder, absolute and resolved |
-| `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path], links?: [path]}`, `links` being links inside the space removed as links. Refused whole: `runs_live` (`detail.run_ids`), `link_refused` (`detail.paths`), and `erase_incomplete` (`detail {removed, failed}`) when some paths stayed |
+| `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path], links?: [path]}`, `links` being links inside the space removed as links. Every link is listed, under the space's resolved path. Refused whole: `runs_live` (`detail.run_ids`), `erase_in_progress`, `link_refused` (`detail.paths`), and `erase_incomplete` (`detail {removed, failed}`) when some paths stayed |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 

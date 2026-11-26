@@ -313,7 +313,8 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   opened once without following a link, and checked and removed through what was opened
   (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
   from being renamed meanwhile), so a link put there after the check is never followed.
-  A link inside the space goes as a link and is named in `links`. Paths it can't remove
+  A link inside the space goes as a link and is named in `links`, every one, under the
+  space's resolved path. A second erase of a space being erased gets `erase_in_progress`. Paths it can't remove
   fail it `erase_incomplete` (`detail {removed, failed}`), the runs concerned keep their
   records, and erasing again finishes.
 
