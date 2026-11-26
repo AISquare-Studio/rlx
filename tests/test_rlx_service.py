@@ -869,8 +869,9 @@ class _Child:
 
 def test_the_sweep_runs_in_a_child_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
     """The sweep keeps what it read in the process that runs it (about 140 MB, measured for the
-    idle budget): the service runs ``metrics stats`` as a detached child instead, and starts
-    no second one while the first still sweeps."""
+    idle budget): the service runs it as a detached child instead (``rlx service sweep``, which
+    is no feature, so no daily ping goes with it: #1842), and starts no second one while the
+    first still sweeps."""
     started: list[list[str]] = []
 
     def detached(command: list[str]) -> _Child:
@@ -884,8 +885,9 @@ def test_the_sweep_runs_in_a_child_one_at_a_time(monkeypatch: pytest.MonkeyPatch
     assert part.tick_part().detail == "a sweep runs (pid 4001)"
     part._child.ended = True  # type: ignore[union-attr]
     assert part.tick_part().detail == "started a sweep (pid 4002)"
-    sweep = ["--json", "metrics", "stats", "--range", "today"]
+    sweep = ["-m", "aisquare", *service_host.SWEEP_COMMAND]
     assert [command[-len(sweep) :] for command in started] == [sweep, sweep]
+    assert service_host.SWEEP_COMMAND == ("service", "sweep")
 
 
 def test_the_shipment_is_the_clis_detached_one_and_nothing_while_sharing_is_off(

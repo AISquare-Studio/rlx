@@ -13,6 +13,7 @@ the real detached process to prove the command never waits on the server.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import subprocess
@@ -371,17 +372,30 @@ def test_the_rlx_service_never_starts_a_ping(
     every day whether anyone opened rlx or not. Its sweep ran `metrics stats`, a counted
     command, whose close sent the ping (#1842). Here SweepPart's own argv runs through the CLI
     as its child runs it, beside `service run` and `service status`: no ping, and no feature
-    counted. The control is the old argv, which does both."""
+    counted. The control is the old argv, which does both.
+
+    The sweep itself runs, over the suite's temp agent home, with the Keychain stubbed on top of
+    the suite's own stub: a scratch home does not scope the Keychain, and a sweep read Claude
+    Code's real item (tester note #1844). A read that reached it would be recorded here."""
     from types import SimpleNamespace
 
     from aisquare.cli import app as cli_app
+    from aisquare.core import claude_accounts as accounts_core
     from aisquare.core import feature_use
-    from aisquare.services import service_host, usage_stats
+    from aisquare.services import service_host
 
     counted: list[str] = []
     monkeypatch.setattr(cli_app, "_launch_usage_shared", lambda: True)  # a counted one records
     monkeypatch.setattr(feature_use, "record", counted.append)
-    monkeypatch.setattr(usage_stats, "maybe_sweep", lambda **_: usage_stats.SweepReport())
+    keychain: list[tuple[str, str]] = []
+
+    def no_keychain(service: str, account: str, *, fresh: bool = False) -> Any:
+        keychain.append((service, account))
+        return accounts_core.KeychainRead(found=False)
+
+    monkeypatch.setattr(accounts_core, "read_keychain", no_keychain)
+    monkeypatch.setattr(accounts_core, "keychain_platform", lambda: False)
+    monkeypatch.setattr(accounts_core, "KEYCHAIN_TOOL", os.devnull)
     monkeypatch.setattr(service_host, "log_to_file", lambda: None)
     monkeypatch.setattr(service_host, "run_service", lambda **_: None)  # the process, ended
     started: list[list[str]] = []
@@ -402,6 +416,7 @@ def test_the_rlx_service_never_starts_a_ping(
 
     assert words == list(service_host.SWEEP_COMMAND)
     assert inline.count == 0 and stub.seen == [] and counted == []
+    assert keychain == [], "the sweep read the Keychain"
 
     runner.invoke(app, ["--json", "metrics", "stats", "--range", "today"])  # the old argv
     assert len(stub.seen) == 1 and counted == ["cli.metrics.stats"], "the control: it pings"
