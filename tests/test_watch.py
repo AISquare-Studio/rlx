@@ -600,6 +600,18 @@ def _on_file(app: Any) -> None:
     assert unsaved == [], unsaved
 
 
+async def _until(pilot: Any, holds: Any, *, what: str) -> None:
+    """Pause a frame at a time until ``holds()``, for 10 s at most, and fail there: what the
+    test reads next must be true on screen, not merely after one frame. On a loaded Windows
+    runner one pause returned before a resize's layout, or a scroll asked before the table had
+    measured its rows, and the test read a premise that was not there yet (#38)."""
+    for _ in range(500):
+        if holds():
+            return
+        await pilot.pause(0.02)
+    pytest.fail(f"never came, in 10 s: {what}")
+
+
 async def _mouse(pilot: Any, kind: Any, x: int, y: int) -> None:
     """One mouse event the way the driver delivers it — through ``App.on_event``.
 
@@ -1053,7 +1065,8 @@ def test_the_board_says_when_the_tasks_are_hidden(runner: CliRunner, work_dir: P
     pytest.importorskip("textual", reason="the [tui] extra is not installed")
     from textual.widgets import OptionList
 
-    from aisquare.cli.ui.board import TASKS_HIDDEN
+    from aisquare.cli.ui.board import TASKS_HIDDEN, WIDE_FROM
+    from aisquare.cli.ui.board_parts import BoardSwitch
 
     team_service.activate()
     _add(runner, "build the API")
@@ -1069,17 +1082,35 @@ def test_the_board_says_when_the_tasks_are_hidden(runner: CliRunner, work_dir: P
                     for name in ("work", "stream")
                 ]
 
+            await _until(pilot, lambda: switch() == [True, False], what="the switch on Work")
             narrow = switch()
             await pilot.press("b")
-            await pilot.pause()
+            await _until(pilot, lambda: switch() == [False, True], what="b: the switch on Stream")
             flipped = switch()
             await pilot.resize_terminal(140, 30)
-            await pilot.press("b")  # wide: Work out of sight
-            await pilot.pause()
+            board = pilot.app.board
+            switch_bar = pilot.app.query_one(BoardSwitch)
+            # Wide, laid out as wide, before ``b``: pressed while the old width's layout still
+            # stood, it flipped the narrow switch and the title said only "stream" (#38).
+            await _until(
+                pilot,
+                lambda: board.size.width >= WIDE_FROM and not switch_bar.display,
+                what="the board laid out wide",
+            )
             feed = pilot.app.query_one("#feed", OptionList)
+            await pilot.press("b")  # wide: Work out of sight
+            await _until(
+                pilot,
+                lambda: TASKS_HIDDEN in str(feed.border_title),
+                what=f"the feed's title saying {TASKS_HIDDEN!r} (it says {feed.border_title!r})",
+            )
             hidden = str(feed.border_title)
             await pilot.press("b")
-            await pilot.pause()
+            await _until(
+                pilot,
+                lambda: TASKS_HIDDEN not in str(feed.border_title),
+                what="b: the Work column back, the title saying so no more",
+            )
             return narrow, flipped, hidden, str(feed.border_title)
 
     narrow, flipped, hidden, back = asyncio.run(drive())
@@ -1250,12 +1281,23 @@ def test_the_tasks_keep_their_scroll_across_a_refresh(runner: CliRunner, work_di
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             table = pilot.app.query_one("#tasks", DataTable)
+            # The premise, waited for rather than assumed after one pause: the forty rows
+            # measured (a scroll asked before that is clamped to the top), then the table
+            # down at row 12. On a loaded Windows runner the scroll read 0 (#38).
+            await _until(pilot, lambda: table.max_scroll_y > 12, what="the rows measured")
             table.scroll_to(y=12, animate=False)
-            await pilot.pause()
+            await _until(pilot, lambda: table.scroll_y == 12, what="the table down at 12")
             before = table.scroll_y
             pilot.app.board.refresh_data()
-            await pilot.pause()
-            await pilot.pause()
+            # The rebuild clears the table (its top again) and puts the scroll back once the
+            # rows are measured, a refresh later: wait for the cleared table to be filled and
+            # laid out again, then for the scroll to come back.
+            await _until(
+                pilot,
+                lambda: table.row_count >= 40 and table.max_scroll_y > 12,
+                what="the rebuilt table laid out",
+            )
+            await _until(pilot, lambda: table.scroll_y == before, what="the scroll put back")
             return before, table.scroll_y, table.max_scroll_y
 
     before, after, most = asyncio.run(drive())
