@@ -38,6 +38,21 @@ pub fn open(path: &Path, echo: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Logs every panic as an `error` entry, before the default hook prints it, so a start
+/// that dies of one says why. It never waits for the log: a panic inside the log itself
+/// is printed only.
+pub fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(log) = LOG.get()
+            && let Ok(mut log) = log.try_lock()
+        {
+            log.write_line(&format!("{} error rlxd panicked: {info}\n", clock::now()));
+        }
+        default(info);
+    }));
+}
+
 /// Writes one entry.
 pub fn write(level: &str, message: fmt::Arguments<'_>) {
     let line = format!("{} {level} {message}\n", clock::now());

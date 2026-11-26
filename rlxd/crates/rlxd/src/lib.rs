@@ -5,10 +5,11 @@
 //! [--gate-dev-mode]`, `rlxd status [--json]`, `rlxd stop`, `rlxd call` and `rlxd
 //! events`. One rlxd runs per home, on a local socket or named pipe, and a client gets in
 //! with the shared token through `hello`. Every reply is the 7.2 envelope, and
-//! `events.subscribe` streams the home's events. The PTY host, the runner and the rest
-//! are later items, each a method on this socket, publishing on the bus. `rlxd here
-//! [--start]` is the probe rlx.app runs over SSH: what is installed, whether rlxd runs,
-//! and the protocol versions it serves.
+//! `events.subscribe` streams the home's events. `settings.get`, `settings.set` and
+//! `settings.list` serve the app settings every device shares. The PTY host, the runner
+//! and the rest are later items, each a method on this socket, publishing on the bus.
+//! `rlxd here [--start]` is the probe rlx.app runs over SSH: what is installed, whether
+//! rlxd runs, and the protocol versions it serves.
 //!
 //! The app gate (5.1) is here too: only rlx's app holds it, proven by a per-device gate
 //! credential and, for a device paired locally, by the peer's identity ([`peer`]). The
@@ -37,6 +38,7 @@ mod claude;
 mod cli;
 mod clock;
 mod config;
+mod durable;
 mod events;
 mod files;
 mod gate;
@@ -50,6 +52,7 @@ pub mod peer;
 pub mod registry;
 mod serve;
 mod server;
+mod settings;
 mod token;
 #[cfg(windows)]
 mod windows;

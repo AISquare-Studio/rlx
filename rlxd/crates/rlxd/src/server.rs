@@ -41,8 +41,9 @@ use std::time::{Duration, Instant};
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, StatusData, SubscribeParams,
-    VERSION, codes, event_types, methods, topics,
+    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, SettingsDeleteParams,
+    SettingsGetParams, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, VERSION,
+    codes, event_types, methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -54,6 +55,7 @@ use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
+use crate::settings::{self, Settings};
 use crate::{claude, token};
 
 /// `daemon.stopping`'s `reason` when a client asked rlxd to stop.
@@ -87,6 +89,7 @@ pub struct Daemon {
     clients: Mutex<Clients>,
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
     bus: Bus,
+    settings: Settings,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
@@ -97,7 +100,10 @@ struct Session {
     protocol_version: u32,
     role: Role,
     peer: Arc<Peer>,
-    /// For `role: app`: its hold on the gate. App connections are counted by the gate.
+    /// The `client` its hello named, for the log.
+    client: String,
+    /// For `role: app`: its hold on the gate, which names its paired device. App
+    /// connections are counted by the gate.
     app: Option<Hold>,
     _counted: Option<Counted>,
 }
@@ -159,7 +165,8 @@ enum Frame {
 }
 
 impl Daemon {
-    /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus`.
+    /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus` and
+    /// serving `settings`.
     /// `pipe_acl` is what `status` says of the pipe's DACL, on Windows.
     pub fn new(
         home: Home,
@@ -167,6 +174,7 @@ impl Daemon {
         pipe_acl: Option<&'static str>,
         gate: Gate,
         bus: Bus,
+        settings: Settings,
     ) -> Arc<Self> {
         Arc::new(Self {
             home,
@@ -176,6 +184,7 @@ impl Daemon {
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
             bus,
+            settings,
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
             gate: Arc::new(gate),
@@ -206,6 +215,15 @@ impl Daemon {
             return;
         }
         info!("stopping: {reason}");
+        // The stop is signalled when this goes, even if publishing panics: an rlxd that
+        // was asked to stop always does.
+        struct Signal<'a>(&'a watch::Sender<bool>);
+        impl Drop for Signal<'_> {
+            fn drop(&mut self) {
+                self.0.send_replace(true);
+            }
+        }
+        let _signal = Signal(&self.stop);
         let data = object(&json!({ "reason": reason }));
         if let Err(e) = self
             .bus
@@ -213,7 +231,6 @@ impl Daemon {
         {
             warning!("daemon.stopping was not published: {e}");
         }
-        self.stop.send_replace(true);
     }
 
     /// Writes what only memory holds, before rlxd exits: when each gate device was last
@@ -319,6 +336,7 @@ impl Daemon {
         let session = Session {
             protocol_version: hello.protocol_version,
             role: hello.role,
+            client: hello.client,
             peer,
             app,
             _counted: counted,
@@ -394,7 +412,11 @@ impl Daemon {
                 Err(error) => Err(error),
             },
             #[cfg(feature = "debug-methods")]
-            methods::DEBUG_EMIT => self.debug_emit(&request.params),
+            methods::DEBUG_EMIT => self.debug_emit(&request.params).await,
+            methods::SETTINGS_GET => self.settings_get(request.params),
+            methods::SETTINGS_SET => self.settings_set(session, request.params),
+            methods::SETTINGS_LIST => self.settings_list(request.params),
+            methods::SETTINGS_DELETE => self.settings_delete(session, request.params),
             methods::GATE_PAIR => match self.gate_pair(session, &request.params).await {
                 Ok((data, minted)) => {
                     return Answer::Paired(Envelope::ok(data).with_id(id), minted);
@@ -452,10 +474,51 @@ impl Daemon {
         Ok(Subscription { id, cursor })
     }
 
+    /// `settings.get {key}`. Every settings call runs as blocking work (`off_worker`): a
+    /// change writes and fsyncs the file under the settings lock, which a read may wait
+    /// on, and neither may hold up the connections the runtime's workers serve.
+    fn settings_get(&self, params: Params) -> Result<Data, ErrorBody> {
+        let params = params_of::<SettingsGetParams>(methods::SETTINGS_GET, params)?;
+        let setting = off_worker(|| self.settings.get(&params.key)).map_err(refused)?;
+        printed(&setting)
+    }
+
+    /// `settings.set {key, value, expected_version?}`: only an app-role connection that
+    /// holds the gate, a paired device, sets a protected key, `send_safety_mode` or one
+    /// under `policy.`. One whose device was unpaired, or whose credential was replaced,
+    /// no longer does.
+    fn settings_set(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let params = params_of::<SettingsSetParams>(methods::SETTINGS_SET, params)?;
+        let who = format!("{} {}", role_name(session.role), session.client);
+        let setting = off_worker(|| self.settings.set(params, writer(session, &who), &self.bus))
+            .map_err(refused)?;
+        printed(&setting)
+    }
+
+    /// `settings.delete {key, expected_version?}`, by the same rules as `settings.set`.
+    fn settings_delete(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let params = params_of::<SettingsDeleteParams>(methods::SETTINGS_DELETE, params)?;
+        let who = format!("{} {}", role_name(session.role), session.client);
+        let setting = off_worker(|| {
+            self.settings
+                .delete(params, writer(session, &who), &self.bus)
+        })
+        .map_err(refused)?;
+        printed(&setting)
+    }
+
+    /// `settings.list {prefix?}`.
+    fn settings_list(&self, params: Params) -> Result<Data, ErrorBody> {
+        let params = params_of::<SettingsListParams>(methods::SETTINGS_LIST, params)?;
+        let list = off_worker(|| self.settings.list(params.prefix.as_deref())).map_err(refused)?;
+        printed(&list)
+    }
+
     /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
-    /// at a time. Test builds only.
+    /// at a time, letting other tasks run every [`bus::BATCH`] of them, as any publisher
+    /// that loops must, or its followers starve on rlxd's two workers. Test builds only.
     #[cfg(feature = "debug-methods")]
-    fn debug_emit(&self, params: &Params) -> Result<Data, ErrorBody> {
+    async fn debug_emit(&self, params: &Params) -> Result<Data, ErrorBody> {
         const MOST: u64 = 100_000;
         let count = params
             .get("count")
@@ -476,6 +539,9 @@ impl Daemon {
                 .publish(topics::DAEMON, "daemon.debug", data)
                 .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
             first.get_or_insert(last);
+            if index % bus::BATCH as u64 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
         Ok(object(&json!({"first": first, "last": last})))
     }
@@ -855,6 +921,13 @@ pub async fn serve_connection<S>(daemon: Arc<Daemon>, stream: S, peer: Peer, han
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
+    // Settings calls run through `block_in_place` (`off_worker`), which only this flavour
+    // of runtime allows.
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread,
+        "rlxd serves connections on a multi-thread runtime"
+    );
     let (reader, mut writer) = tokio::io::split(stream);
     let mut frames = Frames {
         reader: BufReader::new(reader),
@@ -1364,12 +1437,96 @@ fn capabilities() -> Vec<String> {
     CAPABILITIES.iter().map(|&c| c.to_owned()).collect()
 }
 
+/// Runs `work`, which may block on a lock or on the disk, as blocking work: the runtime
+/// hands this worker's other tasks to another, so no other connection waits on it. It
+/// needs the multi-thread runtime `serve` builds (`block_in_place` panics on any other),
+/// which `serve_connection` asserts. A call waiting on the settings lock holds a thread
+/// of tokio's blocking pool meanwhile; the lock's holder never needs the runtime, so
+/// every waiter gets its turn.
+fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(work)
+}
+
+/// Who a connection is, to the settings: app-role only while it holds the gate.
+fn writer<'a>(session: &'a Session, who: &'a str) -> settings::Writer<'a> {
+    let hold = session.app.as_ref().filter(|hold| !hold.is_kicked());
+    settings::Writer {
+        app: hold.is_some(),
+        device: hold.map(Hold::device),
+        who,
+    }
+}
+
+/// A method's params, read as its wire type: `invalid_params` naming the field when not.
+fn params_of<T: serde::de::DeserializeOwned>(method: &str, params: Params) -> Result<T, ErrorBody> {
+    serde_json::from_value(Value::Object(params)).map_err(|e| {
+        error(
+            codes::INVALID_PARAMS,
+            &format!("{method}'s params are not valid: {e}"),
+        )
+    })
+}
+
+/// `value`, printed as a reply's `data`.
+fn printed(value: &impl serde::Serialize) -> Result<Data, ErrorBody> {
+    match serde_json::to_value(value) {
+        Ok(Value::Object(data)) => Ok(data),
+        Ok(_) => Err(error(
+            codes::INTERNAL,
+            "the reply did not print as an object",
+        )),
+        Err(e) => Err(error(
+            codes::INTERNAL,
+            &format!("the reply is not valid: {e}"),
+        )),
+    }
+}
+
+/// The error a refused setting gets.
+fn refused(refused: settings::Refused) -> ErrorBody {
+    match refused {
+        settings::Refused::UnknownKey(key) => error(
+            codes::UNKNOWN_SETTING,
+            &format!("rlxd knows no setting {key:?}"),
+        )
+        .with_hint(format!(
+            "Its settings: {}; any dotted key, <namespace>.<name>, is free to use.",
+            setting_keys::KNOWN.join(", ")
+        )),
+        settings::Refused::NotGate(key) => error(
+            codes::NOT_GATE,
+            &format!(
+                "only an app-role connection holding the gate, a paired device, may change \
+                 {key}"
+            ),
+        )
+        .with_hint("send_safety_mode and every key under policy. are protected."),
+        settings::Refused::Conflict(version) => {
+            let mut detail = Data::new();
+            detail.insert("version".to_owned(), Value::from(version));
+            error(
+                codes::CONFLICT,
+                &format!("the setting is at version {version} now, not the one expected"),
+            )
+            .with_hint("Read it again, and write from its version now.")
+            .with_detail(detail)
+            .expect("conflict's detail is an object")
+        }
+        settings::Refused::Invalid(why) => error(codes::INVALID_PARAMS, &why),
+        settings::Refused::Unwritten(why) => error(codes::INTERNAL, &why),
+    }
+}
+
 /// The methods this rlxd serves after `hello`.
 fn served() -> Vec<&'static str> {
     let mut served = vec![
         methods::STATUS,
         methods::STOP,
         methods::EVENTS_SUBSCRIBE,
+        methods::SETTINGS_GET,
+        methods::SETTINGS_SET,
+        methods::SETTINGS_LIST,
+        methods::SETTINGS_DELETE,
         methods::GATE_PAIR,
         methods::GATE_PAIR_REQUESTS,
         methods::GATE_PAIR_ANSWER,

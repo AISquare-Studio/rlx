@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Setting",
+  "description": "One setting, as `settings.get` and `settings.set` reply and `settings.list` lists it.\n\n```json\n{\"key\": \"theme\", \"version\": 4, \"value\": \"rlx_light\",\n \"updated_at\": \"2026-11-26T12:00:00.000Z\", \"by_device\": \"Sam MacBook\"}\n```\n\nA key never set has version 0 and nothing else: the app's default applies, and for\n`send_safety_mode` that is `draft`.",
+  "type": "object",
+  "properties": {
+    "by_device": {
+      "description": "The paired device that last set it, when an app-role connection did.",
+      "type": "string",
+      "minLength": 1
+    },
+    "key": {
+      "description": "The setting's key.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "updated_at": {
+      "description": "When it was last set: RFC 3339, in UTC, to the millisecond. Absent when it was\nnever set.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "value": {
+      "description": "Its value. Absent when it was never set.",
+      "not": {
+        "type": "null"
+      }
+    },
+    "version": {
+      "description": "Its version: 0 when it was never set, else the number its last change was given,\nfrom one count the home keeps for every setting, so no two changes share one,\neven across a delete. `settings.set {expected_version}` and `settings.delete\n{expected_version}` take it.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "theme"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "layout"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "agent_sign_off"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "maxLength": 512
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "send_safety_mode"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "object",
+            "properties": {
+              "connectors": {
+                "type": "object",
+                "additionalProperties": {
+                  "enum": [
+                    "draft",
+                    "standing_approval",
+                    "auto"
+                  ]
+                },
+                "propertyNames": {
+                  "minLength": 1
+                }
+              },
+              "default": {
+                "enum": [
+                  "draft",
+                  "standing_approval",
+                  "auto"
+                ]
+              }
+            },
+            "required": [
+              "default"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "else": {
+        "required": [
+          "value",
+          "updated_at"
+        ]
+      },
+      "if": {
+        "properties": {
+          "version": {
+            "const": 0
+          }
+        },
+        "required": [
+          "version"
+        ]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "value"
+              ]
+            },
+            {
+              "required": [
+                "updated_at"
+              ]
+            },
+            {
+              "required": [
+                "by_device"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "required": [
+    "key",
+    "version"
+  ]
+}

@@ -232,6 +232,25 @@
       "if": {
         "properties": {
           "topic": {
+            "const": "settings"
+          }
+        },
+        "required": [
+          "topic"
+        ]
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "pattern": "^settings\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "topic": {
             "const": "install"
           }
         },

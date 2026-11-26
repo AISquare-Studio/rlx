@@ -180,6 +180,48 @@ One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
   then builds the dev-dependency. `rlxd --version` says which: a release build's is
   `rlxd <version>` alone.
 
+## Settings
+
+App settings kept in the rlx home and served to every device (the owner's multi-device
+brief, §4), the `crate::settings` module. They are not for secrets: every client with the
+token reads every one.
+
+- **The methods:** `settings.get {key}`, `settings.set {key, value, expected_version?}`,
+  `settings.list {prefix?}` and `settings.delete {key, expected_version?}`, each through
+  `rlxd call`. A stale `expected_version` gets `conflict`, with `detail.version`.
+  Versions come from one count for the whole home, so a key's only rises, even across
+  a delete and a re-create.
+- **The keys:** `theme`, `layout`, `agent_sign_off`, `send_safety_mode`, and any dotted
+  key, `<namespace>.<name>`, for later needs. Their shapes are in `schemas/v1/README.md`.
+- **Protected keys:** `send_safety_mode` and every key under `policy.`. Only an app-role
+  connection may set or delete them; any other gets `not_gate`. Every other key, agents
+  and preferences included, any client may change, so a CLI or TUI user with no app can
+  too.
+- **The log.** Every change is logged with who made it. A `send_safety_mode` change that
+  lowers send safety for any connector is logged as a warning. It needs no confirm in
+  rlxd yet; that is with the hub.
+- **Events:** each change, once on disk, is `settings.changed` or `settings.deleted
+  {key, version, by_device?}` on the `settings` topic.
+- **Limits:**
+  - a value is at most 64 KiB of JSON and 32 arrays or objects deep;
+  - a home holds at most 512 settings and 8 MiB of keys and values, so
+    `settings.list` always fits the 16 MiB line a client reads.
+- **The file** is `<home>/rlxd/settings.json`: 0600, even over a stale temporary file
+  left by a crash, compact JSON, written whole and durably. A change rewrites it as
+  blocking work, so no other connection waits on the disk.
+  - It is read key by key. A key rlxd can't hold, such as a value nested too deep or
+    over 64 KiB, is set aside alone, to a new `settings.json.unreadable-<time>`, and the
+    rest are kept. If that file can't be written, the key stays as it was, unserved.
+  - A key a newer rlxd wrote is kept as it is, and not served.
+  - A file rlxd can't read, or one that isn't a settings document at all, is moved to
+    such a file whole and logged as an error, and rlxd starts with no settings. If it
+    can't be moved either, rlxd refuses every change until a restart, so it never
+    writes over a file it could not read.
+- **An app-role connection** is one that holds the gate (5.1): a device `gate.pair`
+  paired, whose credential its `hello` carries. One whose device is unpaired, or whose
+  credential is replaced, can no longer change a protected key.
+  `crates/rlxd/tests/settings.rs` pairs a device for real, in gate dev mode.
+
 ## `rlxd here`: what rlx.app asks a host before it connects
 
 rlx.app runs `rlxd here --json --start` on a host over SSH, inside the authenticated

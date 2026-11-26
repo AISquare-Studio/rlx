@@ -43,6 +43,13 @@ bound both validators agree on.
 | `hello-reply.json` | `hello`'s reply data: `{protocol_version, protocol_versions, rlxd_version, capabilities}` |
 | `here-reply.json` | `rlxd here`'s data, the probe rlx.app runs over SSH: `{installed: true, running, started, supported, version?, protocol_versions, pid?, socket, home, platform, auth{token_file, token?}, rlxd{version, path, protocol_versions}, rlx{installed, version?, path?}}` |
 | `status-reply.json` | `status`'s reply data (7.4): `{version, pid, platform, protocol_version, capabilities, seq, clients, gate, brain, claude, runs, jobs, paths, pipe_acl?}`. `clients` counts open connections by `hello` role, and `pipe_acl` is Windows' |
+| `settings-get.json` | `settings.get`'s params: `{key}`. A key is a known one (`theme`, `layout`, `agent_sign_off`, `send_safety_mode`) or dotted snake_case names, such as `rlxapp.sidebar` |
+| `settings-set.json` | `settings.set`'s params: `{key, value, expected_version?}`. A known key's value has that key's shape; a dotted key's is any JSON but `null`. `expected_version` 0 means "only if never set" |
+| `settings-list.json` | `settings.list`'s params: `{prefix?}` |
+| `setting.json` | One setting, `settings.get`'s and `settings.set`'s reply: `{key, version, value?, updated_at?, by_device?}`. Version 0, with nothing else, is a key never set |
+| `settings-list-reply.json` | `settings.list`'s reply: `{settings: [setting]}`, in key order |
+| `settings-changed.json` | `settings.changed`'s and `settings.deleted`'s data, on the `settings` topic: `{key, version, by_device?}` |
+| `settings-delete.json` | `settings.delete`'s params: `{key, expected_version?}`. The reply is the setting at version 0 |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 
@@ -119,12 +126,64 @@ For a client:
 
 `data` of the `daemon` events isn't checked by `event.json` yet.
 
+## Settings
+
+App settings live in the rlx home, so every device that connects sees the same values
+(the owner's multi-device brief, §4). They are not for secrets: every client with the
+token reads every one. Device-local state stays on the device: SSH profiles, the window's
+size and position, per-device notifications, caches.
+
+- **The keys.** rlxd knows four, each with a shape:
+  - `theme`, a name of 1 to 64 characters;
+  - `layout`, an object;
+  - `agent_sign_off`, a string of at most 512 characters;
+  - `send_safety_mode`.
+
+  Any dotted key, `<namespace>.<name>`, holds any JSON value but `null`. Another key
+  without a dot gets `unknown_setting`.
+- **Limits.** Every value is at most 64 KiB of JSON and 32 arrays or objects deep; the
+  schemas can't count depth, so only the types check it. A home holds at most 512 settings
+  and 8 MiB of keys and values.
+- **Protected keys:** `send_safety_mode` and every key under `policy.`, such as the
+  app-absent policy or a connector's write policy.
+  - Only an app-role connection holding the gate, a paired device, may set or delete
+    them; any other gets `not_gate`. Every change is logged, and its event names the
+    device.
+  - Any client may change every other key, agents included.
+- **`send_safety_mode`** is `{default, connectors?}`.
+  - It is a policy, so it is strict for a writer: `settings.set` with a field rlxd
+    doesn't know is refused, by `settings-set.json` and by rlxd, rather than ignored.
+  - A reader takes such a field, which a later rlxd may add: `setting.json` and
+    `settings-list-reply.json` allow one, so it never costs a client its
+    `settings.list`.
+  - Each mode is `draft`, `standing_approval` or `auto`, safest first, and `connectors`
+    maps a connector's name to its mode.
+  - A key never set means `draft`.
+  - A change lowers send safety when any connector's mode, its own or else the default,
+    becomes less safe.
+- **Versions** come from one count for the whole home: each set takes the next number,
+  so no two sets share one, and a key's version only rises.
+  - `settings.set` and `settings.delete` with `expected_version` act only when that is
+    the version now, else they get `conflict` with `detail.version`; read again and act
+    from that.
+  - Without `expected_version`, the last change wins.
+  - A deleted key is back to never set, at version 0. Set again, it goes on from the
+    home's count, so a write made from its version before the delete gets `conflict`.
+- **Events.** Every change, once on disk, is a `settings.changed {key, version,
+  by_device?}`, or a `settings.deleted` with the version deleted, on the `settings`
+  topic. One key's events come in version order. Read the new value with `settings.get`.
+
 ## Versioning
 
 `schema_version` is an integer, and every document here carries `1`. A document with
 any other `schema_version` fails to parse rather than misparse.
 
 - New fields and new event types keep the version. Clients ignore what they don't
-  know, so no schema here forbids extra properties.
+  know, so no schema a client reads forbids extra properties.
+- The one schema that does is what a writer sends: `settings-set.json`'s
+  `send_safety_mode` value takes no field but `default` and `connectors`, as rlxd
+  does, since a policy is taken whole. A new field there is not additive for writers,
+  because an older rlxd refuses it, so it raises `protocol_version` by one. Readers
+  still take it in the meantime (`setting.json`, `settings-list-reply.json`).
 - Removing or renaming a field raises `protocol_version` by one. The new schemas go in
   `schemas/v2/`, and rlxd keeps serving v1 for one rlx minor release.

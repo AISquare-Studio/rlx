@@ -149,6 +149,19 @@ pub mod methods {
     /// seqs) out, so a test can fill the event buffer. A release build has no such method
     /// and answers `unknown_method`.
     pub const DEBUG_EMIT: &str = "debug.emit";
+    /// One app setting: [`SettingsGetParams`](crate::SettingsGetParams) in,
+    /// [`Setting`](crate::Setting) out.
+    pub const SETTINGS_GET: &str = "settings.get";
+    /// Sets an app setting: [`SettingsSetParams`](crate::SettingsSetParams) in,
+    /// [`Setting`](crate::Setting) out, and `settings.changed` on the stream.
+    pub const SETTINGS_SET: &str = "settings.set";
+    /// Every app setting set so far: [`SettingsListParams`](crate::SettingsListParams) in,
+    /// [`SettingsList`](crate::SettingsList) out.
+    pub const SETTINGS_LIST: &str = "settings.list";
+    /// Deletes an app setting, back to never set:
+    /// [`SettingsDeleteParams`](crate::SettingsDeleteParams) in, [`Setting`](crate::Setting)
+    /// out at version 0, and `settings.deleted` on the stream.
+    pub const SETTINGS_DELETE: &str = "settings.delete";
 }
 
 impl Request {

@@ -314,6 +314,13 @@ pub mod codes {
     /// mark was deleted. `detail.head` is the last seq. Re-read what you show, then
     /// subscribe again from `status`'s `seq`, or without `since`.
     pub const SINCE_AHEAD: &str = "since_ahead";
+    /// `settings.set {expected_version}`: the setting's version is not that one now, as
+    /// another client set it first. `detail.version` is its version now: read it again,
+    /// and write from that.
+    pub const CONFLICT: &str = "conflict";
+    /// A setting key without a `.` that this rlxd does not know. Dotted keys,
+    /// `<namespace>.<name>`, are always free to use.
+    pub const UNKNOWN_SETTING: &str = "unknown_setting";
 }
 
 impl Envelope {

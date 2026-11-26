@@ -161,10 +161,12 @@ pub mod topics {
     pub const NEEDS_YOU: &str = "needs_you";
     /// The upgrade: `upgrade.started`, `upgrade.done`.
     pub const UPGRADE: &str = "upgrade";
+    /// App settings kept in the rlx home (the multi-device brief, §4): `settings.changed`.
+    pub const SETTINGS: &str = "settings";
 
     /// Every topic above: the stream's, 7.3's.
     pub const ALL: &[&str] = &[
-        DAEMON, RUN, JOB, CONNECTOR, PTY, HOOK, FLEET, BOARD, NEEDS_YOU, UPGRADE,
+        DAEMON, RUN, JOB, CONNECTOR, PTY, HOOK, FLEET, BOARD, NEEDS_YOU, UPGRADE, SETTINGS,
     ];
 
     /// The installer's JSON lines (7.8): `install.step`, `install.done`, `install.error`.
@@ -178,8 +180,8 @@ pub mod topics {
     pub const CLI: &[&str] = &[INSTALL, SIGNIN];
 }
 
-/// The types rlxd itself sends on the `daemon` topic (7.3). A client must also accept
-/// types not listed here.
+/// The types rlxd itself sends on the `daemon` topic (7.3), and on `settings`. A client
+/// must also accept types not listed here.
 pub mod types {
     /// `{version, pid}`: rlxd started. The first event of each rlxd's life.
     pub const DAEMON_STARTED: &str = "daemon.started";
@@ -191,6 +193,12 @@ pub mod types {
     /// later in a stream, whatever its topics. The gap's own `seq` is `to`, so the
     /// stream's seqs still increase and resuming from it skips nothing more.
     pub const DAEMON_GAP: &str = "daemon.gap";
+    /// `{key, version, by_device?}` ([`SettingsChanged`](crate::SettingsChanged)): a
+    /// setting was set. Read its value with `settings.get`.
+    pub const SETTINGS_CHANGED: &str = "settings.changed";
+    /// `{key, version, by_device?}`: a setting was deleted, from `version`; it is back to
+    /// never set, and its default applies.
+    pub const SETTINGS_DELETED: &str = "settings.deleted";
 }
 
 impl Event {

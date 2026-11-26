@@ -8,8 +8,9 @@
 
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
-    InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope, StatusData,
-    SubscribeParams,
+    InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope, Setting,
+    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
+    SettingsSetParams, StatusData, SubscribeParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -66,6 +67,13 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
     assert!(HereData::deserialize(here).is_err());
 
     assert!(SubscribeParams::deserialize(json!({"topics": []})).is_err());
+    assert!(SettingsGetParams::deserialize(json!({"key": "a..b"})).is_err());
+    assert!(SettingsSetParams::deserialize(json!({"key": "theme", "value": 1})).is_err());
+    assert!(SettingsListParams::deserialize(json!({"prefix": null})).is_err());
+    assert!(Setting::deserialize(json!({"key": "theme", "version": 0, "value": "x"})).is_err());
+    assert!(SettingsList::deserialize(json!({"settings": [{"key": "", "version": 0}]})).is_err());
+    assert!(SettingsChanged::deserialize(json!({"key": "theme", "version": 0})).is_err());
+    assert!(SettingsDeleteParams::deserialize(json!({"key": ""})).is_err());
     assert!(ErrorBody::deserialize(json!({"code": "since_ahead", "message": "m"})).is_err());
 
     // And they still read what is valid.
@@ -127,6 +135,35 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
     assert!(printed(&status).is_ok());
     status.pid = 0;
     assert!(printed(&status).is_err());
+
+    let mut set = SettingsSetParams::new("theme", json!("rlx")).unwrap();
+    assert!(printed(&set).is_ok());
+    set.value = json!(1);
+    assert!(printed(&set).is_err());
+    let mut get = SettingsGetParams::new("theme").unwrap();
+    assert!(printed(&get).is_ok());
+    get.key.clear();
+    assert!(printed(&get).is_err());
+    let mut list = SettingsListParams::new();
+    assert!(printed(&list).is_ok());
+    list.prefix = Some("x".repeat(129));
+    assert!(printed(&list).is_err());
+    let mut setting = Setting::unset("theme").unwrap();
+    assert!(printed(&setting).is_ok());
+    setting.value = Some(json!("rlx"));
+    assert!(printed(&setting).is_err());
+    let mut settings = SettingsList::new(Vec::new()).unwrap();
+    assert!(printed(&settings).is_ok());
+    settings.settings.push(setting);
+    assert!(printed(&settings).is_err());
+    let mut delete = SettingsDeleteParams::new("theme").unwrap();
+    assert!(printed(&delete).is_ok());
+    delete.key.clear();
+    assert!(printed(&delete).is_err());
+    let mut changed = SettingsChanged::new("theme", 1, None).unwrap();
+    assert!(printed(&changed).is_ok());
+    changed.version = 0;
+    assert!(printed(&changed).is_err());
 
     let mut subscribe = SubscribeParams::new().with_topics(["run"]).unwrap();
     assert!(printed(&subscribe).is_ok());
