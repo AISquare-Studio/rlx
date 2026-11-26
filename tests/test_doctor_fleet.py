@@ -2091,23 +2091,29 @@ def test_a_ui_tester_bound_to_an_account_alone_is_one_set_up(
 
 
 def test_a_ui_tester_account_picked_in_app_settings_is_one_set_up(home: Path) -> None:
-    """The same binding from App settings' ui-tester row (its account select, saved)."""
-    from textual.widgets import Button, Select
+    """The same binding from App settings' ui-tester row: its account select, kept at once
+    (M5's autosave, #24: the page has no Save button), the way M5's own tests pick one."""
+    from textual.widgets import Select
 
     from aisquare.core import claude_accounts as accounts_core
+    from aisquare.core.config import load_config
+    from tests.settings_fields import leave_fields
     from tests.test_ui_app_settings import drive, settle
 
     accounts_core.create_account()  # slot 2, under the isolated AISQUARE_HOME
     assert diagnostics._ui_tester_wanted() is False
 
-    async def pick(pilot: Any, host: Any) -> None:
+    async def pick(pilot: Any, host: Any) -> list[tuple[str, str]]:
         await settle(pilot)  # the slots arrive from a worker
         host.query_one("#role-acct-ui-tester", Select).value = "2"
-        host.query_one("#save-settings", Button).press()
+        leave_fields(host)
         await settle(pilot)
+        return list(host.notices)
 
-    drive(pick)
+    notices = drive(pick)
 
+    assert any(m.startswith("Saved ") for m, _ in notices), notices
+    assert load_config().team.profiles["ui-tester"].account == "2"
     assert paths.config_path().read_text("utf-8").count("[team.profiles.ui-tester]") == 1
     assert diagnostics._ui_tester_wanted() is True
 
