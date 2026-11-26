@@ -337,7 +337,7 @@ def test_a_key_pattern_holds_its_glob_characters_as_themselves(store: ContextSto
 
 
 @pytest.mark.parametrize("scope", ["as_fleet", "as_board"])
-def test_purging_a_project_removes_its_manager_seat_progress(
+def test_resetting_a_project_removes_its_manager_seat_progress(
     store: ContextStore, scope: str
 ) -> None:
     """Progress belongs to both the fleet that reads and the board it reads from."""
@@ -351,7 +351,7 @@ def test_purging_a_project_removes_its_manager_seat_progress(
     unrelated = manager_seat.progress_key(peer, peer, "pass")
     for key in (urgent, passed, unrelated):
         store.set_meta(key, "value")
-    store.purge_project(PROJECT.id)
+    store.reset_project(PROJECT.id, apply=True)
     assert store.get_meta(urgent) is None and store.get_meta(passed) is None
     assert store.get_meta(unrelated) == "value"
 

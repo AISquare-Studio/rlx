@@ -540,27 +540,30 @@ def test_schedule_compacts_past_held_results_but_refuses_urgent_work(manager: Ma
     assert (why or "").startswith("a question is pending")
 
 
-
 def test_scheduled_compaction_uses_the_completed_pass_decision_watermark(manager: Manager) -> None:
     """A decision only makes the state file stale after its pass completes."""
     from aisquare.services import manager_pass
 
     manager.write_state(ago=timedelta(minutes=5))
     now = datetime.now(UTC)
-    decision = team_service.add_note("decision for the next pass", kind="decision",
-                                     board_id=manager.project.id)
+    decision = team_service.add_note(
+        "decision for the next pass", kind="decision", board_id=manager.project.id
+    )
     with store_session() as store:
         store.set_project_setting(manager.project.id, "manager_wake", "schedule")
         store.touch_session(manager.sid, state="waiting")
         session = manager.session()
         settings = load_config().fleet
-        assert (
-            quiet_compact.refusal(store, session, manager.agent, session.cursor, settings) is None
-        )
+        why = quiet_compact.refusal(store, session, manager.agent, session.cursor, settings)
+        assert why is None
         progress = manager_pass.Progress(
             pending=manager_pass.Pass(
-                id="verified", lower=0, upper=decision.seq, session=manager.sid,
-                attempted_at=now, acknowledged_at=now,
+                id="verified",
+                lower=0,
+                upper=decision.seq,
+                session=manager.sid,
+                attempted_at=now,
+                acknowledged_at=now,
             ),
         )
         assert manager_pass.save(store, manager.project.id, manager.project.id, None, progress)

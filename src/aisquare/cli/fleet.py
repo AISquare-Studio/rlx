@@ -476,12 +476,16 @@ def manager_policy(
             store.set_project_setting(target.id, key, validated)
         policy = manager_seat.policy(store, target.id)
     if get_state().json_output:
-        typer.echo(json.dumps({
-            "project_id": target.id,
-            "manager_wake": policy.wake,
-            "manager_pass_minutes": policy.pass_minutes,
-            "invalid": policy.invalid,
-        }))
+        typer.echo(
+            json.dumps(
+                {
+                    "project_id": target.id,
+                    "manager_wake": policy.wake,
+                    "manager_pass_minutes": policy.pass_minutes,
+                    "invalid": policy.invalid,
+                }
+            )
+        )
         return
     typer.echo(f"{target.id} manager_wake={policy.wake} manager_pass_minutes={policy.pass_minutes}")
     if policy.invalid:

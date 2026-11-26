@@ -97,8 +97,17 @@ def prompt(project: str, board: str, pending: Pass) -> tuple[str, str | None]:
     """Attach commands for the exact range to the project template."""
     body, why = template(project)
     read = program.words(
-        "--json", "team", "log", "--pass-id", pending.id, "--since-seq", str(pending.lower),
-        "--through-seq", str(pending.upper), "--as", pending.session,
+        "--json",
+        "team",
+        "log",
+        "--pass-id",
+        pending.id,
+        "--since-seq",
+        str(pending.lower),
+        "--through-seq",
+        str(pending.upper),
+        "--as",
+        pending.session,
     )
     complete = program.words("team", "complete-pass", pending.id, "--as", pending.session)
     return (
@@ -174,7 +183,8 @@ def observe_transcript(session: TeamSession, pending: Pass) -> bool:
         return False
     path = Path(session.transcript_path)
     try:
-        lines = transcripts.lines_backwards(path, path.stat().st_size, budget=transcripts.TAIL_BUDGET)
+        size = path.stat().st_size
+        lines = transcripts.lines_backwards(path, size, budget=transcripts.TAIL_BUDGET)
         for _, record in reader.records(lines):
             if record is None:
                 continue

@@ -15891,9 +15891,8 @@ def test_explicit_questions_route_across_a_hub_with_an_implicit_default(
         to_role=intended.session_id,
         session_ref=writer,
     )
-    assert [
-        (pane, line) for pane, action, line in hubbed.tmux.typed if action == "paste"
-    ] == [(intended.pane_id, NUDGE_TEXT)]
+    pastes = [(pane, line) for pane, action, line in hubbed.tmux.typed if action == "paste"]
+    assert pastes == [(intended.pane_id, NUDGE_TEXT)]
     assert team_service.hook_stop(wrong.session_id, root) is None
     delivery = team_service.hook_prompt_heartbeat(intended.session_id, root)
     assert "question for the other fleet" in delivery
@@ -16004,17 +16003,17 @@ def test_solo_session_receives_only_scoped_urgency_when_briefed_as_scheduled_man
     _board_session(coder, "working")
     with store_session() as store:
         assert store.get_meta(team_service._unbriefed(sid)) is not None
-        assert store.adopt_fleet_agent_session(
-            manager.id, manager.session_id, sid, datetime.now(UTC)
-        )
+        now = datetime.now(UTC)
+        assert store.adopt_fleet_agent_session(manager.id, manager.session_id, sid, now)
         store.set_project_setting(project.id, "manager_wake", "schedule")
     team_service.set_role("manager", sid)
     ask = team_service.add_note(
         "urgent for this manager", kind="question", to_role=sid, session_ref=coder.session_id
     )
     team_service.add_note("held result for the pass", kind="result", session_ref=coder.session_id)
-    team_service.add_note("question for the coder", kind="question", to_role="coder",
-                          board_id=project.id)
+    team_service.add_note(
+        "question for the coder", kind="question", to_role="coder", board_id=project.id
+    )
 
     def broken(*args: object, **kwargs: object) -> str:
         raise RuntimeError("could not render urgent page")
@@ -16073,7 +16072,10 @@ def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
             since_seq=0,
             through_seq=pending.upper + 1,
         )
-    team_service.complete_manager_pass(pending.id, sid)
+    completed = CliRunner().invoke(
+        app, ["--json", "team", "complete-pass", pending.id, "--as", sid]
+    )
+    assert completed.exit_code == 0 and json.loads(completed.stdout) == {"pass_id": pending.id}
     team_service.complete_manager_pass(pending.id, sid)
     with store_session() as store:
         saved = manager_pass.read(store, project.id, project.id)[1]
@@ -16216,9 +16218,7 @@ def test_manager_pass_timer_stays_manual_until_a_completed_pass_and_healthy_watc
     )
 
 
-def test_manager_pass_prompt_uses_the_project_template_or_builtin(
-    project: ProjectInfo,
-) -> None:
+def test_manager_pass_prompt_uses_the_project_template_or_builtin(project: ProjectInfo) -> None:
     """A missing or empty project prompt still produces a bounded pass command."""
     from aisquare.services import manager_pass
 
@@ -16233,8 +16233,9 @@ def test_manager_pass_prompt_uses_the_project_template_or_builtin(
     path.write_text(" ")
     empty, why = manager_pass.prompt(project.id, project.id, pending)
     assert empty == missing and why == "pass.md empty or too long"
+    read_range = "team log --pass-id test-pass --since-seq 4 --through-seq 9 --as bound-seat"
     for prompt in (missing, customized):
-        assert "team log --pass-id test-pass --since-seq 4 --through-seq 9 --as bound-seat" in prompt
+        assert read_range in prompt
         assert "team complete-pass test-pass --as bound-seat" in prompt
 
 
