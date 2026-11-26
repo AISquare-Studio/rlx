@@ -49,7 +49,7 @@ mod lock;
 mod log;
 mod out;
 pub mod peer;
-mod pty;
+pub mod pty;
 pub mod registry;
 mod serve;
 mod server;

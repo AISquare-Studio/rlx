@@ -530,3 +530,57 @@ fn check_2_the_frame_matches_tmux_byte_for_byte() {
     );
     assert!(String::from_utf8_lossy(&ours).starts_with("\x1b[31mred\x1b[39m plain\n"));
 }
+
+/// `pty.write`'s keys and pastes reach the program as tmux would send them, through the
+/// PTY, in order: a raw-mode program that asked for application cursor keys and
+/// bracketed paste prints what it reads, in hex.
+#[cfg(unix)]
+#[test]
+fn check_3_keys_and_a_paste_reach_the_program_as_tmux_sends_them() {
+    if Command::new("python3").arg("-V").output().is_err() {
+        eprintln!("python3 is not on PATH: the keys were not sent");
+        return;
+    }
+    let home = TestHome::new();
+    home.start();
+    let script = "import os,tty\ntty.setraw(0)\nos.write(1,b'\\x1b[?1h\\x1b[?2004hREADY\\r\\n')\n\
+                  while True:\n    b=os.read(0,4096)\n    if not b: break\n    \
+                  os.write(1,b.hex().encode())\n";
+    let id = spawn(
+        &home,
+        json!({"argv": ["python3", "-c", script], "cols": 200, "rows": 40}),
+    );
+    eventually("the program is ready", || {
+        screen(&home, &id)["text"]
+            .as_str()
+            .unwrap()
+            .contains("READY")
+    });
+    let keys = ["Up", "M-x", "C-c", "Enter", "F5", "BTab", "S-Enter"];
+    for params in [
+        json!({"pty_id": id, "keys": keys}),
+        json!({"pty_id": id, "paste": "one\ntwo"}),
+        json!({"pty_id": id, "text": "é"}),
+    ] {
+        let run = call(&home, "pty.write", &params);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+    }
+    let modes = rlxd::vt::InputModes {
+        cursor_keys: true,
+        bracketed_paste: true,
+        ..Default::default()
+    };
+    let names: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+    let mut expected = rlxd::pty::keys::send_keys(&names, modes);
+    expected.extend(rlxd::pty::paste("one\ntwo", true));
+    expected.extend("é".as_bytes());
+    let expected: String = expected.iter().map(|b| format!("{b:02x}")).collect();
+    eventually("every byte arrives, in order", || {
+        let text = screen(&home, &id)["text"].as_str().unwrap().to_owned();
+        let after: String = text
+            .split_once("READY")
+            .map(|(_, rest)| rest.split_whitespace().collect())
+            .unwrap_or_default();
+        after == expected
+    });
+}

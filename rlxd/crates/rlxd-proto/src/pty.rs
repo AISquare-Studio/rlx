@@ -152,7 +152,8 @@ struct UncheckedRef {
 /// - `keys` are tmux's key names, such as `Enter`, `S-Enter`, `Escape`, `BTab`, `Up`,
 ///   `C-c`, `M-x`, `F5` or `PageDown`, or single characters. Each goes as the bytes tmux's
 ///   `send-keys` sends for it, honouring the modes the program set, such as application
-///   cursor keys. A name tmux doesn't know gets `invalid_params` naming it.
+///   cursor keys. A name tmux doesn't know is typed as its characters, as `send-keys`
+///   types it.
 /// - `paste` goes as `paste-buffer -p` sends it: each newline as a carriage return, and
 ///   bracketed (`ESC [200~` … `ESC [201~`) when the program turned bracketed paste on.
 ///

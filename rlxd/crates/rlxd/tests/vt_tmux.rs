@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use rlxd::pty::{keys, paste};
 use rlxd::vt::Terminal;
 
 /// One screen: a name, its size, and the bytes a program writes.
@@ -262,7 +263,10 @@ impl Tmux {
         if !found.status.success() {
             return None;
         }
-        let socket = format!("rlxd-vt-{}", std::process::id());
+        // One server each: the tests run in parallel, and each kills its own.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket = format!("rlxd-vt-{}-{n}", std::process::id());
         let dir = std::env::temp_dir().join(&socket);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -463,5 +467,210 @@ fn every_fixture_captures_as_tmux_captures_it() {
         fixtures.len(),
         tmux.version(),
         failures.join("\n\n")
+    );
+}
+
+/// A program that sets `argv[1]`'s modes (as hex), says READY, then prints every byte
+/// it reads, in hex, in raw mode.
+const HEX_ECHO: &str = r#"
+import os, sys, tty
+tty.setraw(0)
+os.write(1, bytes.fromhex(sys.argv[1]))
+os.write(1, b"READY\r\n")
+while True:
+    b = os.read(0, 4096)
+    if not b:
+        break
+    os.write(1, b.hex().encode())
+"#;
+
+/// One case of input: the modes a program sets, then keys or a paste.
+struct Input {
+    name: &'static str,
+    setup: &'static str,
+    keys: &'static [&'static str],
+    paste: Option<&'static str>,
+    since: Option<(u32, u32)>,
+}
+
+/// The keys the fleet sends today (core/keys.py, remote_server.py, the agent adapters),
+/// and their modified forms.
+const FLEET_KEYS: &[&str] = &[
+    "Enter", "Escape", "Tab", "BTab", "BSpace", "Space", "Up", "Down", "Left", "Right", "Home",
+    "End", "PageUp", "PageDown", "PPage", "NPage", "Delete", "DC", "IC", "F1", "F2", "F3", "F4",
+    "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "C-c", "C-d", "C-j", "C-l", "C-o", "C-r",
+    "C-u", "C-@", "0", "1", "9", "y", "n", "M-x", "M-Enter", "C-M-x", "C-Up", "M-Up", "S-Up",
+    "C-M-S-Up", "C-M-S-F5", "S-F1", "C-S-F12", "M-S-F12", "S-Enter", "C-Enter", "C-BSpace",
+    "M-BSpace", "C-1", "C-/", "C-?", "C-[", "C-]", "C-^", "C-_", "é", "M-é", "Entr", "KP5",
+    "KPEnter", "^c", "C-Space", "S-Space",
+];
+
+const MODIFIED: &[&str] = &[
+    "S-Enter", "C-Enter", "M-Enter", "C-c", "C-S-a", "C-1", "M-x", "C-M-x", "C-Tab", "S-Tab",
+    "BTab", "C-BTab", "S-Space", "C-Space", "C-é", "Up", "C-Up",
+];
+
+const PASTE: &str = "line one\nline two\ttab\x1b[31mesc\x7fdel\x07bell\rcr é";
+
+fn inputs() -> Vec<Input> {
+    vec![
+        Input {
+            name: "the fleet's keys",
+            setup: "",
+            keys: FLEET_KEYS,
+            paste: None,
+            since: None,
+        },
+        Input {
+            name: "application cursor keys and keypad",
+            setup: "\x1b[?1h\x1b=",
+            keys: &[
+                "Up", "Down", "Left", "Right", "Home", "End", "M-Up", "C-Up", "KP5", "KP/",
+                "KPEnter", "KP.", "F1",
+            ],
+            paste: None,
+            since: None,
+        },
+        Input {
+            // tmux before 3.5 encodes extended keys otherwise.
+            name: "extended keys, modifyOtherKeys 1",
+            setup: "\x1b[>4;1m",
+            keys: MODIFIED,
+            paste: None,
+            since: Some((3, 5)),
+        },
+        Input {
+            name: "extended keys, modifyOtherKeys 2",
+            setup: "\x1b[>4;2m",
+            keys: MODIFIED,
+            paste: None,
+            since: Some((3, 5)),
+        },
+        Input {
+            name: "a paste",
+            setup: "",
+            keys: &[],
+            paste: Some(PASTE),
+            since: None,
+        },
+        Input {
+            name: "a bracketed paste",
+            setup: "\x1b[?2004h",
+            keys: &[],
+            paste: Some(PASTE),
+            since: None,
+        },
+    ]
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+impl Tmux {
+    /// What the program in `fixture`'s pane reads after `input`'s keys or paste, as
+    /// hex.
+    fn received(&self, n: usize, input: &Input) -> String {
+        let script = self.dir.join("hex_echo.py");
+        std::fs::write(&script, HEX_ECHO).unwrap();
+        let session = format!("k{n}");
+        let command = format!(
+            "exec python3 '{}' '{}'",
+            script.display(),
+            hex(input.setup.as_bytes())
+        );
+        self.run(&[
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-x",
+            "200",
+            "-y",
+            "50",
+            &command,
+        ]);
+        let ready = Instant::now() + Duration::from_secs(10);
+        while !String::from_utf8_lossy(&self.run(&["capture-pane", "-p", "-t", &session]))
+            .contains("READY")
+        {
+            assert!(
+                Instant::now() < ready,
+                "{}: the program never got ready",
+                input.name
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(text) = input.paste {
+            self.run(&["set-buffer", "-b", "rlxd-test", "--", text]);
+            self.run(&["paste-buffer", "-p", "-b", "rlxd-test", "-t", &session]);
+        } else {
+            let mut args = vec!["send-keys", "-t", &session, "--"];
+            args.extend(input.keys);
+            self.run(&args);
+        }
+        self.settle(&session);
+        let text = self.run(&["capture-pane", "-p", "-J", "-S", "-", "-t", &session]);
+        let text = String::from_utf8_lossy(&text);
+        text.split_once("READY")
+            .map(|(_, after)| after.split_whitespace().collect())
+            .unwrap_or_default()
+    }
+}
+
+#[test]
+fn keys_and_pastes_send_tmuxs_bytes() {
+    let Some(tmux) = tmux_or_skip() else {
+        return;
+    };
+    if Command::new("python3").arg("-V").output().is_err() {
+        assert!(
+            std::env::var_os("RLXD_TMUX_REQUIRED").is_none_or(|v| v != "1"),
+            "RLXD_TMUX_REQUIRED=1, and python3 is not on PATH"
+        );
+        eprintln!("python3 is not on PATH: the keys were not compared");
+        return;
+    }
+    // Extended keys as the fleet's tmux has them, before any pane asks.
+    tmux.run(&["new-session", "-d", "-s", "base", "exec sleep 60"]);
+    tmux.run(&["set-option", "-s", "extended-keys", "on"]);
+    let version = tmux.numbers();
+    let mut failures = Vec::new();
+    for (n, input) in inputs().iter().enumerate() {
+        if let Some(since) = input.since
+            && version < since
+        {
+            eprintln!(
+                "{}: skipped, as tmux {}.{} sends it otherwise",
+                input.name, version.0, version.1
+            );
+            continue;
+        }
+        let theirs = tmux.received(n, input);
+        let mut model = Terminal::new(80, 24, 0, "test");
+        model.feed(input.setup.as_bytes());
+        let modes = model.input_modes();
+        let ours = match input.paste {
+            Some(text) => paste(text, modes.bracketed_paste),
+            None => {
+                let names: Vec<String> = input.keys.iter().map(|k| (*k).to_owned()).collect();
+                keys::send_keys(&names, modes)
+            }
+        };
+        if theirs != hex(&ours) {
+            failures.push(format!(
+                "{}:\n  tmux: {theirs}\n  rlxd: {}",
+                input.name,
+                hex(&ours)
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} differ from {}:\n{}",
+        failures.len(),
+        inputs().len(),
+        tmux.version(),
+        failures.join("\n")
     );
 }

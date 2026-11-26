@@ -198,7 +198,8 @@ every connection's `pty.list`.
   newline after every row. `scrollback: n` puts up to `n` lines of history above it, as
   `-S -n` does.
 - **Input is tmux's.** `keys` are tmux's key names, sent as `send-keys` sends them,
-  honouring the modes the program set. `paste` is `paste-buffer -p`'s: newlines as
+  honouring the modes the program set; a name tmux doesn't know is typed as its
+  characters, as `send-keys` types it. `paste` is `paste-buffer -p`'s: newlines as
   carriage returns, bracketed when the program asked for bracketed paste.
 - **A process that ends** keeps its last screen and exit status, `exited` and `status`,
   until `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `status` is the exit

@@ -8,6 +8,8 @@
 //!   `pty.kill`, as tmux's `remain-on-exit on` keeps a pane.
 //! - **Every PTY is the home's.** One spawned by any connection is in every connection's
 //!   `pty.list`; each has 128 random bits for its id.
+//! - **Keys are tmux's** (`keys`): a name is read as `send-keys` reads it, and sent as
+//!   tmux sends it, honouring the program's modes; a name tmux doesn't know is typed.
 //! - **Writes queue**, in order, behind the program's own replies to its queries: a
 //!   `pty.write` returns once its bytes are queued, as tmux's `send-keys` returns once
 //!   they are buffered. A program that reads none of them stops taking more at 16 MiB.
@@ -17,6 +19,7 @@
 //! - **Limits:** [`MAX_PTYS`] PTYs a home, the exited ones included, and
 //!   [`SCROLLBACK`] lines of history each.
 
+pub mod keys;
 #[cfg(unix)]
 mod unix;
 
@@ -305,11 +308,7 @@ impl Host {
             match params.input() {
                 PtyInput::Text(text) => text.as_bytes().to_vec(),
                 PtyInput::Paste(text) => paste(text, modes.bracketed_paste),
-                PtyInput::Keys(_) => {
-                    return Err(Refused::Invalid(
-                        "keys are not sent by this build yet: send their bytes as text".to_owned(),
-                    ));
-                }
+                PtyInput::Keys(names) => keys::send_keys(names, modes),
                 _ => return Err(Refused::Invalid("no input this rlxd knows".to_owned())),
             }
         };
