@@ -1030,7 +1030,9 @@ def plaintext_credentials_path(
     import unicodedata
 
     source = os.environ if environ is None else environ
-    directory = source.get(SECURE_STORAGE_VAR)
+    directory = _users_secure_storage(source)
+    if directory is None and account.managed:
+        directory = keychain_pin(account)
     if directory is None:
         return credentials_path(account)
     base = Path(unicodedata.normalize("NFC", directory)) if directory else home_config_dir()
@@ -1147,10 +1149,11 @@ def keychain_service(account: ClaudeAccount, environ: Mapping[str, str] | None =
     this environment inherits, wins over both, as it does in Claude Code.
     """
     source = os.environ if environ is None else environ
-    directory = source.get(SECURE_STORAGE_VAR)
+    directory = _users_secure_storage(source)
     if directory is None:
         if account.managed:
-            directory = launch_env(account)[CONFIG_DIR_VAR]
+            launched = launch_env(account)
+            directory = launched.get(SECURE_STORAGE_VAR, launched[CONFIG_DIR_VAR])
         else:
             directory = plain_environment(source).get(CONFIG_DIR_VAR, "")
     suffix = f"-{_js_sha256(directory)[:8]}" if directory else ""
@@ -1351,6 +1354,83 @@ def _keychain_problem(code: int, stderr: bytes) -> tuple[KeychainProblem, str]:
     return "failed", f"could not read the Keychain (security exited {code})"
 
 
+# --- a slot's login kept under its old Keychain name: the home's move (#31) ------------------
+#
+# A login too long to copy without putting it on a command line (``KEYCHAIN_LINE_LIMIT``) stays
+# where it is: the slot is PINNED to the directory its old place's item is named by, recorded in
+# its marker (``MARKER``'s ``keychain_dir``), and every launch on it sets
+# ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` to that directory, which Claude Code keys its item on.
+
+KEYCHAIN_PIN_KEY = "keychain_dir"
+"""The marker's key for a slot's pin: the raw ``CLAUDE_CONFIG_DIR`` its item is named by."""
+KEYCHAIN_PIN_VAR = "AISQUARE_KEYCHAIN_PIN"
+"""Set beside ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` by a pinned slot's launch, to its value: the
+variable is then rlx's pin, not the user's, so a read or a launch of another account in that
+environment names that account's own item (:func:`_users_secure_storage`)."""
+_PINS: dict[str, tuple[int, str | None]] = {}
+"""Each marker's pin as last read, by its path, with the file's ``st_mtime_ns``."""
+
+
+def keychain_pin(account: ClaudeAccount) -> str | None:
+    """The directory ``account``'s Keychain item is named by when the home's move pinned it
+    (:data:`KEYCHAIN_PIN_KEY` in its marker), else ``None``: every slot but one whose login was
+    too long to copy. Read again only when the marker changed."""
+    if not account.managed:
+        return None
+    marker = account.config_dir / MARKER
+    try:
+        changed = marker.stat().st_mtime_ns
+    except OSError:
+        return None
+    kept = _PINS.get(str(marker))
+    if kept is not None and kept[0] == changed:
+        return kept[1]
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    pin = data.get(KEYCHAIN_PIN_KEY) if isinstance(data, dict) else None
+    found = pin if isinstance(pin, str) and pin else None
+    _PINS[str(marker)] = (changed, found)
+    return found
+
+
+def pin_keychain_dir(account: ClaudeAccount, directory: str | None) -> None:
+    """Record (``directory``) or take away (``None``) ``account``'s pin in its marker, keeping
+    everything else the marker says. Raises ``OSError`` when it cannot be written."""
+    from aisquare.core.atomic import write_replacing
+
+    marker = account.config_dir / MARKER
+    if directory is None and not marker.is_file():
+        return  # no slot there: nothing pinned to take away
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if directory is None:
+        data.pop(KEYCHAIN_PIN_KEY, None)
+    else:
+        data[KEYCHAIN_PIN_KEY] = directory
+    write_replacing(marker, json.dumps(data, indent=2) + "\n")
+    _PINS.pop(str(marker), None)
+
+
+def _users_secure_storage(source: Mapping[str, str]) -> str | None:
+    """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` as the user set it in ``source``; ``None`` when unset
+    or when it is a pinned slot's (:data:`KEYCHAIN_PIN_VAR`), which names that slot's item only."""
+    directory = source.get(SECURE_STORAGE_VAR)
+    if directory is not None and source.get(KEYCHAIN_PIN_VAR) == directory:
+        return None
+    return directory
+
+
+def keychain_copy_fits(service: str, account: str, data: bytes) -> bool:
+    """Whether :func:`add_keychain_item` can write ``data`` on one ``security -i`` line."""
+    return len(_add_line(service, account, data)) <= KEYCHAIN_LINE_LIMIT
+
+
 # --- an item copied to another name: the home's move (#31, H2) ----------------------------------
 #
 # A managed slot's item is named by its config dir (`keychain_service`), so a slot the home's
@@ -1412,7 +1492,7 @@ def add_keychain_item(service: str, account: str, data: bytes) -> str | None:
     goes on past a command that failed."""
     if not (_ITEM_NAME.fullmatch(service) and _ITEM_NAME.fullmatch(account)):
         return "its name cannot be given to security as it stands"
-    line = f'add-generic-password -U -a "{account}" -s "{service}" -X "{data.hex()}"\n'
+    line = _add_line(service, account, data)
     if len(line) > KEYCHAIN_LINE_LIMIT:
         return f"it is {len(data):,} bytes, too long to copy without putting it on a command line"
     done = _run_security(["-i"], stdin=line.encode("ascii"))
@@ -1420,6 +1500,11 @@ def add_keychain_item(service: str, account: str, data: bytes) -> str | None:
         return done
     code, _stdout, stderr = done
     return None if code == 0 else _keychain_problem(code, stderr)[1]
+
+
+def _add_line(service: str, account: str, data: bytes) -> str:
+    """The ``security -i`` line that writes ``data`` as the item, as Claude Code writes one."""
+    return f'add-generic-password -U -a "{account}" -s "{service}" -X "{data.hex()}"\n'
 
 
 def delete_keychain_item(service: str, account: str) -> str | None:
@@ -1849,6 +1934,13 @@ def launch_env(account: ClaudeAccount) -> dict[str, str]:
         # Each of its scratch variables names the slot's scratch dir; Codex has none, and
         # keeps its temporary files under its home.
         env.update(dict.fromkeys(accounts.extra_env, str(account.tmp_dir)))
+    pin = keychain_pin(account)
+    if pin is not None:
+        # Its login stays under the Keychain name its old place hashed to (#31): Claude Code
+        # keys its item on this variable when it is set. Said as ours beside it, so no other
+        # account's launch or read in this environment takes it for the user's own.
+        env[SECURE_STORAGE_VAR] = pin
+        env[KEYCHAIN_PIN_VAR] = pin
     return env
 
 
@@ -1870,6 +1962,9 @@ def apply_launch_env(
     """
     launch_vars, plain_vars = _launch_vars(account.agent)
     plain = plain_environment(shell, agent=account.agent)
+    pin = env.pop(KEYCHAIN_PIN_VAR, None)
+    if pin is not None and env.get(SECURE_STORAGE_VAR) == pin:
+        del env[SECURE_STORAGE_VAR]  # another slot's pin (#31): set again below only for its own
     wanted: dict[str, str | None]
     if account.managed:
         env.update(launch_env(account))

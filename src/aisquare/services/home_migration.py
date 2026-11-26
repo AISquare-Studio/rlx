@@ -22,7 +22,8 @@ back. The steps, in order:
 2. ``keychain``: on macOS, each managed Claude Code slot's login is copied to the Keychain item
    its new place names (``core.claude_accounts.keychain_service``), as Claude Code writes one,
    through ``security -i`` on its stdin, and read back by Claude Code's own lookup: the same
-   bytes, or the move stops.
+   bytes, or the move stops. A login too long for that line is never put on a command line: the
+   slot is pinned to its old item's name instead (``core.claude_accounts.keychain_pin``).
 3. ``move``: each old name at the home's top renamed to its new place (``paths.MOVES``); in a
    named home the store goes last, as the rename that makes it read as new; the default home
    then renames ``~/.aisquare`` to ``~/.rlx``, the rename that makes it read as new.
@@ -41,12 +42,14 @@ back. The steps, in order:
 9. ``done``.
 
 ROLLBACK is defined for every step before 8 (:func:`roll_back_move`): the link removed, each file
-copied aside put back, the store restored from its backup, each rename reversed, the root's
-last, and the Keychain copies deleted, so the home is as it was. A failure at any of them rolls
-back on its own; a crash leaves the journal, and the next run resumes (or ``--rollback`` rolls
-back). Only step 8 and after are forward-only: once the old items are deleted, the move only goes
-on. A move back to a release before 0.10.2 after it finds no ``context.db`` in ``~/.aisquare``
-and starts empty (:data:`DOWNGRADE_GAP`).
+copied aside put back (every file a hook refresh writes among them), the store restored from its
+backup, each rename reversed, the root's first, and the Keychain copies deleted and the pins
+taken away, so the home is as it was. The roll-back is journaled too, phase by phase
+(:data:`UNDO_PHASES`), so a crash during it is finished by the next run. A failure at any step
+rolls back on its own; a crash leaves the journal, and the next run resumes (or ``--rollback``
+rolls back). Only step 8 and after are forward-only: once the old items are deleted, the move
+only goes on. A move back to a release before 0.10.2 after it finds no ``context.db`` in
+``~/.aisquare`` and starts empty (:data:`DOWNGRADE_GAP`).
 """
 
 from __future__ import annotations
@@ -60,7 +63,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,6 +76,7 @@ from aisquare.core import launch_seal, paths
 from aisquare.core import program as prog
 from aisquare.core.atomic import write_replacing
 from aisquare.core.locking import holding
+from aisquare.models import ClaudeAccount
 
 if TYPE_CHECKING:
     from aisquare.core.tmux import TmuxServer
@@ -84,6 +88,9 @@ file it rewrote as it was. Kept until the next release (the manager's condition 
 JOURNAL_NAME = "journal.json"
 STEPS = ("backup", "keychain", "move", "rewrite", "check", "hooks", "link", "forget", "done")
 """The journal's steps, in order (the module's docstring)."""
+UNDO_PHASES = ("link", "aside", "store", "root", "renames", "made", "keychain", "folder")
+"""A roll-back's phases, in order: each is written down once done, and each within it (a file put
+back, a rename reversed) as it is done, so the next run finishes it where it stopped."""
 FORWARD_ONLY = "forget"
 """The first step after which the move cannot be rolled back: the old Keychain items go."""
 FIRST_RELEASE = "0.10.2"
@@ -159,6 +166,8 @@ class Rename(BaseModel):
     done: bool = False
     skipped: bool = False
     """Nothing was there to rename when its turn came."""
+    undone: bool = False
+    """Reversed by a roll-back."""
 
 
 class Copied(BaseModel):
@@ -169,7 +178,9 @@ class Copied(BaseModel):
     account: str
     old: str
     new: str
-    state: Literal["planned", "copying", "copied", "absent", "forgotten"] = "planned"
+    state: Literal["planned", "copying", "copied", "absent", "pinned", "forgotten"] = "planned"
+    """``pinned``: too long to copy without a command line, so the slot is pinned to its old
+    item's name instead (``core.claude_accounts.keychain_pin``), and nothing is copied."""
     existed: bool = False
     """The new item was there before, holding the same login: a roll-back leaves it."""
 
@@ -181,6 +192,9 @@ class Aside(BaseModel):
     place: list[str]
     copy_at: list[str]
     tree: bool = False
+    created: bool = False
+    """The move made the file (a hook refresh's trust record): a roll-back removes it."""
+    restored: bool = False
 
 
 class Journal(BaseModel):
@@ -189,11 +203,11 @@ class Journal(BaseModel):
 
     Rollback is defined at every step before :data:`FORWARD_ONLY` (:func:`roll_back_move`): the link
     removed, each file in :attr:`aside` put back, the store restored from its backup, each
-    rename in :attr:`renames` reversed (the root's last), and each Keychain copy in
-    :attr:`items` deleted. A check that fails after the rewrite (step ``check``: a fleet row
-    whose replay was allowed before and is refused after, or an account signed out) rolls back
-    whole. From :data:`FORWARD_ONLY` on (the old Keychain items deleted) the move only goes
-    on."""
+    rename in :attr:`renames` reversed (the root's first), and each Keychain copy in
+    :attr:`items` deleted and each pin taken away; each phase written down in :attr:`undone`.
+    A check that fails after the rewrite (step ``check``: the fleet rows whose replay is allowed
+    not the same as before, or an account signed out) rolls back whole. From
+    :data:`FORWARD_ONLY` on (the old Keychain items deleted) the move only goes on."""
 
     version: int = JOURNAL_VERSION
     old_root: str
@@ -207,6 +221,12 @@ class Journal(BaseModel):
     forgetting: bool = False
     """Step :data:`FORWARD_ONLY` began: no roll-back from here."""
     rolling_back: bool = False
+    undone: list[str] = Field(default_factory=list)
+    """The roll-back's phases done (:data:`UNDO_PHASES`), so a crash in it is finished, never
+    begun again over what it already put back (the tester's blocker 2 on #31)."""
+    in_flight: int | None = None
+    """The rename a crash may have stopped between making it and writing it down, as the
+    roll-back found it when it began."""
     renames: list[Rename] = Field(default_factory=list)
     renames_planned: bool = False
     """:attr:`renames` was listed, from the home as it stood when the step began (the backup
@@ -284,8 +304,9 @@ def planned_move() -> Plan | None:
     layout with no unfinished move, or no home at all. Reads only. Raises
     :class:`MigrationRefused` for a home that cannot be moved as it stands: both ``~/.aisquare``
     and ``~/.rlx`` there, or a place in the new layout taken already."""
-    root, layout = paths.home_of()
-    named = paths.named_home() is not None
+    default = _names_the_default_home()
+    root, layout = paths.home_of(_without_home_variables() if default else None)
+    named = paths.named_home() is not None and not default
     unfinished = _unfinished_move(root)
     if unfinished is not None:
         if not unfinished.named:
@@ -514,6 +535,8 @@ class Moved:
     """The store's copy from before the move, kept until the next release."""
     copied: list[str] = field(default_factory=list)
     """The Keychain logins copied, by account (``claude-code 2``)."""
+    pinned: list[str] = field(default_factory=list)
+    """The logins too long to copy, kept under their old names by a pin (``claude-code 4``)."""
     notes: list[str] = field(default_factory=list)
     left: list[str] = field(default_factory=list)
     """What still names the old home, left as written (``team_event.text: 3``)."""
@@ -530,6 +553,7 @@ class Moved:
             "in_place": self.named,
             "backup": str(self.backup),
             "keychain_copied": list(self.copied),
+            "keychain_pinned": list(self.pinned),
             "linked": self.linked,
             "left": list(self.left),
             "notes": list(self.notes),
@@ -551,6 +575,47 @@ def _one_at_a_time(old_root: str) -> Iterator[None]:
         raise MigrationRefused("another move of this home is running") from None
 
 
+def _names_the_default_home(environment: Mapping[str, str] | None = None) -> bool:
+    """Whether ``RLX_HOME`` or ``AISQUARE_HOME`` names ``~/.aisquare`` itself: the fleet hands
+    every window it opens the home by both names, resolved (``services.fleet``), and a shell
+    started from one inherits them. Such a home is the default one, moved to ``~/.rlx`` and
+    linked: laid out in place, the next rlx without the variable read ``~/.aisquare`` as an old
+    home with no store, and made an empty one (the tester's blocker 3 on #31)."""
+    named = paths.named_home(environment)
+    if named is None:
+        return False
+    default = Path.home() / paths.OLD_HOME_NAME
+    return os.path.realpath(named) == os.path.realpath(default)
+
+
+def _without_home_variables() -> dict[str, str]:
+    """This process's environment without the two home variables: the default home's rule."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name not in (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR)
+    }
+
+
+@contextlib.contextmanager
+def _as_the_default_home() -> Iterator[None]:
+    """For a move of the default home a variable names (:func:`_names_the_default_home`), the
+    variables set aside while it runs, so every path ``core.paths`` builds follows the default
+    home's rule (``~/.aisquare`` until its rename, ``~/.rlx`` after), and put back after."""
+    if not _names_the_default_home():
+        yield
+        return
+    kept = {
+        name: os.environ.pop(name)
+        for name in (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR)
+        if name in os.environ
+    }
+    try:
+        yield
+    finally:
+        os.environ.update(kept)
+
+
 def move_home(
     *, drop_cache: bool = False, say: Callable[[str], None] = lambda line: None
 ) -> Moved | None:
@@ -559,6 +624,12 @@ def move_home(
     :class:`MigrationRefused` (nothing touched) while the home is not quiet or cannot be moved,
     and :class:`MigrationFailed` when a step fails: rolled back before
     :data:`FORWARD_ONLY`, else left for the next run to finish."""
+    with _as_the_default_home():
+        return _move_home(drop_cache=drop_cache, say=say)
+
+
+def _move_home(*, drop_cache: bool, say: Callable[[str], None]) -> Moved | None:
+    """:func:`move_home`, the home's variables as the move reads them."""
     found = planned_move()
     if found is None:
         return None
@@ -628,7 +699,7 @@ def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None
                 ) from exc
             say(f"moving the home: {found.shown}")
         elif journal.rolling_back:
-            roll_back_move(journal)
+            _roll_back_move(journal)
             raise MigrationFailed("a roll-back a crash stopped was finished", rolled_back=True)
         else:
             say(f"resuming the home's move: {found.shown}")
@@ -641,7 +712,7 @@ def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None
                 raise MigrationFailed(_why_stopped(exc), rolled_back=False) from exc
             say(f"the move stopped ({_why_stopped(exc)}): rolling it back")
             try:
-                roll_back_move(journal)
+                _roll_back_move(journal)
             except Exception as undo:
                 raise MigrationFailed(
                     f"{_why_stopped(exc)}; and its roll-back stopped too "
@@ -655,7 +726,12 @@ def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None
             journal.named,
             _move_folder(journal.root) / paths.OLD_STORE,
             copied=[
-                f"{item.agent} {item.slot}" for item in journal.items if item.state != "absent"
+                f"{item.agent} {item.slot}"
+                for item in journal.items
+                if item.state in ("copied", "forgotten")
+            ],
+            pinned=[
+                f"{item.agent} {item.slot}" for item in journal.items if item.state == "pinned"
             ],
             notes=list(journal.notes),
             left=list(journal.left),
@@ -724,7 +800,7 @@ def _copy_logins(journal: Journal) -> None:
         journal.items = _logins_to_copy(journal)
         _save_move_journal(journal)
     for item in journal.items:
-        if item.state in ("copied", "absent"):
+        if item.state in ("copied", "absent", "pinned"):
             continue
         old = accounts_core.keychain_item_data(item.old, item.account)
         if old.unreadable is not None:
@@ -736,6 +812,13 @@ def _copy_logins(journal: Journal) -> None:
         if old.data is None:
             item.state = "absent"
             _save_move_journal(journal)
+            continue
+        if item.state == "planned" and not accounts_core.keychain_copy_fits(
+            item.new, item.account, old.data
+        ):
+            # Too long for `security -i`'s line, and never put on a command line: the slot keeps
+            # its old item's name instead (the owner's brief's alternative, #2071's note).
+            _pin_the_slot(item, journal)
             continue
         if item.state == "planned":
             there = accounts_core.keychain_item_data(item.new, item.account)
@@ -764,6 +847,22 @@ def _copy_logins(journal: Journal) -> None:
         item.state = "copied"
         _save_move_journal(journal)
     accounts_core.forget_keychain_reads()
+
+
+def _the_slot(item: Copied) -> ClaudeAccount:
+    """``item``'s account where the home keeps it now, in whichever layout it is in."""
+    return accounts_core._managed(item.slot, item.agent)
+
+
+def _pin_the_slot(item: Copied, journal: Journal) -> None:
+    """Pin ``item``'s slot to the directory its item is named by now, its raw
+    ``CLAUDE_CONFIG_DIR`` before the move (``core.claude_accounts.pin_keychain_dir``), so after
+    the move Claude Code and rlx still name the old item; nothing is copied, nothing deleted."""
+    account = _the_slot(item)
+    raw = accounts_core.launch_env(account)[accounts_core.CONFIG_DIR_VAR]
+    accounts_core.pin_keychain_dir(account, raw)
+    item.state = "pinned"
+    _save_move_journal(journal)
 
 
 def _logins_to_copy(journal: Journal) -> list[Copied]:
@@ -943,6 +1042,39 @@ def _paths_left_in(
     return left
 
 
+SLOT_FILE_LIMIT = 8 * 1024 * 1024
+"""The largest file at a slot's top the hook step copies aside: settings and trust records are
+small; a transcript or a history is never one a refresh writes."""
+
+
+def _slot_files(directory: Path) -> set[Path]:
+    """The regular files at ``directory``'s top (no link followed) up to :data:`SLOT_FILE_LIMIT`."""
+    found: set[Path] = set()
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return found
+    for entry in entries:
+        try:
+            if entry.is_file(follow_symlinks=False) and entry.stat().st_size <= SLOT_FILE_LIMIT:
+                found.add(Path(entry.path))
+        except OSError:
+            continue
+    return found
+
+
+def _made_by_the_move(journal: Journal, made: set[Path]) -> None:
+    """Record each file in ``made`` as one the move created: a roll-back removes it."""
+    root = journal.root
+    for path in sorted(made):
+        place = list(path.relative_to(root).parts)
+        if any(aside.place == place for aside in journal.aside):
+            continue
+        journal.aside.append(Aside(place=place, copy_at=[], created=True))
+    if made:
+        _save_move_journal(journal)
+
+
 def _copy_aside(journal: Journal, path: Path, *, tree: bool = False) -> None:
     """Copy ``path`` aside before it is rewritten, once: a roll-back puts it back."""
     root = journal.root
@@ -980,13 +1112,21 @@ def _move_file_paths(journal: Journal, path: Path, mover: _Mover) -> None:
 
 @_move_step("check")
 def _check_the_move(journal: Journal) -> None:
-    """Every fleet row whose replay was allowed before is allowed now, by the fleet's own check,
-    and every account signed in before is signed in now: else the move rolls back whole."""
-    refused = sorted(set(journal.accepted) - set(_replayable_rows()))
-    if refused:
+    """The fleet rows whose replay the fleet's own check allows are the same rows after the move
+    as before it, every one, and every account signed in before is signed in now: else the move
+    rolls back whole. The same, not merely kept: a row the check refused before and allows
+    after was let through by the move, which loosens the seal check (the manager's condition 4
+    on #31: never loosen it)."""
+    before, after = set(journal.accepted), set(_replayable_rows())
+    if before != after:
+        lost, gained = sorted(before - after), sorted(after - before)
+        said = []
+        if lost:
+            said.append(f"{', '.join(lost)} could no longer be restarted from its launch record")
+        if gained:
+            said.append(f"{', '.join(gained)}, refused before, would be restarted after")
         raise MigrationFailed(
-            f"after the rewrite, {len(refused)} fleet row(s) could no longer be restarted from "
-            f"their launch records ({', '.join(refused)})",
+            f"after the rewrite, the fleet's seal check changed its answer: {'; '.join(said)}",
             rolled_back=False,
         )
     accounts_core.forget_keychain_reads()
@@ -1042,17 +1182,29 @@ def _write_hooks_again(journal: Journal) -> None:
         settings = spec.settings_path if spec is not None else None
         if settings is None or not settings.is_file():
             continue
-        _copy_aside(journal, settings)
-        if agent_core.hook_commands(account.agent, account.config_dir):
-            try:
-                agents_service.refresh_hooks(account.agent, account.config_dir)
-                continue
-            except (KeyError, ValueError, OSError) as exc:
-                journal.notes.append(
-                    f"{account.agent} account {account.slot}'s hooks were not written again "
-                    f"({_why_stopped(exc)}): their paths were moved instead"
-                )
-        _move_file_paths(journal, settings, mover)
+        # What a refresh may write, all of it set aside first: the settings, and beside them
+        # Codex's trust of the hooks (its config.toml's [hooks.state], its trust record) and
+        # agents.json's record of what was connected. Before, only the settings were, and a
+        # roll-back left the trust of the new hooks over the old (the tester's blocker 1).
+        before = _slot_files(account.config_dir)
+        for path in sorted(before):
+            _copy_aside(journal, path)
+        registry = paths.agents_registry_path()
+        if registry.is_file():
+            _copy_aside(journal, registry)
+        try:
+            if agent_core.hook_commands(account.agent, account.config_dir):
+                try:
+                    agents_service.refresh_hooks(account.agent, account.config_dir)
+                    continue
+                except (KeyError, ValueError, OSError) as exc:
+                    journal.notes.append(
+                        f"{account.agent} account {account.slot}'s hooks were not written again "
+                        f"({_why_stopped(exc)}): their paths were moved instead"
+                    )
+            _move_file_paths(journal, settings, mover)
+        finally:
+            _made_by_the_move(journal, _slot_files(account.config_dir) - before)
 
 
 @_move_step("link")
@@ -1121,6 +1273,12 @@ def roll_back_move(journal: Journal | None = None) -> bool:
     whether there was one to undo. Refused (:class:`MigrationFailed`) once the old Keychain
     items began to go (:data:`FORWARD_ONLY`). Each undo is found done on a re-run, so a crash
     here is finished by the next run."""
+    with _as_the_default_home():
+        return _roll_back_move(journal)
+
+
+def _roll_back_move(journal: Journal | None = None) -> bool:
+    """:func:`roll_back_move`, the home's variables as the move reads them."""
     if journal is None:
         found = planned_move()
         journal = found.journal if found is not None else None
@@ -1131,52 +1289,140 @@ def roll_back_move(journal: Journal | None = None) -> bool:
             "the move deleted the old Keychain items already: it can only be finished",
             rolled_back=False,
         )
-    journal.rolling_back = True
-    _save_move_journal(journal)
-    old_root, new_root = Path(journal.old_root), Path(journal.new_root)
+    if not journal.rolling_back:
+        journal.rolling_back = True
+        # Which rename a crash may have stopped between making it and writing it down: read
+        # once, as the forward run left the journal, never again from a half-reversed one.
+        journal.in_flight = next(
+            (at for at, r in enumerate(journal.renames) if not r.done and not r.skipped), None
+        )
+        _save_move_journal(journal)
+    for phase in UNDO_PHASES:
+        if phase in journal.undone:
+            continue
+        _UNDO[phase](journal)
+        if phase == "folder":
+            return True  # the journal went with the folder: the home is as it was
+        journal.undone.append(phase)
+        _save_move_journal(journal)
+    return True
+
+
+def _undo_link(journal: Journal) -> None:
+    """The link ``~/.aisquare`` → ``~/.rlx`` removed, when the move made it."""
+    old_root = Path(journal.old_root)
     if journal.linked or (not journal.named and journal.flipped and old_root.is_symlink()):
         with contextlib.suppress(FileNotFoundError):
             old_root.unlink()
         journal.linked = False
-        _save_move_journal(journal)
+
+
+def _undo_aside(journal: Journal) -> None:
+    """Each file the move rewrote put back from its copy, and each it made removed, at the
+    places they had when it did (the new layout's: the renames are reversed after), each one
+    written down as it is done."""
     root = journal.root
     for aside in reversed(journal.aside):
-        place, copy = root.joinpath(*aside.place), root.joinpath(*aside.copy_at)
-        if not os.path.lexists(copy):
+        if aside.restored:
             continue
-        if aside.tree:
-            shutil.rmtree(place, ignore_errors=True)
-            shutil.copytree(copy, place, symlinks=True)
+        place = root.joinpath(*aside.place)
+        if aside.created:
+            with contextlib.suppress(FileNotFoundError):
+                place.unlink()
         else:
-            shutil.copy2(copy, place)
+            copy = root.joinpath(*aside.copy_at)
+            if os.path.lexists(copy):
+                if aside.tree:
+                    shutil.rmtree(place, ignore_errors=True)
+                    shutil.copytree(copy, place, symlinks=True)
+                else:
+                    shutil.copy2(copy, place)
+        aside.restored = True
+        _save_move_journal(journal)
+
+
+def _undo_store(journal: Journal) -> None:
     _restore_the_store(journal)
+
+
+def _undo_root(journal: Journal) -> None:
+    """The default home's root renamed back to ``~/.aisquare``; the journal goes with it."""
+    old_root, new_root = Path(journal.old_root), Path(journal.new_root)
     if journal.flipped:
         if os.path.lexists(new_root) and not os.path.lexists(old_root):
-            os.rename(new_root, old_root)
+            _rename_once(new_root, old_root)
         journal.flipped = False
-        _save_move_journal(journal)
-    # Each rename made, and the one a crash may have stopped between making it and writing it
-    # down: reversed where its target is and its source is not.
-    in_flight = next((r for r in journal.renames if not r.done and not r.skipped), None)
-    for rename in reversed(journal.renames):
-        if not rename.done and rename is not in_flight:
+
+
+def _undo_renames(journal: Journal) -> None:
+    """Each rename made, and the one in flight, reversed where its target is and its source is
+    not, each written down as it is."""
+    old_root = Path(journal.old_root)
+    for at in range(len(journal.renames) - 1, -1, -1):
+        rename = journal.renames[at]
+        if rename.undone or not (rename.done or at == journal.in_flight):
             continue
         source, target = old_root.joinpath(*rename.source), old_root.joinpath(*rename.target)
         if os.path.lexists(target) and not os.path.lexists(source):
-            os.rename(target, source)
-        rename.done = False
+            _rename_once(target, source)
+        rename.undone = True
         _save_move_journal(journal)
+
+
+def _undo_made(journal: Journal) -> None:
+    """The folders the renames made for their targets, removed while they are empty."""
+    old_root = Path(journal.old_root)
     for parts in reversed(journal.made):
         with contextlib.suppress(OSError):
             old_root.joinpath(*parts).rmdir()
+
+
+def _undo_keychain(journal: Journal) -> None:
+    """Each Keychain copy deleted, and each pin taken away (its marker back at its old place)."""
     for item in journal.items:
         if item.state in ("copying", "copied") and not item.existed:
-            accounts_core.delete_keychain_item(item.new, item.account)
+            why = accounts_core.delete_keychain_item(item.new, item.account)
+            if why is not None:
+                raise MigrationFailed(
+                    f"the copy {item.new!r} was not deleted ({why})", rolled_back=False
+                )
+        elif item.state == "pinned":
+            accounts_core.pin_keychain_dir(_the_slot(item), None)
+        item.state = "planned"
+        _save_move_journal(journal)
     accounts_core.forget_keychain_reads()
-    shutil.rmtree(_move_folder(old_root), ignore_errors=True)
+
+
+def _undo_folder(journal: Journal) -> None:
+    """The move's own folder removed, its journal last: until then a crash finishes this."""
+    folder = _move_folder(Path(journal.old_root))
+    record = _move_journal_path(Path(journal.old_root))
+    for entry in list(folder.iterdir()) if folder.is_dir() else []:
+        if entry == record:
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                entry.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        record.unlink()
     with contextlib.suppress(OSError):
-        _move_folder(old_root).parent.rmdir()  # backups/, when the move made it
-    return True
+        folder.rmdir()
+    with contextlib.suppress(OSError):
+        folder.parent.rmdir()  # backups/, when the move made it
+
+
+_UNDO: dict[str, Callable[[Journal], None]] = {
+    "link": _undo_link,
+    "aside": _undo_aside,
+    "store": _undo_store,
+    "root": _undo_root,
+    "renames": _undo_renames,
+    "made": _undo_made,
+    "keychain": _undo_keychain,
+    "folder": _undo_folder,
+}
 
 
 def _restore_the_store(journal: Journal) -> None:
@@ -1205,6 +1451,11 @@ def said_of_move(moved: Moved) -> list[str]:
         lines = [f"the home was laid out anew, in place: {paths.shown(moved.new_root)}"]
     if moved.copied:
         lines.append(f"Keychain logins copied to their new place: {', '.join(moved.copied)}")
+    if moved.pinned:
+        lines.append(
+            "Keychain logins too long to copy without a command line, kept under their old "
+            f"names (CLAUDE_SECURESTORAGE_CONFIG_DIR pinned for them): {', '.join(moved.pinned)}"
+        )
     if moved.linked:
         lines.append(
             f"{paths.shown(moved.old_root)} is a link to {paths.shown(moved.new_root)} until "

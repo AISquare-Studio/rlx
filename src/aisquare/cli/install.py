@@ -146,6 +146,13 @@ def _emit_check(plan: lifecycle_service.UpgradePlan) -> None:
         return
     _say(f"rlx {plan.current} — {plan.route.describe()}")
     _say(_latest_line(plan))
+    if plan.home_move is not None:
+        # The move is said with or without a newer release: on the release that runs,
+        # `rlx upgrade` makes it (#31; the manager's #1937 (A) and #1985 (1)).
+        how = f"{prog.word()} upgrade" if plan.runnable else f"{prog.word()} move-home"
+        _say(f"home: laid out before 0.10.2 — `{how}` moves it ({plan.home_move})")
+    elif plan.home_refusal is not None:
+        _say(f"home: laid out before 0.10.2, and cannot be moved as it stands: {plan.home_refusal}")
     # A release PyPI does not list may be on an index the command reads and this CLI does
     # not: PIP_INDEX_URL, pip.conf, pipx's default index, uv.toml, UV_INDEX_URL. Every
     # route's, a uv tool's too, whose receipt does not record an index set in uv's own
@@ -159,8 +166,9 @@ def _emit_check(plan: lifecycle_service.UpgradePlan) -> None:
         return
     if plan.runnable:
         if plan.up_to_date:
-            # Not "upgrade with: aisquare upgrade", which answers "nothing to do" (sweep of #257).
-            _say("nothing to upgrade")
+            # Not "upgrade with: aisquare upgrade", which answers "nothing to do" (sweep of #257);
+            # with a home to move, it does that (the line above).
+            _say("nothing newer to install" if plan.home_move is not None else "nothing to upgrade")
             return
         if plan.target is None and plan.update_available is None:
             # Nothing to compare (an index of its own, PyPI out of reach): "upgrade with"

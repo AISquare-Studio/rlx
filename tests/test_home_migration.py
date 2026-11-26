@@ -1195,3 +1195,291 @@ def test_an_upgrade_starts_the_service_again_only_once_the_home_has_moved(
     verbs = [argv[1:] for argv in installed.captured]
     assert verbs.index(["--json", "move-home"]) < verbs.index(["service", "start"]), verbs
     assert "✓ the home moved" in result.output
+
+
+# --- round 2 (the tester's #2071) ----------------------------------------------------------
+
+
+def test_a_roll_back_after_the_hooks_step_puts_codex_s_trust_of_its_hooks_back(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 1: the refresh rewrote config.toml's [hooks.state] and the trust record beside
+    hooks.json; a roll-back put hooks.json back alone, so the old hooks lost their trust."""
+    from aisquare.core import agents as agent_core
+
+    codex = _slot(3, "codex")
+    assert agent_core.install_hooks("codex", codex)
+    files_before = {path.name: path.read_bytes() for path in codex.iterdir() if path.is_file()}
+    registry_before = paths.agents_registry_path().read_bytes()
+    assert agent_core.hook_trust_recorded("codex", codex), "the premise: trusted before"
+
+    def full(journal: home_migration.Journal) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setitem(home_migration._MOVE_STEPS, "link", full)
+    with pytest.raises(home_migration.MigrationFailed) as failed:
+        home_migration.move_home()
+
+    assert failed.value.rolled_back
+    files_after = {path.name: path.read_bytes() for path in codex.iterdir() if path.is_file()}
+    assert files_after == files_before
+    assert paths.agents_registry_path().read_bytes() == registry_before
+    assert agent_core.hook_trust_recorded("codex", codex)
+
+
+def _snapshot(user_home: Path, keychain: FakeSecurity, into: Path) -> None:
+    shutil.copytree(user_home, into / "user", symlinks=True)
+    shutil.copy2(keychain.table, into / "items.json")
+
+
+def _restore(user_home: Path, keychain: FakeSecurity, saved: Path) -> None:
+    for entry in user_home.iterdir():
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        else:
+            shutil.rmtree(entry)
+    for entry in (saved / "user").iterdir():
+        target = user_home / entry.name
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.copytree(entry, target, symlinks=True)
+        else:
+            shutil.copy2(entry, target, follow_symlinks=False)
+    shutil.copy2(saved / "items.json", keychain.table)
+    accounts_core.forget_keychain_reads()
+
+
+@pytest.mark.parametrize("failing", ["check", "hooks", "link"])
+def test_a_crash_at_each_write_of_a_roll_back_is_finished_by_the_next_run(
+    old_home: Path,
+    user_home: Path,
+    keychain: FakeSecurity,
+    tmp_path: Path,
+    failing: str,
+) -> None:
+    """Blocker 2: the roll-back is journaled phase by phase, each file put back and each rename
+    reversed written down, so a crash at any of its journal writes (before the write lands, or
+    after) is finished by the next run, and the home is as it was: no stray copy of the seals,
+    no slot left at its new place, every login where it was."""
+    from aisquare.core import agents as agent_core
+
+    assert agent_core.install_hooks("codex", _slot(3, "codex"))
+    saved = tmp_path / "saved"
+    saved.mkdir()
+    _snapshot(user_home, keychain, saved)
+    before = _tree(old_home)
+    rows = _store_rows(old_home, paths.OLD_STORE)
+    items = keychain.items()
+    real_save = home_migration._save_move_journal
+
+    def stopped_at(n: int, when: str) -> int:
+        """Run the failing move, crashing at the n-th journal write of its roll-back; how
+        many writes the roll-back made when n is past the last."""
+        seen = [0]
+
+        def save(journal: home_migration.Journal) -> None:
+            if journal.rolling_back:
+                seen[0] += 1
+                if seen[0] == n and when == "before":
+                    raise Crash("before a roll-back write")
+                real_save(journal)
+                if seen[0] == n:
+                    raise Crash("after a roll-back write")
+                return
+            real_save(journal)
+
+        def fails(journal: home_migration.Journal) -> None:
+            raise OSError(28, "No space left on device")
+
+        with pytest.MonkeyPatch.context() as crash:
+            crash.setattr(home_migration, "_save_move_journal", save)
+            crash.setitem(home_migration._MOVE_STEPS, failing, fails)
+            with contextlib.suppress(Crash, home_migration.MigrationFailed):
+                home_migration.move_home()
+        return seen[0]
+
+    writes = stopped_at(10_000, "after")
+    _restore(user_home, keychain, saved)
+    assert writes > 5, writes
+    for n in range(1, writes + 1):
+        for when in ("before", "after"):
+            stopped_at(n, when)
+            try:
+                home_migration.move_home()  # the next run: it finishes the roll-back
+            except home_migration.MigrationFailed as exc:
+                assert exc.rolled_back, (n, when, exc.reason)
+            case = (failing, n, when)
+            if os.path.lexists(user_home / ".rlx"):
+                # Crashed before the roll-back was written down at all: the journal still says
+                # a move, and the next run finishes it, whole.
+                assert (n, when) == (1, "before"), case
+                assert paths.home_of() == (user_home / ".rlx", paths.NEW), case
+                assert (user_home / ".aisquare").is_symlink(), case
+                assert home_migration.planned_move() is None, case
+                assert _accepted() == {"agt-captain", "agt-coder"}, case
+            else:
+                assert _same_but_store(_tree(old_home), before), case
+                assert _store_rows(old_home, paths.OLD_STORE) == rows, case
+                assert keychain.items() == items, case
+                assert not (old_home / "backups").exists(), case
+                assert home_migration.planned_move() is not None, case
+            _restore(user_home, keychain, saved)
+
+
+def test_a_variable_naming_aisquare_itself_moves_it_to_rlx_and_links_it(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 3: the fleet hands every window the home by both names, resolved; a shell
+    started from one moved ~/.aisquare in place, and an rlx without the variable then read an
+    empty old home. Named so, it is the default home: moved to ~/.rlx and linked."""
+    for variable in (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR):
+        monkeypatch.setenv(variable, os.path.realpath(old_home))
+    found = home_migration.planned_move()
+    assert found is not None and not found.named and found.new_root == user_home / ".rlx"
+
+    moved = home_migration.move_home()
+
+    assert moved is not None and not moved.named and moved.linked
+    assert (user_home / ".aisquare").is_symlink() and (user_home / ".rlx" / "rlx.db").is_file()
+    assert paths.home_of()[1] == paths.NEW and paths.db_path().resolve() == (
+        user_home / ".rlx" / "rlx.db"
+    )
+    monkeypatch.delenv(paths.RLX_HOME_ENV)
+    monkeypatch.delenv(paths.HOME_ENV_VAR)
+    assert paths.home_of() == (user_home / ".rlx", paths.NEW)
+    with store_session() as store:
+        assert {p.id for p in store.list_projects(all=True)} >= {"prj_home", "prj_app"}
+
+
+def test_a_crash_after_the_root_rename_with_the_variable_set_is_finished(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for variable in (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR):
+        monkeypatch.setenv(variable, os.path.realpath(old_home))
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "link", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+
+    assert home_migration.move_home() is not None
+    assert (user_home / ".aisquare").is_symlink() and home_migration.planned_move() is None
+
+
+def test_upgrade_check_says_in_words_that_the_home_would_move(
+    old_home: Path, user_home: Path, installed: Installed
+) -> None:
+    """Blocker 4: only --json said it."""
+    result = CliRunner().invoke(app, ["upgrade", "--check"])
+
+    assert result.exit_code == 0, result.output
+    said = result.output.replace("\n", " ")
+    assert f"home: laid out before 0.10.2 — `{prog.word()} upgrade` moves it ({MOVE})" in said
+    assert "nothing newer to install" in said and "nothing to upgrade" not in said
+
+
+def test_a_row_refused_before_the_move_and_allowed_after_it_rolls_the_move_back(
+    old_home: Path, user_home: Path, keychain: FakeSecurity
+) -> None:
+    """Blocker 5 (condition 4, never loosen): a project whose root is already ~/.rlx/captain
+    and a record that names ~/.aisquare/captain is refused before; the move's rewrite of the
+    record alone would have let it through. The two sets must be equal."""
+    captain = paths.captain_dir()
+    with store_session() as store:
+        store.ensure_project(ProjectInfo(id="prj_plant", root=user_home / ".rlx" / "captain"))
+        store.upsert_fleet_agent(
+            FleetAgent(
+                id="agt-plant",
+                project_id="prj_plant",
+                label="plant",
+                role="coder",
+                pane_id="%2",
+                cwd=captain,
+                created_at=NOW,
+                ended_at=NOW,
+            )
+        )
+    record = launch_seal.LaunchRecord(
+        id="agt-plant",
+        project_id="prj_plant",
+        project_root=str(captain),
+        role="coder",
+        agent="claude-code",
+        binary="claude",
+        cwd=str(captain),
+        spec=LaunchSpec(binary="claude"),
+    )
+    assert launch_seal.write(record) is None
+    assert "agt-plant" not in _accepted()
+    before, items = _tree(old_home), keychain.items()
+
+    with pytest.raises(home_migration.MigrationFailed, match="agt-plant, refused before") as failed:
+        home_migration.move_home()
+
+    assert failed.value.rolled_back
+    assert not os.path.lexists(user_home / ".rlx") and keychain.items() == items
+    assert _same_but_store(_tree(old_home), before)
+
+
+def _a_long_item(token: str) -> str:
+    """A Claude Code item with many MCP logins: longer than `security -i`'s line holds."""
+    item = json.loads(_item(token))
+    item["mcpOAuth"] = {
+        f"server-{n}": {"accessToken": f"mcp-{n}-" + "x" * 120, "refreshToken": "r" * 120}
+        for n in range(8)
+    }
+    return json.dumps(item, separators=(",", ":"))
+
+
+def test_a_login_too_long_to_copy_is_pinned_to_its_old_name_and_never_on_argv(
+    old_home: Path, user_home: Path, keychain: FakeSecurity
+) -> None:
+    """#2071's note, the manager's requirement: an item too long for `security -i` keeps its
+    old name; the slot is pinned with CLAUDE_SECURESTORAGE_CONFIG_DIR, recorded in its marker,
+    and still reads as signed in after the move. Nothing of it is copied or deleted."""
+    four = accounts_core._managed(4)
+    old_dir = str(four.config_dir)
+    old_service = accounts_core.keychain_service(four)
+    long_item = _a_long_item("token-4")
+    assert len(long_item) > 2000
+    keychain.put(old_service, long_item)
+
+    moved = home_migration.move_home()
+
+    assert (
+        moved is not None
+        and moved.pinned == ["claude-code 4"]
+        and moved.copied == ["claude-code 2"]
+    )
+    assert keychain.has(old_service), "the pinned login stays where it is"
+    assert not [call for call in keychain.calls() if "-X" in call or "token-4" in " ".join(call)]
+    four_now = accounts_core._managed(4)
+    assert four_now.config_dir.is_relative_to(user_home / ".rlx")
+    assert accounts_core.keychain_pin(four_now) == old_dir
+    env = accounts_core.launch_env(four_now)
+    assert env[accounts_core.SECURE_STORAGE_VAR] == old_dir
+    assert accounts_core.keychain_service(four_now) == old_service
+    accounts_core.forget_keychain_reads()
+    assert accounts_core.signed_in(four_now, fresh=True)
+    # Another slot's launch or read in a pinned slot's environment names that slot's own item.
+    two_now = accounts_core._managed(2)
+    other = accounts_core.apply_launch_env(dict(env), two_now)
+    assert accounts_core.SECURE_STORAGE_VAR not in other
+    assert accounts_core.KEYCHAIN_PIN_VAR not in other
+    assert accounts_core.keychain_service(two_now, env) == accounts_core.keychain_service(two_now)
+    assert "kept under their old names" in " ".join(home_migration.said_of_move(moved))
+
+
+def test_a_roll_back_takes_a_pin_away(
+    old_home: Path, user_home: Path, keychain: FakeSecurity
+) -> None:
+    four = accounts_core._managed(4)
+    keychain.put(accounts_core.keychain_service(four), _a_long_item("token-4"))
+    items = keychain.items()
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "rewrite", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+
+    assert home_migration.roll_back_move() is True
+
+    assert accounts_core.keychain_pin(accounts_core._managed(4)) is None
+    assert keychain.items() == items and not os.path.lexists(user_home / ".rlx")

@@ -105,6 +105,10 @@ Everything else has the same name in both.
 `RLX_HOME` or `AISQUARE_HOME` names is laid out anew where it is. Nothing else moves a home: no
 other command, no hook and no start of rlx does.
 
+A variable that names `~/.aisquare` itself (`RLX_HOME` or `AISQUARE_HOME`; every window the fleet
+opens has both) still means the default home: it moves to `~/.rlx` and is linked, as without the
+variable.
+
 In the app, the ⬆ row under Settings offers **Move rlx's home** while the home is old, even when
 no newer release is out. Its *Restart & move* closes rlx, moves the home and reopens rlx. An
 update to a newer release moves the home too. Doctor's `home-layout` row says the home is laid
@@ -143,6 +147,11 @@ so a crash at any step is finished by the next run:
    account's Keychain item after its folder, and the folder moves. So rlx copies each item to the
    name its new folder gives, as Claude Code writes one, and reads the copy back with Claude
    Code's own lookup. The secret goes to `security` on its input, never on a command line.
+   `security` reads one line of input at most 4,096 bytes long, so a login over about 1,990
+   bytes (a Claude Code login with several MCP sign-ins can be) is not copied. That account is
+   pinned instead: its marker records the folder its old item is named by, and every launch on
+   it sets `CLAUDE_SECURESTORAGE_CONFIG_DIR` to it, so Claude Code and rlx keep reading the old
+   item. Its old item is not deleted.
 3. **The folders are renamed** to their new places (the table above), on the same disk: a rename,
    never a copy. The store goes last in a named home. In the default home, `~/.aisquare` is then
    renamed to `~/.rlx`.
@@ -163,7 +172,8 @@ so a crash at any step is finished by the next run:
 Before step 8, the move can be rolled back whole: the link removed, each rewritten file put back,
 the store restored from its backup, each rename reversed, and the Keychain copies deleted. A
 failure at any of those steps does this by itself. After a crash, `rlx move-home --rollback`
-does it. From step 8 on, the move can only be finished.
+does it. The roll-back is written down as it goes, so a crash during it is finished by the next
+run. From step 8 on, the move can only be finished.
 
 The cache moves with the home, as a rename costs nothing. `rlx move-home --drop-cache` drops
 it once the move is done: rlx makes it again as it needs it.
