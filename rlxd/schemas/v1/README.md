@@ -5,7 +5,7 @@
 > 0.10.3 on, v1 changes only additively.
 
 These are JSON Schemas (draft 2020-12) for rlxd's wire format, following handoff 0.10.3
-rev 6: 7.2, 7.3, 7.4, 5.1 and 4.1. They are generated from the types in
+rev 7: 7.2, 7.3, 7.4, 5.1, 4.1 and 1.4. They are generated from the types in
 `rlxd/crates/rlxd-proto`.
 
 **Don't edit them by hand.** Change the types, then regenerate and commit:
@@ -18,10 +18,12 @@ cargo run -p rlxd-proto --bin gen-schemas -- --check # what CI runs: exit 1 on d
 
 The types hold every document to the same rules as its schema. A document the schema
 refuses also fails to parse, with an error naming the field. The types are stricter in
-two places JSON Schema can't reach:
+three places JSON Schema can't reach:
 
 - A float with a zero fraction, such as `1.0` where an integer belongs, passes the
   schema and fails to parse.
+- A `pty.write`'s 1 MiB of `text`, `paste` or key names is counted in bytes. JSON Schema
+  counts a string's length in characters, so only the types check it.
 - An event's `type` must start with its `topic`. The schema can't compare one field
   with another, so it checks that only for the topics v1 lists: 7.3's, plus 7.8's
   `install` and `signin`. The types check it for every topic.
@@ -50,6 +52,17 @@ bound both validators agree on.
 | `settings-list-reply.json` | `settings.list`'s reply: `{settings: [setting]}`, in key order |
 | `settings-changed.json` | `settings.changed`'s and `settings.deleted`'s data, on the `settings` topic: `{key, version, by_device?}` |
 | `settings-delete.json` | `settings.delete`'s params: `{key, expected_version?}`. The reply is the setting at version 0 |
+| `pty-spawn.json` | `pty.spawn`'s params (1.4): `{argv, cols, rows, cwd?, env?, label?}`. `env` sets a variable, or removes it with `null`. Sizes are 1 to 1000 cells |
+| `pty-ref.json` | One PTY, `{pty_id}`: the reply of `pty.spawn`, `pty.write`, `pty.resize` and `pty.kill`. A `pty_id` is 128 random bits, as 32 lowercase hex digits |
+| `pty-write.json` | `pty.write`'s params: `{pty_id}` and exactly one of `text`, `keys` (tmux's key names) and `paste` (a bracketed paste) |
+| `pty-resize.json` | `pty.resize`'s params: `{pty_id, cols, rows}` |
+| `pty-screen.json` | `pty.screen`'s params: `{pty_id, scrollback?}`, at most 50,000 lines of history |
+| `pty-screen-reply.json` | `pty.screen`'s reply, and a `pty.snapshot`'s data: `{pty_id, text, cursor{x, y, visible}, cols, rows, alternate, history, exited, status?, signal?, seq}`. `text` is byte for byte what `tmux capture-pane -e -p` prints. `status` comes exactly when `exited` |
+| `pty-subscribe.json` | `pty.subscribe`'s params: `{pty_id, read_only}` |
+| `pty-kill.json` | `pty.kill`'s params: `{pty_id}` |
+| `pty-list-reply.json` | `pty.list`'s reply: `{ptys: [{pty_id, label?, argv, cwd, pid, cols, rows, started_at, exited, status?, signal?}]}`, in the order they started |
+| `pty-output.json` | `pty.output`'s data, on the `pty` topic: `{pty_id, bytes_b64}`, the process's bytes in standard base64 |
+| `pty-exited.json` | `pty.exited`'s data, on the `pty` topic: `{pty_id, status, signal?}` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 
@@ -172,6 +185,53 @@ size and position, per-device notifications, caches.
 - **Events.** Every change, once on disk, is a `settings.changed {key, version,
   by_device?}`, or a `settings.deleted` with the version deleted, on the `settings`
   topic. One key's events come in version order. Read the new value with `settings.get`.
+
+## PTYs
+
+rlxd holds processes on pseudo-terminals (handoff 1.4), as tmux held the fleet's panes,
+with ConPTY on Windows. A PTY outlives every client, and one any connection spawned is in
+every connection's `pty.list`.
+
+- **The screen is tmux's.** `pty.screen`'s `text` is what `tmux capture-pane -e -p`
+  prints for the same screen, byte for byte, so a renderer that reads tmux's captures
+  reads it: SGR sequences in tmux's forms and order, trailing spaces dropped, and a
+  newline after every row. `scrollback: n` puts up to `n` lines of history above it, as
+  `-S -n` does.
+- **Input is tmux's.** `keys` are tmux's key names, sent as `send-keys` sends them,
+  honouring the modes the program set. `paste` is `paste-buffer -p`'s: newlines as
+  carriage returns, bracketed when the program asked for bracketed paste.
+- **A process that ends** keeps its last screen and exit status, `exited` and `status`,
+  until `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `status` is the exit
+  code, or 128 plus the signal that ended it, with `signal` too. `pty.write` and
+  `pty.resize` to it get `pty_exited`.
+- **`pty.kill`** ends the process and every process in its group (on Windows, its job),
+  and frees the PTY. A process that left the group itself is not ended, as under tmux.
+- **The stream.** `pty.subscribe {pty_id, read_only}` first sends a `pty.snapshot`, the
+  screen as `pty-screen-reply.json` describes it, whose `seq` the stream goes on from.
+  Then come the PTY's `pty.output` and `pty.exited` events. A client too slow to keep up
+  never holds the PTY back: what it missed is dropped, and it gets a new `pty.snapshot`.
+  The reply, `{seq}`, ends the stream once the PTY is killed or rlxd stops.
+- **Output is kept apart.** rlxd keeps `pty.output` events in a budget of their own, so
+  a busy PTY never pushes another topic's events out. A stream that asked for `pty` gets
+  a `daemon.gap` when output it hadn't read was dropped; a stream that didn't ask for it
+  never gets a gap on its account. `pty.exited` is kept with the other events.
+- **Who may do what.**
+
+  | Role | `pty.list`, `pty.screen`, `pty.subscribe {read_only: true}` | `pty.write` | `pty.spawn`, `pty.resize`, `pty.kill`, `pty.subscribe {read_only: false}` |
+  |---|---|---|---|
+  | `cli`, `tui` | yes | yes | yes |
+  | `remote` | yes | yes | no |
+  | `app` | yes | no | no |
+
+  Any other call gets `role_not_allowed`, with `detail.role` and `detail.method`. A
+  connection subscribed to a PTY read-only gets `read_only` for its `pty.write` to it.
+  `pty.spawn` never waits on the app gate, and a PTY keeps working with the app quit.
+- **Limits.** A home holds at most 64 PTYs, the exited ones included, else
+  `too_many_ptys`. Each keeps at most 50,000 lines of history. A `pty.write` carries at
+  most 1 MiB.
+- **The terminal** a process sees is `TERM=xterm-256color` with `COLORTERM=truecolor`,
+  unless `env` says otherwise. The fleet's tmux sets `tmux-256color`, which macOS's
+  terminfo lacks.
 
 ## Versioning
 

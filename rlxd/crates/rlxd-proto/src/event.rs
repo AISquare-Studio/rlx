@@ -180,8 +180,8 @@ pub mod topics {
     pub const CLI: &[&str] = &[INSTALL, SIGNIN];
 }
 
-/// The types rlxd itself sends on the `daemon` topic (7.3), and on `settings`. A client
-/// must also accept types not listed here.
+/// The types rlxd itself sends on the `daemon` topic (7.3), on `settings` and on `pty`. A
+/// client must also accept types not listed here.
 pub mod types {
     /// `{version, pid}`: rlxd started. The first event of each rlxd's life.
     pub const DAEMON_STARTED: &str = "daemon.started";
@@ -199,6 +199,16 @@ pub mod types {
     /// `{key, version, by_device?}`: a setting was deleted, from `version`; it is back to
     /// never set, and its default applies.
     pub const SETTINGS_DELETED: &str = "settings.deleted";
+    /// `{pty_id, bytes_b64}` ([`PtyOutput`](crate::PtyOutput)): a PTY's process wrote
+    /// these bytes. rlxd keeps less of this output than of other events, apart from them.
+    pub const PTY_OUTPUT: &str = "pty.output";
+    /// `{pty_id, status, signal?}` ([`PtyExited`](crate::PtyExited)): a PTY's process
+    /// ended. The PTY keeps its last screen until `pty.kill`.
+    pub const PTY_EXITED: &str = "pty.exited";
+    /// The screen ([`PtyScreen`](crate::PtyScreen)), first in a `pty.subscribe` stream
+    /// and again after output the client missed. Only that stream carries it: rlxd keeps
+    /// none, and its `seq` is the last event the screen takes in.
+    pub const PTY_SNAPSHOT: &str = "pty.snapshot";
 }
 
 impl Event {

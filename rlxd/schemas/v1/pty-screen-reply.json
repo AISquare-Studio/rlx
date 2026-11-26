@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtyScreen",
+  "description": "`pty.screen`'s reply, and a `pty.snapshot`'s data: the screen, as tmux would print it.\n\n```json\n{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\", \"text\": \"\\u001b[31mred\\u001b[39m plain\\n\",\n \"cursor\": {\"x\": 9, \"y\": 0, \"visible\": true}, \"cols\": 80, \"rows\": 24,\n \"alternate\": false, \"history\": 0, \"exited\": false, \"seq\": 41}\n```",
+  "type": "object",
+  "properties": {
+    "alternate": {
+      "description": "Whether the program is on the alternate screen, as a full-screen program is.",
+      "type": "boolean"
+    },
+    "cols": {
+      "description": "The width, in cells.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 1000,
+      "minimum": 1
+    },
+    "cursor": {
+      "description": "The cursor.",
+      "$ref": "#/$defs/PtyCursor"
+    },
+    "exited": {
+      "description": "Whether the process has ended.",
+      "type": "boolean"
+    },
+    "history": {
+      "description": "The lines of history the PTY holds above the screen.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 50000,
+      "minimum": 0
+    },
+    "pty_id": {
+      "description": "The PTY.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "rows": {
+      "description": "The height, in cells.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 1000,
+      "minimum": 1
+    },
+    "seq": {
+      "description": "The last event `seq` this screen takes in: a stream goes on from the event after\nit.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "signal": {
+      "description": "The signal that ended it, on macOS and Linux, when one did.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 127,
+      "minimum": 1
+    },
+    "status": {
+      "description": "Its exit status, once it has ended: its exit code, or 128 plus the signal that\nended it, as a shell reports one.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 0
+    },
+    "text": {
+      "description": "The screen, byte for byte what `tmux capture-pane -e -p` prints for it (with\n`-S -n` for `scrollback`): each line, its colours and attributes as SGR sequences,\ntrailing spaces dropped, and a newline after every line, the blank ones too.",
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "status"
+              ]
+            },
+            {
+              "required": [
+                "signal"
+              ]
+            }
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "exited": {
+            "const": true
+          }
+        },
+        "required": [
+          "exited"
+        ]
+      },
+      "then": {
+        "required": [
+          "status"
+        ]
+      }
+    }
+  ],
+  "required": [
+    "pty_id",
+    "text",
+    "cursor",
+    "cols",
+    "rows",
+    "alternate",
+    "history",
+    "exited",
+    "seq"
+  ],
+  "$defs": {
+    "PtyCursor": {
+      "description": "Where the cursor is, from the screen's top left, and whether the program shows it.",
+      "type": "object",
+      "properties": {
+        "visible": {
+          "description": "Whether the program shows the cursor.",
+          "type": "boolean"
+        },
+        "x": {
+          "description": "The column, from 0. It is `cols` while a line's last cell is written and the next\ncharacter would wrap.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "y": {
+          "description": "The row, from 0.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "visible"
+      ]
+    }
+  }
+}

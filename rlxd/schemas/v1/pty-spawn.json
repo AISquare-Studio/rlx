@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtySpawnParams",
+  "description": "`pty.spawn`'s params: what to run, where, and on how big a terminal.\n\n```json\n{\"argv\": [\"sh\", \"-c\", \"echo ready; sleep 30\"], \"cols\": 80, \"rows\": 24,\n \"cwd\": \"/Users/sam/code\", \"env\": {\"FOO\": \"1\", \"BAR\": null}, \"label\": \"coder\"}\n```\n\nThe process gets rlxd's environment, with `TERM=xterm-256color` and\n`COLORTERM=truecolor`, then `env` over it.",
+  "type": "object",
+  "properties": {
+    "argv": {
+      "description": "The program and its arguments. The program is looked up on `PATH` when it has no\npath of its own. No item holds a NUL.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "not": {
+          "pattern": "\\x00"
+        }
+      },
+      "minItems": 1,
+      "prefixItems": [
+        {
+          "minLength": 1
+        }
+      ]
+    },
+    "cols": {
+      "description": "The terminal's width, in cells.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 1000,
+      "minimum": 1
+    },
+    "cwd": {
+      "description": "The directory it starts in: an absolute path. Absent is rlxd's home directory.",
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "\\x00"
+      }
+    },
+    "env": {
+      "description": "Variables to set, over rlxd's environment and the defaults above, or to remove,\nwith `null`. A name is not empty and holds no `=` or NUL; a value holds no NUL.",
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string",
+            "not": {
+              "pattern": "\\x00"
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "propertyNames": {
+        "minLength": 1,
+        "not": {
+          "pattern": "[=\\x00]"
+        }
+      }
+    },
+    "label": {
+      "description": "A name for people, shown by `pty.list`, such as an agent's: 1 to 128 characters,\nnone of them a control character.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "not": {
+        "pattern": "[\\x00-\\x1f\\x7f-\\x9f]"
+      }
+    },
+    "rows": {
+      "description": "The terminal's height, in cells.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 1000,
+      "minimum": 1
+    }
+  },
+  "required": [
+    "argv",
+    "cols",
+    "rows"
+  ]
+}

@@ -162,6 +162,26 @@ pub mod methods {
     /// [`SettingsDeleteParams`](crate::SettingsDeleteParams) in, [`Setting`](crate::Setting)
     /// out at version 0, and `settings.deleted` on the stream.
     pub const SETTINGS_DELETE: &str = "settings.delete";
+    /// Starts a process on a new PTY: [`PtySpawnParams`](crate::PtySpawnParams) in,
+    /// [`PtyRef`](crate::PtyRef) out. Never gated by the app.
+    pub const PTY_SPAWN: &str = "pty.spawn";
+    /// Types text, presses keys or pastes into a PTY:
+    /// [`PtyWriteParams`](crate::PtyWriteParams) in, [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_WRITE: &str = "pty.write";
+    /// Resizes a PTY: [`PtyResizeParams`](crate::PtyResizeParams) in,
+    /// [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_RESIZE: &str = "pty.resize";
+    /// A PTY's screen, as `tmux capture-pane -e -p` prints it:
+    /// [`PtyScreenParams`](crate::PtyScreenParams) in, [`PtyScreen`](crate::PtyScreen) out.
+    pub const PTY_SCREEN: &str = "pty.screen";
+    /// Streams a PTY's screen, then its output:
+    /// [`PtySubscribeParams`](crate::PtySubscribeParams) in; the reply ends the stream.
+    pub const PTY_SUBSCRIBE: &str = "pty.subscribe";
+    /// Ends a PTY's process and every process in its group or job, and frees the PTY:
+    /// [`PtyKillParams`](crate::PtyKillParams) in, [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_KILL: &str = "pty.kill";
+    /// Every PTY of the home: no params, [`PtyList`](crate::PtyList) out.
+    pub const PTY_LIST: &str = "pty.list";
 }
 
 impl Request {

@@ -321,6 +321,22 @@ pub mod codes {
     /// A setting key without a `.` that this rlxd does not know. Dotted keys,
     /// `<namespace>.<name>`, are always free to use.
     pub const UNKNOWN_SETTING: &str = "unknown_setting";
+    /// The connection's role may not call that method, such as an `app` connection's
+    /// `pty.write`. `detail` names the `role` and the `method`.
+    pub const ROLE_NOT_ALLOWED: &str = "role_not_allowed";
+    /// `pty.spawn`: the home holds as many PTYs as it may, the live and the exited ones.
+    /// `pty.kill` one first. `detail.max` is the cap.
+    pub const TOO_MANY_PTYS: &str = "too_many_ptys";
+    /// No PTY of that `pty_id`: there never was one, or it was killed.
+    pub const UNKNOWN_PTY: &str = "unknown_pty";
+    /// `pty.write`: this connection subscribed to the PTY read-only.
+    pub const READ_ONLY: &str = "read_only";
+    /// `pty.write` or `pty.resize`: the PTY's process has ended. Its screen stays until
+    /// `pty.kill`.
+    pub const PTY_EXITED: &str = "pty_exited";
+    /// `pty.spawn`: the process could not be started, such as a program that isn't there
+    /// or a `cwd` that isn't a directory. The message says why.
+    pub const SPAWN_FAILED: &str = "spawn_failed";
 }
 
 impl Envelope {
