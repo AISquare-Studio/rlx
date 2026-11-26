@@ -505,11 +505,17 @@ class PersonasTab(SavesAsYouGo, Vertical):
             self.reload()
             return
         persona = result.persona
-        self.kept(
-            f"the import of {persona.name}",
-            lambda: self._persona_take_back(persona.name, persona.layer),
-            said=f"✓ imported {persona.name} ({result.engine})",
-        )
+        said = f"✓ imported {persona.name} ({result.engine})"
+        if result.replaced:
+            # It took the place of a persona of that name, which rlx keeps no copy of: ctrl+z
+            # removing the import would lose both, so this one is not offered.
+            self.notify(said, timeout=6, markup=False)
+        else:
+            self.kept(
+                f"the import of {persona.name}",
+                lambda: self._persona_take_back(persona.name, persona.layer),
+                said=said,
+            )
         for warning in result.warnings:
             self.notify(warning, severity="warning", timeout=8, markup=False)
         self.reload(select=f"{persona.layer}:{persona.name}")

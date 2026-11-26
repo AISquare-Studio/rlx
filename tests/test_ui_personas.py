@@ -1897,3 +1897,39 @@ def test_ctrl_z_takes_back_an_edit_and_then_the_new_persona_itself(
     assert seen["twice"] is False, "ctrl+z again: the new persona removed"
     assert "Saved the new persona pair-programmer · Undo: ctrl+z" in seen["notices"]
     assert "Saved pair-programmer's SKILL.md · Undo: ctrl+z" in seen["notices"], seen["notices"]
+
+
+def test_an_import_that_replaced_a_persona_offers_no_undo_that_would_lose_it(
+    project: ProjectInfo,
+    catalogue: dict[str, Path],
+    skills: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M5: an import's Undo removes what it made. One that took the place of a persona of
+    that name (rlx keeps no copy of the one replaced) offers none: ctrl+z would leave neither.
+    Its toast says what it did, with no Undo, and ctrl+z leaves the persona where it is."""
+
+    def answer(source: str, **_: object) -> personas_service.ImportResult:
+        directory = catalogue["pair"]  # the user persona it took the place of
+        (directory / "SKILL.md").write_text(skill_text("Pairs, imported."), encoding="utf-8")
+        return result_for(directory).model_copy(update={"replaced": True})
+
+    monkeypatch.setattr(personas_service, "import_source", Recorder(answer))
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Any]:
+        await press(pilot, "#persona-import")
+        dialog = await wait_for(pilot, ImportPersonaScreen)
+        dialog.query_one("#import-source", Input).value = "./skills/pair"
+        await pilot.pause()
+        await press(pilot, "#import-submit")
+        await settle(pilot)
+        tab(host).focus()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        return [list(host.notices), catalogue["pair"].exists()]
+
+    notices, still_there = drive(scenario, project=project)
+    assert ("✓ imported pair (copy)", "information") in notices, notices
+    assert not any("Undo" in message for message, _ in notices)
+    assert ("Nothing to undo here", "information") in notices
+    assert still_there, "ctrl+z left the persona the import made"
