@@ -1802,7 +1802,7 @@ def test_the_offer_after_a_move_refuses_too_while_anything_runs(
     named = _an_instance(user_home / ".rlx")
     said: list[str] = []
     monkeypatch.setattr(install_cli, "_stdin_is_a_terminal", lambda: True)
-    monkeypatch.setattr(install_cli.typer, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr("aisquare.cli.install.typer.confirm", lambda *a, **k: True)
     monkeypatch.setattr(install_cli, "_say", said.append)
 
     install_cli._offer_the_cache(yes=False)
