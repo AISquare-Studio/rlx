@@ -128,9 +128,10 @@ The move refuses, and names each thing it found, while any of these run on the h
 - a window on rlx's tmux server, or on a server a launch record names;
 - the watcher;
 - Remote, served from another process;
-- an `rlx launch` waiting on its agent.
+- an agent started with `rlx launch`, on any account.
 
-Stop them, then run `rlx upgrade` again. Nothing is touched until the home is quiet.
+Stop them, then run `rlx upgrade` again. Nothing is touched until the home is quiet. The app's
+Move rlx's home says what runs before it closes rlx.
 
 The rlx service (`rlx service`, [service.md](service.md)) is not one of them: the move stops it
 first and starts it again afterwards, on the home where it then is. A service that does not stop
@@ -175,8 +176,17 @@ failure at any of those steps does this by itself. After a crash, `rlx move-home
 does it. The roll-back is written down as it goes, so a crash during it is finished by the next
 run. From step 8 on, the move can only be finished.
 
-The cache moves with the home, as a rename costs nothing. `rlx move-home --drop-cache` drops
-it once the move is done: rlx makes it again as it needs it.
+The cache moves with the home, as a rename costs nothing. After the move, `rlx upgrade` at a
+terminal offers to drop it, saying its size; off a terminal it says how. `rlx move-home
+--drop-cache` drops it, after the move as well: rlx makes it again as it needs it.
+
+While a move is unfinished (a crash stopped it), no other rlx command runs: each says how to
+finish it (`rlx move-home`) or put the home back (`rlx move-home --rollback`). An agent's hook
+does nothing meanwhile. Otherwise a command would make a new, empty store where the old one
+was, and the move could not be finished.
+
+An install rlx does not upgrade itself (Homebrew, pipx) has its home moved by `rlx upgrade`
+too, which then says how that install upgrades.
 
 ### What it leaves
 
@@ -195,6 +205,11 @@ the folder and no credential store is touched. A Codex account's login is its `a
 moves with its folder on every platform. A Codex account set to keep its login in the system's
 keyring (`cli_auth_credentials_store = "keyring"`) is keyed by its folder, and is not moved: sign
 in to it again after the move.
+
+No Windows CI run moves a home: the move's tests use a stand-in for `security`, a POSIX script,
+and run on macOS and Linux only. On Windows the renames, the roll-back and the junction
+`~/.aisquare` → `~/.rlx` are not exercised by any test; the Windows fleet runs in WSL in
+0.10.2, where the move runs as on Linux.
 
 ### Checking the Keychain copy by hand
 
