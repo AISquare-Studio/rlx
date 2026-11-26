@@ -1522,6 +1522,7 @@ CREATE TABLE IF NOT EXISTS account_rank (
 # recorded Codex rows before the column (review r28 of #113, m1). One neither names keeps
 # NULL, which reads as the default agent's, only where the store never recorded another.
 _SCHEMA_V50 = ""
+_SCHEMA_V51 = ""
 # Ordered migrations; index i upgrades the db from user_version i to i+1.
 _MIGRATIONS = (
     _SCHEMA_V1,
@@ -1574,7 +1575,7 @@ _MIGRATIONS = (
     _SCHEMA_V48,
     _SCHEMA_V49,
     _SCHEMA_V50,
-    "ALTER TABLE team_session ADD COLUMN manager_wake TEXT;",
+    _SCHEMA_V51,
 )
 SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -1679,6 +1680,7 @@ _PRODUCTS: dict[int, _Products] = {
     47: _Products(columns=(("claude_usage", "windows", "TEXT"),)),
     48: _Products(("account_rank",)),
     49: _Products(columns=(("usage_session", "agent", "TEXT"),)),
+    50: _Products(columns=(("team_session", "manager_wake", "TEXT"),)),
 }
 
 _PROJECT_COLUMNS = (
