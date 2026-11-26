@@ -27,7 +27,7 @@ curl -fsSL https://aisquare.studio/rlx/install.sh | sh
   conventions reach every new session, so it starts oriented, not cold.
 - **Everything is also a command**, for your scripts and for the agents.
 - **Local-first.** Your memory, boards and fleet live in a SQLite store under
-  `~/.aisquare` on your machine. rlx runs no daemon (the agents run in a tmux
+  `~/.rlx` on your machine. rlx runs no daemon (the agents run in a tmux
   server) and needs no cloud service of its own.
 
 ## Install

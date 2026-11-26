@@ -69,7 +69,10 @@ def _the_server() -> dict[str, object]:
     return {
         "command": sys.executable,
         "args": ["-m", "aisquare.services.captain", "--stdio", "--close-after", "0"],
-        "env": {"AISQUARE_HOME": str(paths.aisquare_home())},
+        "env": {
+            "AISQUARE_HOME": str(paths.aisquare_home()),
+            "RLX_HOME": str(paths.aisquare_home()),
+        },
     }
 
 

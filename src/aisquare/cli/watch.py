@@ -578,11 +578,11 @@ def _build_app_class(interval: float, project: ProjectInfo | None = None) -> Any
             self.action_pick_theme()
 
         def action_screenshot(self, filename: str | None = None, path: str | None = None) -> None:
-            """Save an SVG of the board to ~/.aisquare/screenshots (always local —
+            """Save an SVG of the board to ~/.rlx/screenshots (always local —
             textual's own palette screenshot 'delivers' and can fail in plain
             terminals)."""
             try:
-                target = Path(path) if path else paths.aisquare_home() / "screenshots"
+                target = Path(path) if path else paths.screenshots_dir()
                 target.mkdir(parents=True, exist_ok=True)
                 name = filename or f"board-{datetime.now():%Y%m%d-%H%M%S}.svg"
                 file = target / name

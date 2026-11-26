@@ -5,7 +5,7 @@ helper wrote another. This is phase A of the code-intelligence program (#91): a 
 definitions and references the agent can ask before it greps, and before it writes a
 helper (``aisquare code similar``).
 
-**Its own database.** ``~/.aisquare/projects/<id>/code/index.db`` (SQLite, WAL), apart
+**Its own database.** ``~/.rlx/projects/<id>/code/index.db`` (SQLite, WAL), apart
 from ``context.db``: it is a cache of the checkout, rebuilt from it at will, so it takes
 no migration and a damaged one is deleted and built again. Tables: ``file`` (path,
 sha256, size, mtime_ns, lang, parser), ``symbol`` (name, qualname, kind, path, line,

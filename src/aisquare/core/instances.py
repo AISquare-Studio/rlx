@@ -90,7 +90,6 @@ KIND_SECONDS = 60.0
 
 _ID = re.compile(r"[0-9a-f]{12}")
 
-FOLDER = "instances"
 GATE_LOCK = ".gate.lock"
 
 _log = logging.getLogger(__name__)
@@ -204,7 +203,7 @@ def _zoned(moment: datetime) -> datetime:
 
 def registry_dir() -> Path:
     """``<home>/instances``; made by the first asq to register, never by a reader."""
-    return paths.aisquare_home() / FOLDER
+    return paths.instances_dir()
 
 
 def valid_id(text: str) -> bool:

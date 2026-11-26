@@ -418,7 +418,7 @@ def _our_config_name(version: str) -> str:
 def _api_off_config(version: str) -> Path | None:
     """Our config for ngrok configs of ``version``, written into the aisquare home if it is not
     there as it should be; ``None`` when it cannot be."""
-    path = paths.aisquare_home() / _our_config_name(version)
+    path = paths.ngrok_config_path(_our_config_name(version))
     body = _API_OFF_HEADER + API_OFF_CONFIGS[version]
     try:
         # With replacement: a byte that is no UTF-8 in it raised a UnicodeDecodeError, no

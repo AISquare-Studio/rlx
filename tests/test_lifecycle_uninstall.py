@@ -1097,7 +1097,8 @@ def test_the_plans_ask_a_server_its_start_writing_nothing_and_waiting_seconds(
     monkeypatch.setattr(tmux_core, "_tmux", tmux)
     _initialised(runner, tmp_path)
     _live_agent(tmp_path / "repo", socket_path=tmp_path / "asq", server_started_at=then)
-    conf = paths.aisquare_home() / tmux_core.CONF_NAME
+    conf = paths.tmux_conf_path()
+    conf.parent.mkdir(parents=True, exist_ok=True)
     conf.write_text("# an older aisquare's conf\n", encoding="utf-8")
 
     if plan == "uninstall":
@@ -1430,7 +1431,7 @@ def test_a_home_aisquare_home_moved_is_never_purged_whatever_its_names(
     custom = lifecycle.purge_refusal(work, custom=True)
     default = lifecycle.purge_refusal(work, custom=False)
 
-    assert custom is not None and "AISQUARE_HOME moved the home" in custom
+    assert custom is not None and "(or AISQUARE_HOME) moved the home" in custom
     assert default is None, "the default ~/.aisquare is aisquare's by name"
 
 
@@ -2187,7 +2188,7 @@ def test_a_refused_purge_says_why_under_json(
 
     error = _one_object(result.stdout)
     assert error["error"] == "purge_refused"
-    assert "AISQUARE_HOME moved the home" in error["detail"]
+    assert "(or AISQUARE_HOME) moved the home" in error["detail"]
 
 
 def test_off_a_terminal_a_refused_plan_exits_1_without_sending_them_to_yes(
@@ -2393,8 +2394,7 @@ def test_the_plan_neither_migrates_the_store_nor_recreates_the_home(
     import sqlite3
 
     _initialised(runner, tmp_path)
-    home = paths.aisquare_home()
-    for directory in (home / "cache", home / "log"):
+    for directory in (paths.cache_dir(), paths.log_dir()):
         for child in sorted(directory.rglob("*"), reverse=True):
             child.unlink() if child.is_file() else child.rmdir()
         directory.rmdir()
@@ -2410,7 +2410,7 @@ def test_the_plan_neither_migrates_the_store_nor_recreates_the_home(
         after = connection.execute("PRAGMA user_version").fetchone()[0]
     connection.close()
     assert after == version - 1, "the plan migrated the store"
-    assert not (home / "cache").exists() and not (home / "log").exists()
+    assert not paths.cache_dir().exists() and not paths.log_dir().exists()
 
 
 def test_upgrade_and_uninstall_agree_on_which_uv_tools_they_touch(
@@ -3687,7 +3687,7 @@ def _codex_hooked(home: Path, program: Path | str, *, config: str | None = None)
 
 
 def _codex_account(slot: str) -> Path:
-    return paths.aisquare_home() / "codex-accounts" / slot
+    return paths.agent_accounts_dir("codex-accounts") / slot
 
 
 def _record_codex(*homes: Path) -> None:

@@ -74,7 +74,7 @@ def _now() -> datetime:
 
 def captain_dir() -> Path:
     """``$AISQUARE_HOME/captain`` — the captain's files (not created here)."""
-    return paths.aisquare_home() / "captain"
+    return paths.captain_dir()
 
 
 def speech_dir() -> Path:
@@ -105,7 +105,7 @@ def ui_socket_path(*, create: bool = False) -> Path:
     spellings of one home (a symlink) land on one path.
     """
     home = paths.aisquare_home().resolve()
-    natural = home / "captain" / "ui.sock"
+    natural = paths.captain_dir().resolve() / "ui.sock"
     if _fits(natural):
         if create:
             natural.parent.mkdir(parents=True, exist_ok=True)
@@ -138,7 +138,7 @@ def ui_socket_to_dial() -> Path | None:
     """
     path = ui_socket_path()
     folder = path.parent
-    if folder == paths.aisquare_home().resolve() / "captain":
+    if folder == paths.captain_dir().resolve():
         return path  # inside the user's own home
     try:
         facts = folder.lstat()

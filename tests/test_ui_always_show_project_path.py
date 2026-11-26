@@ -23,8 +23,10 @@ from aisquare.cli.ui.sidebar import (
     project_subtitle,
     short_path,
 )
+from aisquare.cli.ui.views.app_settings import AppSettingsView
 from aisquare.models import ProjectInfo
 from aisquare.services import settings as settings_service
+from tests.settings_fields import reopen
 from tests.test_ui_shell import card_for, drive, fleet_app, refreshed, seed, settle, shown
 from tests.test_ui_shell import no_real_tmux as _no_real_tmux
 from tests.test_ui_shell import script as _script
@@ -173,8 +175,7 @@ def test_the_refresh_tick_never_reads_the_preference(
             await refreshed(app)
         ticked = _subtitles(app)["prj_u"]
         await _open_app_settings(app)
-        app.query_one("#reload-settings", Button).press()
-        await settle(app)
+        await reopen(pilot, app.query_one(AppSettingsView))  # there is no Reload (M5)
         return at_start, len(reads), ticked, _subtitles(app)["prj_u"]
 
     at_start, after_ticks, ticked, reloaded = drive(go)

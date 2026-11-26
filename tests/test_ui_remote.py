@@ -2386,3 +2386,46 @@ def test_news_that_arrives_once_asq_s_screens_are_gone_is_dropped_not_raised() -
     assert not app._screen_stack, "asq's screens are gone"
     app.on_remote_news(app_mod.RemoteNews("Remote is off", False))
     app.on_remote_news(app_mod.RemoteNews("revoked", False, done=True))
+
+
+def test_the_write_switch_and_auto_off_are_kept_as_they_change_and_ctrl_z_puts_them_back() -> None:
+    """M5: the Remote page's two settings are kept as they change, each said with its Undo
+    key; ctrl+z on the page takes the last back, on disk and on screen. (Auto-off reaches
+    ``state.json`` through the app's saver, on its own thread, by the time the app is left.)"""
+
+    def allow_write() -> bool:
+        return bool(json.loads(paths.remote_state_path().read_text())["allow_write"])
+
+    async def go(pilot: Pilot[None]) -> dict[str, Any]:
+        app = pilot.app
+        assert isinstance(app, FleetApp)
+        modal = await open_panel(pilot)
+        writes = modal.query_one("#remote-allow-write", Switch)
+        writes.focus()
+        writes.toggle()
+        await written(pilot)
+        seen: dict[str, Any] = {"on": allow_write()}
+        auto_off = modal.query_one("#remote-auto-off", Select)
+        seen["before"] = auto_off.value
+        auto_off.focus()
+        auto_off.value = 120
+        await written(pilot)
+        seen["auto_off"] = app.remote.state.auto_off_minutes
+        await pilot.press("ctrl+z")
+        await written(pilot)
+        seen["auto_off_back"] = (app.remote.state.auto_off_minutes, auto_off.value)
+        await pilot.press("ctrl+z")
+        await written(pilot)
+        seen["off"] = (allow_write(), writes.value)
+        seen["toasts"] = [n.message for n in app._notifications]
+        return seen
+
+    seen = drive(go, tunnel=missing_ngrok)
+    before = seen["before"]
+    assert seen["on"] is True and seen["auto_off"] == 120, "each kept, no Save pressed"
+    assert seen["auto_off_back"] == (before, before), "ctrl+z: the auto-off it replaced"
+    on_disk = json.loads(paths.state_path().read_text()).get("auto_off_minutes", before)
+    assert on_disk == before, "and that is what the file holds"
+    assert seen["off"] == (False, False), "ctrl+z again: writes off, on disk and on the switch"
+    assert "Saved allow write actions: on · Undo: ctrl+z" in seen["toasts"], seen["toasts"]
+    assert "Undone: allow write actions: on" in seen["toasts"]

@@ -1550,7 +1550,13 @@ def test_the_hubs_doctor_link_opens_the_doctor_page_and_runs_the_checks(
         await pilot.pause()
         await settle(app)
         await pilot.pause()
-        report = shown(app.query_one("#doctor", DoctorView).query_one("#doctor-report", Static))
+        doctor_page = app.query_one("#doctor", DoctorView)
+        # The problems, then the passing rows behind their fold (Q5): the whole report.
+        report = (
+            shown(doctor_page.query_one("#doctor-report", Static))
+            + "\n"
+            + shown(doctor_page.query_one("#doctor-passed-list", Static))
+        )
         return (
             calls_after_mount,
             before,
@@ -7412,8 +7418,10 @@ def test_the_settings_tab_follows_a_rename_made_on_the_card_or_in_a_shell(
         app.refresh_data()
         await settle(app)
         out["typing"] = seen()
+        field.focus()
+        await settle(app)
         field.value = ""
-        tab.query_one("#save-nickname", Button).press()
+        field.blur()  # leaving the field keeps it: there is no Save (M5)
         await settle(app)
         out["cleared"] = (seen(), stored())
         return out
@@ -7426,7 +7434,7 @@ def test_the_settings_tab_follows_a_rename_made_on_the_card_or_in_a_shell(
         "what the operator is typing stays; the title says the stored name"
     )
     assert out["cleared"] == (("", "project settings — alpha"), None), (
-        "a blank Save clears a nickname set elsewhere"
+        "a blank field, left, clears a nickname set elsewhere"
     )
 
 

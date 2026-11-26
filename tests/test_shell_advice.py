@@ -165,6 +165,9 @@ ALLOWED: dict[str, str] = {
         "doctor-fix: the switches its row's fix names"
     ),
     "services/diagnostics.py::_check_claude_code": "doctor-fix: the connects its row's fix names",
+    "services/diagnostics.py::_check_statusline": (
+        "doctor-fix: the install its OK row offers, a quiet pane button in asq (#15)"
+    ),
     "services/diagnostics.py::_check_database": (
         "doctor-fix: the copy (cp) its fix says to keep; the search its detail names is "
         "detail_advice"
@@ -582,7 +585,7 @@ SHELL = {
     "a vanished account": "no Claude account in slot ? any more — it was removed meanwhile; "
     "see: rlx accounts",
     "a sign-in's usage fix": "press Log in (in a terminal: rlx accounts run 2, then /login)",
-    "another Remote on": "another Remote is on for this ~/.aisquare (the rlx UI's R panel, or "
+    "another Remote on": "another Remote is on for this ~/.rlx (the rlx UI's R panel, or "
     "`rlx remote serve` in another shell) — turn it off first: two would share one link, one "
     "passphrase, one auto-off and one list of phones",
     "Remote on elsewhere": "press Ctrl-C where `rlx remote serve` runs, or turn Remote off in "

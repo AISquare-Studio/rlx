@@ -413,7 +413,8 @@ def test_a_first_shipment_that_fails_is_not_said_and_the_switch_stays_on() -> No
     assert line.startswith("On — ")
     for word in ("fail", "404", "retry", "error", "reach", "wait"):
         assert word not in line.lower(), word
-    assert toasts == []
+    # Nothing says the shipment failed; the one toast is the switch kept (M5's save model).
+    assert toasts == ["Saved usage sharing on · Undo: ctrl+z"], toasts
 
 
 def test_the_state_is_read_again_when_the_page_is_shown_again() -> None:
@@ -1074,3 +1075,37 @@ def test_a_fresh_home_is_asked_once_welcome_has_its_fleet_up_and_never_before(
     assert seen["asked_before"] == 0, "not asked while it was set up"
     assert seen["after"] == ("welcome", "ConsentDialog"), seen
     assert fake.calls.count("consent_due") == 1
+
+
+# --- M5: one save model ---------------------------------------------------------------------
+
+
+def test_each_switch_is_kept_as_it_is_pressed_and_ctrl_z_flips_it_back() -> None:
+    """M5: a switch is kept at its press, says "Saved … · Undo: ctrl+z", and ctrl+z flips it
+    back, on disk (the sharing service's state) and on screen."""
+    fake = FakeSharing(signed_in=True)
+
+    async def go(pilot: Pilot[None], box: SharingBox) -> dict[str, Any]:
+        seen: dict[str, Any] = {}
+        await pilot.click("#usage-share-toggle")
+        await settle_page(box.app)
+        seen["on"] = (fake.status_now.enabled, _label(box))
+        await pilot.press("ctrl+z")
+        await settle_page(box.app)
+        seen["undone"] = (fake.status_now.enabled, _label(box))
+        await released(pilot, box.query_one("#active-ping-toggle", Button))
+        await pilot.click("#active-ping-toggle")
+        await settle_page(box.app)
+        seen["ping_off"] = fake.ping_now.switch
+        await pilot.press("ctrl+z")
+        await settle_page(box.app)
+        seen["ping_back"] = fake.ping_now.switch
+        seen["toasts"] = [n.message for n in box.app._notifications]
+        return seen
+
+    seen = _drive_page(fake, go)
+    assert seen["on"] == (True, "Turn sharing off")
+    assert seen["undone"] == (False, "Turn sharing on"), "ctrl+z turned it off again"
+    assert (seen["ping_off"], seen["ping_back"]) == (False, True)
+    assert "Saved usage sharing on · Undo: ctrl+z" in seen["toasts"]
+    assert "Saved the daily ping off · Undo: ctrl+z" in seen["toasts"]

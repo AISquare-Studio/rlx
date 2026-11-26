@@ -94,6 +94,10 @@ footers (``Esc to close``, ``Esc to go back``), so the edge, not a footer, is wh
 box's own rules are ``─``: no idle or working screen draws it, and it is read only with no box
 drawn."""
 RATING = re.compile(r"How is Claude doing this session")
+EFFORT_ROW = re.compile(r"·\s*/effort\s*$")
+"""The effort row Claude Code draws just above its box since 2.1.318 (``◉ xhigh · /effort``,
+right-aligned): it sits between the session-rating survey and the box, so the survey is read
+above it (a live capture of 2.1.332, ``tests/screens/real_survey_2_1_332.txt``)."""
 WORKING = re.compile(r"esc to interrupt", re.IGNORECASE)
 """What a turn in progress shows at the box: in the footer, or on the spinner line."""
 LIVE_SPINNER = re.compile(r"^\s*[·✢✳✶✻✽*]\s*\S[^…]*…")
@@ -331,7 +335,11 @@ def modal_showing(lines: Sequence[str]) -> str | None:
         return None
     box = input_box_at(rows)
     if box is not None:
-        above = "\n".join(rows[max(0, box - 2) : box])
+        # The one or two lines above the box, past the effort row 2.1.318 on draws there.
+        top = box
+        while top > 0 and EFFORT_ROW.search(rows[top - 1]):
+            top -= 1
+        above = "\n".join(rows[max(0, top - 2) : top])
         return "the session-rating prompt" if RATING.search(above) else None
     prompt = prompt_showing(rows)
     if prompt is not None:

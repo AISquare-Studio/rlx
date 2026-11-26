@@ -9,7 +9,7 @@ only after two consecutive scans saw it, only if it is still there when its
 excerpt, a detail or anything else an agent wrote: a lock screen shows it to
 whoever holds the phone.
 
-**Keys and subscriptions** live in ``~/.aisquare/remote-push.json``, owner-only
+**Keys and subscriptions** live in ``~/.rlx/remote/push.json``, owner-only
 like ``remote.json``: one VAPID key pair (P-256, made on first use and never
 rotated, because every subscription a browser holds was made against its
 public half), one subscription per device id, and the ids already pushed, so a

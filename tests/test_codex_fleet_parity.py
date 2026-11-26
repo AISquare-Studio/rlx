@@ -38,7 +38,7 @@ from aisquare.cli.ui.views.agent import key_spellings
 from aisquare.cli.ui.views.app_settings import launch_line
 from aisquare.core import agents as agent_core
 from aisquare.core import claude_accounts as accounts_core
-from aisquare.core import harness, launch_seal, procs, prompt_origin
+from aisquare.core import harness, launch_seal, paths, procs, prompt_origin
 from aisquare.core.agent_adapters import codex_config, get_adapter
 from aisquare.core.agent_adapters.types import AgentAdapter, prepare_store, screen_of, store_dir
 from aisquare.core.config import (
@@ -2458,7 +2458,7 @@ def test_a_sandboxed_launch_makes_what_its_profile_names_before_the_sandbox_can(
     prepare_store(store)
 
     assert store.is_dir()
-    assert (store / launch_seal.DIR_NAME).is_dir()
+    assert paths.launch_seals_dir().is_dir()
 
 
 @pytest.mark.parametrize(

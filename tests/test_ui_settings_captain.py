@@ -28,6 +28,7 @@ from aisquare.cli.ui.sidebar import (
     StartCaptain,
 )
 from aisquare.cli.ui.spawn import SpawnDialog
+from aisquare.cli.ui.views.app_settings import AppSettingsView
 from aisquare.cli.ui.views.captain import WHAT_IS_UP
 from aisquare.cli.ui.views.settings_captain import ABOUT, CaptainToggle, captain_agent
 from aisquare.core import experimental
@@ -39,6 +40,7 @@ from tests import test_captain_say as say_suite
 from tests import test_ui_shell as ui_suite
 from tests.captain_screens import INPUT_BOX, REAL_TRUST
 from tests.fleet_fakes import list_agents_as
+from tests.settings_fields import reopen
 from tests.test_captain_say import Captain, Clock
 from tests.test_captain_sidebar import until
 from tests.test_captain_view import _captain, _open_view, drive
@@ -120,8 +122,8 @@ def test_ticking_the_captain_box_shows_the_captain_at_once_and_unticking_hides_i
 def test_reset_all_and_reload_move_the_box_and_the_shell_with_the_file(
     tmp_path: Path, script: Script, captain_off: None
 ) -> None:
-    """The box sits in App settings' form now (#41), whose Reset all and Reload re-read the
-    file: the box and the shell follow it. Reset all with the captain ticked put the file's
+    """The box sits in App settings' form now (#41), whose Reset all and reopening re-read
+    the file: the box and the shell follow it. Reset all with the captain ticked put the file's
     captain back to off while the box stayed ticked and the captain's slot stayed until a restart;
     a ``config set`` from a shell, then Reload, left both as they were."""
     seed(tmp_path, ("prj_aaa", "alpha", "amber-otter"))
@@ -147,7 +149,7 @@ def test_reset_all_and_reload_move_the_box_and_the_shell_with_the_file(
         config = load_config()
         config.experimental.captain = True  # what `config set experimental.captain true` writes
         save_config(config)
-        await pilot.click("#reload-settings")
+        await reopen(pilot, app.query_one(AppSettingsView))  # no Reload (M5)
         await settle_page(app)
         await refreshed(app)
         return ticked, reset, seen()
@@ -184,7 +186,7 @@ def test_the_captains_agent_is_chosen_beside_its_box_and_saved_at_once(
         config = load_config()
         config.team.profiles["captain"] = RoleLaunchProfile(agent="codex")  # `team bind`
         save_config(config)
-        await pilot.click("#reload-settings")
+        await reopen(pilot, app.query_one(AppSettingsView))  # no Reload (M5)
         await settle_page(app)
         return str(select.value), chosen, cleared, captain_agent(load_config())
 
@@ -397,3 +399,30 @@ def test_a_typed_what_is_up_is_a_message_like_any(
         assert f"sent to the captain: {WHAT_IS_UP}" in told, told
     else:
         assert left == WHAT_IS_UP, "back in the box to send again"
+
+
+def test_a_tick_of_the_captain_box_is_taken_back_by_ctrl_z(
+    tmp_path: Path, script: Script, captain_off: None
+) -> None:
+    """M5: the box is kept as it is ticked, said with its Undo key; ctrl+z on the page puts the
+    file's captain back off, and the shell follows."""
+    seed(tmp_path, ("prj_aaa", "alpha", "amber-otter"))
+
+    async def body(pilot: Pilot[None]) -> tuple[bool, bool, bool, bool, list[str]]:
+        app = fleet_app(pilot)
+        await refreshed(app)
+        toggle = await _settings(pilot)
+        box = toggle.query_one("#captain-toggle", Checkbox)
+        box.focus()
+        await _tick(pilot, box)
+        ticked = load_config().experimental.captain
+        await pilot.press("ctrl+z")
+        await settle_page(app)
+        await refreshed(app)
+        toasts = [n.message for n in app._notifications]
+        return ticked, load_config().experimental.captain, box.value, app.captain_on, toasts
+
+    ticked, undone, shown, shell, toasts = drive(body)
+    assert ticked is True
+    assert (undone, shown, shell) == (False, False, False), "off on disk, on the box, the shell"
+    assert "Saved the captain: on · Undo: ctrl+z" in toasts, toasts

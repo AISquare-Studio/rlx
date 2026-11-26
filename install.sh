@@ -270,13 +270,50 @@ shown_path() {
     esac
 }
 
-# Where init writes the aisquare home, and the settings.json it merges Claude
-# Code's hooks into, as aisquare resolves them: AISQUARE_HOME and
-# CLAUDE_CONFIG_DIR when set (core/paths.py aisquare_home, core/agents.py
-# _claude_home), else the defaults. Shown, never used as paths.
+# Where init writes rlx's home, and the settings.json it merges Claude Code's
+# hooks into, as rlx resolves them (core/paths.py home_of, core/agents.py
+# _claude_home): RLX_HOME, else AISQUARE_HOME (its name before 0.10.2), else
+# ~/.rlx if it is there, else ~/.aisquare if it is (a home from before 0.10.2),
+# else ~/.rlx; CLAUDE_CONFIG_DIR when set, else ~/.claude. Shown, never used as paths.
+aisquare_home_dir() {
+    if [ -n "${RLX_HOME:-}" ]; then
+        _ah_dir=$RLX_HOME
+    elif [ -n "${AISQUARE_HOME:-}" ]; then
+        _ah_dir=$AISQUARE_HOME
+    elif [ -d "$HOME/.rlx" ]; then
+        _ah_dir=$HOME/.rlx
+    elif [ -d "$HOME/.aisquare" ]; then
+        _ah_dir=$HOME/.aisquare
+    else
+        _ah_dir=$HOME/.rlx
+    fi
+    printf '%s' "${_ah_dir%/}"
+}
 aisquare_home_shown() {
-    _ah_dir=${AISQUARE_HOME:-$HOME/.aisquare}
-    shown_path "${_ah_dir%/}"
+    shown_path "$(aisquare_home_dir)"
+}
+# The store's file in that home, by its layout (core/paths.py layout_of): rlx.db, or
+# context.db in a home from before 0.10.2 (~/.aisquare, or one holding its files).
+home_store_shown() {
+    _hs_dir=$(aisquare_home_dir)
+    if [ -e "$_hs_dir/rlx.db" ]; then
+        printf 'rlx.db'
+    elif [ "$_hs_dir" = "$HOME/.aisquare" ] || old_layout_at "$_hs_dir"; then
+        printf 'context.db'
+    else
+        printf 'rlx.db'
+    fi
+}
+# Whether $1 holds the old layout's files at its top (core/paths.py OLD_LAYOUT_MARKERS, and
+# an agent's *-accounts/ folder).
+old_layout_at() {
+    for _ol_name in context.db launch-seals instances log fleet-tmux.conf remote.json credentials; do
+        [ -e "$1/$_ol_name" ] && return 0
+    done
+    for _ol_dir in "$1"/*-accounts; do
+        [ -d "$_ol_dir" ] && return 0
+    done
+    return 1
 }
 claude_settings_shown() {
     _cs_dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
@@ -1388,7 +1425,7 @@ banner() {
     fi
     # Where this run's init writes, as aisquare resolves it: AISQUARE_HOME,
     # CLAUDE_CONFIG_DIR and CODEX_HOME redirect them, and the one-liner inherits them.
-    note "$(printf '%-33s %s' "$(aisquare_home_shown)/" "config.toml, context.db, projects/")"
+    note "$(printf '%-33s %s' "$(aisquare_home_shown)/" "config.toml, $(home_store_shown), projects/")"
     if wants_claude; then
         note "$(printf '%-33s %s' "$(claude_settings_shown)" "MERGED — rlx's hook groups only")"
     fi

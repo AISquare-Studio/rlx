@@ -93,7 +93,7 @@ def test_the_hooks_home_is_named_in_full_as_this_platform_spells_it() -> None:
     """On the Windows runner the account home sat under the user's folder and step 2 named
     it ``~/AppData/.../codex-accounts/2``, a spelling neither cmd nor Explorer takes; it is
     named in full, as the binary and a hooks-off config.toml are, wherever it lives."""
-    home = Path.home() / ".aisquare" / "codex-accounts" / "2"
+    home = Path.home() / ".rlx" / "accounts" / "codex" / "2"
     for state in (CODEX_UNHOOKED, CODEX_TRUSTED):
         text = claude_text(dataclasses.replace(state, home=home), platform=sys.platform).plain
         assert f" in {home}" in text and "~" not in text, text

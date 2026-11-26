@@ -45,6 +45,7 @@ from textual.widgets import Button, Static
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.click_guard import GuardedButton
+from aisquare.cli.ui.save_model import UNDO_BINDING, SavesAsYouGo
 from aisquare.models import SharingStatus, ShipReport
 from aisquare.services import active_ping, usage_share
 from aisquare.services.active_ping import PingStatus
@@ -200,8 +201,14 @@ def ping_status_text(status: PingStatus) -> str:
     return "On — sent once on each day you use rlx."
 
 
-class SharingBox(Vertical):
-    """The switch, its line of explanation, its state, and *What's shared*."""
+class SharingBox(SavesAsYouGo, Vertical):
+    """The switch, its line of explanation, its state, and *What's shared*.
+
+    Each switch is kept as it is pressed, as every settings control is (``cli.ui.save_model``,
+    M5): ``Saved … · Undo: ctrl+z``, and ctrl+z flips it back. (Undo cannot recall what sharing
+    already sent when it was turned on; it turns sharing off again.)"""
+
+    BINDINGS: ClassVar = [UNDO_BINDING]
 
     DEFAULT_CSS = """
     SharingBox { height: auto; border: round $primary-darken-2; padding: 0 1; margin-bottom: 1; }
@@ -223,6 +230,8 @@ class SharingBox(Vertical):
         """The state last read: what the button and the line show."""
         self.ping: PingStatus | None = None
         """The daily ping's state last read: what its button and line show."""
+        self._pressed: set[str] = set()
+        """The flips a press asked for (not a read, not Undo): each one, done, is a kept change."""
 
     def compose(self) -> ComposeResult:
         yield Static(Text("Share anonymous usage"), id="usage-share-title")
@@ -309,6 +318,7 @@ class SharingBox(Vertical):
             return
         status_line = self.query_one("#usage-share-status", Static)
         if event.state is WorkerState.ERROR:
+            self._pressed.discard(SHARE_WORKER)  # nothing was kept
             status_line.update(Text(f"Could not change sharing: {event.worker.error}", style="red"))
             self.query_one("#usage-share-toggle", Button).disabled = self.status is None
             return
@@ -319,6 +329,7 @@ class SharingBox(Vertical):
             return
         _action, status, _report = result
         self.show(status)  # whatever the shipment did: sharing says nothing of failing
+        self._kept_flip(SHARE_WORKER)
 
     def show(self, status: SharingStatus) -> None:
         """Draw ``status``: the button's label and whether it can be pressed, and the line."""
@@ -333,6 +344,7 @@ class SharingBox(Vertical):
     def _ping_worker_done(self, event: Worker.StateChanged) -> None:
         line = self.query_one("#active-ping-status", Static)
         if event.state is WorkerState.ERROR:
+            self._pressed.discard(PING_WORKER)  # nothing was kept
             line.update(Text(f"Could not change the ping: {event.worker.error}", style="red"))
             self.query_one("#active-ping-toggle", Button).disabled = (
                 self.ping is None or self.ping.forced_off is not None
@@ -340,6 +352,7 @@ class SharingBox(Vertical):
             return
         if event.state is WorkerState.SUCCESS and isinstance(event.worker.result, PingStatus):
             self.show_ping(event.worker.result)
+            self._kept_flip(PING_WORKER)
 
     def show_ping(self, status: PingStatus) -> None:
         """Draw the daily ping's ``status``: its button's label, whether it can be pressed, and
@@ -356,6 +369,7 @@ class SharingBox(Vertical):
         event.stop()
         if self.ping is None or self.ping_busy:
             return
+        self._pressed.add(PING_WORKER)
         self._flip_ping(not self.ping.switch)
 
     @on(Button.Pressed, "#usage-share-toggle")
@@ -363,7 +377,28 @@ class SharingBox(Vertical):
         event.stop()
         if self.status is None or self.busy:
             return
+        self._pressed.add(SHARE_WORKER)
         self._flip_sharing("disable" if self.status.enabled else "enable")
+
+    def _kept_flip(self, worker: str) -> None:
+        """A flip a press asked for is done: say so, and how ctrl+z takes it back."""
+        if worker not in self._pressed:
+            return  # a read, or Undo's own flip
+        self._pressed.discard(worker)
+        # The button was disabled while it flipped, which left the focus nowhere: back on it,
+        # so the keys (ctrl+z among them) reach this page again.
+        toggle = self.query_one(
+            "#usage-share-toggle" if worker == SHARE_WORKER else "#active-ping-toggle", Button
+        )
+        if self.app.focused is None and not toggle.disabled:
+            toggle.focus()
+        if worker == SHARE_WORKER and self.status is not None:
+            on = self.status.enabled
+            back = "disable" if on else "enable"
+            self.kept(f"usage sharing {'on' if on else 'off'}", lambda: self._flip_sharing(back))
+        elif worker == PING_WORKER and self.ping is not None:
+            on = bool(self.ping.switch)
+            self.kept(f"the daily ping {'on' if on else 'off'}", lambda: self._flip_ping(not on))
 
     @on(Button.Pressed, "#usage-share-preview")
     def _preview(self, event: Button.Pressed) -> None:

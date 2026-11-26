@@ -58,6 +58,7 @@ from aisquare.services.install_route import Facts, InstallRoute, LatestRelease
 from aisquare.services.lifecycle import UpgradePlan
 from tests.installer_seams import no_real_installer  # noqa: F401 — autouse, applied by import
 from tests.rendered import plain
+from tests.settings_fields import leave_fields
 from tests.test_lifecycle_upgrade import Machine, Tool, _hooked, _record, machine, tool  # noqa: F401
 from tests.test_release_check import _state
 from tests.test_ui_doctor_handoff import Terminal, terminal  # noqa: F401
@@ -274,7 +275,7 @@ def test_the_release_check_switch_takes_the_row_away_and_brings_it_back_at_once(
             hold.clear()  # asked before this save, answered after it
             app.check_release()
         app.query_one("#updates-check", Switch).value = on
-        app.query_one("#save-settings", Button).press()
+        leave_fields(app)
         # Messages only: the check this test holds open is a worker settle_page waits for.
         await settle_page(app, group="no-worker-of-this-name")
         hold.set()
@@ -319,7 +320,7 @@ def test_an_asq_started_with_the_check_off_asks_at_once_when_it_is_switched_on(
 
     async def save(app: FleetApp, on: bool) -> None:
         app.query_one("#updates-check", Switch).value = on
-        app.query_one("#save-settings", Button).press()
+        leave_fields(app)
         await settle_page(app)
 
     async def body(pilot: Pilot[None], app: FleetApp) -> list[object]:
