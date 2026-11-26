@@ -35,6 +35,7 @@ from aisquare.cli import (
     remote,
     root,
     serve,
+    service,
     task,
     team,
     watcher,
@@ -118,8 +119,10 @@ def main_callback(
 
 #: Commands that tools run for the user, on every prompt or for the life of a session: what
 #: they do is not a choice of the user's, so they are not counted as features used. And
-#: ``uninstall``, whose plan must change no file of the home and whose purge removes it.
-_NOT_FEATURES = frozenset({"hook", "serve", "inject", "uninstall"})
+#: ``uninstall``, whose plan must change no file of the home and whose purge removes it. And
+#: ``service``, whose ``run`` the OS or ``start`` runs for weeks: counted, it sent the daily
+#: active ping on every day it was up, which the ruling on #32 (Q2) keeps out (#1743).
+_NOT_FEATURES = frozenset({"hook", "serve", "inject", "uninstall", "service"})
 
 
 #: The detached shipper and the detached pinger themselves: not features, and neither may start
@@ -284,6 +287,7 @@ launch.register(app)  # needs context_settings to forward agent args
 command_reports.register(app)  # `exec` forwards everything after -- to the command
 app.command("serve")(serve.serve)
 app.add_typer(remote.app, name="remote")
+app.add_typer(service.app, name="service")
 app.add_typer(fleet.app, name="fleet")
 app.add_typer(watcher.app, name="watch")
 app.add_typer(code.app, name="code")

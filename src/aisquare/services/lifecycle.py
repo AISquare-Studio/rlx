@@ -22,6 +22,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from aisquare.core import agents as agent_core
@@ -1255,20 +1256,30 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     if plan.reason is not None:
         raise UpgradeRefused(plan.reason, plan.command)
     unkept = _keep_the_numbers(plan)
+    from aisquare.services import service_host  # before the installer: nothing is imported after
+
+    service_ran = _stop_the_service(plan.command)
     code = install_route.run_installer(plan.argv, env=plan.env, to_stderr=to_stderr)
     if code != 0:
         # Asked too: uv resolves before it replaces anything (measured, uv 0.12.19), so a
         # run it could not resolve, as under a cutoff that excludes even the release that
         # runs, leaves that release installed, and no reinstall from nothing is needed.
         kept, _ = _installed_version(plan)
+        service_said = _start_the_service_again(service_host, plan, kept) if service_ran else None
         return UpgradeReport(
-            plan, exit_code=code, version=kept, problem=f"{plan.argv[0]} exited {code}"
+            plan,
+            exit_code=code,
+            version=kept,
+            problem=f"{plan.argv[0]} exited {code}",
+            notes=(service_said,) if service_said else (),
         )
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
+    service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
     if problem is not None:
-        return UpgradeReport(plan, exit_code=code, version=version, problem=problem)
-    notes: list[str] = []
+        said = (service_said,) if service_said else ()
+        return UpgradeReport(plan, exit_code=code, version=version, problem=problem, notes=said)
+    notes: list[str] = [service_said] if service_said else []
     latest = plan.latest_version
     moved_elsewhere = latest is not None and not install_route.same_version(version or "", latest)
     pypis = plan.latest is not None and plan.latest.cutoff is None
@@ -1294,6 +1305,42 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         return UpgradeReport(plan, exit_code=code, version=version, notes=tuple(notes))
     hooks = tuple(_refresh(site, plan.route.facts) for site in plan.refresh)
     return UpgradeReport(plan, exit_code=code, version=version, hooks=hooks, notes=tuple(notes))
+
+
+def _stop_the_service(command: str) -> bool:
+    """Stop the rlx service before the installer replaces the code it runs (#32), as a quit
+    request does; whether one ran. :class:`UpgradeRefused` when it will not stop: the upgrade
+    replaces nothing under a running service."""
+    from aisquare.services import service_host
+
+    try:
+        return service_host.stop_service()
+    except service_host.ServiceError as exc:
+        raise UpgradeRefused(f"{exc}: the upgrade replaces nothing under it", command) from exc
+
+
+def _start_the_service_again(
+    service_host: ModuleType, plan: UpgradePlan, version: str | None
+) -> str:
+    """Start the rlx service that :func:`_stop_the_service` stopped, as a new process of the
+    install now in place: what the upgrade says of it.
+
+    On that install's interpreter (``plan.route.facts.executable``, the one the version check
+    asks), never this process's: the installer has replaced what this one runs. And only into
+    a release that has the service, which that interpreter is asked first: a move back to
+    0.10.1 restarted into "No such command" (review of #32, #1717); it stays stopped, said."""
+    command = [str(plan.route.facts.executable), "-P", "-m", "aisquare", "service"]
+    asked = install_route.run_captured([*command, "--help"], timeout=VERSION_CHECK_TIMEOUT_SECONDS)
+    release, stopped = version or "the release now installed", f"the {service_host.SERVICE}"
+    if asked.error is not None:
+        return f"{stopped} stays stopped: {release} could not be asked ({asked.error})"
+    if asked.returncode != 0:
+        return f"{stopped} stays stopped: {release} has no {service_host.SERVICE}"
+    try:
+        service = service_host.start_service(argv=[*command, "run"])
+    except service_host.ServiceError as exc:
+        return f"the {service_host.SERVICE} did not start again: {exc}"
+    return f"the {service_host.SERVICE} runs again (pid {service.pid}), on {service.version}"
 
 
 def _keep_the_numbers(plan: UpgradePlan) -> str | None:
@@ -2302,7 +2349,11 @@ def running_asqs() -> tuple[str, ...]:
     of #462). Inside an asq, that asq is not one."""
     from aisquare.core import instances
 
-    return tuple(instance.label for instance in instances.other_instances(prune=False))
+    return tuple(
+        instance.label
+        for instance in instances.other_instances(prune=False)
+        if instance.kind != "service"  # stopped and started again by the command itself (#32)
+    )
 
 
 def running_launchers() -> tuple[str, ...]:
@@ -2578,6 +2629,17 @@ def _uninstall_plan(purge: bool) -> UninstallPlan:
     )
 
 
+def _stop_the_service_for_good() -> None:
+    """Stop the rlx service before the uninstall removes what it runs (#32);
+    :class:`UninstallRefused` when it will not stop."""
+    from aisquare.services import service_host
+
+    try:
+        service_host.stop_service()
+    except service_host.ServiceError as exc:
+        raise UninstallRefused(f"{exc}: nothing was removed", "service_running") from exc
+
+
 def uninstall(plan: UninstallPlan) -> UninstallReport:
     """Carry out the plan up to — not including — removing the package.
 
@@ -2590,6 +2652,7 @@ def uninstall(plan: UninstallPlan) -> UninstallReport:
     refusal = plan.refusal
     if refusal is not None:
         raise refusal
+    _stop_the_service_for_good()
     removals: list[HookRemoval] = []
     trust_notes: list[tuple[Path, str]] = []
     for site in plan.hooks:

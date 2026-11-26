@@ -15,7 +15,8 @@ Below, each running rlx on a home is an instance, and each one's messages call i
   ```
 
   `Mac` (`local` on Linux) is an rlx at this machine, `ssh` is one reached from another machine,
-  and a host name is an rlx on another machine that shares the home. Hover the chip to see each
+  `service` is the [rlx service](service.md), and a host name is an rlx on another machine that
+  shares the home. Hover the chip to see each
   rlx's version, host, pid, terminal and start time. With one rlx open, the chip is hidden.
 - **The command.** `rlx instances` lists the live rlx instances: their kind, host, pid,
   version, when each started and how long ago it last checked in. `--json` gives the same list
@@ -48,7 +49,9 @@ Every rlx on a home works on the same things:
 Some things can only have one holder. Whichever rlx takes it first keeps it until it quits:
 
 - **Remote.** Only one process serves Remote for a home. While another rlx serves it, this rlx's
-  Remote panel says so instead of starting a second server.
+  Remote panel says so instead of starting a second server. While the
+  [rlx service](service.md) runs, it serves Remote, and every rlx window's switch turns it on and
+  off.
 - **The captain's ui socket.** The captain's `ui` actions (open a dialog, select a row) go to the
   first rlx that listens on the socket. Another rlx that starts later leaves it alone.
 - **A shared pane's size.** When two rlx instances show the same agent's pane, the rlx you last
