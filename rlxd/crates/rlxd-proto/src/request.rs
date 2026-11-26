@@ -124,14 +124,15 @@ pub mod methods {
     /// Stops rlxd: no params in, `{pid}` out. rlxd answers, then stops taking connections,
     /// cleans up and exits.
     pub const STOP: &str = "stop";
-    /// Asks the resident Python brain (1.6) to answer, through its queue like any request
-    /// to it: no params in, `{pid}` (the brain's) out. While no brain runs, or it does not
-    /// take the request within 5 s, a `brain_*` error says why.
-    pub const BRAIN_PING: &str = "brain.ping";
+    /// Asks the resident Python brain (1.6) to answer, through its queue like a hook:
+    /// no params in, `{pid}` (the brain's) out. While no brain runs, or it does not take
+    /// the request within 5 s, a `brain_*` error says why. rlxd-hook's `ping` (1.5); only a
+    /// `cli` client may call it, any other gets `role_not_allowed`.
+    pub const HOOK_PING: &str = "hook.ping";
     /// One Claude Code hook, from rlxd-hook (1.5): [`HookParams`](crate::HookParams) in,
     /// [`HookReply`](crate::HookReply) out, and one `hook.<event>` on the stream. A hook
     /// the brain never took fails with `hook_not_delivered`, and rlxd-hook runs `rlx hook`
-    /// instead.
+    /// instead. Only a `cli` client may call it; any other gets `role_not_allowed`.
     pub const HOOK: &str = "hook";
     /// Pairs a device as the app gate (5.1): `{device?, gate_credential?}` in,
     /// `{gate_credential, device, route}` out. The credential is shown this once.

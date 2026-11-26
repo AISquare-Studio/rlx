@@ -259,6 +259,9 @@ pub mod codes {
     pub const UNAUTHORIZED: &str = "unauthorized";
     /// No method of that name.
     pub const UNKNOWN_METHOD: &str = "unknown_method";
+    /// The method is not one this connection's `hello` role may call, such as `hook` from
+    /// anything but a `cli` client. `detail` is `{role, method}`.
+    pub const ROLE_NOT_ALLOWED: &str = "role_not_allowed";
     /// `hello` asked for a protocol version this rlxd does not serve. `detail.supported`
     /// lists the ones it does, so the client can say "update" rather than misparse.
     pub const INCOMPATIBLE_PROTOCOL: &str = "incompatible_protocol";

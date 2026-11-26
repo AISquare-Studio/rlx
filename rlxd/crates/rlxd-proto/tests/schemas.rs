@@ -1335,7 +1335,10 @@ fn the_status_builder_prints_what_its_schema_accepts() {
         printed["clients"],
         json!({"app": 0, "tui": 0, "remote": 0, "cli": 0})
     );
-    assert_eq!(printed["brain"], json!({"restarts": 0, "handled": 0}));
+    assert_eq!(
+        printed["brain"],
+        json!({"restarts": 0, "handled": 0, "queued": 0})
+    );
     assert_eq!(
         printed["claude"],
         json!({"installed": false, "signed_in": false})
@@ -2320,7 +2323,7 @@ fn the_brain_builders_print_what_the_schema_accepts() {
 #[test]
 fn a_status_says_why_no_brain_runs_and_how_long_until_the_next_start() {
     let mut status = example("status-reply.json");
-    status["brain"] = json!({"restarts": 3, "handled": 41, "backoff_ms": 2000,
+    status["brain"] = json!({"restarts": 3, "handled": 41, "queued": 2, "backoff_ms": 2000,
         "error": {"code": "brain_exited", "message": "it ended (exit status: 1)"}});
     assert_eq!(agrees::<StatusData>("status-reply.json", &status), status);
     status["brain"]["error"] = json!({"code": "brain_incompatible", "message": "m",
@@ -2331,6 +2334,7 @@ fn a_status_says_why_no_brain_runs_and_how_long_until_the_next_start() {
         json!({"restarts": 0, "handled": 0, "backoff_ms": null}),
         json!({"restarts": 0, "handled": 0, "error": {"code": "", "message": "m"}}),
         json!({"restarts": 0, "handled": 0, "backoff_ms": -1}),
+        json!({"restarts": 0, "handled": 0, "queued": -1}),
     ] {
         let wrong = with(&status, "brain", brain);
         both_refuse::<StatusData>("status-reply.json", wrong);
@@ -2345,7 +2349,8 @@ fn a_status_says_why_no_brain_runs_and_how_long_until_the_next_start() {
     ] {
         assert!(code.starts_with("brain_"), "{code}");
     }
-    assert_eq!(methods::BRAIN_PING, "brain.ping");
+    assert_eq!(methods::HOOK_PING, "hook.ping");
+    assert_eq!(codes::ROLE_NOT_ALLOWED, "role_not_allowed");
 }
 
 // --- hooks over the socket (1.5, 7.3) ----------------------------------------------------------

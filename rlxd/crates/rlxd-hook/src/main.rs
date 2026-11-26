@@ -11,7 +11,7 @@
 //! `stop-failure`, `notification`), it reads the hook's JSON on stdin and sends rlxd
 //! `hook`: those bytes, its working directory, and the variables of rlxd-proto's
 //! `HOOK_ENV_NAMES` it has. It says `hello` as a `cli` client named `rlxd-hook`, with the
-//! token every client uses, and sends nothing but `hook` (or `brain.ping`), for an event of
+//! token every client uses, and sends nothing but `hook` (or `hook.ping`), for an event of
 //! its fixed list: no hook reaches a gate or app-only method. It writes rlxd's reply, the
 //! bytes `rlx hook <event>` would write, on its stdout and stderr, and exits 0.
 //!
@@ -365,7 +365,7 @@ fn ping() -> ExitCode {
     thread::spawn(move || {
         let outcome = connect().and_then(|mut connection| {
             connection
-                .request(methods::BRAIN_PING, Data::new())
+                .request(methods::HOOK_PING, Data::new())
                 .map_err(|e: CallError| e.to_string())
         });
         let _ = said.send(outcome);

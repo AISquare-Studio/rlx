@@ -64,7 +64,7 @@ fn status_names_a_running_brain_and_it_answers_through_its_queue() {
     assert_eq!(status["brain"]["restarts"], 0, "{status}");
     assert!(status["brain"].get("error").is_none(), "{status}");
     for _ in 0..20 {
-        let ping = home.rlxd(&["call", "brain.ping"]);
+        let ping = home.rlxd(&["call", "hook.ping"]);
         assert_eq!(ping.code(), Some(0), "{ping:?}");
     }
     let after = brain(&home);
@@ -93,7 +93,7 @@ fn a_killed_brain_is_started_again_within_five_seconds() {
     assert_eq!(now["restarts"], 1, "{now}");
     let second = now["pid"].as_u64().unwrap_or(0);
     assert!(second > 0 && second != first, "{now}");
-    let ping = home.rlxd(&["call", "brain.ping"]);
+    let ping = home.rlxd(&["call", "hook.ping"]);
     assert_eq!(ping.code(), Some(0), "{ping:?}");
     assert!(home.log().contains("brain_exited"), "{}", home.log());
 }
@@ -164,7 +164,7 @@ fn a_brain_that_dies_at_start_is_started_again_with_backoff() {
     let waiting = now["backoff_ms"].as_u64();
     assert!(waiting.is_some_and(|ms| ms >= 500), "{now}");
     // A request meanwhile is refused as never delivered, not left to hang.
-    let ping = home.rlxd(&["call", "brain.ping"]);
+    let ping = home.rlxd(&["call", "hook.ping"]);
     assert_eq!(ping.code(), Some(1), "{ping:?}");
     assert!(ping.error_code().starts_with("brain_"), "{ping:?}");
     let log = std::fs::read_to_string(home.root().join("rlxd/logs/brain.log")).unwrap();
@@ -184,7 +184,7 @@ fn a_brain_of_another_release_is_named_not_misread() {
         "{message}"
     );
     assert_eq!(brain["error"]["detail"]["rlxd"], serde_json::json!([1]));
-    let ping = home.rlxd(&["call", "brain.ping"]);
+    let ping = home.rlxd(&["call", "hook.ping"]);
     assert_eq!(ping.error_code(), "brain_incompatible", "{ping:?}");
 }
 
@@ -198,7 +198,7 @@ fn with_no_rlx_status_says_so_and_requests_are_refused_at_once() {
     );
     assert_eq!(started["brain"]["restarts"], 0);
     let asked = Instant::now();
-    let ping = home.rlxd(&["call", "brain.ping"]);
+    let ping = home.rlxd(&["call", "hook.ping"]);
     assert_eq!(ping.error_code(), "brain_not_found", "{ping:?}");
     assert!(asked.elapsed() < Duration::from_secs(3), "it did not wait");
 }
@@ -209,7 +209,7 @@ fn a_request_the_brain_never_accepted_was_never_delivered() {
     home.start();
     let first = brain_pid(&home);
     let asked = Instant::now();
-    let ping = home.rlxd(&["call", "brain.ping"]);
+    let ping = home.rlxd(&["call", "hook.ping"]);
     // 2 s for the brain to accept, then killed and reaped before the answer.
     assert!(asked.elapsed() >= Duration::from_secs(2), "{ping:?}");
     assert_eq!(ping.error_code(), "brain_unresponsive", "{ping:?}");
@@ -227,9 +227,68 @@ fn a_request_the_brain_accepted_then_died_on_failed_rather_than_never_ran() {
     let home = TestHome::new().with_rlx(fake_brain("accepts-then-dies"));
     home.start();
     brain_pid(&home);
-    let ping = home.rlxd(&["call", "brain.ping"]);
+    let ping = home.rlxd(&["call", "hook.ping"]);
     assert_eq!(ping.error_code(), "brain_exited", "{ping:?}");
     let message = ping.json()["error"]["message"].as_str().unwrap().to_owned();
     assert!(message.contains("ended running it"), "{message}");
     assert_eq!(brain(&home)["handled"], 0, "no reply came");
+}
+
+#[test]
+fn hook_ping_is_for_command_line_clients_only() {
+    let home = TestHome::new();
+    home.start();
+    for role in ["tui", "remote"] {
+        let refused = home.rlxd(&["call", "--role", role, "--client", "probe", "hook.ping"]);
+        assert_eq!(refused.error_code(), "role_not_allowed", "{refused:?}");
+        let detail = &refused.json()["error"]["detail"];
+        assert_eq!(detail["role"], role, "{refused:?}");
+        assert_eq!(detail["method"], "hook.ping", "{refused:?}");
+    }
+    // A cli client gets through to the brain, which this home has none of.
+    let cli = home.rlxd(&["call", "hook.ping"]);
+    assert_eq!(cli.error_code(), "brain_not_found", "{cli:?}");
+}
+
+#[test]
+fn the_brains_queue_is_bounded_and_status_shows_its_depth() {
+    let home = std::sync::Arc::new(TestHome::new().with_rlx(fake_brain("mute")));
+    home.start();
+    brain_pid(&home);
+    // The mute brain takes one ping and never accepts it: the rest wait, 64 at most.
+    let callers: Vec<_> = (0..100)
+        .map(|_| {
+            let home = std::sync::Arc::clone(&home);
+            thread::spawn(move || {
+                let asked = Instant::now();
+                let ping = home.rlxd(&["call", "hook.ping"]);
+                (asked.elapsed(), ping)
+            })
+        })
+        .collect();
+    let mut deepest = 0;
+    let watched = Instant::now();
+    while watched.elapsed() < Duration::from_millis(1500) {
+        deepest = deepest.max(brain(&home)["queued"].as_u64().unwrap_or(0));
+        thread::sleep(Duration::from_millis(50));
+    }
+    let answers: Vec<_> = callers.into_iter().map(|c| c.join().unwrap()).collect();
+    assert!(
+        (16..=64).contains(&deepest),
+        "status said {deepest} waiting"
+    );
+    let full: Vec<_> = answers
+        .iter()
+        .filter(|(_, ping)| ping.stdout.contains("queue already holds 64"))
+        .collect();
+    assert!(!full.is_empty(), "none refused for a full queue");
+    for (took, ping) in &full {
+        assert_eq!(ping.error_code(), "brain_unresponsive", "{ping:?}");
+        assert!(
+            *took < Duration::from_secs(2),
+            "refused at once, not after {took:?}"
+        );
+    }
+    assert!(answers.iter().all(|(_, ping)| ping.code() == Some(1)));
+    eventually("the queue empties", || brain(&home)["queued"] == 0);
 }
