@@ -15,9 +15,13 @@
 //!   `follow` the reply comes after the replay, and the connection goes on taking
 //!   requests; with it, when rlxd stops. Requests sent meanwhile are answered between
 //!   the events, but a second `events.subscribe` gets `invalid_request`: one stream per
-//!   connection, so event frames need no `id`. A topic the bus does not carry gets
-//!   `unknown_topic`. How a slow client is kept from holding up the rest is the bus's
-//!   (`crate::bus`).
+//!   connection, so event frames need no `id`; it is refused before its params are read.
+//!   Frames are read as they come, so a partial one holds up no event, but a slow request,
+//!   such as a `status` that asks Claude Code, delays that connection's events until it
+//!   is answered. A topic the bus does not carry gets `unknown_topic`, and a `since` past
+//!   the last event `since_ahead`, with `detail.head`. A stream without `follow` ends at
+//!   the last event published when it was asked for. How a slow client is kept from
+//!   holding up the rest is the bus's (`crate::bus`).
 //! - **Stopping.** `daemon.stopping {reason}` is published before any connection learns
 //!   of the stop, so every stream carries it before its reply.
 //! - **`debug.emit {count}`**, in test builds only (the `debug-methods` feature), publishes
@@ -100,11 +104,11 @@ enum Answer {
     Stream(Subscription),
 }
 
-/// An `events.subscribe` that rlxd took.
+/// An `events.subscribe` that rlxd took: its reply's id, and its place, which ends at
+/// the stream's head now unless it follows.
 struct Subscription {
     id: RequestId,
     cursor: Cursor,
-    follow: bool,
 }
 
 /// What the connection does once a stream has ended.
@@ -258,8 +262,9 @@ impl Daemon {
         Ok((session, reply))
     }
 
-    /// What one request frame after `hello` gets.
-    async fn answer(&self, session: &Session, frame: &str) -> Answer {
+    /// What one request frame after `hello` gets. On a connection that carries a stream
+    /// already, `events.subscribe` gets `invalid_request`, whatever its params.
+    async fn answer(&self, session: &Session, frame: &str, streaming: bool) -> Answer {
         let value = match serde_json::from_str::<Value>(frame) {
             Ok(value) => value,
             Err(e) => {
@@ -282,6 +287,10 @@ impl Daemon {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
             }
+            methods::EVENTS_SUBSCRIBE if streaming => Err(error(
+                codes::INVALID_REQUEST,
+                "this connection carries an event stream already: open another for a second",
+            )),
             methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
                 Ok(subscription) => return Answer::Stream(subscription),
                 Err(error) => Err(error),
@@ -328,22 +337,11 @@ impl Daemon {
             None => Topics::ALL,
             Some(names) => Topics::of(names.iter().map(String::as_str)).map_err(unknown_topic)?,
         };
-        let cursor = self.bus.cursor(topics, params.since).map_err(|head| {
-            let since = params.since.unwrap_or_default();
-            error(
-                codes::INVALID_PARAMS,
-                &format!(
-                    "since {since} is past this home's last event, {head}: it comes from \
-                     another numbering of its events"
-                ),
-            )
-            .with_hint("Subscribe without since, and re-read what you show.")
-        })?;
-        Ok(Subscription {
-            id,
-            cursor,
-            follow: params.follow,
-        })
+        let cursor = self
+            .bus
+            .cursor(topics, params.since, params.follow)
+            .map_err(|head| ErrorBody::since_ahead(params.since.unwrap_or_default(), head))?;
+        Ok(Subscription { id, cursor })
     }
 
     /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
@@ -459,6 +457,7 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut frames = Frames {
         reader: BufReader::new(reader),
+        line: Vec::new(),
     };
     let first = tokio::select! {
         first = tokio::time::timeout(HELLO_TIMEOUT, frames.next()) => first,
@@ -515,7 +514,7 @@ where
             }
             Ok(None) | Err(_) => return,
         };
-        match daemon.answer(&session, &frame).await {
+        match daemon.answer(&session, &frame, false).await {
             Answer::Reply(reply) => {
                 if send(&mut writer, &reply).await.is_err() {
                     return;
@@ -541,7 +540,8 @@ where
 }
 
 /// Sends `subscription`'s stream: the events after its place, a batch at a time, then
-/// live ones while it follows, then its reply. Answers the client's requests meanwhile.
+/// live ones while it follows, then its reply. Answers the client's requests meanwhile:
+/// frames are read as they come, so a partial one holds up no event.
 async fn send_stream<R, W>(
     daemon: &Arc<Daemon>,
     session: &Session,
@@ -557,7 +557,9 @@ where
     let mut stopping = false;
     loop {
         loop {
-            let lines = daemon.bus.read(&mut subscription.cursor, bus::BATCH);
+            let lines = daemon
+                .bus
+                .read(&mut subscription.cursor, bus::BATCH, bus::BATCH_BYTES);
             if lines.is_empty() {
                 break;
             }
@@ -565,7 +567,7 @@ where
                 return Flow::Close;
             }
         }
-        if stopping || !subscription.follow {
+        if stopping || subscription.cursor.is_done() {
             let data = object(&json!({"seq": subscription.cursor.after()}));
             let reply = Envelope::ok(data).with_id(subscription.id);
             if send(writer, &reply).await.is_err() {
@@ -579,11 +581,8 @@ where
                 stopping = moved.is_err();
             }
             () = daemon.stopped() => stopping = true,
-            more = frames.more() => {
-                if !matches!(more, Ok(true)) {
-                    return Flow::Close;
-                }
-                if let Some(flow) = answer_in_stream(daemon, session, frames, writer).await {
+            frame = frames.next_line() => {
+                if let Some(flow) = answer_in_stream(daemon, session, frames, writer, frame).await {
                     return flow;
                 }
             }
@@ -591,28 +590,24 @@ where
     }
 }
 
-/// Answers one frame sent while the connection carries a stream. `None` when the stream
+/// Answers `frame`, read while the connection carries a stream. `None` when the stream
 /// goes on.
 async fn answer_in_stream<R, W>(
     daemon: &Arc<Daemon>,
     session: &Session,
     frames: &mut Frames<R>,
     writer: &mut W,
+    frame: std::io::Result<Option<Frame>>,
 ) -> Option<Flow>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (reply, then_stop) = match frames.next_line().await {
-        Ok(Some(Frame::Line(frame))) => match daemon.answer(session, &frame).await {
+    let (reply, then_stop) = match frame {
+        Ok(Some(Frame::Line(frame))) => match daemon.answer(session, &frame, true).await {
             Answer::Reply(reply) => (reply, false),
             Answer::Stop(reply) => (reply, true),
-            Answer::Stream(other) => {
-                let message = "this connection carries an event stream already: open \
-                               another for a second";
-                let reply = reply_err(Some(other.id), codes::INVALID_REQUEST, message.into());
-                (reply, false)
-            }
+            Answer::Stream(_) => unreachable!("a streaming connection takes no second stream"),
         },
         Ok(Some(Frame::Blank)) => return None,
         Ok(Some(Frame::NotText)) => {
@@ -636,13 +631,21 @@ where
     None
 }
 
-/// Sends `lines`, each one event and its newline, in one write.
+/// Sends `lines`, each one event and its newline, as they are: vectored writes of the
+/// buffer's own lines, so a batch is never copied.
 async fn send_lines<W: AsyncWrite + Unpin>(writer: &mut W, lines: &[Line]) -> std::io::Result<()> {
-    let mut text = Vec::with_capacity(lines.iter().map(|line| line.len()).sum());
-    for line in lines {
-        text.extend_from_slice(line);
+    let mut slices: Vec<std::io::IoSlice<'_>> = lines
+        .iter()
+        .map(|line| std::io::IoSlice::new(line))
+        .collect();
+    let mut rest = &mut slices[..];
+    while !rest.is_empty() {
+        let written = writer.write_vectored(rest).await?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        std::io::IoSlice::advance_slices(&mut rest, written);
     }
-    writer.write_all(&text).await?;
     writer.flush().await
 }
 
@@ -690,6 +693,8 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, reply: &Envelope) -> std::i
 
 struct Frames<R> {
     reader: BufReader<R>,
+    /// The frame read so far, until its newline comes.
+    line: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> Frames<R> {
@@ -704,36 +709,36 @@ impl<R: AsyncRead + Unpin> Frames<R> {
     }
 
     /// The next line, blank or not, or `None` once the client has closed.
+    ///
+    /// Cancel safe: what it has read of a frame is kept until the frame's newline comes,
+    /// so a `select!` can race it, and a client that sends part of a frame holds up
+    /// nothing else on its connection.
     async fn next_line(&mut self) -> std::io::Result<Option<Frame>> {
-        let mut line = Vec::new();
         loop {
             let chunk = self.reader.fill_buf().await?;
             if chunk.is_empty() {
+                let line = std::mem::take(&mut self.line);
                 return Ok((!is_blank(&line)).then(|| text(line)));
             }
             let (part, used, ended) = match chunk.iter().position(|&b| b == b'\n') {
                 Some(at) => (&chunk[..at], at + 1, true),
                 None => (chunk, chunk.len(), false),
             };
-            if line.len() + part.len() > MAX_FRAME {
+            if self.line.len() + part.len() > MAX_FRAME {
                 self.reader.consume(used);
+                self.line.clear();
                 return Ok(Some(Frame::TooLong));
             }
-            line.extend_from_slice(part);
+            self.line.extend_from_slice(part);
             self.reader.consume(used);
             if ended {
+                let line = std::mem::take(&mut self.line);
                 if is_blank(&line) {
                     return Ok(Some(Frame::Blank));
                 }
                 return Ok(Some(text(line)));
             }
         }
-    }
-
-    /// Whether the client has sent more, false once it has closed. It reads nothing, so
-    /// it can lose a race in a `select!` without losing a byte.
-    async fn more(&mut self) -> std::io::Result<bool> {
-        Ok(!self.reader.fill_buf().await?.is_empty())
     }
 }
 

@@ -85,7 +85,7 @@ fn one_or_the_other(schema: &mut Schema) {
 
 /// Why a request was refused or failed.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
-#[schemars(rename = "Error", title = "Error", transform = incompatible_protocol_rule)]
+#[schemars(rename = "Error", title = "Error", transform = detail_rules)]
 #[non_exhaustive]
 pub struct ErrorBody {
     /// A stable, machine-readable code, such as `unauthorized`, `unknown_method`,
@@ -185,6 +185,45 @@ impl From<Data> for Detail {
     }
 }
 
+/// The schema's half of the codes whose `detail` is required: `incompatible_protocol`
+/// and `since_ahead`.
+fn detail_rules(schema: &mut Schema) {
+    let mut rules = Schema::default();
+    incompatible_protocol_rule(&mut rules);
+    let mut since_ahead = Schema::default();
+    since_ahead_rule(&mut since_ahead);
+    schema.insert(
+        "allOf".to_owned(),
+        Value::Array(vec![rules.to_value(), since_ahead.to_value()]),
+    );
+}
+
+/// The schema's half of `since_ahead`: such an error must say, in `detail.head`, the last
+/// seq this rlxd has given out.
+fn since_ahead_rule(schema: &mut Schema) {
+    schema.insert(
+        "if".to_owned(),
+        json!({
+            "properties": {"code": {"const": codes::SINCE_AHEAD}},
+            "required": ["code"],
+        }),
+    );
+    schema.insert(
+        "then".to_owned(),
+        json!({
+            "properties": {"detail": {
+                "type": "object",
+                "properties": {
+                    "head": {"type": "integer", "minimum": 0, "maximum": u64::MAX},
+                    "since": {"type": "integer", "minimum": 0, "maximum": u64::MAX},
+                },
+                "required": ["head"],
+            }},
+            "required": ["detail"],
+        }),
+    );
+}
+
 /// The schema's half of `incompatible_protocol`: such an error must say, in
 /// `detail.supported`, which protocol versions rlxd does serve.
 fn incompatible_protocol_rule(schema: &mut Schema) {
@@ -259,6 +298,11 @@ pub mod codes {
     pub const TIMED_OUT: &str = "timed_out";
     /// `rlxd events --until`: the stream ended before one of the types came.
     pub const STREAM_ENDED: &str = "stream_ended";
+    /// `events.subscribe`'s `since` is past the last event this rlxd has given out, so it
+    /// comes from another numbering of the home's events, such as one from before the
+    /// mark was deleted. `detail.head` is the last seq. Re-read what you show, then
+    /// subscribe again from `status`'s `seq`, or without `since`.
+    pub const SINCE_AHEAD: &str = "since_ahead";
 }
 
 impl Envelope {
@@ -360,8 +404,8 @@ impl<'de> Deserialize<'de> for Envelope {
 
 impl ErrorBody {
     /// An error with a code and a message, and no hint or detail. Refuses an empty code
-    /// or message, and `incompatible_protocol`, which needs its `detail`: build that one
-    /// with [`ErrorBody::incompatible_protocol`].
+    /// or message, and the codes that need their `detail`: build those with
+    /// [`ErrorBody::incompatible_protocol`] and [`ErrorBody::since_ahead`].
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Result<Self, Invalid> {
         let error = Self {
             code: code.into(),
@@ -405,10 +449,46 @@ impl ErrorBody {
         }
     }
 
+    /// The reply to an `events.subscribe` whose `since` is past `head`, the last seq this
+    /// rlxd has given out.
+    pub fn since_ahead(since: u64, head: u64) -> Self {
+        let mut detail = Data::new();
+        detail.insert("since".to_owned(), json!(since));
+        detail.insert("head".to_owned(), json!(head));
+        Self {
+            code: codes::SINCE_AHEAD.to_owned(),
+            message: format!(
+                "since {since} is past this home's last event, {head}: it comes from another \
+                 numbering of its events"
+            ),
+            hint: Some(
+                "Re-read what you show, then subscribe from status's seq, or without since."
+                    .to_owned(),
+            ),
+            detail: Some(Detail::Object(detail)),
+        }
+    }
+
     /// Whether this error keeps every rule of `envelope.json`'s `Error`.
     pub fn validate(&self) -> Result<(), Invalid> {
         check::non_empty("code", &self.code)?;
         check::non_empty("message", &self.message)?;
+        if self.code == codes::SINCE_AHEAD {
+            let fields = match &self.detail {
+                Some(Detail::Object(fields)) => Some(fields),
+                _ => None,
+            };
+            let number = |name: &str| fields.and_then(|f| f.get(name)).map(Value::as_u64);
+            let valid =
+                matches!(number("head"), Some(Some(_))) && !matches!(number("since"), Some(None));
+            if !valid {
+                return Err(Invalid::new(
+                    "detail.head",
+                    "since_ahead needs the last seq rlxd has given out, an integer, and \
+                     since, when present, is one too",
+                ));
+            }
+        }
         if self.code == codes::INCOMPATIBLE_PROTOCOL {
             let supported = match &self.detail {
                 Some(Detail::Object(fields)) => fields.get("supported"),

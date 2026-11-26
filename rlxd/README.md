@@ -61,18 +61,30 @@ rlxd events [--as-app] [--topics a,b] [--since SEQ] [--follow] [--until TYPE[,TY
 One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
 
 - **`seq`** numbers every event from 1, across topics and across restarts. rlxd keeps a
-  mark at or above every seq it has given out in `<home>/rlxd/seq`: written 1,000 seqs
-  ahead, and exactly on a clean stop. A client resuming from a seq the buffer no longer
-  holds, a previous rlxd's included, first gets `daemon.gap {from, to}`, whose own seq
-  is `to`. Run events also carry `run_seq`, per run, and the bus indexes them by run.
-- **The buffer** holds the last 10,000 events, none older than 24 hours.
+  mark at or above every seq it has given out in `<home>/rlxd/seq`. It is written 1,000
+  seqs ahead, off the bus lock, before half of them are used, made durable (fsync, then
+  rename, then the folder fsynced, or write-through on Windows), and written exactly on
+  a clean stop. rlxd gives out no seq the mark on disk doesn't cover: when the mark can't
+  be written, it retries every second, and once the mark is used up, a publish is
+  refused rather than risk a repeat.
+- **Gaps.** A client resuming from a seq the buffer no longer holds, a previous rlxd's
+  included, first gets `daemon.gap {from, to}`, whose own seq is `to`. A client that reads
+  so slowly that the buffer drops events it hasn't read gets one mid-stream. Gaps come
+  whatever the topics.
+- **Runs.** Run events also carry `run_seq`, per run. The bus indexes them by run, and
+  a run's replay from the buffer says the home seq to follow on from.
+- **The buffer** holds the last 10,000 events, at most 64 MiB of them, none older than
+  24 hours. One event may be at most 16 MiB, the longest line a client reads.
 - **`events.subscribe {topics?, since?, follow?}`** replays what the buffer holds after
-  `since`, then, while `follow` (the default), live events. Its reply `{seq}` comes last
-  and ends the stream. A connection carries one stream, so event frames carry no `id`.
-  An unknown topic gets `unknown_topic`.
+  `since`, then, while `follow` (the default), live events. Without `follow` it ends at
+  the last event published when it was asked. Its reply `{seq}` comes last and ends the
+  stream. A connection carries one stream, so event frames carry no `id`. An unknown topic
+  gets `unknown_topic`, and a `since` past the last event gets `since_ahead` with
+  `detail.head`.
 - **A slow client holds up no one.** A subscriber is a place in the buffer, not a
-  queue: it is written at its own pace, and when the buffer drops events it has not
-  read, it gets a `daemon.gap` for them and goes on.
+  queue. It is written at its own pace, at most 256 events or 1 MiB at a time, straight
+  from the buffer, and when the buffer drops events it hasn't read, it gets a
+  `daemon.gap` for them and goes on.
 - **`rlxd events`** prints the stream as JSON lines, events only (`jq -s .` makes an
   `event-list.json`). It exits 0 at `--until` or `--limit`, or when the stream ends, and
   4 at `--timeout`. `--until` implies `--follow`. A refusal goes to stderr as its
@@ -83,6 +95,10 @@ One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
   cargo feature `debug-methods`, which only rlxd's dev-dependency on itself turns on:
   `cargo test` has it, `cargo build --release` never does, and
   `crates/rlxd/tests/release_build.rs` builds a release rlxd to check.
+- **Packaging a release** builds `cargo build --release` (`-p rlxd` or `--workspace`),
+  and nothing else. `--all-targets`, `--tests`, or a binary left behind by
+  `cargo test --release` would carry `debug-methods`, because cargo then builds the
+  dev-dependency.
 
 The `status` reply's shape is `schemas/v1/status-reply.json`. `RLXD_CLAUDE_BIN` names the
 program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/`.

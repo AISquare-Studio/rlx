@@ -1596,3 +1596,38 @@ fn the_stream_names_its_method_and_the_daemon_types_their_topic() {
         agrees::<Envelope>("envelope.json", &serde_json::to_value(&reply).unwrap());
     }
 }
+
+#[test]
+fn since_ahead_always_says_the_last_seq() {
+    let reply = Envelope::err(ErrorBody::since_ahead(99, 4)).with_id(id(2));
+    let printed = serde_json::to_value(&reply).unwrap();
+    agrees::<Envelope>("envelope.json", &printed);
+    assert_eq!(printed["error"]["code"], "since_ahead");
+    assert_eq!(printed["error"]["detail"], json!({"since": 99, "head": 4}));
+    assert_eq!(
+        refused(ErrorBody::new(codes::SINCE_AHEAD, "m")),
+        "detail.head"
+    );
+    let base = with_error(&error_base(), "code", json!(codes::SINCE_AHEAD));
+    agrees::<Envelope>(
+        "envelope.json",
+        &with_error(&base, "detail", json!({"head": 4})),
+    );
+    both_refuse::<Envelope>("envelope.json", base.clone());
+    for detail in [
+        json!("text"),
+        json!({}),
+        json!({"since": 9}),
+        json!({"head": "4"}),
+        json!({"head": -1}),
+        json!({"head": 4, "since": "9"}),
+    ] {
+        both_refuse::<Envelope>("envelope.json", with_error(&base, "detail", detail));
+    }
+    // incompatible_protocol's rule still holds beside it.
+    let refused_version = example("envelope-incompatible-protocol.json");
+    both_refuse::<Envelope>(
+        "envelope.json",
+        with_error(&refused_version, "detail", json!({"head": 4})),
+    );
+}

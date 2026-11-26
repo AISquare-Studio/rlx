@@ -187,8 +187,9 @@ pub mod types {
     /// of its life, unless it was killed.
     pub const DAEMON_STOPPING: &str = "daemon.stopping";
     /// `{from, to}`: the stream skipped the events numbered `from` to `to`, which rlxd no
-    /// longer holds. The client re-reads what it shows. The gap's own `seq` is `to`, so
-    /// the stream's seqs still increase and resuming from it skips nothing more.
+    /// longer holds. The client re-reads what it shows. It can come first or anywhere
+    /// later in a stream, whatever its topics. The gap's own `seq` is `to`, so the
+    /// stream's seqs still increase and resuming from it skips nothing more.
     pub const DAEMON_GAP: &str = "daemon.gap";
 }
 

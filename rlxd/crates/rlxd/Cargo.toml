@@ -18,7 +18,9 @@ doc = false
 # 7.3: `debug.emit {count}`), which rlxd's own tests drive. Nothing turns it on but the
 # dev-dependency below, which cargo applies when it builds the tests (`cargo test`,
 # `cargo clippy --all-targets`), so a release build (`cargo build --release`) never has
-# it: tests/release_build.rs builds one and checks.
+# it: tests/release_build.rs builds one and checks. Package exactly that build: with
+# `--all-targets` or `--tests`, or from `cargo test --release`, cargo builds the
+# dev-dependency, and the binary would have the debug methods.
 [features]
 debug-methods = []
 

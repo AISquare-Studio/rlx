@@ -59,6 +59,7 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
     assert!(StatusData::deserialize(status).is_err());
 
     assert!(SubscribeParams::deserialize(json!({"topics": []})).is_err());
+    assert!(ErrorBody::deserialize(json!({"code": "since_ahead", "message": "m"})).is_err());
 
     // And they still read what is valid.
     assert!(Request::deserialize(json!({"id": 1, "method": "status"})).is_ok());

@@ -117,8 +117,11 @@
 //! stream, `{seq}`, the last seq the stream covered. Replies to other requests sent on
 //! the connection meanwhile come between the events, each with its `id`.
 //!
-//! A `since` older than the oldest event rlxd holds starts the stream with a
-//! `daemon.gap {from, to}` ([`event_types::DAEMON_GAP`]), whose own `seq` is `to`.
+//! A `daemon.gap {from, to}` ([`event_types::DAEMON_GAP`]) says the events numbered
+//! `from` to `to` are gone. It starts the stream when `since` is older than the oldest
+//! event rlxd holds, and can also come anywhere later, for a client so slow that rlxd
+//! drops events it has not read. It comes whatever the topics, and its own `seq` is `to`.
+//! A `since` past the last event gets [`codes::SINCE_AHEAD`], with `detail.head`.
 //!
 //! # Versioning
 //!
@@ -146,6 +149,10 @@
 //!   on event frames, the subscribe's, is additive. The name stays reserved for it.
 //! - **The `daemon` events' `data`** is not checked by `event.json` yet: `daemon.gap`'s
 //!   `{from, to}` and the others are described in [`event_types`] only.
+//! - **A numbering epoch.** A `since` from a home whose numbering started again (its
+//!   mark deleted) gets `since_ahead` only until the new numbering passes it. An id made
+//!   with the numbering, carried in `status` and `daemon.started`, would let a client
+//!   always tell.
 //! - **The daemon record's strings** may still be empty: `host`, `version` and the items
 //!   of `argv`. `cwd` isn't required to be absolute. Python's registry (#576) and this
 //!   schema tighten them together, or not at all.

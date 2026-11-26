@@ -15,17 +15,24 @@ use crate::check::{self, Invalid, drop_null, present};
 ///
 /// The stream that follows carries, in order:
 ///
-/// 1. with `since`, every event rlxd still holds after it, oldest first. When `since` is
-///    older than the oldest event rlxd holds, a `daemon.gap {from, to}` comes first,
-///    whatever the topics: the events numbered `from` to `to` are gone, so the client
-///    re-reads what it shows;
-/// 2. with `follow`, which is the default, every later event as it happens.
+/// 1. with `since`, every event rlxd still holds after it, oldest first;
+/// 2. with `follow`, which is the default, every later event as it happens. Without it,
+///    the stream ends at the last event published when rlxd took the subscribe.
 ///
-/// Event frames carry no `id`: a connection carries at most one stream. The request's
-/// reply comes last and ends the stream, `{"id": …, "ok": true, "data": {"seq": …}}`,
-/// where `seq` is the last one the stream covered, a `since` to resume from. Without
-/// `follow`, it comes once the replay is done; with it, when rlxd stops. A subscribe rlxd
-/// refuses gets its error reply and no events.
+/// A `daemon.gap {from, to}` says that the events numbered `from` to `to` are gone, and
+/// the client re-reads what it shows. It comes first when `since` is older than the
+/// oldest event rlxd holds, and also anywhere later, when a client reads so slowly that
+/// rlxd drops events it has not read yet. It comes whatever the `topics`. Its own `seq`
+/// is its `to`, so resuming from it skips nothing it did not report.
+///
+/// Event frames carry no `id`: a connection carries at most one stream, and a frame with
+/// `ok` is a reply, any other an event. There is no "subscribed" reply first: to miss no
+/// event of something you start, take `since` from `status`'s `seq` before starting it,
+/// or start it on the same connection after the subscribe. The request's reply comes
+/// last and ends the stream, `{"id": …, "ok": true, "data": {"seq": …}}`, where `seq` is
+/// the last one the stream covered, whatever its topics: keep it as the `since` to resume
+/// from. Without `follow`, it comes once the replay is done; with it, when rlxd stops. A
+/// subscribe rlxd refuses gets its error reply and no events.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "SubscribeParams")]
 #[non_exhaustive]
@@ -41,12 +48,13 @@ pub struct SubscribeParams {
     pub topics: Option<Vec<String>>,
     /// Replay the events after this `seq` first, `0` for every event rlxd holds. Absent
     /// means live events only. A `seq` this rlxd has not reached yet gets the error
-    /// `invalid_params`.
+    /// `since_ahead`, with `detail.head`: it comes from another numbering, so re-read what
+    /// you show and subscribe again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub since: Option<u64>,
     /// Go on with live events after the replay, until rlxd stops. `false` ends the stream
-    /// once the replay is done.
+    /// at the last event published when rlxd took the subscribe.
     #[serde(default = "follow_by_default")]
     pub follow: bool,
 }

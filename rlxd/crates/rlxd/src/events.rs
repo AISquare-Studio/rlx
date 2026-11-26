@@ -6,7 +6,8 @@
 //!
 //! - **What it prints.** With `--since`, every event rlxd holds after that seq first, with
 //!   a `daemon.gap` before them when rlxd holds none so old. With `--follow`, then every
-//!   later event as it happens, until rlxd stops. `--until` implies `--follow`.
+//!   later event as it happens, until rlxd stops; a reader too slow to keep up gets a
+//!   `daemon.gap` there too. `--until` implies `--follow`.
 //! - **Exit codes.** 0 once an event of one of `--until`'s types has printed, once
 //!   `--limit` events have, or when the stream ends and there is no `--until`. 1 when
 //!   rlxd refuses (an unknown topic, `not_gate` for `--as-app`), or the stream ends before

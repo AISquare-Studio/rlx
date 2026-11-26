@@ -6,6 +6,9 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::io::{BufRead, BufReader, Write};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{TestHome, assert_valid, eventually, finish, kill_hard};
@@ -394,7 +397,7 @@ fn subscribe_refuses_unknown_topics_and_params_it_cannot_take() {
         (r#"{"topics":[]}"#, "invalid_params"),
         (r#"{"topics":"daemon"}"#, "invalid_params"),
         (r#"{"since":-1}"#, "invalid_params"),
-        (r#"{"since":99}"#, "invalid_params"),
+        (r#"{"since":99}"#, "since_ahead"),
         (r#"{"follow":"no"}"#, "invalid_params"),
     ] {
         let run = home.rlxd(&["call", "events.subscribe", params]);
@@ -402,6 +405,12 @@ fn subscribe_refuses_unknown_topics_and_params_it_cannot_take() {
         assert_eq!(run.error_code(), code, "{params}");
         assert_valid("envelope.json", &run.json());
         assert!(!run.json()["error"]["message"].as_str().unwrap().is_empty());
+        if code == "since_ahead" {
+            assert_eq!(
+                run.json()["error"]["detail"],
+                json!({"since": 99, "head": 1})
+            );
+        }
     }
     for params in [r#"{}"#, r#"{"count":0}"#, r#"{"count":"1"}"#] {
         let run = home.rlxd(&["call", "debug.emit", params]);
@@ -440,8 +449,15 @@ fn a_connection_answers_requests_while_it_streams_and_takes_one_stream_only() {
     let second = connection
         .send("events.subscribe", Default::default())
         .unwrap();
+    // Refused for being a second stream, before its params are read.
+    let bad_second = connection
+        .send(
+            "events.subscribe",
+            json!({"topics": ["nope"]}).as_object().unwrap().clone(),
+        )
+        .unwrap();
     let mut replies = Vec::new();
-    while replies.len() < 2 {
+    while replies.len() < 3 {
         match connection.read_incoming().unwrap() {
             Incoming::Reply(reply) => replies.push(reply),
             Incoming::Event(event) => panic!("no event yet: {}", event.line),
@@ -451,6 +467,8 @@ fn a_connection_answers_requests_while_it_streams_and_takes_one_stream_only() {
     assert!(replies[0].is_ok(), "{}", replies[0].line);
     assert_eq!(replies[1].envelope.id, Some(second));
     assert_eq!(replies[1].error().unwrap().code, "invalid_request");
+    assert_eq!(replies[2].envelope.id, Some(bad_second));
+    assert_eq!(replies[2].error().unwrap().code, "invalid_request");
 
     let (seq, _) = home.emit(1);
     match connection.read_incoming().unwrap() {
@@ -508,4 +526,118 @@ fn with_no_since_and_no_follow_rlxd_events_prints_nothing_and_exits_0() {
     let run = home.rlxd(&["events"]);
     assert_eq!(run.code(), Some(0), "{run:?}");
     assert!(run.stdout.is_empty(), "{run:?}");
+}
+
+#[test]
+fn a_stream_without_follow_ends_where_the_stream_was_when_it_was_asked_for() {
+    let home = TestHome::new();
+    home.start();
+    // More than any socket or pipe buffer holds, so rlxd is still writing the replay
+    // when more events come.
+    let (_, head) = home.emit(9_000);
+    let params = SubscribeParams::new().with_since(0).with_follow(false);
+    let mut stream = connect(&home).subscribe(&params).unwrap();
+    let first = match stream.next_frame().unwrap() {
+        Next::Event(event) => event.event.seq,
+        Next::End(reply) => panic!("an event first, not {}", reply.line),
+    };
+    assert_eq!(first, 1, "rlxd took the subscribe");
+    home.emit(100);
+    let mut last = first;
+    let end = loop {
+        match stream.next_frame().unwrap() {
+            Next::Event(event) => {
+                assert!(event.event.seq > last, "in order");
+                last = event.event.seq;
+            }
+            Next::End(reply) => break reply,
+        }
+    };
+    assert_eq!(
+        last, head,
+        "the replay ends at the head when it was asked for"
+    );
+    assert_eq!(end.data().unwrap()["seq"], head);
+}
+
+/// A connection written byte by byte, for frames rlxd-client would not send, and read
+/// on a thread, so a line that never comes fails the test rather than hang it.
+struct Raw {
+    writer: RawStream,
+    lines: mpsc::Receiver<String>,
+}
+
+#[cfg(unix)]
+type RawStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type RawStream = std::fs::File;
+
+impl Raw {
+    fn open(home: &TestHome) -> Self {
+        let home = Home::at(home.root());
+        #[cfg(unix)]
+        let stream = RawStream::connect(home.socket()).unwrap();
+        #[cfg(windows)]
+        let stream = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(home.pipe_name())
+            .unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let (to, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in reader.lines() {
+                let Ok(line) = line else { return };
+                if to.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let token = std::fs::read_to_string(home.token()).unwrap();
+        let mut raw = Self {
+            writer: stream,
+            lines,
+        };
+        let hello = json!({"id": 1, "method": "hello", "params": {"token": token.trim(),
+            "protocol_version": 1, "client": "raw", "client_version": "0", "role": "cli",
+            "capabilities": []}});
+        raw.write(&format!("{hello}\n"));
+        assert_eq!(raw.next()["ok"], true);
+        raw
+    }
+
+    fn write(&mut self, text: &str) {
+        self.writer.write_all(text.as_bytes()).unwrap();
+        self.writer.flush().unwrap();
+    }
+
+    /// The next line rlxd sends, within 10 s.
+    fn next(&self) -> Value {
+        let line = self
+            .lines
+            .recv_timeout(Duration::from_secs(10))
+            .expect("rlxd sent a line within 10 s");
+        serde_json::from_str(&line).unwrap()
+    }
+}
+
+#[test]
+fn a_partial_frame_holds_up_no_event_on_its_connection() {
+    let home = TestHome::new();
+    home.start();
+    let mut raw = Raw::open(&home);
+    raw.write("{\"id\":2,\"method\":\"events.subscribe\",\"params\":{\"topics\":[\"daemon\"]}}\n");
+    raw.write("{\"id\":3,\"method\":\"sta");
+    let (seq, _) = home.emit(1);
+    let event = raw.next();
+    assert_eq!(
+        event["seq"], seq,
+        "the event came while the frame was half sent"
+    );
+    raw.write("tus\"}\n");
+    let reply = raw.next();
+    assert_eq!(reply["id"], 3);
+    assert_eq!(reply["ok"], true, "{reply}");
+    let (seq, _) = home.emit(1);
+    assert_eq!(raw.next()["seq"], seq, "and the stream goes on");
 }
