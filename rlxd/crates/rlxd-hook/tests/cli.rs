@@ -1,4 +1,6 @@
-//! What `rlxd-hook` answers before it does anything else (handoff 0.10.3, 1.1).
+//! What `rlxd-hook` answers before it does anything else (handoff 0.10.3, 1.1), and what it
+//! does with no rlxd to ask (1.5): a fleet hook is `rlx hook`'s, with the same stdin, and
+//! `pre-tool-use` is denied. The hooks with rlxd running are `crates/rlxd/tests/hooks.rs`.
 
 use std::process::{Command, Output};
 
@@ -43,5 +45,123 @@ fn anything_else_is_a_usage_error() {
                 .unwrap()
                 .starts_with("usage: rlxd-hook")
         );
+    }
+}
+
+/// A fresh home with no rlxd, and an `rlx` that says what it was run with: its arguments,
+/// then its stdin.
+struct NoRlxd {
+    root: std::path::PathBuf,
+    rlx: std::path::PathBuf,
+}
+
+impl NoRlxd {
+    fn new(name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("rlxd-hook-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let rlx = if cfg!(windows) {
+            let rlx = root.join("rlx.cmd");
+            std::fs::write(&rlx, "@echo off\r\necho fake rlx: %*\r\nfindstr \"^\"\r\n").unwrap();
+            rlx
+        } else {
+            let rlx = root.join("rlx");
+            std::fs::write(&rlx, "#!/bin/sh\necho \"fake rlx: $*\"\ncat\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&rlx, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            rlx
+        };
+        Self { root, rlx }
+    }
+
+    fn run(&self, args: &[&str], stdin: &[u8]) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rlxd-hook"))
+            .args(args)
+            .env("AISQUARE_HOME", self.root.join("home"))
+            .env_remove("RLX_HOME")
+            .env("RLXD_RLX_BIN", &self.rlx)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("rlxd-hook runs");
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+}
+
+impl Drop for NoRlxd {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn with_no_rlxd_a_fleet_hook_is_rlx_hooks_with_the_same_stdin_and_says_nothing() {
+    let here = NoRlxd::new("fallback");
+    let stdin = b"{\"session_id\":\"t1\",\"hook_event_name\":\"Stop\"}\n";
+    for event in ["session-start", "stop", "session-end"] {
+        let output = here.run(&[event], stdin);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let printed = String::from_utf8(output.stdout.clone()).unwrap();
+        assert!(
+            printed.starts_with(&format!("fake rlx: hook {event}")),
+            "{printed}"
+        );
+        if cfg!(unix) {
+            let mut expected = format!("fake rlx: hook {event}\n").into_bytes();
+            expected.extend_from_slice(stdin);
+            assert_eq!(
+                printed.as_bytes(),
+                expected,
+                "the same stdin, byte for byte"
+            );
+        }
+        assert!(
+            output.stderr.is_empty(),
+            "rlxd not running is today's path: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn with_no_rlxd_pre_tool_use_denies_and_never_falls_back() {
+    let here = NoRlxd::new("deny");
+    for args in [
+        &["pre-tool-use"][..],
+        &["pre-tool-use", "--run", "x", "--attempt", "1"],
+    ] {
+        let output = here.run(args, b"{\"tool_name\":\"t\",\"tool_input\":{}}");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fake rlx"));
+    }
+}
+
+#[test]
+fn ping_with_no_rlxd_exits_3_and_says_why() {
+    let here = NoRlxd::new("ping");
+    let output = here.run(&["ping"], b"");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rlxd is not running"));
+}
+
+#[test]
+fn an_event_it_does_not_take_is_a_usage_error() {
+    for args in [
+        &["codex"][..],
+        &["hook", "stop"],
+        &["stop", "extra"],
+        &["pre-tool-use", "--run", "x"],
+        &["pre-tool-use", "--attempt", "0", "--run", "x"],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
     }
 }

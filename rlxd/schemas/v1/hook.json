@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HookParams",
+  "description": "`hook`'s params: one hook, as rlxd-hook read it.\n\n```json\n{\"event\": \"session-start\", \"stdin_b64\": \"eyJzZXNzaW9uX2lkIjoidDEifQ==\",\n \"cwd\": \"/Users/me/project\", \"env\": {\"AISQUARE_ROLE\": \"coder\"},\n \"accept_ms\": 5000, \"deadline_ms\": 117000}\n```",
+  "type": "object",
+  "properties": {
+    "accept_ms": {
+      "description": "How long the brain may take to accept the hook, in milliseconds, before it is\nwithdrawn unrun (`hook_not_delivered`). Absent is 5000.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 1
+    },
+    "attempt": {
+      "description": "`pre-tool-use --attempt`: the run's attempt (5.1).",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 1
+    },
+    "cwd": {
+      "description": "rlxd-hook's working directory, which Claude Code chose.",
+      "type": "string",
+      "minLength": 1
+    },
+    "deadline_ms": {
+      "description": "How long the whole hook may take, in milliseconds, after which rlxd answers\n`hook_timeout` and starts the brain again. Absent is 50000.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 1
+    },
+    "env": {
+      "description": "The variables of the allowlist rlxd-hook has, by name. A name off the list is\nignored.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    },
+    "event": {
+      "description": "The hook, as rlxd-hook's command line names it: `session-start`,\n`user-prompt-submit`, `session-end`, `stop`, `stop-failure`, `notification` or\n`pre-tool-use`.",
+      "type": "string",
+      "pattern": "^[a-z]+(-[a-z]+)*$"
+    },
+    "run_id": {
+      "description": "`pre-tool-use --run`: the run whose tool call this is (5.1).",
+      "type": "string",
+      "minLength": 1
+    },
+    "stdin_b64": {
+      "description": "The hook's stdin, Claude Code's JSON, as bytes in base64.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "event",
+    "stdin_b64"
+  ]
+}

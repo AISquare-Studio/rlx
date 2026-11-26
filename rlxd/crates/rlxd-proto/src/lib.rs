@@ -22,7 +22,10 @@
 //!   Python's registry and rlxd both write and read;
 //! - [`BrainInput`] and [`BrainOutput`] (1.6): the frames rlxd and its resident Python
 //!   brain, `rlx brain --stdio`, write to each other. That protocol is internal to one rlx
-//!   release, and versioned on its own ([`BRAIN_PROTOCOL`]).
+//!   release, and versioned on its own ([`BRAIN_PROTOCOL`]);
+//! - [`HookParams`], [`HookReply`] and [`HookEventData`] (1.5, 7.3): a Claude Code hook
+//!   rlxd-hook hands rlxd over the socket, what rlxd answers, and the `hook.*` event it
+//!   publishes.
 //!
 //! # One set of rules
 //!
@@ -176,6 +179,7 @@
 //!   of `argv`. `cwd` isn't required to be absolute. Python's registry (#576) and this
 //!   schema tighten them together, or not at all.
 
+pub mod b64;
 mod brain;
 mod check;
 mod daemon;
@@ -183,6 +187,7 @@ mod envelope;
 mod event;
 mod hello;
 mod here;
+mod hook;
 mod marker;
 mod request;
 pub mod schemas;
@@ -197,6 +202,10 @@ pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};
 pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};
 pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
+pub use hook::{
+    HOOK_ENV_NAMES, HOOK_EVENTS, HookEventData, HookParams, HookReply, PRE_TOOL_USE,
+    codes as hook_codes, deny_output, event_type as hook_event_type,
+};
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
 pub use settings::{

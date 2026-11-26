@@ -44,7 +44,12 @@ def _check(frames: list[dict[str, Any]], schema: str) -> None:
         validator.validate(frame)
 
 
-HELLO = {"type": "hello", "protocol": 1, "rlxd_version": "0.10.3"}
+HELLO = {
+    "type": "hello",
+    "protocol": 1,
+    "rlxd_version": "0.10.3",
+    "env_allowlist": list(brain.ENV_NAMES),
+}
 
 
 def _request(request_id: int, method: str, **params: Any) -> dict[str, Any]:
@@ -118,7 +123,7 @@ def test_a_failed_request_is_answered_and_the_brain_goes_on() -> None:
 
 @pytest.mark.parametrize("protocol", [0, 2, 99, "1", True, None])
 def test_a_protocol_the_brain_does_not_speak_is_refused_by_name(protocol: object) -> None:
-    hello = {"type": "hello", "protocol": protocol, "rlxd_version": "9.9.9"}
+    hello = {**HELLO, "protocol": protocol, "rlxd_version": "9.9.9"}
     status, said = _talk(json.dumps(hello).encode() + b"\n" + b"\n")
     assert status == 3
     assert len(said) == 1
@@ -144,6 +149,22 @@ def test_a_frame_the_brain_cannot_read_ends_it_rather_than_be_guessed_at(raw: by
     status, said = _talk(raw)
     assert status == 2
     assert all(frame["type"] == "hello" for frame in said)
+
+
+@pytest.mark.parametrize(
+    "allowlist",
+    [None, [], [*brain.ENV_NAMES, "SECRET"], [name for name in brain.ENV_NAMES if name != "PATH"]],
+)
+def test_an_rlxd_that_would_send_other_variables_is_refused_by_name(
+    allowlist: list[str] | None,
+) -> None:
+    hello = {key: value for key, value in HELLO.items() if key != "env_allowlist"}
+    if allowlist is not None:
+        hello["env_allowlist"] = allowlist
+    status, said = _talk(json.dumps(hello).encode() + b"\n")
+    assert status == 3
+    assert [frame["type"] for frame in said] == ["refused"]
+    assert said[0]["code"] == "env_allowlist_differs"
 
 
 def test_rlxd_gone_before_its_hello_is_a_quiet_exit() -> None:

@@ -13,9 +13,12 @@ JSON lines over the brain's stdin (rlxd's frames) and stdout (the brain's). Ever
 one JSON object on one line, ASCII only, with a ``type``. The shapes are rlxd-proto's
 (``rlxd/schemas/v1/brain-input.json`` and ``brain-output.json``):
 
-1. rlxd says ``{"type": "hello", "protocol": 1, "rlxd_version": "…"}`` first.
+1. rlxd says ``{"type": "hello", "protocol": 1, "rlxd_version": "…", "env_allowlist":
+   […]}`` first.
 2. The brain answers ``{"type": "hello", "protocol": 1, "pid": …, "rlx_version": "…"}``,
-   or, for a ``protocol`` it does not speak, ``{"type": "refused", "code":
+   or, when rlxd's ``env_allowlist`` is not :data:`ENV_NAMES` (rlxd-hook would send other
+   variables than the brain sets), ``{"type": "refused", "code": "env_allowlist_differs",
+   …}``, or, for a ``protocol`` it does not speak, ``{"type": "refused", "code":
    "incompatible_protocol", "message": "…", "supported": [1]}`` and exits. rlxd refuses
    a brain whose ``protocol`` it does not speak the same way. So an rlx and an rlxd of
    different releases fail loudly, with a named error in rlxd's ``status``, and never
@@ -38,14 +41,106 @@ The brain moves the protocol off fds 0 and 1 before it reads anything: it reads 
 writes private duplicates of them, points fd 0 at the null device, and points fd 1 at
 fd 2, its log. So nothing the brain runs, and no process it starts, can read a frame
 meant for it or write into its replies: a stray print lands in rlxd's log of the brain.
+
+Hooks (1.5)
+-----------
+
+``hook {event, stdin_b64, cwd?, env}`` runs one of Claude Code's six fleet hooks
+(:data:`HOOK_EVENTS`) as ``rlx hook <event>`` runs it: ``aisquare.cli.app.main`` itself,
+the same entry point, root callback and handler code, so what ``rlx hook`` does (0.10.2's
+slimmer session-end hook included) the brain does. It answers ``{stdout_b64, stderr_b64,
+exit_code}``: the bytes ``rlx hook`` would have written to its stdout and stderr, and its
+exit status. ``pre-tool-use`` is the gate's (5.1), rlxd's own, and never reaches the brain.
+
+A hook runs in Claude Code's process, not rlxd's: its working directory, and its
+environment. rlxd-hook sends its working directory and the variables of :data:`ENV_NAMES`
+it has, the allowlist. For one request, the brain becomes that process:
+
+- **Environment.** Each name in :data:`ENV_NAMES` is set to rlxd-hook's value, or removed
+  when rlxd-hook had none, so neither rlxd's value nor an earlier hook's leaks in, and
+  ``TZ`` is read again (``time.tzset``). Every other variable is the brain's own, which
+  rlxd started it with. What a process reads only as it starts is the brain's: the
+  locale's ``LC_*`` set Python's own encodings then, and pass on to the hook's children
+  only.
+- **Directory.** ``os.chdir`` to rlxd-hook's working directory (the brain's own when that
+  one is gone, as it can be by the time the hook runs).
+- **Process.** ``sys.argv`` is ``[<this rlx>, "hook", <event>]``. ``sys.stdin`` reads the
+  hook's bytes; fds 1 and 2 are pointed at files of their own and ``sys.stdout`` and
+  ``sys.stderr`` made over them as Python makes them for a pipe (the encoding and errors
+  of the brain's own, ``\r\n`` on Windows), so the bytes are the ones ``rlx hook`` writes,
+  a child's output included. fd 0 stays the null device, which a child of ``rlx hook``
+  would read as the end of a stdin its parent read to the end.
+- **State.** ``core.state``'s runtime state is a fresh one, as the root callback makes it.
+
+All of it is put back afterwards, whatever the hook did. Requests never overlap: rlxd sends
+one at a time, so changing process-wide state for one is safe, and nothing of one is left
+for the next.
+
+The allowlist (:data:`ENV_NAMES`), which rlxd-hook sends and the brain applies:
+
+- **rlx's own:** every ``AISQUARE_*`` variable rlx's code names, and ``RLX_HOME``: the role,
+  the fleet agent and launch, the team, the broker's scope, the home. A test reads every
+  ``AISQUARE_*`` name in ``src/aisquare`` and fails on one that is not here.
+- **The agents':** every ``CLAUDE*`` and ``CODEX_*`` variable rlx's code names, the config
+  dirs above all, but ``CLAUDE_CODE_OAUTH_TOKEN``, a credential no hook reads
+  (:data:`ENV_NOT_FORWARDED`). The same test holds these to the list.
+- **tmux's:** ``TMUX``, ``TMUX_PANE``, ``TMUX_TMPDIR``: which pane the agent runs in.
+- **The process's:** ``PATH`` (which ``tmux``, ``git`` and ``claude`` a hook's children
+  run), ``HOME`` and the user's names and folders (``USER``, ``LOGNAME``, ``USERNAME``,
+  ``USERPROFILE``, ``APPDATA``, ``LOCALAPPDATA``, ``XDG_*``), the temporary folders, ``TZ``
+  and the locale (times a hook prints), the terminal's (``TERM``, ``COLORTERM``,
+  ``NO_COLOR``, ``FORCE_COLOR``, ``COLUMNS``, ``LINES``), and the TLS and proxy settings a
+  call to the team hub uses.
+
+The parity test (``tests/test_brain_hooks.py``) runs each event both ways, ``rlx hook`` in a
+process of its own and the brain, under two different environments (role, config dir,
+agent ids) in turn, and compares stdout byte for byte and the store's rows; it also records
+every variable the handlers read and fails on one that is neither in the allowlist nor one
+that describes the brain's own process (:data:`ENV_OF_THE_BRAIN`, and Python's own,
+:data:`ENV_OF_THE_INTERPRETER`).
+
+Caches (the staleness audit)
+----------------------------
+
+A brain lives for days; ``rlx hook`` re-reads everything each time. So before each hook the
+brain empties every ``functools`` cache of every ``aisquare`` module loaded
+(:func:`fresh_caches`): whatever a cache holds is computed again from this hook's
+environment and files, as a fresh process would. The module state written with ``global``
+on the hook path, each reset or safe as it is (:data:`MODULE_STATE`; a test fails on any
+other):
+
+- ``core.config._LAST_PARSE``: keyed by the config file's path and its bytes, which every
+  load reads again: never stale.
+- ``core.state._state``: the runtime state, which the root callback replaces on every
+  command; the brain puts a fresh one back after each hook.
+- ``core.program._in_app``: true only while asq's UI runs in this process, never in the
+  brain; reset to false.
+- ``core.instances._this``: this process's asq instance record, set only by asq's UI;
+  reset to none.
+- ``core.tmux._boot`` and ``_booted_at``: the machine's boot id and time, the same for
+  every process until a reboot, which also restarts rlxd.
+- ``services.native_telemetry._config_stamp``: the config file's stamp, read again on
+  each use; a change empties the insights cache, which the brain empties anyway.
+- ``core.clipboard``'s ``_cache``, ``_worker`` and ``_pending``: asq's clipboard, never on
+  the hook path.
+
+Module-level values computed from the environment at import would be stale too: none on the
+hook path is (no module of ``aisquare`` reads the environment, the directory or ``argv`` at
+import), and the parity test's second environment would show one.
 """
 
 from __future__ import annotations
 
+import base64
+import contextlib
+import io
 import json
 import os
 import sys
-from collections.abc import Callable, Mapping
+import tempfile
+import time
+import traceback
+from collections.abc import Callable, Iterator, Mapping
 from typing import IO, Any
 
 #: The brain protocols this brain speaks. rlxd's own list is rlxd-proto's
@@ -81,8 +176,387 @@ def _ping(params: Mapping[str, Any]) -> Result:
     return {"pid": os.getpid()}
 
 
+#: The six fleet hooks of Claude Code's that ``rlx hook`` handles and the brain runs.
+#: ``pre-tool-use`` is the gate's, rlxd's own, and is not one.
+HOOK_EVENTS: tuple[str, ...] = (
+    "session-start",
+    "user-prompt-submit",
+    "session-end",
+    "stop",
+    "stop-failure",
+    "notification",
+)
+
+#: rlx's own variables, which rlx's code names: every one, a test says.
+_RLX_NAMES = (
+    "AISQUARE_ACCOUNTS_SHARED",
+    "AISQUARE_AGENT_BIN",
+    "AISQUARE_AGENT_NAME",
+    "AISQUARE_API_URL",
+    "AISQUARE_BOARD_CONTEXT",
+    "AISQUARE_BROKER",
+    "AISQUARE_BROKER_NONCE",
+    "AISQUARE_BROKERED",
+    "AISQUARE_BROKERED_BOARD",
+    "AISQUARE_BROKERED_MEMBERS",
+    "AISQUARE_BROKERED_POOL",
+    "AISQUARE_BROKERED_REPORTS",
+    "AISQUARE_BROKERED_ROOT_IDS",
+    "AISQUARE_BROKERED_ROOTS",
+    "AISQUARE_BROKERED_SEALS",
+    "AISQUARE_CI",
+    "AISQUARE_CI_DELIVERY_OVERRIDE",
+    "AISQUARE_CI_KEY",
+    "AISQUARE_CI_RUN",
+    "AISQUARE_CI_URL",
+    "AISQUARE_CODING_AGENT",
+    "AISQUARE_DB_BUSY_MS",
+    "AISQUARE_EFFORT",
+    "AISQUARE_EXPERIMENTAL_CAPTAIN",
+    "AISQUARE_EXPLAINABILITY_TARGET",
+    "AISQUARE_FLEET_AGENT",
+    "AISQUARE_HARNESS_PROBE",
+    "AISQUARE_HOME",
+    "AISQUARE_IN_APP",
+    "AISQUARE_LAUNCH_AGENT",
+    "AISQUARE_LAUNCH_ID",
+    "AISQUARE_LAUNCH_PID",
+    "AISQUARE_LAUNCH_SETTINGS",
+    "AISQUARE_NO_TELEMETRY",
+    "AISQUARE_PASTE_LOG",
+    "AISQUARE_PERSONA",
+    "AISQUARE_PIN_SESSION_ID",
+    "AISQUARE_PIPELINE_ID",
+    "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR",
+    "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR",
+    "AISQUARE_PLAIN_CODEX_HOME",
+    "AISQUARE_RELEASES_URL",
+    "AISQUARE_REMOTE_AUTO_OFF",
+    "AISQUARE_REMOTE_NGROK_URL",
+    "AISQUARE_REMOTE_PORT",
+    "AISQUARE_REPORTS",
+    "AISQUARE_ROLE",
+    "AISQUARE_RUN_TRACE_ID",
+    "AISQUARE_SERVE_CLIENT",
+    "AISQUARE_SERVE_CLOSE_AFTER",
+    "AISQUARE_SERVE_PORT",
+    "AISQUARE_SERVE_ROLE",
+    "AISQUARE_TEAM",
+    "AISQUARE_TEAM_DELTA",
+    "AISQUARE_TEAM_HUB",
+    "AISQUARE_TEAM_LEASE_MIN",
+    "AISQUARE_TOKEN",
+    "AISQUARE_TRACE_AGENT_NAME",
+    "AISQUARE_WATCH_DETACHED",
+    "RLX_HOME",
+)
+
+#: The coding agents' variables rlx's code names, but :data:`ENV_NOT_FORWARDED`'s.
+_AGENT_NAMES = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_TMPDIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_EFFORT",
+    "CLAUDE_PID",
+    "CLAUDE_PROJECT_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
+    "CODEX_CI",
+    "CODEX_HOME",
+    "CODEX_MANAGED_BY_NPM",
+    "CODEX_MANAGED_PACKAGE_ROOT",
+    "CODEX_PERMISSION_PROFILE",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_TOOL_CALL_ID",
+    "CODEX_VERSION",
+    "TMUX",
+    "TMUX_PANE",
+    "TMUX_TMPDIR",
+)
+
+#: The process's own: its programs, user, folders, time, locale, terminal and network.
+_PROCESS_NAMES = (
+    "ALL_PROXY",
+    "APPDATA",
+    "COLORTERM",
+    "COLUMNS",
+    "FORCE_COLOR",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_TERMINAL",
+    "LINES",
+    "LOCALAPPDATA",
+    "LOGNAME",
+    "NO_COLOR",
+    "NO_PROXY",
+    "PATH",
+    "PATHEXT",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TERM",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USER",
+    "USERNAME",
+    "USERPROFILE",
+    "XDG_BIN_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+
+#: The allowlist: the variables rlxd-hook sends with each hook, and the brain sets (or
+#: removes) for it. rlxd-proto's ``HOOK_ENV_NAMES`` is the same list, which rlxd names in
+#: its hello and the brain checks; see the module's doc.
+ENV_NAMES: tuple[str, ...] = tuple(sorted({*_RLX_NAMES, *_AGENT_NAMES, *_PROCESS_NAMES}))
+
+#: Variables rlx's code names that are never forwarded, and why.
+ENV_NOT_FORWARDED: dict[str, str] = {
+    "CLAUDE_CODE_OAUTH_TOKEN": "a credential; only `launch` and the account checks read it",
+}
+
+#: Variables the hook path reads that describe the brain's own process, not the hook's:
+#: the shell-completion switches of click and typer (a hook never completes), macOS's
+#: per-user text encoding, and the interpreter's own (:data:`ENV_OF_THE_INTERPRETER`).
+ENV_OF_THE_BRAIN: frozenset[str] = frozenset(
+    {
+        "_AISQUARE_COMPLETE",
+        "_RLX_COMPLETE",
+        "_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION",
+        "__CF_USER_TEXT_ENCODING",
+        "ARCHFLAGS",
+    }
+)
+
+#: The prefixes of the variables Python reads about itself (``sysconfig``, ``site``,
+#: ``zoneinfo``, ``subprocess``): the brain's interpreter is the one ``rlx hook``'s would be.
+ENV_OF_THE_INTERPRETER: tuple[str, ...] = ("PYTHON", "_PYTHON_")
+
+#: The module state written with ``global`` on the hook path, and what each is put back to
+#: before a hook (``...`` for one that is safe as it is): see the module's doc.
+MODULE_STATE: dict[tuple[str, str], object] = {
+    ("aisquare.core.config", "_LAST_PARSE"): ...,
+    ("aisquare.core.state", "_state"): ...,
+    ("aisquare.core.program", "_in_app"): False,
+    ("aisquare.core.instances", "_this"): None,
+    ("aisquare.core.tmux", "_boot"): ...,
+    ("aisquare.core.tmux", "_booted_at"): ...,
+    ("aisquare.services.native_telemetry", "_config_stamp"): ...,
+    ("aisquare.core.clipboard", "_cache"): ...,
+    ("aisquare.core.clipboard", "_worker"): ...,
+    ("aisquare.core.clipboard", "_pending"): ...,
+}
+
+
+def fresh_caches() -> int:
+    """Empties every ``functools`` cache of every ``aisquare`` module loaded, and puts the
+    module state of :data:`MODULE_STATE` back: what a fresh process starts with. How many
+    caches it emptied."""
+    emptied = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "aisquare" or name.startswith("aisquare.")):
+            continue
+        for value in list(vars(module).values()):
+            clear = getattr(value, "cache_clear", None)
+            if callable(clear) and getattr(value, "__module__", None) == name:
+                clear()
+                emptied += 1
+    for (name, attribute), value in MODULE_STATE.items():
+        holder = sys.modules.get(name)
+        if holder is not None and value is not ...:
+            setattr(holder, attribute, value)
+    return emptied
+
+
+def _allowed(name: str) -> bool:
+    return name in _ENV_SET
+
+
+_ENV_SET = frozenset(ENV_NAMES)
+
+#: How Python makes ``sys.stdout`` and ``sys.stderr`` over a pipe, read from the brain's
+#: own before anything replaces them: ``(encoding, errors)`` of each.
+_STREAM_FORM: dict[str, tuple[str, str]] = {}
+
+#: Python translates ``\n`` to ``\r\n`` on a standard stream on Windows only.
+_NEWLINE = None if sys.platform == "win32" else "\n"
+
+
+def _remember_stream_form() -> None:
+    for name in ("stdout", "stderr", "stdin"):
+        stream = getattr(sys, name)
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        errors = getattr(stream, "errors", None) or "strict"
+        _STREAM_FORM.setdefault(name, (encoding, errors))
+
+
+def _writer(fd: int, name: str, *, line_buffering: bool) -> io.TextIOWrapper:
+    """A text stream over ``fd`` as Python makes ``sys.<name>`` over a pipe."""
+    encoding, errors = _STREAM_FORM.get(name, ("utf-8", "strict"))
+    buffered = io.BufferedWriter(io.FileIO(fd, "w", closefd=False))
+    return io.TextIOWrapper(
+        buffered,
+        encoding=encoding,
+        errors=errors,
+        newline=_NEWLINE,
+        line_buffering=line_buffering,
+    )
+
+
+def _reader(data: bytes) -> io.TextIOWrapper:
+    """``sys.stdin`` over the hook's bytes, as Python makes it over a pipe."""
+    encoding, errors = _STREAM_FORM.get("stdin", ("utf-8", "strict"))
+    return io.TextIOWrapper(
+        io.BufferedReader(io.BytesIO(data)), encoding=encoding, errors=errors, newline=_NEWLINE
+    )
+
+
+def _read_tz() -> None:
+    """Reads ``TZ`` again, as a process does when it starts: local times follow the hook's
+    zone (POSIX; Windows reads its zone from the system)."""
+    tzset = getattr(time, "tzset", None)
+    if tzset is not None:
+        tzset()
+
+
+@contextlib.contextmanager
+def _as_the_hook(
+    env: Mapping[str, str], cwd: str | None, argv: list[str], stdin: bytes
+) -> Iterator[dict[str, bytes]]:
+    """For its block, this process is the hook's: its environment, directory, ``argv``,
+    stdin and fds 1 and 2. Yields where the block's stdout and stderr land, filled once it
+    ends, and puts every one of them back."""
+    from aisquare.core import state
+
+    _remember_stream_form()
+    saved_env = dict(os.environ)
+    try:
+        saved_cwd: str | None = os.getcwd()
+    except OSError:
+        saved_cwd = None
+    saved_argv = sys.argv
+    saved_streams = (sys.stdin, sys.stdout, sys.stderr)
+    saved_state = state.get_state()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_fds = (os.dup(1), os.dup(2))
+    captured: dict[str, bytes] = {}
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        try:
+            for name in ENV_NAMES:
+                if name in env:
+                    os.environ[name] = env[name]
+                else:
+                    os.environ.pop(name, None)
+            _read_tz()
+            if cwd:
+                try:
+                    os.chdir(cwd)
+                except OSError as exc:
+                    _say(f"hook: cannot enter {cwd!r} ({exc}); it runs in the brain's own")
+            sys.argv = argv
+            state.reset_state()
+            os.dup2(out.fileno(), 1)
+            os.dup2(err.fileno(), 2)
+            sys.stdin = _reader(stdin)
+            sys.stdout = _writer(1, "stdout", line_buffering=False)
+            sys.stderr = _writer(2, "stderr", line_buffering=True)
+            yield captured
+        finally:
+            for stream in (sys.stdout, sys.stderr):
+                with contextlib.suppress(Exception):
+                    stream.flush()
+            sys.stdin, sys.stdout, sys.stderr = saved_streams
+            os.dup2(saved_fds[0], 1)
+            os.dup2(saved_fds[1], 2)
+            for fd in saved_fds:
+                os.close(fd)
+            sys.argv = saved_argv
+            state.set_state(saved_state)
+            if saved_cwd is not None:
+                with contextlib.suppress(OSError):
+                    os.chdir(saved_cwd)
+            os.environ.clear()
+            os.environ.update(saved_env)
+            _read_tz()
+            for name, file in (("stdout", out), ("stderr", err)):
+                file.seek(0)
+                captured[name] = file.read()
+
+
+def _run_rlx(argv: list[str]) -> int:
+    """``aisquare.cli.app.main`` on ``argv``, as the console script runs it: its exit
+    status."""
+    from aisquare.cli import app as app_module
+
+    try:
+        app_module.main()
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            return 0
+        if isinstance(code, int):
+            return code
+        sys.stderr.write(f"{code}\n")
+        return 1
+    except BaseException:  # what the interpreter would print, and its status
+        traceback.print_exc()
+        return 1
+    return 0
+
+
+def _hook(params: Mapping[str, Any]) -> Result:
+    """``hook {event, stdin_b64, cwd?, env}``: ``rlx hook <event>`` with the hook's stdin,
+    directory and allowlisted environment. ``{stdout_b64, stderr_b64, exit_code}``."""
+    event = params.get("event")
+    if event not in HOOK_EVENTS:
+        raise BrainError("unknown_event", f"the brain runs no hook {event!r}")
+    try:
+        stdin = base64.b64decode(str(params.get("stdin_b64", "")), validate=True)
+    except ValueError as exc:
+        raise BrainError("invalid_params", f"stdin_b64 is not base64: {exc}") from exc
+    cwd = params.get("cwd")
+    raw_env = params.get("env", {})
+    if not isinstance(raw_env, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw_env.items()
+    ):
+        raise BrainError("invalid_params", "env must map names to strings")
+    env = {name: value for name, value in raw_env.items() if _allowed(name)}
+    fresh_caches()
+    argv = [sys.argv[0], "hook", str(event)]
+    with _as_the_hook(env, cwd if isinstance(cwd, str) else None, argv, stdin) as captured:
+        code = _run_rlx(argv)
+    return {
+        "stdout_b64": base64.b64encode(captured["stdout"]).decode("ascii"),
+        "stderr_b64": base64.b64encode(captured["stderr"]).decode("ascii"),
+        "exit_code": code,
+    }
+
+
 #: The methods, by name.
-METHODS: dict[str, Method] = {"ping": _ping}
+METHODS: dict[str, Method] = {"ping": _ping, "hook": _hook}
 
 
 def _rlx_version() -> str:
@@ -153,6 +627,17 @@ def greet(channel: Channel, frame: Mapping[str, Any]) -> bool:
                 "supported": list(PROTOCOLS),
             }
         )
+        _say(message)
+        return False
+    theirs = frame.get("env_allowlist")
+    if theirs != list(ENV_NAMES):
+        named = set(theirs) if isinstance(theirs, list) else set()
+        message = (
+            f"rlxd sends other variables with a hook than this rlx {_rlx_version()} sets: "
+            f"only rlxd's {sorted(map(str, named - set(ENV_NAMES)))}, only rlx's "
+            f"{sorted(set(ENV_NAMES) - named)}; install the rlx and rlxd of one release"
+        )
+        channel.write({"type": "refused", "code": "env_allowlist_differs", "message": message})
         _say(message)
         return False
     channel.write(
@@ -232,4 +717,5 @@ def private_channel() -> Channel:
 
 def serve_stdio() -> int:
     """``rlx brain --stdio``: the protocol on this process's stdin and stdout."""
+    _remember_stream_form()
     return serve(private_channel())

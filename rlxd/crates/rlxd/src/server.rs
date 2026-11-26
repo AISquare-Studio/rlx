@@ -413,6 +413,7 @@ impl Daemon {
                 return Answer::Stop(Envelope::ok(data).with_id(id));
             }
             methods::BRAIN_PING => crate::brain::ping(&self.brain).await,
+            methods::HOOK => crate::hooks::hook(self, request.params).await,
             methods::EVENTS_SUBSCRIBE if streaming => Err(error(
                 codes::INVALID_REQUEST,
                 "this connection carries an event stream already: open another for a second",
@@ -1534,6 +1535,7 @@ fn served() -> Vec<&'static str> {
         methods::STATUS,
         methods::STOP,
         methods::BRAIN_PING,
+        methods::HOOK,
         methods::EVENTS_SUBSCRIBE,
         methods::SETTINGS_GET,
         methods::SETTINGS_SET,

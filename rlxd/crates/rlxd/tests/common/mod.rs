@@ -189,6 +189,38 @@ impl TestHome {
         )
     }
 
+    /// `program args…` in this home, from `cwd`, with `stdin` on its stdin and `envs` set:
+    /// stdout as bytes, for a hook's, which must match byte for byte.
+    pub fn run_bytes(
+        &self,
+        program: &Path,
+        args: &[&str],
+        cwd: &Path,
+        stdin: &[u8],
+        envs: &[(&str, &str)],
+    ) -> (Option<i32>, Vec<u8>, String) {
+        let mut command = self.command_of(program, args);
+        command
+            .current_dir(cwd)
+            .envs(envs.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = launch(&mut command).expect("the program starts");
+        let mut input = child.stdin.take().unwrap();
+        let bytes = stdin.to_vec();
+        let writer = thread::spawn(move || {
+            let _ = input.write_all(&bytes);
+        });
+        let output = wait_output(child);
+        let _ = writer.join();
+        (
+            output.status.code(),
+            output.stdout,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
     /// `rlxd args…` in this home, with `stdin` on its stdin.
     pub fn rlxd_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Run {
         let mut command = self.command(args);
@@ -201,7 +233,8 @@ impl TestHome {
     }
 
     /// The `rlxd` command, in this home: `AISQUARE_HOME` names it and `RLX_HOME` is
-    /// unset, so neither a developer's home nor CI's is touched.
+    /// unset, so neither a developer's home nor CI's is touched, and no agent's variables
+    /// are passed on.
     pub fn command(&self, args: &[&str]) -> Command {
         let binary = self
             .binary
@@ -214,6 +247,18 @@ impl TestHome {
     /// rlxd, such as a signed helper, or a wrapper that runs it.
     pub fn command_of(&self, program: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(program);
+        // Not the identity of an agent the tests run under (its role, fleet agent, config
+        // dir, tmux pane): rlx's hooks would act on it.
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            if name.starts_with("AISQUARE_")
+                || name.starts_with("CLAUDE")
+                || name.starts_with("CODEX_")
+                || name.starts_with("TMUX")
+            {
+                command.env_remove(name.as_ref());
+            }
+        }
         command
             .args(args)
             .envs(self.envs.iter().map(|(k, v)| (k, v)))
@@ -374,6 +419,18 @@ fn end(mut child: Child) -> Result<Run, String> {
     })
 }
 
+/// `child`'s end and all its output, failing the test past [`COMMAND_LIMIT`].
+fn wait_output(child: Child) -> std::process::Output {
+    let (done, output) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    output
+        .recv_timeout(COMMAND_LIMIT)
+        .expect("the program ended in time")
+        .expect("its output was read")
+}
+
 /// All of `pipe`, once every process holding it open has let it go.
 fn read_all(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     let (read, text) = mpsc::channel();
@@ -515,6 +572,40 @@ pub fn real_rlx() -> Option<PathBuf> {
         eprintln!("skipped: no rlx (set RLXD_RLX_BIN, or run where `uv run` works)");
     }
     found
+}
+
+/// rlxd-hook, built from this tree: the executable cargo reports, so a test of the rlxd
+/// package runs the rlxd-hook of the same sources. Set `CARGO_BUILD_JOBS` to bound it.
+pub fn rlxd_hook() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let output = Command::new(cargo)
+                .args([
+                    "build",
+                    "--locked",
+                    "--package",
+                    "rlxd-hook",
+                    "--bin",
+                    "rlxd-hook",
+                    "--message-format=json-render-diagnostics",
+                ])
+                .current_dir(workspace())
+                .stdin(Stdio::null())
+                .stderr(Stdio::inherit())
+                .output()
+                .expect("cargo runs");
+            assert!(output.status.success(), "cargo build -p rlxd-hook failed");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|message| message["reason"] == "compiler-artifact")
+                .filter(|message| message["target"]["name"] == "rlxd-hook")
+                .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+                .expect("cargo names the rlxd-hook executable it built")
+        })
+        .clone()
 }
 
 /// Whether process `pid` is running.

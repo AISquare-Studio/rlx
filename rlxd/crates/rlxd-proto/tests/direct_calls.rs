@@ -8,9 +8,9 @@
 
 use rlxd_proto::{
     Auth, BrainInput, BrainOutput, DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData,
-    HelloParams, HereData, InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope,
-    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
-    SettingsListParams, SettingsSetParams, StatusData, SubscribeParams,
+    HelloParams, HereData, HookEventData, HookParams, InstalledRlx, InstalledRlxd, Paths, Request,
+    RequestId, Role, RunScope, Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams,
+    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -78,6 +78,9 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
 
     assert!(BrainInput::deserialize(json!({"type": "request", "id": 0, "method": "m"})).is_err());
     assert!(BrainOutput::deserialize(json!({"type": "reply", "id": 1, "ok": true})).is_err());
+    assert!(HookParams::deserialize(json!({"event": "codex", "stdin_b64": ""})).is_err());
+    let no_run = json!({"session_id": "t1", "cwd": "/p", "run_id": ""});
+    assert!(HookEventData::deserialize(no_run).is_err());
 
     // And they still read what is valid.
     assert!(Request::deserialize(json!({"id": 1, "method": "status"})).is_ok());
@@ -182,6 +185,14 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
         *ok = false;
     }
     assert!(printed(&reply).is_err());
+    let mut hook = HookParams::new("stop", "", None, Default::default()).unwrap();
+    assert!(printed(&hook).is_ok());
+    hook.event = "codex".to_owned();
+    assert!(printed(&hook).is_err());
+    let mut event = HookEventData::new("t1", "/p");
+    assert!(printed(&event).is_ok());
+    event.run_id = Some(String::new());
+    assert!(printed(&event).is_err());
 
     let mut subscribe = SubscribeParams::new().with_topics(["run"]).unwrap();
     assert!(printed(&subscribe).is_ok());

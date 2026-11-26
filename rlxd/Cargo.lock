@@ -686,6 +686,11 @@ dependencies = [
 [[package]]
 name = "rlxd-hook"
 version = "0.10.1"
+dependencies = [
+ "rlxd-client",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "rlxd-proto"
