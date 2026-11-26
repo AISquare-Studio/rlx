@@ -105,7 +105,7 @@ def test_a_record_that_cannot_be_read_or_names_another_row_is_left_and_said(
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a folder's write bit is POSIX's")
 def test_a_file_that_cannot_be_written_is_said_failed(tmp_path: Path) -> None:
-    if os.geteuid() == 0:
+    if getattr(os, "geteuid", lambda: 1)() == 0:
         pytest.skip("root writes anywhere")
     assert launch_seal.write(_record("agt-1", str(tmp_path / "old"))) is None
     window = launch_seal.WindowPlace(

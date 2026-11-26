@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from aisquare.core import claude_accounts as core
+from aisquare.models import ClaudeAccount
 from tests.test_home_migration import FakeSecurity
 
 POSIX_ONLY = pytest.mark.skipif(
@@ -28,8 +29,8 @@ def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSecurity:
     return security
 
 
-def _slot(tmp_path: Path, marker: str | None = '{"slot": 2}') -> Any:
-    account = core.ClaudeAccount(slot=2, config_dir=tmp_path / "slot", managed=True)
+def _slot(tmp_path: Path, marker: str | None = '{"slot": 2}') -> ClaudeAccount:
+    account = ClaudeAccount(slot=2, config_dir=tmp_path / "slot", managed=True)
     account.config_dir.mkdir()
     if marker is not None:
         (account.config_dir / core.MARKER).write_text(marker, encoding="utf-8")
