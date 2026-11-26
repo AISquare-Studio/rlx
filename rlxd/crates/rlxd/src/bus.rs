@@ -66,8 +66,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -76,9 +76,8 @@ use rlxd_proto::{Data, Event, Invalid, RunScope, event_types, topics};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::clock;
 use crate::log::error;
-use crate::registry::private_file;
+use crate::{clock, durable};
 
 /// What the buffer holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -698,43 +697,14 @@ impl Mark {
         })
     }
 
-    /// Writes `seq` whole and durably: a sibling written and fsynced, renamed over the
-    /// mark, and the rename itself made durable.
+    /// Writes `seq` whole and durably (`crate::durable`).
     fn write(&self, seq: u64) -> io::Result<()> {
         #[cfg(test)]
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(io::Error::other("a test made the mark unwritable"));
         }
-        let temporary = sibling(&self.path, "tmp");
-        let mut file = private_file(&temporary)?;
-        file.write_all(format!("{seq}\n").as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        replace_durably(&temporary, &self.path)
+        durable::write(&self.path, format!("{seq}\n").as_bytes())
     }
-}
-
-/// Renames `from` over `to`, and returns once the rename is on disk: POSIX fsyncs the
-/// folder after the rename.
-#[cfg(unix)]
-fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)?;
-    let folder = to.parent().unwrap_or(Path::new("."));
-    fs::File::open(folder)?.sync_all()
-}
-
-/// Renames `from` over `to`, and returns once the rename is on disk: Windows writes it
-/// through. A rename another handle refuses for a moment is tried again.
-#[cfg(windows)]
-fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
-    crate::registry::retry_refused(|| crate::windows::replace_durably(from, to))
-}
-
-fn sibling(path: &Path, extension: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".");
-    name.push(extension);
-    path.with_file_name(name)
 }
 
 #[cfg(test)]

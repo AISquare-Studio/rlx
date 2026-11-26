@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
     InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request,
-    RequestId, Role, RunScope, SCHEMA_VERSION, StatusData, SubscribeParams, codes, daemon_kinds,
-    event_types, methods, protocol_version_of, schema_version_of, schemas, topics,
+    RequestId, Role, RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsGetParams,
+    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, codes,
+    daemon_kinds, event_types, methods, protocol_version_of, schema_version_of, schemas,
+    send_safety_floor, send_safety_modes, setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1816,4 +1818,272 @@ fn a_here_reply_refuses_its_wrong_shapes() {
         broken[inner][field] = value;
         both_refuse::<HereData>("here-reply.json", broken);
     }
+}
+
+// --- settings -----------------------------------------------------------------------------
+
+#[test]
+fn settings_documents_validate_and_print_back_as_themselves() {
+    for key in [
+        "theme",
+        "rlxapp.sidebar",
+        "rlxapp.sidebar.width",
+        "later_known_key",
+    ] {
+        let get = json!({ "key": key });
+        assert_eq!(agrees::<SettingsGetParams>("settings-get.json", &get), get);
+    }
+    let set = json!({"key": "theme", "value": "rlx_light", "expected_version": 3});
+    assert_eq!(agrees::<SettingsSetParams>("settings-set.json", &set), set);
+    let long_theme = "é".repeat(64);
+    let long_sign_off = "—".repeat(512);
+    for (key, value) in [
+        ("theme", json!(long_theme)),
+        (
+            "layout",
+            json!({"panes": [1, 2], "sidebar": {"open": true}}),
+        ),
+        ("agent_sign_off", json!("— Ava, Sam's AI Agent")),
+        ("agent_sign_off", json!("")),
+        ("agent_sign_off", json!(long_sign_off)),
+        ("send_safety_mode", json!({"default": "draft"})),
+        (
+            "send_safety_mode",
+            json!({"default": "standing_approval", "connectors": {"claude.ai Slack": "auto"},
+                   "later": 1}),
+        ),
+        ("rlxapp.sidebar", json!(240)),
+        ("rlxapp.flags", json!([true, "x", {"y": null}])),
+        ("rlxapp.note", json!("")),
+        // A bare key a later rlxd may know: its shape is that rlxd's to check.
+        ("later_known_key", json!("anything")),
+    ] {
+        agrees::<SettingsSetParams>("settings-set.json", &json!({"key": key, "value": value}));
+    }
+    for list in [
+        json!({}),
+        json!({"prefix": "rlxapp."}),
+        json!({"prefix": ""}),
+    ] {
+        agrees::<SettingsListParams>("settings-list.json", &list);
+    }
+
+    let set_one = json!({"key": "theme", "version": 4, "value": "rlx_light",
+        "updated_at": TIME, "by_device": "Sam's MacBook"});
+    assert_eq!(agrees::<Setting>("setting.json", &set_one), set_one);
+    let unset = json!({"key": "send_safety_mode", "version": 0});
+    assert_eq!(agrees::<Setting>("setting.json", &unset), unset);
+    let list = json!({"settings": [set_one, without(&set_one, "by_device")]});
+    assert_eq!(
+        agrees::<SettingsList>("settings-list-reply.json", &list),
+        list
+    );
+    agrees::<SettingsList>("settings-list-reply.json", &json!({"settings": []}));
+    let changed = json!({"key": "theme", "version": 4, "by_device": "Sam's MacBook"});
+    assert_eq!(
+        agrees::<SettingsChanged>("settings-changed.json", &changed),
+        changed
+    );
+    agrees::<SettingsChanged>("settings-changed.json", &without(&changed, "by_device"));
+    // What a client does not know is ignored.
+    agrees::<Setting>("setting.json", &with(&set_one, "later", json!(1)));
+    agrees::<SettingsChanged>("settings-changed.json", &with(&changed, "later", json!(1)));
+}
+
+#[test]
+fn settings_documents_refuse_their_wrong_shapes() {
+    for key in [
+        json!(""),
+        json!("Theme"),
+        json!("a..b"),
+        json!(".a"),
+        json!("a."),
+        json!("x".repeat(129)),
+        json!(1),
+        json!(null),
+    ] {
+        both_refuse::<SettingsGetParams>("settings-get.json", json!({ "key": key }));
+    }
+    both_refuse::<SettingsGetParams>("settings-get.json", json!({}));
+    both_refuse::<SettingsGetParams>("settings-get.json", json!(["theme"]));
+
+    let long_theme = "x".repeat(65);
+    let long_sign_off = "x".repeat(513);
+    for (key, value) in [
+        ("theme", json!("")),
+        ("theme", json!(long_theme)),
+        ("theme", json!(1)),
+        ("layout", json!("wide")),
+        ("layout", json!([1])),
+        ("agent_sign_off", json!(long_sign_off)),
+        ("agent_sign_off", json!(null)),
+        ("send_safety_mode", json!("draft")),
+        ("send_safety_mode", json!({"default": "yolo"})),
+        ("send_safety_mode", json!({"connectors": {"s": "auto"}})),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": {"": "auto"}}),
+        ),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": {"s": "nope"}}),
+        ),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": ["auto"]}),
+        ),
+        ("rlxapp.sidebar", json!(null)),
+    ] {
+        both_refuse::<SettingsSetParams>("settings-set.json", json!({"key": key, "value": value}));
+    }
+    for wrong in [
+        json!({"key": "theme"}),
+        json!({"key": "theme", "value": "x", "expected_version": -1}),
+        json!({"key": "theme", "value": "x", "expected_version": null}),
+        json!({"value": "x"}),
+        json!([]),
+    ] {
+        both_refuse::<SettingsSetParams>("settings-set.json", wrong);
+    }
+    both_refuse::<SettingsListParams>("settings-list.json", json!({ "prefix": "x".repeat(129) }));
+    both_refuse::<SettingsListParams>("settings-list.json", json!({"prefix": null}));
+    both_refuse::<SettingsListParams>("settings-list.json", json!([]));
+
+    let set_one = json!({"key": "theme", "version": 4, "value": "rlx_light",
+        "updated_at": TIME});
+    for wrong in [
+        with(
+            &json!({"key": "theme", "version": 0}),
+            "value",
+            json!("rlx"),
+        ),
+        with(
+            &json!({"key": "theme", "version": 0}),
+            "updated_at",
+            json!(TIME),
+        ),
+        with(
+            &json!({"key": "theme", "version": 0}),
+            "by_device",
+            json!("d"),
+        ),
+        without(&set_one, "value"),
+        without(&set_one, "updated_at"),
+        with(&set_one, "updated_at", json!("yesterday")),
+        with(&set_one, "value", json!(7)),
+        with(&set_one, "value", json!(null)),
+        with(&set_one, "by_device", json!("")),
+        with(&set_one, "version", json!(-1)),
+    ] {
+        both_refuse::<Setting>("setting.json", wrong);
+    }
+    both_refuse::<SettingsList>(
+        "settings-list-reply.json",
+        json!({"settings": [without(&set_one, "value")]}),
+    );
+    for wrong in [
+        json!({"key": "theme", "version": 0}),
+        json!({"key": "theme", "version": 1, "by_device": ""}),
+        json!({"key": "Theme", "version": 1}),
+    ] {
+        both_refuse::<SettingsChanged>("settings-changed.json", wrong);
+    }
+}
+
+#[test]
+fn settings_builders_print_what_their_schemas_accept() {
+    let set = SettingsSetParams::new(setting_keys::THEME, json!("rlx"))
+        .unwrap()
+        .expecting(0);
+    let printed = serde_json::to_value(&set).unwrap();
+    assert_eq!(
+        printed,
+        json!({"key": "theme", "value": "rlx", "expected_version": 0})
+    );
+    agrees::<SettingsSetParams>("settings-set.json", &printed);
+    assert_eq!(refused(SettingsSetParams::new("theme", json!(1))), "value");
+    assert_eq!(refused(SettingsSetParams::new("a..b", json!(1))), "key");
+    assert_eq!(refused(SettingsGetParams::new("")), "key");
+    let list = SettingsListParams::new().with_prefix("rlxapp.");
+    agrees::<SettingsListParams>("settings-list.json", &serde_json::to_value(&list).unwrap());
+
+    let unset = Setting::unset(setting_keys::SEND_SAFETY_MODE).unwrap();
+    agrees::<Setting>("setting.json", &serde_json::to_value(&unset).unwrap());
+    let mode = json!({"default": send_safety_modes::DRAFT});
+    let set_one = Setting::new("send_safety_mode", 2, mode, TIME, Some("d".to_owned())).unwrap();
+    agrees::<Setting>("setting.json", &serde_json::to_value(&set_one).unwrap());
+    assert_eq!(
+        refused(Setting::new("theme", 0, json!("x"), TIME, None)),
+        "version"
+    );
+    assert_eq!(
+        refused(Setting::new("theme", 1, json!("x"), "now", None)),
+        "updated_at"
+    );
+    let listed = SettingsList::new(vec![set_one.clone(), unset]).unwrap();
+    agrees::<SettingsList>(
+        "settings-list-reply.json",
+        &serde_json::to_value(&listed).unwrap(),
+    );
+
+    let changed = SettingsChanged::new("theme", 3, None).unwrap();
+    let data = changed.to_data().unwrap();
+    assert_eq!(
+        Value::Object(data.clone()),
+        json!({"key": "theme", "version": 3})
+    );
+    let event = Event::new(
+        9,
+        TIME,
+        topics::SETTINGS,
+        event_types::SETTINGS_CHANGED,
+        data,
+    )
+    .unwrap();
+    agrees::<Event>("event.json", &serde_json::to_value(&event).unwrap());
+    assert_eq!(refused(SettingsChanged::new("theme", 0, None)), "version");
+    // The settings topic's types start with it, as every topic's must.
+    let wrong = json!({"schema_version": 1, "seq": 1, "time": TIME, "topic": "settings",
+        "type": "daemon.started", "data": {}});
+    both_refuse::<Event>("event.json", wrong);
+}
+
+#[test]
+fn the_settings_api_names_its_methods_codes_and_gated_keys() {
+    assert_eq!(methods::SETTINGS_GET, "settings.get");
+    assert_eq!(methods::SETTINGS_SET, "settings.set");
+    assert_eq!(methods::SETTINGS_LIST, "settings.list");
+    assert!(topics::ALL.contains(&topics::SETTINGS));
+    assert_eq!(setting_keys::GATED, [setting_keys::SEND_SAFETY_MODE]);
+    for key in setting_keys::KNOWN {
+        assert!(
+            !key.contains('.'),
+            "known keys are bare; dotted ones are free"
+        );
+    }
+    for code in [codes::CONFLICT, codes::UNKNOWN_SETTING] {
+        let reply = Envelope::err(ErrorBody::new(code, "m").unwrap()).with_id(id(1));
+        agrees::<Envelope>("envelope.json", &serde_json::to_value(&reply).unwrap());
+    }
+}
+
+#[test]
+fn send_safety_floor_ranks_the_least_safe_mode_set() {
+    let floor = |v: Value| send_safety_floor(&v);
+    assert_eq!(floor(json!({"default": "draft"})), Some(0));
+    assert_eq!(floor(json!({"default": "auto"})), Some(2));
+    assert_eq!(
+        floor(json!({"default": "draft", "connectors": {"s": "standing_approval"}})),
+        Some(1)
+    );
+    assert_eq!(
+        floor(json!({"default": "standing_approval", "connectors": {"s": "draft", "t": "auto"}})),
+        Some(2)
+    );
+    assert_eq!(floor(json!({"default": "nope"})), None);
+    assert_eq!(floor(json!("draft")), None);
+    assert_eq!(
+        send_safety_modes::ALL,
+        ["draft", "standing_approval", "auto"]
+    );
 }

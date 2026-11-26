@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SettingsListParams",
+  "description": "`settings.list`'s params.\n\n```json\n{\"prefix\": \"rlxapp.\"}\n```",
+  "type": "object",
+  "properties": {
+    "prefix": {
+      "description": "Only the keys that start with this. Absent lists every setting.",
+      "type": "string",
+      "maxLength": 128
+    }
+  }
+}

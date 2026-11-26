@@ -20,6 +20,7 @@ pub struct TestHome {
     root: PathBuf,
     claude: Option<PathBuf>,
     binary: Option<PathBuf>,
+    env: Vec<(String, String)>,
 }
 
 /// What one `rlxd` command did.
@@ -92,7 +93,25 @@ impl TestHome {
             root,
             claude: None,
             binary: None,
+            env: Vec::new(),
         }
+    }
+
+    /// This home, every `rlxd` in it run with `name` set to `value`.
+    pub fn with_env(mut self, name: &str, value: &str) -> Self {
+        self.env.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// This home, its rlxd taking an app-role hello as the paired device `device`: the
+    /// test build's stand-in for gate pairing. `rlxd call --as-app` sends the credential
+    /// it keeps in `<home>/test-gate-credential`, and rlxd is told the same one through
+    /// `RLXD_TEST_GATE_CREDENTIAL`. A release build ignores it.
+    pub fn with_test_gate(self, device: &str) -> Self {
+        let credential = format!("test-credential-{}", self.root.display().to_string().len());
+        std::fs::write(self.root.join("test-gate-credential"), &credential).unwrap();
+        self.with_env("RLXD_TEST_GATE_CREDENTIAL", &credential)
+            .with_env("RLXD_TEST_GATE_DEVICE", device)
     }
 
     /// This home, run by the rlxd at `binary` rather than this test build's.
@@ -168,7 +187,12 @@ impl TestHome {
                 self.claude
                     .clone()
                     .unwrap_or_else(|| self.root.join("no-claude")),
-            );
+            )
+            .env_remove("RLXD_TEST_GATE_CREDENTIAL")
+            .env_remove("RLXD_TEST_GATE_DEVICE");
+        for (name, value) in &self.env {
+            command.env(name, value);
+        }
         command
     }
 

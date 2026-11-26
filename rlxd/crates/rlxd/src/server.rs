@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, StatusData, SubscribeParams,
-    VERSION, codes, event_types, methods, topics,
+    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, SettingsGetParams,
+    SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, VERSION, codes,
+    event_types, methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,6 +46,7 @@ use tokio::sync::watch;
 
 use crate::bus::{self, Bus, Cursor, Line, Topics};
 use crate::log::{info, warning};
+use crate::settings::{self, Settings};
 use crate::{claude, token};
 
 /// `daemon.stopping`'s `reason` when a client asked rlxd to stop.
@@ -78,13 +80,22 @@ pub struct Daemon {
     clients: Mutex<Clients>,
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
     bus: Bus,
+    settings: Settings,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
+    /// Test builds: the stand-in device's credential and name ([`Daemon::app_device`]).
+    #[cfg(feature = "debug-methods")]
+    test_gate: Option<(String, String)>,
 }
 
 /// What a connection was let in as.
 struct Session {
     protocol_version: u32,
+    role: Role,
+    /// The `client` its hello named, for the log.
+    client: String,
+    /// For `role: app`: the paired device it is.
+    device: Option<String>,
     _counted: Counted,
 }
 
@@ -130,9 +141,15 @@ enum Frame {
 }
 
 impl Daemon {
-    /// An rlxd serving `home` with `token`, publishing on `bus`. `pipe_acl` is what
-    /// `status` says of the pipe's DACL, on Windows.
-    pub fn new(home: Home, token: String, pipe_acl: Option<&'static str>, bus: Bus) -> Arc<Self> {
+    /// An rlxd serving `home` with `token`, publishing on `bus` and serving `settings`.
+    /// `pipe_acl` is what `status` says of the pipe's DACL, on Windows.
+    pub fn new(
+        home: Home,
+        token: String,
+        pipe_acl: Option<&'static str>,
+        bus: Bus,
+        settings: Settings,
+    ) -> Arc<Self> {
         Arc::new(Self {
             home,
             token,
@@ -141,8 +158,11 @@ impl Daemon {
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
             bus,
+            settings,
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
+            #[cfg(feature = "debug-methods")]
+            test_gate: test_gate(),
         })
     }
 
@@ -233,15 +253,22 @@ impl Daemon {
             let error = error(codes::UNAUTHORIZED, "the token is wrong").with_hint(hint);
             return Err(Envelope::err(error).with_optional_id(id));
         }
-        if hello.role == Role::App {
-            info!("hello refused: role app, from {} (not_gate)", hello.client);
-            let error = error(
-                codes::NOT_GATE,
-                "this rlxd lets no connection be the gate: gate pairing is not available yet",
-            )
-            .with_hint("Connect with role tui, remote or cli.");
-            return Err(Envelope::err(error).with_optional_id(id));
-        }
+        let device = match hello.role {
+            Role::App => match self.app_device(&hello) {
+                Some(device) => Some(device),
+                None => {
+                    info!("hello refused: role app, from {} (not_gate)", hello.client);
+                    let error = error(
+                        codes::NOT_GATE,
+                        "this rlxd lets no connection be the gate: gate pairing is not \
+                         available yet",
+                    )
+                    .with_hint("Connect with role tui, remote or cli.");
+                    return Err(Envelope::err(error).with_optional_id(id));
+                }
+            },
+            _ => None,
+        };
         let Some(counted) = Counted::new(self, hello.role) else {
             let message = format!("role {} is not one this rlxd serves", role_name(hello.role));
             return refuse(id, message);
@@ -257,9 +284,33 @@ impl Daemon {
             .map_err(|e| reply_err(id, codes::INTERNAL, e.to_string()))?;
         let session = Session {
             protocol_version: hello.protocol_version,
+            role: hello.role,
+            client: hello.client,
+            device,
             _counted: counted,
         };
         Ok((session, reply))
+    }
+
+    /// The paired device an app-role `hello` comes from, if any. There is none yet: gate
+    /// pairing (5.1) is not here, so every app-role hello gets `not_gate`.
+    ///
+    /// Test builds (`debug-methods`) have one stand-in device, so tests can drive what
+    /// only an app may do: rlxd started with `RLXD_TEST_GATE_CREDENTIAL` set takes an
+    /// app-role hello carrying that `gate_credential` as the device named by
+    /// `RLXD_TEST_GATE_DEVICE` (else `test device`). A release build has no such path.
+    #[cfg(feature = "debug-methods")]
+    fn app_device(&self, hello: &HelloParams) -> Option<String> {
+        let (credential, device) = self.test_gate.as_ref()?;
+        let offered = hello.gate_credential.as_deref()?;
+        token::matches(credential, offered).then(|| device.clone())
+    }
+
+    /// The paired device an app-role `hello` comes from, if any. There is none yet: gate
+    /// pairing (5.1) is not here, so every app-role hello gets `not_gate`.
+    #[cfg(not(feature = "debug-methods"))]
+    fn app_device(&self, _hello: &HelloParams) -> Option<String> {
+        None
     }
 
     /// What one request frame after `hello` gets. On a connection that carries a stream
@@ -297,6 +348,9 @@ impl Daemon {
             },
             #[cfg(feature = "debug-methods")]
             methods::DEBUG_EMIT => self.debug_emit(&request.params),
+            methods::SETTINGS_GET => self.settings_get(request.params),
+            methods::SETTINGS_SET => self.settings_set(session, request.params),
+            methods::SETTINGS_LIST => self.settings_list(request.params),
             methods::HELLO => Err(error(
                 codes::INVALID_REQUEST,
                 "hello was already said on this connection",
@@ -342,6 +396,40 @@ impl Daemon {
             .cursor(topics, params.since, params.follow)
             .map_err(|head| ErrorBody::since_ahead(params.since.unwrap_or_default(), head))?;
         Ok(Subscription { id, cursor })
+    }
+
+    /// `settings.get {key}`.
+    fn settings_get(&self, params: Params) -> Result<Data, ErrorBody> {
+        let params = parse::<SettingsGetParams>(methods::SETTINGS_GET, params)?;
+        let setting = self.settings.get(&params.key).map_err(refused)?;
+        printed(&setting)
+    }
+
+    /// `settings.set {key, value, expected_version?}`: only an app-role connection sets
+    /// a gated key, such as `send_safety_mode`.
+    fn settings_set(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let params = parse::<SettingsSetParams>(methods::SETTINGS_SET, params)?;
+        let who = format!("{} {}", role_name(session.role), session.client);
+        let writer = settings::Writer {
+            app: session.role == Role::App,
+            device: session.device.as_deref(),
+            who: &who,
+        };
+        let setting = self
+            .settings
+            .set(params, writer, &self.bus)
+            .map_err(refused)?;
+        printed(&setting)
+    }
+
+    /// `settings.list {prefix?}`.
+    fn settings_list(&self, params: Params) -> Result<Data, ErrorBody> {
+        let params = parse::<SettingsListParams>(methods::SETTINGS_LIST, params)?;
+        let list = self
+            .settings
+            .list(params.prefix.as_deref())
+            .map_err(refused)?;
+        printed(&list)
     }
 
     /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
@@ -764,9 +852,88 @@ fn capabilities() -> Vec<String> {
     CAPABILITIES.iter().map(|&c| c.to_owned()).collect()
 }
 
+/// The stand-in device of a test build, from `RLXD_TEST_GATE_CREDENTIAL` and
+/// `RLXD_TEST_GATE_DEVICE` ([`Daemon::app_device`]).
+#[cfg(feature = "debug-methods")]
+fn test_gate() -> Option<(String, String)> {
+    let credential = std::env::var("RLXD_TEST_GATE_CREDENTIAL").ok()?;
+    if credential.is_empty() {
+        return None;
+    }
+    let device = std::env::var("RLXD_TEST_GATE_DEVICE")
+        .ok()
+        .filter(|device| !device.is_empty())
+        .unwrap_or_else(|| "test device".to_owned());
+    warning!("test build: an app-role hello with the test gate credential is device {device:?}");
+    Some((credential, device))
+}
+
+/// A method's params, read as its wire type: `invalid_params` naming the field when not.
+fn parse<T: serde::de::DeserializeOwned>(method: &str, params: Params) -> Result<T, ErrorBody> {
+    serde_json::from_value(Value::Object(params)).map_err(|e| {
+        error(
+            codes::INVALID_PARAMS,
+            &format!("{method}'s params are not valid: {e}"),
+        )
+    })
+}
+
+/// `value`, printed as a reply's `data`.
+fn printed(value: &impl serde::Serialize) -> Result<Data, ErrorBody> {
+    match serde_json::to_value(value) {
+        Ok(Value::Object(data)) => Ok(data),
+        Ok(_) => Err(error(
+            codes::INTERNAL,
+            "the reply did not print as an object",
+        )),
+        Err(e) => Err(error(
+            codes::INTERNAL,
+            &format!("the reply is not valid: {e}"),
+        )),
+    }
+}
+
+/// The error a refused setting gets.
+fn refused(refused: settings::Refused) -> ErrorBody {
+    match refused {
+        settings::Refused::UnknownKey(key) => error(
+            codes::UNKNOWN_SETTING,
+            &format!("rlxd knows no setting {key:?}"),
+        )
+        .with_hint(format!(
+            "Its settings: {}; any dotted key, <namespace>.<name>, is free to use.",
+            setting_keys::KNOWN.join(", ")
+        )),
+        settings::Refused::NotGate(key) => error(
+            codes::NOT_GATE,
+            &format!("only an app-role connection, a paired device, may set {key}"),
+        ),
+        settings::Refused::Conflict(version) => {
+            let mut detail = Data::new();
+            detail.insert("version".to_owned(), Value::from(version));
+            error(
+                codes::CONFLICT,
+                &format!("the setting is at version {version} now, not the one expected"),
+            )
+            .with_hint("Read it again, and write from its version now.")
+            .with_detail(detail)
+            .expect("conflict's detail is an object")
+        }
+        settings::Refused::Invalid(why) => error(codes::INVALID_PARAMS, &why),
+        settings::Refused::Unwritten(why) => error(codes::INTERNAL, &why),
+    }
+}
+
 /// The methods this rlxd serves after `hello`.
 fn served() -> Vec<&'static str> {
-    let mut served = vec![methods::STATUS, methods::STOP, methods::EVENTS_SUBSCRIBE];
+    let mut served = vec![
+        methods::STATUS,
+        methods::STOP,
+        methods::EVENTS_SUBSCRIBE,
+        methods::SETTINGS_GET,
+        methods::SETTINGS_SET,
+        methods::SETTINGS_LIST,
+    ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);
     }

@@ -33,6 +33,7 @@ use crate::listener::Listener;
 use crate::log::{error, info, warning};
 use crate::registry::{self, Registration};
 use crate::server::{self, Daemon};
+use crate::settings::Settings;
 use crate::{cli, lock, log, out, token};
 
 /// The hidden flag a detached rlxd is started with: log to the file only.
@@ -125,7 +126,8 @@ async fn serve_until_stopped(home: Home, token: String) -> Result<(), String> {
         }
     };
     let keeper = Keeper::start(home.clone(), registration);
-    let daemon = Daemon::new(home, token, listener.acl(), bus);
+    let settings = Settings::open(&home);
+    let daemon = Daemon::new(home, token, listener.acl(), bus, settings);
     daemon.started();
     tokio::spawn(watch_signals(Arc::clone(&daemon)));
     info!("listening on {endpoint}");

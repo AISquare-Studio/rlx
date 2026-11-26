@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SettingsGetParams",
+  "description": "`settings.get`'s params.\n\n```json\n{\"key\": \"theme\"}\n```",
+  "type": "object",
+  "properties": {
+    "key": {
+      "description": "The setting's key, such as `theme` or `rlxapp.sidebar`.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    }
+  },
+  "required": [
+    "key"
+  ]
+}

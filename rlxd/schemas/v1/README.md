@@ -43,6 +43,12 @@ bound both validators agree on.
 | `hello-reply.json` | `hello`'s reply data: `{protocol_version, protocol_versions, rlxd_version, capabilities}` |
 | `here-reply.json` | `rlxd here`'s data, the probe rlx.app runs over SSH: `{installed: true, running, started, supported, version?, protocol_versions, pid?, socket, home, platform, auth{token_file, token?}, rlxd{version, path, protocol_versions}, rlx{installed, version?, path?}}` |
 | `status-reply.json` | `status`'s reply data (7.4): `{version, pid, platform, protocol_version, capabilities, seq, clients, gate, brain, claude, runs, jobs, paths, pipe_acl?}`. `clients` counts open connections by `hello` role, and `pipe_acl` is Windows' |
+| `settings-get.json` | `settings.get`'s params: `{key}`. A key is a known one (`theme`, `layout`, `agent_sign_off`, `send_safety_mode`) or dotted snake_case names, such as `rlxapp.sidebar` |
+| `settings-set.json` | `settings.set`'s params: `{key, value, expected_version?}`. A known key's value has that key's shape; a dotted key's is any JSON but `null`. `expected_version` 0 means "only if never set" |
+| `settings-list.json` | `settings.list`'s params: `{prefix?}` |
+| `setting.json` | One setting, `settings.get`'s and `settings.set`'s reply: `{key, version, value?, updated_at?, by_device?}`. Version 0, with nothing else, is a key never set |
+| `settings-list-reply.json` | `settings.list`'s reply: `{settings: [setting]}`, in key order |
+| `settings-changed.json` | `settings.changed`'s data, on the `settings` topic: `{key, version, by_device?}` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 
@@ -118,6 +124,28 @@ For a client:
   a run older than the buffer through it, not `events.subscribe`.
 
 `data` of the `daemon` events isn't checked by `event.json` yet.
+
+## Settings
+
+App settings live in the rlx home, so every device that connects sees the same values
+(the owner's multi-device brief, §4). Device-local state stays on the device: SSH
+profiles, the window's size and position, per-device notifications, caches.
+
+- **The keys.** rlxd knows four, each with a shape: `theme` (a name of 1 to 64
+  characters), `layout` (an object), `agent_sign_off` (a string of at most 512
+  characters) and `send_safety_mode`. Any dotted key, `<namespace>.<name>`, holds any JSON
+  value but `null`, up to 64 KiB. Another key without a dot gets `unknown_setting`.
+- **`send_safety_mode`** is `{default, connectors?}`. Each mode is `draft`,
+  `standing_approval` or `auto`, safest first, and `connectors` maps a connector's name to
+  its mode. A key never set means `draft`. Only an app-role connection, a paired device,
+  may set it; any other gets `not_gate`. Every change is logged, and its event names the
+  device.
+- **Versions.** Each key counts its writes from 1. `settings.set` with `expected_version`
+  writes only when that is the version now, else it gets `conflict` with
+  `detail.version`; read again and write from that. Without it, the last write wins.
+- **Events.** Every write, once on disk, is a `settings.changed {key, version,
+  by_device?}` on the `settings` topic, one key's in version order. Read the value with
+  `settings.get`.
 
 ## Versioning
 

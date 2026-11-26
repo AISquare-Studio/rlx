@@ -5,10 +5,11 @@
 //! [--detach]`, `rlxd status [--json]`, `rlxd stop`, `rlxd call` and `rlxd events`. One
 //! rlxd runs per home, on a local socket or named pipe, and a client gets in with the
 //! shared token through `hello`. Every reply is the 7.2 envelope, and `events.subscribe`
-//! streams the home's events. The PTY host, the runner and the rest are later items,
-//! each a method on this socket, publishing on the bus. `rlxd here [--start]` is the
-//! probe rlx.app runs over SSH: what is installed, whether rlxd runs, and the protocol
-//! versions it serves.
+//! streams the home's events. `settings.get`, `settings.set` and `settings.list` serve
+//! the app settings every device shares. The PTY host, the runner and the rest are later
+//! items, each a method on this socket, publishing on the bus. `rlxd here [--start]` is
+//! the probe rlx.app runs over SSH: what is installed, whether rlxd runs, and the
+//! protocol versions it serves.
 //!
 //! Exit codes: 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage error,
 //! 3 when rlxd is not running. `rlxd here` exits 3 and 4 (unsupported) with an `ok`
@@ -30,6 +31,7 @@ pub mod bus;
 mod claude;
 mod cli;
 mod clock;
+mod durable;
 mod events;
 mod here;
 mod host;
@@ -40,6 +42,7 @@ mod out;
 pub mod registry;
 mod serve;
 mod server;
+mod settings;
 mod token;
 #[cfg(windows)]
 mod windows;

@@ -105,6 +105,29 @@ One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
   `cargo test --release` would carry `debug-methods`, because cargo then builds the
   dev-dependency.
 
+## Settings
+
+App settings kept in the rlx home and served to every device (the owner's multi-device
+brief, §4), the `crate::settings` module:
+
+- **`settings.get {key}`, `settings.set {key, value, expected_version?}` and
+  `settings.list {prefix?}`**, each through `rlxd call`. A stale `expected_version` gets
+  `conflict`, with `detail.version`.
+- **The keys:** `theme`, `layout`, `agent_sign_off`, `send_safety_mode`, and any dotted
+  key, `<namespace>.<name>`, for later needs. Their shapes are in `schemas/v1/README.md`.
+- **`send_safety_mode`** only an app-role connection, a paired device, may set: any other
+  gets `not_gate`. Every change is logged with the device, and a change that lowers send
+  safety is logged as a warning. It needs no confirm in rlxd yet; that is with the hub.
+- **Events:** each write, once on disk, is `settings.changed {key, version, by_device?}`
+  on the `settings` topic.
+- **The file** is `<home>/rlxd/settings.json`, 0600, written whole and durably. One rlxd
+  can't read is moved to `settings.json.unreadable`, and rlxd starts with no settings.
+- **Until gate pairing lands** (5.1), no connection is app-role, so `send_safety_mode`
+  can't be set at all. Test builds have a stand-in device: rlxd built with
+  `debug-methods` and started with `RLXD_TEST_GATE_CREDENTIAL` takes an app-role hello
+  carrying that credential, as `RLXD_TEST_GATE_DEVICE`. `crates/rlxd/tests/settings.rs`
+  uses it, and `release_build.rs` checks that a release rlxd doesn't.
+
 ## `rlxd here`: what rlx.app asks a host before it connects
 
 rlx.app runs `rlxd here --json --start` on a host over SSH, inside the authenticated

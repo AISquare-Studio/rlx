@@ -10,6 +10,9 @@
 //! - [`Event`] (7.3): one event on the event stream; `event-list.json` is an array of
 //!   them;
 //! - [`SubscribeParams`] (7.3): `events.subscribe`'s params, which open the stream;
+//! - the settings API (the multi-device brief, §4): [`SettingsGetParams`],
+//!   [`SettingsSetParams`], [`SettingsListParams`], [`Setting`], [`SettingsList`] and
+//!   [`SettingsChanged`], app settings every device shares;
 //! - [`StatusData`] (7.4): `status`'s reply, what rlxd is and whether Claude Code is
 //!   installed and signed in;
 //! - [`HereData`]: `rlxd here`'s reply, the probe rlx.app runs over SSH: what rlx is
@@ -151,6 +154,12 @@
 //!   on event frames, the subscribe's, is additive. The name stays reserved for it.
 //! - **The `daemon` events' `data`** is not checked by `event.json` yet: `daemon.gap`'s
 //!   `{from, to}` and the others are described in [`event_types`] only.
+//! - **Lowering `send_safety_mode` needs no confirm** in rlxd: an app-role connection's
+//!   write takes effect at once, and is logged as a warning. Whether it should need one,
+//!   such as a confirm on another paired device, is with the hub.
+//! - **`send_safety_mode`'s shape and mode names** (`{default, connectors?}`, `draft`,
+//!   `standing_approval`, `auto`) are rlxd's proposal until the remote addendum states
+//!   them.
 //! - **A numbering epoch.** A `since` from a home whose numbering started again (its
 //!   mark deleted) gets `since_ahead` only until the new numbering passes it. An id made
 //!   with the numbering, carried in `status` and `daemon.started`, would let a client
@@ -168,6 +177,7 @@ mod here;
 mod marker;
 mod request;
 pub mod schemas;
+mod settings;
 mod status;
 mod subscribe;
 
@@ -179,6 +189,11 @@ pub use hello::{HelloData, HelloParams, Role};
 pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
+pub use settings::{
+    MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged, SettingsGetParams, SettingsList,
+    SettingsListParams, SettingsSetParams, check_key as check_setting_key,
+    check_value as check_setting_value, keys as setting_keys, send_safety_floor, send_safety_modes,
+};
 pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
 pub use subscribe::SubscribeParams;
 
