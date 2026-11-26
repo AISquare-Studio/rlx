@@ -1220,7 +1220,8 @@ def test_a_model_in_the_extra_args_is_the_family_the_label_picks_by(
         "utilization": 99.0,
         "resets_at": (ACCOUNTS_NOW + timedelta(days=2)).isoformat(),
     }
-    endpoint = _Usage({"tok-two": out_of_opus, "tok-three": _payload(10.0, week=20.0)})
+    # Spare fuller than work's 20%: rank 1 keeps 20% of its week for the person (#35).
+    endpoint = _Usage({"tok-two": out_of_opus, "tok-three": _payload(10.0, week=50.0)})
     monkeypatch.setattr(accounts_service, "_http_get", endpoint)
     reads: list[list[str]] = []
 
@@ -4136,9 +4137,7 @@ def test_new_account_from_a_codex_form_signs_codex_in_and_reopens_the_form_on_it
     the form on Codex with that slot selected."""
     project = register(tmp_path / "alpha", project_id="prj_a")
     slots = [(2, "claude-code")]
-    codex = ClaudeAccount(
-        slot=5, config_dir=tmp_path / "codex-accounts" / "5", agent="codex", managed=True
-    )
+    codex = ClaudeAccount(slot=5, config_dir=tmp_path / "slots" / "5", agent="codex", managed=True)
     begun: list[tuple[int | None, str]] = []
     opened: list[str] = []
     monkeypatch.setattr(accounts_view, "LOGIN_POLL_SECONDS", 3600.0)  # the tick is the test's

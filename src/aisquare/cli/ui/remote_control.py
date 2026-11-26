@@ -7,11 +7,11 @@ Textual, so every branch — on/off, ngrok missing, auto-off, restore after a
 restart — is a plain unit test.
 
 Persistence (PLAN §1): the two switch values ``remote_enabled`` and
-``auto_off_minutes`` sit next to the theme key in ``~/.aisquare/state.json``
+``auto_off_minutes`` sit next to the theme key in ``~/.rlx/state.json``
 through the file's one locked writer (``core.state_file.update_state``), each
 key on its own, and in the fleet UI through the autosave the theme uses, off
 Textual's thread. Token, password, devices and the write switch are the
-SERVER's (``~/.aisquare/remote.json``) and are only read and written through its
+SERVER's (``~/.rlx/remote/remote.json``) and are only read and written through its
 API, so ``aisquare remote allow-write`` and ``regenerate-password`` from a shell
 and this modal always agree.
 

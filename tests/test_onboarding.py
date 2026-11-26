@@ -15,6 +15,7 @@ import ast
 import inspect
 import json
 import os
+import shutil
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -495,6 +496,52 @@ def test_fix_commands_leaves_everything_that_is_not_our_command_as_text() -> Non
     assert fix_commands(not_buttons) == []
 
 
+def test_m3s_new_fixes_map_their_checks_to_an_action_that_runs() -> None:
+    """M3 (0.10.2): the usage-limit row moves each limited agent, one button each; the
+    watcher row stops it, then starts it. Each button says what it does, and its click runs
+    the command (a spy)."""
+    limited = _fix(
+        "claude-account-limits",
+        "Move one to an account with headroom: rlx fleet switch --project amber-otter coder-1; "
+        "rlx fleet switch --project amber-otter tester-2; or wait",
+    )
+    watcher = _fix("fleet watcher", "rlx watch --stop; then rlx watch --detach")
+
+    fixes = fix_commands([limited, watcher])
+
+    assert [(fix.check, fix.argv, fix.title) for fix in fixes] == [
+        (
+            "claude-account-limits",
+            ("fleet", "switch", "--project", "amber-otter", "coder-1"),
+            "Move coder-1 to an account with room",
+        ),
+        (
+            "claude-account-limits",
+            ("fleet", "switch", "--project", "amber-otter", "tester-2"),
+            "Move tester-2 to an account with room",
+        ),
+        ("fleet watcher", ("watch", "--stop"), "Stop the watcher"),
+        ("fleet watcher", ("watch", "--detach"), "Start the watcher"),
+    ]
+    for fix in fixes:
+        spy = Scripted({fix.argv[0]: _result("{}")})
+        assert apply_fix(fix, None, run=spy).ok
+        assert spy.calls == [(["--json", *fix.argv], None)]
+
+
+@pytest.mark.parametrize(
+    "fix",
+    [
+        "rlx fleet switch --project amber-otter",  # no label: nothing to move
+        "rlx fleet switch --project amber-otter coder-1 --to 3",  # a flag the entry does not take
+        "rlx fleet switch --project amber-otter $(whoami)",  # not a label's shape
+        "rlx fleet switch --project amber-otter coder-1 tester-2",  # two labels
+    ],
+)
+def test_a_fleet_switch_hint_that_is_not_one_label_is_no_button(fix: str) -> None:
+    assert fix_commands([_fix("claude-account-limits", fix)]) == []
+
+
 def test_fix_commands_ignores_ok_checks_and_deduplicates_by_command() -> None:
     passing = _fix(
         "claude-code", "(Re)connect it: aisquare agents connect claude-code", CheckStatus.ok
@@ -795,3 +842,74 @@ def test_the_child_that_runs_init_never_has_a_terminal_on_stdin() -> None:
     # The flag stays regardless: §4.2 puts the consent on the `explainability
     # enable` button, not on a prompt in a subprocess nobody is looking at.
     assert "--no-explainability" in onboarding.INIT_FLAGS
+
+
+# --------------------------------------------------------------------------- pane fixes (#15)
+
+
+def _offered(name: str, offer: str) -> DoctorCheck:
+    return DoctorCheck(name=name, status=CheckStatus.ok, detail="d", offer=offer)
+
+
+def test_the_three_pane_fixes_come_quiet_from_ok_rows_and_loud_from_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hub's one pattern (#15, seq 229): an OK row's offer is a quiet pane button, never a
+    problem; the browser-tools warning (a ui-tester is wanted) has the same button as its fix."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
+    add = "claude mcp add chrome-devtools --scope user npx chrome-devtools-mcp@latest"
+    rows = [
+        _offered("status line", "rlx accounts statusline --install"),
+        _offered("gh", "gh auth login"),
+        _fix("browser tools", f"Add the Chrome DevTools MCP to Claude Code: {add}"),
+    ]
+
+    fixes = fix_commands(rows)
+
+    assert [(f.check, f.title, f.pane, f.foreign, f.quiet) for f in fixes] == [
+        ("status line", "Install status line", True, False, True),
+        ("gh", "Sign in to GitHub", True, True, True),
+        ("browser tools", "Add browser tools", True, True, False),
+    ]
+    assert fixes[1].label == "gh auth login" and fixes[2].argv[:3] == ("claude", "mcp", "add")
+    for fix in fixes:
+        result = apply_fix(fix, None, run=Scripted({}))
+        assert not result.ok and "pane" in (result.reason or "")  # never run here
+
+
+def test_a_pane_fix_is_offered_only_where_its_tool_is_installed_and_named_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert fix_commands([_offered("gh", "gh auth login")]) == [], "no gh on PATH: no button"
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
+    for not_it in ("gh auth login --with-token", "gh auth logins", "run gh auth status"):
+        assert fix_commands([_offered("gh", not_it)]) == [], not_it
+    assert fix_commands([_fix("status line", "rlx accounts statusline --install --wrap")]) == []
+
+
+def test_where_no_pane_can_open_no_pane_fix_is_offered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No tmux, or a host with no uid (Windows outside WSL): a pane button would only fail
+    (the reviewer of #15)."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(onboarding, "pane_available", lambda: False)
+
+    assert fix_commands([_offered("gh", "gh auth login")]) == []
+
+    monkeypatch.setattr(onboarding, "pane_available", lambda: True)
+    assert [fix.title for fix in fix_commands([_offered("gh", "gh auth login")])] == [
+        "Sign in to GitHub"
+    ]
+
+
+def test_pane_available_wants_tmux_and_a_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert onboarding.pane_available() is False, "no tmux on PATH"
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/tmux")
+    monkeypatch.delattr(os, "getuid", raising=False)
+    assert onboarding.pane_available() is False, "no uid: no tmux socket of the fleet's"

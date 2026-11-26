@@ -126,7 +126,7 @@ def test_a_lock_held_too_long_is_a_timeout_that_names_the_lock(
     the directory: the temp made before the wait goes with the refusal."""
     monkeypatch.setattr(credentials, "LOCK_WAIT_S", 0.2)
     credentials.store(api_key=_KEY)  # creates the lock file
-    fd = os.open(isolated_home / "credentials.lock", os.O_RDWR)
+    fd = os.open(paths.credentials_path().with_name("credentials.lock"), os.O_RDWR)
     lock_exclusive(fd)
     try:
         with pytest.raises(TimeoutError, match=r"credentials\.lock is held by another"):
@@ -135,7 +135,7 @@ def test_a_lock_held_too_long_is_a_timeout_that_names_the_lock(
         unlock(fd)
         os.close(fd)
     assert credentials.load_all() == {"api_key": _KEY}
-    files = sorted(p.name for p in isolated_home.iterdir() if p.is_file())
+    files = sorted(p.name for p in paths.credentials_path().parent.iterdir() if p.is_file())
     assert files == ["credentials", "credentials.lock"], files
     credentials.store(serve_token=_TOKEN)  # released: back in business
     assert credentials.load_all() == {"api_key": _KEY, "serve_token": _TOKEN}
@@ -154,7 +154,7 @@ def test_the_restriction_runs_before_the_writers_lock_is_taken(
     so the whole of it comes first. The probe records whether the lock was free when it ran,
     then restricts for real."""
     credentials.store(api_key=_KEY, iam_token="t")
-    lock_path = isolated_home / "credentials.lock"
+    lock_path = paths.credentials_path().with_name("credentials.lock")
     real = paths.restrict_to_owner
     free_when_restricting: list[bool] = []
 

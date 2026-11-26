@@ -76,6 +76,7 @@ from aisquare.services import fleet as fleet_service
 from aisquare.services import project as project_service
 from aisquare.services import settings as settings_service
 from aisquare.services import team as team_service
+from aisquare.services.onboarding import BROWSER_TOOLS_ARGV
 
 
 def status() -> StatusReport:
@@ -172,6 +173,7 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             *_claude_accounts_checks(),
             *_shared_number_checks(),
             *_other_accounts_checks(),
+            *_optional(_check_statusline()),
             *_optional(_undeclared_share_check()),
             *_check_role_bindings(),
             _check_tmux(),
@@ -410,8 +412,10 @@ def _live_only(live: bool, check: Callable[[], DoctorCheck | None]) -> list[Doct
     return [found] if found is not None else []
 
 
-def _ok(name: str, detail: str) -> DoctorCheck:
-    return DoctorCheck(name=name, status=CheckStatus.ok, detail=detail)
+def _ok(name: str, detail: str, *, offer: str | None = None) -> DoctorCheck:
+    """A passing row; ``offer`` is an optional improvement asq's Doctor makes a quiet button
+    of (``DoctorCheck.offer``, #15), never a problem."""
+    return DoctorCheck(name=name, status=CheckStatus.ok, detail=detail, offer=offer)
 
 
 def _warn(name: str, detail: str, fix: str, *, ui_fix: str | None = None) -> DoctorCheck:
@@ -701,7 +705,7 @@ def _check_home_filesystem() -> DoctorCheck:
 
     ``save_config`` publishes changes with write-temp/fsync/rename/fsync-parent,
     and the atomicity of that rename is a property of the FILESYSTEM. It was
-    measured on a native disk, which is where the default ``~/.aisquare`` sits.
+    measured on a native disk, which is where the default ``~/.rlx`` sits.
     ``AISQUARE_HOME`` is taken verbatim, so a Windows-backed path is one export
     away — and until now nothing in the code could tell an operator which kind of
     path they were on.
@@ -3016,7 +3020,13 @@ def _check_fleet_terminal(
                 "shell's values; agents already running keep the server's)"
             )
         if prefix and prefix != "None":
-            parts.append(f"the running server still has prefix {prefix}")
+            parts.append(
+                prog.detail_advice(
+                    f"the running server still has prefix {prefix}",
+                    app=f"rlx's agent server still runs with an old setting that keeps {prefix} "
+                    "from the agent",
+                )
+            )
             return _warn(
                 name,
                 "; ".join(parts),
@@ -3026,9 +3036,9 @@ def _check_fleet_terminal(
                 f"{fleet_service.settings().tmux_socket} kill-server",
             )
         parts.append(
-            "server prefix None (every key reaches the agent"
-            + prog.detail_advice(
-                " in fleet attach; F12 detaches)", app=" in its pane; F12 returns to the sidebar)"
+            prog.detail_advice(
+                "server prefix None (every key reaches the agent in fleet attach; F12 detaches)",
+                app="every key you type reaches the agent in its pane (F12 returns to the sidebar)",
             )
         )
         return _ok(name, "; ".join(parts))
@@ -3141,7 +3151,7 @@ def _check_watcher() -> DoctorCheck:
         return _warn(
             name,
             f"running (pid {found.pid}), {looked}",
-            f"{prog.word()} watch --stop, then {prog.word()} watch --detach",
+            f"{prog.word()} watch --stop; then {prog.word()} watch --detach",
         )
     return _ok(name, f"running (pid {found.pid}), {looked}")
 
@@ -3257,7 +3267,7 @@ def _check_fleet_server_env(
         # The home of an agent whose tool shell started the server is that spawner's too.
         watched = (*TEAM_ENV_VARS, *agent_identity_env_vars(), *tool_shell_homes(held))
         pinned = {var: held[var] for var in watched if var in held}
-        where = f"the fleet server (-L {srv.socket})"
+        where = prog.detail_advice(f"the fleet server (-L {srv.socket})", app="rlx's agent server")
         if not pinned:
             return _ok(name, f"{where} pins no team variable and no agent's process identity")
         wanted = list(boards) if boards is not None else _fleet_boards(srv.socket, cwd)
@@ -3661,21 +3671,99 @@ def _check_browser_tools(cwd: Path | None = None) -> DoctorCheck:
             f"{', '.join(dict.fromkeys(declared))} declared — the ui-tester can measure; "
             f"{chrome_note}",
         )
-    return _ok(
-        name,
+    detail = (
         f"no browser MCP/plugin declared in {len(dirs)} config dir(s) or {_short_path(mcp_json)}; "
         f"{chrome_note}. Without one the ui-tester reopens UI tasks as 'not browser-verified' "
         "rather than passing them on code alone — "
         # In the app, the same advice without the shell's command (review of #542).
         + prog.detail_advice(
             "add the Chrome DevTools MCP with "
-            "`claude mcp add -s user chrome-devtools npx chrome-devtools-mcp@latest` (what "
+            f"`{BROWSER_TOOLS_ADD}` (what "
             "install.sh --with chrome-devtools runs), or install the "
             "Claude in Chrome extension (claude.ai/chrome)",
             "add the Chrome DevTools MCP to Claude Code, or install the Claude in Chrome "
             "extension (claude.ai/chrome)",
-        ),
+        )
     )
+    # OK, with the add as a quiet offer (#15). A warning, the add its fix, only while a
+    # ui-tester is wanted: one running, or the role in the person's own config. A fresh
+    # install has neither, so install.sh's amber set (the docstring) never meets it.
+    if _ui_tester_wanted():
+        return _warn(
+            name, detail, f"Add the Chrome DevTools MCP to Claude Code: {BROWSER_TOOLS_ADD}"
+        )
+    return _ok(name, detail, offer=BROWSER_TOOLS_ADD)
+
+
+BROWSER_TOOLS_ADD = " ".join(BROWSER_TOOLS_ARGV)
+"""What the browser-tools row offers (#15): the Chrome DevTools MCP, as install.sh adds it,
+in its adapter's words (``onboarding.BROWSER_TOOLS_ARGV``), which its pane fix matches whole."""
+
+
+def _ui_tester_wanted() -> bool:
+    """Whether a ui-tester is wanted here: one runs on the fleet, or the person set the role
+    up themselves (:func:`_ui_tester_set_up`). Read-only, and no for anything that cannot be
+    read; each read on its own, so a store that will not open still has the config asked
+    (the tester of #15, round 3)."""
+    return _ui_tester_running() or _ui_tester_set_up()
+
+
+def _ui_tester_running() -> bool:
+    """A live fleet row in a ui-tester's seat, numbered or not (``ui-tester2``): a launch
+    stores the seat as given, so it is read by its role (``harness.base_role``)."""
+    try:
+        if not paths.db_path().exists():
+            return False
+        with store_session() as store:
+            return any(
+                harness.base_role(agent.role or "") == "ui-tester"
+                for agent in store.live_fleet_agents()
+            )
+    except Exception:
+        return False
+
+
+def _ui_tester_set_up() -> bool:
+    """The role in the person's own ``config.toml``: its ``[fleet.roles.ui-tester]`` table
+    other than the built-in one, or a ``[team.profiles.<seat>]`` of a ui-tester's that binds
+    anything: how it launches (``team bind ui-tester --bin …``) or only its account (``team
+    bind ui-tester --account 1``, ``accounts default 1 --role ui-tester``, App settings' role
+    row; the tester of #15, round 4). Hub #429: a team profile that names a ui-tester.
+
+    The fleet's table alone is not enough: ``save_config`` writes every role's table whole
+    (``config._with_whole_role_tables``), so any setting saved writes the default one too
+    (the reviewer of #15). Team profiles are written as set, none by default."""
+    import tomllib
+
+    from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, _default_fleet_roles
+
+    try:
+        own = tomllib.loads(paths.config_path().read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    fleet = own.get("fleet")
+    roles = fleet.get("roles") if isinstance(fleet, dict) else None
+    table = roles.get("ui-tester") if isinstance(roles, dict) else None
+    if isinstance(table, dict):
+        try:
+            if FleetRoleSettings.model_validate(table) != _default_fleet_roles()["ui-tester"]:
+                return True
+        except Exception:
+            pass  # a table that does not load is the config row's to report
+    team = own.get("team")
+    profiles = team.get("profiles") if isinstance(team, dict) else None
+    if not isinstance(profiles, dict):
+        return False
+    for seat, profile in profiles.items():
+        if harness.base_role(str(seat)) != "ui-tester" or not isinstance(profile, dict):
+            continue
+        try:
+            bound = RoleLaunchProfile.model_validate(profile)
+        except Exception:
+            continue
+        if bound.carries_launch or bound.account:
+            return True
+    return False
 
 
 def _agents_own_browser(cwd: Path) -> DoctorCheck | None:
@@ -3761,6 +3849,36 @@ def _short_path(path: PurePath, home: PurePath | None = None) -> str:
         return str(path)
 
 
+STATUSLINE_INSTALL = ("accounts", "statusline", "--install")
+"""What the status line row offers (#15): ``asq-statusline`` where an account has none."""
+GH_SIGN_IN = "gh auth login"
+"""What the gh row offers while no sign-in is visible (#15): GitHub CLI's own sign-in."""
+
+
+def _check_statusline() -> DoctorCheck | None:
+    """``status line``: Claude Code's ``asq-statusline`` on each account, which is opt-in
+    (#287). Where some account has no status line, an OK row with a quiet offer to install
+    it (#15, the hub's decision): never a problem, and nothing when every account has one,
+    none does a status line, or the accounts cannot be read."""
+    try:
+        if not paths.db_path().exists():  # a doctor run creates nothing
+            return None
+        sites = claude_accounts_service.statusline_sites(action="status")
+    except Exception:
+        return None
+    off = [site for site in sites if site.state == "none"]
+    if not off:
+        return None
+    command = prog.words(*STATUSLINE_INSTALL)
+    return _ok(
+        "status line",
+        f"off on {len(off)} account(s): Claude Code's status line can show each account's use "
+        "and the session's context"
+        + prog.detail_advice(f"; `{command}` sets it", app=" (optional)"),
+        offer=command,
+    )
+
+
 def _check_gh() -> DoctorCheck:
     """GitHub CLI: the fleet's coder and reviewer open and review PRs through it (§3.5)."""
     name = "gh"
@@ -3775,7 +3893,12 @@ def _check_gh() -> DoctorCheck:
                 ui_fix=f"Install GitHub CLI and sign in to it as {GH_INSTALL_PAGE} says, then "
                 "re-run the checks",
             )
-        return _ok(name, f"gh at {found} — PR flow available{_gh_login_note()}")
+        note = _gh_login_note()
+        # Signed out stays OK (an earlier decision, pinned in test_doctor_fleet): the sign-in
+        # is a quiet offer, a pane in asq (#15).
+        return _ok(
+            name, f"gh at {found} — PR flow available{note}", offer=GH_SIGN_IN if note else None
+        )
     except Exception as exc:  # diagnostics must never crash
         # The last check in this file without the guard every sibling has, and
         # the gap was reachable: see _gh_login_note. Failing open costs this
@@ -4016,7 +4139,7 @@ def _fleet_conf() -> Path:
     the path up front skips both. tmux only reads ``-f`` when it STARTS a
     server, and nothing here starts one, so a missing file costs nothing.
     """
-    return paths.aisquare_home() / tmux_core.CONF_NAME
+    return paths.tmux_conf_path()
 
 
 def _fleet_server(socket: str) -> tmux_core.TmuxServer:
@@ -4244,10 +4367,15 @@ def _check_fleet(
                 if taken:
                     unreached.extend(taken)
                     problems.append(
-                        f"{len(taken)} recorded live but another tmux server answers on the "
-                        f"socket of the private tmux server '{sock}', not the one "
-                        f"{'it was' if len(taken) == 1 else 'they were'} started on, which may "
-                        f"still be running: {_fleet_labels(taken, names)}"
+                        prog.detail_advice(
+                            f"{len(taken)} recorded live but another tmux server answers on the "
+                            f"socket of the private tmux server '{sock}', not the one "
+                            f"{'it was' if len(taken) == 1 else 'they were'} started on, which "
+                            f"may still be running: {_fleet_labels(taken, names)}",
+                            app=f"{len(taken)} recorded running, but another program now answers "
+                            "in place of rlx's agent server, which may still be running: "
+                            f"{_fleet_labels(taken, names)}",
+                        )
                     )
             elif servers[sock].server_absent():
                 # tmux itself says there is no server — the one case reap's
@@ -4275,24 +4403,36 @@ def _check_fleet(
                 if down:
                     server_down = True
                     problems.append(
-                        f"{len(down)} recorded live but the private tmux server "
-                        f"'{sock}' is not running: {_fleet_labels(down, names)}"
+                        prog.detail_advice(
+                            f"{len(down)} recorded live but the private tmux server "
+                            f"'{sock}' is not running: {_fleet_labels(down, names)}",
+                            app=f"{len(down)} recorded running, but rlx's agent server is not "
+                            f"running: {_fleet_labels(down, names)}",
+                        )
                     )
                 if held:
                     unreached.extend(held)
                     problems.append(
-                        f"{len(held)} recorded live but no tmux client reaches the private "
-                        f"tmux server '{sock}', as its socket file is gone or could not be "
-                        f"asked, and it may still be running: {_fleet_labels(held, names)}"
+                        prog.detail_advice(
+                            f"{len(held)} recorded live but no tmux client reaches the private "
+                            f"tmux server '{sock}', as its socket file is gone or could not be "
+                            f"asked, and it may still be running: {_fleet_labels(held, names)}",
+                            app=f"{len(held)} recorded running, but rlx cannot reach its agent "
+                            f"server, which may still be running: {_fleet_labels(held, names)}",
+                        )
                     )
             else:
                 # Silent but not absent: a protocol mismatch after a tmux upgrade,
                 # a wedged server, a socket under another TMUX_TMPDIR. The agents
                 # may well be alive; nothing here should vouch otherwise.
                 problems.append(
-                    f"{len(agents)} recorded live but the private tmux server '{sock}' "
-                    f"does not answer (not a missing server — a version mismatch or a "
-                    f"different TMUX_TMPDIR?): {listed}"
+                    prog.detail_advice(
+                        f"{len(agents)} recorded live but the private tmux server '{sock}' "
+                        f"does not answer (not a missing server — a version mismatch or a "
+                        f"different TMUX_TMPDIR?): {listed}",
+                        app=f"{len(agents)} recorded running, but rlx's agent server does not "
+                        f"answer (it may be running after a tmux update): {listed}",
+                    )
                 )
         if exited:
             problems.append(
@@ -4329,16 +4469,28 @@ def _check_fleet(
         if live:
             return _ok(
                 name,
-                f"{len(live)} live agent(s) across {len(sessions)} session(s) on the private "
-                f"tmux server '{today}'",
+                prog.detail_advice(
+                    f"{len(live)} live agent(s) across {len(sessions)} session(s) on the private "
+                    f"tmux server '{today}'",
+                    app=f"{len(live)} agent(s) running in {len(sessions)} project(s)",
+                ),
             )
         if sessions:
             return _ok(
                 name,
-                f"private tmux server '{today}' running with {len(sessions)} session(s); "
-                "no agents recorded live",
+                prog.detail_advice(
+                    f"private tmux server '{today}' running with {len(sessions)} session(s); "
+                    "no agents recorded live",
+                    app="rlx's agent server is running; no agent is",
+                ),
             )
-        return _ok(name, f"no fleet agents; the private tmux server '{today}' is not running")
+        return _ok(
+            name,
+            prog.detail_advice(
+                f"no fleet agents; the private tmux server '{today}' is not running",
+                app="no agents running",
+            ),
+        )
     except Exception as exc:  # diagnostics must never crash
         # A store that will not open is the database check's verdict. Failing
         # open here costs the stale-row report — a label can stay taken and a

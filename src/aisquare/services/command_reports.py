@@ -40,10 +40,9 @@ from typing import IO, Any, BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from aisquare.core import orchestrator
+from aisquare.core import orchestrator, paths
 from aisquare.core.insights import RUN_KEY_ENV_VAR
 from aisquare.core.names import as_text
-from aisquare.core.paths import aisquare_home
 from aisquare.core.source_revision import (
     checkout_of,
     fingerprint_of,
@@ -205,7 +204,7 @@ def reports_dir() -> Path:
     sandbox = sandbox_dir()
     if sandbox is not None:
         return sandbox / store_broker.REPORTS
-    return aisquare_home() / "reports"
+    return paths.reports_dir()
 
 
 # --------------------------------------------------------------------------- storage

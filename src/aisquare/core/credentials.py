@@ -1,4 +1,4 @@
-"""One reader and one writer for ``~/.aisquare/credentials``.
+"""One reader and one writer for ``~/.rlx/accounts/aisquare/credentials``.
 
 The file had two writers with two formats: ``init --api-key`` replaced the whole
 file with a bare key string, and ``serve_token`` read JSON and fell back to

@@ -1,7 +1,7 @@
 # Running more than one rlx on one home
 
 You can run rlx at the Mac and, at the same time, over SSH into that same Mac. Both use the same
-home (`~/.aisquare`) and the same fleet. This page explains what the two share, what only one of
+home (`~/.rlx`) and the same fleet. This page explains what the two share, what only one of
 them holds at a time, and what rlx does to keep two releases from running against one home.
 Below, each running rlx on a home is an instance, and each one's messages call it rlx.
 
@@ -31,7 +31,7 @@ Below, each running rlx on a home is an instance, and each one's messages call i
 - **The doctor.** `rlx doctor` (and rlx's Doctor page) has an `asq instances` row. It is ok
   when every live rlx runs this release and store schema, and warns when one doesn't.
 
-Every rlx writes a small record to `~/.aisquare/instances/` when it starts, refreshes it every
+Every rlx writes a small record to `~/.rlx/run/instances/` when it starts, refreshes it every
 5 seconds, and removes it when it quits. A crashed rlx's record is ignored at once, and deleted
 by the next rlx that starts or by the next heartbeat of any rlx still running. Looking (the chip,
 the command, the doctor) never changes the folder.

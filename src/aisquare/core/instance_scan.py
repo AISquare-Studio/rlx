@@ -221,7 +221,7 @@ def _environment(process: _Process) -> dict[str, str] | None:
         except OSError:
             return None
         found = dict(pair.split("=", 1) for pair in pairs if "=" in pair)
-        return {key: found[key] for key in ("AISQUARE_HOME", "HOME") if key in found}
+        return {key: found[key] for key in ("RLX_HOME", "AISQUARE_HOME", "HOME") if key in found}
     argv = ["ps", "-E", "-ww", "-p", str(process.pid), "-o", "command="]
     try:
         done = subprocess.run(
@@ -247,13 +247,13 @@ def _on_this_home(process: _Process) -> bool:
     environment = _environment(process)
     if environment is None:
         return True
-    named = environment.get("AISQUARE_HOME")
-    if named:
-        home = Path(named).expanduser()
+    named = paths.named_home(environment)
+    if named is not None:
+        home = named
         if not home.is_absolute():
             return True  # relative to its working directory, which is not ours to read
     elif environment.get("HOME"):
-        home = Path(environment["HOME"]) / ".aisquare"
+        home = paths.home_of(environment, user_home=Path(environment["HOME"]))[0]
     else:
         return True
     try:

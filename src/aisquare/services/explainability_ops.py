@@ -171,7 +171,7 @@ class ResolvedTarget:
     #: the key-file fallback: until then `api_key_env` WAS the provenance,
     #: because the environment was the only place a key could come from. After
     #: it, every surface rendered `${api_key_env} is set` for a key that came
-    #: out of `~/.aisquare/explainability-key` while that variable was empty —
+    #: out of `~/.rlx/explainability-key` while that variable was empty —
     #: which sends an operator to rotate or debug a credential source that is
     #: not in play.
     key_source: str

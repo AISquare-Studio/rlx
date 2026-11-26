@@ -121,7 +121,7 @@ def initialize(
     assume_yes: bool,
     explainability: bool | None = None,
 ) -> SetupReport:
-    """Set up ``~/.aisquare``, register the project, and connect agents.
+    """Set up ``~/.rlx``, register the project, and connect agents.
 
     Idempotent and non-interactive: safe to re-run (``assume_yes`` is therefore
     moot for now). ``reinit`` resets ``config.toml`` to defaults. Agents named via
@@ -180,7 +180,7 @@ def initialize(
         # prefix: the two paths cannot drift into saying different things about
         # where the key landed.
         notes.append(
-            "Stored API key in ~/.aisquare/credentials"
+            f"Stored API key in {paths.shown(paths.credentials_path())}"
             + (
                 "."
                 if restricted
@@ -1544,11 +1544,11 @@ def _trusted(site: HookSite) -> bool:
 # Nothing here goes through `agents_service.disconnect`: it calls set_connected,
 # which calls `paths.ensure_home()`, and an uninstall that recreated the home it
 # was keeping out of — or had just purged — would be the one place that broke the
-# promise that the plan never creates ~/.aisquare.
+# promise that the plan never creates ~/.rlx.
 
 #: Files that make a directory an aisquare home: at least one must be there
 #: before --purge deletes anything.
-HOME_MARKERS = ("config.toml", "context.db", "agents.json")
+HOME_MARKERS = ("config.toml", "rlx.db", "context.db", "agents.json")
 
 
 def fleet_shutdown() -> str:
@@ -1579,7 +1579,7 @@ class UninstallRefused(RuntimeError):
 class UninstallPlan:
     """What ``aisquare uninstall`` would do, read before anything is touched.
 
-    Read-only, and it never creates ``~/.aisquare``: the store is opened only when
+    Read-only, and it never creates ``~/.rlx``: the store is opened only when
     ``context.db`` already exists, and every other read is a file that is there
     or is not.
     """
@@ -1941,10 +1941,15 @@ def _home_there(home: Path) -> tuple[bool, str | None]:
 
 
 def custom_home(home: Path) -> bool:
-    """Whether AISQUARE_HOME moved the home away from ``~/.aisquare``."""
-    if not os.environ.get(paths.HOME_ENV_VAR):
+    """Whether ``$RLX_HOME`` (or ``$AISQUARE_HOME``) moved the home away from where it is by
+    default (``~/.rlx``, or an existing ``~/.aisquare``)."""
+    if paths.named_home() is None:
         return False
-    return agent_core.dir_identity(home) != agent_core.dir_identity(_user_home() / ".aisquare")
+    user = _user_home()
+    defaults = {
+        agent_core.dir_identity(user / name) for name in (paths.HOME_NAME, paths.OLD_HOME_NAME)
+    }
+    return agent_core.dir_identity(home) not in defaults
 
 
 def purge_refusal(home: Path, *, custom: bool) -> str | None:
@@ -1959,7 +1964,8 @@ def purge_refusal(home: Path, *, custom: bool) -> str | None:
     - ANY home AISQUARE_HOME moved elsewhere. A directory someone chose can hold
       their own things under names aisquare also uses (``projects/``,
       ``screenshots/``), and no name tells the two apart (review of #253), so
-      only ``~/.aisquare`` — aisquare's by name — is ever deleted.
+      only ``~/.rlx`` (or ``~/.aisquare``, a home from before 0.10.2) — rlx's by name — is
+      ever deleted.
     """
     there, unreachable = _home_there(home)
     if unreachable is not None:
@@ -1982,7 +1988,8 @@ def purge_refusal(home: Path, *, custom: bool) -> str | None:
         return f"{home} holds none of {', '.join(HOME_MARKERS)}, so it is not an rlx home"
     if custom:
         return (
-            f"AISQUARE_HOME moved the home to {home}, and --purge deletes only ~/.aisquare: a "
+            f"RLX_HOME (or AISQUARE_HOME) moved the home to {home}, and --purge deletes only "
+            "~/.rlx or ~/.aisquare: a "
             "directory you chose may hold your own files under names rlx also uses — "
             "delete it by hand"
         )

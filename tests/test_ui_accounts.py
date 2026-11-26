@@ -84,6 +84,7 @@ from aisquare.services import device_flow, iam
 from aisquare.services import fleet as fleet_service
 from tests import windows_timers as windows_timers_module
 from tests.pane_harness import asks_a_server, socket_of
+from tests.test_ui_shell import to_the_sidebar
 from tests.ui_workers import settle_page, settle_until
 
 T = TypeVar("T")
@@ -272,6 +273,7 @@ async def open_accounts(pilot: Pilot[None]) -> AccountsView:
     ``AccountsSelected`` to the app, whose handler mounts the page, so one pause could
     return before it existed."""
     app = fleet_app(pilot)
+    await to_the_sidebar(app)  # below 70 columns, start on Welcome shows the other side (L2)
     await pilot.click(app.query_one(StatusLine))
     await settle(app)
     view = app.query_one("#accounts", AccountsView)
@@ -1859,7 +1861,7 @@ def _script_claude_sign_in(
     }
     account = ClaudeAccount(
         slot=2,
-        config_dir=tmp_path / "claude-accounts" / "2",
+        config_dir=tmp_path / "slots" / "2",
         tmp_dir=tmp_path / "cache" / "2",
         managed=True,
     )
@@ -4584,3 +4586,32 @@ def test_a_row_that_leaves_takes_its_projection_with_it(
     usage_before, trends_before, usage_after, trends_after = drive(go, overview=both)
     assert usage_before == trends_before == {1, 2}
     assert usage_after == trends_after == {1}
+
+
+def test_a_rename_is_kept_and_ctrl_z_names_the_slot_as_it_was(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M5: a rename says "Saved … · Undo: ctrl+z", and ctrl+z names the slot as it was, in
+    the registry."""
+    core.create_account()
+    accounts_service.set_alias("2", "work")
+
+    async def go(
+        pilot: Pilot[None],
+    ) -> tuple[dict[int, str | None], dict[int, str | None], list[str]]:
+        app = fleet_app(pilot)
+        view = await open_accounts(pilot)
+        await rename(pilot, 2)
+        field(view, 2).value = "home"
+        await pilot.press("enter")
+        await settle(app)
+        renamed = aliases()
+        row(view, 2).focus()
+        await pilot.press("ctrl+z")
+        await settle(app)
+        return renamed, aliases(), [n.message for n in app._notifications]
+
+    renamed, undone, toasts = drive_registry(go)
+    assert renamed == {1: None, 2: "home"}
+    assert undone == {1: None, 2: "work"}, "ctrl+z: the name it replaced"
+    assert "Saved slot 2's name · Undo: ctrl+z" in toasts, toasts

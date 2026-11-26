@@ -39,6 +39,7 @@ from typer.testing import CliRunner
 
 from aisquare.cli.app import app
 from aisquare.core import claude_accounts as core
+from aisquare.core import paths
 from aisquare.models import ClaudeAccount, ClaudeAccountStatus, UsageCause
 from aisquare.services import claude_accounts as service
 from tests.test_claude_accounts import NOW, _installed, _sign_in
@@ -203,6 +204,9 @@ def test_a_managed_slots_item_hashes_the_dir_its_launch_is_given(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AISQUARE_HOME", "/Users/me/.aisquare")
+    # An existing home, laid out as before 0.10.2 (#30): its slots keep their folders, so
+    # their logins keep their Keychain items (the one Node names here is for that path).
+    monkeypatch.setattr(paths, "layout_of", lambda root: paths.OLD)
     slot = core._managed(2)
     assert str(slot.config_dir) == "/Users/me/.aisquare/claude-accounts/2"
     assert core.keychain_service(slot, {}) == MANAGED_SLOT_2
@@ -226,6 +230,7 @@ def test_its_accounts_slot_names_the_same_items_and_their_rows_byte_for_byte(
     row a process that can read one says its login in (``usage-login:``) is keyed as it
     always was, byte for byte."""
     monkeypatch.setenv("AISQUARE_HOME", "/Users/me/.aisquare")
+    monkeypatch.setattr(paths, "layout_of", lambda root: paths.OLD)  # an existing home (#30)
     monkeypatch.setenv("USER", "me")
     for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
         monkeypatch.delenv(name, raising=False)

@@ -76,8 +76,7 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
                 agent.region,
             ),
             "buttons": [
-                _whole(app.query_one(wid, Button), view.region)
-                for wid in ("#save-settings", "#reload-settings", "#reset-settings")
+                _whole(app.query_one(wid, Button), view.region) for wid in ("#reset-settings",)
             ],
             "note lines": app.query_one("#settings-note", Static).region.height,
         }
@@ -125,9 +124,9 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
         fold = app.query_one(f"#{PREFERENCES_ADVANCED}", Collapsible)
         seen["advanced"] = _whole(fold.query_one("CollapsibleTitle"), prefs.region)
         seen["scrolled"] = prefs.scroll_y
-        await pilot.click("#updates-check")
-        await pilot.click("#save-settings")
+        await pilot.click("#updates-check")  # kept as it is clicked: there is no Save (M5)
         await settle(app)
+        seen["saved"] = [n.message for n in app._notifications if n.message.startswith("Saved ")]
         return seen
 
     seen = drive(go, size=(80, 24))
@@ -137,7 +136,7 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
     assert seen["captain"] == [True, True], "the Captain box and its line, whole once shown"
     assert isinstance(seen["agent rows"], int)
     assert seen["agent rows"] >= MAIN_WHOLE_ROWS, seen
-    assert seen["buttons"] == [True, True, True], "Save, Reload and Reset all, whole"
+    assert seen["buttons"] == [True], "Reset all, whole (no Save, no Reload: M5)"
     assert seen["note lines"] == 1
     assert seen["display"] == [True] * len(DISPLAY_CHOICES), seen
     assert seen["hint"] is True, seen
@@ -146,6 +145,8 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
     assert seen["scrolled"] == 0
     assert load_config().ui.always_show_project_path is True, "the tick was reached and saved"
     assert load_config().updates.check is False, "the release check's switch saved off"
+    saved = seen["saved"]
+    assert isinstance(saved, list) and "Saved the daily release check: off · Undo: ctrl+z" in saved
 
 
 def _shown(widget: Widget, body: Widget) -> bool:

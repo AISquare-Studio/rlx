@@ -144,7 +144,7 @@ def authored(origin: str) -> str:
 
 def origin_markers_dir() -> Path:
     """Where markers wait for their prompt: ``$AISQUARE_HOME/run/origin``."""
-    return paths.aisquare_home() / "run" / "origin"
+    return paths.run_dir() / "origin"
 
 
 def origin_digest(text: str) -> str:

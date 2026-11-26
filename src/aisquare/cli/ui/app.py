@@ -40,7 +40,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -81,6 +81,7 @@ from aisquare.cli.ui.groups import (
     TogglePin,
     UndoLayout,
 )
+from aisquare.cli.ui.needs_you_bar import BAR_WORKER, OPEN_KEY, NeedsYouBar
 from aisquare.cli.ui.project_menu import (
     FRESH,
     PAUSE,
@@ -766,7 +767,7 @@ class HelpScreen(ModalScreen[None]):
 
     CSS = """
     HelpScreen { align: center middle; }
-    #helpbox { width: 78; height: auto; max-height: 90%; border: heavy $accent;
+    #helpbox { width: 78; max-width: 100%; height: auto; max-height: 90%; border: heavy $accent;
                background: $surface; padding: 1 2; }
     #helpbox Static { height: auto; }
     """
@@ -841,6 +842,11 @@ class HelpScreen(ModalScreen[None]):
                 "on an agent's row, its menu: Pause or Resume, Stop, Restart, Rename",
             ),
             (self.escape_key.upper(), "hand focus from an agent's pane back to the sidebar"),
+            (
+                self.escape_key.upper(),
+                f"under {Panes.ONE_PANE_BELOW} columns, one side shows: switch to the other "
+                "(or click the bar on top)",
+            ),
             ("wheel", "scroll an agent pane; shift/alt+PgUp/PgDn too, shift+Home/End"),
             ("drag", "select text in a pane (double-click: a word) — copied on release"),
             *(self.MAC_COPY_KEYS if mac_keyboard() else ()),
@@ -941,6 +947,11 @@ class HelpScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+PaneSide = Literal["sidebar", "content"]
+SIDEBAR_SIDE: PaneSide = "sidebar"
+CONTENT_SIDE: PaneSide = "content"
+
+
 class Panes(Horizontal):
     """The two panes and the partition between them — and the partition's wiring (#137).
 
@@ -966,6 +977,14 @@ class Panes(Horizontal):
       a sentence typed at the agent from landing on the sidebar's one-key
       bindings, so the side WITHOUT the focus is faded too (``-unfocused``):
       the side the keys go to is the brighter one.
+    - **One pane at a time** (L2), below :attr:`ONE_PANE_BELOW` columns (SSH, a phone): the
+      sidebar and the content never share the row. The side shown is the side the focus is
+      in, so the keys go to what is on screen: an agent's pane taking the keyboard shows the
+      content, ``F12`` from it shows the sidebar. The escape key from anywhere else, and the
+      bar above (``PaneSwitch``), switch sides (:meth:`switch_side`). The sidebar fills the
+      row through its floor (``min-width``), never its width: that is the divider's ask,
+      kept for a wider terminal, and the divider is hidden. Crossing the line keeps the
+      selection and the focus.
 
     The app keeps no handler for any of it, and nothing here assumes there is
     one ``Divider`` on the screen: the handle and the navigator are this
@@ -992,6 +1011,10 @@ class Panes(Horizontal):
     # fade, and draws the rest of its widget's text as the fade would (``theme.MarkStatic``).
     DEFAULT_CSS = f"""
     Panes > .-unfocused {{ opacity: {FADE_OPACITY}; }}
+    Panes.-one-pane > Divider {{ display: none; }}
+    Panes.-one-pane > ContentSwitcher {{ display: none; }}
+    Panes.-one-pane.-content-side > ContentSwitcher {{ display: block; }}
+    Panes.-one-pane.-content-side > Sidebar {{ display: none; }}
     Panes > .{KEYBOARD_CLASS} Activatable.selected {{
         background: ${HIGHLIGHT_VARIABLE};
         color: ${HIGHLIGHT_TEXT_VARIABLE};
@@ -1004,10 +1027,29 @@ class Panes(Horizontal):
 
     MIN_CONTENT: ClassVar[int] = 40
     """The columns the content pane keeps, whatever the drag or the terminal's size."""
+    ONE_PANE_BELOW: ClassVar[int] = 70
+    """Below this many columns one side shows at a time (L2: SSH and phones)."""
+
+    class SideShown(Message):
+        """The side on screen changed, or whether one side shows at a time did."""
+
+        def __init__(self, one_pane: bool, side: PaneSide) -> None:
+            self.one_pane = one_pane
+            self.side: PaneSide = side
+            super().__init__()
+
+    one_pane = False
+    """Whether one side shows at a time: the terminal is under :attr:`ONE_PANE_BELOW`."""
+    side: PaneSide = "sidebar"
+    """The side shown while :attr:`one_pane`: the one the focus is in, or was last in."""
 
     @property
     def sidebar(self) -> Sidebar:
         return self.query_children(Sidebar).first()
+
+    @property
+    def content(self) -> ContentSwitcher:
+        return self.query_children(ContentSwitcher).first()
 
     @property
     def divider(self) -> Divider:
@@ -1028,11 +1070,86 @@ class Panes(Horizontal):
 
     def _fit(self, total: int) -> None:
         sidebar = self.sidebar
-        sidebar.styles.max_width = self.sidebar_ceiling(total, floor_of(sidebar))
+        one_pane = total < self.ONE_PANE_BELOW
+        if one_pane:
+            # The whole row while it is the side shown: its floor is the row, and its width
+            # stays the divider's ask (``Divider._restore``), for a wider terminal.
+            sidebar.styles.max_width = None
+            sidebar.styles.min_width = total
+        else:
+            sidebar.styles.min_width = None  # the stylesheet's floor again
+            sidebar.styles.max_width = self.sidebar_ceiling(total, floor_of(sidebar))
+        if one_pane is self.one_pane:
+            return
+        self.one_pane = one_pane
+        self.set_class(one_pane, "-one-pane")
+        # The side the focus is in, crossing the line either way; the sidebar with none.
+        in_content = self._side_of(self.screen.focused) is self.content
+        self._show_side(CONTENT_SIDE if in_content else SIDEBAR_SIDE, changed=True)
+
+    def _show_side(self, side: PaneSide, *, changed: bool = False) -> None:
+        """Show ``side`` while one side shows at a time, and say so (:class:`SideShown`)."""
+        if side == self.side and not changed:
+            return
+        self.side = side
+        self.set_class(side == CONTENT_SIDE, "-content-side")
+        self.post_message(self.SideShown(self.one_pane, side))
+
+    def show_sidebar(self) -> None:
+        """One side at a time: the sidebar, with the keyboard."""
+        if not self.one_pane:
+            return
+        self._show_side(SIDEBAR_SIDE)
+        self.sidebar.focus()
+
+    def show_content(self, *, focus: bool = True) -> None:
+        """One side at a time: the content, and the keyboard in it once it is laid out
+        (``focus``): an agent's pane, else the open view's first stop. A view with nothing to
+        focus leaves the keyboard with no widget, where the app's keys are live, not with the
+        hidden sidebar's rows."""
+        if not self.one_pane:
+            return
+        self._show_side(CONTENT_SIDE)
+        if focus:
+            self.call_after_refresh(self._focus_content)
+
+    def switch_side(self) -> None:
+        """The escape key or the bar (``PaneSwitch``): the other side."""
+        if self.side == CONTENT_SIDE:
+            self.show_sidebar()
+        else:
+            self.show_content()
+
+    def _focus_content(self) -> None:
+        if not self.one_pane or self.side != CONTENT_SIDE:
+            return
+        screen = self.screen
+        content = self.content
+        if self._side_of(screen.focused) is content:
+            return  # already there: a selected agent's pane took it (``FleetApp._focus_pane``)
+        view = content.visible_content
+        pane = getattr(view, "pane", None)
+        if view is None:
+            target: Widget | None = None
+        elif isinstance(pane, TerminalPane):
+            target = pane
+        else:
+            target = next((w for w in screen.focus_chain if view in w.ancestors_with_self), None)
+        screen.set_focus(target)
+
+    def _side_of(self, focused: Widget | None) -> DOMNode | None:
+        """The direct child ``focused`` is in; ``None`` for no focus or one outside."""
+        if focused is None:
+            return None
+        return next((node for node in focused.ancestors_with_self if node.parent is self), None)
 
     def on_resize_sidebar(self, event: ResizeSidebar) -> None:
-        """The sidebar's keyboard fallback: step or reset the partition."""
+        """The sidebar's keyboard fallback: step or reset the partition. Not while one side
+        shows at a time: no divider is on screen, and a step would remember a width the
+        sidebar's floor, the whole row, had clamped."""
         event.stop()
+        if self.one_pane:
+            return
         if event.delta is None:
             self.divider.reset()
         else:
@@ -1055,14 +1172,12 @@ class Panes(Horizontal):
         in; with nothing focused, or the focus outside this container, no side
         has it and none is faded.
         """
-        focused = self.screen.focused
-        side = (
-            None
-            if focused is None
-            else next((node for node in focused.ancestors_with_self if node.parent is self), None)
-        )
+        side = self._side_of(self.screen.focused)
         divider = self.divider
         divider.set_class(side is self.sidebar, "-neighbour-focused")
+        if self.one_pane and side is not None:
+            # The side shown follows the keyboard: what the keys go to is what is on screen.
+            self._show_side(SIDEBAR_SIDE if side is self.sidebar else CONTENT_SIDE)
         # Display ▸ *Fade the side without the keyboard* (``[ui] fade_unfocused``, R17): off,
         # neither side fades; the divider's light still says where the keyboard is.
         ui = getattr(self.app, "ui_shown", None)
@@ -1118,6 +1233,32 @@ class Panes(Horizontal):
         if fades:
             for widget in side.walk_children(Widget):
                 widget.notify_style_update()
+
+
+class PaneSwitch(Static):
+    """The bar above the panes while one side shows at a time (L2): the side that is hidden,
+    and the way to it, a click here or the escape key (:meth:`Panes.switch_side`). Hidden
+    from :attr:`Panes.ONE_PANE_BELOW` columns up."""
+
+    DEFAULT_CSS = """
+    PaneSwitch { height: 1; width: 1fr; padding: 0 1; display: none; background: $boost; }
+    PaneSwitch:hover { background: $accent 30%; }
+    """
+    ALLOW_SELECT: ClassVar[bool] = False
+
+    def __init__(self, key: str, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self.key = key.upper()
+
+    def show_side(self, one_pane: bool, side: PaneSide) -> None:
+        """Shown while ``one_pane``, naming the side ``side`` hides."""
+        self.display = one_pane
+        hidden = "▸ open view" if side == SIDEBAR_SIDE else "◂ sidebar"
+        self.update(Text.assemble(hidden, " · ", (self.key, "bold")))
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        self.screen.query_one(Panes).switch_side()
 
 
 class _WorkerThreads(WorkerManager):
@@ -1314,6 +1455,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         Binding("R", "remote_panel", "remote"),
         Binding("r", "refresh_now", "refresh"),
         Binding("a", "toggle_captured", "captured", show=False),
+        Binding(OPEN_KEY, "open_need", "needs you", show=False),  # M7: the bar's first item
     ]
     SIDEBAR_ACTIONS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -1452,6 +1594,9 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         Claude-only machine never names one, as 0.9.2 did not (C1 of #120). From the
         accounts read, handed on when it lands; a read that failed leaves it as it was."""
         self.escape_key = escape_key or fleet_service.settings().escape_key
+        # Below Panes.ONE_PANE_BELOW columns it switches sides from anywhere an agent's pane
+        # does not hold it (the pane hands it back to the sidebar itself); wide, it is not live.
+        self.bind(self.escape_key, "switch_pane", description="switch side", show=False)
         ui = settings_service.ui_settings()
         self.ui_shown: UiSettings = ui
         """``[ui]`` as the shell last applied it: Display's switches (R17) are applied again only
@@ -1540,6 +1685,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     # --- layout -------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        yield NeedsYouBar(id="needs-you-bar")  # M7: what needs you, in any project
+        yield PaneSwitch(self.escape_key, id="pane-switch")
         with Panes(id="main"):
             yield Sidebar(id="sidebar", captain=self.captain_on)
             # The partition is a widget, not a border: drag it, or step it with
@@ -1581,6 +1728,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if home is not None:
             self.doctor_scope = home
             self.call_later(self.go_home)
+        else:
+            # Start lands on Welcome, no project listed. While one side shows at a time (L2,
+            # under ONE_PANE_BELOW) it is the side shown, as any view a person asks for is: the
+            # focus sat in the sidebar, so the narrow layout showed that, with Welcome hidden
+            # (review of #585, #1247).
+            self.call_after_refresh(self.query_one(Panes).show_content)
         self.run_doctor()
         # After the first frame, off the UI thread: the reopen's look at the agents the press
         # recorded, and the release check, which asks PyPI at most once a day whatever the
@@ -1714,6 +1867,9 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             )
         if action == "toggle_captured" and not self.capturing:
             return False  # nothing is captured, so there is nothing to show (#139)
+        if action == "switch_pane":
+            panes = next(iter(self.query(Panes)), None)
+            return panes is not None and panes.one_pane
         if action not in self.SIDEBAR_ACTIONS:
             return True
         focused = self.focused
@@ -1726,6 +1882,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     def on_escape_to_sidebar(self, event: EscapeToSidebar) -> None:
         self.sidebar.focus()
+
+    def action_switch_pane(self) -> None:
+        """The escape key while one side shows at a time (L2): the other side."""
+        self.query_one(Panes).switch_side()
+
+    def on_panes_side_shown(self, event: Panes.SideShown) -> None:
+        self.query_one(PaneSwitch).show_side(event.one_pane, event.side)
 
     # --- theme ----------------------------------------------------------------------
 
@@ -1844,6 +2007,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.unsaved = Autosave.flush_all(self)
 
     # --- help / refresh ---------------------------------------------------------------
+
+    def action_open_need(self) -> None:
+        """F6: the needs-you bar's first item, on its project's board (M7)."""
+        self.query_one(NeedsYouBar).open_first()
 
     def action_help(self) -> None:
         self.push_screen(
@@ -2523,7 +2690,9 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """Switch the right pane to ``view_id``, building it with ``factory`` the first time.
 
         ``counted``: a use of the view for the feature counts. Not one the sidebar's arrows
-        open on their way past its row — browsing ten rows is not ten uses (#77).
+        open on their way past its row — browsing ten rows is not ten uses (#77). A counted
+        view is one asked for, so while one side shows at a time it is the side shown, the
+        keyboard in it (L2); the arrows' views open behind the sidebar.
         """
         switcher = self.content
         try:
@@ -2536,6 +2705,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             switcher.current = view_id
         if counted:
             feature_use.record(view_feature(view_id))
+            self.query_one(Panes).show_content()
         self.call_after_refresh(self._maybe_ask_sharing)  # once, after onboarding: see there
 
     async def on_add_project(self, event: AddProject) -> None:
@@ -2771,7 +2941,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         started = event.agent
         project = self.snapshot.project(started.project_id) if self.snapshot else None
         named = agent_name(started.label, project)
-        self.notify(f"✓ {restart_word(receipt)} {named} — {receipt.how}", timeout=6, markup=False)
+        if event.moved_to is None and isinstance(receipt, fleet_service.RestartReceipt):
+            said = f"✓ {restart_word(receipt)} {named} — {receipt.how}"
+        else:
+            said = event.headline(named)  # a Move's, said once (#14)
+        self.notify(said, timeout=6, markup=False)
         for note in receipt.notes:
             self.notify(note, severity="warning", timeout=8, markup=False)
         await self._show_restarted(event, read_again=True)
@@ -2786,9 +2960,14 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.refresh_data(then=lambda: self._show_restarted(event, read_again=False))
             return
         if status is None:
+            receipt = event.receipt
+            done = (
+                restart_word(receipt)
+                if isinstance(receipt, fleet_service.RestartReceipt)
+                else "moved"  # a Move's switch (#14)
+            )
             self.notify(
-                f"{started.label} {restart_word(event.receipt)} — its row appears on the next "
-                "refresh",
+                f"{started.label} {done} — its row appears on the next refresh",
                 timeout=5,
                 markup=False,
             )
@@ -3116,6 +3295,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 self.post_message(StopAgent(project_id, agent_id))
             elif choice in (AGENT_PAUSE, AGENT_RESUME, RESTART):
                 self._agent_action(status, choice)
+            elif choice is not None:  # a limited agent's Move or Wait (#14)
+                from aisquare.cli.ui.views.agent import from_menu
+
+                from_menu(self, status, choice, menu.offer)
 
         menu = AgentMenu(status, event.anchor, pausable=pausable(status), rename_refusal=refusal)
         self.push_screen(menu, chosen)
@@ -4739,6 +4922,7 @@ def _writing_workers() -> dict[str, str]:
         project,
         settings,
         settings_remote,
+        tmux_page,
         welcome,
     )
 
@@ -4763,7 +4947,9 @@ def _writing_workers() -> dict[str, str]:
         settings_remote.TOKEN_WORKER: "Settings ▸ Remote's save of the ngrok token",
         agent.RESTART_WORKER: "an agent's restart",
         agent.PAUSE_WORKER: "an agent's pause",
+        agent.MOVE_WORKER: "an agent's move to another account",
         fleet_bulk.BULK_WORKER: "a restart, stop, pause or resume of many agents",
+        tmux_page.ACT_WORKER: "Settings ▸ tmux's close or adopt of a window",
         accounts.SIGN_OUT_WORKER: "an AISquare sign-out",
         accounts.COMPLETE_WORKER: "a Claude sign-in",
         accounts.ABANDON_WORKER: "a Claude sign-in's discard",
@@ -4801,6 +4987,7 @@ def _waited_reads() -> dict[str, str]:
         fleet_bulk,
         resources,
         settings_remote,
+        tmux_page,
         welcome,
     )
 
@@ -4820,10 +5007,14 @@ def _waited_reads() -> dict[str, str]:
         accounts.LOGIN_OPEN_WORKER: "a Claude log-in's stored login",
         accounts.LOGIN_POLL_WORKER: "a Claude sign-in's check",
         agent.LABELS_WORKER: "an agent's account names",
+        agent.TASK_WORKER: "an agent's task",
+        agent.OFFER_WORKER: "the account a limited agent can move to",
         board.LABELS_WORKER: "a board's account names",
+        BAR_WORKER: "the needs-you bar's read of the boards",
         board.HISTORY_WORKER: "a board's task history",
         fleet_bulk.PLAN_WORKER: "Settings ▸ Fleet's read of the running agents",
         resources.SAMPLE_WORKER: "Agent resources' read of the agents",
+        tmux_page.READ_WORKER: "Settings ▸ tmux's read of the windows",
         app_settings.ACCOUNTS_WORKER: "App settings' accounts",
         welcome.worker_name("look"): "Welcome's checks",
         welcome.worker_name("candidates"): "Welcome's folder list",

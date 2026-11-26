@@ -914,7 +914,8 @@ def test_fleet_check_fails_open_on_a_damaged_store(home: Path) -> None:
 
 def test_fleet_check_does_not_write_the_tmux_conf(home: Path) -> None:
     """Read-only in the fleet's own terms: ``argv`` would create the bundled conf; we do not."""
-    conf = home / tmux_core.CONF_NAME
+    conf = paths.tmux_conf_path()  # in the home's own layout (#30)
+    assert conf.is_relative_to(home)
     assert not conf.exists()
 
     diagnostics._check_fleet(lambda socket: FakeServer(socket=socket))
@@ -966,7 +967,7 @@ def test_real_tmux_reports_available_and_sees_a_pane_come_and_go(
     assert "1 live agent(s)" in healthy.detail
     assert stale.status is CheckStatus.warn, stale.detail
     assert "coder-1" in stale.detail and stale.fix and "fleet reap" in stale.fix
-    assert not (home / tmux_core.CONF_NAME).exists(), "doctor wrote the fleet's conf"
+    assert not paths.tmux_conf_path().exists(), "doctor wrote the fleet's conf"
 
 
 # --- doctor(cwd=…) ----------------------------------------------------------------------------
@@ -1316,8 +1317,10 @@ def test_the_fleet_terminal_row_says_the_agent_s_keys_in_asq_s_words_in_asq() ->
 
     assert "(every key reaches the agent in fleet attach; F12 detaches)" in shell
     assert shown == shell.replace(
-        "in fleet attach; F12 detaches)", "in its pane; F12 returns to the sidebar)"
+        "server prefix None (every key reaches the agent in fleet attach; F12 detaches)",
+        "every key you type reaches the agent in its pane (F12 returns to the sidebar)",
     )
+    assert "server prefix" not in shown, "no tmux word in asq's Doctor (0.10.2)"
 
 
 def test_the_fleet_terminal_row_names_the_running_servers_tmux_not_the_binary_on_path() -> None:
@@ -1965,3 +1968,253 @@ def test_doctor_says_a_role_on_another_agent_gets_no_deny_token(
     (reviewer,) = [c for c in diagnostics._check_role_tools() if c.name == "reviewer tools"]
     assert reviewer.status == CheckStatus.ok
     assert reviewer.detail.startswith("no deny token: 'aider' is not claude"), reviewer.detail
+
+
+def test_asqs_doctor_shows_no_tmux_words(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.10.2 (the exploratory test's cosmetics): asq's Doctor said "server prefix None",
+    "(-L asq)" and "the private tmux server 'asq'". Built as asq gets them (``doctor --json``
+    under ``IN_APP_ENV``) and shown in its Doctor, the rows say rlx's agent server, and what
+    a key does in the pane. The shell keeps its words (the tests above)."""
+    import asyncio
+
+    from textual.app import App, ComposeResult
+    from textual.widgets import Collapsible, Static
+
+    from aisquare.cli.ui.views.doctor import DoctorView
+    from aisquare.core import program
+    from tests.ui_workers import settle_page
+
+    monkeypatch.setenv(program.IN_APP_ENV, "1")
+    idle = diagnostics._check_fleet(lambda socket: FakeServer(socket=socket))  # no agents yet
+    terminal = FakeServer(version=(3, 7), absent=False)
+    terminal.scripted = {
+        ("show-options", "-gv", "prefix"): "None\n",
+        ("show-environment", "-g"): "",
+    }
+    project = _seed(tmp_path / "repo")
+    _seed(tmp_path / "repo", _agent(project.id, "manager", "%1"))
+    pinned = FakeServer(version=(3, 7), absent=False)
+    pinned.scripted = {("show-environment", "-g"): "AISQUARE_TEAM_HUB=/elsewhere\n"}
+    rows = [
+        _terminal_row(terminal, {}),
+        diagnostics._check_fleet(lambda socket: FakeServer(sessions=(), panes={}, absent=True)),
+        diagnostics._check_fleet_server_env(pinned, boards=[tmp_path / "repo"]),
+        idle,
+        *_every_other_fleet_branch(tmp_path, monkeypatch),
+    ]
+
+    class Host(App[None]):
+        def compose(self) -> ComposeResult:
+            yield DoctorView(refresh=lambda cwd: rows, id="doctor")
+
+    async def drive() -> str:
+        host = Host()
+        async with host.run_test(size=(160, 50)):
+            view = host.query_one(DoctorView)
+            view.show(rows)
+            await settle_page(host)
+            view.query_one("#doctor-passed", Collapsible).collapsed = False
+            await settle_page(host)
+            return "\n".join(str(s.render()) for s in view.query("Static").results(Static))
+
+    shown = asyncio.run(drive())
+
+    for word in ("server prefix", "(-L ", "tmux server '"):
+        assert word not in shown, (word, shown)
+    assert "rlx's agent server" in shown
+    assert "every key you type reaches the agent in its pane" in shown
+
+
+def test_a_ui_tester_is_wanted_when_one_runs_or_the_persons_own_config_names_it(
+    home: Path, tmp_path: Path
+) -> None:
+    """The built-in default role alone is not wanting one: every install has it, and every
+    saved setting writes its table whole (the reviewer of #15)."""
+    from aisquare.services import settings as settings_service
+
+    assert diagnostics._ui_tester_wanted() is False, "a fresh home: no file, no agent"
+
+    settings_service.set_value("agents.mcp", "true")  # an unrelated setting saved
+    assert "ui-tester" in paths.config_path().read_text("utf-8"), "the premise: written whole"
+    assert diagnostics._ui_tester_wanted() is False, "the default table, written whole, is not"
+
+    settings_service.set_value("fleet.roles.ui-tester.deny_tools", '["Bash"]')
+    assert diagnostics._ui_tester_wanted() is True, "set up by the person: other than built in"
+
+    paths.config_path().unlink()
+    project = _seed(tmp_path / "repo")
+    tester = _agent(project.id, "ui-tester-1", "%4").model_copy(update={"role": "ui-tester"})
+    _seed(tmp_path / "repo", tester)
+    assert diagnostics._ui_tester_wanted() is True, "one runs"
+
+
+@pytest.mark.parametrize("seat", ["ui-tester", "ui-tester2"])
+def test_a_team_profile_of_a_ui_tester_is_one_set_up(home: Path, seat: str) -> None:
+    """The tester of #15, round 3: ``team bind ui-tester --bin claude`` writes
+    ``[team.profiles.ui-tester]``, and the doctor still said none was wanted (hub #429: a team
+    profile that names a ui-tester counts). Another role's profile is not one."""
+    runner = CliRunner()
+
+    bound = runner.invoke(app, ["team", "bind", "coder", "--bin", "claude"])
+    assert bound.exit_code == 0, bound.output
+    assert diagnostics._ui_tester_wanted() is False, "a coder's profile is no ui-tester's"
+
+    bound = runner.invoke(app, ["team", "bind", seat, "--bin", "claude"])
+    assert bound.exit_code == 0, bound.output
+    assert f"[team.profiles.{seat}]" in paths.config_path().read_text("utf-8"), "the premise"
+    assert diagnostics._ui_tester_wanted() is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["team", "bind", "ui-tester", "--account", "1"],
+        ["accounts", "default", "1", "--role", "ui-tester"],
+    ],
+    ids=["team bind --account", "accounts default --role"],
+)
+def test_a_ui_tester_bound_to_an_account_alone_is_one_set_up(
+    home: Path, command: list[str]
+) -> None:
+    """The tester of #15, round 4: ``team bind ui-tester --account 1`` writes a profile of
+    its account alone (no ``carries_launch``), and the doctor still said none was wanted."""
+    bound = CliRunner().invoke(app, command)
+    assert bound.exit_code == 0, bound.output
+    from aisquare.core.config import load_config
+
+    profile = load_config().team.profiles["ui-tester"]
+    assert profile.account == "1" and not profile.carries_launch, "the premise"
+
+    assert diagnostics._ui_tester_wanted() is True
+
+
+def test_a_ui_tester_account_picked_in_app_settings_is_one_set_up(home: Path) -> None:
+    """The same binding from App settings' ui-tester row: its account select, kept at once
+    (M5's autosave, #24: the page has no Save button), the way M5's own tests pick one."""
+    from textual.widgets import Select
+
+    from aisquare.core import claude_accounts as accounts_core
+    from aisquare.core.config import load_config
+    from tests.settings_fields import leave_fields
+    from tests.test_ui_app_settings import drive, settle
+
+    accounts_core.create_account()  # slot 2, under the isolated AISQUARE_HOME
+    assert diagnostics._ui_tester_wanted() is False
+
+    async def pick(pilot: Any, host: Any) -> list[tuple[str, str]]:
+        await settle(pilot)  # the slots arrive from a worker
+        host.query_one("#role-acct-ui-tester", Select).value = "2"
+        leave_fields(host)
+        await settle(pilot)
+        return list(host.notices)
+
+    notices = drive(pick)
+
+    assert any(m.startswith("Saved ") for m, _ in notices), notices
+    assert load_config().team.profiles["ui-tester"].account == "2"
+    assert paths.config_path().read_text("utf-8").count("[team.profiles.ui-tester]") == 1
+    assert diagnostics._ui_tester_wanted() is True
+
+
+def test_a_numbered_ui_tester_seat_running_is_one_running(home: Path, tmp_path: Path) -> None:
+    """A launch stores the seat as given (``ui-tester2``); it is a ui-tester all the same
+    (``harness.base_role``; the tester of #15, round 3)."""
+    project = _seed(tmp_path / "repo")
+    seat = _agent(project.id, "ui-tester-2", "%4").model_copy(update={"role": "ui-tester2"})
+    _seed(tmp_path / "repo", seat)
+
+    assert diagnostics._ui_tester_wanted() is True
+
+
+def test_a_store_that_will_not_open_still_has_the_config_asked(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One try for both reads skipped the config whenever the store failed (round 3, nit)."""
+    from aisquare.services import settings as settings_service
+
+    _seed(tmp_path / "repo")  # a store on disk
+    settings_service.set_value("fleet.roles.ui-tester.deny_tools", '["Bash"]')
+
+    def refused() -> None:
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(diagnostics, "store_session", refused)
+
+    assert diagnostics._ui_tester_wanted() is True
+
+
+def test_the_status_line_row_is_ok_with_a_quiet_install_offer(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    states = ["none", "ours", "none"]
+    from aisquare.services import claude_accounts as accounts_service
+
+    monkeypatch.setattr(
+        accounts_service,
+        "statusline_sites",
+        lambda **_: [SimpleNamespace(state=state) for state in states],
+    )
+
+    row = diagnostics._check_statusline()
+
+    assert row is not None and row.status is CheckStatus.ok
+    assert row.detail.startswith("off on 2 account(s)")
+    assert row.offer is not None and row.offer.endswith("accounts statusline --install")
+    states[:] = ["ours", "wrapped", "foreign"]
+    assert diagnostics._check_statusline() is None, "every account has one: no row"
+
+
+def _every_other_fleet_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[DoctorCheck]:
+    """``_check_fleet``'s other rows, each built in a home of its own (the reviewer of #15):
+    live agents, a server running with none, one whose socket file is gone, another server on
+    its socket, a server that does not answer. Each as the tests above set it up."""
+    monkeypatch.setattr(tmux_core, "boot_id", lambda: "this-boot")
+    then = datetime(2026, 10, 13, 9, 0, 7, tzinfo=UTC)
+    built: list[DoctorCheck] = []
+
+    def in_a_home(name: str) -> ProjectInfo:
+        monkeypatch.setenv(paths.HOME_ENV_VAR, str(tmp_path / f"home-{name}"))
+        paths.ensure_home()
+        with store_session():
+            pass
+        return _seed(tmp_path / f"repo-{name}")
+
+    project = in_a_home("live")
+    _seed(
+        tmp_path / "repo-live", _agent(project.id, "manager", "%1"), _agent(project.id, "c", "%2")
+    )
+    live = FakeServer(sessions=("asq-x",), panes={"%1": _facts("%1"), "%2": _facts("%2")})
+    built.append(diagnostics._check_fleet(lambda socket: live))
+
+    in_a_home("sessions")
+    built.append(diagnostics._check_fleet(lambda socket: FakeServer(sessions=("asq-x",), panes={})))
+
+    project = in_a_home("held")
+    held = _agent(project.id, "coder-1", "%2").model_copy(update={"boot_id": "this-boot"})
+    _seed(tmp_path / "repo-held", held)
+    gone = FakeServer(sessions=(), panes={}, absent=True, listened="gone")
+    built.append(diagnostics._check_fleet(lambda socket: gone))
+
+    project = in_a_home("taken")
+    taken = _agent(project.id, "coder-1", "%2").model_copy(
+        update={"boot_id": "this-boot", "server_started_at": then}
+    )
+    _seed(tmp_path / "repo-taken", taken)
+    other = FakeServer(
+        sessions=("asq-other",), panes={}, started=then + timedelta(minutes=5), listened="answers"
+    )
+    built.append(diagnostics._check_fleet(lambda socket: other))
+
+    project = in_a_home("silent")
+    _seed(tmp_path / "repo-silent", _agent(project.id, "coder-1", "%2"))
+    silent = FakeServer(sessions=(), panes={}, absent=False)
+    built.append(diagnostics._check_fleet(lambda socket: silent))
+
+    said = " | ".join(row.detail for row in built)
+    for branch in ("agent(s) running", "no agent is", "cannot reach", "another program", "answer"):
+        assert branch in said, f"the premise: the {branch!r} branch was built: {said}"
+    return built

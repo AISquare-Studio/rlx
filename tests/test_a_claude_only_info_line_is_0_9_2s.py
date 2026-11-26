@@ -12,10 +12,13 @@ accounts of more than one agent listed (``named``: ``FleetApp.agents_named``), a
 follows the account and its use, outside what a narrow row keeps whole.
 
 :data:`LINES_0_9_2` is what 0.9.2's own ``info_line`` (6a77e650's views/agent.py, loaded
-beside this package) painted for these rows. These are fixed strings, not a live import of
-0.9.2, and they cover text, styles and the label's cut. The rows carry ``agent="claude-code"``,
-as every spawn records it since #113; a row with no agent recorded hid C1 from the tests
-before this one."""
+beside this package) painted for these rows, less one thing on purpose: the pane id (``%3``)
+that ended them. 0.10.2's UX audit (Q2) took it out of every header: a ``%N`` is tmux's name
+for the pane, nobody's. With nothing after the account and its use, the manager's row at 38
+cells no longer ends in ``…``. Every cut, cell and style before it is 0.9.2's, unchanged.
+These are fixed strings, not a live import of 0.9.2, and they cover text, styles and the
+label's cut. The rows carry ``agent="claude-code"``, as every spawn records it since #113; a
+row with no agent recorded hid C1 from the tests before this one."""
 
 from __future__ import annotations
 
@@ -79,20 +82,21 @@ ROWS = {
     ),
 }
 
-#: 0.9.2's painted line for each row at each width (a nowrap, ellipsis row of that width).
+#: 0.9.2's painted line for each row at each width (a nowrap, ellipsis row of that width),
+#: less the pane id 0.10.2 took out of the header (Q2; the module docstring).
 LINES_0_9_2 = {
-    ("manager", 38): "🧭 manager  ◦ waiting  account 3 · 0%…",
-    ("manager", 45): "🧭 manager  ◦ waiting  account 3 · 0%  %3",
-    ("manager", 60): "🧭 manager  ◦ waiting  account 3 · 0%  %3",
-    ("manager", 200): "🧭 manager  ◦ waiting  account 3 · 0%  %3",
+    ("manager", 38): "🧭 manager  ◦ waiting  account 3 · 0%",
+    ("manager", 45): "🧭 manager  ◦ waiting  account 3 · 0%",
+    ("manager", 60): "🧭 manager  ◦ waiting  account 3 · 0%",
+    ("manager", 200): "🧭 manager  ◦ waiting  account 3 · 0%",
     ("coder-r2l", 38): "🔨 coder-…  ◦ waiting  account 3 · 0%…",
     ("coder-r2l", 45): "🔨 coder-r2l  ◦ waiting  account 3 · 0%  cla…",
     ("coder-r2l", 60): "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-haiku-5-5 m…",
-    ("coder-r2l", 200): "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-haiku-5-5 medium  %3",
+    ("coder-r2l", 200): "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-haiku-5-5 medium",
     ("coder-01m78wvz", 38): "🔨 coder-01m78…  ▶ working  work · 7%…",
     ("coder-01m78wvz", 45): "🔨 coder-01m78wvz  ▶ working  work · 7%  cla…",
     ("coder-01m78wvz", 60): "🔨 coder-01m78wvz  ▶ working  work · 7%  claude-opus-5-5 hi…",
-    ("coder-01m78wvz", 200): "🔨 coder-01m78wvz  ▶ working  work · 7%  claude-opus-5-5 high  %7",
+    ("coder-01m78wvz", 200): "🔨 coder-01m78wvz  ▶ working  work · 7%  claude-opus-5-5 high",
 }
 
 #: 0.9.2's line with its styles (``Text.markup``) where the label is cut and where it is not.
@@ -100,17 +104,16 @@ MARKUP_0_9_2 = {
     ("coder-r2l", 38): (
         "🔨 [bold]coder-…[/bold]  [dim]◦ waiting[/dim]  [blue]account 3[dim][/blue] · "
         "[#3fb950][/dim]0%[/#3fb950]  [dim cyan]claude-haiku-5-5[/dim cyan] [cyan]medium"
-        "[/cyan]  [dim italic]%3[/dim italic]"
+        "[/cyan]"
     ),
     ("coder-r2l", 200): (
         "🔨 [bold]coder-r2l[/bold]  [dim]◦ waiting[/dim]  [blue]account 3[dim][/blue] · "
         "[#3fb950][/dim]0%[/#3fb950]  [dim cyan]claude-haiku-5-5[/dim cyan] [cyan]medium"
-        "[/cyan]  [dim italic]%3[/dim italic]"
+        "[/cyan]"
     ),
     ("coder-01m78wvz", 38): (
         "🔨 [bold]coder-01m78…[/bold]  [green]▶ working[/green]  [blue]work[dim][/blue] · "
         "[#3fb950][/dim]7%[/#3fb950]  [dim cyan]claude-opus-5-5[/dim cyan] [cyan]high[/cyan]"
-        "  [dim italic]%7[/dim italic]"
     ),
 }
 
@@ -154,14 +157,14 @@ def test_beside_another_agents_accounts_a_narrow_row_keeps_0_9_2s_account_and_us
 @pytest.mark.parametrize(
     ("row", "line"),
     [
-        ("manager", "🧭 manager  ◦ waiting  account 3 · 0%  claude-code  %3"),
+        ("manager", "🧭 manager  ◦ waiting  account 3 · 0%  claude-code"),
         (
             "coder-r2l",
-            "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-code  claude-haiku-5-5 medium  %3",
+            "🔨 coder-r2l  ◦ waiting  account 3 · 0%  claude-code  claude-haiku-5-5 medium",
         ),
         (
             "coder-01m78wvz",
-            "🔨 coder-01m78wvz  ▶ working  work · 7%  claude-code  claude-opus-5-5 high  %7",
+            "🔨 coder-01m78wvz  ▶ working  work · 7%  claude-code  claude-opus-5-5 high",
         ),
     ],
 )

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from textual.widgets import Button, Input, Static
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.remote_control import RemoteController
+from aisquare.cli.ui.save_model import CommitInput
 from aisquare.cli.ui.ticks import while_running
 from aisquare.services import ngrok_sdk
 from aisquare.services.ngrok_sdk import BAD_TOKEN
@@ -192,14 +194,15 @@ class NgrokLookedFor(Message):
 
 
 class TokenSlot(Vertical):
-    """*Paste your ngrok token*: the field, where a free one comes from, *Save*, and why a
-    token was refused, beside the field. The Remote page shows it while no token is
+    """*Paste your ngrok token*: the field, where a free one comes from, and why a token was
+    refused, beside the field. The Remote page shows it while no token is
     configured, and as *Replace your ngrok token* while ngrok refuses the one there is or its
     *Change* asked for it (``RemotePanel._paint_remote_needs``), with a line saying so where
     ``NGROK_AUTHTOKEN`` overrides what it saves.
 
-    *Save* (or Enter) hands the field to :func:`store_ngrok_token` on a worker; the field
-    hides what is typed, and the token is said nowhere.
+    Enter, or leaving the field (M5: there is no *Save*), hands it to :func:`store_ngrok_token`
+    on a worker; the field hides what is typed, and the token is said nowhere. No ctrl+z takes
+    a token back: the one it replaced is a secret rlx keeps no copy of.
     """
 
     DEFAULT_CSS = """
@@ -223,17 +226,18 @@ class TokenSlot(Vertical):
             classes="remote-token-about",
         )
         with Horizontal(id="settings-remote-token-row"):
-            yield Input(
+            yield CommitInput(
                 placeholder="your ngrok token",
                 password=True,
                 id="settings-remote-token-field",
                 compact=True,
             )
-            yield Button("Save", id="settings-remote-token-save", variant="primary", compact=True)
             yield Button("Get one", id="settings-remote-token-open", compact=True)
         yield Static("", id="settings-remote-token-problem")
 
     def on_mount(self) -> None:
+        field = self.query_one("#settings-remote-token-field", CommitInput)
+        field.leaving = self.remote_keep_typed_token  # set here, as every page's (M5)
         self.query_one("#settings-remote-token-problem").display = False
         self.query_one("#settings-remote-token-env").display = False
 
@@ -251,15 +255,48 @@ class TokenSlot(Vertical):
         event.stop()
         self.app.open_url(AUTHTOKEN_FROM)
 
-    @on(Button.Pressed, "#settings-remote-token-save")
-    def _save_pressed(self, event: Button.Pressed) -> None:
+    @on(CommitInput.Committed, "#settings-remote-token-field")
+    def _save_committed(self, event: CommitInput.Committed) -> None:
         event.stop()
-        self.remote_save_token()
+        if event.value:  # a field emptied is no token to save
+            self.remote_save_token()
 
-    @on(Input.Submitted, "#settings-remote-token-field")
-    def _save_submitted(self, event: Input.Submitted) -> None:
-        event.stop()
-        self.remote_save_token()
+    def remote_keep_typed_token(self, field: CommitInput) -> None:
+        """The page closed, or rlx quitting, with a token typed and not entered
+        (``CommitInput.leaving``): checked and saved as Enter would, showing nothing
+        here. While rlx runs, on a worker of the app's, which says how it went; quitting, before
+        rlx goes, for as long as ngrok's check may take (``ngrok_sdk.CHECK_SECONDS``) at most."""
+        token = field.value
+        if not token.strip():
+            return
+        app = self.app
+
+        def remote_store_typed() -> str:
+            try:
+                store_ngrok_token(token)
+            except TokenRefused as exc:
+                return f"the ngrok token was not saved: {exc}"
+            except Exception as exc:  # never the token: only what kind of failure
+                return f"the ngrok token could not be saved: {type(exc).__name__}"
+            return "✓ ngrok token saved"
+
+        if app._running:
+
+            def remote_store_and_say() -> None:
+                said = remote_store_typed()
+                app.call_from_thread(app.notify, said, timeout=6, markup=False)
+
+            app.run_worker(
+                remote_store_and_say,
+                name=TOKEN_WORKER,
+                group=TOKEN_WORKER,
+                thread=True,
+                exit_on_error=False,
+            )
+            return
+        quitting = threading.Thread(target=remote_store_typed, name=TOKEN_WORKER, daemon=True)
+        quitting.start()
+        quitting.join(ngrok_sdk.CHECK_SECONDS + 1)
 
     def remote_save_token(self) -> None:
         """Save what the field holds, off the UI thread; one save at a time."""
@@ -269,7 +306,6 @@ class TokenSlot(Vertical):
         ):
             return
         token = self.query_one("#settings-remote-token-field", Input).value
-        self.query_one("#settings-remote-token-save", Button).disabled = True
         self.run_worker(
             lambda: store_ngrok_token(token),
             name=TOKEN_WORKER,
@@ -282,11 +318,10 @@ class TokenSlot(Vertical):
         if event.worker.name != TOKEN_WORKER or not event.worker.is_finished:
             return
         event.stop()
-        self.query_one("#settings-remote-token-save", Button).disabled = False
         problem = self.query_one("#settings-remote-token-problem", Static)
         error = event.worker.error
         if event.state is WorkerState.SUCCESS:
-            self.query_one("#settings-remote-token-field", Input).value = ""
+            self.query_one("#settings-remote-token-field", CommitInput).keep("")
             problem.display = False
             self.notify("✓ ngrok token saved", timeout=5, markup=False)
             self.post_message(TokenSaved())
