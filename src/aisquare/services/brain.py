@@ -506,8 +506,8 @@ def _as_the_hook(
                 captured[name] = file.read()
 
 
-def _run_rlx(argv: list[str]) -> int:
-    """``aisquare.cli.app.main`` on ``argv``, as the console script runs it: its exit
+def _run_rlx() -> int:
+    """``aisquare.cli.app.main`` on ``sys.argv``, as the console script runs it: its exit
     status."""
     from aisquare.cli import app as app_module
 
@@ -547,7 +547,7 @@ def _hook(params: Mapping[str, Any]) -> Result:
     fresh_caches()
     argv = [sys.argv[0], "hook", str(event)]
     with _as_the_hook(env, cwd if isinstance(cwd, str) else None, argv, stdin) as captured:
-        code = _run_rlx(argv)
+        code = _run_rlx()
     return {
         "stdout_b64": base64.b64encode(captured["stdout"]).decode("ascii"),
         "stderr_b64": base64.b64encode(captured["stderr"]).decode("ascii"),
