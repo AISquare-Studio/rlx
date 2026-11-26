@@ -45,7 +45,8 @@ import dataclasses
 import os
 import shutil
 import sys
-from collections.abc import Callable, Iterator, Mapping
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -53,7 +54,7 @@ from typing import Literal, Protocol
 from aisquare.core import agents as agent_core
 from aisquare.core import claude_accounts as accounts_core
 from aisquare.core import config as config_core
-from aisquare.core import harness, orchestrator, paths, selfcli
+from aisquare.core import harness, launch_seal, orchestrator, paths, selfcli
 from aisquare.core import program as prog
 from aisquare.core import tmux as tmux_core
 from aisquare.core.agent_adapters import adapters, get_adapter
@@ -990,6 +991,25 @@ row reads so), and ``lost`` (its window is gone) and ``exited`` agents are not t
 LiveAgents = Callable[[ProjectInfo], list[FleetAgentStatus]]
 
 
+def is_a_fleet(running: Iterable[str]) -> bool:
+    """Whether agents of these roles, each one running, are a fleet that is up, as Welcome's
+    step 3 says "Your fleet is up": a manager and :data:`CODERS` coders."""
+    roles = list(running)
+    return FLEET_ROLE in roles and roles.count(CODER_ROLE) >= CODERS
+
+
+def fleet_is_up(rows: Iterable[FleetAgentStatus]) -> bool:
+    """Whether a project's fleet is up (:func:`is_a_fleet`), by the listing's rows of it: an
+    agent whose row has not ended and that the listing sees there (:data:`RUNNING`).
+
+    What the shell's usage-sharing question waits for (Q6: after "Your fleet is up", never
+    mid-setup), whichever page rlx opens on: until a listed project's fleet is up, a first run
+    is still being set up."""
+    return is_a_fleet(
+        row.agent.role for row in rows if row.agent.ended_at is None and row.state in RUNNING
+    )
+
+
 def live_agents(project: ProjectInfo) -> list[FleetAgentStatus]:
     """The project's agents whose rows are not ended, with the state the listing derives.
 
@@ -1255,3 +1275,67 @@ def start_on_agent(
         return started
     first, *rest = started.steps
     return FleetStart((dataclasses.replace(first, notes=(*notes, *first.notes)), *rest))
+
+
+# --- the coders, once the manager's folder is trusted (M4/L3) -----------------------------
+
+TRUST_WAIT = 30 * 60.0
+"""How long :func:`wait_for_trust` waits for the manager's folder-trust answer, in seconds:
+past it, step 3's *Start the coders* is the user's."""
+
+TRUST_POLL = 1.0
+"""How often it asks, in seconds."""
+
+
+def trust_answered(manager: FleetAgent) -> bool:
+    """Whether ``manager`` has come past its folder-trust question: its first hook has run. An
+    agent runs no hook in a folder nobody trusted, so its ``SessionStart`` is the answer.
+    Codex's, whose hooks run only once they are trusted too, comes once both are.
+
+    First as this launch's own record says it (``fleet._started_by_its_hook``, ``tell``'s
+    word): no clock is compared, so a start that came before the row was stamped counts. The
+    row's ``created_at`` is stamped once its window is open, and in a folder trusted already
+    the agent's ``SessionStart`` can come first (the reviewer of #570). Else its board
+    session seen since that launch (``fleet._started_since``)."""
+    record = launch_seal.read(manager.id)
+    if isinstance(record, launch_seal.LaunchRecord) and fleet_service._started_by_its_hook(record):
+        return True
+    return fleet_service._started_since(manager.session_id, manager.created_at)
+
+
+def _manager_ended(manager: FleetAgent) -> bool:
+    """Whether ``manager``'s row has ended: stopped, or its window gone and reaped."""
+    try:
+        with store_session() as store:
+            row = store.get_fleet_agent(manager.id)
+    except Exception:  # a store that will not answer ends nothing: the next poll asks again
+        return False
+    return row is None or row.ended_at is not None
+
+
+def wait_for_trust(
+    manager: FleetAgent,
+    *,
+    answered: Callable[[FleetAgent], bool] = trust_answered,
+    ended: Callable[[FleetAgent], bool] = _manager_ended,
+    cancelled: Callable[[], bool] = lambda: False,
+    wait: float = TRUST_WAIT,
+    poll: float = TRUST_POLL,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Whether ``manager`` answered its folder-trust question (:func:`trust_answered`) before
+    the wait ended: its row ended, the caller cancelled (``cancelled``: Welcome's worker, at a
+    quit), or ``wait`` seconds passed. Reads, and writes nothing: a quit may cut it off.
+
+    Welcome's *Start fleet* opens the manager's pane for that answer and runs this; on a
+    ``True`` it starts the coders as *Start the coders* does (:func:`start_on_agent` with no
+    manager), so they follow the answer on their own (M4/L3). Each coder, started first, would
+    ask the same question in a pane nobody is looking at. The two halves are two workers: this
+    wait, which a quit may cut off, and the start, which a quit waits for."""
+    deadline = clock() + wait
+    while not answered(manager):
+        if cancelled() or ended(manager) or clock() >= deadline:
+            return False
+        sleep(poll)
+    return not (cancelled() or ended(manager))
