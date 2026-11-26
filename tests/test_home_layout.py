@@ -8,7 +8,8 @@ so nothing reads or writes this machine's ``~/.aisquare`` or ``~/.rlx``.
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator
+import os
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -159,6 +160,59 @@ def test_either_variable_names_the_home_and_its_contents_say_how(
     assert paths.home_of() == (named, paths.OLD), "an old layout's folder: an old home"
     (named / "rlx.db").write_text("")
     assert paths.home_of() == (named, paths.NEW), "rlx.db: a new home, whatever else is there"
+
+
+def _frozen(folder: Path, change: Callable[[], object]) -> None:
+    """``change`` made at ``folder``'s top with its modification time left as it was, as a
+    coarse timestamp (NTFS's ~15.6 ms, a Linux jiffy) leaves it (CI 45737236858, windows)."""
+    before = folder.stat()
+    change()
+    os.utime(folder, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert folder.stat().st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize(
+    ("start", "change", "after"),
+    [
+        ("launch-seals/", "rlx.db", paths.NEW),  # an old home given its new store
+        ("context.db", "rlx.db", paths.NEW),
+        ("rlx.db", "-rlx.db", paths.OLD),  # the new store moved aside, an old one beside it
+        ("", "context.db", paths.OLD),
+        ("", "claude-accounts/", paths.OLD),
+    ],
+)
+def test_a_layout_never_outlives_a_change_at_the_homes_top(
+    user_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str,
+    change: str,
+    after: paths.Layout,
+) -> None:
+    """The layout is read from what is at the home's top each time it is asked: a verdict kept
+    by the folder's modification time came back stale on Windows when ``rlx.db`` appeared
+    within one tick (the full matrix of #592, round 2)."""
+
+    def make(name: str) -> None:
+        if name.endswith("/"):
+            (named / name).mkdir()
+        elif name:
+            (named / name).write_text("", encoding="utf-8")
+
+    named = tmp_path / "named"
+    named.mkdir()
+    monkeypatch.setenv(paths.RLX_HOME_ENV, str(named))
+    make(start)
+    if change.startswith("-"):
+        make("context.db")
+    paths.layout_of(named)  # asked once before the change, as a running rlx would
+    paths.layout_of(named)
+    if change.startswith("-"):
+        _frozen(named, (named / change[1:]).unlink)
+    else:
+        _frozen(named, lambda: make(change))
+    assert paths.layout_of(named) == after
+    assert paths.home_of() == (named, after)
 
 
 def test_rlx_home_wins_over_aisquare_home(

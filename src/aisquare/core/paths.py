@@ -444,37 +444,20 @@ def home_of(
     return new, NEW
 
 
-_LAYOUTS: dict[tuple[str, int], Layout] = {}
-"""Each home's layout as its markers decided it, keyed by its folder and the folder's
-modification time, which an entry made or removed at its top moves: one ``stat`` per question
-once a marker is there. A home with no marker yet is looked at again every time."""
-
-
 def layout_of(root: Path) -> Layout:
     """How the home at ``root`` is laid out, by what is at its top: :data:`NEW` with
-    ``rlx.db``, :data:`OLD` with any of :data:`OLD_LAYOUT_MARKERS`, :data:`NEW` with neither
-    (a home not made yet, or made and not used)."""
-    try:
-        stamp = root.stat().st_mtime_ns
-    except OSError:
-        return NEW  # nothing there yet: a new home
-    key = (str(root), stamp)
-    found = _LAYOUTS.get(key)
-    if found is not None:
-        return found
+    ``rlx.db``, :data:`OLD` with any of :data:`OLD_LAYOUT_MARKERS` or an agent's accounts
+    folder, :data:`NEW` with neither (a home not made yet, or made and not used).
+
+    Read afresh each time: a ``stat`` for a new home, two for an old one with its store, all of
+    them for one with no marker yet. Nothing is kept, as a verdict kept by the folder's
+    modification time outlived a marker made within one tick of it (NTFS's ~15.6 ms, a Linux
+    jiffy): an old home given its ``rlx.db`` still read as old (#592's full matrix, Windows)."""
     if any((root / marker).exists() for marker in NEW_LAYOUT_MARKERS):
-        found = NEW
-    elif any((root / marker).exists() for marker in OLD_LAYOUT_MARKERS) or _has_old_accounts(root):
-        found = OLD
-    else:
-        # Not kept: a marker made within the folder's timestamp's resolution (a jiffy on
-        # Linux, about 15.6 ms on NTFS) leaves its modification time as it was, and a kept
-        # "nothing yet" would outlive it. A home's markers, once there, stay.
         return NEW
-    if len(_LAYOUTS) > 64:  # a test suite's many homes: keep it small
-        _LAYOUTS.clear()
-    _LAYOUTS[key] = found
-    return found
+    if any((root / marker).exists() for marker in OLD_LAYOUT_MARKERS) or _has_old_accounts(root):
+        return OLD
+    return NEW  # nothing there yet, or made and not used: a new home
 
 
 def _has_old_accounts(root: Path) -> bool:
