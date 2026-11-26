@@ -94,6 +94,7 @@ from aisquare.cli.ui.project_menu import (
 )
 from aisquare.cli.ui.receiver import listen_for_ui, stop_listening_for_ui
 from aisquare.cli.ui.remote_control import SWITCHES, RemoteController, ngrok_ends_with
+from aisquare.cli.ui.service_client import ServiceClient
 from aisquare.cli.ui.sidebar import (
     ALIVE_STATES,
     CAPTAIN_READING,
@@ -244,7 +245,7 @@ from aisquare.models import (
     ShipReport,
 )
 from aisquare.services import claude_accounts as accounts_service
-from aisquare.services import diagnostics, install_route, project_groups
+from aisquare.services import diagnostics, install_route, project_groups, service_host
 from aisquare.services import fleet as fleet_service
 from aisquare.services import fresh as fresh_service
 from aisquare.services import lifecycle as lifecycle_service
@@ -542,6 +543,9 @@ class _FleetRead:
     asqs: tuple[instances.Instance, ...] | None = None
     """The asqs live on this home (#20), for the chip under the status line; ``None`` when the
     read did not ask (a read a test builds) or the registry could not be read."""
+    service: service_host.Hosting | None = None
+    """The rlx service of this release among :attr:`asqs`, which hosts what this TUI then
+    leaves to it (#32, ``cli.ui.service_client``)."""
 
 
 def _read_frame(
@@ -553,9 +557,11 @@ def _read_frame(
     """One frame of the sidebar, read on the calling thread: the fleet, then the captain's
     home board and row when the captain is on (``experimental.captain``). ``viewed`` and
     ``scope`` as for :func:`_read_fleet`."""
-    read = _read_fleet(show_captured, viewed, scope, captain=captain)
+    asqs = _live_asqs()
+    service = service_host.hosting(asqs)  # it retries held-back nudges then, not this TUI (#32)
+    read = _read_fleet(show_captured, viewed, scope, captain=captain, nudges=service is None)
     read = replace(_read_captain(read), captain_asked=True) if captain else read
-    return replace(read, asqs=_live_asqs())
+    return replace(read, asqs=asqs, service=service)
 
 
 def _live_asqs() -> tuple[instances.Instance, ...] | None:
@@ -575,6 +581,7 @@ def _read_fleet(
     scope: Collection[str] | None = None,
     *,
     captain: bool = False,
+    nudges: bool = True,
 ) -> _FleetRead:
     """One frame of the fleet, read on the calling thread: the projects and their groups,
     then their agents. One store session reads them all; ``list_agents_many`` then asks
@@ -635,8 +642,9 @@ def _read_fleet(
         ]
     # The one write a frame makes: a manager nudge a draft held back goes out once its input
     # box is clear (P0-W2, #276); nothing is opened when nothing is owed.
-    with contextlib.suppress(Exception):
-        fleet_service.send_deferred_nudges(owed)
+    if nudges:  # not while the rlx service runs, which retries them itself (#32)
+        with contextlib.suppress(Exception):
+            fleet_service.send_deferred_nudges(owed)
     return _FleetRead(
         capturing,
         projects,
@@ -1510,6 +1518,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # A start saves its switch here once its deadline is written on the controller's
         # writer thread, in order with a turn-off's own save (post_message is thread-safe).
         self.remote.call_back = self.call_later
+        self.service_client = ServiceClient(
+            self.remote,
+            lambda said: self.notify(
+                said, title=service_host.SERVICE, severity="warning", timeout=10
+            ),
+        )
+        """The rlx service, if one runs: this TUI is then its client (#32)."""
         self.refresh_seconds = refresh_seconds
         self._doctor = doctor
         self._release_check = release_check
@@ -1942,6 +1957,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         and a runner has eight. An hourly interval of the release check's own took one for
         the app's whole life, and the UI tests whose thread workers then queued behind the
         timers failed on Windows CI, the same seven twice (runs 39991862850, 40013337378)."""
+        self.service_client.take_back()  # the rlx service died: what it hosted is ours again
         self._remote_auto_off()
         if (
             self._release_check is not None
@@ -2184,6 +2200,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if read.asqs is not None:  # read beside the store, so said whatever the store said
             mine = instances.this_instance()
             sidebar.show_instances(read.asqs, None if mine is None else mine.id)
+            self.service_client.note_hosting(read.service)
         if read.error is not None:  # the store is briefly unavailable — keep what is shown
             self.store_error = read.error
             if self.snapshot is None:
@@ -4754,7 +4771,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # The others as the registration's beat thread last read them: the UI thread reads no
         # folder (review of #462). An asq that started since is the command's to refuse.
         registration = instances.this_registration()
-        others = () if registration is None else tuple(i.label for i in registration.others)
+        others = (
+            ()
+            if registration is None
+            # Not the rlx service: the command stops it, and the upgrade starts it again, itself
+            # (``lifecycle.running_asqs`` leaves it out the same way; #32, #1743).
+            else tuple(i.label for i in registration.others if i.kind != "service")
+        )
         refusal = lifecycle_service.asqs_refusal(
             event.args[0], others, again=f"press {button} again"
         )

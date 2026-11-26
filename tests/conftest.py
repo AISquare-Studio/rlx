@@ -944,6 +944,53 @@ def no_background_shipper(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(active_ping, "_spawn", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def no_real_service(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test starts a REAL detached ``rlx service run`` unless it asks for :func:`real_service`.
+
+    One outlives the test that started it (ppid 1), minds that test's home and holds its Remote
+    port: ``tests/test_stubs.py`` running ``service start`` with no arguments left real services
+    running after pytest (#32's tester, #1743). The one place a service is started,
+    ``service_host._spawn_service``, refuses here, as :class:`ServiceError` says it."""
+    if "real_service" in request.fixturenames:
+        return
+    from aisquare.services import service_host
+
+    def refuse(command: Any, out: Any) -> Any:
+        raise service_host.ServiceError(
+            "a test may not start a real rlx service (tests/conftest.py::no_real_service); "
+            "one that must asks for the real_service fixture"
+        )
+
+    monkeypatch.setattr(service_host, "_spawn_service", refuse)
+
+
+@pytest.fixture
+def real_service(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Any]]:
+    """Real ``rlx service run`` processes for this test: each one it starts is listed, and one
+    still running at its end is killed and FAILS the test, so none outlives it."""
+    from aisquare.services import service_host
+
+    started: list[Any] = []
+    spawn = service_host._spawn_service
+
+    def recorded(command: Any, out: Any) -> Any:
+        child = spawn(command, out)
+        started.append(child)
+        return child
+
+    monkeypatch.setattr(service_host, "_spawn_service", recorded)
+    yield started
+    left = [child for child in started if child.poll() is None]
+    for child in left:
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except Exception:
+            child.kill()
+    assert not left, f"the test left rlx services running: pids {[c.pid for c in left]}"
+
+
 @pytest.fixture
 def sharing_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Usage sharing may be turned on: none of the three things that force it off is set

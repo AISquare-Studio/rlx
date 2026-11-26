@@ -13,6 +13,7 @@ the real detached process to prove the command never waits on the server.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import subprocess
@@ -362,6 +363,65 @@ def test_hooks_and_the_detached_senders_never_start_a_ping(
     runner.invoke(app, ["metrics", "ship"])
 
     assert inline.count == 0 and stub.seen == []
+
+
+def test_the_rlx_service_never_starts_a_ping(
+    stub: Stub, clock: Clock, inline: Starts, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ruling on #32 (Q2): the daily active ping stays out of the rlx service, which is up
+    every day whether anyone opened rlx or not. Its sweep ran `metrics stats`, a counted
+    command, whose close sent the ping (#1842). Here SweepPart's own argv runs through the CLI
+    as its child runs it, beside `service run` and `service status`: no ping, and no feature
+    counted. The control is the old argv, which does both.
+
+    The sweep itself runs, over the suite's temp agent home, which is EMPTY (no transcripts, no
+    ~/.claude). The Keychain is ON (``keychain_platform`` true) with ``read_keychain`` recording
+    every read, so a read is seen. None is made: an empty sweep asks no account's login. It ran
+    `security` for 'Claude Code-credentials' (#1844, #1891); a home with transcripts is
+    test_rlx_service.py's."""
+    from types import SimpleNamespace
+
+    from aisquare.cli import app as cli_app
+    from aisquare.core import claude_accounts as accounts_core
+    from aisquare.core import feature_use
+    from aisquare.services import service_host
+
+    counted: list[str] = []
+    monkeypatch.setattr(cli_app, "_launch_usage_shared", lambda: True)  # a counted one records
+    monkeypatch.setattr(feature_use, "record", counted.append)
+    keychain: list[tuple[str, str]] = []
+
+    def no_keychain(service: str, account: str, *, fresh: bool = False) -> Any:
+        keychain.append((service, account))
+        return accounts_core.KeychainRead(found=False)
+
+    monkeypatch.setattr(accounts_core, "read_keychain", no_keychain)
+    monkeypatch.setattr(accounts_core, "keychain_platform", lambda: True)  # so a read is seen
+    monkeypatch.setattr(accounts_core, "KEYCHAIN_TOOL", os.devnull)
+    monkeypatch.setattr(service_host, "log_to_file", lambda: None)
+    monkeypatch.setattr(service_host, "run_service", lambda **_: None)  # the process, ended
+    started: list[list[str]] = []
+
+    def detached(command: list[str]) -> object:
+        started.append(list(command))
+        return SimpleNamespace(pid=4242, poll=lambda: None)
+
+    monkeypatch.setattr(service_host, "_detached", detached)
+    service_host.SweepPart().tick_part()
+    (argv,) = started
+    words = argv[argv.index("aisquare") + 1 :]  # what follows `python -P -m aisquare`
+
+    runner = CliRunner()
+    for command in (words, ["service", "run"], ["service", "status"]):
+        ran = runner.invoke(app, command)
+        assert ran.exception is None or isinstance(ran.exception, SystemExit), ran.output
+
+    assert words == list(service_host.SWEEP_COMMAND)
+    assert inline.count == 0 and stub.seen == [] and counted == []
+    assert keychain == [], "an empty sweep read the Keychain"
+
+    runner.invoke(app, ["--json", "metrics", "stats", "--range", "today"])  # the old argv
+    assert len(stub.seen) == 1 and counted == ["cli.metrics.stats"], "the control: it pings"
 
 
 def test_the_cli_loads_the_ping_module_only_when_it_runs_it() -> None:
