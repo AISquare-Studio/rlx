@@ -343,6 +343,18 @@ impl Reader {
             Err(e) => return Err(e),
         };
         self.gone = false;
+        let len = file.metadata()?.len();
+        if len < self.offset {
+            // The log was cut back under this reader: a failed append is cut off
+            // ([`append`]). What it had read of that append goes, so it is never joined
+            // to the next line.
+            let held = self.offset - self.partial.len() as u64;
+            match usize::try_from(len.saturating_sub(held)) {
+                Ok(keep) if len >= held => self.partial.truncate(keep),
+                _ => self.partial.clear(),
+            }
+            self.offset = len;
+        }
         file.seek(SeekFrom::Start(self.offset))?;
         let end = loop {
             let mut fresh = Vec::new();
@@ -486,5 +498,20 @@ mod tests {
         let mut rest = fs::OpenOptions::new().append(true).open(&path).unwrap();
         rest.write_all(b"\":1}\n").unwrap();
         assert_eq!(reader.read().unwrap(), vec![b"{\"partial\":1}\n".to_vec()]);
+    }
+
+    #[test]
+    fn a_reader_drops_what_it_read_of_an_append_cut_back() {
+        let (_temp, path) = temp("cut");
+        let mut reader = Reader::new(path.clone());
+        fs::write(&path, line(1, 3) + "{\"type\":\"run.te").unwrap();
+        assert_eq!(reader.read().unwrap(), vec![line(1, 3).into_bytes()]);
+        // The append failed part way and was cut back off; then the next one came.
+        let log = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        log.set_len(line(1, 3).len() as u64).unwrap();
+        assert!(reader.read().unwrap().is_empty());
+        let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        log.write_all(line(2, 3).as_bytes()).unwrap();
+        assert_eq!(reader.read().unwrap(), vec![line(2, 3).into_bytes()]);
     }
 }

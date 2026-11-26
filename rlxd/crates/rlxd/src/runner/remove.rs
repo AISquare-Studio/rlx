@@ -8,19 +8,27 @@
 //! - **macOS and Linux:** every folder is a descriptor opened with `O_NOFOLLOW |
 //!   O_DIRECTORY` relative to its parent's (`openat`), and files and folders are removed
 //!   relative to it (`unlinkat`). A link put at a path that was checked is never reached.
+//!   A folder on another filesystem than its parent's (a mount point) is not gone into.
+//!   The removal walks the tree with a stack of its own, at most [`MAX_DEPTH`] folders
+//!   deep, so no tree is deep enough to overflow a thread's stack.
 //! - **Windows:** every folder on the way is a handle opened with
 //!   `FILE_FLAG_OPEN_REPARSE_POINT`, checked through the handle, and held without
 //!   `FILE_SHARE_DELETE` until the erase is done: while it is held, nothing can delete or
 //!   rename that folder, so no link can take its place. What is removed below it is
-//!   removed by std, which follows no reparse point.
+//!   removed by std, which follows no reparse point (a volume mount point is one).
 //!
 //! A root (`<home>`, a Claude Code config directory) is opened following links: it is
-//! resolved once and taken as it is (manager #2548). Only what is below it is held to the
-//! rule.
+//! resolved once, and everything below it goes by what it resolved to (manager #2548).
+//! Only what is below it is held to the rule.
 
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// How many folders deep a removal goes below the folder it removes; deeper, it stops
+/// and fails, naming where. (On Windows std removes the tree, with no recursion.)
+#[cfg_attr(windows, allow(dead_code))]
+pub const MAX_DEPTH: usize = 256;
 
 /// What opening a folder below another found.
 pub enum Opened {
@@ -28,8 +36,41 @@ pub enum Opened {
     Missing,
     /// A link (a junction on Windows), which is not followed.
     Link,
+    /// A folder on another filesystem (a mount point), which is not gone into. (On
+    /// Windows a volume mount point is a junction, so a [`Opened::Link`].)
+    #[cfg_attr(windows, allow(dead_code))]
+    Mount,
+    /// A file, not a folder.
+    File,
     /// A folder, held.
     Dir(Dir),
+}
+
+/// A removal that failed: where, and why.
+#[derive(Debug)]
+pub struct Failed {
+    pub path: PathBuf,
+    pub error: io::Error,
+}
+
+impl Failed {
+    /// `error`, at `path`.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn at(path: PathBuf) -> impl FnOnce(io::Error) -> Failed {
+        move |error| Failed { path, error }
+    }
+
+    /// A mount point at `path`, which a removal doesn't go into.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn mount(path: PathBuf) -> Self {
+        Failed {
+            path,
+            error: io::Error::other(
+                "another filesystem is mounted here, and rlxd does not erase into it: \
+                 unmount it first",
+            ),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -40,23 +81,50 @@ pub use windows::Dir;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod unix {
-    use std::ffi::{CStr, CString, OsStr};
+    use std::ffi::{CStr, CString, OsStr, OsString};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
-    use super::Opened;
+    use super::{Failed, MAX_DEPTH, Opened};
 
     /// A folder, held open by a descriptor.
     pub struct Dir {
         fd: OwnedFd,
         /// Its path, for what is reported.
         shown: PathBuf,
+        /// The filesystem it is on.
+        dev: libc::dev_t,
     }
 
     fn c_name(name: &OsStr) -> io::Result<CString> {
         CString::new(name.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
+    /// `fd`, just opened, as a [`Dir`] at `shown`.
+    fn held(fd: libc::c_int, shown: PathBuf) -> io::Result<Dir> {
+        // SAFETY: `fd` was just opened, and nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: stat is plain data, for which zero is a valid value.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat(2) of a held descriptor into a writable stat.
+        if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Dir {
+            fd,
+            shown,
+            dev: stat.st_dev,
+        })
+    }
+
+    /// One level of a removal: a folder being emptied, its name in its parent, and the
+    /// names in it still to remove.
+    struct Level {
+        name: OsString,
+        dir: Dir,
+        names: Vec<CString>,
     }
 
     impl Dir {
@@ -64,7 +132,7 @@ mod unix {
         /// it isn't there.
         pub fn open_root(path: &Path) -> io::Result<Option<Dir>> {
             let c = c_name(path.as_os_str())?;
-            // SAFETY: open(2) of a NUL-terminated path; the descriptor is owned below.
+            // SAFETY: open(2) of a NUL-terminated path; the descriptor is owned by held().
             let fd = unsafe {
                 libc::open(
                     c.as_ptr(),
@@ -78,11 +146,7 @@ mod unix {
                     _ => Err(e),
                 };
             }
-            Ok(Some(Dir {
-                // SAFETY: `fd` was just opened, and nothing else owns it.
-                fd: unsafe { OwnedFd::from_raw_fd(fd) },
-                shown: path.to_path_buf(),
-            }))
+            held(fd, path.to_path_buf()).map(Some)
         }
 
         /// Its path.
@@ -90,10 +154,12 @@ mod unix {
             &self.shown
         }
 
-        /// The folder `name` in it, opened without following a link.
+        /// The folder `name` in it, opened without following a link, and only on its own
+        /// filesystem.
         pub fn child(&self, name: &OsStr) -> io::Result<Opened> {
             let c = c_name(name)?;
-            // SAFETY: openat(2) relative to a held descriptor; the result is owned below.
+            // SAFETY: openat(2) relative to a held descriptor; the result is owned by
+            // held().
             let fd = unsafe {
                 libc::openat(
                     self.fd.as_raw_fd(),
@@ -102,36 +168,29 @@ mod unix {
                 )
             };
             if fd >= 0 {
-                return Ok(Opened::Dir(Dir {
-                    // SAFETY: `fd` was just opened, and nothing else owns it.
-                    fd: unsafe { OwnedFd::from_raw_fd(fd) },
-                    shown: self.shown.join(name),
-                }));
+                let dir = held(fd, self.shown.join(name))?;
+                if dir.dev != self.dev {
+                    return Ok(Opened::Mount);
+                }
+                return Ok(Opened::Dir(dir));
             }
             let e = io::Error::last_os_error();
             match e.raw_os_error() {
                 Some(libc::ENOENT) => Ok(Opened::Missing),
                 Some(libc::ELOOP) => Ok(Opened::Link),
                 // Not a folder: a link (some systems say ENOTDIR for O_NOFOLLOW) or a file.
-                Some(libc::ENOTDIR) => {
-                    if self.is_link(name)? {
-                        Ok(Opened::Link)
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "{} is a file, not a folder",
-                                self.shown.join(name).display()
-                            ),
-                        ))
-                    }
-                }
+                Some(libc::ENOTDIR) => match self.kind(name)? {
+                    Some(libc::S_IFLNK) => Ok(Opened::Link),
+                    Some(_) => Ok(Opened::File),
+                    None => Ok(Opened::Missing),
+                },
                 _ => Err(e),
             }
         }
 
-        /// Whether `name` in it is a link.
-        fn is_link(&self, name: &OsStr) -> io::Result<bool> {
+        /// What `name` in it is (`S_IFMT` of its mode, a link not followed), or `None` when
+        /// nothing is there.
+        fn kind(&self, name: &OsStr) -> io::Result<Option<libc::mode_t>> {
             let c = c_name(name)?;
             // SAFETY: stat is plain data, for which zero is a valid value.
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -145,9 +204,13 @@ mod unix {
                 )
             };
             if done != 0 {
-                return Err(io::Error::last_os_error());
+                let e = io::Error::last_os_error();
+                return match e.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(None),
+                    _ => Err(e),
+                };
             }
-            Ok(stat.st_mode & libc::S_IFMT == libc::S_IFLNK)
+            Ok(Some(stat.st_mode & libc::S_IFMT))
         }
 
         /// Removes the file (or link) `name` in it. Whether there was one.
@@ -165,45 +228,105 @@ mod unix {
             }
         }
 
-        /// Removes the folder `name` in it and all it holds, following no link: each link
-        /// inside goes as a link, and is added to `links`.
-        pub fn remove_tree(&self, name: &OsStr, links: &mut Vec<PathBuf>) -> io::Result<()> {
-            match self.child(name)? {
-                Opened::Missing => return Ok(()),
-                Opened::Link => {
-                    self.remove_file(name)?;
-                    links.push(self.shown.join(name));
-                    return Ok(());
-                }
-                Opened::Dir(dir) => dir.empty(links)?,
-            }
+        /// Removes the empty folder `name` in it. A link put there meanwhile is not
+        /// followed: it fails with ENOTDIR.
+        fn remove_dir(&self, name: &OsStr) -> io::Result<()> {
             let c = c_name(name)?;
-            // SAFETY: unlinkat(2) of the emptied folder, relative to a held descriptor.
-            if unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-                return Err(io::Error::last_os_error());
+            // SAFETY: unlinkat(2) of a folder, relative to a held descriptor.
+            if unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+                return Ok(());
             }
-            Ok(())
+            let e = io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::ENOENT) => Ok(()),
+                _ => Err(e),
+            }
         }
 
-        /// Removes all it holds.
-        fn empty(&self, links: &mut Vec<PathBuf>) -> io::Result<()> {
-            for name in self.names()? {
-                let name = OsStr::from_bytes(name.to_bytes());
-                if self.is_link(name)? {
-                    self.remove_file(name)?;
-                    links.push(self.shown.join(name));
-                    continue;
+        /// Removes the folder `name` in it and all it holds, following no link and going
+        /// into no mount point: each link inside goes as a link, and is added to `links`.
+        /// It walks the tree with a stack of its own, at most [`MAX_DEPTH`] deep. What
+        /// failed, where, stops it.
+        pub fn remove_tree(&self, name: &OsStr, links: &mut Vec<PathBuf>) -> Result<(), Failed> {
+            let path = self.shown.join(name);
+            let top = match self.child(name).map_err(Failed::at(path.clone()))? {
+                Opened::Missing => return Ok(()),
+                Opened::Link => {
+                    self.remove_file(name).map_err(Failed::at(path.clone()))?;
+                    links.push(path);
+                    return Ok(());
                 }
-                match self.child(name) {
-                    Ok(Opened::Dir(_)) => self.remove_tree(name, links)?,
-                    Ok(Opened::Link) => {
-                        self.remove_file(name)?;
-                        links.push(self.shown.join(name));
+                Opened::File => {
+                    self.remove_file(name).map_err(Failed::at(path))?;
+                    return Ok(());
+                }
+                Opened::Mount => return Err(Failed::mount(path)),
+                Opened::Dir(dir) => dir,
+            };
+            let names = top.names().map_err(Failed::at(path))?;
+            let mut stack = vec![Level {
+                name: name.to_owned(),
+                dir: top,
+                names,
+            }];
+            while let Some(level) = stack.last_mut() {
+                let Some(entry) = level.names.pop() else {
+                    // Emptied: it goes, from its parent.
+                    let Some(done) = stack.pop() else { break };
+                    let parent = stack.last().map_or(self, |up| &up.dir);
+                    parent
+                        .remove_dir(&done.name)
+                        .map_err(Failed::at(done.dir.shown.clone()))?;
+                    continue;
+                };
+                let name = OsStr::from_bytes(entry.to_bytes());
+                let path = level.dir.shown.join(name);
+                let opened = match level.dir.kind(name).map_err(Failed::at(path.clone()))? {
+                    // Gone meanwhile.
+                    None => continue,
+                    Some(libc::S_IFDIR) => match level.dir.child(name) {
+                        Ok(opened) => opened,
+                        // A folder it may not read (mode 000, say) goes if it is empty;
+                        // else what failed is said of it.
+                        Err(e) => {
+                            if level.dir.remove_dir(name).is_ok() {
+                                continue;
+                            }
+                            return Err(Failed { path, error: e });
+                        }
+                    },
+                    Some(libc::S_IFLNK) => Opened::Link,
+                    Some(_) => Opened::File,
+                };
+                match opened {
+                    Opened::Missing => {}
+                    Opened::Link => {
+                        level
+                            .dir
+                            .remove_file(name)
+                            .map_err(Failed::at(path.clone()))?;
+                        links.push(path);
                     }
-                    Ok(Opened::Missing) => {}
-                    // A file.
-                    Err(_) => {
-                        self.remove_file(name)?;
+                    Opened::File => {
+                        level.dir.remove_file(name).map_err(Failed::at(path))?;
+                    }
+                    Opened::Mount => return Err(Failed::mount(path)),
+                    Opened::Dir(dir) => {
+                        if stack.len() >= MAX_DEPTH {
+                            return Err(Failed {
+                                path,
+                                error: io::Error::other(format!(
+                                    "the tree goes deeper than {MAX_DEPTH} folders, and rlxd \
+                                     stops here: remove it by hand"
+                                )),
+                            });
+                        }
+                        let names = dir.names().map_err(Failed::at(path))?;
+                        stack.push(Level {
+                            name: name.to_owned(),
+                            dir,
+                            names,
+                        });
                     }
                 }
             }
@@ -253,23 +376,31 @@ mod unix {
 mod windows {
     use std::ffi::OsStr;
     use std::io;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
 
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-        OPEN_EXISTING,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
     };
 
-    use super::Opened;
+    use super::{Failed, Opened};
+
+    /// A reparse tag's name-surrogate bit: a link of some kind (a symbolic link, a
+    /// junction, a volume mount point), as std's `is_symlink` reads it.
+    const NAME_SURROGATE: u32 = 0x2000_0000;
 
     /// A folder, held by a handle that lets nothing delete or rename it meanwhile.
     pub struct Dir {
-        path: PathBuf,
+        /// Its path below the resolved root, which every call goes by.
+        by: PathBuf,
+        /// Its path as it is shown, without the verbatim prefix.
+        shown: PathBuf,
         _held: OwnedHandle,
     }
 
@@ -311,43 +442,95 @@ mod windows {
         Ok(Some((held, info.dwFileAttributes)))
     }
 
+    /// The path `held` was opened at, as the OS resolved it (`\\?\C:\…`).
+    fn final_path(held: &OwnedHandle) -> io::Result<PathBuf> {
+        let mut wide = vec![0_u16; 512];
+        loop {
+            let size = u32::try_from(wide.len()).unwrap_or(u32::MAX);
+            // SAFETY: `wide` is writable for `size` wide characters; the handle is open.
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    held.as_raw_handle(),
+                    wide.as_mut_ptr(),
+                    size,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            };
+            let len = usize::try_from(len).unwrap_or(0);
+            if len == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if len < wide.len() {
+                wide.truncate(len);
+                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&wide)));
+            }
+            // Too small: `len` is the size it needs.
+            wide.resize(len + 1, 0);
+        }
+    }
+
+    /// Whether the reparse point `held` is a link of some kind (a name surrogate).
+    fn is_link(held: &OwnedHandle) -> io::Result<bool> {
+        let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+        let size = u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(0);
+        // SAFETY: `tag` is a writable FILE_ATTRIBUTE_TAG_INFO of `size`; the handle is open.
+        let read = unsafe {
+            GetFileInformationByHandleEx(
+                held.as_raw_handle(),
+                FileAttributeTagInfo,
+                (&raw mut tag).cast(),
+                size,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(tag.ReparseTag & NAME_SURROGATE != 0)
+    }
+
     impl Dir {
-        /// The folder `path`, following links: a root, taken as it resolves.
+        /// The folder `path`, following links: a root, taken as it resolves, once. All
+        /// below it goes by the path its handle resolved to, so a link at `path`
+        /// retargeted meanwhile changes nothing.
         pub fn open_root(path: &Path) -> io::Result<Option<Dir>> {
-            Ok(open(path, true)?.map(|(held, _)| Dir {
-                path: path.to_path_buf(),
+            let Some((held, _)) = open(path, true)? else {
+                return Ok(None);
+            };
+            let resolved = final_path(&held)?;
+            Ok(Some(Dir {
+                shown: crate::spaces::plain(&resolved),
+                by: resolved,
                 _held: held,
             }))
         }
 
         /// Its path.
         pub fn path(&self) -> &Path {
-            &self.path
+            &self.shown
         }
 
         /// The folder `name` in it, its reparse point not followed.
         pub fn child(&self, name: &OsStr) -> io::Result<Opened> {
-            let path = self.path.join(name);
+            let path = self.by.join(name);
             let Some((held, attributes)) = open(&path, false)? else {
                 return Ok(Opened::Missing);
             };
-            if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                && std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
-            {
+            if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && is_link(&held)? {
                 return Ok(Opened::Link);
             }
             if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is a file, not a folder", path.display()),
-                ));
+                return Ok(Opened::File);
             }
-            Ok(Opened::Dir(Dir { path, _held: held }))
+            Ok(Opened::Dir(Dir {
+                shown: self.shown.join(name),
+                by: path,
+                _held: held,
+            }))
         }
 
         /// Removes the file (or link) `name` in it. Whether there was one.
         pub fn remove_file(&self, name: &OsStr) -> io::Result<bool> {
-            match std::fs::remove_file(self.path.join(name)) {
+            match std::fs::remove_file(self.by.join(name)) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(e),
@@ -357,13 +540,22 @@ mod windows {
         /// Removes the folder `name` in it and all it holds, following no link: each link
         /// inside goes as a link, and is added to `links`. This folder stays held, so
         /// nothing can take `name`'s place by a rename above it.
-        pub fn remove_tree(&self, name: &OsStr, links: &mut Vec<PathBuf>) -> io::Result<()> {
-            let path = self.path.join(name);
-            links.extend(crate::spaces::links_in(&path));
+        pub fn remove_tree(&self, name: &OsStr, links: &mut Vec<PathBuf>) -> Result<(), Failed> {
+            let path = self.by.join(name);
+            let shown = self.shown.join(name);
+            links.extend(crate::spaces::links_in(&path).iter().map(|link| {
+                match link.strip_prefix(&path) {
+                    Ok(rest) => shown.join(rest),
+                    Err(_) => crate::spaces::plain(link),
+                }
+            }));
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
+                Err(e) => Err(Failed {
+                    path: shown,
+                    error: e,
+                }),
             }
         }
     }
@@ -374,8 +566,9 @@ pub fn name_of(path: &Path) -> &OsStr {
     path.file_name().unwrap_or_default()
 }
 
-/// The folders on the way from `root` down `steps`, each opened without following a link:
-/// all of them, or the path of the first that is a link, or `None` when one is missing.
+/// The folders on the way from `root` down `steps`, each opened without following a link
+/// or going into a mount point: all of them, or the path of the first that is a link or a
+/// mount point, or `None` when one is missing.
 pub fn walk(root: &Path, steps: &[&OsStr]) -> io::Result<Result<Option<Vec<Dir>>, PathBuf>> {
     let Some(mut dir) = Dir::open_root(root)? else {
         return Ok(Ok(None));
@@ -384,7 +577,16 @@ pub fn walk(root: &Path, steps: &[&OsStr]) -> io::Result<Result<Option<Vec<Dir>>
     for step in steps {
         match dir.child(step)? {
             Opened::Missing => return Ok(Ok(None)),
-            Opened::Link => return Ok(Err(dir.path().join(step))),
+            Opened::Link | Opened::Mount => return Ok(Err(dir.path().join(step))),
+            Opened::File => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} is a file, not a folder",
+                        dir.path().join(step).display()
+                    ),
+                ));
+            }
             Opened::Dir(next) => {
                 held.push(dir);
                 dir = next;
@@ -447,6 +649,88 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(elsewhere.join("keep")).unwrap(),
             "x"
+        );
+    }
+
+    /// `levels` folders, one in the other, made in `root` from `top`: the deepest.
+    fn chain(root: &Path, top: &str, levels: usize) -> PathBuf {
+        let mut deepest = root.join(top);
+        for _ in 1..levels {
+            deepest.push("d");
+        }
+        std::fs::create_dir_all(&deepest).unwrap();
+        deepest
+    }
+
+    #[test]
+    fn a_deep_tree_goes_to_its_bound_and_stops_past_it_naming_where() {
+        // A folder held per level: more than a default limit of 256 open files.
+        assert!(crate::runner::process::raise_fd_limit().is_some_and(|n| n > 512));
+        let root = temp("deep");
+        let dir = Dir::open_root(&root).unwrap().unwrap();
+        // MAX_DEPTH folders, the removed one the first: all go, with no recursion.
+        std::fs::write(chain(&root, "fits", MAX_DEPTH).join("f"), "x").unwrap();
+        let mut links = Vec::new();
+        dir.remove_tree(OsStr::new("fits"), &mut links).unwrap();
+        assert!(!root.join("fits").exists());
+        // One more: it stops there, and says where.
+        let deepest = chain(&root, "deeper", MAX_DEPTH + 1);
+        let failed = dir
+            .remove_tree(OsStr::new("deeper"), &mut links)
+            .unwrap_err();
+        assert_eq!(failed.path, deepest);
+        assert!(
+            failed.error.to_string().contains("deeper than"),
+            "{failed:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_mount_point_is_not_gone_into() {
+        // /dev is a filesystem of its own (devfs, devtmpfs) mounted on /.
+        let root = Dir::open_root(Path::new("/")).unwrap().unwrap();
+        assert!(matches!(
+            root.child(OsStr::new("dev")).unwrap(),
+            Opened::Mount
+        ));
+        assert!(matches!(
+            root.child(OsStr::new("etc")).unwrap(),
+            Opened::Dir(_) | Opened::Link
+        ));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_folder_it_may_not_read_is_named_unless_it_is_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid(2) can't fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads every folder
+        }
+        let root = temp("locked");
+        let dir = Dir::open_root(&root).unwrap().unwrap();
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        // Empty, it goes.
+        let empty = chain(&root, "a", 2);
+        mode(&empty, 0o000);
+        dir.remove_tree(OsStr::new("a"), &mut Vec::new()).unwrap();
+        assert!(!root.join("a").exists());
+        // Not empty, the erase stops at it, and names it.
+        let full = chain(&root, "b", 2);
+        std::fs::write(full.join("f"), "x").unwrap();
+        mode(&full, 0o000);
+        let failed = dir
+            .remove_tree(OsStr::new("b"), &mut Vec::new())
+            .unwrap_err();
+        mode(&full, 0o755);
+        assert_eq!(failed.path, full);
+        assert_eq!(
+            failed.error.kind(),
+            io::ErrorKind::PermissionDenied,
+            "{failed:?}"
         );
     }
 

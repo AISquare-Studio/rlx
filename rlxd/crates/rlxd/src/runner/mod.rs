@@ -103,6 +103,12 @@ pub struct Runner {
     /// made durable, to show a slow disk under one run holds up nothing else
     /// (`RLXD_TEST_SLOW_PERSIST=<space>:<ms>`).
     slow_persist: Option<(String, Duration)>,
+    /// Test builds only: a space whose `run.start`s write their records this long, and so
+    /// stay being started (`RLXD_TEST_SLOW_START=<space>:<ms>`).
+    slow_start: Option<(String, Duration)>,
+    /// Test builds only: a space whose erases take this long before they remove anything
+    /// (`RLXD_TEST_SLOW_ERASE=<space>:<ms>`).
+    slow_erase: Option<(String, Duration)>,
     runs: Mutex<Runs>,
     /// Set once rlxd stops: no run starts from then on.
     stopping: AtomicBool,
@@ -112,7 +118,8 @@ pub struct Runner {
 struct Runs {
     by_id: HashMap<RunId, Arc<Run>>,
     pools: HashMap<RunKind, Pool>,
-    /// Run ids taken by a `run.start` whose record is being written, outside this lock.
+    /// Runs being started (their records written) or resumed (decided under their own
+    /// locks), outside this lock, by id, with their spaces: an erase counts them live.
     reserved: HashMap<RunId, String>,
     /// Spaces being erased, outside this lock: no run starts or resumes in one.
     erasing: std::collections::HashSet<String>,
@@ -138,6 +145,31 @@ struct Run {
     state: watch::Sender<RunState>,
     /// The last `run_seq` in the run's log on disk: what `run.events` follows.
     logged: watch::Sender<u64>,
+    /// What `run.list` shows of the run, as last published: its own lock, held for a copy
+    /// and never over the disk, so a listing never waits on a run's lock.
+    view: Mutex<View>,
+}
+
+/// A run as `run.list` shows it.
+#[derive(Clone)]
+struct View {
+    state: RunState,
+    attempt: u64,
+    started_at: String,
+    ended_at: Option<String>,
+    last_run_seq: u64,
+}
+
+impl View {
+    fn of(inner: &RunInner) -> Self {
+        Self {
+            state: inner.state,
+            attempt: inner.attempt,
+            started_at: inner.started_at.clone(),
+            ended_at: inner.ended_at.clone(),
+            last_run_seq: inner.last_run_seq,
+        }
+    }
 }
 
 struct RunInner {
@@ -225,13 +257,20 @@ impl Runner {
     /// record says, so a pid the OS has given another process since is left alone.
     pub fn new(home: Home, bus: Arc<Bus>) -> Arc<Self> {
         let rlxd = std::env::current_exe().ok();
+        // An erase holds a folder open per level it is down.
+        #[cfg(unix)]
+        if let Some(limit) = process::raise_fd_limit() {
+            info!("open files: up to {limit}");
+        }
         let runner = Arc::new(Self {
             home,
             bus,
             spawner: Spawner::start(),
             hook: argv::hook_beside(rlxd.as_deref()),
             launch_delay: test_delay("RLXD_TEST_LAUNCH_DELAY_MS"),
-            slow_persist: test_slow_persist(),
+            slow_persist: test_slow_in("RLXD_TEST_SLOW_PERSIST"),
+            slow_start: test_slow_in("RLXD_TEST_SLOW_START"),
+            slow_erase: test_slow_in("RLXD_TEST_SLOW_ERASE"),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
         });
@@ -287,7 +326,7 @@ impl Runner {
                 && this_boot
                 && let Some(process) = &record.process
                 && let Some(started) = &process.started
-                && process::sweep(process.pid, started)
+                && process::sweep(process.pid, started, id.as_str())
             {
                 info!("run {id}: ended what an earlier rlxd left of its process group");
             }
@@ -369,6 +408,13 @@ impl Runner {
                 }),
                 state: watch::Sender::new(record.state),
                 logged: watch::Sender::new(tail.last_run_seq),
+                view: Mutex::new(View {
+                    state: record.state,
+                    attempt: record.attempt,
+                    started_at: record.started_at.clone(),
+                    ended_at: record.ended_at.clone(),
+                    last_run_seq,
+                }),
                 params: record.params,
             });
             if let Some(event) = lost {
@@ -509,6 +555,7 @@ impl Runner {
                 format!("rlxd already knows a run {id}: pick a new run_id"),
             ));
         }
+        let started_at = clock::now();
         let run = Arc::new(Run {
             job_id,
             client: client.to_owned(),
@@ -516,7 +563,7 @@ impl Runner {
             inner: Mutex::new(RunInner {
                 state: RunState::Queued,
                 attempt: 1,
-                started_at: clock::now(),
+                started_at: started_at.clone(),
                 ended_at: None,
                 last_run_seq: 0,
                 session: None,
@@ -537,9 +584,17 @@ impl Runner {
             }),
             state: watch::Sender::new(RunState::Queued),
             logged: watch::Sender::new(0),
+            view: Mutex::new(View {
+                state: RunState::Queued,
+                attempt: 1,
+                started_at,
+                ended_at: None,
+                last_run_seq: 0,
+            }),
             params,
         });
         let created = blocking(|| {
+            wait_if(self.slow_start.as_ref(), &run.params.space);
             run.dir.create()?;
             let mut inner = run.inner();
             inner.events = Some(run.dir.open_events()?);
@@ -663,13 +718,72 @@ impl Runner {
         }
         let run = self.find(&params.run_id)?;
         let id = params.run_id;
-        let mut runs = self.runs();
-        if runs.erasing.contains(&run.params.space) {
-            return Err(refusal(
-                codes::RUN_START_FAILED,
-                format!("the space {:?} is being erased", run.params.space),
-            ));
+        {
+            // The run is held for this resume under the runner's lock, and no run's lock
+            // is taken under it: an erase of its space counts it live meanwhile, and a
+            // second resume is refused.
+            let mut runs = self.runs();
+            if runs.erasing.contains(&run.params.space) {
+                return Err(refusal(
+                    codes::RUN_START_FAILED,
+                    format!("the space {:?} is being erased", run.params.space),
+                ));
+            }
+            if runs.reserved.contains_key(&id) {
+                return Err(refusal(
+                    codes::RUN_ALIVE,
+                    format!("run {id} is being resumed already"),
+                ));
+            }
+            runs.reserved.insert(id.clone(), run.params.space.clone());
         }
+        let resumed = self.resume_under_its_lock(&run, params.reply);
+        let kind = run.params.kind;
+        let queued = {
+            let mut runs = self.runs();
+            runs.reserved.remove(&id);
+            if resumed.is_err() {
+                None
+            } else {
+                let pool = runs.pools.entry(kind).or_default();
+                if pool.active < kind.pool() {
+                    pool.active += 1;
+                    None
+                } else {
+                    pool.waiting.push_back(Arc::clone(&run));
+                    Some(u32::try_from(pool.waiting.len()).unwrap_or(u32::MAX))
+                }
+            }
+        };
+        let attempt = resumed?;
+        info!("run {id}: resumed, attempt {attempt}");
+        match queued {
+            None => self.launch(&run),
+            Some(position) => {
+                let mut inner = run.inner();
+                // Unless a cancel ended it meanwhile: its place in the queue then goes on
+                // when its turn comes (launch()).
+                if inner.state == RunState::Queued {
+                    let record = run.record(&inner);
+                    if let Err(e) = blocking(|| run.dir.write_record(&record)) {
+                        warning!("run {id}: its record was not written: {e}");
+                    }
+                    self.emit(
+                        &run,
+                        &mut inner,
+                        run_types::QUEUED,
+                        &RunQueuedData::new(position),
+                    );
+                }
+            }
+        }
+        Ok(RunResumeData::new(id, attempt))
+    }
+
+    /// `run.resume`'s checks and its new attempt, under the run's own lock alone: the
+    /// attempt's number, or the refusal.
+    fn resume_under_its_lock(&self, run: &Run, reply: Option<String>) -> Result<u64, ErrorBody> {
+        let id = &run.params.run_id;
         let mut inner = run.inner();
         if inner.state.is_live() {
             return Err(refusal(
@@ -707,42 +821,13 @@ impl Runner {
         }
         inner.attempt += 1;
         inner.ending = None;
-        inner.reply = params.reply;
+        inner.reply = reply;
         inner.ended_at = None;
         inner.state = RunState::Queued;
         run.state.send_replace(RunState::Queued);
         self.clear_needs_you(&mut inner);
-        let attempt = inner.attempt;
-        let kind = run.params.kind;
-        let pool = runs.pools.entry(kind).or_default();
-        let queued = if pool.active < kind.pool() {
-            pool.active += 1;
-            None
-        } else {
-            pool.waiting.push_back(Arc::clone(&run));
-            Some(u32::try_from(pool.waiting.len()).unwrap_or(u32::MAX))
-        };
-        drop(runs);
-        info!("run {id}: resumed, attempt {attempt}");
-        match queued {
-            None => {
-                drop(inner);
-                self.launch(&run);
-            }
-            Some(position) => {
-                let record = run.record(&inner);
-                if let Err(e) = blocking(|| run.dir.write_record(&record)) {
-                    warning!("run {id}: its record was not written: {e}");
-                }
-                self.emit(
-                    &run,
-                    &mut inner,
-                    run_types::QUEUED,
-                    &RunQueuedData::new(position),
-                );
-            }
-        }
-        Ok(RunResumeData::new(id, attempt))
+        run.show(&inner);
+        Ok(inner.attempt)
     }
 
     /// `run.get`: one run, from what rlxd holds of it, which its record and log on disk
@@ -775,34 +860,34 @@ impl Runner {
     /// `run.list`: every run rlxd knows, live or ended, those from before a restart too,
     /// the latest started first, of `states` and `job_id` when given, at most `limit`.
     pub fn list(&self, params: &RunListParams) -> RunListData {
-        let runs = self.runs();
-        let mut summaries: Vec<RunSummary> = runs
-            .by_id
-            .values()
+        // Each run's view is read with the runner's lock let go, and not its own lock,
+        // which may be held over a slow disk.
+        let mut summaries: Vec<RunSummary> = self
+            .snapshot()
+            .iter()
             .filter(|run| params.job_id.is_none() || run.job_id == params.job_id)
             .filter_map(|run| {
-                let inner = run.inner();
+                let view = run.view();
                 if let Some(states) = &params.states
-                    && !states.contains(&inner.state)
+                    && !states.contains(&view.state)
                 {
                     return None;
                 }
                 let mut summary = RunSummary::new(
                     run.params.run_id.clone(),
                     run.params.kind,
-                    inner.state,
-                    inner.started_at.clone(),
+                    view.state,
+                    view.started_at,
                 );
-                summary.ended_at.clone_from(&inner.ended_at);
-                summary.last_run_seq = inner.last_run_seq;
+                summary.ended_at = view.ended_at;
+                summary.last_run_seq = view.last_run_seq;
                 summary.job_id.clone_from(&run.job_id);
                 summary.client.clone_from(&run.client);
-                summary.attempt = inner.attempt;
+                summary.attempt = view.attempt;
                 summary.space.clone_from(&run.params.space);
                 Some(summary)
             })
             .collect();
-        drop(runs);
         summaries.sort_by(|a, b| {
             b.started_at
                 .cmp(&a.started_at)
@@ -887,7 +972,10 @@ impl Runner {
             runs.erasing.insert(name.to_owned());
             ours
         };
-        let erased = blocking(|| self.erase_files(&root, &space, &ours));
+        let erased = blocking(|| {
+            wait_if(self.slow_erase.as_ref(), name);
+            self.erase_files(&root, &space, &ours)
+        });
         let mut runs = self.runs();
         runs.erasing.remove(name);
         let (removed, links, failed, gone) = erased?;
@@ -959,7 +1047,7 @@ impl Runner {
             && let Some(spaces_dir) = held.last()
             && matches!(
                 spaces_dir.child(&name).map_err(internal)?,
-                remove::Opened::Link
+                remove::Opened::Link | remove::Opened::Mount
             )
         {
             linked.push(spaces_dir.path().join(&name).display().to_string());
@@ -983,8 +1071,8 @@ impl Runner {
         linked.dedup();
         if !linked.is_empty() {
             let message = format!(
-                "erasing the space would go through links, which rlxd does not follow ({}); \
-                 nothing was removed",
+                "erasing the space would go through links or mount points, which rlxd does \
+                 not follow ({}); nothing was removed",
                 linked.join(", ")
             );
             return Err(with_detail(
@@ -1023,19 +1111,18 @@ impl Runner {
             && let Some(spaces_dir) = held.last()
             && !matches!(spaces_dir.child(&name), Ok(remove::Opened::Missing))
         {
+            // Named under the space's resolved path, as removed[] and space.ensure name it.
+            let held_space = spaces_dir.path().join(&name);
+            let shown = |path: &std::path::Path| {
+                path.strip_prefix(&held_space)
+                    .map_or_else(|_| path.to_path_buf(), |rest| resolved.join(rest))
+            };
             let mut found = Vec::new();
             match spaces_dir.remove_tree(&name, &mut found) {
                 Ok(()) => removed.push(resolved.display().to_string()),
-                Err(e) => fail(&mut failed, space, &e),
+                Err(e) => fail(&mut failed, &shown(&e.path), &e.error),
             }
-            // Named under the space's resolved path, as removed[] and space.ensure name it.
-            let held_space = spaces_dir.path().join(&name);
-            links.extend(found.iter().map(|path| {
-                path.strip_prefix(&held_space)
-                    .map_or_else(|_| path.clone(), |rest| resolved.join(rest))
-                    .display()
-                    .to_string()
-            }));
+            links.extend(found.iter().map(|path| shown(path).display().to_string()));
         }
         // rlxd's records of its runs: its own folder.
         let mut gone = Vec::new();
@@ -1112,6 +1199,7 @@ impl Runner {
             inner.state = RunState::Running;
             inner.text.clear();
             run.state.send_replace(RunState::Running);
+            run.show(&inner);
             let record = run.record(&inner);
             if let Err(e) = blocking(|| run.dir.write_record(&record)) {
                 warning!("run {}: its record was not written: {e}", run.params.run_id);
@@ -1214,6 +1302,7 @@ impl Runner {
         self.bus.end_run(run.params.run_id.as_str());
         inner.seeded = false;
         run.state.send_replace(state);
+        run.show(inner);
         info!("run {}: {state}", run.params.run_id);
         std::mem::take(&mut inner.placed)
     }
@@ -1310,11 +1399,14 @@ impl Runner {
         if let Some(reason) = ending {
             return ended_early(run, reason);
         }
+        let mut env = run_env();
+        // Every process of the run inherits it: the start sweep's way to know them.
+        env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
         let launch = Launch {
             program: program.clone(),
             args: argv::args(params, attempt, &settings),
             cwd: space,
-            env: run_env(),
+            env,
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -1594,6 +1686,7 @@ impl Runner {
             })?;
         inner.last_run_seq = run_seq;
         inner.last_line = Some(bus::Line::clone(&line));
+        run.show(inner);
         if blocking(|| log_line(run, inner, run_seq, r#type, &line)) {
             inner.logged = run_seq;
             run.logged.send_replace(run_seq);
@@ -1612,11 +1705,7 @@ impl Runner {
         data: &Data,
     ) {
         let id = run.params.run_id.as_str();
-        if let Some((space, delay)) = &self.slow_persist
-            && *space == run.params.space
-        {
-            std::thread::sleep(*delay);
-        }
+        wait_if(self.slow_persist.as_ref(), &run.params.space);
         if let Some(events) = inner.events.as_mut()
             && let Err(e) = events.sync_data()
         {
@@ -1662,6 +1751,16 @@ fn log_line(run: &Run, inner: &mut RunInner, run_seq: u64, r#type: &str, line: &
 }
 
 impl Run {
+    /// Shows `inner`, the run as it is now, in `run.list`.
+    fn show(&self, inner: &RunInner) {
+        *self.view.lock().unwrap_or_else(|p| p.into_inner()) = View::of(inner);
+    }
+
+    /// The run as `run.list` shows it.
+    fn view(&self) -> View {
+        self.view.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     /// The run's lock. It may be held over a slow disk (a state event is fsynced under
     /// it), so when it is taken, the wait is blocking work: no tokio worker waits on it.
     fn inner(&self) -> MutexGuard<'_, RunInner> {
@@ -1948,17 +2047,26 @@ fn test_delay(_name: &str) -> Option<Duration> {
     None
 }
 
-/// Test builds only: `RLXD_TEST_SLOW_PERSIST=<space>:<ms>`.
+/// Test builds only: `<name>=<space>:<ms>`, a space and how long something of it waits.
 #[cfg(feature = "debug-methods")]
-fn test_slow_persist() -> Option<(String, Duration)> {
-    let value = std::env::var("RLXD_TEST_SLOW_PERSIST").ok()?;
+fn test_slow_in(name: &str) -> Option<(String, Duration)> {
+    let value = std::env::var(name).ok()?;
     let (space, ms) = value.split_once(':')?;
     Some((space.to_owned(), Duration::from_millis(ms.parse().ok()?)))
 }
 
 #[cfg(not(feature = "debug-methods"))]
-fn test_slow_persist() -> Option<(String, Duration)> {
+fn test_slow_in(_name: &str) -> Option<(String, Duration)> {
     None
+}
+
+/// Waits as `slow` says when `space` is its space: a test build's slow disk.
+fn wait_if(slow: Option<&(String, Duration)>, space: &str) {
+    if let Some((slowed, delay)) = slow
+        && slowed == space
+    {
+        std::thread::sleep(*delay);
+    }
 }
 
 /// `error`, with `detail` when it takes it.

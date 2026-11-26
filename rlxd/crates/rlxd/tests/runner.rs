@@ -1413,9 +1413,9 @@ fn a_result_too_large_for_run_done_still_ends_the_run_with_its_reason() {
 
 #[test]
 fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
-    // Test builds only: the state events of runs in the space "slowdisk" wait 3 s before
+    // Test builds only: the state events of runs in the space "slowdisk" wait 4 s before
     // they are made durable, as under a slow fsync.
-    let home = home_with("hello", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:3000")]);
+    let home = home_with("hello", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:4000")]);
     let since = seq(&home);
     let mut slow = task("hi");
     slow["space"] = json!("slowdisk");
@@ -1455,20 +1455,37 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
         "space.ensure",
         &["call", "space.ensure", r#"{"name":"other"}"#],
     );
-    // Another run, in another space, starts and ends meanwhile.
-    let b = run_id();
-    start(&home, &task("hi"), &b);
-    let events = wait_until(&home, since, 20, "B ends", |e| ended(e, &b));
-    assert!(
-        of(&events, &a, Some("run.started")).is_empty(),
-        "B ended while A's run.started was still being made durable: {events:#?}"
-    );
+    // A listing reads each run with the runner's lock let go; a resume of the slow run
+    // waits for that run's lock alone.
+    quick("run.list", &["call", "run.list", "{}"]);
+    thread::scope(|scope| {
+        let resume =
+            scope.spawn(|| home.rlxd(&["call", "run.resume", &json!({"run_id": a}).to_string()]));
+        thread::sleep(Duration::from_millis(200));
+        quick("status during a resume", &["call", "status"]);
+        quick("run.list during a resume", &["call", "run.list", "{}"]);
+        quick(
+            "run.start during a resume",
+            &["call", "run.start", &with_id(&task("hi"), &run_id())],
+        );
+        // Another run, in another space, starts and ends meanwhile.
+        let b = run_id();
+        start(&home, &task("hi"), &b);
+        let events = wait_until(&home, since, 20, "B ends", |e| ended(e, &b));
+        assert!(
+            of(&events, &a, Some("run.started")).is_empty(),
+            "B ended while A's run.started was still being made durable: {events:#?}"
+        );
+        let resumed = resume.join().unwrap();
+        assert_eq!(resumed.error_code(), "run_alive", "{resumed:?}");
+    });
     // A cancel of the slow run waits for that run, and holds up nothing else meanwhile.
     thread::scope(|scope| {
         let cancel =
             scope.spawn(|| home.rlxd(&["call", "run.cancel", &json!({"run_id": a}).to_string()]));
         thread::sleep(Duration::from_millis(300));
         quick("status during a cancel", &["call", "status"]);
+        quick("run.list during a cancel", &["call", "run.list", "{}"]);
         quick(
             "run.start during a cancel",
             &["call", "run.start", &with_id(&task("hi"), &run_id())],
@@ -1596,6 +1613,204 @@ fn a_run_recorded_in_another_boot_is_never_swept() {
         left, 1,
         "the run's Claude Code, of \"another boot\", is left alone"
     );
+}
+
+#[test]
+fn an_erase_in_progress_refuses_a_second_erase_and_runs_in_its_space() {
+    // Test builds only: an erase of "busy" waits 2 s before it removes anything.
+    let home = home_with("hello", &[("RLXD_TEST_SLOW_ERASE", "busy:2000")]);
+    let mut busy = task("hi");
+    busy["space"] = json!("busy");
+    let (r, _, _) = gated_start(&home, &busy).wait();
+    thread::scope(|scope| {
+        let erase = scope.spawn(|| call(&home, "space.erase", &json!({"name": "busy"})));
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            refused(&home, "space.erase", &json!({"name": "busy"})),
+            "erase_in_progress"
+        );
+        let mut another = busy.clone();
+        another["run_id"] = json!(run_id());
+        assert_eq!(refused(&home, "run.start", &another), "run_start_failed");
+        assert_eq!(
+            refused(&home, "run.resume", &json!({"run_id": r})),
+            "run_start_failed"
+        );
+        let erased = erase.join().unwrap();
+        assert!(
+            !erased["removed"].as_array().unwrap().is_empty(),
+            "{erased:#}"
+        );
+    });
+    // Erased, the run is gone with its space.
+    assert_eq!(
+        refused(&home, "run.get", &json!({"run_id": r})),
+        "unknown_run"
+    );
+}
+
+#[test]
+fn a_run_being_started_counts_as_live_for_an_erase_of_its_space() {
+    // Test builds only: a run.start in "slowdisk" writes its record for 2 s.
+    let home = home_with("hello", &[("RLXD_TEST_SLOW_START", "slowdisk:2000")]);
+    let since = seq(&home);
+    let mut slow = task("hi");
+    slow["space"] = json!("slowdisk");
+    let r = run_id();
+    thread::scope(|scope| {
+        let started = scope.spawn(|| start(&home, &slow, &r));
+        thread::sleep(Duration::from_millis(400));
+        let erase = home.rlxd(&["call", "space.erase", r#"{"name":"slowdisk"}"#]);
+        assert_eq!(erase.error_code(), "runs_live", "{erase:?}");
+        assert_eq!(
+            erase.json()["error"]["detail"]["run_ids"],
+            json!([r]),
+            "{erase:?}"
+        );
+        started.join().unwrap();
+    });
+    wait_until(&home, since, 20, "the run ends", |e| ended(e, &r));
+    call(&home, "space.erase", &json!({"name": "slowdisk"}));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_erase_lists_every_link_in_the_space_past_a_hundred() {
+    let home = home("hello");
+    let ensured = call(&home, "space.ensure", &json!({"name": "linky"}));
+    let space = PathBuf::from(ensured["path"].as_str().unwrap());
+    let elsewhere = home.root().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep"), "x").unwrap();
+    std::fs::create_dir_all(space.join("nested").join("deeper")).unwrap();
+    let mut made = Vec::new();
+    for n in 0..150 {
+        let at = match n % 3 {
+            0 => space.join(format!("l{n}")),
+            1 => space.join("nested").join(format!("l{n}")),
+            _ => space.join("nested").join("deeper").join(format!("l{n}")),
+        };
+        let target = if n % 2 == 0 {
+            elsewhere.clone()
+        } else {
+            elsewhere.join("keep")
+        };
+        std::os::unix::fs::symlink(target, &at).unwrap();
+        made.push(at.display().to_string());
+    }
+    let erased = call(&home, "space.erase", &json!({"name": "linky"}));
+    let mut links: Vec<String> = erased["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_owned())
+        .collect();
+    links.sort();
+    made.sort();
+    assert_eq!(links, made);
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("keep")).unwrap(),
+        "x"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_leaderless_group_that_took_the_runs_group_id_is_never_swept() {
+    // The tester's scenario: a run's guard and Claude Code are gone with rlxd, and another
+    // group, its leader gone too, now has the guard's pid as its id. It leads a session of
+    // its own, and started after the run: only that none of it carries the run's id tells
+    // it apart. The next rlxd leaves it be.
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    let rlxd = home.status()["pid"].as_u64().unwrap();
+    let guard = guard_of(&home, &r);
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &rlxd.to_string(), &guard.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", &pattern(&home, "slow")])
+        .status();
+    common::eventually("rlxd and the run are gone", || {
+        home.rlxd(&["call", "status"]).code() == Some(3)
+            && processes_matching(&pattern(&home, "slow")) == 0
+    });
+    // A bystander: a sleep in a group and session of their own, whose leader has exited.
+    let planted = std::process::Command::new("perl")
+        .args([
+            "-e",
+            "use POSIX; POSIX::setsid() or die; my $p = fork(); \
+             if ($p == 0) { open(STDOUT, '>/dev/null'); open(STDERR, '>/dev/null'); exec('sleep', '300') or die } \
+             print \"$$ $p\\n\";",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&planted.stdout).to_string();
+    let pids: Vec<u64> = text
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect();
+    let (group, bystander) = (pids[0], pids[1]);
+    let path = record_path(&home, &r);
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["process"]["pid"] = json!(group);
+    std::fs::write(&path, record.to_string()).unwrap();
+    home.start_dev();
+    let got = call(&home, "run.get", &json!({"run_id": r}));
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &bystander.to_string()])
+        .status()
+        .unwrap()
+        .success();
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &bystander.to_string()])
+        .status();
+    assert!(alive, "the bystander was killed");
+    assert_eq!(
+        got["last_event"]["data"]["reason"], "engine_restarted",
+        "{got:#}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stopped_guard_ends_nothing() {
+    // A stop is not an exit: the run goes on once the guard is continued.
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    let guard = guard_of(&home, &r).to_string();
+    let signal = |name: &str| {
+        let sent = std::process::Command::new("kill")
+            .args([name, &guard])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill {name}");
+    };
+    signal("-STOP");
+    thread::sleep(Duration::from_millis(1000));
+    let got = call(&home, "run.get", &json!({"run_id": r}));
+    signal("-CONT");
+    assert_eq!(got["state"], "running", "{got:#}");
+    let cancelled = call(&home, "run.cancel", &json!({"run_id": r}));
+    assert_eq!(cancelled["state"], "failed", "{cancelled:#}");
+    let events = wait_until(&home, since, 20, "the run ends", |e| ended(e, &r));
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["data"]["reason"], "cancelled", "{events:#?}");
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
 }
 
 /// The run's record, `<home>/rlxd/runs/<r>/run.json`.

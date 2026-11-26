@@ -96,15 +96,20 @@ pub fn links_in(space: &Path) -> Vec<PathBuf> {
 
 /// `path` resolved, without Windows' verbatim prefix (`\\?\C:\x` is `C:\x`).
 pub fn resolved(path: &Path) -> io::Result<PathBuf> {
-    let resolved = fs::canonicalize(path)?;
-    let text = resolved.to_string_lossy();
+    Ok(plain(&fs::canonicalize(path)?))
+}
+
+/// `path` without Windows' verbatim prefix (`\\?\C:\x` is `C:\x`, `\\?\UNC\s\x` is
+/// `\\s\x`), as it is shown.
+pub fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
     if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-        return Ok(PathBuf::from(format!(r"\\{unc}")));
+        return PathBuf::from(format!(r"\\{unc}"));
     }
     if let Some(plain) = text.strip_prefix(r"\\?\") {
-        return Ok(PathBuf::from(plain));
+        return PathBuf::from(plain);
     }
-    Ok(resolved)
+    path.to_path_buf()
 }
 
 #[cfg(test)]

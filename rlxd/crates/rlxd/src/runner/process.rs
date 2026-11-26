@@ -26,7 +26,7 @@
 //!     ([`sweep`]) by the recorded guard pid and start time: the whole group if the guard
 //!     still runs with that start time, nothing if another process has that pid, and
 //!     otherwise each process of the guard's group and session that started at or after
-//!     the run.
+//!     the run and carries the run's id ([`RUN_ID_ENV`]).
 //!   - Everywhere, the run's stdin closes with rlxd, and Claude Code ends its turn and
 //!     exits on it; that is a courtesy, not what the guarantee rests on.
 
@@ -39,6 +39,10 @@ use std::thread;
 
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
+
+/// The variable every process of a run inherits, set to its run's id: how rlxd's start
+/// sweep knows a process for the run's, when nothing else is left of the run to go by.
+pub const RUN_ID_ENV: &str = "RLXD_RUN_ID";
 
 /// What starts a run's process: its program, arguments, folder and environment.
 pub struct Launch {
@@ -357,7 +361,16 @@ fn wait_without_reaping(pid: u32) -> bool {
             )
         };
         if waited == 0 {
-            return true;
+            // An exit only: macOS reports a stop too (SIGSTOP, SIGTSTP), which ends
+            // nothing, though WSTOPPED wasn't asked for.
+            if matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ) {
+                return true;
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+            continue;
         }
         if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             return false;
@@ -390,16 +403,19 @@ fn kill_tree(tree: &Tree) {
 /// - Another process now has that pid: the run's group is gone (no pid is given out
 ///   while a group of that id exists), and nothing is killed.
 /// - No process has it: the guard died too, as `killall -9 rlxd` does, and the group may
-///   outlive it. Each process still in group `pid` and in session `pid`, the guard's,
-///   that started at or after `started` is killed: it came from the run, which started
-///   then. A group a process of that pid left behind after the run's was gone is in that
-///   process's session, which is not `pid` unless it too led a session of its own.
+///   outlive it, or be another's that took its id once it was empty. It is the run's
+///   only when one of its processes is known for the run's: in session `pid` (the
+///   guard's), started at or after `started`, and carrying `RLXD_RUN_ID=<run_id>`
+///   ([`RUN_ID_ENV`]). A group's id can't be taken while a process of the group lives,
+///   so then the group is the run's, and each of its processes in that session that
+///   started at or after `started` is killed, one whose environment the OS hides
+///   included (macOS hides an Apple binary's). Otherwise nothing is.
 ///
 /// Only for a run of this boot ([`boot_id`]): across a reboot a pid, a group id and (on
 /// Linux) a start time may be anyone's. Whether it killed anything.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-pub fn sweep(pid: u32, started: &str) -> bool {
+pub fn sweep(pid: u32, started: &str, run_id: &str) -> bool {
     let Ok(guard) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -414,21 +430,169 @@ pub fn sweep(pid: u32, started: &str) -> bool {
     let Some(since) = start_key(started) else {
         return false;
     };
+    let members: Vec<libc::pid_t> = group_members(pid)
+        .into_iter()
+        .filter(|member| {
+            start_time(*member)
+                .as_deref()
+                .and_then(start_key)
+                .is_some_and(|key| key >= since)
+        })
+        .filter_map(|member| libc::pid_t::try_from(member).ok())
+        .filter(|member| session_of(*member) == Some(guard))
+        .collect();
+    let known = members
+        .iter()
+        .any(|member| u32::try_from(*member).is_ok_and(|member| carries(member, run_id)));
+    if !known {
+        return false;
+    }
     let mut killed = false;
-    for member in group_members(pid) {
-        if start_time(member)
-            .as_deref()
-            .and_then(start_key)
-            .is_some_and(|key| key >= since)
-            && let Ok(member) = libc::pid_t::try_from(member)
-            && session_of(member) == Some(guard)
-        {
-            // SAFETY: kill(2) to a process of the run's group and session that started
-            // with or after the run.
-            killed |= unsafe { libc::kill(member, libc::SIGKILL) } == 0;
-        }
+    for member in members {
+        // SAFETY: kill(2) to a process of the run's group and session that started with
+        // or after the run, the group known for the run's by one of them.
+        killed |= unsafe { libc::kill(member, libc::SIGKILL) } == 0;
     }
     killed
+}
+
+/// Whether process `pid`'s environment, as it started, holds `RLXD_RUN_ID=<run_id>`: from
+/// `/proc/<pid>/environ` on Linux, `KERN_PROCARGS2` on macOS (rlxd's own user's processes
+/// only, as the run's are).
+#[cfg(unix)]
+fn carries(pid: u32, run_id: &str) -> bool {
+    let wanted = format!("{RUN_ID_ENV}={run_id}");
+    environment(pid).is_some_and(|env| {
+        env.split(|&b| b == 0)
+            .any(|entry| entry == wanted.as_bytes())
+    })
+}
+
+/// Process `pid`'s environment as it started, its entries NUL-separated.
+#[cfg(target_os = "linux")]
+fn environment(pid: u32) -> Option<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ")).ok()
+}
+
+/// Process `pid`'s arguments and environment as it started (`KERN_PROCARGS2`: its argument
+/// count, its executable's path, then its arguments and environment, NUL-separated), the
+/// count and path left out. What follows the environment is not one of its entries.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn environment(pid: u32) -> Option<Vec<u8>> {
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: sysctl(3) of kern.argmax, an int, into `argmax` of `size` bytes.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&raw mut argmax).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; usize::try_from(argmax).ok()?];
+    let mut size = buffer.len();
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROCARGS2,
+        libc::c_int::try_from(pid).ok()?,
+    ];
+    // SAFETY: sysctl(3) of the process's arguments into `buffer`, writable for `size`
+    // bytes; it says how many it wrote.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buffer.truncate(size);
+    let count = buffer.get(..4)?;
+    let argc = usize::try_from(i32::from_ne_bytes(count.try_into().ok()?)).ok()?;
+    // The executable's path, then the NULs that pad it.
+    let mut rest = &buffer[4..];
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    rest = &rest[path_end..];
+    let start = rest.iter().position(|&b| b != 0)?;
+    rest = &rest[start..];
+    // The arguments.
+    for _ in 0..argc {
+        let end = rest.iter().position(|&b| b == 0)?;
+        rest = rest.get(end + 1..)?;
+    }
+    Some(rest.to_vec())
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn environment(_pid: u32) -> Option<Vec<u8>> {
+    None
+}
+
+/// Raises the soft limit on open files to the hard one (capped at 65,536, and on macOS at
+/// `kern.maxfilesperproc`): an erase holds one folder open per level it is down
+/// ([`super::remove::MAX_DEPTH`]), and launchd starts a daemon with 256. The limit it has
+/// then, or `None` when it could not be read.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn raise_fd_limit() -> Option<libc::rlim_t> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit(2) into a writable rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return None;
+    }
+    let target = limit.rlim_max.min(65_536);
+    #[cfg(target_os = "macos")]
+    let target = {
+        let mut target = target;
+        let mut most: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: kern.maxfilesperproc is an int, which `most` is, of `size` bytes.
+        let read = unsafe {
+            libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&raw mut most).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read == 0
+            && let Ok(most) = libc::rlim_t::try_from(most)
+            && most > 0
+        {
+            target = target.min(most);
+        }
+        target
+    };
+    if target <= limit.rlim_cur {
+        return Some(limit.rlim_cur);
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: setrlimit(2) of the soft limit, no higher than the hard one.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } == 0 {
+        Some(target)
+    } else {
+        Some(limit.rlim_cur)
+    }
 }
 
 /// Process `pid`'s session id (`getsid`), or `None` when there is no such process.
@@ -643,7 +807,7 @@ fn kill_tree(tree: &Tree) {
 
 /// Windows needs no sweep: a job whose last handle closes kills its processes.
 #[cfg(windows)]
-pub fn sweep(_pid: u32, _started: &str) -> bool {
+pub fn sweep(_pid: u32, _started: &str, _run_id: &str) -> bool {
     false
 }
 
@@ -731,24 +895,46 @@ mod tests {
         let first = start_time(me).expect("this process has a start time");
         assert_eq!(start_time(me).as_deref(), Some(first.as_str()));
         assert!(
-            !sweep(me, "0.000000"),
+            !sweep(me, "0.000000", "r"),
             "a start time that differs kills nothing"
         );
         assert_eq!(start_time(u32::try_from(i32::MAX).unwrap()), None);
     }
 
+    /// Started by [`leaderless_group`] as a process of its group: this test binary,
+    /// whose environment the OS shows (macOS hides an Apple binary's, `sleep`'s).
+    #[test]
+    #[ignore = "a process for the sweep's test to start"]
+    fn sleeper() {
+        if std::env::var_os("RLXD_TEST_SLEEPER").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
     /// A shell that leads a new group (and with `new_session`, a new session) starts a
-    /// `sleep` in it and exits, reaped: a group without its leader, as a run's is after
-    /// `killall -9 rlxd`. The shell's pid, the group's id, and the sleep's.
+    /// `sleep` and a [`sleeper`] in it, `RLXD_RUN_ID=<run_id>` in their environment when
+    /// given, and exits, reaped: a group without its leader, as a run's is after
+    /// `killall -9 rlxd`. The shell's pid, the group's id, and the two others'.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[allow(unsafe_code)]
-    fn leaderless_group(new_session: bool) -> (u32, u32) {
+    fn leaderless_group(new_session: bool, run_id: Option<&str>) -> (u32, [u32; 2]) {
         use std::io::BufRead;
         use std::os::unix::process::CommandExt;
         let mut command = std::process::Command::new("/bin/sh");
         command
-            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
+            .args([
+                "-c",
+                "sleep 30 </dev/null >/dev/null 2>&1 & a=$!; \
+                 \"$0\" --ignored --exact runner::process::tests::sleeper \
+                 </dev/null >/dev/null 2>&1 & echo $a $!",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .env_remove(RUN_ID_ENV)
+            .env("RLXD_TEST_SLEEPER", "1")
             .stdout(Stdio::piped());
+        if let Some(run_id) = run_id {
+            command.env(RUN_ID_ENV, run_id);
+        }
         if new_session {
             // SAFETY: setsid(2) in the child between fork and exec, async-signal-safe.
             unsafe {
@@ -768,7 +954,32 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         shell.wait().unwrap();
-        (shell.id(), line.trim().parse().unwrap())
+        let pids: Vec<u32> = line
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        // Each is the shell's fork until it has run its program.
+        let ran = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for pid in &pids {
+            while command_of(*pid).ends_with("sh") {
+                assert!(
+                    std::time::Instant::now() < ran,
+                    "{pid} never ran its program"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        (shell.id(), [pids[0], pids[1]])
+    }
+
+    /// The program `pid` runs, as `ps` names it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn command_of(pid: u32) -> String {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&ps.stdout).trim().to_owned()
     }
 
     /// Whether `pid` runs, a zombie not counted.
@@ -785,26 +996,44 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[allow(unsafe_code)]
     #[test]
-    fn the_sweep_kills_a_leaderless_group_only_in_the_guards_own_session() {
+    fn the_sweep_kills_a_leaderless_group_only_of_the_guards_session_and_the_runs_id() {
+        /// Kills the processes it holds when the test ends, passed or failed.
+        struct Started(Vec<u32>);
+        impl Drop for Started {
+            fn drop(&mut self) {
+                for pid in &self.0 {
+                    // SAFETY: kill(2) of a process this test started.
+                    unsafe { libc::kill(libc::pid_t::try_from(*pid).unwrap(), libc::SIGKILL) };
+                }
+            }
+        }
         let before = start_time(std::process::id()).unwrap();
-        // A group whose leader is gone, in another session (this test's): a pid's
-        // recycled group, say, not the run's. Its sleep started after `before`, and stays.
-        let (group, sleep) = leaderless_group(false);
+        let mut started = Started(Vec::new());
+        // Groups whose leaders are gone, whose processes started after `before`: a pid's
+        // later groups, not the run's. Each stays.
+        for (new_session, run_id, what) in [
+            (false, Some("r1"), "in another session (this test's)"),
+            (true, None, "without the run's id"),
+            (true, Some("r2"), "with another run's id"),
+        ] {
+            let (group, both) = leaderless_group(new_session, run_id);
+            started.0.extend(both);
+            assert!(!sweep(group, &before, "r1"), "a group {what} is left alone");
+            for pid in both {
+                assert!(runs(pid), "a group {what}: its processes run on");
+            }
+        }
+        // The run's: the group leads its own session, as the guard's does, and a process
+        // of it carries the run's id, so the sleep goes too, whose environment macOS
+        // hides.
+        let (group, both) = leaderless_group(true, Some("r1"));
+        started.0.extend(both);
         assert!(
-            !sweep(group, &before),
-            "another session's group is left alone"
-        );
-        assert!(runs(sleep), "the other session's sleep runs on");
-        // SAFETY: kill(2) of the sleep this test started.
-        unsafe { libc::kill(libc::pid_t::try_from(sleep).unwrap(), libc::SIGKILL) };
-        // The run's: the group leads its own session, as the guard's does.
-        let (group, sleep) = leaderless_group(true);
-        assert!(
-            sweep(group, &before),
-            "the guard's group and session are swept"
+            sweep(group, &before, "r1"),
+            "the guard's group and session, with the run's id, are swept"
         );
         let gone = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while runs(sleep) {
+        while both.iter().any(|pid| runs(*pid)) {
             assert!(
                 std::time::Instant::now() < gone,
                 "the swept sleep still runs"
