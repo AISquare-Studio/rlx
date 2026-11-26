@@ -1125,6 +1125,8 @@ mod tests {
             ("\u{3164}", "looks blank"),
             ("\u{FFA0}\u{FFA0}", "looks blank"),
             ("\u{115F}", "looks blank"),
+            ("\u{064E}", "looks blank"),
+            ("\u{064E}\u{0650}", "looks blank"),
             ("laptop\u{3164}", "UTS #39"),
         ] {
             let refused = device_name(name).expect_err(name);
