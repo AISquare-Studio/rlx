@@ -271,11 +271,23 @@ fn helper_hands_its_pipe_to_its_parent() {
         reply.line
     );
 
-    let pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(home.pipe_name())
-        .unwrap();
+    // Every instance can be busy for a moment, between rlxd's accept and its next one.
+    let pipe = (0..500)
+        .find_map(|_| {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(home.pipe_name())
+            {
+                Ok(pipe) => Some(pipe),
+                Err(e) if e.raw_os_error() == Some(231) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                }
+                Err(e) => panic!("cannot open {}: {e}", home.pipe_name()),
+            }
+        })
+        .expect("a pipe instance came free");
     // Long enough for rlxd to accept the connection and pin this process.
     std::thread::sleep(Duration::from_millis(300));
     // SAFETY: opens the parent for handle duplication; checked below.
