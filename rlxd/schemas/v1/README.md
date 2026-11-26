@@ -150,19 +150,25 @@ size and position, per-device notifications, caches.
     them; any other gets `not_gate`. Every change is logged, and its event names the
     device.
   - Any client may change every other key, agents included.
-- **`send_safety_mode`** is `{default, connectors?}`, and nothing else: it is a policy,
-  so a field rlxd doesn't know is refused rather than ignored.
+- **`send_safety_mode`** is `{default, connectors?}`.
+  - It is a policy, so it is strict for a writer: `settings.set` with a field rlxd
+    doesn't know is refused, by `settings-set.json` and by rlxd, rather than ignored.
+  - A reader takes such a field, which a later rlxd may add: `setting.json` and
+    `settings-list-reply.json` allow one, so it never costs a client its
+    `settings.list`.
   - Each mode is `draft`, `standing_approval` or `auto`, safest first, and `connectors`
     maps a connector's name to its mode.
   - A key never set means `draft`.
   - A change lowers send safety when any connector's mode, its own or else the default,
     becomes less safe.
-- **Versions.** Each key counts its writes from 1.
+- **Versions** come from one count for the whole home: each set takes the next number,
+  so no two sets share one, and a key's version only rises.
   - `settings.set` and `settings.delete` with `expected_version` act only when that is
     the version now, else they get `conflict` with `detail.version`; read again and act
     from that.
   - Without `expected_version`, the last change wins.
-  - A deleted key is back to never set, at version 0, and its numbering starts again.
+  - A deleted key is back to never set, at version 0. Set again, it goes on from the
+    home's count, so a write made from its version before the delete gets `conflict`.
 - **Events.** Every change, once on disk, is a `settings.changed {key, version,
   by_device?}`, or a `settings.deleted` with the version deleted, on the `settings`
   topic. One key's events come in version order. Read the new value with `settings.get`.
@@ -173,6 +179,11 @@ size and position, per-device notifications, caches.
 any other `schema_version` fails to parse rather than misparse.
 
 - New fields and new event types keep the version. Clients ignore what they don't
-  know, so no schema here forbids extra properties.
+  know, so no schema a client reads forbids extra properties.
+- The one schema that does is what a writer sends: `settings-set.json`'s
+  `send_safety_mode` value takes no field but `default` and `connectors`, as rlxd
+  does, since a policy is taken whole. A new field there is not additive for writers,
+  because an older rlxd refuses it, so it raises `protocol_version` by one. Readers
+  still take it in the meantime (`setting.json`, `settings-list-reply.json`).
 - Removing or renaming a field raises `protocol_version` by one. The new schemas go in
   `schemas/v2/`, and rlxd keeps serving v1 for one rlx minor release.

@@ -2179,3 +2179,37 @@ fn settings_delete_params_validate_and_refuse_their_wrong_shapes() {
     );
     assert_eq!(refused(SettingsDeleteParams::new("a..b")), "key");
 }
+
+#[test]
+fn send_safety_mode_is_strict_for_a_writer_and_additive_for_a_reader() {
+    // A later rlxd's field, in what a client reads: taken, and printed back with it, so a
+    // new field never costs an older client its settings.list.
+    let later = json!({"default": "draft", "connectors": {"slack": "auto"}, "later": 1});
+    let setting = json!({"key": "send_safety_mode", "version": 7, "value": later,
+                         "updated_at": "2026-11-26T12:00:00.000Z", "by_device": "Sam MacBook"});
+    assert_eq!(agrees::<Setting>("setting.json", &setting), setting);
+    let list = json!({ "settings": [setting] });
+    assert_eq!(
+        agrees::<SettingsList>("settings-list-reply.json", &list),
+        list
+    );
+    assert!(rlxd_proto::check_setting_value("value", "send_safety_mode", &later).is_ok());
+    assert!(!send_safety_lowers(
+        Some(&json!({"default": "draft"})),
+        &json!({"default": "draft", "later": 1})
+    ));
+
+    // What a writer sends: refused, by the schema and the type alike.
+    let error = both_refuse::<SettingsSetParams>(
+        "settings-set.json",
+        json!({"key": "send_safety_mode", "value": later}),
+    );
+    assert!(error.contains("no other field"), "{error}");
+    assert!(rlxd_proto::check_setting_value_to_write("value", "send_safety_mode", &later).is_err());
+    // A reader still refuses a value that is not a policy at all.
+    both_refuse::<Setting>(
+        "setting.json",
+        json!({"key": "send_safety_mode", "version": 7, "value": {"default": "often"},
+               "updated_at": "2026-11-26T12:00:00.000Z"}),
+    );
+}

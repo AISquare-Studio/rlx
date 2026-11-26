@@ -45,7 +45,7 @@
           }
         },
         "version": {
-          "description": "How many times it has been set, from 1; 0 when it never has. `settings.set\n{expected_version}` takes it.",
+          "description": "Its version: 0 when it was never set, else the number its last change was given,\nfrom one count the home keeps for every setting, so no two changes share one,\neven across a delete. `settings.set {expected_version}` and `settings.delete\n{expected_version}` take it.",
           "type": "integer",
           "format": "uint64",
           "maximum": 18446744073709551615,
@@ -150,7 +150,6 @@
                     ]
                   }
                 },
-                "additionalProperties": false,
                 "required": [
                   "default"
                 ]

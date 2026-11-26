@@ -6,11 +6,14 @@
 //! with the token reads every one.
 //!
 //! - **The file** is `<home>/rlxd/settings.json`, 0600, compact JSON written whole and
-//!   durably (`crate::durable`): `{"schema_version": 1, "settings": {key: {version,
-//!   value, updated_at, by_device?}}}`.
-//! - **Versions** count each key's writes from 1, and a key never set is at 0. A write or
-//!   a delete with an `expected_version` that is not the key's version now gets
-//!   `conflict`, with `detail.version`. A deleted key's numbering starts again.
+//!   durably (`crate::durable`): `{"schema_version": 1, "last_version": n, "settings":
+//!   {key: {version, value, updated_at, by_device?}}}`.
+//! - **Versions** come from one count for the whole home, kept in the file as
+//!   `last_version`: each set takes the next number, so no two sets share one and a key's
+//!   version only rises, even across a delete and a re-create. A key never set, or
+//!   deleted, is at 0. A write or a delete with an `expected_version` that is not the
+//!   key's version now gets `conflict`, with `detail.version`, so a stale write from
+//!   before a delete and a re-create is caught.
 //! - **Who may change what.** Every client may read every setting. The protected keys,
 //!   `send_safety_mode` and every key under `policy.` (`setting_is_protected`), only an
 //!   app-role connection holding the gate, a paired device, may set or delete; any other
@@ -22,19 +25,23 @@
 //! - **Order.** A change is on disk before its reply and its event, and one key's events
 //!   come in version order. A change writes and fsyncs the whole file under the settings
 //!   lock, so the server runs every settings call as blocking work
-//!   (`tokio::task::block_in_place`): no other connection waits on the disk.
+//!   (`tokio::task::block_in_place`, on the multi-thread runtime `serve` builds, which
+//!   `server::serve_connection` asserts): no other connection waits on the disk.
 //! - **Limits.** A value is at most [`MAX_VALUE`] bytes of JSON and
 //!   [`rlxd_proto::MAX_SETTING_DEPTH`] arrays or objects deep. The home holds at most
 //!   [`MAX_KEYS`] settings and [`MAX_TOTAL`] bytes of keys and values, so `settings.list`'s
 //!   reply always fits the line a client reads (16 MiB).
 //! - **Reading the file** goes key by key, so one bad value never costs the others. A key
-//!   whose entry this rlxd cannot hold is set aside: written to
+//!   whose entry this rlxd cannot hold, past a limit included, is set aside: written to
 //!   `settings.json.unreadable-<time>`, a new file each time, logged, and left out of
-//!   the file from then on. A key without a `.` that this rlxd does not know, a newer
-//!   rlxd's, is kept as it is through every write, and not served. A file that is not
-//!   one of these documents at all is moved to such a file whole, and rlxd starts with no
-//!   settings; clients then see every key at version 0 and apply their defaults.
-//!   `send_safety_mode`'s is `draft`, the safest.
+//!   the file from then on. If that file can't be written, the key stays in the settings
+//!   file as it was, unserved. A key without a `.` that this rlxd does not know, a newer
+//!   rlxd's, is kept as it is through every write, and not served.
+//! - **A file rlxd can't read**, or that is not one of these documents at all, is moved
+//!   to such a file whole, logged as an error, and rlxd starts with no settings: clients
+//!   see every key at version 0 and apply their defaults, `send_safety_mode`'s `draft`,
+//!   the safest. If it can't be moved either, rlxd refuses every change, with
+//!   `Unwritten`, until a restart: it never writes over a file it could not read.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -94,14 +101,20 @@ pub struct Settings {
     path: PathBuf,
     limits: Limits,
     store: Mutex<Store>,
+    /// Why every change is refused: the file could not be read at start, nor moved aside,
+    /// so writing would replace what rlxd never read.
+    frozen: Option<String>,
 }
 
 #[derive(Default)]
 struct Store {
     /// The settings this rlxd serves.
     entries: BTreeMap<String, Entry>,
-    /// Keys without a `.` that this rlxd does not know, kept verbatim for a newer one.
+    /// Entries kept verbatim and not served: keys without a `.` that this rlxd does not
+    /// know, for a newer one, and keys it could not hold nor set aside.
     kept: BTreeMap<String, Box<RawValue>>,
+    /// The last version given, home-wide: the next set takes the one after.
+    last_version: u64,
 }
 
 /// One setting as the file holds it.
@@ -118,7 +131,16 @@ struct Entry {
 #[derive(Deserialize)]
 struct FileIn {
     schema_version: u32,
+    #[serde(default)]
+    last_version: u64,
     settings: BTreeMap<String, Box<RawValue>>,
+}
+
+/// Just an entry's version, read from any entry, held or not, so the count never goes
+/// back under it.
+#[derive(Deserialize)]
+struct VersionOf {
+    version: u64,
 }
 
 /// One key of the file, as written.
@@ -164,21 +186,16 @@ impl Settings {
     /// The settings in the file `path`, holding what `limits` allow, read key by key: what
     /// this rlxd cannot hold is set aside and logged, and the rest kept.
     pub fn open_at(path: PathBuf, limits: Limits) -> Self {
-        let store = match fs::read(&path) {
+        let (store, frozen) = match fs::read(&path) {
             Ok(text) => load(&path, &text, limits),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Store::default(),
-            Err(e) => {
-                error!(
-                    "{} cannot be read, so rlxd starts with no settings: {e}",
-                    path.display()
-                );
-                Store::default()
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (Store::default(), None),
+            Err(e) => (Store::default(), set_aside_whole(&path, &e.to_string())),
         };
         Self {
             path,
             limits,
             store: Mutex::new(store),
+            frozen,
         }
     }
 
@@ -216,6 +233,7 @@ impl Settings {
     ) -> Result<Setting, Refused> {
         let key = params.key.as_str();
         may_change(key, writer, "set")?;
+        self.writable()?;
         let limits = self.limits;
         let length = json_length(&params.value);
         if length > limits.value {
@@ -249,17 +267,19 @@ impl Settings {
             )));
         }
         let entry = Entry {
-            version: version + 1,
+            version: store.last_version + 1,
             value: params.value,
             updated_at: clock::now(),
             by_device: writer.device.filter(|_| writer.app).map(str::to_owned),
         };
         let old = store.entries.insert(key.to_owned(), entry.clone());
+        store.last_version = entry.version;
         if let Err(why) = self.write(&store) {
             match old {
                 Some(old) => store.entries.insert(key.to_owned(), old),
                 None => store.entries.remove(key),
             };
+            store.last_version -= 1;
             return Err(why);
         }
         log_set(key, old.as_ref(), &entry, writer);
@@ -287,6 +307,7 @@ impl Settings {
     ) -> Result<Setting, Refused> {
         let key = params.key.as_str();
         may_change(key, writer, "delete")?;
+        self.writable()?;
         let mut store = self.store();
         let version = store.entries.get(key).map_or(0, |entry| entry.version);
         if let Some(expected) = params.expected_version
@@ -309,6 +330,14 @@ impl Settings {
         let by_device = writer.device.filter(|_| writer.app);
         publish(bus, event_types::SETTINGS_DELETED, key, version, by_device);
         Ok(unset)
+    }
+
+    /// Refuses a change while the file could not be read nor moved aside.
+    fn writable(&self) -> Result<(), Refused> {
+        match &self.frozen {
+            Some(why) => Err(Refused::Unwritten(why.clone())),
+            None => Ok(()),
+        }
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
@@ -438,33 +467,44 @@ fn log_set(key: &str, old: Option<&Entry>, new: &Entry, writer: Writer<'_>) {
     }
 }
 
-/// The file `text` at `path`, read key by key. What this rlxd cannot hold is set aside to a
-/// new `settings.json.unreadable-<time>`, logged, and written out of the file.
-fn load(path: &Path, text: &[u8], limits: Limits) -> Store {
+/// The file `text` at `path`, read key by key, and why every change is refused, if it is.
+/// What this rlxd cannot hold is set aside to a new `settings.json.unreadable-<time>`,
+/// logged, and written out of the file; a key that can't be set aside stays in the file
+/// as it was. A file that is not a settings document is moved aside whole.
+fn load(path: &Path, text: &[u8], limits: Limits) -> (Store, Option<String>) {
     let file = match serde_json::from_slice::<FileIn>(text) {
         Ok(file) if file.schema_version == 1 => file,
         Ok(file) => {
-            set_aside_whole(
-                path,
-                &format!("schema_version {} is not 1", file.schema_version),
-            );
-            return Store::default();
+            let why = format!("schema_version {} is not 1", file.schema_version);
+            return (Store::default(), set_aside_whole(path, &why));
         }
-        Err(e) => {
-            set_aside_whole(path, &e.to_string());
-            return Store::default();
-        }
+        Err(e) => return (Store::default(), set_aside_whole(path, &e.to_string())),
     };
-    let mut store = Store::default();
+    let mut store = Store {
+        last_version: file.last_version,
+        ..Store::default()
+    };
     let mut aside: BTreeMap<String, (Box<RawValue>, String)> = BTreeMap::new();
     let mut total = 0;
     for (key, raw) in file.settings {
+        if let Ok(of) = serde_json::from_str::<VersionOf>(raw.get()) {
+            store.last_version = store.last_version.max(of.version);
+        }
         match read_entry(&key, &raw) {
             Ok(None) => {
                 store.kept.insert(key, raw);
             }
             Ok(Some(entry)) => {
-                let grows = size(&key, &entry);
+                let length = json_length(&entry.value);
+                if length > limits.value {
+                    let why = format!(
+                        "its value is {length} bytes of JSON, more than {}",
+                        limits.value
+                    );
+                    aside.insert(key, (raw, why));
+                    continue;
+                }
+                let grows = key.len() + length;
                 if store.entries.len() >= limits.keys || total + grows > limits.total {
                     aside.insert(key, (raw, "past the home's limits".to_owned()));
                     continue;
@@ -477,16 +517,23 @@ fn load(path: &Path, text: &[u8], limits: Limits) -> Store {
             }
         }
     }
-    if !aside.is_empty() {
-        set_aside_keys(path, &aside);
+    if aside.is_empty() {
+        return (store, None);
+    }
+    if set_aside_keys(path, &aside) {
         if let Err(e) = write_file(path, &store) {
             error!(
                 "settings: cannot write {} without them: {e}",
                 path.display()
             );
         }
+    } else {
+        // Nowhere else holds them: they stay in the file as they were, unserved.
+        store
+            .kept
+            .extend(aside.into_iter().map(|(key, (raw, _))| (key, raw)));
     }
-    store
+    (store, None)
 }
 
 /// One key's entry: `None` for a key without a `.` this rlxd does not know, kept as it is.
@@ -501,22 +548,36 @@ fn read_entry(key: &str, raw: &RawValue) -> Result<Option<Entry>, String> {
     Ok(Some(entry))
 }
 
-/// Moves the whole file aside, when it is not a settings document at all.
-fn set_aside_whole(path: &Path, why: &str) {
+/// Moves the whole file aside, when rlxd can't read it or it is not a settings document at
+/// all, never over another file. If it can't be moved, why every change is refused until a
+/// restart: writing would replace a file rlxd never read.
+fn set_aside_whole(path: &Path, why: &str) -> Option<String> {
     let aside = unreadable(path);
-    let moved = fs::rename(path, &aside);
-    error!(
-        "{} cannot be read, so rlxd starts with no settings ({why}); {}",
-        path.display(),
-        match moved {
-            Ok(()) => format!("it was moved to {}", aside.display()),
-            Err(e) => format!("and it could not be moved aside: {e}"),
+    match fs::rename(path, &aside) {
+        Ok(()) => {
+            error!(
+                "settings: {} cannot be read ({why}), so rlxd starts with no settings; it \
+                 was moved to {}, as it was",
+                path.display(),
+                aside.display()
+            );
+            None
         }
-    );
+        Err(e) => {
+            let frozen = format!(
+                "{} could not be read at start ({why}), nor moved aside ({e}), so rlxd \
+                 changes no setting: fix the file, or move it away, and restart rlxd",
+                path.display()
+            );
+            error!("settings: {frozen}");
+            Some(frozen)
+        }
+    }
 }
 
-/// Writes the keys set aside, each with why, to a new file beside the settings.
-fn set_aside_keys(path: &Path, aside: &BTreeMap<String, (Box<RawValue>, String)>) {
+/// Writes the keys set aside, each with why, to a new file beside the settings. Whether it
+/// was written.
+fn set_aside_keys(path: &Path, aside: &BTreeMap<String, (Box<RawValue>, String)>) -> bool {
     #[derive(Serialize)]
     struct Aside<'a> {
         settings: BTreeMap<&'a str, &'a RawValue>,
@@ -539,17 +600,25 @@ fn set_aside_keys(path: &Path, aside: &BTreeMap<String, (Box<RawValue>, String)>
         .map_err(io::Error::other)
         .and_then(|text| durable::write(&target, &text));
     match written {
-        Ok(()) => error!(
-            "settings: {} can't be held, and were set aside to {}: {}",
-            keys.join(", "),
-            target.display(),
-            reasons.join("; ")
-        ),
-        Err(e) => error!(
-            "settings: {} can't be held, and could not be set aside to {}: {e}",
-            keys.join(", "),
-            target.display()
-        ),
+        Ok(()) => {
+            error!(
+                "settings: {} can't be held, and were set aside to {}: {}",
+                keys.join(", "),
+                target.display(),
+                reasons.join("; ")
+            );
+            true
+        }
+        Err(e) => {
+            error!(
+                "settings: {} can't be held, and could not be set aside to {} ({e}), so \
+                 they stay in the file as they were, unserved: {}",
+                keys.join(", "),
+                target.display(),
+                reasons.join("; ")
+            );
+            false
+        }
     }
 }
 
@@ -579,6 +648,7 @@ fn write_file(path: &Path, store: &Store) -> io::Result<()> {
     #[derive(Serialize)]
     struct FileOut<'a> {
         schema_version: u32,
+        last_version: u64,
         settings: BTreeMap<&'a str, Out<'a>>,
     }
     let mut settings: BTreeMap<&str, Out<'_>> = store
@@ -594,6 +664,7 @@ fn write_file(path: &Path, store: &Store) -> io::Result<()> {
     );
     let mut text = serde_json::to_vec(&FileOut {
         schema_version: 1,
+        last_version: store.last_version,
         settings,
     })
     .map_err(io::Error::other)?;
@@ -774,7 +845,11 @@ mod tests {
                 settings.delete(delete(key), CLI, &bus),
                 Err(Refused::NotGate(_))
             ));
-            assert_eq!(settings.get(key).unwrap().version, 1, "{key} stays");
+            assert_eq!(
+                settings.get(key).unwrap().version,
+                done.version,
+                "{key} stays"
+            );
         }
         // The rest any client sets and deletes, agents included.
         for key in ["theme", "agents.ava", "rlxapp.policy"] {
@@ -817,9 +892,19 @@ mod tests {
                 .version,
             0
         );
-        // Its numbering starts again; a key never set deletes to nothing, unannounced.
+        // A re-created key goes on from the home's count, so a stale expected_version
+        // from before the delete is a conflict; a key never set deletes to nothing,
+        // unannounced.
         let again = settings.set(set("rlxapp.a", json!(3)), CLI, &bus).unwrap();
-        assert_eq!(again.version, 1);
+        assert_eq!(again.version, 3);
+        let twice = settings.set(set("rlxapp.a", json!(4)), CLI, &bus).unwrap();
+        assert_eq!(twice.version, 4);
+        // A writer that read version 2, before the delete: counted per key, the key would
+        // be at 2 again, and the stale write would go through.
+        assert!(matches!(
+            settings.set(set("rlxapp.a", json!(5)).expecting(2), CLI, &bus),
+            Err(Refused::Conflict(4))
+        ));
         let head = bus.head();
         let never = settings.delete(delete("rlxapp.never"), CLI, &bus).unwrap();
         assert_eq!(never.version, 0);
@@ -1073,6 +1158,247 @@ mod tests {
         ));
         assert_eq!(settings.get("theme").unwrap().version, 0);
         assert_eq!(bus.head(), 0);
+    }
+
+    /// Sets `path`'s mode, and back to `after` when dropped, so a failed test still
+    /// leaves a folder its `Dir` can remove.
+    #[cfg(unix)]
+    struct Mode(PathBuf, u32);
+
+    #[cfg(unix)]
+    impl Mode {
+        fn set(path: &Path, mode: u32, after: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            Self(path.to_owned(), after)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// Whether this process ignores file modes, as root does: then a mode can't make a
+    /// file unreadable, and the tests that need one say so and stop.
+    #[cfg(unix)]
+    fn modes_bind(dir: &Dir) -> bool {
+        let probe = dir.0.join("probe");
+        fs::write(&probe, "x").unwrap();
+        let mode = Mode::set(&probe, 0o000, 0o600);
+        let binds = fs::read(&probe).is_err();
+        drop(mode);
+        fs::remove_file(&probe).unwrap();
+        if !binds {
+            eprintln!("file modes don't bind this process (root?): nothing to check");
+        }
+        binds
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_rlxd_cannot_read_is_moved_aside_whole_and_no_setting_is_lost() {
+        let dir = Dir::new();
+        if !modes_bind(&dir) {
+            return;
+        }
+        let bus = dir.bus();
+        let settings = dir.settings();
+        settings
+            .set(set("theme", json!("rlx_light")), CLI, &bus)
+            .unwrap();
+        settings.set(set("rlxapp.a", json!(1)), CLI, &bus).unwrap();
+        drop(settings);
+        let before = fs::read(dir.file()).unwrap();
+        let unreadable = Mode::set(&dir.file(), 0o000, 0o600);
+
+        let settings = dir.settings();
+        assert_eq!(settings.get("theme").unwrap().version, 0);
+        assert!(settings.list(None).unwrap().settings.is_empty());
+        // The file is aside, as it was, so a change writes a new one, over nothing.
+        let aside = dir.unreadable();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert!(!dir.file().exists());
+        let after = settings.set(set("rlxapp.b", json!(2)), CLI, &bus).unwrap();
+        assert_eq!(after.version, 1);
+        drop(unreadable);
+        let moved = dir.0.join(&aside[0]);
+        let _readable = Mode::set(&moved, 0o600, 0o600);
+        assert_eq!(fs::read(&moved).unwrap(), before, "every setting is kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_can_be_neither_read_nor_moved_aside_is_never_written_over() {
+        let dir = Dir::new();
+        if !modes_bind(&dir) {
+            return;
+        }
+        let bus = dir.bus();
+        for (text, mode) in [
+            ("{not json", 0o600),
+            (r#"{"schema_version":1,"settings":{}}"#, 0o000),
+        ] {
+            fs::write(dir.file(), text).unwrap();
+            let file_mode = Mode::set(&dir.file(), mode, 0o600);
+            // A folder rlxd can't write in: the file can't be renamed out of it.
+            let folder = Mode::set(&dir.0, 0o500, 0o700);
+            let settings = dir.settings();
+            assert_eq!(settings.get("theme").unwrap().version, 0);
+            for refused in [
+                settings.set(set("theme", json!("rlx")), CLI, &bus),
+                settings.set(
+                    set("send_safety_mode", json!({"default": "auto"})),
+                    APP,
+                    &bus,
+                ),
+                settings.delete(delete("rlxapp.a"), CLI, &bus),
+            ] {
+                match refused {
+                    Err(Refused::Unwritten(why)) => {
+                        assert!(why.contains("restart rlxd"), "{why}");
+                        assert!(why.contains("nor moved aside"), "{why}");
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            drop(folder);
+            // Even once rlxd could write again, the same rlxd still changes nothing.
+            assert!(matches!(
+                settings.set(set("theme", json!("rlx")), CLI, &bus),
+                Err(Refused::Unwritten(_))
+            ));
+            drop(file_mode);
+            assert_eq!(
+                fs::read_to_string(dir.file()).unwrap(),
+                text,
+                "never written over"
+            );
+            assert!(dir.unreadable().is_empty());
+        }
+        assert_eq!(bus.head(), 0, "nothing was published");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_that_cannot_be_set_aside_stays_in_the_file_as_it_was() {
+        let dir = Dir::new();
+        if !modes_bind(&dir) {
+            return;
+        }
+        let deep = entry(&nested(40));
+        write_raw(
+            &dir,
+            &[("rlxapp.deep", deep.clone()), ("theme", entry(r#""rlx""#))],
+        );
+        let before = fs::read_to_string(dir.file()).unwrap();
+        let folder = Mode::set(&dir.0, 0o500, 0o700);
+        let settings = dir.settings();
+        drop(folder);
+        assert!(dir.unreadable().is_empty(), "nowhere to set it aside");
+        assert_eq!(
+            fs::read_to_string(dir.file()).unwrap(),
+            before,
+            "not rewritten"
+        );
+        assert_eq!(settings.get("theme").unwrap().version, 3);
+        assert_eq!(
+            settings.get("rlxapp.deep").unwrap().version,
+            0,
+            "not served"
+        );
+        // Kept through a write, as it was.
+        let bus = dir.bus();
+        settings.set(set("rlxapp.b", json!(1)), CLI, &bus).unwrap();
+        let text = fs::read_to_string(dir.file()).unwrap();
+        assert!(
+            text.contains(&format!(r#""rlxapp.deep":{deep}"#)),
+            "{}",
+            &text[..200]
+        );
+    }
+
+    #[test]
+    fn a_value_in_the_file_past_the_value_cap_is_set_aside() {
+        let dir = Dir::new();
+        let big = format!(r#""{}""#, "x".repeat(100));
+        write_raw(
+            &dir,
+            &[("rlxapp.big", entry(&big)), ("theme", entry(r#""rlx""#))],
+        );
+        let small = Limits {
+            value: 64,
+            ..Limits::DEFAULT
+        };
+        let settings = Settings::open_at(dir.file(), small);
+        assert_eq!(settings.get("rlxapp.big").unwrap().version, 0);
+        assert_eq!(settings.get("theme").unwrap().version, 3);
+        let aside = dir.unreadable();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        let text = fs::read_to_string(dir.0.join(&aside[0])).unwrap();
+        assert!(text.contains("more than 64"), "{text}");
+        assert!(
+            !fs::read_to_string(dir.file())
+                .unwrap()
+                .contains("rlxapp.big")
+        );
+    }
+
+    #[test]
+    fn versions_come_from_one_count_for_the_home_kept_in_the_file() {
+        let dir = Dir::new();
+        let bus = dir.bus();
+        let settings = dir.settings();
+        let versions: Vec<u64> = [
+            ("theme", json!("a")),
+            ("rlxapp.a", json!(1)),
+            ("theme", json!("b")),
+        ]
+        .into_iter()
+        .map(|(key, value)| settings.set(set(key, value), CLI, &bus).unwrap().version)
+        .collect();
+        assert_eq!(versions, [1, 2, 3], "no two sets share a number");
+        settings.delete(delete("theme"), CLI, &bus).unwrap();
+        settings.delete(delete("rlxapp.a"), CLI, &bus).unwrap();
+        let text = fs::read_to_string(dir.file()).unwrap();
+        assert!(text.contains(r#""last_version":3"#), "{text}");
+        // Every key deleted, a later rlxd still goes on from the count.
+        let settings = dir.settings();
+        assert_eq!(
+            settings
+                .set(set("theme", json!("c")), CLI, &bus)
+                .unwrap()
+                .version,
+            4
+        );
+        drop(settings);
+
+        // A file without the count, or with one under a key's version, goes on from the
+        // highest version it holds, a key it keeps verbatim or sets aside included.
+        let at = |version: u64, value: &str| {
+            format!(
+                r#"{{"version":{version},"value":{value},"updated_at":"2026-11-26T12:00:00.000Z"}}"#
+            )
+        };
+        write_raw(
+            &dir,
+            &[
+                ("theme", at(5, r#""rlx""#)),
+                ("later", at(9, "1")),
+                ("rlxapp.deep", at(12, &nested(40))),
+            ],
+        );
+        let settings = dir.settings();
+        assert_eq!(
+            settings
+                .set(set("rlxapp.x", json!(1)), CLI, &bus)
+                .unwrap()
+                .version,
+            13
+        );
     }
 
     #[cfg(unix)]

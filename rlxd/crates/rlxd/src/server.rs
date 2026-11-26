@@ -920,6 +920,13 @@ pub async fn serve_connection<S>(daemon: Arc<Daemon>, stream: S, peer: Peer, han
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
+    // Settings calls run through `block_in_place` (`off_worker`), which only this flavour
+    // of runtime allows.
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread,
+        "rlxd serves connections on a multi-thread runtime"
+    );
     let (reader, mut writer) = tokio::io::split(stream);
     let mut frames = Frames {
         reader: BufReader::new(reader),
@@ -1407,7 +1414,11 @@ fn capabilities() -> Vec<String> {
 }
 
 /// Runs `work`, which may block on a lock or on the disk, as blocking work: the runtime
-/// hands this worker's other tasks to another, so no other connection waits on it.
+/// hands this worker's other tasks to another, so no other connection waits on it. It
+/// needs the multi-thread runtime `serve` builds (`block_in_place` panics on any other),
+/// which `serve_connection` asserts. A call waiting on the settings lock holds a thread
+/// of tokio's blocking pool meanwhile; the lock's holder never needs the runtime, so
+/// every waiter gets its turn.
 fn off_worker<T>(work: impl FnOnce() -> T) -> T {
     tokio::task::block_in_place(work)
 }

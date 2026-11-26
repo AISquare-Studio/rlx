@@ -43,9 +43,9 @@ pub mod keys {
     /// `— Ava, Sam's AI Agent`: a string of at most 512 characters.
     pub const AGENT_SIGN_OFF: &str = "agent_sign_off";
     /// How much the app lets an agent send unasked: `{default, connectors?}`, each a
-    /// [`send_safety_modes`] name, `connectors` by connector name. A policy, so it is
-    /// strict: a field rlxd doesn't know is refused, not ignored. It is protected, and
-    /// every change is logged.
+    /// [`send_safety_modes`] name, `connectors` by connector name. A policy, so a writer
+    /// may send no field rlxd doesn't know; a reader ignores one, which a later rlxd may
+    /// add. It is protected, and every change is logged.
     pub const SEND_SAFETY_MODE: &str = "send_safety_mode";
 
     /// Every key above.
@@ -168,7 +168,8 @@ struct UncheckedSet {
 /// {"key": "rlxapp.sidebar", "expected_version": 3}
 /// ```
 ///
-/// The key's numbering starts again: its next write is version 1.
+/// A version is never given twice in a home, so a stale `expected_version` from before a
+/// delete and a re-create gets `conflict`.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "SettingsDeleteParams")]
 #[non_exhaustive]
@@ -243,8 +244,10 @@ pub struct Setting {
         regex(pattern = r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
     )]
     pub key: String,
-    /// How many times it has been set, from 1; 0 when it never has. `settings.set
-    /// {expected_version}` takes it.
+    /// Its version: 0 when it was never set, else the number its last change was given,
+    /// from one count the home keeps for every setting, so no two changes share one,
+    /// even across a delete. `settings.set {expected_version}` and `settings.delete
+    /// {expected_version}` take it.
     pub version: u64,
     /// Its value. Absent when it was never set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -363,9 +366,21 @@ pub fn check_key(field: &str, key: &str) -> Result<(), Invalid> {
     Ok(())
 }
 
-/// Whether `value` has `key`'s shape: a known key's, or for any other key any value but
-/// `null`.
+/// Whether `value` has `key`'s shape, as a reader takes it: a known key's, or for any other
+/// key any value but `null`. A reader ignores a field it doesn't know in a
+/// `send_safety_mode`, which a later rlxd may add; a writer may not send one
+/// ([`check_value_to_write`]).
 pub fn check_value(field: &str, key: &str, value: &Value) -> Result<(), Invalid> {
+    check_shape(field, key, value, false)
+}
+
+/// Whether `value` has `key`'s shape, as a writer must send it: [`check_value`]'s, and a
+/// `send_safety_mode` with no field rlxd doesn't know, since it is a policy, taken whole.
+pub fn check_value_to_write(field: &str, key: &str, value: &Value) -> Result<(), Invalid> {
+    check_shape(field, key, value, true)
+}
+
+fn check_shape(field: &str, key: &str, value: &Value, strict: bool) -> Result<(), Invalid> {
     let wrong = |shape: &str| Err(Invalid::new(field, format!("{key} takes {shape}")));
     let deep = depth(value);
     if deep > MAX_DEPTH {
@@ -387,19 +402,24 @@ pub fn check_value(field: &str, key: &str, value: &Value) -> Result<(), Invalid>
             Some(text) if text.chars().count() <= 512 => Ok(()),
             _ => wrong("a string of at most 512 characters"),
         },
-        keys::SEND_SAFETY_MODE => check_send_safety(value).or_else(|_| {
-            wrong(
+        keys::SEND_SAFETY_MODE => check_send_safety(value, strict).or_else(|_| {
+            wrong(if strict {
                 "{default, connectors?} and no other field: each a mode, draft, \
                  standing_approval or auto, and connectors an object from connector names \
-                 to modes",
-            )
+                 to modes"
+            } else {
+                "{default, connectors?}: each a mode, draft, standing_approval or auto, and \
+                 connectors an object from connector names to modes"
+            })
         }),
         _ if value.is_null() => wrong("any JSON value but null"),
         _ => Ok(()),
     }
 }
 
-fn check_send_safety(value: &Value) -> Result<(), ()> {
+/// Whether `value` is a send-safety policy; with `strict`, one with no field rlxd doesn't
+/// know.
+fn check_send_safety(value: &Value, strict: bool) -> Result<(), ()> {
     let mode = |v: &Value| {
         v.as_str()
             .is_some_and(|m| send_safety_modes::ALL.contains(&m))
@@ -407,10 +427,11 @@ fn check_send_safety(value: &Value) -> Result<(), ()> {
     let Value::Object(fields) = value else {
         return Err(());
     };
-    // A policy is read whole: a field this rlxd doesn't know is refused, not ignored.
-    if fields
-        .keys()
-        .any(|field| field != "default" && field != "connectors")
+    // A writer's policy is taken whole: a field rlxd doesn't know is refused, not ignored.
+    if strict
+        && fields
+            .keys()
+            .any(|field| field != "default" && field != "connectors")
     {
         return Err(());
     }
@@ -437,7 +458,7 @@ fn check_send_safety(value: &Value) -> Result<(), ()> {
 pub fn send_safety_lowers(before: Option<&Value>, after: &Value) -> bool {
     let draft = json!({ "default": send_safety_modes::DRAFT });
     let before = before.unwrap_or(&draft);
-    if check_send_safety(after).is_err() {
+    if check_send_safety(after, false).is_err() {
         return false;
     }
     let rank = |mode: Option<&Value>| {
@@ -501,10 +522,11 @@ impl SettingsSetParams {
         self
     }
 
-    /// Whether these params keep every rule of `settings-set.json`.
+    /// Whether these params keep every rule of `settings-set.json`: a writer's, so a
+    /// `send_safety_mode` carries no field rlxd doesn't know.
     pub fn validate(&self) -> Result<(), Invalid> {
         check_key("key", &self.key)?;
-        check_value("value", &self.key, &self.value)
+        check_value_to_write("value", &self.key, &self.value)
     }
 }
 
@@ -681,9 +703,25 @@ fn not_null(schema: &mut Schema) {
     schema.insert("not".to_owned(), json!({"type": "null"}));
 }
 
-/// Each known key's value shape, as `if key is K then value is …` rules.
-fn value_shapes() -> Vec<Value> {
+/// Each known key's value shape, as `if key is K then value is …` rules. With `strict`,
+/// a writer's: a `send_safety_mode` with no other field.
+fn value_shapes(strict: bool) -> Vec<Value> {
     let modes = json!(send_safety_modes::ALL);
+    let mut send_safety = json!({
+        "type": "object",
+        "properties": {
+            "default": {"enum": modes},
+            "connectors": {
+                "type": "object",
+                "propertyNames": {"minLength": 1},
+                "additionalProperties": {"enum": modes},
+            },
+        },
+        "required": ["default"],
+    });
+    if strict {
+        send_safety["additionalProperties"] = json!(false);
+    }
     let shapes = [
         (
             keys::THEME,
@@ -694,22 +732,7 @@ fn value_shapes() -> Vec<Value> {
             keys::AGENT_SIGN_OFF,
             json!({"type": "string", "maxLength": 512}),
         ),
-        (
-            keys::SEND_SAFETY_MODE,
-            json!({
-                "type": "object",
-                "properties": {
-                    "default": {"enum": modes},
-                    "connectors": {
-                        "type": "object",
-                        "propertyNames": {"minLength": 1},
-                        "additionalProperties": {"enum": modes},
-                    },
-                },
-                "required": ["default"],
-                "additionalProperties": false,
-            }),
-        ),
+        (keys::SEND_SAFETY_MODE, send_safety),
     ];
     shapes
         .into_iter()
@@ -722,15 +745,16 @@ fn value_shapes() -> Vec<Value> {
         .collect()
 }
 
-/// The schema half of `settings.set`'s rules: a known key's value has its shape.
+/// The schema half of `settings.set`'s rules: a known key's value has its shape, a
+/// writer's.
 fn value_rules(schema: &mut Schema) {
-    schema.insert("allOf".to_owned(), Value::Array(value_shapes()));
+    schema.insert("allOf".to_owned(), Value::Array(value_shapes(true)));
 }
 
 /// The schema half of a setting's rules: a known key's value has its shape, and version 0
 /// carries nothing else while a later one carries its value and when it was set.
 fn setting_rules(schema: &mut Schema) {
-    let mut rules = value_shapes();
+    let mut rules = value_shapes(false);
     rules.push(json!({
         "if": {"properties": {"version": {"const": 0}}, "required": ["version"]},
         "then": {"not": {"anyOf": [

@@ -440,7 +440,49 @@ fn an_unreadable_settings_file_is_set_aside_and_rlxd_still_starts() {
     let aside = set_aside(&home);
     assert_eq!(aside.len(), 1, "{aside:?}");
     assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), "{not json");
-    assert!(log(&home).contains("cannot be read, so rlxd starts with no settings"));
+    assert!(log(&home).contains("so rlxd starts with no settings"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_settings_file_rlxd_cannot_read_is_moved_aside_and_the_next_set_loses_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TestHome::new();
+    home.start();
+    for params in [
+        json!({"key": "theme", "value": "rlx_light"}),
+        json!({"key": "rlxapp.a", "value": 1}),
+    ] {
+        assert_eq!(set(&home, false, params).code(), Some(0));
+    }
+    assert_eq!(home.rlxd(&["stop"]).code(), Some(0));
+    let file = Home::at(home.root()).rlxd_dir().join("settings.json");
+    let before = std::fs::read(&file).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&file).is_ok() {
+        eprintln!("file modes don't bind this process (root?): nothing to check");
+        return;
+    }
+
+    home.start();
+    let list = home.rlxd(&["call", "settings.list"]).data();
+    assert_eq!(list["settings"], json!([]), "{list}");
+    let after = set(&home, false, json!({"key": "rlxapp.b", "value": 2}));
+    assert_eq!(after.code(), Some(0), "{after:?}");
+    assert!(
+        log(&home).contains("so rlxd starts with no settings; it was moved to"),
+        "logged as an error"
+    );
+    let aside = set_aside(&home);
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    std::fs::set_permissions(&aside[0], std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        std::fs::read(&aside[0]).unwrap(),
+        before,
+        "every setting is kept"
+    );
+    let now: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(now["settings"]["rlxapp.b"]["value"], 2);
 }
 
 /// The files rlxd set aside, `settings.json.unreadable-<time>`.
@@ -669,8 +711,34 @@ fn a_status_call_stays_fast_while_large_sets_write_the_file() {
     std::fs::write(dir.join("settings.json"), text).unwrap();
     home.start();
 
+    // How long a set takes alone, and status alone: the bound is relative to them, so a
+    // slow runner slows both.
+    let mut alone = connect(&home);
+    let mut solo: Vec<Duration> = (0..3)
+        .map(|i| {
+            let params = json!({"key": format!("rlxapp.k{}", 100 + i), "value": value});
+            let started = Instant::now();
+            let reply = alone
+                .request("settings.set", params.as_object().unwrap().clone())
+                .unwrap();
+            assert!(reply.is_ok());
+            started.elapsed()
+        })
+        .collect();
+    solo.sort();
+    let solo = solo[1];
+    let baseline = (0..5)
+        .map(|_| {
+            let started = Instant::now();
+            assert!(alone.request("status", Default::default()).unwrap().is_ok());
+            started.elapsed()
+        })
+        .max()
+        .unwrap();
+
     // Four writers set at once, five times each; status is asked meanwhile, on a
-    // connection of its own.
+    // connection of its own. Were a write on a worker, a status call would wait at least
+    // one whole write: both workers held, one writing, one waiting on the lock.
     let writers: Vec<_> = (0..4)
         .map(|w| {
             let mut connection = connect(&home);
@@ -715,10 +783,12 @@ fn a_status_call_stays_fast_while_large_sets_write_the_file() {
         .max()
         .unwrap();
     assert!(asked >= 1);
+    let bound = (solo / 2).max(Duration::from_millis(100));
     assert!(
-        slowest_status < Duration::from_millis(250),
-        "status waited {slowest_status:?} ({asked} asked) while the slowest set took \
-         {slowest_set:?}"
+        slowest_status < bound,
+        "status waited {slowest_status:?} ({asked} asked), more than {bound:?}: half a \
+         set alone ({solo:?}), at least 100 ms; status alone took {baseline:?}, and the \
+         slowest concurrent set {slowest_set:?}"
     );
 }
 

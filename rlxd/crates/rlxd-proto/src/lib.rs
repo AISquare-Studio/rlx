@@ -198,8 +198,8 @@ pub use settings::{
     MAX_DEPTH as MAX_SETTING_DEPTH, MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged,
     SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams,
     check_key as check_setting_key, check_value as check_setting_value,
-    is_protected as setting_is_protected, keys as setting_keys, send_safety_lowers,
-    send_safety_modes,
+    check_value_to_write as check_setting_value_to_write, is_protected as setting_is_protected,
+    keys as setting_keys, send_safety_lowers, send_safety_modes,
 };
 pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
 pub use subscribe::SubscribeParams;

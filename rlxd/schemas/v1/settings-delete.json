@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SettingsDeleteParams",
-  "description": "`settings.delete`'s params: the key to set back to never set, and, for a delete that\nmust not undo another device's write, the version it was made from.\n\n```json\n{\"key\": \"rlxapp.sidebar\", \"expected_version\": 3}\n```\n\nThe key's numbering starts again: its next write is version 1.",
+  "description": "`settings.delete`'s params: the key to set back to never set, and, for a delete that\nmust not undo another device's write, the version it was made from.\n\n```json\n{\"key\": \"rlxapp.sidebar\", \"expected_version\": 3}\n```\n\nA version is never given twice in a home, so a stale `expected_version` from before a\ndelete and a re-create gets `conflict`.",
   "type": "object",
   "properties": {
     "expected_version": {
