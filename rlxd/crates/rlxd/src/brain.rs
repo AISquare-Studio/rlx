@@ -575,6 +575,12 @@ async fn serve(
             }
             Next::Ended(said) => return exited(&format!("it ended ({said})")),
             Next::Unasked(frame) => {
+                if frame.is_none()
+                    && let Ok(said) = timeout(STOP_GRACE, exit.wait()).await
+                {
+                    // Its stdout closes as it ends, and can be seen first.
+                    return exited(&format!("it ended ({said})"));
+                }
                 let what = match frame {
                     None => "its stdout closed".to_owned(),
                     Some(Ok(frame)) => format!("it said {frame:?} unasked"),

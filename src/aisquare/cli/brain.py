@@ -18,7 +18,7 @@ def brain(
 ) -> None:
     """Answer rlxd's requests, as JSON lines on stdin and stdout, until stdin closes."""
     if not stdio:
-        typer.echo("rlx brain is rlxd's: it runs as `rlx brain --stdio`.", err=True)
+        typer.echo("This command is rlxd's: rlxd starts it, with --stdio.", err=True)
         raise typer.Exit(2)
     from aisquare.services import brain as brain_service
 

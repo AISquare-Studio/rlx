@@ -162,7 +162,7 @@ def test_rlx_brain_runs_only_as_rlxd_starts_it_and_is_no_feature_counted(
     monkeypatch.setattr(feature_use, "record", record)
     result = CliRunner().invoke(app_module.app, ["brain"])
     assert result.exit_code == 2
-    assert "rlx brain --stdio" in result.output
+    assert "rlxd starts it, with --stdio" in result.output
     assert counted == [], "rlxd starts the brain: no feature use, no active ping"
     assert "brain" in app_module._NOT_FEATURES
 
