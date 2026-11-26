@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -410,3 +411,73 @@ def test_fresh_caches_empties_every_functools_cache_of_rlx() -> None:
     assert program.word.cache_info().currsize == 1
     assert brain.fresh_caches() >= 1
     assert program.word.cache_info().currsize == 0
+
+
+def _children() -> set[int]:
+    """This process's children, by pid (POSIX)."""
+    listed = subprocess.run(
+        ["pgrep", "-P", str(os.getpid())], capture_output=True, text=True, check=False
+    )
+    return {int(pid) for pid in listed.stdout.split()}
+
+
+def test_nothing_a_hook_starts_outlives_its_request_but_a_detached_worker(
+    tmp_path: Path, template: tuple[Path, Path]
+) -> None:
+    """Each event, run by the brain's own ``hook`` in this process: no non-daemon thread it
+    started is left, and every child still running is in a session of its own, a worker
+    ``services.hooks`` detaches on purpose, as it would from ``rlx hook``."""
+    template_home, project = template
+    home = _copy(template_home, tmp_path / "in-process")
+    env = {name: os.environ[name] for name in brain.ENV_NAMES if name in os.environ}
+    env.update({"AISQUARE_HOME": str(home), "AISQUARE_ROLE": "coder"})
+    for event in PAYLOADS:
+        threads = {thread for thread in threading.enumerate() if not thread.daemon}
+        children = set() if sys.platform == "win32" else _children()
+        result = brain.METHODS["hook"](
+            {
+                "event": event,
+                "stdin_b64": base64.b64encode(_payload(event, project)).decode(),
+                "cwd": str(project),
+                "env": env,
+            }
+        )
+        assert result["exit_code"] == 0, base64.b64decode(result["stderr_b64"])
+        left = {thread for thread in threading.enumerate() if not thread.daemon} - threads
+        assert not left, f"{event} left threads running: {left}"
+        if sys.platform != "win32":  # Windows has no sessions to tell a detached worker by
+            for pid in _children() - children:
+                assert os.getsid(pid) == pid, f"{event} left child {pid} in the brain's session"
+    assert os.environ.get("AISQUARE_ROLE") != "coder", "the hook's environment was put back"
+
+
+def test_the_brain_waits_for_a_thread_the_hook_started_and_keeps_what_it_printed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As a process waits for its non-daemon threads before it exits: the hook's reply
+    comes once the thread is done, with what it printed."""
+    import time
+
+    from aisquare.services import agent_events
+
+    handle = agent_events.handle
+
+    def handle_and_leave_a_thread(*args: Any, **kwargs: Any) -> str:
+        def late() -> None:
+            time.sleep(0.3)
+            print("printed by a thread the hook started", flush=True)
+
+        threading.Thread(target=late, name="hook-leftover").start()
+        return handle(*args, **kwargs)
+
+    monkeypatch.setattr(agent_events, "handle", handle_and_leave_a_thread)
+    result = brain.METHODS["hook"](
+        {
+            "event": "stop",
+            "stdin_b64": base64.b64encode(_payload("stop", tmp_path)).decode(),
+            "cwd": str(tmp_path),
+            "env": {"AISQUARE_HOME": str(tmp_path / "home")},
+        }
+    )
+    assert not [thread for thread in threading.enumerate() if thread.name == "hook-leftover"]
+    assert b"printed by a thread the hook started" in base64.b64decode(result["stdout_b64"])

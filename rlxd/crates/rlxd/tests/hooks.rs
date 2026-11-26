@@ -288,3 +288,73 @@ fn rlxd_hook_ping_is_quick() {
         assert!(median < Duration::from_millis(30), "median {median:?}");
     }
 }
+
+/// `hook`'s params for `event`, with `env`.
+fn hook_params(home: &TestHome, event: &str, env: Value) -> String {
+    json!({
+        "event": event,
+        "stdin_b64": "eyJzZXNzaW9uX2lkIjoidDEifQ==",
+        "cwd": home.root().display().to_string(),
+        "env": env,
+    })
+    .to_string()
+}
+
+#[test]
+fn a_hook_of_another_home_is_not_delivered_and_publishes_nothing() {
+    let home = TestHome::new();
+    home.start();
+    let own = home.root().display().to_string();
+    let elsewhere = home.root().join("elsewhere").display().to_string();
+    for env in [
+        json!({"AISQUARE_HOME": elsewhere}),
+        json!({"RLX_HOME": elsewhere, "AISQUARE_HOME": own}),
+        // rlx before and after 0.10.2 would disagree on this one's home.
+        json!({"RLX_HOME": own, "AISQUARE_HOME": elsewhere}),
+    ] {
+        let params = hook_params(&home, "stop", env.clone());
+        let refused = home.rlxd(&["call", "hook", &params]);
+        assert_eq!(
+            refused.error_code(),
+            "hook_not_delivered",
+            "{env}: {refused:?}"
+        );
+    }
+    // The same home, written another way (a relative path from the hook's directory),
+    // is this rlxd's: it gets as far as the brain, which this home has none of.
+    let relative = json!({"AISQUARE_HOME": "."});
+    let params = hook_params(&home, "stop", relative);
+    let reached = home.rlxd(&["call", "hook", &params]);
+    assert_eq!(reached.error_code(), "hook_not_delivered", "{reached:?}");
+    let message = reached.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("brain never took"), "{message}");
+    let events = home.rlxd(&["events", "--topics", "hook", "--since", "0"]);
+    let published: Vec<Value> = events.lines();
+    assert_eq!(
+        published.len(),
+        1,
+        "only the hook of this home: {published:?}"
+    );
+}
+
+#[test]
+fn hook_is_for_command_line_clients_only() {
+    let home = TestHome::new();
+    home.start();
+    let own = home.root().display().to_string();
+    let params = hook_params(&home, "stop", json!({"AISQUARE_HOME": own}));
+    for role in ["tui", "remote"] {
+        let refused = home.rlxd(&["call", "--role", role, "--client", "probe", "hook", &params]);
+        assert_eq!(refused.error_code(), "role_not_allowed", "{refused:?}");
+        assert_eq!(refused.json()["error"]["detail"]["method"], "hook");
+        assert_eq!(refused.json()["error"]["detail"]["role"], role);
+    }
+    let events = home.rlxd(&["events", "--topics", "hook", "--since", "0"]);
+    assert!(
+        events.lines().is_empty(),
+        "a refused hook publishes nothing"
+    );
+}

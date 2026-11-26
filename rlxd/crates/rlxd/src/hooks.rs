@@ -1,7 +1,11 @@
 //! `hook` (handoff 0.10.3, 1.5): one Claude Code hook, from rlxd-hook.
 //!
-//! - **The event.** Every `hook` that parses publishes one `hook.<event>` on the `hook`
-//!   topic first, `{session_id, cwd, run_id?}` (7.3): the session and directory from the
+//! - **Its home.** A hook whose own rlx home (by `rlxd_client::Home`'s rules, on the
+//!   variables rlxd-hook sent) is not this rlxd's is `hook_not_delivered`, so rlxd-hook runs
+//!   `rlx hook` in its own; and nothing is published here. Only a `cli` client may call
+//!   `hook` (`role_not_allowed`).
+//! - **The event.** Every other `hook` that parses publishes one `hook.<event>` on the
+//!   `hook` topic first, `{session_id, cwd, run_id?}` (7.3): the session and directory from the
 //!   hook's JSON (the directory rlxd-hook ran in when the JSON names none).
 //! - **The fleet's six** go to the resident brain (`crate::brain`), which runs `rlx hook
 //!   <event>`'s own code with the hook's stdin, directory and allowlisted environment
@@ -15,8 +19,11 @@
 //! - **`pre-tool-use`** is the gate's (5.1). Until the gate decides tool calls, rlxd
 //!   denies every one itself, and nothing here can allow one.
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rlxd_client::Home;
 use rlxd_proto::{
     Data, ErrorBody, HOOK_ENV_NAMES, HookEventData, HookParams, HookReply, PRE_TOOL_USE, b64,
     codes, deny_output, hook_codes, hook_event_type, topics,
@@ -48,6 +55,9 @@ pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
             &format!("hook's params are not valid: {e}"),
         )
     })?;
+    if let Err(why) = same_home(daemon.home(), &params) {
+        return Err(error(hook_codes::HOOK_NOT_DELIVERED, &why));
+    }
     let stdin = b64::decode(&params.stdin_b64).unwrap_or_default();
     publish(daemon, &params, &stdin);
     if params.event == PRE_TOOL_USE {
@@ -102,6 +112,61 @@ pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
             ),
         )),
     }
+}
+
+/// Whether the hook's own rlx home, by `rlxd_client::Home`'s rules on the variables
+/// rlxd-hook sent (`RLX_HOME`, else `AISQUARE_HOME`, else `.aisquare` in its user's home;
+/// a relative one taken from its directory), is the home this rlxd serves. Else why not:
+/// its brain would act on another home than `rlx hook` would. So is a hook whose
+/// `RLX_HOME` and `AISQUARE_HOME` name different homes: rlx reads `AISQUARE_HOME` alone
+/// before 0.10.2's sync, `RLX_HOME` first after it.
+fn same_home(own: &Home, params: &HookParams) -> Result<(), String> {
+    let var = |name: &str| {
+        params
+            .env
+            .get(name)
+            .filter(|value| !value.is_empty())
+            .map(OsString::from)
+    };
+    let user = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let user_home = var(user).map(PathBuf::from).or_else(std::env::home_dir);
+    let cwd = params.cwd.as_deref().map(Path::new);
+    let resolve = |rlx: Option<OsString>, legacy: Option<OsString>| {
+        Home::from_values(rlx, legacy, user_home.clone())
+            .map(|home| real(home.root(), cwd))
+            .map_err(|e| e.to_string())
+    };
+    let theirs = resolve(var("RLX_HOME"), var("AISQUARE_HOME"))?;
+    if var("RLX_HOME").is_some()
+        && var("AISQUARE_HOME").is_some()
+        && resolve(None, var("AISQUARE_HOME"))? != theirs
+    {
+        return Err(
+            "the hook's RLX_HOME and AISQUARE_HOME name different homes, so rlx's \
+             releases would disagree on its home: run as `rlx hook`, which picks its own"
+                .to_owned(),
+        );
+    }
+    let ours = real(own.root(), None);
+    if theirs == ours {
+        Ok(())
+    } else {
+        Err(format!(
+            "the hook's rlx home is {}, not this rlxd's ({}): run as `rlx hook`, in its own",
+            theirs.display(),
+            ours.display()
+        ))
+    }
+}
+
+/// `path`, joined to `cwd` when relative, as the OS resolves it (links and `..` gone)
+/// when it exists.
+fn real(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    let path = match cwd {
+        Some(cwd) if path.is_relative() => cwd.join(path),
+        _ => path.to_path_buf(),
+    };
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 /// Publishes the hook's `hook.<event>`.

@@ -76,6 +76,16 @@ All of it is put back afterwards, whatever the hook did. Requests never overlap:
 one at a time, so changing process-wide state for one is safe, and nothing of one is left
 for the next.
 
+Nothing a hook starts outlives its request but what ``rlx hook``'s would outlive its
+process: the brain waits for each non-daemon thread the hook started, as a process does
+before it exits (what they print is the hook's), and every child still running after it
+is a detached worker (``services.hooks._detach``: a session of its own, which also leaves
+``rlx hook`` behind on purpose, such as the code index's refresh). The brain collects each
+child that has ended after every hook, so none stays a zombie. Daemon threads (a Remote
+push, say) run on: ``rlx hook`` would wait for them at exit (``atexit``), and the brain,
+which does not exit, lets them finish. The protocol's own fds are not inheritable, so no
+child holds the brain's pipes.
+
 The allowlist (:data:`ENV_NAMES`), which rlxd-hook sends and the brain applies:
 
 - **rlx's own:** every ``AISQUARE_*`` variable rlx's code names, and ``RLX_HOME``: the role,
@@ -138,6 +148,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping
@@ -527,6 +538,29 @@ def _run_rlx() -> int:
     return 0
 
 
+def _join_threads_since(before: set[threading.Thread]) -> None:
+    """Waits for every non-daemon thread the hook started, as a process waits for them
+    before it exits: what they print is the hook's, and none outlives its request."""
+    for thread in threading.enumerate():
+        if thread not in before and not thread.daemon and thread is not threading.current_thread():
+            thread.join()
+
+
+def _reap_children() -> None:
+    """Collects every child that has ended, a detached worker the hook started among them,
+    which would otherwise stay a zombie of the brain's until the next start of a process.
+    POSIX only: Windows keeps no zombies."""
+    if sys.platform == "win32":
+        return
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
 def _hook(params: Mapping[str, Any]) -> Result:
     """``hook {event, stdin_b64, cwd?, env}``: ``rlx hook <event>`` with the hook's stdin,
     directory and allowlisted environment. ``{stdout_b64, stderr_b64, exit_code}``."""
@@ -546,8 +580,11 @@ def _hook(params: Mapping[str, Any]) -> Result:
     env = {name: value for name, value in raw_env.items() if _allowed(name)}
     fresh_caches()
     argv = [sys.argv[0], "hook", str(event)]
+    before = set(threading.enumerate())
     with _as_the_hook(env, cwd if isinstance(cwd, str) else None, argv, stdin) as captured:
         code = _run_rlx()
+        _join_threads_since(before)
+    _reap_children()
     return {
         "stdout_b64": base64.b64encode(captured["stdout"]).decode("ascii"),
         "stderr_b64": base64.b64encode(captured["stderr"]).decode("ascii"),
