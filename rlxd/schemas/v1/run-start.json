@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunStartParams",
+  "description": "`run.start`'s params (7.5). It returns `{run_id}` (`run-ref.json`).\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\", \"kind\": \"task\", \"prompt\": \"…\",\n \"mount\": {\"kind\": \"no_tools\"}, \"persist_session\": true, \"space\": \"default\",\n \"partial\": true, \"timeout_s\": 900, \"deadline_ms\": 120000}\n```\n\nrlxd refuses, by error code:\n- `run_exists`: a `run_id` it already knows;\n- `kind_mount_mismatch`: a `check`, `parse_instruction` or `widget_author` run whose\n  mount is not `no_tools`;\n- `pinned_call_required`: a `send_executor` or `watch` run without `pinned_call`;\n- `not_implemented`: a non-empty `needs_connectors`, until the connector gate (5.5);\n- `invalid_params`: anything else these rules or the schema refuse.",
+  "type": "object",
+  "properties": {
+    "append_system_prompt": {
+      "description": "Text appended to Claude Code's system prompt (`--append-system-prompt`).",
+      "type": "string"
+    },
+    "deadline_ms": {
+      "description": "How long the gate waits for the app's answer to each tool call, in milliseconds\n(5.1). The hook's own timeout is this plus 10 s.",
+      "type": "integer",
+      "format": "uint64",
+      "default": 120000,
+      "maximum": 3600000,
+      "minimum": 1
+    },
+    "kind": {
+      "description": "What the run is for.",
+      "$ref": "#/$defs/RunKind"
+    },
+    "mount": {
+      "description": "Which tools the run may reach.",
+      "$ref": "#/$defs/Mount"
+    },
+    "needs_connectors": {
+      "description": "The connectors that must be `connected` before the first turn (5.5). Not yet\nserved: a non-empty list is refused with `not_implemented`.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "needs_you_when": {
+      "description": "When the finished run is `needs_you` rather than `done`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NeedsYouWhen"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "output_schema": {
+      "description": "A JSON Schema the final output must match (`--json-schema`); `run.done` then\ncarries `structured_output`.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "partial": {
+      "description": "Stream partial text as it comes (`--include-partial-messages`): `run.text` events\nwith `partial: true`.",
+      "type": "boolean",
+      "default": false
+    },
+    "persist_session": {
+      "description": "Whether Claude Code keeps the session, so the run can be resumed. Absent: `true`\nfor a `task`, `false` for every other kind (`--no-session-persistence`).",
+      "type": "boolean"
+    },
+    "pinned_call": {
+      "description": "The one call a `send_executor` or `watch` run may make. `null` is none.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PinnedCall"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "prompt": {
+      "description": "The prompt, sent as the run's first stream-json user message.",
+      "type": "string",
+      "default": ""
+    },
+    "run_id": {
+      "description": "The run's id, which the app picks: a lower-case UUID, also Claude Code's session\nid.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "space": {
+      "description": "The space the run works in (`space.ensure`). Absent: `default`.",
+      "type": "string",
+      "default": "default",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9_-]+)*$"
+    },
+    "timeout_s": {
+      "description": "End the run `failed {reason: \"timeout\"}` once its process has run this many\nseconds. Absent: no limit.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 604800,
+      "minimum": 1
+    }
+  },
+  "required": [
+    "run_id",
+    "kind",
+    "mount"
+  ],
+  "$defs": {
+    "Mount": {
+      "description": "Which tools a run may reach (7.5).\n\n- `{\"kind\": \"no_tools\"}`: none. rlxd passes `--tools \"\" --strict-mcp-config`, so\n  neither built-in tools nor connectors are mounted.\n- `{\"kind\": \"connectors\", \"connectors\": [\"claude.ai Slack\"]}`: built-in tools are\n  dropped (`--tools \"\"`); the gate (5.1) decides which connector tools may be called.",
+      "oneOf": [
+        {
+          "description": "No tools at all.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "no_tools"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Only these connectors' tools, each call decided by the gate.",
+          "type": "object",
+          "properties": {
+            "connectors": {
+              "description": "The connectors, by the name `system/init` gives them, such as `claude.ai\nSlack`.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "connectors"
+            }
+          },
+          "required": [
+            "kind",
+            "connectors"
+          ]
+        }
+      ]
+    },
+    "NeedsYouWhen": {
+      "description": "When a finished run is `needs_you` rather than `done` (7.5): its final output, read at\n`pointer`, equals `equals`. The question is read at `question_pointer`. The output is\n`structured_output` when the run has one, else the result's text read as JSON.",
+      "type": "object",
+      "properties": {
+        "equals": {
+          "description": "The value there that means the run needs the user."
+        },
+        "pointer": {
+          "description": "A JSON pointer (RFC 6901) into the output, such as `/status`.",
+          "type": "string",
+          "pattern": "^(/.*)?$"
+        },
+        "question_pointer": {
+          "description": "A JSON pointer to the question to show, such as `/question`.",
+          "type": "string",
+          "pattern": "^(/.*)?$"
+        }
+      },
+      "required": [
+        "pointer",
+        "equals"
+      ]
+    },
+    "PinnedCall": {
+      "description": "The one call a `send_executor` or `watch` run may make (5.1).",
+      "type": "object",
+      "properties": {
+        "input_sha256": {
+          "description": "The SHA-256, in lower-case hex, of the call's input as RFC 8785 canonical JSON.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "tool": {
+          "description": "The tool, such as `mcp__claude_ai_Slack__slack_send_message`.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "tool",
+        "input_sha256"
+      ]
+    },
+    "RunKind": {
+      "description": "What a run is for (7.5). Each kind has its own pool, and rlxd's gate rules for it\n(5.1).",
+      "oneOf": [
+        {
+          "description": "A task the user asked for. The only kind whose session persists by default.",
+          "type": "string",
+          "const": "task"
+        },
+        {
+          "description": "Sends one pinned call. Never resumed: a send is never retried.",
+          "type": "string",
+          "const": "send_executor"
+        },
+        {
+          "description": "Refreshes a widget's data.",
+          "type": "string",
+          "const": "widget_refresh"
+        },
+        {
+          "description": "One pinned read call for a scheduled watch.",
+          "type": "string",
+          "const": "watch"
+        },
+        {
+          "description": "rlxapp's send-time `Check`: no tools.",
+          "type": "string",
+          "const": "check"
+        },
+        {
+          "description": "Parses an instruction: no tools.",
+          "type": "string",
+          "const": "parse_instruction"
+        },
+        {
+          "description": "Writes a widget: no tools.",
+          "type": "string",
+          "const": "widget_author"
+        }
+      ]
+    }
+  }
+}
