@@ -148,6 +148,138 @@ jobs:
       - name: cargo deny check
         run: cargo deny --locked check
 
+  # `rlxd here` over a real `ssh localhost` (the owner's remote brief, §3), as rlx.app runs
+  # it: by absolute path, in a non-login session that has not read the user's profile. It
+  # must give the answer `env -i HOME=$HOME rlxd here --json` gives locally, in each state.
+  # sshd is the runner's own. Its host key is pinned from its own file, not fetched over
+  # the connection, and both sides allow public-key auth only. Forwarding the socket over
+  # SSH (direct-streamlocal) can extend this job.
+  ssh:
+    name: rlxd here over ssh (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rlxd -> target
+
+      # check-jsonschema, for the schema checks below.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.0"
+
+      - name: cargo build
+        run: cargo build --locked -p rlxd
+
+      - name: Start sshd on localhost, key-only, its host key pinned
+        run: |
+          if ! command -v sshd >/dev/null && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          # The server takes public keys only.
+          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
+            | sudo tee /etc/ssh/sshd_config.d/10-rlxd-ci.conf >/dev/null
+          sudo systemctl restart ssh || sudo service ssh restart
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          chmod go-w ~
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          # The host key, read from the host's own file: pinned, not trusted on first use.
+          printf 'localhost %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" \
+            > ~/.ssh/known_hosts
+          # Every ssh below: that key only, public-key auth only, never a prompt.
+          printf '%s\n' 'Host localhost' '  BatchMode yes' '  StrictHostKeyChecking yes' \
+            '  HostKeyAlgorithms ssh-ed25519' '  PreferredAuthentications publickey' \
+            '  IdentitiesOnly yes' '  IdentityFile ~/.ssh/id_ed25519' > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          ssh -G localhost | grep -E '^(batchmode|stricthostkeychecking|preferredauthentications|hostkeyalgorithms) '
+          ssh localhost true
+          echo "a non-login session's PATH: $(ssh localhost 'echo $PATH')"
+
+      # The step's shell is `bash -e`: an exit the check expects, 3, 5 or 127, is caught
+      # with `|| code=$?`.
+      - name: rlxd here gives the same answer over ssh as locally
+        working-directory: .
+        run: |
+          rlxd="$PWD/rlxd/target/debug/rlxd"
+          over_ssh() { ssh localhost "$@"; }
+          # `rlxd here --json` locally with nothing but HOME, and over ssh, into
+          # <state>-local.json and <state>-ssh.json. Both must exit $2 and match.
+          both() {
+            local state=$1 want=$2 code
+            code=0; env -i HOME="$HOME" "$rlxd" here --json > "$state-local.json" || code=$?
+            [ "$code" = "$want" ] || { echo "::error::$state: local exit $code, not $want"; exit 1; }
+            code=0; over_ssh "$rlxd here --json" > "$state-ssh.json" || code=$?
+            [ "$code" = "$want" ] || { echo "::error::$state: ssh exit $code, not $want"; exit 1; }
+            diff <(jq -S . "$state-local.json") <(jq -S . "$state-ssh.json") \
+              || { echo "::error::$state: the answer over ssh differs"; exit 1; }
+            jq -c .data "$state-ssh.json"
+          }
+
+          both stopped 3
+          jq -e '.ok and .data.installed and (.data.running|not) and (.data|has("pid")|not)' stopped-ssh.json
+
+          over_ssh "$rlxd here --json --start" > started-ssh.json
+          jq -e '.ok and .data.running and .data.started and .data.pid > 0' started-ssh.json
+          pid=$(jq .data.pid started-ssh.json)
+
+          # The session had SSH_CONNECTION and SSH_CLIENT; the rlxd it started has none.
+          [ -n "$(over_ssh 'echo "$SSH_CONNECTION"')" ] \
+            || { echo "::error::the ssh session has no SSH_CONNECTION"; exit 1; }
+          echo "the started rlxd's SSH_ and PATH variables, as ps eww -p $pid shows them:"
+          ps eww -p "$pid" | tr ' ' '\n' | grep -E '^(SSH_[A-Z_]*|PATH)=' || true
+          tr '\0' '\n' < "/proc/$pid/environ" > daemon-environ.txt
+          grep -q '^PATH=' daemon-environ.txt \
+            || { echo "::error::the started rlxd's environment was not read"; exit 1; }
+          if grep -E '^SSH_[A-Z_]*=' daemon-environ.txt; then
+            echo "::error::the rlxd --start started kept the SSH session's variables"; exit 1
+          fi
+
+          both running 0
+          jq -e --argjson pid "$pid" --arg home "$HOME" '.data.running and (.data.started|not)
+            and .data.pid == $pid and .data.socket == ($home + "/.aisquare/run/rlxd.sock")
+            and .data.protocol_versions == [1]' running-ssh.json
+
+          # The README's command, as an app sends it, in its three cases. It runs rlxd by
+          # absolute path, as on a host whose non-login PATH lacks ~/.local/bin (this
+          # runner's has it).
+          snippet=$(grep -m1 -E "^sh -c '.*exit 127'\$" rlxd/README.md)
+          mkdir -p ~/.local/bin
+          cp "$rlxd" ~/.local/bin/rlxd
+          over_ssh "$snippet" > snippet-ssh.json
+          jq -e --argjson pid "$pid" '.data.running and .data.pid == $pid
+            and (.data.rlxd.path|endswith("/.local/bin/rlxd"))' snippet-ssh.json
+
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/envelope.json -- *-ssh.json *-local.json
+          mkdir data
+          for answer in *-ssh.json *-local.json; do jq .data "$answer" > "data/$answer"; done
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/here-reply.json -- data/*.json
+
+          over_ssh "$rlxd stop"
+          rm ~/.local/bin/rlxd
+
+          # rlx with no rlxd, as on a host with rlx from before 0.10.3: exit 5, rlx's version.
+          printf '#!/bin/sh\necho "rlx 0.10.1"\n' > ~/.local/bin/rlx
+          chmod 755 ~/.local/bin/rlx
+          code=0; said=$(over_ssh "$snippet") || code=$?
+          [ "$code" = 5 ] || { echo "::error::rlx and no rlxd: the command exits $code, not 5"; exit 1; }
+          [ "$said" = "rlx 0.10.1" ] || { echo "::error::rlx and no rlxd: it said '$said'"; exit 1; }
+          rm ~/.local/bin/rlx
+
+          code=0; over_ssh "$snippet" > /dev/null || code=$?
+          [ "$code" = 127 ] || { echo "::error::with nothing installed the command exits $code, not 127"; exit 1; }
+
   # 1.2: rlxd and rlxd-hook for the five targets, as the artifact `rlxd-archives`,
   # installed by `rlx daemon install` on each OS (rlxd-release.yml). It attaches to a
   # release only with a release_tag given by hand, and then only if dry_run is off.
