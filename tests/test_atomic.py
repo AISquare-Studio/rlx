@@ -203,7 +203,7 @@ def test_bytes_land_exactly_and_text_lands_as_it_always_has(tmp_path: Path) -> N
     text = tmp_path / "config.toml"
     write_replacing(text, 'model = "café"\nkeep = true\n')
     assert text.read_bytes() == f'model = "café"{os.linesep}keep = true{os.linesep}'.encode()
-    assert _leftovers(tmp_path) == ["config.toml", "remote.json"]
+    assert _leftovers(tmp_path) == ["config.toml", "secret.json"]
 
 
 def test_durable_syncs_the_file_then_the_directory_and_not_durable_syncs_nothing(

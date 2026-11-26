@@ -1430,7 +1430,7 @@ def test_a_home_aisquare_home_moved_is_never_purged_whatever_its_names(
     custom = lifecycle.purge_refusal(work, custom=True)
     default = lifecycle.purge_refusal(work, custom=False)
 
-    assert custom is not None and "AISQUARE_HOME moved the home" in custom
+    assert custom is not None and "(or AISQUARE_HOME) moved the home" in custom
     assert default is None, "the default ~/.aisquare is aisquare's by name"
 
 
@@ -2187,7 +2187,7 @@ def test_a_refused_purge_says_why_under_json(
 
     error = _one_object(result.stdout)
     assert error["error"] == "purge_refused"
-    assert "AISQUARE_HOME moved the home" in error["detail"]
+    assert "(or AISQUARE_HOME) moved the home" in error["detail"]
 
 
 def test_off_a_terminal_a_refused_plan_exits_1_without_sending_them_to_yes(
