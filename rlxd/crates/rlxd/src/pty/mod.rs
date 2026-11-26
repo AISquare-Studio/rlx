@@ -22,6 +22,11 @@
 pub mod keys;
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+pub use windows::shim;
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -104,8 +109,9 @@ struct Pty {
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     queued: Arc<AtomicUsize>,
+    /// The Job Object that holds the PTY's processes.
     #[cfg(windows)]
-    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    job: windows::Job,
 }
 
 impl Pty {
@@ -215,8 +221,39 @@ impl Host {
             }
             None => home_dir(),
         };
-        let mut command = CommandBuilder::new(&params.argv[0]);
-        command.args(&params.argv[1..]);
+        #[cfg(windows)]
+        let job = {
+            // The shim starts the program, so a program that isn't there is seen here,
+            // as CreateProcess would look for it, while spawn_failed can still say so.
+            let path = match params.env.as_ref().and_then(|env| env.get("PATH")) {
+                Some(Some(path)) => Some(path.clone()),
+                Some(None) => Some(String::new()),
+                None => None,
+            };
+            if windows::find_program(&params.argv[0], path.as_deref(), Path::new(&cwd)).is_none() {
+                return Err(Refused::SpawnFailed(format!(
+                    "cannot start {:?}: no such program",
+                    params.argv[0]
+                )));
+            }
+            windows::Job::create(&new_id())
+                .map_err(|e| Refused::SpawnFailed(format!("no job for the pty: {e}")))?
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let rlxd = std::env::current_exe()
+                .map_err(|e| Refused::SpawnFailed(format!("rlxd can't find itself: {e}")))?;
+            let mut command = CommandBuilder::new(rlxd);
+            command.args(["__pty-shim", "--job", job.name(), "--"]);
+            command.args(&params.argv);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = CommandBuilder::new(&params.argv[0]);
+            command.args(&params.argv[1..]);
+            command
+        };
         command.cwd(&cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -277,7 +314,7 @@ impl Host {
             input: Mutex::new(Some(input)),
             queued: Arc::clone(&queued),
             #[cfg(windows)]
-            killer: Mutex::new(child.clone_killer()),
+            job,
         });
         let short = &id[..8];
         let threads = [
@@ -431,13 +468,17 @@ fn end(pty: &Pty) {
     }
     #[cfg(windows)]
     {
-        if pty.state().exit.is_none() {
-            let mut killer = pty.killer.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = killer.kill() {
-                warning!("pty {}: cannot kill pid {}: {e}", pty.id, pty.pid);
-            }
-            drop(killer);
-            wait_until(pty, KILL_GRACE, |state| state.exit.is_some());
+        // Every process of the job at once, the shim and the program among them.
+        if let Err(e) = pty.job.terminate(1) {
+            warning!("pty {}: cannot end its job: {e}", pty.id);
+        }
+        wait_until(pty, KILL_GRACE, |state| state.exit.is_some());
+        let deadline = Instant::now() + KILL_GRACE;
+        while pty.job.active().is_ok_and(|n| n > 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if pty.job.active().is_ok_and(|n| n > 0) {
+            warning!("pty {}: processes of its job still run", pty.id);
         }
     }
     pty.input.lock().unwrap_or_else(|p| p.into_inner()).take();

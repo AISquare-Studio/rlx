@@ -130,6 +130,18 @@ enum Action {
         #[arg(long)]
         read_only: bool,
     },
+    /// On Windows, the process a PTY's ConPTY starts: joins the PTY's job, then runs the
+    /// program in it. rlxd starts it; nothing else should.
+    #[cfg(windows)]
+    #[command(name = "__pty-shim", hide = true)]
+    PtyShim {
+        /// The job's name.
+        #[arg(long)]
+        job: String,
+        /// The program and its arguments.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -279,6 +291,8 @@ pub fn main() -> ExitCode {
             force,
         }) => cli::gate_pair(request_id, !deny, force),
         Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
+        #[cfg(windows)]
+        Action::PtyShim { job, argv } => pty::shim(&job, &argv),
         Action::Attach { pty_id, read_only } => {
             attach::attach(attach::AttachArgs { pty_id, read_only })
         }

@@ -250,6 +250,12 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
   this terminal. Ctrl-] detaches. `--read-only` sends nothing and leaves the size alone.
 - **`pty.kill`** ends the process's whole group: SIGHUP and SIGTERM, then SIGKILL after
   two seconds. It replies once the group is gone.
+- **On Windows** each PTY's processes are in a Job Object that rlxd makes, named with
+  128 random bits, with `KILL_ON_JOB_CLOSE`; `pty.kill` ends the job. The ConPTY's
+  process is rlxd itself in a hidden mode, `rlxd __pty-shim`, which joins the job before
+  it starts the program, so nothing the program starts escapes it, and exits with the
+  program's exit code, all 32 bits. The shim lives through Ctrl-C and Ctrl-Break, which
+  the console sends the program too. `pty.list`'s `pid` there is the shim's.
 - **Who may do what:** `cli` and `tui` every method; `remote` the reads and
   `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
 - **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;

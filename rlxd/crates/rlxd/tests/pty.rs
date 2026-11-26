@@ -6,9 +6,7 @@
 
 mod common;
 
-#[cfg(unix)]
 use std::process::Command;
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use common::{TestHome, assert_valid, eventually};
@@ -1008,4 +1006,154 @@ fn rlxd_attach_puts_a_pty_in_a_terminal_and_types_into_it() {
     eventually("the watcher detaches", || {
         screen(&home, &watcher)["exited"] == true
     });
+}
+
+/// On Windows, `rlxd __pty-shim` runs only in a job rlxd made.
+#[cfg(windows)]
+#[test]
+fn windows_the_shim_refuses_to_run_without_its_job() {
+    let home = TestHome::new();
+    let run = home.rlxd(&[
+        "__pty-shim",
+        "--job",
+        "Local\\rlxd-pty-nope",
+        "--",
+        "cmd",
+        "/c",
+        "exit 0",
+    ]);
+    assert_eq!(run.code(), Some(2), "{run:?}");
+    assert!(run.stderr.contains("no job"), "{run:?}");
+    let not_ours = home.rlxd(&[
+        "__pty-shim",
+        "--job",
+        "Global\\other",
+        "--",
+        "cmd",
+        "/c",
+        "exit 0",
+    ]);
+    assert_eq!(not_ours.code(), Some(2), "{not_ours:?}");
+}
+
+/// On Windows, the program runs inside its PTY's Job Object: it opens the job by the name
+/// the shim gave it, and asks.
+#[cfg(windows)]
+#[test]
+fn windows_the_program_runs_inside_its_ptys_job() {
+    let home = TestHome::new();
+    home.start();
+    let script = "Add-Type -Namespace W -Name K -MemberDefinition '\
+        [DllImport(\"kernel32.dll\", CharSet=CharSet.Unicode)] public static extern IntPtr OpenJobObjectW(uint a, bool i, string n); \
+        [DllImport(\"kernel32.dll\")] public static extern bool IsProcessInJob(IntPtr p, IntPtr j, out bool r); \
+        [DllImport(\"kernel32.dll\")] public static extern IntPtr GetCurrentProcess();'; \
+        $j = [W.K]::OpenJobObjectW(4, $false, $env:RLXD_PTY_JOB); $r = $false; \
+        [void][W.K]::IsProcessInJob([W.K]::GetCurrentProcess(), $j, [ref]$r); \
+        Write-Output \"INJOB=$r\"; Start-Sleep 30";
+    let id = spawn(
+        &home,
+        json!({"argv": ["powershell", "-NoProfile", "-Command", script], "cols": 120, "rows": 24}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = screen(&home, &id)["text"].as_str().unwrap().to_owned();
+        if text.contains("INJOB=True") {
+            break;
+        }
+        assert!(!text.contains("INJOB=False"), "{text}");
+        assert!(Instant::now() < deadline, "no answer: {text}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// On Windows, an exit code above 255 comes through whole.
+#[cfg(windows)]
+#[test]
+fn windows_an_exit_code_above_255_comes_through() {
+    let home = TestHome::new();
+    home.start();
+    for code in [1000u64, 70000] {
+        let argv = json!(["cmd", "/c", format!("exit {code}")]);
+        let id = spawn(&home, json!({"argv": argv, "cols": 80, "rows": 24}));
+        eventually("the process ends", || screen(&home, &id)["exited"] == true);
+        assert_eq!(screen(&home, &id)["status"], code);
+    }
+}
+
+/// The pid's process, by `tasklist`: whether it still runs.
+#[cfg(windows)]
+fn running(pid: &str) -> bool {
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// On Windows, pty.kill ends the program and what it started, by its job.
+#[cfg(windows)]
+#[test]
+fn windows_pty_kill_ends_the_whole_tree() {
+    let home = TestHome::new();
+    home.start();
+    let script = "$c = Start-Process -FilePath powershell -ArgumentList '-NoProfile','-Command','Start-Sleep 300' \
+                  -NoNewWindow -PassThru; Write-Output \"PIDS $PID $($c.Id) END\"; Start-Sleep 300";
+    let id = spawn(
+        &home,
+        json!({"argv": ["powershell", "-NoProfile", "-Command", script], "cols": 120, "rows": 24}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pids: Vec<String> = loop {
+        let text = screen(&home, &id)["text"].as_str().unwrap().to_owned();
+        if let Some(line) = text
+            .lines()
+            .find(|l| l.starts_with("PIDS ") && l.contains(" END"))
+        {
+            break line
+                .split_whitespace()
+                .skip(1)
+                .take(2)
+                .map(str::to_owned)
+                .collect();
+        }
+        assert!(Instant::now() < deadline, "no pids: {text}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(pids.iter().all(|pid| running(pid)), "{pids:?}");
+    assert_eq!(
+        call(&home, "pty.kill", &json!({ "pty_id": id })).code(),
+        Some(0)
+    );
+    for pid in &pids {
+        assert!(!running(pid), "pid {pid} survived pty.kill");
+    }
+}
+
+/// On Windows, Ctrl-C reaches the program, and the shim lives on to pass its end on.
+#[cfg(windows)]
+#[test]
+fn windows_ctrl_c_reaches_the_program() {
+    let home = TestHome::new();
+    home.start();
+    let id = spawn(
+        &home,
+        json!({"argv": ["ping", "-t", "127.0.0.1"], "cols": 120, "rows": 30}),
+    );
+    eventually("ping pings", || {
+        screen(&home, &id)["text"]
+            .as_str()
+            .unwrap()
+            .contains("127.0.0.1")
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        call(&home, "pty.write", &json!({"pty_id": id, "keys": ["C-c"]})).code(),
+        Some(0)
+    );
+    eventually("ping stops", || screen(&home, &id)["exited"] == true);
+    let text = screen(&home, &id)["text"].as_str().unwrap().to_owned();
+    assert!(
+        text.contains("statistics"),
+        "ping, not the shim, took the Ctrl-C: {text}"
+    );
 }
