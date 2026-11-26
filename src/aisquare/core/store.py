@@ -1522,6 +1522,8 @@ CREATE TABLE IF NOT EXISTS account_rank (
 # recorded Codex rows before the column (review r28 of #113, m1). One neither names keeps
 # NULL, which reads as the default agent's, only where the store never recorded another.
 _SCHEMA_V50 = ""
+
+# v51 adds team_session.manager_wake through _PRODUCTS.
 _SCHEMA_V51 = ""
 # Ordered migrations; index i upgrades the db from user_version i to i+1.
 _MIGRATIONS = (
