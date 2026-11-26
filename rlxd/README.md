@@ -258,7 +258,8 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
   process is rlxd itself in a hidden mode, `rlxd __pty-shim`, which joins the job before
   it starts the program, so nothing the program starts escapes it, and exits with the
   program's exit code, all 32 bits. The shim lives through Ctrl-C and Ctrl-Break, which
-  the console sends the program too. `pty.list`'s `pid` there is the shim's.
+  the console sends the program too, and turns Ctrl-C back on for the program first: a
+  detached rlxd's process group ignores it, and every process would inherit that. `pty.list`'s `pid` there is the shim's.
 - **Who may do what:** `cli` and `tui` every method; `remote` the reads and
   `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
 - **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;

@@ -15,8 +15,11 @@
 //!
 //! The shim survives Ctrl-C and Ctrl-Break with a handler of its own: the console sends
 //! them to every process on it, the real program among them, which handles them as it
-//! would anywhere. (A null handler would not do: the program would inherit ignoring
-//! Ctrl-C.) `pty.kill` is `TerminateJobObject`.
+//! would anywhere. First it turns Ctrl-C back on: a detached rlxd runs in a process group
+//! of its own, which ignores Ctrl-C, and every process inherits that from the one that
+//! starts it. Turned back on, the program inherits that instead. (A null handler for the
+//! shim would not do: the program would inherit ignoring Ctrl-C again.) `pty.kill` is
+//! `TerminateJobObject`.
 
 #![allow(unsafe_code)]
 
@@ -162,6 +165,10 @@ pub fn shim(job: &str, argv: &[String]) -> ExitCode {
     if checked == 0 || inside == 0 {
         return refuse(format!("not in {job} after joining it"));
     }
+    // Ctrl-C back on, for the program to inherit: a detached rlxd's process group
+    // ignores it, and so would every process it starts.
+    // SAFETY: a null handler and FALSE: restores normal Ctrl-C processing.
+    unsafe { SetConsoleCtrlHandler(None, 0) };
     // SAFETY: `survive` is a valid handler for the process's life.
     unsafe { SetConsoleCtrlHandler(Some(survive), 1) };
     let status = std::process::Command::new(program)
