@@ -718,12 +718,11 @@ def _check_home_layout() -> DoctorCheck | None:
         move, refusal = lifecycle.planned_home_move()
     except Exception:
         return None
-    upgrade = f"{prog.word()} upgrade"
     if refusal is not None:
         return _warn(
             "home-layout",
             f"laid out before 0.10.2, and it cannot be moved as it stands: {refusal}",
-            f"Move what is in the way aside, then run `{upgrade}`",
+            f"Move what is in the way aside, then run `{prog.word()} upgrade`",
             ui_fix="Move what is in the way aside, then use ⬆ Move rlx's home in the sidebar",
         )
     if move is None:
@@ -731,8 +730,8 @@ def _check_home_layout() -> DoctorCheck | None:
     return _warn(
         "home-layout",
         f"laid out before 0.10.2 ({move})"
-        + prog.detail_advice(f": `{upgrade}` moves it, once nothing runs on it"),
-        f"Move it: `{upgrade}` (run it again if it installed a release)",
+        + prog.detail_advice(f": `{prog.word()} upgrade` moves it, once nothing runs on it"),
+        f"Move it: `{prog.word()} upgrade` (run it again if it installed a release)",
         ui_fix=HOME_LAYOUT_UI_FIX,
     )
 
