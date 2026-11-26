@@ -64,7 +64,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -73,6 +73,9 @@ from aisquare.core import launch_seal, paths
 from aisquare.core import program as prog
 from aisquare.core.atomic import write_replacing
 from aisquare.core.locking import holding
+
+if TYPE_CHECKING:
+    from aisquare.core.tmux import TmuxServer
 
 JOURNAL_VERSION = 1
 FOLDER: tuple[str, ...] = ("backups", "home-migration")
@@ -205,6 +208,9 @@ class Journal(BaseModel):
     """Step :data:`FORWARD_ONLY` began: no roll-back from here."""
     rolling_back: bool = False
     renames: list[Rename] = Field(default_factory=list)
+    renames_planned: bool = False
+    """:attr:`renames` was listed, from the home as it stood when the step began (the backup
+    before it may have made a folder the home did not have, as any command does)."""
     made: list[list[str]] = Field(default_factory=list)
     """The folders the renames made for their targets, outermost first."""
     flipped: bool = False
@@ -383,7 +389,6 @@ def _rlx_server_panes() -> list[str]:
         servers[("asq", None)] = None
     for _digest, window in launch_seal.recorded_windows():
         servers[(window.tmux_socket, window.socket_path)] = None
-    own = os.environ.get("TMUX_PANE")
     found: list[str] = []
     for socket, path in servers:
         server = asking_server(socket)
@@ -396,11 +401,25 @@ def _rlx_server_panes() -> list[str]:
         except TmuxError as exc:
             found.append(f"rlx's tmux server {socket!r}, which did not answer ({exc})")
             continue
+        own = _own_pane_on(server)
         count = sum(len(ids - {own}) for ids in panes.values())
         if count:
             windows = f"{count} live pane{'s' if count != 1 else ''}"
             found.append(f"{windows} on rlx's tmux server {socket!r}: close them")
     return found
+
+
+def _own_pane_on(server: TmuxServer) -> str | None:
+    """The pane this process runs in when it runs on ``server`` (``$TMUX`` names its socket),
+    else ``None``: ``rlx upgrade`` typed in a window of rlx's own server is no pane to stop."""
+    pane, socket = os.environ.get("TMUX_PANE"), os.environ.get("TMUX", "").split(",")[0]
+    if not pane or not socket:
+        return None
+    try:
+        same = os.path.realpath(socket) == os.path.realpath(server.socket_path())
+    except Exception:
+        return None
+    return pane if same else None
 
 
 # --- moving the paths a file holds -------------------------------------------------------------
@@ -543,28 +562,23 @@ def move_home(
     found = planned_move()
     if found is None:
         return None
-    running = running_on_home()
+    try:
+        running = running_on_home()
+    except Exception as exc:  # a home that cannot be told quiet is not moved
+        raise MigrationRefused(
+            f"whether anything runs on the home could not be told ({_why_stopped(exc)})"
+        ) from exc
     if running:
         raise MigrationRefused(f"{len(running)} thing(s) run on this home", running)
     with _one_at_a_time(str(found.old_root)):
         journal = found.journal
         if journal is None:
-            # The store last of all: in a named home, its rename is the one that makes the
-            # home read as new (``paths.layout_of``); its sidecars just before it.
-            order = sorted(
-                found.renames,
-                key=lambda entry: (
-                    entry[0] == paths.OLD_STORE,
-                    entry[0].startswith(paths.OLD_STORE),
-                ),
-            )
             journal = Journal(
                 old_root=str(found.old_root),
                 new_root=str(found.new_root),
                 named=found.named,
                 spellings=_home_spellings(found.old_root),
                 started_at=datetime.now(UTC),
-                renames=[Rename(source=[name], target=list(place)) for name, place in order],
             )
             try:
                 _save_move_journal(journal)
@@ -586,7 +600,14 @@ def move_home(
             if journal.forgetting:
                 raise MigrationFailed(_why_stopped(exc), rolled_back=False) from exc
             say(f"the move stopped ({_why_stopped(exc)}): rolling it back")
-            roll_back_move(journal)
+            try:
+                roll_back_move(journal)
+            except Exception as undo:
+                raise MigrationFailed(
+                    f"{_why_stopped(exc)}; and its roll-back stopped too "
+                    f"({_why_stopped(undo)}): run it again to finish the roll-back",
+                    rolled_back=False,
+                ) from undo
             raise MigrationFailed(_why_stopped(exc), rolled_back=True) from exc
         moved = Moved(
             Path(journal.old_root),
@@ -728,6 +749,23 @@ def _logins_to_copy(journal: Journal) -> list[Copied]:
     return found
 
 
+def _planned_renames(root: Path) -> list[Rename]:
+    """Each old name at ``root``'s top and its new place, the store last of all: in a named home,
+    its rename is the one that makes the home read as new (``paths.layout_of``), its sidecars
+    just before it."""
+    found = [
+        (name, place) for name in os.listdir(root) if (place := paths.new_place(name)) is not None
+    ]
+    found.sort(
+        key=lambda entry: (
+            entry[0] == paths.OLD_STORE,
+            entry[0].startswith(paths.OLD_STORE),
+            entry[0],
+        )
+    )
+    return [Rename(source=[name], target=list(place)) for name, place in found]
+
+
 def _rename_once(source: Path, target: Path) -> None:
     """One rename of the move (a seam the tests crash between)."""
     os.rename(source, target)
@@ -738,6 +776,10 @@ def _rename_names(journal: Journal) -> None:
     """Each old name renamed to its new place, the store last; the default home's root then
     renamed to ``~/.rlx``. Each written down before it is made, and found made on a resume."""
     root = Path(journal.old_root)
+    if not journal.renames_planned and not journal.flipped:
+        journal.renames = _planned_renames(root)
+        journal.renames_planned = True
+        _save_move_journal(journal)
     for rename in journal.renames:
         if rename.done or journal.flipped:
             continue

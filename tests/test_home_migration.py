@@ -754,6 +754,23 @@ def test_the_mover_moves_paths_under_the_home_and_nothing_else() -> None:
     assert named.text("/h/launch-seals/a.json /h/logs") == "/h/fleet/launch-seals/a.json /h/logs"
 
 
+def test_a_folder_the_backup_makes_is_moved_too_and_no_old_name_is_left(
+    old_home: Path, user_home: Path
+) -> None:
+    """An old home with no log folder: the backup opens the store, which makes one, as any
+    command does. Listed when the renames began, before the backup, it was left behind under
+    its old name. Mutant: the renames listed when the move starts."""
+    shutil.rmtree(paths.log_dir())
+    assert not paths.log_dir().exists()
+
+    assert home_migration.move_home() is not None
+
+    new = user_home / ".rlx"
+    left = [name for name in os.listdir(new) if paths.new_place(name) is not None]
+    assert left == [], left
+    assert (new / "logs").is_dir()
+
+
 def test_a_named_home_is_laid_out_anew_in_place_with_no_link(
     tmp_path: Path, user_home: Path, keychain: FakeSecurity, monkeypatch: pytest.MonkeyPatch
 ) -> None:
