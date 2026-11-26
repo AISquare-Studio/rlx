@@ -13,6 +13,12 @@
 //! On Windows, clients connect to the named pipe `\\.\pipe\rlxd-<hash of home>` instead
 //! ([`Home::pipe_name`]). The socket and the lock sit under `run/`, where rlx 0.10.2's
 //! layout keeps sockets and locks. The rest of rlxd's state stays under `rlxd/`.
+//!
+//! A socket's path must fit the OS's `sockaddr_un` ([`SOCKET_PATH_MAX`]). When a home is
+//! nested too deep for `run/rlxd.sock` to fit, the socket is
+//! `/tmp/rlxd-<uid>/<hash of home>.sock` instead ([`Home::short_socket`]), in a folder
+//! only its user may enter. [`Home::socket`] says which one a home uses, so rlxd and every
+//! client agree, and `status` and `rlxd here` report it.
 
 use std::env;
 use std::ffi::OsString;
@@ -31,6 +37,14 @@ pub const LEGACY_HOME_ENV: &str = "AISQUARE_HOME";
 /// The home's folder under the user's home directory when neither variable is set, as
 /// `aisquare.core.paths.aisquare_home` makes it.
 pub const DEFAULT_HOME_DIR: &str = ".aisquare";
+
+/// The longest socket path the OS takes, in bytes: `sockaddr_un`'s `sun_path` holds 108
+/// on Linux and 104 on macOS and the BSDs, its terminating NUL included.
+pub const SOCKET_PATH_MAX: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+    107
+} else {
+    103
+};
 
 /// An rlx home: the folder holding a user's rlx config and state, and one rlxd's files.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,9 +126,54 @@ impl Home {
         self.root.join("rlxd")
     }
 
-    /// `<home>/run/rlxd.sock`: where clients connect on macOS and Linux.
+    /// Where clients connect on macOS and Linux: [`Home::socket_in_home`] when its path
+    /// fits the OS's limit, else [`Home::short_socket`] ([`Home::uses_short_socket`]).
     pub fn socket(&self) -> PathBuf {
+        #[cfg(unix)]
+        if self.uses_short_socket() {
+            return self.short_socket();
+        }
+        self.socket_in_home()
+    }
+
+    /// `<home>/run/rlxd.sock`: the socket's place in the home, which [`Home::socket`] is
+    /// unless its path is too long.
+    pub fn socket_in_home(&self) -> PathBuf {
         self.run_dir().join("rlxd.sock")
+    }
+
+    /// Whether the socket in the home is too long for the OS, so clients connect to
+    /// [`Home::short_socket`]: its absolute path is longer than [`SOCKET_PATH_MAX`]
+    /// bytes. Never on Windows, where clients connect to a named pipe.
+    ///
+    /// The path is made absolute from the working directory, as `bind` and `connect`
+    /// read a relative one; nothing is resolved on disk.
+    pub fn uses_short_socket(&self) -> bool {
+        if cfg!(windows) {
+            return false;
+        }
+        let socket = self.socket_in_home();
+        let absolute = std::path::absolute(&socket).unwrap_or(socket);
+        absolute.as_os_str().len() > SOCKET_PATH_MAX
+    }
+
+    /// `/tmp/rlxd-<uid>/<hash>.sock`: where clients connect when the home's own socket
+    /// path is too long ([`Home::uses_short_socket`]). The hash is the pipe name's, so two
+    /// spellings of one home share it. About 40 bytes, well inside every OS's limit.
+    #[cfg(unix)]
+    pub fn short_socket(&self) -> PathBuf {
+        Self::short_socket_dir().join(format!("{}.sock", self.hash()))
+    }
+
+    /// `/tmp/rlxd-<uid>/`: the short sockets' folder, one per user, 0700. It is `/tmp`
+    /// and not `$TMPDIR` or `$XDG_RUNTIME_DIR` because every process of the user must
+    /// name the same folder, whatever its environment holds: a desktop session, a
+    /// non-login SSH session and `env -i` alike. And logind removes
+    /// `$XDG_RUNTIME_DIR` at the user's last logout, which an rlxd started over SSH
+    /// outlives.
+    #[cfg(unix)]
+    pub fn short_socket_dir() -> PathBuf {
+        PathBuf::from(format!("/tmp/rlxd-{}", crate::unix::uid()))
     }
 
     /// `\\.\pipe\rlxd-<hash>`: where clients connect on Windows.
@@ -124,10 +183,15 @@ impl Home {
     /// prefix (Python's `str(Path(home).resolve())`), so two spellings of one home name
     /// one pipe. A home that does not exist is hashed as written: no rlxd serves it.
     pub fn pipe_name(&self) -> String {
+        format!(r"\\.\pipe\rlxd-{}", self.hash())
+    }
+
+    /// The first 16 hex digits of the SHA-256 of the home's canonical path, as UTF-8:
+    /// the pipe's name and the short socket's carry it.
+    fn hash(&self) -> String {
         let path = canonical(&self.root);
         let digest = Sha256::digest(path.to_string_lossy().as_bytes());
-        let hash: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-        format!(r"\\.\pipe\rlxd-{hash}")
+        digest[..8].iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Where clients connect on this OS, as `status` reports it: the socket's path, or
@@ -264,12 +328,68 @@ mod tests {
         let home = Home::at("/h");
         let at = |parts: &[&str]| parts.iter().fold(PathBuf::from("/h"), |p, x| p.join(x));
         assert_eq!(home.socket(), at(&["run", "rlxd.sock"]));
+        assert_eq!(home.socket_in_home(), at(&["run", "rlxd.sock"]));
         assert_eq!(home.lock(), at(&["run", "rlxd.lock"]));
         assert_eq!(home.token(), at(&["rlxd", "token"]));
         assert_eq!(home.logs(), at(&["rlxd", "logs"]));
         assert_eq!(home.log_file(), at(&["rlxd", "logs", "rlxd.log"]));
         assert_eq!(home.daemons(), at(&["daemons"]));
         assert_eq!(home.test_gate_credential(), at(&["test-gate-credential"]));
+    }
+
+    /// A home whose `run/rlxd.sock` is `len` bytes long.
+    fn home_whose_socket_is(len: usize) -> Home {
+        let suffix = "/run/rlxd.sock".len();
+        Home::at(format!("/{}", "h".repeat(len - 1 - suffix)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_moves_to_tmp_only_when_the_homes_is_too_long() {
+        let fits = home_whose_socket_is(SOCKET_PATH_MAX);
+        assert_eq!(fits.socket_in_home().as_os_str().len(), SOCKET_PATH_MAX);
+        assert!(!fits.uses_short_socket());
+        assert_eq!(fits.socket(), fits.socket_in_home());
+        assert_eq!(fits.endpoint(), fits.socket_in_home().display().to_string());
+
+        let over = home_whose_socket_is(SOCKET_PATH_MAX + 1);
+        assert!(over.uses_short_socket());
+        let short = over.socket();
+        assert_eq!(short, over.short_socket());
+        assert_eq!(over.endpoint(), short.display().to_string());
+        let dir = PathBuf::from(format!("/tmp/rlxd-{}", crate::unix::uid()));
+        assert_eq!(Home::short_socket_dir(), dir);
+        assert_eq!(short.parent(), Some(dir.as_path()));
+        let hash = &over.pipe_name()[r"\\.\pipe\rlxd-".len()..];
+        assert_eq!(short.file_name().unwrap(), format!("{hash}.sock").as_str());
+        assert!(
+            short.as_os_str().len() <= SOCKET_PATH_MAX,
+            "{}",
+            short.display()
+        );
+        let other = home_whose_socket_is(SOCKET_PATH_MAX + 2);
+        assert_ne!(other.socket(), short, "one short socket per home");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_spellings_of_one_deep_home_share_its_short_socket() {
+        let dir = env::temp_dir().join(format!("rlxd-home-{}", std::process::id()));
+        let deep = dir.join("d".repeat(SOCKET_PATH_MAX));
+        std::fs::create_dir_all(&deep).unwrap();
+        let home = Home::at(&deep);
+        let spelled = Home::at(deep.join("."));
+        assert!(home.uses_short_socket() && spelled.uses_short_socket());
+        assert_eq!(home.socket(), spelled.socket());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_never_uses_a_short_socket() {
+        let deep = home_whose_socket_is(SOCKET_PATH_MAX + 50);
+        assert!(!deep.uses_short_socket());
+        assert_eq!(deep.socket(), deep.socket_in_home());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::Path;
 
 use rlxd_proto::{
     Data, Envelope, ErrorBody, HelloParams, Outcome, Params, Request, RequestId, methods,
@@ -44,10 +45,12 @@ pub enum ConnectError {
         /// What the OS said.
         source: io::Error,
     },
-    /// Windows: the pipe is served by a process of another user, so it is not this
-    /// user's rlxd. Nothing was sent to it.
+    /// The socket or pipe is another user's, so it is not this user's rlxd. Nothing was
+    /// sent to it. On Windows, a process of another user serves the pipe. On macOS and
+    /// Linux, the short socket ([`Home::short_socket`]) or its folder in `/tmp` is
+    /// another user's, or others may enter the folder.
     NotOurs {
-        /// The pipe.
+        /// The socket or pipe.
         endpoint: String,
     },
 }
@@ -59,9 +62,14 @@ impl fmt::Display for ConnectError {
                 write!(f, "rlxd is not running ({endpoint}: {source})")
             }
             Self::Io { endpoint, source } => write!(f, "cannot connect to {endpoint}: {source}"),
-            Self::NotOurs { endpoint } => write!(
+            Self::NotOurs { endpoint } if cfg!(windows) => write!(
                 f,
                 "{endpoint} is served by another user's process, not this user's rlxd"
+            ),
+            Self::NotOurs { endpoint } => write!(
+                f,
+                "{endpoint} or its folder is another user's, or others may enter the \
+                 folder: it is not this user's rlxd"
             ),
         }
     }
@@ -141,12 +149,33 @@ impl Reply {
 }
 
 impl Connection {
-    /// A connection to the rlxd serving `home`. Sends nothing: say [`Connection::hello`]
-    /// first.
+    /// A connection to the rlxd serving `home`, at [`Home::endpoint`]. Sends nothing: say
+    /// [`Connection::hello`] first.
+    ///
+    /// A short socket ([`Home::uses_short_socket`]) sits in `/tmp`, so before it connects
+    /// it checks that the socket and its folder are this user's and that no one else may
+    /// enter the folder, else [`ConnectError::NotOurs`].
     pub fn open(home: &Home) -> Result<Self, ConnectError> {
-        let stream = open_stream(home)?;
+        #[cfg(unix)]
+        if home.uses_short_socket() {
+            check_short_socket(&home.socket())?;
+        }
+        Self::open_at(home.endpoint())
+    }
+
+    /// A connection to the rlxd at `endpoint`: a socket's path on macOS and Linux, a named
+    /// pipe's name on Windows. Sends nothing: say [`Connection::hello`] first.
+    ///
+    /// Over SSH, `endpoint` is the local end of a direct-streamlocal forward to the host's
+    /// socket (`ssh -N -L <endpoint>:<socket> host`), and the token is the host's
+    /// (`rlxd here --show-token`, or its `auth.token_file` read over the session). Who
+    /// made the socket is not checked: the caller named it. On Windows, the pipe's server
+    /// must run as this user, as for [`Connection::open`].
+    pub fn open_at(endpoint: impl AsRef<Path>) -> Result<Self, ConnectError> {
+        let endpoint = endpoint.as_ref();
+        let stream = open_stream(endpoint)?;
         let writer = stream.try_clone().map_err(|source| ConnectError::Io {
-            endpoint: home.endpoint(),
+            endpoint: endpoint.display().to_string(),
             source,
         })?;
         Ok(Self {
@@ -228,9 +257,8 @@ impl Connection {
 }
 
 #[cfg(unix)]
-fn open_stream(home: &Home) -> Result<Stream, ConnectError> {
-    let path = home.socket();
-    Stream::connect(&path).map_err(|source| {
+fn open_stream(path: &Path) -> Result<Stream, ConnectError> {
+    Stream::connect(path).map_err(|source| {
         let endpoint = path.display().to_string();
         match source.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
@@ -241,19 +269,48 @@ fn open_stream(home: &Home) -> Result<Stream, ConnectError> {
     })
 }
 
+/// Checks that the short socket `socket` and its folder are this user's, and that no one
+/// else may enter the folder, before the token goes to it. Neither is followed through a
+/// link. A missing folder or socket is [`ConnectError::NotRunning`].
+#[cfg(unix)]
+fn check_short_socket(socket: &Path) -> Result<(), ConnectError> {
+    use crate::unix::{is_owned, is_private_dir};
+
+    let endpoint = || socket.display().to_string();
+    let read = |path: &Path| {
+        std::fs::symlink_metadata(path).map_err(|source| match source.kind() {
+            io::ErrorKind::NotFound => ConnectError::NotRunning {
+                endpoint: endpoint(),
+                source,
+            },
+            _ => ConnectError::Io {
+                endpoint: endpoint(),
+                source,
+            },
+        })
+    };
+    let dir = socket.parent().unwrap_or(Path::new("/"));
+    if !is_private_dir(&read(dir)?) || !is_owned(&read(socket)?) {
+        return Err(ConnectError::NotOurs {
+            endpoint: endpoint(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
-fn open_stream(home: &Home) -> Result<Stream, ConnectError> {
+fn open_stream(path: &Path) -> Result<Stream, ConnectError> {
     use std::time::{Duration, Instant};
 
     /// Every instance of the pipe is busy: wait for one to come free.
     const ERROR_PIPE_BUSY: i32 = 231;
-    let endpoint = home.pipe_name();
+    let endpoint = path.display().to_string();
     let deadline = Instant::now() + Duration::from_secs(5);
     let pipe = loop {
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&endpoint)
+            .open(path)
         {
             Ok(pipe) => break pipe,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -275,5 +332,92 @@ fn open_stream(home: &Home) -> Result<Stream, ConnectError> {
         Ok(true) => Ok(pipe),
         Ok(false) => Err(ConnectError::NotOurs { endpoint }),
         Err(source) => Err(ConnectError::Io { endpoint, source }),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// A fresh folder, `mode`, with a socket listening in it.
+    fn socket_in(name: &str, mode: u32) -> (PathBuf, UnixListener) {
+        let dir = std::env::temp_dir().join(format!("rlxd-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+        let socket = dir.join("s.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        (socket, listener)
+    }
+
+    #[test]
+    fn a_short_socket_in_a_private_folder_of_ours_passes() {
+        let (socket, _listener) = socket_in("private", 0o700);
+        assert!(check_short_socket(&socket).is_ok());
+        fs::remove_dir_all(socket.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_short_socket_in_a_folder_others_may_enter_is_refused() {
+        for mode in [0o755, 0o710, 0o701, 0o777] {
+            let (socket, _listener) = socket_in(&format!("open-{mode:o}"), mode);
+            let refused = check_short_socket(&socket);
+            assert!(
+                matches!(refused, Err(ConnectError::NotOurs { .. })),
+                "{mode:o}: {refused:?}"
+            );
+            fs::remove_dir_all(socket.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_short_socket_behind_a_link_is_refused() {
+        let (socket, _listener) = socket_in("linked", 0o700);
+        let dir = socket.parent().unwrap();
+        let link = dir.with_extension("link");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(dir, &link).unwrap();
+        let refused = check_short_socket(&link.join("s.sock"));
+        assert!(
+            matches!(refused, Err(ConnectError::NotOurs { .. })),
+            "{refused:?}"
+        );
+        fs::remove_file(&link).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_short_socket_that_is_not_there_is_not_running() {
+        let (socket, listener) = socket_in("gone", 0o700);
+        drop(listener);
+        fs::remove_file(&socket).unwrap();
+        let missing = check_short_socket(&socket);
+        assert!(
+            matches!(missing, Err(ConnectError::NotRunning { .. })),
+            "{missing:?}"
+        );
+        let dir = socket.parent().unwrap().to_path_buf();
+        fs::remove_dir(&dir).unwrap();
+        let missing = check_short_socket(&socket);
+        assert!(
+            matches!(missing, Err(ConnectError::NotRunning { .. })),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn open_at_connects_to_the_socket_it_is_given() {
+        let (socket, listener) = socket_in("open-at", 0o700);
+        let connection = Connection::open_at(&socket);
+        assert!(connection.is_ok());
+        assert!(listener.accept().is_ok());
+        fs::remove_dir_all(socket.parent().unwrap()).unwrap();
+        let gone = Connection::open_at(&socket);
+        assert!(matches!(gone, Err(ConnectError::NotRunning { .. })));
     }
 }

@@ -9,6 +9,10 @@
 //! - [`install`] lists the folders rlx and rlxd install to, where a session whose `PATH`
 //!   lacks them still finds them.
 //!
+//! Over SSH, rlx.app forwards a direct-streamlocal channel to the host's socket, which
+//! `rlxd here` names (`socket`). [`Connection::open_at`] connects to such a socket by its
+//! path: the forward's local end, as `ssh -N -L local.sock:<socket> host` makes it.
+//!
 //! ```no_run
 //! use rlxd_client::{Connection, Home};
 //! use rlxd_client::proto::{HelloParams, Role};
@@ -28,9 +32,11 @@
 mod connection;
 mod home;
 pub mod install;
+#[cfg(unix)]
+pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 
 pub use connection::{CallError, ConnectError, Connection, MAX_LINE, Reply};
-pub use home::{DEFAULT_HOME_DIR, HOME_ENV, Home, LEGACY_HOME_ENV, NoHome};
+pub use home::{DEFAULT_HOME_DIR, HOME_ENV, Home, LEGACY_HOME_ENV, NoHome, SOCKET_PATH_MAX};
 pub use rlxd_proto as proto;

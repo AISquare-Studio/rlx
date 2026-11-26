@@ -130,14 +130,14 @@ jobs:
       - name: cargo deny check
         run: cargo deny --locked check
 
-  # `rlxd here` over a real `ssh localhost` (the owner's remote brief, §3), as rlx.app runs
-  # it: by absolute path, in a non-login session that has not read the user's profile. It
-  # must give the answer `env -i HOME=$HOME rlxd here --json` gives locally, in each state.
-  # sshd is the runner's own. Its host key is pinned from its own file, not fetched over
-  # the connection, and both sides allow public-key auth only. Forwarding the socket over
-  # SSH (direct-streamlocal) can extend this job.
+  # rlx.app's way to a host over a real `ssh localhost` (the owner's remote brief, §3).
+  # First `rlxd here`, as rlx.app runs it: by absolute path, in a non-login session that
+  # has not read the user's profile. It must give the answer `env -i HOME=$HOME rlxd here
+  # --json` gives locally, in each state. Then rlxd's socket through a direct-streamlocal
+  # forward. sshd is the runner's own. Its host key is pinned from its own file, not
+  # fetched over the connection, and both sides allow public-key auth only.
   ssh:
-    name: rlxd here over ssh (ubuntu)
+    name: rlxd here and its socket over ssh (ubuntu)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -167,8 +167,10 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq openssh-server
           fi
-          # The server takes public keys only.
-          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
+          # The server takes public keys only, and forwards to Unix sockets locally (-L)
+          # only, as rlx.app needs: OpenSSH's default is both ways.
+          printf '%s\n' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' \
+            'AllowStreamLocalForwarding local' \
             | sudo tee /etc/ssh/sshd_config.d/10-rlxd-ci.conf >/dev/null
           sudo systemctl restart ssh || sudo service ssh restart
           mkdir -p ~/.ssh
@@ -261,3 +263,77 @@ jobs:
 
           code=0; over_ssh "$snippet" > /dev/null || code=$?
           [ "$code" = 127 ] || { echo "::error::with nothing installed the command exits $code, not 127"; exit 1; }
+
+      # rlxd's socket as rlx.app reaches it: a direct-streamlocal channel, here OpenSSH's
+      # `ssh -N -L <local socket>:<host's socket>`, so nothing listens on TCP. The client
+      # side is a home with no rlxd and no token: `socket` and the token come from `rlxd
+      # here --start --show-token`, run inside the session. Two homes: ~/.aisquare, whose
+      # socket is its run/rlxd.sock, and one too deep for that, served on its short socket
+      # in /tmp/rlxd-<uid>/.
+      - name: rlxd's socket through an ssh direct-streamlocal forward
+        working-directory: .
+        run: |
+          rlxd="$PWD/rlxd/target/debug/rlxd"
+          client_home=$(mktemp -d)
+          forwards=$(mktemp -d)
+          uid=$(id -u)
+          # 20 folders of 21 bytes: run/rlxd.sock is far past Linux's 107 bytes.
+          deep="$HOME/$(printf 'a-folder-of-the-home/%.0s' $(seq 20))home"
+          fail() { echo "::error::$*"; exit 1; }
+
+          through_a_forward() {
+            local name=$1 home=$2 here remote token local_sock forward code
+            here="$name-here.json"
+            code=0
+            ssh localhost "RLX_HOME='$home' '$rlxd' here --json --start --show-token" > "$here" \
+              || code=$?
+            token=$(jq -r '.data.auth.token // empty' "$here")
+            [ -z "$token" ] || echo "::add-mask::$token"
+            [ "$code" = 0 ] && jq -e '.ok and .data.running and .data.supported' "$here" > /dev/null \
+              || fail "$name: rlxd here --start exits $code: $(jq -c .error "$here")"
+            remote=$(jq -r .data.socket "$here")
+            echo "$name: the host's socket is $remote (${#remote} bytes)"
+
+            local_sock="$forwards/$name.sock"
+            ssh -N -o ExitOnForwardFailure=yes -L "$local_sock:$remote" localhost &
+            forward=$!
+            for _ in $(seq 100); do [ -S "$local_sock" ] && break; sleep 0.1; done
+            [ -S "$local_sock" ] || fail "$name: the forward made no local socket"
+
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token "$token" status \
+              > "$name-status.json" || fail "$name: status through the forward: $(cat "$name-status.json")"
+            jq -e --arg socket "$remote" --arg home "$home" \
+              '.ok and .data.paths.socket == $socket and .data.paths.home == $home' \
+              "$name-status.json" > /dev/null \
+              || fail "$name: status through the forward names another rlxd: $(jq -c .data.paths "$name-status.json")"
+            jq -c '.data | {pid, clients, paths}' "$name-status.json"
+
+            # Nothing listens on TCP or UDP: not rlxd, not ssh.
+            if ss -Htulnp | grep -E 'users:\(\("(rlxd|ssh)"'; then
+              fail "$name: rlxd or ssh listens on a port"
+            fi
+
+            kill "$forward"
+            wait "$forward" || true
+            code=0
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token "$token" status \
+              > /dev/null || code=$?
+            [ "$code" = 3 ] || fail "$name: with the forward gone the call exits $code, not 3"
+            ssh localhost "RLX_HOME='$home' '$rlxd' stop" > /dev/null
+            rm "$here"
+          }
+
+          through_a_forward default "$HOME/.aisquare"
+          [ "$(jq -r .data.paths.socket default-status.json)" = "$HOME/.aisquare/run/rlxd.sock" ] \
+            || fail "the default home is not served on its run/rlxd.sock"
+
+          through_a_forward deep "$deep"
+          short=$(jq -r .data.paths.socket deep-status.json)
+          case "$short" in
+            "/tmp/rlxd-$uid/"?*.sock) ;;
+            *) fail "the deep home's socket is $short, not its short one in /tmp/rlxd-$uid/" ;;
+          esac
+          [ "$(stat -c '%a %u' "/tmp/rlxd-$uid")" = "700 $uid" ] \
+            || fail "/tmp/rlxd-$uid is $(stat -c '%a %u' "/tmp/rlxd-$uid"), not 700 $uid"
+          [ ! -e "$deep/run/rlxd.sock" ] || fail "the deep home has a socket of its own"
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/envelope.json -- *-status.json

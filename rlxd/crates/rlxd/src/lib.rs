@@ -101,6 +101,10 @@ struct CallOptions {
     /// The token to send, instead of the one in <home>/rlxd/token.
     #[arg(long, value_name = "T")]
     token: Option<String>,
+    /// Connect to this socket (a named pipe on Windows) instead of the home's, such as
+    /// the local end of `ssh -N -L <PATH>:<host's socket> host`.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
     /// The hello's protocol version.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     protocol_version: Option<String>,
@@ -142,6 +146,7 @@ pub fn main() -> ExitCode {
             client: options.client,
             gate_credential: options.gate_credential,
             token: options.token,
+            socket: options.socket,
             protocol_version: options.protocol_version,
             env: options.env,
             raw: options.raw,

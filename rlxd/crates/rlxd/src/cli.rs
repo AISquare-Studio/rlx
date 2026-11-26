@@ -3,6 +3,7 @@
 //! says `hello`, sends one request and prints the reply envelope.
 
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,6 +34,9 @@ pub struct CallArgs {
     pub gate_credential: Option<String>,
     /// `hello`'s `token`, instead of the token file's.
     pub token: Option<String>,
+    /// Connect to this socket or pipe instead of the home's, such as an SSH forward's
+    /// local end.
+    pub socket: Option<PathBuf>,
     /// `hello`'s `protocol_version`, as JSON writes a number.
     pub protocol_version: Option<String>,
     /// `hello`'s `env`, a JSON object.
@@ -79,7 +83,7 @@ pub fn call(args: CallArgs) -> ExitCode {
         Err(e) => return report(AskError::NotRunning(e.to_string())),
     };
     if args.raw {
-        return raw(&home);
+        return raw(&home, args.socket.as_deref());
     }
     let Some(method) = args.method.as_deref() else {
         return out::usage("call needs a method, or --raw");
@@ -99,9 +103,9 @@ pub fn call(args: CallArgs) -> ExitCode {
             _ => return out::usage(&format!("--protocol-version {text} is not a number")),
         },
     };
-    let mut connection = match Connection::open(&home) {
+    let mut connection = match connect(&home, args.socket.as_deref()) {
         Ok(connection) => connection,
-        Err(e) => return report(connect_error(&home, e)),
+        Err(e) => return report(e),
     };
     let token = match args.token.clone().map_or_else(|| read_token(&home), Ok) {
         Ok(token) => token,
@@ -139,7 +143,7 @@ pub fn call(args: CallArgs) -> ExitCode {
 
 /// `rlxd call --raw`: stdin's frames, sent as they are with no `hello`, and each reply
 /// printed as it came. Exits as the last reply says.
-fn raw(home: &Home) -> ExitCode {
+fn raw(home: &Home, socket: Option<&Path>) -> ExitCode {
     let mut input = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut input) {
         return out::usage(&format!("cannot read stdin: {e}"));
@@ -148,9 +152,9 @@ fn raw(home: &Home) -> ExitCode {
     if frames.is_empty() {
         return out::usage("--raw sends stdin's frames, and stdin has none");
     }
-    let mut connection = match Connection::open(home) {
+    let mut connection = match connect(home, socket) {
         Ok(connection) => connection,
-        Err(e) => return report(connect_error(home, e)),
+        Err(e) => return report(e),
     };
     for frame in &frames {
         // rlxd closes the connection on a refused first frame: what it already sent
@@ -320,6 +324,19 @@ fn parse_object(text: Option<&str>, what: &str) -> Result<Option<Data>, String> 
         Ok(Value::Object(object)) => Ok(Some(object)),
         Ok(_) => Err(format!("{what} must be a JSON object")),
         Err(e) => Err(format!("{what} is not JSON: {e}")),
+    }
+}
+
+/// A connection to `socket` when given (`--socket`), else to `home`'s rlxd.
+pub fn connect(home: &Home, socket: Option<&Path>) -> Result<Connection, AskError> {
+    match socket {
+        Some(socket) => Connection::open_at(socket).map_err(|error| match error {
+            ConnectError::NotRunning { .. } => {
+                AskError::NotRunning(format!("no rlxd listens on {}", socket.display()))
+            }
+            other => AskError::Failed(other.to_string()),
+        }),
+        None => Connection::open(home).map_err(|error| connect_error(home, error)),
     }
 }
 
