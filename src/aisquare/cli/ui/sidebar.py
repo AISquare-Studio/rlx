@@ -819,11 +819,19 @@ def _append_agent(
     text.append_text(line)
 
 
-def update_row_text(version: str, *, runnable: bool = True) -> Text:
+HOME_MOVE_ROW = "Move rlx's home"
+"""The ⬆ row's words for the move of a home from before 0.10.2 alone (#31): no command (R13)."""
+
+
+def update_row_text(version: str, *, runnable: bool = True, home: bool = False) -> Text:
     """``⬆ 0.8.3 · restart to update`` — the row under *⚙ Settings* while a newer release is
     out. An install asq does not update itself (Homebrew, pip) is told how instead, so the
-    row says that: its dialog shows the command and no restart."""
+    row says that: its dialog shows the command and no restart. ``home``: no newer release,
+    and a home from before 0.10.2 to move (``updates.Offer.home_only``): ``⬆ Move rlx's home``."""
     text = Text(no_wrap=True, overflow="ellipsis")
+    if home:
+        text.append(f"{UPDATE_ICON} {HOME_MOVE_ROW}", style=f"bold {GREEN}")
+        return text
     text.append(f"{UPDATE_ICON} {version}", style=f"bold {GREEN}")
     text.append(" · restart to update" if runnable else " · how to update", style="dim")
     return text
@@ -1983,11 +1991,12 @@ class UpdateRow(Activatable):
     def message(self) -> Message:
         return UpdateSelected()
 
-    def offer(self, version: str | None, *, runnable: bool = True) -> None:
-        """Show the row for ``version``; ``None`` takes it away."""
+    def offer(self, version: str | None, *, runnable: bool = True, home: bool = False) -> None:
+        """Show the row for ``version`` (``home``: the home's move alone); ``None`` takes it
+        away."""
         self.version = version
         if version is not None:
-            self.update(update_row_text(version, runnable=runnable))
+            self.update(update_row_text(version, runnable=runnable, home=home))
         self.set_class(version is not None, "offered")
 
 
@@ -3013,10 +3022,12 @@ class Sidebar(Vertical):
             title.rebuild()
             title.tooltip = fleet_title_tooltip(self._title_count())
 
-    def show_update(self, version: str | None, *, runnable: bool = True) -> None:
-        """The ⬆ row for a newer release (``services.updates.check_for_release``); ``None``
-        hides it."""
-        self.query_one(UpdateRow).offer(version, runnable=runnable)
+    def show_update(
+        self, version: str | None, *, runnable: bool = True, home: bool = False
+    ) -> None:
+        """The ⬆ row for a newer release (``services.updates.check_for_release``), or for the
+        move of a home from before 0.10.2 alone (``home``); ``None`` hides it."""
+        self.query_one(UpdateRow).offer(version, runnable=runnable, home=home)
 
     def _paint_status(self) -> None:
         self.query_one(StatusLine).show_facts(

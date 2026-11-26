@@ -28,16 +28,20 @@ from typer.testing import CliRunner
 from aisquare.cli.app import app
 from aisquare.core import claude_accounts as accounts_core
 from aisquare.core import launch_seal, locking, paths
+from aisquare.core import program as prog
 from aisquare.core.state import get_state, set_state
 from aisquare.core.store import store_session
 from aisquare.models import FleetAgent, LaunchSpec, ProjectInfo, TeamSession
+from aisquare.services import diagnostics, home_migration, install_route, lifecycle, updates, watch
 from aisquare.services import fleet as fleet_service
-from aisquare.services import home_migration, install_route, lifecycle, watch
-from aisquare.services.install_route import Captured, LatestRelease
+from aisquare.services.install_route import Captured, Facts, InstallRoute, LatestRelease
+from aisquare.services.lifecycle import UpgradePlan
 from tests.installer_seams import no_real_installer  # noqa: F401 — autouse, applied by import
 from tests.old_home import OLD_FILES, make_old_home
 from tests.test_claude_accounts import _sign_in
 from tests.test_claude_keychain import _item
+from tests.test_lifecycle_upgrade import Machine, Tool, machine, tool  # noqa: F401
+from tests.test_ui_doctor_handoff import Terminal, terminal  # noqa: F401
 
 POSIX_ONLY = pytest.mark.skipif(
     sys.platform == "win32", reason="the fake `security` is a POSIX script, as the real one is"
@@ -153,6 +157,14 @@ def keychain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeSe
     accounts_core.forget_keychain_reads()
 
 
+MOVE = "~/.aisquare → ~/.rlx"
+UI_FACTS = Facts(
+    prefix=Path("/tools/aisquare-cli"),
+    base_prefix=Path("/usr"),
+    executable=Path("/tools/aisquare-cli/bin/python"),
+    platform="darwin",
+    python_version="3.12",
+)
 SESSION = str(uuid.UUID(int=7))
 NOW = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
 
@@ -957,3 +969,129 @@ def test_an_upgrade_that_cannot_move_the_home_says_so_and_exits_1(
     said = result.output.replace("\n", " ")
     assert "✗ the home was not moved" in said and named in said
     assert not os.path.lexists(user_home / ".rlx")
+
+
+# --- the app's Update and the Doctor (#1985) ----------------------------------------------------
+
+
+@pytest.fixture
+def running(monkeypatch: pytest.MonkeyPatch, tool: Tool, user_home: Path) -> Tool:  # noqa: F811
+    """The ``tool`` install at 0.9.0, in a user home of the test's own."""
+    monkeypatch.setattr(updates, "__version__", "0.9.0")
+    monkeypatch.setattr(updates, "check_enabled", lambda: True)
+    return tool
+
+
+def test_the_daily_check_offers_the_move_of_an_old_home_with_no_newer_release(
+    running: Tool,
+    machine: Machine,  # noqa: F811
+    user_home: Path,
+) -> None:
+    machine.latest = LatestRelease("0.9.0")
+    make_old_home(user_home)
+
+    offer = updates.check_for_release()
+
+    assert offer is not None and offer.home_only and offer.home_move == MOVE
+    assert (offer.version, offer.current, offer.runnable, offer.announce) == (
+        "0.9.0",
+        "0.9.0",
+        True,
+        False,
+    )
+    machine.latest = LatestRelease("0.9.1")
+    newer = updates.check_for_release(datetime_later())
+    assert newer is not None and newer.version == "0.9.1" and newer.home_move == MOVE
+    assert not newer.home_only
+
+
+def datetime_later() -> Any:
+    """A day after now: the next check asks PyPI again."""
+    from datetime import UTC, datetime, timedelta
+
+    return datetime.now(UTC) + timedelta(days=2)
+
+
+def test_one_click_on_the_latest_release_moves_the_home_and_reopens(
+    runner: CliRunner,
+    tool: Tool,  # noqa: F811
+    machine: Machine,  # noqa: F811
+    terminal: Terminal,  # noqa: F811
+    old_home: Path,
+    user_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lifecycle, "__version__", "0.9.0")
+    machine.latest = LatestRelease("0.9.0")
+    updates.record_press([])
+
+    result = runner.invoke(app, ["upgrade", "--one-click"])
+
+    assert result.exit_code == 0, result.output
+    assert machine.installs == [], "nothing newer: nothing installed"
+    assert "✓ the home moved: ~/.aisquare → ~/.rlx" in result.output
+    assert paths.home_of() == (user_home / ".rlx", paths.NEW)
+    assert terminal.prompts == [] and terminal.reopened == [["ui", "--after-update"]]
+
+
+def test_one_click_on_a_busy_home_says_what_runs_and_reopens_after_enter(
+    runner: CliRunner,
+    tool: Tool,  # noqa: F811
+    machine: Machine,  # noqa: F811
+    terminal: Terminal,  # noqa: F811
+    old_home: Path,
+    user_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lifecycle, "__version__", "0.9.0")
+    machine.latest = LatestRelease("0.9.0")
+    named = _an_instance(old_home)
+
+    result = runner.invoke(app, ["upgrade", "--one-click"])
+
+    assert result.exit_code == 1
+    assert named in result.output.replace("\n", " ")
+    assert not os.path.lexists(user_home / ".rlx")
+    assert len(terminal.prompts) == 1 and terminal.reopened == [["ui", "--after-update"]]
+
+
+def test_the_doctor_names_a_home_laid_out_before_0_10_2_and_asq_names_no_command(
+    user_home: Path,
+    runner: CliRunner,
+) -> None:
+    assert diagnostics._check_home_layout() is None, "a new home: no row"
+    make_old_home(user_home)
+
+    row = diagnostics._check_home_layout()
+
+    assert row is not None and row.status.value == "warn" and row.name == "home-layout"
+    assert row.detail.startswith(f"laid out before 0.10.2 ({MOVE})")
+    assert f"`{prog.word()} upgrade` moves it" in row.detail
+    assert row.ui_fix == diagnostics.HOME_LAYOUT_UI_FIX and "upgrade" not in row.ui_fix
+    done = runner.invoke(app, ["--json", "doctor"])
+    rows = {check["name"]: check for check in json.loads(done.stdout)}
+    assert rows["home-layout"]["status"] == "warn"
+
+
+def test_an_install_rlx_does_not_upgrade_says_how_to_move_its_home(
+    old_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = UpgradePlan(
+        route=InstallRoute(install_route.HOMEBREW, UI_FACTS, formula="aisquare-cli"),
+        current="0.9.0",
+        target=None,
+        latest=None,
+        argv=("brew", "upgrade", "aisquare-cli"),
+        env={},
+        reason="Homebrew installs are upgraded with brew",
+        home_move=MOVE,
+    )
+    monkeypatch.setattr(lifecycle, "upgrade_plan", lambda *a, **k: plan)
+
+    result = CliRunner().invoke(app, ["upgrade", "--yes"])
+
+    assert result.exit_code == 1
+    assert f"Move its home ({MOVE}) with: {prog.word()} move-home" in result.output.replace(
+        "\n", " "
+    )

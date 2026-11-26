@@ -704,6 +704,9 @@ def _upgrade(
         # That command too would replace another program's rlx or relax without a word.
         taken = lifecycle_service.taken_refusal("upgrade", plan.commands_taken, again="run it")
         command += f" {taken}" if taken else ""
+        if plan.home_move is not None:
+            # The move is rlx's own, whoever installs it (#31).
+            command += f" Move its home ({plan.home_move}) with: {prog.word()} move-home"
         fail(
             f"rlx does not upgrade this install itself ({plan.reason}).{command}",
             error="upgrade_unsupported_route",

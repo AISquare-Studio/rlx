@@ -3988,7 +3988,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if offer is None:
             self.sidebar.show_update(None)
             return
-        self.sidebar.show_update(offer.version, runnable=offer.runnable)
+        self.sidebar.show_update(offer.version, runnable=offer.runnable, home=offer.home_only)
         if offer.announce:
             how = "restarts rlx to update" if offer.runnable else "says how to update this install"
             self.notify(
@@ -4084,7 +4084,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         An answer that nothing is newer than the version that runs takes the row away and
         says so, and closes the dialog, or keeps it from opening (:meth:`_update_planned`
         opens none without an offer): before the plan was read, the click opened nothing and
-        the row went in silence (review of #301, m2)."""
+        the row went in silence (review of #301, m2). But not with a home from before 0.10.2
+        to move (#31): the dialog and the row stay, as the move alone."""
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR):
             return
         if event.worker is not self._refresh_worker:
@@ -4096,8 +4097,14 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         offer = self.release
         screen = self.screen if isinstance(self.screen, UpdateScreen) else None
         current = offer.current if offer is not None else screen.plan.current if screen else None
+        home = offer.home_move if offer is not None else screen.plan.home_move if screen else None
         if found is not None and current is not None:
-            if lifecycle_service.newer_release(found, current) is not True:
+            newer = lifecycle_service.newer_release(found, current) is True
+            if not newer and home is not None:
+                if offer is not None and not offer.home_only:
+                    self.release = offer = replace(offer, version=current, announce=False)
+                    self.sidebar.show_update(current, runnable=offer.runnable, home=True)
+            elif not newer:
                 self.release = None
                 self.sidebar.show_update(None)
                 if screen is not None:
@@ -4108,7 +4115,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                     markup=False,
                 )
                 return
-            if offer is not None and found != offer.version:
+            elif offer is not None and found != offer.version:
                 self.release = replace(offer, version=found)
                 self.sidebar.show_update(found, runnable=offer.runnable)
                 if self._planned_runnable is not None:
@@ -4157,7 +4164,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             # The row was decided from the install's route alone; the dialog's plan has the
             # last word (uv gone from PATH since, say), and the row says what it says.
             self.release = offer = replace(offer, runnable=plan.runnable)
-            self.sidebar.show_update(offer.version, runnable=plan.runnable)
+            self.sidebar.show_update(offer.version, runnable=plan.runnable, home=offer.home_only)
         screen = UpdateScreen(plan, len(self._live_agents()), offer.version)
         if self._refreshed is not None:
             screen.show_latest(self._refreshed[0])  # PyPI answered before the plan was read

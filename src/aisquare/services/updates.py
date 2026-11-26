@@ -66,7 +66,8 @@ _CHECKOUTS = frozenset({install_route.EDITABLE, install_route.LOCAL_SOURCE})
 
 @dataclass(frozen=True)
 class Offer:
-    """A newer release, as the sidebar's ⬆ row offers it."""
+    """A newer release, as the sidebar's ⬆ row offers it; or, with :attr:`home_move` and no
+    newer release (:attr:`home_only`), the move of a home from before 0.10.2 (#31)."""
 
     version: str
     """The newest release the check found."""
@@ -76,6 +77,15 @@ class Offer:
     """Whether asq updates this install itself; otherwise its dialog says the command."""
     announce: bool
     """The first time this release was found: one toast says so."""
+    home_move: str | None = None
+    """The move of a home from before 0.10.2 the press makes too, in words (``~/.aisquare →
+    ~/.rlx``: ``lifecycle.planned_home_move``); ``None`` for a home in the new layout."""
+
+    @property
+    def home_only(self) -> bool:
+        """Whether the row offers the home's move alone: no newer release is out, and the press
+        runs the same one-click upgrade, which moves the home on the release that runs."""
+        return self.home_move is not None and self.version == self.current
 
 
 def lookup_latest() -> str | None:
@@ -126,10 +136,10 @@ def check_for_release(now: datetime | None = None) -> Offer | None:
     store, a little: the answer, and the release announced.
     """
     if not check_enabled():
-        return None
+        return _home_only(install_route.detect())
     route = install_route.detect()
     if not route_is_checked(route):
-        return None
+        return _home_only(route)
     now = now or datetime.now(UTC)
     with store_session() as store:
         checked_at = _instant(store.ui_state(CHECKED_KEY))
@@ -142,7 +152,7 @@ def check_for_release(now: datetime | None = None) -> Offer | None:
                 store.set_ui_state(CHECKED_KEY, now.isoformat())
                 store.set_ui_state(LATEST_KEY, found)
     if latest is None or lifecycle_service.newer_release(latest, __version__) is not True:
-        return None
+        return _home_only(route)
     with store_session() as store:
         announce = store.ui_state(ANNOUNCED_KEY) != latest
         if announce:
@@ -155,6 +165,29 @@ def check_for_release(now: datetime | None = None) -> Offer | None:
         current=__version__,
         runnable=install_route.not_automated(route) is None,
         announce=announce,
+        home_move=_home_move(),
+    )
+
+
+def _home_move() -> str | None:
+    """The move this home needs (``lifecycle.planned_home_move``), in words; ``None`` for a
+    home in the new layout, and for one that cannot be read: the check never fails on it."""
+    try:
+        return lifecycle_service.planned_home_move()[0]
+    except Exception:
+        return None
+
+
+def _home_only(route: install_route.InstallRoute) -> Offer | None:
+    """The ⬆ row's offer with no newer release to offer: the move of a home from before 0.10.2
+    (#31), on an install asq updates itself, whose one-click upgrade makes the move; ``None``
+    with no home to move, or on an install the way it came updates (it says ``rlx upgrade``
+    in the doctor's row, which the shell runs)."""
+    move = _home_move()
+    if move is None or install_route.not_automated(route) is not None:
+        return None
+    return Offer(
+        version=__version__, current=__version__, runnable=True, announce=False, home_move=move
     )
 
 
