@@ -59,14 +59,13 @@ from aisquare.core.tmux import TmuxError
 from aisquare.models import (
     CLOSED_STATUSES,
     FleetAgent,
-    ManagerWake,
     ProjectInfo,
     TaskStatus,
     TeamEvent,
     TeamSession,
     TeamTask,
 )
-from aisquare.services import install_route, mcp_host, model_memory
+from aisquare.services import install_route, manager_pass, manager_seat, mcp_host, model_memory
 from aisquare.services import project as project_service
 
 #: The fail-open reads of the fleet row say here what they swallowed. Nothing
@@ -549,35 +548,97 @@ def held_in_standby(event: TeamEvent) -> bool:
     )
 
 
-def manager_wakes(
-    store: ContextStore, event: TeamEvent, me: TeamSession, standby: Standby | None
-) -> bool:
-    """Whether ``event`` wakes the manager ``me``: :func:`wake_class`, less an echo of news it
-    has read (:func:`is_echo`) and, in standby, what standby holds (:func:`held_in_standby`).
-    The one rule every door reads: the nudge, the Stop hook, its deferral."""
-    if wake_class(event, me) != "wake" or is_echo(store, event, me):
-        return False
-    if me.role == MANAGER_ROLE and me.manager_wake == "schedule":
-        return _scheduled_manager_wake(event, me)
-    return standby is None or not held_in_standby(event)
-
-
 _SCHEDULED_SYSTEM_WAKES = frozenset({"limited", "handover_failed", "prompt_unsent"})
-_SCHEDULED_WAKE_KINDS = _SCHEDULED_SYSTEM_WAKES | {"question", "agent_exited", "watch"}
+_SCHEDULED_WAKE_KINDS = _SCHEDULED_SYSTEM_WAKES | {"note", "question", "agent_exited", "watch"}
 
 
-def _scheduled_manager_wake(event: TeamEvent, me: TeamSession) -> bool:
-    """Keep direct questions and urgent system events in the manager's wake stream."""
-    if event.kind == "question":
-        return (event.to_role or "").strip().lower() in {
-            MANAGER_ROLE,
-            (me.label or MANAGER_ROLE).strip().lower(),
-            me.id.lower(),
-            short_id(me.id).lower(),
+class _ManagerAddresses:
+    """Resolve a board recipient once per write or urgent scan."""
+
+    def __init__(self, store: ContextStore, board: str) -> None:
+        self.store = store
+        self.board = board
+        self.seats = {
+            session.id: row.project_id
+            for row in store.live_fleet_agents()
+            if (row.board or row.project_id) == board
+            if (session := manager_seat.bound(store, row)) is not None
         }
+        self.names = {
+            session.id: addressee_names(store, session.id)
+            for session in store.team_sessions(board)
+            if session.ended_at is None
+        }
+
+    def resolve(
+        self, address: str | None, writer: str | None, root: Path | _Nowhere,
+        explicit_project: str | None = None,
+    ) -> str | None:
+        """Resolve IDs first, then aliases and contextual manager addresses."""
+        name = (address or "").strip().lower()
+        if name:
+            exact = next((ref for ref in self.names if ref.lower() == name), None)
+            if exact is not None:
+                return self.seats.get(exact)
+            short = [ref for ref in self.names if short_id(ref).lower() == name]
+            if short:
+                return self.seats.get(short[0]) if len(short) == 1 else None
+            aliases = [ref for ref, names in self.names.items() if name in names]
+            if name != MANAGER_ROLE:
+                return self.seats.get(aliases[0]) if len(aliases) == 1 else None
+        projects = set(self.seats.values())
+        origin = self.store.fleet_agent_for_session(writer) if writer else None
+        if origin is not None and origin.project_id in projects:
+            return origin.project_id
+        if explicit_project in projects:
+            return explicit_project
+        if isinstance(root, Path):
+            roots = [
+                (len(project.root.parts), project.id)
+                for project_id in projects
+                if (project := self.store.get_project(project_id)) is not None
+                if root.is_relative_to(project.root)
+            ]
+            if roots:
+                return max(roots)[1]
+        return next(iter(projects)) if len(projects) == 1 else None
+
+
+def manager_wakes(
+    store: ContextStore,
+    event: TeamEvent,
+    me: TeamSession,
+    standby: Standby | None,
+    *,
+    mode: tuple[manager_seat.WakeMode, str | None] | None = None,
+    addresses: _ManagerAddresses | None = None,
+) -> bool:
+    """Apply the bound seat's wake policy to one board event."""
+    wake, project = mode if mode is not None else manager_seat.mode(store, me)
+    if wake == "blocked" or me.id in (event.actor, event.session_id):
+        return False
+    meta = event.meta or {}
+    if manager_seat.EVENT_PROJECT in meta and meta[manager_seat.EVENT_PROJECT] != project:
+        return False
+    if wake == "every_write":
+        return (
+            wake_class(event, me) == "wake"
+            and not is_echo(store, event, me)
+            and (standby is None or not held_in_standby(event))
+        )
+    if event.kind == "question" or (
+        event.kind == "note" and event.session_id is None and (event.to_role or "").strip()
+    ):
+        if manager_seat.EVENT_PROJECT in meta:
+            return True
+        if addresses is None:
+            addresses = _ManagerAddresses(store, me.project_id)
+        return addresses.resolve(event.to_role, event.session_id, NOWHERE) == project
     if event.kind == "watch":
         return not held_in_standby(event)
-    return event.kind == "agent_exited" or event.kind in _SCHEDULED_SYSTEM_WAKES
+    if event.kind == "agent_exited":
+        return exit_wakes(event.meta if event.meta is not None else _exit_meta_from_text(event.text))
+    return event.kind in _SCHEDULED_SYSTEM_WAKES
 
 
 class TeamDisabledError(RuntimeError):
@@ -1653,6 +1714,8 @@ def log_events(
     by: str | None = None,
     since: datetime | None = None,
     since_seq: int | None = None,
+    through_seq: int | None = None,
+    pass_id: str | None = None,
     kind: str | None = None,
     task_ref: str | None = None,
     session_ref: str | None = None,
@@ -1669,6 +1732,15 @@ def log_events(
     with store_session() as store:
         session = _resolve_session(store, session_ref)
         board = _board(store, session, cwd)
+        if pass_id is not None:
+            if session is None or board.id != session.project_id:
+                raise ValueError("a pass requires its bound manager session and board")
+            pending = manager_pass.bound_range(store, session, pass_id)
+            if since_seq is None or not pending.lower <= since_seq <= pending.upper:
+                raise ValueError("cursor is outside the pending pass range")
+            if through_seq is not None and through_seq != pending.upper:
+                raise ValueError("upper sequence does not match the pending pass")
+            through_seq = pending.upper
         author = _resolve_session(store, by, acting=False)
         task_id: str | None = None
         if task_ref is not None:
@@ -1676,17 +1748,30 @@ def log_events(
             if task is None:
                 raise KeyError(task_ref)
             task_id = task.id
-        if author is None and since is None and since_seq is None and kind is None and not task_id:
+        if (author is None and since is None and since_seq is None and through_seq is None
+                and kind is None and not task_id):
             return store.recent_events(board.id, limit=limit)
         return store.filtered_events(
             board.id,
             session_id=author.id if author is not None else None,
             since_iso=since.astimezone(UTC).isoformat() if since is not None else None,
             since_seq=since_seq,
+            through_seq=through_seq,
             kind=kind,
             task_id=task_id,
             limit=limit,
         )
+
+
+def complete_manager_pass(pass_id: str, session_ref: str) -> None:
+    """Complete a pass through the caller's scoped manager identity."""
+    _require_enabled()
+    with store_session() as store:
+        session = _resolve_session(store, session_ref)
+        if session is None:
+            raise ValueError("a manager session is required")
+        _board(store, session, None)
+        manager_pass.complete(store, session, pass_id)
 
 
 @dataclass(frozen=True)
@@ -2165,32 +2250,37 @@ def add_note(
                 # ref for every reader here.
                 _out_of_board(f"--task {task_ref}: that task belongs to another project's board")
             task_id = task.id
+        recipient: str | None = None
+        meta: dict[str, object] | None = None
+        writer = session.id if session is not None else None
+        scheduled_kind = kind == "question" or (
+            kind == "note" and writer is None and bool((to_role or "").strip())
+        )
+        if scheduled_kind:
+            recipient = _ManagerAddresses(store, board.id).resolve(
+                to_role, writer, (cwd or Path.cwd()).resolve(), project_id
+            )
+            if recipient is not None and not manager_seat.policy(store, recipient).configured:
+                recipient = None
+            elif recipient is not None:
+                meta = {manager_seat.EVENT_PROJECT: recipient}
         event = _emit(
             store,
             board.id,
             kind,
             text,
-            session_id=session.id if session else None,
+            session_id=writer,
             task_id=task_id,
             to_role=to_role,
+            meta=meta,
         )
         _route_up(store, event)
         wakes = kind in ("result", "question") or _addressed_to_manager(to_role)
-        manager = (
-            _nudge_target(store, session.id if session else None, board.id, cwd)
-            if wakes
-            else board.id
-        )
+        manager = recipient or (_nudge_target(store, writer, board.id, cwd) if wakes else None)
     stored = _record_delivery(event, board)
-    if kind in ("result", "question"):
-        _nudge_manager(manager, reason=kind, board=board.id)
-    elif _addressed_to_manager(to_role):
-        # §7.3 path 2 lists `note --to manager` among the writes that wake a
-        # waiting manager, and only the KIND was consulted here: a note
-        # addressed to the manager reached a waiting one on no path at all —
-        # 'note' is not a MANAGER_WAKE_KIND either, so its Stop hook did not
-        # deliver it and it sat past the cursor until some unrelated event.
-        _nudge_manager(manager, reason=f"{kind}_to_manager", board=board.id)
+    if manager is not None:
+        reason = kind if kind in ("result", "question") else f"{kind}_to_manager"
+        _nudge_manager(manager, reason=reason, board=board.id)
     _flush_routed()
     return stored
 
@@ -3014,6 +3104,12 @@ def _briefing_events(
     reads, relevant = (True, None) if session is None else _board_reading(store, session)
     if not reads:
         return []
+    if session is not None and session.role == MANAGER_ROLE:
+        mode, project = manager_seat.mode(store, session)
+        if mode == "blocked":
+            return []
+        if mode == "schedule" and project is not None:
+            return []
     return store.recent_events(
         project_id, exclude_kinds=HUMAN_BOARD_KINDS, relevant=relevant, limit=_BOARD_EVENTS
     )
@@ -3054,15 +3150,6 @@ HOOK_OUTPUT_CAP = 10_000
 #: Held back under :data:`HOOK_OUTPUT_CAP` for what joins the parts of a session start
 #: and the line ending ``hook session-start`` prints after them.
 _HOOK_MARGIN = 64
-
-
-def _session_manager_wake(role: str | None) -> ManagerWake | None:
-    """Read the manager's launch setting when its own session registers."""
-    if role != MANAGER_ROLE:
-        return None
-    from aisquare.services.fleet import role_settings
-
-    return role_settings(role).wake
 
 
 def hook_session_start(
@@ -3143,7 +3230,6 @@ def hook_session_start(
                 native_session_id=native_session_id or session_id,
                 project_id=project.id,
                 role=role or (known.role if known else "unassigned"),
-                manager_wake=_session_manager_wake(role or (known.role if known else None)),
                 started_at=now,
                 last_seen_at=now,
                 cursor=store.latest_seq(project.id),
@@ -3413,7 +3499,6 @@ def hook_prompt_heartbeat(
                     native_session_id=native_session_id or session_id,
                     project_id=project.id,
                     role=role or "unassigned",
-                    manager_wake=_session_manager_wake(role),
                     started_at=now,
                     last_seen_at=now,
                     cursor=store.latest_seq(project.id),
@@ -3491,8 +3576,17 @@ def hook_prompt_heartbeat(
         # delivered: dropped after it, a run of audit lines was the whole page, prompt
         # after prompt, with a coder's result behind it (review of #240, finding 11).
         reads, relevant = _board_reading(store, session)
-        events = _wake_candidates(store, session, relevant)
+        mode, project = manager_seat.mode(store, session) if session.role == MANAGER_ROLE else (
+            "every_write", None
+        )
+        scheduled = mode == "schedule" and project is not None
+        if scheduled and project is not None:
+            events = _scheduled_wake_candidates(store, session, project, head=newest)
+        else:
+            events = _wake_candidates(store, session, relevant)
         if not events or not orchestrator.delta_enabled() or not reads:
+            if scheduled and project is not None and not events:
+                manager_seat.advance_urgent(store, project, session.project_id, newest)
             # Nothing delivered is still something read: the cursor moves past it, the
             # left-out rows included, rather than stay in front of them for every later
             # prompt to scan again.
@@ -3502,7 +3596,9 @@ def hook_prompt_heartbeat(
             return collision + briefing
         truncated = len(events) > _DELTA_LIMIT
         shown = events[:_DELTA_LIMIT]
-        store.touch_session(session.id, cursor=shown[-1].seq, state="working")
+        store.touch_session(session.id, cursor=max(session.cursor, shown[-1].seq), state="working")
+        if scheduled and project is not None:
+            manager_seat.advance_urgent(store, project, session.project_id, shown[-1].seq)
         authors = authors_of(store.team_sessions(session.project_id))
         board = _board_of(store, session.project_id).name
         # One read, and only when a line names a task: this runs on every prompt.
@@ -3511,6 +3607,7 @@ def hook_prompt_heartbeat(
             collision
             + briefing
             + _render_delta(shown, authors, truncated=truncated, board=board, numbers=numbers)
+            + _held_pointer(store, project if scheduled else None, session.project_id)
         )
 
 
@@ -3755,8 +3852,12 @@ def _wake_candidates(
     ``relevant`` is ``me``'s board context (:func:`_board_reading`), applied in the query
     as the prompt's delta applies it: a manager reads everything.
     """
-    if me.role == MANAGER_ROLE and me.manager_wake == "schedule":
-        return _scheduled_wake_candidates(store, me)
+    if me.role == MANAGER_ROLE:
+        mode, project = manager_seat.mode(store, me)
+        if mode == "blocked":
+            return []
+        if mode == "schedule" and project is not None:
+            return _scheduled_wake_candidates(store, me, project)
     return store.events_since(
         me.project_id,
         me.cursor,
@@ -3768,25 +3869,31 @@ def _wake_candidates(
     )
 
 
-def _scheduled_wake_candidates(store: ContextStore, me: TeamSession) -> list[TeamEvent]:
-    """Read a page of urgent events, scanning past candidates that do not wake this manager."""
+def _scheduled_wake_candidates(
+    store: ContextStore, me: TeamSession, project: str, *, head: int | None = None
+) -> list[TeamEvent]:
+    """Read an exact urgent page through a captured board head."""
     limit = _DELTA_LIMIT + 1
-    head = store.latest_seq(me.project_id)
-    cursor = me.cursor
+    if head is None:
+        head = store.latest_seq(me.project_id)
+    cursor = manager_seat.urgent_position(store, project, me.project_id)
     urgent: list[TeamEvent] = []
+    addresses = _ManagerAddresses(store, me.project_id)
+    standby = standby_of(store, me)
     while cursor < head:
         events = store.events_since(
             me.project_id,
             cursor,
+            through_seq=head,
             exclude_session=me.id,
             exclude_actor=me.id,
             include_kinds=_SCHEDULED_WAKE_KINDS,
             limit=limit,
         )
         for event in events:
-            if event.seq > head:
-                return urgent
-            if manager_wakes(store, event, me, None):
+            if manager_wakes(
+                store, event, me, standby, mode=("schedule", project), addresses=addresses
+            ):
                 urgent.append(event)
                 if len(urgent) == limit:
                     return urgent
@@ -3796,13 +3903,23 @@ def _scheduled_wake_candidates(store: ContextStore, me: TeamSession) -> list[Tea
     return urgent
 
 
-def wake_pending(store: ContextStore, me: TeamSession) -> bool:
-    """Whether news a manager wakes for is past its cursor, unread (:func:`manager_wakes`):
-    what every nudge is due for, a write's own and one owed since a write tmux refused
-    (``services.fleet.deliver_owed_nudge``). Every write that nudges is one of these events,
-    so a write that is not (its own result, an echo, a line standby holds) wakes nobody."""
+def pending_wakes(store: ContextStore, me: TeamSession) -> list[TeamEvent]:
+    """Return the same pending urgency used by pane delivery and Stop."""
+    mode = manager_seat.mode(store, me)
+    if mode[0] == "blocked":
+        return []
+    if mode[0] == "schedule" and mode[1] is not None:
+        return _scheduled_wake_candidates(store, me, mode[1])
     standby = standby_of(store, me)
-    return any(manager_wakes(store, event, me, standby) for event in _wake_candidates(store, me))
+    return [
+        event for event in _wake_candidates(store, me)
+        if manager_wakes(store, event, me, standby, mode=mode)
+    ]
+
+
+def wake_pending(store: ContextStore, me: TeamSession) -> bool:
+    """Check for pending manager work before typing into a waiting pane."""
+    return bool(pending_wakes(store, me))
 
 
 def _deferred_wake_reason(store: ContextStore, me: TeamSession) -> str | None:
@@ -3828,11 +3945,16 @@ def _deferred_wake_reason(store: ContextStore, me: TeamSession) -> str | None:
     """
     if not orchestrator.delta_enabled():
         return None
-    standby = standby_of(store, me)
-    for event in _wake_candidates(store, me):
-        if manager_wakes(store, event, me, standby):
-            return f"deferred:{event.kind}"
-    return None
+    pending = pending_wakes(store, me)
+    return f"deferred:{pending[0].kind}" if pending else None
+
+
+def _held_pointer(store: ContextStore, project: str | None, board: str) -> str:
+    """Point to held work without changing the pass read position."""
+    if project is None:
+        return ""
+    seq = manager_pass.read(store, project, board)[1].read
+    return f"\nHeld board range starts after #{seq}; review it on your board pass."
 
 
 def _manager_wakeup(
@@ -3840,11 +3962,15 @@ def _manager_wakeup(
 ) -> StopDecision | None:
     """Keep a manager going on fresh board decisions (:func:`manager_wakes`), or ``None``."""
     standby = standby_of(store, me)
+    mode = manager_seat.mode(store, me)
+    if mode[0] == "blocked":
+        return None
     return _wakeup(
         store,
         me,
         stop_hook_active=stop_hook_active,
-        wakes=lambda e: manager_wakes(store, e, me, standby),
+        wakes=lambda e: mode[0] == "schedule" or manager_wakes(store, e, me, standby, mode=mode),
+        scheduled_project=mode[1] if mode[0] == "schedule" else None,
     )
 
 
@@ -3857,6 +3983,7 @@ def _wakeup(
     act: str | None = None,
     relevant: Relevance | None = None,
     keep: Callable[[TeamEvent], bool] | None = None,
+    scheduled_project: str | None = None,
 ) -> StopDecision | None:
     """Keep ``me`` going on the board since its cursor when an event there ``wakes`` it, or
     ``None`` to let it wait: the manager's wake-up (§7.3) and every other role's turn-end
@@ -3893,11 +4020,13 @@ def _wakeup(
     board = _board_of(store, me.project_id).name
     numbers = store.task_numbers(me.project_id) if any(e.task_id for e in shown) else {}
     store.set_meta(key, str(used + 1))
-    store.touch_session(me.id, cursor=shown[-1].seq, state="working")
+    store.touch_session(me.id, cursor=max(me.cursor, shown[-1].seq), state="working")
+    if scheduled_project is not None:
+        manager_seat.advance_urgent(store, scheduled_project, me.project_id, shown[-1].seq)
     return StopDecision(
         reason=_render_wakeup(
             shown, authors, truncated=truncated, board=board, numbers=numbers, act=act
-        ),
+        ) + _held_pointer(store, scheduled_project, me.project_id),
         cursor=shown[-1].seq,
     )
 
@@ -4121,6 +4250,7 @@ def hook_stop_failure(
                     handing_over=handing_over,
                 ),
                 session_id=session.id,
+                meta={manager_seat.EVENT_PROJECT: agent.project_id} if agent is not None else None,
             )
         refreshed = store.get_session(session.id) or session
     if manager is not None:  # not already limited, and no hand-over coming
@@ -4253,13 +4383,16 @@ def hook_handover_failed(
     if not orchestrator.team_enabled():
         return
     with store_session() as store:
-        _emit(store, project_id, "handover_failed", text, session_id=session_id)
         session = store.get_session(session_id) if session_id is not None else None
         agent = store.fleet_agent_for_session(session_id) if session_id is not None else None
         manager = (
             agent.project_id
             if agent is not None
             else _nudge_target(store, None, session.project_id if session else project_id)
+        )
+        _emit(
+            store, project_id, "handover_failed", text, session_id=session_id,
+            meta={manager_seat.EVENT_PROJECT: agent.project_id} if agent is not None else None,
         )
     if manager is not None:
         who = label or (short_id(session_id) if session_id else "an agent")
@@ -4274,7 +4407,9 @@ def hook_note(project_id: str, text: str, *, session_id: str | None = None) -> N
         _emit(store, project_id, "note", text, session_id=session_id)
 
 
-def watch_event(board_id: str, text: str, *, urgent: bool = True) -> None:
+def watch_event(
+    board_id: str, text: str, *, urgent: bool = True, project_id: str | None = None
+) -> None:
     """``aisquare watch``'s one line for a project with new items (P2-W2, #284): kind
     ``watch``, addressed to the manager, so it wakes it (:func:`wake_class`) and a working
     manager is handed it at its turn's end. Counts and a path, never an excerpt. ``urgent``
@@ -4282,7 +4417,10 @@ def watch_event(board_id: str, text: str, *, urgent: bool = True) -> None:
     if not orchestrator.team_enabled():
         return
     with store_session() as store:
-        _emit(store, board_id, "watch", text, to_role=MANAGER_ROLE, meta={"urgent": urgent})
+        meta: dict[str, object] = {"urgent": urgent}
+        if project_id is not None:
+            meta[manager_seat.EVENT_PROJECT] = project_id
+        _emit(store, board_id, "watch", text, to_role=MANAGER_ROLE, meta=meta)
 
 
 def hook_notice(project_id: str, text: str, *, session_id: str | None = None) -> None:
@@ -5032,6 +5170,21 @@ def _start_pack(
         fleet=fleet,
         cwd=cwd,
     )
+    policy = manager_seat.policy(store, home.id)
+    if policy.configured:
+        from aisquare.services import watch
+
+        state = manager_pass.read(store, home.id, me.project_id)[1]
+        watcher = watch.watch_status()
+        age = watcher.age()
+        healthy = (
+            watcher.pid is not None and watcher.pid > 0 and age is not None
+            and age.total_seconds() <= 3 * load_config().watch.interval_seconds
+        )
+        if policy.pass_minutes and state.completed and healthy:
+            tail.append("The watcher owns board passes. Retire the manual pass timer.")
+        else:
+            tail.append("Keep the manual board pass timer until a watcher pass has completed.")
     tail.append("</aisquare-team>")
     head += _open_items(store, project, me, sessions, agents, numbers, authors)
     items = _task_lines(tasks, numbers, labels, _link_marks(project.id, store))
@@ -5077,12 +5230,7 @@ def _open_items(
             on = f" #{number}" if number is not None else ""
             slot = f" [account {agent.account_slot}]" if agent.account_slot is not None else ""
             lines.append(f"  - {agent.label} {agent.role} {state}{on}{slot}")
-    standby = standby_of(store, me)
-    pending = [
-        e
-        for e in store.events_since(project.id, me.cursor, exclude_session=me.id, limit=500)
-        if manager_wakes(store, e, me, standby)
-    ]
+    pending = pending_wakes(store, me)
     lines.append(f"wake events pending past your cursor: {len(pending)}")
     return lines
 

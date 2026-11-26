@@ -516,3 +516,17 @@ def test_a_later_turn_that_asks_supersedes_the_worker_an_earlier_one_armed(
     # The control: a third, quiet turn arms again, and its worker compacts.
     third = manager.stop(armed)
     assert _check(manager, third) == "compacted"
+
+
+
+def test_schedule_compacts_past_held_results_but_refuses_urgent_work(manager: Manager) -> None:
+    """Scheduled compaction sees the same urgency as pane delivery."""
+    with store_session() as store:
+        store.set_project_setting(manager.project.id, "manager_wake", "schedule")
+        store.touch_session(manager.sid, state="waiting")
+    team_service.add_note("held result", kind="result", board_id=manager.project.id)
+    assert manager.refusal() is None
+    team_service.add_note(
+        "urgent question", kind="question", to_role=manager.sid, board_id=manager.project.id
+    )
+    assert (manager.refusal() or "").startswith("a question is pending")

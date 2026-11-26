@@ -1749,7 +1749,7 @@ instead, which is what an unfinished turn is."""
 _SESSION_COLUMNS = (
     "id, project_id, role, label, focus, started_at, last_seen_at, ended_at, cursor, state, "
     "transcript_path, account, model, effort, limit_resets_at, agent, native_session_id, "
-    "persona, prompted_at, manager_wake"
+    "persona, prompted_at"
 )
 _USAGE_COLUMNS = (
     "slot, fetched_at, session_percent, session_resets_at, week_percent, week_resets_at, "
@@ -2017,6 +2017,7 @@ class ContextStore(Protocol):
         project_id: str,
         seq: int,
         *,
+        through_seq: int | None = None,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
         include_kinds: Collection[str] = (),
@@ -2039,6 +2040,7 @@ class ContextStore(Protocol):
         session_id: str | None = None,
         since_iso: str | None = None,
         since_seq: int | None = None,
+        through_seq: int | None = None,
         kind: str | None = None,
         task_id: str | None = None,
         to_role: str | None = None,
@@ -2521,7 +2523,6 @@ def _row_to_session(row: sqlite3.Row) -> TeamSession:
         limit_resets_at=_maybe_dt(row["limit_resets_at"]),
         persona=row["persona"],
         prompted_at=_maybe_dt(row["prompted_at"]),
-        manager_wake=row["manager_wake"],
     )
 
 
@@ -3605,7 +3606,7 @@ class SqliteStore:
             return stored  # A delayed MCP upsert must not resurrect the provisional row.
         self._conn.execute(
             f"INSERT INTO team_session ({_SESSION_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET "
             "last_seen_at = excluded.last_seen_at, ended_at = NULL, "
             "state = CASE excluded.state WHEN 'waiting' THEN 'waiting' ELSE 'working' END, "
@@ -3616,8 +3617,7 @@ class SqliteStore:
             "agent = COALESCE(excluded.agent, agent), "
             "native_session_id = COALESCE(excluded.native_session_id, native_session_id), "
             "persona = COALESCE(excluded.persona, persona), "
-            "prompted_at = COALESCE(excluded.prompted_at, prompted_at), "
-            "manager_wake = COALESCE(excluded.manager_wake, manager_wake)",
+            "prompted_at = COALESCE(excluded.prompted_at, prompted_at)",
             (
                 session.id,
                 session.project_id,
@@ -3638,7 +3638,6 @@ class SqliteStore:
                 session.native_session_id,
                 session.persona,
                 session.prompted_at.isoformat() if session.prompted_at else None,
-                session.manager_wake,
             ),
         )
         self._commit()
@@ -5285,6 +5284,7 @@ class SqliteStore:
         session_id: str | None = None,
         since_iso: str | None = None,
         since_seq: int | None = None,
+        through_seq: int | None = None,
         kind: str | None = None,
         task_id: str | None = None,
         to_role: str | None = None,
@@ -5315,6 +5315,9 @@ class SqliteStore:
         if since_seq is not None:
             clauses.append("seq > ?")
             params.append(since_seq)
+        if through_seq is not None:
+            clauses.append("seq <= ?")
+            params.append(through_seq)
         if kind is not None:
             clauses.append("kind = ?")
             params.append(kind)
@@ -5342,6 +5345,7 @@ class SqliteStore:
         project_id: str,
         seq: int,
         *,
+        through_seq: int | None = None,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
         include_kinds: Collection[str] = (),
@@ -5362,18 +5366,20 @@ class SqliteStore:
         page, and the event behind it was not read at all (review of #240, finding 11).
         """
         keep, kept = _relevant_clause(relevant)
-        included = f"AND kind IN ({', '.join('?' * len(include_kinds))}) " if include_kinds else ""
+        bounds = "AND seq <= ? " if through_seq is not None else ""
+        included = _and_kinds(include_kinds)
         rows = self._conn.execute(
             f"SELECT {_EVENT_COLUMNS} FROM team_event "
             "WHERE project_id = ? AND seq > ? "
             "AND (session_id IS NULL OR session_id != ?) "
             "AND (actor IS NULL OR actor != ?) "
-            f"{_and_not_kinds(exclude_kinds)}{included}{keep}ORDER BY seq LIMIT ?",
+            f"{bounds}{_and_not_kinds(exclude_kinds)}{included}{keep}ORDER BY seq LIMIT ?",
             (
                 project_id,
                 seq,
                 exclude_session or "",
                 exclude_actor or "",
+                *((through_seq,) if through_seq is not None else ()),
                 *exclude_kinds,
                 *include_kinds,
                 *kept,
@@ -7475,7 +7481,10 @@ the launch record's refusal its board was last told (``services.fleet._say_refus
 go with the row (:func:`_fleet_meta_terms`): nothing else expires a ``first-prompt:``,
 ``fleet-stopped:`` or ``launch-refused:`` key."""
 
-_PROJECT_META: tuple[str, ...] = ("signal/{}/*", "nudge-owed:{}", "broker-refused:{}:*")
+_PROJECT_META: tuple[str, ...] = (
+    "signal/{}/*", "nudge-owed:{}", "broker-refused:{}:*",
+    "manager-seat/{}/*", "manager-seat/*/{}/*",
+)
 """The ``team_meta`` keys kept per project, as GLOBs of its id: its signals, the nudge a board
 write owed its manager (``services.fleet.NUDGE_OWED``) and the once-per-launch-and-kind marks
 of the broker refusals its board was told (``services.store_broker.record_refusal``). A reset
@@ -7571,6 +7580,11 @@ def _relevant_clause(relevant: Relevance | None) -> tuple[str, list[str]]:
     if not terms:
         return "AND 0 ", []  # keeps nothing: no task, no name, no decisions
     return f"AND ({' OR '.join(terms)}) ", params
+
+
+def _and_kinds(kinds: Collection[str]) -> str:
+    """Include kinds inside an event page."""
+    return f"AND kind IN ({', '.join('?' * len(kinds))}) " if kinds else ""
 
 
 def _and_not_kinds(kinds: Collection[str]) -> str:

@@ -6310,7 +6310,10 @@ def test_a_managers_own_stop_says_so_and_nudges_nobody_and_a_kill_by_anyone_else
 
     exits = {e.text.split(" ")[0]: e for e in _board_events(project, "agent_exited")}
     assert exits["coder-a"].actor == manager.session_id
-    assert exits["coder-a"].meta == {"status": None, "force": True, "released": 0, "why": None}
+    assert exits["coder-a"].meta == {
+        "status": None, "force": True, "released": 0, "why": None,
+        "manager_project": project.id,
+    }
     assert exits["coder-a"].text == "coder-a exited (?) — stopped by manager (--force)"
     assert exits["coder-c"].text == "coder-c exited (0) — stopped by user"
 
@@ -15659,12 +15662,10 @@ def _manager_with_wake_setting(
     monkeypatch: pytest.MonkeyPatch,
     wake: ManagerWake | None,
 ) -> str:
-    """Register a waiting manager, then restore the config the writer will see."""
-    original = load_config()
+    """Register a waiting manager with the given project policy."""
     if wake is not None:
-        config = original.model_copy(deep=True)
-        config.fleet.roles["manager"] = FleetRoleSettings(wake=wake)
-        save_config(config)
+        with store_session() as store:
+            store.set_project_setting(project.id, "manager_wake", wake)
     manager = fleet_service.spawn(project, "manager").agent
     session_id = manager.session_id
     assert session_id is not None
@@ -15674,8 +15675,6 @@ def _manager_with_wake_setting(
         team_service.hook_session_start(session_id, project.root, "startup")
     _board_session(manager, "waiting")
     tmux.set_command(manager.pane_id, "claude")
-    if wake is not None:
-        save_config(original)
     tmux.typed.clear()
     return session_id
 
@@ -15706,7 +15705,11 @@ def test_scheduled_manager_waits_for_routine_writes(
 
 @pytest.mark.parametrize("delivery_path", ["pane", "stop"])
 @pytest.mark.parametrize(
-    "kind", ["question", "limited", "handover_failed", "watch", "agent_exited"]
+    "kind",
+    [
+        "question", "unaddressed", "note", "limited", "handover_failed", "watch",
+        "agent_exited", "prompt_unsent",
+    ],
 )
 def test_scheduled_manager_wakes_for_urgent_events(
     tmux: FakeTmux,
@@ -15718,7 +15721,11 @@ def test_scheduled_manager_wakes_for_urgent_events(
 ) -> None:
     """Each urgent producer wakes the manager past routine board traffic."""
     manager = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
-    coder = fleet_service.spawn(project, "coder").agent
+    coder = (
+        _coder(project, prompt="/effort max", spawned_by="user")
+        if kind == "prompt_unsent"
+        else fleet_service.spawn(project, "coder").agent
+    )
     _board_session(coder, "working")
     assert coder.session_id is not None
     with store_session() as store:
@@ -15742,6 +15749,14 @@ def test_scheduled_manager_wakes_for_urgent_events(
             to_role=manager[:8],
             board_id=project.id,
         )
+    elif kind in ("unaddressed", "note"):
+        team_service.add_note(
+            "please decide",
+            session_ref=coder.session_id if kind == "unaddressed" else None,
+            kind="question" if kind == "unaddressed" else "note",
+            to_role=manager[:8] if kind == "note" else None,
+            board_id=project.id,
+        )
     elif kind == "limited":
         team_service.hook_stop_failure(
             coder.session_id, error="rate_limit", message="usage limit", details=None
@@ -15753,6 +15768,8 @@ def test_scheduled_manager_wakes_for_urgent_events(
     elif kind == "watch":
         team_service.watch_event(project.id, "watch: blocking permission dialog")
         fleet_service.nudge_manager(project.id, reason="watch", board=project.id)
+    elif kind == "prompt_unsent":
+        assert fleet_service._first_prompt_unsent(coder, "test delivery stalled")
     else:
         fleet_service.stop(project, coder.label, force=True)
     if delivery_path == "pane":
@@ -15766,11 +15783,137 @@ def test_scheduled_manager_wakes_for_urgent_events(
     assert "elsewhere" not in delivered
     assert {
         "question": "please decide",
+        "unaddressed": "please decide",
+        "note": "please decide",
         "limited": "usage limit",
         "handover_failed": "could not switch",
         "watch": "blocking permission dialog",
         "agent_exited": "exited",
+        "prompt_unsent": "test delivery stalled",
     }[kind] in delivered
+
+
+@pytest.mark.parametrize("producer", ["id", "alias", "watch"])
+@pytest.mark.parametrize("path", ["pane", "stop"])
+def test_scheduled_managers_isolate_urgent_wakes_on_a_shared_hub(
+    hubbed: _Hubbed, tmp_path: Path, producer: str, path: str
+) -> None:
+    """The selected fleet alone receives a typed wake or a Stop continuation."""
+    from aisquare.services import watch
+
+    first = hubbed
+    root = tmp_path / "another-fleet"
+    root.mkdir()
+    with store_session() as store:
+        second = store.onboard_project(team_project(root))
+        for project in (first.fleet, second):
+            store.set_project_setting(project.id, "manager_wake", "schedule")
+    other, sid = _spawned(second, "manager", None, first.tmux, first.monkeypatch)
+    team_service.hook_session_start(sid, second.root, "startup")
+    first.monkeypatch.setattr(fleet_service, "nudge_manager", first.nudge)
+    intended, wrong = (first.manager_sid, sid) if producer == "alias" else (sid, first.manager_sid)
+    intended_pane = first.manager.pane_id if producer == "alias" else other.pane_id
+    with store_session() as store:
+        for session in (intended, wrong):
+            store.touch_session(session, state="waiting" if path == "pane" else "working")
+    first.tmux.typed.clear()
+    if producer == "watch":
+        watch._deliver(
+            second.id,
+            [watch.WatchItem("urgent", second.id, "second", "dialog", "permission")],
+            tmp_path / "watch.json",
+        )
+        expected = "watch:"
+    else:
+        team_service.add_note(
+            "scoped question",
+            kind="question",
+            to_role=sid if producer == "id" else " MANAGER ",
+            session_ref=first.coder_sid,
+        )
+        expected = "scoped question"
+    pastes = [(pane, line) for pane, action, line in first.tmux.typed if action == "paste"]
+    if path == "pane":
+        assert pastes == [(intended_pane, NUDGE_TEXT)]
+        assert expected in team_service.hook_prompt_heartbeat(intended, root)
+    else:
+        assert pastes == []
+        decision = team_service.hook_stop(intended, root)
+        assert decision is not None and expected in decision.reason
+    assert team_service.hook_stop(wrong, root) is None
+
+
+def test_scheduled_activation_replays_and_replacement_resumes_urgent_progress(hubbed: _Hubbed) -> None:
+    """A seat ignores the new session's board-head cursor and resumes its unread urgency."""
+    from aisquare.services import manager_seat
+
+    first = hubbed
+    ask = team_service.add_note(
+        "retained direct question", kind="question", to_role=first.manager_sid,
+        session_ref=first.coder_sid,
+    )
+    with store_session() as store:
+        store.touch_session(first.manager_sid, cursor=ask.seq)
+        store.set_project_setting(first.fleet.id, "manager_wake", "schedule")
+    decision = team_service.hook_stop(first.manager_sid, first.fleet.root)
+    assert decision is not None and "retained direct question" in decision.reason
+    another = team_service.add_note(
+        "question survives replacement", kind="question", to_role=first.manager_sid,
+        session_ref=first.coder_sid,
+    )
+    _become(first.manager, first.tmux, first.monkeypatch, pid=PANE_PID, role="manager")
+    new_id = "a2bf9bc0-1234-4123-8123-abcdef123456"
+    _clear(first.manager_sid, new_id, first.fleet)
+    with store_session() as store:
+        session = store.get_session(new_id)
+        assert session is not None and session.cursor >= another.seq
+        assert manager_seat.urgent_position(store, first.fleet.id, first.hub.id) == ask.seq
+    decision = team_service.hook_stop(new_id, first.fleet.root)
+    assert decision is not None
+    assert "question survives replacement" in decision.reason
+    assert "retained direct question" not in decision.reason
+
+
+def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late acknowledgement belongs to one range, and appends belong to the next."""
+    from aisquare.services import manager_pass, watch
+
+    sid = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_pass_minutes", "15")
+    first = team_service.add_note("held decision", kind="decision", board_id=project.id)
+    watcher = watch.Watcher()
+    monkeypatch.setattr(watcher, "look_all", lambda *args: [])
+    now = datetime.now(UTC)
+    watcher.tick(now)
+    with store_session() as store:
+        progress = manager_pass.read(store, project.id, project.id)[1]
+        assert progress.pending is not None
+        pending = progress.pending
+    assert pending.lower == 0 and pending.upper == first.seq
+    team_service.add_note("appended later", kind="decision", board_id=project.id)
+    prompt = next(line for _, action, line in tmux.typed if action == "paste")
+    assert pending.id in prompt
+    assert not manager_pass.acknowledge(sid, "unrelated prompt", now)
+    watcher.tick(now + timedelta(seconds=1))
+    assert sum(action == "paste" for _, action, _ in tmux.typed) == 1
+    assert manager_pass.acknowledge(sid, prompt, now)
+    page = team_service.log_events(
+        session_ref=sid, pass_id=pending.id, since_seq=pending.lower, through_seq=pending.upper
+    )
+    assert [event.text for event in page if event.kind == "decision"] == ["held decision"]
+    with pytest.raises(ValueError, match="upper sequence"):
+        team_service.log_events(
+            session_ref=sid, pass_id=pending.id, since_seq=0, through_seq=pending.upper + 1,
+        )
+    team_service.complete_manager_pass(pending.id, sid)
+    team_service.complete_manager_pass(pending.id, sid)
+    with store_session() as store:
+        saved = manager_pass.read(store, project.id, project.id)[1]
+    assert saved.read == first.seq and saved.decision_at == first.created_at
+    assert saved.pending is None
 
 
 def test_manager_still_wakes_for_a_result_by_default(

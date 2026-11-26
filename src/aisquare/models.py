@@ -1533,7 +1533,6 @@ class TeamSession(BaseModel):
     native_session_id: str | None = None
     project_id: str
     role: str = "unassigned"
-    manager_wake: ManagerWake | None = None
     label: str | None = None
     focus: str | None = None
     """What this session says it is working on right now."""

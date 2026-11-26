@@ -32,7 +32,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 from aisquare.core import paths
 from aisquare.core.atomic import write_replacing
 from aisquare.core.paths import despite_windows_contention
-from aisquare.models import ManagerWake, Pool, RedactionLevel
+from aisquare.models import Pool, RedactionLevel
 
 
 class CaptureSettings(BaseModel):
@@ -321,7 +321,6 @@ class FleetRoleSettings(BaseModel):
     different surface, documented in the README).
     """
 
-    wake: ManagerWake = "every_write"
     permission: str | None = None
     permission_mode: str = "auto"
     sandbox: str | None = None

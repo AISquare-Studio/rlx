@@ -39,6 +39,8 @@ def _print_tick(report: watch_service.TickReport) -> None:
         console.print(f"{stamp} {item.project_name} {item.kind}: {item.summary}", markup=False)
     for path in report.files.values():
         console.print(f"  → {path}", markup=False)
+    for project, pass_id in report.passed.items():
+        console.print(f"  {project}: acknowledged manager pass {pass_id}", markup=False)
     for label in report.stopped:
         console.print(f"  auto-stopped {label}", markup=False)
     for note in report.notes:

@@ -430,6 +430,39 @@ def spawn(
         console.print(f"  {'✓' if note in receipt.shared else '⚠'} {note}")
 
 
+@app.command("manager-policy")
+def manager_policy(
+    key: Annotated[str | None, typer.Argument(help="manager_wake or manager_pass_minutes.")] = None,
+    value: Annotated[str | None, typer.Argument(help="Value to set.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Fleet project or ID.")] = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Restore the selected key's default.")] = False,
+) -> None:
+    """Read, set, or clear the project's manager scheduling policy."""
+    from aisquare.core.store import store_session
+    from aisquare.services import manager_seat
+
+    target = _project(project)
+    if key not in (None, manager_seat.WAKE, manager_seat.PASS_MINUTES):
+        raise typer.BadParameter("unknown manager policy key")
+    if (clear or value is not None) and key is None:
+        raise typer.BadParameter("select a manager policy key")
+    if clear and value is not None:
+        raise typer.BadParameter("--clear cannot be combined with a value")
+    with store_session() as store:
+        if key is not None and clear:
+            store.clear_project_setting(target.id, key)
+        if key is not None and value is not None:
+            try:
+                validated = manager_seat.validate(key, value)
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            store.set_project_setting(target.id, key, validated)
+        policy = manager_seat.policy(store, target.id)
+    typer.echo(f"{target.id} manager_wake={policy.wake} manager_pass_minutes={policy.pass_minutes}")
+    if policy.invalid:
+        typer.echo(f"Using defaults for invalid settings: {', '.join(policy.invalid)}", err=True)
+
+
 @app.command("ls")
 def ls(
     project: ProjectRef = None,

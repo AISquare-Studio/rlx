@@ -287,6 +287,9 @@ def prompt_submitted(
     if session_id is None:
         return retrieved
     _observe(session_id, agent, native_session_id, transcript_path, account)
+    from aisquare.services import manager_pass
+
+    manager_pass.acknowledge(session_id, prompt, datetime.now(UTC))
     delta = team_service.hook_prompt_heartbeat(
         session_id,
         cwd,
