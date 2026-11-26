@@ -18,6 +18,7 @@ on:
       - "src/aisquare/cli/daemon.py"
       - "tests/stub_releases.py"
       - "tests/test_rlxd_install.py"
+      - "tests/test_rlxd_release_attach.py"
       - "pyproject.toml"
       - "src/aisquare/core/daemons.py"
       - "src/aisquare/core/locking.py"
@@ -26,10 +27,11 @@ on:
   push:
     branches: [main, "rc/**"]
   workflow_dispatch:
-    # rlxd-release.yml's attach, by hand (1.2): a dry run unless dry_run is unticked.
+    # rlxd-release.yml's attach, by hand (1.2): a dry run unless dry_run is unticked, and
+    # run on the tag itself (`--ref vX.Y.Z`), which attach checks.
     inputs:
       release_tag:
-        description: Also attach the archives to this GitHub Release (vX.Y.Z, pyproject.toml's version on this ref). Empty builds and packages only.
+        description: Also attach the archives to this GitHub Release (vX.Y.Z). Run on that tag (--ref vX.Y.Z); any other ref is refused. Empty builds and packages only.
         required: false
         type: string
         default: ""
@@ -41,9 +43,12 @@ on:
 
 # Cancel superseded runs on the same branch/PR, grouped by event as ci.yml's are, so a
 # run by hand never cancels a push's run or the other way round.
+# A newer run of a ref cancels the older, but never a dispatch with a release_tag: its
+# attach may be part-way through `gh release upload --clobber`, and one cut off can leave
+# the release with some archives replaced and the sums not. Such a run waits instead.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.release_tag == '' }}
 
 permissions:
   contents: read

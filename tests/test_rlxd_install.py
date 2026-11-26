@@ -9,6 +9,7 @@ pointed at a temp folder with ``UV_TOOL_BIN_DIR``. Runs on macOS, Linux and Wind
 from __future__ import annotations
 
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -135,6 +137,7 @@ def test_rm_rlxd_then_daemon_install_leaves_an_executable_rlxd(stub: Stub) -> No
     assert _executable(stub.bin_dir / f"rlxd-hook{EXE}")
     assert stub.bin_entries() == sorted([f"rlxd{EXE}", f"rlxd-hook{EXE}"])  # no temp file left
     assert f"rlxd {__version__} installed in {stub.bin_dir}" in output
+    assert stub.url in output  # the releases root it used, named every time
     archive = rlxd_install.archive_name(HOST)
     assert stub.requested()[-2:] == [
         f"/v{__version__}/rlxd-SHA256SUMS",
@@ -170,6 +173,7 @@ def test_json_names_what_was_installed_and_where(stub: Stub) -> None:
         "version": __version__,
         "target": HOST,
         "archive": archive,
+        "releases_url": stub.url,
         "url": f"{stub.url}/v{__version__}/{archive}",
         "sha256": sums[archive],
         "bin_dir": str(stub.bin_dir),
@@ -350,6 +354,220 @@ def test_an_unsupported_machine_is_refused_by_name() -> None:
         rlxd_install.host_target("linux", "riscv64")
 
 
+# --- where a release may come from (review of #593, major 2) ------------------------------
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "file:///tmp/releases",
+        "http://example.invalid/releases",
+        "http://10.0.0.1:8000",
+        "ftp://127.0.0.1/releases",
+        "http://127.0.0.1@example.invalid",
+        "releases",
+    ],
+)
+def test_a_releases_url_that_is_not_https_or_loopback_is_refused(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch, root: str
+) -> None:
+    """``AISQUARE_RELEASES_URL`` names the root the sums come from too, so the shipped CLI
+    takes https://, or http:// to this machine for a test server, and nothing else."""
+    monkeypatch.setenv(rlxd_install.RELEASES_URL_ENV, root)
+    data = _refused(stub, "unsafe_releases_url")
+    assert data["detail"] == root
+    assert stub.requested() == []
+
+
+def test_a_file_url_root_installs_nothing_even_with_a_release_there(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's reproduction: a ``file://`` root holding a good release."""
+    monkeypatch.setenv(rlxd_install.RELEASES_URL_ENV, stub.root.as_uri())
+    exit_code, output = _daemon_install()
+    assert exit_code == 1
+    assert "refusing to install rlxd from file:" in output
+    assert stub.bin_entries() == []
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "https://github.com/AISquare-Studio/rlx/releases/download",
+        "https://mirror.example.com/rlx",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000/releases",
+        "http://[::1]:8000",
+    ],
+)
+def test_https_and_loopback_http_roots_are_allowed(root: str) -> None:
+    assert rlxd_install.check_releases_url(root) == root
+
+
+class _Redirect(http.server.BaseHTTPRequestHandler):
+    """Answers every request with a 302 to ``LOCATION`` + the path."""
+
+    LOCATION = ""
+
+    def do_GET(self) -> None:
+        self.send_response(302)
+        self.send_header("Location", self.LOCATION + self.path)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+@pytest.fixture
+def redirecting(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], str]]:
+    """A loopback server that redirects every path to the location given; returns its URL."""
+    servers: list[http.server.ThreadingHTTPServer] = []
+
+    def start(location: str) -> str:
+        handler = type("Redirect", (_Redirect,), {"LOCATION": location})
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_redirect_off_this_machine_over_http_is_refused(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch, redirecting: Callable[[str], str]
+) -> None:
+    """A loopback root that redirects to plain http elsewhere: refused before it is followed."""
+    monkeypatch.setenv(rlxd_install.RELEASES_URL_ENV, redirecting("http://example.invalid"))
+    data = _refused(stub, "unsafe_redirect")
+    assert "-> http://example.invalid/" in str(data["detail"])
+
+
+def test_a_redirect_from_https_to_http_is_refused() -> None:
+    """The real handler, as urllib calls it on a 302 from an https URL: refused, even to
+    plain http on this machine, and the response it was given is closed."""
+    import urllib.request
+
+    handler = rlxd_install.https_redirects_only()
+    response = io.BytesIO(b"")
+    with pytest.raises(rlxd_install.InstallError) as refused:
+        handler.redirect_request(
+            urllib.request.Request("https://github.com/x/v1/rlxd-SHA256SUMS"),
+            response,
+            302,
+            "Found",
+            {},
+            "http://127.0.0.1:9/v1/rlxd-SHA256SUMS",
+        )
+    assert refused.value.code == "unsafe_redirect"
+    assert response.closed
+
+
+def test_a_redirect_from_https_to_https_is_followed() -> None:
+    """GitHub's download URL redirects to its https CDN: the handler follows that."""
+    import urllib.request
+
+    handler = rlxd_install.https_redirects_only()
+    followed = handler.redirect_request(
+        urllib.request.Request("https://github.com/x/v1/a.tar.gz"),
+        io.BytesIO(b""),
+        302,
+        "Found",
+        {},
+        "https://objects.githubusercontent.com/a.tar.gz",
+    )
+    assert followed.full_url == "https://objects.githubusercontent.com/a.tar.gz"
+
+
+# --- both binaries or neither (review of #593, minor 4) ---------------------------------
+
+
+def _old_pair(bin_dir: Path, target: str) -> dict[str, bytes]:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    old = {name: f"old {name}".encode() for name in rlxd_install.binary_names(target)}
+    for name, data in old.items():
+        (bin_dir / name).write_bytes(data)
+    return old
+
+
+@pytest.mark.parametrize("target", [HOST, "x86_64-pc-windows-msvc"])
+def test_a_failure_placing_rlxd_puts_the_old_pair_back(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str
+) -> None:
+    """rlxd-hook goes in first; when rlxd then cannot, the old hook is put back beside the
+    old rlxd (``install_failed``), and no temporary or set-aside file is left."""
+    bin_dir = tmp_path / "pair"
+    old = _old_pair(bin_dir, target)
+    rlxd = bin_dir / rlxd_install.binary_names(target)[0]
+    real_replace = os.replace
+
+    def replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst) == rlxd and str(src).endswith(".tmp"):
+            raise PermissionError(13, "Access is denied", str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises(rlxd_install.InstallError) as refused:
+        rlxd_install.install(target=target, bin_dir=bin_dir)
+    assert refused.value.code == "install_failed"
+    assert "as they were" in refused.value.message
+    assert {p.name: p.read_bytes() for p in bin_dir.iterdir()} == old
+
+
+def test_the_cli_reports_install_failed_by_name(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_replace = os.replace
+
+    def replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst).parent == stub.bin_dir:
+            raise PermissionError(13, "Access is denied", str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    data = _refused(stub, "install_failed")
+    assert "Access is denied" in str(data["detail"])
+
+
+def test_a_running_rlxd_exe_is_renamed_aside_and_swept_by_the_next_install(
+    stub: Stub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows as it treats a running ``rlxd.exe``: it can be renamed, not replaced or
+    removed. The install renames it aside, so both new binaries go in; the aside it cannot
+    remove yet is removed by the next install, once rlxd has stopped."""
+    target = "x86_64-pc-windows-msvc"
+    bin_dir = tmp_path / "win"
+    _old_pair(bin_dir, target)
+    running = bin_dir / "rlxd.exe"
+    real_replace, real_unlink = os.replace, os.unlink
+
+    def replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst) == running and running.exists():
+            raise PermissionError(13, "Access is denied: rlxd.exe is running", str(dst))
+        real_replace(src, dst)
+
+    def unlink(path: str | os.PathLike[str], **kwargs: object) -> None:
+        name = Path(path).name
+        if name.startswith(".rlxd.exe.") and name.endswith(".old"):
+            raise PermissionError(13, "Access is denied: rlxd.exe is running", str(path))
+        real_unlink(path)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "unlink", unlink)
+    done = rlxd_install.install(target=target, bin_dir=bin_dir)
+    for path in done.binaries:
+        assert path.read_bytes() == _stand_in(path.name, __version__)
+    left = [p for p in bin_dir.iterdir() if p.name.endswith(".old")]
+    assert [p.read_bytes() for p in left] == [b"old rlxd.exe"]
+
+    monkeypatch.setattr(os, "unlink", real_unlink)  # rlxd has stopped
+    rlxd_install.install(target=target, bin_dir=bin_dir)
+    assert sorted(p.name for p in bin_dir.iterdir()) == ["rlxd-hook.exe", "rlxd.exe"]
+
+
 # --- the names, the target, the bin directory --------------------------------------------
 
 
@@ -393,7 +611,8 @@ def test_the_five_archives_are_named_as_the_handoff_names_them() -> None:
         ({"XDG_BIN_HOME": "{a}/x", "XDG_DATA_HOME": "{a}/d"}, "{a}/x"),
         ({"XDG_DATA_HOME": "{a}/d"}, "{a}/d/../bin"),
         ({}, "{home}/.local/bin"),
-        ({"UV_TOOL_BIN_DIR": "relative", "XDG_BIN_HOME": "{a}/x"}, "{a}/x"),
+        ({"UV_TOOL_BIN_DIR": "relative", "XDG_BIN_HOME": "{a}/x"}, "{cwd}/relative"),
+        ({"UV_TOOL_BIN_DIR": "rel/bin"}, "{cwd}/rel/bin"),
         (
             {"UV_TOOL_BIN_DIR": "", "XDG_BIN_HOME": "rel", "XDG_DATA_HOME": "rel"},
             "{home}/.local/bin",
@@ -401,28 +620,38 @@ def test_the_five_archives_are_named_as_the_handoff_names_them() -> None:
     ],
 )
 def test_the_bin_dir_is_decided_as_uv_decides_it(
-    env: dict[str, str], expected: str, tmp_path: Path
+    env: dict[str, str], expected: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    a, home = str(tmp_path / "abs"), tmp_path / "home"
+    """uv takes a relative ``UV_TOOL_BIN_DIR`` as given, the working directory's, and
+    ignores a relative XDG one."""
+    a, home, cwd = str(tmp_path / "abs"), tmp_path / "home", tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
     resolved = {k: v.format(a=a) for k, v in env.items()}
     assert rlxd_install.uv_tool_bin_dir(resolved, home=home) == Path(
-        expected.format(a=a, home=home)
+        expected.format(a=a, home=home, cwd=cwd)
     )
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv on PATH")
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
 @pytest.mark.parametrize("variable", ["UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "XDG_DATA_HOME"])
-def test_the_bin_dir_is_what_uv_tool_dir_bin_prints(variable: str, tmp_path: Path) -> None:
-    """Checked against uv itself: ``uv tool dir --bin`` under the same environment."""
+def test_the_bin_dir_is_what_uv_tool_dir_bin_prints(
+    variable: str, relative: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checked against uv itself: ``uv tool dir --bin`` under the same environment, run in
+    the same directory. uv prints a relative ``UV_TOOL_BIN_DIR`` as given; it is the
+    directory's."""
     unset = ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "XDG_DATA_HOME")
     env = {k: v for k, v in os.environ.items() if k not in unset}
-    env[variable] = str(tmp_path / "chosen")
+    env[variable] = os.path.join("rel", "chosen") if relative else str(tmp_path / "chosen")
+    monkeypatch.chdir(tmp_path)
     uv = shutil.which("uv")
     assert uv is not None
     printed = subprocess.run(
         [uv, "tool", "dir", "--bin"], env=env, capture_output=True, text=True, check=True
     ).stdout.strip()
-    assert Path(printed) == rlxd_install.uv_tool_bin_dir(env)
+    assert tmp_path / printed == rlxd_install.uv_tool_bin_dir(env)
 
 
 def test_sums_lines_parse_in_both_shasum_modes() -> None:

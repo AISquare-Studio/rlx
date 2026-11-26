@@ -33,12 +33,15 @@ name: rlxd release
 # rlxd.yml calls this on every PR that touches rlxd and every push to an rc/**
 # branch, so each head has `rlxd-archives`; no attach runs there. A published
 # release runs it on its own, and attaches. By hand, rlxd.yml's workflow_dispatch
-# takes `release_tag` and `dry_run` (default true), and passes them here:
+# takes `release_tag` and `dry_run` (default true), and passes them here. It must be
+# run on the tag itself, as `attach` checks: what is attached is built from the tag,
+# never from whatever branch a dispatch named.
 #
-#   gh workflow run rlxd.yml --ref <branch> -f release_tag=v0.10.1          # a dry run
+#   gh workflow run rlxd.yml --ref vX.Y.Z -f release_tag=vX.Y.Z          # a dry run
 #
-# A dry run does everything an attach does, the tag check and `gh release view`
-# included, and prints the `gh release upload` it would run instead of running it.
+# A dry run does everything an attach does, the ref and tag checks and `gh release
+# view` included, and prints the `gh release upload` it would run instead of running
+# it. After a failed release run, re-run its failed jobs: that run is the tag's.
 #
 # Not signed yet: notarization and Authenticode are owner step 1, which wires them
 # in at the marked step of `build`.
@@ -127,14 +130,18 @@ jobs:
       - name: The Ubuntu 22.04 build image (glibc ${{ env.GLIBC_OLDEST }})
         if: runner.os == 'Linux'
         run: |
+          # ubuntu:22.04 pinned by its image index's digest (amd64 and arm64 alike). apt's
+          # packages are jammy's current ones, so the step logs each one's version.
           docker build -q -t rlxd-glibc-floor - <<'EOF'
-          FROM ubuntu:22.04
+          FROM ubuntu:22.04@sha256:b000e69a50ff940390233025e7a337fb8469b509e2334fa4d018ac30f3e18cdb
           RUN apt-get update -q \
            && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
                 gcc libc6-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user \
            && rm -rf /var/lib/apt/lists/*
           EOF
-          docker run --rm rlxd-glibc-floor sh -c 'ldd --version | head -1'
+          docker run --rm rlxd-glibc-floor sh -c 'ldd --version | head -1; dpkg-query -W \
+            gcc gcc-11 binutils libc6 libc6-dev gcc-aarch64-linux-gnu gcc-11-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user'
 
       - name: Install the pinned toolchain and the target
         run: |
@@ -415,11 +422,39 @@ jobs:
       # script, so a tag cannot inject a command.
       TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
       DRY_RUN: ${{ github.event_name != 'release' && inputs.dry_run }}
-      GH_TOKEN: ${{ github.token }}
+      # GH_TOKEN (contents: write) is given to the two gh steps alone.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # What is attached is built from the tag, never from a ref a dispatch picked: every
+      # branch cut after a release carries its version until the bump, so the version
+      # check below would pass a build of any of them, and --clobber would replace the
+      # release's archives and its sums with it. So the run's ref must be the tag (a
+      # release's own run, or a dispatch with --ref vX.Y.Z), and the tag must still name
+      # the commit this run built: one moved since the run started is refused too. A dry
+      # run checks this as well. The repo is public: ls-remote needs no token.
+      - name: The run is the tag's, and built the tag's commit
+        run: |
+          if [ "$GITHUB_REF" != "refs/tags/$TAG" ]; then
+            echo "::error::ref_not_tag: this run is for $GITHUB_REF, not refs/tags/$TAG. Attach only from the tag: gh workflow run rlxd.yml --ref $TAG -f release_tag=$TAG"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags origin)
+          tagged=""
+          while read -r sha ref; do
+            case "$ref" in
+              "refs/tags/$TAG^{}") tagged=$sha; break ;; # an annotated tag, peeled
+              "refs/tags/$TAG") tagged=$sha ;;
+            esac
+          done <<<"$refs"
+          built=$(git rev-parse HEAD)
+          if [ "$built" != "$GITHUB_SHA" ] || [ "$tagged" != "$built" ]; then
+            echo "::error::tag_moved: $TAG names ${tagged:-nothing} at origin, but this run built $GITHUB_SHA"
+            exit 1
+          fi
+          echo "$TAG is $built, the commit this run built"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -436,6 +471,8 @@ jobs:
           echo "attaching rlxd $V to $TAG (dry run: $DRY_RUN)"
 
       - name: The release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,assets \
             --jq '"\(.tagName): draft=\(.isDraft), assets now: \([.assets[].name] | join(", "))"'
@@ -453,6 +490,8 @@ jobs:
       # value included, is a dry run, so this step fails closed.
       - name: Upload to the release (a dry run prints it)
         working-directory: r
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           files=(rlxd-*.tar.gz rlxd-*.zip rlxd-SHA256SUMS)
           cmd=(gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY")

@@ -259,17 +259,24 @@ later), and CI runs them there before packing them.
   and installs it with `rlx daemon install` on ubuntu, macOS and Windows.
 - **A release.** Publishing GitHub Release `vX.Y.Z` attaches the five archives and the
   sums to it. The tag must be `v` + `pyproject.toml`'s version.
-- **By hand.** `gh workflow run rlxd.yml --ref <branch> -f release_tag=vX.Y.Z` does a
+- **By hand.** `gh workflow run rlxd.yml --ref vX.Y.Z -f release_tag=vX.Y.Z` does a
   dry run of that attach: every check, then the `gh release upload` it would run, printed.
-  Add `-f dry_run=false` to attach for real, to re-attach after a failed release run.
+  Add `-f dry_run=false` to attach for real. It runs on the tag only: any other `--ref` is
+  refused (`ref_not_tag`), and so is a tag that has moved since (`tag_moved`), so what is
+  attached is always built from the tag. After a failed release run, re-run its failed
+  jobs instead: that run is the tag's.
 - **Signing.** None yet: notarization and Authenticode are an owner step, wired in at
   the marked step of the build job.
 
 `rlx daemon install` (`../src/aisquare/services/rlxd_install.py`) fetches
 `rlxd-SHA256SUMS` and this machine's archive for `rlx --version` from
 `https://github.com/AISquare-Studio/rlx/releases/download/v<version>/`, or from
-`$AISQUARE_RELEASES_URL/v<version>/` when that is set. It checks the sha256 before it
-writes anything, then installs both binaries into `uv tool dir --bin`, beside `rlx`.
+`$AISQUARE_RELEASES_URL/v<version>/` when that is set, which must be `https://`, or
+`http://` to this machine (127.0.0.1, ::1, localhost) for a test server. A redirect is
+followed only while it stays `https`. It checks the sha256 before it writes anything,
+then installs both binaries into `uv tool dir --bin`, beside `rlx`: both or neither, so
+`rlxd` and `rlxd-hook` are never from different versions. On Windows a running `rlxd.exe`
+is renamed aside, and the next install removes it.
 
 ## Licence
 

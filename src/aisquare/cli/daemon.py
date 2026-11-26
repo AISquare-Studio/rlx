@@ -42,10 +42,12 @@ def install(
     if get_state().json_output:
         typer.echo(json.dumps(done.to_json()))
         return
+    # The root is named every time: the sums come from it too, so it is what the check
+    # vouches for.
     stdout_console().print(
         f"✓ rlxd {done.version} installed in {done.bin_dir} "
         f"({', '.join(path.name for path in done.binaries)}; "
-        f"{done.archive} matched rlxd-SHA256SUMS)",
+        f"{done.archive} matched rlxd-SHA256SUMS, from {done.releases_url})",
         markup=False,
         highlight=False,
     )

@@ -9,20 +9,26 @@ installers put it there and ``rlx upgrade`` replaces it; someone who installed w
 2. It fetches ``rlxd-SHA256SUMS`` of release ``v<version>``, then the archive, from
    ``<releases>/v<version>/<name>``. ``<releases>`` is GitHub's download root for the repo,
    or ``AISQUARE_RELEASES_URL`` when set: the stub releases server of the handoff's
-   pre-release checks.
+   pre-release checks. Whatever names it, the root must be ``https://``, or ``http://`` to
+   this machine (127.0.0.1, ::1, localhost) for a test server (:func:`check_releases_url`),
+   and a redirect is followed only while it stays so: never from https to anything else
+   (:func:`check_redirect`). The sums come from the same root as the archive, so the root
+   is what the sha256 check vouches for.
 3. It checks the archive's sha256 against its line in the sums BEFORE anything is
    written, and the archive's members: exactly ``rlxd`` and ``rlxd-hook`` (``.exe`` on
    Windows), regular files, no directory.
 4. It writes each binary to a temporary file in the bin directory, sets the exec bit
    (not on Windows), and renames it over the old one, so a binary is never half written.
-   rlxd-hook is renamed first, so an ``rlxd`` there always has its hook beside it.
+   Both or neither: each old binary is first set aside, and a failure puts both back, so
+   ``rlxd`` and ``rlxd-hook`` are never from different versions (:func:`_place`). On
+   Windows the old one is renamed aside, which Windows allows for a running ``rlxd.exe``
+   where it refuses to replace it; an aside still in use is removed by the next install.
 
-Every refusal is an :class:`InstallError` with a code: ``release_not_found`` (no sums at
-that version), ``archive_not_listed``, ``archive_not_found``, ``checksum_mismatch``,
-``bad_archive``, ``download_failed``, ``unsupported_platform`` and ``install_failed``.
-All but the last install nothing. ``install_failed`` (the bin directory cannot be written,
-or on Windows a running ``rlxd.exe`` cannot be replaced) leaves the old rlxd in place, beside
-either hook.
+Every refusal is an :class:`InstallError` with a code: ``unsafe_releases_url``,
+``unsafe_redirect``, ``release_not_found`` (no sums at that version), ``archive_not_listed``,
+``archive_not_found``, ``checksum_mismatch``, ``bad_archive``, ``download_failed``,
+``unsupported_platform`` and ``install_failed``. None of them changes what is installed:
+``install_failed`` (the bin directory cannot be written) puts the old binaries back.
 
 The bin directory is decided as ``uv tool dir --bin`` decides it (:func:`uv_tool_bin_dir`),
 without running uv. ``RLX_HOME`` and ``AISQUARE_HOME`` play no part.
@@ -34,11 +40,14 @@ scripts/rlxd_archive.py makes the archives and the sums, by the same names as he
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import os
 import platform as platform_module
 import re
+import secrets
+import shutil
 import sys
 import tempfile
 from collections.abc import Mapping
@@ -52,6 +61,8 @@ RELEASES_URL = "https://github.com/AISquare-Studio/rlx/releases/download"
 """Where release ``vX.Y.Z``'s assets are: ``<this>/vX.Y.Z/<name>``."""
 RELEASES_URL_ENV = "AISQUARE_RELEASES_URL"
 """Names another root with the same layout: the stub releases server in tests and CI."""
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+"""The hosts a plain ``http://`` root may name: this machine, for a test server."""
 
 TARGETS = (
     "aarch64-apple-darwin",
@@ -91,6 +102,7 @@ class Installed:
     sha256: str
     bin_dir: Path
     binaries: tuple[Path, ...]
+    releases_url: str
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -98,6 +110,7 @@ class Installed:
             "version": self.version,
             "target": self.target,
             "archive": self.archive,
+            "releases_url": self.releases_url,
             "url": self.url,
             "sha256": self.sha256,
             "bin_dir": str(self.bin_dir),
@@ -147,14 +160,17 @@ def host_target(platform: str | None = None, machine: str | None = None) -> str:
 def uv_tool_bin_dir(env: Mapping[str, str] | None = None, home: Path | None = None) -> Path:
     """Where uv puts a tool's executables, decided as ``uv tool dir --bin`` decides it.
 
-    The first that is set to an absolute path: ``UV_TOOL_BIN_DIR``, ``XDG_BIN_HOME``,
-    ``XDG_DATA_HOME/../bin``; else ``~/.local/bin``. uv ignores a relative value, so this
-    does too. install.sh's ``uv_bin_dir`` follows the same order."""
+    ``UV_TOOL_BIN_DIR`` when set, as uv takes it: a relative one is the working
+    directory's (``uv tool dir --bin`` prints it as given, and installs there). Else the
+    first of ``XDG_BIN_HOME`` and ``XDG_DATA_HOME/../bin`` that is absolute: uv ignores a
+    relative XDG value, as the XDG spec says to. Else ``~/.local/bin``."""
     env = os.environ if env is None else env
-    for name in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME"):
-        value = env.get(name, "")
-        if value and os.path.isabs(value):
-            return Path(value)
+    tool_bin = env.get("UV_TOOL_BIN_DIR", "")
+    if tool_bin:
+        return Path(tool_bin) if os.path.isabs(tool_bin) else Path.cwd() / tool_bin
+    xdg_bin = env.get("XDG_BIN_HOME", "")
+    if xdg_bin and os.path.isabs(xdg_bin):
+        return Path(xdg_bin)
     data = env.get("XDG_DATA_HOME", "")
     if data and os.path.isabs(data):
         return Path(data) / "../bin"
@@ -166,6 +182,56 @@ def releases_url(env: Mapping[str, str] | None = None) -> str:
     return (env.get(RELEASES_URL_ENV) or RELEASES_URL).rstrip("/")
 
 
+def _allowed_url(url: str) -> bool:
+    """``https://`` to any host, or ``http://`` to this machine; nothing else (``file:``,
+    ``ftp:``, a plain-http host elsewhere)."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    scheme = parts.scheme.lower()
+    if scheme == "https":
+        return bool(host)
+    return scheme == "http" and host in LOOPBACK_HOSTS
+
+
+def check_releases_url(base: str) -> str:
+    """``base``, if a release may come from it (:func:`_allowed_url`); refused by name if not.
+
+    The sums come from the same root as the archive, so a root the user did not mean would
+    pass the sha256 check: only GitHub's, an https mirror, or a test server here."""
+    if not _allowed_url(base):
+        raise InstallError(
+            "unsafe_releases_url",
+            f"refusing to install rlxd from {base}: the releases URL ({RELEASES_URL_ENV}) "
+            "must be https://, or http:// to this machine (127.0.0.1, ::1, localhost) "
+            "for a test server; nothing installed",
+            detail=base,
+        )
+    return base
+
+
+def check_redirect(from_url: str, to_url: str) -> None:
+    """Refuse (``unsafe_redirect``) a redirect that leaves https, or goes where a root could
+    not be (:func:`_allowed_url`). GitHub's download URL redirects to its https CDN, which
+    passes; urllib alone would follow one to plain http."""
+    from urllib.parse import urlsplit
+
+    downgrade = (
+        urlsplit(from_url).scheme.lower() == "https" and urlsplit(to_url).scheme.lower() != "https"
+    )
+    if downgrade or not _allowed_url(to_url):
+        raise InstallError(
+            "unsafe_redirect",
+            f"refusing to install rlxd: {from_url} redirected to {to_url}, which is not "
+            "https; nothing installed",
+            detail=f"{from_url} -> {to_url}",
+        )
+
+
 def asset_url(base: str, version: str, name: str) -> str:
     return f"{base}/v{version}/{name}"
 
@@ -174,10 +240,34 @@ def asset_url(base: str, version: str, name: str) -> str:
 
 
 def open_release_url(request: Any, *, timeout: float) -> Any:
-    """``urllib.request.urlopen`` through ``core.tls``: the one network call here."""
-    from aisquare.core.tls import urlopen
+    """Open ``request`` over ``core.tls``'s verified HTTPS: the one network call here. A
+    redirect is followed only past :func:`check_redirect` (:func:`https_redirects_only`)."""
+    import urllib.request
 
-    return urlopen(request, timeout=timeout)
+    from aisquare.core import tls
+
+    opener = urllib.request.build_opener(https_redirects_only(), tls.https_handler())
+    return opener.open(request, timeout=timeout)
+
+
+def https_redirects_only() -> Any:
+    """A ``urllib.request.HTTPRedirectHandler`` that raises :class:`InstallError`
+    (``unsafe_redirect``) for a redirect :func:`check_redirect` refuses, and follows the
+    rest as urllib does."""
+    import urllib.request
+
+    class _HttpsRedirectsOnly(urllib.request.HTTPRedirectHandler):
+        def redirect_request(
+            self, req: Any, fp: Any, code: Any, msg: Any, headers: Any, newurl: Any
+        ) -> Any:
+            try:
+                check_redirect(req.full_url, newurl)
+            except InstallError:
+                fp.close()
+                raise
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    return _HttpsRedirectsOnly()
 
 
 def _fetch(url: str, *, limit: int, missing: InstallError) -> bytes:
@@ -282,7 +372,7 @@ def install(
     """Download, verify and install ``version``'s rlxd and rlxd-hook (the module docstring)."""
     target = host_target() if target is None else target
     bin_dir = uv_tool_bin_dir() if bin_dir is None else bin_dir
-    base = releases_url() if base is None else base.rstrip("/")
+    base = check_releases_url(releases_url() if base is None else base.rstrip("/"))
     name = archive_name(target)
 
     sums_url = asset_url(base, version, SUMS)
@@ -324,39 +414,114 @@ def install(
             detail=f"expected {expected}, got {actual}, from {url}",
         )
     files = read_archive(target, data)
-    paths = _place(files, bin_dir, executable=not is_windows_target(target))
-    return Installed(version, target, name, url, actual, bin_dir, paths)
+    paths = _place(files, bin_dir, windows=is_windows_target(target))
+    return Installed(version, target, name, url, actual, bin_dir, paths, base)
 
 
-def _place(files: Mapping[str, bytes], bin_dir: Path, *, executable: bool) -> tuple[Path, ...]:
-    """Write every file to a temporary file in ``bin_dir``, then rename each over its name:
-    rlxd-hook first, rlxd last. A temporary file left by a failure is removed."""
+def _place(files: Mapping[str, bytes], bin_dir: Path, *, windows: bool) -> tuple[Path, ...]:
+    """Install ``files`` in ``bin_dir``, both or neither.
+
+    Each is written to a temporary file there first (executable, but on Windows). Then, one
+    at a time, rlxd-hook before rlxd, the old binary is set aside (:func:`_set_aside`) and the
+    new one renamed into its place. When any step fails, every binary set aside is put
+    back and every new one with no old one is removed, so the bin directory holds the old
+    pair again (``install_failed``). An aside is removed once both are in place; one Windows
+    still runs is left, and removed by the next install (:func:`_sweep_set_aside`)."""
     order = sorted(files, key=lambda n: n.startswith("rlxd-hook"), reverse=True)
-    staged: list[tuple[Path, Path]] = []
+    staged: dict[str, Path] = {}
+    aside: dict[str, Path] = {}
+    placed: list[str] = []
     try:
         bin_dir.mkdir(parents=True, exist_ok=True)
+        _sweep_set_aside(bin_dir)
         for name in order:
             fd, temp_name = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=bin_dir)
-            staged.append((Path(temp_name), bin_dir / name))
+            staged[name] = Path(temp_name)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(files[name])
                 handle.flush()
                 os.fsync(handle.fileno())
-            if executable:
+            if not windows:
                 os.chmod(temp_name, 0o755)
-        for staged_file, final in staged:
-            os.replace(staged_file, final)
+        for name in order:
+            final = bin_dir / name
+            if os.path.lexists(final):
+                aside[name] = _set_aside(final, windows=windows)
+            os.replace(staged[name], final)
+            del staged[name]
+            placed.append(name)
     except OSError as exc:
+        unrestored = _put_back(bin_dir, placed, aside)
         raise InstallError(
             "install_failed",
-            f"could not install into {bin_dir}: {exc}"
-            + ("; if rlxd is running, stop it and run this again" if not executable else ""),
+            f"could not install into {bin_dir}: {exc}; "
+            + (
+                "the rlxd and rlxd-hook there are as they were"
+                if not unrestored
+                else f"and could not put back {', '.join(unrestored)}: run this again"
+            ),
             detail=repr(exc),
         ) from exc
     finally:
-        for temp, _final in staged:
+        for temp in staged.values():
             temp.unlink(missing_ok=True)
+    for old in aside.values():
+        _remove_set_aside(old)
     return tuple(bin_dir / name for name in sorted(files))
+
+
+def _set_aside(final: Path, *, windows: bool) -> Path:
+    """Keep the binary at ``final`` beside it, as ``.<name>.<random>.old``, so it can be put
+    back. On Windows it is renamed: a running ``rlxd.exe`` can be renamed but not replaced.
+    Elsewhere it is hard-linked (copied where links are not allowed), so the rename of the
+    new one over ``final`` stays atomic."""
+    old = final.with_name(f".{final.name}.{secrets.token_hex(4)}.old")
+    if windows:
+        os.replace(final, old)
+        return old
+    try:
+        os.link(final, old)
+    except OSError:
+        shutil.copy2(final, old)
+    return old
+
+
+def _put_back(bin_dir: Path, placed: list[str], aside: Mapping[str, Path]) -> list[str]:
+    """Undo a failed :func:`_place`: each binary set aside goes back to its name, and each
+    new one that had no old one is removed. Returns the names it could not restore."""
+    unrestored: list[str] = []
+    for name, old in aside.items():
+        final = bin_dir / name
+        try:
+            if os.path.lexists(final) and os.path.samefile(old, final):
+                # Never replaced: ``old`` is a link to it, and a rename between two links
+                # to one file does nothing (POSIX), so the link is removed instead.
+                os.unlink(old)
+            else:
+                os.replace(old, final)
+        except OSError:
+            unrestored.append(name)
+    for name in placed:
+        if name not in aside:
+            try:
+                (bin_dir / name).unlink(missing_ok=True)
+            except OSError:
+                unrestored.append(name)
+    return unrestored
+
+
+def _remove_set_aside(old: Path) -> None:
+    """Remove an aside; one still running (Windows) is left for the next install. (``unlink``,
+    not ``remove``: tests/test_config_writes_stay_in_the_cli.py links calls by name, and a
+    ``remove`` of the package's writes config.)"""
+    with contextlib.suppress(OSError):
+        os.unlink(old)
+
+
+def _sweep_set_aside(bin_dir: Path) -> None:
+    """Remove what earlier installs set aside and could not remove then."""
+    for old in bin_dir.glob(".rlxd*.old"):
+        _remove_set_aside(old)
 
 
 __all__ = [
@@ -370,7 +535,10 @@ __all__ = [
     "archive_name",
     "asset_url",
     "binary_names",
+    "check_redirect",
+    "check_releases_url",
     "host_target",
+    "https_redirects_only",
     "install",
     "parse_sums",
     "read_archive",
