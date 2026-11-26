@@ -50,8 +50,13 @@ mod unix {
         }
 
         /// Once reading has ended: whether the client is gone, rather than half-closed.
-        /// A half-closed socket can still be written to; a closed one can't (`POLLOUT`
-        /// is gone, `POLLHUP` is set), on macOS and Linux alike.
+        /// Only `POLLHUP` (or `POLLERR`) says so, on macOS and Linux alike. A missing
+        /// `POLLOUT` does not: replies the client has not read yet fill the send buffer
+        /// of a client that is still there.
+        ///
+        /// It polls for `POLLOUT` only, never `POLLIN`: macOS reports `POLLHUP` on the
+        /// read side's end of file, which a half-close is too, while the write side's
+        /// end comes only once the client has closed the connection both ways.
         #[allow(unsafe_code)]
         pub fn gone(&self) -> bool {
             let Some(socket) = &self.socket else {
@@ -64,7 +69,7 @@ mod unix {
             };
             // SAFETY: one live pollfd, and a zero timeout.
             let ready = unsafe { libc::poll(&mut poll, 1, 0) };
-            ready < 0 || poll.revents & libc::POLLOUT == 0 || poll.revents & libc::POLLHUP != 0
+            ready < 0 || poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
         }
 
         /// Resolves once the client is gone, checking a few times a second: for a
@@ -237,6 +242,10 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
+        use std::io::{ErrorKind, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+
         use super::*;
 
         fn fresh(name: &str) -> PathBuf {
@@ -322,6 +331,28 @@ mod unix {
             assert!(refused.to_string().contains("not a folder"), "{refused}");
             fs::remove_file(&link).unwrap();
             fs::remove_dir(&target).unwrap();
+        }
+
+        #[test]
+        fn a_full_send_buffer_is_not_a_client_gone() {
+            // Review #2068, r3 minor 1: replies a client has not read yet leave rlxd's
+            // socket unwritable, which says nothing of whether the client is there.
+            let (rlxd, client) = UnixStream::pair().unwrap();
+            rlxd.set_nonblocking(true).unwrap();
+            let mut writer = &rlxd;
+            loop {
+                match writer.write(&[b'x'; 512]) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("filling the send buffer: {e}"),
+                }
+            }
+            let hangup = Hangup::of_socket(rlxd.as_fd());
+            assert!(!hangup.gone(), "a full buffer, and the client still there");
+            client.shutdown(Shutdown::Write).unwrap();
+            assert!(!hangup.gone(), "a full buffer, and the client half-closed");
+            drop(client);
+            assert!(hangup.gone(), "the client closed both ways");
         }
     }
 }

@@ -1,48 +1,16 @@
-//! Check 7 of task #22 (handoff 0.10.3, 7.3): the test-only methods are absent from a
-//! release build. This builds rlxd as a release does (`cargo build --release`, which
-//! leaves out the `debug-methods` feature that only rlxd's dev-dependency on itself turns
-//! on), starts it in a fresh home and asks it for `debug.emit`: `unknown_method`. The
-//! test build the other tests run answers the same call.
+//! What a release build leaves out. This builds rlxd as a release does (`cargo build
+//! --release`, [`release_rlxd`]), without the features only rlxd's dev-dependency on
+//! itself turns on, and checks against the test build the other tests run:
 //!
-//! The build runs in the workspace's own target folder, so rlxd.yml's later
-//! `cargo build --release` finds it done. Set `CARGO_BUILD_JOBS` to bound it.
+//! - check 7 of task #22 (handoff 0.10.3, 7.3): no test-only methods, so `debug.emit` is
+//!   `unknown_method`;
+//! - handoff 0.10.3 rev 7, 5.1, "No dev mode in a release build": no `--gate-dev-mode`
+//!   flag, `gate.dev_mode` in the config ignored, no marker in `rlxd --version` or in
+//!   status, and not even the feature's name in the binary.
 
 mod common;
 
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-
-use common::{TestHome, workspace};
-use serde_json::Value;
-
-/// rlxd, built for release: the executable `cargo build --release` reports.
-fn release_rlxd() -> PathBuf {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
-        .args([
-            "build",
-            "--release",
-            "--locked",
-            "--package",
-            "rlxd",
-            "--bin",
-            "rlxd",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(workspace())
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()
-        .expect("cargo runs");
-    assert!(output.status.success(), "cargo build --release failed");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|message| message["reason"] == "compiler-artifact")
-        .filter(|message| message["target"]["name"] == "rlxd")
-        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
-        .expect("cargo names the rlxd executable it built")
-}
+use common::{TestHome, release_rlxd};
 
 #[test]
 fn check_7_a_release_build_has_no_debug_methods() {
@@ -66,4 +34,57 @@ fn check_7_a_release_build_has_no_debug_methods() {
     test_build.start();
     let run = test_build.rlxd(&["call", "debug.emit", r#"{"count":1}"#]);
     assert_eq!(run.code(), Some(0), "the test build has it: {run:?}");
+}
+
+#[test]
+fn a_release_build_has_no_gate_dev_mode() {
+    let version = env!("CARGO_PKG_VERSION");
+    let binary = release_rlxd();
+    let release = TestHome::new().with_binary(binary.clone());
+    let run = release.rlxd(&["--version"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert_eq!(run.stdout.trim_end(), format!("rlxd {version}"));
+
+    // The flag is unknown: a usage error, and no rlxd was left running.
+    let run = release.rlxd(&["serve", "--detach", "--gate-dev-mode"]);
+    assert_eq!(run.code(), Some(2), "{run:?}");
+    assert_eq!(release.rlxd(&["call", "status"]).code(), Some(3));
+
+    // The config's key is ignored: the gate takes signed apps only, so this unsigned
+    // client can't make even the first pairing.
+    std::fs::create_dir_all(release.root().join("rlxd")).unwrap();
+    std::fs::write(
+        release.root().join("rlxd").join("config.toml"),
+        "[gate]\ndev_mode = true\n",
+    )
+    .unwrap();
+    release.start();
+    let status = release.status();
+    assert_eq!(status["gate"], "signed app only", "{status}");
+    assert!(status.get("dev_features").is_none(), "{status}");
+    assert!(release.log().contains("ignoring gate.dev_mode"));
+    let run = release.rlxd(&["call", "gate.pair"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "not_gate");
+    assert!(!release.gate_json().exists(), "nothing was paired");
+
+    // Not even the feature's name is in the binary (`strings rlxd | grep -cF ...`).
+    let bytes = std::fs::read(&binary).unwrap();
+    let needle = b"gate-dev-mode";
+    assert_eq!(
+        bytes.windows(needle.len()).filter(|w| w == needle).count(),
+        0
+    );
+
+    // The test build has it all, and says so.
+    let test_build = TestHome::new();
+    let run = test_build.rlxd(&["--version"]);
+    assert_eq!(
+        run.stdout.trim_end(),
+        format!("rlxd {version} (dev: gate-dev-mode)")
+    );
+    test_build.start_dev();
+    let status = test_build.status();
+    assert_eq!(status["gate"], "dev mode (unsigned app accepted)");
+    assert_eq!(status["dev_features"], serde_json::json!(["gate-dev-mode"]));
 }

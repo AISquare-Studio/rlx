@@ -54,9 +54,28 @@ mod token;
 #[cfg(windows)]
 mod windows;
 
+/// What `rlxd --version` says after `rlxd`: the version, and for a build with the
+/// `gate-dev-mode` feature, a marker saying so. A release build says the version alone.
+#[cfg(feature = "gate-dev-mode")]
+const VERSION_TEXT: &str = concat!(env!("CARGO_PKG_VERSION"), " (dev: gate-dev-mode)");
+#[cfg(not(feature = "gate-dev-mode"))]
+const VERSION_TEXT: &str = env!("CARGO_PKG_VERSION");
+
+/// The development-only cargo features this build has, for `status.data.dev_features`.
+#[cfg(feature = "gate-dev-mode")]
+pub(crate) fn dev_features() -> Vec<String> {
+    vec!["gate-dev-mode".to_owned()]
+}
+
+/// A release build has no development-only feature.
+#[cfg(not(feature = "gate-dev-mode"))]
+pub(crate) fn dev_features() -> Vec<String> {
+    Vec::new()
+}
+
 /// The rlx engine: one local daemon per home.
 #[derive(Debug, Parser)]
-#[command(name = "rlxd", version, disable_help_subcommand = true)]
+#[command(name = "rlxd", version = VERSION_TEXT, disable_help_subcommand = true)]
 struct Command {
     #[command(subcommand)]
     action: Action,
@@ -74,8 +93,10 @@ enum Action {
         background: bool,
         /// Gate dev mode, for unsigned dev and CI builds of rlx's app: skip the gate
         /// peer's identity check. The gate credential is still required. Never use it
-        /// otherwise.
-        #[arg(long)]
+        /// otherwise. Only a build with the gate-dev-mode cargo feature has it; a
+        /// release build has no such flag.
+        #[cfg_attr(feature = "gate-dev-mode", arg(long))]
+        #[cfg_attr(not(feature = "gate-dev-mode"), arg(skip))]
         gate_dev_mode: bool,
     },
     /// Print rlxd's status.

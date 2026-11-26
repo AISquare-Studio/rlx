@@ -23,6 +23,13 @@ doc = false
 # `--all-targets` or `--tests`, or from `cargo test --release`, cargo builds the
 # dev-dependency, and the binary would have the debug methods.
 debug-methods = []
+# Development and CI builds only (handoff 0.10.3 rev 7, 5.1): gate dev mode, which
+# accepts an unsigned app as the gate. Without it, as in every release build, rlxd has no
+# --gate-dev-mode flag, ignores gate.dev_mode in its config, and `rlxd --version` says
+# the version alone; with it, `rlxd --version` adds "(dev: gate-dev-mode)" and status
+# lists it in dev_features. Like debug-methods, only the dev-dependency below turns it
+# on, for the tests; tests/release_build.rs checks a release build has none of it.
+gate-dev-mode = []
 # Tests only: lets RLXD_TEST_GATE_REQUIREMENT replace the gate peer's compiled-in identity
 # (handoff 0.10.3, 5.1), so the gate_peer_* tests can sign helpers with a test identity.
 # Release builds never enable it, and without it no config, variable or flag changes the
@@ -65,8 +72,9 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 jsonschema = { version = "0.63", default-features = false }
-# rlxd itself, with the debug methods, so the binary the tests run has them.
-rlxd = { path = ".", features = ["debug-methods"] }
+# rlxd itself, with the debug methods and gate dev mode, so the binary the tests run has
+# them.
+rlxd = { path = ".", features = ["debug-methods", "gate-dev-mode"] }
 toml = "0.9"
 
 [target.'cfg(windows)'.dev-dependencies]

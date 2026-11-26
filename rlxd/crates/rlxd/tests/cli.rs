@@ -17,12 +17,14 @@ fn run(args: &[&str]) -> Output {
 
 #[test]
 fn version_prints_the_name_and_rlxs_version() {
+    // The test build has the gate-dev-mode feature, and says so. A release build says
+    // `rlxd <version>` alone: tests/release_build.rs checks that.
     for flag in ["--version", "-V"] {
         let output = run(&[flag]);
         assert!(output.status.success(), "{flag}: {output:?}");
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            format!("rlxd {}\n", env!("CARGO_PKG_VERSION"))
+            format!("rlxd {} (dev: gate-dev-mode)\n", env!("CARGO_PKG_VERSION"))
         );
     }
 }

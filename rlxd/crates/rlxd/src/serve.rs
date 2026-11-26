@@ -41,7 +41,9 @@ use crate::{cli, lock, log, out, peer, token};
 /// The hidden flag a detached rlxd is started with: log to the file only.
 pub const BACKGROUND_FLAG: &str = "--background";
 
-/// The flag for gate dev mode (handoff 0.10.3, 5.1), passed on to a detached rlxd.
+/// The flag for gate dev mode (handoff 0.10.3, 5.1), passed on to a detached rlxd. Only a
+/// build with the `gate-dev-mode` feature has it.
+#[cfg(feature = "gate-dev-mode")]
 pub const GATE_DEV_MODE_FLAG: &str = "--gate-dev-mode";
 
 /// How long a start waits for the lock while another process holds it: a probe takes it
@@ -54,8 +56,13 @@ const START_WAIT: Duration = Duration::from_secs(15);
 /// How long a stopping rlxd gives its connections to finish.
 const FINISH_WAIT: Duration = Duration::from_secs(3);
 
+/// How long rlxd waits, at a stop, for the connections it aborted to be dropped.
+const ABORT_WAIT: Duration = Duration::from_secs(1);
+
 /// `rlxd serve`, in the foreground: logs to stderr too, unless `background`. With
-/// `gate_dev_mode`, or `gate.dev_mode` in the config, an unsigned app may be the gate.
+/// `gate_dev_mode`, or `gate.dev_mode` in the config, an unsigned app may be the gate, in
+/// a build with the `gate-dev-mode` feature only: a release build ignores the config's
+/// key, and never gets the flag.
 pub fn serve(background: bool, gate_dev_mode: bool) -> ExitCode {
     if background {
         close_inherited();
@@ -92,13 +99,8 @@ pub fn serve(background: bool, gate_dev_mode: bool) -> ExitCode {
         .map_err(|e| format!("cannot make {}: {e}", home.token().display()))
         .and_then(|token| {
             let config = Config::load(&home.config())?;
-            let gate = open_gate(&home, gate_dev_mode || config.gate_dev_mode)?;
-            let flags: &'static [&'static str] = if gate_dev_mode {
-                &[GATE_DEV_MODE_FLAG]
-            } else {
-                &[]
-            };
-            run(home, token, gate, flags)
+            let gate = open_gate(&home, dev_mode(gate_dev_mode, &config))?;
+            run(home, token, gate, dev_flags(gate_dev_mode))
         });
     drop(held);
     match result {
@@ -111,6 +113,35 @@ pub fn serve(background: bool, gate_dev_mode: bool) -> ExitCode {
             out::fail(codes::START_FAILED, &message, None)
         }
     }
+}
+
+/// Whether the gate runs in dev mode: asked for by the flag or the config, in a build that
+/// has it.
+#[cfg(feature = "gate-dev-mode")]
+fn dev_mode(flag: bool, config: &Config) -> bool {
+    flag || config.gate_dev_mode
+}
+
+/// A release build has no gate dev mode: the config's key is ignored, and said to be.
+#[cfg(not(feature = "gate-dev-mode"))]
+fn dev_mode(_flag: bool, config: &Config) -> bool {
+    if config.gate_dev_mode {
+        warning!(
+            "ignoring gate.dev_mode in rlxd's config: this rlxd is a release build, which \
+             has no dev mode, so only a signed app may be the gate"
+        );
+    }
+    false
+}
+
+/// The flags a restarted rlxd needs, as the registry keeps them: gate dev mode's, when on.
+fn dev_flags(gate_dev_mode: bool) -> &'static [&'static str] {
+    #[cfg(feature = "gate-dev-mode")]
+    if gate_dev_mode {
+        return &[GATE_DEV_MODE_FLAG];
+    }
+    let _ = gate_dev_mode;
+    &[]
 }
 
 /// The gate, as gate.json says, logging loudly when it runs in dev mode.
@@ -203,6 +234,12 @@ async fn serve_until_stopped(
             FINISH_WAIT.as_secs()
         );
         connections.abort_all();
+        // An aborted connection drops what it was doing, which undoes a pairing whose
+        // reply it was still sending (`server::send_paired`): let that happen first.
+        let dropped = async { while connections.join_next().await.is_some() {} };
+        if tokio::time::timeout(ABORT_WAIT, dropped).await.is_err() {
+            warning!("connections still not closed after their abort");
+        }
     }
     daemon.flush();
     daemon.bus().close();
@@ -301,9 +338,7 @@ pub fn detach(gate_dev_mode: bool) -> ExitCode {
     };
     // Gate dev mode is the caller's choice, passed on; `rlxd here --start` never asks.
     let adjust = |command: &mut Command| {
-        if gate_dev_mode {
-            command.arg(GATE_DEV_MODE_FLAG);
-        }
+        command.args(dev_flags(gate_dev_mode));
     };
     match start(&home, adjust) {
         Ok(reply) => out::print_reply(&reply),

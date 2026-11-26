@@ -214,7 +214,13 @@ pub fn call(args: CallArgs) -> ExitCode {
     };
     let token = match args.target.token(&home) {
         Ok(token) => token,
-        Err(message) => return out::fail(codes::UNAUTHORIZED, &message, None),
+        // No token file, most likely as no rlxd ever ran here: not running, if it isn't.
+        Err(message) => {
+            return match Connection::open(&home) {
+                Err(e) => report(connect_error(&home, e)),
+                Ok(_) => out::fail(codes::UNAUTHORIZED, &message, None),
+            };
+        }
     };
     let socket = args.target.socket.as_deref();
     let credential = match (args.gate_credential.clone(), args.as_app) {
