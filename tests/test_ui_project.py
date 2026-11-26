@@ -2530,10 +2530,14 @@ def test_a_nickname_the_service_cannot_write_on_quit_raises_nothing_as_rlx_exits
     project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Reviewer of #24: the quit-time write let ``rename_project``'s KeyError (a project gone)
-    out, a traceback as rlx exited. Whatever it raises, rlx exits quietly."""
+    out, a traceback as rlx exited. The name typed is still tried as rlx goes, and whatever
+    the service raises, rlx exits quietly."""
     from aisquare.services import fleet as fleet_service
 
-    def gone(*_a: object, **_k: object) -> None:
+    tried: list[str | None] = []
+
+    def gone(_project: object, wanted: str | None, **_k: object) -> None:
+        tried.append(wanted)
         raise KeyError(project.id)
 
     monkeypatch.setattr(fleet_service, "rename_project", gone)
@@ -2547,4 +2551,5 @@ def test_a_nickname_the_service_cannot_write_on_quit_raises_nothing_as_rlx_exits
         await pilot.pause()
         host.exit()
 
-    drive(project, scenario)  # raises nothing
+    drive(project, scenario)  # exits quietly: a KeyError out of here fails the test
+    assert tried == ["Auth"], "the typed name was written as rlx went, and the error kept in"
