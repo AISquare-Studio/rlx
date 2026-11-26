@@ -18,9 +18,9 @@ name: rlxd release
 #            windows-latest. aarch64 Linux is therefore cross-linked
 #            (gcc-aarch64-linux-gnu) rather than built on an arm runner, which that
 #            rule excludes, and it is run under qemu-user, so every binary answers
-#            `--version` before it is packed. A step holds the Linux binaries to the
-#            oldest glibc they must run on, since ubuntu-latest's glibc moves with
-#            the image.
+#            `--version` before it is packed. Both Linux targets are built in an
+#            Ubuntu 22.04 container, so they link glibc 2.35 whatever ubuntu-latest
+#            carries, and a step runs them there before they are packed.
 #   package  rlxd-SHA256SUMS, the handoff's check run over the result, and the
 #            artifact `rlxd-archives`: the pre-release form of the release assets.
 #   install  on ubuntu, macOS and Windows: `rlx daemon install` of the tree, from a
@@ -110,12 +110,31 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: The aarch64 Linux cross-linker and qemu-user
+      # On the runner: qemu-user and the aarch64 libraries, to run that build here.
+      - name: The aarch64 Linux libraries and qemu-user
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
             gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+
+      # A Linux binary needs the newest version, on the build machine, of each glibc
+      # symbol it links, so ubuntu-latest's glibc would be the floor: #587's process
+      # spawning made it 2.39 there, past Ubuntu 22.04's and Debian 12's. So the Linux
+      # targets are built in Ubuntu 22.04 (glibc 2.35), with its gcc and its aarch64
+      # cross-gcc as the linkers. The image adds no Rust: the runner's rustup and
+      # toolchain are mounted into it, and rustup's builds need only glibc 2.17.
+      - name: The Ubuntu 22.04 build image (glibc ${{ env.GLIBC_OLDEST }})
+        if: runner.os == 'Linux'
+        run: |
+          docker build -q -t rlxd-glibc-floor - <<'EOF'
+          FROM ubuntu:22.04
+          RUN apt-get update -q \
+           && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+                gcc libc6-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user \
+           && rm -rf /var/lib/apt/lists/*
+          EOF
+          docker run --rm rlxd-glibc-floor sh -c 'ldd --version | head -1'
 
       - name: Install the pinned toolchain and the target
         run: |
@@ -123,15 +142,35 @@ jobs:
           rustup target add "$TARGET"
           rustc --version
 
-      # Not for a release's own build: what ships is built from nothing cached.
+      # Not for a release's own build: what ships is built from nothing cached. The
+      # Linux key names the build image, so nothing built on the runner itself (proc
+      # macros linked against its newer glibc) is loaded inside it.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: github.event_name != 'release' && inputs.tag == ''
         with:
           workspaces: rlxd -> target
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}${{ runner.os == 'Linux' && '-ubuntu22.04' || '' }}
 
       - name: cargo build --release --target ${{ matrix.target }}
-        run: cargo build --release --locked --target "$TARGET" -p rlxd -p rlxd-hook
+        run: |
+          build=(cargo build --release --locked --target "$TARGET" -p rlxd -p rlxd-hook)
+          if [ "$RUNNER_OS" != Linux ]; then
+            "${build[@]}"
+            exit 0
+          fi
+          # In the 22.04 image, as the runner's user, with the workspace, cargo's home
+          # and rustup's mounted at their own paths, so rlxd/rust-toolchain.toml, the
+          # toolchain installed above and rust-cache's files are the runner's.
+          cargo_home=${CARGO_HOME:-$HOME/.cargo}
+          rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$PWD" \
+            -v "$cargo_home:$cargo_home" -v "$rustup_home:$rustup_home" \
+            -e HOME -e CARGO_HOME="$cargo_home" -e RUSTUP_HOME="$rustup_home" \
+            -e PATH="$cargo_home/bin:/usr/local/bin:/usr/bin:/bin" \
+            -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL \
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER \
+            rlxd-glibc-floor "${build[@]}"
 
       - name: Rosetta, to run the x86_64 macOS build
         if: matrix.target == 'x86_64-apple-darwin'
@@ -162,14 +201,32 @@ jobs:
       - name: The Linux binaries run on glibc ${{ env.GLIBC_OLDEST }}
         if: endsWith(matrix.target, '-linux-gnu')
         run: |
-          need=$(for b in rlxd rlxd-hook; do readelf -W --dyn-syms "target/$TARGET/release/$b"; done \
-            | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1)
-          echo "the newest glibc symbol version they need: ${need:-none}"
+          syms=$(for b in rlxd rlxd-hook; do readelf -W --dyn-syms "target/$TARGET/release/$b"; done)
+          need=$(grep -o 'GLIBC_[0-9][0-9.]*' <<<"$syms" | sed 's/^GLIBC_//' | sort -uV | tail -1)
+          echo "the newest glibc symbol version they need: ${need:-none}, for:"
+          { grep -F "@GLIBC_$need " <<<"$syms" || true; } | awk '{print "  " $5, $8}' | sort -u
           test -n "$need"
           if [ "$(printf '%s\n' "$need" "$GLIBC_OLDEST" | sort -V | tail -1)" != "$GLIBC_OLDEST" ]; then
             echo "::error::the $TARGET binaries need glibc $need, newer than $GLIBC_OLDEST"
             exit 1
           fi
+          # And they run there: in the Ubuntu 22.04 image, on its glibc (aarch64 under
+          # its qemu-user, with its arm64 glibc).
+          V=$(python -c 'import tomllib; print(tomllib.load(open("../pyproject.toml", "rb"))["project"]["version"])')
+          docker run --rm -v "$PWD/target/$TARGET/release:/b:ro" -e TARGET -e V="$V" \
+            rlxd-glibc-floor bash -ec '
+              echo "Ubuntu 22.04: $(ldd --version | head -1)"
+              for b in rlxd rlxd-hook; do
+                case "$TARGET" in
+                  aarch64-*) got=$(qemu-aarch64 -L /usr/aarch64-linux-gnu "/b/$b" --version) ;;
+                  *) got=$("/b/$b" --version) ;;
+                esac
+                if [ "$got" != "$b $V" ]; then
+                  echo "::error::$b --version on Ubuntu 22.04 printed: $got"
+                  exit 1
+                fi
+                echo "$b on Ubuntu 22.04: $got"
+              done'
 
       # ── OWNER STEP 1: CODE SIGNING GOES HERE (handoff 0.10.3, "Owner steps", 1). ──
       # macOS: codesign --options runtime --timestamp, notarytool submit --wait, then

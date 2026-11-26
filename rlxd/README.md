@@ -107,7 +107,9 @@ rlxd ships with rlx releases (handoff 0.10.3, 1.2). `.github/workflows/rlxd-rele
 builds `rlxd` and `rlxd-hook` for five targets and packs each flat
 (`../scripts/rlxd_archive.py`): `rlxd-<target>.tar.gz` for aarch64 and x86_64 macOS
 and Linux (glibc), `rlxd-x86_64-pc-windows-msvc.zip` with the `.exe`s, and
-`rlxd-SHA256SUMS` over them, which `shasum -a 256 -c` reads.
+`rlxd-SHA256SUMS` over them, which `shasum -a 256 -c` reads. The Linux binaries are
+built in Ubuntu 22.04, so they run on glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and
+later), and CI runs them there before packing them.
 
 - **Every head.** rlxd.yml calls it, so each run uploads the artifact `rlxd-archives`,
   and installs it with `rlx daemon install` on ubuntu, macOS and Windows.
