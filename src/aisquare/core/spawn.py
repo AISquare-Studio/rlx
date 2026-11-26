@@ -376,8 +376,21 @@ SEAMS: dict[str, Seam] = {
     ),
     "aisquare/services/service_host.py::_detached": Seam(
         EXCLUDED,
-        "the rlx service's own workers, one at a time: the usage sweep and the anonymous usage "
-        "shipment (when sharing is on); aisquare's work for the home, not an agent session (#32)",
+        "the rlx service's own workers, one at a time: the usage sweep, the anonymous usage "
+        "shipment (when sharing is on) and the tray (#34); aisquare's work for the home, not an "
+        "agent session (#32)",
+        strips_identity=True,
+    ),
+    "aisquare/services/tray.py::_spawn_terminal": Seam(
+        EXCLUDED,
+        "the tray's Open rlx: the person's terminal app running rlx, on its own, so it outlives "
+        "the tray; a window for the person, not an agent session (#34)",
+        strips_identity=True,
+    ),
+    "aisquare/services/tray.py::_spawn_rlx": Seam(
+        EXCLUDED,
+        "the tray's Restart rlx and Quit rlx: a detached `rlx service restart` or `stop`, since "
+        "either stops the service and the service stops the tray; aisquare's own command (#34)",
         strips_identity=True,
     ),
     "aisquare/services/active_ping.py::_spawn": Seam(

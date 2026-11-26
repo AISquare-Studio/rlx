@@ -643,11 +643,15 @@ def test_an_aisquare_whose_version_fails_is_broken_not_absent(tmp_path: Path, bo
     assert "aisquare — broken" not in result.stdout, result.stdout
 
 
+#: The PyPI package as this OS installs it: with the tray's extra on macOS and Linux (#34).
+_PKG = "aisquare-cli[tray]" if sys.platform in ("darwin", "linux") else "aisquare-cli"
+
+
 @pytest.mark.parametrize(
     ("pin", "package", "spec"),
     [
-        ("", None, "aisquare-cli@latest"),
-        ("0.10.0", None, "aisquare-cli@0.10.0"),
+        ("", None, f"{_PKG}@latest"),
+        ("0.10.0", None, f"{_PKG}@0.10.0"),
         ("", "/w/aisquare.whl", "/w/aisquare.whl"),
     ],
     ids=["latest", "pinned", "local-build"],
@@ -666,8 +670,28 @@ def test_a_broken_install_is_reinstalled_with_force_as_an_upgrade_is(
     assert f"would run: uv tool install --force --python 3.13 --with tiktoken {spec}\n" in out, out
 
 
-_FRESH = "uv tool install --python 3.13 --with tiktoken aisquare-cli"
-_UP = "uv tool install --force --python 3.13 --with tiktoken aisquare-cli@0.10.0"
+_FRESH = f"uv tool install --python 3.13 --with tiktoken {_PKG}"
+_UP = f"uv tool install --force --python 3.13 --with tiktoken {_PKG}@0.10.0"
+
+
+@pytest.mark.parametrize(
+    ("os_name", "wsl", "package"),
+    [
+        ("macos", "0", "aisquare-cli[tray]"),
+        ("linux", "0", "aisquare-cli[tray]"),
+        ("linux", "1", "aisquare-cli"),
+        ("windows", "0", "aisquare-cli"),
+        ("bsd", "0", "aisquare-cli"),
+    ],
+    ids=["macos", "linux", "wsl", "windows", "bsd"],
+)
+def test_the_tray_extra_is_installed_where_there_is_a_tray(
+    os_name: str, wsl: str, package: str
+) -> None:
+    """#34: the rlx service's tray icon needs the `tray` extra, which the script installs on
+    macOS and on Linux outside WSL, and nowhere else (no tray there in 0.10.2)."""
+    result = sh(f'OS={os_name}; IS_WSL={wsl}; printf "%s" "$(cli_package)"')
+    assert result.stdout == package, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

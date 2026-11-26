@@ -965,6 +965,36 @@ def no_real_service(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(service_host, "_spawn_service", refuse)
 
 
+@pytest.fixture(autouse=True)
+def no_real_tray(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test starts a REAL tray (#34): no ``rlx service tray`` child, no terminal, no
+    detached ``rlx service`` command, no ``NSStatusItem`` and no session-bus item. The service
+    finds the ``tray`` extra missing (so a running test service wants no tray), and each of
+    the tray's spawn seams and its backend refuse. A test of the tray itself stubs what it
+    drives and asks for :func:`tray_seams` to keep the real functions."""
+    if "tray_seams" in request.fixturenames:
+        return
+    from aisquare.services import service_tray, tray
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(
+            "a test may not start a real tray, terminal or rlx command "
+            "(tests/conftest.py::no_real_tray)"
+        )
+
+    monkeypatch.setattr(service_tray, "_has_module", lambda _name: False)
+    monkeypatch.setattr(service_tray, "_detached", refuse)
+    monkeypatch.setattr(tray, "_spawn_terminal", refuse)
+    monkeypatch.setattr(tray, "_spawn_rlx", refuse)
+    monkeypatch.setattr(tray, "backend_for", refuse)
+
+
+@pytest.fixture
+def tray_seams() -> None:
+    """Keep the tray's real seams and backend lookup for this test, which stubs them itself
+    (``no_real_tray``)."""
+
+
 @pytest.fixture
 def real_service(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Any]]:
     """Real ``rlx service run`` processes for this test: each one it starts is listed, and one

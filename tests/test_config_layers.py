@@ -271,6 +271,8 @@ def test_the_v1_snapshot_differs_from_today_only_by_the_headroom_defaults_and_th
             "import": {"engine": "auto", "api_model": "claude-opus-5"},
         },
         "experimental": {"captain": False},
+        # The rlx service's tray icon (#34): on, rlx's backslash, the person's own terminal.
+        "tray": {"enabled": True, "icon": "backslash", "terminal": ""},
         # asq's daily release check (services.updates).
         "updates": {"check": True},
         # The symbol index (#285); its ignore list was [snapshot]'s until #399.
