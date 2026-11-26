@@ -6,10 +6,12 @@
 //! ```
 //!
 //! A test signer, a self-signed code-signing certificate whose root is put in
-//! `Cert:\LocalMachine\Root`, signs each helper. `RLXD_TEST_GATE_REQUIREMENT` names that
-//! signer and the helper's path as the expected publisher and binary. Trusting a root
-//! needs an administrator, as CI's runner is: elsewhere these tests are skipped, with a
-//! note, unless `RLXD_GATE_PEER_REQUIRED` is set, as in CI, where they fail instead.
+//! `Cert:\LocalMachine\Root`, signs each helper. There is one for the whole binary, made
+//! by the first test that needs it, with a subject no other run's signer has, and it is
+//! removed when the binary exits. `RLXD_TEST_GATE_REQUIREMENT` names that signer and the
+//! helper's path as the expected publisher and binary. Trusting a root needs an
+//! administrator, as CI's runner is: elsewhere these tests are skipped, with a note,
+//! unless `RLXD_GATE_PEER_REQUIRED` is set, as in CI, where they fail instead.
 //!
 //! A pid reused under a connection, with a later creation time, is refused by the
 //! comparison `peer::windows` unit-tests: a test can't make Windows reuse a pid on
@@ -21,60 +23,112 @@ mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::TestHome;
 use rlxd_client::proto::{HelloParams, Role};
 use rlxd_client::{Connection, Home};
 use serde_json::{Value, json};
 
-/// The test signer's common name.
-const SIGNER: &str = "rlxd gate test";
-
-/// The expected publisher: the test signer's full subject, and, self-signed, its issuer.
-const SUBJECT: &str = "CN=rlxd gate test";
+/// Every test signer's subject starts with this.
+const SUBJECT_PREFIX: &str = "CN=rlxd gate test";
 
 /// Set in the helper process: the parent's pid, to hand the pipe to.
 const HELPER_PARENT: &str = "RLXD_GATE_HELPER_PARENT";
 /// Set in the helper process: the credential its control hello presents.
 const HELPER_CREDENTIAL: &str = "RLXD_GATE_HELPER_CREDENTIAL";
 
-/// The test signer: its certificate in the user's store, and its root trusted by the
-/// machine. Dropping it removes both.
+/// Makes a test signer whose subject is `{subject}` and trusts its root, with `{extra}`
+/// appended to New-SelfSignedCertificate's parameters (where a test injects a failure).
+/// Its last line is `THUMBPRINT <thumbprint>`. Any error, or no certificate made, stops it,
+/// and it exits 1 with the error on stderr, on one line. (In run 45852371615 attempt 1 its
+/// predecessor exited 0 with nothing on stdout, and nothing said why.) First it removes
+/// test signers that have expired, left by runs whose cleanup never ran
+/// ([`TestSigner::remove_at_exit`]). Statements end in `;`, and there are no comments,
+/// so that it means the same on one line.
+const CREATE: &str = r"$ErrorActionPreference = 'Stop';
+$ProgressPreference = 'SilentlyContinue';
+try {
+    try {
+        Get-ChildItem Cert:\CurrentUser\My, Cert:\LocalMachine\Root |
+            Where-Object { $_.Subject -like '{prefix}*' -and $_.NotAfter -lt (Get-Date) } |
+            Remove-Item -ErrorAction SilentlyContinue;
+    } catch {};
+    $c = New-SelfSignedCertificate -Type CodeSigningCert -Subject '{subject}' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1) {extra};
+    if (-not $c -or -not $c.Thumbprint) { throw 'New-SelfSignedCertificate made no certificate' };
+    $f = Join-Path ([IO.Path]::GetTempPath()) ('rlxd-gate-' + $c.Thumbprint + '.cer');
+    try {
+        Export-Certificate -Cert $c -FilePath $f | Out-Null;
+        Import-Certificate -FilePath $f -CertStoreLocation Cert:\LocalMachine\Root | Out-Null;
+    } catch {
+        Remove-Item -LiteralPath ('Cert:\CurrentUser\My\' + $c.Thumbprint) -ErrorAction SilentlyContinue;
+        throw;
+    } finally {
+        Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue;
+    };
+    'THUMBPRINT ' + $c.Thumbprint;
+} catch {
+    [Console]::Error.WriteLine('rlxd-gate-signer: ' + $_.Exception.Message + ' (' + $_.FullyQualifiedErrorId + ')');
+    exit 1;
+}";
+
+/// Signs `{path}` with Authenticode as the test signer `{thumbprint}`. It exits 1, with
+/// the error on stderr, unless the signature is valid.
+const SIGN: &str = r"$ErrorActionPreference = 'Stop';
+$ProgressPreference = 'SilentlyContinue';
+try {
+    $c = Get-Item -LiteralPath 'Cert:\CurrentUser\My\{thumbprint}';
+    $r = Set-AuthenticodeSignature -FilePath '{path}' -Certificate $c -HashAlgorithm SHA256;
+    if ($r.Status -ne 'Valid') { throw ('the signature is ' + $r.Status + ': ' + $r.StatusMessage) };
+} catch {
+    [Console]::Error.WriteLine('rlxd-gate-signer: ' + $_.Exception.Message + ' (' + $_.FullyQualifiedErrorId + ')');
+    exit 1;
+}";
+
+/// Held while a PowerShell script runs, so that this binary's tests make, sign with and
+/// remove certificates one at a time.
+static POWERSHELL: Mutex<()> = Mutex::new(());
+
+/// The test signer: a self-signed code-signing certificate in the user's store, whose
+/// root the machine trusts. There is one for the binary ([`TestSigner::shared`]), removed
+/// when it exits ([`TestSigner::remove_at_exit`]).
 struct TestSigner {
+    /// Its full subject and, self-signed, its issuer: this run's alone.
+    subject: String,
+    /// Its SHA-1 thumbprint: 40 hex digits.
     thumbprint: String,
 }
 
+/// The binary's test signer, or why it has none: made once, by the first test to ask.
+static SHARED: OnceLock<Result<TestSigner, String>> = OnceLock::new();
+
 impl TestSigner {
-    /// The signer, or `None` (with a note) where no root can be trusted.
-    fn new() -> Option<Self> {
-        let made = powershell(&format!(
-            "$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN={SIGNER}' \
-             -CertStoreLocation Cert:\\CurrentUser\\My -NotAfter (Get-Date).AddDays(2); \
-             $f = Join-Path ([IO.Path]::GetTempPath()) ('rlxd-gate-' + $c.Thumbprint + '.cer'); \
-             Export-Certificate -Cert $c -FilePath $f | Out-Null; \
-             try {{ Import-Certificate -FilePath $f -CertStoreLocation Cert:\\LocalMachine\\Root \
-             -ErrorAction Stop | Out-Null }} catch {{ Remove-Item Cert:\\CurrentUser\\My\\$($c.Thumbprint); \
-             Remove-Item $f; throw }}; Remove-Item $f; $c.Thumbprint"
-        ));
-        // PowerShell may print more before it; the thumbprint is the last line.
-        let thumbprint = made.map(|out| {
-            out.lines()
-                .map(str::trim)
-                .rfind(|line| !line.is_empty())
-                .unwrap_or_default()
-                .to_owned()
+    /// The binary's test signer, or `None` (with a note) where no root can be trusted.
+    ///
+    /// One for every test: run 45852371615 attempt 1 failed while three tests each made
+    /// one, with the same subject, at the same moment on a cold runner.
+    fn shared() -> Option<&'static Self> {
+        let made = SHARED.get_or_init(|| {
+            let made = Self::create(&unique_subject("signer"), "");
+            // Past the harness's capture, so that every run's log shows the one signer.
+            let _ = match &made {
+                Ok(signer) => writeln!(
+                    std::io::stderr(),
+                    "gate_peer_windows: made the test signer {:?} ({}), for all of this \
+                     binary's tests; it is removed when the binary exits",
+                    signer.subject,
+                    signer.thumbprint
+                ),
+                Err(why) => writeln!(std::io::stderr(), "gate_peer_windows: {why}"),
+            };
+            made
         });
-        match thumbprint {
-            Ok(thumbprint) => {
-                assert!(
-                    thumbprint.len() == 40 && thumbprint.bytes().all(|b| b.is_ascii_hexdigit()),
-                    "not a thumbprint: {thumbprint:?}"
-                );
-                Some(Self { thumbprint })
-            }
+        match made {
+            Ok(signer) => Some(signer),
             Err(why) => {
                 assert!(
                     std::env::var_os("RLXD_GATE_PEER_REQUIRED").is_none(),
@@ -86,54 +140,145 @@ impl TestSigner {
         }
     }
 
+    /// Makes a signer whose subject is `subject`, and trusts its root, with `extra`
+    /// appended to New-SelfSignedCertificate's parameters ([`CREATE`]). Its error carries
+    /// PowerShell's exit status, stderr and stdout.
+    fn create(subject: &str, extra: &str) -> Result<Self, String> {
+        let ran = powershell(
+            &CREATE
+                .replace("{prefix}", SUBJECT_PREFIX)
+                .replace("{subject}", subject)
+                .replace("{extra}", extra),
+        )
+        .map_err(|why| format!("making the test signer {subject:?}: {why}"))?;
+        let thumbprint = ran
+            .stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("THUMBPRINT "))
+            .map(str::trim)
+            .filter(|t| t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+        let (true, Some(thumbprint)) = (ran.status.success(), thumbprint) else {
+            return Err(format!("making the test signer {subject:?}: {ran}"));
+        };
+        let signer = Self {
+            subject: subject.to_owned(),
+            thumbprint: thumbprint.to_owned(),
+        };
+        signer.remove_at_exit()?;
+        Ok(signer)
+    }
+
+    /// Removes the signer, and its trusted root, once this process has exited, however it
+    /// exits: a static ([`SHARED`]) is never dropped, and a failed run ends with
+    /// `process::exit`. A PowerShell of its own waits for this process, then removes them;
+    /// where it can't start, they are removed now, and this is an error.
+    fn remove_at_exit(&self) -> Result<(), String> {
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        let script = format!(
+            "Wait-Process -Id {} -ErrorAction SilentlyContinue; {}",
+            std::process::id(),
+            self.removal()
+        );
+        let mut command = Command::new("powershell");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // A console of its own, so that a Ctrl+C that ends the tests doesn't end it.
+            .creation_flags(CREATE_NO_WINDOW);
+        match common::launch(&mut command) {
+            // It outlives this process; dropping it leaves it running.
+            Ok(_waiting) => Ok(()),
+            Err(e) => {
+                let removed = match powershell(&self.removal()) {
+                    Ok(ran) => ran.to_string(),
+                    Err(why) => why,
+                };
+                Err(format!(
+                    "cannot start the test signer's removal ({e}), so it was removed now: \
+                     {removed}"
+                ))
+            }
+        }
+    }
+
+    /// A script that removes the signer and its trusted root.
+    fn removal(&self) -> String {
+        format!(
+            "Remove-Item -LiteralPath 'Cert:\\LocalMachine\\Root\\{0}' -ErrorAction SilentlyContinue; \
+             Remove-Item -LiteralPath 'Cert:\\CurrentUser\\My\\{0}' -ErrorAction SilentlyContinue",
+            self.thumbprint
+        )
+    }
+
     /// Signs `path` with Authenticode.
     fn sign(&self, path: &Path) {
-        let signed = powershell(&format!(
-            "$c = Get-Item Cert:\\CurrentUser\\My\\{}; \
-             $r = Set-AuthenticodeSignature -FilePath '{}' -Certificate $c -HashAlgorithm SHA256; \
-             if ($r.Status -ne 'Valid') {{ throw $r.StatusMessage }}",
-            self.thumbprint,
-            path.display()
-        ));
-        if let Err(why) = signed {
-            panic!("signing {}: {why}", path.display());
+        let script = SIGN
+            .replace("{thumbprint}", &self.thumbprint)
+            .replace("{path}", &path.display().to_string());
+        match powershell(&script) {
+            Ok(ran) if ran.status.success() => {}
+            Ok(ran) => panic!("signing {}: {ran}", path.display()),
+            Err(why) => panic!("signing {}: {why}", path.display()),
         }
     }
 }
 
-impl Drop for TestSigner {
-    fn drop(&mut self) {
-        let _ = powershell(&format!(
-            "Remove-Item Cert:\\LocalMachine\\Root\\{0} -ErrorAction SilentlyContinue; \
-             Remove-Item Cert:\\CurrentUser\\My\\{0} -ErrorAction SilentlyContinue",
-            self.thumbprint
-        ));
+/// A subject no other run's test signer has: [`SUBJECT_PREFIX`], then `what`, this
+/// process and the time.
+fn unique_subject(what: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    format!("{SUBJECT_PREFIX} {what} {} {millis}", std::process::id())
+}
+
+/// What a PowerShell script did.
+struct Ran {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+impl std::fmt::Display for Ran {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PowerShell's {}, stderr {:?}, stdout {:?}",
+            self.status,
+            self.stderr.trim(),
+            self.stdout.trim()
+        )
     }
 }
 
-/// Runs `script` in Windows PowerShell: its stdout, or why it failed.
-fn powershell(script: &str) -> Result<String, String> {
-    let out = Command::new("powershell")
+/// Runs `script` in Windows PowerShell, as no other test runs one ([`POWERSHELL`]): what it
+/// did, or why it couldn't run.
+fn powershell(script: &str) -> Result<Ran, String> {
+    let _alone = POWERSHELL.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut command = Command::new("powershell");
+    command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ))
-    }
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = common::launch(&mut command)
+        .and_then(Child::wait_with_output)
+        .map_err(|e| format!("cannot run PowerShell: {e}"))?;
+    Ok(Ran {
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
-/// A fresh home whose rlxd, outside dev mode, expects `binary` signed by the test signer.
-fn home_expecting(binary: &Path) -> TestHome {
+/// A fresh home whose rlxd, outside dev mode, expects `binary` signed by `signer`.
+fn home_expecting(signer: &TestSigner, binary: &Path) -> TestHome {
     TestHome::new().with_env(
         "RLXD_TEST_GATE_REQUIREMENT",
-        &format!("{SUBJECT}|{SUBJECT}|{}", binary.display()),
+        &format!("{0}|{0}|{1}", signer.subject, binary.display()),
     )
 }
 
@@ -145,16 +290,40 @@ fn copy(binary: &Path, dir: &Path, name: &str) -> PathBuf {
     path
 }
 
+/// A test signer that can't be made is an error carrying PowerShell's exit status and
+/// stderr. Run 45852371615 attempt 1 panicked with `not a thumbprint: ""` instead, its
+/// stderr thrown away. Neither failure here makes a certificate, so this runs anywhere,
+/// administrator or not.
+#[test]
+fn a_test_signer_that_cannot_be_made_is_an_error_with_powershells_stderr() {
+    // An invalid parameter: New-SelfSignedCertificate refuses to run.
+    let Err(why) = TestSigner::create(&unique_subject("invalid"), "-NoSuchParameter") else {
+        panic!("made a test signer with an invalid parameter");
+    };
+    assert!(why.contains("exit code: 1"), "{why}");
+    assert!(why.contains("rlxd-gate-signer: "), "{why}");
+    assert!(why.contains("NoSuchParameter"), "{why}");
+    // -WhatIf: no error, and no certificate. The script must not go on without one.
+    let Err(why) = TestSigner::create(&unique_subject("what-if"), "-WhatIf") else {
+        panic!("made a test signer with -WhatIf");
+    };
+    assert!(why.contains("exit code: 1"), "{why}");
+    assert!(
+        why.contains("rlxd-gate-signer: New-SelfSignedCertificate made no certificate"),
+        "{why}"
+    );
+}
+
 #[test]
 fn a_signed_helper_at_the_expected_path_passes_and_still_needs_the_credential() {
-    let Some(signer) = TestSigner::new() else {
+    let Some(signer) = TestSigner::shared() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("rlxd-gate-win-{}", std::process::id()));
     let rlxd = Path::new(env!("CARGO_BIN_EXE_rlxd"));
     let helper = copy(rlxd, &dir, "rlx.exe");
     signer.sign(&helper);
-    let home = home_expecting(&helper);
+    let home = home_expecting(signer, &helper);
     home.start();
     let run = home.run_of(&helper, &["call", "gate.pair"]);
     assert_eq!(run.code(), Some(0), "{run:?}");
@@ -200,14 +369,14 @@ fn an_image_renamed_away_while_it_runs_is_refused() {
     // Review #1991, item 4: an unsigned image runs from the expected path, is renamed
     // away, and the signed file is put back there before the check. The check reads the
     // file the process runs, not the one now at its path.
-    let Some(signer) = TestSigner::new() else {
+    let Some(signer) = TestSigner::shared() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("rlxd-gate-win-swap-{}", std::process::id()));
     let rlxd = Path::new(env!("CARGO_BIN_EXE_rlxd"));
     let helper = copy(rlxd, &dir, "rlx.exe");
     signer.sign(&helper);
-    let home = home_expecting(&helper);
+    let home = home_expecting(signer, &helper);
     home.start();
     let run = home.run_of(&helper, &["call", "gate.pair"]);
     assert_eq!(run.code(), Some(0), "{run:?}");
@@ -271,13 +440,13 @@ fn an_image_renamed_away_while_it_runs_is_refused() {
 fn a_pipe_whose_client_has_exited_is_refused() {
     // "A held handle": the helper connects, hands the pipe to this process with
     // DuplicateHandle, and exits; a hello on that pipe is then refused.
-    let Some(signer) = TestSigner::new() else {
+    let Some(signer) = TestSigner::shared() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("rlxd-gate-win-held-{}", std::process::id()));
     let helper = copy(&std::env::current_exe().unwrap(), &dir, "gate-helper.exe");
     signer.sign(&helper);
-    let home = home_expecting(&helper);
+    let home = home_expecting(signer, &helper);
     home.start_dev();
     let run = home.rlxd(&["call", "gate.pair"]);
     assert_eq!(run.code(), Some(0), "{run:?}");
