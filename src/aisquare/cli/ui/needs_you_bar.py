@@ -23,6 +23,7 @@ from typing import ClassVar
 from rich.text import Text
 from textual import on
 from textual.css.query import NoMatches
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import ContentSwitcher, DataTable, Static, TabPane
 from textual.worker import Worker, WorkerState
@@ -59,8 +60,6 @@ GLYPHS: dict[str, str] = {kind: glyph for kind, glyph, _one, _many in NEEDS_YOU}
 BOARD_TAB = "--content-tab-tab-board"
 """The Board tab's id in a project view's tab row (Textual's ``ContentTab`` prefix on the pane's
 id): there, once the row is filled."""
-KEEP_CHECKS = 20
-"""How many short waits (a second in all) the bar keeps the keys on the item it opened."""
 LAND_TRIES = 40
 """How many short waits the bar gives a project's view to be built before it gives up."""
 
@@ -174,9 +173,8 @@ class NeedsYouBar(Static):
         super().__init__("", id=id)
         self.needs: list[Need] = []
         self._landing: tuple[Need, int] | None = None
-        self._keeping: tuple[ProjectView, BoardPanel, int] | None = None
-        """After an item opened: its view, its board, and the checks made that the keys are on
-        it (:meth:`_keep_the_keys`)."""
+        self._waiting: Timer | None = None
+        """The landing's next short wait, stopped when another item is opened meanwhile."""
 
     def on_mount(self) -> None:
         self.set_interval(BAR_SECONDS, self._tick)
@@ -236,6 +234,9 @@ class NeedsYouBar(Static):
     def open_need(self, need: Need) -> None:
         """Open ``need`` on its project's board, wherever it sits on the lane."""
         self.app.post_message(ProjectSelected(need.project.id))
+        if self._waiting is not None:  # the one opening before: this one replaces it
+            self._waiting.stop()
+            self._waiting = None
         self._landing = (need, 0)
         self.call_after_refresh(self._land)
 
@@ -272,7 +273,13 @@ class NeedsYouBar(Static):
 
     def _open_on_board(self) -> None:
         """The Board tab shown: the item on it. Not shown yet, a short wait; another tab chosen
-        meanwhile, nothing (the person moved on). Nothing is focused that is not on screen."""
+        meanwhile, nothing (the person moved on). Nothing is focused that is not on screen.
+
+        Opened on the board's own queue (``panel.call_later``), not here: once the board is on
+        screen its Show is queued on it, and the board hands the keys to its work list as it
+        handles it. Opened before that, the reader's focus was queued first and the work list's
+        after it; below the wide layout the reader covers that list, its blur reset the focus,
+        and no key reached the card (tester of #11, #1672). After it, the reader's is last."""
         if self._landing is None:
             return
         need, tries = self._landing
@@ -285,57 +292,19 @@ class NeedsYouBar(Static):
             panel = pane.query_one(BoardPanel)
             shown = pane.display and panel.is_on_screen
             if shown:
-                self._open_item(panel, need)
+                panel.call_later(self._open_item, panel, need)
         except NoMatches:
             shown = False
         if shown:
             self._landing = None
-            self._keeping = (view, panel, 0)
-            self.call_after_refresh(self._keep_the_keys)
         else:
             self._try_again(need, tries, self._open_on_board)
 
-    def _keep_the_keys(self) -> None:
-        """The keys on what was opened, checked a short wait at a time for :data:`KEEP_CHECKS`.
-
-        The board may handle its own Show only after the item opened: it hands the keys to
-        its work list, which the reader covers below the wide layout, and the focus fell to
-        nothing; the card showed and no key reached it (tester of #11, #1672). Put back while
-        a card is open: on the reader; else anywhere of the board's on screen. Focus the
-        person put outside the project's view is theirs, and left."""
-        if self._keeping is None:
-            return
-        view, panel, checks = self._keeping
-        focused = self.app.focused
-        try:
-            reader = panel.query_one("#reader")
-            reading = panel.has_class("reading")
-            if reading:
-                kept = focused is reader
-            else:
-                kept = bool(
-                    focused is not None
-                    and focused.is_on_screen
-                    and panel in focused.ancestors_with_self
-                )
-            stray = focused is None or not focused.is_on_screen or view in focused.ancestors
-            if not kept and stray:
-                target = reader if reading else panel.query_one("#tasks")
-                if target.display:
-                    target.focus()
-        except NoMatches:  # the view went meanwhile
-            self._keeping = None
-            return
-        if checks < KEEP_CHECKS:
-            self._keeping = (view, panel, checks + 1)
-            self.set_timer(0.05, self._keep_the_keys)
-        else:
-            self._keeping = None
-
     def _try_again(self, need: Need, tries: int, step: Callable[[], None]) -> None:
+        self._waiting = None
         if tries < LAND_TRIES:
             self._landing = (need, tries + 1)
-            self.set_timer(0.05, step)
+            self._waiting = self.set_timer(0.05, step)
         else:
             self._landing = None  # given up: the bar stays, and F6 tries again
 
@@ -348,7 +317,12 @@ class NeedsYouBar(Static):
         return views[0] if views else None
 
     def _open_item(self, panel: BoardPanel, need: Need) -> None:
-        """``need`` on ``panel``, shown: a card in the board's reader, else the work list."""
+        """``need`` on ``panel``, shown: a card in the board's reader, else the work list. On the
+        board's queue; a board gone meanwhile is nothing to open."""
+        with contextlib.suppress(NoMatches):
+            self._open_on(panel, need)
+
+    def _open_on(self, panel: BoardPanel, need: Need) -> None:
         card = (need.kind, need.target)
         if need.kind in ("blocked", "review") and card not in panel.lane:
             # A view built earlier holds the lane it last read: its ticks skip a hidden board,

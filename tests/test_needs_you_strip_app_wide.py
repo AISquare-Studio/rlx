@@ -19,6 +19,7 @@ from textual.widgets import TabbedContent
 from aisquare.cli.ui import needs_you_bar
 from aisquare.cli.ui.board import BoardPanel
 from aisquare.cli.ui.needs_you_bar import NeedsYouBar
+from aisquare.cli.ui.views.project import ProjectView
 from aisquare.models import ProjectInfo, TaskStatus, TeamEvent, TeamSession, TeamTask
 from aisquare.services import fleet as fleet_service
 from aisquare.services import team as team_service
@@ -464,25 +465,35 @@ def _reader_focused(app: Any, board: BoardPanel | None) -> bool:
 
 
 @pytest.mark.parametrize("size", [(60, 24), (100, 30)], ids=["60x24", "100x30"])
-def test_the_keys_stay_on_the_card_when_the_board_shows_after_it_opened(
+def test_the_card_opens_after_the_board_takes_its_keys_whatever_the_timing(
     projects: dict[str, Any], monkeypatch: pytest.MonkeyPatch, size: tuple[int, int]
 ) -> None:
-    """The tester of #11 (#1672): the card opened before the board handled its own Show, which
-    then handed the keys to its work list; below the wide layout the reader covers that list,
-    and the focus fell to nothing: the card showed and no key reached it. Here the board's
-    Show is made to come last, every time."""
-    from textual import events
+    """The tester of #11 (#1672): the card opened while the board's own Show was still to be
+    handled; handling it, the board handed the keys to its work list after the reader's, and
+    below the wide layout the reader covers that list: the focus fell to nothing. The board
+    is held busy here as its Show comes up, so the card's moment falls before it is handled:
+    the card must still open after it (on the board's own queue), and keep the keys."""
+    from aisquare.cli.ui.board import BoardPanel as Panel
 
     alpha, beta = projects["alpha"], projects["beta"]
+    order: list[tuple[str, int]] = []
+    on_show = Panel.on_show
+
+    async def busy_on_show(self: Panel) -> None:
+        await asyncio.sleep(0.2)  # the board busy as its Show comes up
+        on_show(self)
+        order.append(("show", id(self)))
+
     opened = NeedsYouBar._open_item
 
-    def board_shows_after(self: NeedsYouBar, panel: BoardPanel, need: Any) -> None:
+    def open_item(self: NeedsYouBar, panel: Panel, need: Any) -> None:
+        order.append(("open", id(panel)))
         opened(self, panel, need)
-        panel.post_message(events.Show())  # the board's own Show, handled after the card
 
-    monkeypatch.setattr(NeedsYouBar, "_open_item", board_shows_after)
+    monkeypatch.setattr(Panel, "on_show", busy_on_show)
+    monkeypatch.setattr(NeedsYouBar, "_open_item", open_item)
 
-    async def go(pilot: Any, app: Any) -> str:
+    async def go(pilot: Any, app: Any) -> tuple[list[str], str]:
         await _on_betas_settings(pilot, app, beta)
         projects["frames"][alpha.id] = _blocked_behind_five_reviews(alpha)
         bar = app.query_one(NeedsYouBar)
@@ -491,19 +502,57 @@ def test_the_keys_stay_on_the_card_when_the_board_shows_after_it_opened(
         await pilot.click("#needs-you-bar")
         await _until(
             pilot,
-            lambda: bar._landing is None and bar._keeping is None,
-            what="the landing and its focus checks done",
+            lambda: _reader_focused(app, _alphas_board(app, alpha)),
+            what="the card in the reader with the keys on it",
         )
-        await settle_page(app)
-        assert _reader_focused(app, _alphas_board(app, alpha)), (
-            f"the keys are not on the card: {app.focused!r}"
-        )
-        await pilot.press("escape")  # and the board's keys reach it: Esc closes the reader
-        await settle_page(app)
         board = _alphas_board(app, alpha)
-        return board.reader_text if board is not None else "?"
+        assert board is not None
+        steps = [step for step, panel in order if panel == id(board)]
+        await pilot.press("escape")  # the board's keys reach it: Esc closes the reader
+        await settle_page(app)
+        return steps, board.reader_text
 
-    assert drive(size, go) == "", "Esc closed the reader: the keys were on it"
+    steps, after_escape = drive(size, go)
+    assert "open" in steps and "show" in steps[: steps.index("open")], steps
+    assert after_escape == "", "Esc closed the reader: the keys were on it"
+
+
+@pytest.mark.parametrize("size", [(60, 24), (100, 30)], ids=["60x24", "100x30"])
+def test_once_the_card_is_open_the_persons_own_focus_is_left_alone(
+    projects: dict[str, Any], size: tuple[int, int]
+) -> None:
+    """The reviewer of #11 (round 5): a second of re-checks after the card opened pulled the
+    person's own moves back: a click on the project's Settings tab snapped back to Board, and
+    a move to another project left the focus on the hidden reader. Nothing pulls it back."""
+    from aisquare.cli.ui.sidebar import ProjectSelected
+
+    alpha, beta = projects["alpha"], projects["beta"]
+
+    async def go(pilot: Any, app: Any) -> tuple[str, bool]:
+        await _on_betas_settings(pilot, app, beta)
+        projects["frames"][alpha.id] = _blocked_behind_five_reviews(alpha)
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        await pilot.click("#needs-you-bar")
+        await _until(
+            pilot,
+            lambda: _reader_focused(app, _alphas_board(app, alpha)),
+            what="the card open, the keys on it",
+        )
+        await pilot.click("#--content-tab-tab-settings")  # at once: the person moves on
+        for _ in range(30):  # 0.6 s, inside the second the re-checks held
+            await pilot.pause(0.02)
+        active = app.query_one(f"#project-{alpha.id}", ProjectView).active
+        app.post_message(ProjectSelected(beta.id))
+        for _ in range(30):
+            await pilot.pause(0.02)
+        focused = app.focused
+        return active, focused is None or focused.is_on_screen
+
+    active, focus_visible = drive(size, go)
+    assert active == "tab-settings", "the person's click on Settings stood"
+    assert focus_visible, "no focus left on the hidden reader of the project left"
 
 
 def test_a_warm_board_at_60_columns_takes_the_keys_on_every_click(
@@ -528,8 +577,8 @@ def test_a_warm_board_at_60_columns_takes_the_keys_on_every_click(
             await pilot.click("#needs-you-bar")
             await _until(
                 pilot,
-                lambda: bar._landing is None and bar._keeping is None,
-                what="the landing and its focus checks done",
+                lambda: bar._landing is None and _reader_focused(app, _alphas_board(app, alpha)),
+                what="the card open, the keys on it",
             )
             await settle_page(app)
             seen.append(_reader_focused(app, _alphas_board(app, alpha)))
