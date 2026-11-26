@@ -69,6 +69,7 @@ from aisquare.cli.ui.views.agent import AgentView, info_line
 from aisquare.core.keys import Drop
 from aisquare.core.tmux import BUNDLED_CONF, PASTE_BUFFER, TmuxError, TmuxServer
 from aisquare.models import FleetAgent, FleetAgentStatus
+from aisquare.services import claude_accounts as accounts_service
 from aisquare.services import settings as settings_service
 from tests import toast_log
 from tests.pane_harness import (
@@ -4281,7 +4282,7 @@ def test_agent_view_reads_the_account_labels_off_the_ui_thread_and_repaints(
         answered.set()
         return {2: "work"}
 
-    monkeypatch.setattr("aisquare.services.claude_accounts.slot_labels", slot_labels)
+    monkeypatch.setattr("aisquare.services.claude_accounts.display_labels", slot_labels)
     status = _status()
     on_slot_two = status.model_copy(
         update={"agent": status.agent.model_copy(update={"account_slot": 2})}
@@ -4325,6 +4326,7 @@ def test_a_long_detail_is_what_the_agent_view_cuts_never_the_account_or_its_use(
     from aisquare.services import fleet as fleet_service
 
     monkeypatch.setattr("aisquare.services.claude_accounts.slot_labels", lambda: {3: "dev"})
+    monkeypatch.setattr("aisquare.services.claude_accounts.display_labels", lambda: {3: "dev"})
     server = fake.server(tmp_path)
     base = _status(state="attention")
     status = base.model_copy(
@@ -4359,7 +4361,11 @@ def test_a_long_detail_is_what_the_agent_view_cuts_never_the_account_or_its_use(
             return strip.text, str(header.content)
 
     shown, whole = run(drive())
-    assert whole.endswith("  %1") and "folder trust" in whole  # the line itself is all there
+    # The line itself is all there, its detail last: no pane id after it (Q2, 0.10.2).
+    # The command as this platform's own writer spells it (``claude_accounts.trust_command``):
+    # quoted with '/' here, bare with backslashes on Windows (#14's full matrix, review #1564).
+    tail = f"`{accounts_service.trust_command(_CWD)}`"
+    assert whole.endswith(tail) and "folder trust" in whole and "%1" not in whole
     assert "🔔 attention  dev · 87%  claude-opus-5-5 high  " in shown, shown  # all whole
     assert shown.rstrip().endswith("…"), shown  # the cut is said, and it falls in the detail
     detail_start = shown.index("claude-opus-5-5 high") + len("claude-opus-5-5 high  ")

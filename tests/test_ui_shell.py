@@ -370,6 +370,15 @@ def fleet_app(pilot: Pilot[None]) -> FleetApp:
     return app
 
 
+async def to_the_sidebar(app: FleetApp) -> None:
+    """The sidebar on screen, the keyboard in it, for a test that clicks one of its rows: below
+    ``Panes.ONE_PANE_BELOW`` columns one side shows at a time (L2), and start shows home's view,
+    or Welcome with no project listed. From 70 columns up both sides show, and this changes
+    nothing."""
+    app.query_one(Panes).show_sidebar()
+    await settle(app)
+
+
 async def from_welcome(pilot: Pilot[None]) -> FleetApp:
     """The shell on Welcome with nothing selected, where a test about something other than how
     rlx starts begins. Start opens home since L1, the last-used project's Manager tab
@@ -722,6 +731,9 @@ def test_in_a_90_column_terminal_the_agent_view_gives_way_in_its_label_first(
     script["prj_b"] = [row("prj_b", "coder-01m5d34v", "coder", "attention", 2, 1)]
     # Slots 1 and 4 unaliased: the registry's built-in names, "plain claude" and "account 4".
     monkeypatch.setattr(accounts_service, "slot_labels", lambda store=None: {2: "work", 3: "max"})
+    monkeypatch.setattr(
+        accounts_service, "display_labels", lambda statuses=None: {2: "work", 3: "max"}
+    )
 
     async def bar(pilot: Pilot[None], agent_id: str, *, wider_than: int = 0) -> tuple[int, str]:
         app = fleet_app(pilot)
@@ -793,6 +805,7 @@ def test_at_90_columns_the_manager_tab_cuts_its_info_line_and_shows_its_hint_who
     detail = fleet_service.trust_prompt_detail(tmp_path / "a [deep] folder" / "repo")
     script["prj_a"] = [row.model_copy(update={"session": session, "detail": detail})]
     monkeypatch.setattr(accounts_service, "slot_labels", lambda store=None: {2: "work"})
+    monkeypatch.setattr(accounts_service, "display_labels", lambda statuses=None: {2: "work"})
 
     def rows(widget: Widget) -> list[str]:
         width, height = widget.outer_size
@@ -868,6 +881,7 @@ def test_the_headers_name_the_agent_only_beside_another_agents_accounts_and_afte
         row.model_copy(update={"agent": row.agent.model_copy(update={"agent": "claude-code"})})
     ]
     monkeypatch.setattr(accounts_service, "slot_labels", lambda store=None: {2: "work"})
+    monkeypatch.setattr(accounts_service, "display_labels", lambda statuses=None: {2: "work"})
     frame = [_accounts_frame("claude-code")]
 
     def rows(widget: Widget) -> list[str]:
@@ -900,12 +914,13 @@ def test_the_headers_name_the_agent_only_beside_another_agents_accounts_and_afte
     named, agent_width, agent_line, manager_width, manager_line = alone
     # 37 cells before R17's Pause took 2: the account and its use whole all the same.
     assert (named, agent_width, manager_width) == (False, 35, 57)
-    assert agent_line == ["🧭 manager  ◦ waiting  work · 42% …"], agent_line
-    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%  %1"], manager_line  # 0.9.2's
+    # 0.9.2's, less the pane id 0.10.2 took out of the headers (Q2): nothing left to cut.
+    assert agent_line == ["🧭 manager  ◦ waiting  work · 42%"], agent_line
+    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%"], manager_line
     named, _, agent_line, _, manager_line = mixed
     assert named is True
     assert agent_line == ["🧭 manager  ◦ waiting  work · 42% …"], agent_line
-    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%  claude-code  %1"], manager_line
+    assert manager_line == ["🧭 manager  ◦ waiting  work · 42%  claude-code"], manager_line
     assert alone_again == alone
 
 
@@ -5487,13 +5502,11 @@ def test_a_min_width_of_zero_is_a_floor_of_zero(tmp_path: Path, script: Script) 
     )
     assert collapsed == 0
 
-    async def ceiling(pilot: Pilot[None]) -> int | None:
-        app = fleet_app(pilot)
-        app.sidebar.styles.min_width = 0
-        await _resized(pilot, 1 + Panes.MIN_CONTENT, SIZE[1])  # room for the content alone
-        return cells(app.sidebar.styles.max_width)
-
-    assert drive(ceiling) == 0, "the container's ceiling honours a floor of 0 too"
+    # Room for the content alone. The app is one side at a time there (L2), with no ceiling,
+    # so the rule is read where the container keeps it.
+    assert Panes.sidebar_ceiling(1 + Panes.MIN_CONTENT, 0) == 0, (
+        "the container's ceiling honours a floor of 0 too"
+    )
 
 
 def test_a_gesture_at_the_ceiling_with_a_huge_width_on_file_does_not_reach_the_style_setter(

@@ -1535,10 +1535,10 @@ def test_a_bind_made_with_account_reads_that_account_for_every_agent(
         return option_prompts(picker)
 
     prompts = drive(scenario, dialog=picker_for(project, "new"))
-    assert prompts["bind:manager"] == "manager · codex · account 3 · three@example.com"
-    assert prompts["bind:captain"] == "captain · codex · account 3 · three@example.com"
-    assert prompts["bind:coder3"] == "coder3 · claude · account 2 · two@example.com"
-    assert prompts["bind:coder4"] == "coder4 · claude · account 2 · two@example.com"
+    assert prompts["bind:manager"] == "manager · codex · work · three@example.com"  # Q1
+    assert prompts["bind:captain"] == "captain · codex · work · three@example.com"
+    assert prompts["bind:coder3"] == "coder3 · claude · two@example.com"
+    assert prompts["bind:coder4"] == "coder4 · claude · two@example.com"
     assert prompts["bind:coder5"] == "coder5 · claude · account 9"
     assert prompts["bind:tester1"] == "tester1 · claude · this shell's account"
 

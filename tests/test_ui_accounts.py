@@ -84,6 +84,7 @@ from aisquare.services import device_flow, iam
 from aisquare.services import fleet as fleet_service
 from tests import windows_timers as windows_timers_module
 from tests.pane_harness import asks_a_server, socket_of
+from tests.test_ui_shell import to_the_sidebar
 from tests.ui_workers import settle_page, settle_until
 
 T = TypeVar("T")
@@ -272,6 +273,7 @@ async def open_accounts(pilot: Pilot[None]) -> AccountsView:
     ``AccountsSelected`` to the app, whose handler mounts the page, so one pause could
     return before it existed."""
     app = fleet_app(pilot)
+    await to_the_sidebar(app)  # below 70 columns, start on Welcome shows the other side (L2)
     await pilot.click(app.query_one(StatusLine))
     await settle(app)
     view = app.query_one("#accounts", AccountsView)
