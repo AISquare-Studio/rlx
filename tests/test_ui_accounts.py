@@ -4586,3 +4586,32 @@ def test_a_row_that_leaves_takes_its_projection_with_it(
     usage_before, trends_before, usage_after, trends_after = drive(go, overview=both)
     assert usage_before == trends_before == {1, 2}
     assert usage_after == trends_after == {1}
+
+
+def test_a_rename_is_kept_and_ctrl_z_names_the_slot_as_it_was(
+    fake_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M5: a rename says "Saved … · Undo: ctrl+z", and ctrl+z names the slot as it was, in
+    the registry."""
+    core.create_account()
+    accounts_service.set_alias("2", "work")
+
+    async def go(
+        pilot: Pilot[None],
+    ) -> tuple[dict[int, str | None], dict[int, str | None], list[str]]:
+        app = fleet_app(pilot)
+        view = await open_accounts(pilot)
+        await rename(pilot, 2)
+        field(view, 2).value = "home"
+        await pilot.press("enter")
+        await settle(app)
+        renamed = aliases()
+        row(view, 2).focus()
+        await pilot.press("ctrl+z")
+        await settle(app)
+        return renamed, aliases(), [n.message for n in app._notifications]
+
+    renamed, undone, toasts = drive_registry(go)
+    assert renamed == {1: None, 2: "home"}
+    assert undone == {1: None, 2: "work"}, "ctrl+z: the name it replaced"
+    assert "Saved slot 2's name · Undo: ctrl+z" in toasts, toasts

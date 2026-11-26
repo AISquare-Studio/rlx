@@ -57,6 +57,7 @@ from aisquare.cli.ui.attach import (
     ReturnTo,
     Target,
 )
+from aisquare.cli.ui.save_model import STALE, UNDO_BINDING, SavesAsYouGo, Stale
 from aisquare.cli.ui.spawn import SpawnCompleted, SpawnDialog
 from aisquare.core import personas as core
 from aisquare.core.agent_adapters import get_adapter
@@ -181,7 +182,28 @@ def details_text(entry: Entry) -> Text:
     return text
 
 
-class PersonasTab(Vertical):
+Left = tuple[str | None, bytes | None]
+"""What a change left in a persona's folder: its SKILL.md's text and its ``.persona.json``."""
+
+
+def _left_on_disk(directory: Path) -> Left:
+    """What is in the persona folder ``directory`` now: its SKILL.md's text and its
+    ``.persona.json`` (an import's record, when and from where), ``None`` for one not there.
+    Kept when a change is kept, and read again before its undo acts: the persona may have been
+    changed since by another way in (the Spawn dialog's *Import…*, a shell), and an undo acting
+    on that would remove it, or write an older text over it (the reviewer of #24, #1813)."""
+    try:
+        text: str | None = (directory / core.SKILL_FILE).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        text = None
+    try:
+        record: bytes | None = (directory / core.PROVENANCE_FILE).read_bytes()
+    except OSError:
+        record = None
+    return text, record
+
+
+class PersonasTab(SavesAsYouGo, Vertical):
     """The personas: pick one, preview exactly what is injected, act on it. With no
     ``project`` (Settings ▸ Personas), yours and the bundled ones, and no attach."""
 
@@ -211,6 +233,7 @@ class PersonasTab(Vertical):
         Binding("delete", "remove", "remove"),
         Binding("v", "validate", "validate"),
         Binding("i", "import_persona", "import"),
+        UNDO_BINDING,
     ]
 
     def __init__(self, project: ProjectInfo | None = None, *, id: str | None = None) -> None:
@@ -503,24 +526,101 @@ class PersonasTab(Vertical):
             self.reload()
             return
         persona = result.persona
-        self.notify(f"✓ imported {persona.name} ({result.engine})", timeout=6, markup=False)
+        said = f"✓ imported {persona.name} ({result.engine})"
+        if result.replaced:
+            # It took the place of a persona of that name, which rlx keeps no copy of: ctrl+z
+            # removing the import would lose both, so none is offered, and the page's earlier
+            # undos for that persona go too: each would act on the import now in its place.
+            self.forget((persona.layer, persona.name))
+            self.notify(said, timeout=6, markup=False)
+        else:
+            left = _left_on_disk(persona.path)
+            self.kept(
+                f"the import of {persona.name}",
+                lambda: self._persona_take_back(persona.name, persona.layer, persona.path, left),
+                said=said,
+                key=(persona.layer, persona.name),
+            )
         for warning in result.warnings:
             self.notify(warning, severity="warning", timeout=8, markup=False)
         self.reload(select=f"{persona.layer}:{persona.name}")
 
+    # --- ctrl+z (M5): an import, a new persona or an edit taken back -------------------------
+
+    def _persona_take_back(
+        self, name: str, layer: Layer, directory: Path, left: Left
+    ) -> bool | Stale:
+        """Undo of an import or a *New*: the persona it made, removed again; whether it was. One
+        changed since it was made (:func:`_left_on_disk`) is not this page's to remove."""
+        if _left_on_disk(directory) != left:
+            return STALE
+        try:
+            personas_service.remove(name, layer=layer, root=self.root)
+        except (PersonaError, OSError) as exc:
+            self.notify(dialogs.failure(exc), severity="error", timeout=8, markup=False)
+            return False
+        finally:
+            self.reload()
+        return True
+
+    @staticmethod
+    def _skill_text(entry: Entry) -> str | None:
+        """``entry``'s SKILL.md as it is now, for ctrl+z to put back; ``None`` when unreadable
+        (an edit of it is then not undoable) or bundled (never edited in place)."""
+        if entry.layer == "bundled":
+            return None
+        try:
+            return (entry.path / core.SKILL_FILE).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def _kept_edit(self, entry: Entry, before: str | None) -> None:
+        """An editor closed having saved ``entry``: kept, with ctrl+z writing ``before`` back
+        through the one writer (``services.personas.save``), when the text did change."""
+        if before is None or self._skill_text(entry) in (None, before):
+            return
+        left = _left_on_disk(entry.path)
+        self.kept(
+            f"{entry.name}'s SKILL.md",
+            lambda: self._persona_put_text(entry, before, left),
+            key=(entry.layer, entry.name),
+        )
+
+    def _persona_put_text(self, entry: Entry, text: str, left: Left) -> bool | Stale:
+        """Undo of an edit: ``text`` written back; whether it was. A SKILL.md changed since the
+        edit (:func:`_left_on_disk`) is not written over."""
+        if _left_on_disk(entry.path) != left:
+            return STALE
+        try:
+            personas_service.save(entry.name, text, root=self.root, layer=entry.layer)
+        except (PersonaError, OSError) as exc:
+            self.notify(dialogs.failure(exc), severity="error", timeout=8, markup=False)
+            return False
+        finally:
+            self.reload(select=entry.key)
+        return True
+
     @on(Button.Pressed, "#persona-new")
     def _new(self) -> None:
-        self.app.push_screen(dialogs.NewPersonaScreen(self.root), callback=self._created)
+        self.app.push_screen(dialogs.NewPersonaScreen(self.root), callback=self._persona_created)
 
-    def _created(self, created: dialogs.NewPersona | None) -> None:
+    def _persona_created(self, created: dialogs.NewPersona | None) -> None:
         if created is None:
             return
+        left = _left_on_disk(created.path)
+        self.kept(
+            f"the new persona {created.name}",
+            lambda: self._persona_take_back(created.name, created.layer, created.path, left),
+            key=(created.layer, created.name),
+        )
         self.reload(select=f"{created.layer}:{created.name}")
+        made = Entry(created.name, created.layer, created.path)
+        before = self._skill_text(made)
         self.app.push_screen(
             dialogs.EditPersonaScreen(
                 created.name, created.layer, created.path, self.root, text=created.text
             ),
-            callback=lambda saved: self.reload(select=f"{created.layer}:{created.name}"),
+            callback=lambda saved: self._edited_text(made, before, bool(saved)),
         )
 
     @on(Button.Pressed, "#persona-edit")
@@ -537,31 +637,40 @@ class PersonasTab(Vertical):
 
     def _open(self, entry: Entry) -> None:
         """The SKILL.md in ``$EDITOR``, in a pane (#212). The text box editor for a bundled
-        persona (read-only, with *Save as…*) and wherever no pane can open."""
+        persona (read-only, with *Save as…*) and wherever no pane can open. What it held
+        before is kept for ctrl+z (M5)."""
+        before = self._skill_text(entry)
         if entry.layer != "bundled" and dialogs.editor_unavailable() is None:
             self.app.push_screen(
                 dialogs.EditorPaneScreen(entry.name, entry.layer, entry.path, self.root),
-                callback=lambda result: self._edited(entry, result),
+                callback=lambda result: self._edited(entry, result, before),
             )
             return
-        self._open_text(entry)
+        self._open_text(entry, before)
 
-    def _open_text(self, entry: Entry) -> None:
+    def _open_text(self, entry: Entry, before: str | None) -> None:
         self.app.push_screen(
             dialogs.EditPersonaScreen(entry.name, entry.layer, entry.path, self.root),
-            callback=lambda saved: self.reload(select=entry.name if saved else entry.key),
+            callback=lambda saved: self._edited_text(entry, before, bool(saved)),
         )
 
-    def _edited(self, entry: Entry, result: bool | str | None) -> None:
+    def _edited_text(self, entry: Entry, before: str | None, saved: bool) -> None:
+        self.reload(select=entry.name if saved else entry.key)
+        if saved:
+            self._kept_edit(entry, before)
+
+    def _edited(self, entry: Entry, result: bool | str | None, before: str | None) -> None:
         """The editor pane closed: re-read the catalogue. A pane that could not open hands
         over to the text box editor, saying why."""
         if isinstance(result, str):
             self.notify(
                 f"{result} — editing in the text box instead", severity="warning", markup=False
             )
-            self._open_text(entry)
+            self._open_text(entry, before)
             return
         self.reload(select=entry.name if result else entry.key)
+        if result:
+            self._kept_edit(entry, before)
 
     @on(Button.Pressed, "#persona-export")
     def action_export(self) -> None:
@@ -601,6 +710,7 @@ class PersonasTab(Vertical):
             except (PersonaError, OSError) as exc:
                 self.notify(dialogs.failure(exc), severity="error", timeout=8, markup=False)
             else:
+                self.forget((entry.layer, entry.name))  # their undos would act on nothing now
                 self.notify(f"✓ removed {removed}", timeout=6, markup=False)
             self.reload()
 

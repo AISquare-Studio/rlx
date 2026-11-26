@@ -171,9 +171,13 @@ def bundled_ngrok_with(
 
 
 async def paste(pilot: Pilot[None], section: RemotePanel, token: str) -> None:
-    """Paste ``token`` into the slot and Save, and let the save answer."""
-    section.query_one("#settings-remote-token-field", Input).value = token
-    section.query_one("#settings-remote-token-save", Button).press()
+    """Paste ``token`` into the slot and press Enter (M5: there is no *Save*), and let the save
+    answer."""
+    field = section.query_one("#settings-remote-token-field", Input)
+    field.focus()
+    await pilot.pause()
+    field.value = token
+    await pilot.press("enter")
     await pilot.pause()
     await settle_page(pilot.app)
     await pilot.pause()
@@ -563,3 +567,55 @@ def test_the_authtoken_is_found_where_ngrok_config_add_authtoken_writes_it(
 def test_the_authtoken_in_the_environment_signs_ngrok_in_too(tmp_path: Path) -> None:
     assert has_authtoken({"NGROK_AUTHTOKEN": "2abc"}, [tmp_path / "none.yml"])
     assert not has_authtoken({"NGROK_AUTHTOKEN": "  "}, [tmp_path / "none.yml"])
+
+
+# --- M5: a token typed and not entered, as the page goes ----------------------------------
+
+
+@NEEDS_POSIX
+def test_a_token_typed_and_not_entered_is_saved_when_rlx_quits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #24: quitting before the field was left lost what it held. It is checked
+    and saved as Enter would, before rlx goes."""
+    bundled_ngrok_with(tmp_path, monkeypatch)
+    token = "2abcDEF_0123456789abcdefghijklmnopqrstuvwxyzAB"
+
+    async def go(pilot: Pilot[None]) -> None:
+        section = await opened(pilot)
+        field = section.query_one("#settings-remote-token-field", Input)
+        field.focus()
+        await pilot.pause()
+        field.value = token
+        pilot.app.exit()  # no Enter, the field never left
+
+    drive(go, tunnel=missing_ngrok)
+    assert saved_token() == token
+
+
+@NEEDS_POSIX
+def test_a_token_typed_and_not_entered_is_saved_when_the_page_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Esc closes the Remote page with the token typed: saved, off the UI thread, and said."""
+    bundled_ngrok_with(tmp_path, monkeypatch)
+    token = "2abcDEF_0123456789abcdefghijklmnopqrstuvwxyzAB"
+
+    async def go(pilot: Pilot[None]) -> list[str]:
+        app = pilot.app
+        assert isinstance(app, FleetApp)
+        section = await opened(pilot)
+        told = record(app)
+        field = section.query_one("#settings-remote-token-field", Input)
+        field.focus()
+        await pilot.pause()
+        field.value = token
+        await pilot.press("escape")
+        await until(pilot, lambda: not isinstance(app.screen, RemotePanel), what="the page shut")
+        await until(pilot, lambda: saved_token() == token, what="the token saved")
+        await until(pilot, lambda: "✓ ngrok token saved" in told, what="the toast")
+        return told
+
+    told = drive(go, tunnel=missing_ngrok)
+    assert saved_token() == token
+    assert not any(token in said for said in told), "the token is said nowhere"

@@ -86,6 +86,7 @@ from textual.worker import Worker, WorkerState
 
 from aisquare.cli.common import format_reset, local_time
 from aisquare.cli.ui import adopt_picker
+from aisquare.cli.ui.save_model import UNDO_BINDING, SavesAsYouGo
 from aisquare.cli.ui.terminal import InPlaceField, TerminalPane
 from aisquare.cli.ui.ticks import while_running
 from aisquare.core import browser, paths
@@ -196,10 +197,13 @@ class _RenameWrite(NamedTuple):
 
 
 class _Renamed(NamedTuple):
-    """What a *Rename* write reports: the account as the service stored it, and the notice."""
+    """What a *Rename* write reports: the account as the service stored it, and the notice; the
+    name it replaced, and whether it was Undo's (M5)."""
 
     account: ClaudeAccount
     said: str
+    previous: str | None = None
+    undoing: bool = False
 
 
 @dataclass
@@ -1578,7 +1582,7 @@ class AccountRow(Vertical, can_focus=True):
         button.disabled = not offered
 
 
-class AccountsView(Vertical):
+class AccountsView(SavesAsYouGo, Vertical):
     """The page. ``show`` paints an overview; the buttons run the flows in the module docstring."""
 
     DEFAULT_CSS = """
@@ -1606,7 +1610,7 @@ class AccountsView(Vertical):
     AccountsView #login-actions { height: auto; padding: 0 1; }
     """
 
-    BINDINGS: ClassVar = [Binding("w", "go_welcome", "welcome", show=False)]
+    BINDINGS: ClassVar = [Binding("w", "go_welcome", "welcome", show=False), UNDO_BINDING]
 
     def __init__(
         self,
@@ -2479,7 +2483,7 @@ class AccountsView(Vertical):
         else:
             self._notice(f"slot {row.ref}: rename cancelled — nothing changed")
 
-    def rename_account(self, key: int | str, typed: str) -> None:
+    def rename_account(self, key: int | str, typed: str, *, undoing: bool = False) -> None:
         """Name the row keyed ``key`` ``typed`` (blank: unname it) off the UI thread, as
         ``accounts alias`` does.
 
@@ -2505,13 +2509,16 @@ class AccountsView(Vertical):
         key = str(key)
         named = self.row_of(key)
         ref = named.ref if named is not None else key  # `codex:5` where 5 is shared (#100)
+        previous = named.status.account.alias if named is not None else None
 
         def work() -> _Renamed:
             with self._arranging:
                 account = accounts_service.set_alias(ref, alias)
             if alias is None:
-                return _Renamed(account, f"✓ slot {ref}: alias cleared")
-            return _Renamed(account, f"✓ slot {ref} is now called {account.alias}")
+                return _Renamed(account, f"✓ slot {ref}: alias cleared", previous, undoing)
+            return _Renamed(
+                account, f"✓ slot {ref} is now called {account.alias}", previous, undoing
+            )
 
         worker = self.run_worker(
             work,
@@ -2529,6 +2536,13 @@ class AccountsView(Vertical):
         if state is WorkerState.SUCCESS and isinstance(worker.result, _Renamed):
             stored = worker.result.account
             self._notice(worker.result.said, "ok")
+            if not worker.result.undoing and write is not None:
+                # Kept as every settings change is (M5): ctrl+z names the slot as it was.
+                back, key = worker.result.previous or "", write.key
+                self.kept(
+                    f"slot {stored.slot}'s name",
+                    lambda: self.rename_account(key, back, undoing=True),
+                )
             self._saved[(stored.agent, stored.slot)] = _Saved(stored.alias)
             if self.overview is not None:
                 self._paint_claude(self.overview)  # the label and the next prefill say it now
