@@ -51,13 +51,20 @@ bound both validators agree on.
 | `settings-changed.json` | `settings.changed`'s and `settings.deleted`'s data, on the `settings` topic: `{key, version, by_device?}` |
 | `settings-delete.json` | `settings.delete`'s params: `{key, expected_version?}`. The reply is the setting at version 0 |
 | `run-start.json` | `run.start`'s params (7.5): `{run_id, kind, prompt?, mount, needs_connectors?, output_schema?, persist_session?, space?, append_system_prompt?, partial?, timeout_s?, deadline_ms?, pinned_call?, needs_you_when?, job_id?}`. `run_id` is a lower-case UUID, Claude Code's session id; `space` follows the space name rule |
-| `run-ref.json` | One run by id, `{run_id}`: `run.start`'s reply, and `run.cancel`'s params |
+| `run-ref.json` | One run by id, `{run_id}`: `run.start`'s reply, and `run.cancel`'s and `run.get`'s params |
+| `run-resume.json` | `run.resume`'s params: `{run_id, reply?}`. Refused: `run_alive`, `not_resumable` (a `send_executor`), `no_session` |
+| `run-resume-reply.json` | `run.resume`'s reply: `{run_id, attempt}`, the new attempt, from 2 |
+| `run-get-reply.json` | `run.get`'s reply: `{run_id, kind, state, attempt, space, client, job_id?, started_at, ended_at?, finished_at?, last_run_seq, last_event?, session, structured_output?, calls}`, from the run's durable record, so it survives a restart |
+| `run-list.json` | `run.list`'s params: `{states?, job_id?, limit?}` |
+| `run-list-reply.json` | `run.list`'s reply: `{runs: [{run_id, kind, state, started_at, ended_at?, last_run_seq, job_id?, client, attempt, space}]}`, the latest started first |
+| `run-events.json` | `run.events`'s params: `{run_id, from_run_seq?}` (default 1) |
+| `run-events-reply.json` | `run.events`' reply, which ends its stream: `{run_id, last_run_seq}` |
 | `run-cancel-reply.json` | `run.cancel`'s reply: `{run_id, cancelled, state}`. A run that had ended stays as it was, `cancelled: false` |
-| `run-event.json` | One event of a run's stream: `event.json`, plus each 7.5 run event type's `data` (`run.queued`, `run.started`, `run.text`, `run.tool_result`, `run.rate_limited`, `run.needs_you`, `run.done`, `run.failed`). Other types need only `event.json` |
+| `run-event.json` | One event of a run's stream: `event.json`, plus each 7.5 run event type's `data` (`run.queued`, `run.started`, `run.text`, `run.tool_result`, `run.rate_limited`, `run.needs_you`, `run.done`, `run.failed`) and 7.3's `needs_you.raised {id, source, run_id?, agent_id?, reason, text}` and `needs_you.cleared {id}`. Other types need only `event.json` |
 | `run-event-list.json` | A JSON array of them, as `jq -s .` makes of a capture of the `run` and `needs_you` topics |
 | `space.json` | `space.ensure`'s and `space.erase`'s params: `{name}`, 1 to 64 lower-case letters, digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, no `.` at the end, not a Windows device name |
 | `space-ensure-reply.json` | `space.ensure`'s reply: `{name, path}`, the space's folder, absolute and resolved |
-| `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path]}` |
+| `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path], refused?: [{path, reason}]}`. Refused whole: `runs_live` (`detail.run_ids`), `link_refused` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 

@@ -30,7 +30,7 @@ the same files.
 | Scenario | What it does |
 |---|---|
 | `hello` | One answer, then a successful result |
-| `slow` | Says it is working, then takes `FAKE_CLAUDE_SLOW_MS` (default 60,000) before it answers. It ignores stdin closing, so only rlxd ending its tree ends it |
+| `slow` | Says it is working, then takes `FAKE_CLAUDE_SLOW_MS` (default 60,000) before it answers; the prompt `quick` makes it answer at once. It ignores stdin closing, so only rlxd ending its tree ends it |
 | `structured` | With `--json-schema`, its result's `structured_output` is `structured/output.json` |
 | `rate-limit` | A `rate_limit_event` an hour before the limit resets, then an answer |
 | `asks` | Ends with the output `{"status":"needs_you","question":"Which channel?"}`; resumed, it reads the reply and ends `{"status":"done","channel":<reply>}` |

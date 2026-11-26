@@ -10,10 +10,18 @@
 //!   a stream-json user message, and keeps stdin open for the whole run. Each stream-json
 //!   line becomes run events ([`stream`]). At the `result`, stdin is closed, and the
 //!   tree is killed if it has not exited [`EXIT_GRACE`] later.
-//! - **The end.** `run.done`, or `run.failed {reason}`: `error` when Claude Code fails,
-//!   crashes, or can't be found or started, `timeout` when `timeout_s` runs out,
-//!   `cancelled` on `run.cancel`, and `engine_restarted` when rlxd stops with the run in
-//!   flight. Each failure keeps the assistant text the run got out (`partial_text`).
+//! - **The end.** `run.done`; `run.needs_you {reason: "question"}` when the output matches
+//!   `needs_you_when`, after `needs_you.raised` on the `needs_you` topic; or `run.failed
+//!   {reason}`: `error` when Claude Code fails, crashes, or can't be found or started,
+//!   `timeout` when `timeout_s` runs out, `cancelled` on `run.cancel`, and
+//!   `engine_restarted` when rlxd stops with the run in flight, or is found to have
+//!   stopped so at its next start ([`Runner::new`]). Each failure keeps the assistant text
+//!   the run got out (`partial_text`).
+//! - **The lifecycle** (5.4): `run.resume` goes on with a run that has no live process as
+//!   a new attempt; `run.get` and `run.list` read what rlxd holds, which its records on
+//!   disk hold too, so they survive a restart; `run.events` replays a run's log from disk
+//!   ([`Replay`]) and follows it while it is live; `space.erase` deletes a space with its
+//!   runs' sessions and records.
 //! - **Events** go through one funnel ([`Runner::emit`]), under the run's own lock: the
 //!   bus numbers each, the line is appended to the run's log on disk ([`store`]), and only
 //!   then is it published. Every event but a partial text chunk is fsynced first, and an
@@ -35,9 +43,12 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Data, ErrorBody, FailReason, Mount, RunCancelData, RunDoneData, RunFailedData, RunId, RunKind,
-    RunQueuedData, RunRateLimitedData, RunRef, RunStartParams, RunStartedData, RunState,
-    RunTextData, RunToolResultData, codes, run_types,
+    Data, ErrorBody, Event, FailReason, Mount, NeedsYouClearedData, NeedsYouRaisedData,
+    NeedsYouReason, RefusedPath, RunCancelData, RunDoneData, RunEventsData, RunEventsParams,
+    RunFailedData, RunGetData, RunId, RunKind, RunListData, RunListParams, RunNeedsYouData,
+    RunQueuedData, RunRateLimitedData, RunRef, RunResumeData, RunResumeParams, RunStartParams,
+    RunStartedData, RunState, RunSummary, RunTextData, RunToolResultData, SpaceEraseData, codes,
+    run_types, topics,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -106,8 +117,10 @@ struct Run {
     client: String,
     dir: RunDir,
     inner: Mutex<RunInner>,
-    /// Changes with the run's state: what `run.cancel` waits on.
+    /// Changes with the run's state: what `run.cancel` and `run.events` wait on.
     state: watch::Sender<RunState>,
+    /// The last `run_seq` in the run's log on disk: what `run.events` follows.
+    logged: watch::Sender<u64>,
 }
 
 struct RunInner {
@@ -127,10 +140,16 @@ struct RunInner {
     placed: bool,
     /// Whether the bus numbers this run on from `last_run_seq`.
     seeded: bool,
-    /// The event log, open to append.
+    /// The event log, open to append while the run is in flight.
     events: Option<std::fs::File>,
     /// This attempt's assistant text: its last [`PARTIAL_TEXT`] bytes.
     text: String,
+    /// The run's last event, as published.
+    last_line: Option<bus::Line>,
+    /// The next attempt's first user message, when it is not the prompt: a resume's.
+    reply: Option<String>,
+    /// The `needs_you.raised` the run has out, to clear when it goes on or ends.
+    needs_you: Option<String>,
 }
 
 /// How durable an event is before it is published.
@@ -149,8 +168,12 @@ enum Durability {
 /// How an attempt ended.
 enum End {
     Done(RunDoneData),
+    NeedsYou(RunNeedsYouData, RunDoneData),
     Failed(RunFailedData),
 }
+
+/// What `resume` says a Claude Code told to go on, when the app sends no reply.
+const CONTINUE: &str = "Continue.";
 
 /// What reading an attempt's stream came to.
 enum Streamed {
@@ -166,16 +189,115 @@ enum Streamed {
 
 impl Runner {
     /// The runner of `home`, publishing on `bus`. It must be made inside rlxd's runtime.
+    ///
+    /// It reads every run an earlier rlxd recorded, so `run.list` and `run.get` know them.
+    /// A run that was queued or running then is ended `failed {reason:
+    /// "engine_restarted"}`, after its process tree, if it still runs, is killed: its
+    /// leader's pid is killed only when the process with that pid started when the
+    /// record says, so a pid the OS has given another process since is left alone.
     pub fn new(home: Home, bus: Arc<Bus>) -> Arc<Self> {
         let rlxd = std::env::current_exe().ok();
-        Arc::new(Self {
+        let runner = Arc::new(Self {
             home,
             bus,
             spawner: Spawner::start(),
             hook: argv::hook_beside(rlxd.as_deref()),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
-        })
+        });
+        runner.load();
+        runner
+    }
+
+    /// Reads the runs on disk, ending those an earlier rlxd left in flight.
+    fn load(&self) {
+        let Ok(entries) = std::fs::read_dir(store::runs_dir(&self.home)) else {
+            return;
+        };
+        let mut restarted = Vec::new();
+        for entry in entries.flatten() {
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| RunId::new(name).ok())
+            else {
+                continue;
+            };
+            let dir = RunDir::of(&self.home, &id);
+            let record = match dir.read_record() {
+                Ok(record) if record.run_id == id => record,
+                Ok(_) => {
+                    warning!("run {id}: its record names another run; it is left as it is");
+                    continue;
+                }
+                Err(e) => {
+                    warning!("run {id}: its record could not be read ({e}); it is left as it is");
+                    continue;
+                }
+            };
+            let live = record.state.is_live();
+            if live {
+                if let Some(process) = &record.process
+                    && let Some(started) = &process.started
+                    && process::kill_recorded(process.pid, started)
+                {
+                    info!("run {id}: killed its process tree, left by an earlier rlxd");
+                }
+                if let Err(e) = store::repair(&dir.events()) {
+                    warning!("run {id}: its log could not be repaired: {e}");
+                }
+            }
+            let tail = store::tail(&dir.events()).unwrap_or_else(|e| {
+                warning!("run {id}: its log could not be read: {e}");
+                store::Tail::default()
+            });
+            let text = if live {
+                store::attempt_text(&dir.events(), record.attempt)
+            } else {
+                String::new()
+            };
+            let last_run_seq = record.last_run_seq.max(tail.last_run_seq);
+            let run = Arc::new(Run {
+                job_id: record.job_id.clone(),
+                client: record.client.clone(),
+                dir,
+                inner: Mutex::new(RunInner {
+                    state: record.state,
+                    attempt: record.attempt,
+                    started_at: record.started_at.clone(),
+                    ended_at: record.ended_at.clone(),
+                    last_run_seq,
+                    session: record.session.clone(),
+                    structured_output: record.structured_output.clone(),
+                    process: None,
+                    tree: None,
+                    ending: None,
+                    placed: false,
+                    seeded: false,
+                    events: None,
+                    text,
+                    last_line: tail.last_line.map(bus::Line::from),
+                    reply: None,
+                    needs_you: None,
+                }),
+                state: watch::Sender::new(record.state),
+                logged: watch::Sender::new(last_run_seq),
+                params: record.params,
+            });
+            if live {
+                restarted.push(Arc::clone(&run));
+            }
+            self.runs().by_id.insert(id, run);
+        }
+        for run in restarted {
+            let mut inner = run.inner();
+            let failed = RunFailedData::new(
+                FailReason::EngineRestarted,
+                "rlxd stopped while the run was in flight; run.resume goes on with it",
+                inner.text.clone(),
+            );
+            self.end(&run, &mut inner, End::Failed(failed));
+        }
     }
 
     fn runs(&self) -> MutexGuard<'_, Runs> {
@@ -267,8 +389,12 @@ impl Runner {
                 seeded: false,
                 events: None,
                 text: String::new(),
+                last_line: None,
+                reply: None,
+                needs_you: None,
             }),
             state: watch::Sender::new(RunState::Queued),
+            logged: watch::Sender::new(0),
             params,
         });
         let created = blocking(|| {
@@ -361,6 +487,298 @@ impl Runner {
         Ok(RunCancelData::new(id.clone(), now == RunState::Failed, now))
     }
 
+    /// `run.resume`: a run with no live process goes on as a new attempt, with the same
+    /// `run_id` and `--resume <run_id>`, its own settings file, and the app's reply (or
+    /// "Continue.") as its first message. It takes its place in its pool, as a start does.
+    /// Refused: `run_alive` for a queued or running run, `not_resumable` for a
+    /// `send_executor` (a send is never retried), `no_session` for a session-less run.
+    pub fn resume(self: &Arc<Self>, params: RunResumeParams) -> Result<RunResumeData, ErrorBody> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(refusal(
+                codes::RUN_START_FAILED,
+                "rlxd is stopping: resume the run once it is back".to_owned(),
+            ));
+        }
+        let run = self.find(&params.run_id)?;
+        let id = params.run_id;
+        let mut runs = self.runs();
+        let mut inner = run.inner();
+        if inner.state.is_live() {
+            return Err(refusal(
+                codes::RUN_ALIVE,
+                format!(
+                    "run {id} is {}: only a run with no live process resumes",
+                    inner.state
+                ),
+            ));
+        }
+        if run.params.kind == RunKind::SendExecutor {
+            return Err(refusal(
+                codes::NOT_RESUMABLE,
+                format!(
+                    "run {id} is a send_executor, which is never resumed: a send is never retried"
+                ),
+            ));
+        }
+        if !run.params.persists() {
+            return Err(refusal(
+                codes::NO_SESSION,
+                format!(
+                    "run {id} kept no session (persist_session: false), so there is none to resume"
+                ),
+            ));
+        }
+        inner.attempt += 1;
+        inner.ending = None;
+        inner.reply = params.reply;
+        inner.ended_at = None;
+        inner.state = RunState::Queued;
+        run.state.send_replace(RunState::Queued);
+        self.clear_needs_you(&mut inner);
+        let attempt = inner.attempt;
+        let kind = run.params.kind;
+        let pool = runs.pools.entry(kind).or_default();
+        let queued = if pool.active < kind.pool() {
+            pool.active += 1;
+            None
+        } else {
+            pool.waiting.push_back(Arc::clone(&run));
+            Some(u32::try_from(pool.waiting.len()).unwrap_or(u32::MAX))
+        };
+        drop(runs);
+        info!("run {id}: resumed, attempt {attempt}");
+        match queued {
+            None => {
+                drop(inner);
+                self.launch(&run);
+            }
+            Some(position) => {
+                let record = run.record(&inner);
+                if let Err(e) = blocking(|| run.dir.write_record(&record)) {
+                    warning!("run {id}: its record was not written: {e}");
+                }
+                self.emit(
+                    &run,
+                    &mut inner,
+                    run_types::QUEUED,
+                    &RunQueuedData::new(position),
+                );
+            }
+        }
+        Ok(RunResumeData::new(id, attempt))
+    }
+
+    /// `run.get`: one run, from what rlxd holds of it, which its record and log on disk
+    /// hold too, so it survives a restart.
+    pub fn get(&self, id: &RunId) -> Result<RunGetData, ErrorBody> {
+        let run = self.find(id)?;
+        let inner = run.inner();
+        let mut data = RunGetData::new(
+            id.clone(),
+            run.params.kind,
+            inner.state,
+            inner.started_at.clone(),
+        );
+        data.attempt = inner.attempt;
+        data.space.clone_from(&run.params.space);
+        data.client.clone_from(&run.client);
+        data.job_id.clone_from(&run.job_id);
+        data.ended_at.clone_from(&inner.ended_at);
+        data.finished_at.clone_from(&inner.ended_at);
+        data.last_run_seq = inner.last_run_seq;
+        data.last_event = inner
+            .last_line
+            .as_ref()
+            .and_then(|line| serde_json::from_slice::<Event>(line).ok());
+        data.session.clone_from(&inner.session);
+        data.structured_output.clone_from(&inner.structured_output);
+        Ok(data)
+    }
+
+    /// `run.list`: every run rlxd knows, live or ended, those from before a restart too,
+    /// the latest started first, of `states` and `job_id` when given, at most `limit`.
+    pub fn list(&self, params: &RunListParams) -> RunListData {
+        let runs = self.runs();
+        let mut summaries: Vec<RunSummary> = runs
+            .by_id
+            .values()
+            .filter(|run| params.job_id.is_none() || run.job_id == params.job_id)
+            .filter_map(|run| {
+                let inner = run.inner();
+                if let Some(states) = &params.states
+                    && !states.contains(&inner.state)
+                {
+                    return None;
+                }
+                let mut summary = RunSummary::new(
+                    run.params.run_id.clone(),
+                    run.params.kind,
+                    inner.state,
+                    inner.started_at.clone(),
+                );
+                summary.ended_at.clone_from(&inner.ended_at);
+                summary.last_run_seq = inner.last_run_seq;
+                summary.job_id.clone_from(&run.job_id);
+                summary.client.clone_from(&run.client);
+                summary.attempt = inner.attempt;
+                summary.space.clone_from(&run.params.space);
+                Some(summary)
+            })
+            .collect();
+        drop(runs);
+        summaries.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| a.run_id.cmp(&b.run_id))
+        });
+        if let Some(limit) = params.limit {
+            summaries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        RunListData::new(summaries)
+    }
+
+    /// `run.events`: where a replay of the run's log on disk starts. It never reads the
+    /// bus's buffer, so a run the buffer has dropped replays whole.
+    pub fn replay(&self, params: &RunEventsParams) -> Result<Replay, ErrorBody> {
+        let run = self.find(&params.run_id)?;
+        Ok(Replay {
+            reader: store::Reader::new(run.dir.events()),
+            from: params.from_run_seq,
+            through: 0,
+            logged: run.logged.subscribe(),
+            states: run.state.subscribe(),
+            run,
+        })
+    }
+
+    /// `space.erase`: deletes the space's folder, the Claude Code session files of its
+    /// runs, and rlxd's records of them (2.5). Refused with `runs_live` while a run in the
+    /// space is queued or running, and with `link_refused` when the space's folder is a
+    /// link; nothing is removed then.
+    ///
+    /// Session files are `projects/<encoded space dir>/<run_id>.jsonl` under each config
+    /// directory rlx knows ([`config_dirs`]). Every project folder is looked in, since
+    /// only the space's runs are named and run ids are unique: an encoding that differs
+    /// from Claude Code's can't hide one. A project folder that is a link is not followed:
+    /// what would be found through it is named in `refused`.
+    pub fn erase(&self, name: &str) -> Result<SpaceEraseData, ErrorBody> {
+        let space = spaces::root(&self.home).join(name);
+        if std::fs::symlink_metadata(&space).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(refusal(
+                codes::LINK_REFUSED,
+                format!(
+                    "{} is a link, which rlxd does not follow: nothing was removed",
+                    space.display()
+                ),
+            ));
+        }
+        let mut runs = self.runs();
+        let ours: Vec<Arc<Run>> = runs
+            .by_id
+            .values()
+            .filter(|run| run.params.space == name)
+            .cloned()
+            .collect();
+        let live: Vec<String> = ours
+            .iter()
+            .filter(|run| run.inner().state.is_live())
+            .map(|run| run.params.run_id.to_string())
+            .collect();
+        if !live.is_empty() {
+            let message = format!(
+                "the space {name:?} has runs in flight ({}): cancel them, or wait for them, first",
+                live.join(", ")
+            );
+            let error = refusal(codes::RUNS_LIVE, message);
+            let detail = serde_json::json!({"run_ids": live});
+            return Err(match detail {
+                Value::Object(detail) => error.clone().with_detail(detail).unwrap_or(error),
+                _ => error,
+            });
+        }
+        let ids: Vec<String> = ours
+            .iter()
+            .map(|run| run.params.run_id.to_string())
+            .collect();
+        let mut removed = Vec::new();
+        let mut refused = Vec::new();
+        let mut failed = Vec::new();
+        let mut remove = |path: &std::path::Path, dir: bool| {
+            let result = if dir {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            match result {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => failed.push(format!("{}: {e}", path.display())),
+            }
+        };
+        blocking(|| {
+            if space.exists() {
+                // Named as space.ensure gave it: resolved.
+                remove(
+                    &spaces::resolved(&space).unwrap_or_else(|_| space.clone()),
+                    true,
+                );
+            }
+            for config in config_dirs() {
+                let projects = config.join("projects");
+                let Ok(meta) = std::fs::symlink_metadata(&projects) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    refused.push(RefusedPath::new(
+                        projects.display().to_string(),
+                        "the projects folder is a link out of the config directory: not followed",
+                    ));
+                    continue;
+                }
+                let Ok(entries) = std::fs::read_dir(&projects) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let folder = entry.path();
+                    let linked = entry.file_type().is_ok_and(|t| t.is_symlink());
+                    for id in &ids {
+                        let session = folder.join(format!("{id}.jsonl"));
+                        if linked {
+                            if session.exists() {
+                                refused.push(RefusedPath::new(
+                                    session.display().to_string(),
+                                    "its project folder is a link out of the config directory: not followed",
+                                ));
+                            }
+                        } else if std::fs::symlink_metadata(&session).is_ok() {
+                            // A session file that is itself a link: the link goes, not
+                            // what it names.
+                            remove(&session, false);
+                        }
+                    }
+                }
+            }
+            for run in &ours {
+                remove(run.dir.path(), true);
+            }
+        });
+        for run in &ours {
+            runs.by_id.remove(&run.params.run_id);
+        }
+        drop(runs);
+        if !failed.is_empty() {
+            return Err(refusal(
+                codes::INTERNAL,
+                format!(
+                    "the space was erased only in part; these could not be removed: {}",
+                    failed.join("; ")
+                ),
+            ));
+        }
+        info!("space {name:?} erased: {} paths removed", removed.len());
+        Ok(SpaceEraseData::new(removed, refused))
+    }
+
     /// Ends every run in flight as rlxd stops: no run starts from then on, each process
     /// tree is killed, and each run, queued or running, ends `failed {reason:
     /// "engine_restarted"}`, which `run.resume` goes on from.
@@ -426,11 +844,22 @@ impl Runner {
         if !(inner.state.is_live() || inner.state == RunState::NeedsYou) {
             return false;
         }
+        let mut question = None;
         let (state, r#type, data) = match end {
             End::Done(done) => {
                 inner.session.clone_from(&done.session);
                 inner.structured_output.clone_from(&done.structured_output);
                 (RunState::Done, run_types::DONE, serde_json::to_value(&done))
+            }
+            End::NeedsYou(needs, done) => {
+                inner.session.clone_from(&done.session);
+                inner.structured_output.clone_from(&done.structured_output);
+                question = Some(needs.clone());
+                (
+                    RunState::NeedsYou,
+                    run_types::NEEDS_YOU,
+                    serde_json::to_value(&needs),
+                )
             }
             End::Failed(failed) => (
                 RunState::Failed,
@@ -438,19 +867,60 @@ impl Runner {
                 serde_json::to_value(&failed),
             ),
         };
+        // A needs-you that was out is settled by any end, a new needs-you included.
+        self.clear_needs_you(inner);
         inner.state = state;
         inner.ended_at = Some(clock::now());
         inner.tree = None;
         inner.process = None;
+        if let Some(needs) = question {
+            // Raised before the run's own event, so a capture that stops at
+            // run.needs_you holds it (7.3).
+            let id = format!("run:{}:{}", run.params.run_id, inner.attempt);
+            let reason = match needs.reason {
+                NeedsYouReason::Question => "question",
+                NeedsYouReason::Denied => "denied",
+            };
+            let text = needs
+                .question
+                .clone()
+                .unwrap_or_else(|| "The run needs you.".to_owned());
+            let raised = NeedsYouRaisedData::run(&id, run.params.run_id.as_str(), reason, text);
+            self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
+            inner.needs_you = Some(id);
+        }
         match data {
             Ok(Value::Object(data)) => self.publish(run, inner, r#type, data, Durability::State),
             other => warning!("run {}: {type} did not print: {other:?}", run.params.run_id),
         }
+        inner.events = None;
         self.bus.end_run(run.params.run_id.as_str());
         inner.seeded = false;
         run.state.send_replace(state);
         info!("run {}: {state}", run.params.run_id);
         std::mem::take(&mut inner.placed)
+    }
+
+    /// Clears the `needs_you.raised` the run has out, if it has one.
+    fn clear_needs_you(&self, inner: &mut RunInner) {
+        if let Some(id) = inner.needs_you.take() {
+            self.publish_needs_you(run_types::NEEDS_YOU_CLEARED, &NeedsYouClearedData::new(id));
+        }
+    }
+
+    /// Publishes `data` on the `needs_you` topic.
+    fn publish_needs_you(&self, r#type: &str, data: &impl Serialize) {
+        let published = match serde_json::to_value(data) {
+            Ok(Value::Object(data)) => self
+                .bus
+                .publish(topics::NEEDS_YOU, r#type, data)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            other => Err(format!("it did not print as an object: {other:?}")),
+        };
+        if let Err(e) = published {
+            warning!("{type} was not published: {e}");
+        }
     }
 
     /// When `placed`, gives a place in `kind`'s pool back, to the next run waiting if
@@ -615,8 +1085,14 @@ impl Runner {
         tree: &Tree,
     ) -> Streamed {
         let params = &run.params;
+        // A resumed attempt starts with the app's reply, or is told to go on.
+        let text = match run.inner().reply.take() {
+            Some(reply) => reply,
+            None if attempt > 1 => CONTINUE.to_owned(),
+            None => params.prompt.clone(),
+        };
         let prompt = json!({"type": "user", "message": {"role": "user",
-            "content": [{"type": "text", "text": params.prompt}]},
+            "content": [{"type": "text", "text": text}]},
             "parent_tool_use_id": null, "session_id": params.run_id.as_str()});
         let mut first = prompt.to_string();
         first.push('\n');
@@ -767,7 +1243,14 @@ impl Runner {
         };
         let persist = |numbered: bus::Numbered, line: &bus::Line| {
             inner.last_run_seq = numbered.run_seq;
+            inner.last_line = Some(bus::Line::clone(line));
             let sync = durability != Durability::Appended;
+            if inner.events.is_none() {
+                match run.dir.open_events() {
+                    Ok(events) => inner.events = Some(events),
+                    Err(e) => warning!("run {id}: its log could not be opened: {e}"),
+                }
+            }
             if let Some(events) = inner.events.as_mut()
                 && let Err(e) = store::append(events, line, sync)
             {
@@ -782,6 +1265,7 @@ impl Runner {
                     warning!("run {id}: its record was not written: {e}");
                 }
             }
+            run.logged.send_replace(numbered.run_seq);
         };
         if let Err(e) = blocking(|| self.bus.publish_run_durably(scope, r#type, data, persist)) {
             warning!("run {id}: {type} was not published: {e}");
@@ -813,6 +1297,89 @@ impl Run {
             calls: Vec::new(),
         }
     }
+}
+
+/// A `run.events` stream: the run's log on disk, read from where it was asked, then
+/// followed while the run is live.
+pub struct Replay {
+    run: Arc<Run>,
+    reader: store::Reader,
+    from: u64,
+    /// The last `run_seq` read, sent or not.
+    through: u64,
+    logged: watch::Receiver<u64>,
+    states: watch::Receiver<RunState>,
+}
+
+impl Replay {
+    /// The next lines to send, a few MiB at a time: none once it has caught up with the
+    /// log.
+    pub fn read(&mut self) -> Vec<bus::Line> {
+        let lines = match self.reader.read() {
+            Ok(lines) => lines,
+            Err(e) => {
+                warning!(
+                    "run {}: its log could not be read: {e}",
+                    self.run.params.run_id
+                );
+                return Vec::new();
+            }
+        };
+        let mut sent = Vec::new();
+        for line in lines {
+            let Some(run_seq) = serde_json::from_slice::<Value>(&line)
+                .ok()
+                .and_then(|event| event["data"]["run_seq"].as_u64())
+            else {
+                continue;
+            };
+            self.through = self.through.max(run_seq);
+            if run_seq >= self.from {
+                sent.push(bus::Line::from(line));
+            }
+        }
+        sent
+    }
+
+    /// Whether the stream is over: the run has no live process, and every event it
+    /// logged has been read.
+    pub fn done(&self) -> bool {
+        let inner = self.run.inner();
+        !inner.state.is_live() && self.through >= inner.last_run_seq
+    }
+
+    /// Waits until the run logs more, or its state changes.
+    pub async fn changed(&mut self) {
+        tokio::select! {
+            _ = self.logged.changed() => {}
+            _ = self.states.changed() => {}
+        }
+    }
+
+    /// The reply that ends the stream.
+    pub fn reply(&self) -> RunEventsData {
+        RunEventsData::new(self.run.params.run_id.clone(), self.through)
+    }
+}
+
+/// The Claude Code config directories whose sessions `space.erase` deletes:
+/// `CLAUDE_CONFIG_DIR` from rlxd's environment, and the default `~/.claude`.
+///
+/// TODO(manager): rlx knows every account's config directory (Python's
+/// `services/claude_accounts.py`); once the brain (#30) serves that list, take it from
+/// there, so an erase reaches every account's sessions.
+fn config_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(home) = std::env::home_dir() {
+        let default = home.join(".claude");
+        if !dirs.contains(&default) {
+            dirs.push(default);
+        }
+    }
+    dirs
 }
 
 /// The end of an attempt rlxd ended itself, for `reason`.
@@ -857,7 +1424,37 @@ fn outcome_of(run: &Run, outcome: stream::Outcome) -> End {
         .with_turns(outcome.duration_ms, outcome.num_turns);
     done.structured_output = outcome.structured_output;
     done.cost_usd = outcome.cost_usd;
-    End::Done(done)
+    match needs_you(&run.params, &done) {
+        Some(needs) => End::NeedsYou(needs, done),
+        None => End::Done(done),
+    }
+}
+
+/// Whether a finished run needs the user, as its `needs_you_when` says: its output,
+/// `structured_output` or else the result's text read as JSON, holds `equals` at
+/// `pointer`. The question is the text at `question_pointer`.
+fn needs_you(params: &RunStartParams, done: &RunDoneData) -> Option<RunNeedsYouData> {
+    let when = params.needs_you_when.as_ref()?;
+    let parsed;
+    let output = match &done.structured_output {
+        Some(output) => output,
+        None => {
+            parsed = serde_json::from_str::<Value>(done.result.trim()).ok()?;
+            &parsed
+        }
+    };
+    if output.pointer(&when.pointer) != Some(&when.equals) {
+        return None;
+    }
+    let question = when
+        .question_pointer
+        .as_deref()
+        .and_then(|pointer| output.pointer(pointer))
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        });
+    Some(RunNeedsYouData::question(question))
 }
 
 /// The environment a run's Claude Code gets beyond rlxd's own, which it inherits. The

@@ -1,0 +1,588 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunGetData",
+  "description": "`run.get`'s reply: one run, durably: its state, structured output and end survive an\nrlxd restart.",
+  "type": "object",
+  "properties": {
+    "attempt": {
+      "description": "Its attempt, from 1.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 1
+    },
+    "calls": {
+      "description": "Every gated call's ledger record (5.1).",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RunCall"
+      }
+    },
+    "client": {
+      "description": "The `client` of the connection that started it.",
+      "type": "string"
+    },
+    "ended_at": {
+      "description": "When it last ended, if it has: `finished_at` too.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "description": "When it last ended, if it has (the hub's name for `ended_at`).",
+      "type": "string",
+      "format": "date-time"
+    },
+    "job_id": {
+      "description": "The scheduler job that fired it.",
+      "type": "string"
+    },
+    "kind": {
+      "description": "Its kind.",
+      "$ref": "#/$defs/RunKind"
+    },
+    "last_event": {
+      "description": "Its last event, as the stream carried it.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Event"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "last_run_seq": {
+      "description": "Its last event's `run_seq`, 0 before its first.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "run_id": {
+      "description": "The run.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "session": {
+      "description": "The session to resume, or `null` for a session-less run or one not done yet.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "space": {
+      "description": "Its space.",
+      "type": "string"
+    },
+    "started_at": {
+      "description": "When `run.start` took it.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "state": {
+      "description": "Its state now.",
+      "$ref": "#/$defs/RunState"
+    },
+    "structured_output": {
+      "description": "Its structured output, once it has one."
+    }
+  },
+  "required": [
+    "run_id",
+    "kind",
+    "state",
+    "attempt",
+    "space",
+    "client",
+    "started_at",
+    "last_run_seq",
+    "calls"
+  ],
+  "$defs": {
+    "CallState": {
+      "description": "A gated call's ledger state (5.1).",
+      "oneOf": [
+        {
+          "description": "Decided, and not allowed to run.",
+          "type": "string",
+          "const": "decided"
+        },
+        {
+          "description": "Allowed, and running.",
+          "type": "string",
+          "const": "executing"
+        },
+        {
+          "description": "It ran and succeeded: sent.",
+          "type": "string",
+          "const": "ok"
+        },
+        {
+          "description": "It ran and failed: not sent.",
+          "type": "string",
+          "const": "error"
+        },
+        {
+          "description": "It was running when its run ended: it may have sent.",
+          "type": "string",
+          "const": "unknown"
+        }
+      ]
+    },
+    "Event": {
+      "title": "Event",
+      "description": "One event on the stream `events.subscribe` opens.\n\n```json\n{\"schema_version\": 1, \"seq\": 42, \"time\": \"2026-11-25T12:00:00.000Z\", \"topic\": \"run\",\n \"type\": \"run.text\", \"data\": {\"run_id\": \"…\", \"run_seq\": 3, \"kind\": \"task\", \"attempt\": 1}}\n```\n\nTwo sequences number events. `seq` is per home: every event has one, and\n`events.subscribe {since}` resumes after it. `data.run_seq` is per run: every event\nwhose topic is `run` has one, with the run's `run_id`, `kind`, `attempt` and\n`job_id?`, so a client can replay one run from a known point.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "description": "The type's own fields. On the `run` topic, also `run_id`, `run_seq`, `kind`,\n`attempt` and `job_id?`.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "schema_version": {
+          "description": "The schema version this document follows.",
+          "type": "integer",
+          "const": 1
+        },
+        "seq": {
+          "description": "Strictly increasing per home, from 1, across every topic. `events.subscribe\n{since}` resumes after it.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 1
+        },
+        "time": {
+          "description": "When it happened: RFC 3339, in UTC, to the millisecond (`2026-11-25T12:00:00.000Z`).",
+          "type": "string",
+          "format": "date-time"
+        },
+        "topic": {
+          "description": "What it is about, in snake_case, such as `run` or `needs_you`. A client ignores\ntopics it does not know.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "type": {
+          "description": "What happened: `<topic>.<event>`, the event in snake_case, such as `run.text`,\n`fleet.agent_spawned` or `connector.login.open_url`. It starts with this event's\nown topic. A client ignores types it does not know.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "daemon"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^daemon\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^run\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "job"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^job\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "connector"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^connector\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "pty"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^pty\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "hook"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^hook\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "fleet"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^fleet\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "board"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^board\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "needs_you"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^needs_you\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "upgrade"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^upgrade\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "settings"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^settings\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "install"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^install\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "signin"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^signin\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "attempt": {
+                    "description": "Which attempt of the run, from 1.",
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 1
+                  },
+                  "job_id": {
+                    "description": "The scheduler job that fired the run, if one did.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "description": "The run's kind, such as task or widget_refresh.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "run_id": {
+                    "description": "The run this event belongs to.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "run_seq": {
+                    "description": "Strictly increasing per run, from 1.",
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "run_seq",
+                  "kind",
+                  "attempt"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "required": [
+        "schema_version",
+        "seq",
+        "time",
+        "topic",
+        "type",
+        "data"
+      ]
+    },
+    "RunCall": {
+      "description": "One gated call of a run (5.1): what `run.get` tells the app about a send.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "Who decided: `app`, `rlxd`, `timeout` or `unreachable`.",
+          "type": "string"
+        },
+        "call_id": {
+          "description": "Claude Code's `tool_use_id`.",
+          "type": "string"
+        },
+        "decision": {
+          "description": "`allow`, `deny` or `draft`.",
+          "type": "string"
+        },
+        "input_sha256": {
+          "description": "The SHA-256 of the call's input as RFC 8785 JSON.",
+          "type": "string"
+        },
+        "state": {
+          "description": "Where it stands.",
+          "$ref": "#/$defs/CallState"
+        },
+        "tool": {
+          "description": "The tool.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool",
+        "input_sha256",
+        "state"
+      ]
+    },
+    "RunKind": {
+      "description": "What a run is for (7.5). Each kind has its own pool, and rlxd's gate rules for it\n(5.1).",
+      "oneOf": [
+        {
+          "description": "A task the user asked for. The only kind whose session persists by default.",
+          "type": "string",
+          "const": "task"
+        },
+        {
+          "description": "Sends one pinned call. Never resumed: a send is never retried.",
+          "type": "string",
+          "const": "send_executor"
+        },
+        {
+          "description": "Refreshes a widget's data.",
+          "type": "string",
+          "const": "widget_refresh"
+        },
+        {
+          "description": "One pinned read call for a scheduled watch.",
+          "type": "string",
+          "const": "watch"
+        },
+        {
+          "description": "rlxapp's send-time `Check`: no tools.",
+          "type": "string",
+          "const": "check"
+        },
+        {
+          "description": "Parses an instruction: no tools.",
+          "type": "string",
+          "const": "parse_instruction"
+        },
+        {
+          "description": "Writes a widget: no tools.",
+          "type": "string",
+          "const": "widget_author"
+        }
+      ]
+    },
+    "RunState": {
+      "description": "Where a run stands (7.5).",
+      "oneOf": [
+        {
+          "description": "Waiting for a place in its kind's pool.",
+          "type": "string",
+          "const": "queued"
+        },
+        {
+          "description": "Its Claude Code is running.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "It ended needing the user; `run.resume` goes on with it.",
+          "type": "string",
+          "const": "needs_you"
+        },
+        {
+          "description": "It ended with a result.",
+          "type": "string",
+          "const": "done"
+        },
+        {
+          "description": "It ended without one: `run.failed`'s `reason` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    }
+  }
+}

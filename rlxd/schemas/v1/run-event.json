@@ -157,6 +157,44 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "needs_you.raised"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/NeedsYouRaisedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "needs_you.cleared"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/NeedsYouClearedData"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -585,6 +623,57 @@
         "status"
       ]
     },
+    "NeedsYouClearedData": {
+      "description": "`needs_you.cleared`, on the `needs_you` topic: what `needs_you.raised` named no longer\nneeds the user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The `id` it was raised with.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "NeedsYouRaisedData": {
+      "description": "`needs_you.raised`, on the `needs_you` topic: something needs the user. A run raises\none with its `run.needs_you`, and `needs_you.cleared` with the same `id` follows when\nit is resumed or cancelled.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "description": "The agent, for `source: \"fleet\"`.",
+          "type": "string"
+        },
+        "id": {
+          "description": "What `needs_you.cleared` names: `run:<run_id>:<attempt>` for a run.",
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "description": "Why: for a run, `run.needs_you`'s `reason`.",
+          "type": "string"
+        },
+        "run_id": {
+          "description": "The run, for `source: \"run\"`.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where it comes from.",
+          "$ref": "#/$defs/NeedsYouSource"
+        },
+        "text": {
+          "description": "What to show the user: the question, when there is one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "reason",
+        "text"
+      ]
+    },
     "NeedsYouReason": {
       "description": "Why a run needs the user.",
       "oneOf": [
@@ -597,6 +686,21 @@
           "description": "The app denied a call with `stop: true` (5.1).",
           "type": "string",
           "const": "denied"
+        }
+      ]
+    },
+    "NeedsYouSource": {
+      "description": "Where something that needs the user comes from.",
+      "oneOf": [
+        {
+          "description": "A run (`run_id`).",
+          "type": "string",
+          "const": "run"
+        },
+        {
+          "description": "A fleet agent (`agent_id`), after the fleet moves onto rlxd (1.8).",
+          "type": "string",
+          "const": "fleet"
         }
       ]
     },

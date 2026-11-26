@@ -776,3 +776,438 @@ fn status_counts_live_and_queued_runs() {
     });
     assert_eq!(home.status()["runs"], json!({"live": 0, "queued": 0}));
 }
+
+// --- 5.4 and 7.5, the lifecycle: needs-you, resume, restart, list, attach, erase ---------
+
+/// `rlxd call method params`, which must succeed: its data.
+fn call(home: &TestHome, method: &str, params: &Value) -> Value {
+    let run = home.rlxd(&["call", method, &params.to_string()]);
+    assert_eq!(run.code(), Some(0), "{method}: {run:?}");
+    run.data()
+}
+
+/// `rlxd call method params`, which must be refused: its error code.
+fn refused(home: &TestHome, method: &str, params: &Value) -> String {
+    let run = home.rlxd(&["call", method, &params.to_string()]);
+    assert_eq!(run.code(), Some(1), "{method}: {run:?}");
+    run.error_code()
+}
+
+#[test]
+fn needs_you_then_resume_with_the_reply_as_attempt_2() {
+    let home = home("asks");
+    let mut params = task("post the standup");
+    params["needs_you_when"] =
+        json!({"pointer": "/status", "equals": "needs_you", "question_pointer": "/question"});
+    let (r, s, events) = gated_start(&home, &params).wait();
+    let mine = of(&events, &r, None);
+    let last = mine.last().unwrap();
+    assert_eq!(last["type"], "run.needs_you", "{events:#?}");
+    assert_eq!(last["data"]["question"], "Which channel?");
+    assert_eq!(last["data"]["reason"], "question");
+    // 7.3: needs_you, from runs, on the same capture.
+    let raised: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "needs_you.raised" && e["data"]["run_id"] == r.as_str())
+        .collect();
+    assert_eq!(raised.len(), 1, "{events:#?}");
+    assert_eq!(raised[0]["data"]["source"], "run");
+    assert_eq!(raised[0]["data"]["text"], "Which channel?");
+    let raised_id = raised[0]["data"]["id"].clone();
+    assert_valid("run-event-list.json", &Value::Array(events.clone()));
+    assert_eq!(
+        call(&home, "run.get", &json!({"run_id": r}))["state"],
+        "needs_you"
+    );
+
+    let resumed = call(&home, "run.resume", &json!({"run_id": r, "reply": "#dev"}));
+    assert_eq!(resumed["attempt"], 2);
+    let resumed_run = home.rlxd(&[
+        "events",
+        "--topics",
+        "run,needs_you",
+        "--since",
+        &s.to_string(),
+        "--follow",
+        "--until",
+        "run.done",
+        "--timeout",
+        "30",
+    ]);
+    assert_eq!(resumed_run.code(), Some(0), "{resumed_run:?}");
+    let events = resumed_run.lines();
+    let started = of(&events, &r, Some("run.started"));
+    assert_eq!(started.len(), 2, "{events:#?}");
+    assert_eq!(started[1]["data"]["resumed"], true);
+    assert_eq!(started[1]["data"]["attempt"], 2);
+    let done = of(&events, &r, Some("run.done"));
+    assert_eq!(done[0]["data"]["attempt"], 2);
+    let result: Value = serde_json::from_str(done[0]["data"]["result"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        result["channel"], "#dev",
+        "the reply was attempt 2's first message"
+    );
+    let cleared: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "needs_you.cleared")
+        .collect();
+    assert_eq!(cleared.len(), 1, "{events:#?}");
+    assert_eq!(cleared[0]["data"]["id"], raised_id);
+
+    // The fixture log: two starts, the second resuming the run.
+    let log = fixture_log(&home);
+    let starts = log["starts"].as_array().unwrap();
+    assert_eq!(starts.len(), 2, "{log:#}");
+    let second: Vec<String> = starts[1]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(after(&second, "--resume"), Some(r.as_str()));
+    assert!(!has(&second, "--session-id"));
+    // A resumed attempt gets its own settings, naming it.
+    let settings = home
+        .root()
+        .join("rlxd/runs")
+        .join(&r)
+        .join("2/settings.json");
+    assert_eq!(after(&second, "--settings"), settings.to_str());
+    let text = std::fs::read_to_string(&settings).unwrap();
+    assert!(text.contains(&format!("--run {r} --attempt 2")), "{text}");
+}
+
+#[test]
+fn resume_refuses_a_live_run_a_send_and_a_session_less_run() {
+    let home = home("slow");
+    let since = seq(&home);
+    let live = run_id();
+    start(&home, &task("take your time"), &live);
+    assert_eq!(
+        refused(&home, "run.resume", &json!({"run_id": live})),
+        "run_alive"
+    );
+
+    let send = json!({"kind": "send_executor", "prompt": "quick",
+        "mount": {"kind": "connectors", "connectors": ["claude.ai Slack"]},
+        "pinned_call": {"tool": "mcp__claude_ai_Slack__slack_send_message",
+            "input_sha256": "cdab067e9f3beb32d1252cfd63e492592fecbf591b0d08cadb24bb17f3864246"}});
+    let sent = run_id();
+    start(&home, &send, &sent);
+    let refresh =
+        json!({"kind": "widget_refresh", "prompt": "quick", "mount": {"kind": "no_tools"}});
+    let fresh = run_id();
+    start(&home, &refresh, &fresh);
+    wait_until(&home, since, 20, "both end", |e| {
+        ended(e, &sent) && ended(e, &fresh)
+    });
+    assert_eq!(
+        refused(&home, "run.resume", &json!({"run_id": sent})),
+        "not_resumable"
+    );
+    assert_eq!(
+        refused(&home, "run.resume", &json!({"run_id": fresh})),
+        "no_session"
+    );
+    assert_eq!(
+        refused(&home, "run.resume", &json!({"run_id": run_id()})),
+        "unknown_run"
+    );
+    home.rlxd(&["call", "run.cancel", &json!({"run_id": live}).to_string()]);
+}
+
+#[test]
+fn after_kill_9_and_a_restart_the_run_failed_engine_restarted_and_no_process_is_left() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |events| {
+        !of(events, &r, Some("run.started")).is_empty()
+    });
+    assert!(processes_matching(&pattern(&home, "slow")) >= 1);
+    let pid = home.status()["pid"].as_u64().unwrap();
+    common::kill_hard(pid);
+    common::eventually("rlxd is gone", || {
+        home.rlxd(&["call", "status"]).code() == Some(3)
+    });
+    home.start_dev();
+    let listed = call(&home, "run.list", &json!({}));
+    let mine: Vec<&Value> = listed["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|run| run["run_id"] == r.as_str())
+        .collect();
+    assert_eq!(mine.len(), 1, "{listed:#}");
+    assert_eq!(mine[0]["state"], "failed");
+    let got = call(&home, "run.get", &json!({"run_id": r}));
+    assert_eq!(
+        got["last_event"]["data"]["reason"], "engine_restarted",
+        "{got:#}"
+    );
+    assert!(
+        got["last_event"]["data"]["partial_text"]
+            .as_str()
+            .unwrap()
+            .contains("Working"),
+        "{got:#}"
+    );
+    common::eventually("no slow process is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+    // Its log goes on from the run_seq it had reached: no number twice.
+    let logged = call(&home, "run.get", &json!({"run_id": r}))["last_run_seq"]
+        .as_u64()
+        .unwrap();
+    let replayed = home.rlxd(&["call", "run.events", &json!({"run_id": r}).to_string()]);
+    assert_eq!(replayed.code(), Some(0), "{replayed:?}");
+    let run_seqs: Vec<u64> = replayed
+        .lines()
+        .iter()
+        .map(|e| e["data"]["run_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(run_seqs, (1..=logged).collect::<Vec<_>>());
+    // And it resumes.
+    let resumed = call(&home, "run.resume", &json!({"run_id": r}));
+    assert_eq!(resumed["attempt"], 2);
+    home.rlxd(&["call", "run.cancel", &json!({"run_id": r}).to_string()]);
+}
+
+#[test]
+fn run_list_filters_by_state_job_and_limit() {
+    let home = home("slow");
+    let since = seq(&home);
+    let live = run_id();
+    start(&home, &task("take your time"), &live);
+    let finished = run_id();
+    start(&home, &task("quick"), &finished);
+    wait_until(&home, since, 20, "the quick run ends", |e| {
+        ended(e, &finished)
+    });
+    let running = call(&home, "run.list", &json!({"states": ["running"]}));
+    let runs = running["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{running:#}");
+    assert_eq!(runs[0]["run_id"], live.as_str());
+    let done = call(&home, "run.list", &json!({"states": ["done"]}));
+    let runs = done["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{done:#}");
+    assert_eq!(runs[0]["run_id"], finished.as_str());
+    assert_eq!(runs[0]["client"], "rlxd-cli");
+    assert!(runs[0]["ended_at"].is_string());
+    assert_valid("run-list-reply.json", &done);
+
+    // job_id: the scheduler's, set here through the test-only debug.run_start.
+    let (j1, j2) = (run_id(), run_id());
+    let mut with_job = task("quick");
+    with_job["job_id"] = json!("job-1");
+    for r in [&j1, &j2] {
+        let mut params = with_job.clone();
+        params["run_id"] = json!(r);
+        let started = home.rlxd(&["call", "debug.run_start", &params.to_string()]);
+        assert_eq!(started.code(), Some(0), "{started:?}");
+    }
+    let events = wait_until(&home, since, 20, "both job runs end", |e| {
+        ended(e, &j1) && ended(e, &j2)
+    });
+    assert!(
+        of(&events, &j1, None)
+            .iter()
+            .all(|e| e["data"]["job_id"] == "job-1")
+    );
+    let jobs = call(&home, "run.list", &json!({"job_id": "job-1"}));
+    let ids: Vec<&str> = jobs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["run_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{jobs:#}");
+    assert!(ids.contains(&j1.as_str()) && ids.contains(&j2.as_str()));
+    let limited = call(&home, "run.list", &json!({"limit": 1}));
+    assert_eq!(limited["runs"].as_array().unwrap().len(), 1);
+    // run.start itself takes no job_id: a client can't claim a job's run.
+    let mut claimed = with_job.clone();
+    claimed["run_id"] = json!(run_id());
+    let plain = home.rlxd(&["call", "run.start", &claimed.to_string()]);
+    assert_eq!(
+        plain.code(),
+        Some(0),
+        "an unknown field is ignored: {plain:?}"
+    );
+    let got = call(&home, "run.get", &json!({"run_id": claimed["run_id"]}));
+    assert_eq!(got.get("job_id"), None, "{got:#}");
+    home.rlxd(&["call", "run.cancel", &json!({"run_id": live}).to_string()]);
+}
+
+#[test]
+fn run_events_replays_from_disk_after_the_buffer_dropped_the_run() {
+    let home = home("hello");
+    let (r, _, _) = gated_start(&home, &task("hi")).wait();
+    let got = call(&home, "run.get", &json!({"run_id": r}));
+    // 7.5 Done.
+    assert_eq!(got["state"], "done");
+    assert!(
+        got["last_event"]["data"]["usage"]["output_tokens"].is_number(),
+        "{got:#}"
+    );
+    assert_valid("run-get-reply.json", &got);
+    let n = got["last_run_seq"].as_u64().unwrap();
+    assert!(n > 1, "{got:#}");
+    home.emit(10_001);
+    let replayed = home.rlxd(&[
+        "call",
+        "run.events",
+        &json!({"run_id": r, "from_run_seq": 2}).to_string(),
+    ]);
+    assert_eq!(replayed.code(), Some(0), "{replayed:?}");
+    let events = replayed.lines();
+    assert_eq!(events.len() as u64, n - 1, "{events:#?}");
+    assert_eq!(events[0]["data"]["run_seq"], 2);
+    assert_eq!(events[events.len() - 1]["data"]["run_seq"], n);
+    assert_valid("run-event-list.json", &Value::Array(events));
+    let unknown = home.rlxd(&[
+        "call",
+        "run.events",
+        &json!({"run_id": run_id()}).to_string(),
+    ]);
+    assert_eq!(unknown.code(), Some(1));
+}
+
+#[test]
+fn run_events_follows_a_live_run_until_it_ends() {
+    let home = home_with("slow", &[("FAKE_CLAUDE_SLOW_MS", "1500")]);
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |events| {
+        !of(events, &r, Some("run.started")).is_empty()
+    });
+    let followed = home.rlxd(&["call", "run.events", &json!({"run_id": r}).to_string()]);
+    assert_eq!(followed.code(), Some(0), "{followed:?}");
+    let events = followed.lines();
+    assert_eq!(events.last().unwrap()["type"], "run.done", "{events:#?}");
+    let run_seqs: Vec<u64> = events
+        .iter()
+        .map(|e| e["data"]["run_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(run_seqs, (1..=run_seqs.len() as u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn the_end_state_structured_output_and_finish_survive_a_restart() {
+    let home = home("structured");
+    let mut params = task("judge it");
+    params["output_schema"] = json!({"type": "object", "required": ["verdict"]});
+    let (r, _, _) = gated_start(&home, &params).wait();
+    let before = call(&home, "run.get", &json!({"run_id": r}));
+    home.stop();
+    home.start_dev();
+    let after = call(&home, "run.get", &json!({"run_id": r}));
+    assert_eq!(after["state"], "done");
+    assert!(after["finished_at"].is_string());
+    assert_eq!(after["finished_at"], before["finished_at"]);
+    assert_eq!(after["structured_output"]["verdict"], "ok");
+    assert_eq!(after["structured_output"], before["structured_output"]);
+    assert_eq!(after["last_event"], before["last_event"]);
+    let listed = call(&home, "run.list", &json!({"states": ["done"]}));
+    assert!(
+        listed["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["run_id"] == r.as_str())
+    );
+}
+
+#[test]
+fn space_erase_removes_the_space_its_sessions_and_rlxds_records() {
+    let home = home("persist");
+    let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut params = task("hi");
+    params["persist_session"] = json!(true);
+    let (r, _, _) = gated_start(&home, &params).wait();
+    let config = home.root().join("claude-config").join("projects");
+    let sessions = |id: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(&config)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path().join(format!("{id}.jsonl")))
+                    .filter(|path| path.exists())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        sessions(&r).len(),
+        1,
+        "the session file is where Claude Code keeps it"
+    );
+    let erased = call(&home, "space.erase", &json!({"name": "default"}));
+    assert_valid("space-erase-reply.json", &erased);
+    let removed: Vec<&str> = erased["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert!(removed.contains(&p.as_str()), "{erased:#}");
+    assert!(sessions(&r).is_empty());
+    assert!(!Path::new(&p).exists());
+    assert!(!home.root().join("rlxd/runs").join(&r).exists());
+    let listed = call(&home, "run.list", &json!({}));
+    assert!(
+        !listed["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["run_id"] == r.as_str())
+    );
+    assert_eq!(
+        refused(&home, "run.get", &json!({"run_id": r})),
+        "unknown_run"
+    );
+}
+
+#[test]
+fn space_erase_refuses_while_a_run_in_the_space_is_live() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |events| {
+        !of(events, &r, Some("run.started")).is_empty()
+    });
+    let run = home.rlxd(&["call", "space.erase", r#"{"name":"default"}"#]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "runs_live");
+    assert_eq!(run.json()["error"]["detail"]["run_ids"][0], r.as_str());
+    assert!(
+        home.root().join("spaces/default").exists(),
+        "nothing was removed"
+    );
+    home.rlxd(&["call", "run.cancel", &json!({"run_id": r}).to_string()]);
+    // Another space's erase is not held up by it.
+    call(&home, "space.ensure", &json!({"name": "other"}));
+    call(&home, "space.erase", &json!({"name": "other"}));
+}
+
+#[cfg(unix)]
+#[test]
+fn space_erase_follows_no_link() {
+    let home = home("hello");
+    let elsewhere = home.root().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep"), "x").unwrap();
+    std::fs::create_dir_all(home.root().join("spaces")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.root().join("spaces/linked")).unwrap();
+    assert_eq!(
+        refused(&home, "space.erase", &json!({"name": "linked"})),
+        "link_refused"
+    );
+    assert!(elsewhere.join("keep").exists());
+}

@@ -267,10 +267,31 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   one write and fsynced, except partial text chunks, which ride with the next). Both are
   written before the event is published, so an app never sees an end that a restart
   would not find.
+- **The lifecycle** (5.4). `run.get {run_id}` and `run.list {states?, job_id?, limit?}`
+  read the runs rlxd knows, those from before a restart too: rlxd reads every run's record
+  when it starts. `run.events {run_id, from_run_seq}` replays a run's log from disk,
+  never from the bus's buffer, then follows a live run until it ends; `rlxd call` prints
+  each event as a line and exits 0 when the stream closes.
+- **Needs-you and resume.** A finished run whose output matches `needs_you_when` ends
+  `run.needs_you {reason: "question", question}`, after `needs_you.raised` on the
+  `needs_you` topic. `run.resume {run_id, reply?}` goes on with a run that has no live
+  process as a new attempt (`--resume <run_id>`, its own settings file, the reply as its
+  first message), and `needs_you.cleared` follows. It refuses `run_alive`,
+  `not_resumable` (a `send_executor`) and `no_session`.
+- **After a crash or a `kill -9`,** the next rlxd kills a run's leftover process tree
+  (macOS and Linux, by the recorded pid and start time), cuts a torn last line from its
+  log, and ends it `failed {reason: "engine_restarted"}`, numbered on from its log.
+- **`job_id`** is set by rlxd alone, for the scheduler (7.6). Test builds have
+  `debug.run_start`, `run.start`'s params plus a `job_id`.
 - **Spaces.** `space.ensure {name}` makes `<home>/spaces/<name>/` with an empty project
   `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
   not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
-  separator, no `..` and no leading dot.
+  separator, no `..` and no leading dot. `space.erase {name}` deletes the folder, the
+  Claude Code session files of its runs (`projects/*/<run_id>.jsonl` under
+  `CLAUDE_CONFIG_DIR` and `~/.claude`; every account's config directory once the brain
+  serves rlx's list), and rlxd's records of them. It refuses `runs_live` while a run in
+  the space is queued or running, and `link_refused` when the space is a link; a session
+  it could reach only through a linked project folder is left and named in `refused`.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 

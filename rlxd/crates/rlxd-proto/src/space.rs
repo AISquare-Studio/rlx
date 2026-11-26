@@ -137,8 +137,11 @@ impl SpaceEnsureData {
     }
 }
 
-/// `space.erase`'s reply: every path it removed. It refuses with `runs_live` while a run
-/// in the space is queued or running, and removes nothing then.
+/// `space.erase`'s reply: every path it removed, and each it would not. It refuses with
+/// `runs_live` while a run in the space is queued or running, and with `link_refused`
+/// when the space's folder is a link, and removes nothing then. A session file it finds
+/// only by following a link out of a Claude Code config directory is left, and named in
+/// `refused`.
 ///
 /// ```json
 /// {"removed": ["/Users/u/.aisquare/spaces/default",
@@ -151,11 +154,35 @@ pub struct SpaceEraseData {
     /// The paths removed: the space's folder, its runs' session files, and rlxd's records
     /// of its runs.
     pub removed: Vec<String>,
+    /// The paths it left, because reaching them meant following a link out of the space
+    /// or a config directory, each with why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<RefusedPath>,
+}
+
+/// A path `space.erase` left, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RefusedPath {
+    /// The path.
+    pub path: String,
+    /// Why it was left.
+    pub reason: String,
+}
+
+impl RefusedPath {
+    /// `path`, left for `reason`.
+    pub fn new(path: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            reason: reason.into(),
+        }
+    }
 }
 
 impl SpaceEraseData {
-    /// The reply that names `removed`.
-    pub fn new(removed: Vec<String>) -> Self {
-        Self { removed }
+    /// The reply that names `removed` and `refused`.
+    pub fn new(removed: Vec<String>, refused: Vec<RefusedPath>) -> Self {
+        Self { removed, refused }
     }
 }

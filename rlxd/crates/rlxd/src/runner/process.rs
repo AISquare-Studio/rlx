@@ -167,13 +167,6 @@ fn kill_tree(tree: &Tree) {
 /// left alone. Whether it killed one.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the sweep at rlxd's start, with engine_restarted (5.4)"
-    )
-)]
 pub fn kill_recorded(pid: u32, started: &str) -> bool {
     if start_time(pid).as_deref() != Some(started) {
         return false;
@@ -332,13 +325,6 @@ fn kill_tree(tree: &Tree) {
 
 /// Windows needs no sweep: a job whose last handle closes kills its processes.
 #[cfg(windows)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the sweep at rlxd's start, with engine_restarted (5.4)"
-    )
-)]
 pub fn kill_recorded(_pid: u32, _started: &str) -> bool {
     false
 }

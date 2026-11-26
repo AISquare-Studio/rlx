@@ -335,6 +335,21 @@ pub mod codes {
     /// rlxd could not start the run, such as when Claude Code is not installed; the
     /// message says why.
     pub const RUN_START_FAILED: &str = "run_start_failed";
+    /// `run.resume`: the run is queued or running; only a run with no live process
+    /// resumes.
+    pub const RUN_ALIVE: &str = "run_alive";
+    /// `run.resume`: the run kept no session (`persist_session: false`), so there is
+    /// nothing to resume.
+    pub const NO_SESSION: &str = "no_session";
+    /// `run.resume`: a `send_executor` run is never resumed, since a send is never
+    /// retried.
+    pub const NOT_RESUMABLE: &str = "not_resumable";
+    /// `space.erase`: a run in the space is queued or running. `detail.run_ids` names
+    /// them.
+    pub const RUNS_LIVE: &str = "runs_live";
+    /// `space.erase`: the space's folder is a link, which rlxd does not follow; nothing
+    /// was removed.
+    pub const LINK_REFUSED: &str = "link_refused";
 }
 
 impl Envelope {
