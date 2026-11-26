@@ -1280,16 +1280,16 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     service_ran = _stop_the_service(plan.command)
     # Into a release with no service, its login item goes first: there it would run a command
     # that release does not have at every login, and nothing there could take it away (M1).
-    item_said, item_gone = _no_login_item_for(service_login, plan.target or plan.latest_version)
+    item_said, taken = _no_login_item_for(service_login, plan.target or plan.latest_version)
     code = install_route.run_installer(plan.argv, env=plan.env, to_stderr=to_stderr)
     if code != 0:
         # Asked too: uv resolves before it replaces anything (measured, uv 0.12.19), so a
         # run it could not resolve, as under a cutoff that excludes even the release that
         # runs, leaves that release installed, and no reinstall from nothing is needed.
         kept, _ = _installed_version(plan)
-        if item_gone and (kept is None or not lacks_the_service(kept)):
-            # The move did not happen: the release still here gets its login item back.
-            item_said = _put_the_login_item_back(service_login)
+        if taken is not None and (kept is None or not lacks_the_service(kept)):
+            # The move did not happen: what was taken away for it comes back as it was.
+            item_said = _put_the_login_items_back(service_login, taken) or item_said
         service_said = _start_the_service_again(service_host, plan, kept) if service_ran else None
         return UpgradeReport(
             plan,
@@ -1338,34 +1338,37 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     return UpgradeReport(plan, exit_code=code, version=version, hooks=hooks, notes=tuple(notes))
 
 
-def _no_login_item_for(service_login: ModuleType, release: str | None) -> tuple[str | None, bool]:
-    """The rlx service's login item taken away on a move to ``release`` when it has no service
-    (:func:`lacks_the_service`), an ON choice with it and an OFF one kept
-    (``service_login.forget_at_login``); what to say of it, and whether an item went."""
+def _no_login_item_for(
+    service_login: ModuleType, release: str | None
+) -> tuple[str | None, Any | None]:
+    """Every home's rlx login item taken away on a move to ``release`` when it has no service
+    (:func:`lacks_the_service`), this home's ON choice with it only when its item was there
+    and on (``service_login.forget_at_login``); what to say of it, and what was taken away
+    (``service_login.Taken``), which an installer that fails puts back."""
     if release is None or not lacks_the_service(release):
-        return None, False
+        return None, None
     service = service_login.SERVICE
     try:
-        gone = service_login.forget_at_login()
+        taken = service_login.forget_at_login()
     except service_login.LoginError as exc:
         return (
             f"the {service}'s login item could not be taken away ({exc}): {release} has none",
-            False,
+            None,
         )
-    if not gone:
-        return None, False
-    return f"the {service} no longer starts at login: {release} has no {service}", True
+    if not taken.gone:
+        return None, taken
+    return f"the {service} no longer starts at login: {release} has no {service}", taken
 
 
-def _put_the_login_item_back(service_login: ModuleType) -> str:
-    """The login item :func:`_no_login_item_for` took away, put back after an install that
-    failed, which left this release, with its service, in place (reviewer of #33)."""
+def _put_the_login_items_back(service_login: ModuleType, taken: Any) -> str | None:
+    """What :func:`_no_login_item_for` took away, put back as it was after an install that
+    failed, which left this release, with its service, in place (review of #33, round 3)."""
     service = service_login.SERVICE
     try:
-        service_login.register_at_login()
+        said: str | None = service_login.put_back(taken)
     except (service_login.LoginError, OSError) as exc:
-        return f"the {service}'s login item, taken away for the move, could not be put back: {exc}"
-    return f"the {service} still starts at login: its login item was put back"
+        return f"the {service}'s login items, taken away for the move, could not be put back: {exc}"
+    return said
 
 
 def _refresh_the_login_item(plan: UpgradePlan) -> None:

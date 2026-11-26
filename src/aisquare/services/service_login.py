@@ -595,27 +595,84 @@ def unregister_at_login() -> AtLogin:
     return at_login_state()
 
 
-def forget_at_login() -> bool:
+@dataclass(frozen=True)
+class TakenItem:
+    """One login item :func:`forget_at_login` took away, as it was: its file's bytes, the label
+    (unit) it is loaded by, and whether the OS had it loaded (launchd) or enabled (systemd)."""
+
+    path: Path
+    body: bytes
+    name: str
+    live: bool
+
+
+@dataclass(frozen=True)
+class Taken:
+    """What :func:`forget_at_login` took away, so :func:`put_back` can put exactly that back:
+    the items, and this home's choice as it was (and whether it was forgotten)."""
+
+    how: How | None
+    items: tuple[TakenItem, ...] = ()
+    choice: bool | None = None
+    forgot: bool = False
+
+    @property
+    def gone(self) -> bool:
+        """Whether an item was taken away."""
+        return bool(self.items)
+
+
+def forget_at_login() -> Taken:
     """``rlx uninstall``'s step, and a move to a release with no service (``rlx upgrade``):
     EVERY home's login item taken away, as the install they all run goes or loses its service
     (or the OS would start a program that is gone, or a command that release does not have,
     at every login, and that release has no way to take one away; tester of #33, round 2, m1).
-    Whether an item was there.
 
-    This home's ON choice goes with it, so a later install is on by default again; an OFF one
-    stays, as that release keeps a section it does not know: forgotten, the next init of a
-    release with the service would add the item back (reviewer of #33, round 2). One in a file
-    that cannot be read is left as it is. :class:`LoginError` when an item's file stays."""
+    This home's ON choice is forgotten only when its item was there and on, so a later install
+    is on by default again: one whose item was removed or turned off in the OS stays, or the
+    next init would add back what the person took away (review of #33, round 3); an OFF one
+    stays too, as that release keeps a section it does not know. One in a file that cannot be
+    read is left as it is. What was taken away, for :func:`put_back`. :class:`LoginError` when
+    an item's file stays."""
     try:
         how = login_how()
     except LoginError:
-        return False  # nothing can be in place here
-    there = _take_every_item_away(how)
-    if read_choice() is True:
+        return Taken(None)  # nothing can be in place here
+    choice = read_choice()
+    was_on = at_login_state().on
+    items = _take_every_item_away(how)
+    forgot = False
+    if choice is True and was_on:
         # A config.toml it cannot write: the uninstall goes on without it.
         with contextlib.suppress(OSError):
             _keep_the_choice(None)
-    return there
+            forgot = True
+    return Taken(how, tuple(items), choice, forgot)
+
+
+def put_back(taken: Taken) -> str | None:
+    """Exactly what :func:`forget_at_login` took away, put back, after a move that did not
+    happen: each item's file as it was, loaded or enabled again only where it was, and the
+    choice as it was; never an explicit install, which would turn back on an item the person
+    had turned off, or add this home's for another's (review of #33, round 3). What to say of
+    it; ``None`` when nothing was taken away."""
+    if not taken.items and not taken.forgot:
+        return None
+    for item in taken.items:
+        _write_item(item.path, item.body)
+    if taken.how == "systemd" and taken.items:
+        _service_manager(["systemctl", "--user", "daemon-reload"])
+    for item in taken.items:
+        if not item.live:
+            continue
+        if taken.how == "launchd":
+            _service_manager(["launchctl", "bootstrap", _domain(), str(item.path)])
+        else:
+            _service_manager(["systemctl", "--user", "enable", "--now", item.name])
+    if taken.forgot:
+        with contextlib.suppress(OSError):
+            _keep_the_choice(taken.choice)
+    return f"the {SERVICE}'s login items, taken away for the move, were put back as they were"
 
 
 def _every_item(how: How) -> list[tuple[Path, str]]:
@@ -636,26 +693,41 @@ def _every_item(how: How) -> list[tuple[Path, str]]:
     return found
 
 
-def _take_every_item_away(how: How) -> bool:
+def _live(how: How, name: str) -> bool:
+    """Whether the OS has the item loaded (launchd) or enabled (systemd) now."""
+    if how == "launchd":
+        return _service_manager(["launchctl", "print", f"{_domain()}/{name}"]).ok
+    reply = _service_manager(["systemctl", "--user", "is-enabled", name])
+    return reply.ok and reply.said.strip().splitlines()[-1:] == ["enabled"]
+
+
+def _take_every_item_away(how: How) -> list[TakenItem]:
     """This home's item (booted out whether its file is there or not), then every other home's
-    (:func:`_every_item`). Whether any was there."""
-    there = item_path(how).is_file()
+    (:func:`_every_item`), each as it was before."""
+    mine = item_path(how)
+    candidates = [(mine, label() if how == "launchd" else unit_name())]
+    candidates += [(path, name) for path, name in _every_item(how) if path != mine]
+    taken = [
+        TakenItem(path, path.read_bytes(), name, _live(how, name))
+        for path, name in candidates
+        if path.is_file()
+    ]
     _take_the_item_away(how)
-    others = [(item, name) for item, name in _every_item(how) if item != item_path(how)]
-    for item, name in others:
+    others = [gone for gone in taken if gone.path != mine]
+    for gone in others:
         if how == "launchd":
-            _service_manager(["launchctl", "bootout", f"{_domain()}/{name}"])
+            _service_manager(["launchctl", "bootout", f"{_domain()}/{gone.name}"])
         else:
-            _service_manager(["systemctl", "--user", "disable", "--now", name])
+            _service_manager(["systemctl", "--user", "disable", "--now", gone.name])
         try:
-            item.unlink(missing_ok=True)
+            gone.path.unlink(missing_ok=True)
         except OSError as exc:
             raise LoginError(
-                f"could not remove {paths.shown(item)}: {exc.strerror or exc}"
+                f"could not remove {paths.shown(gone.path)}: {exc.strerror or exc}"
             ) from exc
     if others and how == "systemd":
         _service_manager(["systemctl", "--user", "daemon-reload"])
-    return there or bool(others)
+    return taken
 
 
 _NAMED_SUFFIX = re.compile(r"[0-9a-f]{8}")
@@ -860,6 +932,7 @@ __all__ = [
     "NotHere",
     "OsReply",
     "Registered",
+    "Taken",
     "at_login_state",
     "config_unreadable",
     "decline_by_default",
@@ -871,6 +944,7 @@ __all__ = [
     "lingering",
     "login_how",
     "plist_bytes",
+    "put_back",
     "read_choice",
     "record_from_the_item",
     "refresh_the_item",

@@ -148,10 +148,13 @@ While `config.toml` cannot be read, `rlx init`, the installers, `rlx service ins
 none away) and say why; `rlx uninstall` and a move back to a release before the service still
 take it away, as that release could not. `rlx uninstall` takes every
 home's login item away too, and so does `rlx upgrade` to a release before the service (0.10.1
-and earlier), which has no command for them to run and none to take them away: a choice of on is
-forgotten with it, so a later release sets it up again, and a choice of off is kept. A reset or
-`--reinit` of a `config.toml` that does not parse carries the choice over from its text, or,
-when the text holds none, records it as the OS has it (an item in place is on, none is off).
+and earlier), which has no command for them to run and none to take them away: a choice of on
+whose item was in place and on is forgotten with it, so a later release sets it up again; a choice
+of off, or of on whose item you removed or turned off in the OS, is kept. If that upgrade's
+installer fails, the items are put back as they were. A reset (App settings' *Reset all*, `rlx
+config reset`) or `--reinit` of a `config.toml` that does not parse carries the choice over from
+its text, or, when the text holds none, records the default home's as the OS has it (an item in
+place is on, none is off).
 
 `rlx service status` says whether it starts at login, and if not, why.
 

@@ -123,7 +123,10 @@ def init(
             # the OS has it, so no later init adds an item the person had turned off.
             report.notes.append(
                 f"the {service_login.SERVICE}'s login item was left as it is: {unreadable_before}"
-                " before --reinit replaced it; " + service_login.record_from_the_item()
+                " before --reinit replaced it"
+                + ("; --no-service changed nothing there" if no_service else "")
+                + "; "
+                + service_login.record_from_the_item()
             )
         elif no_service:
             report.notes.append(service_login.decline_by_default())

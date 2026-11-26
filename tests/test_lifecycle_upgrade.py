@@ -4658,7 +4658,7 @@ def test_a_move_to_a_release_with_no_service_leaves_it_stopped_and_says_so(
     install = install_route.run_installer
     order: list[str] = []
 
-    def forget_in_order() -> bool:
+    def forget_in_order() -> service_login.Taken:
         order.append("forget")
         return forget()
 
@@ -4725,3 +4725,54 @@ def test_a_move_back_that_fails_puts_the_login_item_back(
     assert _one_object(result.stdout)["error"] == "upgrade_failed", result.stdout
     assert item.is_file(), "the item taken away for the move is back"
     assert service_login.read_choice() is True
+
+
+def _a_failed_move_back(machine: Machine) -> None:
+    machine.installer_exit = 1
+    machine.new_version = "0.10.2"  # what the failed install left: this release
+
+
+def test_a_failed_move_back_keeps_an_item_removed_in_the_os_removed(
+    runner: CliRunner, tool: Tool, machine: Machine
+) -> None:
+    """(b) of #2309: on, the item removed in the OS, then a move back that fails: the choice is
+    kept, so the next init does not add back what the person removed."""
+    from aisquare.services import service_login
+
+    service_login.register_at_login()
+    service_login.item_path("launchd").unlink()
+    _a_failed_move_back(machine)
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+    again = runner.invoke(app, ["init", "--local", "--yes", "--no-onboard"])
+
+    assert result.exit_code != 0 and again.exit_code == 0, again.output
+    assert service_login.read_choice() is True
+    assert not service_login.item_path("launchd").exists()
+
+
+def test_a_failed_move_back_turns_on_no_item_the_os_had_off(
+    runner: CliRunner,
+    tool: Tool,
+    machine: Machine,
+    no_real_login_item: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) of #2309, Linux: a unit disabled in the OS was enabled again and started by the
+    put-back, which was an explicit install. It is put back as it was: disabled."""
+    from aisquare.services import service_login
+
+    monkeypatch.setattr(service_login, "_platform", lambda: "linux")
+    monkeypatch.setattr(service_login, "_systemd_runs", lambda: True)
+    service_login.register_at_login()
+    no_real_login_item.reply("systemctl", "--user", "is-enabled", code=1, said="disabled")
+    no_real_login_item.calls.clear()
+    _a_failed_move_back(machine)
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code != 0
+    assert service_login.item_path("systemd").is_file()
+    assert service_login.read_choice() is True
+    enables = [call for call in no_real_login_item.calls if "enable" in call]
+    assert enables == [], enables

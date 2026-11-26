@@ -997,9 +997,9 @@ def test_a_move_back_keeps_an_off_choice_and_says_nothing_of_an_item_never_there
     _init(tmp_path / "project", "--no-service")
     login_os.calls.clear()
 
-    said, gone = lifecycle._no_login_item_for(service_login, "0.10.1")
+    said, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
 
-    assert (said, gone) == (None, False)
+    assert said is None and taken is not None and not taken.gone
     assert _choice() is False
     again = _init(tmp_path / "project")
     assert again.exit_code == 0, again.output
@@ -1009,9 +1009,10 @@ def test_a_move_back_keeps_an_off_choice_and_says_nothing_of_an_item_never_there
 def test_a_move_back_forgets_an_on_choice_with_its_item(login_os: LoginOs) -> None:
     _rlx("service", "install")
 
-    said, gone = lifecycle._no_login_item_for(service_login, "0.10.1")
+    said, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
 
-    assert gone is True and not _plist().exists() and _choice() is None
+    assert taken is not None and taken.gone and taken.forgot and not _plist().exists()
+    assert _choice() is None
     assert said == "the rlx service no longer starts at login: 0.10.1 has no rlx service"
 
 
@@ -1139,9 +1140,9 @@ def test_a_move_back_takes_away_every_homes_item(
     theirs.write_bytes(plistlib.dumps({"Label": "studio.aisquare.rlx.service.helper"}))
     login_os.calls.clear()
 
-    said, gone = lifecycle._no_login_item_for(service_login, "0.10.1")
+    said, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
 
-    assert gone is True and said is not None
+    assert taken is not None and taken.gone and said is not None
     assert sorted(path.name for path in service_login.launch_agents_dir().iterdir()) == [
         theirs.name
     ]
@@ -1176,3 +1177,110 @@ def test_a_reinit_of_a_broken_file_keeps_an_on_whose_item_was_removed_outside(
     assert again.exit_code == 0, again.output
     assert _choice() is True and not _plist().exists() and login_os.changes() == []
     assert service_login.at_login_state().why_off == service_login.REMOVED
+
+
+# --- review of #33, round 3 (#2285) and its tester (#2309) ---------------------------------------
+
+
+def test_a_move_back_keeps_an_on_whose_item_was_removed_in_the_os(login_os: LoginOs) -> None:
+    """(a): an ON whose item the person removed in the OS was forgotten, and the installers'
+    step on a later move forward added it back. It is kept now: nothing was there to go."""
+    _rlx("service", "install")
+    _plist().unlink()
+
+    said, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
+
+    assert said is None and taken is not None and not taken.gone and not taken.forgot
+    assert _choice() is True
+    login_os.calls.clear()
+    by_installer = _rlx("service", "install", "--if-undecided")
+    assert by_installer.exit_code == 0, by_installer.output
+    assert not _plist().exists() and login_os.changes() == []
+
+
+def test_a_move_back_keeps_an_on_turned_off_in_login_items(login_os: LoginOs) -> None:
+    _rlx("service", "install")
+    login_os.reply("launchctl", "print-disabled", DOMAIN, said=DISABLED)
+
+    _, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
+
+    assert taken is not None and taken.gone and not taken.forgot
+    assert _choice() is True
+
+
+def test_put_back_restores_each_item_as_it_was_and_turns_none_on(
+    login_os: LoginOs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(c), (d): put back is the files as they were, loaded again only where they were, and
+    the choice as it was: no `launchctl enable`, no kickstart, and no item for a home that had
+    none (the default OFF, a named home's item there)."""
+    monkeypatch.setattr(service_login, "_named_home", lambda: Path("/srv/scratch-home"))
+    service_login.register_at_login()
+    named_label = service_login.label()
+    named_plist = service_login.item_path("launchd")
+    named_bytes = named_plist.read_bytes()
+    monkeypatch.setattr(service_login, "_named_home", lambda: None)
+    _rlx("service", "uninstall")  # the default home: OFF, no item
+    login_os.reply("launchctl", "print", f"{DOMAIN}/{named_label}", code=113, said=NOT_LOADED)
+
+    taken = service_login.forget_at_login()
+    login_os.calls.clear()
+    said = service_login.put_back(taken)
+
+    assert said is not None
+    assert named_plist.read_bytes() == named_bytes
+    assert not _plist().exists() and _choice() is False
+    changes = login_os.changes()
+    assert not any(
+        call[:2] in (("launchctl", "enable"), ("launchctl", "kickstart")) for call in changes
+    )
+    assert not any(call[:2] == ("launchctl", "bootstrap") for call in changes), "it was not loaded"
+
+
+@pytest.mark.usefixtures("linux")
+def test_put_back_leaves_a_disabled_unit_disabled(login_os: LoginOs) -> None:
+    _rlx("service", "install")
+    login_os.reply("systemctl", "--user", "is-enabled", "rlx.service", code=1, said="disabled")
+
+    taken = service_login.forget_at_login()
+    login_os.calls.clear()
+    service_login.put_back(taken)
+
+    assert _unit().is_file() and _choice() is True
+    assert ("systemctl", "--user", "daemon-reload") in login_os.calls
+    assert not any("enable" in call for call in login_os.changes()), login_os.changes()
+
+
+@pytest.mark.parametrize("on", [True, False], ids=["item-there", "no-item"])
+def test_a_config_reset_of_a_file_with_nothing_to_read_records_what_the_os_has(
+    tmp_path: Path, login_os: LoginOs, on: bool
+) -> None:
+    """MINOR 3: a reset of a broken file whose text holds no choice lost an OFF, and the next
+    init added the item. It records the choice as the OS has it, as --reinit does."""
+    _rlx("service", "install")
+    if not on:
+        _rlx("service", "uninstall")
+    _garbage_config()
+    login_os.calls.clear()
+
+    reset = _rlx("config", "reset", "--yes")
+    later = _init(tmp_path / "project")
+
+    assert reset.exit_code == 0 and later.exit_code == 0, reset.output + later.output
+    assert _choice() is on and _plist().is_file() is on
+    assert login_os.changes() == []
+
+
+def test_a_reinit_with_no_service_of_a_broken_file_says_it_changed_nothing(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    _rlx("service", "install")
+    _garbage_config()
+    (tmp_path / "p").mkdir()
+
+    again = _rlx(
+        "init", "--reinit", "--yes", "--no-service", "--local", "--no-onboard", str(tmp_path / "p")
+    )
+
+    assert again.exit_code == 0, again.output
+    assert "--no-service changed nothing there" in again.output, again.output
