@@ -59,6 +59,13 @@ TABLES = ("prompt", "metric", "team_event", "team_session")
 #: Columns whose values are times, durations or fresh ids, the same nowhere twice.
 _MASKED = {"id", "trace_id", "wall_ms", "round_trip_ms", "server_ms"}
 _TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+#: A span from now, such as "resets in 2h 53m" or "0m ago": two runs a minute apart say two.
+#: The clock time beside it, "(Fri 00:30)", stays, and with it the zone's parity.
+_SPAN = re.compile(r"\b(?:\d+h )?\d+m\b")
+
+
+def _no_spans(value: Any) -> Any:
+    return _SPAN.sub("<span>", value) if isinstance(value, str) else value
 
 
 def _program(name: str) -> str:
@@ -113,7 +120,7 @@ def _rows(home: Path) -> dict[str, list[dict[str, Any]]]:
                         if key in _MASKED
                         or key.endswith("_at")
                         or (isinstance(row[key], str) and _TIME.match(row[key]))
-                        else row[key]
+                        else _no_spans(row[key])
                         for key in row.keys()  # noqa: SIM118 (a Row has no __iter__ of keys)
                     }
                 )
@@ -159,10 +166,13 @@ def _hook_env(base: dict[str, str], home: Path, extra: dict[str, str]) -> dict[s
 
 
 def _normal(text: bytes, home: Path) -> bytes:
-    """``text`` with the run's own home, which each run has a copy of, said as ``<home>``."""
+    """``text`` with the run's own home, which each run has a copy of, said as ``<home>``,
+    and its spans from now masked (:data:`_SPAN`)."""
     for spelling in {str(home.resolve()), str(home)}:
         text = text.replace(spelling.encode(), b"<home>")
-    return text
+    return _SPAN.sub("<span>", text.decode("utf-8", "surrogateescape")).encode(
+        "utf-8", "surrogateescape"
+    )
 
 
 class Brain:
