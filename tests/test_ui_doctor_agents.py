@@ -363,9 +363,13 @@ def test_an_ok_rows_offer_is_a_quiet_button_beside_it_in_the_fold_and_no_problem
 
 def test_with_the_fold_open_a_problems_button_stays_above_the_passing_rows(
     pane_world: PaneWorld,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The tester of #15, round 3: opened, the fold's passing rows pushed the problem's own
     button (Add browser tools) below all of them. It sits with the problems now."""
+    # Claude Code installed, as that button asks: on Windows the suite puts no stand-in
+    # ``claude`` on PATH, and a runner has no real one (the full matrix of #15 round 5).
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     add = diagnostics.BROWSER_TOOLS_ADD
     checks = [
         DoctorCheck(
