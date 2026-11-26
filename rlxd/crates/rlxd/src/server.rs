@@ -500,6 +500,7 @@ impl Daemon {
         if self.gate.dev_mode() {
             StatusData::GATE_DEV_MODE.clone_into(&mut status.gate);
         }
+        status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {
@@ -941,7 +942,7 @@ where
                 daemon.stop(STOP_REQUESTED);
             }
             Answer::Paired(reply, minted) => {
-                if send_paired(&daemon, &mut writer, &reply, &minted)
+                if send_paired(&daemon.gate, &mut writer, &reply, &minted)
                     .await
                     .is_err()
                 {
@@ -1054,21 +1055,41 @@ impl Watch {
     }
 }
 
-/// Sends a reply that carries a minted gate credential. When it can't be delivered, the
-/// pairing is undone, and the error says the connection is done.
+/// Sends a reply that carries a minted gate credential. Unless it is sent whole, the
+/// pairing is undone ([`UndoUnlessSent`]), and an error says the connection is done.
 async fn send_paired<W: AsyncWrite + Unpin>(
-    daemon: &Daemon,
+    gate: &Gate,
     writer: &mut W,
     reply: &Envelope,
     minted: &Minted,
 ) -> std::io::Result<()> {
+    let mut undo = UndoUnlessSent {
+        gate,
+        minted,
+        sent: false,
+    };
     let sent = send(writer, reply).await;
-    if sent.is_err() {
-        daemon
-            .gate
-            .undo_undelivered(&minted.device, &minted.sha256, minted.replaced.as_ref());
-    }
+    undo.sent = sent.is_ok();
     sent
+}
+
+/// Undoes a pairing when dropped, unless its reply was sent whole: also when the send
+/// never ends, and the connection's task is aborted mid-send, as rlxd's stop does to a
+/// connection still open after its wait.
+struct UndoUnlessSent<'a> {
+    gate: &'a Gate,
+    minted: &'a Minted,
+    sent: bool,
+}
+
+impl Drop for UndoUnlessSent<'_> {
+    fn drop(&mut self) {
+        if !self.sent {
+            let minted = self.minted;
+            self.gate
+                .undo_undelivered(&minted.device, &minted.sha256, minted.replaced.as_ref());
+        }
+    }
 }
 
 /// Sends `subscription`'s stream: the events after its place, a batch at a time, then
@@ -1172,7 +1193,10 @@ where
             None
         }
         Answer::Paired(reply, minted) => {
-            if send_paired(daemon, writer, &reply, &minted).await.is_err() {
+            if send_paired(&daemon.gate, writer, &reply, &minted)
+                .await
+                .is_err()
+            {
                 return Some(Flow::Close);
             }
             minted.close.then_some(Flow::Dropped)
@@ -1385,5 +1409,74 @@ impl WithOptionalId for Envelope {
             Some(id) => self.with_id(id),
             None => self,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    /// A client that never takes what is written: every write waits.
+    struct Stuck;
+
+    impl AsyncWrite for Stuck {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// A folder of the test's own, removed when dropped.
+    struct Dir(PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pairing_whose_reply_is_dropped_mid_send_is_undone() {
+        // Review #2068, r3 minor 3: rlxd's stop aborts a connection still sending a
+        // re-pairing's reply, and the old credential must be the one left paired.
+        let dir =
+            Dir(std::env::temp_dir().join(format!("rlxd-send-paired-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("gate.json");
+        let gate = Gate::load(&path, false).unwrap();
+        let first = gate.pair(None, None, None).ok().unwrap();
+        let again = gate.pair(None, Some(&first.credential), None).ok().unwrap();
+        let minted = Minted {
+            device: again.device,
+            sha256: again.sha256,
+            replaced: again.replaced,
+            close: false,
+        };
+        let reply = Envelope::ok(Data::new());
+        let mut stuck = Stuck;
+        let sending = send_paired(&gate, &mut stuck, &reply, &minted);
+        // Dropped while it waits to write, as an aborted task's future is.
+        let waited = tokio::time::timeout(Duration::from_millis(50), sending).await;
+        assert!(waited.is_err(), "a stuck client takes nothing");
+        let reloaded = Gate::load(&path, false).unwrap();
+        assert!(
+            reloaded.device_of(&first.credential).is_some(),
+            "the credential the client holds is paired again"
+        );
+        assert!(reloaded.device_of(&again.credential).is_none());
     }
 }

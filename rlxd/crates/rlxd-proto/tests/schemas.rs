@@ -1300,6 +1300,8 @@ fn a_status_validates_and_prints_back_as_itself() {
     assert_eq!(agrees::<StatusData>("status-reply.json", &status), status);
     let windows = with(&status, "pipe_acl", json!("current_user"));
     assert_eq!(agrees::<StatusData>("status-reply.json", &windows), windows);
+    let dev = with(&status, "dev_features", json!(["gate-dev-mode"]));
+    assert_eq!(agrees::<StatusData>("status-reply.json", &dev), dev);
     let mut brain = status.clone();
     brain["brain"]["pid"] = json!(77);
     assert_eq!(agrees::<StatusData>("status-reply.json", &brain), brain);
@@ -1336,6 +1338,11 @@ fn the_status_builder_prints_what_its_schema_accepts() {
     assert_eq!(printed["runs"], json!({"live": 0, "queued": 0}));
     assert_eq!(printed["jobs"], json!({"count": 0}));
     assert_eq!(printed.get("pipe_acl"), None);
+    assert_eq!(
+        printed.get("dev_features"),
+        None,
+        "a release build has none"
+    );
 
     assert_eq!(
         refused(StatusData::new("", 42, "linux", status_paths())),
@@ -1396,6 +1403,8 @@ fn a_status_refuses_its_wrong_shapes() {
         ("gate", json!("")),
         ("pipe_acl", json!("")),
         ("pipe_acl", Value::Null),
+        ("dev_features", json!([""])),
+        ("dev_features", json!("gate-dev-mode")),
         ("clients", json!({"app": 0, "tui": 0, "remote": 0})),
         (
             "clients",

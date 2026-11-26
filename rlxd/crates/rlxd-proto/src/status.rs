@@ -66,6 +66,12 @@ pub struct StatusData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, length(min = 1))]
     pub pipe_acl: Option<String>,
+    /// The development-only cargo features this rlxd was built with, by name, such as
+    /// the one that lets it run in gate dev mode (5.1): a build for development and CI.
+    /// Absent from a release build, which has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(length(min = 1)))]
+    pub dev_features: Vec<String>,
 }
 
 /// The serde code of `StatusData`'s fields, unchecked. It is private, so the only way in or
@@ -94,6 +100,8 @@ struct UncheckedStatus {
         deserialize_with = "present"
     )]
     pipe_acl: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dev_features: Vec<String>,
 }
 
 /// The connections open now, by `hello` role.
@@ -240,6 +248,7 @@ impl StatusData {
             jobs: Jobs::default(),
             paths,
             pipe_acl: None,
+            dev_features: Vec::new(),
         };
         status.validate()?;
         Ok(status)
@@ -257,6 +266,9 @@ impl StatusData {
         check::non_empty("gate", &self.gate)?;
         if let Some(acl) = &self.pipe_acl {
             check::non_empty("pipe_acl", acl)?;
+        }
+        for feature in &self.dev_features {
+            check::non_empty("dev_features", feature)?;
         }
         Ok(())
     }
