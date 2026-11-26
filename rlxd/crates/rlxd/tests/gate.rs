@@ -13,7 +13,6 @@ use common::{TestHome, assert_valid, eventually};
 use rlxd_client::proto::{HelloParams, Role};
 use rlxd_client::{Connection, Home, Incoming};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 /// One app-role connection, held open.
 struct App {
@@ -613,28 +612,13 @@ fn a_dev_mode_start_keeps_its_flag_in_the_registry_for_a_restart() {
     assert_eq!(argv[1..], ["serve", "--detach", "--gate-dev-mode"]);
 }
 
-/// Writes a gate.json holding one device, `route`, whose credential is `credential`: as
-/// any process of the user's could.
-fn plant(home: &TestHome, route: &str, credential: &str) {
-    let sha256: String = Sha256::digest(credential.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let gate = json!({"version": 1, "devices": [{
-        "device": "planted", "route": route, "sha256": sha256,
-        "created": "2026-11-26T00:00:00.000Z",
-    }]});
-    std::fs::create_dir_all(home.root().join("rlxd")).unwrap();
-    std::fs::write(home.gate_json(), gate.to_string()).unwrap();
-}
-
 #[test]
 fn a_planted_ssh_route_device_is_refused_until_ssh_pairing_lands() {
     // Review #1991, major 1: SSH pairing isn't built, so rlxd never minted an ssh-route
     // credential; one in gate.json is refused, outside dev mode and in it, and logged.
     for dev_mode in [false, true] {
         let home = TestHome::new();
-        plant(&home, "ssh", "planted-credential");
+        home.plant("ssh", "planted-credential");
         if dev_mode {
             home.start_dev();
         } else {
@@ -678,7 +662,7 @@ fn a_planted_ssh_route_device_is_refused_until_ssh_pairing_lands() {
     // The control: the same entry with route local passes in dev mode, where only the
     // credential is checked.
     let home = TestHome::new();
-    plant(&home, "local", "planted-credential");
+    home.plant("local", "planted-credential");
     home.start_dev();
     let run = home.rlxd(&[
         "call",
@@ -867,6 +851,82 @@ fn a_client_that_half_closes_still_gets_its_last_reply() {
     assert_eq!(reply["ok"], true, "the stop too: {reply}");
 }
 
+/// How many bytes of replies a client must leave unread for rlxd's end of the socket to
+/// stop being writable, while every one of them is still written whole: half of what a
+/// socket may queue on Linux (writable up to a quarter, `wmem_default`), and on macOS
+/// what it may queue less 1 KB (writable while 2 KB are free, `sendspace`).
+#[cfg(unix)]
+fn unwritable_but_not_blocked() -> usize {
+    let read = |program: &str, args: &[&str]| -> usize {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    };
+    if cfg!(target_os = "macos") {
+        read("sysctl", &["-n", "net.local.stream.sendspace"]) - 1024
+    } else {
+        read("cat", &["/proc/sys/net/core/wmem_default"]) / 2
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_half_closed_client_with_unread_replies_keeps_its_waiting_request() {
+    // Review #2068, r3 minor 1: replies the client has not read yet leave rlxd's end of
+    // the socket unwritable. That is not a client gone, so its gate.pair still waits.
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let mut stream = UnixStream::connect(home.root().join("run").join("rlxd.sock")).unwrap();
+    let hello = json!({"id": 1, "method": "hello", "params": {
+        "token": home.token(), "protocol_version": 1, "client": "unread",
+        "client_version": "0", "role": "cli", "capabilities": [],
+    }});
+    // Replies left unread, as many bytes in all as unwritable_but_not_blocked() says:
+    // hello's, about 150 bytes, then unknown_method ones of at most 32 KiB, which a
+    // frame always holds. Each says the method's name, and about 260 bytes besides.
+    let mut frames = format!("{hello}\n");
+    let mut left = unwritable_but_not_blocked() - 150;
+    let mut fillers = 0;
+    while left > 1024 {
+        let reply = left.min(32 * 1024);
+        fillers += 1;
+        let filler = json!({"id": 1 + fillers, "method": "x".repeat(reply - 260)});
+        frames.push_str(&format!("{filler}\n"));
+        left -= reply;
+    }
+    let pair = json!({"id": 2 + fillers, "method": "gate.pair", "params": {"device": "unread"}});
+    frames.push_str(&format!("{pair}\n"));
+    stream.write_all(frames.as_bytes()).unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let request = until_requested(&home, "unread");
+    // A client gone is noticed within 250 ms: give it time to be wrongly noticed.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let waiting = home.rlxd(&["gate", "pair"]).data()["requests"].clone();
+    assert_eq!(waiting.as_array().map(Vec::len), Some(1), "{waiting}");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let lines: Vec<String> = BufReader::new(stream).lines().map(Result::unwrap).collect();
+    assert_eq!(
+        lines.len(),
+        2 + fillers,
+        "hello's reply, the fillers' and gate.pair's"
+    );
+    for line in &lines[1..=fillers] {
+        let filled: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(filled["error"]["code"], "unknown_method");
+    }
+    let paired: Value = serde_json::from_str(&lines[1 + fillers]).unwrap();
+    assert_eq!(paired["ok"], true, "{paired}");
+    assert_eq!(paired["data"]["device"], "unread");
+    assert_eq!(devices(&home).len(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_client_gone_after_a_half_close_or_with_frames_queued_withdraws_its_request() {
@@ -933,11 +993,13 @@ fn look_alike_names_cannot_dodge_the_revoked_name_rule() {
         assert_eq!(run.code(), Some(1), "{name:?}: {run:?}");
         assert_eq!(run.error_code(), "invalid_params", "{name:?}");
     }
-    // Let in, but as the revoked name: a case apart, an I for an l, a trailing space.
+    // Let in, but as the revoked name: a case apart, an I for an l, a trailing space, a
+    // diacritic (review #2340).
     for (name, kept) in [
         ("LAPTOP", "LAPTOP"),
         ("Iaptop", "Iaptop"),
         ("laptop ", "laptop"),
+        ("lapt\u{1ECD}p", "lapt\u{1ECD}p"),
     ] {
         let params = json!({"device": name}).to_string();
         let waiting = pair_in_background(&home, &params);
@@ -1019,4 +1081,129 @@ fn an_app_connection_carrying_an_event_stream_is_dropped_from_the_gate_too() {
     assert!(matches!(caller.connection.read_line(), Ok(None)));
     assert!(App::connect(&home, &c2).is_err());
     assert!(App::connect(&home, &c3).is_ok());
+}
+
+#[test]
+fn combining_letters_and_fillers_cannot_dodge_the_revoked_name_rule() {
+    // Review #2068, r3 minor 2: "laptop" and a combining Latin letter compared apart from
+    // the revoked "laptop", so it was approved without --force; Hangul fillers paired a
+    // blank-looking name. Each is refused at once now, before any approval.
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let waiting = pair_in_background(&home, r#"{"device":"laptop"}"#);
+    let request = until_requested(&home, "laptop");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert_eq!(finish(waiting).0, Some(0));
+    assert_eq!(home.rlxd(&["gate", "unpair", "laptop"]).code(), Some(0));
+    for name in [
+        "laptop\u{0363}",
+        "lapto\u{0369}p",
+        "laptop\u{1DE7}",
+        "\u{3164}",
+        "\u{FFA0}",
+        "\u{115F}\u{115F}",
+    ] {
+        let params = json!({"device": name}).to_string();
+        let mut child = pair_in_background(&home, &params);
+        // Refused at once; a name taken waits for an approval instead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("{name:?} was taken as a device name: it waits for an approval");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (code, envelope) = finish(child);
+        assert_eq!(code, Some(1), "{name:?}: {envelope}");
+        assert_eq!(envelope["error"]["code"], "invalid_params", "{name:?}");
+    }
+    assert_eq!(home.rlxd(&["gate", "pair"]).data()["requests"], json!([]));
+    assert_eq!(devices(&home).len(), 1, "only the test client");
+}
+
+/// A credential's SHA-256, as gate.json keeps it.
+#[cfg(target_os = "macos")]
+fn sha256_of(credential: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(credential.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// macOS only: there a write waits whole once less than it is free in the send buffer,
+/// so a reply can be left stuck exactly. Linux waits only once its own accounting of
+/// the queued data reaches the buffer, which no reply size hits reliably; there the
+/// unit test `server::tests::a_pairing_whose_reply_is_dropped_mid_send_is_undone`
+/// covers the undo.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_re_pairing_reply_stuck_when_rlxd_stops_leaves_the_old_credential_paired() {
+    // Review #2068, r3 minor 3: rlxd's stop aborted a connection still sending a
+    // re-pairing's reply, so the new credential, which nobody received, stayed paired
+    // and the old one was locked out.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let home = TestHome::new();
+    home.start_dev();
+    let c1 = pair_test_client(&home);
+    let stream = UnixStream::connect(home.root().join("run").join("rlxd.sock")).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut ask = |frame: Value| {
+        writer.write_all(format!("{frame}\n").as_bytes()).unwrap();
+    };
+    let mut reply = String::new();
+    ask(json!({"id": 1, "method": "hello", "params": {
+        "token": home.token(), "protocol_version": 1, "client": "stuck",
+        "client_version": "0", "role": "app", "capabilities": [],
+        "gate_credential": c1,
+    }}));
+    reader.read_line(&mut reply).unwrap();
+    assert!(reply.contains(r#""ok":true"#), "{reply}");
+    // An unknown method's reply says the method's name: its length, besides the name.
+    reply.clear();
+    ask(json!({"id": 2, "method": "x"}));
+    reader.read_line(&mut reply).unwrap();
+    let besides_the_name = reply.len() - 1;
+    // Every reply read, the send buffer is free. One unread reply fills it to 64 bytes
+    // short, so the re-pairing's reply, about 165 bytes, waits.
+    let sendspace: usize = String::from_utf8(
+        std::process::Command::new("sysctl")
+            .args(["-n", "net.local.stream.sendspace"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let name = "x".repeat(sendspace - 64 - besides_the_name);
+    ask(json!({"id": 3, "method": name}));
+    ask(json!({"id": 4, "method": "gate.pair", "params": {"gate_credential": c1}}));
+    let old = sha256_of(&c1);
+    eventually("the re-pairing is written", || {
+        !std::fs::read_to_string(home.gate_json())
+            .unwrap()
+            .contains(&old)
+    });
+    home.stop();
+    assert!(
+        home.log().contains("never reached its client"),
+        "{}",
+        home.log()
+    );
+    assert!(
+        std::fs::read_to_string(home.gate_json())
+            .unwrap()
+            .contains(&old)
+    );
+    home.start_dev();
+    assert!(App::connect(&home, &c1).is_ok(), "the old credential works");
+    drop(reader);
 }

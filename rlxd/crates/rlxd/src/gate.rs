@@ -241,9 +241,10 @@ impl Gate {
         })
     }
 
-    /// Whether rlxd runs in gate dev mode.
+    /// Whether rlxd runs in gate dev mode: never in a build without the `gate-dev-mode`
+    /// feature, whatever it was loaded with.
     pub fn dev_mode(&self) -> bool {
-        self.dev_mode
+        cfg!(feature = "gate-dev-mode") && self.dev_mode
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -758,9 +759,13 @@ pub fn ssh_refused(device: &str) -> String {
 }
 
 /// `raw` as a device name, as rlxd keeps it, or why it can't be one. It is NFKC-
-/// normalized and trimmed, then must have 1 to 64 characters, each a letter, a digit, a
-/// space, `.`, `_` or `-`, all in one script (digits and those marks go with any). So
-/// zero-width and bidi controls, other punctuation and mixed scripts are refused.
+/// normalized and trimmed, then must have 1 to 64 characters and not look blank (its
+/// [`name_key`] is not empty). Each character is a space, or a letter, a digit, `.`, `_`
+/// or `-` that UTS #39 allows in identifiers, all in one script (digits and those marks
+/// go with any). So zero-width and bidi controls, combining letters, fillers, other
+/// punctuation and mixed scripts are refused, and so are the scripts UTS #39 marks
+/// Limited Use or Excluded, such as Cherokee or Tifinagh: a trade-off, accepted for the
+/// gate, against names that only look alike.
 pub fn device_name(raw: &str) -> Result<String, String> {
     use unicode_normalization::UnicodeNormalization;
     use unicode_security::MixedScript;
@@ -772,13 +777,21 @@ pub fn device_name(raw: &str) -> Result<String, String> {
             "a device name has 1 to {DEVICE_MAX} characters, not {count}"
         ));
     }
-    if let Some(c) = name
-        .chars()
-        .find(|c| !(c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-')))
-    {
-        return Err(format!(
-            "a device name has letters, digits, spaces, '.', '_' and '-' only, not {c:?}"
-        ));
+    if name_key(name).is_empty() {
+        return Err(format!("the device name {name:?} looks blank"));
+    }
+    if let Some(c) = name.chars().find(|&c| !allowed_in_name(c)) {
+        return Err(if c.is_alphanumeric() {
+            format!(
+                "a device name has only letters and digits that UTS #39 allows in \
+                 identifiers, and {c:?} is not one: combining letters, fillers, and the \
+                 letters of the scripts it marks Limited Use or Excluded (such as \
+                 Cherokee, Inuktitut, Tifinagh or Javanese) are refused, a security \
+                 trade-off so that names can't only look alike"
+            )
+        } else {
+            format!("a device name has letters, digits, spaces, '.', '_' and '-' only, not {c:?}")
+        });
     }
     if !name.is_single_script() {
         return Err("a device name is written in one script".to_owned());
@@ -786,13 +799,29 @@ pub fn device_name(raw: &str) -> Result<String, String> {
     Ok(name.to_owned())
 }
 
-/// The form two device names are compared in: their UTS #39 confusable skeleton, lower-
-/// cased, with runs of spaces as one. Names that only look alike (Cyrillic for Latin,
-/// `I` for `l`, a case or a doubled space apart) have one key.
+/// Whether a device name may have `c`: a space, or a letter, a digit, `.`, `_` or `-`
+/// whose UTS #39 identifier status is Allowed. That leaves out the letters that change
+/// how a name looks while comparing apart, such as combining Latin letters, and the ones
+/// that look like nothing, such as Hangul fillers.
+fn allowed_in_name(c: char) -> bool {
+    use unicode_security::GeneralSecurityProfile;
+    c == ' ' || ((c.is_alphanumeric() || matches!(c, '.' | '_' | '-')) && c.identifier_allowed())
+}
+
+/// The form two device names are compared in: NFKD with its combining marks dropped,
+/// then the UTS #39 confusable skeleton, lowercased, with runs of spaces as one. Names
+/// that only look alike (a diacritic, Cyrillic for Latin, `I` for `l`, a case or a
+/// doubled space apart) have one key.
 fn name_key(name: &str) -> String {
-    let skeleton: String = unicode_security::skeleton(name).collect();
+    use unicode_normalization::UnicodeNormalization;
+    use unicode_normalization::char::is_combining_mark;
+    let bare = |text: &str| -> String { text.nfkd().filter(|&c| !is_combining_mark(c)).collect() };
+    let skeleton: String = unicode_security::skeleton(&bare(name)).collect();
     let lower: String = unicode_security::skeleton(&skeleton.to_lowercase()).collect();
-    lower.split_whitespace().collect::<Vec<_>>().join(" ")
+    bare(&lower)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether two device names are one name, or look alike.
@@ -1083,6 +1112,57 @@ mod tests {
             Err(Refused::NotGate(_))
         ));
         assert_eq!(loaded.devices().len(), 1);
+    }
+
+    #[test]
+    fn combining_letters_and_hangul_fillers_are_no_part_of_a_name() {
+        // Review #2068, r3 minor 2: a combining Latin letter after a revoked name's last
+        // letter made a new name that looks like it, and Hangul fillers a blank one.
+        for (name, why) in [
+            ("laptop\u{0363}", "UTS #39"),
+            ("lapto\u{0369}p", "UTS #39"),
+            ("laptop\u{1DE7}", "UTS #39"),
+            ("\u{3164}", "looks blank"),
+            ("\u{FFA0}\u{FFA0}", "looks blank"),
+            ("\u{115F}", "looks blank"),
+            ("\u{064E}", "looks blank"),
+            ("\u{064E}\u{0650}", "looks blank"),
+            ("laptop\u{3164}", "UTS #39"),
+        ] {
+            let refused = device_name(name).expect_err(name);
+            assert!(refused.contains(why), "{name:?}: {refused}");
+        }
+        for name in ["ноутбук", "Λάπτοπ", "笔记本", "ラップトップ", "노트북"]
+        {
+            assert!(device_name(name).is_ok(), "{name:?}");
+            assert!(!name_key(name).is_empty(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn diacritics_do_not_tell_names_apart() {
+        // Review #2340: a diacritic made a name that looks like a revoked one.
+        for (a, b) in [
+            ("laptop", "lapt\u{1ECD}p"),
+            ("laptop", "lapto\u{0323}p"),
+            ("cafe", "caf\u{E9}"),
+            ("Muller", "M\u{FC}ller"),
+            ("laptop", "\u{1E37}apt\u{F6}p"),
+        ] {
+            assert!(same_name(a, b), "{a:?} and {b:?}");
+            assert!(device_name(b).is_ok(), "{b:?} is still a name");
+        }
+        assert!(!same_name("laptop", "desktop"));
+    }
+
+    #[test]
+    fn limited_use_scripts_are_refused_and_the_refusal_says_why() {
+        // Review #2340: accepted as a security trade-off, and said so.
+        for name in ["\u{13E3}\u{13B3}\u{13A9}", "\u{2D5C}\u{2D49}\u{2D3C}"] {
+            let refused = device_name(name).expect_err(name);
+            assert!(refused.contains("Limited Use"), "{name:?}: {refused}");
+            assert!(refused.contains("trade-off"), "{name:?}: {refused}");
+        }
     }
 
     #[test]
