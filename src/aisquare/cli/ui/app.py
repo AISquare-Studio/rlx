@@ -4172,10 +4172,17 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         snapshot = self.snapshot
         if snapshot is None or not snapshot.projects:
             return
-        # Never mid-setup (Q6): while Welcome sets a first fleet up, or shows before one is up,
-        # the question waits for "Your fleet is up", then comes at the next page change.
-        shown = self.content.current == "welcome"
-        if any(view.holds_the_sharing_ask(shown) for view in self.query(WelcomeView)):
+        # Never mid-setup (Q6): the question waits for "Your fleet is up", a listed project's
+        # manager and coders running (``first_run.fleet_is_up``), whichever page rlx opened
+        # on; then while Welcome sets another fleet up, or the sign-in it started is open. It
+        # comes at the next page change after that.
+        from aisquare.services import first_run
+
+        if not any(first_run.fleet_is_up(snapshot.agents.get(p.id, [])) for p in snapshot.projects):
+            return
+        if any(view.holds_the_sharing_ask() for view in self.query(WelcomeView)):
+            return
+        if self.after_sign_in is not None and self.after_sign_in.kind == "welcome":
             return
         self._sharing_asked = True
         if usage_share_core.forced_off_reason() is not None:

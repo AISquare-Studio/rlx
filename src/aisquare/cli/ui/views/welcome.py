@@ -40,13 +40,17 @@ the one it goes back to:
    (as after a reboot), is never called running, and a coder whose window is gone
    is restarted under its own label, as its own page's Restart does it.
 
-**A finished step folds to one line** (Q16): its title, what it settled on, and step 1's
-*Choose another*. Step 2 stays open while it still offers a sign-in; step 3, once the fleet
-is up, is the page's point, and keeps its *Open the manager*.
+**A finished step folds to one line** (Q16), which never wraps (cut short with an ellipsis
+on a narrow screen): step 1's number, a ✓, the project and its folder, and *Change*; step
+2's number and agent, a ✓, its version and whether it is signed in. Step 2 stays open while
+it still offers a sign-in; step 3, once the fleet is up, is the page's point, and keeps its
+*Open the manager*.
 
-**The sharing question waits for the fleet** (Q6): while this page sets a first fleet up,
-or shows before one is up, the shell does not ask it (:meth:`WelcomeView.holds_the_sharing_ask`);
-it asks at the next page change after "Your fleet is up".
+**The sharing question waits for the fleet** (Q6): the shell asks it only once a listed
+project's fleet is up (``first_run.fleet_is_up``), whichever page rlx opens on, and not
+while this page sets another fleet up or waits on its manager's trust answer
+(:meth:`WelcomeView.holds_the_sharing_ask`), nor while the sign-in it started is open; it
+asks at the next page change after that.
 
 **The page never takes the keyboard on its own.** The sidebar has it at mount,
 and the app's keys depend on that; the one exception is the return from a sign-in
@@ -99,14 +103,14 @@ from aisquare.services.first_run import (
 from aisquare.services.onboarding import FixResult, OnboardOutcome, PathVerdict
 
 WORKER_GROUP = "welcome"
+"""Every worker the page starts; one of each name runs at a time."""
 TRUST_GROUP = "welcome-trust"
+"""The wait on the manager's trust answer (``trust``): a group of its own, as it may run for
+as long as the human takes, and a wait for the page's work is never a wait for that."""
 TRUST_WORKER = "welcome-trust"
 """Its worker's name (``worker_name("trust")``): the shell's hand-over cuts it off rather than
 waiting for it (``app._cut_off_workers``), as it may wait for as long as the human takes and
 writes nothing."""
-"""The wait on the manager's trust answer (``trust``): a group of its own, as it may run for
-as long as the human takes, and a wait for the page's work is never a wait for that."""
-"""Every worker the page starts; one of each name runs at a time."""
 
 
 def worker_name(step: str) -> str:
@@ -464,12 +468,11 @@ def claude_text(claude: ClaudeState | None, *, platform: str) -> Text:
 
 
 def step_two_summary(claude: ClaudeState) -> str:
-    """Step 2 folded to its title line (Q16): what is settled about the agent."""
+    """Step 2 folded to its title line (Q16): what is settled about the agent, short enough
+    for one line at 80 columns. Connected is what its ✓ says (``ClaudeState.ready``)."""
     parts = [claude.version or "installed"]
     if claude.signed_in is True:
         parts.append("signed in")
-    if claude.connected:
-        parts.append("connected")
     return " · ".join(parts)
 
 
@@ -538,7 +541,8 @@ class WelcomeView(VerticalScroll):
     WelcomeView .card-title { text-style: bold; }
     WelcomeView .card-head { height: auto; }
     WelcomeView .card-head .card-title { width: 1fr; text-wrap: nowrap; text-overflow: ellipsis; }
-    WelcomeView .card-head Button { margin: 0 0 0 1; }
+    WelcomeView .card-title.-folded { text-wrap: nowrap; text-overflow: ellipsis; }
+    WelcomeView .card-head Button { margin: 0 0 0 1; width: auto; min-width: 0; }
     WelcomeView #project-candidates { height: auto; }
     WelcomeView .row { height: auto; }
     WelcomeView .candidate { height: auto; }
@@ -640,6 +644,9 @@ class WelcomeView(VerticalScroll):
         frame lists it (M4/L3): asked before then, the shell says it is no longer listed."""
         self._trust_for: str | None = None
         """The project whose manager the coders wait on (``trust`` in :attr:`busy`)."""
+        self._trust_worker: Worker[Any] | None = None
+        """That wait's worker: the one whose end counts. One it superseded is cancelled, and
+        its end ignored (:meth:`_wait_for_trust`)."""
         self.trust_given_up = False
         """The wait for the manager's trust answer ended without one: *Start the coders* is
         the user's."""
@@ -662,7 +669,7 @@ class WelcomeView(VerticalScroll):
         with Vertical(id="step-project", classes="card"):
             with Horizontal(id="project-head", classes="card-head"):
                 yield Static(id="project-title", classes="card-title")
-                yield Button("Choose another", id="welcome-change", compact=True)
+                yield Button("Change", id="welcome-change", compact=True)
             yield Static(id="project-status")
             yield Vertical(id="project-candidates")
             with Horizontal(id="project-other", classes="row"):
@@ -746,9 +753,11 @@ class WelcomeView(VerticalScroll):
 
     # ------------------------------------------------------------------ workers
 
-    def _run(self, name: str, work: Callable[[], object]) -> None:
+    def _run(self, name: str, work: Callable[[], object]) -> Worker[Any]:
         group = TRUST_GROUP if name == "trust" else WORKER_GROUP
-        self.run_worker(work, name=worker_name(name), group=group, thread=True, exit_on_error=False)
+        return self.run_worker(
+            work, name=worker_name(name), group=group, thread=True, exit_on_error=False
+        )
 
     def _in_flight(self, name: str) -> bool:
         return any(
@@ -819,6 +828,8 @@ class WelcomeView(VerticalScroll):
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
             return
         name = (worker.name or "").removeprefix(worker_name(""))
+        if name == "trust" and worker is not self._trust_worker:
+            return  # a wait superseded by a later one (``_wait_for_trust``): that one is busy
         self.busy.discard(name)
         if event.state is WorkerState.CANCELLED:
             return
@@ -1232,10 +1243,20 @@ class WelcomeView(VerticalScroll):
             self._open_if_listed()
 
     def _wait_for_trust(self, manager: FleetAgent) -> None:
-        """Wait, off the UI thread, for ``manager``'s trust answer; the coders start on it."""
+        """Wait, off the UI thread, for ``manager``'s trust answer; the coders start on it.
+
+        One wait at a time, on the manager started last: a *Start fleet* on another project
+        after *Change* cancels the wait on the first one's manager, whose card is gone, and
+        waits on its own, as its card says the coders follow it (the reviewer of #570: only
+        the first manager was waited on, and its answer started nothing)."""
         project, trust = self.project, self.seams.trust
-        if project is None or "trust" in self.busy:
+        if project is None:
             return
+        waiting = self._trust_worker
+        if waiting is not None and not waiting.is_finished:
+            if self._trust_for == project.id:
+                return  # this project's manager is waited on already
+            waiting.cancel()
         self._trust_for = project.id
         self.trust_given_up = False
 
@@ -1243,7 +1264,9 @@ class WelcomeView(VerticalScroll):
             worker = get_current_worker()
             return trust(manager, lambda: worker.is_cancelled)
 
-        self._start_work("trust", work)
+        self.busy.add("trust")
+        self._trust_worker = self._run("trust", work)
+        self.paint()
 
     def _trusted(self, result: Any, error: BaseException | None) -> None:
         """The wait for the manager's trust answer ended: the coders start on an answer, as
@@ -1317,13 +1340,10 @@ class WelcomeView(VerticalScroll):
     @property
     def fleet_up(self) -> bool:
         """Whether the chosen project's fleet is up, as step 3 says "Your fleet is up": its
-        manager and :data:`first_run.CODERS` coders running in the shell's frame."""
-        live = self._live()
-        manager = live.get("manager")
-        coders = [
-            row for row in live.values() if row.agent.role == "coder" and row.counts_as_running
-        ]
-        return manager is not None and manager.counts_as_running and len(coders) >= first_run.CODERS
+        manager and :data:`first_run.CODERS` coders running in the shell's frame, or just
+        started by this page (``first_run.is_a_fleet``)."""
+        live = self._live().values()
+        return first_run.is_a_fleet(row.agent.role for row in live if row.counts_as_running)
 
     @property
     def setting_up(self) -> bool:
@@ -1333,11 +1353,14 @@ class WelcomeView(VerticalScroll):
         working = bool(self.busy & (FLEET_WORK | {"trust"}))
         return (started or working) and not self.fleet_up
 
-    def holds_the_sharing_ask(self, shown: bool) -> bool:
-        """Whether the shell's usage-sharing question waits (Q6): never mid-setup, so not while
-        this page sets a fleet up, nor while it is ``shown`` before one is up; once "Your fleet
-        is up", it waits no more."""
-        return (self.setting_up or shown) and not self.fleet_up
+    def holds_the_sharing_ask(self) -> bool:
+        """Whether this page holds the shell's usage-sharing question back (Q6: never
+        mid-setup): while it sets a fleet up (:attr:`setting_up`), and while its fleet's work or
+        the wait on the manager's trust answer is in flight, the fleet up or not (the coders
+        started by hand before that answer, it is still the manager's pane's question). The
+        shell asks nothing anyway until a listed project's fleet is up
+        (``first_run.fleet_is_up``)."""
+        return self.setting_up or bool(self.busy & (FLEET_WORK | {"trust"}))
 
     def _read_after_start(self) -> bool:
         """Whether the shell's frame was read after the last start landed, for the chosen
@@ -1447,10 +1470,12 @@ class WelcomeView(VerticalScroll):
         title = Text("1  Project", style="bold")
         status = Text()
         if project is not None:
-            # Folded (Q16): the title line says what step 1 settled on.
-            title.append("  ✓ ", style="green")
-            title.append(project.root.name or str(project.root))
-            title.append(f" — {short_path(project.root)}", style="dim not bold")
+            # Folded (Q16): the title line says what step 1 settled on, the project first, so
+            # a narrow screen cuts its folder, not its name.
+            title = Text("1  ", style="bold")
+            title.append("✓ ", style="green")
+            title.append(project.root.name or str(project.root), style="bold")
+            title.append(f" — {short_path(project.root)}", style="dim")
         else:
             status.append("Pick the folder your agents will work in.")
             if self.candidates is not None and not self.candidates.items:
@@ -1498,6 +1523,7 @@ class WelcomeView(VerticalScroll):
         folded = done and not sign_in and claude is not None and not claude.others
         if folded and claude is not None:
             title.append(f" {step_two_summary(claude)}", style="dim not bold")
+        self.query_one("#claude-title", Static).set_class(folded, "-folded")
         body = claude_text(claude, platform=self.seams.platform)
         if "connect" in self.busy:
             body.append("\nConnecting…", style="dim")

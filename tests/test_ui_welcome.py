@@ -31,6 +31,7 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.message import Message
 from textual.pilot import Pilot
+from textual.widget import Widget
 from textual.widgets import Button, Input, Static
 
 from aisquare.cli.ui import app as app_mod
@@ -146,6 +147,8 @@ class Machine:
     has come. ``None``: none comes, and step 3's *Start the coders* is the user's."""
     waited: list[str] = field(default_factory=list)
     """The manager each wait on its trust answer was for, by label."""
+    waited_for: list[str] = field(default_factory=list)
+    """…and the project whose manager it was, by id."""
     after_choice: list[ClaudeState] = field(default_factory=list)
     """What the looks answer once a pick is saved; the current answers when empty."""
     starts: list[tuple[str, bool, int]] = field(default_factory=list)
@@ -219,6 +222,7 @@ class Machine:
 
         def trust(manager: FleetAgent, cancelled: Callable[[], bool]) -> bool:
             self.waited.append(manager.label)
+            self.waited_for.append(manager.project_id)
             answer = self.trust
             if answer is None:
                 return False
@@ -799,6 +803,51 @@ def test_step_one_judges_a_git_dir_as_steps_two_and_three_do(
     assert hosted(RealPathBox(), go)[0], "control: the folder can be used"
 
 
+def test_a_start_fleet_after_change_waits_on_its_own_managers_trust_answer(
+    tmp_path: Path,
+) -> None:
+    """The reviewer of #570, finding 3: *Change* while the coders waited on alpha's manager,
+    then *Start fleet* on beta. Beta's card said its coders start on their own, but only
+    alpha's manager was waited on (``waited == ['manager']``) and its answer started nothing.
+    The wait now follows the manager started last: alpha's is cancelled, beta's is waited on,
+    and beta's answer starts beta's coders, alone."""
+    alpha = ProjectInfo(id="prj_alpha", root=tmp_path / "alpha", onboarded_at=T0)
+    beta = ProjectInfo(id="prj_beta", root=tmp_path / "beta", onboarded_at=T0)
+    for root in (alpha.root, beta.root):
+        root.mkdir()  # the start's folder: start_fleet refuses one that is gone
+    other = Candidate(root=beta.root, is_git=True, project=beta)
+    machine = Machine(
+        claude=[READY],
+        found=Candidates(items=(here(alpha.root, alpha), other)),
+        trust=threading.Event(),
+    )
+    group = welcome.WORKER_GROUP  # the wait on the answer is held on purpose: not settled
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> dict[str, Any]:
+        page.query_one("#fleet-manager", Button).press()
+        await settle_until(host, lambda: machine.waited_for == [alpha.id], group=group)
+        page.query_one("#welcome-change", Button).press()
+        await settle_page(host, group=group)
+        page.choose(beta.root, beta)
+        await settle_until(host, lambda: visible(page, "fleet-manager"), group=group)
+        page.query_one("#fleet-manager", Button).press()
+        await settle_until(host, lambda: len(machine.waited_for) == 2, group=group)
+        seen: dict[str, Any] = {"waited": list(machine.waited_for)}
+        seen["card"] = card(page, "fleet-status")
+        seen["before"] = list(machine.starts)
+        machine.trust.set()  # type: ignore[union-attr]  # answered in beta's manager's pane
+        await settle_until(host, lambda: len(machine.starts) > 2)
+        await settle_page(host)
+        seen["after"] = list(machine.starts)
+        return seen
+
+    seen = hosted(machine, go)
+    assert seen["waited"] == [alpha.id, beta.id], "beta's manager is waited on too"
+    assert "the coders start on their own" in seen["card"], seen["card"]
+    assert seen["before"] == [(alpha.id, True, 0), (beta.id, True, 0)], "no coder before"
+    assert seen["after"] == [*seen["before"], (beta.id, False, first_run.CODERS)], seen
+
+
 def test_choose_another_is_not_undone_by_a_return_to_the_page(tmp_path: Path) -> None:
     """Step 1 is listed again on every return (`w`, back from Accounts), and each listing
     picked the folder asq started in again, undoing *Choose another* (review of #257)."""
@@ -1336,6 +1385,7 @@ def in_shell(
     fn: Callable[[Pilot[None], FleetApp, WelcomeView], Awaitable[T]],
     *,
     doctor: Callable[[], list[DoctorCheck]] = lambda: [],
+    size: tuple[int, int] = SIZE,
 ) -> T:
     """Run ``fn`` against the real shell, its Welcome page scripted by ``machine`` and on screen.
 
@@ -1345,7 +1395,7 @@ def in_shell(
 
     async def run() -> T:
         app = FleetApp(refresh_seconds=3600, doctor=doctor, accounts=None)
-        async with app.run_test(size=SIZE) as pilot:
+        async with app.run_test(size=size) as pilot:
             await pilot.pause()
             await settle_page(app)
             if app.content.current != "welcome":
@@ -2448,32 +2498,51 @@ def test_claudes_sign_in_asks_for_the_managers_account_and_opens_its_login(tmp_p
     assert opened.return_to is not None and opened.return_to.kind == "welcome"
 
 
-def test_finished_steps_fold_to_one_line_each(tmp_path: Path) -> None:
-    """Q16: once step 1 has its project and step 2 its agent, each card is one line: its title,
-    with what it settled on (and step 1's *Choose another* beside it)."""
-    machine, _project = _ready_machine(tmp_path)
+def _rows(app: App[Any], widget: Widget) -> list[str]:
+    """The screen's rows ``widget`` covers, as drawn, within its own columns."""
+    strips = app.screen._compositor.render_full_update(simplify=True).strips
+    region = widget.region
+    lines = ["".join(segment.text for segment in strip) for (strip,) in strips]
+    return [line[region.x : region.right] for line in lines[region.y : region.bottom]]
 
-    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> dict[str, Any]:
-        await settle_until(page.app, lambda: page.project is not None and page.claude is not None)
-        await settle_page(page.app)
+
+@pytest.mark.parametrize("size", [(80, 24), (60, 24)], ids=["80x24", "60x24"])
+def test_finished_steps_fold_to_one_line_each(
+    captain: str | None,
+    fleet_rows: dict[str, list[FleetAgentStatus]],
+    scripted: Callable[[Machine], None],
+    tmp_path: Path,
+    size: tuple[int, int],
+) -> None:
+    """Q16, in the real shell at the contract's 80x24 and at 60x24: once step 1 has its project
+    and step 2 its agent, each card is ONE line, never wrapped. Step 1's says ✓ and the project
+    first (a narrow screen cuts its folder, not its name), with *Change* beside it; step 2's,
+    its agent and ✓. At 80x24 step 2's version and sign-in fit whole (the round-2 tester of
+    #570: it wrapped to a second line there, and at 60x24 step 1 read "1  Proj…")."""
+    machine, _project = _ready_machine(tmp_path)
+    scripted(machine)
+
+    async def go(pilot: Pilot[None], app: FleetApp, page: WelcomeView) -> dict[str, Any]:
+        await settle_until(app, lambda: page.project is not None and page.claude is not None)
+        await settle_page(app)
         seen: dict[str, Any] = {}
-        for card_id, title_id in (
-            ("step-project", "project-title"),
-            ("step-claude", "claude-title"),
-        ):
+        for card_id in ("step-project", "step-claude"):
             box = page.query_one(f"#{card_id}")
-            lines = [child for child in box.children if child.display and child.region.height]
-            seen[card_id] = (box.content_region.height, len(lines), card(page, title_id))
+            shown_lines = [child for child in box.children if child.display and child.region.height]
+            seen[card_id] = (box.content_region.height, len(shown_lines))
+            seen[f"{card_id} row"] = _rows(app, box)[1]  # under its top border
         seen["change"] = visible(page, "welcome-change")
         seen["fleet"] = page.query_one("#step-fleet").content_region.height
         return seen
 
-    seen = hosted(machine, go)
-    height, children, title = seen["step-project"]
-    assert (height, children) == (1, 1) and "✓ demo-app" in title, seen
-    height, children, title = seen["step-claude"]
-    assert (height, children) == (1, 1) and "signed in · connected" in title, seen
-    assert seen["change"], "step 1's Choose another stays, on its line"
+    seen = in_shell(machine, go, size=size)
+    assert seen["step-project"] == (1, 1) and seen["step-claude"] == (1, 1), seen
+    project_row, claude_row = seen["step-project row"], seen["step-claude row"]
+    assert "1  ✓ demo-app" in project_row and "Change" in project_row, seen
+    assert "2  Claude Code  ✓" in claude_row, seen
+    if size == (80, 24):
+        assert f"✓ {READY.version} · signed in" in claude_row, "whole at the contract's size"
+    assert seen["change"], "step 1's Change stays, on its line"
     assert seen["fleet"] > 1, "step 3, not done, is not folded"
 
 
