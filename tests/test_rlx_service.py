@@ -12,7 +12,9 @@ child does not inherit a test's stubs, and the usage part would read this machin
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
+import logging
 import os
 import sys
 import threading
@@ -258,7 +260,7 @@ def serving() -> Iterator[Callable[..., threading.Thread]]:
         thread.failed = failed  # type: ignore[attr-defined]
         thread.start()
         threads.append(thread)
-        _until(lambda: service_host.running_service() is not None or failed, "it registered")
+        _until(lambda: service_host.running_service() is not None or bool(failed), "it registered")
         return thread
 
     yield run
@@ -505,6 +507,88 @@ def test_a_tui_leaves_remote_and_nudges_to_the_service_and_takes_them_back_when_
     assert said.count(service_client.TAKEN_BACK) == 1, said
 
 
+def test_a_remote_that_will_not_start_is_tried_a_few_times_then_switched_off_and_said_why(
+    server: FakeServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#1717 MAJOR 2: a Remote the switch asks for that cannot start (its port taken) was tried
+    every follow for ever, a WARNING in service.log each time, and the switch stayed on. Now
+    it is tried again after each of REMOTE_RETRY_SECONDS, then no more: the switch is saved
+    off, why is in the part's health for a TUI to say, and the log says it twice in all (the
+    failure, the giving up). Turned on again, it is tried afresh."""
+    update_state("remote_enabled", True)
+    taken = remote_server.RemoteError("port 18751 is in use by another program")
+    server.fail_start = taken
+    tries: list[float] = []
+    real_start = server.start_remote_server
+    now = [0.0]
+
+    def start(*args: Any, **kwargs: Any) -> Any:
+        tries.append(now[0])
+        return real_start(*args, **kwargs)
+
+    server.start_remote_server = start  # type: ignore[method-assign]
+    part = RemotePart(
+        lambda: RemoteController(server=server, tunnel_factory=fake_tunnel_factory(url=PUBLIC)),
+        clock=lambda: now[0],
+    )
+    part.start_part()
+    caplog.set_level(logging.INFO, logger=service_host.__name__)
+    health = []
+    while now[0] <= 200.0:  # every follow for 200 s, as the service ticks it
+        health.append(part.tick_part())
+        now[0] += service_host.REMOTE_FOLLOW_SECONDS
+
+    assert len(tries) == service_host.REMOTE_TRIES == 6, tries
+    waits = [later - before for before, later in itertools.pairwise(tries)]
+    assert waits == list(service_host.REMOTE_RETRY_SECONDS), waits
+    assert remote_control.load_remote_state().remote_enabled is False, "the switch saved off"
+    last = health[-1]
+    assert last.state == "off" and last.extra["problem"].endswith(str(taken)), last
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warned) == 2 and warned[-1].endswith("so its switch is saved off"), warned
+
+    # status.json carries why to a TUI, which reads it into its ServiceRemote
+    me = instances.describe_this_process(kind="service")
+    status = {"instance": me.id, "parts": {"remote": last.to_json()}}
+    service_host.status_path().parent.mkdir(parents=True, exist_ok=True)
+    service_host.status_path().write_text(json.dumps(status), encoding="utf-8")
+    seen = service_host.hosting([me])
+    assert seen is not None and seen.remote.problem == last.extra["problem"]
+    assert seen.remote.problem_at is not None and not seen.remote.on
+
+    update_state("remote_enabled", True)  # a TUI's switch, on again: tried afresh
+    part.tick_part()
+    assert len(tries) == service_host.REMOTE_TRIES + 1 and part.gave_up is None
+    part.stop_part()
+
+
+def test_a_client_says_why_the_service_stopped_trying_and_its_switch_is_off(
+    server: FakeServer,
+) -> None:
+    """#1717 MAJOR 2, a TUI's side: the panel said 'turns Remote on…' for ever and its switch
+    read off. Once the service has stopped trying, the line says why and that the switch is
+    off; a press of it after that asks again, and the old give-up is no longer its answer."""
+    update_state("remote_enabled", False)
+    controller = RemoteController(server=server, tunnel_factory=fake_tunnel_factory(url=PUBLIC))
+    controller.service = ServiceRemote(on=False)
+    controller.turn_on()
+    assert remote_control.SERVICE_TURNS_ON in controller.status_line()
+
+    why = "Remote could not start — port 18751 is in use by another program"
+    gave_up = ServiceRemote(on=False, problem=why, problem_at=datetime.now(UTC))
+    controller.service = gave_up  # the next frame: the service stopped trying
+    line = controller.status_line()
+    assert remote_control.service_gave_up(why) in line, line
+    assert remote_control.SERVICE_TURNS_ON not in line
+    assert not controller.running, "its switch reads off, as it is saved"
+
+    controller.turn_on()  # a press after the give-up: the service tries again
+    line = controller.status_line()
+    assert remote_control.SERVICE_TURNS_ON in line and why not in line, line
+    assert remote_control.load_remote_state().remote_enabled is True
+    assert "start_remote_server" not in server.calls, "a client starts nothing itself"
+
+
 def _client_of_a_live_service(
     server: FakeServer, *, switch_on: bool
 ) -> tuple[RemoteController, service_client.ServiceClient, list[str]]:
@@ -608,7 +692,12 @@ def test_the_shipment_is_the_clis_detached_one_and_nothing_while_sharing_is_off(
     from aisquare.core import sharing
 
     calls: list[str] = []
-    monkeypatch.setattr(sharing, "start_background_ship", lambda: calls.append("ship") or True)
+
+    def ship() -> bool:
+        calls.append("ship")
+        return True
+
+    monkeypatch.setattr(sharing, "start_background_ship", ship)
     part = service_host.ShipPart()
 
     monkeypatch.setattr(sharing, "enabled", lambda: False)

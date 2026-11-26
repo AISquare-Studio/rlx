@@ -38,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import logging.handlers
 import os
 import signal
 import subprocess
@@ -74,6 +75,14 @@ STATUS_SECONDS = 5.0
 """How often ``status.json`` is rewritten: as often as the registry's heartbeat."""
 REMOTE_FOLLOW_SECONDS = 2.0
 """How often Remote follows its saved switch, which a TUI flips (:class:`RemotePart`)."""
+REMOTE_RETRY_SECONDS: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 32.0)
+"""The waits before each try again of a Remote the switch asks for that would not start: the
+first try, one more after each wait, about a minute in all; then the service stops trying,
+saves the switch off and says why (#1717). It tried every follow, for ever, a WARNING each
+time, and the switch stayed on with no way off from a TUI."""
+REMOTE_TRIES = len(REMOTE_RETRY_SECONDS) + 1
+LOG_BYTES = 1_000_000
+"""``service.log`` is rolled over at this size, one old file kept: a service runs for weeks."""
 REMOTE_WATCH_SECONDS = 30.0
 """How often ngrok is revived if it died, and Remote's auto-off looked at, as a TUI does."""
 USAGE_SECONDS = 60.0
@@ -159,14 +168,29 @@ class RemotePart:
         self._clock = clock
         self.controller: RemoteController | None = None
         self._watched_at: float | None = None
+        self._failures = 0
+        """Tries in a row that left Remote off while its switch asks for it on."""
+        self._retry_at: float | None = None
+        """When the next of those tries is due, on ``clock``; ``None``: at the next follow."""
+        self.gave_up: tuple[str, datetime] | None = None
+        """Why the service stopped trying, and when: told to a TUI (``status.json``) until the
+        switch is turned on again."""
+        self._logged: str | None = None
 
     def start_part(self) -> None:
         from aisquare.cli.ui import remote_control
 
         self.controller = (self._make or remote_control.RemoteController)()
-        self.controller.on_news = lambda news, trouble: _log.log(
-            logging.WARNING if trouble else logging.INFO, "remote: %s", news
-        )
+        self.controller.on_news = self._hear
+
+    def _hear(self, news: str, trouble: bool) -> None:
+        """The controller's news, to ``service.log`` once per change: each try of a start resets
+        the controller's own once-only, and a Remote that would not start wrote the same
+        WARNING every :data:`REMOTE_FOLLOW_SECONDS` (#1717)."""
+        if news == self._logged:
+            return
+        self._logged = news
+        _log.log(logging.WARNING if trouble else logging.INFO, "remote: %s", news)
 
     def tick_part(self) -> PartHealth:
         from aisquare.cli.ui import remote_control
@@ -177,11 +201,14 @@ class RemotePart:
         saved = remote_control.load_remote_state()
         minutes = controller.state.auto_off_minutes
         controller.state = saved  # the switches as any rlx on this home saved them last
-        if saved.remote_enabled and not controller.remote_serving:
-            controller.restore(wait=True)
-        elif not saved.remote_enabled and controller.remote_serving:
-            controller.turn_off(wait=True, persist=False, reason="remote switched off")
-        elif controller.remote_serving and saved.auto_off_minutes != minutes:
+        if not saved.remote_enabled:
+            self._failures, self._retry_at = 0, None  # turned on again: tries afresh
+            if controller.remote_serving:
+                controller.turn_off(wait=True, persist=False, reason="remote switched off")
+        elif not controller.remote_serving:
+            self.gave_up = None
+            self._try_start(controller)
+        elif saved.auto_off_minutes != minutes:
             # A TUI's auto-off picker, as its client saved it: a new deadline from now.
             controller.set_auto_off(saved.auto_off_minutes, wait=True)
         now = self._clock()
@@ -191,6 +218,30 @@ class RemotePart:
                 controller.revive_tunnel_if_dead()
                 controller.enforce_auto_off(wait=True)
         return self.health()
+
+    def _try_start(self, controller: RemoteController) -> None:
+        """Start the Remote the switch asks for, when a try is due: again after each of
+        :data:`REMOTE_RETRY_SECONDS`, then no more, the switch saved off, why told once.
+        Another rlx serving this home is waited for, not counted: it takes nothing to fix."""
+        now = self._clock()
+        if self._retry_at is not None and now < self._retry_at:
+            return
+        controller.restore(wait=True)
+        if controller.remote_serving or not controller.state.remote_enabled:
+            self._failures, self._retry_at = 0, None  # up; or its missed auto-off saved it off
+            return
+        if controller.served_elsewhere_now():
+            self._failures, self._retry_at = 0, None
+            return
+        self._failures += 1
+        if self._failures < REMOTE_TRIES:
+            self._retry_at = now + REMOTE_RETRY_SECONDS[self._failures - 1]
+            return
+        why = controller.message or "Remote would not start"
+        self._failures, self._retry_at = 0, None
+        controller.switch_off_unstarted()
+        self.gave_up = (why, datetime.now(UTC))
+        self._hear(f"{why}; tried {REMOTE_TRIES} times, so its switch is saved off", True)
 
     def health(self) -> PartHealth:
         controller = self.controller
@@ -208,10 +259,17 @@ class RemotePart:
             where = controller.public_origin or "this machine only (ngrok not up)"
             return PartHealth("ok", f"serving: {where}", extra=facts)
         if not controller.state.remote_enabled:
-            return PartHealth("off", "switched off", extra=facts)
+            if self.gave_up is None:
+                return PartHealth("off", "switched off", extra=facts)
+            why, when = self.gave_up
+            facts.update(problem=why, problem_at=when.isoformat())
+            return PartHealth("off", f"switched off: {why}", extra=facts)
         if controller.served_elsewhere_now():
             return PartHealth("waiting", "served by another rlx on this home", extra=facts)
-        return PartHealth("error", controller.message or "not serving", extra=facts)
+        detail = controller.message or "not serving"
+        if self._failures:
+            detail = f"{detail} (try {self._failures} of {REMOTE_TRIES})"
+        return PartHealth("error", detail, extra=facts)
 
     def stop_part(self) -> None:
         controller = self.controller
@@ -628,6 +686,9 @@ class ServiceRemote:
     on: bool
     public_origin: str | None = None
     auto_off_at: datetime | None = None
+    problem: str | None = None
+    """Why the service stopped trying to start Remote, its switch saved off (#1717)."""
+    problem_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -655,19 +716,25 @@ def hosting(live: Sequence[instances.Instance] | None) -> Hosting | None:
     if not isinstance(remote, dict):
         return Hosting(found, ServiceRemote(on=False))
     origin = remote.get("public_origin")
-    until = remote.get("auto_off_at")
-    try:
-        deadline = datetime.fromisoformat(until) if isinstance(until, str) else None
-    except ValueError:
-        deadline = None
+    problem = remote.get("problem")
     return Hosting(
         found,
         ServiceRemote(
             on=remote.get("on") is True,
             public_origin=origin if isinstance(origin, str) else None,
-            auto_off_at=deadline,
+            auto_off_at=_when(remote.get("auto_off_at")),
+            problem=problem if isinstance(problem, str) else None,
+            problem_at=_when(remote.get("problem_at")),
         ),
     )
+
+
+def _when(value: object) -> datetime | None:
+    """A time ``status.json`` holds, as written; ``None`` for none or a damaged one."""
+    try:
+        return datetime.fromisoformat(value) if isinstance(value, str) else None
+    except ValueError:
+        return None
 
 
 def running_service(*, prune: bool = False) -> instances.Instance | None:
@@ -815,7 +882,9 @@ def log_to_file() -> None:
     time; INFO and up."""
     log = log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log, encoding="utf-8")
+    handler = logging.handlers.RotatingFileHandler(
+        log, maxBytes=LOG_BYTES, backupCount=1, encoding="utf-8"
+    )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.addHandler(handler)

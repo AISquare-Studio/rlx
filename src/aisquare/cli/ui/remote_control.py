@@ -216,6 +216,11 @@ SERVICE_TURNS_OFF = f"the {SERVICE} turns Remote off…"
 SERVED_BY_SERVICE = f"served by the {SERVICE}, which keeps it on with no rlx window open"
 
 
+def service_gave_up(problem: str) -> str:
+    """A client's status line once the service stopped trying to start Remote (#1717)."""
+    return f"{problem} — the {SERVICE} stopped trying and turned Remote's switch off"
+
+
 SwitchSaver = Callable[[str, object], None]
 """Hands one switch's new value to ``state.json``, by key: :func:`update_state`'s shape, which
 raises :class:`StateUnwritableError` when the file refuses it."""
@@ -253,6 +258,9 @@ class RemoteController:
         self.state = state if state is not None else load_remote_state()
         self.info: remote_server.RemoteInfo | None = None
         """This process's own Remote server, while it serves one (:attr:`remote_serving`)."""
+        self._service_asked_at: datetime | None = None
+        """When this controller, as the service's client, last turned Remote's switch on: a
+        give-up the service says from before then is not that press's answer."""
         self.service: ServiceRemote | None = None
         """The rlx service's Remote, while a service of this release runs on this home and
         this process serves none (#32): this controller is then its client
@@ -397,6 +405,7 @@ class RemoteController:
             # The service serves this home's Remote: the switch is what it follows.
             self._set_state(remote_enabled=True)
             self.message = SERVICE_TURNS_ON
+            self._service_asked_at = _aware(self._now())
             return
         self._turn_on(wait=wait, restoring=False)
 
@@ -1163,13 +1172,15 @@ class RemoteController:
         not land (:attr:`save_problem`), why the file could not be read (:attr:`read_problem`)
         and a switch ``state.json`` refused, each on a line of its own."""
         service = self.service
-        if (
-            self.info is None
-            and service is not None
-            and self.message in (SERVICE_TURNS_ON, SERVICE_TURNS_OFF)
-            and service.on == (self.message == SERVICE_TURNS_ON)
-        ):
-            self.message = None  # the service did what the switch asked
+        gave_up = None
+        if self.info is None and service is not None:
+            if self.message in (SERVICE_TURNS_ON, SERVICE_TURNS_OFF) and service.on == (
+                self.message == SERVICE_TURNS_ON
+            ):
+                self.message = None  # the service did what the switch asked
+            gave_up = self._service_gave_up(service)
+            if gave_up is not None and self.message == SERVICE_TURNS_ON:
+                self.message = None  # it stopped trying: why is the line instead
         tunnel = self.tunnel
         api = tunnel.api_warning if tunnel is not None else None
         since = self._writing_since
@@ -1177,6 +1188,7 @@ class RemoteController:
         lines = (
             SERVED_BY_SERVICE if self.client and self.running and self.message is None else None,
             self.message,
+            None if gave_up is None else service_gave_up(gave_up),
             api,
             saving,
             self.save_problem,
@@ -1422,6 +1434,23 @@ class RemoteController:
         return False
 
     # --- persistence -----------------------------------------------------------------------------
+
+    def _service_gave_up(self, service: ServiceRemote) -> str | None:
+        """Why the service stopped trying to start Remote, while that is the news: Remote off,
+        and no press of this client's since (it is trying again for that one)."""
+        problem, at, asked = service.problem, service.problem_at, self._service_asked_at
+        if service.on or problem is None:
+            return None
+        if asked is not None and (at is None or _aware(at) < asked):
+            return None
+        return problem
+
+    def switch_off_unstarted(self) -> None:
+        """Save Remote's switch off after the starts it asked for kept failing, as a press's
+        failed start saves it (:meth:`_start_failed`): for the rlx service, which tries a few
+        times and then stops (#1717). Nothing while this process serves, or while another
+        Remote is on for this home."""
+        self._start_failed()
 
     def reload_switches(self) -> None:
         """The saved switches again, as ``state.json`` holds them now: what any rlx on this
