@@ -16,13 +16,13 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rlxd_client::Home;
+use rlxd_client::{Home, Reply};
 use rlxd_proto::{VERSION, codes, methods};
 use tokio::task::JoinSet;
 
@@ -238,44 +238,76 @@ pub fn detach() -> ExitCode {
         Ok(home) => home,
         Err(e) => return out::fail(codes::START_FAILED, &e.to_string(), None),
     };
+    match start(&home, |_| {}) {
+        Ok(reply) => out::print_reply(&reply),
+        Err(StartError::AlreadyRunning) => already_running(&home),
+        Err(StartError::Failed { message, hint }) => {
+            out::fail(codes::START_FAILED, &message, hint.as_deref())
+        }
+    }
+}
+
+/// Why [`start`] gave no rlxd of its own.
+pub enum StartError {
+    /// An rlxd already runs for the home.
+    AlreadyRunning,
+    /// It could not start: what went wrong, and where to look.
+    Failed {
+        /// What went wrong.
+        message: String,
+        /// Where to look, such as the log.
+        hint: Option<String>,
+    },
+}
+
+/// Starts rlxd for `home` in the background, detached from this terminal, and returns its
+/// `status` reply once it takes a connection. `adjust` changes its command first, such as
+/// its environment.
+pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, StartError> {
+    let failed = |message: String, hint: Option<String>| StartError::Failed { message, hint };
     match lock::is_held(&home.lock()) {
-        Ok(true) => return already_running(&home),
+        Ok(true) => return Err(StartError::AlreadyRunning),
         Ok(false) => {}
         Err(e) => {
             let message = format!("cannot read {}: {e}", home.lock().display());
-            return out::fail(codes::START_FAILED, &message, None);
+            return Err(failed(message, None));
         }
     }
-    let mut child = match background_command().and_then(|mut command| command.spawn()) {
+    let command = background_command().map(|mut command| {
+        adjust(&mut command);
+        command
+    });
+    let mut child = match command.and_then(|mut c| c.spawn()) {
         Ok(child) => child,
         Err(e) => {
             let message = format!("cannot start rlxd in the background: {e}");
-            return out::fail(codes::START_FAILED, &message, None);
+            return Err(failed(message, None));
         }
     };
     let deadline = Instant::now() + START_WAIT;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             if lock::is_held(&home.lock()).unwrap_or(false) {
-                return already_running(&home);
+                return Err(StartError::AlreadyRunning);
             }
             let mut message = format!("rlxd exited ({status}) before it took a connection");
-            if let Some(said) = last_error(&home) {
+            if let Some(said) = last_error(home) {
                 message = format!("{message}: {said}");
             }
-            return out::fail(codes::START_FAILED, &message, Some(&see_the_log(&home)));
+            return Err(failed(message, Some(see_the_log(home))));
         }
-        if let Ok(reply) = cli::ask(&home, methods::STATUS) {
+        if let Ok(reply) = cli::ask(home, methods::STATUS) {
             let pid = reply
                 .data()
                 .and_then(|data| data.get("pid"))
                 .and_then(serde_json::Value::as_u64);
             if pid == Some(u64::from(child.id())) {
-                return out::print_reply(&reply);
+                return Ok(reply);
             }
             if child.try_wait().ok().flatten().is_some() || pid.is_some() {
                 // Another rlxd took the home first; this one exits on its own.
-                return already_running(&home);
+                wait_for_loser(&mut child);
+                return Err(StartError::AlreadyRunning);
             }
         }
         if Instant::now() >= deadline {
@@ -284,10 +316,27 @@ pub fn detach() -> ExitCode {
                 "rlxd did not take a connection within {} s, and was stopped",
                 START_WAIT.as_secs()
             );
-            return out::fail(codes::START_FAILED, &message, Some(&see_the_log(&home)));
+            return Err(failed(message, Some(see_the_log(home))));
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Waits for `child`, a start that lost the home to another rlxd, to give up, which it
+/// does once its [`LOCK_WAIT`] ends. So when [`start`] returns, no rlxd it started is
+/// still waiting for the lock. One that still runs after that took the home after all,
+/// from an rlxd that stopped meanwhile, and is stopped: nothing runs that the caller was
+/// told it did not start.
+fn wait_for_loser(child: &mut Child) {
+    let deadline = Instant::now() + LOCK_WAIT + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// `rlxd serve` in the background: no stdin, its output to nowhere (it logs to its file),

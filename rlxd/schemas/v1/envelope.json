@@ -18,7 +18,7 @@
   },
   "anyOf": [
     {
-      "description": "It worked. The process exits 0.",
+      "description": "It worked. The process exits 0, with one exception: `rlxd here` exits 3 (rlxd is\ninstalled but not running) and 4 (unsupported) with this envelope too, because its\nprobe worked and the exit code says which case it found.",
       "type": "object",
       "properties": {
         "data": {

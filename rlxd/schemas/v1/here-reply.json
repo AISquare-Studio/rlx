@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HereData",
+  "description": "`rlxd here`'s reply data.\n\n```json\n{\"installed\": true, \"running\": true, \"started\": false, \"supported\": true,\n \"version\": \"0.10.3\", \"protocol_versions\": [1], \"pid\": 4242,\n \"socket\": \"/home/u/.aisquare/run/rlxd.sock\", \"home\": \"/home/u/.aisquare\",\n \"platform\": \"linux\", \"auth\": {\"token_file\": \"/home/u/.aisquare/rlxd/token\"},\n \"rlxd\": {\"version\": \"0.10.3\", \"path\": \"/home/u/.local/bin/rlxd\", \"protocol_versions\": [1]},\n \"rlx\": {\"installed\": true, \"version\": \"0.10.3\", \"path\": \"/home/u/.local/bin/rlx\"}}\n```\n\nWhen rlxd runs, `version`, `protocol_versions`, `pid` and `socket` are the running\nrlxd's, as it reported them. When it does not, they are this rlxd's, which it serves\nonce started, and there is no `pid`.",
+  "type": "object",
+  "properties": {
+    "auth": {
+      "description": "How a client gets in.",
+      "$ref": "#/$defs/Auth"
+    },
+    "home": {
+      "description": "The home: `RLX_HOME`, else `AISQUARE_HOME`, else `~/.aisquare`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "installed": {
+      "description": "Always `true`: a probe that answers is an installed rlxd. Not installed is for the\ncaller to see: the command is missing.",
+      "const": true
+    },
+    "pid": {
+      "description": "The running rlxd's process id, from 1 to 2147483647 (2^31 - 1). Absent when it\ndoes not run, or when it runs but would not say.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 2147483647,
+      "minimum": 1
+    },
+    "platform": {
+      "description": "The OS, as Rust's `std::env::consts::OS` names it: `macos`, `linux` or `windows`\nwhere rlxd ships, and another name, such as `freebsd`, elsewhere.",
+      "type": "string",
+      "minLength": 1
+    },
+    "protocol_versions": {
+      "description": "Every protocol version rlxd serves, ascending: the running rlxd's, else what this\nrlxd serves once started. `hello`'s `protocol_version` must be one of them.",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint32",
+        "maximum": 4294967295,
+        "minimum": 1
+      },
+      "minItems": 1
+    },
+    "rlx": {
+      "description": "rlx's command, found beside this rlxd or in the folders rlx installs to.",
+      "$ref": "#/$defs/InstalledRlx"
+    },
+    "rlxd": {
+      "description": "This rlxd: the program that answered.",
+      "$ref": "#/$defs/InstalledRlxd"
+    },
+    "running": {
+      "description": "Whether an rlxd runs for this home now.",
+      "type": "boolean"
+    },
+    "socket": {
+      "description": "Where clients connect: the socket's path on macOS and Linux, the named pipe's name\non Windows. The running rlxd's own, as `status` reports it, when it runs.",
+      "type": "string",
+      "minLength": 1
+    },
+    "started": {
+      "description": "Whether this probe started it (`--start`). False when it was running already.",
+      "type": "boolean"
+    },
+    "supported": {
+      "description": "Whether rlxd serves a protocol version the caller speaks: one of `--protocols`,\nelse one of `rlxd.protocol_versions`. The running rlxd's versions count when it\nruns, else this rlxd's.",
+      "type": "boolean"
+    },
+    "version": {
+      "description": "The version of the rlxd that runs, else of this rlxd, which is rlx's version.\nAbsent when it runs but would not say.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "installed",
+    "running",
+    "started",
+    "supported",
+    "protocol_versions",
+    "socket",
+    "home",
+    "platform",
+    "auth",
+    "rlxd",
+    "rlx"
+  ],
+  "$defs": {
+    "Auth": {
+      "description": "How a client gets in: `hello`'s `token` is the contents of `token_file`.",
+      "type": "object",
+      "properties": {
+        "token": {
+          "description": "The token itself, only when asked for with `--show-token` and the file exists. It\nis a secret: whoever holds it can connect. Never log it, and fetch it again for\neach session rather than store it (rlxd's README, \"The shared token over SSH\").",
+          "type": "string",
+          "minLength": 1
+        },
+        "token_file": {
+          "description": "The file holding the shared client token. rlxd makes it the first time it starts.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "token_file"
+      ]
+    },
+    "InstalledRlx": {
+      "description": "rlx's command.",
+      "type": "object",
+      "properties": {
+        "installed": {
+          "description": "Whether it was found.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Its path, when it was found.",
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "description": "Its version, as `rlx --version` said it. Absent when it is not installed or would\nnot say.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "installed"
+      ]
+    },
+    "InstalledRlxd": {
+      "description": "The rlxd that answered.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Its path.",
+          "type": "string",
+          "minLength": 1
+        },
+        "protocol_versions": {
+          "description": "Every protocol version it serves, ascending.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "maximum": 4294967295,
+            "minimum": 1
+          },
+          "minItems": 1
+        },
+        "version": {
+          "description": "Its version, which is rlx's.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "version",
+        "path",
+        "protocol_versions"
+      ]
+    }
+  }
+}
