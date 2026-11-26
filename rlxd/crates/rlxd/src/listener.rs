@@ -1,7 +1,13 @@
 //! Where clients connect (handoff 0.10.3, 1.3):
 //!
 //! - **macOS and Linux:** the Unix socket `<home>/run/rlxd.sock`, mode 0600, in a 0700
-//!   folder.
+//!   folder. When that path is too long for the OS, the short socket
+//!   `/tmp/rlxd-<uid>/<hash of home>.sock` instead ([`Home::socket`]). Its folder must be
+//!   this user's, mode 0700, and not a link, in a `/tmp` that is root's and sticky: rlxd
+//!   refuses to start otherwise, and never changes a folder it finds into shape.
+//! - **Replacing a socket.** A socket left at the path by an rlxd that is gone is
+//!   replaced; one that something still listens on is refused, never taken over. A stop
+//!   removes the socket only if it is still the one this rlxd made.
 //! - **Windows:** the named pipe `\\.\pipe\rlxd-<hash of home>`, whose DACL holds one
 //!   entry, for the user rlxd runs as. rlxd makes its first instance, so a pipe someone
 //!   else made first under that name fails the start, and it reads the DACL back from
@@ -19,13 +25,13 @@ pub use windows::{Hangup, Listener};
 mod unix {
     use std::fs;
     use std::io;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
 
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::time::Duration;
 
-    use rlxd_client::Home;
+    use rlxd_client::{Home, SOCKET_PATH_MAX, unix};
     use tokio::net::{UnixListener, UnixStream};
 
     use crate::peer::Peer;
@@ -79,18 +85,31 @@ mod unix {
     pub struct Listener {
         listener: UnixListener,
         path: PathBuf,
+        /// The socket file's device and inode, so a stop removes only this one.
+        made: (u64, u64),
     }
 
     impl Listener {
         /// Listens on `home`'s socket, replacing a stale one: the caller holds the lock,
-        /// so no other rlxd serves it.
+        /// so no other rlxd serves it. A short socket's folder is made first.
         pub fn bind(home: &Home) -> io::Result<Self> {
             let path = home.socket();
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            let short = if home.uses_short_socket() {
+                let in_home = home.socket_in_home();
+                crate::log::info!(
+                    "the home's socket path, {}, is {} bytes, over this OS's {SOCKET_PATH_MAX}: \
+                     listening on {} instead",
+                    in_home.display(),
+                    in_home.as_os_str().len(),
+                    path.display()
+                );
+                let dir = Home::short_socket_dir();
+                unix::check_sticky(dir.parent().unwrap_or(Path::new("/tmp")))?;
+                Some((private_short_dir(&dir)?, dir))
+            } else {
+                None
+            };
+            replace_stale(&path)?;
             let listener = UnixListener::bind(&path).map_err(|error| {
                 let len = path.as_os_str().len();
                 io::Error::new(
@@ -98,8 +117,24 @@ mod unix {
                     format!("cannot listen on {} ({len} bytes): {error}", path.display()),
                 )
             })?;
+            // The folder was checked, then used by path. /tmp is sticky, so no one else
+            // can have swapped it in between; look again all the same.
+            if let Some((checked, dir)) = short {
+                let now = fs::symlink_metadata(&dir)?;
+                if (now.dev(), now.ino()) != checked || !unix::is_private_dir(&now) {
+                    return Err(io::Error::other(format!(
+                        "{} changed while rlxd made its socket in it; refusing it",
+                        dir.display()
+                    )));
+                }
+            }
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-            Ok(Self { listener, path })
+            let made = fs::symlink_metadata(&path)?;
+            Ok(Self {
+                listener,
+                path,
+                made: (made.dev(), made.ino()),
+            })
         }
 
         /// The next connection, its peer, and its hangup probe.
@@ -119,18 +154,184 @@ mod unix {
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
+            remove_if_made(&self.path, self.made);
         }
+    }
+
+    /// Removes the socket at `path` if it is still the one this rlxd made, `made` (its
+    /// device and inode), and not one another rlxd has bound there since.
+    fn remove_if_made(path: &Path, made: (u64, u64)) {
+        if let Ok(found) = fs::symlink_metadata(path)
+            && (found.dev(), found.ino()) == made
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Clears `path` for rlxd to bind. The caller holds the home's lock, so no rlxd of
+    /// this home listens there. A socket that still takes a connection is someone else's,
+    /// such as another home's rlxd, and is refused rather than taken over. A socket
+    /// nothing listens on, left by an rlxd that is gone, or any other file, is removed.
+    fn replace_stale(path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+        match fs::symlink_metadata(path) {
+            Ok(found) => {
+                if found.file_type().is_socket()
+                    && std::os::unix::net::UnixStream::connect(path).is_ok()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!(
+                            "something already listens on {}, and it is not this home's \
+                             rlxd, whose lock this one holds: rlxd will not take it over",
+                            path.display()
+                        ),
+                    ));
+                }
+                fs::remove_file(path)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Makes `dir`, the short sockets' folder in `/tmp`, 0700, and gives its device and
+    /// inode. One that is there must be a folder, not a link, this user's, and 0700, else
+    /// it is refused, never changed into shape: while it was otherwise, another user could
+    /// have left entries in it. The folder is left behind on stop, as other homes' sockets
+    /// may be in it.
+    fn private_short_dir(dir: &Path) -> io::Result<(u64, u64)> {
+        match fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot make {}: {error}", dir.display()),
+                ));
+            }
+        }
+        let found = fs::symlink_metadata(dir)?;
+        if !found.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is not a folder; remove it, and rlxd makes it",
+                dir.display()
+            )));
+        }
+        if !unix::is_owned(&found) {
+            return Err(io::Error::other(format!(
+                "{} belongs to uid {}, not to this user (uid {}): rlxd will not put its \
+                 socket there",
+                dir.display(),
+                found.uid(),
+                unix::uid()
+            )));
+        }
+        if !unix::is_private_dir(&found) {
+            return Err(io::Error::other(format!(
+                "{} has mode {:o}, so others may enter it: rlxd will not put its socket \
+                 there. Remove it once no rlxd uses it (`rm -r {}`), and rlxd makes it \
+                 again, 0700",
+                dir.display(),
+                found.mode() & 0o7777,
+                dir.display()
+            )));
+        }
+        Ok((found.dev(), found.ino()))
     }
 
     #[cfg(test)]
     mod tests {
         use std::io::{ErrorKind, Write};
         use std::net::Shutdown;
-        use std::os::fd::AsFd;
         use std::os::unix::net::UnixStream;
 
-        use super::Hangup;
+        use super::*;
+
+        fn fresh(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("rlxd-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_file(&dir);
+            dir
+        }
+
+        fn mode(path: &Path) -> u32 {
+            fs::symlink_metadata(path).unwrap().mode() & 0o777
+        }
+
+        #[test]
+        fn the_short_folder_is_made_0700_and_a_wider_one_refused_as_it_is() {
+            let dir = fresh("short-made");
+            private_short_dir(&dir).unwrap();
+            assert_eq!(mode(&dir), 0o700);
+            private_short_dir(&dir).unwrap();
+            for wider in [0o755, 0o750, 0o701, 0o1777] {
+                fs::set_permissions(&dir, fs::Permissions::from_mode(wider)).unwrap();
+                let refused = private_short_dir(&dir).unwrap_err().to_string();
+                assert!(refused.contains("others may enter it"), "{refused}");
+                assert!(refused.contains(&format!("mode {wider:o}")), "{refused}");
+                let left = fs::symlink_metadata(&dir).unwrap().mode() & 0o7777;
+                assert_eq!(left, wider, "never changed into shape");
+            }
+            fs::remove_dir(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_live_socket_is_refused_and_a_stale_one_or_a_file_replaced() {
+            let dir = fresh("short-stale");
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join("s.sock");
+            replace_stale(&path).unwrap();
+            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let refused = replace_stale(&path).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::AddrInUse, "{refused}");
+            assert!(path.exists());
+            drop(live);
+            replace_stale(&path).unwrap();
+            assert!(!path.exists(), "a socket nothing listens on is replaced");
+            fs::write(&path, "").unwrap();
+            replace_stale(&path).unwrap();
+            assert!(!path.exists());
+            fs::remove_dir(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_stop_removes_only_the_socket_it_made() {
+            let dir = fresh("short-made-only");
+            fs::create_dir(&dir).unwrap();
+            let path = dir.join("s.sock");
+            let _first = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let made = fs::symlink_metadata(&path).unwrap();
+            let made = (made.dev(), made.ino());
+            // Moved aside, not removed, so its inode can't be reused for the next one.
+            fs::rename(&path, dir.join("moved.sock")).unwrap();
+            let _second = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            remove_if_made(&path, made);
+            assert!(path.exists(), "another rlxd's socket stays");
+            let now = fs::symlink_metadata(&path).unwrap();
+            remove_if_made(&path, (now.dev(), now.ino()));
+            assert!(!path.exists());
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_file_or_a_link_where_the_short_folder_goes_is_refused() {
+            let file = fresh("short-file");
+            fs::write(&file, "").unwrap();
+            let refused = private_short_dir(&file).unwrap_err();
+            assert!(refused.to_string().contains("not a folder"), "{refused}");
+            fs::remove_file(&file).unwrap();
+
+            let target = fresh("short-target");
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            let link = fresh("short-link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let refused = private_short_dir(&link).unwrap_err();
+            assert!(refused.to_string().contains("not a folder"), "{refused}");
+            fs::remove_file(&link).unwrap();
+            fs::remove_dir(&target).unwrap();
+        }
 
         #[test]
         fn a_full_send_buffer_is_not_a_client_gone() {
