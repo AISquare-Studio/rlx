@@ -63,8 +63,10 @@ enum Action {
     },
     /// Stop rlxd, and wait until it has stopped.
     Stop,
+    // Boxed: its options are the largest variant, more so on Windows, whose paths are
+    // wider (clippy::large_enum_variant).
     /// Send one request on a new connection, and print the reply envelope.
-    Call(CallOptions),
+    Call(Box<CallOptions>),
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
