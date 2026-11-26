@@ -12,6 +12,14 @@ on:
     paths:
       - "rlxd/**"
       - ".github/workflows/rlxd.yml"
+      - ".github/workflows/rlxd-release.yml"
+      - "scripts/rlxd_archive.py"
+      - "src/aisquare/services/rlxd_install.py"
+      - "src/aisquare/cli/daemon.py"
+      - "tests/stub_releases.py"
+      - "tests/test_rlxd_install.py"
+      - "tests/test_rlxd_release_attach.py"
+      - "tests/test_rlxd_release_features.py"
       - "pyproject.toml"
       - "src/aisquare/core/daemons.py"
       - "src/aisquare/core/locking.py"
@@ -20,12 +28,32 @@ on:
   push:
     branches: [main, "rc/**"]
   workflow_dispatch:
+    # rlxd-release.yml's attach, by hand (1.2): a dry run unless dry_run is unticked, and
+    # run on the tag itself (`--ref vX.Y.Z`), which attach checks.
+    inputs:
+      release_tag:
+        description: Also attach the archives to this GitHub Release (vX.Y.Z). Run on that tag (--ref vX.Y.Z); any other ref is refused. Empty builds and packages only.
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: With release_tag, check everything and print the upload instead of running it.
+        required: false
+        type: boolean
+        default: true
 
 # Cancel superseded runs on the same branch/PR, grouped by event as ci.yml's are, so a
 # run by hand never cancels a push's run or the other way round.
+# A newer run of a ref cancels the older, but never a dispatch with a release_tag: its
+# attach may be part-way through `gh release upload --clobber`, and one cut off can leave
+# the release with some archives replaced and the sums not. The release_tag is in the
+# group, so such a run shares it only with dispatches attaching the same tag, which wait
+# rather than cancel. A plain dispatch on the tag's ref (no release_tag) is in another
+# group: it can neither cancel a running attach nor replace a pending one, as GitHub
+# replaces a group's pending run with any newer one.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.release_tag }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.release_tag == '' }}
 
 permissions:
   contents: read
@@ -298,3 +326,17 @@ jobs:
 
           code=0; over_ssh "$snippet" > /dev/null || code=$?
           [ "$code" = 127 ] || { echo "::error::with nothing installed the command exits $code, not 127"; exit 1; }
+
+  # 1.2: rlxd and rlxd-hook for the five targets, as the artifact `rlxd-archives`,
+  # installed by `rlx daemon install` on each OS (rlxd-release.yml). It attaches to a
+  # release only with a release_tag given by hand, and then only if dry_run is off.
+  # contents: write is for that attach job alone; rlxd-release.yml holds every other
+  # job to read.
+  release:
+    name: release
+    uses: ./.github/workflows/rlxd-release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ inputs.release_tag || '' }}
+      dry_run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}

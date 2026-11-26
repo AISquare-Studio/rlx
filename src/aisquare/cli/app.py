@@ -40,6 +40,7 @@ from aisquare.cli import (
     watcher,
 )
 from aisquare.cli import config as config_cli
+from aisquare.cli import daemon as daemon_cli
 from aisquare.cli import instances as instances_cli
 from aisquare.cli import metrics as metrics_cli
 from aisquare.cli import outcomes as outcomes_cli
@@ -249,6 +250,7 @@ app.add_typer(accounts.app, name="accounts")
 app.add_typer(connectors.app, name="connectors", hidden=True)
 app.add_typer(context.app, name="context")
 app.add_typer(context.app, name="ctx", hidden=True, help="Alias of 'context'.")
+app.add_typer(daemon_cli.app, name="daemon")  # rlxd on this machine (0.10.3, 1.2)
 app.add_typer(project.app, name="project")
 app.add_typer(project.app, name="workspace", hidden=True, help="Alias of 'project'.")
 app.add_typer(capture.app, name="capture", hidden=True)

@@ -360,7 +360,7 @@ class Registration:
                 try:
                     self._lock_fd = REGISTRY.keep_lock(self._daemon.id, self._lock_fd)
                 except OSError:  # kept as it was: tried again at the next beat
-                    _log.debug("the rlx daemon lock could not be taken again", exc_info=True)
+                    _log.debug("the daemon's lock could not be taken again", exc_info=True)
             self._daemon = replace(self._daemon, heartbeat_at=datetime.now(UTC))
             REGISTRY.write(self._daemon.id, self._daemon.to_record())
 
@@ -382,7 +382,7 @@ class Registration:
             try:
                 self.beat()
             except Exception:  # a beat missed is one more next time, never a dead thread
-                _log.debug("the rlx daemon record could not be written", exc_info=True)
+                _log.debug("the daemon's record could not be written", exc_info=True)
 
 
 def _cwd() -> str | None:
@@ -452,7 +452,7 @@ def registered(
     try:
         registration: Registration | None = register(kind, argv=argv, restartable=restartable)
     except OSError as exc:
-        _log.debug("the rlx daemon could not register", exc_info=True)
+        _log.debug("the daemon could not register", exc_info=True)
         if on_error is not None:
             on_error(exc)
         registration = None

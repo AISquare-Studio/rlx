@@ -400,6 +400,44 @@ together:
 `.github/workflows/rlxd.yml` also runs for a PR that changes only `pyproject.toml`, so
 a bump on one side alone fails before it merges.
 
+## Release archives
+
+rlxd ships with rlx releases (handoff 0.10.3, 1.2). `.github/workflows/rlxd-release.yml`
+builds `rlxd` and `rlxd-hook` for five targets and packs each flat
+(`../scripts/rlxd_archive.py`): `rlxd-<target>.tar.gz` for aarch64 and x86_64 macOS
+and Linux (glibc), `rlxd-x86_64-pc-windows-msvc.zip` with the `.exe`s, and
+`rlxd-SHA256SUMS` over them, which `shasum -a 256 -c` reads. The Linux binaries are
+built in Ubuntu 22.04, so they run on glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and
+later), and CI runs them there before packing them.
+
+- **Every head.** rlxd.yml calls it, so each run uploads the artifact `rlxd-archives`,
+  and installs it with `rlx daemon install` on ubuntu, macOS and Windows.
+- **A release.** Publishing GitHub Release `vX.Y.Z` attaches the five archives and the
+  sums to it. The tag must be `v` + `pyproject.toml`'s version.
+- **By hand.** `gh workflow run rlxd.yml --ref vX.Y.Z -f release_tag=vX.Y.Z` does a
+  dry run of that attach: every check, then the `gh release upload` it would run, printed.
+  Add `-f dry_run=false` to attach for real. It runs on the tag only: any other `--ref` is
+  refused (`ref_not_tag`), and so is a tag that has moved since (`tag_moved`), so what is
+  attached is always built from the tag. After a failed release run, re-run its failed
+  jobs instead: that run is the tag's.
+- **No test or dev features.** The build names its cargo features (`RELEASE_FEATURES`,
+  none) with `--no-default-features`, never `--all-features`, and refuses a list naming
+  a test or dev one. Gate dev mode is a cargo feature releases never enable (#24), and
+  `package` fails if any binary's `--version` carries its marker, `(dev: …)`, or is
+  anything but `<binary> <version>`.
+- **Signing.** None yet: notarization and Authenticode are an owner step, wired in at
+  the marked step of the build job.
+
+`rlx daemon install` (`../src/aisquare/services/rlxd_install.py`) fetches
+`rlxd-SHA256SUMS` and this machine's archive for `rlx --version` from
+`https://github.com/AISquare-Studio/rlx/releases/download/v<version>/`, or from
+`$AISQUARE_RELEASES_URL/v<version>/` when that is set, which must be `https://`, or
+`http://` to this machine (127.0.0.1, ::1, localhost) for a test server. A redirect is
+followed only while it stays `https`. It checks the sha256 before it writes anything,
+then installs both binaries into `uv tool dir --bin`, beside `rlx`: both or neither, so
+`rlxd` and `rlxd-hook` are never from different versions. On Windows a running `rlxd.exe`
+is renamed aside, and the next install removes it.
+
 ## Licence
 
 MIT, as rlx is (`../LICENSE`).
