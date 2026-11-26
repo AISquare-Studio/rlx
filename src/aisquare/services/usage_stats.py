@@ -459,6 +459,12 @@ def account_types(store: ContextStore, *, refresh: bool = True) -> dict[int, str
         return cached
     types: dict[int, str] = {}
     for account in accounts_core.list_accounts():
+        if not account.config_dir.exists():
+            # A home its agent never ran in (Claude Code's plain ~/.claude before its first
+            # run) keeps no login: none is asked for, of the Keychain or a file (#1891), as
+            # the usage read asks none for an account with no login recorded.
+            types[account.slot] = cached.get(account.slot, UNKNOWN_TYPE)
+            continue
         try:
             types[account.slot] = _subscription_of(account)
         except Exception:  # an account whose login cannot be read is one of unknown type
@@ -591,7 +597,9 @@ def _sweep(
     purged = purged_repos(store)
     repos: dict[Path, tuple[str, Path] | None] = {}
     seen_repos: dict[str, Path] = {}
-    types = account_types(store)
+    # Nothing to attribute: no account's login is read. An empty home's sweep (the rlx
+    # service's, every ten minutes) ran `security` for Claude Code's item (#32, #1891).
+    types = account_types(store) if found else {}
     for index, transcript in enumerate(found):
         if progress is not None:
             progress(index, len(found))

@@ -943,11 +943,36 @@ class _ServiceLog(logging.handlers.RotatingFileHandler):
     def __init__(self, path: Path, *, follow: tuple[int, ...]) -> None:
         super().__init__(path, maxBytes=LOG_BYTES, backupCount=1, encoding="utf-8")
         self._follow = follow
+        self.unrollable: str | None = None
+        """Why the last rollover failed: the log goes on in the file it has, unrolled, until the
+        service starts again (a log folder it cannot write, #1889)."""
         self._point_fds()
 
     def doRollover(self) -> None:
-        super().doRollover()
+        """Roll over; or, when the folder will not take the rename (``0o500``), keep logging
+        to the file it had and say so once. The failure ended the service, its stream closed
+        by the failed roll (review of #32, #1889): under S2's KeepAlive, a crash loop."""
+        try:
+            super().doRollover()
+        except OSError as exc:
+            self.unrollable = str(exc)
+            if self.stream is None:  # the failed roll closed it first
+                with contextlib.suppress(OSError):
+                    self.stream = self._open()
+            stream = self.stream
+            if stream is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.write(
+                        f"service.log could not be rolled over ({exc}): it grows on until the "
+                        f"{SERVICE} starts again\n"
+                    )
+                    stream.flush()
         self._point_fds()
+
+    def shouldRollover(self, record: logging.LogRecord) -> int:
+        if self.unrollable is not None:
+            return 0
+        return super().shouldRollover(record)
 
     def _point_fds(self) -> None:
         stream = self.stream
@@ -962,6 +987,8 @@ class _ServiceLog(logging.handlers.RotatingFileHandler):
     def roll_if_due(self) -> None:
         """Roll over once the file is :data:`LOG_BYTES` long, whoever wrote it: lines on fd 1
         and 2 pass no handler, which looks at the size only as it writes a record."""
+        if self.unrollable is not None:
+            return
         try:
             due = Path(self.baseFilename).stat().st_size >= LOG_BYTES
         except OSError:

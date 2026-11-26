@@ -374,9 +374,11 @@ def test_the_rlx_service_never_starts_a_ping(
     as its child runs it, beside `service run` and `service status`: no ping, and no feature
     counted. The control is the old argv, which does both.
 
-    The sweep itself runs, over the suite's temp agent home, with the Keychain stubbed on top of
-    the suite's own stub: a scratch home does not scope the Keychain, and a sweep read Claude
-    Code's real item (tester note #1844). A read that reached it would be recorded here."""
+    The sweep itself runs, over the suite's temp agent home, which is EMPTY (no transcripts, no
+    ~/.claude). The Keychain is ON (``keychain_platform`` true) with ``read_keychain`` recording
+    every read, so a read is seen. None is made: an empty sweep asks no account's login. It ran
+    `security` for 'Claude Code-credentials' (#1844, #1891); a home with transcripts is
+    test_rlx_service.py's."""
     from types import SimpleNamespace
 
     from aisquare.cli import app as cli_app
@@ -394,7 +396,7 @@ def test_the_rlx_service_never_starts_a_ping(
         return accounts_core.KeychainRead(found=False)
 
     monkeypatch.setattr(accounts_core, "read_keychain", no_keychain)
-    monkeypatch.setattr(accounts_core, "keychain_platform", lambda: False)
+    monkeypatch.setattr(accounts_core, "keychain_platform", lambda: True)  # so a read is seen
     monkeypatch.setattr(accounts_core, "KEYCHAIN_TOOL", os.devnull)
     monkeypatch.setattr(service_host, "log_to_file", lambda: None)
     monkeypatch.setattr(service_host, "run_service", lambda **_: None)  # the process, ended
@@ -416,7 +418,7 @@ def test_the_rlx_service_never_starts_a_ping(
 
     assert words == list(service_host.SWEEP_COMMAND)
     assert inline.count == 0 and stub.seen == [] and counted == []
-    assert keychain == [], "the sweep read the Keychain"
+    assert keychain == [], "an empty sweep read the Keychain"
 
     runner.invoke(app, ["--json", "metrics", "stats", "--range", "today"])  # the old argv
     assert len(stub.seen) == 1 and counted == ["cli.metrics.stats"], "the control: it pings"

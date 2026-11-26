@@ -841,6 +841,88 @@ def test_a_failed_service_command_says_why_in_its_json_detail(
     assert said["error"] == error and said["detail"] == why, said
 
 
+@pytest.mark.parametrize(
+    ("answer", "kind"),
+    [("not found", "max"), ("locked", "unknown"), ("refused", "unknown")],
+)
+def test_the_service_sweep_asks_each_login_once_in_six_hours_whatever_the_keychain_says(
+    machine: Any, monkeypatch: pytest.MonkeyPatch, answer: str, kind: str
+) -> None:
+    """#1891 (b), the manager's decision: with transcripts to attribute, `rlx service sweep`
+    reads each account's subscription as a TUI's sweep does, once in ACCOUNT_TYPES_MAX_AGE (6 h),
+    and a Keychain that is locked or refused is not asked again before then either. The
+    Keychain is ON with read_keychain recording, so every read is seen. The plain slot is the
+    one account here; its login file holds 'max', which a Keychain with no item falls back to."""
+    from aisquare.core import claude_accounts as accounts_core
+    from aisquare.core.store import store_session
+    from aisquare.services import usage_stats
+    from tests.usage_stats_support import NOW, prompt, request
+
+    reads: list[tuple[str, str]] = []
+
+    def keychain(service: str, account: str, *, fresh: bool = False) -> Any:
+        reads.append((service, account))
+        if answer == "not found":
+            return accounts_core.KeychainRead(found=False)
+        return accounts_core.KeychainRead(found=False, unreadable=answer, problem=answer)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(accounts_core, "read_keychain", keychain)
+    monkeypatch.setattr(accounts_core, "keychain_platform", lambda: True)
+    machine.account(1, "max")
+    repo = machine.repo("served")
+    machine.session(1, repo, "s1", prompt(NOW, cwd=repo), request(NOW, "m1", cwd=repo))
+    plain = next(a for a in accounts_core.list_accounts() if a.slot == 1)
+    item = (accounts_core.keychain_service(plain), accounts_core.keychain_account())
+
+    first = CliRunner().invoke(app, ["service", "sweep"])
+    assert first.exit_code == 0, first.output
+    assert reads == [item], "one read of the one login"
+
+    machine.session(1, repo, "s2", prompt(NOW, cwd=repo), request(NOW, "m2", cwd=repo))
+    usage_stats.maybe_sweep(now=datetime.now(UTC) + timedelta(minutes=11))  # the next sweep
+    assert reads == [item], "within six hours the cached type is used, locked or not"
+    with store_session() as store:
+        assert usage_stats.account_types(store, refresh=False) == {1: kind}
+
+
+def test_a_log_folder_it_cannot_write_does_not_end_the_service_at_a_roll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1889/#1891 MINOR 2: a log folder the service cannot write (0o500) plus a roll due ended
+    the service within 5 s (roll_if_due -> doRollover -> PermissionError), its stream closed
+    by the failed roll; under S2's KeepAlive, a crash loop. It goes on logging to the file it
+    has, says once that it cannot roll, and tries no more."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root renames in any folder")
+    monkeypatch.setattr(service_host, "LOG_BYTES", 300)
+    root = logging.getLogger()
+    level = root.level
+    service_host.log_to_file()  # in-process: fd 1 and 2 are not the log, so none is moved
+    handler = service_host._service_log
+    assert handler is not None
+    log = service_host.log_path()
+    try:
+        with log.open("a", encoding="utf-8") as other:
+            other.write("y" * 400 + "\n")  # a roll is due
+        log.parent.chmod(0o500)
+        try:
+            service_host.roll_log_if_due()  # raised PermissionError: the service ended
+            logging.getLogger("rlx-test-roll").warning("still logging after the failed roll")
+            service_host.roll_log_if_due()  # tried no more
+        finally:
+            log.parent.chmod(0o700)
+        text = log.read_text(encoding="utf-8")
+        assert "still logging after the failed roll" in text
+        assert text.count("could not be rolled over") == 1, "said once"
+        assert not log.with_name(log.name + ".1").exists(), "nothing rolled"
+        assert handler.stream is not None and not handler.stream.closed
+    finally:
+        root.removeHandler(handler)
+        handler.close()
+        root.setLevel(level)
+        monkeypatch.setattr(service_host, "_service_log", None)
+
+
 def test_the_cli_every_hook_imports_does_not_import_the_service() -> None:
     """``rlx service`` is registered with the CLI, which every hook imports: its module imports
     the service only when a command runs, so the hook path pays nothing for it."""
