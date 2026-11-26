@@ -50,6 +50,9 @@ const FINISH_WAIT: Duration = Duration::from_secs(3);
 
 /// `rlxd serve`, in the foreground: logs to stderr too, unless `background`.
 pub fn serve(background: bool) -> ExitCode {
+    if background {
+        close_inherited();
+    }
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => return out::fail(codes::START_FAILED, &e.to_string(), None),
@@ -347,6 +350,7 @@ fn wait_for_loser(child: &mut Child) {
 
 /// `rlxd serve` in the background: no stdin, its output to nowhere (it logs to its file),
 /// in a process group or console of its own, so the terminal's signals do not reach it.
+/// On POSIX it closes, first, any other descriptor it inherits ([`close_inherited`]).
 fn background_command() -> io::Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
     command
@@ -369,6 +373,44 @@ fn background_command() -> io::Result<Command> {
     }
     Ok(command)
 }
+
+/// Closes every descriptor above stderr this process was started with. A detached rlxd
+/// outlives the process that starts it, so a descriptor it inherited would stay open as
+/// long as rlxd runs; if that were a pipe the starter's caller reads to its end, such as
+/// `rlxd here --start`'s stdout, the caller would wait for rlxd to stop. Each descriptor
+/// Rust opens is close-on-exec, but a process may still pass one on: on macOS a pipe is
+/// made close-on-exec just after it is made, so a program that starts two commands at
+/// once can give one command the other's pipe, and that command its rlxd.
+///
+/// It runs first, before rlxd opens anything, and lists the descriptors in
+/// `/proc/self/fd` (Linux) or `/dev/fd` (macOS).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn close_inherited() {
+    let Some(listing) = ["/proc/self/fd", "/dev/fd"]
+        .into_iter()
+        .find_map(|dir| fs::read_dir(dir).ok())
+    else {
+        return;
+    };
+    let inherited: Vec<libc::c_int> = listing
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    // The listing's own descriptor is among them, and closed by now: closing it again
+    // fails, and changes nothing.
+    for fd in inherited {
+        // SAFETY: nothing in this process owns a descriptor above 2 yet, so none is
+        // closed under its owner.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// Windows passes a child only the handles marked inheritable, and a detached rlxd's
+/// starter marks its stdio not ([`crate::windows::keep_std_handles_from_children`]).
+#[cfg(not(unix))]
+fn close_inherited() {}
 
 fn already_running(home: &Home) -> ExitCode {
     let message = format!("rlxd is already running for {}", home.root().display());
