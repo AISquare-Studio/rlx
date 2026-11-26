@@ -250,10 +250,11 @@ def _home_lines(home: lifecycle_service.HomeMove) -> None:
         for line in rest:
             _say(f"· {line}")
     elif home.problem is not None:
+        again = f"{prog.word()} upgrade"
         then = (
-            "it is as it was: stop what runs, then run rlx upgrade again"
+            f"it is as it was: stop what runs, then run {again} again"
             if home.rolled_back
-            else "run rlx upgrade again to finish it"
+            else f"run {again} again to finish it"
         )
         _say(f"✗ the home was not moved: {home.problem} — {then}")
 
