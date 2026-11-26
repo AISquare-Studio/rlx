@@ -48,7 +48,9 @@ pub struct Envelope {
 #[serde(untagged)]
 #[schemars(transform = one_or_the_other)]
 pub enum Outcome {
-    /// It worked. The process exits 0.
+    /// It worked. The process exits 0, with one exception: `rlxd here` exits 3 (rlxd is
+    /// installed but not running) and 4 (unsupported) with this envelope too, because its
+    /// probe worked and the exit code says which case it found.
     Ok {
         /// `true`.
         ok: True,

@@ -3,10 +3,11 @@
 //! folders on its `PATH`. rlxapp looks in it for a local rlxd, and the README spells it
 //! out for a remote one, where a non-login SSH session has not read the user's profile.
 //!
-//! 1. **uv's tool bin folder**, where `uv tool install` puts `rlx` and `rlx daemon
-//!    install` puts `rlxd` beside it, found as uv finds it: `UV_TOOL_BIN_DIR`, else
-//!    `XDG_BIN_HOME`, else `XDG_DATA_HOME/../bin`, else `~/.local/bin`. A variable
-//!    counts only when it holds an absolute path.
+//! 1. **uv's tool bin folder**, where `uv tool install` puts `rlx`, found as uv finds it:
+//!    `UV_TOOL_BIN_DIR`, else `XDG_BIN_HOME`, else `XDG_DATA_HOME/../bin`, else
+//!    `~/.local/bin`. A variable counts only when it holds an absolute path. rlxd goes
+//!    beside rlx here: it ships with 0.10.3's release binaries, which `rlx daemon install`
+//!    (#21) puts in place, and the installer and `rlx upgrade` must put it here too.
 //! 2. **`~/.local/bin`**, uv's default, again: a variable that moved uv's folder is often
 //!    set only in the profile a non-login session skips.
 //! 3. **Homebrew's** `bin` folders: `/opt/homebrew/bin` (Apple silicon) and

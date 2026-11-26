@@ -21,7 +21,7 @@
 //! A non-login SSH session has not read the user's profile, so its `PATH` may lack the
 //! folders rlx and Claude Code are installed in. The rlxd `--start` starts gets them on
 //! its `PATH`, after the session's own: this rlxd's folder, [`install::dirs`], and the
-//! system's.
+//! system's. It does not keep the session's `SSH_*` variables ([`SESSION_VARS`]).
 
 use std::env;
 use std::ffi::OsString;
@@ -59,6 +59,17 @@ const SYSTEM_DIRS: &[&str] = if cfg!(windows) {
 } else {
     &["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 };
+
+/// The SSH session's own variables, which the rlxd `--start` starts does not keep: it
+/// outlives the session, and the Claude Code it runs must not use an agent the session
+/// forwarded.
+const SESSION_VARS: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+    "SSH_ORIGINAL_COMMAND",
+];
 
 /// `rlxd here`'s options, as the command line gave them.
 #[derive(Debug, Default)]
@@ -181,7 +192,16 @@ fn answer(
     }
     here.supported = shares(accepted, &here.protocol_versions);
     if args.start && !here.running && here.supported {
-        match serve::start(home, daemon_path(beside).as_deref()) {
+        let path = daemon_path(beside);
+        let adjust = |command: &mut Command| {
+            if let Some(path) = &path {
+                command.env("PATH", path);
+            }
+            for name in SESSION_VARS {
+                command.env_remove(name);
+            }
+        };
+        match serve::start(home, adjust) {
             Ok(_) => here.started = true,
             Err(StartError::AlreadyRunning) => {}
             Err(StartError::Failed { message, hint }) => {
@@ -404,8 +424,8 @@ fn parse_versions(text: &str) -> Result<Vec<u32>, String> {
     Ok(versions)
 }
 
-/// rlx's command: beside this rlxd first, where `rlx daemon install` puts the pair, then
-/// in the install folders, then on `PATH`.
+/// rlx's command: beside this rlxd first, since rlxd is installed in rlx's folder
+/// ([`install::dirs`]), then in the install folders, then on `PATH`.
 fn find_rlx(beside: Option<&Path>) -> InstalledRlx {
     let mut dirs: Vec<PathBuf> = beside.into_iter().map(Path::to_path_buf).collect();
     dirs.extend(install::dirs());
@@ -498,9 +518,15 @@ fn describe(here: &HereData, accepted: &[u32], status: u8) -> ExitCode {
             .unwrap_or_default();
         let started = if here.started { ", started now" } else { "" };
         format!("rlxd {version} runs for {}{pid}{started}", here.home)
-    } else {
+    } else if here.supported {
         format!(
             "rlxd {version} is installed, and not running for {}. `rlxd here --start` starts it.",
+            here.home
+        )
+    } else {
+        // --start does not start an rlxd the caller can't speak to.
+        format!(
+            "rlxd {version} is installed, and not running for {}.",
             here.home
         )
     }];

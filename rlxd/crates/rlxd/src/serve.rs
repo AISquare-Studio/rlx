@@ -13,7 +13,6 @@
 //! is free everything else is done. `--detach` starts the same in the background and returns once it takes
 //! a connection, printing its `status`.
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -239,7 +238,7 @@ pub fn detach() -> ExitCode {
         Ok(home) => home,
         Err(e) => return out::fail(codes::START_FAILED, &e.to_string(), None),
     };
-    match start(&home, None) {
+    match start(&home, |_| {}) {
         Ok(reply) => out::print_reply(&reply),
         Err(StartError::AlreadyRunning) => already_running(&home),
         Err(StartError::Failed { message, hint }) => {
@@ -261,9 +260,10 @@ pub enum StartError {
     },
 }
 
-/// Starts rlxd for `home` in the background, detached from this terminal, with `path` as
-/// its `PATH` when given, and returns its `status` reply once it takes a connection.
-pub fn start(home: &Home, path: Option<&OsStr>) -> Result<Reply, StartError> {
+/// Starts rlxd for `home` in the background, detached from this terminal, and returns its
+/// `status` reply once it takes a connection. `adjust` changes its command first, such as
+/// its environment.
+pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, StartError> {
     let failed = |message: String, hint: Option<String>| StartError::Failed { message, hint };
     match lock::is_held(&home.lock()) {
         Ok(true) => return Err(StartError::AlreadyRunning),
@@ -273,7 +273,11 @@ pub fn start(home: &Home, path: Option<&OsStr>) -> Result<Reply, StartError> {
             return Err(failed(message, None));
         }
     }
-    let mut child = match background_command(path).and_then(|mut c| c.spawn()) {
+    let command = background_command().map(|mut command| {
+        adjust(&mut command);
+        command
+    });
+    let mut child = match command.and_then(|mut c| c.spawn()) {
         Ok(child) => child,
         Err(e) => {
             let message = format!("cannot start rlxd in the background: {e}");
@@ -319,17 +323,13 @@ pub fn start(home: &Home, path: Option<&OsStr>) -> Result<Reply, StartError> {
 
 /// `rlxd serve` in the background: no stdin, its output to nowhere (it logs to its file),
 /// in a process group or console of its own, so the terminal's signals do not reach it.
-/// `path`, when given, is its `PATH`.
-fn background_command(path: Option<&OsStr>) -> io::Result<Command> {
+fn background_command() -> io::Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["serve", BACKGROUND_FLAG])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

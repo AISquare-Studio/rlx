@@ -1,6 +1,9 @@
 //! `rlxd here`'s reply: what rlx is installed on this machine, whether its rlxd runs for
 //! the home, which protocol versions it serves, and how a client gets in. rlx.app runs
 //! it over SSH to decide how to connect (the owner's remote brief, §3).
+//!
+//! Its envelope is `ok` whenever the probe worked, and `rlxd here` exits 3 (not running)
+//! and 4 (unsupported) with it: the one place an `ok` envelope does not mean exit 0.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -59,7 +62,8 @@ pub struct HereData {
     /// The home: `RLX_HOME`, else `AISQUARE_HOME`, else `~/.aisquare`.
     #[schemars(length(min = 1))]
     pub home: String,
-    /// The OS: `macos`, `linux` or `windows`.
+    /// The OS, as Rust's `std::env::consts::OS` names it: `macos`, `linux` or `windows`
+    /// where rlxd ships, and another name, such as `freebsd`, elsewhere.
     #[schemars(length(min = 1))]
     pub platform: String,
     /// How a client gets in.
@@ -110,7 +114,8 @@ pub struct Auth {
     #[schemars(length(min = 1))]
     pub token_file: String,
     /// The token itself, only when asked for with `--show-token` and the file exists. It
-    /// is a secret: whoever holds it can connect.
+    /// is a secret: whoever holds it can connect. Never log it, and fetch it again for
+    /// each session rather than store it (rlxd's README, "The shared token over SSH").
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

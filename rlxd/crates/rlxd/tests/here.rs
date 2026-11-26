@@ -297,3 +297,126 @@ fn an_rlxd_that_holds_the_lock_and_never_listens_fails_the_probe() {
     }
     drop(lock);
 }
+
+/// The environment of the process `pid`, as `NAME=value` text: `/proc/<pid>/environ` on
+/// Linux, `ps eww` elsewhere.
+#[cfg(unix)]
+fn environment_of(pid: u64) -> String {
+    if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
+        return String::from_utf8_lossy(&bytes).replace('\0', " ");
+    }
+    let output = std::process::Command::new("ps")
+        .args(["eww", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn the_rlxd_start_starts_keeps_no_ssh_session_variable() {
+    const SESSION: [&str; 5] = [
+        "SSH_AUTH_SOCK",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+        "SSH_ORIGINAL_COMMAND",
+    ];
+    let home = TestHome::new();
+    let mut command = home.command(&["here", "--json", "--start"]);
+    for name in SESSION {
+        command.env(name, format!("/session/{name}"));
+    }
+    // A variable that is kept, to show the environment is really read.
+    command.env("RLXD_HERE_TEST_KEPT", "kept");
+    let (code, started) = answer(&common::run(command, None));
+    assert_eq!(code, Some(0), "{started}");
+    let pid = started["pid"].as_u64().unwrap();
+    let environment = environment_of(pid);
+    // Whole names: `_P9K_SSH_TTY=` is not `SSH_TTY=`.
+    let has = |name: &str| {
+        let prefix = format!("{name}=");
+        environment
+            .split_whitespace()
+            .any(|w| w.starts_with(&prefix))
+    };
+    assert!(
+        has("RLXD_HERE_TEST_KEPT"),
+        "the daemon's environment was not read: {environment}"
+    );
+    assert!(has("PATH"), "{environment}");
+    for name in SESSION {
+        assert!(!has(name), "{name} kept: {environment}");
+    }
+}
+
+/// The command rlx.app sends over SSH, as the README gives it.
+#[cfg(unix)]
+fn readme_command() -> String {
+    let readme = common::workspace().join("README.md");
+    let text = std::fs::read_to_string(&readme).unwrap();
+    text.lines()
+        .find(|line| line.starts_with("sh -c '") && line.ends_with("exit 127'"))
+        .unwrap_or_else(|| panic!("no `sh -c '…exit 127'` line in {}", readme.display()))
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn the_readme_command_runs_rlxd_else_says_rlx_else_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    // Folders every user shares: an rlx or rlxd there would answer instead of this test's.
+    let shared = [
+        "/opt/homebrew/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/usr/local/bin",
+    ];
+    if let Some(found) = shared
+        .iter()
+        .flat_map(|dir| ["rlx", "rlxd"].map(|p| Path::new(dir).join(p)))
+        .find(|p| p.exists())
+    {
+        eprintln!(
+            "skipped: {} answers the README's command first",
+            found.display()
+        );
+        return;
+    }
+    let user = TestHome::new();
+    let session = StopsWithNoEnvironment(user.root());
+    let bin = user.root().join(".local").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sent = readme_command();
+    // A non-login session: HOME and a system PATH, nothing from a profile.
+    let send = || {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .env_clear()
+            .env("HOME", user.root())
+            .env("PATH", "/usr/bin:/bin")
+            .args(["-c", &sent]);
+        common::run(command, None)
+    };
+
+    let nothing = send();
+    assert_eq!(nothing.code(), Some(127), "{nothing:?}");
+
+    let rlx = bin.join("rlx");
+    std::fs::write(&rlx, "#!/bin/sh\necho 'rlx 0.10.1'\n").unwrap();
+    std::fs::set_permissions(&rlx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old = send();
+    assert_eq!(old.code(), Some(5), "{old:?}");
+    assert_eq!(old.stdout.trim(), "rlx 0.10.1");
+
+    std::fs::copy(env!("CARGO_BIN_EXE_rlxd"), bin.join("rlxd")).unwrap();
+    let (code, started) = answer(&send());
+    assert_eq!(code, Some(0), "{started}");
+    assert_eq!(started["started"], true);
+    assert_eq!(
+        real(started["rlxd"]["path"].as_str().unwrap()),
+        real(bin.join("rlxd"))
+    );
+    assert_eq!(real(started["rlx"]["path"].as_str().unwrap()), real(&rlx));
+    assert_eq!(started["rlx"]["version"], "0.10.1");
+    assert_eq!(session.rlxd(&["stop"]).code(), Some(0));
+}

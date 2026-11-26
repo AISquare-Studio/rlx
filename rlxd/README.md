@@ -69,8 +69,10 @@ started first.
 
 - rlxd is the program that serves the protocol, so the versions it reports are compiled
   into it, not looked up.
-- It is one native binary that answers in milliseconds. `rlx` is Python, and starting it
-  takes about 0.3 s before it does anything.
+- It is one native binary, with nothing to resolve on `PATH` or in a virtualenv, so it
+  runs as it is from a session that has read no profile, even `env -i`. A probe still
+  takes about 0.4 s when rlx is installed: nearly all of it is `rlx --version`, run for
+  `rlx.version`.
 - `--start` is `rlxd serve --detach`, run by the same binary.
 - Its answer is an rlxd-proto type, with its schema in `schemas/v1/` like every wire
   type.
@@ -83,23 +85,29 @@ A non-login SSH session hasn't read the user's shell profile, so its `PATH` usua
 the folder rlx is installed in. Run rlxd by its absolute path, trying these folders in
 order (`rlxd_client::install::dirs()` is the same list):
 
-1. uv's tool bin folder, where `uv tool install` puts `rlx` and `rlx daemon install` puts
-   `rlxd` beside it: `$UV_TOOL_BIN_DIR`, else `$XDG_BIN_HOME`, else
-   `$XDG_DATA_HOME/../bin`, else `~/.local/bin`;
+1. uv's tool bin folder, where `uv tool install` puts `rlx`: `$UV_TOOL_BIN_DIR`, else
+   `$XDG_BIN_HOME`, else `$XDG_DATA_HOME/../bin`, else `~/.local/bin`. rlxd goes there
+   too, beside rlx: it ships with 0.10.3's release binaries, which `rlx daemon install`
+   (#21, PR #593) puts in place. The installer and `rlx upgrade` must put it there as
+   well;
 2. `~/.local/bin`, uv's default, in case a variable moved it only in the profile;
 3. Homebrew's `/opt/homebrew/bin` and `/home/linuxbrew/.linuxbrew/bin`;
 4. `/usr/local/bin`.
 
 The command an app sends. ssh hands it to the user's login shell, which may be fish or
-csh, so it runs under `sh -c`:
+csh, so it runs under `sh -c`. It runs the first rlxd it finds. When there is none, it
+looks for rlx in the same folders:
 
 ```sh
-sh -c 'for d in "${UV_TOOL_BIN_DIR:-}" "${XDG_BIN_HOME:-}" "${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}" "$HOME/.local/bin" /opt/homebrew/bin /home/linuxbrew/.linuxbrew/bin /usr/local/bin; do if [ -n "$d" ] && [ -x "$d/rlxd" ]; then exec "$d/rlxd" here --json --start; fi; done; exit 127'
+sh -c 'set -- "${UV_TOOL_BIN_DIR:-}" "${XDG_BIN_HOME:-}" "${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}" "$HOME/.local/bin" /opt/homebrew/bin /home/linuxbrew/.linuxbrew/bin /usr/local/bin; for d do if [ -n "$d" ] && [ -x "$d/rlxd" ]; then exec "$d/rlxd" here --json --start; fi; done; for d do if [ -n "$d" ] && [ -x "$d/rlx" ]; then "$d/rlx" --version; exit 5; fi; done; exit 127'
 ```
 
-Exit 127 means no rlxd in any of them: rlx is not installed, case 4 ("No active rlx
-instances found"). An `rlx` in those folders with no `rlxd` beside it is an rlx from before
-0.10.3, or one whose rlxd was never installed: the app can treat that as case 2.
+- **rlxd found:** its exit code and envelope, in the table below.
+- **Exit 5: rlx, but no rlxd.** It is an rlx from before 0.10.3, or one whose rlxd was
+  never installed, so it is case 2: "This rlx (vX) isn't supported. Upgrade rlx on the
+  host." stdout is what `rlx --version` printed, `rlx 0.10.1`, so its last word is the vX.
+- **Exit 127: neither.** rlx is not installed, case 4: "No active rlx instances found on
+  <host>."
 
 ### Options and exit codes
 
@@ -117,7 +125,14 @@ instances found"). An `rlx` in those folders with no `rlxd` beside it is an rlx 
 | 4 | 2: unsupported. rlxd serves none of the caller's versions; `--start` starts nothing | `ok`, `supported: false` |
 | 1 | the probe failed: an rlxd that holds its lock but takes no connections, or a start that failed | `ok: false` (`disconnected`, `start_failed`, …) |
 | 2 | a usage error | none; the message is on stderr |
-| 127 | 4: not installed. The shell, not rlxd, says it | none |
+| 5 | 2: rlx with no rlxd. The command above says it, not rlxd | none; stdout is `rlx --version`'s line |
+| 127 | 4: nothing installed. The command above, or the shell, says it | none |
+
+**Exit 3 and 4 come with an `ok` envelope.** Everywhere else, `ok: true` means exit 0
+(handoff 7.2, and `envelope.json`'s text). `rlxd here` is the one exception: its answer is
+`ok` whenever the probe itself worked, and the exit code says which case it found. So
+read `data.running` and `data.supported`, or the exit code, not `ok` alone. (`rlxd status`
+also exits 3, with `ok: false` and `not_running`.)
 
 ### The answer
 
@@ -144,12 +159,31 @@ instances found"). An `rlx` in those folders with no `rlxd` beside it is an rlx 
 - **`auth`**: `hello`'s `token` is the contents of `auth.token_file`, which the app reads
   inside the authenticated SSH session, or takes from `auth.token` with `--show-token`.
   The per-device gate credential (5.1) will be added here.
+- **`platform`** is the OS as Rust names it (`std::env::consts::OS`): `macos`, `linux` or
+  `windows` where rlxd ships, and another name, such as `freebsd`, elsewhere.
 - **The protocol range.** This rlxd serves protocol version 1, and `hello`'s reply lists
   the same.
 
-The rlxd `--start` starts gets a `PATH` it can find Claude Code and rlx on: the
-session's own first, then this rlxd's folder, the folders above and the system's
-(`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`), each one only if it exists. It runs in a
+### The shared token over SSH
+
+SSH user authentication is the boundary for the shared token (brief §5). Whoever can run
+`rlxd here --show-token` as the host's user can already read `auth.token_file`, and the
+exec channel is encrypted, so `--show-token` exposes nothing new. rlxd never writes the
+token to its log or into an error. For the app:
+
+- **Never log it.** Keep `data.auth.token` out of logs, error reports and crash dumps.
+- **Fetch it again for each session.** Read it inside each authenticated SSH session and
+  keep it in memory only. A shared token stored on a device can't be revoked for that
+  device alone by `rlxd gate unpair`. Whether the app may store it is a decision the hub
+  has not made yet, and until it does, the answer is no.
+
+### The rlxd `--start` starts
+
+It gets a `PATH` it can find Claude Code and rlx on: the session's own first, then this
+rlxd's folder, the folders above and the system's (`/usr/bin`, `/bin`, `/usr/sbin`,
+`/sbin`), each one only if it exists. It does not get the SSH session's own variables:
+`SSH_AUTH_SOCK`, `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY` and `SSH_ORIGINAL_COMMAND` are
+removed, so the Claude Code it runs can't use an agent the session forwarded. It runs in a
 process group of its own with no terminal, so it outlives the SSH session, unless the
 host's systemd-logind has `KillUserProcesses=yes` (no distribution's default), which ends
 every process of a closed session. There, rlxd has to run as a user service instead
@@ -157,7 +191,9 @@ every process of a closed session. There, rlxd has to run as a user service inst
 session).
 
 `.github/workflows/rlxd.yml`'s `ssh` job runs the probe through a real `ssh localhost`
-on ubuntu and checks that the answer matches the local one.
+on ubuntu, with the host key pinned and public-key auth only. It checks that each answer
+matches the local one and that the started rlxd has no `SSH_*` variables. It also runs the
+command above in all three of its cases: rlxd, rlx only (exit 5) and nothing (exit 127).
 
 ## Building and checking
 
