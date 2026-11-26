@@ -10,8 +10,9 @@
 //!   `daemon.gap` there too. `--until` implies `--follow`.
 //! - **Exit codes.** 0 once an event of one of `--until`'s types has printed, once
 //!   `--limit` events have, or when the stream ends and there is no `--until`. 1 when
-//!   rlxd refuses (an unknown topic, `not_gate` for `--as-app`), or the stream ends before
-//!   an `--until` type. 2 on a usage error, 3 when rlxd is not running, and 4 when
+//!   rlxd refuses (an unknown topic, or `not_gate` for `--as-app`, which presents the
+//!   test gate credential `rlxd call --as-app` kept and never pairs itself), or the
+//!   stream ends before an `--until` type. 2 on a usage error, 3 when rlxd is not running, and 4 when
 //!   `--timeout` runs out first.
 //! - **stdout carries events only,** so `jq -s .` of it is an `event-list.json`. A refusal
 //!   or a failure goes to stderr, as its envelope on one line.

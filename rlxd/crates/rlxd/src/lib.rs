@@ -1,14 +1,19 @@
 //! rlxd, the rlx engine: one local daemon per home that hosts processes and pushes events
 //! to its clients (handoff 0.10.3, section 1).
 //!
-//! This is its core (1.3, 7.2, 7.4) and its event bus (1.7, 7.3): `rlxd serve
-//! [--detach]`, `rlxd status [--json]`, `rlxd stop`, `rlxd call` and `rlxd events`. One
-//! rlxd runs per home, on a local socket or named pipe, and a client gets in with the
-//! shared token through `hello`. Every reply is the 7.2 envelope, and `events.subscribe`
-//! streams the home's events. The PTY host, the runner and the rest are later items,
-//! each a method on this socket, publishing on the bus. `rlxd here [--start]` is the
-//! probe rlx.app runs over SSH: what is installed, whether rlxd runs, and the protocol
-//! versions it serves.
+//! This is its core (1.3, 7.2, 7.4) and its event bus (1.7, 7.3): `rlxd serve [--detach]
+//! [--gate-dev-mode]`, `rlxd status [--json]`, `rlxd stop`, `rlxd call` and `rlxd
+//! events`. One rlxd runs per home, on a local socket or named pipe, and a client gets in
+//! with the shared token through `hello`. Every reply is the 7.2 envelope, and
+//! `events.subscribe` streams the home's events. The PTY host, the runner and the rest
+//! are later items, each a method on this socket, publishing on the bus. `rlxd here
+//! [--start]` is the probe rlx.app runs over SSH: what is installed, whether rlxd runs,
+//! and the protocol versions it serves.
+//!
+//! The app gate (5.1) is here too: only rlx's app holds it, proven by a per-device gate
+//! credential and, for a device paired locally, by the peer's identity ([`peer`]). The
+//! user manages the paired devices with `rlxd gate devices`, `rlxd gate pair` and `rlxd
+//! gate unpair`.
 //!
 //! Exit codes: 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage error,
 //! 3 when rlxd is not running. `rlxd here` exits 3 and 4 (unsupported) with an `ok`
@@ -16,8 +21,9 @@
 //!
 //! The binary is [`main`]. The library exists for rlxd's own tests. [`registry`], rlxd's
 //! side of the daemon registry, is what `tests/registry_interop.rs` reads Python's
-//! records with. [`bus`] is the event bus the later items publish on, run events
-//! included. Nothing else is public.
+//! records with, [`peer`]'s compiled-in identity is what the gate's peer tests sign
+//! their helpers against, and [`bus`] is the event bus the later items publish on, run
+//! events included. Nothing else is public.
 //!
 //! The cargo feature `debug-methods` adds the socket's test-only methods, such as
 //! `debug.emit`. Only rlxd's own tests turn it on; no release build has it.
@@ -30,13 +36,17 @@ pub mod bus;
 mod claude;
 mod cli;
 mod clock;
+mod config;
 mod events;
+mod files;
+mod gate;
 mod here;
 mod host;
 mod listener;
 mod lock;
 mod log;
 mod out;
+pub mod peer;
 pub mod registry;
 mod serve;
 mod server;
@@ -62,6 +72,11 @@ enum Action {
         /// Started by --detach: log to the file only.
         #[arg(long, hide = true)]
         background: bool,
+        /// Gate dev mode, for unsigned dev and CI builds of rlx's app: skip the gate
+        /// peer's identity check. The gate credential is still required. Never use it
+        /// otherwise.
+        #[arg(long)]
+        gate_dev_mode: bool,
     },
     /// Print rlxd's status.
     Status {
@@ -74,6 +89,9 @@ enum Action {
     /// Send one request on a new connection, and print the reply envelope. A stream's
     /// events print one per line instead, and it exits 0 when the stream ends.
     Call(CallOptions),
+    /// The devices paired as the app gate: list, approve or unpair them.
+    #[command(subcommand)]
+    Gate(GateAction),
     /// Print the home's events as JSON lines: those rlxd holds after --since, then with
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
     Events(EventsOptions),
@@ -93,6 +111,31 @@ enum Action {
         /// rlxd serves none of them. Default: this rlxd's.
         #[arg(long, value_name = "VERSIONS")]
         protocols: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GateAction {
+    /// List the paired devices, with each one's route and when it was last seen.
+    Devices,
+    /// List the waiting pairing requests, or answer one, on this host. Without
+    /// --request-id it lists them (id, device, the asking process and its binary) and
+    /// approves nothing.
+    Pair {
+        /// The request to approve, as the list names it.
+        #[arg(long, value_name = "ID")]
+        request_id: Option<String>,
+        /// Deny the request instead.
+        #[arg(long, requires = "request_id")]
+        deny: bool,
+        /// Approve a request for the name of a device you unpaired.
+        #[arg(long, requires = "request_id", conflicts_with = "deny")]
+        force: bool,
+    },
+    /// Unpair a device, or every device, and drop its app connections.
+    Unpair {
+        /// The device to unpair. Without it, every device is unpaired.
+        device: Option<String>,
     },
 }
 
@@ -159,8 +202,16 @@ struct CallOptions {
 /// `rlxd`, as its command line says.
 pub fn main() -> ExitCode {
     match Command::parse().action {
-        Action::Serve { detach: true, .. } => serve::detach(),
-        Action::Serve { background, .. } => serve::serve(background),
+        Action::Serve {
+            detach: true,
+            gate_dev_mode,
+            ..
+        } => serve::detach(gate_dev_mode),
+        Action::Serve {
+            background,
+            gate_dev_mode,
+            ..
+        } => serve::serve(background, gate_dev_mode),
         Action::Status { json } => cli::status(json),
         Action::Stop => cli::stop(),
         Action::Here {
@@ -186,6 +237,13 @@ pub fn main() -> ExitCode {
             method: options.method,
             params: options.params,
         }),
+        Action::Gate(GateAction::Devices) => cli::gate_devices(),
+        Action::Gate(GateAction::Pair {
+            request_id,
+            deny,
+            force,
+        }) => cli::gate_pair(request_id, !deny, force),
+        Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
         Action::Events(options) => events::events(events::EventsArgs {
             as_app: options.as_app,
             topics: options.topics,
