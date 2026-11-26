@@ -69,6 +69,20 @@ spending tokens without losing them, *⚙ Settings ▸ Fleet ▸ Pause all…* e
 each one and keeps its task, worktree and session; *Resume all…* brings each
 back where it was.
 
+### Manager wake schedule
+
+Set this in your rlx config before starting or restarting the manager session.
+
+```toml
+[fleet.roles.manager]
+wake = "schedule"
+```
+
+The manager can read routine board updates on its own schedule with
+`rlx team log --since-seq <last-read-seq>`. Questions addressed to it,
+usage limits, failed handovers, blocking dialogs, and exits that need
+attention still wake it. The default is `wake = "every_write"`.
+
 ## Accounts
 
 Each account signs in through its agent's own login, and *⚙ Settings ▸

@@ -1522,6 +1522,9 @@ alone. Only ``doing`` carries a LEASE — the ``claim_expires_at`` that
 two hold their claim indefinitely (review of #203)."""
 
 
+ManagerWake = Literal["every_write", "schedule"]
+
+
 class TeamSession(BaseModel):
     """One live agent session on the orchestrator (id = the agent's session id)."""
 
@@ -1530,6 +1533,7 @@ class TeamSession(BaseModel):
     native_session_id: str | None = None
     project_id: str
     role: str = "unassigned"
+    manager_wake: ManagerWake | None = None
     label: str | None = None
     focus: str | None = None
     """What this session says it is working on right now."""

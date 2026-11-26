@@ -59,6 +59,7 @@ from aisquare.core.tmux import TmuxError
 from aisquare.models import (
     CLOSED_STATUSES,
     FleetAgent,
+    ManagerWake,
     ProjectInfo,
     TaskStatus,
     TeamEvent,
@@ -556,7 +557,27 @@ def manager_wakes(
     The one rule every door reads: the nudge, the Stop hook, its deferral."""
     if wake_class(event, me) != "wake" or is_echo(store, event, me):
         return False
+    if me.role == MANAGER_ROLE and me.manager_wake == "schedule":
+        return _scheduled_manager_wake(event, me)
     return standby is None or not held_in_standby(event)
+
+
+_SCHEDULED_SYSTEM_WAKES = frozenset({"limited", "handover_failed", "prompt_unsent"})
+_SCHEDULED_WAKE_KINDS = _SCHEDULED_SYSTEM_WAKES | {"question", "agent_exited", "watch"}
+
+
+def _scheduled_manager_wake(event: TeamEvent, me: TeamSession) -> bool:
+    """Keep direct questions and urgent system events in the manager's wake stream."""
+    if event.kind == "question":
+        return (event.to_role or "").strip().lower() in {
+            MANAGER_ROLE,
+            (me.label or MANAGER_ROLE).strip().lower(),
+            me.id.lower(),
+            short_id(me.id).lower(),
+        }
+    if event.kind == "watch":
+        return not held_in_standby(event)
+    return event.kind == "agent_exited" or event.kind in _SCHEDULED_SYSTEM_WAKES
 
 
 class TeamDisabledError(RuntimeError):
@@ -3035,6 +3056,15 @@ HOOK_OUTPUT_CAP = 10_000
 _HOOK_MARGIN = 64
 
 
+def _session_manager_wake(role: str | None) -> ManagerWake | None:
+    """Read the manager's launch setting when its own session registers."""
+    if role != MANAGER_ROLE:
+        return None
+    from aisquare.services.fleet import role_settings
+
+    return role_settings(role).wake
+
+
 def hook_session_start(
     session_id: str,
     cwd: Path | None,
@@ -3113,6 +3143,7 @@ def hook_session_start(
                 native_session_id=native_session_id or session_id,
                 project_id=project.id,
                 role=role or (known.role if known else "unassigned"),
+                manager_wake=_session_manager_wake(role or (known.role if known else None)),
                 started_at=now,
                 last_seen_at=now,
                 cursor=store.latest_seq(project.id),
@@ -3382,6 +3413,7 @@ def hook_prompt_heartbeat(
                     native_session_id=native_session_id or session_id,
                     project_id=project.id,
                     role=role or "unassigned",
+                    manager_wake=_session_manager_wake(role),
                     started_at=now,
                     last_seen_at=now,
                     cursor=store.latest_seq(project.id),
@@ -3459,15 +3491,7 @@ def hook_prompt_heartbeat(
         # delivered: dropped after it, a run of audit lines was the whole page, prompt
         # after prompt, with a coder's result behind it (review of #240, finding 11).
         reads, relevant = _board_reading(store, session)
-        events = store.events_since(
-            session.project_id,
-            session.cursor,
-            exclude_session=session.id,
-            exclude_kinds=HUMAN_BOARD_KINDS,
-            exclude_actor=session.id,
-            relevant=relevant,
-            limit=_DELTA_LIMIT * 3 + 1,
-        )
+        events = _wake_candidates(store, session, relevant)
         if not events or not orchestrator.delta_enabled() or not reads:
             # Nothing delivered is still something read: the cursor moves past it, the
             # left-out rows included, rather than stay in front of them for every later
@@ -3731,6 +3755,8 @@ def _wake_candidates(
     ``relevant`` is ``me``'s board context (:func:`_board_reading`), applied in the query
     as the prompt's delta applies it: a manager reads everything.
     """
+    if me.role == MANAGER_ROLE and me.manager_wake == "schedule":
+        return _scheduled_wake_candidates(store, me)
     return store.events_since(
         me.project_id,
         me.cursor,
@@ -3740,6 +3766,34 @@ def _wake_candidates(
         relevant=relevant,
         limit=_DELTA_LIMIT * 3 + 1,
     )
+
+
+def _scheduled_wake_candidates(store: ContextStore, me: TeamSession) -> list[TeamEvent]:
+    """Read a page of urgent events, scanning past candidates that do not wake this manager."""
+    limit = _DELTA_LIMIT + 1
+    head = store.latest_seq(me.project_id)
+    cursor = me.cursor
+    urgent: list[TeamEvent] = []
+    while cursor < head:
+        events = store.events_since(
+            me.project_id,
+            cursor,
+            exclude_session=me.id,
+            exclude_actor=me.id,
+            include_kinds=_SCHEDULED_WAKE_KINDS,
+            limit=limit,
+        )
+        for event in events:
+            if event.seq > head:
+                return urgent
+            if manager_wakes(store, event, me, None):
+                urgent.append(event)
+                if len(urgent) == limit:
+                    return urgent
+        if len(events) < limit:
+            break
+        cursor = events[-1].seq
+    return urgent
 
 
 def wake_pending(store: ContextStore, me: TeamSession) -> bool:

@@ -1574,6 +1574,7 @@ _MIGRATIONS = (
     _SCHEMA_V48,
     _SCHEMA_V49,
     _SCHEMA_V50,
+    "ALTER TABLE team_session ADD COLUMN manager_wake TEXT;",
 )
 SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -1744,7 +1745,7 @@ instead, which is what an unfinished turn is."""
 _SESSION_COLUMNS = (
     "id, project_id, role, label, focus, started_at, last_seen_at, ended_at, cursor, state, "
     "transcript_path, account, model, effort, limit_resets_at, agent, native_session_id, "
-    "persona, prompted_at"
+    "persona, prompted_at, manager_wake"
 )
 _USAGE_COLUMNS = (
     "slot, fetched_at, session_percent, session_resets_at, week_percent, week_resets_at, "
@@ -2014,6 +2015,7 @@ class ContextStore(Protocol):
         *,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
+        include_kinds: Collection[str] = (),
         exclude_actor: str | None = None,
         relevant: Relevance | None = None,
         limit: int = 50,
@@ -2515,6 +2517,7 @@ def _row_to_session(row: sqlite3.Row) -> TeamSession:
         limit_resets_at=_maybe_dt(row["limit_resets_at"]),
         persona=row["persona"],
         prompted_at=_maybe_dt(row["prompted_at"]),
+        manager_wake=row["manager_wake"],
     )
 
 
@@ -3598,7 +3601,7 @@ class SqliteStore:
             return stored  # A delayed MCP upsert must not resurrect the provisional row.
         self._conn.execute(
             f"INSERT INTO team_session ({_SESSION_COLUMNS}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (id) DO UPDATE SET "
             "last_seen_at = excluded.last_seen_at, ended_at = NULL, "
             "state = CASE excluded.state WHEN 'waiting' THEN 'waiting' ELSE 'working' END, "
@@ -3609,7 +3612,8 @@ class SqliteStore:
             "agent = COALESCE(excluded.agent, agent), "
             "native_session_id = COALESCE(excluded.native_session_id, native_session_id), "
             "persona = COALESCE(excluded.persona, persona), "
-            "prompted_at = COALESCE(excluded.prompted_at, prompted_at)",
+            "prompted_at = COALESCE(excluded.prompted_at, prompted_at), "
+            "manager_wake = COALESCE(excluded.manager_wake, manager_wake)",
             (
                 session.id,
                 session.project_id,
@@ -3630,6 +3634,7 @@ class SqliteStore:
                 session.native_session_id,
                 session.persona,
                 session.prompted_at.isoformat() if session.prompted_at else None,
+                session.manager_wake,
             ),
         )
         self._commit()
@@ -5335,6 +5340,7 @@ class SqliteStore:
         *,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
+        include_kinds: Collection[str] = (),
         exclude_actor: str | None = None,
         relevant: Relevance | None = None,
         limit: int = 50,
@@ -5346,24 +5352,26 @@ class SqliteStore:
         agent's session, with the manager as its actor. ``relevant`` keeps only what a
         ``relevant`` board context reads (:class:`Relevance`).
 
-        ``exclude_kinds`` leaves those kinds out INSIDE the query, as
+        ``include_kinds`` and ``exclude_kinds`` filter kinds inside the query, as
         :meth:`filtered_events` does, so ``limit`` counts rows the caller can use.
         Dropped after the LIMIT, a run of the captain's audit lines filled the whole
         page, and the event behind it was not read at all (review of #240, finding 11).
         """
         keep, kept = _relevant_clause(relevant)
+        included = f"AND kind IN ({', '.join('?' * len(include_kinds))}) " if include_kinds else ""
         rows = self._conn.execute(
             f"SELECT {_EVENT_COLUMNS} FROM team_event "
             "WHERE project_id = ? AND seq > ? "
             "AND (session_id IS NULL OR session_id != ?) "
             "AND (actor IS NULL OR actor != ?) "
-            f"{_and_not_kinds(exclude_kinds)}{keep}ORDER BY seq LIMIT ?",
+            f"{_and_not_kinds(exclude_kinds)}{included}{keep}ORDER BY seq LIMIT ?",
             (
                 project_id,
                 seq,
                 exclude_session or "",
                 exclude_actor or "",
                 *exclude_kinds,
+                *include_kinds,
                 *kept,
                 limit,
             ),

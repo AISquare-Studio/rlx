@@ -76,6 +76,7 @@ from aisquare.models import (
     FleetAgent,
     FleetAgentStatus,
     LaunchSpec,
+    ManagerWake,
     ProjectInfo,
     TeamEvent,
     TeamSession,
@@ -15650,6 +15651,139 @@ def _waiting_manager(tmux: FakeTmux, project: ProjectInfo) -> FleetAgent:
     # The board write these nudges follow, unread: a nudge is due only for news (R12).
     team_service.watch_event(project.id, "watch: 1 new (1 permission)")
     return manager
+
+
+def _manager_with_wake_setting(
+    tmux: FakeTmux,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    wake: ManagerWake | None,
+) -> str:
+    """Register a waiting manager, then restore the config the writer will see."""
+    original = load_config()
+    if wake is not None:
+        config = original.model_copy(deep=True)
+        config.fleet.roles["manager"] = FleetRoleSettings(wake=wake)
+        save_config(config)
+    manager = fleet_service.spawn(project, "manager").agent
+    session_id = manager.session_id
+    assert session_id is not None
+    with monkeypatch.context() as manager_env:
+        manager_env.setenv("AISQUARE_ROLE", "manager")
+        manager_env.setenv(FLEET_AGENT_ENV_VAR, manager.id)
+        team_service.hook_session_start(session_id, project.root, "startup")
+    _board_session(manager, "waiting")
+    tmux.set_command(manager.pane_id, "claude")
+    if wake is not None:
+        save_config(original)
+    tmux.typed.clear()
+    return session_id
+
+
+@pytest.mark.parametrize("kind", ["result", "note"])
+@pytest.mark.parametrize("delivery_path", ["pane", "stop"])
+def test_scheduled_manager_waits_for_routine_writes(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    delivery_path: str,
+) -> None:
+    """A teammate's result or note waits for the pass whether the manager works or waits."""
+    manager = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    coder = fleet_service.spawn(project, "coder").agent
+    _board_session(coder, "working")
+    if delivery_path == "stop":
+        with store_session() as store:
+            store.touch_session(manager, state="working")
+    team_service.add_note(
+        "routine update", session_ref=coder.session_id, kind=kind, to_role="manager"
+    )
+    assert tmux.typed == []
+    assert team_service.hook_stop(manager, project.root) is None
+
+
+@pytest.mark.parametrize("delivery_path", ["pane", "stop"])
+@pytest.mark.parametrize(
+    "kind", ["question", "limited", "handover_failed", "watch", "agent_exited"]
+)
+def test_scheduled_manager_wakes_for_urgent_events(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_path: str,
+    kind: str,
+) -> None:
+    """Each urgent producer wakes the manager past routine board traffic."""
+    manager = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    coder = fleet_service.spawn(project, "coder").agent
+    _board_session(coder, "working")
+    assert coder.session_id is not None
+    with store_session() as store:
+        if delivery_path == "stop":
+            store.touch_session(manager, state="working")
+        for _ in range(team_service._DELTA_LIMIT * 3 + 1):
+            team_service._emit(store, project.id, "result", "routine", session_id=coder.session_id)
+            team_service._emit(
+                store,
+                project.id,
+                "question",
+                "elsewhere",
+                session_id=coder.session_id,
+                to_role="coder",
+            )
+    if kind == "question":
+        team_service.add_note(
+            "please decide",
+            session_ref=coder.session_id,
+            kind=kind,
+            to_role=manager[:8],
+            board_id=project.id,
+        )
+    elif kind == "limited":
+        team_service.hook_stop_failure(
+            coder.session_id, error="rate_limit", message="usage limit", details=None
+        )
+    elif kind == "handover_failed":
+        team_service.hook_handover_failed(
+            project.id, "could not switch", session_id=coder.session_id
+        )
+    elif kind == "watch":
+        team_service.watch_event(project.id, "watch: blocking permission dialog")
+        fleet_service.nudge_manager(project.id, reason="watch", board=project.id)
+    else:
+        fleet_service.stop(project, coder.label, force=True)
+    if delivery_path == "pane":
+        assert [typed for _, action, typed in tmux.typed if action == "paste"] == [NUDGE_TEXT]
+        delivered = team_service.hook_prompt_heartbeat(manager, project.root)
+    else:
+        decision = team_service.hook_stop(manager, project.root)
+        assert decision is not None
+        delivered = decision.reason
+    assert "routine" not in delivered
+    assert "elsewhere" not in delivered
+    assert {
+        "question": "please decide",
+        "limited": "usage limit",
+        "handover_failed": "could not switch",
+        "watch": "blocking permission dialog",
+        "agent_exited": "exited",
+    }[kind] in delivered
+
+
+def test_manager_still_wakes_for_a_result_by_default(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unconfigured manager still receives a routine result on both wake paths."""
+    manager = _manager_with_wake_setting(tmux, project, monkeypatch, None)
+    coder = fleet_service.spawn(project, "coder").agent
+    _board_session(coder, "working")
+    team_service.add_note("ready for review", session_ref=coder.session_id, kind="result")
+    assert [typed for _, action, typed in tmux.typed if action == "paste"] == [NUDGE_TEXT]
+    decision = team_service.hook_stop(manager, project.root)
+    assert decision is not None and "ready for review" in decision.reason
 
 
 def test_nudge_types_one_fixed_line_into_a_waiting_manager(
