@@ -12,8 +12,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::{TestHome, assert_valid, eventually};
-use rlxd_client::proto::{HelloParams, Role};
-use rlxd_client::{Connection, Home};
+use rlxd_client::proto::{HelloParams, PtySubscribeParams, Role};
+use rlxd_client::{Connection, Home, Incoming, Next};
 use serde_json::{Value, json};
 
 /// A command that prints `ready` then waits, as the handoff's check runs.
@@ -583,4 +583,299 @@ fn check_3_keys_and_a_paste_reach_the_program_as_tmux_sends_them() {
             .unwrap_or_default();
         after == expected
     });
+}
+
+/// The events of a `pty.subscribe` stream, until `stop` says so or it ends.
+#[cfg(unix)]
+fn stream_until(
+    subscription: &mut rlxd_client::Subscription,
+    mut stop: impl FnMut(&Value) -> bool,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    loop {
+        match subscription.next_frame().unwrap() {
+            Next::Event(line) => {
+                let event: Value = serde_json::from_str(&line.line).unwrap();
+                let done = stop(&event);
+                events.push(event);
+                if done {
+                    return events;
+                }
+            }
+            Next::End(reply) => {
+                events.push(serde_json::from_str(&reply.line).unwrap());
+                return events;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn output_text(events: &[Value]) -> String {
+    events
+        .iter()
+        .filter(|e| e["type"] == "pty.output")
+        .map(|e| {
+            let bytes = rlxd::pty::unbase64(e["data"]["bytes_b64"].as_str().unwrap()).unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_subscribe_streams_its_screen_then_its_output_and_end() {
+    let home = TestHome::new();
+    home.start();
+    let id = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "echo one; read x; echo two; sleep 1; exit 4"],
+               "cols": 80, "rows": 24}),
+    );
+    // Another PTY's output goes on meanwhile, and stays out of this stream.
+    let other = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "while :; do echo noise; sleep 0.05; done"],
+               "cols": 80, "rows": 24}),
+    );
+    eventually("the first line", || {
+        screen(&home, &id)["text"].as_str().unwrap().contains("one")
+    });
+    let params = PtySubscribeParams::new(&id, true).unwrap();
+    let mut stream = connect(&home, Role::Tui).subscribe_pty(&params).unwrap();
+    let first = stream_until(&mut stream, |_| true);
+    assert_eq!(first[0]["type"], "pty.snapshot", "{first:?}");
+    assert_valid("pty-screen-reply.json", &first[0]["data"]);
+    assert!(first[0]["data"]["text"].as_str().unwrap().contains("one"));
+    assert_eq!(first[0]["seq"], first[0]["data"]["seq"]);
+    assert_eq!(
+        call(&home, "pty.write", &json!({"pty_id": id, "text": "\r"})).code(),
+        Some(0)
+    );
+    let events = stream_until(&mut stream, |e| e["type"] == "pty.exited");
+    let exited = events.last().unwrap();
+    assert_eq!(exited["data"], json!({"pty_id": id, "status": 4}));
+    for event in &events {
+        assert_eq!(
+            event["data"]["pty_id"],
+            id.as_str(),
+            "only this PTY's: {event}"
+        );
+        assert_valid("event.json", event);
+    }
+    assert!(output_text(&events).contains("two"), "{events:?}");
+    let seqs: Vec<u64> = std::iter::once(&first[0])
+        .chain(&events)
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seqs rise: {seqs:?}");
+    // Killed, the PTY ends the stream with its reply.
+    assert_eq!(
+        call(&home, "pty.kill", &json!({ "pty_id": id })).code(),
+        Some(0)
+    );
+    let end = stream_until(&mut stream, |_| false);
+    let reply = end.last().unwrap();
+    assert_eq!(reply["ok"], true, "{end:?}");
+    assert!(reply["data"]["seq"].as_u64().unwrap() >= *seqs.last().unwrap());
+    assert_eq!(
+        call(&home, "pty.kill", &json!({ "pty_id": other })).code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_read_only_watcher_may_not_write_and_only_cli_and_tui_may_watch_to_write() {
+    let home = TestHome::new();
+    home.start_dev();
+    let id = spawn(&home, json!({"argv": ready_argv(), "cols": 80, "rows": 24}));
+    let params = PtySubscribeParams::new(&id, true).unwrap();
+    let mut stream = connect(&home, Role::Tui).subscribe_pty(&params).unwrap();
+    assert!(matches!(stream.next_frame().unwrap(), Next::Event(_)));
+    let mut text = serde_json::Map::new();
+    text.insert("pty_id".to_owned(), json!(id));
+    text.insert("text".to_owned(), json!("x"));
+    stream.send("pty.write", text).unwrap();
+    let refused = loop {
+        if let Incoming::Reply(reply) = stream.next_incoming().unwrap() {
+            break reply;
+        }
+    };
+    assert_eq!(
+        refused.error().unwrap().code,
+        "read_only",
+        "{}",
+        refused.line
+    );
+    // Another connection, not watching, may.
+    assert_eq!(
+        call(&home, "pty.write", &json!({"pty_id": id, "text": "x"})).code(),
+        Some(0)
+    );
+
+    let writable = PtySubscribeParams::new(&id, false).unwrap();
+    let mut refused = connect(&home, Role::Remote)
+        .subscribe_pty(&writable)
+        .unwrap();
+    match refused.next_frame().unwrap() {
+        Next::End(reply) => {
+            assert_eq!(
+                reply.error().unwrap().code,
+                "role_not_allowed",
+                "{}",
+                reply.line
+            );
+        }
+        Next::Event(event) => panic!("remote watched to write: {}", event.line),
+    }
+    let pair = call(&home, "gate.pair", &json!({"device": "Sam MacBook"}));
+    let credential = pair.data()["gate_credential"].as_str().unwrap().to_owned();
+    let app = {
+        let home = Home::at(home.root());
+        let token = std::fs::read_to_string(home.token()).unwrap();
+        let mut connection = Connection::open(&home).unwrap();
+        let hello = HelloParams::new(token.trim(), "pty-test", "0", Role::App)
+            .unwrap()
+            .with_gate_credential(credential)
+            .unwrap();
+        assert!(connection.hello(&hello).unwrap().is_ok());
+        connection
+    };
+    let writable = PtySubscribeParams::new(&id, false).unwrap();
+    let mut refused = app.subscribe_pty(&writable).unwrap();
+    match refused.next_frame().unwrap() {
+        Next::End(reply) => assert_eq!(reply.error().unwrap().code, "role_not_allowed"),
+        Next::Event(event) => panic!("the app watched to write: {}", event.line),
+    }
+}
+
+/// rlxd's resident memory, in KiB.
+#[cfg(unix)]
+fn rss_kib(pid: u64) -> u64 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+#[test]
+fn check_5_a_stalled_subscriber_holds_up_neither_the_pty_nor_memory() {
+    let home = TestHome::new();
+    home.start();
+    let rlxd_pid = home.status()["pid"].as_u64().unwrap();
+    let since = home.status()["seq"].as_u64().unwrap();
+    let (first, last) = home.emit(50);
+    assert_eq!(last - first + 1, 50);
+    let script = "read x; yes 'the quick brown fox jumps over the lazy dog 0123456789 abcdefghij' \
+                  | head -c 50000000; echo DONE; sleep 60";
+    let id = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", script], "cols": 80, "rows": 24}),
+    );
+    // A subscriber that never reads, while 50 MB go by.
+    let params = PtySubscribeParams::new(&id, true).unwrap();
+    let mut stalled = connect(&home, Role::Tui).subscribe_pty(&params).unwrap();
+    let before = rss_kib(rlxd_pid);
+    assert_eq!(
+        call(&home, "pty.write", &json!({"pty_id": id, "text": "\r"})).code(),
+        Some(0)
+    );
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut slowest = Duration::ZERO;
+    loop {
+        let asked = Instant::now();
+        let text = screen(&home, &id)["text"].as_str().unwrap().to_owned();
+        slowest = slowest.max(asked.elapsed());
+        if text.contains("DONE") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the PTY never got through its output"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let after = rss_kib(rlxd_pid);
+    assert!(
+        slowest < Duration::from_secs(2),
+        "pty.screen took {slowest:?}"
+    );
+    assert!(
+        after < before + 400 * 1024,
+        "rlxd grew from {before} KiB to {after} KiB for a stalled subscriber"
+    );
+    // The daemon topic lost nothing to the flood: its replay is whole, with no gap.
+    let replay = home.rlxd(&[
+        "events",
+        "--topics",
+        "daemon",
+        "--since",
+        &since.to_string(),
+    ]);
+    let debug: Vec<Value> = replay
+        .lines()
+        .into_iter()
+        .filter(|e| e["type"] == "daemon.debug" || e["type"] == "daemon.gap")
+        .collect();
+    assert_eq!(debug.len(), 50, "{:?}", debug.first());
+    assert!(debug.iter().all(|e| e["type"] == "daemon.debug"));
+    // The stalled subscriber, reading again, is put back on the screen with a snapshot,
+    // never a gap.
+    let resumed = stream_until(&mut stalled, |e| {
+        e["type"] == "pty.snapshot" && e["data"]["text"].as_str().unwrap().contains("DONE")
+            || e["type"] == "daemon.gap"
+    });
+    assert!(resumed.iter().all(|e| e["type"] != "daemon.gap"));
+    let snapshots = resumed
+        .iter()
+        .filter(|e| e["type"] == "pty.snapshot")
+        .count();
+    assert!(
+        snapshots >= 2,
+        "the first, and one after the output it missed"
+    );
+}
+
+/// The end of a process comes after its last output: a burst right before it exits
+/// still reaches the stream, and the screen, before `pty.exited`.
+#[cfg(unix)]
+#[test]
+fn pty_exited_comes_after_every_byte_the_process_wrote() {
+    let home = TestHome::new();
+    home.start();
+    for round in 0..5 {
+        let script = "read x; yes y | head -c 2000000; echo END; exit 7";
+        let id = spawn(
+            &home,
+            json!({"argv": ["sh", "-c", script], "cols": 80, "rows": 24}),
+        );
+        let params = PtySubscribeParams::new(&id, true).unwrap();
+        let mut stream = connect(&home, Role::Tui).subscribe_pty(&params).unwrap();
+        assert_eq!(
+            call(&home, "pty.write", &json!({"pty_id": id, "text": "\r"})).code(),
+            Some(0)
+        );
+        let events = stream_until(&mut stream, |e| e["type"] == "pty.exited");
+        assert_eq!(events.last().unwrap()["data"]["status"], 7, "round {round}");
+        let text = output_text(&events);
+        assert!(
+            text.ends_with("END\r\n"),
+            "round {round}: the output ends {:?}",
+            &text[text.len().saturating_sub(20)..]
+        );
+        let shown = screen(&home, &id);
+        assert!(
+            shown["text"].as_str().unwrap().contains("END"),
+            "round {round}"
+        );
+        assert_eq!(
+            call(&home, "pty.kill", &json!({ "pty_id": id })).code(),
+            Some(0)
+        );
+    }
 }

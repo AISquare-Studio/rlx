@@ -229,8 +229,13 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
 
 - **The methods:** `pty.spawn {argv, cols, rows, cwd?, env?, label?}`, `pty.write
   {pty_id, text | keys | paste}`, `pty.resize`, `pty.screen {pty_id, scrollback?}`,
-  `pty.kill` and `pty.list`, each through `rlxd call`. Their shapes are in
-  `schemas/v1/README.md`.
+  `pty.subscribe {pty_id, read_only}`, `pty.kill` and `pty.list`, each through `rlxd
+  call` but the stream. Their shapes are in `schemas/v1/README.md`.
+- **The stream:** `pty.subscribe` sends the screen (`pty.snapshot`), then the PTY's
+  `pty.output` and `pty.exited`. A client too slow to keep up gets a fresh snapshot
+  instead of what it missed; the PTY never waits for it. `pty.output` has a partition of
+  the bus to itself (20,000 events, 32 MiB), so it never pushes another topic's events
+  out.
 - **The screen is tmux's.** `pty.screen`'s `text` is what `tmux capture-pane -e -p`
   prints for the same screen, byte for byte. `crate::vt` is tmux 3.8's own grid, screen
   writes and input parser, ported. Each ported file keeps tmux's ISC notice.

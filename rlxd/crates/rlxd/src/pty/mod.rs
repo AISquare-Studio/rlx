@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rlxd_proto::{
-    MAX_PTY_SCROLLBACK, PtyCursor, PtyExited, PtyInfo, PtyInput, PtyKillParams, PtyList, PtyRef,
-    PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams, PtyWriteParams, VERSION,
+    MAX_PTY_SCROLLBACK, PtyCursor, PtyExited, PtyInfo, PtyInput, PtyKillParams, PtyList, PtyOutput,
+    PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams, PtyWriteParams, VERSION,
     event_types, topics,
 };
 
@@ -56,8 +56,8 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// How long the end of a process waits for its last output to reach the screen.
 const DRAIN: Duration = Duration::from_millis(500);
 
-/// How much one read of a PTY's output takes.
-const READ_CHUNK: usize = 64 << 10;
+/// How much one read of a PTY's output takes: one `pty.output` event's worth at most.
+const READ_CHUNK: usize = 32 << 10;
 
 /// Why a PTY call was refused.
 #[derive(Debug)]
@@ -161,6 +161,8 @@ impl Pty {
 pub struct Host {
     ptys: Mutex<Vec<Arc<Pty>>>,
     bus: Arc<Bus>,
+    /// Bumped each time a PTY goes, so a stream watching one can end.
+    gone: tokio::sync::watch::Sender<u64>,
 }
 
 impl Host {
@@ -169,7 +171,18 @@ impl Host {
         Self {
             ptys: Mutex::new(Vec::new()),
             bus,
+            gone: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// Changes each time a PTY goes.
+    pub fn gone(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.gone.subscribe()
+    }
+
+    /// Whether the PTY `id` is still the home's.
+    pub fn exists(&self, id: &str) -> bool {
+        self.ptys().iter().any(|pty| pty.id == id)
     }
 
     fn ptys(&self) -> MutexGuard<'_, Vec<Arc<Pty>>> {
@@ -273,8 +286,9 @@ impl Host {
             }),
             {
                 let pty = Arc::clone(&pty);
+                let bus = Arc::clone(&self.bus);
                 spawn_thread(format!("pty-{short}-out"), move || {
-                    read_output(&pty, reader)
+                    read_output(&pty, reader, &bus);
                 })
             },
             {
@@ -375,14 +389,12 @@ impl Host {
 
     /// Ends `params`' PTY's process and its whole group, and frees the PTY, for `who`.
     pub fn kill(&self, params: &PtyKillParams, who: &str) -> Result<PtyRef, Refused> {
-        let pty = {
-            let mut ptys = self.ptys();
-            let Some(at) = ptys.iter().position(|pty| pty.id == params.pty_id) else {
-                return Err(Refused::Unknown(params.pty_id.clone()));
-            };
-            ptys.remove(at)
-        };
+        let pty = self.find(&params.pty_id)?;
+        // The process ends first, so its pty.exited reaches a stream before the stream
+        // ends with the PTY.
         end(&pty);
+        self.ptys().retain(|held| !Arc::ptr_eq(held, &pty));
+        self.gone.send_modify(|n| *n += 1);
         info!("pty {} killed, by {who}", pty.id);
         PtyRef::new(&pty.id).map_err(|e| Refused::Invalid(e.to_string()))
     }
@@ -400,6 +412,7 @@ impl Host {
         for handle in handles {
             let _ = handle.join();
         }
+        self.gone.send_modify(|n| *n += 1);
     }
 }
 
@@ -485,14 +498,36 @@ fn write_input(
 }
 
 /// Reads the program's output into the screen, and sends its queries' replies back.
-fn read_output(pty: &Pty, mut reader: Box<dyn Read + Send>) {
+fn read_output(pty: &Pty, mut reader: Box<dyn Read + Send>, bus: &Bus) {
     let mut buf = vec![0u8; READ_CHUNK];
+    let mut warned = false;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        let replies = pty.state().terminal.feed(&buf[..n]);
+        let chunk = &buf[..n];
+        let replies = {
+            // The screen takes the bytes and the bus numbers them under one lock, so a
+            // snapshot taken under it holds exactly the output up to the bus's head.
+            let mut state = pty.state();
+            let replies = state.terminal.feed(chunk);
+            let data = PtyOutput::new(&pty.id, base64(chunk)).and_then(|o| o.to_data());
+            let published = match data {
+                Ok(data) => bus
+                    .publish(topics::PTY, event_types::PTY_OUTPUT, data)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(why) = published
+                && !warned
+            {
+                warned = true;
+                error!("pty {}: its output was not published: {why}", pty.id);
+            }
+            replies
+        };
         if !replies.is_empty() {
             let _ = pty.send(replies);
         }
@@ -506,7 +541,19 @@ fn wait_for_end(pty: &Pty, child: Box<dyn portable_pty::Child + Send + Sync>, bu
     let exit = ended(pty, child);
     // The last output can still be on its way: let it reach the screen first.
     wait_until(pty, DRAIN, |state| state.drained);
-    pty.state().exit = Some(exit);
+    let mut state = pty.state();
+    state.exit = Some(exit);
+    // Published under the lock, as output is: a snapshot either shows the end, or comes
+    // before its event.
+    let data = PtyExited::new(&pty.id, exit.status, exit.signal).and_then(|e| e.to_data());
+    let published = match data {
+        Ok(data) => bus
+            .publish(topics::PTY, event_types::PTY_EXITED, data)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    drop(state);
     pty.changed.notify_all();
     info!(
         "pty {}: pid {} ended, status {}{}",
@@ -517,14 +564,6 @@ fn wait_for_end(pty: &Pty, child: Box<dyn portable_pty::Child + Send + Sync>, bu
             .map(|s| format!(" (signal {s})"))
             .unwrap_or_default()
     );
-    let data = PtyExited::new(&pty.id, exit.status, exit.signal).and_then(|e| e.to_data());
-    let published = match data {
-        Ok(data) => bus
-            .publish(topics::PTY, event_types::PTY_EXITED, data)
-            .map(|_| ())
-            .map_err(|e| e.to_string()),
-        Err(e) => Err(e.to_string()),
-    };
     if let Err(why) = published {
         error!("pty {}: pty.exited was not published: {why}", pty.id);
     }
@@ -564,6 +603,61 @@ fn ended(pty: &Pty, mut child: Box<dyn portable_pty::Child + Send + Sync>) -> Ex
             }
         }
     }
+}
+
+/// `bytes` in standard base64, with padding.
+pub fn base64(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(DIGITS[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Standard base64 back to bytes: `None` when it isn't.
+pub fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| -> Option<u32> {
+        Some(u32::from(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        }))
+    };
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &chunk[..4 - pad] {
+            n = (n << 6) | value(c)?;
+        }
+        n <<= 6 * pad as u32;
+        let decoded = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&decoded[..3 - pad]);
+    }
+    Some(out)
 }
 
 /// 128 random bits, as 32 lowercase hex digits.
@@ -628,6 +722,24 @@ mod tests {
         assert_eq!(paste("a\nb", true), b"\x1b[200~a\rb\x1b[201~");
         assert_eq!(paste("\x1b[31m\x03\x7f\tok\\", false), b"^[[31m^C^?\tok\\");
         assert_eq!(paste("中\r\n", false), "中\r\r".as_bytes());
+    }
+
+    #[test]
+    fn base64_goes_there_and_back() {
+        for bytes in [
+            &b""[..],
+            b"r",
+            b"re",
+            b"rea",
+            b"ready\r\n",
+            &[0, 255, 128, 7],
+        ] {
+            let text = base64(bytes);
+            assert!(text.is_empty() || rlxd_proto::PtyOutput::new("0".repeat(32), &text).is_ok());
+            assert_eq!(unbase64(&text).as_deref(), Some(bytes));
+        }
+        assert_eq!(base64(b"ready\r\n"), "cmVhZHkNCg==");
+        assert_eq!(unbase64("abc"), None);
     }
 
     #[test]

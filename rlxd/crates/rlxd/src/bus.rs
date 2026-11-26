@@ -44,6 +44,13 @@
 //! `events.subscribe {since}` replays. One event's line may be at most [`MAX_EVENT`]
 //! bytes, the longest line a client reads.
 //!
+//! **PTY output is kept apart** (handoff 1.4): `pty.output` events, which a busy terminal
+//! publishes by the thousand, go to a partition of their own, with its own caps
+//! ([`Limits::OUTPUT`]), so they never push a run, job or other topic's event out. Seqs
+//! stay the home's, one numbering across both. A subscriber reads both in seq order, and
+//! gets a `daemon.gap` for the output partition only when it asked for the `pty` topic.
+//! `pty.exited` stays with the other events.
+//!
 //! # Subscribers
 //!
 //! A subscriber is a place in the buffer ([`Cursor`]), not a queue of its own. Publishing
@@ -99,6 +106,14 @@ impl Limits {
     pub const DEFAULT: Self = Self {
         events: 10_000,
         bytes: 64 << 20,
+        age: Duration::from_secs(24 * 60 * 60),
+    };
+
+    /// The `pty.output` partition's: the last 20,000 events, at most 32 MiB of them, none
+    /// older than 24 hours.
+    pub const OUTPUT: Self = Self {
+        events: 20_000,
+        bytes: 32 << 20,
         age: Duration::from_secs(24 * 60 * 60),
     };
 }
@@ -248,17 +263,25 @@ pub struct Bus {
     head: watch::Sender<u64>,
     mark: Mark,
     limits: Limits,
+    output_limits: Limits,
     #[cfg(test)]
     hooks: tests::Hooks,
 }
 
 struct State {
-    /// The events held, oldest first: seqs `floor + 1` to `head`, one each.
+    /// The events held but `pty.output`, oldest first, in seq order.
     held: VecDeque<Held>,
     /// The bytes of their lines.
     bytes: usize,
-    /// Every seq at or below it is gone: dropped from the buffer, or an earlier rlxd's.
+    /// Every one of them at or below it is gone: dropped from the buffer, or an earlier
+    /// rlxd's.
     floor: u64,
+    /// The `pty.output` events held, oldest first, in seq order.
+    output: VecDeque<Held>,
+    /// The bytes of their lines.
+    output_bytes: usize,
+    /// Every `pty.output` event at or below it is gone.
+    output_floor: u64,
     /// The last seq given out.
     head: u64,
     /// The mark on disk: seqs up to it may be given out.
@@ -295,8 +318,15 @@ impl Bus {
         Self::open_at(home.rlxd_dir().join(MARK_FILE), Limits::DEFAULT)
     }
 
-    /// A bus whose mark is `path`, holding what `limits` allow.
+    /// A bus whose mark is `path`, holding what `limits` allow, and `pty.output` what
+    /// [`Limits::OUTPUT`] does.
     pub fn open_at(path: PathBuf, limits: Limits) -> Result<Self, String> {
+        Self::open_with(path, limits, Limits::OUTPUT)
+    }
+
+    /// A bus whose mark is `path`, holding what `limits` allow, and `pty.output` what
+    /// `output` does.
+    pub fn open_with(path: PathBuf, limits: Limits, output: Limits) -> Result<Self, String> {
         let mark = Mark::new(path);
         let last = mark.read()?;
         if last > u64::MAX - RESERVE {
@@ -315,6 +345,9 @@ impl Bus {
                 held: VecDeque::new(),
                 bytes: 0,
                 floor: last,
+                output: VecDeque::new(),
+                output_bytes: 0,
+                output_floor: last,
                 head: last,
                 reserved,
                 writing: false,
@@ -327,6 +360,10 @@ impl Bus {
             limits: Limits {
                 events: limits.events.max(1),
                 ..limits
+            },
+            output_limits: Limits {
+                events: output.events.max(1),
+                ..output
             },
             #[cfg(test)]
             hooks: tests::Hooks::default(),
@@ -362,7 +399,8 @@ impl Bus {
         let seq = state.head + 1;
         let event = Event::new(seq, clock::now(), topic, r#type, data).map_err(Refused::Event)?;
         let line = line(&event)?;
-        let write = self.append(&mut state, seq, bit, None, line);
+        let output = topic == topics::PTY && r#type == event_types::PTY_OUTPUT;
+        let write = self.append_to(&mut state, seq, bit, None, line, output);
         drop(state);
         self.after_unlock(seq, write);
         Ok(seq)
@@ -388,7 +426,7 @@ impl Bus {
         let log = state.runs.entry(Arc::clone(&id)).or_default();
         log.last = run_seq;
         log.held.push_back((run_seq, seq));
-        let write = self.append(&mut state, seq, bit, Some(id), line);
+        let write = self.append_to(&mut state, seq, bit, Some(id), line, false);
         drop(state);
         self.after_unlock(seq, write);
         Ok(Numbered { seq, run_seq })
@@ -480,25 +518,56 @@ impl Bus {
     /// events after it. None when it is up to date, or done.
     pub fn read(&self, cursor: &mut Cursor, lines: usize, bytes: usize) -> Vec<Line> {
         let mut state = self.state();
-        state.drop_old(&self.limits);
+        state.drop_old(&self.limits, &self.output_limits);
         let end = cursor.until.unwrap_or(state.head).min(state.head);
         let mut batch = Vec::new();
         if cursor.after >= end {
             return batch;
         }
+        let output = bit(topics::PTY).is_some_and(|pty| cursor.topics.has(pty));
         let mut taken = 0;
-        if cursor.after < state.floor {
-            let to = state.floor.min(end);
+        // A gap for each partition that dropped what this cursor has not read, the output
+        // partition's only when it asked for `pty`: one gap, to the later of the two.
+        let mut lost = (cursor.after < state.floor).then_some(state.floor);
+        if output && cursor.after < state.output_floor {
+            lost = Some(lost.unwrap_or(0).max(state.output_floor));
+        }
+        if let Some(to) = lost {
+            let to = to.min(end);
             let gap = gap(cursor.after + 1, to);
             taken += gap.len();
             batch.push(gap);
             cursor.after = to;
         }
-        let start = usize::try_from(cursor.after.saturating_sub(state.floor)).unwrap_or(usize::MAX);
-        for held in state.held.range(start.min(state.held.len())..) {
+        let mut main = state.held.partition_point(|held| held.seq <= cursor.after);
+        let mut out = if output {
+            state
+                .output
+                .partition_point(|held| held.seq <= cursor.after)
+        } else {
+            state.output.len()
+        };
+        loop {
+            let a = state.held.get(main).filter(|held| held.seq <= end);
+            let b = state.output.get(out).filter(|held| held.seq <= end);
+            let held = match (a, b) {
+                (Some(a), Some(b)) if a.seq < b.seq => a,
+                (Some(a), None) => a,
+                (_, Some(b)) => b,
+                (None, None) => {
+                    // Every event up to the end is read or not this cursor's.
+                    cursor.after = end;
+                    break;
+                }
+            };
             let full = batch.len() >= lines.max(1) || (!batch.is_empty() && taken >= bytes);
-            if held.seq > end || full {
+            if full {
                 break;
+            }
+            if a.is_some_and(|a| a.seq == held.seq) {
+                main += 1;
+            } else {
+                out += 1;
             }
             cursor.after = held.seq;
             if cursor.topics.has(held.topic) {
@@ -548,26 +617,34 @@ impl Bus {
         Ok(state)
     }
 
-    /// Appends event `seq`, the next, and moves the head watch on while the lock is still
-    /// held, so it never goes back. The mark to write ahead, when this publisher is to.
-    fn append(
+    /// Appends event `seq`, the next, to the `output` partition or the other, and moves
+    /// the head watch on while the lock is still held, so it never goes back. The mark to
+    /// write ahead, when this publisher is to.
+    fn append_to(
         &self,
         state: &mut State,
         seq: u64,
         topic: u32,
         run: Option<Arc<str>>,
         line: Line,
+        output: bool,
     ) -> Option<u64> {
-        state.bytes += line.len();
-        state.held.push_back(Held {
+        let held = Held {
             seq,
             topic,
             at: SystemTime::now(),
             run,
             line,
-        });
+        };
+        if output {
+            state.output_bytes += held.line.len();
+            state.output.push_back(held);
+        } else {
+            state.bytes += held.line.len();
+            state.held.push_back(held);
+        }
         state.head = seq;
-        state.drop_old(&self.limits);
+        state.drop_old(&self.limits, &self.output_limits);
         self.head.send_replace(seq);
         let retry = state
             .failed
@@ -617,10 +694,23 @@ impl Bus {
 }
 
 impl State {
-    /// Drops the oldest events while there are more than `limits` allow, or they are too
-    /// old. The newest event stays.
-    fn drop_old(&mut self, limits: &Limits) {
+    /// Drops the oldest events of each partition while it holds more than its limits
+    /// allow, or they are too old. Each partition's newest event stays.
+    fn drop_old(&mut self, limits: &Limits, output: &Limits) {
         let now = SystemTime::now();
+        while let Some(oldest) = self.output.front() {
+            let old = now.duration_since(oldest.at).unwrap_or_default() > output.age;
+            let over = self.output.len() > output.events
+                || (self.output_bytes > output.bytes && self.output.len() > 1);
+            if !over && !old {
+                break;
+            }
+            let Some(gone) = self.output.pop_front() else {
+                break;
+            };
+            self.output_floor = gone.seq;
+            self.output_bytes -= gone.line.len();
+        }
         while let Some(oldest) = self.held.front() {
             let old = now.duration_since(oldest.at).unwrap_or_default() > limits.age;
             let over = self.held.len() > limits.events
@@ -645,9 +735,12 @@ impl State {
         }
     }
 
-    /// The line of held event `seq`.
+    /// The line of held event `seq`, which is not `pty.output`.
     fn line(&self, seq: u64) -> Line {
-        let at = usize::try_from(seq - self.floor - 1).expect("a held seq");
+        let at = self
+            .held
+            .binary_search_by_key(&seq, |held| held.seq)
+            .expect("a held seq");
         Arc::clone(&self.held[at].line)
     }
 }
@@ -1508,5 +1601,111 @@ mod tests {
             !bus.state().runs.contains_key("idle"),
             "nothing held: gone at once"
         );
+    }
+
+    const PTY_ID: &str = "6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b";
+
+    fn output(bus: &Bus, n: u64) -> u64 {
+        let mut last = 0;
+        for _ in 0..n {
+            let data = rlxd_proto::PtyOutput::new(PTY_ID, "cmVhZHkNCg==")
+                .unwrap()
+                .to_data()
+                .unwrap();
+            last = bus
+                .publish(topics::PTY, event_types::PTY_OUTPUT, data)
+                .unwrap();
+        }
+        last
+    }
+
+    #[test]
+    fn pty_output_never_pushes_another_topics_event_out() {
+        let dir = Dir::new();
+        let few = Limits {
+            events: 4,
+            ..Limits::DEFAULT
+        };
+        let bus = Bus::open_with(
+            dir.mark(),
+            few,
+            Limits {
+                events: 3,
+                ..Limits::OUTPUT
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            bus.publish_run(run("r1"), "run.text", Data::new()).unwrap();
+        }
+        let flood = output(&bus, 500);
+        // The run's events are all still here, for a replay and for a since.
+        let replay = bus.run_events("r1", 1).unwrap();
+        assert_eq!(seqs(&replay.lines), [1, 2, 3]);
+        let mut runs = bus
+            .cursor(Topics::of([topics::RUN]).unwrap(), Some(0), false)
+            .unwrap();
+        let read = bus.read(&mut runs, BATCH, BATCH_BYTES);
+        assert_eq!(
+            seqs(&read),
+            [1, 2, 3],
+            "no gap for a topic that lost nothing"
+        );
+        assert!(
+            runs.is_done(),
+            "a replay ends at the head, an output event's"
+        );
+        assert_eq!(runs.after(), flood);
+        // The output partition kept its last three.
+        let mut pty = bus
+            .cursor(Topics::of([topics::PTY]).unwrap(), Some(0), false)
+            .unwrap();
+        let read = events(&bus.read(&mut pty, BATCH, BATCH_BYTES));
+        assert_eq!(read[0]["type"], "daemon.gap");
+        assert_eq!(read[0]["data"], json!({"from": 1, "to": flood - 3}));
+        let after: Vec<u64> = read[1..]
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(after, [flood - 2, flood - 1, flood]);
+    }
+
+    #[test]
+    fn both_partitions_read_in_seq_order() {
+        let dir = Dir::new();
+        let bus = dir.bus(CAPACITY);
+        let mut expected = Vec::new();
+        for i in 0..20 {
+            expected.push(if i % 3 == 0 {
+                emit(&bus, 1)
+            } else {
+                output(&bus, 1)
+            });
+        }
+        let pty_exited = rlxd_proto::PtyExited::new(PTY_ID, 3, None)
+            .unwrap()
+            .to_data()
+            .unwrap();
+        expected.push(
+            bus.publish(topics::PTY, event_types::PTY_EXITED, pty_exited)
+                .unwrap(),
+        );
+        let mut all = bus.cursor(Topics::ALL, Some(0), false).unwrap();
+        let mut read = Vec::new();
+        loop {
+            let batch = bus.read(&mut all, 4, BATCH_BYTES);
+            if batch.is_empty() {
+                break;
+            }
+            read.extend(seqs(&batch));
+        }
+        assert_eq!(read, expected);
+        // A cursor that didn't ask for pty passes the output over, and still ends.
+        let mut daemon = bus
+            .cursor(Topics::of([topics::DAEMON]).unwrap(), Some(0), false)
+            .unwrap();
+        let read = seqs(&bus.read(&mut daemon, BATCH, BATCH_BYTES));
+        assert_eq!(read, [1, 4, 7, 10, 13, 16, 19]);
+        assert!(daemon.is_done());
     }
 }

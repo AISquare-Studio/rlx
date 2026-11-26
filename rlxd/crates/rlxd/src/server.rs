@@ -40,11 +40,11 @@ use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
+    Claude, Clients, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, PROTOCOL_VERSION,
     PROTOCOL_VERSIONS, Params, Paths, PtyKillParams, PtyResizeParams, PtyScreenParams,
-    PtySpawnParams, PtyWriteParams, Request, RequestId, Role, SettingsDeleteParams,
-    SettingsGetParams, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, VERSION,
-    codes, event_types, methods, setting_keys, topics,
+    PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role,
+    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams, StatusData,
+    SubscribeParams, VERSION, codes, event_types, methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -109,6 +109,8 @@ struct Session {
     /// connections are counted by the gate.
     app: Option<Hold>,
     _counted: Option<Counted>,
+    /// The PTY this connection's stream watches, and whether read-only, while it does.
+    watching: Mutex<Option<(String, bool)>>,
 }
 
 /// A connection counted in `status`'s `clients` while it is open.
@@ -145,6 +147,14 @@ struct Minted {
 struct Subscription {
     id: RequestId,
     cursor: Cursor,
+    /// For `pty.subscribe`: the PTY, and the snapshot that starts the stream.
+    pty: Option<PtyWatch>,
+}
+
+/// A `pty.subscribe` stream's PTY.
+struct PtyWatch {
+    id: String,
+    snapshot: Line,
 }
 
 /// What the connection does once a stream has ended.
@@ -350,6 +360,7 @@ impl Daemon {
             peer,
             app,
             _counted: counted,
+            watching: Mutex::new(None),
         };
         Ok((session, reply))
     }
@@ -427,6 +438,14 @@ impl Daemon {
             methods::SETTINGS_SET => self.settings_set(session, request.params),
             methods::SETTINGS_LIST => self.settings_list(request.params),
             methods::SETTINGS_DELETE => self.settings_delete(session, request.params),
+            methods::PTY_SUBSCRIBE if streaming => Err(error(
+                codes::INVALID_REQUEST,
+                "this connection carries a stream already: open another for a second",
+            )),
+            methods::PTY_SUBSCRIBE => match self.pty_subscribe(session, id, request.params) {
+                Ok(subscription) => return Answer::Stream(subscription),
+                Err(error) => Err(error),
+            },
             methods::PTY_SPAWN
             | methods::PTY_WRITE
             | methods::PTY_RESIZE
@@ -487,7 +506,11 @@ impl Daemon {
             .bus
             .cursor(topics, params.since, params.follow)
             .map_err(|head| ErrorBody::since_ahead(params.since.unwrap_or_default(), head))?;
-        Ok(Subscription { id, cursor })
+        Ok(Subscription {
+            id,
+            cursor,
+            pty: None,
+        })
     }
 
     /// `settings.get {key}`. Every settings call runs as blocking work (`off_worker`): a
@@ -545,6 +568,13 @@ impl Daemon {
             }
             methods::PTY_WRITE => {
                 let params = params_of::<PtyWriteParams>(method, params)?;
+                if watching_read_only(session, &params.pty_id) {
+                    return Err(error(
+                        codes::READ_ONLY,
+                        &format!("this connection watches pty {} read-only", params.pty_id),
+                    )
+                    .with_hint("Write from a connection that doesn't watch it read-only."));
+                }
                 printed(&off_worker(|| self.ptys.write(&params)).map_err(pty_refused)?)
             }
             methods::PTY_RESIZE => {
@@ -561,6 +591,65 @@ impl Daemon {
             }
             _ => printed(&off_worker(|| self.ptys.list()).map_err(pty_refused)?),
         }
+    }
+
+    /// `pty.subscribe {pty_id, read_only}`: the stream of one PTY, which starts with its
+    /// snapshot. Only `cli` and `tui` may watch with `read_only: false`.
+    fn pty_subscribe(
+        &self,
+        session: &Session,
+        id: RequestId,
+        params: Params,
+    ) -> Result<Subscription, ErrorBody> {
+        let method = methods::PTY_SUBSCRIBE;
+        if !pty_allowed(session.role, method) {
+            return Err(role_not_allowed(session.role, method));
+        }
+        let params = params_of::<PtySubscribeParams>(method, params)?;
+        if !params.read_only && !matches!(session.role, Role::Cli | Role::Tui) {
+            return Err(role_not_allowed(session.role, method).with_hint(
+                "Only cli and tui may watch a pty with read_only false; subscribe with \
+                 read_only true.",
+            ));
+        }
+        let (snapshot, seq) = off_worker(|| self.pty_snapshot(&params.pty_id))?;
+        let topics = Topics::of([topics::PTY]).expect("the bus carries pty events");
+        let cursor = self
+            .bus
+            .cursor(topics, Some(seq), true)
+            .map_err(|head| ErrorBody::since_ahead(seq, head))?;
+        *session.watching.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((params.pty_id.clone(), params.read_only));
+        Ok(Subscription {
+            id,
+            cursor,
+            pty: Some(PtyWatch {
+                id: params.pty_id,
+                snapshot,
+            }),
+        })
+    }
+
+    /// `pty_id`'s screen as a `pty.snapshot` event's line, and the seq it is pinned to.
+    fn pty_snapshot(&self, pty_id: &str) -> Result<(Line, u64), ErrorBody> {
+        let params = PtyScreenParams::new(pty_id)
+            .map_err(|e| error(codes::INVALID_PARAMS, &e.to_string()))?;
+        let screen = self.ptys.screen(&params).map_err(pty_refused)?;
+        let data = screen
+            .to_data()
+            .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        let event = Event::new(
+            screen.seq.max(1),
+            crate::clock::now(),
+            topics::PTY,
+            event_types::PTY_SNAPSHOT,
+            data,
+        )
+        .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        let mut line =
+            serde_json::to_vec(&event).map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        line.push(b'\n');
+        Ok((Line::from(line), screen.seq))
     }
 
     /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
@@ -1231,7 +1320,15 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut head = daemon.bus.watch();
+    let mut gone = daemon.ptys.gone();
     let mut stopping = false;
+    if let Some(pty) = &subscription.pty
+        && send_lines(writer, std::slice::from_ref(&pty.snapshot))
+            .await
+            .is_err()
+    {
+        return end_watch(session, Flow::Close);
+    }
     loop {
         loop {
             let lines = daemon
@@ -1240,34 +1337,96 @@ where
             if lines.is_empty() {
                 break;
             }
+            let lines = match &subscription.pty {
+                None => lines,
+                Some(pty) => match pty_lines(daemon, &mut subscription.cursor, pty, lines) {
+                    Ok(lines) => lines,
+                    Err(()) => break,
+                },
+            };
             if send_lines(writer, &lines).await.is_err() {
-                return Flow::Close;
+                return end_watch(session, Flow::Close);
             }
         }
-        if stopping || subscription.cursor.is_done() {
+        let pty_gone = subscription
+            .pty
+            .as_ref()
+            .is_some_and(|pty| !daemon.ptys.exists(&pty.id));
+        if stopping || subscription.cursor.is_done() || pty_gone {
             let data = object(&json!({"seq": subscription.cursor.after()}));
             let reply = Envelope::ok(data).with_id(subscription.id);
             if send(writer, &reply).await.is_err() {
                 return Flow::Close;
             }
-            return if stopping { Flow::Linger } else { Flow::GoOn };
+            return end_watch(session, if stopping { Flow::Linger } else { Flow::GoOn });
         }
         let after = subscription.cursor.after();
         tokio::select! {
             moved = async { head.wait_for(|&seq| seq > after).await.map(|_| ()) } => {
                 stopping = moved.is_err();
             }
+            _ = gone.changed(), if subscription.pty.is_some() => {}
             () = daemon.stopped() => stopping = true,
-            () = kicked(session) => return Flow::Dropped,
+            () = kicked(session) => return end_watch(session, Flow::Dropped),
             frame = watch.next_line(frames) => {
                 if let Some(flow) =
                     answer_in_stream(daemon, session, frames, writer, watch, frame).await
                 {
-                    return flow;
+                    return end_watch(session, flow);
                 }
             }
         }
     }
+}
+
+/// Ends a stream's watch of a PTY, if it had one: the connection may write to it again.
+fn end_watch(session: &Session, flow: Flow) -> Flow {
+    session
+        .watching
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    flow
+}
+
+/// Whether this connection watches `pty_id` read-only.
+fn watching_read_only(session: &Session, pty_id: &str) -> bool {
+    session
+        .watching
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|(id, read_only)| *read_only && id == pty_id)
+}
+
+/// A `pty.subscribe` stream's lines out of a batch the bus gave: its PTY's events only.
+/// A gap means output it had not read was dropped: it gets a fresh snapshot instead, and
+/// its cursor goes on from that. `Err` when the snapshot can't be taken, as when the PTY
+/// has just gone.
+fn pty_lines(
+    daemon: &Daemon,
+    cursor: &mut Cursor,
+    pty: &PtyWatch,
+    lines: Vec<Line>,
+) -> Result<Vec<Line>, ()> {
+    let id = format!("\"pty_id\":\"{}\"", pty.id);
+    let mut kept = Vec::with_capacity(lines.len());
+    for line in lines {
+        if contains(&line, b"\"type\":\"daemon.gap\"") {
+            let (snapshot, seq) = off_worker(|| daemon.pty_snapshot(&pty.id)).map_err(|_| ())?;
+            let topics = Topics::of([topics::PTY]).expect("the bus carries pty events");
+            *cursor = daemon.bus.cursor(topics, Some(seq), true).map_err(|_| ())?;
+            return Ok(vec![snapshot]);
+        }
+        if contains(&line, id.as_bytes()) {
+            kept.push(line);
+        }
+    }
+    Ok(kept)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Answers `frame`, read while the connection carries a stream. `None` when the stream
@@ -1644,6 +1803,7 @@ fn served() -> Vec<&'static str> {
         methods::PTY_WRITE,
         methods::PTY_RESIZE,
         methods::PTY_SCREEN,
+        methods::PTY_SUBSCRIBE,
         methods::PTY_KILL,
         methods::PTY_LIST,
     ];

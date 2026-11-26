@@ -547,18 +547,19 @@ fn inputs() -> Vec<Input> {
             since: Some((3, 5)),
         },
         Input {
+            // tmux 3.8 makes each pasted line safe (vis): before, ESC and DEL went raw.
             name: "a paste",
             setup: "",
             keys: &[],
             paste: Some(PASTE),
-            since: None,
+            since: Some((3, 8)),
         },
         Input {
             name: "a bracketed paste",
             setup: "\x1b[?2004h",
             keys: &[],
             paste: Some(PASTE),
-            since: None,
+            since: Some((3, 8)),
         },
     ]
 }
