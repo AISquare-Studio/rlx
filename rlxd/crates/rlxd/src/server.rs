@@ -95,7 +95,7 @@ pub struct Daemon {
     runner: Arc<Runner>,
     settings: Settings,
     /// The app's environment for Claude Code (4.3), and the `claude` it resolves to.
-    env: Env,
+    env: Arc<Env>,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
@@ -182,9 +182,9 @@ impl Daemon {
         bus: Bus,
         settings: Settings,
     ) -> Arc<Self> {
-        let env = Env::open(&home);
+        let env = Arc::new(Env::open(&home));
         let bus = Arc::new(bus);
-        let runner = Runner::new(home.clone(), Arc::clone(&bus));
+        let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
         Arc::new(Self {
             home,
             token,

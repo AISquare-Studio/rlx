@@ -8,7 +8,10 @@
 //! Windows) and point `RLXD_CLAUDE_BIN` there. So the process's command line names its
 //! scenario, as `pgrep -f fake-claude/slow` expects, and no shell, Python or batch file
 //! stands in between on any OS. Started as `fake-claude` itself, the first argument
-//! `--scenario=<name>` names it.
+//! `--scenario=<name>` names it. Started by a name that is no scenario, such as
+//! `bin/claude` (4.3's "Absolute paths"), it follows the name's links to one that is (a
+//! symlink to `fake-claude/print-env`), else takes `FAKE_CLAUDE_SCENARIO` (Windows, where
+//! the test copies it).
 //!
 //! Each scenario is one module under `scenarios/` and one line of
 //! [`scenarios::ALL`]. A later item adds its own scenarios there without touching these.
@@ -151,6 +154,16 @@ fn scenario_of(argv: &[String]) -> (String, Vec<String>) {
         && let Some(name) = args.first().and_then(|a| a.strip_prefix("--scenario="))
     {
         return (name.to_owned(), args[1..].to_vec());
+    }
+    if scenarios::find(&stem).is_none() {
+        let linked = std::fs::canonicalize(&program)
+            .ok()
+            .and_then(|real| real.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .filter(|name| scenarios::find(name).is_some());
+        let named = std::env::var("FAKE_CLAUDE_SCENARIO").ok();
+        if let Some(name) = linked.or(named) {
+            return (name, args);
+        }
     }
     (stem, args)
 }

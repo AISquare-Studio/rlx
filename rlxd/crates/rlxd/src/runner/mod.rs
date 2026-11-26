@@ -38,9 +38,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Data, ErrorBody, FailReason, Mount, RunCancelData, RunDoneData, RunFailedData, RunId, RunKind,
-    RunQueuedData, RunRateLimitedData, RunRef, RunStartParams, RunStartedData, RunState,
-    RunTextData, RunToolResultData, codes, run_types,
+    Data, EnvValues, ErrorBody, FailReason, Mount, RunCancelData, RunDoneData, RunFailedData,
+    RunId, RunKind, RunQueuedData, RunRateLimitedData, RunRef, RunStartParams, RunStartedData,
+    RunState, RunTextData, RunToolResultData, codes, run_types,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -49,8 +49,10 @@ use tokio::process::{ChildStderr, ChildStdin};
 use tokio::sync::watch;
 
 use crate::bus::{self, Bus};
+use crate::claude::{self, Resolved};
+use crate::env::Env;
 use crate::log::{info, warning};
-use crate::{claude, clock, spaces};
+use crate::{clock, spaces};
 
 mod argv;
 #[cfg(unix)]
@@ -81,6 +83,9 @@ const CANCEL_WAIT: Duration = Duration::from_secs(10);
 pub struct Runner {
     home: Home,
     bus: Arc<Bus>,
+    /// The app's environment (4.3): passed raw to every Claude Code, and the absolute
+    /// `claude` it resolved to when the app set it or rlxd started, which every run starts.
+    env: Arc<Env>,
     spawner: Spawner,
     /// `rlxd-hook` beside this rlxd, which each run's settings name, or why it can't be
     /// named: then `run.start` refuses `hook_not_found`.
@@ -186,11 +191,12 @@ enum Streamed {
 
 impl Runner {
     /// The runner of `home`, publishing on `bus`. It must be made inside rlxd's runtime.
-    pub fn new(home: Home, bus: Arc<Bus>) -> Arc<Self> {
+    pub fn new(home: Home, bus: Arc<Bus>, env: Arc<Env>) -> Arc<Self> {
         let rlxd = std::env::current_exe().ok();
         Arc::new(Self {
             home,
             bus,
+            env,
             spawner: Spawner::start(),
             hook: argv::hook_beside(rlxd.as_deref()),
             launch_delay: test_delay("RLXD_TEST_LAUNCH_DELAY_MS"),
@@ -202,6 +208,35 @@ impl Runner {
 
     fn runs(&self) -> MutexGuard<'_, Runs> {
         self.runs.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The `claude` a run starts: the absolute path the app's environment resolved to
+    /// (4.3), or the refusal `run.start` gives when it resolved to none rlxd runs.
+    fn claude_to_run(&self) -> Result<PathBuf, ErrorBody> {
+        let (resolved, source) = self.env.claude();
+        let looked = match source {
+            claude::Source::App => "on the app's PATH".to_owned(),
+            claude::Source::Rlxd => "on rlxd's PATH, as the app set none".to_owned(),
+            claude::Source::RlxdClaudeBin => format!("where {} names", claude::BIN_ENV),
+        };
+        match resolved {
+            Resolved::Found(program) => Ok(program),
+            Resolved::NotFound => Err(refusal(
+                codes::CLAUDE_NOT_FOUND,
+                format!(
+                    "Claude Code was not found: there is no claude {looked}. rlxd looks when \
+                     the app sets PATH and when it starts"
+                ),
+            )),
+            Resolved::NotRunnable(program) => Err(refusal(
+                codes::CLAUDE_NOT_RUNNABLE,
+                format!(
+                    "the claude found first {looked}, {}, is a batch file, which rlxd does not \
+                     run through cmd: install Claude Code's native build",
+                    program.display()
+                ),
+            )),
+        }
     }
 
     /// Every run rlxd knows now, to read with the runner's lock let go.
@@ -226,8 +261,9 @@ impl Runner {
     /// `run.start`: the run is recorded, and started or queued. Refused with
     /// `kind_mount_mismatch`, `pinned_call_required` (only that it is there: the gate
     /// enforces it, 5.1), `not_implemented` for a non-empty `needs_connectors` (until
-    /// 5.5), `run_exists`, or `run_start_failed` when rlxd is stopping or the run's record
-    /// can't be written.
+    /// 5.5), `run_exists`, `claude_not_found` or `claude_not_runnable` when the `claude`
+    /// resolved for the app's environment (4.3) is none rlxd runs, or `run_start_failed`
+    /// when rlxd is stopping or the run's record can't be written.
     pub fn start(
         self: &Arc<Self>,
         params: RunStartParams,
@@ -275,6 +311,7 @@ impl Runner {
                 ),
             ));
         }
+        self.claude_to_run()?;
         let id = params.run_id.clone();
         let dir = RunDir::of(&self.home, &id);
         {
@@ -585,12 +622,12 @@ impl Runner {
                 run.inner().text.clone(),
             ))
         };
-        let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
-            return failed(format!(
-                "Claude Code was not found: there is no `claude` on rlxd's PATH, and {} \
-                 names none",
-                claude::BIN_ENV
-            ));
+        // The absolute path resolved when the app set its environment or rlxd started,
+        // never a lookup now (4.3). Refused at run.start when there was none; this is for
+        // an environment changed since.
+        let program = match self.claude_to_run() {
+            Ok(program) => program,
+            Err(refused) => return failed(refused.message),
         };
         let prepared = blocking(|| -> std::io::Result<(PathBuf, PathBuf)> {
             let space = spaces::ensure(&self.home, &params.space)?;
@@ -616,7 +653,7 @@ impl Runner {
             program: program.clone(),
             args: argv::args(params, attempt, &settings),
             cwd: space,
-            env: run_env(),
+            env: run_env(&self.env.values()),
             status: status_path.clone(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
@@ -1055,11 +1092,15 @@ fn outcome_of(run: &Run, outcome: stream::Outcome) -> End {
     End::Done(done)
 }
 
-/// The environment a run's Claude Code gets beyond rlxd's own, which it inherits. The
-/// app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3) plug in
-/// here; until then there is nothing to add.
-fn run_env() -> Vec<(OsString, OsString)> {
-    Vec::new()
+/// The environment a run's Claude Code gets beyond rlxd's own, which it inherits: the
+/// app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3), raw, those
+/// it set. A run takes the values current when its attempt starts.
+fn run_env(values: &EnvValues) -> Vec<(OsString, OsString)> {
+    values
+        .pairs()
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect()
 }
 
 /// Adds `text` to `kept`, which holds at most the last [`PARTIAL_TEXT`] bytes.

@@ -272,11 +272,19 @@ rlxd call env.get
     starts one through `cmd`, whose rules no escaping makes safe for a prompt. `status`
     then says Claude Code isn't installed. `RLXD_CLAUDE_BIN`, the tests' override, is
     taken as it names, as the `auth-status.cmd` fixture needs.
+- **Runs** start that `claude`, by its absolute path, with the values raw on top of
+  rlxd's own environment. A run takes the values and the `claude` current when its
+  attempt's process starts: one still queued picks up a change made before it starts,
+  and one running keeps what it started with. `run.start` refuses `claude_not_found`
+  when no `claude` was found where rlxd looked, and `claude_not_runnable` when the one
+  found is a batch file. The message says where it looked.
 - **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
   links no Keychain crate: `rlxd.yml`'s `deny` job fails when `cargo tree --target all
   -e normal` holds `security-framework` or `keyring`.
 
-`crates/rlxd/tests/env.rs` runs 4.3's Accept lines that start no run, on three OSes.
+`crates/rlxd/tests/env.rs` runs 4.3's Accept lines that start no run, and
+`crates/rlxd/tests/env_runs.rs` those that do, with fake-claude's `print-env`, on three
+OSes.
 
 ## The runner and spaces
 
@@ -293,9 +301,12 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   [--strict-mcp-config] [--json-schema …] [--append-system-prompt …]
   [--include-partial-messages] --settings <home>/rlxd/runs/<run_id>/<attempt>/settings.json
   --setting-sources project --permission-mode dontAsk`, never `--allowedTools` or `--bare`.
-  Claude Code is resolved to an absolute path when each attempt starts
-  (`RLXD_CLAUDE_BIN`, from rlxd's own environment only, else `claude` on rlxd's `PATH`).
-  Its environment is rlxd's own until 4.3 passes the app's.
+  Each attempt starts the absolute `claude` resolved when the app last set its
+  environment, or when rlxd started (4.3, never a lookup at the run's start), with the
+  app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` on top of rlxd's
+  own environment ([The app's environment](#the-apps-environment-for-claude-code)).
+  `run.start` refuses `claude_not_found` when that resolved to none, and
+  `claude_not_runnable` when to a batch file.
 - **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
   pre-tool-use --run <run_id> --attempt <n>` by the absolute path of the `rlxd-hook`
   beside rlxd (quoted when it must be; on Windows in forward slashes, always quoted),

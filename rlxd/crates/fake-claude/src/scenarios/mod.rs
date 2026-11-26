@@ -12,6 +12,7 @@ mod hello;
 mod huge;
 mod orphan;
 mod persist;
+mod print_env;
 mod rate_limit;
 mod slow;
 mod structured;
@@ -31,6 +32,7 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("huge", huge::run),
     ("orphan", orphan::run),
     ("persist", persist::run),
+    ("print-env", print_env::run),
     ("rate-limit", rate_limit::run),
     ("slow", slow::run),
     ("structured", structured::run),
