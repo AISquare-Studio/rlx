@@ -457,6 +457,35 @@ mod tests {
     }
 
     #[test]
+    fn status_carries_only_its_own_fields_of_claude_codes_answer() {
+        // Manager #2554: nothing of auth status's org, folders or expiry is passed on.
+        let mut claude = Claude::default();
+        let status = json!({"loggedIn": true, "authMethod": "claude.ai",
+            "apiProvider": "firstParty", "analyticsDisabled": false,
+            "projectsDirectory": "/p", "configDirectory": "/c",
+            "loginExpiresAt": "2026-12-01T00:00:00.000Z", "email": "probe@example.com",
+            "orgId": "00000000-0000-0000-0000-000000000000", "orgName": "Probe Org",
+            "subscriptionType": "pro", "storedClaudeAiLogin": true, "planTier": "pro_1"});
+        read_auth_status(&mut claude, &status);
+        let printed = serde_json::to_value(&claude).unwrap();
+        let keys: Vec<&str> = printed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["account", "auth_method", "installed", "plan", "signed_in"],
+            "{printed}"
+        );
+        let text = printed.to_string();
+        for kept_out in ["Probe Org", "00000000", "/c", "/p", "2026-12-01", "pro_1"] {
+            assert!(!text.contains(kept_out), "{kept_out}: {text}");
+        }
+    }
+
+    #[test]
     fn auth_method_is_claude_codes_or_the_provider_for_a_third_party() {
         let method =
             |m: &str, p: Option<&str>| auth_method(Some(m.to_owned()), p.map(str::to_owned));
