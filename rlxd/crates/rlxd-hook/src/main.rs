@@ -9,8 +9,8 @@
 //!
 //! For a fleet hook (`session-start`, `user-prompt-submit`, `session-end`, `stop`,
 //! `stop-failure`, `notification`), it reads the hook's JSON on stdin and sends rlxd
-//! `hook`: those bytes, its working directory, and the variables it has that rlxd-proto's
-//! `hook_env_forwarded` allows (`HOOK_ENV_NAMES`, and each agent's own but its credentials). It says `hello` as a `cli` client named `rlxd-hook`, with the
+//! `hook`: those bytes, its working directory, and the variables it has of rlxd-proto's
+//! `HOOK_ENV_NAMES`, by exact name. It says `hello` as a `cli` client named `rlxd-hook`, with the
 //! token every client uses, and sends nothing but `hook` (or `hook.ping`), for an event of
 //! its fixed list: no hook reaches a gate or app-only method. It writes rlxd's reply, the
 //! bytes `rlx hook <event>` would write, on its stdout and stderr, and exits 0.
@@ -35,7 +35,9 @@
 //!
 //! **`pre-tool-use`** never falls back (`rlx hook` has no such handler): it prints a deny
 //! and exits 0 on any failure, and rlxd itself denies every call until the gate decides
-//! them (5.1). Every hook exits 0.
+//! them (5.1). Until then it prints rlxd's reply only when it is a deny
+//! (`is_deny_output`); any other reply, an empty one included, is a failure too, so none
+//! lets a call through. Every hook exits 0.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -49,7 +51,7 @@ use std::time::Duration;
 
 use rlxd_client::proto::{
     Data, HOOK_ENV_NAMES, HOOK_EVENTS, HelloParams, HookParams, HookReply, PRE_TOOL_USE, Role,
-    VERSION, b64, deny_output, hook_codes, hook_env_forwarded, methods,
+    VERSION, b64, deny_output, hook_codes, is_deny_output, methods,
 };
 use rlxd_client::{CallError, ConnectError, Connection, Home, install};
 use serde::Deserialize;
@@ -193,8 +195,14 @@ fn fleet_hook(event: &str) -> ExitCode {
 fn pre_tool_use(run: Option<(String, u64)>) -> ExitCode {
     let mut stdin = Vec::new();
     let _ = io::stdin().read_to_end(&mut stdin);
+    // Until the gate decides tool calls (5.1), only a deny goes through: a reply that is
+    // anything else, an empty one included (on which Claude Code asks no one), is denied.
     match ask_in_time(PRE_TOOL_USE, &stdin, run, budget(PRE_TOOL_USE)) {
-        Asked::Answered(reply) if decoded(&reply.stdout_b64).is_some() => emit(&reply),
+        Asked::Answered(reply)
+            if decoded(&reply.stdout_b64).is_some_and(|stdout| is_deny_output(&stdout)) =>
+        {
+            emit(&reply);
+        }
         Asked::Answered(_) | Asked::NeverRan(_) | Asked::MayHaveRun(_) => {
             write_out(deny_output(UNREACHED).as_bytes());
         }
@@ -255,25 +263,11 @@ fn ask_in_time(event: &str, stdin: &[u8], run: Option<(String, u64)>, budget: Du
 
 /// `hook`'s params for this hook.
 fn params_of(event: &str, stdin: &[u8], run: Option<(String, u64)>) -> Result<Data, String> {
-    // By name, as Windows looks one up whatever its case; and every other one the rule
-    // allows (an agent's), upper-case on Windows, as Python's os.environ has it there.
-    let mut env: BTreeMap<String, String> = HOOK_ENV_NAMES
+    // By exact name, as Windows looks one up whatever its case; nothing else.
+    let env: BTreeMap<String, String> = HOOK_ENV_NAMES
         .iter()
         .filter_map(|&name| Some((name.to_owned(), std::env::var(name).ok()?)))
         .collect();
-    for (name, value) in std::env::vars_os() {
-        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
-            continue;
-        };
-        let name = if cfg!(windows) {
-            name.to_ascii_uppercase()
-        } else {
-            name.to_owned()
-        };
-        if hook_env_forwarded(&name) && !env.contains_key(&name) {
-            env.insert(name, value.to_owned());
-        }
-    }
     let cwd = std::env::current_dir()
         .ok()
         .map(|dir| dir.display().to_string())

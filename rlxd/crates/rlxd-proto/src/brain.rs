@@ -37,8 +37,7 @@ pub const BRAIN_PROTOCOLS: &[u32] = &[BRAIN_PROTOCOL];
 /// A frame rlxd writes on the brain's stdin.
 ///
 /// ```json
-/// {"type": "hello", "protocol": 1, "rlxd_version": "0.10.3", "env_allowlist": ["…"],
-///  "env_prefixes": ["CLAUDE", "CODEX"], "env_secret_words": ["…"]}
+/// {"type": "hello", "protocol": 1, "rlxd_version": "0.10.3", "env_allowlist": ["…"]}
 /// {"type": "request", "id": 7, "method": "ping", "params": {}}
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -54,17 +53,11 @@ pub enum BrainInput {
         /// rlxd's version, which is rlx's.
         #[schemars(length(min = 1))]
         rlxd_version: String,
-        /// The variables rlxd-hook sends with each hook by name (`HOOK_ENV_NAMES`), sorted.
-        /// The brain refuses an rlxd whose lists are not the ones it sets
+        /// The variables rlxd-hook sends with each hook, by exact name (`HOOK_ENV_NAMES`),
+        /// sorted. The brain refuses an rlxd whose list is not the one it sets
         /// (`env_allowlist_differs`).
         #[serde(default)]
         env_allowlist: Vec<String>,
-        /// The prefixes of the agents' variables it sends (`HOOK_ENV_PREFIXES`).
-        #[serde(default)]
-        env_prefixes: Vec<String>,
-        /// The words of the agents' variables it never sends (`HOOK_ENV_SECRET_WORDS`).
-        #[serde(default)]
-        env_secret_words: Vec<String>,
     },
     /// One request. rlxd sends the next only once this one has its reply.
     Request {
@@ -90,10 +83,6 @@ enum UncheckedInput {
         rlxd_version: String,
         #[serde(default)]
         env_allowlist: Vec<String>,
-        #[serde(default)]
-        env_prefixes: Vec<String>,
-        #[serde(default)]
-        env_secret_words: Vec<String>,
     },
     Request {
         id: u64,
@@ -227,14 +216,12 @@ fn owned(list: &[&str]) -> Vec<String> {
 
 impl BrainInput {
     /// rlxd's hello, speaking [`BRAIN_PROTOCOL`] and naming the hook variables
-    /// ([`hook_env_forwarded`](crate::hook_env_forwarded)'s lists).
+    /// ([`hook_env_forwarded`](crate::hook_env_forwarded)'s list).
     pub fn hello(rlxd_version: impl Into<String>) -> Result<Self, Invalid> {
         let hello = Self::Hello {
             protocol: BRAIN_PROTOCOL,
             rlxd_version: rlxd_version.into(),
             env_allowlist: owned(crate::HOOK_ENV_NAMES),
-            env_prefixes: owned(crate::HOOK_ENV_PREFIXES),
-            env_secret_words: owned(crate::HOOK_ENV_SECRET_WORDS),
         };
         hello.validate()?;
         Ok(hello)

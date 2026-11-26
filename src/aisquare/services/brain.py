@@ -14,10 +14,9 @@ one JSON object on one line, ASCII only, with a ``type``. The shapes are rlxd-pr
 (``rlxd/schemas/v1/brain-input.json`` and ``brain-output.json``):
 
 1. rlxd says ``{"type": "hello", "protocol": 1, "rlxd_version": "…", "env_allowlist":
-   […], "env_prefixes": […], "env_secret_words": […]}`` first.
+   […]}`` first.
 2. The brain answers ``{"type": "hello", "protocol": 1, "pid": …, "rlx_version": "…"}``,
-   or, when rlxd's ``env_allowlist``, ``env_prefixes`` and ``env_secret_words`` are not this
-   brain's (:data:`ENV_NAMES`, :data:`ENV_PREFIXES`, :data:`ENV_SECRET_WORDS`: rlxd-hook
+   or, when rlxd's ``env_allowlist`` is not this brain's (:data:`ENV_NAMES`: rlxd-hook
    would send other variables than the brain sets), ``{"type": "refused", "code":
    "env_allowlist_differs", …}``, or, for a ``protocol`` it does not speak,
    ``{"type": "refused", "code": "incompatible_protocol", "message": "…", "supported":
@@ -59,15 +58,14 @@ exit status. ``pre-tool-use`` is the gate's (5.1), rlxd's own, and never reaches
 
 A hook runs in Claude Code's process, not rlxd's: its working directory, and its
 environment. rlxd-hook sends its working directory and the variables of the allowlist it
-has (:func:`forwarded`: :data:`ENV_NAMES`, and the agents' own by :data:`ENV_PREFIXES`). For
-one request, the brain becomes that process:
+has (:data:`ENV_NAMES`). For one request, the brain becomes that process:
 
 - **Environment.** Each allowlisted variable is set to rlxd-hook's value, or removed when
-  rlxd-hook had none, so neither rlxd's value nor an earlier hook's leaks in, and
-  ``TZ`` is read again (``time.tzset``). Every other variable is the brain's own, which
-  rlxd started it with. What a process reads only as it starts is the brain's: the
-  locale's ``LC_*`` set Python's own encodings then, and pass on to the hook's children
-  only.
+  rlxd-hook had none, so neither rlxd's value nor an earlier hook's leaks in; ``TZ`` is
+  read again (``time.tzset``), and so is the temporary folder (``tempfile.tempdir``).
+  Every other variable is the brain's own, which rlxd started it with. What a process
+  reads only as it starts is the brain's: the locale's ``LC_*`` set Python's own encodings
+  then, and pass on to the hook's children only.
 - **Directory.** ``os.chdir`` to rlxd-hook's working directory (the brain's own when that
   one is gone, as it can be by the time the hook runs).
 - **Process.** ``sys.argv`` is ``[<this rlx>, "hook", <event>]``. ``sys.stdin`` reads the
@@ -76,88 +74,95 @@ one request, the brain becomes that process:
   of the brain's own, ``\r\n`` on Windows), so the bytes are the ones ``rlx hook`` writes,
   a child's output included. fd 0 stays the null device, which a child of ``rlx hook``
   would read as the end of a stdin its parent read to the end.
-- **State.** ``core.state``'s runtime state is a fresh one, as the root callback makes it.
+- **State.** ``core.state``'s runtime state is a fresh one, as the root callback makes it,
+  and every module of rlx's is as a fresh process has it (below).
 
 All of it is put back afterwards, whatever the hook did. Requests never overlap: rlxd sends
 one at a time, so changing process-wide state for one is safe, and nothing of one is left
 for the next.
 
-Nothing a hook starts outlives its request but what ``rlx hook``'s would outlive its
-process: the brain waits for each non-daemon thread the hook started, as a process does
-before it exits (what they print is the hook's), and every child still running after it
-is a detached worker (``services.hooks._detach``: a session of its own, which also leaves
-``rlx hook`` behind on purpose, such as the code index's refresh). The brain collects each
-child that has ended after every hook, so none stays a zombie. Daemon threads (a Remote
-push, say) run on: ``rlx hook`` would wait for them at exit (``atexit``), and the brain,
-which does not exit, lets them finish. The protocol's own fds are not inheritable, so no
-child holds the brain's pipes.
+**The end of a hook is a process's end.** The brain waits for each non-daemon thread the
+hook started; runs the exit handlers it registered (``atexit.register`` is the brain's
+for the hook), the last first, then those rlx's modules register at import
+(:data:`EXIT_HANDLERS`: a Remote push the hook began is sent, tmux control clients close);
+then gives the daemon threads the hook started :data:`DAEMON_WAIT` to end, and logs any
+still running, which an exit would have stopped. All of it inside the hook, so what they
+print is the hook's. Then it collects the children the hook let go of
+(``subprocess``'s own record), and only those. A child still running after a hook is a
+detached worker (``services.hooks._detach``), which leaves ``rlx hook`` behind on purpose
+(the code index's refresh, a hand-over): on POSIX in a session of its own, outside the
+brain's process group; on Windows its start asks to leave the brain's job
+(:func:`breaking_away`), which rlxd's job allows. The protocol's own fds are not
+inheritable, so no child holds the brain's pipes.
 
-The allowlist, which rlxd-hook sends and the brain applies:
+The allowlist (:data:`ENV_NAMES`), exact names, which rlxd-hook sends and the brain applies:
 
-- **rlx's own:** every ``AISQUARE_*`` variable rlx's code names, and ``RLX_HOME``: the role,
-  the fleet agent and launch, the team, the broker's scope, the home. A test reads every
-  ``AISQUARE_*`` name in ``src/aisquare`` and fails on one that is not here.
-- **The agents':** every variable under an agent's own prefix (:data:`ENV_PREFIXES`, read
-  off the adapters: the first word of each one's home variable), its config dir above all,
-  but a credential's (:data:`ENV_SECRET_WORDS`: its token), which no hook reads. A test
-  holds every agent variable rlx's code names to that rule.
-- **tmux's:** ``TMUX``, ``TMUX_PANE``, ``TMUX_TMPDIR``: which pane the agent runs in.
+- **rlx's own the hook path reads:** the home (``AISQUARE_HOME``, and ``RLX_HOME``, its
+  name from 0.10.2's sync on), the role, the fleet agent and its launch, the team and its
+  hub, the broker's scope, the persona, the store's wait.
+- **The agents' own,** which only their adapters name: ``AgentAdapter.hook_env`` (Claude
+  Code's config dir, pid, temporary folder and effort). No credential is among them.
+- **tmux's:** ``TMUX`` and ``TMUX_PANE``, the agent's pane.
 - **The process's:** ``PATH`` (which ``tmux``, ``git`` and ``claude`` a hook's children
-  run), ``HOME`` and the user's names and folders (``USER``, ``LOGNAME``, ``USERNAME``,
-  ``USERPROFILE``, ``APPDATA``, ``LOCALAPPDATA``, ``XDG_*``), the temporary folders, ``TZ``
-  and the locale (times a hook prints), the terminal's (``TERM``, ``COLORTERM``,
-  ``NO_COLOR``, ``FORCE_COLOR``, ``COLUMNS``, ``LINES``), and the TLS and proxy settings a
-  call to the team hub uses.
+  run), the user's home (``HOME``, and Windows' ``USERPROFILE``), ``TZ`` (times a hook
+  prints), the locale's ``LC_CTYPE``, the temporary folder (``TMPDIR``, Windows' ``TEMP``
+  and ``TMP``), and Windows' user folders.
 
 The parity test (``tests/test_brain_hooks.py``) runs each event both ways, ``rlx hook`` in a
-process of its own and the brain, under two different environments (role, config dir,
-agent ids) in turn, and compares stdout byte for byte and the store's rows; it also records
-every variable the handlers read and fails on one that is neither in the allowlist nor one
-that describes the brain's own process (:data:`ENV_OF_THE_BRAIN`, and Python's own,
-:data:`ENV_OF_THE_INTERPRETER`).
+process of its own and the brain, under three environments in turn in one brain, and
+compares stdout and stderr byte for byte and the store's rows. It records every variable
+the handlers read: each must be in the allowlist, or describe the brain's own process
+(:data:`ENV_OF_THE_BRAIN`, and Python's own, :data:`ENV_OF_THE_INTERPRETER`); and each name
+in the allowlist must be one they read, or be in :data:`ENV_READ_ELSEWHERE`, with why.
 
-Caches (the staleness audit)
-----------------------------
+Module state (the staleness audit)
+----------------------------------
 
-A brain lives for days; ``rlx hook`` re-reads everything each time. So before each hook the
-brain empties every ``functools`` cache of every ``aisquare`` module loaded
-(:func:`fresh_caches`): whatever a cache holds is computed again from this hook's
-environment and files, as a fresh process would. The module state written with ``global``
-on the hook path, each reset or safe as it is (:data:`MODULE_STATE`; a test fails on any
-other):
+A brain lives for days; ``rlx hook`` starts from its modules as they are imported, every
+time. So the brain keeps that state as it is before its first request
+(:func:`take_baseline`: every module-level value of every ``aisquare`` module, and a copy
+of each container's content), and before each hook puts it back (:func:`fresh_state`):
 
-- ``core.config._LAST_PARSE``: keyed by the config file's path and its bytes, which every
-  load reads again: never stale.
-- ``core.state._state``: the runtime state, which the root callback replaces on every
-  command; the brain puts a fresh one back after each hook.
-- ``core.program._in_app``: true only while asq's UI runs in this process, never in the
-  brain; reset to false.
-- ``core.instances._this``: this process's asq instance record, set only by asq's UI;
-  reset to none.
-- ``core.tmux._boot`` and ``_booted_at``: the machine's boot id and time, the same for
-  every process until a reboot, which also restarts rlxd.
-- ``services.native_telemetry._config_stamp``: the config file's stamp, read again on
-  each use; a change empties the insights cache, which the brain empties anyway.
-- ``core.clipboard``'s ``_cache``, ``_worker`` and ``_pending``: asq's clipboard, never on
-  the hook path.
+- every ``functools`` cache is emptied: whatever it held is computed again from this
+  hook's environment and files;
+- every module-level name is bound to its object again, so state written with ``global``
+  is back (``core.config._LAST_PARSE``, ``core.state._state``, ``core.program._in_app``,
+  ``core.instances._this``, ``core.tmux._boot``, ``services.native_telemetry.
+  _config_stamp``…);
+- every module-level container's content is put back in place, so state mutated where it
+  lies is back too: ``core.launch_seal._SEEN`` (the session facts a hook was handed, which
+  a later hook's ``adopted`` would otherwise act on), ``core.orchestrator._WARNED_HUBS``
+  (a warning each ``rlx hook`` prints once), ``core.process_table``'s held lookups,
+  ``services.remote_push``'s pushes said, the accounts' read-through caches;
+- a name a hook added at module level is removed (a submodule it imported stays).
+
+Tests hold it: after the six events, every module-level value is its baseline's and every
+container's content equals it; the session facts and the hub warning are shown back; and
+the six events import no module of rlx's the baseline lacks (one imported later would keep
+its state across hooks).
 
 Module-level values computed from the environment at import would be stale too: none on the
 hook path is (no module of ``aisquare`` reads the environment, the directory or ``argv`` at
-import), and the parity test's second environment would show one.
+import), and the parity test's second and third environments would show one.
 """
 
 from __future__ import annotations
 
+import atexit
 import base64
+import collections
 import contextlib
+import copy
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
+import types
 from collections.abc import Callable, Iterator, Mapping
 from typing import IO, Any
 
@@ -205,157 +210,104 @@ HOOK_EVENTS: tuple[str, ...] = (
     "notification",
 )
 
-#: rlx's own variables, which rlx's code names: every one, a test says.
+#: rlx's own variables the hook path reads: the home, the role, the fleet agent and its
+#: launch, the team and its hub, the broker's scope, the persona, the store's wait, the
+#: captain's switch.
 _RLX_NAMES = (
-    "AISQUARE_ACCOUNTS_SHARED",
-    "AISQUARE_AGENT_BIN",
-    "AISQUARE_AGENT_NAME",
-    "AISQUARE_API_URL",
     "AISQUARE_BOARD_CONTEXT",
     "AISQUARE_BROKER",
-    "AISQUARE_BROKER_NONCE",
     "AISQUARE_BROKERED",
-    "AISQUARE_BROKERED_BOARD",
-    "AISQUARE_BROKERED_MEMBERS",
-    "AISQUARE_BROKERED_POOL",
-    "AISQUARE_BROKERED_REPORTS",
-    "AISQUARE_BROKERED_ROOT_IDS",
-    "AISQUARE_BROKERED_ROOTS",
-    "AISQUARE_BROKERED_SEALS",
     "AISQUARE_CI",
-    "AISQUARE_CI_DELIVERY_OVERRIDE",
-    "AISQUARE_CI_KEY",
-    "AISQUARE_CI_RUN",
-    "AISQUARE_CI_URL",
-    "AISQUARE_CODING_AGENT",
     "AISQUARE_DB_BUSY_MS",
-    "AISQUARE_EFFORT",
     "AISQUARE_EXPERIMENTAL_CAPTAIN",
-    "AISQUARE_EXPLAINABILITY_TARGET",
     "AISQUARE_FLEET_AGENT",
-    "AISQUARE_HARNESS_PROBE",
     "AISQUARE_HOME",
-    "AISQUARE_IN_APP",
-    "AISQUARE_LAUNCH_AGENT",
     "AISQUARE_LAUNCH_ID",
     "AISQUARE_LAUNCH_PID",
-    "AISQUARE_LAUNCH_SETTINGS",
-    "AISQUARE_NO_TELEMETRY",
-    "AISQUARE_PASTE_LOG",
     "AISQUARE_PERSONA",
-    "AISQUARE_PIN_SESSION_ID",
     "AISQUARE_PIPELINE_ID",
-    "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR",
-    "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR",
-    "AISQUARE_PLAIN_CODEX_HOME",
-    "AISQUARE_RELEASES_URL",
-    "AISQUARE_REMOTE_AUTO_OFF",
-    "AISQUARE_REMOTE_NGROK_URL",
-    "AISQUARE_REMOTE_PORT",
-    "AISQUARE_REPORTS",
     "AISQUARE_ROLE",
-    "AISQUARE_RUN_TRACE_ID",
-    "AISQUARE_SERVE_CLIENT",
-    "AISQUARE_SERVE_CLOSE_AFTER",
-    "AISQUARE_SERVE_PORT",
-    "AISQUARE_SERVE_ROLE",
     "AISQUARE_TEAM",
     "AISQUARE_TEAM_DELTA",
     "AISQUARE_TEAM_HUB",
     "AISQUARE_TEAM_LEASE_MIN",
-    "AISQUARE_TOKEN",
-    "AISQUARE_TRACE_AGENT_NAME",
-    "AISQUARE_WATCH_DETACHED",
     "RLX_HOME",
 )
 
-#: tmux's, which say which pane the agent runs in.
-_TMUX_NAMES = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")
+#: tmux's: the pane the agent runs in.
+_TMUX_NAMES = ("TMUX", "TMUX_PANE")
 
-#: The process's own: its programs, user, folders, time, locale, terminal and network.
+#: The process's own that the hook path reads: its programs, its user's home, its zone and
+#: locale; and Windows' for the same (its user's home and folders, its temporary folder).
 _PROCESS_NAMES = (
-    "ALL_PROXY",
-    "APPDATA",
-    "COLORTERM",
-    "COLUMNS",
-    "FORCE_COLOR",
     "HOME",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "LANG",
-    "LC_ALL",
     "LC_CTYPE",
-    "LC_TERMINAL",
-    "LINES",
-    "LOCALAPPDATA",
-    "LOGNAME",
-    "NO_COLOR",
-    "NO_PROXY",
     "PATH",
-    "PATHEXT",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
+    "TZ",
+    "APPDATA",
+    "LOCALAPPDATA",
     "TEMP",
-    "TERM",
     "TMP",
     "TMPDIR",
-    "TZ",
-    "USER",
     "USERNAME",
     "USERPROFILE",
-    "XDG_BIN_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",
-    "XDG_STATE_HOME",
-    "all_proxy",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
 )
 
-#: The allowlist's names: variables rlxd-hook sends with each hook, and the brain sets (or
-#: removes) for it. rlxd-proto's ``HOOK_ENV_NAMES`` is the same list, which rlxd names in
-#: its hello and the brain checks; see the module's doc.
-ENV_NAMES: tuple[str, ...] = tuple(sorted({*_RLX_NAMES, *_TMUX_NAMES, *_PROCESS_NAMES}))
-_ENV_SET = frozenset(ENV_NAMES)
 
-
-def _agent_prefixes() -> tuple[str, ...]:
+def _agent_names() -> set[str]:
+    """Each agent's own, which only its adapter may name (``AgentAdapter.hook_env``)."""
     from aisquare.core.agent_adapters import adapters
 
-    return tuple(sorted({a.home_env.split("_")[0] for a in adapters() if a.home_env}))
+    return {name for adapter in adapters() for name in adapter.hook_env}
 
 
-#: The allowlist's prefixes: every coding agent's own variables, named by the first word of
-#: its home's variable, as its adapter declares it (Claude Code's ``CLAUDE``, Codex's
-#: ``CODEX``): its config dir, its pid, its session's marks, its effort. A new agent's come
-#: with its adapter. rlxd-proto's ``HOOK_ENV_PREFIXES`` is the same list.
-ENV_PREFIXES: tuple[str, ...] = _agent_prefixes()
+#: The allowlist, exact names only: the variables rlxd-hook sends with each hook, and the
+#: brain sets for it (or removes, when rlxd-hook had none). rlxd-proto's
+#: ``HOOK_ENV_NAMES`` is the same list, which rlxd names in its hello and the brain checks.
+#: The parity test holds it to what the hooks read: every variable they read is here, and
+#: every one here they read, or is in :data:`ENV_READ_ELSEWHERE`.
+ENV_NAMES: tuple[str, ...] = tuple(
+    sorted({*_RLX_NAMES, *_TMUX_NAMES, *_PROCESS_NAMES, *_agent_names()})
+)
+_ENV_SET = frozenset(ENV_NAMES)
 
-#: The words that make a variable under :data:`ENV_PREFIXES` a credential, which is never
-#: forwarded: no hook reads an agent's token (rlx's own launch and account checks do, in
-#: processes of their own). rlxd-proto's ``HOOK_ENV_SECRET_WORDS`` is the same list.
-ENV_SECRET_WORDS: tuple[str, ...] = ("CREDENTIALS", "KEY", "PASSWORD", "SECRET", "TOKEN")
-
-
-def is_credential(name: str) -> bool:
-    """Whether ``name`` is a credential's, by its words (:data:`ENV_SECRET_WORDS`)."""
-    return bool(set(name.upper().split("_")) & set(ENV_SECRET_WORDS))
+#: Names in the allowlist the parity test's recording does not see read (the C library, ``os``
+#: itself, a program a hook starts, or another platform reads them), and why each is sent.
+ENV_READ_ELSEWHERE: dict[str, str] = {
+    "RLX_HOME": "the home's variable from 0.10.2's sync on, read before AISQUARE_HOME; "
+    "rlxd's home check reads it now",
+    "LC_CTYPE": "the locale the C library reads on macOS, where Python asks it",
+    "APPDATA": "Windows: the user's roaming folder",
+    "LOCALAPPDATA": "Windows: the user's local folder, where rlx keeps its own",
+    "TEMP": "Windows: the temporary folder tempfile takes",
+    "TMP": "Windows: the temporary folder tempfile takes when TEMP is unset",
+    "TMPDIR": "the temporary folder tempfile takes first (os.getenv: os's own read), a "
+    "process's own on macOS",
+    "USERNAME": "Windows: the user's name, as getpass reads it",
+    "USERPROFILE": "Windows: the user's home, where Path.home() looks",
+    "PATH": "where every program a hook starts is found (os.get_exec_path, shutil.which: "
+    "os's own reads), and the PATH a worker a hook detaches inherits",
+    "TZ": "the zone the C library reads for every local time a hook prints or stores (the "
+    "brain calls time.tzset); core.claude_accounts reads it for a reset's time",
+    "TMUX": "the tmux server every tmux a hook starts reaches, and a worker it detaches "
+    "(fleet switch, spawn) finds; core.instances, core.clipboard and services.fleet read it "
+    "on paths these runs do not take",
+    "TMUX_PANE": "the pane every tmux a hook starts, or a worker it detaches, takes as its "
+    "own when a command names none",
+    "HOME": "POSIX: the user's home, where Path.home() looks",
+}
 
 
 def forwarded(name: str) -> bool:
     """Whether the variable ``name`` crosses from rlxd-hook to the brain: one of
-    :data:`ENV_NAMES`, or an agent's own (:data:`ENV_PREFIXES`) that is not a credential."""
-    if name in _ENV_SET:
-        return True
-    return name.upper().startswith(ENV_PREFIXES) and not is_credential(name)
+    :data:`ENV_NAMES`, as Windows compares names, whatever their case."""
+    return name.upper() in _ENV_SET or name in _ENV_SET
 
 
-#: Variables the hook path reads that describe the brain's own process, not the hook's:
-#: the shell-completion switches of click and typer (a hook never completes), macOS's
-#: per-user text encoding, and the interpreter's own (:data:`ENV_OF_THE_INTERPRETER`).
+#: Variables the hook path reads that describe the brain's own process or machine, not the
+#: hook's, and so are not sent: the shell-completion switches of click and typer (a hook
+#: never completes), macOS's per-user text encoding, and Windows' system folders and
+#: program lookup, the same for every process of the user's.
 ENV_OF_THE_BRAIN: frozenset[str] = frozenset(
     {
         "_AISQUARE_COMPLETE",
@@ -363,6 +315,10 @@ ENV_OF_THE_BRAIN: frozenset[str] = frozenset(
         "_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION",
         "__CF_USER_TEXT_ENCODING",
         "ARCHFLAGS",
+        "COMSPEC",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
     }
 )
 
@@ -370,41 +326,150 @@ ENV_OF_THE_BRAIN: frozenset[str] = frozenset(
 #: ``zoneinfo``, ``subprocess``): the brain's interpreter is the one ``rlx hook``'s would be.
 ENV_OF_THE_INTERPRETER: tuple[str, ...] = ("PYTHON", "_PYTHON_")
 
-#: The module state written with ``global`` on the hook path, and what each is put back to
-#: before a hook (``...`` for one that is safe as it is): see the module's doc.
-MODULE_STATE: dict[tuple[str, str], object] = {
-    ("aisquare.core.config", "_LAST_PARSE"): ...,
-    ("aisquare.core.state", "_state"): ...,
-    ("aisquare.core.program", "_in_app"): False,
-    ("aisquare.core.instances", "_this"): None,
-    ("aisquare.core.tmux", "_boot"): ...,
-    ("aisquare.core.tmux", "_booted_at"): ...,
-    ("aisquare.services.native_telemetry", "_config_stamp"): ...,
-    ("aisquare.core.clipboard", "_cache"): ...,
-    ("aisquare.core.clipboard", "_worker"): ...,
-    ("aisquare.core.clipboard", "_pending"): ...,
-}
+#: The exit handlers rlx's modules register as they are imported, which a process runs as it
+#: exits: the brain runs them after each hook (a test holds this to every ``atexit.register``
+#: of rlx's): a Remote push the hook began is sent, tmux control clients it opened close.
+EXIT_HANDLERS: tuple[tuple[str, str], ...] = (
+    ("aisquare.services.remote_push", "push_drain"),
+    ("aisquare.core.clipboard", "flush"),
+    ("aisquare.core.tmux_control", "_tidy_up"),
+)
+
+#: How long the brain waits, after a hook's exit handlers, for daemon threads the hook
+#: started; one still running after it is logged (an exit would have stopped it).
+DAEMON_WAIT = 2.0
+
+#: The containers a module-level value can be, whose content :func:`fresh_state` puts back.
+_CONTAINERS = (dict, list, set, collections.deque, bytearray)
+
+#: Not a container: nothing of its content to put back.
+_PLAIN = object()
+
+#: Every module-level value of every rlx module, and the content of each container among
+#: them, as they were before the first hook (:func:`take_baseline`).
+_BASELINE: dict[tuple[str, str], tuple[object, object]] = {}
+_BASELINE_MODULES: set[str] = set()
 
 
-def fresh_caches() -> int:
-    """Empties every ``functools`` cache of every ``aisquare`` module loaded, and puts the
-    module state of :data:`MODULE_STATE` back: what a fresh process starts with. How many
-    caches it emptied."""
-    emptied = 0
+def _ours(name: str, module: object) -> bool:
+    return (
+        module is not None
+        and (name == "aisquare" or name.startswith("aisquare."))
+        and name != __name__
+    )
+
+
+def _copy(value: object, memo: dict[int, object] | None = None) -> object:
+    """A copy of the container ``value`` and of every container in it; anything else in it
+    is the same object, so a registry's entries (an adapter, a lock, a compiled pattern)
+    stay the ones its holders hold, and only what holds them is put back."""
+    memo = {} if memo is None else memo
+    if id(value) in memo:
+        return memo[id(value)]
+    if isinstance(value, dict):
+        made: dict[Any, Any] = copy.copy(value)
+        memo[id(value)] = made
+        for key, item in value.items():
+            made[key] = _copy(item, memo)
+        return made
+    if isinstance(value, list):
+        listed: list[Any] = copy.copy(value)
+        memo[id(value)] = listed
+        listed[:] = [_copy(item, memo) for item in value]
+        return listed
+    if isinstance(value, collections.deque):
+        queued: collections.deque[Any] = copy.copy(value)
+        memo[id(value)] = queued
+        queued.clear()
+        queued.extend(_copy(item, memo) for item in value)
+        return queued
+    if isinstance(value, (set, bytearray)):  # a set's members are hashable: kept as they are
+        return copy.copy(value)
+    return value
+
+
+def take_baseline() -> None:
+    """Keeps every module-level value of every rlx module loaded, and a copy of the content
+    of each container among them: the state a fresh ``rlx hook`` starts from, which
+    :func:`fresh_state` puts back before each hook. :func:`serve` takes it after the hello,
+    before any request."""
+    import aisquare.cli.app  # noqa: F401  (the hook path's entry, and every module it loads)
+
+    _BASELINE.clear()
+    _BASELINE_MODULES.clear()
     for name, module in list(sys.modules.items()):
-        if module is None or not (name == "aisquare" or name.startswith("aisquare.")):
+        if not _ours(name, module):
+            continue
+        _BASELINE_MODULES.add(name)
+        for attribute, value in list(vars(module).items()):
+            # A module's own (``__builtins__``, ``__dict__``-like dunders) is Python's.
+            container = isinstance(value, _CONTAINERS) and not attribute.startswith("__")
+            kept = _copy(value) if container else _PLAIN
+            _BASELINE[(name, attribute)] = (value, kept)
+
+
+def _put_back(value: object, kept: object) -> None:
+    """Gives the container ``value`` the content ``kept`` (a copy of it), in place, so every
+    holder of it sees the change."""
+    fresh = _copy(kept)
+    if isinstance(value, dict) and isinstance(fresh, dict):
+        value.clear()
+        value.update(fresh)
+    elif isinstance(value, (list, bytearray)) and isinstance(fresh, (list, bytearray)):
+        value[:] = fresh
+    elif isinstance(value, set) and isinstance(fresh, set):
+        value.clear()
+        value.update(fresh)
+    elif isinstance(value, collections.deque) and isinstance(fresh, collections.deque):
+        value.clear()
+        value.extend(fresh)
+
+
+def fresh_state() -> int:
+    """Puts rlx's modules back as a fresh process has them: every ``functools`` cache
+    emptied, and with a baseline (:func:`take_baseline`) every module-level name it knows
+    bound to its object again, each container's content put back, and every name added
+    since removed (but a submodule's). How many values it changed."""
+    changed = 0
+    for name, module in list(sys.modules.items()):
+        if not _ours(name, module):
             continue
         for value in list(vars(module).values()):
             clear = getattr(value, "cache_clear", None)
             if callable(clear) and getattr(value, "__module__", None) == name:
                 clear()
-                emptied += 1
-    for (name, attribute), value in MODULE_STATE.items():
+        if name not in _BASELINE_MODULES:
+            continue
+        namespace = vars(module)
+        added = [
+            attribute
+            for attribute, value in namespace.items()
+            if (name, attribute) not in _BASELINE and not isinstance(value, types.ModuleType)
+        ]
+        for attribute in added:  # a submodule imported since stays its package's
+            del namespace[attribute]
+            changed += 1
+    for (name, attribute), (value, kept) in _BASELINE.items():
         holder = sys.modules.get(name)
-        if holder is not None and value is not ...:
-            setattr(holder, attribute, value)
-    return emptied
+        if holder is None:
+            continue
+        namespace = vars(holder)
+        if namespace.get(attribute, _PLAIN) is not value:
+            namespace[attribute] = value
+            changed += 1
+        if kept is not _PLAIN:
+            try:
+                same = bool(value == kept)
+            except Exception:
+                same = False
+            if not same:
+                _put_back(value, kept)
+                changed += 1
+    return changed
 
+
+#: An exit handler a hook registered: the function, and what to call it with.
+ExitHandler = tuple[Callable[..., Any], tuple[Any, ...], dict[str, Any]]
 
 #: How Python makes ``sys.stdout`` and ``sys.stderr`` over a pipe, read from the brain's
 #: own before anything replaces them: ``(encoding, errors)`` of each.
@@ -451,35 +516,78 @@ def _read_tz() -> None:
         tzset()
 
 
+#: Windows' ``CREATE_BREAKAWAY_FROM_JOB``: a process started with it leaves the brain's job.
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def breaking_away(popen: Callable[..., Any]) -> Callable[..., Any]:
+    """``subprocess.Popen`` as a hook sees it on Windows: a start that asks for a session of
+    its own (``start_new_session``, which Windows ignores: ``services.hooks._detach``'s
+    workers ask it) asks to leave the brain's job as well, so the worker outlives the brain
+    as it outlives ``rlx hook``. rlxd's job allows it; a job above rlxd's that does not
+    refuses the start, which is then made in the brain's job."""
+
+    def start(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("start_new_session"):
+            flags = kwargs.get("creationflags") or 0
+            try:
+                return popen(
+                    *args, **{**kwargs, "creationflags": flags | _CREATE_BREAKAWAY_FROM_JOB}
+                )
+            except OSError:
+                pass
+        return popen(*args, **kwargs)
+
+    return start
+
+
 @contextlib.contextmanager
 def _as_the_hook(
     env: Mapping[str, str], cwd: str | None, argv: list[str], stdin: bytes
-) -> Iterator[dict[str, bytes]]:
+) -> Iterator[tuple[dict[str, bytes], list[ExitHandler]]]:
     """For its block, this process is the hook's: its environment, directory, ``argv``,
-    stdin and fds 1 and 2. Yields where the block's stdout and stderr land, filled once it
-    ends, and puts every one of them back."""
+    stdin, fds 1 and 2, and on Windows its spawns' breakaway. Yields where the block's
+    stdout and stderr land, filled once it ends, and the exit handlers registered in it,
+    and puts every one of them back."""
     from aisquare.core import state
 
     _remember_stream_form()
-    saved_env = dict(os.environ)
-    try:
-        saved_cwd: str | None = os.getcwd()
-    except OSError:
-        saved_cwd = None
-    saved_argv = sys.argv
-    saved_streams = (sys.stdin, sys.stdout, sys.stderr)
-    saved_state = state.get_state()
+    captured: dict[str, bytes] = {}
+    handlers: list[ExitHandler] = []
     sys.stdout.flush()
     sys.stderr.flush()
-    saved_fds = (os.dup(1), os.dup(2))
-    captured: dict[str, bytes] = {}
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+    with contextlib.ExitStack() as held:
+        out = held.enter_context(tempfile.TemporaryFile())
+        err = held.enter_context(tempfile.TemporaryFile())
+        saved_out = os.dup(1)
+        held.callback(os.close, saved_out)
+        saved_err = os.dup(2)
+        held.callback(os.close, saved_err)
+        saved_env = dict(os.environ)
+        try:
+            saved_cwd: str | None = os.getcwd()
+        except OSError:
+            saved_cwd = None
+        saved_argv = sys.argv
+        saved_streams = (sys.stdin, sys.stdout, sys.stderr)
+        saved_state = state.get_state()
+        saved_register, saved_unregister = atexit.register, atexit.unregister
+        saved_popen = subprocess.Popen
+
+        def register(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+            handlers.append((function, args, kwargs))
+            return function
+
+        def unregister(function: Callable[..., Any]) -> None:
+            handlers[:] = [handler for handler in handlers if handler[0] != function]
+
         try:
             for name in [*ENV_NAMES, *(name for name in os.environ if forwarded(name))]:
                 if name not in env:
                     os.environ.pop(name, None)
             os.environ.update(env)
             _read_tz()
+            tempfile.tempdir = None  # read again, from the hook's TMPDIR, TEMP or TMP
             if cwd:
                 try:
                     os.chdir(cwd)
@@ -487,21 +595,24 @@ def _as_the_hook(
                     _say(f"hook: cannot enter {cwd!r} ({exc}); it runs in the brain's own")
             sys.argv = argv
             state.reset_state()
+            atexit.register, atexit.unregister = register, unregister  # type: ignore[assignment]
+            if sys.platform == "win32":
+                vars(subprocess)["Popen"] = breaking_away(saved_popen)
             os.dup2(out.fileno(), 1)
             os.dup2(err.fileno(), 2)
             sys.stdin = _reader(stdin)
             sys.stdout = _writer(1, "stdout", line_buffering=False)
             sys.stderr = _writer(2, "stderr", line_buffering=True)
-            yield captured
+            yield captured, handlers
         finally:
             for stream in (sys.stdout, sys.stderr):
                 with contextlib.suppress(Exception):
                     stream.flush()
             sys.stdin, sys.stdout, sys.stderr = saved_streams
-            os.dup2(saved_fds[0], 1)
-            os.dup2(saved_fds[1], 2)
-            for fd in saved_fds:
-                os.close(fd)
+            os.dup2(saved_out, 1)
+            os.dup2(saved_err, 2)
+            vars(subprocess)["Popen"] = saved_popen
+            atexit.register, atexit.unregister = saved_register, saved_unregister
             sys.argv = saved_argv
             state.set_state(saved_state)
             if saved_cwd is not None:
@@ -510,6 +621,7 @@ def _as_the_hook(
             os.environ.clear()
             os.environ.update(saved_env)
             _read_tz()
+            tempfile.tempdir = None
             for name, file in (("stdout", out), ("stderr", err)):
                 file.seek(0)
                 captured[name] = file.read()
@@ -536,27 +648,47 @@ def _run_rlx() -> int:
     return 0
 
 
-def _join_threads_since(before: set[threading.Thread]) -> None:
-    """Waits for every non-daemon thread the hook started, as a process waits for them
-    before it exits: what they print is the hook's, and none outlives its request."""
+def _end_as_a_process(
+    before: set[threading.Thread],
+    handlers: list[ExitHandler],
+    event: str,
+) -> None:
+    """What a process does as it exits, for the hook: waits for each non-daemon thread it
+    started, runs the exit handlers it registered (the last first), then rlx's own
+    (:data:`EXIT_HANDLERS`), as ``atexit`` does, and gives the daemon threads it started
+    :data:`DAEMON_WAIT` to end. What they all print is the hook's."""
+    current = threading.current_thread()
     for thread in threading.enumerate():
-        if thread not in before and not thread.daemon and thread is not threading.current_thread():
+        if thread not in before and not thread.daemon and thread is not current:
             thread.join()
-
-
-def _reap_children() -> None:
-    """Collects every child that has ended, a detached worker the hook started among them,
-    which would otherwise stay a zombie of the brain's until the next start of a process.
-    POSIX only: Windows keeps no zombies."""
-    if sys.platform == "win32":
-        return
-    while True:
+    exits = [*reversed(handlers)]
+    for module_name, attribute in EXIT_HANDLERS:
+        module = sys.modules.get(module_name)
+        function = getattr(module, attribute, None) if module is not None else None
+        if callable(function):
+            exits.append((function, (), {}))
+    for function, args, kwargs in exits:
         try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if pid == 0:
-            return
+            function(*args, **kwargs)
+        except Exception:  # as atexit prints it, and goes on
+            print(f"Exception ignored in atexit callback {function!r}:", file=sys.stderr)
+            traceback.print_exc()
+    deadline = time.monotonic() + DAEMON_WAIT
+    for thread in threading.enumerate():
+        if thread not in before and thread.daemon and thread is not current:
+            thread.join(max(0.0, deadline - time.monotonic()))
+    left = [t.name for t in threading.enumerate() if t not in before and t.is_alive()]
+    if left:
+        _say(f"hook {event}: daemon threads {left} still run after it (an exit stops them)")
+
+
+def _reap_abandoned() -> None:
+    """Collects the children the hook started and let go of (``subprocess``'s own record of
+    them: a detached worker that has ended, say), and no other: a child something still
+    waits on keeps its status."""
+    cleanup = getattr(subprocess, "_cleanup", None)
+    if callable(cleanup):
+        cleanup()
 
 
 def _hook(params: Mapping[str, Any]) -> Result:
@@ -576,13 +708,14 @@ def _hook(params: Mapping[str, Any]) -> Result:
     ):
         raise BrainError("invalid_params", "env must map names to strings")
     env = {name: value for name, value in raw_env.items() if forwarded(name)}
-    fresh_caches()
+    fresh_state()
     argv = [sys.argv[0], "hook", str(event)]
     before = set(threading.enumerate())
-    with _as_the_hook(env, cwd if isinstance(cwd, str) else None, argv, stdin) as captured:
+    hook_cwd = cwd if isinstance(cwd, str) else None
+    with _as_the_hook(env, hook_cwd, argv, stdin) as (captured, handlers):
         code = _run_rlx()
-        _join_threads_since(before)
-    _reap_children()
+        _end_as_a_process(before, handlers, str(event))
+    _reap_abandoned()
     return {
         "stdout_b64": base64.b64encode(captured["stdout"]).decode("ascii"),
         "stderr_b64": base64.b64encode(captured["stderr"]).decode("ascii"),
@@ -664,20 +797,13 @@ def greet(channel: Channel, frame: Mapping[str, Any]) -> bool:
         )
         _say(message)
         return False
-    ours = {
-        "env_allowlist": list(ENV_NAMES),
-        "env_prefixes": list(ENV_PREFIXES),
-        "env_secret_words": list(ENV_SECRET_WORDS),
-    }
-    differ = [key for key, value in ours.items() if frame.get(key) != value]
-    if differ:
-        theirs = frame.get("env_allowlist")
+    theirs = frame.get("env_allowlist")
+    if theirs != list(ENV_NAMES):
         named = set(theirs) if isinstance(theirs, list) else set()
         message = (
-            f"rlxd sends other variables with a hook than this rlx {_rlx_version()} sets "
-            f"({', '.join(differ)} differ: only rlxd's names "
-            f"{sorted(map(str, named - set(ENV_NAMES)))}, only rlx's "
-            f"{sorted(set(ENV_NAMES) - named)}); install the rlx and rlxd of one release"
+            f"rlxd sends other variables with a hook than this rlx {_rlx_version()} sets: "
+            f"only rlxd's {sorted(map(str, named - set(ENV_NAMES)))}, only rlx's "
+            f"{sorted(set(ENV_NAMES) - named)}; install the rlx and rlxd of one release"
         )
         channel.write({"type": "refused", "code": "env_allowlist_differs", "message": message})
         _say(message)
@@ -717,6 +843,7 @@ def serve(channel: Channel, methods: Mapping[str, Method] | None = None) -> int:
             return 0  # rlxd went away before it said anything
         if not greet(channel, hello):
             return 3
+        take_baseline()
         while True:
             frame = channel.read()
             if frame is None:

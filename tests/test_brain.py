@@ -49,8 +49,6 @@ HELLO = {
     "protocol": 1,
     "rlxd_version": "0.10.3",
     "env_allowlist": list(brain.ENV_NAMES),
-    "env_prefixes": list(brain.ENV_PREFIXES),
-    "env_secret_words": list(brain.ENV_SECRET_WORDS),
 }
 
 
@@ -160,9 +158,6 @@ def test_a_frame_the_brain_cannot_read_ends_it_rather_than_be_guessed_at(raw: by
         ("env_allowlist", []),
         ("env_allowlist", [*brain.ENV_NAMES, "SECRET"]),
         ("env_allowlist", [name for name in brain.ENV_NAMES if name != "PATH"]),
-        ("env_prefixes", [*brain.ENV_PREFIXES, "EDITOR"]),
-        ("env_prefixes", None),
-        ("env_secret_words", ["TOKEN"]),
     ],
 )
 def test_an_rlxd_that_would_send_other_variables_is_refused_by_name(

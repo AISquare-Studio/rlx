@@ -203,9 +203,9 @@ pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};
 pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use hook::{
-    HOOK_ENV_NAMES, HOOK_ENV_PREFIXES, HOOK_ENV_SECRET_WORDS, HOOK_EVENTS, HookEventData,
-    HookParams, HookReply, PRE_TOOL_USE, codes as hook_codes, deny_output,
-    event_type as hook_event_type, hook_env_forwarded,
+    HOOK_ENV_NAMES, HOOK_EVENTS, HookEventData, HookParams, HookReply, PRE_TOOL_USE,
+    codes as hook_codes, deny_output, event_type as hook_event_type, hook_env_forwarded,
+    is_deny_output,
 };
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};

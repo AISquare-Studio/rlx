@@ -38,139 +38,55 @@ pub const HOOK_EVENTS: &[&str] = &[
 /// The gate's hook (5.1), which never falls back to `rlx hook`.
 pub const PRE_TOOL_USE: &str = "pre-tool-use";
 
-/// The variables rlxd-hook sends with a hook by name, and the brain sets for it (or
-/// removes, when rlxd-hook had none): the allowlist's names, `aisquare.services.brain.
-/// ENV_NAMES`, whose doc says why each is here. With [`HOOK_ENV_PREFIXES`] and
-/// [`HOOK_ENV_SECRET_WORDS`], rlxd names it in its hello to the brain, which refuses an rlxd
-/// whose lists are not its own (`env_allowlist_differs`, so `brain_incompatible` in
+/// The variables rlxd-hook sends with a hook, by exact name, and the brain sets for it (or
+/// removes, when rlxd-hook had none): `aisquare.services.brain.ENV_NAMES`, whose doc says
+/// why each is here. A coding agent's own come from its adapter (`AgentAdapter.hook_env`),
+/// and none is a credential. rlxd names the list in its hello to the brain, which refuses an
+/// rlxd whose list is not its own (`env_allowlist_differs`, so `brain_incompatible` in
 /// `status`). Sorted. [`hook_env_forwarded`] is the whole rule.
 pub const HOOK_ENV_NAMES: &[&str] = &[
-    "AISQUARE_ACCOUNTS_SHARED",
-    "AISQUARE_AGENT_BIN",
-    "AISQUARE_AGENT_NAME",
-    "AISQUARE_API_URL",
     "AISQUARE_BOARD_CONTEXT",
     "AISQUARE_BROKER",
     "AISQUARE_BROKERED",
-    "AISQUARE_BROKERED_BOARD",
-    "AISQUARE_BROKERED_MEMBERS",
-    "AISQUARE_BROKERED_POOL",
-    "AISQUARE_BROKERED_REPORTS",
-    "AISQUARE_BROKERED_ROOTS",
-    "AISQUARE_BROKERED_ROOT_IDS",
-    "AISQUARE_BROKERED_SEALS",
-    "AISQUARE_BROKER_NONCE",
     "AISQUARE_CI",
-    "AISQUARE_CI_DELIVERY_OVERRIDE",
-    "AISQUARE_CI_KEY",
-    "AISQUARE_CI_RUN",
-    "AISQUARE_CI_URL",
-    "AISQUARE_CODING_AGENT",
     "AISQUARE_DB_BUSY_MS",
-    "AISQUARE_EFFORT",
     "AISQUARE_EXPERIMENTAL_CAPTAIN",
-    "AISQUARE_EXPLAINABILITY_TARGET",
     "AISQUARE_FLEET_AGENT",
-    "AISQUARE_HARNESS_PROBE",
     "AISQUARE_HOME",
-    "AISQUARE_IN_APP",
-    "AISQUARE_LAUNCH_AGENT",
     "AISQUARE_LAUNCH_ID",
     "AISQUARE_LAUNCH_PID",
-    "AISQUARE_LAUNCH_SETTINGS",
-    "AISQUARE_NO_TELEMETRY",
-    "AISQUARE_PASTE_LOG",
     "AISQUARE_PERSONA",
-    "AISQUARE_PIN_SESSION_ID",
     "AISQUARE_PIPELINE_ID",
-    "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR",
-    "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR",
-    "AISQUARE_PLAIN_CODEX_HOME",
-    "AISQUARE_RELEASES_URL",
-    "AISQUARE_REMOTE_AUTO_OFF",
-    "AISQUARE_REMOTE_NGROK_URL",
-    "AISQUARE_REMOTE_PORT",
-    "AISQUARE_REPORTS",
     "AISQUARE_ROLE",
-    "AISQUARE_RUN_TRACE_ID",
-    "AISQUARE_SERVE_CLIENT",
-    "AISQUARE_SERVE_CLOSE_AFTER",
-    "AISQUARE_SERVE_PORT",
-    "AISQUARE_SERVE_ROLE",
     "AISQUARE_TEAM",
     "AISQUARE_TEAM_DELTA",
     "AISQUARE_TEAM_HUB",
     "AISQUARE_TEAM_LEASE_MIN",
-    "AISQUARE_TOKEN",
-    "AISQUARE_TRACE_AGENT_NAME",
-    "AISQUARE_WATCH_DETACHED",
-    "ALL_PROXY",
     "APPDATA",
-    "COLORTERM",
-    "COLUMNS",
-    "FORCE_COLOR",
+    "CLAUDE_CODE_TMPDIR",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_EFFORT",
+    "CLAUDE_PID",
     "HOME",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "LANG",
-    "LC_ALL",
     "LC_CTYPE",
-    "LC_TERMINAL",
-    "LINES",
     "LOCALAPPDATA",
-    "LOGNAME",
-    "NO_COLOR",
-    "NO_PROXY",
     "PATH",
-    "PATHEXT",
     "RLX_HOME",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
     "TEMP",
-    "TERM",
     "TMP",
     "TMPDIR",
     "TMUX",
     "TMUX_PANE",
-    "TMUX_TMPDIR",
     "TZ",
-    "USER",
     "USERNAME",
     "USERPROFILE",
-    "XDG_BIN_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",
-    "XDG_STATE_HOME",
-    "all_proxy",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
 ];
 
-/// The allowlist's prefixes: every coding agent's own variables, by the first word of its
-/// home's variable (`aisquare.services.brain.ENV_PREFIXES`, which reads them off the agent
-/// adapters): Claude Code's and Codex's.
-pub const HOOK_ENV_PREFIXES: &[&str] = &["CLAUDE", "CODEX"];
-
-/// The words that make an agent's variable a credential, which is never sent: its token.
-pub const HOOK_ENV_SECRET_WORDS: &[&str] = &["CREDENTIALS", "KEY", "PASSWORD", "SECRET", "TOKEN"];
-
 /// Whether rlxd-hook sends the variable `name` with a hook, and the brain sets it: one of
-/// [`HOOK_ENV_NAMES`], or one under [`HOOK_ENV_PREFIXES`] none of whose words is one of
-/// [`HOOK_ENV_SECRET_WORDS`]. Names are read upper-case, as Windows compares them.
+/// [`HOOK_ENV_NAMES`], by its exact name, which Windows compares upper-case. Nothing else
+/// is, whatever it is called.
 pub fn hook_env_forwarded(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    if HOOK_ENV_NAMES.contains(&upper.as_str()) || HOOK_ENV_NAMES.contains(&name) {
-        return true;
-    }
-    HOOK_ENV_PREFIXES
-        .iter()
-        .any(|prefix| upper.starts_with(prefix))
-        && !upper
-            .split('_')
-            .any(|word| HOOK_ENV_SECRET_WORDS.contains(&word))
+    HOOK_ENV_NAMES.contains(&name) || HOOK_ENV_NAMES.contains(&name.to_ascii_uppercase().as_str())
 }
 
 /// The `hook.*` event type of a hook named as rlxd-hook's command line names it:
@@ -192,6 +108,24 @@ pub fn deny_output(reason: &str) -> String {
         }
     });
     format!("{reply}\n")
+}
+
+/// Whether `stdout` is a `pre-tool-use` deny and nothing else: one JSON document that is
+/// [`deny_output`]'s for some reason, whitespace around it aside. Until the gate decides
+/// tool calls (5.1), rlxd-hook prints rlxd's reply only when it is one; any other (empty,
+/// text, `{}`, an allow, an ask, a deny with more in it) is denied as unreached, so no reply
+/// lets a call through.
+pub fn is_deny_output(stdout: &[u8]) -> bool {
+    let Ok(said) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return false;
+    };
+    let Some(reason) = said
+        .pointer("/hookSpecificOutput/permissionDecisionReason")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&deny_output(reason)).is_ok_and(|deny| deny == said)
 }
 
 /// `hook`'s params: one hook, as rlxd-hook read it.
@@ -491,26 +425,63 @@ mod tests {
     }
 
     #[test]
-    fn an_agents_variables_go_and_its_credentials_do_not() {
+    fn only_the_listed_names_go_and_no_credential_does() {
         for name in [
             "CLAUDE_CONFIG_DIR",
-            "CLAUDECODE",
-            "CODEX_HOME",
+            "CLAUDE_EFFORT",
+            "AISQUARE_ROLE",
             "PATH",
             "Path",
             "TMUX_PANE",
         ] {
             assert!(hook_env_forwarded(name), "{name}");
         }
+        // What the prefix rule let through (review #2555, F5), and what it never did.
         for name in [
+            "CLAUDE_CODE_AUTH",
+            "CLAUDE_CODE_SESSION_COOKIE",
+            "CODEX_ACCESS_TOKENS",
+            "CLAUDE_CODE_APIKEY",
+            "CLAUDE_CODE_PASSPHRASE",
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDECODE",
+            "CODEX_HOME",
             "CODEX_API_KEY",
             "ANTHROPIC_API_KEY",
             "SECRET",
             "EDITOR",
+            "AISQUARE_ROLE_X",
+            "claude_config",
         ] {
             assert!(!hook_env_forwarded(name), "{name}");
         }
+    }
+
+    #[test]
+    fn only_a_deny_is_a_deny() {
+        assert!(is_deny_output(deny_output("no gate yet").as_bytes()));
+        assert!(is_deny_output(
+            br#" {"hookSpecificOutput": {"permissionDecision": "deny", "hookEventName": "PreToolUse", "permissionDecisionReason": ""}} "#
+        ));
+        for said in [
+            &b""[..],
+            b"\n",
+            b"just some text\n",
+            b"{}",
+            b"null",
+            b"[]",
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "r"}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": "r"}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": 3}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PostToolUse", "permissionDecision": "deny", "permissionDecisionReason": "r"}}"#,
+            br#"{"decision": "approve", "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "r"}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "r", "updatedInput": {}}}"#,
+        ] {
+            assert!(!is_deny_output(said), "{}", String::from_utf8_lossy(said));
+        }
+        let twice = format!("{}{}", deny_output("r"), deny_output("r"));
+        assert!(!is_deny_output(twice.as_bytes()));
     }
 
     #[test]

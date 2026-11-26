@@ -13,7 +13,6 @@ state ``services.brain`` audits.
 
 from __future__ import annotations
 
-import ast
 import base64
 import json
 import os
@@ -129,8 +128,10 @@ def _rows(home: Path) -> dict[str, list[dict[str, Any]]]:
 
 
 def _environments(tmp_path: Path) -> dict[str, dict[str, str]]:
-    """Three hooks' environments, each its own role, config dir, agent ids and zone; the
-    third names none of them, so whatever an earlier one set must be gone."""
+    """Five hooks' environments, each its own role, config dir, agent ids and zone; the
+    third names none of them, so whatever an earlier one set must be gone; the last two name
+    the same relative hub, which every fresh process warns of, so the brain must warn of it
+    in both."""
     return {
         "a": {
             "AISQUARE_ROLE": "coder",
@@ -147,6 +148,10 @@ def _environments(tmp_path: Path) -> dict[str, dict[str, str]]:
             "TZ": "America/New_York",
         },
         "c": {},
+        # A relative hub: each ``rlx hook`` warns of it once, as its process starts fresh,
+        # so the brain must too (``core.orchestrator._WARNED_HUBS``, put back per hook).
+        "d": {"AISQUARE_ROLE": "coder", "AISQUARE_TEAM_HUB": "relative-hub"},
+        "e": {"AISQUARE_ROLE": "coder", "AISQUARE_TEAM_HUB": "relative-hub"},
     }
 
 
@@ -181,7 +186,7 @@ class Brain:
     def __init__(self, env: dict[str, str], cwd: Path, record: Path) -> None:
         driver = textwrap.dedent(
             """
-            import os, sys
+            import json, os, sys
             reads = set()
             here = os.path.normcase(os.path.abspath(sys.argv[1]))
 
@@ -214,8 +219,13 @@ class Brain:
             try:
                 code = brain.serve_stdio()
             finally:
+                late = sorted(
+                    name for name in sys.modules
+                    if name.startswith("aisquare") and name not in brain._BASELINE_MODULES
+                    and name != "aisquare.services.brain"
+                )
                 with open(here, "w", encoding="utf-8") as out:
-                    out.write("\\n".join(sorted(reads)))
+                    out.write(json.dumps({"reads": sorted(reads), "late": late}))
             raise SystemExit(code)
             """
         )
@@ -232,8 +242,6 @@ class Brain:
             "protocol": 1,
             "rlxd_version": "test",
             "env_allowlist": list(brain.ENV_NAMES),
-            "env_prefixes": list(brain.ENV_PREFIXES),
-            "env_secret_words": list(brain.ENV_SECRET_WORDS),
         }
         assert self._send(hello)["type"] == "hello"
 
@@ -320,10 +328,12 @@ def parity(tmp_path: Path, template: tuple[Path, Path]) -> Iterator[dict[str, An
             through_brain[name] = (printed, _rows(home))
     finally:
         assert running.close() == 0
+    said = json.loads(record.read_text(encoding="utf-8"))
     yield {
         "fresh": fresh,
         "brain": through_brain,
-        "reads": set(record.read_text(encoding="utf-8").split()),
+        "reads": set(said["reads"]),
+        "late": said["late"],
         "project": project,
     }
 
@@ -331,7 +341,7 @@ def parity(tmp_path: Path, template: tuple[Path, Path]) -> Iterator[dict[str, An
 def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
     parity: dict[str, Any],
 ) -> None:
-    for name in ("a", "b", "c"):
+    for name in ("a", "b", "c", "d", "e"):
         fresh_printed, fresh_rows = parity["fresh"][name]
         brain_printed, brain_rows = parity["brain"][name]
         for event in PAYLOADS:
@@ -346,38 +356,54 @@ def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
     assert rows["a"][0]["role"] == "coder" and rows["b"][0]["role"] == "manager"
     assert rows["a"][0]["account"] != rows["b"][0]["account"]
     assert [row["text"] for row in parity["fresh"]["a"][1]["prompt"]] == ["hook-parity-probe"]
+    for name in ("d", "e"):
+        start_err = parity["brain"][name][0]["session-start"][2]
+        assert b"RELATIVE" in start_err, f"{name}: the brain warns of the hub each time"
 
 
-def test_every_variable_the_hooks_read_is_in_the_allowlist(parity: dict[str, Any]) -> None:
-    unlisted = {
-        name
+def test_the_allowlist_is_what_the_hooks_read_and_nothing_else(parity: dict[str, Any]) -> None:
+    read = {
+        name.upper()
         for name in parity["reads"] - brain.ENV_OF_THE_BRAIN
-        if not brain.forwarded(name) and not name.startswith(brain.ENV_OF_THE_INTERPRETER)
+        if not name.startswith(brain.ENV_OF_THE_INTERPRETER)
     }
+    unlisted = {name for name in read if not brain.forwarded(name)}
     assert not unlisted, f"the hooks read variables the brain is not sent: {sorted(unlisted)}"
-    assert {"AISQUARE_ROLE", "CLAUDE_CONFIG_DIR", "AISQUARE_FLEET_AGENT"} <= parity["reads"]
-
-
-def test_every_variable_rlxs_code_names_is_forwarded_or_kept_out_on_purpose() -> None:
-    names = (
-        r"AISQUARE_[A-Z0-9_]*[A-Z0-9]",
-        r"RLX_[A-Z0-9_]*[A-Z0-9]",
-        r"CLAUDE[A-Z0-9_]*[A-Z0-9]",
-        r"CODEX_[A-Z0-9_]*[A-Z0-9]",
-        r"TMUX[A-Z0-9_]*",
+    unread = set(brain.ENV_NAMES) - read - set(brain.ENV_READ_ELSEWHERE)
+    assert not unread, (
+        f"sent, and no hook here read them: {sorted(unread)}; drop them, or say in "
+        "ENV_READ_ELSEWHERE where they are read"
     )
-    named = re.compile(r"[\"'](" + "|".join(names) + r")[\"']")
-    found: set[str] = set()
-    for path in SRC.rglob("*.py"):
-        found |= set(named.findall(path.read_text(encoding="utf-8")))
-    assert len(found) > 50
-    missing = {
-        name for name in found if not brain.forwarded(name) and not brain.is_credential(name)
-    }
-    assert not missing, f"name these in services.brain's allowlist, or keep them out: {missing}"
-    # A credential is kept out, and the rule says so of the one rlx's code names.
-    assert brain.is_credential("CLAUDE_CODE_OAUTH_TOKEN")
-    assert not brain.forwarded("CLAUDE_CODE_OAUTH_TOKEN")
+    assert set(brain.ENV_READ_ELSEWHERE) <= set(brain.ENV_NAMES)
+    assert {"AISQUARE_ROLE", "CLAUDE_CONFIG_DIR", "AISQUARE_FLEET_AGENT", "HOME"} <= read
+
+
+def test_an_agents_variables_come_from_its_adapter_and_no_credential_goes() -> None:
+    from aisquare.core.agent_adapters import adapters
+
+    for adapter in adapters():
+        assert set(adapter.hook_env) <= set(brain.ENV_NAMES), adapter.id
+    own = {name for adapter in adapters() for name in adapter.hook_env}
+    assert {"CLAUDE_CONFIG_DIR", "CLAUDE_EFFORT"} <= own
+    for name in (
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_AUTH",
+        "CLAUDE_AUTH_HEADER",
+        "CLAUDE_CODE_SESSION_COOKIE",
+        "CODEX_ACCESS_TOKENS",
+        "CLAUDE_CODE_SECRETS",
+        "CLAUDE_CODE_CREDENTIAL",
+        "CLAUDE_CODE_APIKEY",
+        "CLAUDE_CODE_PASSPHRASE",
+        "CLAUDE_CODE_PASSWD",
+        "CLAUDE_CODE_BEARER",
+        "CLAUDE_CODE_OAUTHTOKEN",
+        "CODEX_AUTH_JSON",
+        "CLAUDEAI_SESSION",
+    ):
+        assert not brain.forwarded(name), name
 
 
 def test_rlxd_sends_the_same_list_the_brain_sets() -> None:
@@ -390,49 +416,69 @@ def test_rlxd_sends_the_same_list_the_brain_sets() -> None:
         return re.findall(r'"([^"]+)"', block)
 
     assert listed("HOOK_ENV_NAMES") == list(brain.ENV_NAMES)
-    assert listed("HOOK_ENV_PREFIXES") == list(brain.ENV_PREFIXES)
-    assert listed("HOOK_ENV_SECRET_WORDS") == list(brain.ENV_SECRET_WORDS)
+    assert "HOOK_ENV_PREFIXES" not in source, "exact names only"
     assert list(brain.ENV_NAMES) == sorted(set(brain.ENV_NAMES))
 
 
-def test_the_module_state_the_hook_path_writes_is_the_state_the_brain_audits() -> None:
-    """Every ``global`` assignment in a module the hook path loads is in ``MODULE_STATE``."""
-    loaded = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys, aisquare.cli.app, aisquare.services.brain;"
-            "print('\\n'.join(n for n in sys.modules if n.startswith('aisquare')))",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
-    written: set[tuple[str, str]] = set()
-    for name in loaded:
-        parts = name.split(".")[1:]
-        candidates = [SRC.joinpath(*parts, "__init__.py")]
-        if parts:
-            candidates.append(SRC.joinpath(*parts[:-1], parts[-1] + ".py"))
-        path = next((candidate for candidate in candidates if candidate.exists()), None)
-        if path is None:
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Global):
-                written |= {(name, target) for target in node.names}
-    unaudited = written - set(brain.MODULE_STATE)
-    assert not unaudited, f"audit these in services.brain (MODULE_STATE and its doc): {unaudited}"
-    assert ("aisquare.core.state", "_state") in written
+def test_the_hooks_import_no_module_of_rlxs_the_brain_did_not_have(parity: dict[str, Any]) -> None:
+    """One imported by a hook after the baseline would keep its state across hooks."""
+    assert parity["late"] == []
 
 
-def test_fresh_caches_empties_every_functools_cache_of_rlx() -> None:
-    from aisquare.core import program
+@pytest.fixture
+def baseline() -> Iterator[None]:
+    """The brain's baseline, taken in this process for one test, and dropped after it."""
+    brain.take_baseline()
+    try:
+        yield
+    finally:
+        brain._BASELINE.clear()
+        brain._BASELINE_MODULES.clear()
 
+
+@pytest.mark.usefixtures("baseline")
+def test_fresh_state_puts_rlxs_modules_back_as_a_fresh_process_has_them() -> None:
+    from aisquare.core import launch_seal, orchestrator, program, state
+
+    seen_before = dict(launch_seal._SEEN)
+    original_state = state.get_state()
     program.word()
-    assert program.word.cache_info().currsize == 1
-    assert brain.fresh_caches() >= 1
-    assert program.word.cache_info().currsize == 0
+    launch_seal._SEEN["a-session"] = object()  # type: ignore[assignment]
+    orchestrator._WARNED_HUBS.add("relative-hub")
+    program._in_app = True
+    state._state = state.RuntimeState(verbose=True)
+    vars(orchestrator)["_ADDED_BY_A_HOOK"] = 1
+    try:
+        assert brain.fresh_state() >= 5
+        assert seen_before == launch_seal._SEEN
+        assert "relative-hub" not in orchestrator._WARNED_HUBS
+        assert program._in_app is False
+        assert state.get_state() is original_state
+        assert not hasattr(orchestrator, "_ADDED_BY_A_HOOK")
+        assert program.word.cache_info().currsize == 0
+        for (name, attribute), (value, kept) in brain._BASELINE.items():
+            assert vars(sys.modules[name]).get(attribute) is value, (name, attribute)
+            if kept is not brain._PLAIN:
+                assert value == kept, (name, attribute)
+        assert brain.fresh_state() == 0, "nothing more to put back"
+    finally:
+        launch_seal._SEEN.clear()
+        launch_seal._SEEN.update(seen_before)
+        orchestrator._WARNED_HUBS.discard("relative-hub")
+        program._in_app = False
+        state.set_state(original_state)
+        vars(orchestrator).pop("_ADDED_BY_A_HOOK", None)
+
+
+def test_every_exit_handler_rlxs_modules_register_is_run_after_a_hook() -> None:
+    registered: set[tuple[str, str]] = set()
+    pattern = re.compile(r"^atexit\.register\((\w+)\)|^@atexit\.register\s*\ndef (\w+)", re.M)
+    for path in SRC.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        module = "aisquare." + ".".join(path.relative_to(SRC).with_suffix("").parts)
+        for found in pattern.finditer(text):
+            registered.add((module, found.group(1) or found.group(2)))
+    assert registered == set(brain.EXIT_HANDLERS)
 
 
 def _children() -> set[int]:
@@ -503,3 +549,128 @@ def test_the_brain_waits_for_a_thread_the_hook_started_and_keeps_what_it_printed
     )
     assert not [thread for thread in threading.enumerate() if thread.name == "hook-leftover"]
     assert b"printed by a thread the hook started" in base64.b64decode(result["stdout_b64"])
+
+
+def _stop_hook(tmp_path: Path) -> dict[str, Any]:
+    """The brain's own ``hook`` for a Stop, in this process."""
+    result: dict[str, Any] = brain.METHODS["hook"](
+        {
+            "event": "stop",
+            "stdin_b64": base64.b64encode(_payload("stop", tmp_path)).decode(),
+            "cwd": str(tmp_path),
+            "env": {"AISQUARE_HOME": str(tmp_path / "home")},
+        }
+    )
+    return result
+
+
+def test_an_exit_handler_a_hook_registers_runs_at_its_end_as_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As at a process's exit, and not at the brain's: what it prints is the hook's, and
+    the brain's own exit handlers stay as they were."""
+    import atexit
+
+    from aisquare.services import agent_events
+
+    handle = agent_events.handle
+
+    def handle_and_register(*args: Any, **kwargs: Any) -> str:
+        atexit.register(print, "said by the hook's exit handler")
+        return handle(*args, **kwargs)
+
+    monkeypatch.setattr(agent_events, "handle", handle_and_register)
+    before = atexit._ncallbacks()
+    result = _stop_hook(tmp_path)
+    assert b"said by the hook's exit handler" in base64.b64decode(result["stdout_b64"])
+    assert atexit._ncallbacks() == before
+
+
+def test_a_daemon_thread_the_hook_started_is_given_time_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    from aisquare.services import agent_events
+
+    handle = agent_events.handle
+
+    def handle_and_leave_a_daemon(*args: Any, **kwargs: Any) -> str:
+        def late() -> None:
+            time.sleep(0.3)
+            print("printed by a daemon thread of the hook's", flush=True)
+
+        threading.Thread(target=late, name="hook-daemon", daemon=True).start()
+        return handle(*args, **kwargs)
+
+    monkeypatch.setattr(agent_events, "handle", handle_and_leave_a_daemon)
+    result = _stop_hook(tmp_path)
+    assert not [thread for thread in threading.enumerate() if thread.name == "hook-daemon"]
+    assert b"printed by a daemon thread" in base64.b64decode(result["stdout_b64"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX: Windows keeps no zombies")
+def test_a_hook_collects_no_child_another_still_waits_on(tmp_path: Path) -> None:
+    import time
+
+    held = subprocess.Popen([sys.executable, "-c", "raise SystemExit(7)"])
+    # It ends, and stays a zombie for its holder to reap.
+    deadline = time.monotonic() + 10
+    while (
+        "Z"
+        not in subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(held.pid)], capture_output=True, text=True, check=False
+        ).stdout
+    ):
+        assert time.monotonic() < deadline, "the child never ended"
+        time.sleep(0.05)
+    _stop_hook(tmp_path)
+    assert held.wait(timeout=10) == 7, "the hook took its status"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="lists its fds in /dev/fd")
+def test_a_hook_that_cannot_capture_its_output_leaks_no_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    made = tempfile.TemporaryFile
+    calls: list[int] = []
+
+    def second_fails(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("no room")
+        return made(*args, **kwargs)
+
+    def open_fds() -> set[str]:
+        return set(os.listdir("/dev/fd"))
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", second_fails)
+    before = open_fds()
+    with pytest.raises(OSError, match="no room"), brain._as_the_hook({}, None, ["x"], b""):
+        pass
+    assert open_fds() <= before
+
+
+def test_on_windows_a_detached_start_asks_to_leave_the_brains_job() -> None:
+    breakaway = 0x01000000
+    flags: list[int] = []
+    refuse_first = [True]
+
+    def popen(*args: Any, **kwargs: Any) -> str:
+        flags.append(kwargs.get("creationflags") or 0)
+        if refuse_first[0] and flags[-1] & breakaway:
+            refuse_first[0] = False
+            raise PermissionError("a job above allows no breakaway")
+        return "started"
+
+    start = brain.breaking_away(popen)
+    refuse_first[0] = False
+    assert start(["worker"], start_new_session=True, creationflags=0x200) == "started"
+    assert flags[-1] == 0x200 | breakaway
+    assert start(["git", "status"]) == "started"
+    assert flags[-1] == 0, "only a detached start asks"
+    refuse_first[0] = True
+    assert start(["worker"], start_new_session=True) == "started"
+    assert flags[-2:] == [breakaway, 0], "refused, it is started in the brain's job"

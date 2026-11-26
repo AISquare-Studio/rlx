@@ -714,6 +714,8 @@ class CodexAdapter:
     mark: AgentMark | None = AgentMark(">_", on_dark="#6BA1F8", on_light="#0B5EE7")
     binary = "codex"
     home_env = "CODEX_HOME"
+    #: Its hooks stay on ``rlx hook codex``: rlxd-hook sends none of its variables.
+    hook_env: tuple[str, ...] = ()
     home_name = ".codex"
     settings_name = "hooks.json"
     install_hint = "npm install -g @openai/codex"

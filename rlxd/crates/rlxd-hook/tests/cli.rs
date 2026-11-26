@@ -165,3 +165,111 @@ fn an_event_it_does_not_take_is_a_usage_error() {
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
     }
 }
+
+/// A stand-in for rlxd in `here`'s home: it says ok to the hello and answers every `hook`
+/// with an ok reply whose stdout is `stdout`, as a wrong rlxd or brain could. It stops
+/// listening when dropped.
+#[cfg(unix)]
+struct FakeRlxd {
+    socket: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeRlxd {
+    fn answering(here: &NoRlxd, stdout: &[u8]) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        use rlxd_client::Home;
+        use rlxd_client::proto::b64;
+        use serde_json::{Value, json};
+
+        let layout = Home::at(here.root.join("home"));
+        std::fs::create_dir_all(layout.run_dir()).unwrap();
+        std::fs::create_dir_all(layout.rlxd_dir()).unwrap();
+        std::fs::write(layout.token(), "t").unwrap();
+        let socket = layout.socket();
+        let dir = socket.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let data = json!({"stdout_b64": b64::encode(stdout), "stderr_b64": "", "exit_code": 0});
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let data = data.clone();
+                std::thread::spawn(move || {
+                    let mut writer = &stream;
+                    for line in BufReader::new(&stream).lines() {
+                        let Ok(line) = line else { return };
+                        let request: Value = serde_json::from_str(&line).unwrap_or_default();
+                        let said = match request["method"].as_str() {
+                            Some("hello") => json!({"protocol_version": 1,
+                                "protocol_versions": [1], "rlxd_version": "0.10.3",
+                                "capabilities": []}),
+                            _ => data.clone(),
+                        };
+                        let reply = json!({"schema_version": 1, "id": request["id"],
+                            "ok": true, "data": said});
+                        if writeln!(writer, "{reply}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { socket }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeRlxd {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// Until the gate decides tool calls (5.1), rlxd-hook prints rlxd's `pre-tool-use` reply
+/// only when it is a deny: an empty reply (on which Claude Code would ask no one), text,
+/// `{}` or an allow is denied as unreached, and never goes to `rlx hook`.
+#[cfg(unix)]
+#[test]
+fn pre_tool_use_prints_only_a_deny_whatever_rlxd_answers() {
+    const UNREACHED: &str = "rlxd could not be asked about this tool call, so it is denied";
+    let allow = r#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "fine"}}"#;
+    let deny = rlxd_client::proto::deny_output("rlxd's own reason");
+    for (case, stdout, passes) in [
+        ("empty", &b""[..], false),
+        ("text", b"just some text\n", false),
+        ("object", b"{}", false),
+        ("allow", allow.as_bytes(), false),
+        ("deny", deny.as_bytes(), true),
+    ] {
+        let here = NoRlxd::new(&format!("gate-{case}"));
+        let _rlxd = FakeRlxd::answering(&here, stdout);
+        let output = here.run(
+            &["pre-tool-use"],
+            b"{\"tool_name\":\"t\",\"tool_input\":{}}",
+        );
+        assert_eq!(output.status.code(), Some(0), "{case}: {output:?}");
+        assert!(output.stderr.is_empty(), "{case}: {output:?}");
+        if passes {
+            assert_eq!(
+                output.stdout, stdout,
+                "{case}: a deny goes through as it is"
+            );
+            continue;
+        }
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("{case}: not one JSON reply ({e}): {output:?}"));
+        let said = &reply["hookSpecificOutput"];
+        assert_eq!(said["permissionDecision"], "deny", "{case}");
+        assert_eq!(said["permissionDecisionReason"], UNREACHED, "{case}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("fake rlx"),
+            "{case}"
+        );
+    }
+}

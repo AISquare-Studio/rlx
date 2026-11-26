@@ -1,30 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "BrainInput",
-  "description": "A frame rlxd writes on the brain's stdin.\n\n```json\n{\"type\": \"hello\", \"protocol\": 1, \"rlxd_version\": \"0.10.3\", \"env_allowlist\": [\"…\"],\n \"env_prefixes\": [\"CLAUDE\", \"CODEX\"], \"env_secret_words\": [\"…\"]}\n{\"type\": \"request\", \"id\": 7, \"method\": \"ping\", \"params\": {}}\n```",
+  "description": "A frame rlxd writes on the brain's stdin.\n\n```json\n{\"type\": \"hello\", \"protocol\": 1, \"rlxd_version\": \"0.10.3\", \"env_allowlist\": [\"…\"]}\n{\"type\": \"request\", \"id\": 7, \"method\": \"ping\", \"params\": {}}\n```",
   "oneOf": [
     {
       "description": "The first frame: the brain protocol rlxd speaks.",
       "type": "object",
       "properties": {
         "env_allowlist": {
-          "description": "The variables rlxd-hook sends with each hook by name (`HOOK_ENV_NAMES`), sorted.\nThe brain refuses an rlxd whose lists are not the ones it sets\n(`env_allowlist_differs`).",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "env_prefixes": {
-          "description": "The prefixes of the agents' variables it sends (`HOOK_ENV_PREFIXES`).",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "env_secret_words": {
-          "description": "The words of the agents' variables it never sends (`HOOK_ENV_SECRET_WORDS`).",
+          "description": "The variables rlxd-hook sends with each hook, by exact name (`HOOK_ENV_NAMES`),\nsorted. The brain refuses an rlxd whose list is not the one it sets\n(`env_allowlist_differs`).",
           "type": "array",
           "default": [],
           "items": {
