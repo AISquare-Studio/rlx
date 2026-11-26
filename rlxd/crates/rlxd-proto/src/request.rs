@@ -124,6 +124,10 @@ pub mod methods {
     /// Stops rlxd: no params in, `{pid}` out. rlxd answers, then stops taking connections,
     /// cleans up and exits.
     pub const STOP: &str = "stop";
+    /// Asks the resident Python brain (1.6) to answer, through its queue like any request
+    /// to it: no params in, `{pid}` (the brain's) out. While no brain runs, or it does not
+    /// take the request within 5 s, a `brain_*` error says why.
+    pub const BRAIN_PING: &str = "brain.ping";
     /// Pairs a device as the app gate (5.1): `{device?, gate_credential?}` in,
     /// `{gate_credential, device, route}` out. The credential is shown this once.
     pub const GATE_PAIR: &str = "gate.pair";

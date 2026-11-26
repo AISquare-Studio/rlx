@@ -33,6 +33,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+mod brain;
 pub mod bus;
 mod claude;
 mod cli;

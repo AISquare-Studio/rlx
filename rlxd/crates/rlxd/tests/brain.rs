@@ -1,0 +1,235 @@
+//! The resident Python brain rlxd supervises (handoff 0.10.3, 1.6): `status.brain`, its
+//! restart after a kill, its backoff when it keeps dying, a brain of another release, its
+//! record in the registry, and that no brain outlives rlxd's stop.
+//!
+//! The checks of a brain that works run the checkout's own `rlx brain --stdio`
+//! ([`common::real_rlx`]); they skip where there is none, unless `RLXD_INTEROP_REQUIRED`
+//! is set, as rlxd.yml sets it. The others run `tests/fixtures/fake-brain`.
+
+mod common;
+
+use std::thread;
+use std::time::{Duration, Instant};
+
+use common::{TestHome, alive, assert_valid, eventually, fake_brain, kill_hard, real_rlx};
+use rlxd_client::Home;
+use rlxd_proto::daemon_kinds;
+use serde_json::Value;
+
+/// `status.brain`.
+fn brain(home: &TestHome) -> Value {
+    home.status()["brain"].clone()
+}
+
+/// The brain's pid, once one runs.
+fn brain_pid(home: &TestHome) -> u64 {
+    let mut pid = 0;
+    eventually("a brain runs", || {
+        pid = brain(home)["pid"].as_u64().unwrap_or(0);
+        pid > 0
+    });
+    pid
+}
+
+/// Every pid the log says a brain ran as: the program rlxd started, and the Python it
+/// said its hello from (the same on POSIX; on Windows `rlx.exe` starts Python).
+fn logged_brain_pids(home: &TestHome) -> Vec<u64> {
+    home.log()
+        .lines()
+        .filter_map(|line| line.split_once("brain: pid ").map(|(_, rest)| rest))
+        .flat_map(|rest| {
+            let words: Vec<&str> = rest.split([' ', '(', ')', ',']).collect();
+            let started = words.first().and_then(|w| w.parse().ok());
+            let python = words
+                .iter()
+                .position(|w| *w == "python")
+                .and_then(|at| words.get(at + 1))
+                .and_then(|w| w.parse().ok());
+            [started, python].into_iter().flatten()
+        })
+        .collect()
+}
+
+#[test]
+fn status_names_a_running_brain_and_it_answers_through_its_queue() {
+    let Some(rlx) = real_rlx() else { return };
+    let home = TestHome::new().with_rlx(rlx);
+    // `serve --detach` returns once the brain runs, so the next status names it (1.6).
+    let started = home.start();
+    let pid = started["brain"]["pid"].as_u64().unwrap_or(0);
+    assert!(pid > 0, "{started}");
+    let status = home.status();
+    assert_valid("status-reply.json", &status);
+    assert_eq!(status["brain"]["pid"].as_u64(), Some(pid), "{status}");
+    assert_eq!(status["brain"]["restarts"], 0, "{status}");
+    assert!(status["brain"].get("error").is_none(), "{status}");
+    for _ in 0..20 {
+        let ping = home.rlxd(&["call", "brain.ping"]);
+        assert_eq!(ping.code(), Some(0), "{ping:?}");
+    }
+    let after = brain(&home);
+    assert_eq!(after["pid"].as_u64(), Some(pid), "the same brain: {after}");
+    assert!(after["handled"].as_u64().unwrap() >= 20, "{after}");
+    assert_eq!(after["restarts"], 0, "{after}");
+}
+
+#[test]
+fn a_killed_brain_is_started_again_within_five_seconds() {
+    let Some(rlx) = real_rlx() else { return };
+    let home = TestHome::new().with_rlx(rlx);
+    home.start();
+    let first = brain_pid(&home);
+    // `kill -9`, or `taskkill /F` on Windows.
+    kill_hard(first);
+    let killed = Instant::now();
+    let mut now = Value::Null;
+    while killed.elapsed() < Duration::from_secs(5) {
+        now = brain(&home);
+        if now["restarts"] == 1 && now["pid"].as_u64().is_some_and(|pid| pid != first) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(now["restarts"], 1, "{now}");
+    let second = now["pid"].as_u64().unwrap_or(0);
+    assert!(second > 0 && second != first, "{now}");
+    let ping = home.rlxd(&["call", "brain.ping"]);
+    assert_eq!(ping.code(), Some(0), "{ping:?}");
+    assert!(home.log().contains("brain_exited"), "{}", home.log());
+}
+
+#[test]
+fn the_brain_is_registered_while_it_runs_and_stop_leaves_no_brain() {
+    let Some(rlx) = real_rlx() else { return };
+    let home = TestHome::new().with_rlx(rlx.clone());
+    home.start();
+    let pid = brain_pid(&home);
+    let roll = rlxd::registry::read(&Home::at(home.root())).unwrap();
+    let brains: Vec<_> = roll
+        .live
+        .iter()
+        .filter(|record| record.kind == daemon_kinds::BRAIN)
+        .collect();
+    assert_eq!(brains.len(), 1, "{roll:?}");
+    assert_eq!(u64::from(brains[0].pid), pid);
+    assert_eq!(
+        brains[0].argv,
+        [rlx.display().to_string(), "brain".into(), "--stdio".into()]
+    );
+    assert!(
+        !brains[0].restartable,
+        "rlxd restarts its brain, not an upgrade"
+    );
+    let record = home
+        .root()
+        .join("daemons")
+        .join(format!("{}.json", brains[0].id));
+    let text = std::fs::read_to_string(&record).unwrap();
+    assert_valid("daemon-record.json", &serde_json::from_str(&text).unwrap());
+
+    let pids = logged_brain_pids(&home);
+    assert!(pids.contains(&pid), "{pids:?} in {}", home.log());
+    home.stop();
+    for pid in pids {
+        assert!(!alive(pid), "brain process {pid} outlived rlxd's stop");
+    }
+    let roll = rlxd::registry::read(&Home::at(home.root())).unwrap();
+    assert!(
+        !roll
+            .live
+            .iter()
+            .chain(&roll.dead)
+            .any(|record| record.kind == daemon_kinds::BRAIN),
+        "{roll:?}"
+    );
+    assert!(home.log().contains("brain: stopped"), "{}", home.log());
+}
+
+#[test]
+fn a_brain_that_dies_at_start_is_started_again_with_backoff() {
+    let home = TestHome::new().with_rlx(fake_brain("dies"));
+    let started = home.start();
+    assert_eq!(
+        started["brain"]["error"]["code"], "brain_exited",
+        "{started}"
+    );
+    thread::sleep(Duration::from_millis(2500));
+    let now = brain(&home);
+    assert_valid("status-reply.json", &home.status());
+    assert!(now.get("pid").is_none(), "{now}");
+    assert_eq!(now["error"]["code"], "brain_exited", "{now}");
+    // Waits of 250, 500, 1000 and 2000 ms: about 3 starts again in 2.5 s, never a spin.
+    let restarts = now["restarts"].as_u64().unwrap();
+    assert!((2..=4).contains(&restarts), "{now}");
+    let waiting = now["backoff_ms"].as_u64();
+    assert!(waiting.is_some_and(|ms| ms >= 500), "{now}");
+    // A request meanwhile is refused as never delivered, not left to hang.
+    let ping = home.rlxd(&["call", "brain.ping"]);
+    assert_eq!(ping.code(), Some(1), "{ping:?}");
+    assert!(ping.error_code().starts_with("brain_"), "{ping:?}");
+    let log = std::fs::read_to_string(home.root().join("rlxd/logs/brain.log")).unwrap();
+    assert!(log.contains("fake-brain/dies: dying at start"), "{log}");
+}
+
+#[test]
+fn a_brain_of_another_release_is_named_not_misread() {
+    let home = TestHome::new().with_rlx(fake_brain("skewed"));
+    let started = home.start();
+    let brain = &started["brain"];
+    assert_eq!(brain["error"]["code"], "brain_incompatible", "{started}");
+    assert!(brain.get("pid").is_none(), "{started}");
+    let message = brain["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("protocol 99") && message.contains("9.9.9"),
+        "{message}"
+    );
+    assert_eq!(brain["error"]["detail"]["rlxd"], serde_json::json!([1]));
+    let ping = home.rlxd(&["call", "brain.ping"]);
+    assert_eq!(ping.error_code(), "brain_incompatible", "{ping:?}");
+}
+
+#[test]
+fn with_no_rlx_status_says_so_and_requests_are_refused_at_once() {
+    let home = TestHome::new();
+    let started = home.start();
+    assert_eq!(
+        started["brain"]["error"]["code"], "brain_not_found",
+        "{started}"
+    );
+    assert_eq!(started["brain"]["restarts"], 0);
+    let asked = Instant::now();
+    let ping = home.rlxd(&["call", "brain.ping"]);
+    assert_eq!(ping.error_code(), "brain_not_found", "{ping:?}");
+    assert!(asked.elapsed() < Duration::from_secs(3), "it did not wait");
+}
+
+#[test]
+fn a_request_the_brain_never_accepted_was_never_delivered() {
+    let home = TestHome::new().with_rlx(fake_brain("mute"));
+    home.start();
+    let first = brain_pid(&home);
+    let asked = Instant::now();
+    let ping = home.rlxd(&["call", "brain.ping"]);
+    // 2 s for the brain to accept, then killed and reaped before the answer.
+    assert!(asked.elapsed() >= Duration::from_secs(2), "{ping:?}");
+    assert_eq!(ping.error_code(), "brain_unresponsive", "{ping:?}");
+    let message = ping.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("did not accept"), "{message}");
+    assert!(!alive(first), "the mute brain was killed before the answer");
+    eventually("the brain is started again", || {
+        let now = brain(&home);
+        now["restarts"] == 1 && now["pid"].as_u64().is_some_and(|pid| pid != first)
+    });
+}
+
+#[test]
+fn a_request_the_brain_accepted_then_died_on_failed_rather_than_never_ran() {
+    let home = TestHome::new().with_rlx(fake_brain("accepts-then-dies"));
+    home.start();
+    brain_pid(&home);
+    let ping = home.rlxd(&["call", "brain.ping"]);
+    assert_eq!(ping.error_code(), "brain_exited", "{ping:?}");
+    let message = ping.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("ended running it"), "{message}");
+    assert_eq!(brain(&home)["handled"], 0, "no reply came");
+}

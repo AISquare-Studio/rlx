@@ -19,7 +19,10 @@
 //! - [`HereData`]: `rlxd here`'s reply, the probe rlx.app runs over SSH: what rlx is
 //!   installed, whether its rlxd runs, and the protocol versions it serves;
 //! - [`DaemonRecord`] (4.1): one non-UI rlx process in `<home>/daemons/`, a file that
-//!   Python's registry and rlxd both write and read.
+//!   Python's registry and rlxd both write and read;
+//! - [`BrainInput`] and [`BrainOutput`] (1.6): the frames rlxd and its resident Python
+//!   brain, `rlx brain --stdio`, write to each other. That protocol is internal to one rlx
+//!   release, and versioned on its own ([`BRAIN_PROTOCOL`]).
 //!
 //! # One set of rules
 //!
@@ -173,6 +176,7 @@
 //!   of `argv`. `cwd` isn't required to be absolute. Python's registry (#576) and this
 //!   schema tighten them together, or not at all.
 
+mod brain;
 mod check;
 mod daemon;
 mod envelope;
@@ -186,6 +190,7 @@ mod settings;
 mod status;
 mod subscribe;
 
+pub use brain::{BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, codes as brain_codes};
 pub use check::Invalid;
 pub use daemon::{DaemonRecord, kinds as daemon_kinds};
 pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};

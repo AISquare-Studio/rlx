@@ -8,13 +8,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
-    Auth, DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
-    InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request,
-    RequestId, Role, RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsDeleteParams,
-    SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, StatusData,
-    SubscribeParams, codes, daemon_kinds, event_types, methods, protocol_version_of,
-    schema_version_of, schemas, send_safety_lowers, send_safety_modes, setting_is_protected,
-    setting_keys, topics,
+    Auth, BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, DaemonRecord, Data, Detail,
+    Envelope, ErrorBody, Event, HelloData, HelloParams, HereData, InstalledRlx, InstalledRlxd,
+    Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, RunScope,
+    SCHEMA_VERSION, Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams,
+    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, brain_codes,
+    codes, daemon_kinds, event_types, methods, protocol_version_of, schema_version_of, schemas,
+    send_safety_lowers, send_safety_modes, setting_is_protected, setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2221,4 +2221,125 @@ fn send_safety_mode_is_strict_for_a_writer_and_additive_for_a_reader() {
         json!({"key": "send_safety_mode", "version": 7, "value": {"default": "often"},
                "updated_at": "2026-11-26T12:00:00.000Z"}),
     );
+}
+
+// --- the brain protocol (1.6) -----------------------------------------------------------------
+
+#[test]
+fn brain_frames_validate_and_print_back_as_themselves() {
+    for frame in [
+        json!({"type": "hello", "protocol": 1, "rlxd_version": "0.10.3"}),
+        json!({"type": "request", "id": 7, "method": "ping", "params": {}}),
+        json!({"type": "request", "id": 8, "method": "hook", "params": {"event": "stop"}}),
+    ] {
+        assert_eq!(agrees::<BrainInput>("brain-input.json", &frame), frame);
+    }
+    for frame in [
+        json!({"type": "hello", "protocol": 1, "pid": 4243, "rlx_version": "0.10.3"}),
+        json!({"type": "refused", "code": "incompatible_protocol", "message": "m",
+               "supported": [1]}),
+        json!({"type": "accepted", "id": 7}),
+        json!({"type": "reply", "id": 7, "ok": true, "result": {"pid": 4243}}),
+        json!({"type": "reply", "id": 8, "ok": false,
+               "error": {"code": "unknown_method", "message": "m"}}),
+    ] {
+        assert_eq!(agrees::<BrainOutput>("brain-output.json", &frame), frame);
+    }
+    // Absent params mean none; what a later release adds is ignored.
+    let bare = json!({"type": "request", "id": 1, "method": "ping"});
+    assert_eq!(
+        agrees::<BrainInput>("brain-input.json", &bare),
+        json!({"type": "request", "id": 1, "method": "ping", "params": {}})
+    );
+    let later = json!({"type": "hello", "protocol": 1, "pid": 2, "rlx_version": "v",
+                       "env_allowlist": {"names": ["PATH"]}});
+    agrees::<BrainOutput>("brain-output.json", &later);
+}
+
+#[test]
+fn brain_frames_refuse_their_wrong_shapes() {
+    for frame in [
+        json!({"type": "hello", "protocol": 0, "rlxd_version": "v"}),
+        json!({"type": "hello", "protocol": 1, "rlxd_version": ""}),
+        json!({"type": "hello", "protocol": 1}),
+        json!({"type": "request", "id": 0, "method": "ping"}),
+        json!({"type": "request", "id": 1, "method": ""}),
+        json!({"type": "request", "id": 1, "method": "ping", "params": []}),
+        json!({"type": "accepted", "id": 1}),
+        json!({"id": 1, "method": "ping"}),
+    ] {
+        both_refuse::<BrainInput>("brain-input.json", frame);
+    }
+    for frame in [
+        json!({"type": "hello", "protocol": 1, "pid": 0, "rlx_version": "v"}),
+        json!({"type": "hello", "protocol": 1, "pid": 2147483648u64, "rlx_version": "v"}),
+        json!({"type": "refused", "code": "", "message": "m"}),
+        json!({"type": "accepted", "id": 0}),
+        json!({"type": "reply", "id": 1}),
+        json!({"type": "reply", "id": 1, "ok": true, "result": null}),
+        json!({"type": "reply", "id": 1, "ok": false, "error": null}),
+        json!({"type": "request", "id": 1, "method": "ping"}),
+        json!({"type": "something", "id": 1}),
+    ] {
+        both_refuse::<BrainOutput>("brain-output.json", frame);
+    }
+    // A reply says its result or its error, as `ok` says: the type holds it to that.
+    for frame in [
+        json!({"type": "reply", "id": 1, "ok": true}),
+        json!({"type": "reply", "id": 1, "ok": false, "result": {}}),
+        json!({"type": "reply", "id": 1, "ok": true, "result": {},
+               "error": {"code": "c", "message": "m"}}),
+    ] {
+        assert!(
+            serde_json::from_value::<BrainOutput>(frame.clone()).is_err(),
+            "{frame}"
+        );
+    }
+}
+
+#[test]
+fn the_brain_builders_print_what_the_schema_accepts() {
+    let hello = BrainInput::hello("0.10.3").unwrap();
+    let printed = agrees::<BrainInput>("brain-input.json", &serde_json::to_value(&hello).unwrap());
+    assert_eq!(
+        printed,
+        json!({"type": "hello", "protocol": BRAIN_PROTOCOL, "rlxd_version": "0.10.3"})
+    );
+    assert!(BRAIN_PROTOCOLS.contains(&BRAIN_PROTOCOL));
+    let request = BrainInput::request(3, "ping", Data::new()).unwrap();
+    agrees::<BrainInput>("brain-input.json", &serde_json::to_value(&request).unwrap());
+    assert_eq!(refused(BrainInput::request(0, "ping", Data::new())), "id");
+    assert_eq!(refused(BrainInput::request(1, "", Data::new())), "method");
+    assert_eq!(refused(BrainInput::hello("")), "rlxd_version");
+}
+
+#[test]
+fn a_status_says_why_no_brain_runs_and_how_long_until_the_next_start() {
+    let mut status = example("status-reply.json");
+    status["brain"] = json!({"restarts": 3, "handled": 41, "backoff_ms": 2000,
+        "error": {"code": "brain_exited", "message": "it ended (exit status: 1)"}});
+    assert_eq!(agrees::<StatusData>("status-reply.json", &status), status);
+    status["brain"]["error"] = json!({"code": "brain_incompatible", "message": "m",
+        "detail": {"rlxd": [1]}});
+    assert_eq!(agrees::<StatusData>("status-reply.json", &status), status);
+    for brain in [
+        json!({"restarts": 0, "handled": 0, "error": null}),
+        json!({"restarts": 0, "handled": 0, "backoff_ms": null}),
+        json!({"restarts": 0, "handled": 0, "error": {"code": "", "message": "m"}}),
+        json!({"restarts": 0, "handled": 0, "backoff_ms": -1}),
+    ] {
+        let wrong = with(&status, "brain", brain);
+        both_refuse::<StatusData>("status-reply.json", wrong);
+    }
+    for code in [
+        brain_codes::BRAIN_NOT_FOUND,
+        brain_codes::BRAIN_START_FAILED,
+        brain_codes::BRAIN_INCOMPATIBLE,
+        brain_codes::BRAIN_EXITED,
+        brain_codes::BRAIN_UNRESPONSIVE,
+        brain_codes::BRAIN_FAILED,
+    ] {
+        assert!(code.starts_with("brain_"), "{code}");
+    }
+    assert_eq!(methods::BRAIN_PING, "brain.ping");
 }

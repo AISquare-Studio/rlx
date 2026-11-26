@@ -50,6 +50,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
+use crate::brain::Brain;
 use crate::bus::{self, Bus, Cursor, Line, Topics};
 use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
@@ -93,6 +94,7 @@ pub struct Daemon {
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
+    brain: Arc<Brain>,
 }
 
 /// What a connection was let in as.
@@ -165,8 +167,8 @@ enum Frame {
 }
 
 impl Daemon {
-    /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus` and
-    /// serving `settings`.
+    /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus`,
+    /// serving `settings`, and asking `brain`.
     /// `pipe_acl` is what `status` says of the pipe's DACL, on Windows.
     pub fn new(
         home: Home,
@@ -175,6 +177,7 @@ impl Daemon {
         gate: Gate,
         bus: Bus,
         settings: Settings,
+        brain: Arc<Brain>,
     ) -> Arc<Self> {
         Arc::new(Self {
             home,
@@ -188,7 +191,13 @@ impl Daemon {
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
             gate: Arc::new(gate),
+            brain,
         })
+    }
+
+    /// The resident Python brain.
+    pub fn brain(&self) -> &Brain {
+        &self.brain
     }
 
     /// The home's event bus.
@@ -403,6 +412,7 @@ impl Daemon {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
             }
+            methods::BRAIN_PING => crate::brain::ping(&self.brain).await,
             methods::EVENTS_SUBSCRIBE if streaming => Err(error(
                 codes::INVALID_REQUEST,
                 "this connection carries an event stream already: open another for a second",
@@ -568,6 +578,7 @@ impl Daemon {
         }
         status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
+        status.brain = self.brain.status();
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {
             Ok(Value::Object(data)) => Ok(data),
@@ -1522,6 +1533,7 @@ fn served() -> Vec<&'static str> {
     let mut served = vec![
         methods::STATUS,
         methods::STOP,
+        methods::BRAIN_PING,
         methods::EVENTS_SUBSCRIBE,
         methods::SETTINGS_GET,
         methods::SETTINGS_SET,

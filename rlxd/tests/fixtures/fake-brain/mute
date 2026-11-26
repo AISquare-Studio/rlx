@@ -1,0 +1,7 @@
+#!/bin/sh
+# fake-brain/mute: says a good hello, then reads requests and never accepts one, as a
+# wedged brain would. rlxd must kill it, start it again, and say the request was never
+# delivered. mute.cmd is the same for Windows.
+read -r hello
+printf '%s\n' "{\"type\":\"hello\",\"protocol\":1,\"pid\":$$,\"rlx_version\":\"0.0.0\"}"
+cat > /dev/null

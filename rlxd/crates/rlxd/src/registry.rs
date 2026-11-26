@@ -12,7 +12,9 @@
 //!   is `run/rlxd.lock`'s to enforce, and pruning is the readers'. When the gate cannot
 //!   be had, nothing is written and rlxd runs unregistered, trying again at each beat.
 //! - **The record** is [`DaemonRecord`], `kind: "rlxd"`, written whole: `<id>.json.tmp`,
-//!   fsynced, renamed over `<id>.json`.
+//!   fsynced, renamed over `<id>.json`. rlxd also registers the brain it supervises
+//!   (`kind: "brain"`, [`Registration::register_process`]), holding that record's lock
+//!   itself: see `crate::brain`.
 //! - **The heartbeat**, every 5 s, rewrites it with a new `heartbeat_at`. First it checks
 //!   that `<id>.lock` is still the file it holds (POSIX: the same device and inode), and
 //!   takes it again under the gate when someone deleted or replaced it. On Windows a held
@@ -66,12 +68,6 @@ impl Registration {
     /// Registers this rlxd in `home`'s registry. Its record's `argv`, which restarts it,
     /// is `rlxd serve --detach` plus `flags`, the flags it was started with.
     pub fn register(home: &Home, flags: &[&str]) -> io::Result<Self> {
-        let dir = home.daemons();
-        crate::serve::private_dir(&dir)?;
-        let _gate = gate(&dir)?;
-        let id = fresh_id(&dir)?;
-        let lock = take(&dir.join(format!("{id}.lock")))?;
-        let now = clock::now();
         let exe = std::env::current_exe()?;
         let mut argv = vec![
             exe.display().to_string(),
@@ -79,20 +75,50 @@ impl Registration {
             "--detach".to_owned(),
         ];
         argv.extend(flags.iter().map(|&flag| flag.to_owned()));
-        let mut record = DaemonRecord::new(
-            id,
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.display().to_string());
+        Self::register_process(
+            home,
             daemon_kinds::RLXD,
             std::process::id(),
+            argv,
+            true,
+            cwd,
+        )
+    }
+
+    /// Registers another process in `home`'s registry, which this rlxd holds the lock of:
+    /// a child it supervises, such as the brain (kind `brain`), whose pid is `pid`, run as
+    /// `argv` in `cwd`. `restartable` says whether an upgrade may restart it from `argv`.
+    pub fn register_process(
+        home: &Home,
+        kind: &str,
+        pid: u32,
+        argv: Vec<String>,
+        restartable: bool,
+        cwd: Option<String>,
+    ) -> io::Result<Self> {
+        let dir = home.daemons();
+        crate::serve::private_dir(&dir)?;
+        let _gate = gate(&dir)?;
+        let id = fresh_id(&dir)?;
+        let lock = take(&dir.join(format!("{id}.lock")))?;
+        let now = clock::now();
+        let mut record = DaemonRecord::new(
+            id,
+            kind,
+            pid,
             host::name(),
             VERSION,
             now.clone(),
             now,
             argv,
-            true,
+            restartable,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if let Ok(cwd) = std::env::current_dir() {
-            record = record.with_cwd(cwd.display().to_string());
+        if let Some(cwd) = cwd {
+            record = record.with_cwd(cwd);
         }
         let registration = Self { dir, record, lock };
         if let Err(error) = registration.write() {

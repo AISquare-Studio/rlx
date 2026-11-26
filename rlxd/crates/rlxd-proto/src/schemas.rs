@@ -9,9 +9,9 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, Request, Setting,
-    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
-    SettingsSetParams, StatusData, SubscribeParams,
+    BrainInput, BrainOutput, DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData,
+    Request, Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
+    SettingsListParams, SettingsSetParams, StatusData, SubscribeParams,
 };
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
@@ -26,6 +26,8 @@ pub struct SchemaFile {
 /// Every schema file of this schema version, in name order.
 pub fn all() -> Vec<SchemaFile> {
     let mut files = vec![
+        file::<BrainInput>("brain-input.json"),
+        file::<BrainOutput>("brain-output.json"),
         file::<DaemonRecord>("daemon-record.json"),
         file::<Envelope>("envelope.json"),
         file::<Event>("event.json"),

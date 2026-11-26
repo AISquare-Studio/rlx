@@ -7,10 +7,10 @@
 //! wins a `Type::f` path over the trait's. These tests fail if one comes back.
 
 use rlxd_proto::{
-    Auth, DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
-    InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope, Setting,
-    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
-    SettingsSetParams, StatusData, SubscribeParams,
+    Auth, BrainInput, BrainOutput, DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData,
+    HelloParams, HereData, InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope,
+    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
+    SettingsListParams, SettingsSetParams, StatusData, SubscribeParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -75,6 +75,9 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
     assert!(SettingsChanged::deserialize(json!({"key": "theme", "version": 0})).is_err());
     assert!(SettingsDeleteParams::deserialize(json!({"key": ""})).is_err());
     assert!(ErrorBody::deserialize(json!({"code": "since_ahead", "message": "m"})).is_err());
+
+    assert!(BrainInput::deserialize(json!({"type": "request", "id": 0, "method": "m"})).is_err());
+    assert!(BrainOutput::deserialize(json!({"type": "reply", "id": 1, "ok": true})).is_err());
 
     // And they still read what is valid.
     assert!(Request::deserialize(json!({"id": 1, "method": "status"})).is_ok());
@@ -164,6 +167,21 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
     assert!(printed(&changed).is_ok());
     changed.version = 0;
     assert!(printed(&changed).is_err());
+
+    let mut hello = BrainInput::hello("0.10.3").unwrap();
+    assert!(printed(&hello).is_ok());
+    if let BrainInput::Hello { protocol, .. } = &mut hello {
+        *protocol = 0;
+    }
+    assert!(printed(&hello).is_err());
+    let mut reply: BrainOutput =
+        serde_json::from_value(json!({"type": "reply", "id": 1, "ok": true, "result": {}}))
+            .unwrap();
+    assert!(printed(&reply).is_ok());
+    if let BrainOutput::Reply { ok, .. } = &mut reply {
+        *ok = false;
+    }
+    assert!(printed(&reply).is_err());
 
     let mut subscribe = SubscribeParams::new().with_topics(["run"]).unwrap();
     assert!(printed(&subscribe).is_ok());
