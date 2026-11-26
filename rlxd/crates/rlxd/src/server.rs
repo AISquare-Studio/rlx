@@ -41,9 +41,10 @@ use std::time::Duration;
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, EnvRefusal, EnvValues, Envelope, ErrorBody, HelloData, HelloParams,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role,
-    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams, StatusData,
-    SubscribeParams, VERSION, codes, event_types, methods, setting_keys, topics,
+    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, RunRef,
+    RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
+    SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
+    methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -56,8 +57,9 @@ use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
+use crate::runner::Runner;
 use crate::settings::{self, Settings};
-use crate::{claude, token};
+use crate::{claude, spaces, token};
 
 /// `daemon.stopping`'s `reason` when a client asked rlxd to stop.
 pub const STOP_REQUESTED: &str = "stop";
@@ -86,7 +88,8 @@ pub struct Daemon {
     clients: Mutex<Clients>,
     /// `status.claude`, probed in the background (7.4).
     claude: Arc<claude::Probe>,
-    bus: Bus,
+    bus: Arc<Bus>,
+    runner: Arc<Runner>,
     settings: Settings,
     /// The app's environment for Claude Code (4.3), and the `claude` it resolves to.
     env: Arc<Env>,
@@ -177,6 +180,8 @@ impl Daemon {
         settings: Settings,
     ) -> Arc<Self> {
         let env = Arc::new(Env::open(&home));
+        let bus = Arc::new(bus);
+        let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
         Arc::new(Self {
             home,
             token,
@@ -185,6 +190,7 @@ impl Daemon {
             clients: Mutex::new(Clients::default()),
             claude: Arc::new(claude::Probe::new()),
             bus,
+            runner,
             settings,
             env,
             stopping: AtomicBool::new(false),
@@ -237,8 +243,10 @@ impl Daemon {
     }
 
     /// Writes what only memory holds, before rlxd exits: when each gate device was last
-    /// seen.
+    /// seen. Ends the runs in flight first, killing their process trees: runs don't
+    /// outlive rlxd.
     pub fn flush(&self) {
+        self.runner.shutdown();
         self.gate.flush();
     }
 
@@ -429,6 +437,10 @@ impl Daemon {
         let id = request.id;
         let outcome = match request.method.as_str() {
             methods::STATUS => self.status(session).await,
+            methods::RUN_START | methods::RUN_CANCEL | methods::SPACE_ENSURE => {
+                self.runs_and_spaces(session, &request.method, request.params)
+                    .await
+            }
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
@@ -615,6 +627,7 @@ impl Daemon {
         }
         status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
+        (status.runs.live, status.runs.queued) = self.runner.counts();
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {
             Ok(Value::Object(data)) => Ok(data),
@@ -626,6 +639,44 @@ impl Daemon {
     /// What Claude Code says about itself: the background probe's answer (7.4).
     async fn claude(&self) -> Claude {
         self.claude.answer(&self.env).await
+    }
+
+    /// The runner's methods (handoff 0.10.3, 7.5) and spaces' (2.5): `run.start`,
+    /// `run.cancel` and `space.ensure`. A run's client, in `run.list`, is the `client` the
+    /// connection's hello named.
+    async fn runs_and_spaces(
+        &self,
+        session: &Session,
+        method: &str,
+        params: Params,
+    ) -> Result<Data, ErrorBody> {
+        match method {
+            methods::RUN_START => {
+                let params = params_of::<RunStartParams>(method, params)?;
+                // Blocking work: it may wait on a run's lock, or write the run's record.
+                printed(&off_worker(|| {
+                    self.runner.start(params, &session.client, None)
+                })?)
+            }
+            methods::RUN_CANCEL => {
+                let params = params_of::<RunRef>(method, params)?;
+                printed(&self.runner.cancel(&params.run_id).await?)
+            }
+            _ => {
+                let params = params_of::<SpaceParams>(method, params)?;
+                let path =
+                    off_worker(|| spaces::ensure(&self.home, &params.name)).map_err(|e| {
+                        error(
+                            codes::INTERNAL,
+                            &format!("the space {:?} could not be made: {e}", params.name),
+                        )
+                    })?;
+                printed(&SpaceEnsureData::new(
+                    params.name,
+                    path.display().to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -1572,6 +1623,9 @@ fn served() -> Vec<&'static str> {
         methods::GATE_PAIR_ANSWER,
         methods::GATE_DEVICES,
         methods::GATE_UNPAIR,
+        methods::RUN_START,
+        methods::RUN_CANCEL,
+        methods::SPACE_ENSURE,
     ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);
