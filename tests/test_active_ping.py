@@ -368,17 +368,43 @@ def test_the_rlx_service_never_starts_a_ping(
     stub: Stub, clock: Clock, inline: Starts, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ruling on #32 (Q2): the daily active ping stays out of the rlx service, which is up
-    every day whether anyone opened rlx or not. `rlx service run` counted itself as a feature
-    and started the ping at its exit (#1743): it is not a feature, as `serve` is not."""
-    from aisquare.services import service_host
+    every day whether anyone opened rlx or not. Its sweep ran `metrics stats`, a counted
+    command, whose close sent the ping (#1842). Here SweepPart's own argv runs through the CLI
+    as its child runs it, beside `service run` and `service status`: no ping, and no feature
+    counted. The control is the old argv, which does both."""
+    from types import SimpleNamespace
 
+    from aisquare.cli import app as cli_app
+    from aisquare.core import feature_use
+    from aisquare.services import service_host, usage_stats
+
+    counted: list[str] = []
+    monkeypatch.setattr(cli_app, "_launch_usage_shared", lambda: True)  # a counted one records
+    monkeypatch.setattr(feature_use, "record", counted.append)
+    monkeypatch.setattr(usage_stats, "maybe_sweep", lambda **_: usage_stats.SweepReport())
     monkeypatch.setattr(service_host, "log_to_file", lambda: None)
     monkeypatch.setattr(service_host, "run_service", lambda **_: None)  # the process, ended
-    runner = CliRunner()
-    runner.invoke(app, ["service", "run"])
-    runner.invoke(app, ["service", "status"])
+    started: list[list[str]] = []
 
-    assert inline.count == 0 and stub.seen == []
+    def detached(command: list[str]) -> object:
+        started.append(list(command))
+        return SimpleNamespace(pid=4242, poll=lambda: None)
+
+    monkeypatch.setattr(service_host, "_detached", detached)
+    service_host.SweepPart().tick_part()
+    (argv,) = started
+    words = argv[argv.index("aisquare") + 1 :]  # what follows `python -P -m aisquare`
+
+    runner = CliRunner()
+    for command in (words, ["service", "run"], ["service", "status"]):
+        ran = runner.invoke(app, command)
+        assert ran.exception is None or isinstance(ran.exception, SystemExit), ran.output
+
+    assert words == list(service_host.SWEEP_COMMAND)
+    assert inline.count == 0 and stub.seen == [] and counted == []
+
+    runner.invoke(app, ["--json", "metrics", "stats", "--range", "today"])  # the old argv
+    assert len(stub.seen) == 1 and counted == ["cli.metrics.stats"], "the control: it pings"
 
 
 def test_the_cli_loads_the_ping_module_only_when_it_runs_it() -> None:

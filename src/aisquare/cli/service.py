@@ -52,7 +52,7 @@ def service_run() -> None:
     try:
         service_host.run_service()
     except service_host.ServiceError as exc:
-        fail(str(exc), error="service_not_started")
+        fail(str(exc), error="service_not_started", detail=str(exc))
 
 
 @app.command("start")
@@ -64,7 +64,7 @@ def service_start() -> None:
     try:
         service = service_host.start_service()
     except service_host.ServiceError as exc:
-        fail(str(exc), error="service_not_started")
+        fail(str(exc), error="service_not_started", detail=str(exc))
     started = before is None
     line = (
         f"started the {SERVICE} (pid {service.pid})"
@@ -79,6 +79,20 @@ def service_start() -> None:
     _say(data, line)
 
 
+@app.command("sweep", hidden=True)
+def service_sweep() -> None:
+    """The usage sweep, in a process of the service's own (``SweepPart``): what ``metrics
+    stats`` reads first, as a command nobody counts. ``service`` is no feature, so no daily
+    active ping and no shipment goes with it (the ruling on #32, Q2; #1842)."""
+    from aisquare.services import usage_stats
+
+    report = usage_stats.maybe_sweep()
+    _say(
+        {"transcripts": report.transcripts, "sessions_new": report.sessions_new},
+        f"swept: {report.sessions_new} new session(s) of {report.transcripts} transcript(s)",
+    )
+
+
 @app.command("stop")
 def service_stop() -> None:
     """Stop the service: Remote and ngrok wound down, Remote's switch kept for its next start."""
@@ -87,7 +101,7 @@ def service_stop() -> None:
     try:
         stopped = service_host.stop_service()
     except service_host.ServiceError as exc:
-        fail(str(exc), error="service_not_stopped")
+        fail(str(exc), error="service_not_stopped", detail=str(exc))
     _say({"stopped": stopped}, f"stopped the {SERVICE}" if stopped else f"no {SERVICE} runs")
 
 
@@ -99,7 +113,7 @@ def service_restart() -> None:
     try:
         service = service_host.restart_service()
     except service_host.ServiceError as exc:
-        fail(str(exc), error="service_not_restarted")
+        fail(str(exc), error="service_not_restarted", detail=str(exc))
     _say(
         {"restarted": True, "pid": service.pid, "version": service.version},
         f"restarted the {SERVICE} (pid {service.pid})",

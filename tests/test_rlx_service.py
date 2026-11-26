@@ -16,6 +16,7 @@ import itertools
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -764,6 +765,80 @@ def test_a_start_that_fails_quotes_what_that_run_wrote_not_an_earlier_ones(
     said = str(raised.value)
     assert said.endswith("the real reason") and "earlier run" not in said, said
     assert len(real_service) == 1 and real_service[0].wait(timeout=5) == 1
+
+
+def test_the_log_rolls_over_and_the_services_own_output_follows_it() -> None:
+    """#1717/#1842: service.log rolls over at LOG_BYTES, one old file kept, and the service's own
+    fd 1 and 2 (its log, as start_service hands it) follow each rollover: uvicorn's raw lines
+    and a traceback went on into the rolled-over file, then an unlinked one. Also rolled when
+    only fd 1 and 2 filled it, which no handler sees. In a child process: the dup2 is that
+    process's own."""
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import logging, os
+        from aisquare.services import service_host as s
+        s.LOG_BYTES = 600
+        s.log_to_file()
+        say = logging.getLogger("rlx-test")
+        for i in range(40):
+            say.info("a logged line %02d %s", i, "x" * 30)
+        os.write(1, b"stdout after the rolls\\n")
+        os.write(2, b"stderr after the rolls\\n")
+        os.write(1, b"r" * 700 + b"\\n")  # raw only, past LOG_BYTES: no handler sees it
+        s.roll_log_if_due()
+        os.write(1, b"stdout after the raw roll\\n")
+        """
+    )
+    log = service_host.log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "ab") as out:  # as start_service hands the service its log
+        subprocess.run(
+            [sys.executable, "-P", "-c", script],
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            check=True,
+            timeout=60,
+        )
+
+    now = log.read_text(encoding="utf-8")
+    old = log.with_name(log.name + ".1").read_text(encoding="utf-8")
+    assert "stdout after the raw roll" in now and len(now) < 600, now
+    assert "stdout after the rolls" in old and "stderr after the rolls" in old, old
+    assert "r" * 700 in old, "the raw-only bytes rolled over too"
+    assert not log.with_name(log.name + ".2").exists(), "one old file kept"
+
+
+@pytest.mark.parametrize(
+    ("verb", "error"),
+    [
+        ("start", "service_not_started"),
+        ("stop", "service_not_stopped"),
+        ("restart", "service_not_restarted"),
+        ("run", "service_not_started"),
+    ],
+)
+def test_a_failed_service_command_says_why_in_its_json_detail(
+    monkeypatch: pytest.MonkeyPatch, verb: str, error: str
+) -> None:
+    """#1842 nit: S3's tray reads `rlx --json service …`'s failures; each carries its why as
+    detail, as the upgrade's and the uninstall's do."""
+    why = "the rlx service (pid 7) did not stop within 15 s"
+
+    def refuse(**_: Any) -> Any:
+        raise ServiceError(why)
+
+    for name in ("start_service", "stop_service", "restart_service", "run_service"):
+        monkeypatch.setattr(service_host, name, refuse)
+    monkeypatch.setattr(service_host, "log_to_file", lambda: None)
+    monkeypatch.setattr(service_host, "running_service", lambda **_: None)
+
+    result = CliRunner().invoke(app, ["--json", "service", verb])
+
+    assert result.exit_code != 0
+    said = json.loads(next(line for line in result.output.splitlines() if line.startswith("{")))
+    assert said["error"] == error and said["detail"] == why, said
 
 
 def test_the_cli_every_hook_imports_does_not_import_the_service() -> None:

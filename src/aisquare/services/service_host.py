@@ -377,6 +377,13 @@ class NudgePart:
         return None
 
 
+SWEEP_COMMAND = ("service", "sweep")
+"""What :class:`SweepPart` runs in a process of its own: a hidden ``rlx service`` verb, which is
+no feature (``cli.app._NOT_FEATURES``). It ran ``metrics stats``, a counted command, whose
+close sends the day's active ping: every day the service was up sent it with nobody at rlx,
+which the ruling on #32 (Q2) keeps out (#1842)."""
+
+
 class SweepPart:
     """The usage sweep the *Usage & stats* page reads, in a process of its own: ``metrics stats``
     sweeps first (``usage_stats.maybe_sweep``, at most every ten minutes, one process at a
@@ -404,9 +411,7 @@ class SweepPart:
         child = self._child
         if child is not None and child.poll() is None:
             return PartHealth("ok", f"a sweep runs (pid {child.pid})")
-        self._child = _detached(
-            selfcli.argv_for(["--json", "metrics", "stats", "--range", "today"])
-        )
+        self._child = _detached(selfcli.argv_for(list(SWEEP_COMMAND)))
         return PartHealth("ok", f"started a sweep (pid {self._child.pid})")
 
     def stop_part(self) -> None:
@@ -573,6 +578,7 @@ class ServiceHost:
             atomic.write_replacing(self._status_path, body, durable=False, owner_only=True)
         except OSError:
             _log.warning("the service's status could not be written", exc_info=True)
+        roll_log_if_due()  # every STATUS_SECONDS: lines on fd 1 and 2 count too
 
 
 def _said(exc: BaseException) -> str:
@@ -927,17 +933,75 @@ def _log_tail(path: Path, lines: int = 3, *, since: int = 0) -> str:
     return " / ".join(tail) if tail else "it wrote nothing in its log"
 
 
+class _ServiceLog(logging.handlers.RotatingFileHandler):
+    """``service.log``, rolled over at :data:`LOG_BYTES` with one old file kept, and this
+    process's fd 1 and 2 moved with it while they are that file. :func:`start_service` hands the
+    service its log as stdout and stderr: what is written there (uvicorn's own lines, a
+    traceback) went on into the rolled-over file, and after a second roll into an unlinked
+    one, growing with no bound (#1842)."""
+
+    def __init__(self, path: Path, *, follow: tuple[int, ...]) -> None:
+        super().__init__(path, maxBytes=LOG_BYTES, backupCount=1, encoding="utf-8")
+        self._follow = follow
+        self._point_fds()
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        self._point_fds()
+
+    def _point_fds(self) -> None:
+        stream = self.stream
+        if not self._follow or stream is None:
+            return
+        for pending in (sys.stdout, sys.stderr):  # what they hold goes where it was written
+            with contextlib.suppress(Exception):
+                pending.flush()
+        for fd in self._follow:
+            os.dup2(stream.fileno(), fd)
+
+    def roll_if_due(self) -> None:
+        """Roll over once the file is :data:`LOG_BYTES` long, whoever wrote it: lines on fd 1
+        and 2 pass no handler, which looks at the size only as it writes a record."""
+        try:
+            due = Path(self.baseFilename).stat().st_size >= LOG_BYTES
+        except OSError:
+            return
+        if due:
+            with self.lock or contextlib.nullcontext():
+                self.doRollover()
+
+
+_service_log: _ServiceLog | None = None
+
+
+def roll_log_if_due() -> None:
+    """:meth:`_ServiceLog.roll_if_due` for this process's ``service.log``, when it has one."""
+    handler = _service_log
+    if handler is not None:
+        handler.roll_if_due()
+
+
+def _is_the_file(fd: int, path: Path) -> bool:
+    try:
+        return os.path.samestat(os.fstat(fd), path.stat())
+    except OSError:
+        return False
+
+
 def log_to_file() -> None:
     """Send this process's log lines to ``service.log`` (``rlx service run``'s), each with its
-    time; INFO and up."""
+    time; INFO and up. Its fd 1 and 2, when :func:`start_service` made them that file, follow
+    each rollover; on a terminal (a ``run`` in the foreground) they stay there."""
+    global _service_log
     log = log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(
-        log, maxBytes=LOG_BYTES, backupCount=1, encoding="utf-8"
-    )
+    log.touch(exist_ok=True)
+    follow = tuple(fd for fd in (1, 2) if _is_the_file(fd, log))
+    handler = _ServiceLog(log, follow=follow)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.addHandler(handler)
+    _service_log = handler
     if root.level > logging.INFO or root.level == logging.NOTSET:
         root.setLevel(logging.INFO)
 
@@ -946,6 +1010,7 @@ __all__ = [
     "KEYCHAIN_OUT_OF_REACH",
     "KIND",
     "NOT_HERE",
+    "SWEEP_COMMAND",
     "Hosting",
     "NudgePart",
     "Part",
@@ -963,6 +1028,7 @@ __all__ = [
     "keychain_out_of_reach",
     "read_status",
     "restart_service",
+    "roll_log_if_due",
     "run_service",
     "running_service",
     "service_status",
