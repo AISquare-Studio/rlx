@@ -1664,7 +1664,7 @@ def test_the_move_renames_and_never_copies(old_home: Path, user_home: Path) -> N
     picks = {
         "slot": _slot(2),
         "store": old_home / paths.OLD_STORE,
-        "cache file": old_home / "cache" / "claude-accounts" / "2" / ".keep",
+        "cache file": accounts_core.tmp_root() / "2" / ".keep",
         "project": old_home / "projects" / "prj_old",
     }
     before = {name: (os.stat(path).st_dev, os.stat(path).st_ino) for name, path in picks.items()}
@@ -1675,7 +1675,7 @@ def test_the_move_renames_and_never_copies(old_home: Path, user_home: Path) -> N
     after = {
         "slot": new / "accounts" / "claude" / "2",
         "store": new / "rlx.db",
-        "cache file": new / "cache" / "claude-accounts" / "2" / ".keep",
+        "cache file": accounts_core.tmp_root() / "2" / ".keep",
         "project": new / "projects" / "prj_old",
     }
     for name, path in after.items():
