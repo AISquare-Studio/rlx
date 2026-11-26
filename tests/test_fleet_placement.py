@@ -100,6 +100,13 @@ MADE: dict[str, dict[str, str]] = {
         )
     },
     f"{UI}/views/accounts.py": {"AccountsView.server": "today's socket: its own sign-in windows"},
+    f"{UI}/views/doctor.py": {
+        "launch_fix_pane": (
+            "today's socket (the config's), where a Doctor pane fix opens its own window: a "
+            "window of no row, which nothing records a place for, as the persona editor's "
+            "(#15)"
+        )
+    },
     f"{UI}/views/agent.py": {
         "AgentView.__init__": "a listed status's socket and path: placed by the resolver"
     },
@@ -220,6 +227,12 @@ ACTS: dict[str, dict[str, str]] = {
         "EditorPaneScreen": (
             "the editor window this screen opened (`_open_editor`), by the pane tmux answered "
             "for it: watched while the editor runs and closed with the screen (#212)"
+        )
+    },
+    f"{UI}/views/doctor.py": {
+        "FixPaneScreen": (
+            "the fix's window this screen opened (`launch_fix_pane`), by the pane tmux "
+            "answered for it: watched while its command runs and closed with the screen (#15)"
         )
     },
     f"{UI}/views/accounts.py": {

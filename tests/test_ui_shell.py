@@ -1550,7 +1550,13 @@ def test_the_hubs_doctor_link_opens_the_doctor_page_and_runs_the_checks(
         await pilot.pause()
         await settle(app)
         await pilot.pause()
-        report = shown(app.query_one("#doctor", DoctorView).query_one("#doctor-report", Static))
+        doctor_page = app.query_one("#doctor", DoctorView)
+        # The problems, then the passing rows behind their fold (Q5): the whole report.
+        report = (
+            shown(doctor_page.query_one("#doctor-report", Static))
+            + "\n"
+            + shown(doctor_page.query_one("#doctor-passed-list", Static))
+        )
         return (
             calls_after_mount,
             before,
