@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -81,6 +82,7 @@ from aisquare.core.spawn import untraced_env
 from aisquare.core.store import ContextStore, store_session
 from aisquare.core.tmux import TmuxServer, WindowInfo
 from aisquare.models import (
+    CLOSED_STATUSES,
     SESSION_WINDOW,
     WEEK_WINDOW,
     AccountsOverview,
@@ -95,6 +97,7 @@ from aisquare.models import (
     ProjectInfo,
     StatuslineSession,
     StatuslineSite,
+    TeamTask,
     UsageCause,
     UsageSample,
     UsageTrend,
@@ -338,9 +341,14 @@ class AccountChoice:
     notes: list[str] = field(default_factory=list)
     """What was skipped or could not be read on the way down the ladder — for
     the launch line's dim notes, never a reason to refuse."""
+    why: str = ""
+    """Why the balanced pick chose the account (``fair share 3/5 · resets Sat · low tier``,
+    :func:`balanced_pick`); ``""`` when another rung did."""
 
     def describe(self) -> str:
-        """``account 2`` for a flag; ``work · preferred (rank 1)`` when the order decided."""
+        """``account 2`` for a flag; ``work · preferred (rank 1)`` when the order decided;
+        ``slot 3 · the man (fair share 3/5 · resets Sat · low tier)`` when the balanced pick
+        did."""
         if self.account is None:
             return ""
         name = core.label(self.account)
@@ -348,6 +356,8 @@ class AccountChoice:
             return name
         if self.source == "preferred":
             return f"{name} · preferred (rank {self.account.position})"
+        if self.why:
+            return f"{pick_name(self.account)} ({self.why})"
         return f"{name} · {self.source}"
 
 
@@ -863,6 +873,51 @@ def slot_labels(store: ContextStore | None = None) -> dict[int, str]:
         return {}
 
 
+def display_name(account: ClaudeAccount, identity: ClaudeIdentity | None) -> str:
+    """What a person reads an account as (the 0.10.2 UX audit's Q1, "accounts named by email"):
+    the alias the operator gave it, else the email it is signed in as, else its built-in
+    name (``plain claude``, ``account 3``: :func:`core.label`).
+
+    Display only. The board text hooks inject into agents, a launch line and ``fleet ls``
+    keep :func:`slot_labels`: an agent names an account by it in its own commands
+    (``--to "account 3"``), and an email in the injected text would put a person's address
+    in every agent's prompt. ``identity`` is the account's signed-in identity
+    (``ClaudeAccountStatus.identity``, or ``core.identity``)."""
+    if account.alias:
+        return account.alias
+    if identity is not None and identity.email:
+        return identity.email
+    return core.label(account)
+
+
+def display_labels(statuses: Iterable[ClaudeAccountStatus] | None = None) -> dict[int, str]:
+    """Slot → :func:`display_name`, for the surfaces a person reads an account on (the
+    Accounts page, the agent header, the account picker): :func:`slot_labels`' shape, so a
+    surface can take either. From ``statuses`` when the caller holds them (the shell's
+    ``AccountsOverview.accounts``: no reading at all), else read here, each account's
+    identity from its home (``core.identity``: Claude Code's ``.claude.json``, which can be
+    large, so not for a hot path). Fails open as :func:`slot_labels` does: ``{}`` when the
+    accounts cannot be listed, and a slot whose identity cannot be read by its built-in
+    name."""
+    if statuses is not None:
+        return {
+            status.account.slot: display_name(status.account, status.identity)
+            for status in statuses
+        }
+    try:
+        accounts = list_accounts()
+    except Exception:
+        return {}
+    labels: dict[int, str] = {}
+    for account in accounts:
+        try:
+            identity = core.identity(account)
+        except Exception:
+            identity = None
+        labels[account.slot] = display_name(account, identity)
+    return labels
+
+
 def slot_of(config_dir: str | Path) -> int | None:
     """Which slot a Claude config directory IS: a managed slot's number, 1 for the plain
     claude's directory, ``None`` for a directory the CLI does not own (a hand-made layout).
@@ -914,6 +969,7 @@ def choose(
     pick: AgentPick | None = None,
     family: str | None = None,
     max_age: float | None = None,
+    task_id: str | None = None,
 ) -> AccountChoice:
     """THE account resolver: which Claude account a launch runs under, and why.
 
@@ -957,16 +1013,23 @@ def choose(
     usage through the cache, a minute deep (:data:`PICK_MAX_AGE_SECONDS`); a
     hand-over (``spread=True``) reads it live.
 
-    ``pick`` is the launch's agent rung's answer (:func:`agent_pick`): an account of
-    ``agent`` it chose by headroom across agents is the headroom rung's answer, with no
-    second usage read, unless a limit mark shuts it to ``family`` (that rung ran before
-    the model was known), when the headroom rung reads as usual; every rung above it
-    still wins.
+    ``pick`` is the launch's agent rung's answer (:func:`agent_pick`): it chose the agent,
+    and the account it found first under the line is weighed again by the balanced pick
+    among that agent's accounts (the agent rung's readings, from the cache: no second
+    request), so a limit mark it could not see (it ran before the model was known) shuts
+    that account here as it would any; every rung above it still wins.
 
     ``family`` is the launch's model family (``services.fleet.spawn_runs``), for the
     headroom rung's per-family weeks and limit marks (#277). ``max_age`` is how deep a
     launch's headroom rung reads the cache, :data:`PICK_MAX_AGE_SECONDS` when unsaid: a
     form that only SHOWS the pick reads the shared five minutes (:func:`launch_default`).
+
+    The headroom rung is the balanced pick (#35, :func:`balanced_pick`), no longer the first
+    account under the line: each account's capacity left, its fair share of the live fleet,
+    and the tier of the agent being launched (``role``, and ``task_id``, the task it is
+    spawned for: one another open task ``--needs`` makes a coder ``high``). It decides among
+    the agent rung's agent's accounts, so an account ``pick`` chose by the order across agents
+    is weighed again, by the same readings (the cache serves them, a minute deep).
 
     ``exclude`` is honoured on EVERY rung: a binding or a project default that
     names the account being left is skipped with a note and the ladder goes on,
@@ -1048,28 +1111,24 @@ def choose(
         return AccountChoice(None, None, notes)
     settings = accounts_settings()
     by_headroom = spread if spread is not None else settings.pick == "headroom"
-    chosen = pick.account if pick is not None else None
-    if (
-        by_headroom
-        and chosen is not None
-        and chosen.agent == agent
-        and chosen.slot not in skip
-        and not _marked(chosen, family)
-    ):
-        notes.extend(pick.notes if pick is not None else ())
-        return AccountChoice(chosen, "headroom", notes)
     if by_headroom:
-        # A hand-over reads live; a launch through the cache, a minute deep unless told.
+        # A hand-over reads live; a launch through the cache, a minute deep unless told. The
+        # agent rung's account (``pick``) is the first of the order under the line: the
+        # balanced pick weighs that agent's accounts again, from the readings the rung took.
         depth = PICK_MAX_AGE_SECONDS if max_age is None else max_age
-        picked, more = headroom_choice(
-            [a for a in accounts if a.agent == agent],
+        own = [a for a in accounts if a.agent == agent]
+        decision = headroom_decision(
+            own,
             switch_at=settings.switch_at,
             exclude=skip,
             fetch=fetch,
             max_age=depth if spread is None else None,
             family=family,
             prefer=settings.prefer,
+            balance=balance_for(role, task_id, accounts=own),
+            known=pick.readings if pick is not None and spread is None else None,
         )
+        picked, more = decision.account, decision.notes
         if spread is None:
             # The default rung since 0.8.1, so every machine walks it: one with no account
             # to pick from (an API key, no login yet) is not told so on every launch. A
@@ -1077,7 +1136,7 @@ def choose(
             more = [note for note in more if note != _NOTHING_TO_PICK]
         notes.extend(more)
         if picked is not None:
-            return AccountChoice(picked, "headroom", notes)
+            return AccountChoice(picked, "headroom", notes, why=decision.why)
     if hand_written:  # a hand-over that found no room: rank 1 is still a silent default
         return AccountChoice(None, None, notes)
     # Rank 1 of the one order, among this launch's agent's accounts: with the agent left
@@ -4334,6 +4393,12 @@ class HeadroomDecision:
     measured: bool = True
     """``False`` when ``account`` was taken with no reading to go by: an account that could
     not be measured keeps its place (``unread_keeps_place``), it is not a full one."""
+    why: str = ""
+    """What put the agent there when the balanced pick chose (:func:`balanced_pick`):
+    ``fair share 3/5 · resets Sat · low tier``; ``""`` for any other answer."""
+    readings: Mapping[int, ClaudeUsage] = field(default_factory=dict)
+    """The readings it decided by, as read (slot → reading): what the launch's account rung
+    decides by again, with no second read (:attr:`AgentPick.readings`)."""
 
 
 def headroom_choice(
@@ -4347,6 +4412,7 @@ def headroom_choice(
     max_age: float | None = None,
     family: str | None = None,
     prefer: str = "priority",
+    balance: Balance | None = None,
 ) -> tuple[ClaudeAccount | None, list[str]]:
     """The account with headroom, and the notes that say how it was picked
     (:func:`headroom_decision`, an account that cannot be read skipped)."""
@@ -4360,6 +4426,7 @@ def headroom_choice(
         max_age=max_age,
         family=family,
         prefer=prefer,
+        balance=balance,
     )
     return decision.account, decision.notes
 
@@ -4376,6 +4443,8 @@ def headroom_decision(
     family: str | None = None,
     prefer: str = "priority",
     unread_keeps_place: bool = False,
+    balance: Balance | None = None,
+    known: Mapping[int, ClaudeUsage] | None = None,
 ) -> HeadroomDecision:
     """The account with headroom, and the notes that say how it was picked.
 
@@ -4410,6 +4479,15 @@ def headroom_decision(
     by its kept reading, and the next read that can wait refreshes it; an
     account another call is reading is read by the pick itself, without
     waiting (:func:`cached_usage`).
+
+    ``balance`` (#35) replaces that first-under-the-line rule with the balanced pick
+    (:func:`balanced_pick`): among the accounts read under the line, the one its capacity
+    left, its fair share of the live fleet and the tier of the agent being placed (``balance``,
+    read by :func:`balance_for`) say, the reason in :attr:`HeadroomDecision.why` and the
+    note. A launch's account rung and a hand-over pass it (:func:`choose`,
+    :func:`choose_for_handover`); the agent rung and the cross-agent hand-off, which choose
+    an AGENT by the order, do not. ``known`` is readings already taken for every candidate
+    (the agent rung's, :attr:`AgentPick.readings`): decided by, with no read of its own.
 
     ``unread_keeps_place`` is the launch's AGENT rung's rule (:func:`agent_pick`, review
     of #14, M1): an account that could not be read is *unmeasured*, not *full*, so it keeps
@@ -4460,7 +4538,9 @@ def headroom_decision(
     # Never waiting on a stale token's refresh, nor on a fetch lock another call holds
     # (``refresh=False``): the launch, spawn or hand-over behind the pick would, up to a
     # minute and saying nothing (review of #485: m1, rounds 2 and 3).
-    if max_age is None:
+    if known is not None and all(account.slot in known for account in candidates):
+        readings = {account.slot: known[account.slot] for account in candidates}
+    elif max_age is None:
         readings = read_usage(candidates, now=now, fetch=fetch, refresh=False)
     elif len(candidates) == 1 and least_bad:
         return HeadroomDecision(
@@ -4468,6 +4548,7 @@ def headroom_decision(
         )
     else:
         readings = cached_usage(candidates, max_age=max_age, now=now, fetch=fetch, refresh=False)
+    read = dict(readings)
     readings = dict(readings)
     window = timedelta(seconds=max_age if max_age is not None else USAGE_MAX_AGE_SECONDS)
     full_by_age: set[int] = set()
@@ -4605,7 +4686,7 @@ def headroom_decision(
             )
     if not measured:
         notes.append("headroom: no account's usage could be read — the default decides")
-        return HeadroomDecision(None, notes)
+        return HeadroomDecision(None, notes, readings=read)
     summary = " · ".join(
         describe_headroom(a, readings[a.slot], family)
         if pct is not None
@@ -4615,6 +4696,16 @@ def headroom_decision(
     under_line = [(a, pct) for a, pct in measured if pct is None or pct < switch_at]
     first_under = under_line[0] if under_line else None
     read_under = [a for a, pct in under_line if pct is not None]
+    if balance is not None and read_under and not unread_keeps_place:
+        # The balanced pick (#35), where fill-first took the first account under the line.
+        seats = [
+            seat_of(a, readings[a.slot], balance=balance, family=family, plan=_plan_of(a))
+            for a in read_under
+        ]
+        placed = balanced_pick(seats, balance.tier, now=moment, soonest=prefer == "reset-soonest")
+        chosen = next(a for a in read_under if a.slot == placed.slot)
+        notes.append(f"headroom: {summary} — {pick_name(chosen)} ({placed.reason})")
+        return HeadroomDecision(chosen, notes, why=placed.reason, readings=read)
     if (
         prefer == "reset-soonest"
         and len(read_under) > 1
@@ -4628,7 +4719,7 @@ def headroom_decision(
                 f"headroom: {summary} — {core.label(soonest)}'s week resets first of those "
                 f"under the {switch_at}%-used line (prefer = reset-soonest)"
             )
-            return HeadroomDecision(soonest, notes)
+            return HeadroomDecision(soonest, notes, readings=read)
     if first_under is not None:
         under, under_percent = first_under
         notes.append(
@@ -4637,13 +4728,13 @@ def headroom_decision(
             else f"headroom: {summary} — {core.label(under)} is first in the order and no "
             f"account measured over the {switch_at}%-used line is ahead of it"
         )
-        return HeadroomDecision(under, notes, measured=under_percent is not None)
+        return HeadroomDecision(under, notes, measured=under_percent is not None, readings=read)
     if not least_bad:
         notes.append(
             f"headroom: {summary} — every account is over the {switch_at}%-used line; "
             "nothing to switch to"
         )
-        return HeadroomDecision(None, notes)
+        return HeadroomDecision(None, notes, readings=read)
     # A floor is a lower bound of use, not a figure: a live reading beats it however the two
     # compare (before a floor counted, it was unread and the live one won), and the floors
     # compete among themselves only when no account has a live reading (review r23 of #113,
@@ -4663,7 +4754,7 @@ def headroom_decision(
         f"headroom: {summary} — every account is over the {switch_at}%-used line; "
         f"{core.label(least)} {room}"
     )
-    return HeadroomDecision(least, notes)
+    return HeadroomDecision(least, notes, readings=read)
 
 
 def _over_the_line(account: ClaudeAccount, switch_at: int, *, now: datetime | None) -> list[str]:
@@ -4685,6 +4776,415 @@ def _over_the_line(account: ClaudeAccount, switch_at: int, *, now: datetime | No
     ]
 
 
+# --- the balanced pick (0.10.2, #35) ------------------------------------------------------------
+#
+# Fill-first, the first account in priority order under ``switch_at``, sent every launch to one
+# account until it crossed the line: on the owner's Mac, 25 of 26 agents on a Max 20x account at
+# 45% of its week while three Max 5x accounts sat at 0-4%. The pick below spreads them by what
+# each account can still give, and there is no setting for it. What stays as it was: the line
+# (an account over ``switch_at`` is no candidate), the explicit rungs (``--account``, a role
+# binding, a project default), disabled accounts, and agents already running, which stay where
+# they are (a hand-over on a limit, ``on_limit = "switch"``, moves one, as before).
+#
+# :func:`balanced_pick` is pure: it is given each account's figures as a :class:`Seat` and
+# returns a :class:`Placement`. :func:`balance_for` reads what it needs (the live fleet rows, the
+# boards' ``--needs``, the status line's sessions), and :func:`headroom_decision` calls the pick
+# where it took the first account under the line.
+
+Tier = Literal["high", "normal", "low"]
+"""How an agent weighs on the pick (:func:`agent_tier`): ``high`` goes where the runway is
+longest, ``low`` where the week resets soonest with room left, ``normal`` by room alone."""
+
+HIGH_TIER_ROLES = frozenset({"manager", "captain"})
+"""Roles whose agents are always ``high``: the ones the rest of the fleet waits on."""
+
+LOW_TIER_ROLES = frozenset({"tester", "reviewer", "validator", "ui-tester", "runner"})
+"""Roles whose agents are ``low``: short, checking work that spends quota soon to reset as well
+as any (``runner`` is the tester's older name)."""
+
+PLAN_UNITS = core.PLAN_UNITS
+"""Capacity units per Claude Code plan, as ``accounts list`` names it (``subscription_label``):
+a Max 5x is one unit, a Max 20x four, a Pro about a fifth. A plan an agent does not name
+(``max`` with no multiplier, ``team``, an unknown or unread plan) counts one unit, and so does
+every plan of an agent with no units (``AgentAccounts.plan_units``: Codex's)."""
+
+HUMAN_RESERVE_PERCENT = 20.0
+"""The share of its week kept free on the account the person uses themselves
+(:func:`human_slot`), while another account has room."""
+
+SESSION_EASE_FROM = 60.0
+"""Over this much of its five-hour window used, an account's units shrink in step, to none at
+100%: it has room for the week but little until its five hours reset."""
+
+TIER_WEIGHT: Mapping[Tier, float] = {"high": 1.5, "normal": 1.0, "low": 0.5}
+"""How much one live agent of each tier loads its account, in the score's denominator: a
+manager runs all day, a reviewer for a while."""
+
+_WEEK = timedelta(days=7)
+
+
+def agent_tier(role: str | None, *, critical: bool = False) -> Tier:
+    """``role``'s tier: ``high`` for a manager (or the captain), and for an agent of any other
+    role but a checking one whose task another open task waits on (``critical``: its task is in
+    their ``--needs``); ``low`` for testers, reviewers and validators; ``normal`` otherwise,
+    an ordinary coder's or a launch with no role."""
+    if role in HIGH_TIER_ROLES:
+        return "high"
+    if role in LOW_TIER_ROLES:
+        return "low"
+    return "high" if critical else "normal"
+
+
+def critical_tasks(tasks: Iterable[TeamTask]) -> set[str]:
+    """The ids of the tasks an open task waits on (its ``needs``): the critical path."""
+    return {need for task in tasks if task.status not in CLOSED_STATUSES for need in task.needs}
+
+
+def plan_units(plan: str | None, agent: str = AGENT) -> float:
+    """Capacity units of ``agent``'s plan named ``plan`` (its ``AgentAccounts.plan_units``,
+    Claude Code's :data:`PLAN_UNITS`); 1 for a plan it does not name, or none."""
+    if plan is None:
+        return 1.0
+    return core.kind(agent).plan_units.get(plan.strip().lower(), 1.0)
+
+
+def human_slot(
+    sessions: Iterable[StatuslineSession],
+    accounts: Sequence[ClaudeAccount],
+    default: ClaudeAccount | None,
+) -> int | None:
+    """The account the person uses for their own sessions, inferred: the one of ``accounts``
+    the newest of ``sessions`` that no fleet row owns ran on (the status line's records, newest
+    first: ``AISQUARE_FLEET_AGENT`` unset), else the machine default, ``default``."""
+    slots = {account.slot for account in accounts}
+    for session in sessions:
+        if not session.fleet_agent and session.slot in slots:
+            return session.slot
+    return default.slot if default is not None else None
+
+
+@dataclass(frozen=True)
+class Seat:
+    """One account as :func:`balanced_pick` weighs it, in figures alone."""
+
+    slot: int
+    plan_units: float = 1.0
+    week_used: float = 0.0
+    """Percent of its week USED (its agent's family week, when fuller)."""
+    week_resets_at: datetime | None = None
+    session_used: float | None = None
+    """Percent of its five-hour window USED; ``None`` for a plan with none."""
+    live: Mapping[Tier, int] = field(default_factory=dict)
+    """Its live fleet agents, by tier."""
+    human: bool = False
+    """The account the person uses themselves (:func:`human_slot`)."""
+
+    @property
+    def agents(self) -> int:
+        return sum(self.live.values())
+
+    @property
+    def load(self) -> float:
+        """Its live agents, each weighed by its tier (:data:`TIER_WEIGHT`)."""
+        return sum(TIER_WEIGHT[tier] * count for tier, count in self.live.items())
+
+
+def seat_units(seat: Seat, *, reserve: bool = False) -> float:
+    """What ``seat`` can still give, in capacity units: its plan's units (:data:`PLAN_UNITS`) times
+    the share of its week left, less :data:`HUMAN_RESERVE_PERCENT` of it on the person's own
+    account when ``reserve``, and scaled down once its five-hour window is past
+    :data:`SESSION_EASE_FROM`."""
+    left = max(0.0, 100.0 - seat.week_used)
+    if reserve and seat.human:
+        left = max(0.0, left - HUMAN_RESERVE_PERCENT)
+    ease = 1.0
+    if seat.session_used is not None and seat.session_used > SESSION_EASE_FROM:
+        ease = max(0.0, 100.0 - seat.session_used) / (100.0 - SESSION_EASE_FROM)
+    return seat.plan_units * left / 100.0 * ease
+
+
+def seats_units(seats: Sequence[Seat]) -> dict[int, float]:
+    """Each seat's :func:`seat_units`, the person's own account's reserve kept while another
+    seat has room, and spent when none has."""
+    plain = {seat.slot: seat_units(seat) for seat in seats}
+    return {
+        seat.slot: seat_units(
+            seat, reserve=any(plain[other.slot] > 0 for other in seats if other is not seat)
+        )
+        for seat in seats
+    }
+
+
+def fair_shares(units: Mapping[int, float], agents: int) -> dict[int, float]:
+    """Each account's fair share of ``agents`` live agents: its units over the total. This IS the
+    most agents an account takes, derived: :func:`balanced_pick` passes over an account one more
+    agent would put more than one over its share."""
+    total = sum(units.values())
+    if total <= 0:
+        return dict.fromkeys(units, 0.0)
+    return {slot: agents * share / total for slot, share in units.items()}
+
+
+def share_text(count: int, share: float) -> str:
+    """``3/5``: ``count`` agents of a fair share of ``share``, the share rounded up."""
+    return f"{count}/{max(1, math.ceil(share - 1e-9))}"
+
+
+@dataclass(frozen=True)
+class Placement:
+    """:func:`balanced_pick`'s answer: the slot, and the figures that put the agent there."""
+
+    slot: int | None
+    tier: Tier
+    units: Mapping[int, float] = field(default_factory=dict)
+    shares: Mapping[int, float] = field(default_factory=dict)
+    """Each seat's fair share of the live agents, this one included."""
+    reason: str = ""
+    """``fair share 3/5 · resets Sat · low tier``: what the spawn line says after the account."""
+
+
+def _runway(seat: Seat, now: datetime) -> float:
+    """How much of a week is left before ``seat``'s week resets, 0 to 1; a half when unknown."""
+    if seat.week_resets_at is None:
+        return 0.5
+    return min(1.0, max(0.0, (seat.week_resets_at - now) / _WEEK))
+
+
+def _reset_words(resets_at: datetime | None, now: datetime) -> str | None:
+    """``resets Sat``, or ``resets in 5h 10m`` within a day; ``None`` when unknown."""
+    if resets_at is None:
+        return None
+    if resets_at - now < timedelta(days=1):
+        return f"resets {core.format_reset(resets_at, now=now, clock=False)}"
+    return f"resets {resets_at.astimezone().strftime('%a')}"
+
+
+def balanced_pick(
+    seats: Sequence[Seat], tier: Tier, *, now: datetime, soonest: bool = False
+) -> Placement:
+    """Where an agent of ``tier`` goes among ``seats``, the candidates in priority order (each
+    enabled, signed in, under the line): pure, no disk, no network.
+
+    1. **Units** (:func:`seats_units`): plan units times the share of the week left, scaled down
+       near a five-hour cap, the person's own account keeping :data:`HUMAN_RESERVE_PERCENT`
+       of its week while another account has room. A seat with none is passed over while
+       another has some.
+    2. **Fair share** (:func:`fair_shares`) of the live agents, this one included: a seat one
+       more agent would put more than one over its share is passed over. Another seat is then
+       always under its share, so no account ends more than one over it.
+    3. **Score**: units ÷ (its live agents weighed by tier + 1), so two equal accounts take
+       turns. ``high`` multiplies it by the runway (1 + the share of a week before its week
+       resets): the most units and the latest reset. ``low`` (and ``normal`` with ``soonest``,
+       ``[accounts] prefer = "reset-soonest"``) takes the seat whose week resets soonest, the
+       score breaking ties: quota that resets in hours is worth less than quota that must
+       last days. Ties go to the priority order.
+    """
+    if not seats:
+        return Placement(None, tier)
+    units = seats_units(seats)
+    shares = fair_shares(units, sum(seat.agents for seat in seats) + 1)
+    roomy = [seat for seat in seats if units[seat.slot] > 0] or list(seats)
+    within = [seat for seat in roomy if seat.agents <= shares[seat.slot] + 1e-9] or roomy
+    order = {seat.slot: index for index, seat in enumerate(seats)}
+
+    def score(seat: Seat) -> float:
+        return round(units[seat.slot] / (seat.load + 1), 9)
+
+    never = datetime.max.replace(tzinfo=UTC)
+    if tier == "low" or (tier == "normal" and soonest):
+        best = min(
+            within,
+            key=lambda s: (s.week_resets_at or never, -score(s), order[s.slot]),
+        )
+    elif tier == "high":
+        best = min(
+            within,
+            key=lambda s: (-round(score(s) * (1 + _runway(s, now)), 9), order[s.slot]),
+        )
+    else:
+        best = min(within, key=lambda s: (-score(s), order[s.slot]))
+    words = [f"fair share {share_text(best.agents + 1, shares[best.slot])}"]
+    if (resets := _reset_words(best.week_resets_at, now)) is not None:
+        words.append(resets)
+    words.append(f"{tier} tier")
+    if best.human and units[best.slot] < seat_units(best):
+        words.append(f"keeps {HUMAN_RESERVE_PERCENT:.0f}% for you")
+    return Placement(best.slot, tier, units, shares, " · ".join(words))
+
+
+def pick_name(account: ClaudeAccount) -> str:
+    """``slot 3 · the man`` for an aliased account, :func:`core.label` otherwise
+    (``account 3``): how the spawn line names the account the balanced pick chose."""
+    if account.alias:
+        return f"slot {account.slot} · {account.alias}"
+    return core.label(account)
+
+
+@dataclass(frozen=True)
+class Balance:
+    """What :func:`balanced_pick` needs besides the readings, read by :func:`balance_for`."""
+
+    tier: Tier = "normal"
+    """The tier of the agent being placed."""
+    live: Mapping[int, Mapping[Tier, int]] = field(default_factory=dict)
+    """Slot → its live fleet agents by tier, every project's."""
+    human: int | None = None
+    """The slot the person uses themselves (:func:`human_slot`)."""
+
+
+def balance_for(
+    role: str | None,
+    task_id: str | None = None,
+    *,
+    accounts: Sequence[ClaudeAccount] = (),
+    now: datetime | None = None,
+) -> Balance:
+    """:class:`Balance` for an agent of ``role`` working ``task_id``, read now: the live fleet
+    rows of every project (each one's tier by its role and whether an open task ``--needs``
+    its task), and the person's own account among ``accounts`` (:func:`human_slot`: the status
+    line's newest session no fleet row owns, else the first of ``accounts`` a launch could take,
+    the machine default). Only an agent's that ``reserves_for_person`` have one (Claude
+    Code's: its sessions are the status line's). Never raises: what
+    cannot be read is left out, and the pick weighs what it has. Makes no store on a machine
+    that has none."""
+    rows: list[Any] = []
+    tasks: list[TeamTask] = []
+    if paths.db_path().exists():
+        try:
+            with store_session() as store:
+                rows = store.live_fleet_agents()
+                boards = {row.board or row.project_id for row in rows if row.task_id}
+                if task_id:
+                    with contextlib.suppress(Exception):
+                        if (task := store.get_task(task_id)) is not None:
+                            boards.add(task.project_id)
+                for board in boards:
+                    tasks.extend(store.team_tasks(board))
+        except Exception:  # a store that cannot be read costs the balance, never the launch
+            rows, tasks = [], []
+    critical = critical_tasks(tasks)
+    live: dict[int, dict[Tier, int]] = {}
+    for row in rows:
+        if row.account_slot is None:
+            continue
+        tier = agent_tier(row.role, critical=row.task_id in critical)
+        counts = live.setdefault(row.account_slot, {})
+        counts[tier] = counts.get(tier, 0) + 1
+    try:
+        sessions = _read_statusline_records(now or _now())
+    except Exception:
+        sessions = []
+    human = None
+    # The person's own sessions are what the status line reports (Claude Code's), so only an
+    # agent that keeps a reserve for them has one (``reserves_for_person``); another agent's
+    # accounts are all the fleet's.
+    with contextlib.suppress(Exception):
+        own = [account for account in accounts if core.kind(account.agent).reserves_for_person]
+        if own:
+            human = human_slot(sessions, own, preferred_account(own))
+    return Balance(
+        tier=agent_tier(role, critical=task_id is not None and task_id in critical),
+        live=live,
+        human=human,
+    )
+
+
+def _week_of(reading: ClaudeUsage, family: str | None) -> tuple[float, datetime | None]:
+    """The percent of its week ``reading`` says is USED, and when the week resets: its week
+    window's, ``family``'s week when fuller; for an agent of other windows, the one that limits."""
+    week = reading.window(WEEK_WINDOW)
+    used = week.used_percent if week is not None else None
+    resets = week.resets_at if week is not None else None
+    if used is None:
+        limiting = reading.limiting
+        used = headroom_percent(reading) or 0.0
+        resets = limiting.resets_at if limiting is not None else None
+    own = reading.family_week_percent.get(family) if family is not None else None
+    if family is not None and own is not None and own > used:
+        used = own
+        resets = reading.family_week_resets_at.get(family) or resets
+    return used, resets
+
+
+def seat_of(
+    account: ClaudeAccount,
+    reading: ClaudeUsage,
+    *,
+    balance: Balance,
+    family: str | None = None,
+    plan: str | None = None,
+) -> Seat:
+    """``account``'s :class:`Seat`, from its ``reading``, its ``plan`` (``accounts list``'s
+    words) and ``balance``."""
+    used, resets = _week_of(reading, family)
+    return Seat(
+        slot=account.slot,
+        plan_units=plan_units(plan, account.agent),
+        week_used=used,
+        week_resets_at=resets,
+        session_used=reading.session_percent,
+        live=balance.live.get(account.slot, {}),
+        human=account.slot == balance.human,
+    )
+
+
+def _plan_of(account: ClaudeAccount) -> str | None:
+    """The plan ``accounts list`` shows for ``account``, or ``None`` when it cannot be read."""
+    try:
+        return core.kind(account.agent).subscription(account)
+    except Exception:
+        return None
+
+
+def account_shares(
+    accounts: Sequence[ClaudeAccount],
+    readings: Mapping[int, ClaudeUsage],
+    *,
+    balance: Balance,
+    switch_at: int,
+    plans: Mapping[int, str | None] | None = None,
+) -> dict[int, tuple[int, float | None]]:
+    """Slot → (its live fleet agents, its fair share of them) for each of ``accounts``, one
+    agent's, as ``accounts usage`` shows them: the figures :func:`balanced_pick` weighs. The
+    share is ``None`` for an account no launch could take now (disabled, unread, or over
+    ``switch_at``), and the shares are of the live agents on the others. Display only.
+    ``plans`` is slot → plan (``accounts list``'s words), read when not given."""
+    seats = []
+    for account in accounts:
+        reading = readings.get(account.slot)
+        used = headroom_percent(reading) if reading is not None else None
+        if account.disabled or reading is None or used is None or used >= switch_at:
+            continue
+        plan = plans.get(account.slot) if plans is not None else _plan_of(account)
+        seats.append(seat_of(account, reading, balance=balance, plan=plan))
+    shares = fair_shares(seats_units(seats), sum(seat.agents for seat in seats))
+    return {
+        account.slot: (
+            sum(balance.live.get(account.slot, {}).values()),
+            shares.get(account.slot),
+        )
+        for account in accounts
+    }
+
+
+def usage_shares(
+    accounts: Sequence[ClaudeAccount],
+    readings: Mapping[int, ClaudeUsage],
+    plans: Mapping[int, str | None] | None = None,
+) -> dict[int, tuple[int, float | None]]:
+    """:func:`account_shares` for ``accounts`` of every agent, each agent's apart (a Claude Code
+    agent never runs on a Codex account), with what :func:`balance_for` reads now."""
+    switch_at = accounts_settings().switch_at
+    found: dict[int, tuple[int, float | None]] = {}
+    for agent in dict.fromkeys(account.agent for account in accounts):
+        own = [account for account in accounts if account.agent == agent]
+        balance = balance_for(None, accounts=own)
+        found.update(
+            account_shares(own, readings, balance=balance, switch_at=switch_at, plans=plans)
+        )
+    return found
+
+
 @dataclass(frozen=True)
 class AgentPick:
     """Which agent, and which of its accounts, the one priority order puts first.
@@ -4699,6 +5199,9 @@ class AgentPick:
     agent: str | None
     account: ClaudeAccount | None
     notes: tuple[str, ...] = ()
+    readings: Mapping[int, ClaudeUsage] = field(default_factory=dict)
+    """The readings the agent rung decided by (slot → reading), which :func:`choose`'s
+    balanced pick weighs again rather than read a second time."""
 
 
 def usable_accounts(
@@ -4870,13 +5373,7 @@ def agent_pick(
         return AgentPick(first.agent, None, (*notes, f"{core.label(first)} is first in the order"))
     if not decision.measured:
         return AgentPick(picked.agent, None, tuple(notes))
-    return AgentPick(picked.agent, picked, tuple(notes))
-
-
-def _marked(account: ClaudeAccount, family: str | None) -> bool:
-    """Whether a limit mark still in force shuts ``account`` to an agent of ``family``: the
-    launch's agent rung picked before the model was known, so a family's mark is read here."""
-    return any(mark.blocks(family) for mark in limit_marks().get(account.slot, []))
+    return AgentPick(picked.agent, picked, tuple(notes), decision.readings)
 
 
 def choose_for_handover(
@@ -4890,6 +5387,7 @@ def choose_for_handover(
     agent: str = AGENT,
     family: str | None = None,
     max_age: float | None = None,
+    task_id: str | None = None,
 ) -> AccountChoice:
     """The target of a hand-over: HEADROOM FIRST; the ladder only when nothing can be measured.
 
@@ -4924,6 +5422,10 @@ def choose_for_handover(
     ``max_age`` reads the candidates through the cache instead, that deep: the move
     ``[accounts] before_limit`` makes (F2 of #400), of an agent that hit no limit, whose
     hook read them a moment ago (:func:`headroom_choice`).
+
+    Among the accounts under the line, the target is the balanced pick's (#35,
+    :func:`balanced_pick`), the one a launch of ``role`` (working ``task_id``) would take:
+    a limit's switch, a switch by hand and asq's *Move* offer all name that account.
     """
     skip = frozenset(exclude)  # read three times below: never an iterator
     if explicit is not None:
@@ -4934,8 +5436,9 @@ def choose_for_handover(
     assert accounts is not None  # listed, or there is a note
     notes: list[str] = []
     settings = accounts_settings()
-    picked, more = headroom_choice(
-        [a for a in accounts if a.agent == agent],
+    own = [a for a in accounts if a.agent == agent]
+    decision = headroom_decision(
+        own,
         switch_at=settings.switch_at,
         exclude=skip,
         fetch=fetch,
@@ -4943,10 +5446,11 @@ def choose_for_handover(
         family=family,
         prefer=settings.prefer,
         max_age=max_age,
+        balance=balance_for(role, task_id, accounts=own),
     )
-    notes.extend(more)
-    if picked is not None:
-        return AccountChoice(picked, "headroom", notes)
+    notes.extend(decision.notes)
+    if decision.account is not None:
+        return AccountChoice(decision.account, "headroom", notes, why=decision.why)
     if automatic:
         return AccountChoice(None, None, notes)
     fallback = choose(

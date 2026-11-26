@@ -28,6 +28,7 @@ from textual.widgets import (
     Static,
     Switch,
     TabbedContent,
+    TabPane,
 )
 from textual.widgets._tooltip import Tooltip
 
@@ -43,6 +44,7 @@ from aisquare.cli.ui.views.app_settings import (
     FALLBACK_AGENT_TIP,
     NOT_ASKING_LINE,
     ON_LIMIT_MODES,
+    PICK_MODES,
     PREFERENCES_ADVANCED,
     PREFERENCES_TAB,
     REMOTE_TAB,
@@ -846,6 +848,32 @@ def test_role_names_modes_and_bindings_written_by_hand_are_shown_as_text_not_mar
     assert saved.team.profiles["a[/b]c"].account == "w[/z]"
 
 
+def test_the_accounts_choices_say_most_room_left_not_headroom() -> None:
+    """Q15 (the UX audit): plain words. *Launches pick* and *on a usage limit* said "the
+    account with headroom"; they say "the account with the most room left", and the saved
+    values stay what they were (``headroom``, ``switch``)."""
+    config = load_config()
+    config.accounts.pick = "headroom"
+    config.accounts.on_limit = "switch"
+    save_config(config)
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> list[str]:
+        await settle(pilot)
+        return [
+            str(host.query_one(f"{wid} SelectCurrent #label", Static).render())
+            for wid in ("#accounts-pick", "#accounts-on-limit")
+        ]
+
+    shown = drive(scenario)
+    assert shown == [
+        "the account with the most room left",
+        "switch to the account with the most room left",
+    ]
+    labels = [label for label, _value in (*PICK_MODES, *ON_LIMIT_MODES)]
+    assert not [label for label in labels if "headroom" in label], labels
+    assert [value for _label, value in PICK_MODES] == ["default", "headroom"], "values kept"
+
+
 def test_the_usage_limit_choices_name_no_agent() -> None:
     """SCOPE #113, 0.8.1 item 19: *wait* read "Claude Code continues by itself", which a
     Codex agent does not (it waits for its next prompt). The choice is every agent's."""
@@ -1335,6 +1363,7 @@ def test_the_form_opens_on_agent_settings_beside_preferences_display_and_remote(
                 str(tabs.get_tab(pane).label)
                 for pane in (AGENT_TAB, PREFERENCES_TAB, DISPLAY_TAB, REMOTE_TAB)
             ],
+            "order": [pane.id for pane in tabs.query(TabPane)],
             "active": tabs.active,
             "agent fields": all(
                 host.query_one(f"#{AGENT_TAB}").query(wid)
@@ -1363,6 +1392,7 @@ def test_the_form_opens_on_agent_settings_beside_preferences_display_and_remote(
 
     seen = drive(scenario)
     assert seen["labels"] == ["Agent settings", "User preferences", "Display", "Remote"]
+    assert seen["order"] == [AGENT_TAB, PREFERENCES_TAB, DISPLAY_TAB, REMOTE_TAB]
     assert seen["active"] == AGENT_TAB
     assert seen["agent fields"] is True
     assert seen["in display"] is True
@@ -1610,10 +1640,10 @@ def test_a_save_made_elsewhere_moves_what_it_changed_and_no_other() -> None:
 #: Per tab, what shows as it opens (the owner's bare minimum, #41) and what its *Advanced*
 #: folds — the list posted to the board before the fold was built.
 IN_VIEW = {
-    AGENT_TAB: ("#captain-toggle", "#accounts-pick", "#accounts-on-limit"),
+    AGENT_TAB: ("#accounts-pick", "#accounts-on-limit", f"#{AGENT_ADVANCED}"),
     PREFERENCES_TAB: ("#updates-check", "#updates-check-about"),
     DISPLAY_TAB: (*(f"#{wid}" for wid in DISPLAY_CHOICES), "#ui-always-show-path-about"),
-    REMOTE_TAB: ("#settings-remote-title",),
+    REMOTE_TAB: ("#settings-remote-title", "#settings-remote-state", "#settings-remote-open"),
 }
 FOLDED = {
     AGENT_TAB: (
@@ -1633,19 +1663,20 @@ FOLDED = {
     ),
     PREFERENCES_TAB: (f"#{NOT_ASKING_LINE}", f"#{ASK_AGAIN_BUTTON}", "#preferences-from-a-shell"),
     DISPLAY_TAB: (),
-    REMOTE_TAB: ("#settings-remote-regen", "#settings-remote-write", "#settings-remote-auto-off"),
+    REMOTE_TAB: (),
 }
 ADVANCED = {
     AGENT_TAB: f"#{AGENT_ADVANCED}",
     PREFERENCES_TAB: f"#{PREFERENCES_ADVANCED}",
-    REMOTE_TAB: "#settings-remote-advanced",
 }
+TABS_IN_ORDER = (AGENT_TAB, PREFERENCES_TAB, DISPLAY_TAB, REMOTE_TAB)
 
 
 def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> None:
     """The fold (#41): what a new user needs shows, the rest is one click on *Advanced* away;
-    the Captain box tops *Agent settings*; Save, Reload and Reset all hide on *Remote*, whose
-    controls act at once, and come back on the form's tabs."""
+    the Captain box is the last of *Agent settings*, under its *Advanced*, not atop it (Q18);
+    Save, Reload and Reset all hide on *Remote*, whose controls act at once, and come back on
+    the form's tabs."""
 
     def area(host: AppHost, wid: str) -> int:
         return host.query_one(wid).region.area
@@ -1653,15 +1684,15 @@ def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> 
     async def scenario(pilot: Pilot[None], host: AppHost) -> dict[str, object]:
         tabs = host.query_one("#app-settings-tabs", TabbedContent)
         seen: dict[str, object] = {
-            "first": host.query_one("#agent-settings").children[0].id,
+            "agent tab": [child.id for child in host.query_one("#agent-settings").children],
         }
-        for tab in (AGENT_TAB, PREFERENCES_TAB, DISPLAY_TAB, REMOTE_TAB):
+        for tab in TABS_IN_ORDER:
             tabs.active = tab
             await settle(pilot)
             seen[f"{tab} in view"] = [wid for wid in IN_VIEW[tab] if area(host, wid) == 0]
             seen[f"{tab} folded"] = [wid for wid in FOLDED[tab] if area(host, wid) > 0]
             seen[f"{tab} buttons"] = area(host, "#save-settings") > 0
-            if tab not in ADVANCED:  # Display has no fold: one line a switch, all in view
+            if tab not in ADVANCED:  # Display and Remote have no fold: all in view
                 seen[f"{tab} unfolded"] = []
                 continue
             host.query_one(ADVANCED[tab], Collapsible).collapsed = False
@@ -1679,8 +1710,10 @@ def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> 
         return seen
 
     seen = drive(scenario)
-    assert seen["first"] == "settings-captain"
-    for tab in (AGENT_TAB, PREFERENCES_TAB, DISPLAY_TAB, REMOTE_TAB):
+    agent_tab = cast(list[str], seen["agent tab"])
+    assert agent_tab[-1] == "settings-captain", agent_tab
+    assert agent_tab.index(AGENT_ADVANCED) < agent_tab.index("settings-captain"), "under it"
+    for tab in TABS_IN_ORDER:
         assert seen[f"{tab} in view"] == [], f"{tab}: shown as it opens"
         assert seen[f"{tab} folded"] == [], f"{tab}: folded until Advanced is opened"
         assert seen[f"{tab} unfolded"] == [], f"{tab}: shown once Advanced is opened"

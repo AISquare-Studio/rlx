@@ -6,9 +6,10 @@ User preferences switch was off screen behind a two-row viewport, where main's s
 scroll had shown four whole role rows. The buttons are one compact line and the note one
 line now, and the tab body takes the rest.
 
-Folded (#41), the Agent settings tab opens on the Captain box and the first of how
-launches pick an account, whole, with no scrolling; its *Advanced*, opened and scrolled to
-the roles, still shows as many whole role rows as main's single scroll did.
+Folded (#41), the Agent settings tab opens on how launches pick an account and what a usage
+limit does, whole, with no scrolling; its *Advanced*, opened and scrolled to the roles,
+still shows as many whole role rows as main's single scroll did. The Captain box, which
+topped it, is its last section (Q18), whole once scrolled to, as the hub's *Captain* does.
 
 And every row ends inside its tab (#44, m4): a label of 24 columns and a field of 26 ran
 to column 82 of a tab that ends at 79, so each select's arrow was cut off, and a role's
@@ -29,6 +30,7 @@ from aisquare.cli.ui.sidebar import AppSettingsSelected
 from aisquare.cli.ui.views.app_settings import (
     AGENT_ADVANCED,
     AGENT_TAB,
+    CAPTAIN,
     DISPLAY_CHOICES,
     DISPLAY_TAB,
     PREFERENCES_ADVANCED,
@@ -66,10 +68,13 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
         seen: dict[str, object] = {
             # Rows, as main's measure is; how far right each reaches is the test below.
             "in view": [
-                _whole(app.query_one(wid), agent.region)
-                for wid in ("#captain-toggle", "#captain-toggle-about")
-            ]
-            + [_whole(app.query_one("#accounts-pick").parent, agent.region)],  # type: ignore[arg-type]
+                _whole(app.query_one(wid).parent, agent.region)  # type: ignore[arg-type]
+                for wid in ("#accounts-pick", "#accounts-on-limit")
+            ],
+            "advanced": _whole(
+                app.query_one(f"#{AGENT_ADVANCED}", Collapsible).query_one("CollapsibleTitle"),
+                agent.region,
+            ),
             "buttons": [
                 _whole(app.query_one(wid, Button), view.region)
                 for wid in ("#save-settings", "#reload-settings", "#reset-settings")
@@ -82,6 +87,17 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
         await settle(app)
         seen["agent rows"] = sum(_whole(row, agent.region) for row in agent.query(".row"))
         tabs = app.query_one("#app-settings-tabs", TabbedContent)
+        # The Captain box, the tab's last section (Q18): whole once the hub's link has scrolled
+        # to it, from another tab, as the link's message lands (``AppSettingsSelected``).
+        tabs.active = REMOTE_TAB
+        await settle(app)
+        app.post_message(AppSettingsSelected(CAPTAIN))
+        await settle(app)
+        seen["captain tab"] = tabs.active
+        seen["captain"] = [
+            _whole(app.query_one(wid), agent.region)
+            for wid in ("#captain-toggle", "#captain-toggle-about")
+        ]
         # Display (R17): every switch one line, all of them whole as the tab opens, and its
         # project-directory switch saved by the click that ticks it.
         tabs.active = DISPLAY_TAB
@@ -115,7 +131,10 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
         return seen
 
     seen = drive(go, size=(80, 24))
-    assert seen["in view"] == [True, True, True], "the Captain box, its line, launches pick"
+    assert seen["in view"] == [True, True], "launches pick and on a usage limit, whole"
+    assert seen["advanced"] is True, "Agent settings' Advanced, on screen as the tab opens"
+    assert seen["captain tab"] == AGENT_TAB
+    assert seen["captain"] == [True, True], "the Captain box and its line, whole once shown"
     assert isinstance(seen["agent rows"], int)
     assert seen["agent rows"] >= MAIN_WHOLE_ROWS, seen
     assert seen["buttons"] == [True, True, True], "Save, Reload and Reset all, whole"

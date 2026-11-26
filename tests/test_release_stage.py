@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
+from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -364,6 +366,18 @@ BROWSER_OPTION_ROWS = [
 ]
 
 
+#: typer 0.29 draws each option's type (``<bool>``) in a column of its own, which moves the
+#: page's columns and where its help wraps. The head's page was drawn by 0.28: under 0.29 it
+#: is compared word for word, the types and the box aside.
+TYPER_DRAWS_TYPES = tuple(int(part) for part in re.findall(r"\d+", version("typer"))[:2]) >= (0, 29)
+
+
+def _words(lines: list[str]) -> list[str]:
+    """The page's words in reading order, without typer 0.29's ``<type>`` labels or the box."""
+    text = re.sub(r"<[A-Za-z_]+>", " ", " ".join(lines))
+    return text.translate(str.maketrans("", "", "─│╭╮╰╯")).split()
+
+
 @pytest.mark.usefixtures("help_console")
 def test_the_accounts_add_help_page_reads_as_the_head_but_for_codexs_browser() -> None:
     result = CliRunner().invoke(app, ["accounts", "add", "--help"])
@@ -372,11 +386,16 @@ def test_the_accounts_add_help_page_reads_as_the_head_but_for_codexs_browser() -
     # line ends in its border, so it is compared whole), and Codex's --browser after --agent.
     head = [line.rstrip() for line in HEAD_ACCOUNTS_ADD_HELP.rstrip("\n").splitlines()]
     now = [line.rstrip() for line in result.output.rstrip("\n").splitlines()]
-    at = next(i for i, line in enumerate(now) if "--browser" in line)
-    assert now[at : at + len(BROWSER_OPTION_ROWS)] == BROWSER_OPTION_ROWS, result.output
-    assert "--agent  " in now[at - 1], "--browser follows --agent"
-    del now[at : at + len(BROWSER_OPTION_ROWS)]
-    assert now == head, result.output  # --agent's row too: no mark (0.10.0 drew one)
+    if TYPER_DRAWS_TYPES:
+        agent = next(i for i, line in enumerate(head) if "--agent  " in line)
+        expected = [*head[: agent + 1], *BROWSER_OPTION_ROWS, *head[agent + 1 :]]
+        assert _words(now) == _words(expected), result.output
+    else:
+        at = next(i for i, line in enumerate(now) if "--browser" in line)
+        assert now[at : at + len(BROWSER_OPTION_ROWS)] == BROWSER_OPTION_ROWS, result.output
+        assert "--agent  " in now[at - 1], "--browser follows --agent"
+        del now[at : at + len(BROWSER_OPTION_ROWS)]
+        assert now == head, result.output  # --agent's row too: no mark (0.10.0 drew one)
     root = CliRunner().invoke(app, ["--help"])
     assert root.exit_code == 0 and MARK not in root.output
 

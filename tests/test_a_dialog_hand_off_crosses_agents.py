@@ -1,4 +1,4 @@
-"""The Spawn dialog's *Hand off from* onto another agent, run end to end (review r22 of #113,
+"""The Spawn dialog's *Continue from* onto another agent, run end to end (review r22 of #113,
 #15's f5), and the pins its mutation run asked for.
 
 The dialog's *Take over* is ``fleet.hand_off(mode="take_over", to_agent=)`` over

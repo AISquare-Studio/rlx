@@ -6151,8 +6151,8 @@ def test_stop_types_into_an_agent_this_install_does_not_know_what_its_dialog_say
 
     [(pane, how, typed), *_] = tmux.typed
     assert (pane, how) == (agent.pane_id, "literal"), tmux.typed
-    assert f"{typed}, then the window is killed after" in question, question
-    assert f"Force skips the {typed}." in question, question
+    assert f"asked to quit (rlx types {typed}) and closed" in question, question
+    assert "Force closes it at once." in question, question
 
 
 def test_stop_types_the_exit_and_its_enter_apart(
@@ -18287,9 +18287,8 @@ def test_a_switch_picks_by_headroom_before_the_binding_and_the_automatic_one_ref
     receipt = fleet_service.switch(project, agent.label)
 
     assert receipt.to_slot == 4  # headroom, not the binding
-    assert any(
-        "headroom:" in note and "account 4 is first under the 85%-used line" in note
-        for note in receipt.notes
+    assert any(  # the balanced pick's reason (#35): the only account under the line
+        "headroom:" in note and " — account 4 (fair share 1/1 · " in note for note in receipt.notes
     )
     assert "--to" not in _command(tmux) and _flag(_command(tmux), "--account") == "4"
 
@@ -21631,7 +21630,7 @@ def test_a_restart_given_a_permission_mode_changes_the_mode_alone_and_records_it
     assert _flag(_command(tmux), "--permission-mode") == "acceptEdits", "the role says auto"
     assert (
         "launched as recorded — binary, permission mode and arguments come from its launch "
-        "record, not from today's config (#144)" in again.notes
+        "record, not from today's config" in again.notes
     )
 
 
@@ -21727,7 +21726,7 @@ def test_a_restart_whose_recorded_binary_left_the_path_resolves_it_again_and_say
     # Not beside it "the binary is the recorded one" (review of #169, F7): it was not.
     assert (
         "launched as recorded — permission mode and arguments come from its launch record, "
-        "not from today's config (#144)" in receipt.notes
+        "not from today's config" in receipt.notes
     ), receipt.notes
     assert receipt.started.launch_spec is not None
     assert receipt.started.launch_spec.binary == "claude", "the spec records what ran"
@@ -23291,7 +23290,9 @@ def test_a_fork_on_this_shells_account_runs_where_a_plain_spawn_runs(
     """runner2-1's reopen of #234: Account edited to (this shell's) was dropped, because the
     dialog sent None, and None keeps the teammate's own slot. THIS_SHELL_ACCOUNT says it
     explicitly: no --account, the ladder a plain spawn runs, never the teammate's slot."""
-    _two_slots_with_usage(monkeypatch, work=10, personal=10)
+    # Slot 3's five hours busier: the balanced pick (#35) sends a plain spawn to slot 2
+    # whatever the live agents, rank 1's reserve for the person included.
+    _two_slots_with_usage(monkeypatch, work=10, personal=75)
     # Slot 3: since 0.8.1 a plain spawn here lands on slot 2, the first one signed in.
     source = fleet_service.spawn(project, "coder", worktree=False, account="3").agent
     plain = fleet_service.spawn(project, "coder", worktree=False).agent
@@ -23310,7 +23311,9 @@ def test_a_take_over_on_this_shells_account_runs_where_a_plain_spawn_runs(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same through Take over, which is the teammate's restart."""
-    _two_slots_with_usage(monkeypatch, work=10, personal=10)
+    # Slot 3's five hours busier: the balanced pick (#35) sends a plain spawn to slot 2
+    # whatever the live agents, rank 1's reserve for the person included.
+    _two_slots_with_usage(monkeypatch, work=10, personal=75)
     # Slot 3: since 0.8.1 a plain spawn here lands on slot 2, the first one signed in.
     source = fleet_service.spawn(project, "coder", worktree=False, account="3").agent
     plain = fleet_service.spawn(project, "coder", worktree=False).agent

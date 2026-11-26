@@ -50,7 +50,7 @@ from aisquare.services.captain import actions
 from aisquare.services.captain import state as captain_state
 from tests import test_ui_shell as ui_suite
 from tests.test_captain_sidebar import until
-from tests.test_ui_shell import Script, drive, fleet_app, seed, status
+from tests.test_ui_shell import Script, drive, fleet_app, from_welcome, seed, status
 from tests.ui_workers import settle_page
 
 # The UI suite's fixtures, bound here so pytest finds them for this module's tests
@@ -216,7 +216,7 @@ def test_open_spawn_with_no_project_takes_the_one_selected_in_the_sidebar(
     fleet(tmp_path, script)
 
     async def body(pilot: Pilot[None]) -> list[Any]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         seen: list[Any] = []
         seen.append(await send(pilot, ui_path, "open_spawn"))  # nothing selected yet
         seen.append(await send(pilot, ui_path, "select_agent", "captain"))
@@ -512,8 +512,9 @@ def test_focus_project_selects_it_and_hands_the_keyboard_to_its_card(
         app = fleet_app(pilot)
         app.sidebar.focus()
         await pilot.pause()
-        for _ in range(2):  # the arrows leave the highlight on a row of their own: the captain's
-            await pilot.press("down")
+        # The highlight on a row of its own, the captain's (start opens home since L1, whose
+        # row the arrows would go on from).
+        app.sidebar.select(f"agent:{home.id.replace('prj_', 'agt_')}_captain")
         app.set_focus(None)
         await pilot.pause()
         before = (app.focused, cursor_keys(app))

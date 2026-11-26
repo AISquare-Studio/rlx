@@ -11,11 +11,13 @@ docs/plans/claude-accounts.md. Two halves, one page:
 - **Coding agent accounts** — ONE table (:data:`LAYOUT`) of every agent's slots, in the
   one priority order a launch that names no agent picks its agent from (owner, PR #113):
   one aligned row per slot that ``services.claude_accounts`` knows, in priority order:
-  *↑*/*↓*, the slot, its name behind its agent's two-letter mark, who is signed in, the
-  five-hour and seven-day windows (a bar and the percent USED, ``no 5h limit`` for a plan
-  with a week alone, or one ``!`` across the two when there is no reading, whose tooltip
-  says why and what to do) with *Log in* beside
-  them, when each window resets (the distance; the clock time on hover), then the plan.
+  *↑*/*↓*, the slot, the account behind its agent's two-letter mark (its email, or its alias
+  with the email after it), the five-hour and seven-day windows (a bar and the percent USED,
+  ``no 5h limit`` for a plan with a week alone, or ``!`` and why in words across the two
+  when there is no reading, whose tooltip says the whole of it and what to do) with *Log in*
+  beside them, when each window resets (the distance; the clock time on hover), then the
+  plan. Narrower than the whole line, the table leaves out the slot, the resets and the plan,
+  which the other cells' tooltips say, and fits a 120-column terminal.
   *Add* makes a fresh slot and opens Claude Code's own login in a tmux window
   rendered right here (a ``TerminalPane``); the view polls the slot's
   directory and, the moment Claude Code has written a login into it, records
@@ -67,7 +69,7 @@ import math
 import threading
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple
 
@@ -83,7 +85,7 @@ from textual.widgets import Button, Input, Static
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli.common import format_reset, local_time
-from aisquare.cli.ui.adopt_picker import AdoptPicker
+from aisquare.cli.ui import adopt_picker
 from aisquare.cli.ui.terminal import InPlaceField, TerminalPane
 from aisquare.cli.ui.ticks import while_running
 from aisquare.core import browser, paths
@@ -103,7 +105,6 @@ from aisquare.models import (
     UsageCause,
     UsageTrend,
 )
-from aisquare.services import adopt as adopt_service
 from aisquare.services import auth as auth_service
 from aisquare.services import claude_accounts as accounts_service
 from aisquare.services import credits as credits_service
@@ -140,10 +141,10 @@ REMOVE_WORKER = "claude-remove"
 ARRANGE_WORKER = "claude-arrange"
 RENAME_WORKER = "claude-rename"
 SESSIONS_WORKER = "machine-sessions"
-ADOPT_LIST_WORKER = "adopt-list"
-"""Reads the conversations *Adopt a conversation…* offers (``services.adopt.recent``)."""
-ADOPT_WORKER = "adopt-conversation"
-"""Adopts the one picked (``services.adopt.adopt``): a fleet spawn, so a writer."""
+ADOPT_LIST_WORKER = adopt_picker.ADOPT_LIST_WORKER
+"""Reads the conversations *Adopt a conversation…* offers: ``adopt_picker.AdoptFlow``'s."""
+ADOPT_WORKER = adopt_picker.ADOPT_WORKER
+"""Adopts the one picked, a fleet spawn, so a writer: ``adopt_picker.AdoptFlow``'s."""
 """Reads the sessions the status line reported (``statusline_sessions``): files and a store."""
 SESSIONS_WINDOW = timedelta(minutes=15)
 """How recent a session's report must be for *Sessions on this machine* (#287, 2c)."""
@@ -174,6 +175,9 @@ def machine_sessions_text(sessions: Sequence[StatuslineSession], now: datetime) 
             text.append(f" · {session.fleet_label}", style="cyan")
     return text
 
+
+_TONES = {"ok": "green", "warn": "yellow", "error": "bold red"}
+"""A notice's tone → its style; anything else is dim."""
 
 _BAR_CELLS = 5
 _WARN_AT = 50.0
@@ -430,8 +434,7 @@ class Column(NamedTuple):
 COLUMNS: tuple[Column, ...] = (
     Column("slot", "#", 2),
     Column("agent", "agent", 2),
-    Column("name", "name", 12),
-    Column("email", "signed in as", 17),
+    Column("name", "account", 24),
     Column("session", "session used", 16),
     Column("week", "week used", 10),
     Column("session-resets", "5h resets", 9),
@@ -440,15 +443,18 @@ COLUMNS: tuple[Column, ...] = (
 )
 """The table's data columns, left to right; the header and every row are cut from them.
 
+The account is named by its email (the 0.10.2 UX audit's Q1): the name's column says the
+alias the operator gave it, else the email it is signed in as, else its built-in name
+(``accounts_service.display_name``), and an aliased account's email follows its alias, dim.
+So there is no column of its own for the email: 0.10.1's ``signed in as`` said it beside a
+name that said ``account 2``.
+
 The ``agent`` cell is not a column of its own: it is the first word of the name's column
-(:func:`agent_marks`: ``✻`` and ``>_``, two cells each once padded), whose 12 cells it shares
+(:func:`agent_marks`: ``✻`` and ``>_``, two cells each once padded), whose cells it shares
 with the name, and only when the table lists the accounts of more than one agent
 (:func:`marks_shown`). So a table of one agent's accounts, a Claude-only machine's, has no
-mark and names of 12 cells, as 0.9.2's has; with both agents' the name has 9 (the mark
-takes two and a space), and one longer ends in ``…`` with the whole in its tooltip, which
-the CHANGELOG says. As a column of its own it
-took the table past the 163 cells a 200-column screen shows (the ui-tester at 200x50, r23 of
-#113); inside the name's, the line keeps the 123 cells below whatever agents it lists.
+mark; with both agents' the mark takes two cells and a space, and a name longer than the
+rest ends in ``…`` with the whole in its tooltip.
 
 Fixed widths, so a column starts at the same x on every row whatever its values:
 a value too long for its cell ends in ``…`` and never wraps (the whole text is the
@@ -456,17 +462,17 @@ cell's tooltip). The resets columns show the distance alone, ``format_reset(cloc
 a session window resets within five hours, at most ``in 4h 59m`` (9 cells), and a week's
 at most ``in 23h 59m`` (10; ``in 6d 12h`` is 9), a kept reading whose window has reset
 reads ``reset``; the whole reset, ``in 6d 12h (Tue 02:00)`` or ``reset 12m ago``, is the
-cell's tooltip (:func:`reset_tooltip`). Their headers say ``5h`` and ``wk``, as the
-status line does. The usage columns fit ``▮▮▮▮▮ 100%``, the session's also a
+cell's tooltip (:func:`reset_tooltip`), and the usage cell's. Their headers say ``5h`` and
+``wk``, as the status line does. The usage columns fit ``▮▮▮▮▮ 100%``, the session's also a
 kept reading's age beside its bar, ``▮▮▮▮▮ 100% · 59m`` (F1 of #400): a session window
 resets within five hours, and a kept reading's reset window reads ``reset``. When there
-is no reading, one ``!`` stands across the two usage cells (:data:`PROBLEM_COLUMN`), and
-its tooltip says why and what to do (:func:`problem_tooltip`): a reason cut to 16 cells
-was noise, and ``—`` read as no usage rather than as an error.
+is no reading, why stands across the two usage cells in words (:data:`PROBLEM_COLUMN`,
+:func:`problem_words`: ``! login expired``), and its tooltip says the whole reason and what
+to do (:func:`problem_tooltip`); ``—`` read as no usage rather than as an error.
 
 With the *↑*/*↓*, *Log in* and arranging buttons as wide as their labels, a whole line
-is 123 cells, the width a 160-column terminal gives the page beside the default sidebar
-(seq 4391 on the board: at 167 the week-resets column was cut and the table scrolled).
+is :data:`FULL_WIDTH` cells, which a 160-column terminal gives the page beside the default
+sidebar with room to spare. Narrower than that, the table drops to :data:`NARROW_LAYOUT`.
 """
 
 MOVE_COLUMNS: tuple[Column, ...] = (Column("up", "↑", 1), Column("down", "↓", 1))
@@ -476,11 +482,37 @@ _SESSION, _WEEK = (column for column in COLUMNS if column.key in ("session", "we
 
 PROBLEM_COLUMN = Column("problem", "", _SESSION.width + 1 + _WEEK.width)
 """The one cell a row with no usage to show has in place of its two usage cells, exactly as
-wide as the two and the cell between them: a ``!`` whose tooltip says why and the fix
-(``services.claude_accounts.usage_problem``). Not in :data:`LAYOUT`: the header keeps both."""
+wide as the two and the cell between them: ``!`` and why in words (:func:`problem_words`),
+whose tooltip says the whole reason and the fix (``services.claude_accounts.usage_problem``).
+Not in :data:`LAYOUT`: the header keeps both."""
 
 PROBLEM_MARK = "!"
-"""What a row with no usage to show reads across its usage cells: why is its tooltip."""
+"""What a row with no usage to show reads across its usage cells first, then why in words
+(:func:`problem_words`); the whole reason and the fix are its tooltip."""
+
+PROBLEM_WORDS: dict[UsageCause, str] = {
+    UsageCause.not_signed_in: "not signed in",
+    UsageCause.token_missing: "no login found",
+    UsageCause.token_expired: "login expired",
+    UsageCause.token_rejected: "login rejected",
+    UsageCause.token_refreshing: "refreshing the login",
+    UsageCause.keychain_locked: "Keychain locked",
+    UsageCause.keychain_locked_ssh: "Keychain locked (SSH)",
+    UsageCause.keychain_refused: "Keychain refused rlx",
+    UsageCause.keychain_timeout: "Keychain did not answer",
+    UsageCause.keychain_failed: "Keychain read failed",
+    UsageCause.rate_limited: "rate-limited",
+    UsageCause.unreachable: "usage server unreachable",
+    UsageCause.tls_bundle: "TLS bundle unreadable",
+    UsageCause.tls_cert: "certificate not trusted",
+    UsageCause.http_error: "usage server error",
+    UsageCause.bad_answer: "unexpected usage answer",
+    UsageCause.read_failed: "usage read failed",
+}
+"""Why a row has no usage, in the words its usage cells have room for (the 0.10.2 UX audit's
+Q19: a lone ``!`` said nothing until hovered, and a terminal over SSH or on a phone has no
+hover). Each fits :data:`PROBLEM_COLUMN` after ``! `` whole; the reason as the reading says
+it, and the fix, are the cells' tooltip (:func:`problem_tooltip`)."""
 
 NO_READING_YET = "no reading yet"
 """What a signed-in account reads across its usage cells while its agent has recorded no
@@ -512,7 +544,7 @@ again*, the same flow as a secondary action on a row that reads fine
 
 LAYOUT: tuple[Column, ...] = (
     *MOVE_COLUMNS,
-    *(column for column in COLUMNS if column.key in ("slot", "name", "email", "session", "week")),
+    *(column for column in COLUMNS if column.key in ("slot", "name", "session", "week")),
     LOGIN_COLUMN,
     *(column for column in COLUMNS if column.key.endswith("-resets")),
     *(column for column in COLUMNS if column.key == "plan"),
@@ -521,6 +553,24 @@ LAYOUT: tuple[Column, ...] = (
 the usage that says why it is there — what needs doing reads, and can be done, without
 scrolling sideways — and the plan last; then the arranging buttons (:data:`_ACTIONS`).
 At 160 columns the whole line fits, the arranging buttons too (see :data:`COLUMNS`)."""
+
+NARROW_HIDDEN: tuple[str, ...] = ("slot", "session-resets", "week-resets", "plan")
+"""The columns a narrow table leaves out (:data:`NARROW_LAYOUT`): each says again what the
+row's other cells' tooltips say — the number the name's, the resets the usage cells', the
+plan the name's."""
+
+NARROW_NAME = Column("name", "account", 22)
+"""The name's column in a narrow table: two cells short of the full one's."""
+
+NARROW_LAYOUT: tuple[Column, ...] = tuple(
+    NARROW_NAME if column.key == "name" else column
+    for column in LAYOUT
+    if column.key not in NARROW_HIDDEN
+)
+"""The line where the page is narrower than :data:`FULL_WIDTH` (the 0.10.2 UX audit's Q19:
+"the table fits at 120 columns", whose page beside the default sidebar is 83 cells): *↑*/*↓*,
+the account, its usage or why not, *Log in*, then the arranging buttons, :data:`NARROW_WIDTH`
+cells in all. Below that it scrolls sideways as one, as the full table did."""
 
 
 def agent_marks(dark: bool = True) -> dict[str, Text]:
@@ -566,7 +616,7 @@ def agent_mark(agent: str, dark: bool = True) -> Text:
     return mark
 
 
-MARKED_NAME_TITLE = "agent name"
+MARKED_NAME_TITLE = "agent account"
 """The name column's header when the rows carry their agent's mark (:func:`marks_shown`)."""
 
 
@@ -727,6 +777,52 @@ def kept_tooltip(
     return said if fix is None else f"{said}\n{fix}"
 
 
+def name_text(status: ClaudeAccountStatus) -> Text:
+    """The name's cell: ``me@example.com``, or ``work`` and the email after it, dim; a slot
+    signed in as no one by its built-in name, ``account 3`` (``accounts_service.display_name``).
+    Cyan, dim while the account is disabled."""
+    account = status.account
+    text = Text(
+        accounts_service.display_name(account, status.identity),
+        style="dim cyan" if account.disabled else "cyan",
+    )
+    email = status.identity.email if status.identity is not None else None
+    if account.alias and email:
+        text.append(f" {email}", style="dim")
+    return text
+
+
+def problem_words(
+    status: ClaudeAccountStatus, usage: ClaudeUsage | None, *, now: datetime | None = None
+) -> Text:
+    """``! login expired``: why the row has no usage, across its usage cells
+    (:data:`PROBLEM_WORDS`); a rate limit says until when, as of ``now``; another agent's
+    login it lacks is "login incomplete", as its tooltip says. A reading whose cause is not
+    one of the table's says its own reason, cut to the cells. Empty for a row that shows
+    usage."""
+    problem = accounts_service.usage_problem(status, usage)
+    if problem is None:
+        return Text()
+    cause = problem.cause
+    if cause is UsageCause.rate_limited and problem.rate_limited_until is not None:
+        until = problem.rate_limited_until
+        moment = now or accounts_service._now()
+        words = (
+            accounts_service.rate_limited_until_text(until)
+            if until > moment
+            else "rate limit ended"
+        )
+    elif cause is UsageCause.token_missing and not core.kind(status.account.agent).network_usage:
+        words = "login incomplete"
+    elif cause is not None:
+        words = PROBLEM_WORDS[cause]
+    else:
+        words = problem.reason or "usage unavailable"
+    text = Text(f"{PROBLEM_MARK} ", style="bold yellow")
+    text.append(words, style="yellow")
+    return text
+
+
 def account_cells(
     status: ClaudeAccountStatus,
     usage: ClaudeUsage | None,
@@ -734,17 +830,19 @@ def account_cells(
     now: datetime | None = None,
     dark: bool = True,
 ) -> dict[str, Text]:
-    """One slot's cells, keyed like :data:`COLUMNS`: ``2``, ``work``, ``me@…``,
-    ``▮▯▯▯▯ 12%``, ``▮▮▯▯▯ 40%``, ``in 3h 10m``, ``in 6d 12h``, ``max 5x`` (each reset's clock
-    time is its cell's tooltip, :func:`reset_tooltip`).
+    """One slot's cells, keyed like :data:`COLUMNS`: ``2``, ``work me@…``, ``▮▯▯▯▯ 12%``,
+    ``▮▮▯▯▯ 40%``, ``in 3h 10m``, ``in 6d 12h``, ``max 5x`` (each reset's clock time is its
+    cell's tooltip, :func:`reset_tooltip`).
 
-    The name is the alias when there is one (``core.label``), so the row reads the way
-    the operator named it. With no reading to show — no login, a missing, expired or
-    rejected token, why the usage cannot be read (``usage_problem``) — the session cell
-    is :data:`PROBLEM_MARK` and the week cell empty, never a reason or ``—``: the row shows
-    the mark across both (:data:`PROBLEM_COLUMN`), and :func:`problem_tooltip` says why. A
-    signed-in account its agent has recorded no reading on yet reads :data:`NO_READING_YET`
-    there instead, dim, with the same tooltip (:func:`awaits_first_reading`).
+    The name is the account's email (the 0.10.2 UX audit's Q1), or the alias the operator
+    gave it with the email after it, dim (:func:`name_text`); one with neither says its
+    built-in name. With no reading to show — no login, a missing, expired or rejected
+    token, why the usage cannot be read (``usage_problem``) — the session cell says why in
+    words (:func:`problem_words`: ``! login expired``) and the week cell is empty, never
+    ``—``: the row shows the words across both (:data:`PROBLEM_COLUMN`), and
+    :func:`problem_tooltip` says the whole reason and the fix. A signed-in account its agent
+    has recorded no reading on yet reads :data:`NO_READING_YET` there instead, dim, with the
+    same tooltip (:func:`awaits_first_reading`).
     ``usage`` is ``None`` while a reading is owed (``…``).
 
     Another agent's row (Codex's) says how old its reading is (:func:`reading_age`): it
@@ -757,9 +855,8 @@ def account_cells(
     cells = {column.key: Text() for column in COLUMNS}
     cells["slot"] = Text(str(account.slot), style="bold", justify="right")
     cells["agent"] = agent_mark(account.agent, dark)  # the theme's darkness picks its colour
-    cells["name"] = Text(status.label, style="dim cyan" if account.disabled else "cyan")
+    cells["name"] = name_text(status)
     if status.identity is not None:
-        cells["email"] = Text(status.identity.email)
         if status.subscription:
             cells["plan"] = Text(status.subscription, style="dim")
         for window in ("session", "week"):
@@ -773,7 +870,7 @@ def account_cells(
         cells["session"] = (
             Text(NO_READING_YET, style="dim")
             if awaits_first_reading(status, usage)
-            else Text(PROBLEM_MARK, style="bold yellow")
+            else problem_words(status, usage, now=now)
         )
     elif (
         not tokened
@@ -791,16 +888,22 @@ def account_cells(
 
 
 def windows_text(
-    status: ClaudeAccountStatus, usage: ClaudeUsage | None, *, now: datetime | None = None
+    status: ClaudeAccountStatus,
+    usage: ClaudeUsage | None,
+    *,
+    now: datetime | None = None,
+    layout: Sequence[Column] = LAYOUT,
 ) -> Text | None:
     """The line under a row whose reading has windows called otherwise than session and week
     (``ClaudeUsage.own_windows``: an agent of daily per-model quotas): each window a line,
-    by its name, its bar and percent USED and its reset, starting under the session column,
-    and ``limits`` beside the one that limits (``ClaudeUsage.limiting``, the figure the
-    sidebar and the info line show). ``None`` for a row the two columns show whole."""
+    by its name, its bar and percent USED and its reset, starting under the session column
+    of ``layout`` (the table's: :data:`LAYOUT`, or :data:`NARROW_LAYOUT`), and ``limits``
+    beside the one that limits (``ClaudeUsage.limiting``, the figure the sidebar and the
+    info line show). ``None`` for a row the two columns show whole."""
     if not status.signed_in or usage is None or not usage.available or not usage.own_windows:
         return None
-    indent = " " * sum(column.width + 1 for column in LAYOUT[: LAYOUT.index(_SESSION)])
+    keys = [column.key for column in layout]
+    indent = " " * sum(column.width + 1 for column in layout[: keys.index(_SESSION.key)])
     widest = max(len(window.name) for window in usage.own_windows)
     limiting = usage.limiting
     lines: list[Text] = []
@@ -977,11 +1080,17 @@ def _hooks_did_not_install(error: object, agent: str = core.AGENT) -> str:
 
 
 def _column_css() -> str:
-    """Every column's width, for the header and the rows alike: one rule per column."""
-    return "\n".join(
+    """Every column's width, for the header and the rows alike: one rule per column; and the
+    narrow table's (:data:`NARROW_LAYOUT`), the columns it leaves out and its name's width."""
+    full = [
         f"AccountsTable .col-{column.key} {{ width: {column.width}; }}"
         for column in (*LAYOUT, PROBLEM_COLUMN)
-    )
+    ]
+    narrow = [
+        *(f"AccountsTable.-narrow .col-{key} {{ display: none; }}" for key in NARROW_HIDDEN),
+        f"AccountsTable.-narrow .col-name {{ width: {NARROW_NAME.width}; }}",
+    ]
+    return "\n".join([*full, *narrow])
 
 
 _ACTIONS: tuple[tuple[str, str, int], ...] = (
@@ -994,14 +1103,29 @@ the row's buttons' ``line_pad`` to 0, as Button's own CSS pads a label by a cell
 *↑*/*↓* and *Log in* are not among them: they have columns of their own (:data:`LAYOUT`)."""
 
 
+def line_width(layout: Sequence[Column]) -> int:
+    """How many cells a line of ``layout`` takes, its arranging buttons included: each column
+    and each button with the one cell after it."""
+    return sum(column.width + 1 for column in layout) + sum(width + 1 for *_, width in _ACTIONS)
+
+
+FULL_WIDTH = line_width(LAYOUT)
+"""A whole line of :data:`LAYOUT`: the page is at least this wide from a 154-column terminal
+with the default sidebar."""
+NARROW_WIDTH = line_width(NARROW_LAYOUT)
+"""A whole line of :data:`NARROW_LAYOUT`: the 83 cells a 120-column terminal gives the page
+beside the default sidebar."""
+
+
 class AccountsTable(Vertical):
     """The accounts table, every agent's in the one priority order: a header line, then
     one :class:`AccountRow` per slot, its agent the first word of its name's column.
 
-    At 160 columns the whole table fits the page, nothing to scroll: its line is cut to the
-    123 cells the page has there (:data:`COLUMNS`). On a narrower terminal it scrolls
-    sideways as one, so the header stays over its columns and the action buttons stay
-    reachable at any width (a focused button is scrolled into view).
+    Where the page has :data:`FULL_WIDTH` cells (a 160-column terminal has) the whole table
+    shows. Narrower, it drops to :data:`NARROW_LAYOUT`, which a 120-column terminal shows
+    whole (the 0.10.2 UX audit's Q19). Narrower still it scrolls sideways as one, so the
+    header stays over its columns and the action buttons stay reachable at any width (a
+    focused button is scrolled into view).
     """
 
     DEFAULT_CSS = """
@@ -1010,6 +1134,21 @@ class AccountsTable(Vertical):
     AccountsTable .cell { height: 1; margin: 0 1 0 0; text-wrap: nowrap; text-overflow: ellipsis; }
     AccountsTable .account-actions { width: auto; height: 1; }
     """ + _column_css()
+
+    @property
+    def narrow(self) -> bool:
+        """Whether the table is laid out as :data:`NARROW_LAYOUT`."""
+        return self.has_class("-narrow")
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Lay the table out for the width it has: the whole line where it fits, else the
+        narrow one. A horizontal scrollbar changes the table's height alone, never this."""
+        narrow = event.size.width < FULL_WIDTH
+        if narrow == self.narrow:
+            return
+        self.set_class(narrow, "-narrow")
+        for row in self.query(AccountRow):
+            row.relayout()
 
 
 class AccountsHeader(Horizontal):
@@ -1247,7 +1386,7 @@ class AccountRow(Vertical, can_focus=True):
         return self.alias_field.display
 
     def open_rename(self, on_its_way: str | None = None) -> None:
-        """Open the field over the name, prefilled with it, focused.
+        """Open the field over the name, prefilled with its alias (empty with none), focused.
 
         ``on_its_way`` is the name a write still in flight is saving, and it
         wins: the frame's name predates that write, and a field reopened
@@ -1258,12 +1397,12 @@ class AccountRow(Vertical, can_focus=True):
         field = self.alias_field
         if not field.display:
             self.openings += 1
-            if on_its_way is None:
-                field.value = self.status.label
-            else:  # a blank on its way clears the name: the built-in one is what it will say
-                field.value = on_its_way.strip() or core.label(
-                    self.status.account.model_copy(update={"alias": None})
-                )
+            # The alias, or nothing to edit where there is none: the cell says the account's
+            # email, which no alias may contain ('@' reads as an email), so the field opens
+            # empty under its hint rather than offer it (the 0.10.2 UX audit's Q1). A blank on
+            # its way clears the name: none is what it will have.
+            alias = self.status.account.alias if on_its_way is None else on_its_way.strip()
+            field.value = alias or ""
             self.prefill = field.value
             self.query_one(NameCell).display = False
             self.cell("agent").display = False  # the field covers the whole name column
@@ -1342,6 +1481,17 @@ class AccountRow(Vertical, can_focus=True):
     def on_unmount(self) -> None:
         self._forget_the_wait()
 
+    @property
+    def narrow(self) -> bool:
+        """Whether the row's table is laid out as :data:`NARROW_LAYOUT`."""
+        table = next((node for node in self.ancestors if isinstance(node, AccountsTable)), None)
+        return table is not None and table.narrow
+
+    def relayout(self) -> None:
+        """The table changed its layout: draw again what depends on it (the windows' line)."""
+        if self.is_mounted:
+            self._paint()
+
     def cell(self, key: str) -> Static:
         """The cell of column ``key`` (``name`` is the label the field covers while open)."""
         if key == "name":
@@ -1356,7 +1506,7 @@ class AccountRow(Vertical, can_focus=True):
         for column in COLUMNS:
             cell = self.cell(column.key)
             cell.update(cells[column.key])
-            if column.key in ("name", "email", "session", "week"):
+            if column.key in ("name", "session", "week"):
                 # The whole value, for the cell that cut it short with an ellipsis.
                 cell.tooltip = self._cell_tooltip(column.key, cells[column.key])
             elif column.key == "agent":
@@ -1366,7 +1516,7 @@ class AccountRow(Vertical, can_focus=True):
                 window = column.key.removesuffix("-resets")
                 shown_reset = cells[column.key].plain
                 cell.tooltip = reset_tooltip(self.usage, window) if shown_reset else None
-        # No usage to show: one '!' across both usage cells, why and the fix on hover.
+        # No usage to show: why in words across both usage cells, the whole and the fix on hover.
         why = problem_tooltip(self.status, self.usage)
         problem = self.cell(PROBLEM_COLUMN.key)
         problem.update(cells["session"] if why is not None else Text())
@@ -1374,7 +1524,8 @@ class AccountRow(Vertical, can_focus=True):
         problem.display = why is not None
         for key in ("session", "week"):
             self.cell(key).display = why is None
-        windows = windows_text(self.status, self.usage)
+        layout = NARROW_LAYOUT if self.narrow else LAYOUT
+        windows = windows_text(self.status, self.usage, layout=layout)
         line = self.query_one(f"#account-windows-{self.key}", Static)
         line.update(windows or "")
         line.display = windows is not None
@@ -1394,13 +1545,22 @@ class AccountRow(Vertical, can_focus=True):
         self._offer(self.query_one(f"#account-remove-{self.key}", Button), account.managed)
 
     def _cell_tooltip(self, key: str, text: Text) -> str | None:
+        """A cell's hover: its whole value, and what the narrow table leaves out of the row
+        (:data:`NARROW_HIDDEN`): the number and the plan on the name's, each window's reset
+        on its usage cell's."""
         if key == "name":
             disabled = (
                 " (disabled: never picked automatically)" if self.status.account.disabled else ""
             )
-            return f"{text.plain}{disabled} — double-click (or Enter / F2) to rename"
+            said = f"{text.plain}{disabled} — double-click (or Enter / F2) to rename"
+            plan = f" · {self.status.subscription}" if self.status.subscription else ""
+            return f"{said}\nslot {self.ref}{plan}"
+        lines = [text.plain] if text.plain else []
+        window = key if key in ("session", "week") else None
+        reset = reset_tooltip(self.usage, window) if window is not None else None
+        if reset is not None:
+            lines.append(reset if reset.startswith("reset") else f"resets {reset}")
         if key == "session":
-            lines = [text.plain] if text.plain else []
             kept = kept_tooltip(self.usage, slot=self.slot, agent=self.status.account.agent)
             if kept is not None:
                 lines.append(kept)  # why the bar is an older reading (F1 of #400)
@@ -1409,8 +1569,7 @@ class AccountRow(Vertical, can_focus=True):
             pace = accounts_service.describe_trend(self.trend)
             if pace:
                 lines.append(pace)  # where the session window is heading (#146)
-            return "\n".join(lines) or None
-        return text.plain or None
+        return "\n".join(lines) or None
 
     @staticmethod
     def _offer(button: Button, offered: bool) -> None:
@@ -1430,6 +1589,8 @@ class AccountsView(Vertical):
     AccountsView #aisquare-code { height: auto; margin-top: 1; }
     AccountsView .actions { height: auto; margin-top: 1; }
     AccountsView .actions Button { margin: 0 1 0 0; }
+    AccountsView #aisquare-outcome { width: 1fr; height: auto; min-height: 3; }
+    AccountsView #aisquare-outcome { content-align: left middle; }
     AccountsView #accounts-table { margin-top: 1; }
     AccountsView #accounts-order { height: auto; color: $text-muted; }
     AccountsView .agent-section { height: auto; }
@@ -1457,6 +1618,8 @@ class AccountsView(Vertical):
         id: str | None = None,
     ) -> None:
         super().__init__(id=id)
+        self._adopt = adopt_picker.AdoptFlow(self, self._notice)
+        """*Adopt a conversation…*: the + menu's flow, said on this page's notice line."""
         self.escape_key = escape_key or fleet_service.settings().escape_key
         self._server = server
         self._read_session = session_reader
@@ -1512,6 +1675,7 @@ class AccountsView(Vertical):
                 yield Button("Sign in", id="aisquare-sign-in", variant="primary")
                 yield Button("Sign out", id="aisquare-sign-out")
                 yield Button("Cancel", id="aisquare-cancel", variant="warning")
+                yield Static("", id="aisquare-outcome")
             yield Static(
                 Text("Coding agent accounts", style="bold"),
                 id="accounts-title",
@@ -1781,7 +1945,7 @@ class AccountsView(Vertical):
         summary = accounts_service.fleet_headroom(
             [status.account for status in statuses], self.usage
         )
-        labels = {status.account.slot: status.label for status in statuses}
+        labels = accounts_service.display_labels(statuses)  # named as the rows name them
         sentence = accounts_service.summary_sentence(summary, labels)
         self.query_one("#fleet-summary", Static).update(Text(sentence or "", style="bold"))
 
@@ -1823,9 +1987,18 @@ class AccountsView(Vertical):
         return next((node for node in widget.ancestors if isinstance(node, AccountRow)), None)
 
     def _notice(self, text: str, tone: str = "dim") -> None:
-        style = {"ok": "green", "warn": "yellow", "error": "bold red"}.get(tone, "dim")
-        self.query_one("#accounts-notice", Static).update(Text(text, style=style))
+        self.query_one("#accounts-notice", Static).update(Text(text, style=_TONES.get(tone, "dim")))
         self.query_one("#accounts-next-row", Horizontal).display = False  # said since
+
+    def _aisquare_notice(self, text: str, tone: str = "dim") -> None:
+        """What the AISquare *Sign in* or *Sign out* came to, beside its buttons.
+
+        Not at the page's foot, where the coding agents' notices go: that was 28 rows under
+        the button, so at 80x24 a failed sign-in (a 429, a 503) changed nothing on screen
+        (the 0.10.1 release's exploratory test, 2026-11-18)."""
+        self.query_one("#aisquare-outcome", Static).update(
+            Text(text, style=_TONES.get(tone, "dim"))
+        )
 
     def show_next_step(self, step: NextStep) -> None:
         """Under the notice of a sign-in that landed: the one step after it (#286)."""
@@ -2036,7 +2209,7 @@ class AccountsView(Vertical):
         if self._cancel_sign_in is not None:
             return
         if self._env_token():
-            self._notice(
+            self._aisquare_notice(
                 f"{iam.TOKEN_ENV_VAR} is set where rlx started, so rlx is using that token: "
                 "the browser sign-in is off while it is.",
                 "warn",
@@ -2044,7 +2217,7 @@ class AccountsView(Vertical):
             return
         cancel = threading.Event()
         self._cancel_sign_in = cancel
-        self._notice("")
+        self._aisquare_notice("")
         code = self.query_one("#aisquare-code", Static)
         code.update(Text("Contacting the identity provider…", style="dim"))
         code.display = True
@@ -2094,21 +2267,21 @@ class AccountsView(Vertical):
             who = self.session.email or self.session.sub or "you"
             if self.session.unrestricted:
                 # The service warns on stderr, which Textual captures while it runs.
-                self._notice(
+                self._aisquare_notice(
                     f"✓ Signed in to AISquare as {who}, but {iam.unrestricted_warning()}", "warn"
                 )
             else:
-                self._notice(f"✓ Signed in to AISquare as {who}", "ok")
+                self._aisquare_notice(f"✓ Signed in to AISquare as {who}", "ok")
             self.post_message(AccountsChanged())
             self.refresh_credits()  # the new session's workspaces, not a minute from now
         elif state is WorkerState.ERROR:
             error = worker.error
             if isinstance(error, iam.IamError) and error.code == "cancelled":
-                self._notice("Sign-in cancelled. Nothing was stored.")
+                self._aisquare_notice("Sign-in cancelled. Nothing was stored.")
             elif isinstance(error, iam.IamError):
-                self._notice(f"✗ {error.message}", "error")
+                self._aisquare_notice(f"✗ {error.message}", "error")
             else:
-                self._notice(f"✗ sign-in failed: {type(error).__name__}: {error}", "error")
+                self._aisquare_notice(f"✗ sign-in failed: {type(error).__name__}: {error}", "error")
         self._paint_aisquare()
 
     @on(Button.Pressed, "#aisquare-sign-out")
@@ -2141,10 +2314,10 @@ class AccountsView(Vertical):
             if owed:
                 said = f"{said}; {destinations.describe_owed(owed)} — {destinations.revoke_retry()}"
                 tone = "warn"
-            self._notice(said, tone)
+            self._aisquare_notice(said, tone)
             self.post_message(AccountsChanged())
         elif state is WorkerState.ERROR:
-            self._notice(f"✗ sign-out failed: {worker.error}", "error")
+            self._aisquare_notice(f"✗ sign-out failed: {worker.error}", "error")
         self._paint_aisquare()
         self.refresh_credits()
 
@@ -2699,47 +2872,10 @@ class AccountsView(Vertical):
 
     @on(Button.Pressed, "#sessions-adopt")
     def _adopt_pressed(self, event: Button.Pressed) -> None:
-        """``fleet adopt --list`` as a picker: read off the UI thread, then shown."""
+        """``fleet adopt --list`` as a picker, then the adoption: the + menu's flow, the
+        page's notice line saying each step (``adopt_picker.AdoptFlow``)."""
         event.stop()
-        self.run_worker(
-            lambda: adopt_service.recent(),
-            name=ADOPT_LIST_WORKER,
-            group=ADOPT_LIST_WORKER,
-            exclusive=True,
-            thread=True,
-            exit_on_error=False,
-        )
-
-    def _adopt_listed(self, worker: Worker[Any], state: WorkerState) -> None:
-        if state is WorkerState.SUCCESS and isinstance(worker.result, list):
-            picker = AdoptPicker(worker.result, datetime.now(tz=UTC))
-            self.app.push_screen(picker, self._adopt_chosen)
-        elif state is WorkerState.ERROR:
-            self._notice(f"✗ the conversations could not be read: {worker.error}", "error")
-
-    def _adopt_chosen(self, session_id: str | None) -> None:
-        if session_id is None:
-            return
-        self._notice(f"adopting {session_id[:8]}…")
-        self.run_worker(
-            lambda: adopt_service.adopt(session_id),
-            name=ADOPT_WORKER,
-            group=ADOPT_WORKER,
-            exclusive=True,
-            thread=True,
-            exit_on_error=False,
-        )
-
-    def _adopt_finished(self, worker: Worker[Any], state: WorkerState) -> None:
-        if state is WorkerState.SUCCESS and isinstance(worker.result, fleet_service.SpawnReceipt):
-            agent = worker.result.agent
-            self._notice(
-                f"✓ adopted {(agent.session_id or '')[:8]} as {agent.label}: "
-                "it runs in the fleet now, on its project in the sidebar",
-                "ok",
-            )
-        elif state is WorkerState.ERROR:
-            self._notice(f"✗ {worker.error}", "error")
+        self._adopt.begin_adoption()
 
     # --- worker results -----------------------------------------------------------------------
 
@@ -2759,10 +2895,8 @@ class AccountsView(Vertical):
         elif worker.name == CREDITS_WORKER:
             if state is WorkerState.SUCCESS and isinstance(worker.result, tuple):
                 self._show_credits(*worker.result)
-        elif worker.name == ADOPT_LIST_WORKER:
-            self._adopt_listed(worker, state)
-        elif worker.name == ADOPT_WORKER:
-            self._adopt_finished(worker, state)
+        elif self._adopt.adoption_answered(worker, state):
+            pass  # the list read, or the adoption: said on the notice line
         elif worker.name == SESSIONS_WORKER:
             if state is WorkerState.SUCCESS and isinstance(worker.result, list):
                 self.query_one("#machine-sessions", Static).update(
