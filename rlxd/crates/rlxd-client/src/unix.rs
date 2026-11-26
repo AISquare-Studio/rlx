@@ -53,9 +53,56 @@ pub fn check_sticky(dir: &Path) -> io::Result<()> {
     )))
 }
 
+/// The uid of the process at the other end of the connected Unix socket `socket`: the
+/// one that listens, for a client. Read from the connection, not the path, so it is who
+/// was actually reached. `getpeereid` on macOS and the BSDs, `SO_PEERCRED` on Linux.
+pub fn peer_uid(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    let fd = socket.as_raw_fd();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` and `len` are ours and the size `len` says; the call fills them.
+        let done = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if done != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.uid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: `uid` and `gid` are ours; the call fills them.
+        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(uid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_of_ours_is_this_user() {
+        use std::os::fd::AsFd;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(a.as_fd()).unwrap(), uid());
+    }
 
     #[test]
     fn tmp_is_roots_and_sticky_and_a_folder_of_ours_is_not() {

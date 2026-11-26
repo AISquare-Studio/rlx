@@ -218,14 +218,23 @@ impl Connection {
     /// it checks that `/tmp` is root's and sticky, and that the socket and its folder are
     /// this user's and that no one else may enter the folder, else
     /// [`ConnectError::NotOurs`].
+    ///
+    /// It connects to the very path it checked, [`Home::socket`] as a path, never the
+    /// display string [`Home::endpoint`] reports, so a home whose path isn't UTF-8 is
+    /// reached too.
     pub fn open(home: &Home) -> Result<Self, ConnectError> {
         #[cfg(unix)]
-        if home.uses_short_socket() {
+        let endpoint = {
             let socket = home.socket();
-            check_tmp(&socket)?;
-            check_short_socket(&socket)?;
-        }
-        Self::from_endpoint(Path::new(&home.endpoint()))
+            if socket.parent() == Some(Home::short_socket_dir().as_path()) {
+                check_tmp(&socket)?;
+                check_short_socket(&socket)?;
+            }
+            socket
+        };
+        #[cfg(windows)]
+        let endpoint = std::path::PathBuf::from(home.pipe_name());
+        Self::from_endpoint(&endpoint)
     }
 
     /// A connection to the rlxd at `endpoint`: a socket's path on macOS and Linux, a named
@@ -235,10 +244,11 @@ impl Connection {
     /// socket (`ssh -N -L <endpoint>:<socket> host`), and the token is the host's
     /// (`rlxd here --show-token`, or its `auth.token_file` read over the session), never
     /// this home's. On macOS and Linux the endpoint must be a socket, not a link to one,
-    /// that this user owns, as ssh makes the forward's local end: else
-    /// [`ConnectError::NotOurs`], before anything is sent. Keep it in a folder only this
-    /// user may enter, so no one else can bind its path first. On Windows, the pipe's
-    /// server must run as this user, as for [`Connection::open`].
+    /// that this user owns, as ssh makes the forward's local end, and the process
+    /// listening on it must run as this user: else [`ConnectError::NotOurs`], before
+    /// anything is sent. Keep it in a folder only this user may enter, so no one else can
+    /// bind its path first. On Windows, the pipe's server must run as this user, as for
+    /// [`Connection::open`].
     pub fn open_at(endpoint: impl AsRef<Path>) -> Result<Self, ConnectError> {
         let endpoint = endpoint.as_ref();
         #[cfg(unix)]
@@ -246,8 +256,25 @@ impl Connection {
         Self::from_endpoint(endpoint)
     }
 
+    /// Connects to `endpoint`. On macOS and Linux, the process listening there must run
+    /// as this user, read from the connected socket itself (`getpeereid`, `SO_PEERCRED`),
+    /// so no swap of the path between a check and the connect gets the token.
     fn from_endpoint(endpoint: &Path) -> Result<Self, ConnectError> {
         let stream = open_stream(endpoint)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+            let peer =
+                crate::unix::peer_uid(stream.as_fd()).map_err(|source| ConnectError::Io {
+                    endpoint: endpoint.display().to_string(),
+                    source,
+                })?;
+            if peer != crate::unix::uid() {
+                return Err(ConnectError::NotOurs {
+                    endpoint: endpoint.display().to_string(),
+                });
+            }
+        }
         let writer = stream.try_clone().map_err(|source| ConnectError::Io {
             endpoint: endpoint.display().to_string(),
             source,

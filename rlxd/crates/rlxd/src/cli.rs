@@ -70,6 +70,8 @@ pub struct CallArgs {
 pub enum AskError {
     /// No rlxd runs for this home.
     NotRunning(String),
+    /// Nothing listens on `--socket`: a forward that is down, or no rlxd on the host.
+    NotListening(String),
     /// `hello` was refused; the refusal.
     Refused(Box<Reply>),
     /// Anything else, said.
@@ -629,7 +631,7 @@ pub fn connect(home: &Home, socket: Option<&Path>) -> Result<Connection, AskErro
     match socket {
         Some(socket) => Connection::open_at(socket).map_err(|error| match error {
             ConnectError::NotRunning { .. } => {
-                AskError::NotRunning(format!("no rlxd listens on {}", socket.display()))
+                AskError::NotListening(format!("no rlxd listens on {}", socket.display()))
             }
             other => AskError::Failed(other.to_string()),
         }),
@@ -650,6 +652,10 @@ fn call_error(error: CallError) -> AskError {
     AskError::Failed(error.to_string())
 }
 
+/// The hint for nothing listening on `--socket`: not this home's rlxd to start.
+const NOT_LISTENING_HINT: &str = "Check that the forward to it is up (ssh -L), and run \
+                                  `rlxd here --start` on the host it leads to.";
+
 /// Prints the envelope for `error`, with its exit code.
 fn report(error: AskError) -> ExitCode {
     match error {
@@ -658,6 +664,12 @@ fn report(error: AskError) -> ExitCode {
             codes::NOT_RUNNING,
             &message,
             Some("Start it with `rlxd serve --detach`."),
+        ),
+        AskError::NotListening(message) => out::fail_with(
+            out::NOT_RUNNING,
+            codes::NOT_RUNNING,
+            &message,
+            Some(NOT_LISTENING_HINT),
         ),
         AskError::Refused(reply) => out::print_reply(&reply),
         AskError::Failed(message) => out::fail(codes::DISCONNECTED, &message, None),
@@ -674,6 +686,12 @@ pub fn report_on_stderr(error: AskError) -> ExitCode {
             &message,
             Some("Start it with `rlxd serve --detach`."),
         ),
+        AskError::NotListening(message) => out::fail_on_stderr(
+            out::NOT_RUNNING,
+            codes::NOT_RUNNING,
+            &message,
+            Some(NOT_LISTENING_HINT),
+        ),
         AskError::Refused(reply) => out::print_reply_on_stderr(&reply),
         AskError::Failed(message) => {
             out::fail_on_stderr(out::FAILED, codes::DISCONNECTED, &message, None)
@@ -684,7 +702,9 @@ pub fn report_on_stderr(error: AskError) -> ExitCode {
 /// `error`, on stderr, for a person, with its exit code.
 fn report_to_a_person(error: AskError) -> ExitCode {
     let (message, status) = match error {
-        AskError::NotRunning(message) => (message, out::NOT_RUNNING),
+        AskError::NotRunning(message) | AskError::NotListening(message) => {
+            (message, out::NOT_RUNNING)
+        }
         AskError::Refused(reply) => {
             let message = reply.error().map_or_else(
                 || reply.line.clone(),

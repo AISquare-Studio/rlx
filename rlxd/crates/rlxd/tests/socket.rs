@@ -209,6 +209,48 @@ fn call_socket_where_nothing_listens_is_not_running() {
     assert_eq!(run.error_code(), "not_running");
     let message = text(&run.json()["error"]["message"]).to_owned();
     assert!(message.contains(&nowhere), "{message}");
+    let hint = text(&run.json()["error"]["hint"]).to_owned();
+    assert!(
+        hint.contains("rlxd here --start"),
+        "not this home's rlxd: {hint}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_home_whose_path_is_not_utf8_reaches_its_rlxd() {
+    // Linux takes any bytes in a name (APFS refuses these). Clients connect to the
+    // socket's path as bytes, not its display string, so call and stop reach the rlxd,
+    // and serve --detach sees the rlxd it started. Once in the home, once too deep.
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+
+    let below = TestHome::new();
+    let deep = [
+        b"\xff".as_slice(),
+        "d".repeat(rlxd_client::SOCKET_PATH_MAX).as_bytes(),
+    ]
+    .concat();
+    for name in [b"caf\xe9-\xff".as_slice(), deep.as_slice()] {
+        let root = below.root().join(OsStr::from_bytes(name));
+        std::fs::create_dir_all(&root).unwrap();
+        let rlxd = |args: &[&str]| {
+            let mut command = below.command(args);
+            command.env("AISQUARE_HOME", &root).stdin(Stdio::null());
+            common::run(command, None)
+        };
+        let run = rlxd(&["serve", "--detach"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        let pid = run.data()["pid"].clone();
+        let run = rlxd(&["call", "status"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        assert_eq!(run.data()["pid"], pid);
+        let run = rlxd(&["stop"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        let run = rlxd(&["status", "--json"]);
+        assert_eq!(run.code(), Some(3), "{run:?}");
+    }
 }
 
 /// A home nested too deep for its own socket (macOS and Linux; Windows has a pipe).

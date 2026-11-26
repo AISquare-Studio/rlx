@@ -326,17 +326,18 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
    dir=$(mktemp -d)   # 0700: no one else can bind the forward's path first or read the token
    here=$(ssh host '<rlxd> here --json --start --show-token')
    (umask 077 && printf '%s' "$here" | jq -r .data.auth.token > "$dir/token")
-   ssh -N -o ExitOnForwardFailure=yes \
-     -L "$dir/rlxd.sock:$(printf '%s' "$here" | jq -r .data.socket)" host &
+   ssh -f -N -o ExitOnForwardFailure=yes \
+     -L "$dir/rlxd.sock:$(printf '%s' "$here" | jq -r .data.socket)" host
    rlxd call --socket "$dir/rlxd.sock" --token-file "$dir/token" status
    rlxd events --socket "$dir/rlxd.sock" --token-file "$dir/token" --follow
    ```
 
    `<rlxd>` is rlxd's absolute path on the host ([Finding it with no
    profile](#finding-it-with-no-profile)). The forward's local socket goes in a folder
-   only you may enter, so no other local user can take its path before ssh does, and
+   only you may enter, so no other local user can take its path before ssh does.
    `ExitOnForwardFailure=yes` makes ssh exit rather than run on without the forward when
-   it can't. `--token-file` keeps the host's token out of the command line, which other
+   it can't, and with it `-f` puts ssh in the background only once the forward is up, so
+   the next command finds the socket. `--token-file` keeps the host's token out of the command line, which other
    local users can read (`ps`); `--token` works too, but shows it.
 
    `--socket` connects there instead of to the home's socket. It sends nothing of the
@@ -346,8 +347,12 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
    - `--as-app` needs `--gate-credential-file <file>` (or `--gate-credential`), where
      the test client keeps its credential for the rlxd at `--socket`: the home's
      `test-gate-credential` is never sent there, nor that rlxd's credential kept here;
-   - the socket must be a socket, not a link, that this user owns, as ssh makes it:
-     otherwise nothing is sent.
+   - the socket must be a socket, not a link, that this user owns, as ssh makes it, and
+     the process listening on it must run as this user, read from the connection
+     itself (`getpeereid`, `SO_PEERCRED`): otherwise nothing is sent. A connection to
+     the home's own socket is checked the same way;
+   - when nothing listens there, the hint is the forward and `rlxd here --start` on
+     the host, never this home's `rlxd serve`.
 
 - **sshd must allow it,** as OpenSSH's defaults do. The channel needs local forwarding
   allowed twice: `AllowStreamLocalForwarding` `yes` or `local`, and
@@ -376,8 +381,9 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
 localhost, for `~/.aisquare` and for a home too deep for its own socket. Its sshd is that
 narrowest setting, `AllowStreamLocalForwarding local`, `AllowTcpForwarding local` and
 `PermitListen none`, with no agent, X11 or tunnel forwarding, which `sshd -T` must show
-in effect. A remote (`-R`) forward of a Unix socket and of a TCP port must each be
-refused. A second sshd with `AllowTcpForwarding no` must refuse the very `-L` to a
+in effect for the job's own connection (`-C user=…,host=localhost,addr=127.0.0.1`, so a
+`Match` block counts). A remote (`-R`) forward of a Unix socket and of a TCP port must
+each be refused. A second sshd with `AllowTcpForwarding no` must refuse the very `-L` to a
 Unix socket that the first one serves, which shows the constraint above and fails if
 OpenSSH ever drops it. The client side is a home with no rlxd and no token, and the
 host's token goes in a 0600 file for `--token-file`. Through the forward:
