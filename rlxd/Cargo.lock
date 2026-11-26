@@ -685,6 +685,7 @@ dependencies = [
 name = "rlxd-client"
 version = "0.10.1"
 dependencies = [
+ "libc",
  "rlxd-proto",
  "serde_json",
  "sha2",
