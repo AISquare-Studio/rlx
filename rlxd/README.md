@@ -185,8 +185,9 @@ token reads every one.
   - a value is at most 64 KiB of JSON and 32 arrays or objects deep;
   - a home holds at most 512 settings and 8 MiB of keys and values, so
     `settings.list` always fits the 16 MiB line a client reads.
-- **The file** is `<home>/rlxd/settings.json`: 0600, compact JSON, written whole and
-  durably.
+- **The file** is `<home>/rlxd/settings.json`: 0600, even over a stale temporary file
+  left by a crash, compact JSON, written whole and durably. A change rewrites it as
+  blocking work, so no other connection waits on the disk.
   - It is read key by key. A key rlxd can't hold, such as a value nested too deep, is
     set aside alone, to a new `settings.json.unreadable-<time>`, and the rest are kept.
   - A key a newer rlxd wrote is kept as it is, and not served.

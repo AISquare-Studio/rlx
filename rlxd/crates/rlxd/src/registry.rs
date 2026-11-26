@@ -206,6 +206,9 @@ fn fresh_id(dir: &Path) -> io::Result<String> {
     }
 }
 
+/// `path`, opened to be written from empty, and 0600 on POSIX however it was before: the
+/// mode `open` sets applies only to a file it creates, so a stale one left 0644 is
+/// narrowed here, before anything is written to it.
 pub(crate) fn private_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -214,7 +217,15 @@ pub(crate) fn private_file(path: &Path) -> io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 /// Deletes `path`; a file already gone is fine.

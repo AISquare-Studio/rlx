@@ -646,3 +646,107 @@ fn a_lowering_for_one_connector_is_logged_as_one_even_with_the_floor_unchanged()
         "{line}"
     );
 }
+
+#[test]
+fn a_status_call_stays_fast_while_large_sets_write_the_file() {
+    // A home near the total cap, written by hand, so each set rewrites and fsyncs about
+    // 7 MiB of settings.
+    let home = TestHome::new();
+    let dir = Home::at(home.root()).rlxd_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let value = "x".repeat(64_000);
+    let entries: Vec<String> = (0..110)
+        .map(|n| {
+            format!(
+                r#""rlxapp.k{n}":{{"version":1,"value":"{value}","updated_at":"2026-11-26T12:00:00.000Z"}}"#
+            )
+        })
+        .collect();
+    let text = format!(
+        r#"{{"schema_version":1,"settings":{{{}}}}}"#,
+        entries.join(",")
+    );
+    std::fs::write(dir.join("settings.json"), text).unwrap();
+    home.start();
+
+    // Four writers set at once, five times each; status is asked meanwhile, on a
+    // connection of its own.
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let mut connection = connect(&home);
+            let value = value.clone();
+            std::thread::spawn(move || {
+                let mut slowest = Duration::ZERO;
+                for i in 0..5 {
+                    let params = json!({"key": format!("rlxapp.k{}", w * 5 + i), "value": value});
+                    let started = Instant::now();
+                    let reply = connection
+                        .request("settings.set", params.as_object().unwrap().clone())
+                        .unwrap();
+                    assert!(
+                        reply.is_ok(),
+                        "{}",
+                        &reply.line[..200.min(reply.line.len())]
+                    );
+                    slowest = slowest.max(started.elapsed());
+                }
+                slowest
+            })
+        })
+        .collect();
+    let mut status = connect(&home);
+    let mut slowest_status = Duration::ZERO;
+    let mut asked = 0;
+    while writers.iter().any(|w| !w.is_finished()) {
+        let started = Instant::now();
+        assert!(
+            status
+                .request("status", Default::default())
+                .unwrap()
+                .is_ok()
+        );
+        slowest_status = slowest_status.max(started.elapsed());
+        asked += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let slowest_set = writers
+        .into_iter()
+        .map(|w| w.join().unwrap())
+        .max()
+        .unwrap();
+    assert!(asked >= 1);
+    assert!(
+        slowest_status < Duration::from_millis(250),
+        "status waited {slowest_status:?} ({asked} asked) while the slowest set took \
+         {slowest_set:?}"
+    );
+}
+
+#[test]
+fn send_safety_mode_refuses_a_field_it_does_not_know_even_from_the_app() {
+    let home = paired_home("Sam MacBook");
+    for value in [
+        json!({"default": "auto", "extra": 1}),
+        json!({"default": "draft", "connectors": {}, "later": true}),
+    ] {
+        let run = set(
+            &home,
+            true,
+            json!({"key": "send_safety_mode", "value": value}),
+        );
+        assert_eq!(run.code(), Some(1), "{run:?}");
+        assert_eq!(run.error_code(), "invalid_params");
+        assert!(run.stdout.contains("no other field"), "{run:?}");
+    }
+    assert_eq!(
+        get(&home, "send_safety_mode")["version"],
+        0,
+        "nothing was set"
+    );
+    let strict = set(
+        &home,
+        true,
+        json!({"key": "send_safety_mode", "value": {"default": "draft", "connectors": {"slack": "auto"}}}),
+    );
+    assert_eq!(strict.code(), Some(0), "{strict:?}");
+}

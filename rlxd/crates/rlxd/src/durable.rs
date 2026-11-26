@@ -52,6 +52,24 @@ pub fn sibling(path: &Path, extension: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_sibling_left_0644_still_gives_a_0600_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rlxd-durable-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let stale = sibling(&path, "tmp");
+        std::fs::write(&stale, "left by a crash").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write(&path, b"{}\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_failed_write_names_the_file_it_failed_on() {
         let dir = std::env::temp_dir().join(format!("rlxd-durable-{}", std::process::id()));

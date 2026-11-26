@@ -20,7 +20,9 @@
 //!   as a warning when it lowers send safety for any connector. Lowering it needs no
 //!   confirm here: whether it should is the hub's to decide.
 //! - **Order.** A change is on disk before its reply and its event, and one key's events
-//!   come in version order.
+//!   come in version order. A change writes and fsyncs the whole file under the settings
+//!   lock, so the server runs every settings call as blocking work
+//!   (`tokio::task::block_in_place`): no other connection waits on the disk.
 //! - **Limits.** A value is at most [`MAX_VALUE`] bytes of JSON and
 //!   [`rlxd_proto::MAX_SETTING_DEPTH`] arrays or objects deep. The home holds at most
 //!   [`MAX_KEYS`] settings and [`MAX_TOTAL`] bytes of keys and values, so `settings.list`'s

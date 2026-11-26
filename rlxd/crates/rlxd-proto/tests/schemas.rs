@@ -1850,8 +1850,7 @@ fn settings_documents_validate_and_print_back_as_themselves() {
         ("send_safety_mode", json!({"default": "draft"})),
         (
             "send_safety_mode",
-            json!({"default": "standing_approval", "connectors": {"claude.ai Slack": "auto"},
-                   "later": 1}),
+            json!({"default": "standing_approval", "connectors": {"claude.ai Slack": "auto"}}),
         ),
         ("rlxapp.sidebar", json!(240)),
         ("rlxapp.flags", json!([true, "x", {"y": null}])),
@@ -1932,6 +1931,12 @@ fn settings_documents_refuse_their_wrong_shapes() {
         (
             "send_safety_mode",
             json!({"default": "draft", "connectors": ["auto"]}),
+        ),
+        // A policy is strict: a field it doesn't know is refused, not ignored.
+        ("send_safety_mode", json!({"default": "auto", "extra": 1})),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": {}, "later": true}),
         ),
         ("rlxapp.sidebar", json!(null)),
     ] {

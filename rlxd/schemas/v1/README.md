@@ -150,7 +150,8 @@ size and position, per-device notifications, caches.
     them; any other gets `not_gate`. Every change is logged, and its event names the
     device.
   - Any client may change every other key, agents included.
-- **`send_safety_mode`** is `{default, connectors?}`.
+- **`send_safety_mode`** is `{default, connectors?}`, and nothing else: it is a policy,
+  so a field rlxd doesn't know is refused rather than ignored.
   - Each mode is `draft`, `standing_approval` or `auto`, safest first, and `connectors`
     maps a connector's name to its mode.
   - A key never set means `draft`.

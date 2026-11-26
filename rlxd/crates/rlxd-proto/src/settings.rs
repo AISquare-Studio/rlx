@@ -43,7 +43,8 @@ pub mod keys {
     /// `— Ava, Sam's AI Agent`: a string of at most 512 characters.
     pub const AGENT_SIGN_OFF: &str = "agent_sign_off";
     /// How much the app lets an agent send unasked: `{default, connectors?}`, each a
-    /// [`send_safety_modes`] name, `connectors` by connector name. It is protected, and
+    /// [`send_safety_modes`] name, `connectors` by connector name. A policy, so it is
+    /// strict: a field rlxd doesn't know is refused, not ignored. It is protected, and
     /// every change is logged.
     pub const SEND_SAFETY_MODE: &str = "send_safety_mode";
 
@@ -388,8 +389,9 @@ pub fn check_value(field: &str, key: &str, value: &Value) -> Result<(), Invalid>
         },
         keys::SEND_SAFETY_MODE => check_send_safety(value).or_else(|_| {
             wrong(
-                "{default, connectors?}: each a mode, draft, standing_approval or auto, and \
-                 connectors an object from connector names to modes",
+                "{default, connectors?} and no other field: each a mode, draft, \
+                 standing_approval or auto, and connectors an object from connector names \
+                 to modes",
             )
         }),
         _ if value.is_null() => wrong("any JSON value but null"),
@@ -405,6 +407,13 @@ fn check_send_safety(value: &Value) -> Result<(), ()> {
     let Value::Object(fields) = value else {
         return Err(());
     };
+    // A policy is read whole: a field this rlxd doesn't know is refused, not ignored.
+    if fields
+        .keys()
+        .any(|field| field != "default" && field != "connectors")
+    {
+        return Err(());
+    }
     if !fields.get("default").is_some_and(mode) {
         return Err(());
     }
@@ -698,6 +707,7 @@ fn value_shapes() -> Vec<Value> {
                     },
                 },
                 "required": ["default"],
+                "additionalProperties": false,
             }),
         ),
     ];

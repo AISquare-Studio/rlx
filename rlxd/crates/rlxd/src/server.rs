@@ -474,10 +474,12 @@ impl Daemon {
         Ok(Subscription { id, cursor })
     }
 
-    /// `settings.get {key}`.
+    /// `settings.get {key}`. Every settings call runs as blocking work (`off_worker`): a
+    /// change writes and fsyncs the file under the settings lock, which a read may wait
+    /// on, and neither may hold up the connections the runtime's workers serve.
     fn settings_get(&self, params: Params) -> Result<Data, ErrorBody> {
         let params = params_of::<SettingsGetParams>(methods::SETTINGS_GET, params)?;
-        let setting = self.settings.get(&params.key).map_err(refused)?;
+        let setting = off_worker(|| self.settings.get(&params.key)).map_err(refused)?;
         printed(&setting)
     }
 
@@ -488,9 +490,7 @@ impl Daemon {
     fn settings_set(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
         let params = params_of::<SettingsSetParams>(methods::SETTINGS_SET, params)?;
         let who = format!("{} {}", role_name(session.role), session.client);
-        let setting = self
-            .settings
-            .set(params, writer(session, &who), &self.bus)
+        let setting = off_worker(|| self.settings.set(params, writer(session, &who), &self.bus))
             .map_err(refused)?;
         printed(&setting)
     }
@@ -499,20 +499,18 @@ impl Daemon {
     fn settings_delete(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
         let params = params_of::<SettingsDeleteParams>(methods::SETTINGS_DELETE, params)?;
         let who = format!("{} {}", role_name(session.role), session.client);
-        let setting = self
-            .settings
-            .delete(params, writer(session, &who), &self.bus)
-            .map_err(refused)?;
+        let setting = off_worker(|| {
+            self.settings
+                .delete(params, writer(session, &who), &self.bus)
+        })
+        .map_err(refused)?;
         printed(&setting)
     }
 
     /// `settings.list {prefix?}`.
     fn settings_list(&self, params: Params) -> Result<Data, ErrorBody> {
         let params = params_of::<SettingsListParams>(methods::SETTINGS_LIST, params)?;
-        let list = self
-            .settings
-            .list(params.prefix.as_deref())
-            .map_err(refused)?;
+        let list = off_worker(|| self.settings.list(params.prefix.as_deref())).map_err(refused)?;
         printed(&list)
     }
 
@@ -1406,6 +1404,12 @@ fn request_id(frame: &Value) -> Option<RequestId> {
 
 fn capabilities() -> Vec<String> {
     CAPABILITIES.iter().map(|&c| c.to_owned()).collect()
+}
+
+/// Runs `work`, which may block on a lock or on the disk, as blocking work: the runtime
+/// hands this worker's other tasks to another, so no other connection waits on it.
+fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(work)
 }
 
 /// Who a connection is, to the settings: app-role only while it holds the gate.
