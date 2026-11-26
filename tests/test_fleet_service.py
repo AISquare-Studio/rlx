@@ -15804,8 +15804,9 @@ def test_scheduled_manager_wakes_for_urgent_events(
 
 @pytest.mark.parametrize("producer", ["id", "alias", "watch"])
 @pytest.mark.parametrize("path", ["pane", "stop"])
+@pytest.mark.parametrize("other_policy", ["schedule", "every_write"])
 def test_scheduled_managers_isolate_urgent_wakes_on_a_shared_hub(
-    hubbed: _Hubbed, tmp_path: Path, producer: str, path: str
+    hubbed: _Hubbed, tmp_path: Path, producer: str, path: str, other_policy: str
 ) -> None:
     """The selected fleet alone receives a typed wake or a Stop continuation."""
     from aisquare.services import watch
@@ -15825,8 +15826,11 @@ def test_scheduled_managers_isolate_urgent_wakes_on_a_shared_hub(
     intended, wrong = (first.manager_sid, sid) if producer == "alias" else (sid, first.manager_sid)
     intended_pane = first.manager.pane_id if producer == "alias" else other.pane_id
     with store_session() as store:
+        wrong_project = second.id if producer == "alias" else first.fleet.id
+        store.set_project_setting(wrong_project, "manager_wake", other_policy)
         for session in (intended, wrong):
             store.touch_session(session, state="waiting" if path == "pane" else "working")
+        store.touch_session(wrong, cursor=store.latest_seq(first.hub.id))
     first.tmux.typed.clear()
     if producer == "watch":
         watch._deliver(

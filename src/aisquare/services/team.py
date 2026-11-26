@@ -620,16 +620,16 @@ def manager_wakes(
     wake, project = mode if mode is not None else manager_seat.mode(store, me)
     if wake == "blocked" or me.id in (event.actor, event.session_id):
         return False
+    meta = event.meta or {}
+    target = meta.get(manager_seat.EVENT_PROJECT)
+    if project is not None and target is not None and target != project:
+        return False
     if wake == "every_write":
         return (
             wake_class(event, me) == "wake"
             and not is_echo(store, event, me)
             and (standby is None or not held_in_standby(event))
         )
-    meta = event.meta or {}
-    target = meta.get(manager_seat.EVENT_PROJECT)
-    if target is not None and target != project:
-        return False
     if event.kind == "question" or (
         event.kind == "note" and event.session_id is None and (event.to_role or "").strip()
     ):
