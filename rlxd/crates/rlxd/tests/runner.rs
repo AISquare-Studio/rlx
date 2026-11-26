@@ -1361,6 +1361,41 @@ fn a_claude_code_killed_by_a_signal_is_said_to_be() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_the_runs_folder_wedges_nothing_and_the_signal_is_still_said() {
+    // How Claude Code ended comes from its guard over a pipe: no file of the run's folder
+    // is opened for it, so FIFOs where one might be (`<run>/1/exit`, as before) hold up
+    // nothing.
+    let home = home_with("abort", &[("FAKE_CLAUDE_ABORT_AFTER_MS", "1500")]);
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("go"), &r);
+    wait_until(&home, since, 20, "the run talks", |e| {
+        !of(e, &r, Some("run.text")).is_empty()
+    });
+    let attempt = record_path(&home, &r).with_file_name("1");
+    for name in ["exit", "status"] {
+        let made = std::process::Command::new("mkfifo")
+            .arg(attempt.join(name))
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo {name}");
+    }
+    let events = wait_until(&home, since, 20, "the run ends", |e| ended(e, &r));
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    let message = last["data"]["message"].as_str().unwrap();
+    assert!(message.contains("signal: 6"), "{message}");
+    let asked = Instant::now();
+    assert_eq!(home.rlxd(&["call", "status"]).code(), Some(0));
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
 #[test]
 fn a_result_too_large_for_run_done_still_ends_the_run_with_its_reason() {
     let home = home("huge");
@@ -1442,6 +1477,125 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
     });
     // A ends, cancelled, once its disk lets it.
     wait_until(&home, since, 30, "A ends", |e| ended(e, &a));
+}
+
+#[test]
+fn a_place_handed_to_a_run_being_cancelled_on_a_slow_disk_stalls_nothing() {
+    // Test builds only: state events of runs in "slowdisk" wait 4 s before they are made
+    // durable, and a freed place goes to the next run 1.5 s late. Both of a pool's places
+    // go to queued runs whose cancels hold their locks over the slow disk: the two
+    // launches wait for those locks as blocking work, and no tokio worker waits with them.
+    let home = home_with(
+        "slow",
+        &[
+            ("RLXD_TEST_SLOW_PERSIST", "slowdisk:4000"),
+            ("RLXD_TEST_LAUNCH_DELAY_MS", "1500"),
+        ],
+    );
+    let since = seq(&home);
+    let running = [run_id(), run_id()];
+    for r in &running {
+        start(&home, &task("take your time"), r);
+    }
+    wait_until(&home, since, 20, "both run", |e| {
+        running
+            .iter()
+            .all(|r| !of(e, r, Some("run.started")).is_empty())
+    });
+    let mut slow = task("quick");
+    slow["space"] = json!("slowdisk");
+    let queued = [run_id(), run_id()];
+    for r in &queued {
+        start(&home, &slow, r);
+    }
+    wait_until(&home, since, 20, "both wait", |e| {
+        queued
+            .iter()
+            .all(|r| !of(e, r, Some("run.queued")).is_empty())
+    });
+    let cancel = |r: &str| home.rlxd(&["call", "run.cancel", &json!({"run_id": r}).to_string()]);
+    thread::scope(|scope| {
+        // The places go to the queued runs, 1.5 s from now.
+        for r in &running {
+            scope.spawn(move || assert_eq!(cancel(r).code(), Some(0)));
+        }
+        common::eventually("the running runs end", || {
+            running
+                .iter()
+                .all(|r| call(&home, "run.get", &json!({"run_id": r}))["state"] == "failed")
+        });
+        // Their cancels take their locks over 4 s of slow disk, before the launches come.
+        let cancels: Vec<_> = queued
+            .iter()
+            .map(|r| scope.spawn(move || cancel(r)))
+            .collect();
+        thread::sleep(Duration::from_millis(2200));
+        let began = Instant::now();
+        let status = home.rlxd(&["call", "status"]);
+        assert_eq!(status.code(), Some(0), "{status:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "status waited {:?} behind the launches",
+            began.elapsed()
+        );
+        for cancelled in cancels {
+            assert_eq!(cancelled.join().unwrap().code(), Some(0));
+        }
+    });
+    let events = wait_until(&home, since, 30, "the queued runs end", |e| {
+        queued.iter().all(|r| ended(e, r))
+    });
+    for r in &queued {
+        let last = of(&events, r, None).last().copied().unwrap().clone();
+        assert_eq!(last["data"]["reason"], "cancelled", "{events:#?}");
+        assert!(
+            of(&events, r, Some("run.started")).is_empty(),
+            "no Claude Code for a cancelled run"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_run_recorded_in_another_boot_is_never_swept() {
+    // After a reboot a recorded pid and group id may be anyone's: the start sweep leaves
+    // the run's processes alone unless its record is of this boot. (macOS only: on Linux
+    // Claude Code dies with its guard by its parent-death signal.)
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    let rlxd = home.status()["pid"].as_u64().unwrap();
+    let guard = guard_of(&home, &r);
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &rlxd.to_string(), &guard.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    common::eventually("rlxd is gone", || {
+        home.rlxd(&["call", "status"]).code() == Some(3)
+    });
+    let path = record_path(&home, &r);
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["boot"] = json!("00000000-0000-0000-0000-000000000000");
+    std::fs::write(&path, record.to_string()).unwrap();
+    home.start_dev();
+    let got = call(&home, "run.get", &json!({"run_id": r}));
+    assert_eq!(
+        got["last_event"]["data"]["reason"], "engine_restarted",
+        "{got:#}"
+    );
+    let left = processes_matching(&pattern(&home, "slow"));
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", &pattern(&home, "slow")])
+        .status();
+    assert_eq!(
+        left, 1,
+        "the run's Claude Code, of \"another boot\", is left alone"
+    );
 }
 
 /// The run's record, `<home>/rlxd/runs/<r>/run.json`.

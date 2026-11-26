@@ -260,13 +260,16 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   without rlxd holding it, and a result or structured output over 1 MiB fails it
   (`output_too_large`), so a run always gets its end.
 - **The process tree.** On macOS and Linux Claude Code runs under a guard, the hidden
-  `rlxd __run-guard`: Claude Code leads a process group of its own, and the guard kills
-  that group when Claude Code exits (what it left running goes with it), when rlxd tells
-  it to (cancel, timeout), and when rlxd dies (it checks its parent every 100 ms; on Linux
-  its parent-death signal too). It kills the group only while Claude Code is unreaped,
-  so the group's id can't be another's, and it exits as Claude Code did, a signal
-  included. On Windows Claude Code is started suspended inside a Job Object with
-  `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
+  `rlxd __run-guard`, which leads a new session and process group (ids: its pid, which
+  stays held while it is unreaped); Claude Code and what it starts run in that group,
+  with no terminal. The guard kills the group when Claude Code exits (what it left
+  running goes with it), and when rlxd dies (it checks its parent every 100 ms; on Linux
+  its parent-death signal too, and Claude Code's from the guard). rlxd kills the group
+  on a cancel or a timeout, and as soon as it sees the guard exit, before it reaps it,
+  so a guard killed alone leaves nothing. The guard tells rlxd how Claude Code ended
+  (`exit 1`, `signal 6`) over an inherited pipe, for `run.failed`'s message, and never
+  re-raises the signal. On Windows Claude Code is started suspended inside a Job Object
+  with `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
   "engine_restarted"}`.
 - **The log** of each run is `<home>/rlxd/runs/<run_id>/`: `run.json`, rewritten whole and
   durably, and `events.jsonl`, each event as published. The runner numbers each run's
@@ -289,9 +292,11 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   `run_alive`, `not_resumable` (a `send_executor`) and `no_session`, also for a run that
   never reached `run.started` (cancelled while queued, failed before it started), which
   has no session to resume.
-- **After a crash or a `kill -9`,** the guard has already ended the run's process group;
-  should the guard have died with rlxd, the next rlxd ends a guard that still runs with
-  the recorded pid, start time and boot. It cuts a torn last line from the run's log,
+- **After a crash or a `kill -9`,** the guard has already ended the run's process group.
+  Should the guard have died with rlxd (`killall -9 rlxd`), the next rlxd, in the same
+  boot only, kills the guard's group if the guard still runs with the recorded pid and
+  start time, and otherwise each process left in the guard's group and session that
+  started at or after the run. It cuts a torn last line from the run's log,
   puts back a state event its record holds that the log lost, and ends the run `failed
   {reason: "engine_restarted"}`, numbered on from its log.
 - **`job_id`** is set by rlxd alone, for the scheduler (7.6). Test builds have

@@ -399,11 +399,34 @@ pub fn walk(root: &Path, steps: &[&OsStr]) -> io::Result<Result<Option<Vec<Dir>>
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
+    /// A test's own folder, removed when the test ends, passed or failed.
+    struct Temp(PathBuf);
+
+    impl std::ops::Deref for Temp {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Temp {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp(name: &str) -> Temp {
         let dir = std::env::temp_dir().join(format!("rlxd-remove-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Temp(dir)
     }
 
     #[test]

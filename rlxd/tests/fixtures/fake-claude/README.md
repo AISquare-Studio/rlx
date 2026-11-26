@@ -37,7 +37,7 @@ the same files.
 | `crash` | Says part of an answer, then exits 1 with no result |
 | `persist` | `hello`, named for the erase check: every scenario writes its session file where Claude Code does unless `--no-session-persistence` |
 | `orphan` | Starts a process of its own that would linger a minute, answers, and exits: the run's end must take that process too |
-| `abort` | Says part of an answer, then dies of `SIGABRT` (an abort), so rlxd reports the signal |
+| `abort` | Says part of an answer, waits `FAKE_CLAUDE_ABORT_AFTER_MS` (default 0), then dies of `SIGABRT` (an abort), so rlxd reports the signal |
 | `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
 

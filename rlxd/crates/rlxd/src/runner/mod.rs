@@ -280,11 +280,11 @@ impl Runner {
             // A record written in another boot: its processes are gone, and its last
             // unsynced events may be too.
             let rebooted = matches!((&record.boot, &boot), (Some(then), Some(now)) if !process::same_boot(then, now));
-            // On Linux a start time counts from boot, so another boot's can't be compared;
-            // macOS's is absolute, and needs no boot to be the same.
-            let comparable = !rebooted || !cfg!(target_os = "linux");
+            // Swept only in the boot it ran in, known to be: in another, its pid and group
+            // id may be any process's, and on Linux its start time counts from another boot.
+            let this_boot = matches!((&record.boot, &boot), (Some(then), Some(now)) if process::same_boot(then, now));
             if record.state.is_live()
-                && comparable
+                && this_boot
                 && let Some(process) = &record.process
                 && let Some(started) = &process.started
                 && process::sweep(process.pid, started)
@@ -492,13 +492,22 @@ impl Runner {
                     ),
                 ));
             }
-            if runs.by_id.contains_key(&id) || runs.reserved.contains_key(&id) || dir.exists() {
+            if runs.by_id.contains_key(&id) || runs.reserved.contains_key(&id) {
                 return Err(refusal(
                     codes::RUN_EXISTS,
                     format!("rlxd already knows a run {id}: pick a new run_id"),
                 ));
             }
             runs.reserved.insert(id.clone(), params.space.clone());
+        }
+        // A folder rlxd didn't read at its start is a run too: the disk is looked at with
+        // the id reserved, and no lock held.
+        if blocking(|| dir.exists()) {
+            self.runs().reserved.remove(&id);
+            return Err(refusal(
+                codes::RUN_EXISTS,
+                format!("rlxd already knows a run {id}: pick a new run_id"),
+            ));
         }
         let run = Arc::new(Run {
             job_id,
@@ -1301,14 +1310,11 @@ impl Runner {
         if let Some(reason) = ending {
             return ended_early(run, reason);
         }
-        let status_path = run.dir.status(attempt);
-        let _ = std::fs::remove_file(&status_path);
         let launch = Launch {
             program: program.clone(),
             args: argv::args(params, attempt, &settings),
             cwd: space,
             env: run_env(),
-            status: status_path.clone(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -1379,7 +1385,7 @@ impl Runner {
                     return ended_early(run, reason);
                 }
                 let said = stderr.await.unwrap_or_default();
-                let how = how_it_ended(status, &status_path);
+                let how = how_it_ended(status, &tree);
                 let mut message = format!("Claude Code {how} before its result");
                 if !said.trim().is_empty() {
                     message.push_str(": ");
@@ -1656,8 +1662,16 @@ fn log_line(run: &Run, inner: &mut RunInner, run_seq: u64, r#type: &str, line: &
 }
 
 impl Run {
+    /// The run's lock. It may be held over a slow disk (a state event is fsynced under
+    /// it), so when it is taken, the wait is blocking work: no tokio worker waits on it.
     fn inner(&self) -> MutexGuard<'_, RunInner> {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+        match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                blocking(|| self.inner.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+        }
     }
 
     fn record(&self, inner: &RunInner) -> Record {
@@ -1777,13 +1791,12 @@ fn config_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// How Claude Code ended, for `run.failed`'s message: as its guard wrote it (macOS and
-/// Linux), else as the exit status of rlxd's child says.
-fn how_it_ended(status: Option<std::process::ExitStatus>, file: &std::path::Path) -> String {
+/// How Claude Code ended, for `run.failed`'s message: as its guard wrote it to its pipe
+/// (macOS and Linux), else as the exit status of rlxd's child says.
+fn how_it_ended(status: Option<std::process::ExitStatus>, tree: &process::Tree) -> String {
     #[cfg(unix)]
     {
-        let written = std::fs::read_to_string(file).ok();
-        if let Some(ended) = written.as_deref().and_then(guard::read_status) {
+        if let Some(ended) = tree.ended_how() {
             return format!("exited ({ended})");
         }
         if let Some(status) = status {
@@ -1792,7 +1805,7 @@ fn how_it_ended(status: Option<std::process::ExitStatus>, file: &std::path::Path
         }
     }
     #[cfg(not(unix))]
-    let _ = file;
+    let _ = tree;
     match status {
         Some(status) => format!("exited ({status})"),
         None => "closed its output".to_owned(),

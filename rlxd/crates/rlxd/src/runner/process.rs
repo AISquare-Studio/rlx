@@ -2,8 +2,8 @@
 //! whole, and so that it never outlives rlxd.
 //!
 //! - **Its own group, made before it runs.** On macOS and Linux the run runs under a
-//!   guard, `rlxd __run-guard` ([`super::guard`]), which leads a new process group:
-//!   Claude Code runs in it, and so does what Claude Code starts. On Windows Claude Code
+//!   guard, `rlxd __run-guard` ([`super::guard`]), which leads a new session and so a new
+//!   process group: Claude Code runs in it, and so does what Claude Code starts. On Windows Claude Code
 //!   is started suspended, put in a Job Object of its own, and only then let run, so
 //!   nothing of it runs outside the job.
 //! - **Killing the tree.** A cancel or a timeout kills the whole group (`SIGKILL`), or
@@ -22,10 +22,11 @@
 //!     thread that started the process exits, not the process, so every run is started
 //!     from one thread that lives as long as rlxd ([`Spawner`]).
 //!   - When rlxd and the guard die together (`killall -9 rlxd` kills both, since the
-//!     guard is an rlxd), rlxd's next start sweeps the run's group ([`sweep`]) by the
-//!     recorded guard pid and start time: the whole group if the guard still runs with
-//!     that start time, nothing if another process has that pid, and otherwise each
-//!     process of the group that started at or after the run.
+//!     guard is an rlxd), rlxd's next start in the same boot sweeps the run's group
+//!     ([`sweep`]) by the recorded guard pid and start time: the whole group if the guard
+//!     still runs with that start time, nothing if another process has that pid, and
+//!     otherwise each process of the guard's group and session that started at or after
+//!     the run.
 //!   - Everywhere, the run's stdin closes with rlxd, and Claude Code ends its turn and
 //!     exits on it; that is a courtesy, not what the guarantee rests on.
 
@@ -33,7 +34,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use tokio::process::{Child, Command};
@@ -45,9 +46,6 @@ pub struct Launch {
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
     pub env: Vec<(OsString, OsString)>,
-    /// Where the run's guard writes how Claude Code ended (macOS and Linux).
-    #[cfg_attr(windows, allow(dead_code))]
-    pub status: PathBuf,
 }
 
 /// A started run's process tree, to kill. The leader's [`Child`] is apart from it, so
@@ -58,12 +56,16 @@ pub struct Tree {
     pub pid: u32,
     /// When it started, as [`start_time`] says, for the sweep at rlxd's next start.
     pub started: Option<String>,
-    /// Whether rlxd has reaped its child: from then on its pid may be another process's,
-    /// so it is never signalled again ([`Tree::reap`]).
-    reaped: std::sync::Mutex<bool>,
+    /// Whether rlxd's child is reaped, by rlxd or (never meant to happen) anything else:
+    /// from then on its pid may be another process's, so it is never signalled again
+    /// ([`Tree::reap`]).
+    reaped: Arc<Mutex<bool>>,
     /// Set once the guard has exited and its group was killed, before it is reaped.
     #[cfg(unix)]
-    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exited: Arc<std::sync::atomic::AtomicBool>,
+    /// The read end of the guard's pipe for how Claude Code ended, non-blocking.
+    #[cfg(unix)]
+    status: std::os::fd::OwnedFd,
     #[cfg(windows)]
     job: std::os::windows::io::OwnedHandle,
 }
@@ -115,6 +117,36 @@ impl Tree {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// How Claude Code ended, as its guard wrote it once it had (`exit status: 1`,
+    /// `signal: 6`): `None` when the guard wrote nothing, being killed first. Read once the
+    /// guard has exited: the pipe never blocks, and holds a few bytes at most.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    pub fn ended_how(&self) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        let mut bytes = [0_u8; 64];
+        let mut len = 0;
+        while len < bytes.len() {
+            let rest = &mut bytes[len..];
+            // SAFETY: read(2) into `rest`, writable for its length, from the pipe's
+            // non-blocking read end.
+            let read = unsafe {
+                libc::read(
+                    self.status.as_raw_fd(),
+                    rest.as_mut_ptr().cast(),
+                    rest.len(),
+                )
+            };
+            match usize::try_from(read) {
+                Ok(0) => break,
+                Ok(n) => len += n,
+                Err(_) if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        super::guard::read_status(std::str::from_utf8(&bytes[..len]).ok()?)
     }
 }
 
@@ -177,20 +209,44 @@ fn command(launch: Launch) -> Command {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn spawn(launch: Launch) -> io::Result<(Child, Tree)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
     // Claude Code runs under the guard:
-    // `rlxd __run-guard --parent <rlxd> --status <file> -- <claude> <args…>`. On Linux by
+    // `rlxd __run-guard --parent <rlxd> --status-fd <fd> -- <claude> <args…>`. On Linux by
     // /proc/self/exe, which still names this rlxd after an upgrade replaced its file.
     let rlxd = if cfg!(target_os = "linux") {
         PathBuf::from("/proc/self/exe")
     } else {
         std::env::current_exe()?
     };
+    // How Claude Code ended comes back over a pipe the guard inherits, past stdio's
+    // numbers; rlxd's end never blocks.
+    let (reader, writer) = io::pipe()?;
+    let reader = OwnedFd::from(reader);
+    let writer = OwnedFd::from(writer);
+    // SAFETY: fcntl(2) F_DUPFD_CLOEXEC of an open descriptor, to one numbered 3 or more.
+    let raw = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if raw == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` was just made by F_DUPFD_CLOEXEC and is owned by nothing else.
+    let writer = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fcntl(2) F_GETFL and F_SETFL on the read end, open.
+    let nonblocking = unsafe {
+        let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+        flags != -1
+            && libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
+    };
+    if !nonblocking {
+        return Err(io::Error::last_os_error());
+    }
+    let status_fd = writer.as_raw_fd();
     let mut args: Vec<OsString> = vec![
         "__run-guard".into(),
         "--parent".into(),
         std::process::id().to_string().into(),
-        "--status".into(),
-        launch.status.into(),
+        "--status-fd".into(),
+        status_fd.to_string().into(),
         "--".into(),
         launch.program.into(),
     ];
@@ -200,19 +256,26 @@ fn spawn(launch: Launch) -> io::Result<(Child, Tree)> {
         args,
         cwd: launch.cwd,
         env: launch.env,
-        status: PathBuf::new(),
     };
     let mut command = command(launch);
-    // The guard leads the run's group; Claude Code joins it.
-    command.process_group(0);
     #[cfg(target_os = "linux")]
-    {
-        let rlxd = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
-        // SAFETY: the closure runs in the child between fork and exec, and calls only
-        // prctl(2) and getppid(2), which are async-signal-safe, and builds an io::Error
-        // from an errno without allocating.
-        unsafe {
-            command.pre_exec(move || {
+    let rlxd = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+    // SAFETY: the closure runs in the child between fork and exec, and calls only
+    // setsid(2), fcntl(2), prctl(2) and getppid(2), which are async-signal-safe, and
+    // builds an io::Error from an errno without allocating.
+    unsafe {
+        command.pre_exec(move || {
+            // The guard leads a new session, and so the run's process group: no terminal,
+            // and a session id, the guard's pid, that the sweep checks.
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // The guard keeps its end of the status pipe across exec.
+            if libc::fcntl(status_fd, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            #[cfg(target_os = "linux")]
+            {
                 // SIGTERM, which the guard catches to kill the run's group.
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                     return Err(io::Error::last_os_error());
@@ -222,43 +285,64 @@ fn spawn(launch: Launch) -> io::Result<(Child, Tree)> {
                 if libc::getppid() != rlxd {
                     return Err(io::Error::from_raw_os_error(libc::ESRCH));
                 }
-                Ok(())
-            });
-        }
+            }
+            Ok(())
+        });
     }
     let child = command.spawn()?;
+    // Only the guard holds the write end now: the pipe ends with it.
+    drop(writer);
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("the run's process has no pid"))?;
-    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reaped = Arc::new(Mutex::new(false));
     {
         // The moment the guard exits, unreaped, its group is killed: whatever of the run
         // is left, even when the guard was killed alone.
-        let exited = std::sync::Arc::clone(&exited);
-        std::thread::Builder::new()
+        let exited = Arc::clone(&exited);
+        let reaped = Arc::clone(&reaped);
+        let watcher = std::thread::Builder::new()
             .name("rlxd-run-group".to_owned())
             .spawn(move || {
-                wait_without_reaping(pid);
-                kill_group(pid);
+                let seen = wait_without_reaping(pid);
+                let mut reaped = reaped.lock().unwrap_or_else(|p| p.into_inner());
+                if seen {
+                    if !*reaped {
+                        kill_group(pid);
+                    }
+                } else {
+                    // Not rlxd's child any more (something reaped it): its pid, the
+                    // group's id, may be another's now, and is never signalled again.
+                    *reaped = true;
+                }
                 exited.store(true, std::sync::atomic::Ordering::SeqCst);
-            })?;
+            });
+        if let Err(e) = watcher {
+            // Without the watcher, the run's group can't be followed: end it now, while
+            // the guard is unreaped and its id still the run's.
+            kill_group(pid);
+            return Err(e);
+        }
     }
     Ok((
         child,
         Tree {
             pid,
             started: start_time(pid),
-            reaped: std::sync::Mutex::new(false),
+            reaped,
             exited,
+            status: reader,
         },
     ))
 }
 
 /// Waits until rlxd's child `pid` has exited, leaving it unreaped (`WNOWAIT`), so its pid,
-/// the run's group's id, stays held.
+/// the run's group's id, stays held. Whether its exit was seen so: `false` when `pid` is
+/// not rlxd's child to wait for (`ECHILD`: reaped already), whose id may then be another's.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn wait_without_reaping(pid: u32) {
+fn wait_without_reaping(pid: u32) -> bool {
     let id = libc::id_t::from(pid);
     loop {
         // SAFETY: siginfo_t is plain data, for which zero is a valid value.
@@ -272,8 +356,11 @@ fn wait_without_reaping(pid: u32) {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if waited == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return;
+        if waited == 0 {
+            return true;
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return false;
         }
     }
 }
@@ -303,15 +390,21 @@ fn kill_tree(tree: &Tree) {
 /// - Another process now has that pid: the run's group is gone (no pid is given out
 ///   while a group of that id exists), and nothing is killed.
 /// - No process has it: the guard died too, as `killall -9 rlxd` does, and the group may
-///   outlive it. Each process still in group `pid` that started at or after `started`
-///   is killed: it came from the run, which started then.
+///   outlive it. Each process still in group `pid` and in session `pid`, the guard's,
+///   that started at or after `started` is killed: it came from the run, which started
+///   then. A group a process of that pid left behind after the run's was gone is in that
+///   process's session, which is not `pid` unless it too led a session of its own.
 ///
-/// Whether it killed anything.
+/// Only for a run of this boot ([`boot_id`]): across a reboot a pid, a group id and (on
+/// Linux) a start time may be anyone's. Whether it killed anything.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub fn sweep(pid: u32, started: &str) -> bool {
+    let Ok(guard) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
     match start_time(pid) {
-        Some(now) if now == started => {
+        Some(now) if now == started && session_of(guard) == Some(guard) => {
             kill_group(pid);
             return true;
         }
@@ -328,13 +421,23 @@ pub fn sweep(pid: u32, started: &str) -> bool {
             .and_then(start_key)
             .is_some_and(|key| key >= since)
             && let Ok(member) = libc::pid_t::try_from(member)
+            && session_of(member) == Some(guard)
         {
-            // SAFETY: kill(2) to a process of the run's group that started with or after
-            // the run.
+            // SAFETY: kill(2) to a process of the run's group and session that started
+            // with or after the run.
             killed |= unsafe { libc::kill(member, libc::SIGKILL) } == 0;
         }
     }
     killed
+}
+
+/// Process `pid`'s session id (`getsid`), or `None` when there is no such process.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn session_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    // SAFETY: getsid(2) of a pid; a gone one fails with ESRCH.
+    let session = unsafe { libc::getsid(pid) };
+    (session != -1).then_some(session)
 }
 
 /// A [`start_time`] as a pair that orders by time: `sec.usec` on macOS, clock ticks on
@@ -480,7 +583,7 @@ fn spawn(launch: Launch) -> io::Result<(Child, Tree)> {
         Tree {
             pid,
             started: None,
-            reaped: std::sync::Mutex::new(false),
+            reaped: Arc::new(Mutex::new(false)),
             job,
         },
     ))
@@ -545,8 +648,9 @@ pub fn sweep(_pid: u32, _started: &str) -> bool {
 }
 
 /// This boot of the OS, as a token another boot would not give: Linux's
-/// `/proc/sys/kernel/random/boot_id`, macOS's `kern.boottime`, and on Windows the boot time
-/// from the tick count, to the second, marked `~` since it may drift by one.
+/// `/proc/sys/kernel/random/boot_id`, macOS's `kern.bootsessionuuid` (made at each boot;
+/// `kern.boottime` moves when the clock is set), and on Windows the boot time from the
+/// tick count, to the second, marked `~` since it may drift by one.
 #[cfg(target_os = "linux")]
 pub fn boot_id() -> Option<String> {
     let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
@@ -556,22 +660,24 @@ pub fn boot_id() -> Option<String> {
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub fn boot_id() -> Option<String> {
-    let mut boot = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-    let mut size = std::mem::size_of::<libc::timeval>();
-    // SAFETY: kern.boottime is a struct timeval, which `boot` is, of `size` bytes.
+    let mut uuid = [0_u8; 64];
+    let mut size = uuid.len();
+    // SAFETY: kern.bootsessionuuid is a NUL-ended string, which `uuid` holds `size` bytes
+    // of; sysctlbyname(3) writes at most that and says how many it wrote.
     let read = unsafe {
         libc::sysctlbyname(
-            c"kern.boottime".as_ptr(),
-            (&raw mut boot).cast(),
+            c"kern.bootsessionuuid".as_ptr(),
+            uuid.as_mut_ptr().cast(),
             &raw mut size,
             std::ptr::null_mut(),
             0,
         )
     };
-    (read == 0).then(|| format!("{}.{:06}", boot.tv_sec, boot.tv_usec))
+    if read != 0 {
+        return None;
+    }
+    let text = std::ffi::CStr::from_bytes_until_nul(uuid.get(..size)?).ok()?;
+    Some(text.to_str().ok()?.to_owned()).filter(|id| !id.is_empty())
 }
 
 #[cfg(windows)]
@@ -631,6 +737,82 @@ mod tests {
         assert_eq!(start_time(u32::try_from(i32::MAX).unwrap()), None);
     }
 
+    /// A shell that leads a new group (and with `new_session`, a new session) starts a
+    /// `sleep` in it and exits, reaped: a group without its leader, as a run's is after
+    /// `killall -9 rlxd`. The shell's pid, the group's id, and the sleep's.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(unsafe_code)]
+    fn leaderless_group(new_session: bool) -> (u32, u32) {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
+            .stdout(Stdio::piped());
+        if new_session {
+            // SAFETY: setsid(2) in the child between fork and exec, async-signal-safe.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        } else {
+            command.process_group(0);
+        }
+        let mut shell = command.spawn().unwrap();
+        let mut line = String::new();
+        io::BufReader::new(shell.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        shell.wait().unwrap();
+        (shell.id(), line.trim().parse().unwrap())
+    }
+
+    /// Whether `pid` runs, a zombie not counted.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn runs(pid: u32) -> bool {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&ps.stdout);
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(unsafe_code)]
+    #[test]
+    fn the_sweep_kills_a_leaderless_group_only_in_the_guards_own_session() {
+        let before = start_time(std::process::id()).unwrap();
+        // A group whose leader is gone, in another session (this test's): a pid's
+        // recycled group, say, not the run's. Its sleep started after `before`, and stays.
+        let (group, sleep) = leaderless_group(false);
+        assert!(
+            !sweep(group, &before),
+            "another session's group is left alone"
+        );
+        assert!(runs(sleep), "the other session's sleep runs on");
+        // SAFETY: kill(2) of the sleep this test started.
+        unsafe { libc::kill(libc::pid_t::try_from(sleep).unwrap(), libc::SIGKILL) };
+        // The run's: the group leads its own session, as the guard's does.
+        let (group, sleep) = leaderless_group(true);
+        assert!(
+            sweep(group, &before),
+            "the guard's group and session are swept"
+        );
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runs(sleep) {
+            assert!(
+                std::time::Instant::now() < gone,
+                "the swept sleep still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// On Windows a run's tree is a job, which this starts directly. (On macOS and Linux a
     /// run starts under rlxd's guard, which only the rlxd binary has: tests/runner.rs.)
     #[cfg(windows)]
@@ -643,7 +825,6 @@ mod tests {
                 args: vec!["/c".into(), "ping -n 30 127.0.0.1 > NUL".into()],
                 cwd: std::env::temp_dir(),
                 env: Vec::new(),
-                status: PathBuf::new(),
             })
             .await
             .unwrap();

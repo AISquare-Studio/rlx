@@ -114,11 +114,6 @@ impl RunDir {
         self.dir.join(attempt.to_string()).join("settings.json")
     }
 
-    /// `<attempt>/exit`: how the attempt's Claude Code ended, as its guard writes it.
-    pub fn status(&self, attempt: u64) -> PathBuf {
-        self.dir.join(attempt.to_string()).join("exit")
-    }
-
     /// Writes `attempt`'s settings durably, and returns their path.
     pub fn write_settings(&self, attempt: u64, settings: &Value) -> io::Result<PathBuf> {
         let path = self.settings(attempt);
@@ -402,11 +397,22 @@ fn private_dir(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn temp(name: &str) -> PathBuf {
+    /// A test's own folder, removed when the test ends, passed or failed.
+    struct Temp(PathBuf);
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A test's folder, and the log in it.
+    fn temp(name: &str) -> (Temp, PathBuf) {
         let dir = std::env::temp_dir().join(format!("rlxd-store-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir.join("events.jsonl")
+        let log = dir.join("events.jsonl");
+        (Temp(dir), log)
     }
 
     fn line(run_seq: u64, pad: usize) -> String {
@@ -418,7 +424,7 @@ mod tests {
 
     #[test]
     fn an_empty_or_missing_log_has_no_tail() {
-        let path = temp("empty");
+        let (_temp, path) = temp("empty");
         assert!(tail(&path).unwrap().last_line.is_none(), "missing");
         fs::write(&path, "").unwrap();
         let empty = tail(&path).unwrap();
@@ -430,7 +436,7 @@ mod tests {
 
     #[test]
     fn the_tail_is_the_last_whole_line_even_past_a_chunk() {
-        let path = temp("long");
+        let (_temp, path) = temp("long");
         // A last line longer than one 64 KiB chunk, after a short one.
         let text = line(1, 10) + &line(2, 200_000);
         fs::write(&path, &text).unwrap();
@@ -444,7 +450,7 @@ mod tests {
 
     #[test]
     fn a_torn_last_line_is_no_tail_and_repair_cuts_it() {
-        let path = temp("torn");
+        let (_temp, path) = temp("torn");
         let whole = line(1, 10) + &line(2, 70_000);
         let torn = whole.clone() + "{\"type\":\"run.done\",\"data\":{\"run_seq\":3";
         fs::write(&path, &torn).unwrap();
@@ -469,7 +475,7 @@ mod tests {
 
     #[test]
     fn the_reader_gives_each_whole_line_once_and_says_when_the_log_is_gone() {
-        let path = temp("reader");
+        let (_temp, path) = temp("reader");
         let mut reader = Reader::new(path.clone());
         assert!(reader.read().unwrap().is_empty());
         assert!(reader.gone());
