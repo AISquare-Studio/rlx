@@ -518,10 +518,8 @@
     {
       "what": "the session-rating survey above the effort row, a live capture of Claude Code 2.1.332 (tests/screens/real_survey_2_1_332.txt): the effort row sits between it and the box, and it is still named",
       "rows": [
-        "▎ Auto mode is now Claude Code's default permission mode.",
-        "▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and ",
-        "▎ prompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.",
-        "▎ https://code.claude.com/docs/en/permission-modes",
+        "",
+        "",
         "",
         "",
         "",
