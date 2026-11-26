@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -24,7 +24,7 @@ from rich.text import Text
 from textual import on
 from textual.css.query import NoMatches
 from textual.widget import Widget
-from textual.widgets import DataTable, Static
+from textual.widgets import ContentSwitcher, DataTable, Static, TabPane
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli import watch
@@ -56,6 +56,9 @@ the waiting agent. One order: the bar's first item is its project's first lane r
 on the lane the key opens (tester of #11: blocked before review here, review before blocked
 there, and the card the bar named was past the rows the lane draws)."""
 GLYPHS: dict[str, str] = {kind: glyph for kind, glyph, _one, _many in NEEDS_YOU} | {HANDOVER: "⏳"}
+BOARD_TAB = "--content-tab-tab-board"
+"""The Board tab's id in a project view's tab row (Textual's ``ContentTab`` prefix on the pane's
+id): there, once the row is filled."""
 LAND_TRIES = 40
 """How many short waits the bar gives a project's view to be built before it gives up."""
 
@@ -135,6 +138,22 @@ def read_needs(projects: Sequence[ProjectInfo]) -> list[Need]:
             shown, sessions, tasks, events, seq=seq, fleet_labels=read.fleet_labels
         )
     return sorted(needs, key=lambda need: KIND_ORDER.index(need.kind))
+
+
+def _board_ready(view: ProjectView) -> bool:
+    """Whether ``view`` can show its Board tab: the tab in its tab row, and the tab's pane in its
+    switcher with the board in it composed. Before all of that, setting its active tab raises,
+    or hides one pane and shows none."""
+    if not view.is_mounted:
+        return False
+    if not view.query(f"ContentTabs #tabs-list > #{BOARD_TAB}"):
+        return False
+    pane = view.get_child_by_type(ContentSwitcher).get_child_by_id("tab-board")
+    panels = pane.query(BoardPanel)
+    if not panels:
+        return False
+    panel = panels.first()
+    return panel.is_mounted and bool(panel.query("#sessions")) and bool(panel.query("#tasks"))
 
 
 class NeedsYouBar(Static):
@@ -223,29 +242,69 @@ class NeedsYouBar(Static):
             table.move_cursor(row=table.get_row_index(task_id))
 
     def _land(self) -> None:
-        """Once the project's view is built: its Board tab, on the item."""
+        """Once the project's view is ready (:func:`_board_ready`): its Board tab, and once that
+        is shown, the item (:meth:`_open_on_board`).
+
+        A view still mounting is waited for, a short wait at a time: set as it mounted, its
+        Board tab raised out of here (``ValueError``, the tab row not filled yet: asq exited),
+        or showed no pane at all (the board's pane not mounted yet: the reader opened in a
+        hidden pane, the keys going to it) (tester of #11, #1636)."""
         if self._landing is None:
             return
         need, tries = self._landing
+        view = self._view_of(need)
+        try:
+            ready = view is not None and _board_ready(view)
+            if ready and view is not None:
+                view.active = "tab-board"
+        except (NoMatches, ValueError):  # mounting still, under the checks
+            ready = False
+        if not ready:
+            self._try_again(need, tries, self._land)
+            return
+        self._landing = (need, 0)
+        self.call_after_refresh(self._open_on_board)
+
+    def _open_on_board(self) -> None:
+        """The Board tab shown: the item on it. Not shown yet, a short wait; another tab chosen
+        meanwhile, nothing (the person moved on). Nothing is focused that is not on screen."""
+        if self._landing is None:
+            return
+        need, tries = self._landing
+        view = self._view_of(need)
+        if view is None or view.active != "tab-board":
+            self._landing = None
+            return
+        try:
+            pane = view.query_one("#tab-board", TabPane)
+            panel = pane.query_one(BoardPanel)
+            shown = pane.display and panel.is_on_screen
+            if shown:
+                self._open_item(panel, need)
+        except NoMatches:
+            shown = False
+        if shown:
+            self._landing = None
+        else:
+            self._try_again(need, tries, self._open_on_board)
+
+    def _try_again(self, need: Need, tries: int, step: Callable[[], None]) -> None:
+        if tries < LAND_TRIES:
+            self._landing = (need, tries + 1)
+            self.set_timer(0.05, step)
+        else:
+            self._landing = None  # given up: the bar stays, and F6 tries again
+
+    def _view_of(self, need: Need) -> ProjectView | None:
         views = [
             node
             for node in self.app.query(f"#project-{need.project.id}")
             if isinstance(node, ProjectView)
         ]
-        try:
-            if not views:
-                raise NoMatches("the project's view is not built yet")
-            view = views[0]
-            view.active = "tab-board"  # raises until its tabs are composed
-        except NoMatches:
-            if tries < LAND_TRIES:
-                self._landing = (need, tries + 1)
-                self.set_timer(0.05, self._land)
-            else:
-                self._landing = None
-            return
-        self._landing = None
-        panel = view.query_one(BoardPanel)
+        return views[0] if views else None
+
+    def _open_item(self, panel: BoardPanel, need: Need) -> None:
+        """``need`` on ``panel``, shown: a card in the board's reader, else the work list."""
         card = (need.kind, need.target)
         if need.kind in ("blocked", "review") and card not in panel.lane:
             # A view built earlier holds the lane it last read: its ticks skip a hidden board,

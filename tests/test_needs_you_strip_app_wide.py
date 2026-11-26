@@ -392,3 +392,61 @@ def test_a_card_past_the_rows_the_lane_draws_still_opens(
     index, drawn, reader = drive((100, 30), go)
     assert index >= drawn, f"the premise: the card is past the lane's drawn rows ({index}, {drawn})"
     assert reader.startswith("fix the login race\n#2 · blocked"), reader
+
+
+@pytest.mark.parametrize("steps", range(24))
+def test_landing_on_a_cold_projects_view_at_any_moment_of_its_mount(
+    tmp_path: Path, projects: dict[str, Any], steps: int
+) -> None:
+    """The tester of #11 (#1636): the bar landed on a project's view while it was still
+    mounting. ``steps`` event-loop turns after the view first appears: 1 to 4 raised out of
+    the landing (its tab row not filled: asq exited), 5 raised on the board's parts, 6 to 23
+    opened the reader in a hidden pane, the keys going to it. At every moment now: no error,
+    and the card the bar named, in a reader on screen, focused."""
+    from aisquare.cli.ui.sidebar import ProjectSelected
+    from tests.test_ui_spawn import register
+
+    gamma = register(tmp_path / "gamma", project_id="prj_gamma", codename="calm-gecko")
+    projects["frames"][gamma.id] = _blocked_behind_five_reviews(gamma)
+
+    def gammas_board(app: Any) -> BoardPanel | None:
+        panels = app.query(f"#project-{gamma.id} BoardPanel")  # none while it mounts
+        return panels.first() if panels else None
+
+    async def go(pilot: Any, app: Any) -> tuple[str, bool, bool]:
+        await _on_betas_settings(pilot, app, projects["beta"])
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        named = bar.needs[0]
+        assert named.project.id == gamma.id, "the premise: the bar names gamma's card"
+        app.post_message(ProjectSelected(gamma.id))
+        for _ in range(5000):
+            if app.query(f"#project-{gamma.id}"):
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("gamma's view never appeared")
+        for _ in range(steps):
+            await asyncio.sleep(0)
+        bar._landing = (named, 0)  # what open_need leaves for the landing, at this moment
+        bar._land()
+        await _until(
+            pilot,
+            lambda: bool(
+                (board := gammas_board(app))
+                and board.reader_text
+                and board.is_on_screen
+                and app.focused is not None
+                and app.focused.is_on_screen
+            ),
+            what="gamma's card in a reader on screen, focused",
+        )
+        board = gammas_board(app)
+        assert board is not None
+        focused = app.focused
+        return board.reader_text, board.is_on_screen, bool(focused and focused.is_on_screen)
+
+    reader, shown, focused = drive((100, 30), go)
+    assert reader.startswith("review thing 0\n#10 · review"), reader
+    assert shown and focused
