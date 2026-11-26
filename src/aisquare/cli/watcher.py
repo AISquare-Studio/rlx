@@ -76,7 +76,18 @@ def watch(
         return
     if stop:
         pid = watch_service.stop_detached()
-        _say({"stopped": pid}, f"stopped the watcher (pid {pid})" if pid else "no watcher runs")
+        # A watcher mid-look finishes that look first: "stopped" only once it has exited.
+        stopping = pid is not None and watch_service.running_pid() is not None
+        if not pid:
+            line = "no watcher runs"
+        elif stopping:
+            line = (
+                f"the watcher (pid {pid}) is still stopping: it finishes its look first"
+                + prog.shell_advice(f"; `{prog.word()} watch --status` says when it has")
+            )
+        else:
+            line = f"stopped the watcher (pid {pid})"
+        _say({"stopped": pid, "stopping": stopping}, line)
         return
     if detach:
         try:

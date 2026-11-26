@@ -810,7 +810,10 @@ class _StampedStdin:
 
 
 async def _serve_stdio_until_idle(
-    server: MCPServer, close_after: int, command: str | None = None
+    server: MCPServer,
+    close_after: int,
+    command: str | None = None,
+    before_exit: Callable[[], object] | None = None,
 ) -> None:
     """Run the stdio transport with an idle deadline (#19).
 
@@ -849,6 +852,9 @@ async def _serve_stdio_until_idle(
                 "closing (idle deadline; --close-after 0 disables)\n"
             )
             sys.stderr.flush()
+            if before_exit is not None:  # what a normal return would have run: os._exit won't
+                with contextlib.suppress(Exception):
+                    before_exit()
             os._exit(0)
 
     async with anyio.create_task_group() as tg:
@@ -915,6 +921,7 @@ def run_stdio(
     close_after: int = DEFAULT_CLOSE_AFTER,
     server: MCPServer | None = None,
     command: str | None = None,
+    before_exit: Callable[[], object] | None = None,
 ) -> None:
     """Serve over stdio (Claude Desktop launches and owns the process).
 
@@ -925,7 +932,9 @@ def run_stdio(
 
     ``server`` defaults to this module's; the captain passes its own, and
     ``command`` is how the idle notice on stderr names the process (``rlx serve --stdio``,
-    with the word hints print, when ``None``).
+    with the word hints print, when ``None``). ``before_exit`` runs just before the idle
+    deadline's ``os._exit``, which runs no ``finally`` (``serve`` leaves the daemon registry
+    there, ``core.daemons``); it never stops the exit.
     """
     global _stdio
     keep_the_protocol_pipe_to_ourselves()  # before anything is built or started
@@ -937,7 +946,7 @@ def run_stdio(
         return
     import anyio
 
-    anyio.run(_serve_stdio_until_idle, served, close_after, command)
+    anyio.run(_serve_stdio_until_idle, served, close_after, command, before_exit)
 
 
 class _BearerGuard:
