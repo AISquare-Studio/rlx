@@ -15891,6 +15891,34 @@ def test_scheduled_activation_replays_and_replacement_resumes_urgent_progress(
     assert "retained direct question" not in decision.reason
 
 
+def test_failed_scheduled_render_leaves_urgent_progress_unread(
+    hubbed: _Hubbed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed render does not consume the queue."""
+    from aisquare.services import manager_seat
+
+    with store_session() as store:
+        store.set_project_setting(hubbed.fleet.id, "manager_wake", "schedule")
+    team_service.add_note(
+        "urgent after render failure",
+        kind="question",
+        to_role=hubbed.manager_sid,
+        session_ref=hubbed.coder_sid,
+    )
+
+    def broken(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("render failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(team_service, "_render_wakeup", broken)
+        with pytest.raises(team_service.ManagerWakeupError):
+            team_service.hook_stop(hubbed.manager_sid, hubbed.fleet.root)
+    with store_session() as store:
+        assert manager_seat.urgent_position(store, hubbed.fleet.id, hubbed.hub.id) == 0
+    wake = team_service.hook_stop(hubbed.manager_sid, hubbed.fleet.root)
+    assert wake is not None and "urgent after render failure" in wake.reason
+
+
 def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:

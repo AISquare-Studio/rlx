@@ -3607,6 +3607,8 @@ def hook_prompt_heartbeat(
         scheduled = mode == "schedule" and project is not None
         if scheduled and project is not None:
             events = _scheduled_wake_candidates(store, session, project, head=newest)
+        elif mode == "blocked":
+            events = []
         else:
             events = _wake_candidates(store, session, relevant)
         if not events or not orchestrator.delta_enabled() or not reads:
@@ -3621,19 +3623,16 @@ def hook_prompt_heartbeat(
             return collision + briefing
         truncated = len(events) > _DELTA_LIMIT
         shown = events[:_DELTA_LIMIT]
-        store.touch_session(session.id, cursor=max(session.cursor, shown[-1].seq), state="working")
-        if scheduled and project is not None:
-            manager_seat.advance_urgent(store, project, session.project_id, shown[-1].seq)
         authors = authors_of(store.team_sessions(session.project_id))
         board = _board_of(store, session.project_id).name
         # One read, and only when a line names a task: this runs on every prompt.
         numbers = store.task_numbers(session.project_id) if any(e.task_id for e in shown) else {}
-        return (
-            collision
-            + briefing
-            + _render_delta(shown, authors, truncated=truncated, board=board, numbers=numbers)
-            + _held_pointer(store, project if scheduled else None, session.project_id)
-        )
+        rendered = _render_delta(shown, authors, truncated=truncated, board=board, numbers=numbers)
+        if scheduled and project is not None:
+            rendered += "\n" + _held_pointer(store, project, session.project_id)
+            manager_seat.advance_urgent(store, project, session.project_id, shown[-1].seq)
+        store.touch_session(session.id, cursor=max(session.cursor, shown[-1].seq), state="working")
+        return collision + briefing + rendered
 
 
 def _brief_when_a_team_forms(store: ContextStore, session: TeamSession, cwd: Path | None) -> str:
@@ -3881,12 +3880,6 @@ def _wake_candidates(
     ``relevant`` is ``me``'s board context (:func:`_board_reading`), applied in the query
     as the prompt's delta applies it: a manager reads everything.
     """
-    if me.role == MANAGER_ROLE:
-        mode, project = manager_seat.mode(store, me)
-        if mode == "blocked":
-            return []
-        if mode == "schedule" and project is not None:
-            return _scheduled_wake_candidates(store, me, project)
     return store.events_since(
         me.project_id,
         me.cursor,
@@ -3986,7 +3979,7 @@ def _held_pointer(store: ContextStore, project: str | None, board: str) -> str:
     if project is None:
         return ""
     seq = manager_pass.read(store, project, board)[1].read
-    return f"\nHeld board range starts after #{seq}; review it on your board pass."
+    return f"Held board range starts after #{seq}; review it on your board pass."
 
 
 def _manager_wakeup(
@@ -4037,7 +4030,11 @@ def _wakeup(
     """
     if stop_hook_active or not orchestrator.delta_enabled():
         return None
-    events = _wake_candidates(store, me, relevant)
+    events = (
+        _scheduled_wake_candidates(store, me, scheduled_project)
+        if scheduled_project is not None
+        else _wake_candidates(store, me, relevant)
+    )
     if keep is not None:
         events = [event for event in events if keep(event)]
     if not any(wakes(event) for event in events):
@@ -4051,17 +4048,23 @@ def _wakeup(
     authors = authors_of(store.team_sessions(me.project_id))
     board = _board_of(store, me.project_id).name
     numbers = store.task_numbers(me.project_id) if any(e.task_id for e in shown) else {}
+    decision = StopDecision(
+        reason=_render_wakeup(
+            shown,
+            authors,
+            truncated=truncated,
+            board=board,
+            numbers=numbers,
+            act=act,
+            held=_held_pointer(store, scheduled_project, me.project_id),
+        ),
+        cursor=shown[-1].seq,
+    )
     store.set_meta(key, str(used + 1))
     store.touch_session(me.id, cursor=max(me.cursor, shown[-1].seq), state="working")
     if scheduled_project is not None:
         manager_seat.advance_urgent(store, scheduled_project, me.project_id, shown[-1].seq)
-    return StopDecision(
-        reason=_render_wakeup(
-            shown, authors, truncated=truncated, board=board, numbers=numbers, act=act
-        )
-        + _held_pointer(store, scheduled_project, me.project_id),
-        cursor=shown[-1].seq,
-    )
+    return decision
 
 
 #: Claude Code ``notification_type`` values that mean A HUMAN IS NEEDED: a
@@ -6527,6 +6530,7 @@ def _render_wakeup(
     board: str,
     numbers: Mapping[str, int] | None = None,
     act: str | None = None,
+    held: str = "",
 ) -> str:
     """The Stop reason: the delta in the same lines the prompt hook would have used,
     framed as the instruction Claude Code continues the turn with (``act``: the manager's
@@ -6555,6 +6559,7 @@ def _render_wakeup(
     act = act or "Act on what needs the manager — reopen, re-spec, spawn, report."
     frame = [
         *(["… more waiting — run `aisquare board` for the full picture."] if truncated else []),
+        *([held] if held else []),
         f"{act} {WAKEUP_CLOSE}",
     ]
     spent = _output_cost(head) + sum(_output_cost(line) + 2 for line in frame)

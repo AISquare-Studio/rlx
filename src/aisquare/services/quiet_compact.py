@@ -206,11 +206,12 @@ def refusal(
         return f"it reads {session.state}, not waiting"
     if session.cursor != cursor:
         return "it has read the board since its turn ended"
-    if manager_seat.policy(store, agent.project_id).configured:
-        if manager_seat.bound(store, agent) is None:
-            return "manager seat and board binding disagree"
+    policy = manager_seat.policy(store, agent.project_id)
+    if policy.configured and manager_seat.bound(store, agent) is None:
+        return "manager seat and board binding disagree"
+    if policy.pass_minutes:
         pending = manager_pass.read(store, agent.project_id, session.project_id)[1].pending
-        if pending is not None and pending.attempted_at is not None:
+        if pending is not None:
             return f"manager pass {pending.id} is outstanding"
     wakes = team_service.pending_wakes(store, session, limit=500)
     if wakes:
