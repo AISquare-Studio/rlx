@@ -1129,7 +1129,13 @@ def unfinished_home_move() -> Path | None:
     every command but the move asks first, so none writes into a home half moved (the reviewer's
     M3 on #31). A stat, and a read of a small file only while one is there. A variable that
     names ``~/.aisquare`` itself is the default home, as the move reads it."""
-    root = home_of(_default_home_environment())[0]
+    return unfinished_home_move_at(home_of(_default_home_environment())[0])
+
+
+def unfinished_home_move_at(root: Path) -> Path | None:
+    """:func:`unfinished_home_move` of the home at ``root``: the journal there unless it says
+    the move is done. One that cannot be read is unfinished: a crash cannot be ruled out, and
+    the move says the way out (``services.home_migration.journal_refusal``)."""
     journal = root.joinpath(*MOVE_JOURNAL)
     try:
         text = journal.read_text(encoding="utf-8")

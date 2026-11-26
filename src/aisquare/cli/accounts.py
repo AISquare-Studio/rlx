@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1681,7 +1682,13 @@ def share(
 
 
 def _exec(binary: str, argv: list[str], env: dict[str, str]) -> None:
-    """Replace this process with the agent (indirection so tests can intercept)."""
+    """Replace this process with the agent (indirection so tests can intercept). Recorded
+    first, as `rlx launch` records its own, so the home's move does not run under the agent
+    on its account (#31; the reviewer's round-3 MAJOR 1)."""
+    if sys.platform != "win32":
+        from aisquare.core import launchers
+
+        launchers.execing(Path(binary).stem)
     os.execve(binary, argv, env)
 
 

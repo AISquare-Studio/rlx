@@ -1852,3 +1852,106 @@ def test_upgrade_check_on_a_home_part_way_through_its_move_says_so(
     assert "part-way: a run of the move stopped and the next finishes it" in result.output.replace(
         "\n", " "
     )
+
+
+# --- round 4, the reviewer's #2295 -----------------------------------------------------------
+
+
+def test_every_exec_of_an_agent_in_the_cli_records_itself_first() -> None:
+    """MAJOR 1: `accounts run` and `team spawn --exec` exec'd agents on managed slots with no
+    record, and the move ran under them. Every os.execve/os.execvpe of cli/ is in a function
+    that calls launchers.execing, so the next path to exec an agent is held to it."""
+    import ast
+
+    found: list[str] = []
+    for module in sorted(
+        (Path(__file__).resolve().parents[1] / "src" / "aisquare" / "cli").rglob("*.py")
+    ):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            calls = [n for n in ast.walk(function) if isinstance(n, ast.Call)]
+            names = {
+                f"{c.func.value.id}.{c.func.attr}"
+                for c in calls
+                if isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name)
+            }
+            if names & {"os.execve", "os.execvpe"} and "launchers.execing" not in names:
+                found.append(f"{module.name}::{function.name}")
+    assert found == []
+
+
+def test_an_agent_accounts_run_execs_is_counted_by_the_quiet_check(
+    old_home: Path, user_home: Path
+) -> None:
+    import subprocess
+
+    script = (
+        "import os, sys\n"
+        "from aisquare.cli import accounts\n"
+        "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+        "accounts._exec('/bin/sleep', ['sleep', '60'], dict(os.environ))\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script], stdout=subprocess.PIPE, env=dict(os.environ)
+    )
+    try:
+        assert process.stdout is not None and process.stdout.readline() == b"ready\n"
+        for _ in range(100):  # until the exec has happened and the lock is the agent's
+            if home_migration.running_on_home():
+                break
+            import time
+
+            time.sleep(0.05)
+        with pytest.raises(home_migration.MigrationRefused) as refused:
+            home_migration.move_home()
+        assert any(f"(pid {process.pid})" in line for line in refused.value.running)
+    finally:
+        process.kill()
+        process.wait()
+
+
+@pytest.mark.parametrize(
+    ("body", "said"),
+    [
+        ("{not json", "cannot read"),
+        ("{}", "cannot read"),
+        (json.dumps({"version": 99, "steps": ["backup"]}), "a newer rlx's move"),
+    ],
+    ids=["garbage", "no-journal-shape", "a-newer-rlx"],
+)
+def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywhere(
+    old_home: Path, user_home: Path, body: str, said: str
+) -> None:
+    """MAJOR 2: the guard read such a journal as open and the move read it as none, so every
+    command refused and the move said there was nothing to do: locked out for good. One reading
+    for both, and the way out said; once the file is moved aside rlx runs again."""
+    journal = old_home.joinpath(*paths.MOVE_JOURNAL)
+    journal.parent.mkdir(parents=True)
+    journal.write_text(body, encoding="utf-8")
+    runner = CliRunner()
+
+    for command in (["fleet", "ls"], ["move-home"], ["move-home", "--rollback"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1, (command, result.output)
+        out = result.output.replace("\n", " ")
+        assert said in out and "aside" in out, (command, out)
+
+    journal.rename(journal.with_name("journal.json.aside"))
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+
+
+def test_mid_move_help_and_uninstall_s_dry_run_still_answer_and_a_dry_run_says_part_way(
+    old_home: Path, user_home: Path
+) -> None:
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "rewrite", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+    runner = CliRunner()
+
+    assert runner.invoke(app, ["fleet", "--help"]).exit_code == 0
+    assert "part-way through its move" not in runner.invoke(app, ["uninstall", "--dry-run"]).output
+    dry = runner.invoke(app, ["move-home", "--dry-run"])
+    assert dry.exit_code == 0 and "the home's move is part-way (a run stopped)" in dry.output

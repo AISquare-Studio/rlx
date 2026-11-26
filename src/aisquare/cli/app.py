@@ -113,7 +113,7 @@ def main_callback(
     )
     set_state(state)
     ctx.obj = state
-    if ctx.invoked_subcommand not in _THROUGH_A_MOVE:
+    if ctx.invoked_subcommand not in _THROUGH_A_MOVE and not _only_asks(ctx):
         _refuse_a_half_moved_home(ctx.invoked_subcommand)
     if ctx.invoked_subcommand is None:
         _no_arguments(ctx)
@@ -126,6 +126,15 @@ def main_callback(
 _THROUGH_A_MOVE = frozenset({"move-home", "upgrade"})
 
 
+def _only_asks(ctx: typer.Context) -> bool:
+    """Whether the command line only asks (a help page, an uninstall's dry run): it changes
+    nothing, so it runs on a home part-way through its move too (the reviewer's nits)."""
+    words = list(ctx.meta.get(DISPATCHED_WORDS, []))
+    if _asks_for_help(words):
+        return True
+    return ctx.invoked_subcommand == "uninstall" and "--dry-run" in words
+
+
 def _refuse_a_half_moved_home(command: str | None) -> None:
     """Start no command on a home whose move a crash stopped (its journal still open): one
     would make a new empty store in the old layout's place, and the move could then never be
@@ -134,10 +143,16 @@ def _refuse_a_half_moved_home(command: str | None) -> None:
     from aisquare.core import paths
     from aisquare.core import program as prog
 
-    if paths.unfinished_home_move() is None:
+    journal = paths.unfinished_home_move()
+    if journal is None:
         return
     if command == "hook":
         raise typer.Exit(0)
+    from aisquare.services import home_migration
+
+    unreadable = home_migration.journal_refusal(journal)
+    if unreadable is not None:
+        fail(unreadable, error="home_mid_move")
     word = prog.word()
     fail(
         f"rlx's home is part-way through its move to the new layout (a run of the move "

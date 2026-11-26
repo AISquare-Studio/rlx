@@ -14,6 +14,7 @@ import typer
 
 from aisquare.cli.common import fail
 from aisquare.core import paths
+from aisquare.core import program as prog
 from aisquare.core.console import stdout_console
 from aisquare.core.state import get_state
 from aisquare.services import home_migration
@@ -111,7 +112,14 @@ def migrate_home(
                 }
             )
             return
-        _say_home(f"the home would move: {found.shown}")
+        if found.journal is not None:
+            _say_home(f"the home's move is part-way (a run stopped): {found.shown}")
+            word = prog.word()
+            _say_home(
+                f"  `{word} move-home` finishes it; `{word} move-home --rollback` puts it back"
+            )
+        else:
+            _say_home(f"the home would move: {found.shown}")
         for line in running:
             _say_home(f"  but first: {line}")
         return

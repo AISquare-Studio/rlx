@@ -266,14 +266,51 @@ def _save_move_journal(journal: Journal) -> None:
 
 
 def _unfinished_move(root: Path) -> Journal | None:
-    """The journal of a move of the home at ``root`` that has not finished, or ``None``."""
+    """The journal of a move of the home at ``root`` that has not finished, or ``None``. Read
+    as ``paths.unfinished_home_move`` reads it, which every other command asks first: one that
+    cannot be read, holds no journal, or is a newer rlx's is unfinished there too, so it is
+    refused here (:func:`journal_refusal`), saying the way out. Read as none, it locked a
+    person out for good: every command refused, and the move said there was nothing to do
+    (the reviewer's round-3 MAJOR 2)."""
+    path = _move_journal_path(root)
+    if paths.unfinished_home_move_at(root) is None:
+        return None
+    why = journal_refusal(path)
+    if why is not None:
+        raise MigrationRefused(why)
+    return Journal.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def journal_refusal(path: Path) -> str | None:
+    """Why the unfinished move whose journal is ``path`` cannot be taken up by this rlx, with
+    the way out; ``None`` for one it can finish or roll back."""
     try:
-        journal = Journal.model_validate_json(_move_journal_path(root).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValidationError):
-        return None
-    if "done" in journal.steps or journal.version > JOURNAL_VERSION:
-        return None
-    return journal
+        text = path.read_text(encoding="utf-8")
+        loaded: Any = json.loads(text)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return _unreadable_journal(path, exc)
+    version = loaded.get("version") if isinstance(loaded, dict) else None
+    if isinstance(version, int) and version > JOURNAL_VERSION:
+        # Read before its shape: a newer release's journal may hold what this one lacks.
+        return (
+            f"a newer rlx's move of this home is unfinished (its journal is version "
+            f"{version}): finish it with that release, or move {paths.shown(path)} aside once "
+            "the home is whole"
+        )
+    try:
+        Journal.model_validate_json(text)
+    except ValidationError as exc:
+        return _unreadable_journal(path, exc)
+    return None
+
+
+def _unreadable_journal(path: Path, exc: Exception) -> str:
+    why = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+    return (
+        f"the home's move left a journal this rlx cannot read ({why}): {paths.shown(path)}. "
+        "Check that the home is whole (docs/home-layout.md), then move that file aside, and "
+        "rlx runs again"
+    )
 
 
 # --- where the home goes -----------------------------------------------------------------------

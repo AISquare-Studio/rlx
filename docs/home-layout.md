@@ -131,8 +131,9 @@ The move refuses, and names each thing it found, while any of these run on the h
 - a window on rlx's tmux server, or on a server a launch record names;
 - the watcher;
 - Remote, served from another process;
-- an agent started with `rlx launch` by rlx 0.10.2 or later, on any account. An `rlx launch`
-  started by 0.10.1 left no record of itself, so the move cannot see it: stop such agents first.
+- an agent started by rlx 0.10.2 or later with `rlx launch`, `rlx accounts run` or
+  `rlx team spawn --exec`, on any account. One started by 0.10.1 left no record of itself, so
+  the move cannot see it: stop such agents first.
 
 Stop them, then run `rlx upgrade` again. Nothing is touched until the home is quiet. The app's
 Move rlx's home says what runs before it closes rlx.
@@ -194,8 +195,11 @@ links it, what was made is kept beside it (`~/.aisquare-made-during-the-move-<wh
 link is made.
 
 While a move is unfinished (a crash stopped it), no other rlx command runs: each says how to
-finish it (`rlx move-home`) or put the home back (`rlx move-home --rollback`). An agent's hook
-does nothing meanwhile. Otherwise a command would make a new, empty store where the old one
+finish it (`rlx move-home`) or put the home back (`rlx move-home --rollback`). A help page and
+`rlx uninstall --dry-run` still answer, and an agent's hook does nothing meanwhile. A journal
+this rlx cannot read, or a newer release's, is refused the same way by every command and by the
+move: finish that move with the release that began it, or check the home and move the journal
+aside. Otherwise a command would make a new, empty store where the old one
 was, and the move could not be finished.
 
 An install rlx does not upgrade itself (Homebrew, pipx) has its home moved by `rlx upgrade`
