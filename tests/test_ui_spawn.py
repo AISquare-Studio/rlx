@@ -1220,7 +1220,8 @@ def test_a_model_in_the_extra_args_is_the_family_the_label_picks_by(
         "utilization": 99.0,
         "resets_at": (ACCOUNTS_NOW + timedelta(days=2)).isoformat(),
     }
-    endpoint = _Usage({"tok-two": out_of_opus, "tok-three": _payload(10.0, week=20.0)})
+    # Spare fuller than work's 20%: rank 1 keeps 20% of its week for the person (#35).
+    endpoint = _Usage({"tok-two": out_of_opus, "tok-three": _payload(10.0, week=50.0)})
     monkeypatch.setattr(accounts_service, "_http_get", endpoint)
     reads: list[list[str]] = []
 

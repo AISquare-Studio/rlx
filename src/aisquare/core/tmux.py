@@ -80,6 +80,7 @@ import os
 import re
 import shutil
 import socket as socket_module
+import stat
 import subprocess
 import sys
 import time
@@ -1883,6 +1884,12 @@ class TmuxServer:
         """Kill the window holding ``pane_id`` (a dead pane included)."""
         self.run("kill-window", "-t", pane_id)
 
+    def kill_pane(self, pane_id: str) -> None:
+        """Kill ``pane_id`` alone (a dead pane included): every other pane of its window stays,
+        and the window goes with it only when it held no other, as tmux closes one left
+        empty."""
+        self.run("kill-pane", "-t", pane_id)
+
     def kill_session(self, session: str) -> None:
         self.run("kill-session", "-t", _session_target(session))
 
@@ -2193,3 +2200,115 @@ class TmuxServer:
         was (:func:`size_claim_commands`)."""
         claim, resize = size_claim_commands(pane_id, owner, width, height)
         self.run(*claim, ";", *resize)
+
+
+# --- the tmux servers rlx did not start: read, never written (Settings ▸ tmux) -------------
+
+#: :meth:`ForeignServer.panes`'s line: where the pane is, and what tmux says of it. The window's
+#: name, a program's to set, is split off last with ``maxsplit``, as a pane's title is in
+#: :data:`_FACTS_FIELDS`, so no name can make the listing unparseable.
+_FOREIGN_FIELDS = (
+    "session_name",
+    "window_index",
+    "pane_id",
+    "pane_dead",
+    "pane_dead_status",
+    "pane_current_command",
+    "window_name",
+)
+_FOREIGN_FORMAT = _SEP.join(f"#{{{name}}}" for name in _FOREIGN_FIELDS)
+
+
+@dataclass(frozen=True)
+class ForeignPane:
+    """One pane of a tmux server rlx did not start, as ``list-panes -a`` says it."""
+
+    socket: Path
+    """The socket of the server it is on."""
+    session: str
+    window_index: str
+    window_name: str
+    pane_id: str
+    dead: bool
+    dead_status: int | None
+    current_command: str
+
+
+class ForeignServer:
+    """A tmux server in the user's socket folder that rlx did not start: the user's own
+    ``default``, another tool's. Read, and nothing else, by construction: it has one method,
+    :meth:`panes`, and that puts one ``list-panes`` to tmux. No method here types into, sends a
+    key to, renames, resizes or kills anything, and none hands tmux a configuration file (``-f``
+    is read only when a server starts, and nothing here starts one), so a server rlx did not
+    start never meets rlx's conf or rlx's keys.
+
+    Asked at its path (``tmux -S``), never by name: its name is only the file's.
+    """
+
+    def __init__(self, path: Path, *, binary: str | None = None, runner: Runner | None = None):
+        self.path = path
+        self._binary = binary
+        self._runner: Runner = runner or _tmux_asking
+
+    def argv(self, *args: str) -> list[str]:
+        found = shutil.which(self._binary or "tmux")
+        if found is None:
+            raise TmuxUnavailable("tmux is not installed (or not on PATH)")
+        return [found, "-S", str(self.path), *args]
+
+    def panes(self) -> list[ForeignPane]:
+        """Every pane of the server, each session's in tmux's order; empty when no server
+        listens behind the file (:data:`_ABSENT`: tmux leaves its socket file when its server
+        exits). A server that was there and would not answer raises :class:`TmuxError`."""
+        completed = self._runner(self.argv("list-panes", "-a", "-F", _FOREIGN_FORMAT), None)
+        if completed.returncode != 0:
+            if _ABSENT.search(completed.stderr):
+                return []
+            raise TmuxError(completed.stderr.strip() or "tmux list-panes could not be reached")
+        panes: list[ForeignPane] = []
+        for line in completed.stdout.splitlines():
+            fields = line.split(_SEP, len(_FOREIGN_FIELDS) - 1)
+            if len(fields) != len(_FOREIGN_FIELDS):
+                continue
+            values = dict(zip(_FOREIGN_FIELDS, fields, strict=True))
+            panes.append(
+                ForeignPane(
+                    socket=self.path,
+                    session=values["session_name"],
+                    window_index=values["window_index"],
+                    window_name=values["window_name"],
+                    pane_id=values["pane_id"],
+                    dead=values["pane_dead"] == "1",
+                    dead_status=_optional_int(values["pane_dead_status"]),
+                    current_command=values["pane_current_command"],
+                )
+            )
+        return panes
+
+
+def socket_folder(socket: str = DEFAULT_SOCKET) -> Path | None:
+    """The folder tmux keeps this user's sockets in, ``tmux-<uid>`` under ``TMUX_TMPDIR`` (or
+    ``/tmp`` when it is unset), where :meth:`TmuxServer.socket_path` puts ``socket``'s;
+    ``None`` where there is no uid (Windows outside WSL), so no tmux server."""
+    try:
+        return TmuxServer(socket).socket_path().parent
+    except TmuxUnavailable:
+        return None
+
+
+def sockets_in(folder: Path | None) -> list[Path]:
+    """The sockets in ``folder``, by name: what may be a tmux server, each one's file. A
+    folder that is not there, or cannot be listed, has none; an entry that is no socket (a
+    file left by something else) is none either."""
+    if folder is None:
+        return []
+    try:
+        entries = sorted(folder.iterdir())
+    except OSError:
+        return []
+    found: list[Path] = []
+    for entry in entries:
+        with contextlib.suppress(OSError):
+            if stat.S_ISSOCK(entry.lstat().st_mode):
+                found.append(entry)
+    return found

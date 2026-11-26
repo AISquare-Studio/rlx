@@ -4716,6 +4716,7 @@ def _writing_workers() -> dict[str, str]:
         project,
         settings,
         settings_remote,
+        tmux_page,
         welcome,
     )
 
@@ -4741,6 +4742,7 @@ def _writing_workers() -> dict[str, str]:
         agent.RESTART_WORKER: "an agent's restart",
         agent.PAUSE_WORKER: "an agent's pause",
         fleet_bulk.BULK_WORKER: "a restart, stop, pause or resume of many agents",
+        tmux_page.ACT_WORKER: "Settings ▸ tmux's close or adopt of a window",
         accounts.SIGN_OUT_WORKER: "an AISquare sign-out",
         accounts.COMPLETE_WORKER: "a Claude sign-in",
         accounts.ABANDON_WORKER: "a Claude sign-in's discard",
@@ -4778,6 +4780,7 @@ def _waited_reads() -> dict[str, str]:
         fleet_bulk,
         resources,
         settings_remote,
+        tmux_page,
         welcome,
     )
 
@@ -4801,6 +4804,7 @@ def _waited_reads() -> dict[str, str]:
         board.HISTORY_WORKER: "a board's task history",
         fleet_bulk.PLAN_WORKER: "Settings ▸ Fleet's read of the running agents",
         resources.SAMPLE_WORKER: "Agent resources' read of the agents",
+        tmux_page.READ_WORKER: "Settings ▸ tmux's read of the windows",
         app_settings.ACCOUNTS_WORKER: "App settings' accounts",
         welcome.worker_name("look"): "Welcome's checks",
         welcome.worker_name("candidates"): "Welcome's folder list",
