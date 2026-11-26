@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+import os
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
@@ -20,6 +21,7 @@ from textual.app import App, ComposeResult
 from textual.pilot import Pilot
 from textual.widgets import Button, Static
 
+from aisquare.cli.ui import app as app_mod
 from aisquare.cli.ui.app import FleetApp
 from aisquare.cli.ui.sidebar import SettingsRow
 from aisquare.cli.ui.views.usage_sharing import (
@@ -31,10 +33,20 @@ from aisquare.cli.ui.views.usage_sharing import (
 )
 from aisquare.cli.ui.views.usage_stats import UsageStatsView
 from aisquare.core import sharing as sharing_core
-from aisquare.models import SharingStatus, ShipReport
-from aisquare.services import usage_share
+from aisquare.core import tmux as tmux_core
+from aisquare.core.tmux import Completed, TmuxServer
+from aisquare.models import (
+    FleetAgent,
+    FleetAgentStatus,
+    ProjectInfo,
+    SharingStatus,
+    ShipReport,
+)
+from aisquare.services import first_run, usage_share
+from aisquare.services import fleet as fleet_service
 from aisquare.services.active_ping import PingStatus
 from tests import guard_paint
+from tests.fleet_fakes import list_agents_as
 from tests.projects import add_project
 from tests.test_ui_settings_hub import GOOD
 from tests.ui_workers import released, settle_page, settle_until
@@ -613,8 +625,16 @@ async def _open_settings(app: FleetApp, pilot: Pilot[None]) -> None:
     )
 
 
+@pytest.fixture
+def a_fleet_is_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A listed project's fleet is up (``first_run.fleet_is_up``), the moment the question
+    waits for (Q6): for the tests of the question itself. Its wait has tests of its own, with
+    the listing's own rows (the end of this file)."""
+    monkeypatch.setattr(first_run, "fleet_is_up", lambda rows: True)
+
+
 def test_the_question_is_asked_once_after_onboarding_and_no_thanks_is_remembered(
-    tmp_path: Path, sharing_allowed: None, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, sharing_allowed: None, a_fleet_is_up: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     add_project(tmp_path / "work")
     (tmp_path / "work").mkdir(exist_ok=True)
@@ -652,7 +672,7 @@ def test_the_question_is_asked_once_after_onboarding_and_no_thanks_is_remembered
 
 
 def test_share_anonymous_usage_turns_it_on_and_sends_the_first_shipment(
-    tmp_path: Path, sharing_allowed: None
+    tmp_path: Path, sharing_allowed: None, a_fleet_is_up: None
 ) -> None:
     add_project(tmp_path / "work")
     fake = FakeSharing(signed_in=True)
@@ -673,7 +693,7 @@ def test_share_anonymous_usage_turns_it_on_and_sends_the_first_shipment(
 
 
 def test_escape_is_no_thanks(
-    tmp_path: Path, sharing_allowed: None, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, sharing_allowed: None, a_fleet_is_up: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     add_project(tmp_path / "work")
     fake = FakeSharing()
@@ -692,7 +712,7 @@ def test_escape_is_no_thanks(
 
 
 def test_see_exactly_whats_sent_opens_the_preview_over_the_question_and_returns_to_it(
-    tmp_path: Path, sharing_allowed: None
+    tmp_path: Path, sharing_allowed: None, a_fleet_is_up: None
 ) -> None:
     add_project(tmp_path / "work")
     fake = FakeSharing()
@@ -716,7 +736,9 @@ def test_see_exactly_whats_sent_opens_the_preview_over_the_question_and_returns_
     assert fake.calls.count("preview") == 1 and "declined" not in fake.calls
 
 
-def test_the_question_is_never_asked_where_something_forces_sharing_off(tmp_path: Path) -> None:
+def test_the_question_is_never_asked_where_something_forces_sharing_off(
+    tmp_path: Path, a_fleet_is_up: None
+) -> None:
     """The suite forces it off (AISQUARE_NO_TELEMETRY), as a CI run or DO_NOT_TRACK does."""
     add_project(tmp_path / "work")
     fake = FakeSharing()
@@ -733,7 +755,7 @@ def test_the_question_is_never_asked_where_something_forces_sharing_off(tmp_path
 
 
 def test_the_question_is_not_asked_when_it_was_answered_before(
-    tmp_path: Path, sharing_allowed: None
+    tmp_path: Path, sharing_allowed: None, a_fleet_is_up: None
 ) -> None:
     add_project(tmp_path / "work")
     fake = FakeSharing(due=False)
@@ -750,7 +772,9 @@ def test_the_question_is_not_asked_when_it_was_answered_before(
     assert asyncio.run(go()) == 1 and fake.calls == ["consent_due"]
 
 
-def test_with_no_project_yet_there_is_no_question(tmp_path: Path, sharing_allowed: None) -> None:
+def test_with_no_project_yet_there_is_no_question(
+    tmp_path: Path, sharing_allowed: None, a_fleet_is_up: None
+) -> None:
     fake = FakeSharing()
 
     async def go() -> int:
@@ -812,6 +836,245 @@ def test_the_shell_does_not_look_at_the_shipper_before_a_minute_has_passed(
 
     assert asyncio.run(go()) == []
     assert usage_share.TIMEOUT_S == 5.0
+
+
+# --- Q6: after "Your fleet is up", never mid-setup ----------
+
+
+Rows = dict[str, list[FleetAgentStatus]]
+Q6_SOCKET = f"asq-test-{os.getpid()}-sharing-ask"
+
+
+@pytest.fixture
+def listed(monkeypatch: pytest.MonkeyPatch) -> Rows:
+    """What the listing says of each project's agents (``fleet.list_agents``), by project id;
+    and no tmux server but a private one, which never answers."""
+
+    def no_server(argv: Sequence[str], stdin: bytes | None) -> Completed:
+        assert "-L" not in argv or Q6_SOCKET in argv, argv
+        return Completed(1, "", "no server running (a UI test addresses no real fleet)\n")
+
+    monkeypatch.setattr(tmux_core, "_tmux", no_server)
+    monkeypatch.setattr(fleet_service, "server", lambda config=None: TmuxServer(Q6_SOCKET))
+    rows: Rows = {}
+    list_agents_as(monkeypatch, lambda project, live_only=True: list(rows.get(project.id, [])))
+    return rows
+
+
+def _running(project: ProjectInfo, label: str, role: str) -> FleetAgentStatus:
+    agent = FleetAgent(
+        id=f"agt_{project.id}_{label}",
+        project_id=project.id,
+        label=label,
+        role=role,
+        pane_id="%1",
+        tmux_socket=Q6_SOCKET,
+        cwd=project.root,
+        created_at=datetime(2026, 11, 25, 9, 0, tzinfo=UTC),
+    )
+    return FleetAgentStatus(agent=agent, state="working")
+
+
+def _fleet_of(project: ProjectInfo, coders: int) -> list[FleetAgentStatus]:
+    manager = _running(project, "manager", "manager")
+    return [manager, *(_running(project, f"coder-{n}", "coder") for n in range(1, coders + 1))]
+
+
+async def _listed_again(app: FleetApp) -> None:
+    app.refresh_data()
+    await settle_page(app, group=app_mod.FLEET_WORKER)
+
+
+async def _page_change(app: FleetApp, pilot: Pilot[None]) -> str:
+    """Settings, then what is on screen: a page change is where the question is asked."""
+    await _open_settings(app, pilot)
+    return type(app.screen).__name__
+
+
+def test_the_question_waits_for_a_fleet_that_is_up_whichever_page_rlx_opens_on(
+    tmp_path: Path, sharing_allowed: None, listed: Rows
+) -> None:
+    """Q6 (the round-2 tester of #570): since #580 rlx opens on the last project's Manager tab
+    whenever one is listed, so with a project and no fleet the question came at start,
+    mid-setup, and Welcome being shown held nothing. It waits for a listed project's manager
+    and coders to be running (``first_run.fleet_is_up``), whatever page is open; the next page
+    change then asks, once."""
+    project = add_project(tmp_path / "work")
+    (tmp_path / "work").mkdir(exist_ok=True)
+    fake = FakeSharing()
+
+    async def go() -> dict[str, Any]:
+        app = _fleet(fake)
+        async with app.run_test(size=(130, 50)) as pilot:
+            await settle_page(app)
+            seen: dict[str, Any] = {"start": (app.content.current, type(app.screen).__name__)}
+            seen["settings"] = await _page_change(app, pilot)
+            listed[project.id] = _fleet_of(project, first_run.CODERS - 1)  # one coder short
+            await _listed_again(app)
+            seen["short"] = await _page_change(app, pilot)
+            listed[project.id] = _fleet_of(project, first_run.CODERS)
+            await _listed_again(app)
+            seen["listed"] = type(app.screen).__name__  # no page change yet
+            seen["up"] = await _page_change(app, pilot)
+            return seen
+
+    seen = asyncio.run(go())
+    page, screen = seen["start"]
+    assert page == f"project-{project.id}" and screen != "ConsentDialog", seen
+    assert "ConsentDialog" not in (seen["settings"], seen["short"], seen["listed"]), seen
+    assert seen["up"] == "ConsentDialog", seen
+    assert fake.calls.count("consent_due") == 1
+
+
+def test_the_fleet_is_up_with_a_manager_and_the_coders_running_and_not_before() -> None:
+    project = ProjectInfo(id="prj_q6", root=Path("work"))
+    up = _fleet_of(project, first_run.CODERS)
+    assert first_run.fleet_is_up(up)
+    assert not first_run.fleet_is_up(up[1:]), "no manager"
+    assert not first_run.fleet_is_up(up[:-1]), "a coder short"
+    lost = [*up[:-1], up[-1].model_copy(update={"state": "lost"})]
+    assert not first_run.fleet_is_up(lost), "a coder whose window is gone"
+    ended = up[-1].agent.model_copy(update={"ended_at": datetime(2026, 11, 25, tzinfo=UTC)})
+    assert not first_run.fleet_is_up([*up[:-1], up[-1].model_copy(update={"agent": ended})])
+
+
+def test_welcome_holds_the_question_while_it_sets_a_fleet_up_or_waits_on_its_trust_answer(
+    tmp_path: Path, sharing_allowed: None, listed: Rows
+) -> None:
+    """Q6 with a fleet up already: Welcome setting another project's up holds the question (its
+    manager started, its coders not yet), and so does its wait on the manager's trust answer,
+    the coders up or not (started by hand before it). Then the next page change asks."""
+    from aisquare.cli.ui.views.welcome import WelcomeView
+    from aisquare.services.first_run import FleetStep
+
+    up = add_project(tmp_path / "up")
+    new = add_project(tmp_path / "new")
+    for root in (up.root, new.root):
+        root.mkdir(exist_ok=True)
+    fake = FakeSharing()
+
+    async def go() -> dict[str, Any]:
+        app = _fleet(fake)
+        async with app.run_test(size=(130, 50)) as pilot:
+            await settle_page(app)
+            await app.action_welcome()  # `w`: no fleet up yet, so nothing is asked
+            await settle_page(app)
+            page = app.query_one(WelcomeView)
+            page.project = new
+            manager = _running(new, "manager", "manager").agent
+            page.steps = {"manager": FleetStep("manager", "manager", "started", agent=manager)}
+            listed[up.id] = _fleet_of(up, first_run.CODERS)
+            await _listed_again(app)
+            seen: dict[str, Any] = {"setting_up": page.setting_up}
+            seen["setting up"] = await _page_change(app, pilot)
+            for n in range(1, first_run.CODERS + 1):
+                coder = _running(new, f"coder-{n}", "coder").agent
+                page.steps[coder.label] = FleetStep(coder.label, "coder", "started", agent=coder)
+            page.busy.add("trust")  # its wait on the trust answer still runs
+            seen["fleet_up"] = page.fleet_up
+            seen["trust"] = await _page_change(app, pilot)
+            page.busy.discard("trust")
+            seen["answered"] = await _page_change(app, pilot)
+            return seen
+
+    seen = asyncio.run(go())
+    assert seen["setting_up"] and seen["fleet_up"], seen
+    assert seen["setting up"] != "ConsentDialog", "not while Welcome sets a fleet up"
+    assert seen["trust"] != "ConsentDialog", "not while the manager's trust answer is awaited"
+    assert seen["answered"] == "ConsentDialog", seen
+    assert fake.calls.count("consent_due") == 1
+
+
+def test_a_fresh_home_is_asked_once_welcome_has_its_fleet_up_and_never_before(
+    tmp_path: Path, sharing_allowed: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q6 from a fresh home (the reviewer of #570): no project, so rlx opens on Welcome. Step 1
+    sets a folder up, *Start fleet* opens the manager's pane in place for its trust question,
+    and the coders follow the answer. Nothing is asked on the way, the pages it opens
+    included; once the fleet is up, the next page change asks, once."""
+    import threading
+
+    from aisquare.cli.ui.views import welcome
+    from aisquare.cli.ui.views.welcome import WelcomeView
+    from aisquare.models import SetupReport
+    from aisquare.services.first_run import Candidates
+    from aisquare.services.onboarding import OnboardOutcome
+    from tests import test_ui_welcome as screens
+
+    folder = tmp_path / "shop"
+    folder.mkdir()
+    machine = screens.Machine(
+        claude=[screens.READY],
+        found=Candidates(items=(screens.here(folder),)),
+        trust=threading.Event(),
+    )
+
+    def onboarded(path: Path) -> OnboardOutcome:
+        project = add_project(path)  # in the store, so the shell lists it
+        machine.stored[project.id] = project
+        report = SetupReport(home=path / ".home", already_initialized=False, project=project)
+        return OnboardOutcome(path=path, project_id=project.id, report=report)
+
+    machine.onboard_answer = onboarded
+    monkeypatch.setattr(welcome, "DEFAULT_SEAMS", machine.seams())
+    list_agents_as(monkeypatch, lambda project, live_only=True: machine.statuses(project))
+    sockets = (Q6_SOCKET, screens.PRIVATE_SOCKET)
+
+    def no_server(argv: Sequence[str], stdin: bytes | None) -> Completed:
+        assert "-L" not in argv or any(socket in argv for socket in sockets), argv
+        return Completed(1, "", "no server running (a UI test addresses no real fleet)\n")
+
+    monkeypatch.setattr(tmux_core, "_tmux", no_server)
+    monkeypatch.setattr(fleet_service, "server", lambda config=None: TmuxServer(Q6_SOCKET))
+    fake = FakeSharing()
+    group = welcome.WORKER_GROUP  # the wait on the trust answer is held on purpose
+
+    async def go() -> dict[str, Any]:
+        app = _fleet(fake)
+        async with app.run_test(size=(130, 50)) as pilot:
+            await settle_page(app)
+            page = app.query_one(WelcomeView)
+            seen: dict[str, Any] = {"start": app.content.current, "screens": []}
+
+            def look() -> None:
+                seen["screens"].append((app.content.current, type(app.screen).__name__))
+
+            screens.first_candidate(page).press()
+            await settle_until(
+                app,
+                lambda: (
+                    app.snapshot is not None
+                    and bool(app.snapshot.projects)
+                    and screens.visible(page, "fleet-manager")
+                ),
+                group=group,
+            )
+            look()
+            page.query_one("#fleet-manager", Button).press()
+            await settle_until(
+                app, lambda: machine.waited and app.content.current != "welcome", group=group
+            )
+            await settle_page(app, group=group)
+            look()  # the manager's pane, its trust question unanswered
+            machine.trust.set()  # type: ignore[union-attr]  # answered there
+            await settle_until(app, lambda: len(machine.starts) > 1)
+            await _listed_again(app)
+            look()  # the fleet is up: no page change yet
+            seen["asked_before"] = fake.calls.count("consent_due")
+            app.sidebar.focus()
+            await pilot.press("w")  # Welcome again: a page change
+            await settle_until(app, lambda: isinstance(app.screen, ConsentDialog))
+            seen["after"] = (app.content.current, type(app.screen).__name__)
+            return seen
+
+    seen = asyncio.run(go())
+    assert seen["start"] == "welcome", seen
+    [(set_up, on_it), (manager, over_it), (_up, then)] = seen["screens"]
+    assert set_up == "welcome" and manager.startswith("agent-"), seen
+    assert "ConsentDialog" not in (on_it, over_it, then), seen
+    assert seen["asked_before"] == 0, "not asked while it was set up"
+    assert seen["after"] == ("welcome", "ConsentDialog"), seen
+    assert fake.calls.count("consent_due") == 1
 
 
 # --- M5: one save model ---------------------------------------------------------------------
