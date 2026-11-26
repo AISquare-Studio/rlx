@@ -6,13 +6,39 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rlxd_client::Home;
+use rlxd_proto::daemon_kinds;
 use serde_json::Value;
 
 /// How long one `rlxd` command may take before the test fails.
 const COMMAND_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long a command's stdout and stderr may stay open after it exits. Only a process it
+/// started and left running can hold them, and none may: one that did would keep the test
+/// waiting for as long as it ran.
+const OUTPUT_LIMIT: Duration = Duration::from_secs(20);
+
+/// Held while a test starts a command. To start one, Rust makes its pipes, and on macOS
+/// marks them close-on-exec only after it has made them: a command another thread starts
+/// in between inherits them, and the rlxd it starts with them, holding the first
+/// command's output open. Starting one command at a time, none inherits another's pipes.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
+/// Starts `command`, as no other thread of the test starts one ([`SPAWNING`]).
+pub fn launch(command: &mut Command) -> std::io::Result<Child> {
+    let _alone = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+    command.spawn()
+}
+
+/// A new pipe, made as no command starts ([`SPAWNING`]), so none inherits it.
+pub fn pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+    let _alone = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+    std::io::pipe().expect("a pipe")
+}
 
 /// A fresh home, under the system's temporary folder with a short name so the socket's
 /// path fits the OS's limit. Dropping it stops its rlxd and removes it.
@@ -139,7 +165,7 @@ impl TestHome {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        command.spawn().expect("rlxd starts")
+        launch(&mut command).expect("rlxd starts")
     }
 
     /// `rlxd call debug.emit {count}`, which must succeed: the seqs of the first and the
@@ -260,7 +286,7 @@ impl TestHome {
 
 impl Drop for TestHome {
     fn drop(&mut self) {
-        let _ = self.rlxd(&["stop"]);
+        stop_for_good(self.command(&["stop"]), &Home::at(&self.root));
         let deadline = Instant::now() + Duration::from_secs(5);
         while std::fs::remove_dir_all(&self.root).is_err() && self.root.exists() {
             if Instant::now() > deadline {
@@ -272,49 +298,102 @@ impl Drop for TestHome {
 }
 
 /// Runs `command` to its end, failing the test if it takes longer than
-/// [`COMMAND_LIMIT`].
-pub fn run(mut command: Command, stdin: Option<&str>) -> Run {
+/// [`COMMAND_LIMIT`], or its output stays open [`OUTPUT_LIMIT`] after it ends.
+pub fn run(command: Command, stdin: Option<&str>) -> Run {
+    run_or_say(command, stdin).unwrap_or_else(|failure| panic!("{failure}"))
+}
+
+/// [`run`], what goes wrong said rather than failing the test: for a drop guard, which
+/// must not panic.
+fn run_or_say(mut command: Command, stdin: Option<&str>) -> Result<Run, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().expect("rlxd starts");
+    let mut child = launch(&mut command).map_err(|e| format!("{command:?} did not start: {e}"))?;
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().unwrap();
-        pipe.write_all(text.as_bytes()).unwrap();
+        pipe.write_all(text.as_bytes())
+            .map_err(|e| format!("cannot write to {command:?}'s stdin: {e}"))?;
     }
-    finish(child)
+    end(child)
 }
 
 /// Waits for `child`, started with its stdout and stderr piped, to end, failing the test if
-/// it takes longer than [`COMMAND_LIMIT`].
-pub fn finish(mut child: Child) -> Run {
-    let stdout = read_all(child.stdout.take().unwrap());
-    let stderr = read_all(child.stderr.take().unwrap());
-    let status = wait(&mut child);
-    Run {
-        status,
-        stdout: stdout.join().unwrap(),
-        stderr: stderr.join().unwrap(),
-    }
+/// it takes longer than [`COMMAND_LIMIT`], or its output stays open [`OUTPUT_LIMIT`]
+/// after it ends.
+pub fn finish(child: Child) -> Run {
+    end(child).unwrap_or_else(|failure| panic!("{failure}"))
 }
 
-fn read_all(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut text = String::new();
-        let _ = pipe.read_to_string(&mut text);
-        text
+fn end(mut child: Child) -> Result<Run, String> {
+    let stdout = read_all(child.stdout.take().unwrap());
+    let stderr = read_all(child.stderr.take().unwrap());
+    let status = wait(&mut child)?;
+    let deadline = Instant::now() + OUTPUT_LIMIT;
+    let rest = |output: mpsc::Receiver<String>, name: &str| {
+        output
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| {
+                format!(
+                    "the command exited ({status}), but its {name} was still open {} s \
+                     later: a process it started holds it",
+                    OUTPUT_LIMIT.as_secs()
+                )
+            })
+    };
+    Ok(Run {
+        status,
+        stdout: rest(stdout, "stdout")?,
+        stderr: rest(stderr, "stderr")?,
     })
 }
 
-fn wait(child: &mut Child) -> ExitStatus {
+/// All of `pipe`, once every process holding it open has let it go.
+fn read_all(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (read, text) = mpsc::channel();
+    thread::spawn(move || {
+        let mut text = String::new();
+        let _ = pipe.read_to_string(&mut text);
+        let _ = read.send(text);
+    });
+    text
+}
+
+fn wait(child: &mut Child) -> Result<ExitStatus, String> {
     let deadline = Instant::now() + COMMAND_LIMIT;
     loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return status;
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() <= deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "rlxd ran longer than {} s",
+                    COMMAND_LIMIT.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("cannot wait for rlxd: {e}")),
         }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("rlxd ran longer than {} s", COMMAND_LIMIT.as_secs());
-        }
-        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Stops the rlxd of `home` with `stop`, an `rlxd stop` in it, then kills hard any rlxd
+/// still running for it: one a stop could not stop still holds its registry record's
+/// lock. So a test's rlxd never outlives the test, however the test ended. For drop
+/// guards: it fails no test, and prints what went wrong.
+pub fn stop_for_good(stop: Command, home: &Home) {
+    if let Err(failure) = run_or_say(stop, None) {
+        eprintln!("rlxd stop for {}: {failure}", home.root().display());
+    }
+    let live = rlxd::registry::read(home)
+        .map(|roll| roll.live)
+        .unwrap_or_default();
+    for record in live.iter().filter(|r| r.kind == daemon_kinds::RLXD) {
+        let killed = kill(u64::from(record.pid));
+        eprintln!(
+            "rlxd {} still ran for {} after a stop: killed: {killed}",
+            record.pid,
+            home.root().display()
+        );
     }
 }
 
@@ -370,13 +449,23 @@ pub fn fake_claude(scenario: &str) -> PathBuf {
 
 /// Kills the process `pid` as `kill -9` does: no chance to clean up.
 pub fn kill_hard(pid: u64) {
-    let status = if cfg!(windows) {
-        Command::new("taskkill")
+    assert!(kill(pid), "kill {pid}");
+}
+
+/// [`kill_hard`], and whether it could.
+fn kill(pid: u64) -> bool {
+    let mut command = if cfg!(windows) {
+        let mut taskkill = Command::new("taskkill");
+        taskkill
             .args(["/F", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .status()
+            .stdout(Stdio::null());
+        taskkill
     } else {
-        Command::new("kill").args(["-9", &pid.to_string()]).status()
+        let mut kill = Command::new("kill");
+        kill.args(["-9", &pid.to_string()]);
+        kill
     };
-    assert!(status.unwrap().success(), "kill {pid}");
+    launch(&mut command)
+        .and_then(|mut child| child.wait())
+        .is_ok_and(|status| status.success())
 }

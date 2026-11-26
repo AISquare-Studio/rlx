@@ -159,24 +159,30 @@ fn without_json_it_describes_and_exits_the_same() {
     );
 }
 
-/// Stops the rlxd of the home `env -i HOME=<dir>` names, when dropped.
+/// Stops the rlxd of the home `env -i HOME=<dir>` names, `<dir>/.aisquare`, when
+/// dropped, for good ([`common::stop_for_good`]).
 #[cfg(unix)]
 struct StopsWithNoEnvironment<'a>(&'a Path);
 
 #[cfg(unix)]
 impl StopsWithNoEnvironment<'_> {
     /// `env -i HOME=<dir> rlxd args…`: no `PATH`, no home variable, nothing else.
-    fn rlxd(&self, args: &[&str]) -> Run {
+    fn command(&self, args: &[&str]) -> std::process::Command {
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rlxd"));
         command.env_clear().env("HOME", self.0).args(args);
-        common::run(command, None)
+        command
+    }
+
+    fn rlxd(&self, args: &[&str]) -> Run {
+        common::run(self.command(args), None)
     }
 }
 
 #[cfg(unix)]
 impl Drop for StopsWithNoEnvironment<'_> {
     fn drop(&mut self) {
-        let _ = self.rlxd(&["stop"]);
+        let home = Home::at(self.0.join(".aisquare"));
+        common::stop_for_good(self.command(&["stop"]), &home);
     }
 }
 
@@ -313,11 +319,93 @@ fn environment_of(pid: u64) -> String {
     if let Ok(bytes) = std::fs::read(format!("/proc/{pid}/environ")) {
         return String::from_utf8_lossy(&bytes).replace('\0', " ");
     }
-    let output = std::process::Command::new("ps")
-        .args(["eww", "-p", &pid.to_string()])
-        .output()
-        .expect("ps runs");
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    let mut ps = std::process::Command::new("ps");
+    ps.args(["eww", "-p", &pid.to_string()]);
+    common::run(ps, None).stdout
+}
+
+/// What the process `pid`'s stdin, stdout and stderr are open on: `/proc/<pid>/fd/<n>`
+/// on Linux, `lsof` elsewhere.
+#[cfg(unix)]
+fn stdio_of(pid: u64) -> Vec<String> {
+    let fds = PathBuf::from(format!("/proc/{pid}/fd"));
+    if fds.is_dir() {
+        return ["0", "1", "2"]
+            .map(|fd| {
+                std::fs::read_link(fds.join(fd))
+                    .map_or_else(|e| format!("{fd}: {e}"), |p| p.display().to_string())
+            })
+            .to_vec();
+    }
+    let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+        .unwrap_or("lsof");
+    let mut command = std::process::Command::new(lsof);
+    // One field per line: `p<pid>`, then `f<fd>` and `n<name>` for each descriptor.
+    command.args(["-a", "-p", &pid.to_string(), "-d", "0,1,2", "-F", "n"]);
+    let run = common::run(command, None);
+    run.stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `command`, its process to inherit `fd` as it is: a descriptor passed on by mistake, as
+/// a pipe a thread has just made is to a command another thread starts in that moment
+/// (on macOS, Rust makes a pipe close-on-exec only after it has made it).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn inheriting(mut command: std::process::Command, fd: std::os::fd::RawFd) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the child, between fork and exec, and makes one call,
+    // which is async-signal-safe and changes only the child's own descriptor.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn the_rlxd_start_starts_holds_none_of_its_callers_descriptors() {
+    // Its caller reads `here`'s output to the end, and may have passed it other pipes by
+    // mistake: an rlxd that held one would keep its reader waiting as long as rlxd ran.
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let home = TestHome::new();
+    let (mut reader, writer) = common::pipe();
+    let command = inheriting(
+        home.command(&["here", "--json", "--start"]),
+        writer.as_raw_fd(),
+    );
+    let (code, started) = answer(&common::run(command, None));
+    drop(writer);
+    assert_eq!(code, Some(0), "{started}");
+    assert_eq!(started["started"], true, "{started}");
+    let pid = started["pid"].as_u64().unwrap();
+    assert_eq!(
+        stdio_of(pid),
+        ["/dev/null"; 3],
+        "rlxd {pid}'s stdin, stdout and stderr"
+    );
+    // `here` has exited, so with no rlxd holding a copy, the pipe has ended.
+    let (read, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = read.send(reader.read_to_end(&mut Vec::new()));
+    });
+    assert!(
+        ended
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok(),
+        "rlxd {pid} holds the pipe its starter inherited"
+    );
 }
 
 #[cfg(unix)]
