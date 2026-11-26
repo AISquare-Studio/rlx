@@ -103,8 +103,13 @@ Everything else has the same name in both.
 
 `rlx upgrade` moves an old home to the new layout: `~/.aisquare` becomes `~/.rlx`, and a home
 `RLX_HOME` or `AISQUARE_HOME` names is laid out anew where it is. Nothing else moves a home: no
-other command, no hook and no start of rlx does. The app's Update runs `rlx upgrade`, so it
-moves the home too.
+other command, no hook and no start of rlx does.
+
+In the app, the ⬆ row under Settings offers **Move rlx's home** while the home is old, even when
+no newer release is out. Its *Restart & move* closes rlx, moves the home and reopens rlx. An
+update to a newer release moves the home too. Doctor's `home-layout` row says the home is laid
+out before 0.10.2 until it moves. An install rlx does not upgrade itself (Homebrew, pipx) moves
+its home with `rlx move-home`.
 
 The release that moves homes is 0.10.2, and an upgrade from 0.10.1 runs 0.10.1's code, which does
 not know how. So on a home from before 0.10.2, run `rlx upgrade` twice: the first installs 0.10.2,
