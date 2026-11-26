@@ -1086,3 +1086,45 @@ fn an_app_connection_carrying_an_event_stream_is_dropped_from_the_gate_too() {
     assert!(App::connect(&home, &c2).is_err());
     assert!(App::connect(&home, &c3).is_ok());
 }
+
+#[test]
+fn combining_letters_and_fillers_cannot_dodge_the_revoked_name_rule() {
+    // Review #2068, r3 minor 2: "laptop" and a combining Latin letter compared apart from
+    // the revoked "laptop", so it was approved without --force; Hangul fillers paired a
+    // blank-looking name. Each is refused at once now, before any approval.
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let waiting = pair_in_background(&home, r#"{"device":"laptop"}"#);
+    let request = until_requested(&home, "laptop");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert_eq!(finish(waiting).0, Some(0));
+    assert_eq!(home.rlxd(&["gate", "unpair", "laptop"]).code(), Some(0));
+    for name in [
+        "laptop\u{0363}",
+        "lapto\u{0369}p",
+        "laptop\u{1DE7}",
+        "\u{3164}",
+        "\u{FFA0}",
+        "\u{115F}\u{115F}",
+    ] {
+        let params = json!({"device": name}).to_string();
+        let mut child = pair_in_background(&home, &params);
+        // Refused at once; a name taken waits for an approval instead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("{name:?} was taken as a device name: it waits for an approval");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (code, envelope) = finish(child);
+        assert_eq!(code, Some(1), "{name:?}: {envelope}");
+        assert_eq!(envelope["error"]["code"], "invalid_params", "{name:?}");
+    }
+    assert_eq!(home.rlxd(&["gate", "pair"]).data()["requests"], json!([]));
+    assert_eq!(devices(&home).len(), 1, "only the test client");
+}

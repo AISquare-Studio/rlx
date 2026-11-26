@@ -70,8 +70,9 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     leaves is withdrawn, and a credential whose reply can't be delivered is revoked, so
     no device is left paired with a credential nobody received; an undelivered
     re-pairing keeps the device's old credential. Device names are NFKC-normalized and
-    trimmed, then may hold only letters, digits, spaces, `.`, `_` and `-`, in one
-    script. Names that only look alike (by their UTS #39 skeleton, case and spacing
+    trimmed, then may hold only spaces, and letters, digits, `.`, `_` and `-` that UTS
+    #39 allows in identifiers (no combining letters or fillers), in one script, and
+    must not look blank. Names that only look alike (by their UTS #39 skeleton, case and spacing
     aside) count as one, so they are unique, and a new device may take the name of one
     the user unpaired, or a look-alike, only with `--force`.
     `rlxd gate unpair [<device>]` is the only reset; unpairing one device never touches
