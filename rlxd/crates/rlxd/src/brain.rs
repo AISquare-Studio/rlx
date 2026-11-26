@@ -19,14 +19,16 @@
 //!   it never ran, and the caller may run it elsewhere. That covers a request still
 //!   queued when its accept window ends (withdrawn, so it never runs), a brain that is
 //!   missing, starting or waiting to restart, and one that died or broke the protocol
-//!   before accepting. A brain that has not accepted within [`ACK_WAIT`] of the write is
-//!   killed, and its tree reaped, before the caller hears. Once accepted, a failure is
+//!   before accepting. "Never accepted" is what the brain wrote, not only what rlxd read
+//!   in time: a brain rlxd has not seen accept within [`ACK_WAIT`] of the write is killed
+//!   and reaped, then every frame it had written is read (`refuse`), and an `accepted`
+//!   among them makes the request one that may have run. Once accepted, a failure is
 //!   [`CallError::Failed`] and an overrun [`CallError::TimedOut`] (the brain is killed and
 //!   started again, so the queue moves): the request may have run, and must not run
 //!   again.
 //! - **Supervision.** A brain that ends is started again after a backoff that doubles
 //!   from 250 ms to [`BACKOFF_CAP`] with each start that fails, and starts over once a
-//!   brain has run [`HEALTHY`]. `status.brain` says its pid, `restarts`, `handled`, how
+//!   brain has run [`HEALTHY`] from its hello. `status.brain` says its pid, `restarts`, `handled`, how
 //!   many requests wait (`queued`, at most [`QUEUE_MOST`]: one more is not delivered), and
 //!   while none runs, why (`error`) and how long until the next start (`backoff_ms`).
 //! - **Its tree** (`process`): a process group on POSIX, a Job Object on Windows. When
@@ -40,7 +42,8 @@
 //!   the brain's parent and the record's one writer, so it takes the lock before the
 //!   record exists (no reader can see a fresh record with a free lock and prune it),
 //!   writes the record only once the brain has said a hello this rlxd speaks, keeps it
-//!   on its own heartbeat, and removes it the moment it sees the brain end. If rlxd dies,
+//!   on a heartbeat of its own (every 5 s, a long hook or not, registering again at a
+//!   beat if it could not at first), and removes it the moment it sees the brain end. If rlxd dies,
 //!   the OS frees the lock, and the brain, its stdin closed, ends too.
 //! - **Its environment** is rlxd's, plus [`Brain::start`]'s `env`: the seam for 4.3, the
 //!   app's `PATH` and Claude Code variables, which rlxd will pass to the brain.
@@ -54,8 +57,8 @@ use std::time::Duration;
 
 use rlxd_client::{Home, install};
 use rlxd_proto::{
-    BRAIN_PROTOCOLS, BrainInput, BrainOutput, Data, ErrorBody, VERSION, brain_codes, codes,
-    daemon_kinds,
+    BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, Data, ErrorBody, VERSION,
+    brain_codes, codes, daemon_kinds,
 };
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
@@ -139,18 +142,19 @@ struct Shared {
 /// A request waiting for the brain.
 struct Job {
     method: String,
-    params: Data,
     claim: Arc<Claim>,
     accept_by: Instant,
     deadline: Instant,
     reply: oneshot::Sender<Result<Data, CallError>>,
 }
 
-/// Where a request stands, and the count of requests still waiting, which whoever moves it
-/// out of [`QUEUED`] lowers, once.
+/// Where a request stands, the count of requests still waiting, which whoever moves it out
+/// of [`QUEUED`] lowers, once, and its params, which a withdrawal drops at once: a withdrawn
+/// request waits in the channel for the supervisor, but holds no hook's payload there.
 struct Claim {
     state: AtomicU8,
     queued: Arc<AtomicUsize>,
+    params: Mutex<Option<Data>>,
 }
 
 impl Claim {
@@ -162,8 +166,19 @@ impl Claim {
             .is_ok();
         if moved {
             self.queued.fetch_sub(1, Ordering::SeqCst);
+            if to == WITHDRAWN {
+                drop(self.take_params());
+            }
         }
         moved
+    }
+
+    fn take_params(&self) -> Data {
+        self.params
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_default()
     }
 
     fn state(&self) -> u8 {
@@ -248,6 +263,7 @@ impl Brain {
         let claim = Arc::new(Claim {
             state: AtomicU8::new(QUEUED),
             queued: Arc::clone(&self.queued),
+            params: Mutex::new(Some(params)),
         });
         if waiting >= QUEUE_MOST {
             claim.leave_queue(WITHDRAWN);
@@ -261,7 +277,6 @@ impl Brain {
         let (reply, mut answer) = oneshot::channel();
         let job = Job {
             method: method.to_owned(),
-            params,
             claim: Arc::clone(&claim),
             accept_by,
             deadline,
@@ -362,13 +377,14 @@ async fn supervise(
         if *stopping.borrow() {
             break;
         }
-        let began = Instant::now();
-        let ended = run(&shared, &mut queue, &mut stopping, &mut started_once).await;
+        let (ended, ready) = run(&shared, &mut queue, &mut stopping, &mut started_once).await;
         let error = match ended {
             Ended::Stopping => break,
             Ended::Failed(error) => error,
         };
-        failures = if began.elapsed() >= HEALTHY {
+        // Healthy is a run from a good hello, not from the start: a brain that hangs
+        // before its hello is never healthy, and its backoff grows.
+        failures = if ready.is_some_and(|at| at.elapsed() >= HEALTHY) {
             1
         } else {
             failures.saturating_add(1)
@@ -411,13 +427,13 @@ fn backoff(failures: u32) -> Duration {
     (BACKOFF_FIRST * 2u32.pow(doublings)).min(BACKOFF_CAP)
 }
 
-/// One brain, from its start to its end.
+/// One brain, from its start to its end: how it ended, and when it said a good hello.
 async fn run(
     shared: &Shared,
     queue: &mut mpsc::UnboundedReceiver<Job>,
     stopping: &mut watch::Receiver<bool>,
     started_once: &mut bool,
-) -> Ended {
+) -> (Ended, Option<Instant>) {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(PathBuf::from));
@@ -432,7 +448,8 @@ async fn run(
                      reinstall rlx"
                 .to_owned(),
         };
-        return Ended::Failed(failure(brain_codes::BRAIN_NOT_FOUND, &message));
+        let error = failure(brain_codes::BRAIN_NOT_FOUND, &message);
+        return (Ended::Failed(error), None);
     };
     let args = ["brain", "--stdio"];
     let spawned = Process::spawn(
@@ -446,7 +463,8 @@ async fn run(
         Ok(brain) => brain,
         Err(e) => {
             let message = format!("{} could not start: {e}", program.display());
-            return Ended::Failed(failure(brain_codes::BRAIN_START_FAILED, &message));
+            let error = failure(brain_codes::BRAIN_START_FAILED, &message);
+            return (Ended::Failed(error), None);
         }
     };
     if std::mem::replace(started_once, true) {
@@ -459,34 +477,45 @@ async fn run(
     );
     if let Err(ended) = greet(&mut brain, stopping).await {
         end(&mut brain).await;
-        return ended;
+        return (ended, None);
     }
+    let ready = Instant::now();
     let mut argv = vec![program.display().to_string()];
     argv.extend(args.iter().map(|&arg| arg.to_owned()));
-    let mut registration = register(shared, brain.pid, argv);
+    let record = Record::keep(shared.home.clone(), brain.pid, argv);
     {
         let mut state = shared.state();
         state.pid = Some(brain.pid);
         state.error = None;
     }
-    let ended = serve(shared, &mut brain, queue, stopping, &mut registration).await;
-    if let Some(registration) = registration {
-        tokio::task::block_in_place(|| registration.leave());
-    }
+    let ended = serve(shared, &mut brain, queue, stopping).await;
+    record.leave();
     shared.state().pid = None;
-    ended
+    (ended, Some(ready))
 }
 
-/// The hello exchange: `Err` with why it failed, the brain still to be ended.
+/// The hello exchange: `Err` with why it failed, the brain still to be ended. A line that
+/// is not JSON before the hello, such as something printed as the brain started, is
+/// logged and passed over; a JSON line that is not a hello of this protocol is a brain of
+/// another release.
 async fn greet(brain: &mut Process, stopping: &mut watch::Receiver<bool>) -> Result<(), Ended> {
     let hello = BrainInput::hello(VERSION).map_err(|e| unresponsive(&e.to_string()))?;
     if write(brain, &hello).await.is_err() {
         let said = end_of(&mut brain.exit_watch()).await;
         return Err(exited(&format!("it ended before its hello ({said})")));
     }
-    let frame = tokio::select! {
-        frame = timeout(HELLO_WAIT, brain.frames.recv()) => frame,
-        () = stopped(stopping) => return Err(Ended::Stopping),
+    let deadline = Instant::now() + HELLO_WAIT;
+    let frame = loop {
+        let frame = tokio::select! {
+            frame = timeout_at(deadline, brain.frames.recv()) => frame,
+            () = stopped(stopping) => return Err(Ended::Stopping),
+        };
+        match frame {
+            Ok(Some(Err(unread))) if !unread.json => {
+                warning!("brain: before its hello it wrote {unread}: passed over");
+            }
+            frame => break frame,
+        }
     };
     match frame {
         Err(_) => Err(unresponsive(&format!(
@@ -501,47 +530,96 @@ async fn greet(brain: &mut Process, stopping: &mut watch::Receiver<bool>) -> Res
             protocol,
             pid,
             rlx_version,
-        }))) => {
-            if BRAIN_PROTOCOLS.contains(&protocol) {
-                info!(
-                    "brain: pid {} (python {pid}), rlx {rlx_version}, brain protocol {protocol}",
-                    brain.pid
-                );
-                Ok(())
-            } else {
-                Err(incompatible(&format!(
-                    "rlx {rlx_version} answered brain protocol {protocol}, and this rlxd \
-                     {VERSION} speaks {BRAIN_PROTOCOLS:?}: install the rlx and rlxd of one \
-                     release"
-                )))
-            }
+        }))) if protocol == BRAIN_PROTOCOL => {
+            info!(
+                "brain: pid {} (python {pid}), rlx {rlx_version}, brain protocol {protocol}",
+                brain.pid
+            );
+            Ok(())
         }
+        Ok(Some(Ok(BrainOutput::Hello {
+            protocol,
+            rlx_version,
+            ..
+        }))) => Err(incompatible(&format!(
+            "rlx {rlx_version} answered brain protocol {protocol}, and this rlxd {VERSION} \
+             offered {BRAIN_PROTOCOL}: install the rlx and rlxd of one release"
+        ))),
         Ok(Some(Ok(BrainOutput::Refused { message, .. }))) => Err(incompatible(&format!(
             "the brain refused this rlxd {VERSION}: {message}"
         ))),
         Ok(Some(Ok(other))) => Err(incompatible(&format!(
             "it answered the hello with {other:?}"
         ))),
-        Ok(Some(Err(text))) => Err(incompatible(&format!(
-            "it answered the hello with {text}: is it of another release than this \
+        Ok(Some(Err(unread))) => Err(incompatible(&format!(
+            "it answered the hello with {unread}: is it of another release than this \
              rlxd {VERSION}?"
         ))),
     }
 }
 
-/// The brain's record in the registry, or `None` (it runs unregistered, as rlxd can).
-fn register(shared: &Shared, pid: u32, argv: Vec<String>) -> Option<Registration> {
-    let cwd = Some(shared.home.root().display().to_string());
-    let registered = tokio::task::block_in_place(|| {
-        Registration::register_process(&shared.home, daemon_kinds::BRAIN, pid, argv, false, cwd)
-    });
+/// The brain's record in the registry (4.1), kept by a task of its own: written once the
+/// brain said its hello, beaten every [`registry::HEARTBEAT`] whatever the brain is doing
+/// (a hook may run for two minutes), written again at a beat when it could not be, and
+/// left as the brain ends.
+struct Record {
+    held: Arc<Mutex<Option<Registration>>>,
+    task: JoinHandle<()>,
+}
+
+impl Record {
+    fn keep(home: Home, pid: u32, argv: Vec<String>) -> Self {
+        let first = tokio::task::block_in_place(|| register(&home, pid, &argv));
+        let held = Arc::new(Mutex::new(first));
+        let beating = Arc::clone(&held);
+        let task = tokio::spawn(async move {
+            let mut beat = tokio::time::interval(registry::HEARTBEAT);
+            beat.reset();
+            loop {
+                beat.tick().await;
+                tokio::task::block_in_place(|| {
+                    let mut held = beating.lock().unwrap_or_else(PoisonError::into_inner);
+                    match held.as_mut() {
+                        Some(registration) => {
+                            if let Err(e) = registration.beat() {
+                                warning!("brain: its heartbeat could not be written: {e}");
+                            }
+                        }
+                        None => *held = register(&home, pid, &argv),
+                    }
+                });
+            }
+        });
+        Self { held, task }
+    }
+
+    /// Stops the beat and leaves the registry.
+    fn leave(self) {
+        self.task.abort();
+        let registration = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(registration) = registration {
+            tokio::task::block_in_place(|| registration.leave());
+        }
+    }
+}
+
+/// The brain's record in the registry, or `None`: it runs unregistered until a beat
+/// registers it, as rlxd's own registration does.
+fn register(home: &Home, pid: u32, argv: &[String]) -> Option<Registration> {
+    let cwd = Some(home.root().display().to_string());
+    let registered =
+        Registration::register_process(home, daemon_kinds::BRAIN, pid, argv.to_vec(), false, cwd);
     match registered {
         Ok(registration) => {
             info!("brain: registered as {}", registration.id());
             Some(registration)
         }
         Err(e) => {
-            warning!("brain: running unregistered: {e}");
+            warning!("brain: unregistered, trying again at the next beat: {e}");
             None
         }
     }
@@ -553,10 +631,7 @@ async fn serve(
     brain: &mut Process,
     queue: &mut mpsc::UnboundedReceiver<Job>,
     stopping: &mut watch::Receiver<bool>,
-    registration: &mut Option<Registration>,
 ) -> Ended {
-    let mut beat = tokio::time::interval(registry::HEARTBEAT);
-    beat.reset();
     let mut exit = brain.exit_watch();
     let mut next_id: u64 = 0;
     loop {
@@ -566,7 +641,6 @@ async fn serve(
             said = exit.wait() => Next::Ended(said),
             frame = brain.frames.recv() => Next::Unasked(frame),
             Some(job) = queue.recv() => Next::Job(job),
-            _ = beat.tick() => Next::Beat,
         };
         match next {
             Next::Stop => {
@@ -584,7 +658,7 @@ async fn serve(
                 let what = match frame {
                     None => "its stdout closed".to_owned(),
                     Some(Ok(frame)) => format!("it said {frame:?} unasked"),
-                    Some(Err(text)) => format!("it said {text}"),
+                    Some(Err(unread)) => format!("it said {unread}"),
                 };
                 end(brain).await;
                 return unresponsive(&format!("{what}, and was stopped"));
@@ -607,13 +681,6 @@ async fn serve(
                     }
                 }
             }
-            Next::Beat => {
-                if let Some(registration) = registration.as_mut()
-                    && let Err(e) = tokio::task::block_in_place(|| registration.beat())
-                {
-                    warning!("brain: its heartbeat could not be written: {e}");
-                }
-            }
         }
     }
 }
@@ -628,8 +695,6 @@ enum Next {
     Unasked(Option<process::Frame>),
     /// A request.
     Job(Job),
-    /// Time for the record's heartbeat.
-    Beat,
 }
 
 /// Runs request `id`, answering `job` whatever happens. `Err` when the brain must be
@@ -637,11 +702,11 @@ enum Next {
 async fn run_job(
     shared: &Shared,
     brain: &mut Process,
-    mut job: Job,
+    job: Job,
     id: u64,
     stopping: &mut watch::Receiver<bool>,
 ) -> Result<(), Ended> {
-    let params = std::mem::take(&mut job.params);
+    let params = job.claim.take_params();
     let request = match BrainInput::request(id, job.method.clone(), params) {
         Ok(request) => request,
         Err(e) => {
@@ -652,7 +717,8 @@ async fn run_job(
     };
     let mut exit = brain.exit_watch();
     let ack_by = Instant::now() + ACK_WAIT;
-    // Not accepted yet: whatever goes wrong now, the request never ran.
+    // Not seen accepted yet: whatever goes wrong now, `refuse` reads what the brain wrote
+    // before it decides.
     let written = match timeout_at(ack_by, write(brain, &request)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(unresponsive(&format!(
@@ -661,7 +727,7 @@ async fn run_job(
         Err(_) => Err(unresponsive("it did not read a request")),
     };
     if let Err(ended) = written {
-        return refuse(brain, job, ended).await;
+        return refuse(shared, brain, job, id, ended).await;
     }
     let accepted = tokio::select! {
         frame = timeout_at(ack_by, brain.frames.recv()) => match frame {
@@ -669,7 +735,7 @@ async fn run_job(
             Ok(Some(Ok(frame))) => Err(unresponsive(&format!(
                 "it answered request {id} with {frame:?}, not accepted"
             ))),
-            Ok(Some(Err(text))) => Err(unresponsive(&format!("it said {text}"))),
+            Ok(Some(Err(unread))) => Err(unresponsive(&format!("it said {unread}"))),
             Ok(None) => {
                 let said = end_of(&mut exit).await;
                 Err(exited(&format!("it ended before it accepted a request ({said})")))
@@ -679,26 +745,18 @@ async fn run_job(
                 ACK_WAIT.as_millis()
             ))),
         },
-        said = exit.wait() => {
-            // It may have said `accepted` just before it ended: read what it wrote.
-            match drain(brain, id, false).await {
-                Drained::Accepted(reply) => return finish_after_exit(shared, job, reply, &said),
-                Drained::Nothing => Err(exited(&format!("it ended ({said})"))),
-            }
-        }
+        said = exit.wait() => Err(exited(&format!("it ended ({said})"))),
     };
     if let Err(ended) = accepted {
-        return refuse(brain, job, ended).await;
+        return refuse(shared, brain, job, id, ended).await;
     }
     // Accepted: from here on, the request may have run, and is never refused.
     let reply = tokio::select! {
         frame = timeout_at(job.deadline, brain.frames.recv()) => frame,
         said = exit.wait() => {
-            let reply = match drain(brain, id, true).await {
-                Drained::Accepted(reply) => reply,
-                Drained::Nothing => None,
-            };
-            return finish_after_exit(shared, job, reply, &said);
+            let seen = drain(brain, id, true).await;
+            answer_after_end(shared, job, seen, &said);
+            return Err(exited(&format!("it ended ({said})")));
         }
         () = stopped(stopping) => {
             // rlxd stops: the request has a little longer to end.
@@ -727,10 +785,11 @@ async fn run_job(
             return Ok(());
         }
         Ok(Some(Ok(frame))) => unresponsive(&format!("it answered request {id} with {frame:?}")),
-        Ok(Some(Err(text))) => unresponsive(&format!("it said {text}")),
+        Ok(Some(Err(unread))) => unresponsive(&format!("it said {unread}")),
         Ok(None) => {
             let said = end_of(&mut exit).await;
-            return finish_after_exit(shared, job, None, &said);
+            answer_after_end(shared, job, Drained::Accepted(None), &said);
+            return Err(exited(&format!("it ended running a request ({said})")));
         }
         Err(_) => {
             job.answer(Err(CallError::TimedOut));
@@ -743,34 +802,66 @@ async fn run_job(
     Err(ended)
 }
 
-/// Answers a job the brain never accepted, once the brain is gone: killed and reaped
-/// first, so that a brain too slow to say `accepted` cannot run it after its caller has
-/// heard it never ran. Passes on why the brain ended.
-async fn refuse(brain: &mut Process, job: Job, ended: Ended) -> Result<(), Ended> {
+/// Answers a job rlxd did not see accepted, once the brain is gone: killed and reaped
+/// first, then every frame it had written read. An `accepted` among them means the request
+/// may have run: its reply if there is one, else a failure (the brain ended) or
+/// [`CallError::TimedOut`] (it stalled), never a fallback. Otherwise it never ran, and the
+/// caller hears [`CallError::NotDelivered`]. Passes on why the brain ended.
+async fn refuse(
+    shared: &Shared,
+    brain: &mut Process,
+    job: Job,
+    id: u64,
+    ended: Ended,
+) -> Result<(), Ended> {
     end(brain).await;
+    let seen = drain(brain, id, false).await;
     let why = match &ended {
         Ended::Failed(error) => error.message.clone(),
         Ended::Stopping => "rlxd is stopping".to_owned(),
     };
-    job.answer(Err(not_delivered(&format!(
-        "the brain did not accept it: {why}"
-    ))));
+    if matches!(seen, Drained::Accepted(Some(_))) {
+        shared.state().handled += 1;
+    }
+    let never = not_delivered(&format!("the brain did not accept it: {why}"));
+    // Accepted, then: an end while running it is a failure; a stall is an overrun.
+    let unanswered = match &ended {
+        Ended::Failed(error) if error.code == brain_codes::BRAIN_EXITED => {
+            CallError::Failed(failure(
+                brain_codes::BRAIN_EXITED,
+                &format!("the brain ended running it: {why}"),
+            ))
+        }
+        _ => CallError::TimedOut,
+    };
+    job.answer(settle(seen, never, unanswered));
     Err(ended)
 }
 
-/// What a brain that ended had still written about request `id`.
+/// What an ended brain had written about request `id`.
+#[derive(Debug)]
 enum Drained {
-    /// It had accepted it; then its reply, if it wrote one.
+    /// It had accepted it (or answered it, which says the same); then its reply, if any.
     Accepted(Option<Result<Data, CallError>>),
-    /// It had not accepted it.
+    /// Nothing about it.
     Nothing,
 }
 
-/// Reads what an ended brain wrote, until its stdout's end: whether it accepted request
-/// `id` (or `accepted` already), and its reply.
-async fn drain(brain: &mut Process, id: u64, mut accepted: bool) -> Drained {
-    let mut reply = None;
+/// Reads every frame an ended brain wrote, until its stdout's end, and what they say of
+/// request `id` (`accepted` already, when rlxd saw that).
+async fn drain(brain: &mut Process, id: u64, accepted: bool) -> Drained {
+    let mut frames = Vec::new();
     while let Ok(Some(frame)) = timeout(STOP_GRACE, brain.frames.recv()).await {
+        frames.push(frame);
+    }
+    seen_in(frames, id, accepted)
+}
+
+/// What `frames` say of request `id`: whether it was accepted (`accepted` already, or an
+/// `accepted` or a reply among them), and its reply.
+fn seen_in(frames: Vec<process::Frame>, id: u64, mut accepted: bool) -> Drained {
+    let mut reply = None;
+    for frame in frames {
         match frame {
             Ok(BrainOutput::Accepted { id: said }) if said == id => accepted = true,
             Ok(BrainOutput::Reply {
@@ -778,7 +869,10 @@ async fn drain(brain: &mut Process, id: u64, mut accepted: bool) -> Drained {
                 ok,
                 result,
                 error,
-            }) if said == id && accepted => reply = Some(reply_of(ok, result, error)),
+            }) if said == id => {
+                accepted = true;
+                reply = Some(reply_of(ok, result, error));
+            }
             _ => {}
         }
     }
@@ -789,24 +883,31 @@ async fn drain(brain: &mut Process, id: u64, mut accepted: bool) -> Drained {
     }
 }
 
-/// Answers an accepted job whose brain ended: its reply if it wrote one, else a failure.
-fn finish_after_exit(
-    shared: &Shared,
-    job: Job,
-    reply: Option<Result<Data, CallError>>,
-    said: &str,
-) -> Result<(), Ended> {
-    match reply {
-        Some(outcome) => {
-            shared.state().handled += 1;
-            job.answer(outcome);
-        }
-        None => job.answer(Err(CallError::Failed(failure(
-            brain_codes::BRAIN_EXITED,
-            &format!("the brain ended running it ({said})"),
-        )))),
+/// What a request comes to once its brain ended before rlxd heard all of it: its reply if
+/// the brain wrote one, `unanswered` if it accepted the request and wrote no reply, and
+/// `never` if it never accepted it.
+fn settle(seen: Drained, never: CallError, unanswered: CallError) -> Result<Data, CallError> {
+    match seen {
+        Drained::Accepted(Some(reply)) => reply,
+        Drained::Accepted(None) => Err(unanswered),
+        Drained::Nothing => Err(never),
     }
-    Err(exited(&format!("it ended ({said})")))
+}
+
+/// Answers an accepted job whose brain ended: its reply if it wrote one, else a failure.
+fn answer_after_end(shared: &Shared, job: Job, seen: Drained, said: &str) {
+    if matches!(seen, Drained::Accepted(Some(_))) {
+        shared.state().handled += 1;
+    }
+    let failed = CallError::Failed(failure(
+        brain_codes::BRAIN_EXITED,
+        &format!("the brain ended running it ({said})"),
+    ));
+    let never = CallError::Failed(failure(
+        brain_codes::BRAIN_EXITED,
+        &format!("the brain ended running it ({said})"),
+    ));
+    job.answer(settle(seen, never, failed));
 }
 
 fn reply_of(ok: bool, result: Option<Data>, error: Option<ErrorBody>) -> Result<Data, CallError> {
@@ -894,6 +995,61 @@ fn incompatible(message: &str) -> Ended {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(value: serde_json::Value) -> process::Frame {
+        Ok(serde_json::from_value(value).unwrap())
+    }
+
+    fn never() -> CallError {
+        not_delivered("never")
+    }
+
+    /// The fallback line, decided from what a killed brain had written (review M1): an
+    /// `accepted` among its frames, even one rlxd read too late, means the request may
+    /// have run.
+    #[test]
+    fn a_request_the_brain_wrote_accepted_for_is_never_refused() {
+        let accepted = frame(json!({"type": "accepted", "id": 7}));
+        let replied = frame(json!({"type": "reply", "id": 7, "ok": true, "result": {"a": 1}}));
+        let outcome = settle(
+            seen_in(vec![accepted], 7, false),
+            never(),
+            CallError::TimedOut,
+        );
+        assert!(matches!(outcome, Err(CallError::TimedOut)), "{outcome:?}");
+        let both = vec![frame(json!({"type": "accepted", "id": 7})), replied];
+        let outcome = settle(seen_in(both, 7, false), never(), CallError::TimedOut);
+        assert_eq!(outcome.unwrap()["a"], 1);
+        // A reply with no `accepted` before it still says the request ran.
+        let alone = vec![frame(json!({"type": "reply", "id": 7, "ok": false,
+            "error": {"code": "c", "message": "m"}}))];
+        let outcome = settle(seen_in(alone, 7, false), never(), CallError::TimedOut);
+        assert!(matches!(outcome, Err(CallError::Failed(_))), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_request_the_brain_never_wrote_accepted_for_was_never_delivered() {
+        for frames in [
+            vec![],
+            vec![frame(json!({"type": "accepted", "id": 6}))],
+            vec![
+                Err(process::Unread {
+                    said: "noise".to_owned(),
+                    json: false,
+                }),
+                frame(json!({"type": "reply", "id": 8, "ok": true, "result": {}})),
+            ],
+        ] {
+            let outcome = settle(seen_in(frames, 7, false), never(), CallError::TimedOut);
+            assert!(
+                matches!(outcome, Err(CallError::NotDelivered(_))),
+                "{outcome:?}"
+            );
+        }
+        // rlxd had seen it accepted already: an end with nothing more is no fallback.
+        let outcome = settle(seen_in(vec![], 7, true), never(), CallError::TimedOut);
+        assert!(matches!(outcome, Err(CallError::TimedOut)), "{outcome:?}");
+    }
 
     #[test]
     fn the_backoff_doubles_from_a_quarter_second_to_its_cap() {
