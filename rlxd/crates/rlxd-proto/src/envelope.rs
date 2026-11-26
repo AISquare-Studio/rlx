@@ -347,9 +347,19 @@ pub mod codes {
     /// `space.erase`: a run in the space is queued or running. `detail.run_ids` names
     /// them.
     pub const RUNS_LIVE: &str = "runs_live";
-    /// `space.erase`: the space's folder is a link, which rlxd does not follow; nothing
-    /// was removed.
+    /// `space.erase`: a link (a junction on Windows) is on the way to what it removes:
+    /// `<home>/spaces`, the space, a Claude Code config directory, its `projects`, or the
+    /// space's folder there. rlxd does not follow one; `detail.paths` names them, and
+    /// nothing was removed.
     pub const LINK_REFUSED: &str = "link_refused";
+    /// `space.erase`: some paths could not be removed. `detail.removed` and
+    /// `detail.failed[{path, error}]` say which; the runs whose files remain keep their
+    /// records, so erasing again finishes the job.
+    pub const ERASE_INCOMPLETE: &str = "erase_incomplete";
+    /// `run.start`: rlxd can't name the absolute path of the `rlxd-hook` beside it, which
+    /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
+    /// why.
+    pub const HOOK_NOT_FOUND: &str = "hook_not_found";
 }
 
 impl Envelope {

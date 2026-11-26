@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SpaceEraseData",
-  "description": "`space.erase`'s reply: every path it removed, and each it would not. It refuses with\n`runs_live` while a run in the space is queued or running, and with `link_refused`\nwhen the space's folder is a link, and removes nothing then. A session file it finds\nonly by following a link out of a Claude Code config directory is left, and named in\n`refused`.\n\n```json\n{\"removed\": [\"/Users/u/.aisquare/spaces/default\",\n             \"/Users/u/.claude/projects/-Users-u--aisquare-spaces-default/<run_id>.jsonl\"]}\n```",
+  "description": "`space.erase`'s reply: every path it removed, and the links inside the space that went\nas links. It refuses with `runs_live` while a run in the space is queued or running,\nand with `link_refused` when a link is on the way to what it removes (`<home>/spaces`,\nthe space, a Claude Code config directory, its `projects` or the space's folder\nthere), and removes nothing then.\n\n```json\n{\"removed\": [\"/Users/u/.aisquare/spaces/default\",\n             \"/Users/u/.claude/projects/-Users-u--aisquare-spaces-default/<run_id>.jsonl\"]}\n```",
   "type": "object",
   "properties": {
-    "refused": {
-      "description": "The paths it left, because reaching them meant following a link out of the space\nor a config directory, each with why.",
+    "links": {
+      "description": "The links that were inside the space, removed as links: what they named is left as\nit was.",
       "type": "array",
       "items": {
-        "$ref": "#/$defs/RefusedPath"
+        "type": "string"
       }
     },
     "removed": {
@@ -21,25 +21,5 @@
   },
   "required": [
     "removed"
-  ],
-  "$defs": {
-    "RefusedPath": {
-      "description": "A path `space.erase` left, and why.",
-      "type": "object",
-      "properties": {
-        "path": {
-          "description": "The path.",
-          "type": "string"
-        },
-        "reason": {
-          "description": "Why it was left.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "path",
-        "reason"
-      ]
-    }
-  }
+  ]
 }

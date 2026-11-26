@@ -127,6 +127,19 @@ enum Action {
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
     // Boxed, as Call is.
     Events(Box<EventsOptions>),
+    /// Runs one run's Claude Code and ends its whole process group with it (macOS and
+    /// Linux). rlxd starts it; nobody else does.
+    #[command(name = "__run-guard", hide = true)]
+    RunGuard {
+        /// Claude Code and its arguments, after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 1..,
+            value_parser = clap::value_parser!(std::ffi::OsString)
+        )]
+        argv: Vec<std::ffi::OsString>,
+    },
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -308,6 +321,10 @@ pub fn main() -> ExitCode {
             force,
         }) => cli::gate_pair(request_id, !deny, force),
         Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
+        #[cfg(unix)]
+        Action::RunGuard { argv } => runner::guard::main(&argv),
+        #[cfg(not(unix))]
+        Action::RunGuard { .. } => ExitCode::from(2),
         Action::Events(options) => events::events(events::EventsArgs {
             as_app: options.as_app,
             topics: options.topics,

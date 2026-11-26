@@ -32,10 +32,10 @@
 //! - **`run_seq`** numbers one run's events, from 1 ([`Bus::publish_run`]). The bus
 //!   indexes the events it holds by run, so one run can be replayed from a `run_seq`, with
 //!   the home seq a live follower then resumes after ([`Bus::run_events`]). Runs outlive the
-//!   buffer: the runner (5.4) keeps each run's events on disk as well, each written there
-//!   before it is published ([`Bus::publish_run_durably`], which holds the seq meanwhile
-//!   and makes later publishers wait, never subscribers), tells the bus where a resumed
-//!   run's numbering stands ([`Bus::seed_run`]), and says when a run has ended
+//!   buffer: the runner (5.4) numbers each run's events itself ([`Bus::publish_run_as`]),
+//!   so that it can make an event durable before it is published, with no lock of the
+//!   bus's held meanwhile; it keeps each run's events on disk, tells the bus where a
+//!   resumed run's numbering stands ([`Bus::seed_run`]), and says when a run has ended
 //!   ([`Bus::end_run`]), so that its entry goes once the buffer holds none of its events.
 //!
 //! # The buffer
@@ -167,6 +167,13 @@ pub enum Refused {
     TooLarge(usize),
     /// The mark is used up and could not be written, so no seq is free: why.
     Unnumbered(String),
+    /// A run event's `run_seq` is not above the run's last ([`Bus::publish_run_as`]).
+    RunSeq {
+        /// The `run_seq` asked for.
+        run_seq: u64,
+        /// The run's last.
+        last: u64,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -182,6 +189,11 @@ impl fmt::Display for Refused {
                 "the event is {length} bytes, more than a client reads ({MAX_EVENT})"
             ),
             Self::Unnumbered(why) => write!(f, "no seq is free: {why}"),
+            Self::RunSeq { run_seq, last } => write!(
+                f,
+                "run_seq {run_seq} is not above the run's last, {last}: each run's events \
+                 are numbered once, in order"
+            ),
         }
     }
 }
@@ -267,9 +279,6 @@ struct State {
     reserved: u64,
     /// A mark write is in flight.
     writing: bool,
-    /// A publisher holds the next seq while it makes its event durable
-    /// ([`Bus::publish_run_durably`]): later publishers wait for it.
-    committing: bool,
     /// When the last mark write failed, and why, until one succeeds.
     failed: Option<(Instant, String)>,
     /// Each run's numbering, and where its events are in the buffer.
@@ -323,7 +332,6 @@ impl Bus {
                 head: last,
                 reserved,
                 writing: false,
-                committing: false,
                 failed: None,
                 runs: HashMap::new(),
             }),
@@ -342,7 +350,7 @@ impl Bus {
     /// Writes the last seq given out as the mark, so the next rlxd numbers on from it.
     pub fn close(&self) {
         let mut state = self.state();
-        while state.writing || state.committing {
+        while state.writing {
             state = self.wait(state);
         }
         let head = state.head;
@@ -376,28 +384,41 @@ impl Bus {
 
     /// Publishes an event of `run`, giving it the run's next `run_seq`.
     pub fn publish_run(&self, run: Run<'_>, r#type: &str, data: Data) -> Result<Numbered, Refused> {
-        self.publish_run_durably(run, r#type, data, |_, _| {})
+        self.publish_numbered(run, None, r#type, data)
             .map(|(numbered, _)| numbered)
     }
 
-    /// [`Bus::publish_run`], with the event made durable before anyone sees it: `persist`
-    /// gets the event's numbers and its line, as subscribers will get it, before the event
-    /// is published. The seq is held for it meanwhile, off the lock: subscribers go on
-    /// reading, and a later publisher waits until this event is published, so seqs stay
-    /// in order. The runner keeps each run's events on disk this way, so an app never
-    /// sees an event that a restart would not find (handoff 0.10.3, 5.4). Gives back the
-    /// numbers and the line.
-    pub fn publish_run_durably(
+    /// Publishes an event of `run` numbered `run_seq` by its publisher, the runner, which
+    /// numbers each run's events itself (under that run's own lock) so that it can make
+    /// one durable before it is published. `run_seq` must be above the run's last, or the
+    /// event is refused ([`Refused::RunSeq`]). The bus's lock is held only to number and
+    /// append it in memory. Gives back its numbers and its line, as subscribers get it.
+    pub fn publish_run_as(
         &self,
         run: Run<'_>,
+        run_seq: u64,
         r#type: &str,
         data: Data,
-        persist: impl FnOnce(Numbered, &Line),
+    ) -> Result<(Numbered, Line), Refused> {
+        self.publish_numbered(run, Some(run_seq), r#type, data)
+    }
+
+    /// A run event numbered `run_seq`, or the run's next when `None`, under one lock.
+    fn publish_numbered(
+        &self,
+        run: Run<'_>,
+        run_seq: Option<u64>,
+        r#type: &str,
+        data: Data,
     ) -> Result<(Numbered, Line), Refused> {
         let bit = bit(topics::RUN).expect("the bus carries run events");
         let mut state = self.lock_for_a_seq()?;
+        let last = state.runs.get(run.id).map_or(0, |log| log.last);
+        let run_seq = run_seq.unwrap_or(last + 1);
+        if run_seq <= last {
+            return Err(Refused::RunSeq { run_seq, last });
+        }
         let seq = state.head + 1;
-        let run_seq = state.runs.get(run.id).map_or(0, |log| log.last) + 1;
         let mut scope = RunScope::new(run.id, run_seq, run.kind, run.attempt);
         if let Some(job_id) = run.job_id {
             scope = scope.with_job(job_id);
@@ -405,34 +426,17 @@ impl Bus {
         let event =
             Event::for_run(seq, clock::now(), r#type, scope, data).map_err(Refused::Event)?;
         let line = line(&event)?;
-        let numbered = Numbered { seq, run_seq };
-        state.committing = true;
+        let id: Arc<str> = match state.runs.get_key_value(run.id) {
+            Some((id, _)) => Arc::clone(id),
+            None => Arc::from(run.id),
+        };
+        let log = state.runs.entry(Arc::clone(&id)).or_default();
+        log.last = run_seq;
+        log.held.push_back((run_seq, seq));
+        let write = self.append(&mut state, seq, bit, Some(id), Arc::clone(&line));
         drop(state);
-        {
-            /// Lets later publishers go on however `persist` ends, a panic included.
-            struct Committed<'a>(&'a Bus);
-            impl Drop for Committed<'_> {
-                fn drop(&mut self) {
-                    self.0.state().committing = false;
-                    self.0.written.notify_all();
-                }
-            }
-            let _committed = Committed(self);
-            persist(numbered, &line);
-            let mut state = self.state();
-            state.committing = false;
-            let id: Arc<str> = match state.runs.get_key_value(run.id) {
-                Some((id, _)) => Arc::clone(id),
-                None => Arc::from(run.id),
-            };
-            let log = state.runs.entry(Arc::clone(&id)).or_default();
-            log.last = run_seq;
-            log.held.push_back((run_seq, seq));
-            let write = self.append(&mut state, seq, bit, Some(id), Arc::clone(&line));
-            drop(state);
-            self.after_unlock(seq, write);
-        }
-        Ok((numbered, line))
+        self.after_unlock(seq, write);
+        Ok((Numbered { seq, run_seq }, line))
     }
 
     /// Says that run `id` has numbered its events up to `last_run_seq` already, as its
@@ -568,9 +572,6 @@ impl Bus {
     fn lock_for_a_seq(&self) -> Result<MutexGuard<'_, State>, Refused> {
         let mut state = self.state();
         loop {
-            while state.committing {
-                state = self.wait(state);
-            }
             if state.head == u64::MAX {
                 return Err(Refused::Unnumbered("every seq is used".to_owned()));
             }
@@ -957,62 +958,58 @@ mod tests {
     }
 
     #[test]
-    fn a_durable_run_event_is_persisted_before_anyone_sees_it_and_later_publishers_wait() {
+    fn run_events_numbered_by_their_runs_and_plain_events_from_many_threads_get_one_seq_each() {
         let dir = Dir::new();
         let bus = Arc::new(dir.bus(CAPACITY));
-        emit(&bus, 1);
-        let mut follower = follower(&bus, Some(1));
-        let (persisting, persisted) = mpsc::channel::<()>();
-        let (go_on, wait) = mpsc::channel::<()>();
-        let publisher = {
+        let mut everything = follower(&bus, Some(0));
+        const PER: u64 = 400;
+        let mut threads = Vec::new();
+        for t in 0..4u64 {
             let bus = Arc::clone(&bus);
-            thread::spawn(move || {
-                bus.publish_run_durably(run("a"), "run.done", Data::new(), |numbered, line| {
-                    assert_eq!((numbered.seq, numbered.run_seq), (2, 1));
-                    let event: Value = serde_json::from_slice(line).unwrap();
-                    assert_eq!(event["seq"], 2);
-                    assert_eq!(event["data"]["run_seq"], 1);
-                    persisting.send(()).unwrap();
-                    wait.recv().unwrap();
-                })
-                .unwrap()
-            })
-        };
-        persisted.recv().unwrap();
-        // While it is made durable, nobody sees it, and the next publisher waits.
-        assert_eq!(bus.head(), 1);
-        assert!(read(&bus, &mut follower, BATCH).is_empty());
-        let later = {
+            threads.push(thread::spawn(move || {
+                let id = format!("r{t}");
+                for run_seq in 1..=PER {
+                    bus.publish_run_as(run(&id), run_seq, "run.text", Data::new())
+                        .unwrap();
+                }
+            }));
+        }
+        for _ in 0..2 {
             let bus = Arc::clone(&bus);
-            thread::spawn(move || emit(&bus, 1))
-        };
-        thread::sleep(Duration::from_millis(100));
-        assert!(
-            !later.is_finished(),
-            "a later publisher waits for the durable one"
-        );
-        go_on.send(()).unwrap();
-        let (numbered, line) = publisher.join().unwrap();
-        assert_eq!(later.join().unwrap(), 3, "and takes the seq after it");
-        let lines = read_all(&bus, &mut follower);
-        assert_eq!(seqs(&lines), [2, 3]);
+            threads.push(thread::spawn(move || {
+                emit(&bus, PER);
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let lines = read_all(&bus, &mut everything);
+        let all = seqs(&lines);
         assert_eq!(
-            &*lines[0], &*line,
-            "subscribers get the line that was persisted"
+            all,
+            (1..=6 * PER).collect::<Vec<_>>(),
+            "one seq each, in order"
         );
-        assert_eq!(numbered.seq, 2);
-    }
-
-    #[test]
-    fn a_persist_that_panics_publishes_nothing_and_holds_up_no_one() {
-        let dir = Dir::new();
-        let bus = dir.bus(CAPACITY);
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bus.publish_run_durably(run("a"), "run.done", Data::new(), |_, _| panic!("disk"))
-        }));
-        assert!(panicked.is_err());
-        assert_eq!(bus.head(), 0);
-        assert_eq!(emit(&bus, 1), 1, "the seq it held is given out again");
+        assert_eq!(bus.head(), 6 * PER);
+        let events = events(&lines);
+        for t in 0..4u64 {
+            let id = format!("r{t}");
+            let run_seqs: Vec<u64> = events
+                .iter()
+                .filter(|e| e["data"]["run_id"] == id.as_str())
+                .map(|e| e["data"]["run_seq"].as_u64().unwrap())
+                .collect();
+            assert_eq!(run_seqs, (1..=PER).collect::<Vec<_>>(), "{id}");
+        }
+        // Each held line is at the place read() takes it from.
+        let mut from_middle = follower(&bus, Some(3 * PER));
+        assert_eq!(seqs(&read(&bus, &mut from_middle, 1)), [3 * PER + 1]);
+        // A run_seq that is not above the run's last is refused, and takes no seq.
+        let refused = bus.publish_run_as(run("r0"), PER, "run.text", Data::new());
+        assert!(
+            matches!(refused, Err(Refused::RunSeq { run_seq, last }) if run_seq == PER && last == PER)
+        );
+        assert_eq!(bus.head(), 6 * PER);
     }
 
     // --- numbering and the buffer ------------------------------------------------------

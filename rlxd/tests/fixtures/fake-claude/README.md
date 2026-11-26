@@ -36,6 +36,9 @@ the same files.
 | `asks` | Ends with the output `{"status":"needs_you","question":"Which channel?"}`; resumed, it reads the reply and ends `{"status":"done","channel":<reply>}` |
 | `crash` | Says part of an answer, then exits 1 with no result |
 | `persist` | `hello`, named for the erase check: every scenario writes its session file where Claude Code does unless `--no-session-persistence` |
+| `orphan` | Starts a process of its own that would linger a minute, answers, and exits: the run's end must take that process too |
+| `abort` | Says part of an answer, then dies of `SIGABRT` (an abort), so rlxd reports the signal |
+| `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's

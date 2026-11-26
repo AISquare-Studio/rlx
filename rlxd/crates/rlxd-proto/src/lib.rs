@@ -216,8 +216,8 @@ pub use settings::{
     keys as setting_keys, send_safety_lowers, send_safety_modes,
 };
 pub use space::{
-    DEFAULT_SPACE, MAX_SPACE_NAME, RefusedPath, SPACE_NAME_PATTERN, SpaceEnsureData,
-    SpaceEraseData, SpaceParams, check_name as check_space_name,
+    DEFAULT_SPACE, MAX_SPACE_NAME, SPACE_NAME_PATTERN, SpaceEnsureData, SpaceEraseData,
+    SpaceParams, check_name as check_space_name,
 };
 pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
 pub use subscribe::SubscribeParams;

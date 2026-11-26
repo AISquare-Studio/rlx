@@ -1,7 +1,8 @@
 //! The runner's Accept checks (handoff 0.10.3, 2.1, 2.5 and 7.5), through the real socket,
 //! with fake-claude standing in for Claude Code on every OS ("How to read the checks").
 //!
-//! Each test gets a fresh home, a `CLAUDE_CONFIG_DIR` inside it, and fake-claude linked
+//! Each test gets a fresh home, a `CLAUDE_CONFIG_DIR` and a user home (`HOME`,
+//! `USERPROFILE`) inside it, so no test reads or writes a real `~/.claude`, and fake-claude linked
 //! into it as `<home>/bin/fake-claude/<scenario>`, which `RLXD_CLAUDE_BIN` names: the
 //! process's command line names its scenario, as `pgrep -f fake-claude/slow` expects. No
 //! check needs tmux.
@@ -45,9 +46,15 @@ fn home_with(scenario: &str, envs: &[(&str, &str)]) -> TestHome {
     let claude = link(home.root(), scenario);
     let config = home.root().join("claude-config");
     std::fs::create_dir_all(&config).unwrap();
+    // A user home of its own too, so nothing reads or writes the real ~/.claude
+    // (space.erase looks there as well as in CLAUDE_CONFIG_DIR).
+    let user = home.root().join("user-home");
+    std::fs::create_dir_all(&user).unwrap();
     let mut home = home
         .with_claude(claude)
-        .with_env("CLAUDE_CONFIG_DIR", config.to_str().unwrap());
+        .with_env("CLAUDE_CONFIG_DIR", config.to_str().unwrap())
+        .with_env("HOME", user.to_str().unwrap())
+        .with_env("USERPROFILE", user.to_str().unwrap());
     for (name, value) in envs {
         home = home.with_env(name, value);
     }
@@ -655,18 +662,31 @@ fn cancel_ends_a_running_run_and_its_tree_and_a_queued_one() {
         "an ended run stays as it ended"
     );
 
-    // A queued run: two refreshes, the second waits; cancel it.
+    // A queued run: refreshes, one at a time; w2 and w3 wait; cancel w2. It leaves its
+    // queue: the next run to wait is second, after w3, not third.
     let since = seq(&home);
     let refresh = json!({"kind": "widget_refresh", "prompt": "x", "mount": {"kind": "no_tools"}});
-    let (w1, w2) = (run_id(), run_id());
+    let (w1, w2, w3, w4) = (run_id(), run_id(), run_id(), run_id());
     start(&home, &refresh, &w1);
     start(&home, &refresh, &w2);
+    start(&home, &refresh, &w3);
     let cancelled = home.rlxd(&["call", "run.cancel", &json!({"run_id": w2}).to_string()]);
     assert_eq!(cancelled.data()["cancelled"], true, "{cancelled:?}");
     let events = wait_until(&home, since, 10, "the queued run fails", |e| ended(e, &w2));
     let failed = of(&events, &w2, Some("run.failed"));
     assert_eq!(failed[0]["data"]["reason"], "cancelled");
     assert!(of(&events, &w2, Some("run.started")).is_empty());
+    start(&home, &refresh, &w4);
+    let events = wait_until(&home, since, 10, "w4 waits", |e| {
+        !of(e, &w4, Some("run.queued")).is_empty()
+    });
+    assert_eq!(
+        of(&events, &w4, Some("run.queued"))[0]["data"]["position"],
+        2
+    );
+    for w in [&w3, &w4] {
+        home.rlxd(&["call", "run.cancel", &json!({"run_id": w}).to_string()]);
+    }
     let unknown = home.rlxd(&[
         "call",
         "run.cancel",
@@ -1228,6 +1248,88 @@ fn space_erase_refuses_while_a_run_in_the_space_is_live() {
     call(&home, "space.erase", &json!({"name": "other"}));
 }
 
+#[test]
+fn a_run_cancelled_as_its_turn_comes_never_starts_and_ends_once() {
+    // A place given back waits 1.5 s before its next run starts (test builds only), so the
+    // cancel lands after the run has left its queue and before it starts: the window a
+    // real cancel can hit.
+    let home = home_with("slow", &[("RLXD_TEST_LAUNCH_DELAY_MS", "1500")]);
+    let since = seq(&home);
+    let refresh = json!({"kind": "widget_refresh", "prompt": "x", "mount": {"kind": "no_tools"}});
+    let (w1, w2, w3) = (run_id(), run_id(), run_id());
+    start(&home, &refresh, &w1);
+    start(&home, &refresh, &w2);
+    wait_until(&home, since, 20, "w1 starts", |e| {
+        !of(e, &w1, Some("run.started")).is_empty()
+    });
+    let first = home.rlxd(&["call", "run.cancel", &json!({"run_id": w1}).to_string()]);
+    assert_eq!(first.code(), Some(0), "{first:?}");
+    // w1's place is on its way to w2, which has left its queue.
+    let cancelled = home
+        .rlxd(&["call", "run.cancel", &json!({"run_id": w2}).to_string()])
+        .data();
+    assert_eq!(cancelled["cancelled"], true, "{cancelled:#}");
+    thread::sleep(Duration::from_millis(2500));
+    let events = replay(&home, since);
+    let ends: Vec<&Value> = of(&events, &w2, None)
+        .into_iter()
+        .filter(|e| {
+            ["run.done", "run.failed", "run.needs_you"].contains(&e["type"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "one end: {events:#?}");
+    assert_eq!(ends[0]["data"]["reason"], "cancelled");
+    assert!(
+        of(&events, &w2, Some("run.started")).is_empty(),
+        "{events:#?}"
+    );
+    let log = fixture_log(&home);
+    let started_w2 = log["starts"].as_array().unwrap().iter().any(|s| {
+        s["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == w2.as_str())
+    });
+    assert!(
+        !started_w2,
+        "no Claude Code ran for the cancelled run: {log:#}"
+    );
+    let record: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            home.root()
+                .join("rlxd")
+                .join("runs")
+                .join(&w2)
+                .join("run.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["state"], "failed");
+    // The place it never took went on: the next run starts.
+    let mut quick = refresh.clone();
+    quick["prompt"] = json!("quick");
+    start(&home, &quick, &w3);
+    wait_until(&home, since, 20, "w3 runs", |e| ended(e, &w3));
+}
+
+#[test]
+fn what_claude_code_leaves_running_ends_with_its_run() {
+    let home = home("orphan");
+    let (r, _, events) = gated_start(&home, &task("start it")).wait();
+    assert_eq!(
+        of(&events, &r, None).last().unwrap()["type"],
+        "run.done",
+        "{events:#?}"
+    );
+    // The lingering process would sleep a minute: the run's end takes it, and nothing
+    // of the run is left.
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "orphan")) == 0
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn space_erase_follows_no_link() {
@@ -1242,4 +1344,483 @@ fn space_erase_follows_no_link() {
         "link_refused"
     );
     assert!(elsewhere.join("keep").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_claude_code_killed_by_a_signal_is_said_to_be() {
+    let home = home("abort");
+    let (r, _, events) = gated_start(&home, &task("go")).wait();
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert_eq!(last["data"]["reason"], "error");
+    let message = last["data"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("signal: 6"),
+        "the guard passes the signal on: {message}"
+    );
+}
+
+#[test]
+fn a_result_too_large_for_run_done_still_ends_the_run_with_its_reason() {
+    let home = home("huge");
+    let (r, _, events) = gated_start(&home, &task("go")).wait();
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert!(
+        last["data"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("output_too_large"),
+        "{last:#}"
+    );
+}
+
+#[test]
+fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
+    // Test builds only: the state events of runs in the space "slowdisk" wait 3 s before
+    // they are made durable, as under a slow fsync.
+    let home = home_with("hello", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:3000")]);
+    let since = seq(&home);
+    let mut slow = task("hi");
+    slow["space"] = json!("slowdisk");
+    let a = run_id();
+    start(&home, &slow, &a);
+    // Wait until A's Claude Code has started: its run.started is then being made durable.
+    common::eventually("A's Claude Code starts", || {
+        std::fs::read_to_string(home.root().join("fake-claude.log.json"))
+            .is_ok_and(|log| log.contains(&a))
+    });
+    thread::sleep(Duration::from_millis(300));
+    let quick = |what: &str, args: &[&str]| {
+        let began = Instant::now();
+        let run = home.rlxd(args);
+        assert_eq!(run.code(), Some(0), "{what}: {run:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "{what} waited {:?}",
+            began.elapsed()
+        );
+        run
+    };
+    let emitted = quick("debug.emit", &["call", "debug.emit", r#"{"count":3}"#]);
+    let last = emitted.data()["last"].as_u64().unwrap();
+    quick(
+        "a follower of another topic",
+        &[
+            "events",
+            "--topics",
+            "daemon",
+            "--since",
+            &(last - 1).to_string(),
+        ],
+    );
+    quick("status", &["call", "status"]);
+    quick(
+        "space.ensure",
+        &["call", "space.ensure", r#"{"name":"other"}"#],
+    );
+    // Another run, in another space, starts and ends meanwhile.
+    let b = run_id();
+    start(&home, &task("hi"), &b);
+    let events = wait_until(&home, since, 20, "B ends", |e| ended(e, &b));
+    assert!(
+        of(&events, &a, Some("run.started")).is_empty(),
+        "B ended while A's run.started was still being made durable: {events:#?}"
+    );
+    // A goes on once its disk does.
+    wait_until(&home, since, 30, "A ends", |e| ended(e, &a));
+}
+
+/// The run's record, `<home>/rlxd/runs/<r>/run.json`.
+fn record_path(home: &TestHome, r: &str) -> PathBuf {
+    home.root()
+        .join("rlxd")
+        .join("runs")
+        .join(r)
+        .join("run.json")
+}
+
+/// The run's log, `<home>/rlxd/runs/<r>/events.jsonl`.
+fn log_path(home: &TestHome, r: &str) -> PathBuf {
+    home.root()
+        .join("rlxd")
+        .join("runs")
+        .join(r)
+        .join("events.jsonl")
+}
+
+/// Claude Code's project folder for the space `p` (its resolved path), in this home's
+/// CLAUDE_CONFIG_DIR.
+fn project_of(home: &TestHome, p: &str) -> PathBuf {
+    let folder: String = p
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    home.root()
+        .join("claude-config")
+        .join("projects")
+        .join(folder)
+}
+
+#[test]
+fn a_needs_you_raised_before_a_restart_is_cleared_after_it() {
+    let home = home("asks");
+    let mut params = task("post the standup");
+    params["needs_you_when"] =
+        json!({"pointer": "/status", "equals": "needs_you", "question_pointer": "/question"});
+    let (r, _, events) = gated_start(&home, &params).wait();
+    let raised: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "needs_you.raised")
+        .collect();
+    let id = raised[0]["data"]["id"].clone();
+    home.stop();
+    home.start_dev();
+    let s = seq(&home);
+    call(&home, "run.resume", &json!({"run_id": r, "reply": "#dev"}));
+    let after = home.rlxd(&[
+        "events",
+        "--topics",
+        "run,needs_you",
+        "--since",
+        &s.to_string(),
+        "--follow",
+        "--until",
+        "run.done",
+        "--timeout",
+        "30",
+    ]);
+    let cleared: Vec<Value> = after
+        .lines()
+        .into_iter()
+        .filter(|e| e["type"] == "needs_you.cleared")
+        .collect();
+    assert_eq!(cleared.len(), 1, "{after:?}");
+    assert_eq!(cleared[0]["data"]["id"], id);
+}
+
+#[test]
+fn a_run_that_never_started_has_no_session_to_resume() {
+    let home = home("slow");
+    let since = seq(&home);
+    let (t1, t2, t3) = (run_id(), run_id(), run_id());
+    for t in [&t1, &t2, &t3] {
+        start(&home, &task("take your time"), t);
+    }
+    wait_until(&home, since, 20, "t3 waits", |e| {
+        !of(e, &t3, Some("run.queued")).is_empty()
+    });
+    call(&home, "run.cancel", &json!({"run_id": t3}));
+    assert_eq!(
+        refused(&home, "run.resume", &json!({"run_id": t3})),
+        "no_session"
+    );
+    for t in [&t1, &t2] {
+        call(&home, "run.cancel", &json!({"run_id": t}));
+    }
+}
+
+#[test]
+fn space_erase_touches_only_the_spaces_own_project_folder() {
+    let home = home("persist");
+    let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut params = task("hi");
+    params["persist_session"] = json!(true);
+    let (r, _, _) = gated_start(&home, &params).wait();
+    let ours = project_of(&home, &p).join(format!("{r}.jsonl"));
+    assert!(ours.exists(), "{}", ours.display());
+    // A session of the same id in an unrelated project is not the space's.
+    let unrelated = home
+        .root()
+        .join("claude-config")
+        .join("projects")
+        .join("-Users-someone-Code-unrelated-project");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    std::fs::write(unrelated.join(format!("{r}.jsonl")), "{}\n").unwrap();
+    let erased = call(&home, "space.erase", &json!({"name": "default"}));
+    assert!(!ours.exists());
+    assert!(unrelated.join(format!("{r}.jsonl")).exists(), "{erased:#}");
+    assert!(!erased.to_string().contains("unrelated"), "{erased:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_partial_erase_keeps_its_runs_and_erasing_again_finishes() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = home("hello");
+    let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut params = task("hi");
+    params["persist_session"] = json!(true);
+    let (r, _, _) = gated_start(&home, &params).wait();
+    let project = project_of(&home, &p);
+    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let run = home.rlxd(&["call", "space.erase", r#"{"name":"default"}"#]);
+    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(run.error_code(), "erase_incomplete", "{run:?}");
+    let detail = run.json()["error"]["detail"].clone();
+    assert!(
+        detail["failed"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("{r}.jsonl")),
+        "{detail}"
+    );
+    // The run is still known, its record kept; erasing again finishes the job.
+    assert_eq!(
+        call(&home, "run.get", &json!({"run_id": r}))["state"],
+        "done"
+    );
+    let erased = call(&home, "space.erase", &json!({"name": "default"}));
+    assert!(
+        erased["removed"]
+            .to_string()
+            .contains(&format!("{r}.jsonl")),
+        "{erased:#}"
+    );
+    assert_eq!(
+        refused(&home, "run.get", &json!({"run_id": r})),
+        "unknown_run"
+    );
+}
+
+#[test]
+fn an_end_logged_before_its_record_was_written_is_taken_not_doubled() {
+    let home = home("hello");
+    let (r, _, _) = gated_start(&home, &task("hi")).wait();
+    home.stop();
+    // As if rlxd died after the end reached the log and before its record did.
+    let mut record: Value =
+        serde_json::from_str(&std::fs::read_to_string(record_path(&home, &r)).unwrap()).unwrap();
+    record["state"] = json!("running");
+    record["last_event"] = Value::Null;
+    std::fs::write(record_path(&home, &r), record.to_string()).unwrap();
+    home.start_dev();
+    let got = call(&home, "run.get", &json!({"run_id": r}));
+    assert_eq!(got["state"], "done", "{got:#}");
+    assert_eq!(got["last_event"]["type"], "run.done");
+    let log = std::fs::read_to_string(log_path(&home, &r)).unwrap();
+    assert!(!log.contains("engine_restarted"), "no second end: {log}");
+}
+
+#[test]
+fn an_end_its_log_lost_is_put_back_from_its_record() {
+    let home = home("hello");
+    let (r, _, _) = gated_start(&home, &task("hi")).wait();
+    home.stop();
+    // As if rlxd died after the end's record was written and before its log line was.
+    let log = std::fs::read_to_string(log_path(&home, &r)).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    let done: Value = serde_json::from_str(lines[lines.len() - 1]).unwrap();
+    assert_eq!(done["type"], "run.done");
+    std::fs::write(
+        log_path(&home, &r),
+        lines[..lines.len() - 1].join("\n") + "\n",
+    )
+    .unwrap();
+    home.start_dev();
+    let replayed = home.rlxd(&["call", "run.events", &json!({"run_id": r}).to_string()]);
+    let events = replayed.lines();
+    let last = events.last().unwrap();
+    assert_eq!(last["type"], "run.done", "{events:#?}");
+    assert_eq!(last["data"]["run_seq"], done["data"]["run_seq"]);
+    assert_eq!(last["data"]["result"], done["data"]["result"]);
+    assert_eq!(
+        call(&home, "run.get", &json!({"run_id": r}))["state"],
+        "done"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn space_erase_removes_links_inside_the_space_as_links_and_names_them() {
+    let home = home("hello");
+    let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let elsewhere = home.root().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep"), "x").unwrap();
+    let nested = Path::new(&p).join("deep").join("er");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, nested.join("out")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("keep"), Path::new(&p).join("file-link")).unwrap();
+    let erased = call(&home, "space.erase", &json!({"name": "default"}));
+    assert_valid("space-erase-reply.json", &erased);
+    let links = erased["links"].as_array().unwrap();
+    assert_eq!(links.len(), 2, "{erased:#}");
+    assert!(!Path::new(&p).exists());
+    assert!(elsewhere.join("keep").exists(), "no link was followed");
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("keep")).unwrap(),
+        "x"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn space_erase_refuses_a_link_on_the_way_and_removes_nothing() {
+    let home = home("hello");
+    let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut params = task("hi");
+    params["persist_session"] = json!(true);
+    let (r, _, _) = gated_start(&home, &params).wait();
+    // The space's project folder, swapped for a link out of the config dir.
+    let project = project_of(&home, &p);
+    let elsewhere = home.root().join("elsewhere-project");
+    std::fs::rename(&project, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &project).unwrap();
+    let run = home.rlxd(&["call", "space.erase", r#"{"name":"default"}"#]);
+    assert_eq!(run.error_code(), "link_refused", "{run:?}");
+    let paths = run.json()["error"]["detail"]["paths"].to_string();
+    assert!(
+        paths.contains(project.file_name().unwrap().to_str().unwrap()),
+        "{paths}"
+    );
+    assert!(Path::new(&p).exists(), "nothing was removed");
+    assert!(elsewhere.join(format!("{r}.jsonl")).exists());
+    assert_eq!(
+        call(&home, "run.get", &json!({"run_id": r}))["state"],
+        "done"
+    );
+    // <home>/spaces itself a link: refused too.
+    let other = TestHome::new();
+    let target = other.root().join("real-spaces");
+    std::fs::create_dir_all(target.join("default")).unwrap();
+    let claude = link(other.root(), "hello");
+    let other = other.with_claude(claude);
+    std::os::unix::fs::symlink(&target, other.root().join("spaces")).unwrap();
+    other.start();
+    let run = other.rlxd(&["call", "space.erase", r#"{"name":"default"}"#]);
+    assert_eq!(run.error_code(), "link_refused", "{run:?}");
+    assert!(target.join("default").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn space_erase_removes_a_junction_inside_the_space_as_a_link() {
+    let home = home("hello");
+    let p = call(&home, "space.ensure", &json!({"name": "default"}))["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let elsewhere = home.root().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep"), "x").unwrap();
+    let junction = Path::new(&p).join("deep").join("j");
+    std::fs::create_dir_all(junction.parent().unwrap()).unwrap();
+    let made = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&elsewhere)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let erased = call(&home, "space.erase", &json!({"name": "default"}));
+    assert_eq!(erased["links"].as_array().unwrap().len(), 1, "{erased:#}");
+    assert!(!Path::new(&p).exists());
+    assert!(
+        elsewhere.join("keep").exists(),
+        "the junction was not followed"
+    );
+}
+
+#[test]
+fn seventy_runs_at_once_get_one_seq_per_event_on_replay_and_on_follow() {
+    // The tester's repro (#2525): 7 kinds x 2 x 5, partial text on.
+    let home = home("hello");
+    let since = seq(&home);
+    let follower = home.spawn(&[
+        "events",
+        "--topics",
+        "run,daemon",
+        "--since",
+        &since.to_string(),
+        "--follow",
+        "--until",
+        "daemon.debug",
+        "--timeout",
+        "120",
+    ]);
+    let kinds = [
+        "task",
+        "send_executor",
+        "widget_refresh",
+        "watch",
+        "check",
+        "parse_instruction",
+        "widget_author",
+    ];
+    let pinned = json!({"tool": "mcp__claude_ai_Slack__slack_send_message",
+        "input_sha256": "cdab067e9f3beb32d1252cfd63e492592fecbf591b0d08cadb24bb17f3864246"});
+    let mut starts = Vec::new();
+    for kind in kinds {
+        for _ in 0..10 {
+            let mut params = json!({"kind": kind, "prompt": "hi",
+                "mount": {"kind": "no_tools"}, "partial": true});
+            if kind == "send_executor" || kind == "watch" {
+                params["pinned_call"] = pinned.clone();
+            }
+            starts.push((run_id(), params));
+        }
+    }
+    thread::scope(|scope| {
+        for (id, params) in &starts {
+            let home = &home;
+            scope.spawn(move || start(home, params, id));
+        }
+    });
+    let ids: Vec<&String> = starts.iter().map(|(id, _)| id).collect();
+    let replayed = wait_until(&home, since, 120, "every run ends", |e| {
+        ids.iter().all(|id| ended(e, id))
+    });
+    home.emit(1);
+    let followed = finish(follower);
+    assert_eq!(followed.code(), Some(0), "the follower: {followed:?}");
+    let followed: Vec<Value> = followed
+        .lines()
+        .into_iter()
+        .filter(|e| e["topic"] == "run")
+        .collect();
+    for (name, events) in [("replay", &replayed), ("follow", &followed)] {
+        let seqs: Vec<u64> = events.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "{name}: seqs repeat or go back"
+        );
+    }
+    assert_eq!(
+        followed, replayed,
+        "the follower got what the replay holds, once"
+    );
+    for id in &ids {
+        let mine = of(&replayed, id, None);
+        let run_seqs: Vec<u64> = mine
+            .iter()
+            .map(|e| e["data"]["run_seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            run_seqs,
+            (1..=run_seqs.len() as u64).collect::<Vec<_>>(),
+            "{id}"
+        );
+        // The run's log holds exactly the events subscribers got, the same seqs.
+        let logged: Vec<Value> = std::fs::read_to_string(log_path(&home, id))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let seen: Vec<Value> = mine.into_iter().cloned().collect();
+        assert_eq!(logged, seen, "{id}");
+    }
 }

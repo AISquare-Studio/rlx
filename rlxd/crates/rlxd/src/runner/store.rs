@@ -56,6 +56,17 @@ pub struct Record {
     /// The scheduler job that fired the run (7.6).
     #[serde(default)]
     pub job_id: Option<String>,
+    /// The run's last state event, `{run_seq, type, data}`, written here before it was
+    /// published: a crash before its line reached the log leaves it here.
+    #[serde(default)]
+    pub last_event: Option<Value>,
+    /// The boot this record was written in ([`crate::runner`]'s `boot_id`): a run in
+    /// flight across a reboot may have lost its last unsynced events.
+    #[serde(default)]
+    pub boot: Option<String>,
+    /// Whether some attempt reached `run.started` with its session kept.
+    #[serde(default)]
+    pub session_started: bool,
     /// The call ledger: one entry per gated call (5.1).
     #[serde(default)]
     pub calls: Vec<Value>,
@@ -206,8 +217,37 @@ fn tail_of(line: Vec<u8>) -> Tail {
     }
 }
 
+/// When the log's last event ends `attempt` (`run.done`, `run.failed` or
+/// `run.needs_you`) and `record` doesn't say so, a crash came between the two: takes the
+/// end into `record`, and names it.
+pub fn adopt_end(tail: &Tail, attempt: u64, record: &mut Record) -> Option<&'static str> {
+    let event: Value = serde_json::from_slice(tail.last_line.as_deref()?).ok()?;
+    if event["data"]["attempt"].as_u64() != Some(attempt) {
+        return None;
+    }
+    let (state, name) = match event["type"].as_str()? {
+        "run.done" => (RunState::Done, "run.done"),
+        "run.failed" => (RunState::Failed, "run.failed"),
+        "run.needs_you" => (RunState::NeedsYou, "run.needs_you"),
+        _ => return None,
+    };
+    record.state = state;
+    record.ended_at = event["time"].as_str().map(str::to_owned);
+    record.last_run_seq = record.last_run_seq.max(tail.last_run_seq);
+    record.process = None;
+    if state == RunState::Done {
+        record.session = event["data"]["session"].as_str().map(str::to_owned);
+        record.structured_output = event["data"]
+            .get("structured_output")
+            .filter(|v| !v.is_null())
+            .cloned();
+    }
+    Some(name)
+}
+
 /// Cuts a last line that a crash left without its newline from the log at `path`, so the
-/// next event starts a line of its own.
+/// next event starts a line of its own. It reads back from the end only as far as the
+/// last newline.
 pub fn repair(path: &Path) -> io::Result<()> {
     let mut file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,
@@ -215,35 +255,40 @@ pub fn repair(path: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     let len = file.metadata()?.len();
-    if len == 0 {
-        return Ok(());
+    let mut end = len;
+    let mut chunk = vec![0u8; 64 << 10];
+    while end > 0 {
+        let start = end.saturating_sub(chunk.len() as u64);
+        let size = usize::try_from(end - start).unwrap_or(0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk[..size])?;
+        if let Some(at) = chunk[..size].iter().rposition(|&b| b == b'\n') {
+            let keep = start + at as u64 + 1;
+            if keep == len {
+                return Ok(());
+            }
+            file.set_len(keep)?;
+            return file.sync_all();
+        }
+        end = start;
     }
-    let mut last = [0u8; 1];
-    file.seek(SeekFrom::Start(len - 1))?;
-    file.read_exact(&mut last)?;
-    if last[0] == b'\n' {
-        return Ok(());
+    if len > 0 {
+        file.set_len(0)?;
+        file.sync_all()?;
     }
-    let mut text = Vec::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_end(&mut text)?;
-    let keep = text
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |at| at + 1);
-    file.set_len(keep as u64)?;
-    file.sync_all()
+    Ok(())
 }
 
 /// The text of `attempt`'s whole assistant messages in the log at `path`: what a run in
-/// flight when rlxd stopped had got out.
+/// flight when rlxd stopped had got out. Read a line at a time.
 pub fn attempt_text(path: &Path, attempt: u64) -> String {
-    let Ok(text) = fs::read(path) else {
+    use std::io::BufRead;
+    let Ok(file) = File::open(path) else {
         return String::new();
     };
     let mut said = String::new();
-    for line in text.split(|&b| b == b'\n') {
-        let Ok(event) = serde_json::from_slice::<Value>(line) else {
+    for line in io::BufReader::new(file).split(b'\n').map_while(Result::ok) {
+        let Ok(event) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         if event["type"] == "run.text"
@@ -263,6 +308,8 @@ pub struct Reader {
     path: PathBuf,
     offset: u64,
     partial: Vec<u8>,
+    /// The log was not there at the last read.
+    gone: bool,
 }
 
 impl Reader {
@@ -272,7 +319,13 @@ impl Reader {
             path,
             offset: 0,
             partial: Vec::new(),
+            gone: false,
         }
+    }
+
+    /// Whether the log was not there at the last read: its run was erased.
+    pub fn gone(&self) -> bool {
+        self.gone
     }
 
     /// The whole lines written since the last read, each with its newline: a few MiB of
@@ -283,9 +336,13 @@ impl Reader {
         const CHUNK: u64 = 4 << 20;
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.gone = true;
+                return Ok(Vec::new());
+            }
             Err(e) => return Err(e),
         };
+        self.gone = false;
         file.seek(SeekFrom::Start(self.offset))?;
         let end = loop {
             let mut fresh = Vec::new();
@@ -328,4 +385,89 @@ fn private_dir(dir: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rlxd-store-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("events.jsonl")
+    }
+
+    fn line(run_seq: u64, pad: usize) -> String {
+        format!(
+            "{{\"type\":\"run.text\",\"data\":{{\"run_seq\":{run_seq},\"pad\":\"{}\"}}}}\n",
+            "x".repeat(pad)
+        )
+    }
+
+    #[test]
+    fn an_empty_or_missing_log_has_no_tail() {
+        let path = temp("empty");
+        assert!(tail(&path).unwrap().last_line.is_none(), "missing");
+        fs::write(&path, "").unwrap();
+        let empty = tail(&path).unwrap();
+        assert!(empty.last_line.is_none());
+        assert_eq!(empty.last_run_seq, 0);
+        repair(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn the_tail_is_the_last_whole_line_even_past_a_chunk() {
+        let path = temp("long");
+        // A last line longer than one 64 KiB chunk, after a short one.
+        let text = line(1, 10) + &line(2, 200_000);
+        fs::write(&path, &text).unwrap();
+        let found = tail(&path).unwrap();
+        assert_eq!(found.last_run_seq, 2);
+        assert_eq!(found.last_line.unwrap().len(), line(2, 200_000).len());
+        // One line only.
+        fs::write(&path, line(7, 5)).unwrap();
+        assert_eq!(tail(&path).unwrap().last_run_seq, 7);
+    }
+
+    #[test]
+    fn a_torn_last_line_is_no_tail_and_repair_cuts_it() {
+        let path = temp("torn");
+        let whole = line(1, 10) + &line(2, 70_000);
+        let torn = whole.clone() + "{\"type\":\"run.done\",\"data\":{\"run_seq\":3";
+        fs::write(&path, &torn).unwrap();
+        assert_eq!(
+            tail(&path).unwrap().last_run_seq,
+            2,
+            "a torn line is not one"
+        );
+        repair(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), whole);
+        repair(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            whole,
+            "a whole log is left as it is"
+        );
+        // A log that is all torn.
+        fs::write(&path, "{\"type\":").unwrap();
+        repair(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn the_reader_gives_each_whole_line_once_and_says_when_the_log_is_gone() {
+        let path = temp("reader");
+        let mut reader = Reader::new(path.clone());
+        assert!(reader.read().unwrap().is_empty());
+        assert!(reader.gone());
+        fs::write(&path, line(1, 3) + "{\"partial").unwrap();
+        assert_eq!(reader.read().unwrap().len(), 1);
+        assert!(!reader.gone());
+        assert!(reader.read().unwrap().is_empty(), "the partial line waits");
+        let mut rest = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        rest.write_all(b"\":1}\n").unwrap();
+        assert_eq!(reader.read().unwrap(), vec![b"{\"partial\":1}\n".to_vec()]);
+    }
 }

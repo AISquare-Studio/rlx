@@ -22,12 +22,15 @@
 //!   disk hold too, so they survive a restart; `run.events` replays a run's log from disk
 //!   ([`Replay`]) and follows it while it is live; `space.erase` deletes a space with its
 //!   runs' sessions and records.
-//! - **Events** go through one funnel ([`Runner::emit`]), under the run's own lock: the
-//!   bus numbers each, the line is appended to the run's log on disk ([`store`]), and only
-//!   then is it published. Every event but a partial text chunk is fsynced first, and an
-//!   event that changes the run's state (`run.started` and each end) also has the run's
-//!   record rewritten first. So an app never sees an event, an end above all, that a
-//!   restart would not find, and the log holds every event in `run_seq` order.
+//! - **Events** go through one funnel ([`Runner::publish`]), under the run's own lock and
+//!   no other: the run numbers its own events. An event that changes the run's state
+//!   (`run.started`, each end) is made durable before it is published: the log so far is
+//!   fsynced and the run's record rewritten with the event. Any other event is published,
+//!   then appended, and fsynced with the run's next state event or every
+//!   [`UNSYNCED_MAX`]. So an app never sees an end that a restart would not find, the log
+//!   holds every event in `run_seq` order, and a slow disk under one run holds up no
+//!   other run and no other topic: the bus's lock is held only in memory, and the
+//!   runner's never across a write.
 //! - **Claude Code's environment** is rlxd's own ([`run_env`] is where the app's `PATH`
 //!   and config directories plug in, 4.3). `RLXD_CLAUDE_BIN` is read from rlxd's own
 //!   environment only, when each attempt starts; no client names the program.
@@ -44,11 +47,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use rlxd_client::Home;
 use rlxd_proto::{
     Data, ErrorBody, Event, FailReason, Mount, NeedsYouClearedData, NeedsYouRaisedData,
-    NeedsYouReason, RefusedPath, RunCancelData, RunDoneData, RunEventsData, RunEventsParams,
-    RunFailedData, RunGetData, RunId, RunKind, RunListData, RunListParams, RunNeedsYouData,
-    RunQueuedData, RunRateLimitedData, RunRef, RunResumeData, RunResumeParams, RunStartParams,
-    RunStartedData, RunState, RunSummary, RunTextData, RunToolResultData, SpaceEraseData, codes,
-    run_types, topics,
+    NeedsYouReason, RunCancelData, RunDoneData, RunEventsData, RunEventsParams, RunFailedData,
+    RunGetData, RunId, RunKind, RunListData, RunListParams, RunNeedsYouData, RunQueuedData,
+    RunRateLimitedData, RunRef, RunResumeData, RunResumeParams, RunStartParams, RunStartedData,
+    RunState, RunSummary, RunTextData, RunToolResultData, SpaceEraseData, codes, run_types, topics,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -61,6 +63,8 @@ use crate::log::{info, warning};
 use crate::{claude, clock, spaces};
 
 mod argv;
+#[cfg(unix)]
+pub(crate) mod guard;
 mod process;
 mod store;
 mod stream;
@@ -88,8 +92,16 @@ pub struct Runner {
     home: Home,
     bus: Arc<Bus>,
     spawner: Spawner,
-    /// `rlxd-hook` beside this rlxd, which each run's settings name.
-    hook: PathBuf,
+    /// `rlxd-hook` beside this rlxd, which each run's settings name, or why it can't be
+    /// named: then `run.start` refuses `hook_not_found`.
+    hook: Result<PathBuf, String>,
+    /// Test builds only: how long a place given back waits before its next run starts,
+    /// to widen the window a cancel can land in (`RLXD_TEST_LAUNCH_DELAY_MS`).
+    launch_delay: Option<Duration>,
+    /// Test builds only: a space whose runs' state events wait this long before they are
+    /// made durable, to show a slow disk under one run holds up nothing else
+    /// (`RLXD_TEST_SLOW_PERSIST=<space>:<ms>`).
+    slow_persist: Option<(String, Duration)>,
     runs: Mutex<Runs>,
     /// Set once rlxd stops: no run starts from then on.
     stopping: AtomicBool,
@@ -99,6 +111,10 @@ pub struct Runner {
 struct Runs {
     by_id: HashMap<RunId, Arc<Run>>,
     pools: HashMap<RunKind, Pool>,
+    /// Run ids taken by a `run.start` whose record is being written, outside this lock.
+    reserved: std::collections::HashSet<RunId>,
+    /// Spaces being erased, outside this lock: no run starts or resumes in one.
+    erasing: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
@@ -150,20 +166,31 @@ struct RunInner {
     reply: Option<String>,
     /// The `needs_you.raised` the run has out, to clear when it goes on or ends.
     needs_you: Option<String>,
+    /// Events appended to the log since its last fsync.
+    unsynced: u32,
+    /// The last `run_seq` in the run's log: an event whose append failed is not counted,
+    /// so `run.events` never waits for it.
+    logged: u64,
+    /// Whether some attempt reached `run.started` with its session kept: only then is
+    /// there a session for `run.resume`.
+    session_started: bool,
 }
 
 /// How durable an event is before it is published.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Durability {
-    /// Appended to the log, durable with the next event that is fsynced: partial text.
-    Appended,
-    /// Appended and fsynced before it is published.
-    Synced,
-    /// Appended and fsynced, and the run's record rewritten, before it is published: an
-    /// event that changes the run's state, so an app never sees an end that a restart
-    /// would not find.
+    /// Appended to the log once published, and fsynced later ([`UNSYNCED_MAX`]).
+    Logged,
+    /// Made durable, the log so far fsynced and the run's record rewritten with it,
+    /// before it is published: an event that changes the run's state, so an app never
+    /// sees an end that a restart would not find.
     State,
 }
+
+/// The most events of a run appended to its log without an fsync. After an OS crash, at
+/// most this many of a run's last events are lost, and the next rlxd numbers past them
+/// (5.4).
+pub(crate) const UNSYNCED_MAX: u32 = 64;
 
 /// How an attempt ended.
 enum End {
@@ -202,6 +229,8 @@ impl Runner {
             bus,
             spawner: Spawner::start(),
             hook: argv::hook_beside(rlxd.as_deref()),
+            launch_delay: test_delay("RLXD_TEST_LAUNCH_DELAY_MS"),
+            slow_persist: test_slow_persist(),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
         });
@@ -214,7 +243,9 @@ impl Runner {
         let Ok(entries) = std::fs::read_dir(store::runs_dir(&self.home)) else {
             return;
         };
+        let boot = process::boot_id();
         let mut restarted = Vec::new();
+        let mut put_back = Vec::new();
         for entry in entries.flatten() {
             let Some(id) = entry
                 .file_name()
@@ -224,10 +255,20 @@ impl Runner {
                 continue;
             };
             let dir = RunDir::of(&self.home, &id);
-            let record = match dir.read_record() {
-                Ok(record) if record.run_id == id => record,
-                Ok(_) => {
+            let mut record = match dir.read_record() {
+                Ok(record) if record.run_id == id && record.version <= store::RECORD_VERSION => {
+                    record
+                }
+                Ok(record) if record.run_id != id => {
                     warning!("run {id}: its record names another run; it is left as it is");
+                    continue;
+                }
+                Ok(record) => {
+                    warning!(
+                        "run {id}: its record is version {}, newer than this rlxd reads; it is \
+                         left as it is",
+                        record.version
+                    );
                     continue;
                 }
                 Err(e) => {
@@ -235,28 +276,61 @@ impl Runner {
                     continue;
                 }
             };
-            let live = record.state.is_live();
-            if live {
-                if let Some(process) = &record.process
-                    && let Some(started) = &process.started
-                    && process::kill_recorded(process.pid, started)
-                {
-                    info!("run {id}: killed its process tree, left by an earlier rlxd");
-                }
-                if let Err(e) = store::repair(&dir.events()) {
-                    warning!("run {id}: its log could not be repaired: {e}");
-                }
+            // A record written in another boot: its processes are gone, and its last
+            // unsynced events may be too.
+            let rebooted = matches!((&record.boot, &boot), (Some(then), Some(now)) if !process::same_boot(then, now));
+            if record.state.is_live()
+                && !rebooted
+                && let Some(process) = &record.process
+                && let Some(started) = &process.started
+                && process::kill_recorded(process.pid, started)
+            {
+                info!("run {id}: ended the guard an earlier rlxd left running");
+            }
+            if let Err(e) = store::repair(&dir.events()) {
+                warning!("run {id}: its log could not be repaired: {e}");
             }
             let tail = store::tail(&dir.events()).unwrap_or_else(|e| {
                 warning!("run {id}: its log could not be read: {e}");
                 store::Tail::default()
             });
+            // An end the log holds and the record doesn't: the crash came between them.
+            if record.state.is_live()
+                && let Some(adopted) = store::adopt_end(&tail, record.attempt, &mut record)
+            {
+                info!("run {id}: took its logged {adopted} into its record");
+                if let Err(e) = dir.write_record(&record) {
+                    warning!("run {id}: its record was not written: {e}");
+                }
+            }
+            let live = record.state.is_live();
             let text = if live {
                 store::attempt_text(&dir.events(), record.attempt)
             } else {
                 String::new()
             };
-            let last_run_seq = record.last_run_seq.max(tail.last_run_seq);
+            // A state event the record holds and the log lost (a crash between the two):
+            // it is put back, numbered as before.
+            let lost = record
+                .last_event
+                .as_ref()
+                .filter(|event| {
+                    event["run_seq"]
+                        .as_u64()
+                        .is_some_and(|n| n > tail.last_run_seq)
+                })
+                .cloned();
+            let mut last_run_seq = match &lost {
+                Some(event) => event["run_seq"].as_u64().unwrap_or(1) - 1,
+                None => record.last_run_seq.max(tail.last_run_seq),
+            };
+            if live && rebooted {
+                // Up to UNSYNCED_MAX events a client saw may be gone with the old boot:
+                // number past them, so no run_seq is given twice.
+                last_run_seq += u64::from(UNSYNCED_MAX);
+            }
+            let needs_you = (record.state == RunState::NeedsYou)
+                .then(|| format!("run:{id}:{}", record.attempt));
             let run = Arc::new(Run {
                 job_id: record.job_id.clone(),
                 client: record.client.clone(),
@@ -268,6 +342,7 @@ impl Runner {
                     ended_at: record.ended_at.clone(),
                     last_run_seq,
                     session: record.session.clone(),
+                    session_started: record.session_started,
                     structured_output: record.structured_output.clone(),
                     process: None,
                     tree: None,
@@ -278,16 +353,33 @@ impl Runner {
                     text,
                     last_line: tail.last_line.map(bus::Line::from),
                     reply: None,
-                    needs_you: None,
+                    needs_you,
+                    unsynced: 0,
+                    logged: tail.last_run_seq,
                 }),
                 state: watch::Sender::new(record.state),
-                logged: watch::Sender::new(last_run_seq),
+                logged: watch::Sender::new(tail.last_run_seq),
                 params: record.params,
             });
+            if let Some(event) = lost {
+                put_back.push((Arc::clone(&run), event));
+            }
             if live {
                 restarted.push(Arc::clone(&run));
             }
             self.runs().by_id.insert(id, run);
+        }
+        for (run, event) in put_back {
+            let mut inner = run.inner();
+            let r#type = event["type"].as_str().unwrap_or_default().to_owned();
+            let Some(Value::Object(data)) = event.get("data").cloned() else {
+                continue;
+            };
+            info!(
+                "run {}: put back its {type}, which its log had lost",
+                run.params.run_id
+            );
+            let _ = self.publish(&run, &mut inner, &r#type, data, Durability::Logged);
         }
         for run in restarted {
             let mut inner = run.inner();
@@ -304,15 +396,20 @@ impl Runner {
         self.runs.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Every run rlxd knows now, to read with the runner's lock let go.
+    fn snapshot(&self) -> Vec<Arc<Run>> {
+        self.runs().by_id.values().cloned().collect()
+    }
+
     /// `status`'s `runs`: how many run, and how many wait.
     pub fn counts(&self) -> (u64, u64) {
-        let runs = self.runs();
+        // Each run's state is read from its watch, with no lock of the run's or the
+        // runner's held: a run's own lock may be held over a slow disk, and status never
+        // waits on it.
+        let runs = self.snapshot();
+        let states: Vec<RunState> = runs.iter().map(|r| *r.state.borrow()).collect();
         let count = |state| {
-            let n = runs
-                .by_id
-                .values()
-                .filter(|r| r.inner().state == state)
-                .count();
+            let n = states.iter().filter(|s| **s == state).count();
             u64::try_from(n).unwrap_or(u64::MAX)
         };
         (count(RunState::Running), count(RunState::Queued))
@@ -361,14 +458,36 @@ impl Runner {
                 "rlxd is stopping: start the run once it is back".to_owned(),
             ));
         }
+        if let Err(why) = &self.hook {
+            return Err(refusal(
+                codes::HOOK_NOT_FOUND,
+                format!(
+                    "{why}; a run's gate hook is always rlxd-hook by its absolute path, \
+                     never a name looked up on PATH"
+                ),
+            ));
+        }
         let id = params.run_id.clone();
         let dir = RunDir::of(&self.home, &id);
-        let mut runs = self.runs();
-        if runs.by_id.contains_key(&id) || dir.exists() {
-            return Err(refusal(
-                codes::RUN_EXISTS,
-                format!("rlxd already knows a run {id}: pick a new run_id"),
-            ));
+        {
+            // The id is taken here; the record is written outside the runner's lock.
+            let mut runs = self.runs();
+            if runs.erasing.contains(&params.space) {
+                return Err(refusal(
+                    codes::RUN_START_FAILED,
+                    format!(
+                        "the space {:?} is being erased: start the run once it is",
+                        params.space
+                    ),
+                ));
+            }
+            if runs.by_id.contains_key(&id) || runs.reserved.contains(&id) || dir.exists() {
+                return Err(refusal(
+                    codes::RUN_EXISTS,
+                    format!("rlxd already knows a run {id}: pick a new run_id"),
+                ));
+            }
+            runs.reserved.insert(id.clone());
         }
         let run = Arc::new(Run {
             job_id,
@@ -392,6 +511,9 @@ impl Runner {
                 last_line: None,
                 reply: None,
                 needs_you: None,
+                unsynced: 0,
+                logged: 0,
+                session_started: false,
             }),
             state: watch::Sender::new(RunState::Queued),
             logged: watch::Sender::new(0),
@@ -405,11 +527,14 @@ impl Runner {
         });
         if let Err(e) = created {
             let _ = std::fs::remove_dir_all(run.dir.path());
+            self.runs().reserved.remove(&id);
             return Err(refusal(
                 codes::RUN_START_FAILED,
                 format!("the run's record could not be written: {e}"),
             ));
         }
+        let mut runs = self.runs();
+        runs.reserved.remove(&id);
         runs.by_id.insert(id.clone(), Arc::clone(&run));
         let kind = run.params.kind;
         let pool = runs.pools.entry(kind).or_default();
@@ -502,6 +627,12 @@ impl Runner {
         let run = self.find(&params.run_id)?;
         let id = params.run_id;
         let mut runs = self.runs();
+        if runs.erasing.contains(&run.params.space) {
+            return Err(refusal(
+                codes::RUN_START_FAILED,
+                format!("the space {:?} is being erased", run.params.space),
+            ));
+        }
         let mut inner = run.inner();
         if inner.state.is_live() {
             return Err(refusal(
@@ -517,6 +648,15 @@ impl Runner {
                 codes::NOT_RESUMABLE,
                 format!(
                     "run {id} is a send_executor, which is never resumed: a send is never retried"
+                ),
+            ));
+        }
+        if run.params.persists() && !inner.session_started {
+            return Err(refusal(
+                codes::NO_SESSION,
+                format!(
+                    "run {id} never reached run.started, so Claude Code holds no session \
+                     of it to resume: start a new run"
                 ),
             ));
         }
@@ -652,131 +792,180 @@ impl Runner {
     }
 
     /// `space.erase`: deletes the space's folder, the Claude Code session files of its
-    /// runs, and rlxd's records of them (2.5). Refused with `runs_live` while a run in the
-    /// space is queued or running, and with `link_refused` when the space's folder is a
-    /// link; nothing is removed then.
+    /// runs, and rlxd's records of them (2.5).
     ///
-    /// Session files are `projects/<encoded space dir>/<run_id>.jsonl` under each config
-    /// directory rlx knows ([`config_dirs`]). Every project folder is looked in, since
-    /// only the space's runs are named and run ids are unique: an encoding that differs
-    /// from Claude Code's can't hide one. A project folder that is a link is not followed:
-    /// what would be found through it is named in `refused`.
+    /// - Refused, removing nothing: `runs_live` while a run in the space is queued or
+    ///   running; `link_refused`, with `detail.paths`, when a link (a junction on Windows)
+    ///   is on the way: `<home>/spaces`, the space itself, a config directory, its
+    ///   `projects`, or the space's project folder there.
+    /// - A link inside the space goes as a link, never followed, and is named in `links`.
+    /// - Session files are `projects/<encoded space dir>/<run_id>.jsonl` under each config
+    ///   directory rlx knows ([`config_dirs`]), the space dir encoded as Claude Code does
+    ///   ([`project_folder`]), for its resolved path and the path as given. No other
+    ///   project folder is touched.
+    /// - A run whose files can't all be removed keeps its record, and the erase fails
+    ///   `erase_incomplete` with `detail {removed, failed}`; erasing again finishes it.
+    /// - The runner's lock is held only to decide; every removal happens outside it, while
+    ///   the space is marked as being erased, so no run starts in it meanwhile.
     pub fn erase(&self, name: &str) -> Result<SpaceEraseData, ErrorBody> {
-        let space = spaces::root(&self.home).join(name);
-        if std::fs::symlink_metadata(&space).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(refusal(
-                codes::LINK_REFUSED,
-                format!(
-                    "{} is a link, which rlxd does not follow: nothing was removed",
-                    space.display()
-                ),
+        let root = spaces::root(&self.home);
+        let space = root.join(name);
+        let ours = {
+            let mut runs = self.runs();
+            if runs.erasing.contains(name) {
+                return Err(refusal(
+                    codes::RUNS_LIVE,
+                    format!("the space {name:?} is being erased already"),
+                ));
+            }
+            let ours: Vec<Arc<Run>> = runs
+                .by_id
+                .values()
+                .filter(|run| run.params.space == name)
+                .cloned()
+                .collect();
+            let live: Vec<String> = ours
+                .iter()
+                .filter(|run| run.state.borrow().is_live())
+                .map(|run| run.params.run_id.to_string())
+                .collect();
+            if !live.is_empty() {
+                let message = format!(
+                    "the space {name:?} has runs in flight ({}): cancel them, or wait for \
+                     them, first",
+                    live.join(", ")
+                );
+                return Err(with_detail(
+                    refusal(codes::RUNS_LIVE, message),
+                    json!({"run_ids": live}),
+                ));
+            }
+            runs.erasing.insert(name.to_owned());
+            ours
+        };
+        let erased = blocking(|| self.erase_files(&root, &space, &ours));
+        let mut runs = self.runs();
+        runs.erasing.remove(name);
+        let (removed, links, failed, gone) = erased?;
+        for run in &gone {
+            runs.by_id.remove(&run.params.run_id);
+        }
+        drop(runs);
+        for run in &gone {
+            let mut inner = run.inner();
+            self.clear_needs_you(&mut inner);
+        }
+        if !failed.is_empty() {
+            let message = format!(
+                "the space {name:?} was erased only in part: {} paths could not be removed; \
+                 erase it again once they can be",
+                failed.len()
+            );
+            return Err(with_detail(
+                refusal(codes::ERASE_INCOMPLETE, message),
+                json!({"removed": removed, "failed": failed, "links": links}),
             ));
         }
-        let mut runs = self.runs();
-        let ours: Vec<Arc<Run>> = runs
-            .by_id
-            .values()
-            .filter(|run| run.params.space == name)
-            .cloned()
-            .collect();
-        let live: Vec<String> = ours
-            .iter()
-            .filter(|run| run.inner().state.is_live())
-            .map(|run| run.params.run_id.to_string())
-            .collect();
-        if !live.is_empty() {
-            let message = format!(
-                "the space {name:?} has runs in flight ({}): cancel them, or wait for them, first",
-                live.join(", ")
-            );
-            let error = refusal(codes::RUNS_LIVE, message);
-            let detail = serde_json::json!({"run_ids": live});
-            return Err(match detail {
-                Value::Object(detail) => error.clone().with_detail(detail).unwrap_or(error),
-                _ => error,
-            });
+        info!("space {name:?} erased: {} paths removed", removed.len());
+        Ok(SpaceEraseData::new(removed, links))
+    }
+
+    /// The removals of `space.erase`, with no lock held: what it removed, the links inside
+    /// the space it removed as links, what failed, and the runs now gone.
+    #[allow(clippy::type_complexity)]
+    fn erase_files(
+        &self,
+        root: &std::path::Path,
+        space: &std::path::Path,
+        ours: &[Arc<Run>],
+    ) -> Result<(Vec<String>, Vec<String>, Vec<Value>, Vec<Arc<Run>>), ErrorBody> {
+        // The space as Claude Code saw it: resolved, before anything is removed.
+        let resolved = spaces::resolved(space)
+            .or_else(|_| {
+                spaces::resolved(root).map(|root| root.join(space.file_name().unwrap_or_default()))
+            })
+            .unwrap_or_else(|_| space.to_path_buf());
+        let mut folders = vec![project_folder(&resolved)];
+        let given = project_folder(space);
+        if !folders.contains(&given) {
+            folders.push(given);
         }
-        let ids: Vec<String> = ours
+        // A link on the way to what erase removes: refused, and nothing removed.
+        let mut on_path: Vec<std::path::PathBuf> = vec![root.to_path_buf(), space.to_path_buf()];
+        for config in config_dirs() {
+            let projects = config.join("projects");
+            on_path.extend(folders.iter().map(|folder| projects.join(folder)));
+            on_path.push(projects);
+            on_path.push(config);
+        }
+        let linked: Vec<String> = on_path
             .iter()
-            .map(|run| run.params.run_id.to_string())
+            .filter(|path| spaces::is_link(path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if !linked.is_empty() {
+            let message = format!(
+                "erasing the space would go through links, which rlxd does not follow ({}); \
+                 nothing was removed",
+                linked.join(", ")
+            );
+            return Err(with_detail(
+                refusal(codes::LINK_REFUSED, message),
+                json!({"paths": linked}),
+            ));
+        }
+        // Links inside the space go as links: their targets are never touched.
+        let links: Vec<String> = spaces::links_in(space)
+            .iter()
+            .map(|path| path.display().to_string())
             .collect();
         let mut removed = Vec::new();
-        let mut refused = Vec::new();
-        let mut failed = Vec::new();
-        let mut remove = |path: &std::path::Path, dir: bool| {
-            let result = if dir {
-                std::fs::remove_dir_all(path)
-            } else {
-                std::fs::remove_file(path)
-            };
-            match result {
-                Ok(()) => removed.push(path.display().to_string()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => failed.push(format!("{}: {e}", path.display())),
-            }
+        let mut failed: Vec<Value> = Vec::new();
+        let fail = |failed: &mut Vec<Value>, path: &std::path::Path, e: &std::io::Error| {
+            failed.push(json!({"path": path.display().to_string(), "error": e.to_string()}));
         };
-        blocking(|| {
-            if space.exists() {
-                // Named as space.ensure gave it: resolved.
-                remove(
-                    &spaces::resolved(&space).unwrap_or_else(|_| space.clone()),
-                    true,
-                );
+        if space.exists() {
+            // As given, never canonicalized: a link swapped in now is removed, not
+            // followed (std's remove_dir_all follows no link).
+            match std::fs::remove_dir_all(space) {
+                Ok(()) => removed.push(resolved.display().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => fail(&mut failed, space, &e),
             }
+        }
+        let mut gone = Vec::new();
+        for run in ours {
+            let id = run.params.run_id.as_str();
+            let before = failed.len();
             for config in config_dirs() {
                 let projects = config.join("projects");
-                let Ok(meta) = std::fs::symlink_metadata(&projects) else {
-                    continue;
-                };
-                if meta.file_type().is_symlink() {
-                    refused.push(RefusedPath::new(
-                        projects.display().to_string(),
-                        "the projects folder is a link out of the config directory: not followed",
-                    ));
-                    continue;
-                }
-                let Ok(entries) = std::fs::read_dir(&projects) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let folder = entry.path();
-                    let linked = entry.file_type().is_ok_and(|t| t.is_symlink());
-                    for id in &ids {
-                        let session = folder.join(format!("{id}.jsonl"));
-                        if linked {
-                            if session.exists() {
-                                refused.push(RefusedPath::new(
-                                    session.display().to_string(),
-                                    "its project folder is a link out of the config directory: not followed",
-                                ));
-                            }
-                        } else if std::fs::symlink_metadata(&session).is_ok() {
-                            // A session file that is itself a link: the link goes, not
-                            // what it names.
-                            remove(&session, false);
+                for folder in &folders {
+                    let session = projects.join(folder).join(format!("{id}.jsonl"));
+                    if std::fs::symlink_metadata(&session).is_ok() {
+                        // A session file that is itself a link: the link goes, not what
+                        // it names.
+                        match std::fs::remove_file(&session) {
+                            Ok(()) => removed.push(session.display().to_string()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => fail(&mut failed, &session, &e),
                         }
                     }
                 }
             }
-            for run in &ours {
-                remove(run.dir.path(), true);
+            if failed.len() > before {
+                // Its record stays, so erasing again finds the run and finishes.
+                continue;
             }
-        });
-        for run in &ours {
-            runs.by_id.remove(&run.params.run_id);
+            match std::fs::remove_dir_all(run.dir.path()) {
+                Ok(()) => {
+                    removed.push(run.dir.path().display().to_string());
+                    gone.push(Arc::clone(run));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => gone.push(Arc::clone(run)),
+                Err(e) => fail(&mut failed, run.dir.path(), &e),
+            }
         }
-        drop(runs);
-        if !failed.is_empty() {
-            return Err(refusal(
-                codes::INTERNAL,
-                format!(
-                    "the space was erased only in part; these could not be removed: {}",
-                    failed.join("; ")
-                ),
-            ));
-        }
-        info!("space {name:?} erased: {} paths removed", removed.len());
-        Ok(SpaceEraseData::new(removed, refused))
+        Ok((removed, links, failed, gone))
     }
 
     /// Ends every run in flight as rlxd stops: no run starts from then on, each process
@@ -784,8 +973,7 @@ impl Runner {
     /// "engine_restarted"}`, which `run.resume` goes on from.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
-        let runs: Vec<Arc<Run>> = self.runs().by_id.values().cloned().collect();
-        for run in runs {
+        for run in self.snapshot() {
             let mut inner = run.inner();
             if !inner.state.is_live() {
                 continue;
@@ -814,9 +1002,22 @@ impl Runner {
     }
 
     /// Starts `run`'s attempt, which holds a place in its pool.
+    ///
+    /// The run may have been cancelled after it left its queue and before this: then it
+    /// is not started, and the place goes to the next run instead. So no Claude Code ever
+    /// starts for a run that has ended.
     fn launch(self: &Arc<Self>, run: &Arc<Run>) {
         {
             let mut inner = run.inner();
+            if inner.state != RunState::Queued || inner.ending.is_some() {
+                drop(inner);
+                info!(
+                    "run {}: ended before its turn came; its place goes on",
+                    run.params.run_id
+                );
+                self.release_if(true, run.params.kind);
+                return;
+            }
             inner.placed = true;
             inner.state = RunState::Running;
             inner.text.clear();
@@ -889,11 +1090,34 @@ impl Runner {
             self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
             inner.needs_you = Some(id);
         }
-        match data {
+        let published = match data {
             Ok(Value::Object(data)) => self.publish(run, inner, r#type, data, Durability::State),
-            other => warning!("run {}: {type} did not print: {other:?}", run.params.run_id),
+            other => Err(format!("it did not print as an object: {other:?}")),
+        };
+        if let Err(why) = published {
+            // A run always gets its end: a small one, when its own can't be published.
+            warning!(
+                "run {}: {type} was not published ({why}); it ends failed",
+                run.params.run_id
+            );
+            inner.state = RunState::Failed;
+            let failed = RunFailedData::new(
+                FailReason::Error,
+                format!("end_not_published: the run's {type} could not be published: {why}"),
+                "",
+            );
+            if let Ok(Value::Object(data)) = serde_json::to_value(&failed)
+                && let Err(why) =
+                    self.publish(run, inner, run_types::FAILED, data, Durability::State)
+            {
+                warning!(
+                    "run {}: its end was not published either: {why}",
+                    run.params.run_id
+                );
+            }
         }
         inner.events = None;
+        let state = inner.state;
         self.bus.end_run(run.params.run_id.as_str());
         inner.seeded = false;
         run.state.send_replace(state);
@@ -944,7 +1168,16 @@ impl Runner {
             }
         };
         if let Some(next) = next {
-            self.launch(&next);
+            match self.launch_delay {
+                Some(delay) => {
+                    let runner = Arc::clone(self);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        runner.launch(&next);
+                    });
+                }
+                None => self.launch(&next),
+            }
         }
     }
 
@@ -968,7 +1201,11 @@ impl Runner {
         };
         let prepared = blocking(|| -> std::io::Result<(PathBuf, PathBuf)> {
             let space = spaces::ensure(&self.home, &params.space)?;
-            let settings = argv::settings(params, attempt, &self.hook);
+            let hook = self
+                .hook
+                .as_ref()
+                .map_err(|why| std::io::Error::other(why.clone()))?;
+            let settings = argv::settings(params, attempt, hook);
             let settings = run.dir.write_settings(attempt, &settings)?;
             Ok((space, settings))
         });
@@ -1023,38 +1260,41 @@ impl Runner {
             .await;
         let end = match streamed {
             Streamed::Result(outcome, mut stdin) => {
-                // Claude Code reads stdin for another turn: closing it ends it.
+                // Claude Code reads stdin for another turn: closing it ends it. Whatever
+                // is left of the tree goes with it (the guard), or is killed after the
+                // grace.
                 let _ = stdin.shutdown().await;
                 drop(stdin);
-                if tokio::time::timeout(EXIT_GRACE, child.wait())
-                    .await
-                    .is_err()
-                {
+                if tree.reap(&mut child, Some(EXIT_GRACE)).await.is_none() {
                     tree.kill();
+                    tree.reap(&mut child, None).await;
                 }
                 outcome_of(run, outcome)
             }
             Streamed::Ended(reason) => {
                 tree.kill();
-                let _ = child.wait().await;
+                tree.reap(&mut child, None).await;
                 ended_early(run, reason)
             }
             Streamed::Broken(message) => {
                 tree.kill();
-                let _ = child.wait().await;
+                tree.reap(&mut child, None).await;
                 failed(message)
             }
             Streamed::Eof => {
-                let status = tokio::time::timeout(EXIT_GRACE, child.wait()).await;
-                tree.kill();
+                let mut status = tree.reap(&mut child, Some(EXIT_GRACE)).await;
+                if status.is_none() {
+                    tree.kill();
+                    status = tree.reap(&mut child, None).await;
+                }
                 let ending = run.inner().ending;
                 if let Some(reason) = ending {
                     return ended_early(run, reason);
                 }
                 let said = stderr.await.unwrap_or_default();
                 let how = match status {
-                    Ok(Ok(status)) => format!("exited ({status})"),
-                    _ => "closed its output".to_owned(),
+                    Some(status) => format!("exited ({status})"),
+                    None => "closed its output".to_owned(),
                 };
                 let mut message = format!("Claude Code {how} before its result");
                 if !said.trim().is_empty() {
@@ -1196,22 +1436,22 @@ impl Runner {
         }
     }
 
-    /// Logs a run event, then publishes it: the funnel every run event goes through. A
-    /// partial text chunk is appended, any other event fsynced too, and `run.started`
-    /// also rewrites the run's record, before it is published.
+    /// Publishes a run event: the funnel every run event but an end goes through.
+    /// `run.started` changes the run's state, so it is made durable first ([`Runner::
+    /// publish`]); any other event is logged once it is published.
     fn emit(&self, run: &Run, inner: &mut RunInner, r#type: &str, data: &impl Serialize) {
         match serde_json::to_value(data) {
             Ok(Value::Object(data)) => {
                 let durability = if r#type == run_types::STARTED {
+                    if run.params.persists() {
+                        inner.session_started = true;
+                    }
                     Durability::State
-                } else if r#type == run_types::TEXT
-                    && data.get("partial") == Some(&Value::Bool(true))
-                {
-                    Durability::Appended
                 } else {
-                    Durability::Synced
+                    Durability::Logged
                 };
-                self.publish(run, inner, r#type, data, durability);
+                // A failure is logged where it happens; the run goes on.
+                let _ = self.publish(run, inner, r#type, data, durability);
             }
             other => warning!(
                 "run {}: {type} did not print as an object: {other:?}",
@@ -1220,8 +1460,18 @@ impl Runner {
         }
     }
 
-    /// Publishes `data` as `run`'s next event, once its line is in the run's log as
-    /// `durability` says: durable before visible.
+    /// Publishes `data` as `run`'s next event, numbered by the run itself, under the
+    /// run's own lock (`inner`) and no other: the bus's lock is held only to append it in
+    /// memory, and the runner's not at all, so a slow disk under one run holds up no
+    /// other run and no other topic.
+    ///
+    /// - A [`Durability::State`] event (`run.started`, `run.needs_you`, each end) is made
+    ///   durable before anyone sees it: the log so far is fsynced, then the run's record
+    ///   is rewritten with the new state and the event itself (`last_event`), then it is
+    ///   published, then its line is appended to the log. A crash between the record and
+    ///   the line leaves the event in the record, from which the next rlxd puts it back.
+    /// - Any other event is published, then appended, and fsynced with the run's next
+    ///   state event or every [`UNSYNCED_MAX`] appends, whichever comes first.
     fn publish(
         &self,
         run: &Run,
@@ -1229,11 +1479,15 @@ impl Runner {
         r#type: &str,
         data: Data,
         durability: Durability,
-    ) {
+    ) -> Result<(), String> {
         let id = run.params.run_id.as_str();
         if !inner.seeded {
             self.bus.seed_run(id, inner.last_run_seq);
             inner.seeded = true;
+        }
+        let run_seq = inner.last_run_seq + 1;
+        if durability == Durability::State {
+            blocking(|| self.persist_state(run, inner, run_seq, r#type, &data));
         }
         let scope = bus::Run {
             id,
@@ -1241,34 +1495,78 @@ impl Runner {
             attempt: inner.attempt,
             job_id: run.job_id.as_deref(),
         };
-        let persist = |numbered: bus::Numbered, line: &bus::Line| {
-            inner.last_run_seq = numbered.run_seq;
-            inner.last_line = Some(bus::Line::clone(line));
-            let sync = durability != Durability::Appended;
-            if inner.events.is_none() {
-                match run.dir.open_events() {
-                    Ok(events) => inner.events = Some(events),
-                    Err(e) => warning!("run {id}: its log could not be opened: {e}"),
-                }
+        let (_, line) = self
+            .bus
+            .publish_run_as(scope, run_seq, r#type, data)
+            .map_err(|e| {
+                warning!("run {id}: {type} was not published: {e}");
+                e.to_string()
+            })?;
+        inner.last_run_seq = run_seq;
+        inner.last_line = Some(bus::Line::clone(&line));
+        if blocking(|| log_line(run, inner, run_seq, r#type, &line)) {
+            inner.logged = run_seq;
+            run.logged.send_replace(run_seq);
+        }
+        Ok(())
+    }
+
+    /// Makes `type`, the run's event `run_seq`, durable before it is published: fsyncs the
+    /// log so far, then rewrites the record with the run's new state and the event.
+    fn persist_state(
+        &self,
+        run: &Run,
+        inner: &mut RunInner,
+        run_seq: u64,
+        r#type: &str,
+        data: &Data,
+    ) {
+        let id = run.params.run_id.as_str();
+        if let Some((space, delay)) = &self.slow_persist
+            && *space == run.params.space
+        {
+            std::thread::sleep(*delay);
+        }
+        if let Some(events) = inner.events.as_mut()
+            && let Err(e) = events.sync_data()
+        {
+            warning!("run {id}: its log could not be fsynced: {e}");
+        }
+        inner.unsynced = 0;
+        let mut record = run.record(inner);
+        record.last_run_seq = run_seq;
+        record.last_event = Some(json!({"run_seq": run_seq, "type": r#type, "data": data}));
+        if let Err(e) = run.dir.write_record(&record) {
+            warning!("run {id}: its record was not written: {e}");
+        }
+    }
+}
+
+/// Appends the published event `run_seq`'s line to the run's log, fsyncing it after
+/// [`UNSYNCED_MAX`] unsynced appends. Whether it was appended.
+fn log_line(run: &Run, inner: &mut RunInner, run_seq: u64, r#type: &str, line: &[u8]) -> bool {
+    let id = run.params.run_id.as_str();
+    if inner.events.is_none() {
+        match run.dir.open_events() {
+            Ok(events) => inner.events = Some(events),
+            Err(e) => warning!("run {id}: its log could not be opened: {e}"),
+        }
+    }
+    let Some(events) = inner.events.as_mut() else {
+        return false;
+    };
+    inner.unsynced += 1;
+    let sync = inner.unsynced >= UNSYNCED_MAX;
+    match store::append(events, line, sync) {
+        Ok(()) => {
+            if sync {
+                inner.unsynced = 0;
             }
-            if let Some(events) = inner.events.as_mut()
-                && let Err(e) = store::append(events, line, sync)
-            {
-                warning!(
-                    "run {id}: {type} (run_seq {}) was not logged: {e}",
-                    numbered.run_seq
-                );
-            }
-            if durability == Durability::State {
-                let record = run.record(inner);
-                if let Err(e) = run.dir.write_record(&record) {
-                    warning!("run {id}: its record was not written: {e}");
-                }
-            }
-            run.logged.send_replace(numbered.run_seq);
-        };
-        if let Err(e) = blocking(|| self.bus.publish_run_durably(scope, r#type, data, persist)) {
-            warning!("run {id}: {type} was not published: {e}");
+            true
+        }
+        Err(e) => {
+            warning!("run {id}: {type} (run_seq {run_seq}) was not logged: {e}");
+            false
         }
     }
 }
@@ -1294,6 +1592,9 @@ impl Run {
             structured_output: inner.structured_output.clone(),
             process: inner.process.clone(),
             job_id: self.job_id.clone(),
+            last_event: None,
+            boot: process::boot_id(),
+            session_started: inner.session_started,
             calls: Vec::new(),
         }
     }
@@ -1341,11 +1642,11 @@ impl Replay {
         sent
     }
 
-    /// Whether the stream is over: the run has no live process, and every event it
-    /// logged has been read.
+    /// Whether the stream is over: the run has no live process, and every event in its
+    /// log has been read, or its log is gone (an erase).
     pub fn done(&self) -> bool {
         let inner = self.run.inner();
-        !inner.state.is_live() && self.through >= inner.last_run_seq
+        !inner.state.is_live() && (self.through >= inner.logged || self.reader.gone())
     }
 
     /// Waits until the run logs more, or its state changes.
@@ -1419,6 +1720,19 @@ fn outcome_of(run: &Run, outcome: stream::Outcome) -> End {
         }
         return End::Failed(RunFailedData::new(FailReason::Error, message, text));
     }
+    let structured = outcome
+        .structured_output
+        .as_ref()
+        .map_or(0, |output| output.to_string().len());
+    if outcome.result.len() > stream::MAX_CONTENT || structured > stream::MAX_CONTENT {
+        let message = format!(
+            "output_too_large: the result is {} bytes and its structured output {structured}, \
+             and run.done carries at most {} of each",
+            outcome.result.len(),
+            stream::MAX_CONTENT
+        );
+        return End::Failed(RunFailedData::new(FailReason::Error, message, text));
+    }
     let session = run.params.persists().then(|| run.params.run_id.to_string());
     let mut done = RunDoneData::new(session, outcome.result, outcome.usage)
         .with_turns(outcome.duration_ms, outcome.num_turns);
@@ -1490,6 +1804,57 @@ async fn tail(mut stderr: ChildStderr) -> String {
         }
     }
     String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// Test builds only: the delay `name` sets in rlxd's environment, in milliseconds. A
+/// release build reads no such variable.
+#[cfg(feature = "debug-methods")]
+fn test_delay(name: &str) -> Option<Duration> {
+    let ms: u64 = std::env::var(name).ok()?.parse().ok()?;
+    Some(Duration::from_millis(ms))
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_delay(_name: &str) -> Option<Duration> {
+    None
+}
+
+/// Test builds only: `RLXD_TEST_SLOW_PERSIST=<space>:<ms>`.
+#[cfg(feature = "debug-methods")]
+fn test_slow_persist() -> Option<(String, Duration)> {
+    let value = std::env::var("RLXD_TEST_SLOW_PERSIST").ok()?;
+    let (space, ms) = value.split_once(':')?;
+    Some((space.to_owned(), Duration::from_millis(ms.parse().ok()?)))
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_slow_persist() -> Option<(String, Duration)> {
+    None
+}
+
+/// `error`, with `detail` when it takes it.
+fn with_detail(error: ErrorBody, detail: Value) -> ErrorBody {
+    match detail {
+        Value::Object(detail) => error.clone().with_detail(detail).unwrap_or(error),
+        _ => error,
+    }
+}
+
+/// The project folder Claude Code keeps the sessions of a working directory in:
+/// `path` with each character but an ASCII letter or digit as `-` (one per UTF-16 unit,
+/// as Claude Code counts them).
+pub(crate) fn project_folder(path: &std::path::Path) -> String {
+    let mut folder = String::new();
+    for c in path.to_string_lossy().chars() {
+        if c.is_ascii_alphanumeric() {
+            folder.push(c);
+        } else {
+            for _ in 0..c.len_utf16() {
+                folder.push('-');
+            }
+        }
+    }
+    folder
 }
 
 /// An error body for a refused runner call.

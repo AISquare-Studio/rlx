@@ -68,6 +68,54 @@ fn linked(path: &Path) -> io::Error {
     )
 }
 
+/// The links inside `space`, found without following any: a symlink, or on Windows a
+/// junction. At most the first 100.
+pub fn links_in(space: &Path) -> Vec<PathBuf> {
+    const MOST: usize = 100;
+    let mut links = Vec::new();
+    let mut pending: Vec<PathBuf> = fs::read_dir(space)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    while let Some(path) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || is_junction(&meta) {
+            links.push(path);
+            if links.len() >= MOST {
+                break;
+            }
+            continue;
+        }
+        if meta.is_dir()
+            && let Ok(entries) = fs::read_dir(&path)
+        {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    links
+}
+
+/// Whether `path` is a link (a symlink, or a junction on Windows), without following it.
+pub fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink() || is_junction(&meta))
+}
+
+/// Whether `meta` is a Windows reparse point standing for another path (a junction,
+/// which `is_symlink` may not say).
+#[cfg(windows)]
+fn is_junction(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    /// FILE_ATTRIBUTE_REPARSE_POINT
+    const REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_junction(_meta: &fs::Metadata) -> bool {
+    false
+}
+
 /// `path` resolved, without Windows' verbatim prefix (`\\?\C:\x` is `C:\x`).
 pub fn resolved(path: &Path) -> io::Result<PathBuf> {
     let resolved = fs::canonicalize(path)?;

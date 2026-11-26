@@ -248,25 +248,34 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   Its environment is rlxd's own until 4.3 passes the app's.
 - **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
   pre-tool-use --run <run_id> --attempt <n>` by the absolute path of the `rlxd-hook`
-  beside rlxd (quoted when it must be), with a timeout of `deadline_ms / 1000 + 10` s. The
+  beside rlxd (quoted when it must be; on Windows in forward slashes, always quoted),
+  with a timeout of `deadline_ms / 1000 + 10` s. When rlxd can't name that path,
+  `run.start` refuses `hook_not_found`; it never falls back to a name on `PATH`. The
   gate's decisions are 5.1's; until then `rlxd-hook` denies every call.
 - **Stdin stays open**: the prompt is a stream-json user message, and stdin closes only
   after the `result`. Each stream-json line becomes `run.started`, `run.text` (and
   partial chunks under `partial`), `run.tool_result` (content up to 1 MiB, then
   `truncated`), `run.rate_limited`, `run.done` or `run.failed {reason}`. Types and fields
   rlxd doesn't know are ignored. A line over 16 MiB fails the run (`line_too_long`)
-  without rlxd holding it.
-- **The process tree** is a process group on macOS and Linux and a Job Object on Windows,
-  made before Claude Code runs. `run.cancel` and `timeout_s` kill it whole. It never
-  outlives rlxd: Windows' job has `KILL_ON_JOB_CLOSE`; Linux's leader has
-  `PR_SET_PDEATHSIG`, set from the one long-lived thread that starts runs; macOS records
-  each leader's pid and start time for a sweep at the next start; and a clean stop ends
-  every run in flight `failed {reason: "engine_restarted"}`.
-- **The log** of each run is `<home>/rlxd/runs/<run_id>/`: `run.json` (rewritten whole and
-  durably on each state change) and `events.jsonl` (each event as published, appended in
-  one write and fsynced, except partial text chunks, which ride with the next). Both are
-  written before the event is published, so an app never sees an end that a restart
-  would not find.
+  without rlxd holding it, and a result or structured output over 1 MiB fails it
+  (`output_too_large`), so a run always gets its end.
+- **The process tree.** On macOS and Linux Claude Code runs under a guard, the hidden
+  `rlxd __run-guard`: Claude Code leads a process group of its own, and the guard kills
+  that group when Claude Code exits (what it left running goes with it), when rlxd tells
+  it to (cancel, timeout), and when rlxd dies (it checks its parent every 100 ms; on Linux
+  its parent-death signal too). It kills the group only while Claude Code is unreaped,
+  so the group's id can't be another's, and it exits as Claude Code did, a signal
+  included. On Windows Claude Code is started suspended inside a Job Object with
+  `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
+  "engine_restarted"}`.
+- **The log** of each run is `<home>/rlxd/runs/<run_id>/`: `run.json`, rewritten whole and
+  durably, and `events.jsonl`, each event as published. The runner numbers each run's
+  events itself, under that run's own lock: an event that changes the run's state
+  (`run.started`, `run.needs_you`, each end) is written into `run.json`, after the log so
+  far is fsynced, before it is published; any other event is published, then appended,
+  and fsynced with the run's next state event or every 64. No fsync happens under the
+  bus's lock or the runner's, so a slow disk under one run holds up no other run and no
+  other topic.
 - **The lifecycle** (5.4). `run.get {run_id}` and `run.list {states?, job_id?, limit?}`
   read the runs rlxd knows, those from before a restart too: rlxd reads every run's record
   when it starts. `run.events {run_id, from_run_seq}` replays a run's log from disk,
@@ -276,22 +285,31 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   `run.needs_you {reason: "question", question}`, after `needs_you.raised` on the
   `needs_you` topic. `run.resume {run_id, reply?}` goes on with a run that has no live
   process as a new attempt (`--resume <run_id>`, its own settings file, the reply as its
-  first message), and `needs_you.cleared` follows. It refuses `run_alive`,
-  `not_resumable` (a `send_executor`) and `no_session`.
-- **After a crash or a `kill -9`,** the next rlxd kills a run's leftover process tree
-  (macOS and Linux, by the recorded pid and start time), cuts a torn last line from its
-  log, and ends it `failed {reason: "engine_restarted"}`, numbered on from its log.
+  first message), and `needs_you.cleared` follows, after a restart too. It refuses
+  `run_alive`, `not_resumable` (a `send_executor`) and `no_session`, also for a run that
+  never reached `run.started` (cancelled while queued, failed before it started), which
+  has no session to resume.
+- **After a crash or a `kill -9`,** the guard has already ended the run's process group;
+  should the guard have died with rlxd, the next rlxd ends a guard that still runs with
+  the recorded pid, start time and boot. It cuts a torn last line from the run's log,
+  puts back a state event its record holds that the log lost, and ends the run `failed
+  {reason: "engine_restarted"}`, numbered on from its log.
 - **`job_id`** is set by rlxd alone, for the scheduler (7.6). Test builds have
   `debug.run_start`, `run.start`'s params plus a `job_id`.
 - **Spaces.** `space.ensure {name}` makes `<home>/spaces/<name>/` with an empty project
   `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
   not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
   separator, no `..` and no leading dot. `space.erase {name}` deletes the folder, the
-  Claude Code session files of its runs (`projects/*/<run_id>.jsonl` under
-  `CLAUDE_CONFIG_DIR` and `~/.claude`; every account's config directory once the brain
-  serves rlx's list), and rlxd's records of them. It refuses `runs_live` while a run in
-  the space is queued or running, and `link_refused` when the space is a link; a session
-  it could reach only through a linked project folder is left and named in `refused`.
+  Claude Code session files of its runs, and rlxd's records of them. Session files are
+  `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
+  (every account's config directory once the brain serves rlx's list), the space dir
+  encoded as Claude Code does: no other project folder is touched.
+  It refuses `runs_live` while a run in the space is queued or running, and
+  `link_refused` (`detail.paths`) when a link or a junction is on the way: `<home>/spaces`,
+  the space itself, a config directory, its `projects`, or the space's folder there;
+  nothing is removed then. A link inside the space goes as a link, never followed, and is
+  named in `links`. Paths it can't remove fail it `erase_incomplete` (`detail {removed,
+  failed}`), the runs concerned keep their records, and erasing again finishes.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 

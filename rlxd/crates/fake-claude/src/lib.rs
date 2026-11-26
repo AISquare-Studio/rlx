@@ -87,6 +87,11 @@ pub fn main() -> ExitCode {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let (name, args) = scenario_of(&argv);
+    if args.iter().any(|arg| arg == scenarios::LINGER) {
+        // The process `orphan` leaves behind: it lingers a minute.
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return ExitCode::SUCCESS;
+    }
     match args
         .iter()
         .map(String::as_str)
