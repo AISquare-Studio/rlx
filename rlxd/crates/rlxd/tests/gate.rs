@@ -867,6 +867,72 @@ fn a_client_that_half_closes_still_gets_its_last_reply() {
     assert_eq!(reply["ok"], true, "the stop too: {reply}");
 }
 
+/// How many bytes of replies a client must leave unread for rlxd's end of the socket to
+/// stop being writable, while a reply that size is still written whole: half of what a
+/// write may queue on Linux (writable up to a quarter), and on macOS what it may queue
+/// less 1 KB (writable while 2 KB are free).
+#[cfg(unix)]
+fn unwritable_but_not_blocked() -> usize {
+    let read = |program: &str, args: &[&str]| -> usize {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    };
+    if cfg!(target_os = "macos") {
+        read("sysctl", &["-n", "net.local.stream.sendspace"]) - 1024
+    } else {
+        read("cat", &["/proc/sys/net/core/wmem_default"]) / 2
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_half_closed_client_with_unread_replies_keeps_its_waiting_request() {
+    // Review #2068, r3 minor 1: replies the client has not read yet leave rlxd's end of
+    // the socket unwritable. That is not a client gone, so its gate.pair still waits.
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let mut stream = UnixStream::connect(home.root().join("run").join("rlxd.sock")).unwrap();
+    let hello = json!({"id": 1, "method": "hello", "params": {
+        "token": home.token(), "protocol_version": 1, "client": "unread",
+        "client_version": "0", "role": "cli", "capabilities": [],
+    }});
+    // hello's reply and an unknown_method's, which says the method's name, are about
+    // 400 bytes besides that name.
+    let name = "x".repeat(unwritable_but_not_blocked() - 400);
+    let filler = json!({"id": 2, "method": name});
+    let pair = json!({"id": 3, "method": "gate.pair", "params": {"device": "unread"}});
+    stream
+        .write_all(format!("{hello}\n{filler}\n{pair}\n").as_bytes())
+        .unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let request = until_requested(&home, "unread");
+    // A client gone is noticed within 250 ms: give it time to be wrongly noticed.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let waiting = home.rlxd(&["gate", "pair"]).data()["requests"].clone();
+    assert_eq!(waiting.as_array().map(Vec::len), Some(1), "{waiting}");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let lines: Vec<String> = BufReader::new(stream).lines().map(Result::unwrap).collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "hello's reply, the filler's and gate.pair's"
+    );
+    let filled: Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(filled["error"]["code"], "unknown_method");
+    let paired: Value = serde_json::from_str(&lines[2]).unwrap();
+    assert_eq!(paired["ok"], true, "{paired}");
+    assert_eq!(paired["data"]["device"], "unread");
+    assert_eq!(devices(&home).len(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_client_gone_after_a_half_close_or_with_frames_queued_withdraws_its_request() {
