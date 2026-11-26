@@ -130,6 +130,45 @@ fn another_binary_is_refused() {
 }
 
 #[test]
+fn without_a_packaged_install_the_uid_and_the_binarys_name_are_checked() {
+    // The hub's rule for an AppImage: Linux's weaker guarantee, not dev mode. No
+    // RLXD_TEST_GATE_REQUIREMENT here, so the compiled-in identity holds, and this host
+    // has no packaged rlx app.
+    for packaged in rlxd::peer::LINUX_PACKAGED_BINARIES {
+        assert!(
+            !Path::new(packaged).exists(),
+            "{packaged} is installed here"
+        );
+    }
+    let home = TestHome::new();
+    let dir = home.root().join("helpers");
+    std::fs::create_dir_all(&dir).unwrap();
+    let app = dir.join(rlxd::peer::LINUX_APP_NAME);
+    std::fs::copy(env!("CARGO_BIN_EXE_rlxd"), &app).unwrap();
+    home.start();
+    let run = home.rlxd(&["call", "gate.pair"]);
+    assert_eq!(run.error_code(), "not_gate", "rlxd's own client: {run:?}");
+    let run = home.run_of(&app, &["call", "gate.pair"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let credential = run.data()["gate_credential"].as_str().unwrap().to_owned();
+    let app_hello = [
+        "call",
+        "--role",
+        "app",
+        "--gate-credential",
+        &credential,
+        "status",
+    ];
+    assert_eq!(home.run_of(&app, &app_hello).code(), Some(0));
+    assert_eq!(home.rlxd(&app_hello).error_code(), "not_gate");
+    assert!(
+        home.log().contains("Linux's weaker guarantee"),
+        "{}",
+        home.log()
+    );
+}
+
+#[test]
 fn a_dead_peer_is_refused() {
     let home = home();
     home.start();

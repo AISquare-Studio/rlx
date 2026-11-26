@@ -16,8 +16,11 @@
 //!   later) pins the process; older kernels pin it with `pidfd_open` on the peer's pid at
 //!   accept, and the log says the check is weaker. Where rlx's app is installed from a
 //!   package ([`LINUX_PACKAGED_BINARIES`]), `/proc/<pid>/exe` must be that binary. An
-//!   AppImage has no fixed path, so without a packaged install the peer passes on its uid
-//!   and on being alive: Linux's weaker guarantee, which is not dev mode.
+//!   AppImage has no fixed path, so without a packaged install the peer passes on its uid,
+//!   on being alive and on its binary's file name being [`LINUX_APP_NAME`]: Linux's weaker
+//!   guarantee, which is not dev mode. The name keeps out other clients that hold the
+//!   token, such as rlx's TUI or a script, by mistake; it does not keep out same-user code
+//!   that means to pass.
 //! - **Windows:** `GetNamedPipeClientProcessId` as soon as the pipe connects, then
 //!   `OpenProcess` at once, and the process's creation time must not be later than the
 //!   connection, so a reused pid can't pass. Through that held handle the process must
@@ -89,6 +92,9 @@ pub const MACOS_REFUSED_ENTITLEMENTS: &[&str] = &[
     "com.apple.security.cs.allow-dyld-environment-variables",
 ];
 
+/// The file name of rlx's app's Linux binary, in a package or an AppImage.
+pub const LINUX_APP_NAME: &str = "rlx-app";
+
 /// Where rlx's app's Linux packages (.deb, .rpm) install its binary. When one of these
 /// exists, a Linux gate peer must be it. rlxapp's packaging confirms the names.
 pub const LINUX_PACKAGED_BINARIES: &[&str] = &["/usr/bin/rlx-app", "/usr/lib/rlx-app/rlx-app"];
@@ -159,7 +165,7 @@ pub(crate) struct Expected {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub requirement: String,
     /// Linux and Windows: the binaries the peer may be. `None` on Linux when rlx's app is
-    /// not installed from a package, so that no path is checked.
+    /// not installed from a package, so that only the binary's file name is checked.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub binaries: Option<Vec<std::path::PathBuf>>,
     /// Windows: the signer's subject name.

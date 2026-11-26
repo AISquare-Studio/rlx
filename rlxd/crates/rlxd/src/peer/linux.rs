@@ -10,7 +10,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
-use super::Expected;
+use super::{Expected, LINUX_APP_NAME};
 
 /// `SO_PEERPIDFD`, Linux 6.5 and later: a pidfd for the process that connected.
 const SO_PEERPIDFD: libc::c_int = 77;
@@ -80,13 +80,14 @@ impl Peer {
         alive(pidfd.as_raw_fd())
             .map_err(|e| format!("{how}: pid {pid} is no longer the peer that connected: {e}"))?;
         let binary = match &expected.binaries {
-            None => {
+            None if exe.file_name().is_some_and(|name| name == LINUX_APP_NAME) => {
                 return Ok(format!(
-                    "{how}: pid {pid}, uid matches; no packaged rlx app on this host, so its \
-                     binary {} is not checked (Linux's weaker guarantee)",
+                    "{how}: pid {pid} runs {}; no packaged rlx app on this host, so only its \
+                     uid and its binary's name are checked (Linux's weaker guarantee)",
                     exe.display()
                 ));
             }
+            None => None,
             Some(binaries) => binaries.iter().find(|b| same_file(b, &exe)),
         };
         match binary {
