@@ -384,6 +384,13 @@ close sends the day's active ping: every day the service was up sent it with nob
 which the ruling on #32 (Q2) keeps out (#1842)."""
 
 
+SWEEP_SLACK_SECONDS = 30.0
+"""What :class:`SweepPart` waits past ``usage_stats.SWEEP_EVERY`` between two children. Each
+child's ``maybe_sweep`` checks that throttle after its Python start-up, so a child every
+exactly ``SWEEP_EVERY`` ran or skipped on start-up jitter: live, 4 of 9 +10-minute children
+skipped, a cadence of 10 or 20 minutes and a Python process each for nothing (#32's tester)."""
+
+
 class SweepPart:
     """The usage sweep the *Usage & stats* page reads, in a process of its own: ``metrics stats``
     sweeps first (``usage_stats.maybe_sweep``, at most every ten minutes, one process at a
@@ -397,7 +404,7 @@ class SweepPart:
     def __init__(self, sweep: Callable[[], object] | None = None) -> None:
         from aisquare.services import usage_stats
 
-        self.every = usage_stats.SWEEP_EVERY.total_seconds()
+        self.every = usage_stats.SWEEP_EVERY.total_seconds() + SWEEP_SLACK_SECONDS
         self._sweep = sweep
         self._child: subprocess.Popen[bytes] | None = None
 

@@ -1050,6 +1050,18 @@ def test_the_sweep_runs_in_a_child_one_at_a_time(monkeypatch: pytest.MonkeyPatch
     assert service_host.SWEEP_COMMAND == ("service", "sweep")
 
 
+def test_each_sweep_child_comes_past_the_sweeps_own_throttle() -> None:
+    """#32's tester (round 4): children every exactly SWEEP_EVERY ran or skipped on their own
+    start-up time, since each one's maybe_sweep checks the throttle after Python starts; live,
+    4 of 9 skipped. The part waits SWEEP_SLACK_SECONDS more, enough for any start-up, so each
+    child comes once the throttle has let go."""
+    from aisquare.services import usage_stats
+
+    throttle = usage_stats.SWEEP_EVERY.total_seconds()
+    every = service_host.SweepPart().every
+    assert every - throttle == service_host.SWEEP_SLACK_SECONDS >= 10.0, (every, throttle)
+
+
 def test_the_shipment_is_the_clis_detached_one_and_nothing_while_sharing_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
