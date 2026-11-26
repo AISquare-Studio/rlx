@@ -62,6 +62,10 @@
 //!
 //! A cursor that does not follow ends at the last event published when it was made, so a
 //! replay ends however fast events come.
+//!
+//! Publishing never waits on a subscriber, but it runs on one of rlxd's two workers: a
+//! publisher that publishes many events in a loop lets other tasks run between batches
+//! (`tokio::task::yield_now`), as `debug.emit` does, or followers starve meanwhile.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
