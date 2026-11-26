@@ -5,16 +5,18 @@ headless Claude Code runs), receives hooks, runs the user's scheduler, and pushe
 events to its clients: the TUI, rlxapp and Remote. Python stays the orchestration
 brain and the TUI. The plan is `docs/plans/0.10.3-handoff.md`, section 1.
 
-This is the daemon's core (1.3, 7.2, 7.4): one rlxd per home, on a local socket or a
-named pipe, a token `hello`, the envelope on every reply, and `status`. The event bus,
-the PTY host, the runner and the rest arrive with later items, each a method on this
-socket. `rlxd-hook` answers `--version` only for now.
+This is the daemon's core (1.3, 7.2, 7.4) and its event bus (1.7, 7.3): one rlxd per
+home, on a local socket or a named pipe, a token `hello`, the envelope on every reply,
+`status`, and `events.subscribe`. The PTY host, the runner and the rest arrive with
+later items, each a method on this socket that publishes on the bus. `rlxd-hook`
+answers `--version` only for now.
 
 ```
 rlxd/
   crates/rlxd-proto/   wire types, schema_version, JSON Schemas (schemars); no I/O
-  crates/rlxd-client/  the library rlxapp depends on: the home's paths, connect, hello, call
-  crates/rlxd/         the daemon: serve, status, stop, call
+  crates/rlxd-client/  the library rlxapp depends on: the home's paths, connect, hello,
+                       call, subscribe
+  crates/rlxd/         the daemon: serve, status, stop, call, events, and the bus
   crates/rlxd-hook/    the tiny hook client (`--version` only for now)
   schemas/v1/          generated from rlxd-proto and checked in; CI fails on drift
   tests/fixtures/      fake-claude scenarios
@@ -28,6 +30,8 @@ rlxd status [--json]    # what it is, who is connected, and Claude Code's sign-i
 rlxd stop               # stop it, and wait until it has
 rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T]
           [--protocol-version N] [--env JSON] [--raw] <method> [<params-json>]
+rlxd events [--as-app] [--topics a,b] [--since SEQ] [--follow] [--until TYPE[,TYPE…]]
+            [--limit N] [--timeout S]
 ```
 
 - **The home** is `RLX_HOME`, else `AISQUARE_HOME`, else `~/.aisquare`, as rlx resolves
@@ -49,7 +53,36 @@ rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T
   `not_gate` until gate pairing lands (5.1).
 - **Logs** are `<home>/rlxd/logs/rlxd.log`, rotated at 5 MiB, three kept.
 - **Exit codes:** 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage
-  error, 3 when rlxd is not running for the home.
+  error, 3 when rlxd is not running for the home. `rlxd events` exits 4 when its
+  `--timeout` runs out.
+
+## The event bus
+
+One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
+
+- **`seq`** numbers every event from 1, across topics and across restarts. rlxd keeps a
+  mark at or above every seq it has given out in `<home>/rlxd/seq`: written 1,000 seqs
+  ahead, and exactly on a clean stop. A client resuming from a seq the buffer no longer
+  holds, a previous rlxd's included, first gets `daemon.gap {from, to}`, whose own seq
+  is `to`. Run events also carry `run_seq`, per run, and the bus indexes them by run.
+- **The buffer** holds the last 10,000 events, none older than 24 hours.
+- **`events.subscribe {topics?, since?, follow?}`** replays what the buffer holds after
+  `since`, then, while `follow` (the default), live events. Its reply `{seq}` comes last
+  and ends the stream. A connection carries one stream, so event frames carry no `id`.
+  An unknown topic gets `unknown_topic`.
+- **A slow client holds up no one.** A subscriber is a place in the buffer, not a
+  queue: it is written at its own pace, and when the buffer drops events it has not
+  read, it gets a `daemon.gap` for them and goes on.
+- **`rlxd events`** prints the stream as JSON lines, events only (`jq -s .` makes an
+  `event-list.json`). It exits 0 at `--until` or `--limit`, or when the stream ends, and
+  4 at `--timeout`. `--until` implies `--follow`. A refusal goes to stderr as its
+  envelope.
+- **The `daemon` topic:** `daemon.started {version, pid}`, `daemon.stopping {reason}`
+  and `daemon.gap {from, to}`.
+- **`debug.emit {count}`** publishes `count` events, for tests. It exists only with the
+  cargo feature `debug-methods`, which only rlxd's dev-dependency on itself turns on:
+  `cargo test` has it, `cargo build --release` never does, and
+  `crates/rlxd/tests/release_build.rs` builds a release rlxd to check.
 
 The `status` reply's shape is `schemas/v1/status-reply.json`. `RLXD_CLAUDE_BIN` names the
 program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/`.
@@ -63,7 +96,7 @@ runs in, so run cargo from here:
 cd rlxd
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
+cargo test --workspace --locked   # also builds a release rlxd (tests/release_build.rs)
 cargo build --release
 cargo run -p rlxd-proto --bin gen-schemas -- --check
 cargo deny check            # licences and advisories (deny.toml)

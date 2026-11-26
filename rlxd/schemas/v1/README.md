@@ -37,6 +37,7 @@ bound both validators agree on.
 | `envelope.json` | Every response: `{schema_version, ok: true, data}` or `{schema_version, ok: false, error{code, message, hint?, detail?}}`, never both, plus `id` on the socket. `detail` is a string or an object. `incompatible_protocol` must carry `detail.supported` |
 | `event.json` | One event: `{schema_version, seq, time, topic, type, data}`. `topic` is snake_case. `type` is `<topic>.<event>`, the event one or more snake_case names joined by `.` (`run.text`, `connector.login.open_url`). On the `run` topic, `data` also carries `run_id`, `run_seq`, `kind`, `attempt` and `job_id?` (7.5) |
 | `event-list.json` | A JSON array of events, as `jq -s .` makes of `rlxd events`' lines |
+| `events-subscribe.json` | `events.subscribe`'s params: `{topics?, since?, follow?}`. `topics` is a non-empty list, absent for every topic; `since` replays the events after that seq first; `follow` (default `true`) goes on with live events |
 | `request.json` | One socket request frame: `{id, method, params?}`. `id` is at most 2^53 - 1 |
 | `hello.json` | `hello`'s params: `{token, protocol_version, client, client_version, role, gate_credential?, capabilities, env?}`, where `role` is `app`, `tui`, `remote` or `cli` |
 | `hello-reply.json` | `hello`'s reply data: `{protocol_version, protocol_versions, rlxd_version, capabilities}` |
@@ -77,6 +78,19 @@ make the connection the gate.
 
   It comes with the run's other fields: `run_id`, `kind`, and `attempt` (from 1, one up
   with each `run.resume`). `job_id` is added when a scheduler job fired the run.
+
+## The stream
+
+`events.subscribe` makes its connection carry the event stream: the events, then the
+subscribe's reply `{seq}`, the last seq the stream covered, which ends it. A connection
+carries one stream, so event frames carry no `id`: a frame with `ok` is a reply, any
+other an event. Replies to requests sent meanwhile come between the events, with their
+`id`.
+
+When `since` is older than the oldest event rlxd holds, the stream starts with
+`daemon.gap {from, to}`: the events numbered `from` to `to` are gone, and the client
+re-reads what it shows. The gap's own `seq` is `to`, so seqs still strictly increase.
+`data` of the `daemon` events isn't checked by `event.json` yet.
 
 ## Versioning
 

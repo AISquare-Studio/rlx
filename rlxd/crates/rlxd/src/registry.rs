@@ -204,7 +204,7 @@ fn fresh_id(dir: &Path) -> io::Result<String> {
     }
 }
 
-fn private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn private_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -225,7 +225,7 @@ fn remove(path: &Path) -> io::Result<()> {
 
 /// Runs `step`, again for up to [`RETRY`] while Windows refuses it because another handle
 /// has the file open.
-fn retry_refused(mut step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn retry_refused(mut step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     /// ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
     const REFUSED: [i32; 2] = [5, 32];
     let deadline = Instant::now() + RETRY;

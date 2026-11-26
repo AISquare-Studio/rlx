@@ -14,6 +14,14 @@ publish.workspace = true
 name = "rlxd"
 doc = false
 
+# Test builds only. `debug-methods` adds the socket's debug.* methods (handoff 0.10.3,
+# 7.3: `debug.emit {count}`), which rlxd's own tests drive. Nothing turns it on but the
+# dev-dependency below, which cargo applies when it builds the tests (`cargo test`,
+# `cargo clippy --all-targets`), so a release build (`cargo build --release`) never has
+# it: tests/release_build.rs builds one and checks.
+[features]
+debug-methods = []
+
 [dependencies]
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 getrandom = "0.3"
@@ -39,6 +47,8 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 jsonschema = { version = "0.63", default-features = false }
+# rlxd itself, with the debug methods, so the binary the tests run has them.
+rlxd = { path = ".", features = ["debug-methods"] }
 toml = "0.9"
 
 [target.'cfg(windows)'.dev-dependencies]

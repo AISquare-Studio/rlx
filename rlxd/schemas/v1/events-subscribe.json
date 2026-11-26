@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SubscribeParams",
+  "description": "`events.subscribe`'s params: which topics to stream, and from where.\n\n```json\n{\"topics\": [\"run\", \"needs_you\"], \"since\": 41, \"follow\": true}\n```\n\nThe stream that follows carries, in order:\n\n1. with `since`, every event rlxd still holds after it, oldest first. When `since` is\n   older than the oldest event rlxd holds, a `daemon.gap {from, to}` comes first,\n   whatever the topics: the events numbered `from` to `to` are gone, so the client\n   re-reads what it shows;\n2. with `follow`, which is the default, every later event as it happens.\n\nEvent frames carry no `id`: a connection carries at most one stream. The request's\nreply comes last and ends the stream, `{\"id\": …, \"ok\": true, \"data\": {\"seq\": …}}`,\nwhere `seq` is the last one the stream covered, a `since` to resume from. Without\n`follow`, it comes once the replay is done; with it, when rlxd stops. A subscribe rlxd\nrefuses gets its error reply and no events.",
+  "type": "object",
+  "properties": {
+    "follow": {
+      "description": "Go on with live events after the replay, until rlxd stops. `false` ends the stream\nonce the replay is done.",
+      "type": "boolean",
+      "default": true
+    },
+    "since": {
+      "description": "Replay the events after this `seq` first, `0` for every event rlxd holds. Absent\nmeans live events only. A `seq` this rlxd has not reached yet gets the error\n`invalid_params`.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "topics": {
+      "description": "The topics to stream, such as `run` and `needs_you`. Absent means every topic. A\ntopic this rlxd does not carry gets the error `unknown_topic`.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "minItems": 1
+    }
+  }
+}

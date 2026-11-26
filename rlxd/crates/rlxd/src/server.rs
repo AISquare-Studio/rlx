@@ -8,23 +8,43 @@
 //!   here yet, so no connection may be the gate (fail closed). A refused hello closes the
 //!   connection and is never counted.
 //! - **Requests.** A frame that is not a request gets `invalid_request` and the
-//!   connection goes on. An unknown method gets `unknown_method`.
+//!   connection goes on. An unknown method gets `unknown_method`, and params a method
+//!   cannot take get `invalid_params`.
+//! - **The event stream** (7.3). `events.subscribe` makes the connection carry the
+//!   stream: the events, then the subscribe's reply `{seq}`, which ends it. Without
+//!   `follow` the reply comes after the replay, and the connection goes on taking
+//!   requests; with it, when rlxd stops. Requests sent meanwhile are answered between
+//!   the events, but a second `events.subscribe` gets `invalid_request`: one stream per
+//!   connection, so event frames need no `id`. A topic the bus does not carry gets
+//!   `unknown_topic`. How a slow client is kept from holding up the rest is the bus's
+//!   (`crate::bus`).
+//! - **Stopping.** `daemon.stopping {reason}` is published before any connection learns
+//!   of the stop, so every stream carries it before its reply.
+//! - **`debug.emit {count}`**, in test builds only (the `debug-methods` feature), publishes
+//!   `count` `daemon.debug {index, count}` events. A release build answers
+//!   `unknown_method`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, StatusData, VERSION, codes, methods,
+    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, StatusData, SubscribeParams,
+    VERSION, codes, event_types, methods, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
+use crate::bus::{self, Bus, Cursor, Line, Topics};
 use crate::log::{info, warning};
 use crate::{claude, token};
+
+/// `daemon.stopping`'s `reason` when a client asked rlxd to stop.
+pub const STOP_REQUESTED: &str = "stop";
 
 /// The longest frame rlxd reads: 1 MiB. A longer one gets `invalid_request`, and the
 /// connection closes.
@@ -53,6 +73,8 @@ pub struct Daemon {
     pipe_acl: Option<&'static str>,
     clients: Mutex<Clients>,
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
+    bus: Bus,
+    stopping: AtomicBool,
     stop: watch::Sender<bool>,
 }
 
@@ -68,24 +90,45 @@ struct Counted {
     role: Role,
 }
 
-/// What the connection does after a reply.
-#[derive(PartialEq, Eq)]
-enum Then {
+/// What a request gets.
+enum Answer {
+    /// A reply, and the connection goes on.
+    Reply(Envelope),
+    /// A reply, then rlxd stops.
+    Stop(Envelope),
+    /// The event stream, whose last frame is the reply.
+    Stream(Subscription),
+}
+
+/// An `events.subscribe` that rlxd took.
+struct Subscription {
+    id: RequestId,
+    cursor: Cursor,
+    follow: bool,
+}
+
+/// What the connection does once a stream has ended.
+enum Flow {
+    /// Takes the next request.
     GoOn,
-    Stop,
+    /// rlxd is stopping: waits for the client to close, then closes.
+    Linger,
+    /// The client has gone, or cannot be written to.
+    Close,
 }
 
 /// One frame, as read.
 enum Frame {
     Line(String),
+    Blank,
     NotText,
     TooLong,
 }
 
 impl Daemon {
-    /// An rlxd serving `home` with `token`. `pipe_acl` is what `status` says of the
-    /// pipe's DACL, on Windows.
-    pub fn new(home: Home, token: String, pipe_acl: Option<&'static str>) -> Arc<Self> {
+    /// An rlxd serving `home` with `token`, publishing on `bus`. `pipe_acl` is what
+    /// `status` says of the pipe's DACL, on Windows.
+    pub fn new(home: Home, token: String, pipe_acl: Option<&'static str>, bus: Bus) -> Arc<Self> {
         Arc::new(Self {
             home,
             token,
@@ -93,15 +136,44 @@ impl Daemon {
             pipe_acl,
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
+            bus,
+            stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
         })
     }
 
-    /// Tells every task to stop: the accept loop and each connection.
-    pub fn stop(&self, why: &str) {
-        if !self.stop.send_replace(true) {
-            info!("stopping: {why}");
+    /// The home's event bus.
+    pub fn bus(&self) -> &Bus {
+        &self.bus
+    }
+
+    /// Publishes `daemon.started {version, pid}`, the first event of this rlxd's life.
+    pub fn started(&self) {
+        let data = object(&json!({"version": VERSION, "pid": self.pid}));
+        if let Err(e) = self
+            .bus
+            .publish(topics::DAEMON, event_types::DAEMON_STARTED, data)
+        {
+            warning!("daemon.started was not published: {e}");
         }
+    }
+
+    /// Tells every task to stop, the accept loop and each connection, once
+    /// `daemon.stopping {reason}` is published: `reason` is a snake_case word, such as
+    /// [`STOP_REQUESTED`] or `sigterm`.
+    pub fn stop(&self, reason: &str) {
+        if self.stopping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        info!("stopping: {reason}");
+        let data = object(&json!({ "reason": reason }));
+        if let Err(e) = self
+            .bus
+            .publish(topics::DAEMON, event_types::DAEMON_STOPPING, data)
+        {
+            warning!("daemon.stopping was not published: {e}");
+        }
+        self.stop.send_replace(true);
     }
 
     /// Resolves once [`Daemon::stop`] was called.
@@ -186,13 +258,13 @@ impl Daemon {
         Ok((session, reply))
     }
 
-    /// The reply to one request frame after `hello`.
-    async fn answer(&self, session: &Session, frame: &str) -> (Envelope, Then) {
+    /// What one request frame after `hello` gets.
+    async fn answer(&self, session: &Session, frame: &str) -> Answer {
         let value = match serde_json::from_str::<Value>(frame) {
             Ok(value) => value,
             Err(e) => {
                 let message = format!("the frame is not JSON: {e}");
-                return (reply_err(None, codes::INVALID_REQUEST, message), Then::GoOn);
+                return Answer::Reply(reply_err(None, codes::INVALID_REQUEST, message));
             }
         };
         let id = request_id(&value);
@@ -200,32 +272,106 @@ impl Daemon {
             Ok(request) => request,
             Err(e) => {
                 let message = format!("the frame is not a request: {e}");
-                return (reply_err(id, codes::INVALID_REQUEST, message), Then::GoOn);
+                return Answer::Reply(reply_err(id, codes::INVALID_REQUEST, message));
             }
         };
-        let id = Some(request.id);
-        match request.method.as_str() {
-            methods::STATUS => match self.status(session).await {
-                Ok(data) => (Envelope::ok(data).with_optional_id(id), Then::GoOn),
-                Err(error) => (Envelope::err(error).with_optional_id(id), Then::GoOn),
-            },
+        let id = request.id;
+        let outcome = match request.method.as_str() {
+            methods::STATUS => self.status(session).await,
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
-                (Envelope::ok(data).with_optional_id(id), Then::Stop)
+                return Answer::Stop(Envelope::ok(data).with_id(id));
             }
-            methods::HELLO => {
-                let message = "hello was already said on this connection".to_owned();
-                (reply_err(id, codes::INVALID_REQUEST, message), Then::GoOn)
-            }
-            method => {
-                let error = error(
-                    codes::UNKNOWN_METHOD,
-                    &format!("rlxd has no method {method:?}"),
-                )
-                .with_hint(format!("The methods it serves: {}.", served().join(", ")));
-                (Envelope::err(error).with_optional_id(id), Then::GoOn)
-            }
+            methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
+                Ok(subscription) => return Answer::Stream(subscription),
+                Err(error) => Err(error),
+            },
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_EMIT => self.debug_emit(&request.params),
+            methods::HELLO => Err(error(
+                codes::INVALID_REQUEST,
+                "hello was already said on this connection",
+            )),
+            method => Err(error(
+                codes::UNKNOWN_METHOD,
+                &format!("rlxd has no method {method:?}"),
+            )
+            .with_hint(format!("The methods it serves: {}.", served().join(", ")))),
+        };
+        Answer::Reply(match outcome {
+            Ok(data) => Envelope::ok(data).with_id(id),
+            Err(error) => Envelope::err(error).with_id(id),
+        })
+    }
+
+    /// `events.subscribe`, taken: where its stream starts. Every topic named must be
+    /// one the bus carries, and `since` one it has reached.
+    fn subscribe(&self, id: RequestId, params: Params) -> Result<Subscription, ErrorBody> {
+        let invalid = |e: &dyn std::fmt::Display| {
+            error(
+                codes::INVALID_PARAMS,
+                &format!("events.subscribe's params are not valid: {e}"),
+            )
+        };
+        // A topic the bus does not carry is unknown_topic, whatever its spelling.
+        if let Some(Value::Array(names)) = params.get("topics")
+            && let Some(unknown) = names
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|name| !topics::ALL.contains(name))
+        {
+            return Err(unknown_topic(unknown));
         }
+        let params =
+            SubscribeParams::deserialize(Value::Object(params)).map_err(|e| invalid(&e))?;
+        let topics = match &params.topics {
+            None => Topics::ALL,
+            Some(names) => Topics::of(names.iter().map(String::as_str)).map_err(unknown_topic)?,
+        };
+        let cursor = self.bus.cursor(topics, params.since).map_err(|head| {
+            let since = params.since.unwrap_or_default();
+            error(
+                codes::INVALID_PARAMS,
+                &format!(
+                    "since {since} is past this home's last event, {head}: it comes from \
+                     another numbering of its events"
+                ),
+            )
+            .with_hint("Subscribe without since, and re-read what you show.")
+        })?;
+        Ok(Subscription {
+            id,
+            cursor,
+            follow: params.follow,
+        })
+    }
+
+    /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
+    /// at a time. Test builds only.
+    #[cfg(feature = "debug-methods")]
+    fn debug_emit(&self, params: &Params) -> Result<Data, ErrorBody> {
+        const MOST: u64 = 100_000;
+        let count = params
+            .get("count")
+            .and_then(Value::as_u64)
+            .filter(|count| (1..=MOST).contains(count))
+            .ok_or_else(|| {
+                error(
+                    codes::INVALID_PARAMS,
+                    &format!("debug.emit takes {{\"count\": N}}, N from 1 to {MOST}"),
+                )
+            })?;
+        let mut first = None;
+        let mut last = 0;
+        for index in 1..=count {
+            let data = object(&json!({"index": index, "count": count}));
+            last = self
+                .bus
+                .publish(topics::DAEMON, "daemon.debug", data)
+                .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+            first.get_or_insert(last);
+        }
+        Ok(object(&json!({"first": first, "last": last})))
     }
 
     /// `status`'s reply data (7.4).
@@ -242,6 +388,7 @@ impl Daemon {
             .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
         status.protocol_version = session.protocol_version;
         status.capabilities = capabilities();
+        status.seq = self.bus.head();
         status.clients = *self.clients();
         status.claude = self.claude().await;
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
@@ -320,7 +467,7 @@ where
     let frame = match first {
         Ok(Ok(Some(Frame::Line(frame)))) => frame,
         Ok(Ok(None) | Err(_)) => return,
-        Ok(Ok(Some(Frame::NotText | Frame::TooLong))) => {
+        Ok(Ok(Some(Frame::Blank | Frame::NotText | Frame::TooLong))) => {
             let message = "the first frame must be a hello request, as JSON".to_owned();
             let reply = reply_err(None, codes::UNAUTHORIZED, message);
             return refuse(&mut frames, &mut writer, &reply).await;
@@ -347,6 +494,7 @@ where
         };
         let frame = match frame {
             Ok(Some(Frame::Line(frame))) => frame,
+            Ok(Some(Frame::Blank)) => continue,
             Ok(Some(Frame::NotText)) => {
                 let message = "the frame is not UTF-8 text".to_owned();
                 if send(
@@ -367,14 +515,143 @@ where
             }
             Ok(None) | Err(_) => return,
         };
-        let (reply, then) = daemon.answer(&session, &frame).await;
-        if send(&mut writer, &reply).await.is_err() {
-            return;
-        }
-        if then == Then::Stop {
-            daemon.stop("a client asked");
+        match daemon.answer(&session, &frame).await {
+            Answer::Reply(reply) => {
+                if send(&mut writer, &reply).await.is_err() {
+                    return;
+                }
+            }
+            Answer::Stop(reply) => {
+                if send(&mut writer, &reply).await.is_err() {
+                    return;
+                }
+                daemon.stop(STOP_REQUESTED);
+            }
+            Answer::Stream(subscription) => {
+                let flow =
+                    send_stream(&daemon, &session, &mut frames, &mut writer, subscription).await;
+                match flow {
+                    Flow::GoOn => {}
+                    Flow::Linger => return linger(&mut frames).await,
+                    Flow::Close => return,
+                }
+            }
         }
     }
+}
+
+/// Sends `subscription`'s stream: the events after its place, a batch at a time, then
+/// live ones while it follows, then its reply. Answers the client's requests meanwhile.
+async fn send_stream<R, W>(
+    daemon: &Arc<Daemon>,
+    session: &Session,
+    frames: &mut Frames<R>,
+    writer: &mut W,
+    mut subscription: Subscription,
+) -> Flow
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut head = daemon.bus.watch();
+    let mut stopping = false;
+    loop {
+        loop {
+            let lines = daemon.bus.read(&mut subscription.cursor, bus::BATCH);
+            if lines.is_empty() {
+                break;
+            }
+            if send_lines(writer, &lines).await.is_err() {
+                return Flow::Close;
+            }
+        }
+        if stopping || !subscription.follow {
+            let data = object(&json!({"seq": subscription.cursor.after()}));
+            let reply = Envelope::ok(data).with_id(subscription.id);
+            if send(writer, &reply).await.is_err() {
+                return Flow::Close;
+            }
+            return if stopping { Flow::Linger } else { Flow::GoOn };
+        }
+        let after = subscription.cursor.after();
+        tokio::select! {
+            moved = async { head.wait_for(|&seq| seq > after).await.map(|_| ()) } => {
+                stopping = moved.is_err();
+            }
+            () = daemon.stopped() => stopping = true,
+            more = frames.more() => {
+                if !matches!(more, Ok(true)) {
+                    return Flow::Close;
+                }
+                if let Some(flow) = answer_in_stream(daemon, session, frames, writer).await {
+                    return flow;
+                }
+            }
+        }
+    }
+}
+
+/// Answers one frame sent while the connection carries a stream. `None` when the stream
+/// goes on.
+async fn answer_in_stream<R, W>(
+    daemon: &Arc<Daemon>,
+    session: &Session,
+    frames: &mut Frames<R>,
+    writer: &mut W,
+) -> Option<Flow>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (reply, then_stop) = match frames.next_line().await {
+        Ok(Some(Frame::Line(frame))) => match daemon.answer(session, &frame).await {
+            Answer::Reply(reply) => (reply, false),
+            Answer::Stop(reply) => (reply, true),
+            Answer::Stream(other) => {
+                let message = "this connection carries an event stream already: open \
+                               another for a second";
+                let reply = reply_err(Some(other.id), codes::INVALID_REQUEST, message.into());
+                (reply, false)
+            }
+        },
+        Ok(Some(Frame::Blank)) => return None,
+        Ok(Some(Frame::NotText)) => {
+            let message = "the frame is not UTF-8 text".to_owned();
+            (reply_err(None, codes::INVALID_REQUEST, message), false)
+        }
+        Ok(Some(Frame::TooLong)) => {
+            let message = format!("the frame is longer than {MAX_FRAME} bytes");
+            let reply = reply_err(None, codes::INVALID_REQUEST, message);
+            refuse(frames, writer, &reply).await;
+            return Some(Flow::Close);
+        }
+        Ok(None) | Err(_) => return Some(Flow::Close),
+    };
+    if send(writer, &reply).await.is_err() {
+        return Some(Flow::Close);
+    }
+    if then_stop {
+        daemon.stop(STOP_REQUESTED);
+    }
+    None
+}
+
+/// Sends `lines`, each one event and its newline, in one write.
+async fn send_lines<W: AsyncWrite + Unpin>(writer: &mut W, lines: &[Line]) -> std::io::Result<()> {
+    let mut text = Vec::with_capacity(lines.iter().map(|line| line.len()).sum());
+    for line in lines {
+        text.extend_from_slice(line);
+    }
+    writer.write_all(&text).await?;
+    writer.flush().await
+}
+
+fn unknown_topic(topic: &str) -> ErrorBody {
+    error(
+        codes::UNKNOWN_TOPIC,
+        &format!("rlxd carries no topic {topic:?}"),
+    )
+    .with_hint(format!("Its topics: {}.", topics::ALL.join(", ")))
 }
 
 /// Sends `reply`, then waits a moment for the client to read it and close.
@@ -418,6 +695,16 @@ struct Frames<R> {
 impl<R: AsyncRead + Unpin> Frames<R> {
     /// The next frame, skipping blank lines, or `None` once the client has closed.
     async fn next(&mut self) -> std::io::Result<Option<Frame>> {
+        loop {
+            match self.next_line().await? {
+                Some(Frame::Blank) => {}
+                frame => return Ok(frame),
+            }
+        }
+    }
+
+    /// The next line, blank or not, or `None` once the client has closed.
+    async fn next_line(&mut self) -> std::io::Result<Option<Frame>> {
         let mut line = Vec::new();
         loop {
             let chunk = self.reader.fill_buf().await?;
@@ -436,12 +723,17 @@ impl<R: AsyncRead + Unpin> Frames<R> {
             self.reader.consume(used);
             if ended {
                 if is_blank(&line) {
-                    line.clear();
-                    continue;
+                    return Ok(Some(Frame::Blank));
                 }
                 return Ok(Some(text(line)));
             }
         }
+    }
+
+    /// Whether the client has sent more, false once it has closed. It reads nothing, so
+    /// it can lose a race in a `select!` without losing a byte.
+    async fn more(&mut self) -> std::io::Result<bool> {
+        Ok(!self.reader.fill_buf().await?.is_empty())
     }
 }
 
@@ -469,7 +761,11 @@ fn capabilities() -> Vec<String> {
 
 /// The methods this rlxd serves after `hello`.
 fn served() -> Vec<&'static str> {
-    vec![methods::STATUS, methods::STOP]
+    let mut served = vec![methods::STATUS, methods::STOP, methods::EVENTS_SUBSCRIBE];
+    if cfg!(feature = "debug-methods") {
+        served.push(methods::DEBUG_EMIT);
+    }
+    served
 }
 
 /// An error whose code and message are both non-empty, as every caller's are.

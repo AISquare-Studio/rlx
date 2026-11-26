@@ -1,13 +1,15 @@
 //! The client commands, `rlxd call`, `rlxd status` and `rlxd stop` (handoff 0.10.3, "How
 //! to read the checks", 1.3 and 7.2). Each opens a new connection to this home's rlxd,
-//! says `hello`, sends one request and prints the reply envelope.
+//! says `hello`, sends one request and prints the reply envelope. For a streaming method,
+//! `events.subscribe`, `rlxd call` prints each event as a JSON line instead, and exits 0
+//! when the stream ends (`crate::events` is `rlxd events`).
 
 use std::io::{self, Read};
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rlxd_client::{CallError, ConnectError, Connection, Home, Reply};
+use rlxd_client::{CallError, ConnectError, Connection, Home, Incoming, Reply};
 use rlxd_proto::{Data, PROTOCOL_VERSION, StatusData, VERSION, codes, methods};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,6 +21,9 @@ const CLIENT: &str = "rlxd-cli";
 
 /// How long `rlxd stop` waits for rlxd to let its lock go.
 const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// The methods whose reply ends a stream of events, which `rlxd call` prints instead.
+const STREAMING: &[&str] = &[methods::EVENTS_SUBSCRIBE];
 
 /// `rlxd call`'s options, as the command line gave them.
 #[derive(Debug, Default)]
@@ -58,18 +63,28 @@ pub enum AskError {
 /// Says `hello` as `cli` to `home`'s rlxd, with the token file's token, then asks
 /// `method` with no params. The reply may be `ok: false`.
 pub fn ask(home: &Home, method: &str) -> Result<Reply, AskError> {
+    open(home, false)?
+        .request(method, Data::new())
+        .map_err(|e| AskError::Failed(e.to_string()))
+}
+
+/// A connection to `home`'s rlxd that has said `hello` with the token file's token: as
+/// `cli`, or with `as_app` as `app`, with the test gate credential when there is one.
+pub fn open(home: &Home, as_app: bool) -> Result<Connection, AskError> {
     let mut connection = Connection::open(home).map_err(|e| connect_error(home, e))?;
     let token = read_token(home).map_err(AskError::Failed)?;
-    let hello = hello_params(&token, &json!(PROTOCOL_VERSION), CLIENT, "cli");
+    let role = if as_app { "app" } else { "cli" };
+    let mut hello = hello_params(&token, &json!(PROTOCOL_VERSION), CLIENT, role);
+    if let Some(credential) = as_app.then(|| test_gate_credential(home)).flatten() {
+        hello.insert("gate_credential".to_owned(), Value::String(credential));
+    }
     let reply = connection
         .request(methods::HELLO, hello)
         .map_err(|e| AskError::Failed(e.to_string()))?;
     if !reply.is_ok() {
         return Err(AskError::Refused(Box::new(reply)));
     }
-    connection
-        .request(method, Data::new())
-        .map_err(|e| AskError::Failed(e.to_string()))
+    Ok(connection)
 }
 
 /// `rlxd call`.
@@ -131,9 +146,39 @@ pub fn call(args: CallArgs) -> ExitCode {
     if !reply.is_ok() {
         return out::print_reply(&reply);
     }
+    if STREAMING.contains(&method) {
+        return print_stream(connection, method, params);
+    }
     match connection.request(method, params) {
         Ok(reply) => out::print_reply(&reply),
         Err(e) => report(call_error(e)),
+    }
+}
+
+/// Sends a streaming method's request, and prints each event of its stream as it came.
+/// Exits 0 when its reply ends the stream `ok`; a refusal is printed, and exits 1.
+fn print_stream(mut connection: Connection, method: &str, params: Data) -> ExitCode {
+    let id = match connection.send(method, params) {
+        Ok(id) => id,
+        Err(e) => return report(call_error(e)),
+    };
+    loop {
+        match connection.read_incoming() {
+            Ok(Incoming::Event(event)) => {
+                if !out::print_line(&event.line) {
+                    return ExitCode::from(out::FAILED);
+                }
+            }
+            Ok(Incoming::Reply(reply)) if reply.envelope.id.is_none_or(|i| i == id) => {
+                return if reply.is_ok() {
+                    ExitCode::SUCCESS
+                } else {
+                    out::print_reply(&reply)
+                };
+            }
+            Ok(Incoming::Reply(_)) => {}
+            Err(e) => return report(call_error(e)),
+        }
     }
 }
 
@@ -347,6 +392,23 @@ fn report(error: AskError) -> ExitCode {
         ),
         AskError::Refused(reply) => out::print_reply(&reply),
         AskError::Failed(message) => out::fail(codes::DISCONNECTED, &message, None),
+    }
+}
+
+/// Prints the envelope for `error` on stderr, with its exit code: for `rlxd events`, whose
+/// stdout carries events only.
+pub fn report_on_stderr(error: AskError) -> ExitCode {
+    match error {
+        AskError::NotRunning(message) => out::fail_on_stderr(
+            out::NOT_RUNNING,
+            codes::NOT_RUNNING,
+            &message,
+            Some("Start it with `rlxd serve --detach`."),
+        ),
+        AskError::Refused(reply) => out::print_reply_on_stderr(&reply),
+        AskError::Failed(message) => {
+            out::fail_on_stderr(out::FAILED, codes::DISCONNECTED, &message, None)
+        }
     }
 }
 

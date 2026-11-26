@@ -249,6 +249,16 @@ pub mod codes {
     pub const DISCONNECTED: &str = "disconnected";
     /// `rlxd stop`: rlxd took the request but was still running when the wait ran out.
     pub const STOP_TIMED_OUT: &str = "stop_timed_out";
+    /// A request's params are not what its method takes: a field missing, of the wrong
+    /// type or out of range. The message names the field.
+    pub const INVALID_PARAMS: &str = "invalid_params";
+    /// `events.subscribe` named a topic this rlxd does not carry. The hint lists the
+    /// ones it does.
+    pub const UNKNOWN_TOPIC: &str = "unknown_topic";
+    /// `rlxd events --timeout`: the time ran out first. Its exit code is 4.
+    pub const TIMED_OUT: &str = "timed_out";
+    /// `rlxd events --until`: the stream ended before one of the types came.
+    pub const STREAM_ENDED: &str = "stream_ended";
 }
 
 impl Envelope {

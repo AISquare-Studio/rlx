@@ -8,7 +8,7 @@
 
 use rlxd_proto::{
     DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, Paths, Request,
-    RequestId, Role, RunScope, StatusData,
+    RequestId, Role, RunScope, StatusData, SubscribeParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +57,8 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
         "claude": {"installed": false, "signed_in": false}, "runs": {"live": 0, "queued": 0},
         "jobs": {"count": 0}, "paths": paths});
     assert!(StatusData::deserialize(status).is_err());
+
+    assert!(SubscribeParams::deserialize(json!({"topics": []})).is_err());
 
     // And they still read what is valid.
     assert!(Request::deserialize(json!({"id": 1, "method": "status"})).is_ok());
@@ -117,4 +119,9 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
     assert!(printed(&status).is_ok());
     status.pid = 0;
     assert!(printed(&status).is_err());
+
+    let mut subscribe = SubscribeParams::new().with_topics(["run"]).unwrap();
+    assert!(printed(&subscribe).is_ok());
+    subscribe.topics = Some(vec!["Run".to_owned()]);
+    assert!(printed(&subscribe).is_err());
 }
