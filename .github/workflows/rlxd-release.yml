@@ -158,19 +158,22 @@ jobs:
             "${build[@]}"
             exit 0
           fi
+          # The crates are fetched here, on the runner, and the image builds offline
+          # (--frozen, --network none), so it needs neither network nor CA certificates.
+          cargo fetch --locked
           # In the 22.04 image, as the runner's user, with the workspace, cargo's home
           # and rustup's mounted at their own paths, so rlxd/rust-toolchain.toml, the
           # toolchain installed above and rust-cache's files are the runner's.
           cargo_home=${CARGO_HOME:-$HOME/.cargo}
           rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
-          docker run --rm --user "$(id -u):$(id -g)" \
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$PWD" \
             -v "$cargo_home:$cargo_home" -v "$rustup_home:$rustup_home" \
             -e HOME -e CARGO_HOME="$cargo_home" -e RUSTUP_HOME="$rustup_home" \
             -e PATH="$cargo_home/bin:/usr/local/bin:/usr/bin:/bin" \
             -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL \
             -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER \
-            rlxd-glibc-floor "${build[@]}"
+            rlxd-glibc-floor cargo build --release --frozen --target "$TARGET" -p rlxd -p rlxd-hook
 
       - name: Rosetta, to run the x86_64 macOS build
         if: matrix.target == 'x86_64-apple-darwin'
