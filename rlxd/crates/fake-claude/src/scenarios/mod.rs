@@ -5,23 +5,31 @@
 
 use crate::Fake;
 
+mod abort;
 mod asks;
 mod crash;
 mod hello;
+mod huge;
+mod orphan;
 mod persist;
 mod rate_limit;
 mod slow;
 mod structured;
 mod tool_result;
 
+pub use orphan::LINGER;
+
 /// One scenario: plays a start, and returns its exit code.
 pub type Scenario = fn(&mut Fake) -> i32;
 
 /// Every scenario, by the name a run starts it as.
 pub const ALL: &[(&str, Scenario)] = &[
+    ("abort", abort::run),
     ("asks", asks::run),
     ("crash", crash::run),
     ("hello", hello::run),
+    ("huge", huge::run),
+    ("orphan", orphan::run),
     ("persist", persist::run),
     ("rate-limit", rate_limit::run),
     ("slow", slow::run),

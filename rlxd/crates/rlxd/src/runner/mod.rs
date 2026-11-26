@@ -14,12 +14,15 @@
 //!   crashes, or can't be found or started, `timeout` when `timeout_s` runs out,
 //!   `cancelled` on `run.cancel`, and `engine_restarted` when rlxd stops with the run in
 //!   flight. Each failure keeps the assistant text the run got out (`partial_text`).
-//! - **Events** go through one funnel ([`Runner::emit`]), under the run's own lock: the
-//!   bus numbers each, the line is appended to the run's log on disk ([`store`]), and only
-//!   then is it published. Every event but a partial text chunk is fsynced first, and an
-//!   event that changes the run's state (`run.started` and each end) also has the run's
-//!   record rewritten first. So an app never sees an event, an end above all, that a
-//!   restart would not find, and the log holds every event in `run_seq` order.
+//! - **Events** go through one funnel ([`Runner::publish`]), under the run's own lock and
+//!   no other: the run numbers its own events. An event that changes the run's state
+//!   (`run.started`, each end) is made durable before it is published: the log so far is
+//!   fsynced and the run's record rewritten with the event. Any other event is published,
+//!   then appended, and fsynced with the run's next state event or every
+//!   [`UNSYNCED_MAX`]. So an app never sees an end that a restart would not find, the log
+//!   holds every event in `run_seq` order, and a slow disk under one run holds up no
+//!   other run and no other topic: the bus's lock is held only in memory, and the
+//!   runner's never across a write.
 //! - **Claude Code's environment** is rlxd's own ([`run_env`] is where the app's `PATH`
 //!   and config directories plug in, 4.3). `RLXD_CLAUDE_BIN` is read from rlxd's own
 //!   environment only, when each attempt starts; no client names the program.
@@ -50,6 +53,8 @@ use crate::log::{info, warning};
 use crate::{claude, clock, spaces};
 
 mod argv;
+#[cfg(unix)]
+pub(crate) mod guard;
 mod process;
 mod store;
 mod stream;
@@ -77,8 +82,16 @@ pub struct Runner {
     home: Home,
     bus: Arc<Bus>,
     spawner: Spawner,
-    /// `rlxd-hook` beside this rlxd, which each run's settings name.
-    hook: PathBuf,
+    /// `rlxd-hook` beside this rlxd, which each run's settings name, or why it can't be
+    /// named: then `run.start` refuses `hook_not_found`.
+    hook: Result<PathBuf, String>,
+    /// Test builds only: how long a place given back waits before its next run starts,
+    /// to widen the window a cancel can land in (`RLXD_TEST_LAUNCH_DELAY_MS`).
+    launch_delay: Option<Duration>,
+    /// Test builds only: a space whose runs' state events wait this long before they are
+    /// made durable, to show a slow disk under one run holds up nothing else
+    /// (`RLXD_TEST_SLOW_PERSIST=<space>:<ms>`).
+    slow_persist: Option<(String, Duration)>,
     runs: Mutex<Runs>,
     /// Set once rlxd stops: no run starts from then on.
     stopping: AtomicBool,
@@ -88,6 +101,8 @@ pub struct Runner {
 struct Runs {
     by_id: HashMap<RunId, Arc<Run>>,
     pools: HashMap<RunKind, Pool>,
+    /// Run ids taken by a `run.start` whose record is being written, outside this lock.
+    reserved: std::collections::HashSet<RunId>,
 }
 
 #[derive(Default)]
@@ -131,20 +146,25 @@ struct RunInner {
     events: Option<std::fs::File>,
     /// This attempt's assistant text: its last [`PARTIAL_TEXT`] bytes.
     text: String,
+    /// Events appended to the log since its last fsync.
+    unsynced: u32,
 }
 
 /// How durable an event is before it is published.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Durability {
-    /// Appended to the log, durable with the next event that is fsynced: partial text.
-    Appended,
-    /// Appended and fsynced before it is published.
-    Synced,
-    /// Appended and fsynced, and the run's record rewritten, before it is published: an
-    /// event that changes the run's state, so an app never sees an end that a restart
-    /// would not find.
+    /// Appended to the log once published, and fsynced later ([`UNSYNCED_MAX`]).
+    Logged,
+    /// Made durable, the log so far fsynced and the run's record rewritten with it,
+    /// before it is published: an event that changes the run's state, so an app never
+    /// sees an end that a restart would not find.
     State,
 }
+
+/// The most events of a run appended to its log without an fsync. After an OS crash, at
+/// most this many of a run's last events are lost, and the next rlxd numbers past them
+/// (5.4).
+pub(crate) const UNSYNCED_MAX: u32 = 64;
 
 /// How an attempt ended.
 enum End {
@@ -173,6 +193,8 @@ impl Runner {
             bus,
             spawner: Spawner::start(),
             hook: argv::hook_beside(rlxd.as_deref()),
+            launch_delay: test_delay("RLXD_TEST_LAUNCH_DELAY_MS"),
+            slow_persist: test_slow_persist(),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
         })
@@ -182,15 +204,20 @@ impl Runner {
         self.runs.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Every run rlxd knows now, to read with the runner's lock let go.
+    fn snapshot(&self) -> Vec<Arc<Run>> {
+        self.runs().by_id.values().cloned().collect()
+    }
+
     /// `status`'s `runs`: how many run, and how many wait.
     pub fn counts(&self) -> (u64, u64) {
-        let runs = self.runs();
+        // Each run's state is read from its watch, with no lock of the run's or the
+        // runner's held: a run's own lock may be held over a slow disk, and status never
+        // waits on it.
+        let runs = self.snapshot();
+        let states: Vec<RunState> = runs.iter().map(|r| *r.state.borrow()).collect();
         let count = |state| {
-            let n = runs
-                .by_id
-                .values()
-                .filter(|r| r.inner().state == state)
-                .count();
+            let n = states.iter().filter(|s| **s == state).count();
             u64::try_from(n).unwrap_or(u64::MAX)
         };
         (count(RunState::Running), count(RunState::Queued))
@@ -239,14 +266,27 @@ impl Runner {
                 "rlxd is stopping: start the run once it is back".to_owned(),
             ));
         }
+        if let Err(why) = &self.hook {
+            return Err(refusal(
+                codes::HOOK_NOT_FOUND,
+                format!(
+                    "{why}; a run's gate hook is always rlxd-hook by its absolute path, \
+                     never a name looked up on PATH"
+                ),
+            ));
+        }
         let id = params.run_id.clone();
         let dir = RunDir::of(&self.home, &id);
-        let mut runs = self.runs();
-        if runs.by_id.contains_key(&id) || dir.exists() {
-            return Err(refusal(
-                codes::RUN_EXISTS,
-                format!("rlxd already knows a run {id}: pick a new run_id"),
-            ));
+        {
+            // The id is taken here; the record is written outside the runner's lock.
+            let mut runs = self.runs();
+            if runs.by_id.contains_key(&id) || runs.reserved.contains(&id) || dir.exists() {
+                return Err(refusal(
+                    codes::RUN_EXISTS,
+                    format!("rlxd already knows a run {id}: pick a new run_id"),
+                ));
+            }
+            runs.reserved.insert(id.clone());
         }
         let run = Arc::new(Run {
             job_id,
@@ -267,6 +307,7 @@ impl Runner {
                 seeded: false,
                 events: None,
                 text: String::new(),
+                unsynced: 0,
             }),
             state: watch::Sender::new(RunState::Queued),
             params,
@@ -279,11 +320,14 @@ impl Runner {
         });
         if let Err(e) = created {
             let _ = std::fs::remove_dir_all(run.dir.path());
+            self.runs().reserved.remove(&id);
             return Err(refusal(
                 codes::RUN_START_FAILED,
                 format!("the run's record could not be written: {e}"),
             ));
         }
+        let mut runs = self.runs();
+        runs.reserved.remove(&id);
         runs.by_id.insert(id.clone(), Arc::clone(&run));
         let kind = run.params.kind;
         let pool = runs.pools.entry(kind).or_default();
@@ -366,8 +410,7 @@ impl Runner {
     /// "engine_restarted"}`, which `run.resume` goes on from.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
-        let runs: Vec<Arc<Run>> = self.runs().by_id.values().cloned().collect();
-        for run in runs {
+        for run in self.snapshot() {
             let mut inner = run.inner();
             if !inner.state.is_live() {
                 continue;
@@ -396,9 +439,22 @@ impl Runner {
     }
 
     /// Starts `run`'s attempt, which holds a place in its pool.
+    ///
+    /// The run may have been cancelled after it left its queue and before this: then it
+    /// is not started, and the place goes to the next run instead. So no Claude Code ever
+    /// starts for a run that has ended.
     fn launch(self: &Arc<Self>, run: &Arc<Run>) {
         {
             let mut inner = run.inner();
+            if inner.state != RunState::Queued || inner.ending.is_some() {
+                drop(inner);
+                info!(
+                    "run {}: ended before its turn came; its place goes on",
+                    run.params.run_id
+                );
+                self.release_if(true, run.params.kind);
+                return;
+            }
             inner.placed = true;
             inner.state = RunState::Running;
             inner.text.clear();
@@ -442,10 +498,33 @@ impl Runner {
         inner.ended_at = Some(clock::now());
         inner.tree = None;
         inner.process = None;
-        match data {
+        let published = match data {
             Ok(Value::Object(data)) => self.publish(run, inner, r#type, data, Durability::State),
-            other => warning!("run {}: {type} did not print: {other:?}", run.params.run_id),
+            other => Err(format!("it did not print as an object: {other:?}")),
+        };
+        if let Err(why) = published {
+            // A run always gets its end: a small one, when its own can't be published.
+            warning!(
+                "run {}: {type} was not published ({why}); it ends failed",
+                run.params.run_id
+            );
+            inner.state = RunState::Failed;
+            let failed = RunFailedData::new(
+                FailReason::Error,
+                format!("end_not_published: the run's {type} could not be published: {why}"),
+                "",
+            );
+            if let Ok(Value::Object(data)) = serde_json::to_value(&failed)
+                && let Err(why) =
+                    self.publish(run, inner, run_types::FAILED, data, Durability::State)
+            {
+                warning!(
+                    "run {}: its end was not published either: {why}",
+                    run.params.run_id
+                );
+            }
         }
+        let state = inner.state;
         self.bus.end_run(run.params.run_id.as_str());
         inner.seeded = false;
         run.state.send_replace(state);
@@ -474,7 +553,16 @@ impl Runner {
             }
         };
         if let Some(next) = next {
-            self.launch(&next);
+            match self.launch_delay {
+                Some(delay) => {
+                    let runner = Arc::clone(self);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        runner.launch(&next);
+                    });
+                }
+                None => self.launch(&next),
+            }
         }
     }
 
@@ -498,7 +586,11 @@ impl Runner {
         };
         let prepared = blocking(|| -> std::io::Result<(PathBuf, PathBuf)> {
             let space = spaces::ensure(&self.home, &params.space)?;
-            let settings = argv::settings(params, attempt, &self.hook);
+            let hook = self
+                .hook
+                .as_ref()
+                .map_err(|why| std::io::Error::other(why.clone()))?;
+            let settings = argv::settings(params, attempt, hook);
             let settings = run.dir.write_settings(attempt, &settings)?;
             Ok((space, settings))
         });
@@ -553,38 +645,41 @@ impl Runner {
             .await;
         let end = match streamed {
             Streamed::Result(outcome, mut stdin) => {
-                // Claude Code reads stdin for another turn: closing it ends it.
+                // Claude Code reads stdin for another turn: closing it ends it. Whatever
+                // is left of the tree goes with it (the guard), or is killed after the
+                // grace.
                 let _ = stdin.shutdown().await;
                 drop(stdin);
-                if tokio::time::timeout(EXIT_GRACE, child.wait())
-                    .await
-                    .is_err()
-                {
+                if tree.reap(&mut child, Some(EXIT_GRACE)).await.is_none() {
                     tree.kill();
+                    tree.reap(&mut child, None).await;
                 }
                 outcome_of(run, outcome)
             }
             Streamed::Ended(reason) => {
                 tree.kill();
-                let _ = child.wait().await;
+                tree.reap(&mut child, None).await;
                 ended_early(run, reason)
             }
             Streamed::Broken(message) => {
                 tree.kill();
-                let _ = child.wait().await;
+                tree.reap(&mut child, None).await;
                 failed(message)
             }
             Streamed::Eof => {
-                let status = tokio::time::timeout(EXIT_GRACE, child.wait()).await;
-                tree.kill();
+                let mut status = tree.reap(&mut child, Some(EXIT_GRACE)).await;
+                if status.is_none() {
+                    tree.kill();
+                    status = tree.reap(&mut child, None).await;
+                }
                 let ending = run.inner().ending;
                 if let Some(reason) = ending {
                     return ended_early(run, reason);
                 }
                 let said = stderr.await.unwrap_or_default();
                 let how = match status {
-                    Ok(Ok(status)) => format!("exited ({status})"),
-                    _ => "closed its output".to_owned(),
+                    Some(status) => format!("exited ({status})"),
+                    None => "closed its output".to_owned(),
                 };
                 let mut message = format!("Claude Code {how} before its result");
                 if !said.trim().is_empty() {
@@ -720,22 +815,19 @@ impl Runner {
         }
     }
 
-    /// Logs a run event, then publishes it: the funnel every run event goes through. A
-    /// partial text chunk is appended, any other event fsynced too, and `run.started`
-    /// also rewrites the run's record, before it is published.
+    /// Publishes a run event: the funnel every run event but an end goes through.
+    /// `run.started` changes the run's state, so it is made durable first ([`Runner::
+    /// publish`]); any other event is logged once it is published.
     fn emit(&self, run: &Run, inner: &mut RunInner, r#type: &str, data: &impl Serialize) {
         match serde_json::to_value(data) {
             Ok(Value::Object(data)) => {
                 let durability = if r#type == run_types::STARTED {
                     Durability::State
-                } else if r#type == run_types::TEXT
-                    && data.get("partial") == Some(&Value::Bool(true))
-                {
-                    Durability::Appended
                 } else {
-                    Durability::Synced
+                    Durability::Logged
                 };
-                self.publish(run, inner, r#type, data, durability);
+                // A failure is logged where it happens; the run goes on.
+                let _ = self.publish(run, inner, r#type, data, durability);
             }
             other => warning!(
                 "run {}: {type} did not print as an object: {other:?}",
@@ -744,8 +836,18 @@ impl Runner {
         }
     }
 
-    /// Publishes `data` as `run`'s next event, once its line is in the run's log as
-    /// `durability` says: durable before visible.
+    /// Publishes `data` as `run`'s next event, numbered by the run itself, under the
+    /// run's own lock (`inner`) and no other: the bus's lock is held only to append it in
+    /// memory, and the runner's not at all, so a slow disk under one run holds up no
+    /// other run and no other topic.
+    ///
+    /// - A [`Durability::State`] event (`run.started`, `run.needs_you`, each end) is made
+    ///   durable before anyone sees it: the log so far is fsynced, then the run's record
+    ///   is rewritten with the new state and the event itself (`last_event`), then it is
+    ///   published, then its line is appended to the log. A crash between the record and
+    ///   the line leaves the event in the record, from which the next rlxd puts it back.
+    /// - Any other event is published, then appended, and fsynced with the run's next
+    ///   state event or every [`UNSYNCED_MAX`] appends, whichever comes first.
     fn publish(
         &self,
         run: &Run,
@@ -753,11 +855,15 @@ impl Runner {
         r#type: &str,
         data: Data,
         durability: Durability,
-    ) {
+    ) -> Result<(), String> {
         let id = run.params.run_id.as_str();
         if !inner.seeded {
             self.bus.seed_run(id, inner.last_run_seq);
             inner.seeded = true;
+        }
+        let run_seq = inner.last_run_seq + 1;
+        if durability == Durability::State {
+            blocking(|| self.persist_state(run, inner, run_seq, r#type, &data));
         }
         let scope = bus::Run {
             id,
@@ -765,27 +871,71 @@ impl Runner {
             attempt: inner.attempt,
             job_id: run.job_id.as_deref(),
         };
-        let persist = |numbered: bus::Numbered, line: &bus::Line| {
-            inner.last_run_seq = numbered.run_seq;
-            let sync = durability != Durability::Appended;
-            if let Some(events) = inner.events.as_mut()
-                && let Err(e) = store::append(events, line, sync)
-            {
-                warning!(
-                    "run {id}: {type} (run_seq {}) was not logged: {e}",
-                    numbered.run_seq
-                );
-            }
-            if durability == Durability::State {
-                let record = run.record(inner);
-                if let Err(e) = run.dir.write_record(&record) {
-                    warning!("run {id}: its record was not written: {e}");
-                }
-            }
-        };
-        if let Err(e) = blocking(|| self.bus.publish_run_durably(scope, r#type, data, persist)) {
-            warning!("run {id}: {type} was not published: {e}");
+        let (_, line) = self
+            .bus
+            .publish_run_as(scope, run_seq, r#type, data)
+            .map_err(|e| {
+                warning!("run {id}: {type} was not published: {e}");
+                e.to_string()
+            })?;
+        inner.last_run_seq = run_seq;
+        blocking(|| log_line(run, inner, run_seq, r#type, &line));
+        Ok(())
+    }
+
+    /// Makes `type`, the run's event `run_seq`, durable before it is published: fsyncs the
+    /// log so far, then rewrites the record with the run's new state and the event.
+    fn persist_state(
+        &self,
+        run: &Run,
+        inner: &mut RunInner,
+        run_seq: u64,
+        r#type: &str,
+        data: &Data,
+    ) {
+        let id = run.params.run_id.as_str();
+        if let Some((space, delay)) = &self.slow_persist
+            && *space == run.params.space
+        {
+            std::thread::sleep(*delay);
         }
+        if let Some(events) = inner.events.as_mut()
+            && let Err(e) = events.sync_data()
+        {
+            warning!("run {id}: its log could not be fsynced: {e}");
+        }
+        inner.unsynced = 0;
+        let mut record = run.record(inner);
+        record.last_run_seq = run_seq;
+        record.last_event = Some(json!({"run_seq": run_seq, "type": r#type, "data": data}));
+        if let Err(e) = run.dir.write_record(&record) {
+            warning!("run {id}: its record was not written: {e}");
+        }
+    }
+}
+
+/// Appends the published event `run_seq`'s line to the run's log, fsyncing it after
+/// [`UNSYNCED_MAX`] unsynced appends.
+fn log_line(run: &Run, inner: &mut RunInner, run_seq: u64, r#type: &str, line: &[u8]) {
+    let id = run.params.run_id.as_str();
+    if inner.events.is_none() {
+        match run.dir.open_events() {
+            Ok(events) => inner.events = Some(events),
+            Err(e) => warning!("run {id}: its log could not be opened: {e}"),
+        }
+    }
+    let Some(events) = inner.events.as_mut() else {
+        return;
+    };
+    inner.unsynced += 1;
+    let sync = inner.unsynced >= UNSYNCED_MAX;
+    match store::append(events, line, sync) {
+        Ok(()) => {
+            if sync {
+                inner.unsynced = 0;
+            }
+        }
+        Err(e) => warning!("run {id}: {type} (run_seq {run_seq}) was not logged: {e}"),
     }
 }
 
@@ -810,6 +960,8 @@ impl Run {
             structured_output: inner.structured_output.clone(),
             process: inner.process.clone(),
             job_id: self.job_id.clone(),
+            last_event: None,
+            boot: process::boot_id(),
             calls: Vec::new(),
         }
     }
@@ -850,6 +1002,19 @@ fn outcome_of(run: &Run, outcome: stream::Outcome) -> End {
             message.push_str(": ");
             message.push_str(&said.join("; "));
         }
+        return End::Failed(RunFailedData::new(FailReason::Error, message, text));
+    }
+    let structured = outcome
+        .structured_output
+        .as_ref()
+        .map_or(0, |output| output.to_string().len());
+    if outcome.result.len() > stream::MAX_CONTENT || structured > stream::MAX_CONTENT {
+        let message = format!(
+            "output_too_large: the result is {} bytes and its structured output {structured}, \
+             and run.done carries at most {} of each",
+            outcome.result.len(),
+            stream::MAX_CONTENT
+        );
         return End::Failed(RunFailedData::new(FailReason::Error, message, text));
     }
     let session = run.params.persists().then(|| run.params.run_id.to_string());
@@ -893,6 +1058,32 @@ async fn tail(mut stderr: ChildStderr) -> String {
         }
     }
     String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// Test builds only: the delay `name` sets in rlxd's environment, in milliseconds. A
+/// release build reads no such variable.
+#[cfg(feature = "debug-methods")]
+fn test_delay(name: &str) -> Option<Duration> {
+    let ms: u64 = std::env::var(name).ok()?.parse().ok()?;
+    Some(Duration::from_millis(ms))
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_delay(_name: &str) -> Option<Duration> {
+    None
+}
+
+/// Test builds only: `RLXD_TEST_SLOW_PERSIST=<space>:<ms>`.
+#[cfg(feature = "debug-methods")]
+fn test_slow_persist() -> Option<(String, Duration)> {
+    let value = std::env::var("RLXD_TEST_SLOW_PERSIST").ok()?;
+    let (space, ms) = value.split_once(':')?;
+    Some((space.to_owned(), Duration::from_millis(ms.parse().ok()?)))
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_slow_persist() -> Option<(String, Duration)> {
+    None
 }
 
 /// An error body for a refused runner call.

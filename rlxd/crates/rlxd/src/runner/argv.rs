@@ -89,23 +89,34 @@ pub fn settings(params: &RunStartParams, attempt: u64, hook: &Path) -> Value {
     ]}]}})
 }
 
-/// `path` as a shell word: as it is when it holds only characters no shell treats
-/// specially, else in double quotes, with `"`, `\`, `$` and `` ` `` escaped. Claude Code
-/// runs a hook's command through a shell. On Windows it is always quoted.
+/// `path` as a shell word, for the shell Claude Code runs a hook's command through: as it
+/// is when it holds only characters no shell treats specially, else in double quotes,
+/// with `"`, `\`, `$` and `` ` `` escaped.
 fn quoted(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let plain = !cfg!(windows)
+    quoted_for(&path.to_string_lossy(), cfg!(windows))
+}
+
+/// [`quoted`], for Windows when `windows`: there the path is written with forward slashes,
+/// which Windows takes and a POSIX shell (Claude Code runs hooks through Git Bash there)
+/// leaves alone, and it is always quoted.
+fn quoted_for(path: &str, windows: bool) -> String {
+    let text = if windows {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    let plain = !windows
         && !text.is_empty()
         && text
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c));
     if plain {
-        return text.into_owned();
+        return text;
     }
     let mut quoted = String::with_capacity(text.len() + 2);
     quoted.push('"');
     for c in text.chars() {
-        if matches!(c, '"' | '\\' | '$' | '`') && !(cfg!(windows) && c == '\\') {
+        if matches!(c, '"' | '\\' | '$' | '`') {
             quoted.push('\\');
         }
         quoted.push(c);
@@ -114,16 +125,27 @@ fn quoted(path: &Path) -> String {
     quoted
 }
 
-/// `rlxd-hook` beside this rlxd: its absolute path, whether or not it is there yet.
-pub fn hook_beside(rlxd: Option<&Path>) -> PathBuf {
+/// `rlxd-hook` beside this rlxd, `rlxd` being this rlxd's own path: its absolute path,
+/// whether or not it is there yet. Never a bare name looked up on `PATH` (rev 7, 4.3 and
+/// 5.1): when rlxd's own path is unknown or not absolute, why not.
+pub fn hook_beside(rlxd: Option<&Path>) -> Result<PathBuf, String> {
     let name = if cfg!(windows) {
         "rlxd-hook.exe"
     } else {
         "rlxd-hook"
     };
     match rlxd.and_then(Path::parent) {
-        Some(dir) => dir.join(name),
-        None => PathBuf::from(name),
+        Some(dir) if dir.is_absolute() => Ok(dir.join(name)),
+        Some(dir) => Err(format!(
+            "rlxd's own folder, {}, is not an absolute path, so the path of the rlxd-hook \
+             beside it can't be named",
+            dir.display()
+        )),
+        None => Err(
+            "rlxd could not find its own path, so the path of the rlxd-hook beside \
+                     it can't be named"
+                .to_owned(),
+        ),
     }
 }
 
@@ -241,9 +263,32 @@ mod tests {
 
     #[test]
     fn a_path_a_shell_would_read_is_escaped() {
-        if cfg!(windows) {
-            return;
+        assert_eq!(quoted_for("/a/$x`y\"z", false), "\"/a/\\$x\\`y\\\"z\"");
+        assert_eq!(
+            quoted_for("/opt/bin/rlxd-hook", false),
+            "/opt/bin/rlxd-hook"
+        );
+        // Windows: forward slashes, always quoted, and a `$` after a separator escaped
+        // rather than read as a variable.
+        assert_eq!(
+            quoted_for(r"C:\Users\a b\$x\rlxd-hook.exe", true),
+            r#""C:/Users/a b/\$x/rlxd-hook.exe""#
+        );
+        assert_eq!(
+            quoted_for(r"C:\bin\rlxd-hook.exe", true),
+            r#""C:/bin/rlxd-hook.exe""#
+        );
+    }
+
+    #[test]
+    fn the_hook_is_never_a_bare_name() {
+        let hook = hook_beside(Some(Path::new("/opt/rlx/bin/rlxd"))).unwrap();
+        assert!(hook.ends_with("rlxd-hook") || hook.ends_with("rlxd-hook.exe"));
+        if !cfg!(windows) {
+            assert!(hook.is_absolute());
         }
-        assert_eq!(quoted(Path::new("/a/$x`y\"z")), "\"/a/\\$x\\`y\\\"z\"");
+        assert!(hook_beside(None).is_err());
+        assert!(hook_beside(Some(Path::new("rlxd"))).is_err());
+        assert!(hook_beside(Some(Path::new("bin/rlxd"))).is_err());
     }
 }

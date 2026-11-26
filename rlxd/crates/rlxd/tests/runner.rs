@@ -806,3 +806,171 @@ fn status_counts_live_and_queued_runs() {
     });
     assert_eq!(home.status()["runs"], json!({"live": 0, "queued": 0}));
 }
+
+#[test]
+fn a_run_cancelled_as_its_turn_comes_never_starts_and_ends_once() {
+    // A place given back waits 1.5 s before its next run starts (test builds only), so the
+    // cancel lands after the run has left its queue and before it starts: the window a
+    // real cancel can hit.
+    let home = home_with("slow", &[("RLXD_TEST_LAUNCH_DELAY_MS", "1500")]);
+    let since = seq(&home);
+    let refresh = json!({"kind": "widget_refresh", "prompt": "x", "mount": {"kind": "no_tools"}});
+    let (w1, w2, w3) = (run_id(), run_id(), run_id());
+    start(&home, &refresh, &w1);
+    start(&home, &refresh, &w2);
+    wait_until(&home, since, 20, "w1 starts", |e| {
+        !of(e, &w1, Some("run.started")).is_empty()
+    });
+    let first = home.rlxd(&["call", "run.cancel", &json!({"run_id": w1}).to_string()]);
+    assert_eq!(first.code(), Some(0), "{first:?}");
+    // w1's place is on its way to w2, which has left its queue.
+    let cancelled = home
+        .rlxd(&["call", "run.cancel", &json!({"run_id": w2}).to_string()])
+        .data();
+    assert_eq!(cancelled["cancelled"], true, "{cancelled:#}");
+    thread::sleep(Duration::from_millis(2500));
+    let events = replay(&home, since);
+    let ends: Vec<&Value> = of(&events, &w2, None)
+        .into_iter()
+        .filter(|e| {
+            ["run.done", "run.failed", "run.needs_you"].contains(&e["type"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(ends.len(), 1, "one end: {events:#?}");
+    assert_eq!(ends[0]["data"]["reason"], "cancelled");
+    assert!(
+        of(&events, &w2, Some("run.started")).is_empty(),
+        "{events:#?}"
+    );
+    let log = fixture_log(&home);
+    let started_w2 = log["starts"].as_array().unwrap().iter().any(|s| {
+        s["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == w2.as_str())
+    });
+    assert!(
+        !started_w2,
+        "no Claude Code ran for the cancelled run: {log:#}"
+    );
+    let record: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            home.root()
+                .join("rlxd")
+                .join("runs")
+                .join(&w2)
+                .join("run.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["state"], "failed");
+    // The place it never took went on: the next run starts.
+    let mut quick = refresh.clone();
+    quick["prompt"] = json!("quick");
+    start(&home, &quick, &w3);
+    wait_until(&home, since, 20, "w3 runs", |e| ended(e, &w3));
+}
+
+#[test]
+fn what_claude_code_leaves_running_ends_with_its_run() {
+    let home = home("orphan");
+    let (r, _, events) = gated_start(&home, &task("start it")).wait();
+    assert_eq!(
+        of(&events, &r, None).last().unwrap()["type"],
+        "run.done",
+        "{events:#?}"
+    );
+    // The lingering process would sleep a minute: the run's end takes it, and nothing
+    // of the run is left.
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "orphan")) == 0
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_claude_code_killed_by_a_signal_is_said_to_be() {
+    let home = home("abort");
+    let (r, _, events) = gated_start(&home, &task("go")).wait();
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert_eq!(last["data"]["reason"], "error");
+    let message = last["data"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("signal: 6"),
+        "the guard passes the signal on: {message}"
+    );
+}
+
+#[test]
+fn a_result_too_large_for_run_done_still_ends_the_run_with_its_reason() {
+    let home = home("huge");
+    let (r, _, events) = gated_start(&home, &task("go")).wait();
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert!(
+        last["data"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("output_too_large"),
+        "{last:#}"
+    );
+}
+
+#[test]
+fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
+    // Test builds only: the state events of runs in the space "slowdisk" wait 3 s before
+    // they are made durable, as under a slow fsync.
+    let home = home_with("hello", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:3000")]);
+    let since = seq(&home);
+    let mut slow = task("hi");
+    slow["space"] = json!("slowdisk");
+    let a = run_id();
+    start(&home, &slow, &a);
+    // Wait until A's Claude Code has started: its run.started is then being made durable.
+    common::eventually("A's Claude Code starts", || {
+        std::fs::read_to_string(home.root().join("fake-claude.log.json"))
+            .is_ok_and(|log| log.contains(&a))
+    });
+    thread::sleep(Duration::from_millis(300));
+    let quick = |what: &str, args: &[&str]| {
+        let began = Instant::now();
+        let run = home.rlxd(args);
+        assert_eq!(run.code(), Some(0), "{what}: {run:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "{what} waited {:?}",
+            began.elapsed()
+        );
+        run
+    };
+    let emitted = quick("debug.emit", &["call", "debug.emit", r#"{"count":3}"#]);
+    let last = emitted.data()["last"].as_u64().unwrap();
+    quick(
+        "a follower of another topic",
+        &[
+            "events",
+            "--topics",
+            "daemon",
+            "--since",
+            &(last - 1).to_string(),
+        ],
+    );
+    quick("status", &["call", "status"]);
+    quick(
+        "space.ensure",
+        &["call", "space.ensure", r#"{"name":"other"}"#],
+    );
+    // Another run, in another space, starts and ends meanwhile.
+    let b = run_id();
+    start(&home, &task("hi"), &b);
+    let events = wait_until(&home, since, 20, "B ends", |e| ended(e, &b));
+    assert!(
+        of(&events, &a, Some("run.started")).is_empty(),
+        "B ended while A's run.started was still being made durable: {events:#?}"
+    );
+    // A goes on once its disk does.
+    wait_until(&home, since, 30, "A ends", |e| ended(e, &a));
+}

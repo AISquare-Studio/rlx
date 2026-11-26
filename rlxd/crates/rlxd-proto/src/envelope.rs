@@ -335,6 +335,10 @@ pub mod codes {
     /// rlxd could not start the run, such as when Claude Code is not installed; the
     /// message says why.
     pub const RUN_START_FAILED: &str = "run_start_failed";
+    /// `run.start`: rlxd can't name the absolute path of the `rlxd-hook` beside it, which
+    /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
+    /// why.
+    pub const HOOK_NOT_FOUND: &str = "hook_not_found";
 }
 
 impl Envelope {

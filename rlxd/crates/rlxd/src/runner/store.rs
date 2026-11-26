@@ -56,6 +56,14 @@ pub struct Record {
     /// The scheduler job that fired the run (7.6).
     #[serde(default)]
     pub job_id: Option<String>,
+    /// The run's last state event, `{run_seq, type, data}`, written here before it was
+    /// published: a crash before its line reached the log leaves it here.
+    #[serde(default)]
+    pub last_event: Option<Value>,
+    /// The boot this record was written in ([`crate::runner`]'s `boot_id`): a run in
+    /// flight across a reboot may have lost its last unsynced events.
+    #[serde(default)]
+    pub boot: Option<String>,
     /// The call ledger: one entry per gated call (5.1).
     #[serde(default)]
     pub calls: Vec<Value>,
