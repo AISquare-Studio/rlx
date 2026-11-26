@@ -1096,6 +1096,43 @@ def new_place(name: str) -> tuple[str, ...] | None:
     return None
 
 
+MOVE_JOURNAL: tuple[str, ...] = ("backups", "home-migration", "journal.json")
+"""Where the home's move keeps its journal, under the home in either layout
+(``services.home_migration``): it goes with the home's last rename."""
+
+
+def unfinished_home_move() -> Path | None:
+    """The journal of a move of this process's home that has not finished, or ``None``: what
+    every command but the move asks first, so none writes into a home half moved (the reviewer's
+    M3 on #31). A stat, and a read of a small file only while one is there. A variable that
+    names ``~/.aisquare`` itself is the default home, as the move reads it."""
+    root = home_of(_default_home_environment())[0]
+    journal = root.joinpath(*MOVE_JOURNAL)
+    try:
+        text = journal.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    import json
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return journal  # a journal that cannot be read is one that has not finished
+    steps = data.get("steps") if isinstance(data, dict) else None
+    return None if isinstance(steps, list) and "done" in steps else journal
+
+
+def _default_home_environment() -> dict[str, str] | None:
+    """This process's environment without the home variables when they name ``~/.aisquare``
+    itself (the fleet hands its windows the home by both names, resolved); ``None`` otherwise."""
+    named = named_home()
+    if named is None:
+        return None
+    if os.path.realpath(named) != os.path.realpath(Path.home() / OLD_HOME_NAME):
+        return None
+    return {k: v for k, v in os.environ.items() if k not in (RLX_HOME_ENV, HOME_ENV_VAR)}
+
+
 NEW_LAYOUT_FOLDERS: tuple[tuple[str, ...], ...] = (
     ("cache",),
     ("logs",),

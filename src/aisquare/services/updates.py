@@ -180,11 +180,10 @@ def _home_move() -> str | None:
 
 def _home_only(route: install_route.InstallRoute) -> Offer | None:
     """The ⬆ row's offer with no newer release to offer: the move of a home from before 0.10.2
-    (#31), on an install asq updates itself, whose one-click upgrade makes the move; ``None``
-    with no home to move, or on an install the way it came updates (it says ``rlx upgrade``
-    in the doctor's row, which the shell runs)."""
+    (#31), on any install: the one-click upgrade it hands off to makes the move whether or not
+    rlx upgrades the install itself (the reviewer's m6); ``None`` with no home to move."""
     move = _home_move()
-    if move is None or install_route.not_automated(route) is not None:
+    if move is None:
         return None
     return Offer(
         version=__version__, current=__version__, runnable=True, announce=False, home_move=move

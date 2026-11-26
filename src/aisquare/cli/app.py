@@ -45,6 +45,7 @@ from aisquare.cli import config as config_cli
 from aisquare.cli import instances as instances_cli
 from aisquare.cli import metrics as metrics_cli
 from aisquare.cli import outcomes as outcomes_cli
+from aisquare.cli.common import fail
 from aisquare.cli.global_flags import DISPATCHED_WORDS, GlobalFlagsGroup
 from aisquare.core import feature_use, sharing
 from aisquare.core.state import RuntimeState, get_state, set_state
@@ -112,10 +113,39 @@ def main_callback(
     )
     set_state(state)
     ctx.obj = state
+    if ctx.invoked_subcommand not in _THROUGH_A_MOVE:
+        _refuse_a_half_moved_home(ctx.invoked_subcommand)
     if ctx.invoked_subcommand is None:
         _no_arguments(ctx)
     else:
         _count_command(ctx)
+
+
+#: The commands that run while the home's move is unfinished: the move itself, and the upgrade,
+#: which runs it (#31).
+_THROUGH_A_MOVE = frozenset({"move-home", "upgrade"})
+
+
+def _refuse_a_half_moved_home(command: str | None) -> None:
+    """Start no command on a home whose move a crash stopped (its journal still open): one
+    would make a new empty store in the old layout's place, and the move could then never be
+    finished (the reviewer's M3 on #31). A hook does nothing and says nothing, so no agent is
+    held up by it; everything else is refused, naming the way out."""
+    from aisquare.core import paths
+    from aisquare.core import program as prog
+
+    if paths.unfinished_home_move() is None:
+        return
+    if command == "hook":
+        raise typer.Exit(0)
+    word = prog.word()
+    fail(
+        f"rlx's home is part-way through its move to the new layout (a run of the move "
+        f"stopped): `{word} move-home` finishes it, or `{word} move-home --rollback` puts it "
+        "back",
+        error="home_mid_move",
+        hint=f"{word} move-home",
+    )
 
 
 #: Commands that tools run for the user, on every prompt or for the life of a session: what

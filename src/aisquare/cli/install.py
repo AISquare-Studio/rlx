@@ -112,6 +112,7 @@ def _plan_json(plan: lifecycle_service.UpgradePlan) -> dict[str, Any]:
         # The move of a home from before 0.10.2 to ~/.rlx the run makes (#31), and why not.
         "home_move": plan.home_move,
         "home_refusal": plan.home_refusal,
+        "home_busy": list(plan.home_busy),
         "home_warning": plan.home_warning,
     }
 
@@ -149,8 +150,9 @@ def _emit_check(plan: lifecycle_service.UpgradePlan) -> None:
     if plan.home_move is not None:
         # The move is said with or without a newer release: on the release that runs,
         # `rlx upgrade` makes it (#31; the manager's #1937 (A) and #1985 (1)).
-        how = f"{prog.word()} upgrade" if plan.runnable else f"{prog.word()} move-home"
-        _say(f"home: laid out before 0.10.2 — `{how}` moves it ({plan.home_move})")
+        _say(f"home: laid out before 0.10.2 — `{prog.word()} upgrade` moves it ({plan.home_move})")
+        for line in plan.home_busy:
+            _say(f"  but first: {line}")
     elif plan.home_refusal is not None:
         _say(f"home: laid out before 0.10.2, and cannot be moved as it stands: {plan.home_refusal}")
     # A release PyPI does not list may be on an index the command reads and this CLI does
@@ -246,6 +248,8 @@ def _home_plan_lines(plan: lifecycle_service.UpgradePlan) -> None:
     """The home's move in the plan (#31): made before the hooks, only while nothing runs."""
     if plan.home_move is not None and not plan.backwards:
         _say(f"  then:    moves the home: {plan.home_move} (once nothing runs on it)")
+        for line in plan.home_busy:
+            _say(f"  but first: {line}")
     if plan.home_refusal is not None:
         _say(f"  leaves:  the home where it is — {plan.home_refusal}")
 
@@ -402,23 +406,29 @@ def _move_the_home(
     one_click: bool,
     started: datetime | None,
 ) -> None:
-    """``rlx upgrade`` on the latest release, with a home from before 0.10.2 to move (#31): the
-    release that moves homes is installed, by a release that did not (0.10.1's upgrade knows
-    no move), so its own upgrade makes the move. Asked first at a terminal, as an install is;
-    off one, a dry run unless ``--yes``."""
+    """``rlx upgrade`` with a home from before 0.10.2 to move and nothing to install (#31): the
+    release is the latest, or rlx does not upgrade this install itself (Homebrew, pipx): the
+    release that moves homes was installed by one that did not (0.10.1's upgrade knows no
+    move), so its own upgrade makes the move. Asked first at a terminal, as an install is;
+    off one, a dry run unless ``--yes``. After it, at a terminal, the cache is offered."""
     json_output = get_state().json_output
+    where = (
+        f"rlx {plan.current} is up to date"
+        if plan.runnable
+        else f"rlx does not upgrade this install itself ({plan.reason})"
+    )
     planned = dry_run or (not yes and (json_output or not _stdin_is_a_terminal()))
     if planned:
         if json_output:
             _echo_json({"dry_run": True, "upgraded": False, "up_to_date": True, **_plan_json(plan)})
             return
-        _say(f"rlx {plan.current} is up to date; its home would move: {plan.home_move}")
+        _say(f"{where}; its home would move: {plan.home_move}")
+        for line in plan.home_busy:
+            _say(f"  but first: {line}")
         if not dry_run:
             _say("dry run: nothing moved — re-run with --yes to move it")
         return
-    if not yes and not typer.confirm(
-        f"rlx {plan.current} is up to date. Move its home, {plan.home_move}?", default=False
-    ):
+    if not yes and not typer.confirm(f"{where}. Move its home, {plan.home_move}?", default=False):
         _say("nothing changed")
         _reopen(reopen, one_click=one_click, started=started)
         return
@@ -435,11 +445,35 @@ def _move_the_home(
             }
         )
     else:
-        _say(f"rlx {plan.current} is up to date")
+        _say(where)
         _home_lines(home)
+        if home.moved and not one_click:
+            _offer_the_cache(yes=yes)
+        if not plan.runnable and plan.command:
+            _say(f"· upgrade this install with: {plan.command}")
     if _home_not_moved(home):
         raise _HomeNotMoved()
     _reopen(reopen, one_click=one_click, installed=True, started=started)
+
+
+def _offer_the_cache(*, yes: bool) -> None:
+    """The home's cache, regenerable, moved with it: at a terminal, asked whether to drop it
+    instead (the owner's brief, must-handle 5); off one, or under ``--yes``, said how."""
+    from aisquare.services import home_migration
+
+    size = home_migration.cache_size()
+    if size <= 0:
+        return
+    shown = home_migration.shown_size(size)
+    if yes or not _stdin_is_a_terminal():
+        _say(
+            f"· its cache ({shown}, regenerable) moved with it: "
+            f"`{prog.word()} move-home --drop-cache` drops it"
+        )
+        return
+    if typer.confirm(f"Drop its cache ({shown})? rlx makes it again as it needs it", default=False):
+        home_migration.drop_cache()
+        _say(f"✓ the cache was dropped ({shown})")
 
 
 def _by_hand(version: str | None) -> str:
@@ -701,6 +735,13 @@ def _upgrade(
     if check:
         _emit_check(plan)
         return
+    if not plan.runnable and plan.home_move is not None and not plan.backwards:
+        # rlx installs nothing here, but the home's move is its own, on any install (#31): it is
+        # made, and the way this install upgrades is said after (the reviewer's m6).
+        _move_the_home(
+            plan, yes=yes, dry_run=dry_run, reopen=reopen, one_click=one_click, started=started
+        )
+        return
     if not plan.runnable and not (plan.target is not None and plan.up_to_date):
         # The command goes in the MESSAGE: `fail` shows a human nothing else; there is none
         # for a pin the route cannot pick (a later review of #257).
@@ -712,9 +753,6 @@ def _upgrade(
         # That command too would replace another program's rlx or relax without a word.
         taken = lifecycle_service.taken_refusal("upgrade", plan.commands_taken, again="run it")
         command += f" {taken}" if taken else ""
-        if plan.home_move is not None:
-            # The move is rlx's own, whoever installs it (#31).
-            command += f" Move its home ({plan.home_move}) with: {prog.word()} move-home"
         fail(
             f"rlx does not upgrade this install itself ({plan.reason}).{command}",
             error="upgrade_unsupported_route",
@@ -836,6 +874,8 @@ def _upgrade(
             detail=report.problem,
         )
     _emit_report(report)
+    if report.home is not None and report.home.moved and not json_output and not one_click:
+        _offer_the_cache(yes=yes)
     if any(not hook.ok for hook in report.hooks) and not plan.backwards:
         raise _HooksFailed()
     if _home_not_moved(report.home):

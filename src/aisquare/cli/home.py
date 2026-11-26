@@ -8,7 +8,7 @@ prints and honours ``--json``.
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, NoReturn
 
 import typer
 
@@ -50,6 +50,14 @@ def migrate_home(
     if rollback:
         try:
             undone = home_migration.roll_back_move()
+        except home_migration.MigrationRefused as exc:
+            named = "; ".join(exc.running)
+            fail(
+                f"the home's move was not rolled back: {exc.reason}"
+                + (f": {named}" if named else ""),
+                error="home_move_refused",
+                detail=named or None,
+            )
         except home_migration.MigrationFailed as exc:
             fail(exc.reason, error="home_move_forward_only")
         if json_output:
@@ -62,12 +70,22 @@ def migrate_home(
     except home_migration.MigrationRefused as exc:
         fail(f"the home was not moved: {exc.reason}", error="home_move_refused")
     if found is None:
+        dropped = None
+        if drop_cache and not dry_run:
+            # The offer after a move says this (the owner's brief, must-handle 5).
+            size = home_migration.cache_size()
+            home_migration.drop_cache()
+            dropped = home_migration.shown_size(size)
         if json_output:
-            _echo_home_json({"moved": False, "home": str(paths.aisquare_home())})
+            _echo_home_json(
+                {"moved": False, "home": str(paths.aisquare_home()), "cache_dropped": dropped}
+            )
         else:
             _say_home(
                 f"the home is laid out as 0.10.2 lays it out: {paths.shown(paths.aisquare_home())}"
             )
+            if dropped is not None:
+                _say_home(f"the cache was dropped ({dropped}): rlx makes it again as it needs it")
         return
     if dry_run:
         running = home_migration.running_on_home()
@@ -93,10 +111,11 @@ def migrate_home(
         )
     except home_migration.MigrationRefused as exc:
         named = "; ".join(exc.running)
-        fail(
+        _stopped(
             f"the home was not moved: {exc.reason}" + (f": {named}" if named else ""),
             error="home_move_refused",
-            detail=named or None,
+            running=exc.running,
+            rolled_back=True,
         )
     except home_migration.MigrationFailed as exc:
         then = (
@@ -104,7 +123,11 @@ def migrate_home(
             if exc.rolled_back
             else "run it again to finish it"
         )
-        fail(f"the home's move stopped: {exc.reason} ({then})", error="home_move_failed")
+        _stopped(
+            f"the home's move stopped: {exc.reason} ({then})",
+            error="home_move_failed",
+            rolled_back=exc.rolled_back,
+        )
     if moved is None:
         if json_output:
             _echo_home_json({"moved": False, "home": str(paths.aisquare_home())})
@@ -114,6 +137,25 @@ def migrate_home(
         return
     for line in home_migration.said_of_move(moved):
         _say_home(line)
+
+
+def _stopped(
+    message: str, *, error: str, rolled_back: bool, running: tuple[str, ...] = ()
+) -> NoReturn:
+    """The move refused or stopped: said whole under ``--json`` too, its words, what runs and
+    whether the home is as it was, which ``rlx upgrade`` reads back from the new install
+    (``fail`` puts only the error's name there)."""
+    if get_state().json_output:
+        _echo_home_json(
+            {
+                "error": error,
+                "message": message,
+                "running": list(running),
+                "rolled_back": rolled_back,
+            }
+        )
+        raise typer.Exit(1)
+    fail(message, error=error)
 
 
 def _says_nothing(_line: str) -> None:

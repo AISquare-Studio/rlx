@@ -400,6 +400,10 @@ class UpgradePlan:
     words: ``~/.aisquare → ~/.rlx``; ``None`` for a home laid out so already (#31)."""
     home_refusal: str | None = None
     """Why this home cannot be moved as it stands, when it cannot (both homes there)."""
+    home_busy: tuple[str, ...] = ()
+    """What runs on this home that the move waits for, each named with how it is stopped
+    (``home_migration.running_on_home``, the service left out: the move stops it): read only
+    when there is a move to make (the reviewer's m7 on #31)."""
 
     @property
     def runnable(self) -> bool:
@@ -773,6 +777,7 @@ def upgrade_plan(
         remote = running_remote()
         asqs = running_asqs()
     home_move, home_refusal = planned_home_move()
+    home_busy = _running_on_home() if home_move is not None else ()
     return UpgradePlan(
         route=route,
         current=__version__,
@@ -796,6 +801,7 @@ def upgrade_plan(
         tools_regained=regained,
         home_move=home_move,
         home_refusal=home_refusal,
+        home_busy=home_busy,
     )
 
 
@@ -809,6 +815,17 @@ def planned_home_move() -> tuple[str | None, str | None]:
     except home_migration.MigrationRefused as exc:
         return None, exc.reason
     return (found.shown if found is not None else None), None
+
+
+def _running_on_home() -> tuple[str, ...]:
+    """What the home's move would wait for now (``home_migration.running_on_home``), the
+    service left out; one line saying so when it cannot be told."""
+    from aisquare.services import home_migration
+
+    try:
+        return tuple(home_migration.running_on_home(but_the_service=True))
+    except Exception as exc:
+        return (f"whether anything runs on the home could not be told ({exc})",)
 
 
 def move_home_here(*, drop_cache: bool = False) -> HomeMove:
@@ -842,18 +859,30 @@ def move_home_in(script: Path) -> HomeMove:
     answer = install_route.run_captured(
         [str(script), "--json", "move-home"], timeout=HOME_MOVE_TIMEOUT_SECONDS
     )
+    # Whether the home is as it was is read from the home, never from what the run said: a
+    # run killed at its timeout says nothing, and its journal says where it stopped (the
+    # reviewer's m2 on #31).
+    as_it_was = paths.unfinished_home_move() is None
     if answer.error is not None:
-        return HomeMove(False, problem=f"the new install could not move it ({answer.error})")
+        return HomeMove(
+            False,
+            problem=f"the new install's move did not finish ({answer.error})",
+            rolled_back=as_it_was,
+        )
     payload = _last_json_object(answer.stdout)
     if payload is None:
         said = _reason_line(answer.stderr, answer.stdout) or f"exit {answer.returncode}"
-        return HomeMove(False, problem=f"the new install's move answered nothing readable ({said})")
+        return HomeMove(
+            False,
+            problem=f"the new install's move answered nothing readable ({said})",
+            rolled_back=as_it_was,
+        )
     if answer.returncode != 0 or payload.get("error"):
         message = str(payload.get("message") or payload.get("error") or "it stopped")
         return HomeMove(
             False,
             problem=message.removeprefix("the home was not moved: "),
-            rolled_back="run it again" not in message,
+            rolled_back=as_it_was,
             payload=payload,
         )
     if not payload.get("moved"):

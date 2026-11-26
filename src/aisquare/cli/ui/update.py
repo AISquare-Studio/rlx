@@ -96,6 +96,21 @@ def taken_line(plan: UpgradePlan) -> str | None:
     return taken_refusal("upgrade", plan.commands_taken, again=TAKEN_AGAIN)
 
 
+def home_busy_line(busy: tuple[str, ...], live: int) -> str:
+    """What the home's move waits for: each thing that runs on the home, as the plan read it
+    (``UpgradePlan.home_busy``: an rlx, a fleet agent, a window on rlx's tmux server, the
+    watcher, Remote served elsewhere, an ``rlx launch``), or the agents the frame shows when
+    the plan read none (the reviewer's m7 on #31)."""
+    if not busy:
+        return home_agents_line(live)
+    shown = "; ".join(busy[:3]) + (f"; and {len(busy) - 3} more" if len(busy) > 3 else "")
+    return (
+        f"⚠ {len(busy)} thing{'s run' if len(busy) != 1 else ' runs'} on this home ({shown}): "
+        "the home moves only once nothing does, so stop them first. Otherwise rlx reopens on "
+        "the old home and says what still runs."
+    )
+
+
 def home_agents_line(live: int) -> str:
     """What the home's move asks of the ``live`` agents: it runs only once nothing runs on the
     home (``services.home_migration``), so they are stopped first; asq names no command."""
@@ -184,12 +199,23 @@ class UpdateScreen(ModalScreen[bool]):
     @property
     def offers_update(self) -> bool:
         """Whether *Restart & update* is offered: an install asq updates, with nothing of
-        another program's in the way (:func:`taken_line`)."""
+        another program's in the way (:func:`taken_line`); or the home's move alone, which is
+        rlx's own on any install (#31)."""
+        if self.moves_home_only:
+            return True
         return self.plan.runnable and taken_line(self.plan) is None
 
     def body(self) -> Text:
         """What the dialog says, above its buttons."""
         text = Text()
+        move = self.plan.home_move
+        if self.moves_home_only and move is not None:
+            text.append(f"rlx closes, moves its home ({move}) and reopens here.\n")
+            text.append(home_busy_line(self.plan.home_busy, self.live))
+            if self.status is not None:
+                text.append("\n")
+                text.append(self.status, style="dim")
+            return text
         taken = taken_line(self.plan) if self.plan.runnable else None
         if taken is not None:
             text.append("rlx cannot update this install now: ", style="bold")
@@ -210,11 +236,7 @@ class UpdateScreen(ModalScreen[bool]):
                 text.append("\n")
                 text.append(self.status, style="dim")
             return text
-        move = self.plan.home_move
-        if self.moves_home_only and move is not None:
-            text.append(f"rlx closes, moves its home ({move}) and reopens here.\n")
-            text.append(home_agents_line(self.live))
-        elif self.confirmed:
+        if self.confirmed:
             text.append(f"rlx closes, installs {self.version} and reopens here.\n")
             text.append(agents_line(self.live))
         else:

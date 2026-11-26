@@ -1073,10 +1073,14 @@ def test_the_doctor_names_a_home_laid_out_before_0_10_2_and_asq_names_no_command
     assert rows["home-layout"]["status"] == "warn"
 
 
-def test_an_install_rlx_does_not_upgrade_says_how_to_move_its_home(
+def test_an_install_rlx_does_not_upgrade_still_has_its_home_moved_by_upgrade(
     old_home: Path,
+    user_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The reviewer's m6: on Homebrew or pipx, rlx installs nothing, but the home's move is its
+    own: `rlx upgrade` makes it, then says how that install upgrades. So Doctor's and the
+    app's way to the move (the ⬆ row's one-click upgrade) is there on every install."""
     plan = UpgradePlan(
         route=InstallRoute(install_route.HOMEBREW, UI_FACTS, formula="aisquare-cli"),
         current="0.9.0",
@@ -1091,10 +1095,11 @@ def test_an_install_rlx_does_not_upgrade_says_how_to_move_its_home(
 
     result = CliRunner().invoke(app, ["upgrade", "--yes"])
 
-    assert result.exit_code == 1
-    assert f"Move its home ({MOVE}) with: {prog.word()} move-home" in result.output.replace(
-        "\n", " "
-    )
+    assert result.exit_code == 0, result.output
+    said = result.output.replace("\n", " ")
+    assert "✓ the home moved: ~/.aisquare → ~/.rlx" in said
+    assert "upgrade this install with: brew upgrade aisquare-cli" in said
+    assert paths.home_of() == (user_home / ".rlx", paths.NEW)
 
 
 # --- the rlx service (#32): stopped for the move, started again after (the brief, item 4) --------
@@ -1483,3 +1488,226 @@ def test_a_roll_back_takes_a_pin_away(
 
     assert accounts_core.keychain_pin(accounts_core._managed(4)) is None
     assert keychain.items() == items and not os.path.lexists(user_home / ".rlx")
+
+
+# --- round 3 (the reviewer's #2076, the manager's #2078) ----------------------------------
+
+
+def test_while_a_move_is_unfinished_no_ordinary_command_runs_and_the_move_finishes(
+    old_home: Path, user_home: Path
+) -> None:
+    """M3: after a crash, an ordinary command made a new empty context.db and log/ in the half
+    moved home, and the move could never be finished. While the journal is open every command
+    but the move refuses, a hook does nothing, and the next move finishes."""
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "rewrite", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+    new = user_home / ".rlx"
+    before = _tree(new)
+    assert paths.unfinished_home_move() is not None
+    runner = CliRunner()
+
+    for command in ([], ["doctor"], ["fleet", "ls"], ["accounts", "list"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1, (command, result.output)
+        assert "part-way through its move" in result.output, command
+    as_json = runner.invoke(app, ["--json", "status"])
+    assert as_json.exit_code == 1 and json.loads(as_json.stdout)["error"] == "home_mid_move"
+    hook = runner.invoke(app, ["hook", "session-start"], input=json.dumps({"session_id": SESSION}))
+    assert hook.exit_code == 0 and hook.output == ""
+
+    assert _tree(new) == before, "nothing written into the half-moved home"
+    assert not (user_home / ".aisquare").exists()
+    done = runner.invoke(app, ["move-home"])
+    assert done.exit_code == 0, done.output
+    assert paths.unfinished_home_move() is None
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+
+
+def _an_execed_launch(tmp_path: Path) -> Any:
+    """An `rlx launch` that became its agent: the record written by `launchers.execing`, then
+    the process exec'd into a stand-in agent that runs until killed."""
+    import subprocess
+
+    script = (
+        "import os, sys\n"
+        "from aisquare.core import launchers\n"
+        "launchers.execing('claude')\n"
+        "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+        "os.execv('/bin/sleep', ['sleep', '60'])\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script], stdout=subprocess.PIPE, env=dict(os.environ)
+    )
+    assert process.stdout is not None and process.stdout.readline() == b"ready\n"
+    return process
+
+
+def test_an_rlx_launch_that_became_its_agent_refuses_the_move(
+    old_home: Path, user_home: Path, tmp_path: Path
+) -> None:
+    """M4: on POSIX `rlx launch` execs its agent and kept no record, so the move ran under an
+    agent whose hooks write into the home and whose login is refreshed in the item step 8
+    deletes. It is recorded before the exec, the lock held by the agent, and counted."""
+    from aisquare.core import launchers
+
+    process = _an_execed_launch(tmp_path)
+    try:
+        sessions = launchers.exec_sessions()
+        assert [s.pid for s in sessions] == [process.pid]
+        assert launchers.waiting_launchers() == (), "not the upgrade's Windows refusal"
+        before = _tree(old_home)
+        with pytest.raises(home_migration.MigrationRefused) as refused:
+            home_migration.move_home()
+        named = f"{prog.word()} launch of claude (pid {process.pid})"
+        assert any(named in line for line in refused.value.running), refused.value.running
+        assert _tree(old_home) == before
+    finally:
+        process.kill()
+        process.wait()
+    assert launchers.exec_sessions() == (), "gone with its agent"
+    assert home_migration.move_home() is not None
+
+
+def test_a_roll_back_takes_the_lock_and_refuses_a_busy_home(
+    old_home: Path, user_home: Path
+) -> None:
+    """m1: --rollback ran with no lock and no look at what runs."""
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "rewrite", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+    named = _an_instance(user_home / ".rlx")
+
+    result = CliRunner().invoke(app, ["move-home", "--rollback"])
+
+    assert result.exit_code == 1 and named in result.output.replace("\n", " ")
+    assert paths.unfinished_home_move() is not None, "nothing undone"
+    for name in os.listdir(paths.instances_dir()):
+        (paths.instances_dir() / name).unlink()
+    assert home_migration.roll_back_move() is True
+    assert not os.path.lexists(user_home / ".rlx")
+
+
+def test_a_move_killed_at_its_timeout_is_said_unfinished_from_the_home_s_state(
+    old_home: Path, user_home: Path, installed: Installed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m2: a run killed at the 600 s timeout said nothing, and was said rolled back."""
+    installed.latest = "0.10.3"
+    real = install_route.run_captured
+
+    def killed(argv: Any, *, timeout: float) -> Captured:
+        if list(argv[1:]) == ["--json", "move-home"]:
+            with pytest.MonkeyPatch.context() as crash:
+                _crash_in(crash, "rewrite", "before")
+                with contextlib.suppress(Crash):
+                    home_migration.move_home()
+            return Captured(None, error="no answer in 600 s")
+        return real(argv, timeout=timeout)
+
+    monkeypatch.setattr(install_route, "run_captured", killed)
+
+    result = CliRunner().invoke(app, ["upgrade", "--yes"])
+
+    assert result.exit_code == 1
+    said = result.output.replace("\n", " ")
+    assert "the new install's move did not finish (no answer in 600 s)" in said
+    assert f"run {prog.word()} upgrade again to finish it" in said
+    assert "it is as it was" not in said
+
+
+def test_after_a_move_at_a_terminal_the_cache_is_offered_and_can_be_dropped(
+    old_home: Path,
+    user_home: Path,
+    installed: Installed,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """m3, the owner's must-handle 5: the regenerable cache is offered to be dropped."""
+    (paths.cache_dir() / "big.bin").write_bytes(b"x" * 4096)
+    answers = iter([True, True])
+    asked: list[str] = []
+
+    def confirm(question: str, default: bool = False) -> bool:
+        asked.append(question)
+        return next(answers)
+
+    monkeypatch.setattr("aisquare.cli.install._stdin_is_a_terminal", lambda: True)
+    monkeypatch.setattr("aisquare.cli.install.typer.confirm", confirm)
+
+    result = CliRunner().invoke(app, ["upgrade"])
+
+    assert result.exit_code == 0, result.output
+    assert asked[0].endswith(f"Move its home, {MOVE}?") and asked[1].startswith("Drop its cache")
+    assert "✓ the cache was dropped" in result.output
+    assert not (user_home / ".rlx" / "cache").exists()
+
+
+def test_off_a_terminal_the_cache_is_said_and_move_home_drops_it_after(
+    old_home: Path, user_home: Path, installed: Installed
+) -> None:
+    (paths.cache_dir() / "big.bin").write_bytes(b"x" * 4096)
+
+    result = CliRunner().invoke(app, ["upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert f"`{prog.word()} move-home --drop-cache` drops it" in result.output.replace("\n", " ")
+    assert (user_home / ".rlx" / "cache" / "big.bin").is_file()
+    dropped = CliRunner().invoke(app, ["move-home", "--drop-cache"])
+    assert dropped.exit_code == 0 and "the cache was dropped" in dropped.output
+    assert not (user_home / ".rlx" / "cache").exists()
+
+
+def test_the_move_renames_and_never_copies(old_home: Path, user_home: Path) -> None:
+    """m4: each folder and file keeps its inode across the move (a copy-then-delete mutant
+    gives each a new one); the same volume, a rename."""
+    picks = {
+        "slot": _slot(2),
+        "store": old_home / paths.OLD_STORE,
+        "cache file": old_home / "cache" / "claude-accounts" / "2" / ".keep",
+        "project": old_home / "projects" / "prj_old",
+    }
+    before = {name: (os.stat(path).st_dev, os.stat(path).st_ino) for name, path in picks.items()}
+
+    assert home_migration.move_home() is not None
+
+    new = user_home / ".rlx"
+    after = {
+        "slot": new / "accounts" / "claude" / "2",
+        "store": new / "rlx.db",
+        "cache file": new / "cache" / "claude-accounts" / "2" / ".keep",
+        "project": new / "projects" / "prj_old",
+    }
+    for name, path in after.items():
+        assert (os.stat(path).st_dev, os.stat(path).st_ino) == before[name], name
+
+
+def test_the_dialog_names_everything_the_move_waits_for() -> None:
+    """m7: the dialog counted the frame's fleet agents only; it says what the move's quiet
+    check would name, from the plan."""
+    from aisquare.cli.ui.update import UpdateScreen
+
+    plan = UpgradePlan(
+        route=InstallRoute(install_route.UV_TOOL, UI_FACTS),
+        current="0.9.0",
+        target=None,
+        latest=LatestRelease("0.9.0"),
+        argv=("uv",),
+        env={},
+        reason=None,
+        home_move=MOVE,
+        home_busy=("the watcher (pid 7)", "1 live pane on rlx's tmux server 'asq'"),
+    )
+    said = UpdateScreen(plan, 0, "0.9.0", checking=False).body().plain
+
+    assert "2 things run on this home (the watcher (pid 7); 1 live pane" in said
+    assert "the home moves only once nothing does" in said
+
+
+def test_the_plan_reads_what_runs_but_the_service(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = _an_instance(old_home)
+    assert any(named in line for line in lifecycle._running_on_home())
+    monkeypatch.setattr(home_migration, "running_on_home", lambda **k: ["x"] if k else ["y"])
+    assert lifecycle._running_on_home() == ("x",), "asked with the service left out"

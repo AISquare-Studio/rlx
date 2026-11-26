@@ -82,10 +82,10 @@ if TYPE_CHECKING:
     from aisquare.core.tmux import TmuxServer
 
 JOURNAL_VERSION = 1
-FOLDER: tuple[str, ...] = ("backups", "home-migration")
+FOLDER: tuple[str, ...] = paths.MOVE_JOURNAL[:-1]
 """The move's own folder under the home: its journal, the store's copy from before it, and each
 file it rewrote as it was. Kept until the next release (the manager's condition 6 on #31)."""
-JOURNAL_NAME = "journal.json"
+JOURNAL_NAME = paths.MOVE_JOURNAL[-1]
 STEPS = ("backup", "keychain", "move", "rewrite", "check", "hooks", "link", "forget", "done")
 """The journal's steps, in order (the module's docstring)."""
 UNDO_PHASES = ("link", "aside", "store", "root", "renames", "made", "keychain", "folder")
@@ -358,18 +358,20 @@ def _an_empty_folder(path: Path) -> bool:
 # --- is the home quiet -------------------------------------------------------------------------
 
 
-def running_on_home() -> list[str]:
+def running_on_home(*, but_the_service: bool = False) -> list[str]:
     """What runs on this home, each named with how it is stopped; ``[]`` for a quiet home (the
     manager's condition 2 on #31: the whole home, every project's). Reads only, and writes
     nothing: what cannot be asked is said as running, so a home that cannot be told quiet is
     not moved."""
-    from aisquare.core import instance_scan, instances
+    from aisquare.core import instance_scan, instances, launchers
     from aisquare.services import lifecycle, watch
 
     found: list[str] = []
     roll = instances.roll(prune=False)
     mine = instances.this_instance()
     for instance in roll.live:
+        if but_the_service and instance.kind == "service":
+            continue  # the move stops it, and starts it again after
         if mine is None or instance.id != mine.id:
             found.append(f"{instance.label}: quit it")
     for unread in roll.unreadable:
@@ -393,6 +395,10 @@ def running_on_home() -> list[str]:
     if remote is not None:
         found.append(f"Remote, on in {remote}: turn it off")
     found += [f"{label}: end it" for label in lifecycle.running_launchers()]
+    # The agents `rlx launch` became (POSIX exec), on a managed slot or the plain one: their
+    # hooks write into the home and their login is refreshed in the Keychain item step 8
+    # deletes (the reviewer's M4 on #31).
+    found += [f"{session.label}: end it" for session in launchers.exec_sessions()]
     return found
 
 
@@ -1274,7 +1280,21 @@ def roll_back_move(journal: Journal | None = None) -> bool:
     items began to go (:data:`FORWARD_ONLY`). Each undo is found done on a re-run, so a crash
     here is finished by the next run."""
     with _as_the_default_home():
-        return _roll_back_move(journal)
+        if journal is not None:
+            return _roll_back_move(journal)
+        found = planned_move()
+        if found is None or found.journal is None:
+            return False
+        try:
+            running = running_on_home()
+        except Exception as exc:
+            raise MigrationRefused(
+                f"whether anything runs on the home could not be told ({_why_stopped(exc)})"
+            ) from exc
+        if running:
+            raise MigrationRefused(f"{len(running)} thing(s) run on this home", running)
+        with _one_at_a_time(str(found.old_root)):
+            return _roll_back_move(found.journal)
 
 
 def _roll_back_move(journal: Journal | None = None) -> bool:
@@ -1442,6 +1462,32 @@ def _restore_the_store(journal: Journal) -> None:
             ):
                 source.backup(target)
             return
+
+
+def cache_size() -> int:
+    """How many bytes this home's cache holds (``paths.cache_dir``): regenerable, so the move
+    offers to drop it (the owner's brief, must-handle 5). Links are not followed."""
+    total = 0
+    for directory, _dirs, files in os.walk(paths.cache_dir()):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(directory, name)).st_size
+    return total
+
+
+def shown_size(size: int) -> str:
+    """``size`` bytes as a person reads it: ``5.6 GB``, ``340 MB``, ``12 KB``."""
+    value = float(size)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if value < 1000 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit in ("bytes", "KB") else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{value:.1f} TB"
+
+
+def drop_cache() -> None:
+    """This home's cache removed: rlx makes it again as it needs it."""
+    shutil.rmtree(paths.cache_dir(), ignore_errors=True)
 
 
 def said_of_move(moved: Moved) -> list[str]:
