@@ -15899,6 +15899,32 @@ def test_explicit_questions_route_across_a_hub_with_an_implicit_default(
     assert "question for the other fleet" in delivery
 
 
+def test_sessionless_hub_question_follows_the_tasks_fleet_before_the_directory(
+    hubbed: _Hubbed, tmp_path: Path
+) -> None:
+    """A phone question about a claimed task goes to the fleet working it."""
+    root = tmp_path / "phone-project"
+    root.mkdir()
+    with store_session() as store:
+        phone = store.onboard_project(team_project(root))
+        for project in (hubbed.fleet, phone):
+            store.set_project_setting(project.id, "manager_wake", "schedule")
+    _, phone_sid = _spawned(phone, "manager", None, hubbed.tmux, hubbed.monkeypatch)
+    team_service.hook_session_start(phone_sid, phone.root, "startup")
+    hubbed.woken.clear()
+    team_service.add_note(
+        "who owns the next step",
+        kind="question",
+        task_ref=hubbed.task.id,
+        board_id=hubbed.hub.id,
+        cwd=phone.root,
+    )
+    assert hubbed.woken == [hubbed.fleet.id]
+    assert team_service.hook_stop(phone_sid, phone.root) is None
+    wake = team_service.hook_stop(hubbed.manager_sid, hubbed.fleet.root)
+    assert wake is not None and "who owns the next step" in wake.reason
+
+
 def test_scheduled_activation_replays_and_replacement_resumes_urgent_progress(
     hubbed: _Hubbed,
 ) -> None:

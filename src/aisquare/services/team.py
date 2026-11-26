@@ -558,9 +558,10 @@ class _ManagerAddresses:
     def __init__(self, store: ContextStore, board: str) -> None:
         self.store = store
         self.board = board
+        self.live = store.live_fleet_agents()
         self.seats = {
             session.id: row.project_id
-            for row in store.live_fleet_agents()
+            for row in self.live
             if (row.board or row.project_id) == board
             if (session := manager_seat.bound(store, row)) is not None
         }
@@ -574,8 +575,10 @@ class _ManagerAddresses:
         self,
         address: str | None,
         writer: str | None,
-        root: Path | _Nowhere,
+        root: Path | _Nowhere | None,
         explicit_project: str | None = None,
+        *,
+        task: TeamTask | None = None,
     ) -> str | None:
         """Resolve IDs first, then aliases and contextual manager addresses."""
         name = (address or "").strip().lower()
@@ -589,22 +592,10 @@ class _ManagerAddresses:
             aliases = [ref for ref, names in self.names.items() if name in names]
             if name != MANAGER_ROLE:
                 return self.seats.get(aliases[0]) if len(aliases) == 1 else None
-        projects = set(self.seats.values())
-        origin = self.store.fleet_agent_for_session(writer) if writer else None
-        if origin is not None and origin.project_id in projects:
-            return origin.project_id
-        if explicit_project in projects:
-            return explicit_project
-        if isinstance(root, Path):
-            roots = [
-                (len(project.root.parts), project.id)
-                for project_id in projects
-                if (project := self.store.get_project(project_id)) is not None
-                if root.is_relative_to(project.root)
-            ]
-            if roots:
-                return max(roots)[1]
-        return next(iter(projects)) if len(projects) == 1 else None
+        return _context_manager(
+            self.store, writer, self.board, root, task=task, live=self.live,
+            projects=set(self.seats.values()), explicit_project=explicit_project,
+        )
 
 
 def manager_wakes(
@@ -637,7 +628,8 @@ def manager_wakes(
             return target == project
         if addresses is None:
             addresses = _ManagerAddresses(store, me.project_id)
-        return addresses.resolve(event.to_role, event.session_id, NOWHERE) == project
+        task = store.get_task(event.task_id) if event.task_id else None
+        return addresses.resolve(event.to_role, event.session_id, NOWHERE, task=task) == project
     if event.kind in _SCHEDULED_SYSTEM_WAKES | {"agent_exited", "watch"} and target is None:
         source = store.fleet_agent_for_session(event.session_id) if event.session_id else None
         if source is not None and source.project_id != project:
@@ -1427,16 +1419,36 @@ def _nudge_target(
     task as it was before the write, so its rows still name it and its claim is still held.
     """
     try:
-        row = store.fleet_agent_for_session(writer) if writer is not None else None
-        if row is not None:
-            return row.project_id
-        live = store.live_fleet_agents()
-        row = None if task is None else _task_row(store, task, live)
-        if row is not None:
-            return row.project_id
-        return _reading_manager(store, board_id, cwd, live) or board_id
+        return _context_manager(store, writer, board_id, cwd, task=task) or board_id
     except Exception:
         return board_id
+
+
+def _context_manager(
+    store: ContextStore,
+    writer: str | None,
+    board: str,
+    cwd: Path | _Nowhere | None,
+    *,
+    task: TeamTask | None,
+    live: Sequence[FleetAgent] | None = None,
+    projects: set[str] | None = None,
+    explicit_project: str | None = None,
+) -> str | None:
+    """Resolve a contextual manager through writer, task, project and directory."""
+    origin = store.fleet_agent_for_session(writer) if writer is not None else None
+    if origin is not None and (projects is None or origin.project_id in projects):
+        return origin.project_id
+    if live is None:
+        live = store.live_fleet_agents()
+    row = _task_row(store, task, live) if task is not None else None
+    if row is not None and (projects is None or row.project_id in projects):
+        return row.project_id
+    if projects is None:
+        projects = {row.project_id for row in live if row.label == MANAGER_ROLE and row.board == board}
+    if explicit_project is not None and explicit_project in projects:
+        return explicit_project
+    return _reading_manager(store, cwd, projects)
 
 
 def _task_row(store: ContextStore, task: TeamTask, live: Sequence[FleetAgent]) -> FleetAgent | None:
@@ -1451,7 +1463,7 @@ def _task_row(store: ContextStore, task: TeamTask, live: Sequence[FleetAgent]) -
 
 
 def _reading_manager(
-    store: ContextStore, board_id: str, cwd: Path | _Nowhere | None, live: Sequence[FleetAgent]
+    store: ContextStore, cwd: Path | _Nowhere | None, projects: set[str]
 ) -> str | None:
     """The project of the ``manager`` row of ``live``, the live rows, whose agent reads board
     ``board_id``, as its spawn recorded (``FleetAgent.board``). Of several, as under a hub,
@@ -1464,16 +1476,15 @@ def _reading_manager(
     from the phone woke the older project's, and its own waited on (review of #259, round 26,
     5/11).
     """
-    managers = [row for row in live if row.label == MANAGER_ROLE and row.board == board_id]
-    if len(managers) == 1:
-        return managers[0].project_id
+    if len(projects) == 1:
+        return next(iter(projects))
     if isinstance(cwd, _Nowhere):
         return None
     here = (cwd or Path.cwd()).resolve()
     holding = [
         project
-        for manager in managers
-        for project in [store.get_project(manager.project_id)]
+        for project_id in sorted(projects)
+        for project in [store.get_project(project_id)]
         if project is not None and here.is_relative_to(project.root)
     ]
     deepest = max(holding, key=lambda project: len(project.root.parts), default=None)
@@ -2255,7 +2266,7 @@ def add_note(
             if named is not None
             else _board(store, session, cwd, write=True)
         )
-        task_id: str | None = None
+        task: TeamTask | None = None
         if task_ref is not None:
             task = find_task(store, task_ref, board.id)
             if task is None:
@@ -2265,7 +2276,6 @@ def add_note(
                 # attached to this board's event would render as a broken
                 # ref for every reader here.
                 _out_of_board(f"--task {task_ref}: that task belongs to another project's board")
-            task_id = task.id
         recipient: str | None = None
         meta: dict[str, object] | None = None
         writer = session.id if session is not None else None
@@ -2274,7 +2284,7 @@ def add_note(
         )
         if scheduled_kind:
             recipient = _ManagerAddresses(store, board.id).resolve(
-                to_role, writer, (cwd or Path.cwd()).resolve(), project_id
+                to_role, writer, cwd, project_id, task=task
             )
             meta = {manager_seat.EVENT_PROJECT: recipient}
             if (
@@ -2290,13 +2300,15 @@ def add_note(
             kind,
             text,
             session_id=writer,
-            task_id=task_id,
+            task_id=task.id if task is not None else None,
             to_role=to_role,
             meta=meta,
         )
         _route_up(store, event)
         wakes = kind in ("result", "question") or _addressed_to_manager(to_role)
-        manager = recipient or (_nudge_target(store, writer, board.id, cwd) if wakes else None)
+        manager = recipient or (
+            _nudge_target(store, writer, board.id, cwd, task=task) if wakes else None
+        )
         if (
             manager is not None
             and recipient is None
