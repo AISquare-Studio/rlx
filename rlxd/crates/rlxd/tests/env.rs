@@ -40,6 +40,8 @@ fn the_app_sets_a_value_and_an_rlxd_started_again_has_it() {
     let data = app_sets(&home, r#"{"CLAUDE_CONFIG_DIR":"cc-test"}"#);
     assert_eq!(data, serde_json::json!({"CLAUDE_CONFIG_DIR": "cc-test"}));
     assert_eq!(env_get(&home)["CLAUDE_CONFIG_DIR"], "cc-test");
+    // The tests' RLXD_CLAUDE_BIN wins over any PATH, and status says so.
+    assert_eq!(home.status()["claude"]["path_source"], "rlxd_claude_bin");
     // rlxd stop && rlxd serve --detach && rlxd call env.get
     home.stop();
     home.start();
@@ -217,6 +219,8 @@ fn claude_is_resolved_on_the_apps_path_when_it_is_set_and_kept_as_found() {
     serve.env_remove("RLXD_CLAUDE_BIN").stdin(Stdio::null());
     let run = common::run(serve, None);
     assert_eq!(run.code(), Some(0), "{run:?}");
+    // The app has set no PATH yet: rlxd looks on its own, and says so.
+    assert_eq!(claude(&home)["path_source"], "rlxd");
 
     let (bin, bin1) = (root.join("bin"), root.join("bin1"));
     let found = place(&program, &bin, name);
@@ -226,6 +230,7 @@ fn claude_is_resolved_on_the_apps_path_when_it_is_set_and_kept_as_found() {
     app_sets(&home, &set);
     let seen = claude(&home);
     assert_eq!(seen["installed"], true, "{seen}");
+    assert_eq!(seen["path_source"], "app", "{seen}");
     assert_eq!(
         seen["path"],
         found.display().to_string(),
@@ -252,6 +257,7 @@ fn claude_is_resolved_on_the_apps_path_when_it_is_set_and_kept_as_found() {
     let seen = claude(&home);
     assert_eq!(seen["installed"], false, "{seen}");
     assert!(seen.get("path").is_none(), "{seen}");
+    assert_eq!(seen["path_source"], "app", "the PATH searched: {seen}");
 
     // Windows: npm's claude.cmd shim is found, and not run.
     #[cfg(windows)]

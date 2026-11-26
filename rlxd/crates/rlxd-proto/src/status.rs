@@ -154,6 +154,17 @@ pub struct Claude {
     )]
     #[schemars(transform = drop_null, length(min = 1))]
     pub path: Option<String>,
+    /// Where rlxd looked for it: `app`, the app's `PATH` (4.3); `rlxd`, rlxd's own `PATH`,
+    /// as the app set none; or `rlxd_claude_bin`, `RLXD_CLAUDE_BIN` in rlxd's own
+    /// environment, which tests set ([`Claude::PATH_SOURCES`]). Set whether or not it was
+    /// found, so the app can tell when its `PATH` was not the one searched.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null, length(min = 1))]
+    pub path_source: Option<String>,
     /// Its version, such as `2.1.314`, when `claude --version` said one.
     #[serde(
         default,
@@ -223,6 +234,21 @@ pub struct Paths {
     pub token: String,
     /// The directory of rlxd's logs.
     pub logs: String,
+}
+
+impl Claude {
+    /// `path_source` when rlxd looked on the app's `PATH`.
+    pub const PATH_SOURCE_APP: &str = "app";
+    /// `path_source` when the app set no `PATH`, and rlxd looked on its own.
+    pub const PATH_SOURCE_RLXD: &str = "rlxd";
+    /// `path_source` when `RLXD_CLAUDE_BIN` named the program.
+    pub const PATH_SOURCE_RLXD_CLAUDE_BIN: &str = "rlxd_claude_bin";
+    /// Every `path_source`.
+    pub const PATH_SOURCES: &[&str] = &[
+        Self::PATH_SOURCE_APP,
+        Self::PATH_SOURCE_RLXD,
+        Self::PATH_SOURCE_RLXD_CLAUDE_BIN,
+    ];
 }
 
 impl StatusData {

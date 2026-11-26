@@ -153,6 +153,11 @@
           "type": "string",
           "minLength": 1
         },
+        "path_source": {
+          "description": "Where rlxd looked for it: `app`, the app's `PATH` (4.3); `rlxd`, rlxd's own `PATH`,\nas the app set none; or `rlxd_claude_bin`, `RLXD_CLAUDE_BIN` in rlxd's own\nenvironment, which tests set ([`Claude::PATH_SOURCES`]). Set whether or not it was\nfound, so the app can tell when its `PATH` was not the one searched.",
+          "type": "string",
+          "minLength": 1
+        },
         "plan": {
           "description": "The account's plan, such as `pro` or `max`.",
           "type": "string"

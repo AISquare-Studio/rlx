@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use rlxd_client::Home;
 use rlxd_proto::{EnvChange, EnvValues};
 
-use crate::claude::{self, Resolved};
+use crate::claude::{self, Resolved, Source};
 use crate::log::{error, info};
 use crate::{clock, durable};
 
@@ -40,7 +40,7 @@ pub struct Env {
 
 struct State {
     values: EnvValues,
-    claude: Resolved,
+    claude: (Resolved, Source),
 }
 
 /// Why a change was not made. Nothing changed.
@@ -77,7 +77,7 @@ impl Env {
             Err(e) => (EnvValues::default(), set_aside(&path, &e.to_string())),
         };
         let claude = resolve(&values);
-        info!("env: {}; claude: {}", describe(&values), shown(&claude));
+        info!("env: {}; claude: {}", describe(&values), shown(&claude.0));
         Self {
             path,
             state: Mutex::new(State { values, claude }),
@@ -90,8 +90,9 @@ impl Env {
         self.state().values.clone()
     }
 
-    /// The `claude` the values resolve to, as resolved when they were last taken in.
-    pub fn claude(&self) -> Resolved {
+    /// The `claude` the values resolve to, as resolved when they were last taken in, and
+    /// where it was looked for.
+    pub fn claude(&self) -> (Resolved, Source) {
         self.state().claude.clone()
     }
 
@@ -114,7 +115,7 @@ impl Env {
             "env: {who} set {}; now {}; claude: {}",
             named.join(", "),
             describe(&values),
-            shown(&state.claude)
+            shown(&state.claude.0)
         );
         Ok(values)
     }
@@ -134,7 +135,7 @@ fn read(text: &[u8]) -> Result<EnvValues, String> {
 }
 
 /// `claude` on the values' `PATH`, else on rlxd's own.
-fn resolve(values: &EnvValues) -> Resolved {
+fn resolve(values: &EnvValues) -> (Resolved, Source) {
     claude::resolve_on(values.path.as_deref().map(std::ffi::OsStr::new))
 }
 

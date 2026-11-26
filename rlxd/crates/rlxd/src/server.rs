@@ -634,7 +634,8 @@ impl Daemon {
         {
             return claude.clone();
         }
-        let claude = claude::probe_at(&self.env.claude()).await;
+        let (resolved, source) = self.env.claude();
+        let claude = claude::probe_at(&resolved, source).await;
         *cached = Some((Instant::now(), claude.clone()));
         claude
     }

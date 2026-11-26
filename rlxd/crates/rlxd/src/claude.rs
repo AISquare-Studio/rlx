@@ -34,6 +34,28 @@ pub const BIN_ENV: &str = "RLXD_CLAUDE_BIN";
 /// How long each of the two commands may take.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Where `claude` was looked for: `status.claude.path_source`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The app's `PATH` (4.3).
+    App,
+    /// rlxd's own `PATH`, as the app set none.
+    Rlxd,
+    /// `RLXD_CLAUDE_BIN`, in rlxd's own environment.
+    RlxdClaudeBin,
+}
+
+impl Source {
+    /// Its name in `status`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::App => Claude::PATH_SOURCE_APP,
+            Self::Rlxd => Claude::PATH_SOURCE_RLXD,
+            Self::RlxdClaudeBin => Claude::PATH_SOURCE_RLXD_CLAUDE_BIN,
+        }
+    }
+}
+
 /// Where `claude` resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolved {
@@ -59,23 +81,31 @@ impl Resolved {
 /// else the first `claude` on `path` (the app's `PATH`), or on rlxd's own `PATH` when the
 /// app set none. Entries that are empty or relative are skipped: a relative one would
 /// depend on rlxd's working directory. The path is kept as found, never canonicalized.
-pub fn resolve_on(path: Option<&OsStr>) -> Resolved {
+pub fn resolve_on(path: Option<&OsStr>) -> (Resolved, Source) {
     let pathext = env::var_os("PATHEXT");
-    let found = if let Some(named) = env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
-        program_at(Path::new(&named), pathext.as_deref())
-            .and_then(|program| std::path::absolute(program).ok())
-    } else {
-        let own = env::var_os("PATH");
-        let Some(path) = path.or(own.as_deref()) else {
-            return Resolved::NotFound;
+    let (found, source) =
+        if let Some(named) = env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
+            let found = program_at(Path::new(&named), pathext.as_deref())
+                .and_then(|program| std::path::absolute(program).ok());
+            (found, Source::RlxdClaudeBin)
+        } else {
+            let own = env::var_os("PATH");
+            let source = if path.is_some() {
+                Source::App
+            } else {
+                Source::Rlxd
+            };
+            let found = path
+                .or(own.as_deref())
+                .and_then(|path| find_on(path, pathext.as_deref()));
+            (found, source)
         };
-        find_on(path, pathext.as_deref())
-    };
-    match found {
+    let resolved = match found {
         Some(program) if is_batch_file(&program) => Resolved::NotRunnable(program),
         Some(program) => Resolved::Found(program),
         None => Resolved::NotFound,
-    }
+    };
+    (resolved, source)
 }
 
 /// The first `claude` in `path`'s entries, in order, skipping empty and relative ones.
@@ -93,9 +123,11 @@ fn is_batch_file(program: &Path) -> bool {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
 }
 
-/// What the Claude Code `resolved` names says about itself now.
-pub async fn probe_at(resolved: &Resolved) -> Claude {
+/// What the Claude Code `resolved` names says about itself now, and where it was looked
+/// for.
+pub async fn probe_at(resolved: &Resolved, source: Source) -> Claude {
     let mut claude = Claude::default();
+    claude.path_source = Some(source.name().to_owned());
     let Some(program) = resolved.program() else {
         return claude;
     };

@@ -261,7 +261,9 @@ rlxd call env.get
   `PATH`, in order, else on rlxd's own `PATH` when the app set none. Empty and relative
   entries are skipped. The path is kept as found, an absolute path with links
   unresolved. `RLXD_CLAUDE_BIN`, from rlxd's own environment only, wins over both.
-  `status.claude` reports it: `installed`, and `path`, the program a run starts.
+  `status.claude` reports it: `installed`; `path`, the program a run starts; and
+  `path_source`, where rlxd looked: `app` (the app's `PATH`), `rlxd` (its own, as the
+  app set none) or `rlxd_claude_bin`.
   - **Windows** tries `claude` with each of `PATHEXT`'s extensions, so `claude.exe`. A
     batch file found first, such as npm's `claude.cmd` shim, isn't run: Rust starts one
     through `cmd`, whose rules no escaping makes safe for a prompt. `status` then says
