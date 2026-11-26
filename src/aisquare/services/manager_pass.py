@@ -9,10 +9,10 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from aisquare.core import harness, paths, program
-from aisquare.core.agent_adapters import recorded_adapter, transcripts
+from aisquare.core.agent_adapters import transcripts
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import TeamSession
-from aisquare.services import manager_seat
+from aisquare.services import manager_seat, transcript
 
 _PREFIX = "Scheduled manager pass "
 _DEFAULT = "Read the board range and act on what needs you. If nothing needs you, stop."
@@ -166,15 +166,12 @@ def observe_transcript(session: TeamSession, pending: Pass) -> bool:
         return False
     if pending.session != session.id or not session.transcript_path:
         return False
-    adapter = recorded_adapter(session.agent)
-    reader = adapter.transcript_reader() if adapter is not None else None
+    reader = transcript.reader_of(session.agent)
     if reader is None:
         return False
     path = Path(session.transcript_path)
     try:
-        lines = transcripts.lines_backwards(
-            path, path.stat().st_size, budget=transcripts.TAIL_BUDGET
-        )
+        lines = transcripts.lines_backwards(path, path.stat().st_size, budget=transcripts.TAIL_BUDGET)
         for _, record in reader.records(lines):
             if record is None:
                 continue
@@ -183,7 +180,8 @@ def observe_transcript(session: TeamSession, pending: Pass) -> bool:
                 continue
             rendered = reader.page_lines(record, width=harness.STATE_FILE_MAX * 2)
             if (
-                len(rendered) > 1 and rendered[0] == transcripts.YOU
+                len(rendered) > 1
+                and rendered[0] == transcripts.YOU
                 and rendered[1].strip() == _PREFIX + pending.id
             ):
                 return acknowledge(session.id, rendered[1].strip(), submitted)

@@ -15968,6 +15968,49 @@ def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
     assert saved.pending is None
 
 
+def test_watcher_recovers_manager_pass_from_claude_transcript(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The transcript acknowledges a submitted pass when the prompt hook did not."""
+    from aisquare.services import manager_pass, watch
+
+    sid = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_pass_minutes", "15")
+    watcher = watch.Watcher()
+    monkeypatch.setattr(watcher, "look_all", lambda *args: [])
+    now = datetime.now(UTC)
+    watcher.tick(now)
+    prompt = next(line for _, action, line in tmux.typed if action == "paste")
+    with store_session() as store:
+        pending = manager_pass.read(store, project.id, project.id)[1].pending
+        assert pending is not None and pending.acknowledged_at is None
+    submitted = now + timedelta(seconds=1)
+    transcript = tmp_path / "manager-pass.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": submitted.isoformat(),
+                "message": {"role": "user", "content": prompt},
+            },
+        )
+        + "\n"
+    )
+    with store_session() as store:
+        store.set_transcript_path(sid, str(transcript))
+    recovered = watcher.tick(submitted)
+    assert recovered.passed[project.id] == pending.id, recovered.notes
+    with store_session() as store:
+        current = manager_pass.read(store, project.id, project.id)[1].pending
+        assert current is not None and current.acknowledged_at == submitted
+    assert [line for _, action, line in tmux.typed if action == "paste"] == [prompt]
+
+
 def test_manager_still_wakes_for_a_result_by_default(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
