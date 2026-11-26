@@ -5,7 +5,8 @@ the tmux command, the Agent view the role, the task and the working directory). 
 one, :func:`~aisquare.cli.ui.views.agent.info_line`, in the manager line's shape with the
 effort and the account added, in the order the owner ruled on #267 — what matters most at a
 glance first, the unbounded detail last but the pane id:
-``🔨 coder-auth  ▶ working  dev · 87%  claude-opus-5-5 high  %4``. The account is its NAME (no
+``🔨 coder-auth  ▶ working  dev · 87%  #14 Agent view…  claude-opus-5-5 high``. The account is
+its NAME (no
 ``#slot``) and the figure beside it the five-hour window, percent USED, never the weekly one.
 The sidebar's rows say ``#<slot>·<pct>%`` with the same colours, from the same helper
 (:func:`~aisquare.cli.ui.sidebar.used_percent_text`).
@@ -21,6 +22,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import pytest
+from rich.cells import cell_len
 from rich.text import Text
 from textual.widgets import Static
 
@@ -136,22 +138,54 @@ def _style_of(text: Text, field: str) -> str:
 
 
 def test_the_info_line_reads_in_the_owners_order_with_effort_and_account() -> None:
-    """``<icon> <label>  <chip> <state>[(exit)]  <nickname> · <pct>%  <model> <effort>
-    [detail]  <pane id>`` (the owner's rulings on #267): the account and its use right after
-    the state, the model and effort after them, the detail last but the pane id."""
+    """``<icon> <label>  <chip> <state>[(exit)]  <nickname> · <pct>%  [#N title]  <model>
+    <effort>  [detail]`` (the owner's rulings on #267): the account and its use right after
+    the state, the model and effort after them, the detail last; no pane id (Q2, 0.10.2)."""
     manager = _status(label="manager", role="manager", state="waiting", effort="xhigh", slot=2)
     coder = _status()
     assert info_line(manager, LABELS, {2: 42.0}).plain == (
-        "🧭 manager  ◦ waiting  work · 42%  claude-opus-5-5 xhigh  %4"
+        "🧭 manager  ◦ waiting  work · 42%  claude-opus-5-5 xhigh"
     )
     assert info_line(coder, LABELS, {3: 87.0}).plain == (
-        "🔨 coder-auth  ▶ working  dev · 87%  claude-opus-5-5 high  %4"
+        "🔨 coder-auth  ▶ working  dev · 87%  claude-opus-5-5 high"
     )
     full = _status(state="attention", detail="Claude needs your permission", slot=2)
     assert info_line(full, LABELS, {2: 42.0}).plain == (
         "🔨 coder-auth  🔔 attention  work · 42%  claude-opus-5-5 high  "
-        "Claude needs your permission  %4"
+        "Claude needs your permission"
     )
+
+
+def test_the_header_names_the_agents_task_by_number_and_title_cut_to_fit() -> None:
+    """The 0.10.2 UX audit's M2: the header shows the task the agent is on, ``#14`` and its
+    title, after the account and its use and before the model: what it is doing, before what
+    it runs on. A long title is cut to ``TASK_KEEP`` cells with ``…``, so the model still
+    shows on a row with room for it; on a narrow row the task gives way before the label,
+    the state, the account and its use do."""
+    from aisquare.cli.ui.views.agent import TASK_KEEP, task_words
+    from aisquare.models import TeamTask
+
+    task = TeamTask(
+        id="tsk_1",
+        project_id="prj_1",
+        number=14,
+        key="agent-view",
+        title="Agent view: move a limited agent, task in header, no pane ids",
+        status="doing",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    words = task_words(task)
+    assert words == "#14 Agent view: move a limited agent, task in header, no pane ids"
+    assert task_words(None) is None
+    line = info_line(_status(slot=2), LABELS, {2: 42.0}, task=words)
+    shown = "#14 Agent view: move a limited …"
+    assert cell_len(shown) == TASK_KEEP and words.startswith(shown[:-1])
+    assert line.plain == f"🔨 coder-auth  ▶ working  work · 42%  {shown}  claude-opus-5-5 high"
+    short = info_line(_status(slot=2), LABELS, {2: 42.0}, task="#3 Fix it").plain
+    assert short == "🔨 coder-auth  ▶ working  work · 42%  #3 Fix it  claude-opus-5-5 high"
+    narrow = _cut(info_line(_status(slot=2), LABELS, {2: 42.0}, width=37, task=words), 37)
+    assert narrow == "🔨 coder-auth  ▶ working  work · 42%…"  # the task gives way first
 
 
 def _cut(line: Text, width: int) -> str:
@@ -167,16 +201,16 @@ def test_a_line_too_wide_gives_way_in_its_label_first() -> None:
     """The owner's ruling 3 on #267: at about 37 cells (the Agent view in a 90-column
     terminal) a spawned agent's label pushed ``max · 42%`` off the line. The label is cut
     first, as the sidebar's rows cut theirs, so ``<icon> <label…>  <chip> <state>  <account>
-    · <pct>%`` and the ``…`` that cuts the rest fit; model, effort, detail and pane id are
-    cut after that, at the line's end. A line that fits keeps its whole label."""
+    · <pct>%`` and the ``…`` that cuts the rest fit; model, effort and detail are cut after
+    that, at the line's end. A line that fits keeps its whole label."""
     usage = {1: 42.0, 2: 42.0, 3: 42.0, 4: 42.0}
     labels = {2: "work", 3: "max"}  # 1 and 4 unaliased: "plain claude", "account 4"
     coder = _status(label="coder-01k8zq7m", slot=3)
     line = info_line(coder, labels, usage, width=37)
     assert _cut(line, 37) == "🔨 coder-01k8…  ▶ working  max · 42%…"
-    assert line.plain.endswith("max · 42%  claude-opus-5-5 high  %4")  # the rest, there to cut
+    assert line.plain.endswith("max · 42%  claude-opus-5-5 high")  # the rest, there to cut
     wide = info_line(coder, labels, usage, width=87)
-    assert wide.plain == "🔨 coder-01k8zq7m  ▶ working  max · 42%  claude-opus-5-5 high  %4"
+    assert wide.plain == "🔨 coder-01k8zq7m  ▶ working  max · 42%  claude-opus-5-5 high"
     assert info_line(coder, labels, usage).plain == wide.plain  # no width: the whole label
     # A label that fits its room is not cut, though the rest is.
     assert _cut(info_line(_status(slot=3), labels, usage, width=37), 37) == (
@@ -207,12 +241,12 @@ def test_the_label_keeps_six_characters_and_a_narrower_row_is_cut_at_its_end() -
 
 
 def test_the_effort_follows_the_model_and_is_left_out_while_unknown() -> None:
-    assert "dev  claude-opus-5-5 high  %4" in info_line(_status(), LABELS).plain
+    assert "dev  claude-opus-5-5 high" in info_line(_status(), LABELS).plain
     without = info_line(_status(effort=None), LABELS).plain
-    assert "dev  claude-opus-5-5  %4" in without and "high" not in without
+    assert "dev  claude-opus-5-5" in without and "high" not in without
     # An effort with no model still shows, in its own place.
     alone = info_line(_status(model=None, effort="low"), LABELS)
-    assert "▶ working  dev  low  %4" in alone.plain
+    assert "▶ working  dev  low" in alone.plain
     assert _style_of(alone, "low") == _style_of(info_line(_status(), LABELS), "high")
 
 
@@ -231,7 +265,7 @@ def test_with_no_slot_the_sessions_account_alone_and_with_neither_no_account() -
     line = info_line(by_hand, LABELS, {1: 10.0, 2: 20.0, 3: 30.0}).plain
     assert "▶ working  .claude-work  claude-opus-5-5" in line, line  # no figure, no " · "
     neither = info_line(_status(slot=None, account=None), LABELS, {3: 30.0}).plain
-    assert neither == "🔨 coder-auth  ▶ working  claude-opus-5-5 high  %4"
+    assert neither == "🔨 coder-auth  ▶ working  claude-opus-5-5 high"
 
 
 def test_the_figure_is_the_window_that_limits() -> None:
@@ -314,11 +348,11 @@ def test_the_persona_ends_the_info_line_and_is_the_first_thing_a_narrow_row_drop
     usage = {3: 87.0}
     status = _status(persona="skeptic")
     bare = info_line(_status(), LABELS, usage)  # the same agent with no persona
-    assert bare.plain == "🔨 coder-auth  ▶ working  dev · 87%  claude-opus-5-5 high  %4"
+    assert bare.plain == "🔨 coder-auth  ▶ working  dev · 87%  claude-opus-5-5 high"
     assert info_line(status, LABELS, usage).plain == f"{bare.plain} · skeptic"
     wide = info_line(status, LABELS, usage, width=100)
     assert wide.plain == f"{bare.plain} · skeptic"
-    assert _style_of(wide, " · skeptic") == "dim" != _style_of(wide, "%4")
+    assert _style_of(wide, " · skeptic") == "dim" != _style_of(wide, "high")
     cut = info_line(status, LABELS, usage, width=bare.cell_len + 6)
     assert cut.plain == f"{bare.plain} · sk…" and cut.cell_len == bare.cell_len + 6
     for spare in range(BADGE_KEEP):  # too few cells for a letter of it: dropped, never " ·"
@@ -333,7 +367,7 @@ def test_the_persona_ends_the_info_line_and_is_the_first_thing_a_narrow_row_drop
     ran_as = plain_row.model_copy(
         update={"session": plain_row.session.model_copy(update={"persona": "tempo"})}
     )
-    assert info_line(ran_as, LABELS, usage).plain.endswith("%4 · tempo")
+    assert info_line(ran_as, LABELS, usage).plain.endswith("high · tempo")
     assert agent_row_text(ran_as, 87.0, width=60).plain.endswith(" · tempo")
 
 
@@ -417,6 +451,8 @@ def test_a_mounted_row_is_never_drawn_wider_than_it_is() -> None:
 
 
 def test_no_hash_tmux_command_role_task_or_working_directory_in_the_info_line() -> None:
+    """With no task to name (``task=None``): no ``#slot``, tmux command, role word, task id
+    or working directory. A task is named by its number and title, never its id (M2)."""
     for state, exit_status in (("working", None), ("exited", 2)):
         line = info_line(
             _status(state=state, exit_status=exit_status, slot=2), LABELS, {2: 55.0}
@@ -434,45 +470,47 @@ def test_an_exited_row_says_its_exit_once() -> None:
     assert "exit 1" not in line and "exited 1" not in line  # not a second time
     # Another detail on an exited row still shows, in the detail's place.
     gone = info_line(_status(state="exited", exit_status=None, detail="exit 3"), LABELS).plain
-    assert gone == "🔨 coder-auth  💤 exited  dev  claude-opus-5-5 high  exit 3  %4"
+    assert gone == "🔨 coder-auth  💤 exited  dev  claude-opus-5-5 high  exit 3"
 
 
-def test_the_detail_comes_after_the_account_and_the_model_before_the_pane() -> None:
+def test_the_detail_comes_last_after_the_account_and_the_model() -> None:
     """The owner's ruling on #267: a detail has no bound, and a line too long for its row is
     cut at its end, so the detail goes after ``account · pct%`` and the model and effort —
-    what gives way first."""
+    what gives way first. It ends the line: the pane id after it is gone (Q2, 0.10.2)."""
     status = _status(state="attention", detail="Claude needs your permission", slot=2)
     assert info_line(status, LABELS, {2: 42.0}).plain.endswith(
-        "work · 42%  claude-opus-5-5 high  Claude needs your permission  %4"
+        "work · 42%  claude-opus-5-5 high  Claude needs your permission"
     )
     # Without an account, the detail follows the effort; without a session, the state.
     alone = _status(state="unknown", detail="tmux unavailable", session=False, slot=None)
-    assert info_line(alone, LABELS).plain == "🔨 coder-auth  · unknown  tmux unavailable  %4"
+    assert info_line(alone, LABELS).plain == "🔨 coder-auth  · unknown  tmux unavailable"
     bare = _status(state="lost", detail="pane gone", slot=None)
     assert info_line(bare, LABELS).plain.endswith("claude-opus-5-5 high  pane gone")
 
 
 @pytest.mark.parametrize(
-    ("state", "held", "shown"),
+    ("state", "held"),
     [
-        ("working", False, True),
-        ("exited", False, True),
-        ("unknown", False, True),
-        ("paused", False, False),
-        ("lost", False, False),
-        ("unknown", True, False),
+        ("working", False),
+        ("exited", False),
+        ("unknown", False),
+        ("paused", False),
+        ("lost", False),
+        ("unknown", True),
+        ("limited", False),
     ],
-    ids=["working", "exited", "unknown", "paused", "lost", "held"],
+    ids=["working", "exited", "unknown", "paused", "lost", "held", "limited"],
 )
-def test_the_pane_id_shows_only_while_the_row_has_a_pane_of_its_own(
-    state: str, held: bool, shown: bool
-) -> None:
-    """Brief 233's ruling: a paused or lost row's pane id was its killed window's, and a held
-    row's is the next server's. tmux hands it to the next agent, so the header named someone
-    else's pane. An exited row keeps its window (remain-on-exit), and its id with it."""
-    line = info_line(_status(state=state).model_copy(update={"held": held}), LABELS).plain
-    assert ("%4" in line) is shown, line
-    assert line.endswith("high  %4" if shown else "high"), line
+def test_no_pane_id_in_the_header_in_any_state(state: str, held: bool) -> None:
+    """The 0.10.2 UX audit's Q2: a ``%4`` is tmux's name for the pane, nobody's. Until then
+    the header ended in it while the row had a pane of its own (brief 233); now never, in any
+    state, with or without a task, at any width."""
+    status = _status(state=state).model_copy(update={"held": held})
+    for task in (None, "#14 Agent view: move a limited agent"):
+        for width in (None, 37, 60, 200):
+            line = info_line(status, LABELS, {3: 42.0}, width=width, task=task).plain
+            assert "%" not in line.replace("42%", ""), line
+            assert "%4" not in line and "pane" not in line, line
 
 
 def test_a_paused_rows_header_names_no_command_to_resume_it() -> None:
@@ -487,7 +525,7 @@ def test_a_paused_rows_header_names_no_command_to_resume_it() -> None:
     assert "fleet resume" not in line and "no process" not in line, line
     assert line.endswith("claude-opus-5-5 high"), line  # no detail, and no pane id (#528)
     working = _status(state="attention", detail="Claude needs your permission")
-    assert info_line(working, LABELS).plain.endswith("Claude needs your permission  %4")
+    assert info_line(working, LABELS).plain.endswith("Claude needs your permission")
 
 
 def test_a_line_with_nothing_after_what_it_keeps_whole_cuts_its_label_to_the_row() -> None:
@@ -503,14 +541,14 @@ def test_a_line_with_nothing_after_what_it_keeps_whole_cuts_its_label_to_the_row
 
 def test_no_two_neighbouring_fields_share_a_style() -> None:
     """Each field reads apart from the next: the label bold, the state its chip's colour,
-    the model dim cyan, then the effort, the account and the pane id each a style of their
+    the model dim cyan, then the effort, the account and the task each a style of their
     own — in every state, including the dim ``💤`` and ``·`` chips beside a dim field."""
     cases = [
         _status(),
         _status(state="attention", detail="Claude needs your permission"),
         _status(state="limited", detail="resets 14:00", model=None),
         _status(state="exited", exit_status=1, detail="exit 1"),
-        _status(state="exited", session=False, slot=None),  # the chip, then the pane id
+        _status(state="exited", session=False, slot=None),  # the chip alone
         _status(state="unknown", detail="tmux unavailable", session=False, slot=None),
         _status(state="lost", detail="pane gone", effort=None),
         _status(model=None, effort=None),
@@ -518,16 +556,17 @@ def test_no_two_neighbouring_fields_share_a_style() -> None:
     for status in cases:
         for percent in (None, 10.0, 75.0, 95.0):
             usage = {} if percent is None else {3: percent}
-            segments = _segments(info_line(status, LABELS, usage))
-            for (left, left_style), (right, right_style) in pairwise(segments):
-                assert left_style != right_style, (status.state, left, right, left_style)
-    full = info_line(_status(), LABELS, {3: 50.0})
+            for task in (None, "#14 Agent view"):
+                segments = _segments(info_line(status, LABELS, usage, task=task))
+                for (left, left_style), (right, right_style) in pairwise(segments):
+                    assert left_style != right_style, (status.state, left, right, left_style)
+    full = info_line(_status(), LABELS, {3: 50.0}, task="#14 Agent view")
     assert _style_of(full, "coder-auth") == "bold"
     assert _style_of(full, "▶ working") == "green"
     assert _style_of(full, "claude-opus-5-5") == "dim cyan"
-    distinct = {_style_of(full, field) for field in ("high", "dev", "%4", "claude-opus-5-5")}
+    fields = ("high", "dev", "#14 Agent view", "claude-opus-5-5")
+    distinct = {_style_of(full, field) for field in fields}
     assert len(distinct) == 4, distinct
-    assert "dim" in _style_of(full, "%4").split()
 
 
 def test_bracketed_labels_and_model_names_render_literally() -> None:
@@ -643,7 +682,7 @@ def test_a_codex_rows_line_and_sidebar_figure_come_from_its_own_readings(tmp_pat
     # A Codex row is listed beside Claude Code's accounts, so its line names its agent, after
     # the account and its use (C1 of #120).
     line = info_line(status, {CODEX_SLOT: "codex-1"}, usage, named=True)
-    assert line.plain == "🔨 coder-1  ▶ working  codex-1 · 42%  codex  gpt-5.5-codex high  %7"
+    assert line.plain == "🔨 coder-1  ▶ working  codex-1 · 42%  codex  gpt-5.5-codex high"
     assert agent_row_text(status, usage.get(CODEX_SLOT)).plain.endswith("▶ #5·42%")
     # Control: Claude Code's summary alone — what the line read before — has no figure for it.
     alone = info_line(status, {CODEX_SLOT: "codex-1"}, claude.limit_by_slot).plain

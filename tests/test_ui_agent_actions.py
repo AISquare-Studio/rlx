@@ -16,6 +16,7 @@ tests/test_config.py.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +30,7 @@ from textual.pilot import Pilot
 from textual.widget import Widget
 from textual.widgets import Button, Checkbox, OptionList, Static
 
+from aisquare.cli.ui import agent_menu as agent_menu_module
 from aisquare.cli.ui.agent_menu import AgentMenu
 from aisquare.cli.ui.app import FleetApp, Panes
 from aisquare.cli.ui.board import BoardPanel
@@ -36,9 +38,11 @@ from aisquare.cli.ui.confirm_action import ASK_AGAIN_WHERE, ConfirmActionScreen,
 from aisquare.cli.ui.sidebar import MENU_GLYPH, AgentRow, ProjectSelected
 from aisquare.cli.ui.stop import StopAgentScreen
 from aisquare.cli.ui.terminal import PANE_GONE, TMUX_UNAVAILABLE
+from aisquare.cli.ui.views import agent as agent_view_module
 from aisquare.cli.ui.views.agent import (
     PAUSED_WORDS,
     AgentView,
+    MoveOffer,
     pause_question,
     restart_question,
 )
@@ -1058,9 +1062,8 @@ def test_every_other_state_keeps_its_own_words(
 
     pane_id, header, said = drive(go)
     assert pane_id == pane
-    # The header names the pane it shows, and none where it shows none (the id is another's).
-    assert header.rstrip().endswith("%1") is (pane is not None), header
-    assert ("%1" in header) is (pane is not None), header
+    # The header names no pane, shown or not: a %N is tmux's name for it (0.10.2's Q2).
+    assert "%1" not in header and "%" not in header, header
     if words is not None:
         assert said == words
     assert PAUSED_WORDS not in said
@@ -1144,3 +1147,308 @@ def test_resume_from_the_paused_view_shows_the_live_pane_and_none_of_the_paused_
     assert (shown_id, current) == (f"{CODER}-2", f"agent-{CODER}-2"), "the resumed row's view"
     assert pane_id == "%1" and typing, "its live pane, with the keyboard"
     assert "Paused" not in said and "Resume" not in said, said
+
+
+# --- M1: a limited agent's Move and Wait (#14) ----------------------------------------------
+
+OFFER = MoveOffer(ref="claude-code:3", name="personal@example.com", left=80.0)
+"""Where Move takes the limited coder: the account the switch's own pick names (its pick is
+tests/test_usage_aware_accounts.py's ``…_move_offer_is_the_account_with_the_most_room``)."""
+
+
+SwitchCall = tuple[str, str, str | None, str | None]
+"""One switch as :class:`Switched` records it: project, label, ``to`` and ``agent_id``."""
+
+NOTED = "account 3 read 20% used just now"
+"""A note every switch has (the headroom read), in the receipt :class:`Switched` answers."""
+
+FAILED = "its claims were not moved: the board was busy"
+"""What the switch could NOT do with its replacement up: a failure, in ``notes`` too."""
+
+MOVED = "⇄ coder-auth (alpha) moved to personal@example.com — resumed its session"
+"""A Move's one toast that it went, the shell's (``AgentRestarted.headline``), naming the
+project as a restart's does."""
+
+
+class Switched:
+    """Stands in for ``fleet_service.switch``: records each call, and answers the receipt the
+    service would, the row replaced by one on the new account."""
+
+    def __init__(self, script: Script) -> None:
+        self.script = script
+        self.calls: list[SwitchCall] = []
+
+    def __call__(
+        self,
+        project: ProjectInfo,
+        label: str,
+        *,
+        to: str | None = None,
+        agent_id: str | None = None,
+        **_: object,
+    ) -> fleet_service.SwitchReceipt:
+        self.calls.append((project.id, label, to, agent_id))
+        rows = self.script.get(project.id, [])
+        row = next(r for r in rows if r.agent.id == agent_id)
+        started = row.agent.model_copy(update={"id": f"{row.agent.id}-2", "account_slot": 3})
+        self.script[project.id] = [
+            FleetAgentStatus(agent=started, state="waiting") if r is row else r for r in rows
+        ]
+        return fleet_service.SwitchReceipt(
+            stopped=row.agent,
+            started=started,
+            from_slot=row.agent.account_slot,
+            to_slot=3,
+            resumed=True,
+            tmux_session="asq-x",
+            notes=[NOTED, FAILED],
+            failures=[FAILED],
+        )
+
+
+@pytest.fixture
+def switched(monkeypatch: pytest.MonkeyPatch, script: Script) -> Switched:
+    """The switch recorded, and the offer the header and the menu read (no usage read)."""
+    recorder = Switched(script)
+    monkeypatch.setattr(fleet_service, "switch", recorder)
+    monkeypatch.setattr(fleet_service, "project_of", lambda agent: _project(agent.project_id))
+
+    def offer(status: FleetAgentStatus) -> MoveOffer | None:
+        return OFFER if status.state == "limited" else None
+
+    monkeypatch.setattr(agent_view_module, "move_offer", offer)
+    monkeypatch.setattr(agent_menu_module, "move_offer", offer)
+    return recorder
+
+
+def offer_bar(view: AgentView) -> tuple[bool, list[str]]:
+    """Whether the bar under the header shows, and its buttons' labels."""
+    bar = view.query_one("#agent-offer")
+    return bar.display, [str(button.label) for button in bar.query(Button)]
+
+
+@pytest.mark.parametrize("state", ["limited", "working", "waiting"])
+def test_a_limited_agents_header_offers_move_to_the_account_with_room_and_wait(
+    tmp_path: Path, script: Script, switched: Switched, state: str
+) -> None:
+    """The 0.10.2 UX audit's M1, the one daily job that still needed the command line: under a
+    limited agent's header, *Move to personal@example.com (80% left)*, the account with the
+    most room and what it has left, and *Wait*. Nowhere else: an agent that is not limited
+    is offered no move."""
+    one_coder(tmp_path, script, state)
+
+    async def go(pilot: Pilot[None]) -> tuple[bool, list[str], str]:
+        view = await open_view(pilot, fleet_app(pilot), CODER)
+        await settle(fleet_app(pilot))
+        shown, buttons = offer_bar(view)
+        return shown, buttons, header_of(view)
+
+    shown, buttons, header = drive(go)
+    assert "%" not in header.replace("80%", ""), header  # and no pane id (Q2)
+    if state == "limited":
+        assert shown and buttons == ["Move to personal@example.com (80% left)", "Wait"]
+    else:
+        assert not shown
+    assert switched.calls == []  # offered, never run by itself
+
+
+def test_move_moves_this_row_to_the_offered_account_and_wait_calls_nothing(
+    tmp_path: Path, script: Script, switched: Switched
+) -> None:
+    """*Move* is the switch ``fleet switch --to`` runs, to the account offered (``to``) and
+    pinned to THIS row (``agent_id``); one toast says where it went and how it began (never
+    also "✓ restarted"), and the switch's notes follow it (review of #579, m3). *Wait* calls
+    nothing, and puts the offer away while this limit lasts."""
+    one_coder(tmp_path, script, "limited")
+
+    async def go(pilot: Pilot[None]) -> tuple[list[SwitchCall], bool, list[SwitchCall]]:
+        app = fleet_app(pilot)
+        view = await open_view(pilot, app, CODER)
+        await settle(app)
+        await press(pilot, view, "wait")
+        await settle(app)
+        waited = list(switched.calls)
+        hidden = not offer_bar(view)[0]
+        view._waited = None  # as after this limit: offered again
+        view._paint_offer()
+        await pilot.pause()
+        await press(pilot, view, "move")
+        await settle(app)
+        return waited, hidden, list(switched.calls)
+
+    waited, hidden, moved = drive(go)
+    assert waited == [] and hidden, "Wait calls nothing and puts the offer away"
+    assert moved == [("prj_a", "coder-auth", "claude-code:3", CODER)]
+    said = messages()
+    assert [m for m in said if m.startswith(("⇄", "✓ restarted"))] == [MOVED], "said once"
+    assert NOTED in said and FAILED in said, "the switch's notes and failures, as a restart's"
+
+
+@pytest.mark.parametrize("view_open", [False, True], ids=["no-view", "view-open"])
+def test_a_limited_agents_menu_offers_move_and_wait_and_move_runs_the_switch(
+    tmp_path: Path, script: Script, switched: Switched, view_open: bool
+) -> None:
+    """The ⋯ menu offers what the header does, first: *Move to personal@example.com (80%
+    left)* once the account is found, and *Wait*. Move from the menu is the same switch, to
+    the same account, pinned to the row, with the view open or not, and is said the same
+    way: one headline, then the switch's notes and failures, as Restart from the menu says
+    a restart's (review of #579, m2). Wait calls nothing."""
+    one_coder(tmp_path, script, "limited")
+
+    async def go(
+        pilot: Pilot[None],
+    ) -> tuple[list[tuple[str, bool]], list[SwitchCall], list[SwitchCall]]:
+        app = fleet_app(pilot)
+        if view_open:
+            await open_view(pilot, app, CODER)
+        else:
+            await settle(app)
+        menu = await right_click(pilot, app, CODER)
+        await settle(app)
+        listed = entries(menu)
+        await choose(pilot, app, menu, "Wait")
+        waited = list(switched.calls)
+        await choose(pilot, app, await right_click(pilot, app, CODER), "(80% left)")
+        await settle(app)
+        return listed, waited, list(switched.calls)
+
+    listed, waited, moved = drive(go)
+    assert listed[:2] == [("⇄ Move to personal@example.com (80% left)", False), ("⏳ Wait", False)]
+    assert waited == []
+    assert moved == [("prj_a", "coder-auth", "claude-code:3", CODER)]
+    said = messages()
+    assert [m for m in said if m.startswith(("⇄", "✓ restarted"))] == [MOVED], "said once"
+    assert NOTED in said and FAILED in said, "the switch's notes and failures, view or none"
+
+
+SPARE = MoveOffer(ref="claude-code:4", name="spare@example.com", left=60.0)
+"""Where a later limit's own read says Move would take the agent."""
+
+
+def test_when_the_limit_ends_the_offer_goes_and_the_next_limit_offers_its_own_read(
+    tmp_path: Path, script: Script, switched: Switched, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #579, m4: the offer was kept past its limit, so the next limit on the row
+    showed the last one's *Move to X (N% left)* until its own read landed, an account and
+    room read minutes before. The offer goes with its limit: a new limit shows nothing until
+    its read answers, then that read's account."""
+    row = one_coder(tmp_path, script, "limited")
+    reads: list[str] = []
+
+    def offer(status: FleetAgentStatus) -> MoveOffer | None:
+        reads.append(status.state)
+        return OFFER if len(reads) == 1 else SPARE
+
+    monkeypatch.setattr(agent_view_module, "move_offer", offer)
+
+    async def go(pilot: Pilot[None]) -> tuple[list[str], MoveOffer | None, bool, list[str]]:
+        app = fleet_app(pilot)
+        view = await open_view(pilot, app, CODER)
+        await settle(app)
+        first = offer_bar(view)[1]
+        view.refresh_status(row.model_copy(update={"state": "working"}))
+        after = view.offer
+        view.refresh_status(row)  # limited again: nothing shown before its own read answers
+        between = offer_bar(view)[0]
+        await settle(app)
+        return first, after, between, offer_bar(view)[1]
+
+    first, after, between, again = drive(go)
+    assert first == ["Move to personal@example.com (80% left)", "Wait"]
+    assert after is None, "the offer goes with its limit"
+    assert not between, "no stale Move to the last limit's account"
+    assert again == ["Move to spare@example.com (60% left)", "Wait"]
+    assert switched.calls == []
+
+
+def test_a_second_move_from_the_menu_while_the_first_runs_does_nothing(
+    tmp_path: Path, script: Script, switched: Switched, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One move of a row at a time from its ⋯ menu, as from its view (review of #579, nit):
+    the switch would refuse the second, but it is not asked."""
+    row = one_coder(tmp_path, script, "limited")
+    running, gate = threading.Event(), threading.Event()
+
+    def held(*args: object, **kwargs: object) -> fleet_service.SwitchReceipt:
+        running.set()
+        assert gate.wait(10)
+        return switched(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fleet_service, "switch", held)
+
+    async def go(pilot: Pilot[None]) -> list[SwitchCall]:
+        app = fleet_app(pilot)
+        await settle(app)
+        agent_view_module.from_menu(app, row, agent_view_module.MOVE, OFFER)
+        # The first is under way (its switch called) before the second press.
+        assert await asyncio.get_running_loop().run_in_executor(None, running.wait, 10)
+        agent_view_module.from_menu(app, row, agent_view_module.MOVE, OFFER)
+        gate.set()
+        await settle(app)
+        return list(switched.calls)
+
+    assert drive(go) == [("prj_a", "coder-auth", "claude-code:3", CODER)]
+
+
+def test_a_working_agents_menu_has_no_move() -> None:
+    """Only a limited agent's menu offers a move: the others list what they did."""
+    row = status("prj_a", "coder-auth", "coder", "working")
+    ids = [
+        option.id
+        for option in agent_menu_module.agent_menu_options(row, pausable=True, rename_refusal=None)
+    ]
+    assert "move" not in ids and "wait" not in ids
+    limited = row.model_copy(update={"state": "limited"})
+    finding = agent_menu_module.agent_menu_options(limited, pausable=True, rename_refusal=None)
+    assert [(str(o.prompt), o.disabled) for o in finding[:2]] == [
+        (agent_menu_module.FINDING, True),
+        ("⏳ Wait", False),
+    ]
+    assert agent_menu_module.move_prompt(None, asked=True) == agent_menu_module.NO_ROOM
+
+
+def test_the_open_views_header_names_the_account_by_email_and_the_task_it_is_on(
+    tmp_path: Path, script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The header as it runs: the account by the name the Accounts page gives it (Q1: the
+    email, ``accounts_service.display_labels``) and the task the agent is on (M2: ``#14`` and
+    its title, ``agent_task``), each read off the UI thread and painted when it lands; no
+    pane id (Q2)."""
+    from aisquare.models import TeamTask
+    from aisquare.services import claude_accounts as accounts_service
+
+    row = one_coder(tmp_path, script)
+    on_two = row.model_copy(update={"agent": row.agent.model_copy(update={"account_slot": 2})})
+    script["prj_a"] = [script["prj_a"][0], on_two]
+    monkeypatch.setattr(accounts_service, "display_labels", lambda: {2: "me@example.com"})
+    now = datetime.now(tz=UTC)
+    task = TeamTask(
+        id="tsk_1",
+        project_id="prj_a",
+        number=14,
+        key="agent-view",
+        title="Agent view",
+        status="doing",
+        created_at=now,
+        updated_at=now,
+    )
+    asked: list[str] = []
+
+    def agent_task(status: FleetAgentStatus) -> TeamTask:
+        asked.append(status.agent.id)
+        return task
+
+    monkeypatch.setattr(agent_view_module, "agent_task", agent_task)
+
+    async def go(pilot: Pilot[None]) -> str:
+        app = fleet_app(pilot)
+        view = await open_view(pilot, app, CODER)
+        await settle(app)
+        return header_of(view)
+
+    header = drive(go)
+    assert "me@example.com" in header and "account 2" not in header, header
+    assert "#14 Agent view" in header, header
+    assert header.index("me@example.com") < header.index("#14"), "the task after the account"
+    assert "%" not in header, header
+    assert asked and set(asked) == {CODER}
