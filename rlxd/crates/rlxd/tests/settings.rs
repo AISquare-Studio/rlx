@@ -2,11 +2,10 @@
 //! home: `settings.get`, `settings.set`, `settings.list` and `settings.changed`. The
 //! checks are task #13's acceptance, by number.
 //!
-//! An app-role connection, the only one that may set `send_safety_mode`, needs gate
-//! pairing (5.1, task #10), which this rlxd does not have yet. So these tests use the
-//! test build's stand-in device ([`TestHome::with_test_gate`]): rlxd built with
-//! `debug-methods` and started with `RLXD_TEST_GATE_CREDENTIAL` takes an app-role hello
-//! carrying that credential. `release_build.rs` checks that a release rlxd ignores it.
+//! An app-role connection, the only one that may set `send_safety_mode`, is a device
+//! that `gate.pair` paired (5.1). These tests pair one for real, in gate dev mode
+//! (`rlxd serve --gate-dev-mode`, which relaxes only the peer identity check), and keep its
+//! credential in `<home>/test-gate-credential`, which `rlxd call --as-app` sends ([`pair`]).
 
 mod common;
 
@@ -44,6 +43,26 @@ fn connect(home: &TestHome) -> Connection {
     let hello = HelloParams::new(token.trim(), "settings-test", "0", Role::Cli).unwrap();
     assert!(connection.hello(&hello).unwrap().is_ok());
     connection
+}
+
+/// Pairs the device `device` with `home`'s rlxd, started in gate dev mode, through
+/// `gate.pair`, and keeps its credential where `rlxd call --as-app` finds it.
+fn pair(home: &TestHome, device: &str) {
+    let params = json!({ "device": device }).to_string();
+    let run = home.rlxd(&["call", "gate.pair", &params]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let data = run.data();
+    assert_eq!(data["device"], device, "{data}");
+    let credential = data["gate_credential"].as_str().unwrap();
+    std::fs::write(home.root().join("test-gate-credential"), credential).unwrap();
+}
+
+/// A home whose rlxd runs in gate dev mode, with `device` paired.
+fn paired_home(device: &str) -> TestHome {
+    let home = TestHome::new();
+    home.start_dev();
+    pair(&home, device);
+    home
 }
 
 fn log(home: &TestHome) -> String {
@@ -140,8 +159,7 @@ fn check_2_two_writes_from_the_same_version_the_first_wins_the_second_conflicts(
 
 #[test]
 fn check_3_only_an_app_role_connection_sets_send_safety_mode_and_its_change_is_logged() {
-    let home = TestHome::new().with_test_gate("Sam's MacBook");
-    home.start();
+    let home = paired_home("Sam MacBook");
     let auto = json!({"key": "send_safety_mode", "value": {"default": "auto"}});
     let cli = set(&home, false, auto.clone());
     assert_eq!(cli.code(), Some(1), "{cli:?}");
@@ -161,18 +179,18 @@ fn check_3_only_an_app_role_connection_sets_send_safety_mode_and_its_change_is_l
     let app = set(&home, true, auto);
     assert_eq!(app.code(), Some(0), "{app:?}");
     assert_eq!(app.data()["value"], json!({"default": "auto"}));
-    assert_eq!(app.data()["by_device"], "Sam's MacBook");
+    assert_eq!(app.data()["by_device"], "Sam MacBook");
     let events = home
         .rlxd(&["events", "--topics", "settings", "--since", &since])
         .lines();
     assert_eq!(
         events[0]["data"],
-        json!({"key": "send_safety_mode", "version": 1, "by_device": "Sam's MacBook"}),
+        json!({"key": "send_safety_mode", "version": 1, "by_device": "Sam MacBook"}),
         "the event names the device"
     );
     let log = log(&home);
     assert!(
-        log.contains(r#"send_safety_mode set, version 1, by device "Sam's MacBook""#)
+        log.contains(r#"send_safety_mode set, version 1, by device "Sam MacBook""#)
             && log.contains("(lowers send safety)"),
         "{log}"
     );
@@ -196,7 +214,7 @@ fn check_3_only_an_app_role_connection_sets_send_safety_mode_and_its_change_is_l
     assert!(!line.contains("lowers"), "{line}");
 
     // Any role may still read it, and set the other settings.
-    assert_eq!(get(&home, "send_safety_mode")["by_device"], "Sam's MacBook");
+    assert_eq!(get(&home, "send_safety_mode")["by_device"], "Sam MacBook");
     let theme = set(&home, false, json!({"key": "theme", "value": "rlx"}));
     assert_eq!(theme.code(), Some(0), "{theme:?}");
     assert!(
@@ -206,17 +224,17 @@ fn check_3_only_an_app_role_connection_sets_send_safety_mode_and_its_change_is_l
 }
 
 #[test]
-fn without_the_test_gate_an_app_role_hello_is_still_not_gate() {
+fn an_app_role_hello_without_a_paired_credential_is_not_gate() {
+    // A credential rlxd never minted.
     let home = TestHome::new();
     home.start();
     std::fs::write(home.root().join("test-gate-credential"), "anything").unwrap();
     let run = home.rlxd(&["call", "--as-app", "settings.list"]);
     assert_eq!(run.code(), Some(1), "{run:?}");
     assert_eq!(run.error_code(), "not_gate");
-    // And a wrong credential with the test gate on.
-    let gated = TestHome::new().with_test_gate("d");
-    gated.start();
-    let wrong = gated.rlxd(&[
+    // A wrong one, beside a device that is paired.
+    let paired = paired_home("d");
+    let wrong = paired.rlxd(&[
         "call",
         "--as-app",
         "--gate-credential",
@@ -224,12 +242,20 @@ fn without_the_test_gate_an_app_role_hello_is_still_not_gate() {
         "settings.list",
     ]);
     assert_eq!(wrong.error_code(), "not_gate");
+    // An unpaired device's credential: send_safety_mode can no longer be set with it.
+    assert_eq!(paired.rlxd(&["gate", "unpair", "d"]).code(), Some(0));
+    let unpaired = set(
+        &paired,
+        true,
+        json!({"key": "send_safety_mode", "value": {"default": "auto"}}),
+    );
+    assert_eq!(unpaired.error_code(), "not_gate", "{unpaired:?}");
+    assert_eq!(get(&paired, "send_safety_mode")["version"], 0);
 }
 
 #[test]
 fn check_4_values_survive_a_restart_in_a_private_file() {
-    let home = TestHome::new().with_test_gate("Sam's MacBook");
-    home.start();
+    let home = paired_home("Sam MacBook");
     set(&home, false, json!({"key": "theme", "value": "rlx_light"}));
     set(&home, false, json!({"key": "theme", "value": "rlx"}));
     set(
@@ -253,7 +279,7 @@ fn check_4_values_survive_a_restart_in_a_private_file() {
     assert_eq!(before["settings"].as_array().unwrap().len(), 4);
 
     assert_eq!(home.rlxd(&["stop"]).code(), Some(0));
-    home.start();
+    home.start_dev();
     let after = home.rlxd(&["call", "settings.list"]).data();
     assert_eq!(after, before, "every value, version and device, as it was");
     assert_eq!(get(&home, "theme")["version"], 2);

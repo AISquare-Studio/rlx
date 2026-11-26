@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "SettingsChanged",
-  "description": "`settings.changed`'s data, on the `settings` topic: a setting was set. Read its value\nwith `settings.get`.\n\n```json\n{\"key\": \"theme\", \"version\": 4, \"by_device\": \"Sam's MacBook\"}\n```",
+  "description": "`settings.changed`'s data, on the `settings` topic: a setting was set. Read its value\nwith `settings.get`.\n\n```json\n{\"key\": \"theme\", \"version\": 4, \"by_device\": \"Sam MacBook\"}\n```",
   "type": "object",
   "properties": {
     "by_device": {

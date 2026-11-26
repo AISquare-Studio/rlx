@@ -354,7 +354,7 @@ mod tests {
 
     const APP: Writer<'static> = Writer {
         app: true,
-        device: Some("Sam's MacBook"),
+        device: Some("Sam MacBook"),
         who: "app test",
     };
 
@@ -373,7 +373,7 @@ mod tests {
             .set(set("theme", json!("rlx_light")), APP, &bus)
             .unwrap();
         assert_eq!((one.version, two.version), (1, 2));
-        assert_eq!(two.by_device.as_deref(), Some("Sam's MacBook"));
+        assert_eq!(two.by_device.as_deref(), Some("Sam MacBook"));
         let again = Settings::open_at(dir.file());
         let read = again.get("theme").unwrap();
         assert_eq!(read.value, Some(json!("rlx_light")));
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(events[0]["data"], json!({"key": "theme", "version": 1}));
         assert_eq!(
             events[1]["data"],
-            json!({"key": "theme", "version": 2, "by_device": "Sam's MacBook"})
+            json!({"key": "theme", "version": 2, "by_device": "Sam MacBook"})
         );
     }
 
@@ -433,7 +433,7 @@ mod tests {
         let done = settings
             .set(set("send_safety_mode", mode), APP, &bus)
             .unwrap();
-        assert_eq!(done.by_device.as_deref(), Some("Sam's MacBook"));
+        assert_eq!(done.by_device.as_deref(), Some("Sam MacBook"));
         // Its other settings a cli connection still sets.
         assert!(settings.set(set("theme", json!("x")), CLI, &bus).is_ok());
     }

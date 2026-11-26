@@ -18,7 +18,7 @@
   "$defs": {
     "Setting": {
       "title": "Setting",
-      "description": "One setting, as `settings.get` and `settings.set` reply and `settings.list` lists it.\n\n```json\n{\"key\": \"theme\", \"version\": 4, \"value\": \"rlx_light\",\n \"updated_at\": \"2026-11-26T12:00:00.000Z\", \"by_device\": \"Sam's MacBook\"}\n```\n\nA key never set has version 0 and nothing else: the app's default applies, and for\n`send_safety_mode` that is `draft`.",
+      "description": "One setting, as `settings.get` and `settings.set` reply and `settings.list` lists it.\n\n```json\n{\"key\": \"theme\", \"version\": 4, \"value\": \"rlx_light\",\n \"updated_at\": \"2026-11-26T12:00:00.000Z\", \"by_device\": \"Sam MacBook\"}\n```\n\nA key never set has version 0 and nothing else: the app's default applies, and for\n`send_safety_mode` that is `draft`.",
       "type": "object",
       "properties": {
         "by_device": {

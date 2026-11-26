@@ -152,7 +152,7 @@ struct UncheckedList {
 ///
 /// ```json
 /// {"key": "theme", "version": 4, "value": "rlx_light",
-///  "updated_at": "2026-11-26T12:00:00.000Z", "by_device": "Sam's MacBook"}
+///  "updated_at": "2026-11-26T12:00:00.000Z", "by_device": "Sam MacBook"}
 /// ```
 ///
 /// A key never set has version 0 and nothing else: the app's default applies, and for
@@ -234,7 +234,7 @@ struct UncheckedSettingsList {
 /// with `settings.get`.
 ///
 /// ```json
-/// {"key": "theme", "version": 4, "by_device": "Sam's MacBook"}
+/// {"key": "theme", "version": 4, "by_device": "Sam MacBook"}
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "SettingsChanged")]

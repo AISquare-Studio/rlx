@@ -19,8 +19,8 @@ const COMMAND_LIMIT: Duration = Duration::from_secs(60);
 pub struct TestHome {
     root: PathBuf,
     claude: Option<PathBuf>,
+    envs: Vec<(String, String)>,
     binary: Option<PathBuf>,
-    env: Vec<(String, String)>,
 }
 
 /// What one `rlxd` command did.
@@ -92,26 +92,15 @@ impl TestHome {
         Self {
             root,
             claude: None,
+            envs: Vec::new(),
             binary: None,
-            env: Vec::new(),
         }
     }
 
     /// This home, every `rlxd` in it run with `name` set to `value`.
     pub fn with_env(mut self, name: &str, value: &str) -> Self {
-        self.env.push((name.to_owned(), value.to_owned()));
+        self.envs.push((name.to_owned(), value.to_owned()));
         self
-    }
-
-    /// This home, its rlxd taking an app-role hello as the paired device `device`: the
-    /// test build's stand-in for gate pairing. `rlxd call --as-app` sends the credential
-    /// it keeps in `<home>/test-gate-credential`, and rlxd is told the same one through
-    /// `RLXD_TEST_GATE_CREDENTIAL`. A release build ignores it.
-    pub fn with_test_gate(self, device: &str) -> Self {
-        let credential = format!("test-credential-{}", self.root.display().to_string().len());
-        std::fs::write(self.root.join("test-gate-credential"), &credential).unwrap();
-        self.with_env("RLXD_TEST_GATE_CREDENTIAL", &credential)
-            .with_env("RLXD_TEST_GATE_DEVICE", device)
     }
 
     /// This home, run by the rlxd at `binary` rather than this test build's.
@@ -133,6 +122,13 @@ impl TestHome {
     /// `rlxd args…` in this home.
     pub fn rlxd(&self, args: &[&str]) -> Run {
         self.rlxd_with_stdin(args, None)
+    }
+
+    /// `program args…` in this home, run to its end.
+    pub fn run_of(&self, program: &Path, args: &[&str]) -> Run {
+        let mut command = self.command_of(program, args);
+        command.stdin(Stdio::null());
+        run(command, None)
     }
 
     /// `rlxd args…` in this home, started and left running, with its stdout and stderr
@@ -177,9 +173,16 @@ impl TestHome {
             .binary
             .clone()
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_rlxd")));
-        let mut command = Command::new(binary);
+        self.command_of(&binary, args)
+    }
+
+    /// `program args…` in this home, as [`TestHome::command`] runs `rlxd`: for a copy of
+    /// rlxd, such as a signed helper, or a wrapper that runs it.
+    pub fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .args(args)
+            .envs(self.envs.iter().map(|(k, v)| (k, v)))
             .env("AISQUARE_HOME", &self.root)
             .env_remove("RLX_HOME")
             .env(
@@ -187,20 +190,64 @@ impl TestHome {
                 self.claude
                     .clone()
                     .unwrap_or_else(|| self.root.join("no-claude")),
-            )
-            .env_remove("RLXD_TEST_GATE_CREDENTIAL")
-            .env_remove("RLXD_TEST_GATE_DEVICE");
-        for (name, value) in &self.env {
-            command.env(name, value);
-        }
+            );
         command
     }
 
     /// `rlxd serve --detach`, which must succeed.
     pub fn start(&self) -> Value {
-        let run = self.rlxd(&["serve", "--detach"]);
+        self.start_with(&[])
+    }
+
+    /// `rlxd serve --detach --gate-dev-mode`, which must succeed.
+    pub fn start_dev(&self) -> Value {
+        self.start_with(&["--gate-dev-mode"])
+    }
+
+    /// `rlxd serve --detach flags…`, which must succeed.
+    pub fn start_with(&self, flags: &[&str]) -> Value {
+        let mut args = vec!["serve", "--detach"];
+        args.extend_from_slice(flags);
+        let run = self.rlxd(&args);
         assert_eq!(run.code(), Some(0), "{run:?}");
         run.data()
+    }
+
+    /// `rlxd stop`, which must succeed.
+    pub fn stop(&self) {
+        let run = self.rlxd(&["stop"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+    }
+
+    /// rlxd's log, as it is now.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.root.join("rlxd").join("logs").join("rlxd.log"))
+            .unwrap_or_default()
+    }
+
+    /// `<home>/rlxd/gate.json`.
+    pub fn gate_json(&self) -> PathBuf {
+        self.root.join("rlxd").join("gate.json")
+    }
+
+    /// The test client's kept credential, `<home>/test-gate-credential`.
+    pub fn test_credential(&self) -> Option<String> {
+        std::fs::read_to_string(self.root.join("test-gate-credential"))
+            .ok()
+            .map(|text| text.trim().to_owned())
+    }
+
+    /// The shared client token.
+    pub fn token(&self) -> String {
+        std::fs::read_to_string(self.root.join("rlxd").join("token"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    /// `rlxd call status`'s `clients.app`.
+    pub fn app_clients(&self) -> u64 {
+        self.status()["clients"]["app"].as_u64().unwrap()
     }
 
     /// `rlxd call status`'s data, which must be `ok`.

@@ -422,13 +422,29 @@ fn subscribe_refuses_unknown_topics_and_params_it_cannot_take() {
 }
 
 #[test]
-fn as_app_is_refused_with_not_gate_until_gate_pairing_lands() {
+fn as_app_streams_with_the_test_clients_gate_credential_and_is_refused_without() {
     let home = TestHome::new();
     home.start();
     let run = home.rlxd(&["events", "--as-app", "--since", "0"]);
     assert_eq!(run.code(), Some(1), "{run:?}");
     assert_eq!(run.stderr_code(), "not_gate");
     assert!(run.stdout.is_empty());
+    home.stop();
+
+    // `rlxd events --as-app` never pairs: it presents the credential that `rlxd call
+    // --as-app` kept when it paired, in gate dev mode.
+    let started = home.start_dev();
+    let run = home.rlxd(&["events", "--as-app", "--since", "0"]);
+    assert_eq!(run.stderr_code(), "not_gate", "{run:?}");
+    let run = home.rlxd(&["call", "--as-app", "status"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let run = home.rlxd(&["events", "--as-app", "--since", "0"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let events = run.lines();
+    assert_valid("event-list.json", &Value::Array(events.clone()));
+    let last = events.last().expect("this rlxd's daemon.started");
+    assert_eq!(last["type"], "daemon.started", "{events:?}");
+    assert_eq!(last["data"]["pid"], started["pid"]);
 }
 
 #[test]

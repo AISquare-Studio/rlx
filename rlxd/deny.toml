@@ -27,6 +27,13 @@ multiple-versions = "warn"
 # A `*` version is refused, except a path dependency inside this workspace.
 wildcards = "deny"
 allow-wildcard-paths = true
+# No Keychain or Security.framework crate (handoff 0.10.3, 4.3 and 5.1): rlxd reads no
+# credential store, and the gate's macOS peer check is raw FFI to Security.framework.
+deny = [
+    { crate = "security-framework", reason = "4.3: no Keychain crate; 5.1's check is raw FFI" },
+    { crate = "security-framework-sys", reason = "4.3: no Keychain crate; 5.1's check is raw FFI" },
+    { crate = "keyring", reason = "4.3: rlxd reads no credential store" },
+]
 
 [sources]
 # crates.io only: a crate from another registry or a git repository fails the check.

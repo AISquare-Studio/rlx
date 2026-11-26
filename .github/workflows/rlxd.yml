@@ -53,9 +53,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     # The registry's interop tests skip where neither this nor RLXD_BIN is set (the
     # Python suite, a checkout with no uv). Here they must run: a missing uv or rlxd
-    # fails them.
+    # fails them. Likewise the gate's peer checks that need `sudo -n` (Linux) or an
+    # administrator (Windows) skip elsewhere, and must run here.
     env:
       RLXD_INTEROP_REQUIRED: "1"
+      RLXD_GATE_PEER_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -88,14 +90,49 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      # The macOS gate tests sign a helper with a self-signed identity. macOS 15's
+      # codesign finds identities only in keychains on the search list, which the tests
+      # never write (tests/macos_signing). So this throwaway runner lists a keychain of
+      # its own, and hands it to them.
+      - name: A keychain for the gate's signing tests (macOS)
+        if: runner.os == 'macOS'
+        working-directory: .
+        run: |
+          kc="$RUNNER_TEMP/rlxd-gate-test.keychain-db"
+          security create-keychain -p rlxd-gate-test "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p rlxd-gate-test "$kc"
+          existing=$(security list-keychains -d user | tr -d '"')
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$kc" $existing
+          echo "RLXD_GATE_TEST_KEYCHAIN=$kc" >> "$GITHUB_ENV"
+          echo "RLXD_GATE_TEST_KEYCHAIN_PASSWORD=rlxd-gate-test" >> "$GITHUB_ENV"
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The gate's peer tests build only with the test-identity feature.
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --locked
 
+      # 5.1: the gate's peer identity check, against helpers signed or built with a test
+      # identity that only the gate-test-requirement feature lets rlxd accept. Each test
+      # compiles to nothing on the other OSes.
+      - name: cargo test, the gate's peer checks (gate-test-requirement)
+        run: >-
+          cargo test -p rlxd --features gate-test-requirement --locked
+          --test gate_peer_macos --test gate_peer_linux --test gate_peer_windows
+
       - name: cargo build --release
         run: cargo build --workspace --release --locked
+
+      # 5.1: the shipped build's compiled-in requirement, which nothing can replace.
+      - name: the gate's compiled-in requirement (macOS, release)
+        if: runner.os == 'macOS'
+        run: cargo test --release -p rlxd --locked --test gate_peer_macos_release
 
       # --release reuses the build above rather than building gen-schemas again.
       - name: schemas/v1 matches rlxd-proto

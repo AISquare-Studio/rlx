@@ -86,9 +86,11 @@
 //! Only rlxapp may hold the gate role (5.1), and rlxd checks two things:
 //!
 //! - **the credential.** A `hello {role: "app"}` carries `gate_credential`, which
-//!   `gate.pair` mints once, for a peer that passes the identity check. Pairing again
-//!   replaces it.
-//! - **the peer's identity**, where the OS allows it.
+//!   `gate.pair` mints for one named device, once, for a peer that passes the identity
+//!   check. The first pairing is trust on first use. Re-pairing a device needs its
+//!   current credential and replaces it; a new device, once one is paired, needs an
+//!   approval from a paired device (`gate.pair_answer`) or the user on the host.
+//! - **the peer's identity**, where the OS allows it, for a device paired locally.
 //!
 //! A `role: app` hello without a valid credential, or from a peer that fails the
 //! identity check, gets [`codes::NOT_GATE`], and it never counts as an app client. So
@@ -99,8 +101,8 @@
 //! first `rlxd call --as-app` pairs, keeps the credential in
 //! `$AISQUARE_HOME/test-gate-credential`, and later calls present it.
 //!
-//! This crate carries the field and the code. Minting, checking and refusing are the
-//! daemon's.
+//! This crate carries the field, the method names ([`methods`]) and the codes. Minting,
+//! checking and refusing are the daemon's.
 //!
 //! # Two sequences
 //!
