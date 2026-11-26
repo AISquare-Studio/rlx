@@ -72,9 +72,19 @@ def migrate_home(
     if found is None:
         dropped = None
         if drop_cache and not dry_run:
-            # The offer after a move says this (the owner's brief, must-handle 5).
+            # The offer after a move says this (the owner's brief, must-handle 5). Only on a
+            # quiet home: the cache holds each slot's scratch.
             size = home_migration.cache_size()
-            home_migration.drop_cache()
+            try:
+                home_migration.drop_cache()
+            except home_migration.MigrationRefused as exc:
+                named = "; ".join(exc.running)
+                _stopped(
+                    f"the cache was not dropped: {exc.reason}" + (f": {named}" if named else ""),
+                    error="cache_in_use",
+                    running=exc.running,
+                    rolled_back=True,
+                )
             dropped = home_migration.shown_size(size)
         if json_output:
             _echo_home_json(

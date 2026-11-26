@@ -588,10 +588,7 @@ def _names_the_default_home(environment: Mapping[str, str] | None = None) -> boo
     linked: laid out in place, the next rlx without the variable read ``~/.aisquare`` as an old
     home with no store, and made an empty one (the tester's blocker 3 on #31)."""
     named = paths.named_home(environment)
-    if named is None:
-        return False
-    default = Path.home() / paths.OLD_HOME_NAME
-    return os.path.realpath(named) == os.path.realpath(default)
+    return named is not None and paths._names_the_old_default(named, Path.home())
 
 
 def _without_home_variables() -> dict[str, str]:
@@ -744,8 +741,11 @@ def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None
             linked=journal.linked,
         )
         if drop_cache:
-            shutil.rmtree(journal.root / "cache", ignore_errors=True)
-            moved.cache_dropped = True
+            try:
+                _drop_the_cache()
+                moved.cache_dropped = True
+            except MigrationRefused as exc:
+                moved.notes.append(f"the cache was not dropped: {exc.reason}")
         return moved
 
 
@@ -1220,9 +1220,18 @@ def _link_old_home(journal: Journal) -> None:
     if journal.named:
         return
     old, new = Path(journal.old_root), Path(journal.new_root)
-    if os.path.lexists(old):
-        journal.linked = old.is_symlink() or _a_junction(old)
+    if os.path.lexists(old) and (old.is_symlink() or _a_junction(old)):
+        journal.linked = True
         return
+    if os.path.lexists(old):
+        # Made again between the root's rename and this step (an asq-statusline under the
+        # variable, say): kept aside, never deleted, and the link made (the tester's N2).
+        aside = old.with_name(f"{old.name}-made-during-the-move-{datetime.now(UTC):%Y%m%dT%H%M%S}")
+        _rename_once(old, aside)
+        journal.notes.append(
+            f"{paths.shown(old)} was made again during the move: what it held is kept at "
+            f"{paths.shown(aside)}"
+        )
     try:
         os.symlink(new, old, target_is_directory=True)
     except OSError:
@@ -1486,8 +1495,33 @@ def shown_size(size: int) -> str:
 
 
 def drop_cache() -> None:
-    """This home's cache removed: rlx makes it again as it needs it."""
-    shutil.rmtree(paths.cache_dir(), ignore_errors=True)
+    """:func:`_drop_the_cache`, for the commands: ``rlx move-home --drop-cache`` and the offer
+    after a move (``rlx upgrade``)."""
+    _drop_the_cache()
+
+
+def _drop_the_cache() -> None:
+    """This home's cache removed, only while nothing runs on the home: it holds each managed
+    slot's ``CLAUDE_CODE_TMPDIR`` (a live session's scratch, a background task's output, the
+    worktrees agents keep there), so it is dropped as the move is made, the rlx service stopped
+    first and started again after (the tester's blocker 2, round 4). Raises
+    :class:`MigrationRefused`, naming what runs, and drops nothing then."""
+    stopped = _stop_the_service()
+    try:
+        try:
+            running = running_on_home()
+        except Exception as exc:
+            raise MigrationRefused(
+                f"whether anything runs on the home could not be told ({_why_stopped(exc)})"
+            ) from exc
+        if running:
+            raise MigrationRefused(
+                f"the cache holds the scratch of what runs ({len(running)} thing(s))", running
+            )
+        shutil.rmtree(paths.cache_dir(), ignore_errors=True)
+    finally:
+        if stopped:
+            _start_the_service_again()
 
 
 def said_of_move(moved: Moved) -> list[str]:

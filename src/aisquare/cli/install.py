@@ -468,11 +468,16 @@ def _offer_the_cache(*, yes: bool) -> None:
     if yes or not _stdin_is_a_terminal():
         _say(
             f"· its cache ({shown}, regenerable) moved with it: "
-            f"`{prog.word()} move-home --drop-cache` drops it"
+            f"`{prog.word()} move-home --drop-cache` drops it while nothing runs on the home"
         )
         return
     if typer.confirm(f"Drop its cache ({shown})? rlx makes it again as it needs it", default=False):
-        home_migration.drop_cache()
+        try:
+            home_migration.drop_cache()
+        except home_migration.MigrationRefused as exc:
+            named = "; ".join(exc.running)
+            _say(f"✗ the cache was not dropped: {exc.reason}" + (f": {named}" if named else ""))
+            return
         _say(f"✓ the cache was dropped ({shown})")
 
 

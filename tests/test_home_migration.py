@@ -1711,3 +1711,144 @@ def test_the_plan_reads_what_runs_but_the_service(
     assert any(named in line for line in lifecycle._running_on_home())
     monkeypatch.setattr(home_migration, "running_on_home", lambda **k: ["x"] if k else ["y"])
     assert lifecycle._running_on_home() == ("x",), "asked with the service left out"
+
+
+# --- round 4 (the tester's #2271) ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["as-given", "resolved", "trailing-slash", "an-alias", "rlx-home-only", "aisquare-home-only"],
+)
+def test_after_the_move_a_variable_naming_aisquare_reads_every_slot_signed_in(
+    old_home: Path,
+    user_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: str,
+) -> None:
+    """Blocker 1: a shell rc, or a shell a fleet window started, keeps AISQUARE_HOME naming
+    ~/.aisquare. After the move it is the link, and the home read through it spelled each
+    slot's folder from ~/.aisquare: its Keychain name hashed a spelling no item has, and both
+    Claude slots read signed out. It is the default home: ~/.rlx, every path spelled from it."""
+    assert home_migration.move_home() is not None
+    old = user_home / ".aisquare"
+    alias = tmp_path / "alias"
+    alias.symlink_to(old)
+    value = {
+        "as-given": str(old),
+        "resolved": os.path.realpath(old),
+        "trailing-slash": f"{old}/",
+        "an-alias": str(alias),
+        "rlx-home-only": str(old),
+        "aisquare-home-only": str(old),
+    }[spelling]
+    if spelling != "aisquare-home-only":
+        monkeypatch.setenv(paths.RLX_HOME_ENV, value)
+    if spelling != "rlx-home-only":
+        monkeypatch.setenv(paths.HOME_ENV_VAR, value)
+    accounts_core.forget_keychain_reads()
+
+    assert paths.home_of() == (user_home / ".rlx", paths.NEW)
+    slots = accounts_core.all_managed_accounts()
+    assert {a.slot for a in slots} == {2, 3, 4}
+    for account in slots:
+        assert account.config_dir.is_relative_to(user_home / ".rlx"), account
+        assert accounts_core.signed_in(account, fresh=True), account
+
+
+def test_before_the_move_a_variable_naming_aisquare_reads_it_as_it_is(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(paths.HOME_ENV_VAR, str(old_home))
+
+    assert paths.home_of() == (old_home, paths.OLD)
+    assert paths.db_path() == old_home / paths.OLD_STORE
+
+
+def test_the_cache_is_never_dropped_while_anything_runs_on_the_home(
+    old_home: Path, user_home: Path
+) -> None:
+    """Blocker 2: after the move, `move-home --drop-cache` (which the upgrade tells a person to
+    run later) dropped the cache with no look at what runs, and the cache holds each slot's
+    CLAUDE_CODE_TMPDIR: a live session's scratch went with it."""
+    assert home_migration.move_home() is not None
+    scratch = accounts_core.tmp_root() / "2" / "session" / "output.txt"
+    scratch.parent.mkdir(parents=True)
+    scratch.write_text("a background task's output", encoding="utf-8")
+    named = _an_instance(user_home / ".rlx")
+
+    refused = CliRunner().invoke(app, ["move-home", "--drop-cache"])
+
+    assert refused.exit_code == 1
+    said = refused.output.replace("\n", " ")
+    assert "the cache was not dropped" in said and named in said
+    assert scratch.is_file(), "the live session's scratch is still there"
+    for name in os.listdir(paths.instances_dir()):
+        (paths.instances_dir() / name).unlink()
+    dropped = CliRunner().invoke(app, ["move-home", "--drop-cache"])
+    assert dropped.exit_code == 0, dropped.output
+    assert not scratch.exists()
+
+
+def test_the_offer_after_a_move_refuses_too_while_anything_runs(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aisquare.cli import install as install_cli
+
+    assert home_migration.move_home() is not None
+    scratch = accounts_core.tmp_root() / "2" / "keep.txt"
+    scratch.write_text("x" * 64, encoding="utf-8")
+    named = _an_instance(user_home / ".rlx")
+    said: list[str] = []
+    monkeypatch.setattr(install_cli, "_stdin_is_a_terminal", lambda: True)
+    monkeypatch.setattr(install_cli.typer, "confirm", lambda *a, **k: True)
+    monkeypatch.setattr(install_cli, "_say", said.append)
+
+    install_cli._offer_the_cache(yes=False)
+
+    assert any("the cache was not dropped" in line and named in line for line in said), said
+    assert scratch.is_file()
+
+
+def test_aisquare_made_again_before_the_link_is_kept_aside_and_the_link_made(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N2: something made ~/.aisquare again between the root's rename and the link (an
+    asq-statusline under the variable); the move finished unlinked, and then read as both homes
+    being there."""
+    real = home_migration._MOVE_STEPS["link"]
+
+    def made_again(journal: home_migration.Journal) -> None:
+        stray = user_home / ".aisquare" / "cache" / "statusline" / "x.json"
+        stray.parent.mkdir(parents=True)
+        stray.write_text("{}", encoding="utf-8")
+        real(journal)
+
+    monkeypatch.setitem(home_migration._MOVE_STEPS, "link", made_again)
+
+    moved = home_migration.move_home()
+
+    assert moved is not None and moved.linked
+    assert (user_home / ".aisquare").is_symlink()
+    kept = [p for p in user_home.iterdir() if p.name.startswith(".aisquare-made-during-the-move")]
+    assert len(kept) == 1 and (kept[0] / "cache" / "statusline" / "x.json").is_file()
+    assert any("was made again during the move" in note for note in moved.notes)
+    assert home_migration.planned_move() is None
+
+
+def test_upgrade_check_on_a_home_part_way_through_its_move_says_so(
+    old_home: Path, user_home: Path, installed: Installed
+) -> None:
+    """N4: it said the home would move, as of a home not begun."""
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "rewrite", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+
+    result = CliRunner().invoke(app, ["upgrade", "--check"])
+
+    assert result.exit_code == 0, result.output
+    assert "part-way: a run of the move stopped and the next finishes it" in result.output.replace(
+        "\n", " "
+    )

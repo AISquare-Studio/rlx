@@ -432,9 +432,20 @@ def home_of(
     it is laid out (the module's docstring has the rule). ``user_home`` is that process's home
     directory, when it is not this one's (``core.instance_scan``)."""
     named = named_home(environment)
-    if named is not None:
-        return named, layout_of(named)
     base = Path.home() if user_home is None else user_home
+    if named is not None:
+        if not _names_the_old_default(named, base):
+            return named, layout_of(named)
+        # A variable naming ~/.aisquare itself, by any spelling (a link to it, a trailing slash,
+        # resolved): the default home, read as without the variable (#31; the fleet hands its
+        # windows the home by both names, and a shell rc may keep the old one). Once the move
+        # made ~/.rlx it is that home, every path spelled from it, so each slot's Keychain item
+        # is named as the move copied it (the tester's blocker 1, round 4). Before, ~/.aisquare
+        # keeps the layout its contents say, as a named home is read.
+        if (base / HOME_NAME).exists():
+            return base / HOME_NAME, NEW
+        old = base / OLD_HOME_NAME
+        return old, layout_of(old)
     new = base / HOME_NAME
     if new.exists():
         return new, NEW
@@ -442,6 +453,18 @@ def home_of(
     if old.exists():
         return old, OLD
     return new, NEW
+
+
+def _names_the_old_default(named: Path, base: Path) -> bool:
+    """Whether ``named`` is ``base``'s ``~/.aisquare``: the same folder (two stats, links
+    followed, so a link to it, an alias or a trailing slash is it, and so is ``~/.rlx`` once
+    ``~/.aisquare`` links to it), or, when either is not there, the same spelling resolved."""
+    old = base / OLD_HOME_NAME
+    try:
+        one, other = os.stat(named), os.stat(old)
+    except OSError:
+        return os.path.abspath(named) == os.path.abspath(old)
+    return (one.st_dev, one.st_ino) == (other.st_dev, other.st_ino)
 
 
 def layout_of(root: Path) -> Layout:
@@ -1126,9 +1149,7 @@ def _default_home_environment() -> dict[str, str] | None:
     """This process's environment without the home variables when they name ``~/.aisquare``
     itself (the fleet hands its windows the home by both names, resolved); ``None`` otherwise."""
     named = named_home()
-    if named is None:
-        return None
-    if os.path.realpath(named) != os.path.realpath(Path.home() / OLD_HOME_NAME):
+    if named is None or not _names_the_old_default(named, Path.home()):
         return None
     return {k: v for k, v in os.environ.items() if k not in (RLX_HOME_ENV, HOME_ENV_VAR)}
 

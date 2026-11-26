@@ -814,7 +814,12 @@ def planned_home_move() -> tuple[str | None, str | None]:
         found = home_migration.planned_move()
     except home_migration.MigrationRefused as exc:
         return None, exc.reason
-    return (found.shown if found is not None else None), None
+    if found is None:
+        return None, None
+    if found.journal is not None:
+        # A run of the move stopped part-way (the tester's N4): the next one finishes it.
+        return f"{found.shown}, part-way: a run of the move stopped and the next finishes it", None
+    return found.shown, None
 
 
 def _running_on_home() -> tuple[str, ...]:
