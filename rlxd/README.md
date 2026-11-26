@@ -427,7 +427,13 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
   local`: no remote forwards of either kind, and no listening.
 - **An rlxd that does not run** shows through the channel as a connection that closes
   before `hello`'s reply: sshd could not connect to the socket, and ssh says `connect
-  failed`. Run `rlxd here --start` first, and again when a connection closes.
+  failed`. Run `rlxd here --start` first, and again when a connection closes. `rlxd
+  call` and `rlxd events` with `--socket` say so: `disconnected` (exit 1), with a hint
+  to start the host's rlxd. When nothing listens at `--socket` at all, as when the
+  forward is down, it is `not_running` (exit 3), with a hint to check the forward.
+- **A missing token.** With `--socket` or `--token-file`, a token file that can't be
+  read is `unauthorized` (exit 1), whatever runs in this home. Only the home's own
+  token file, missing where no rlxd runs, reads as `not_running`.
 - **The gate** checks a forwarded connection as it checks any other, on the short socket
   too: the token, then for the app role the credential and the peer. A forwarded
   connection's peer is sshd, not rlx's app, so outside gate dev mode it can neither pair

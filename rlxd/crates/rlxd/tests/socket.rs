@@ -216,6 +216,70 @@ fn call_socket_where_nothing_listens_is_not_running() {
     );
 }
 
+#[test]
+fn a_missing_token_file_is_unauthorized_whatever_this_home_runs() {
+    // Review #2460: "not running" for a missing token is for the home's own token file
+    // only, as no rlxd may ever have run here. A --token-file that is missing, with
+    // --socket or without, says so as it is.
+    let served = TestHome::new();
+    served.start();
+    let endpoint = Home::at(served.root()).endpoint();
+    let client = TestHome::new();
+    let missing = client.root().join("no-such-token").display().to_string();
+    for args in [
+        &[
+            "call",
+            "--socket",
+            &endpoint,
+            "--token-file",
+            &missing,
+            "status",
+        ][..],
+        &["call", "--token-file", &missing, "status"],
+    ] {
+        let run = client.rlxd(args);
+        assert_eq!(run.code(), Some(1), "{args:?}: {run:?}");
+        assert_eq!(run.error_code(), "unauthorized", "{args:?}");
+        let message = text(&run.json()["error"]["message"]).to_owned();
+        assert!(message.contains("cannot read the token"), "{message}");
+    }
+    // The home's own token, missing with no rlxd here: not running, as before.
+    let run = client.rlxd(&["call", "status"]);
+    assert_eq!(run.code(), Some(3), "{run:?}");
+    assert_eq!(run.error_code(), "not_running");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forward_whose_host_runs_no_rlxd_says_to_start_it_there() {
+    // ssh takes every connection to a forward's local socket, then closes it when sshd
+    // can't reach the host's socket, as when no rlxd runs there. A stand-in that does
+    // the same: every connection taken, then dropped unanswered.
+    let client = TestHome::new();
+    let forward = client.root().join("fwd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&forward).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    let forward = forward.display().to_string();
+    let run = client.rlxd(&["call", "--socket", &forward, "--token", "t", "status"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "disconnected");
+    let hint = text(&run.json()["error"]["hint"]).to_owned();
+    assert!(
+        hint.contains("host's rlxd") && hint.contains("rlxd here --start"),
+        "{hint}"
+    );
+    let run = client.rlxd(&[
+        "events", "--socket", &forward, "--token", "t", "--since", "0",
+    ]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.stderr_code(), "disconnected");
+    assert!(run.stderr.contains("rlxd here --start"), "{run:?}");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_home_whose_path_is_not_utf8_reaches_its_rlxd() {
