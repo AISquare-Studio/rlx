@@ -153,10 +153,10 @@ so a crash at any step is finished by the next run:
 
 Before step 8, the move can be rolled back whole: the link removed, each rewritten file put back,
 the store restored from its backup, each rename reversed, and the Keychain copies deleted. A
-failure at any of those steps does this by itself. After a crash, `rlx home migrate --rollback`
+failure at any of those steps does this by itself. After a crash, `rlx move-home --rollback`
 does it. From step 8 on, the move can only be finished.
 
-The cache moves with the home, as a rename costs nothing. `rlx home migrate --drop-cache` drops
+The cache moves with the home, as a rename costs nothing. `rlx move-home --drop-cache` drops
 it once the move is done: rlx makes it again as it needs it.
 
 ### What it leaves

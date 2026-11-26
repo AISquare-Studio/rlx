@@ -1,4 +1,4 @@
-"""``rlx home migrate``: move a home from before 0.10.2 to ``~/.rlx``, in the new layout (#31).
+"""``rlx move-home``: move a home from before 0.10.2 to ``~/.rlx``, in the new layout (#31).
 
 Hidden: ``rlx upgrade`` (and the app's Update, which runs it) is the way a person moves the home,
 and runs this in the new install. The work is ``services.home_migration``; this module parses,
@@ -18,8 +18,6 @@ from aisquare.core.console import stdout_console
 from aisquare.core.state import get_state
 from aisquare.services import home_migration
 
-app = typer.Typer(help="rlx's home.", no_args_is_help=True)
-
 
 def _echo_home_json(payload: dict[str, Any]) -> None:
     typer.echo(json.dumps(payload, separators=(",", ":")))
@@ -29,7 +27,6 @@ def _say_home(line: str) -> None:
     stdout_console().print(line, markup=False, highlight=False)
 
 
-@app.command("migrate")
 def migrate_home(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Say what would move, and move nothing.")

@@ -3,7 +3,7 @@
 it out.
 
 WHEN: only when asked, by ``rlx upgrade`` (and the app's Update, which runs it) and its hidden
-``rlx home migrate``; never on an ordinary command's start (the manager's condition 1 on #31).
+``rlx move-home``; never on an ordinary command's start (the manager's condition 1 on #31).
 An old home keeps working as it is until then (H1).
 
 ONLY WHEN THE HOME IS QUIET (:func:`running_on_home`): no rlx on it, no fleet agent of any of
@@ -522,7 +522,7 @@ class Moved:
 
     def as_json(self) -> dict[str, Any]:
         """The move as ``--json`` reports it (``rlx upgrade`` reads it back from the new
-        install's ``home migrate``)."""
+        install's ``move-home``)."""
         return {
             "moved": True,
             "old_home": str(self.old_root),
@@ -1159,7 +1159,7 @@ def _restore_the_store(journal: Journal) -> None:
 
 
 def said_of_move(moved: Moved) -> list[str]:
-    """What a move did, line by line, for a person (``rlx upgrade``, ``rlx home migrate``)."""
+    """What a move did, line by line, for a person (``rlx upgrade``, ``rlx move-home``)."""
     lines = [f"the home moved: {paths.shown(moved.old_root)} → {paths.shown(moved.new_root)}"]
     if moved.named:
         lines = [f"the home was laid out anew, in place: {paths.shown(moved.new_root)}"]

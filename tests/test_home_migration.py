@@ -299,7 +299,7 @@ def test_an_old_home_moves_to_rlx_in_the_new_layout_signed_in_sealed_and_linked(
     }
     assert _accepted() == {"agt-captain", "agt-coder"}  # the stray's project root is not its own
 
-    result = CliRunner().invoke(app, ["home", "migrate"])
+    result = CliRunner().invoke(app, ["move-home"])
 
     assert result.exit_code == 0, result.output
     new = user_home / ".rlx"
@@ -613,7 +613,7 @@ def test_a_live_instance_watcher_or_pane_refuses_naming_it_and_nothing_moves(
         with pytest.raises(home_migration.MigrationRefused) as refused:
             home_migration.move_home()
         assert any(named in line for line in refused.value.running), refused.value.running
-        result = CliRunner().invoke(app, ["home", "migrate"])
+        result = CliRunner().invoke(app, ["move-home"])
         assert result.exit_code == 1 and named in result.output.replace("\n", " ")
     finally:
         for fd in held:
@@ -834,7 +834,7 @@ def test_no_ordinary_command_or_hook_moves_an_old_home(old_home: Path, user_home
 def test_a_dry_run_says_what_would_move_and_moves_nothing(old_home: Path, user_home: Path) -> None:
     before = _tree(old_home)
 
-    result = CliRunner().invoke(app, ["home", "migrate", "--dry-run"])
+    result = CliRunner().invoke(app, ["move-home", "--dry-run"])
 
     assert result.exit_code == 0, result.output
     assert "~/.aisquare → ~/.rlx" in result.output
@@ -844,7 +844,7 @@ def test_a_dry_run_says_what_would_move_and_moves_nothing(old_home: Path, user_h
 def test_a_home_in_the_new_layout_has_nothing_to_move(user_home: Path) -> None:
     (user_home / ".rlx").mkdir()
 
-    result = CliRunner().invoke(app, ["--json", "home", "migrate"])
+    result = CliRunner().invoke(app, ["--json", "move-home"])
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["moved"] is False
@@ -866,7 +866,7 @@ class Installed:
 @pytest.fixture
 def installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Installed]:
     """A uv tool install of 0.10.2, the release PyPI's latest, with uv, PyPI and the new
-    install's processes as fakes: the new install's ``home migrate`` is this one's, run here."""
+    install's processes as fakes: the new install's ``move-home`` is this one's, run here."""
     from tests.test_lifecycle_upgrade import _OURS_PINNED, _facts, _prefix, _receipt
 
     prefix = _prefix(tmp_path / "uv", _receipt(_OURS_PINNED))
@@ -880,7 +880,7 @@ def installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Insta
         world.captured.append(list(argv))
         if argv[-1] == "--version":
             return Captured(0, f"aisquare {world.latest}\n")
-        if list(argv[1:]) == ["--json", "home", "migrate"]:
+        if list(argv[1:]) == ["--json", "move-home"]:
             # A process of its own in a real upgrade: here, the CLI's state put back after it.
             outer = get_state()
             done = CliRunner().invoke(app, list(argv[1:]))
@@ -922,7 +922,7 @@ def test_an_upgrade_moves_the_home_in_the_new_install_then_rewrites_its_hooks_th
     from tests.test_lifecycle_upgrade import _hooked
 
     _hooked(_slot(2), installed.script)  # this install's hooks
-    # The new install's `home migrate` is this process (the fake), whose hook refresh names
+    # The new install's `move-home` is this process (the fake), whose hook refresh names
     # this process's rlx: the new install's own, as it is in a real upgrade.
     monkeypatch.setattr(lifecycle, "runs_this_install", lambda binary, found: True)
     installed.latest = "0.10.3"
@@ -934,7 +934,7 @@ def test_an_upgrade_moves_the_home_in_the_new_install_then_rewrites_its_hooks_th
 
     assert result.exit_code == 0, result.output
     verbs = [argv[1:] for argv in installed.captured]
-    moved_at = verbs.index(["--json", "home", "migrate"])
+    moved_at = verbs.index(["--json", "move-home"])
     assert verbs[moved_at - 1] == ["--version"] or verbs[moved_at - 1][-1] == "--version"
     refreshes = [argv for argv in verbs[moved_at + 1 :] if "refresh-hooks" in argv]
     assert refreshes, verbs

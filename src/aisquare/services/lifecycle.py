@@ -302,7 +302,7 @@ def settings_name(agent: str) -> str:
 VERSION_CHECK_TIMEOUT_SECONDS = 60.0
 HOOK_REFRESH_TIMEOUT_SECONDS = 120.0
 HOME_MOVE_TIMEOUT_SECONDS = 600.0
-"""How long the new install's move of an old home may take (``rlx home migrate``, #31): renames
+"""How long the new install's move of an old home may take (``rlx move-home``, #31): renames
 and one store transaction, but a store of years and every slot's Keychain item."""
 
 
@@ -650,7 +650,7 @@ class HomeMove:
     rolled_back: bool = True
     """Whether a move that stopped left the home as it was (else the next run finishes it)."""
     payload: dict[str, Any] | None = None
-    """What ``home migrate --json`` answered, for ``upgrade --json``."""
+    """What ``move-home --json`` answered, for ``upgrade --json``."""
 
 
 @dataclass(frozen=True)
@@ -832,14 +832,14 @@ def _home_refusal_text(reason: str, running: Sequence[str]) -> str:
 
 
 def move_home_in(script: Path) -> HomeMove:
-    """Move an old home by the NEW install, in a process of its own: ``<script> --json home
-    migrate``, as the hook refresh runs it (:func:`_refresh`). Its answer is one JSON object;
+    """Move an old home by the NEW install, in a process of its own: ``<script> --json
+    move-home``, as the hook refresh runs it (:func:`_refresh`). Its answer is one JSON object;
     anything else is said as the problem, and the home is then whatever that run left, which
     its journal says (a re-run finishes or rolls it back)."""
     from aisquare.services import home_migration
 
     answer = install_route.run_captured(
-        [str(script), "--json", "home", "migrate"], timeout=HOME_MOVE_TIMEOUT_SECONDS
+        [str(script), "--json", "move-home"], timeout=HOME_MOVE_TIMEOUT_SECONDS
     )
     if answer.error is not None:
         return HomeMove(False, problem=f"the new install could not move it ({answer.error})")
