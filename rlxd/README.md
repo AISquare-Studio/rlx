@@ -109,6 +109,11 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     says `gate: "dev mode (unsigned app accepted)"` instead of `"signed app only"`. No
     config key, variable or flag changes the identity a release build expects.
 - **Logs** are `<home>/rlxd/logs/rlxd.log`, rotated at 5 MiB, three kept.
+- **Detached** (`--detach`, and the rlxd `rlxd here --start` starts), rlxd holds nothing
+  of the process that started it: its stdin, stdout and stderr are null (it logs to its
+  file), and on macOS and Linux it first closes every other descriptor it inherited. So
+  a caller that reads its starter's output to the end, such as `rlxd here --start | jq`,
+  is never left waiting for rlxd to stop.
 - **Exit codes:** 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage
   error, 3 when rlxd is not running for the home. `rlxd here` also exits 3, and 4, with
   an `ok` envelope: see below. `rlxd events` exits 4 when its `--timeout` runs out.
@@ -345,6 +350,11 @@ cd .. && RLXD_BIN=rlxd/target/release/rlxd uv run --extra dev pytest tests/test_
 that touches `rlxd/`, `pyproject.toml`, the workflow, or the registry's Python side
 (`src/aisquare/core/{daemons,registry,locking}.py`, `tests/test_daemon_registry.py`),
 for every push to `main` or `rc/**`, and by hand.
+
+`tests/stress-here.sh [RUNS]`, which CI does not run, runs `cargo test -p rlxd --test
+here` RUNS times (30 by default), each within a time limit, and fails if a run fails,
+hangs, or leaves an rlxd running. It builds and tests, so on a shared machine run it
+through the memory gate: `rlx fleet gate -- tests/stress-here.sh 30`.
 
 ## One version number
 
