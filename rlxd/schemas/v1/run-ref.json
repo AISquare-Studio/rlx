@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunRef",
+  "description": "One run, by id: `run.start`'s reply, and the params of `run.cancel` and `run.get`.\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\"}\n```",
+  "type": "object",
+  "properties": {
+    "run_id": {
+      "description": "The run's id.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "required": [
+    "run_id"
+  ]
+}

@@ -6,7 +6,9 @@
 //!   `unknown_method`;
 //! - handoff 0.10.3 rev 7, 5.1, "No dev mode in a release build": no `--gate-dev-mode`
 //!   flag, `gate.dev_mode` in the config ignored, no marker in `rlxd --version` or in
-//!   status, and not even the feature's name in the binary.
+//!   status, and not even the feature's name in the binary;
+//! - no `fake-claude`: the runner tests' stand-in for Claude Code is a binary only the
+//!   test-only `fake-claude` feature builds.
 
 mod common;
 
@@ -87,4 +89,36 @@ fn a_release_build_has_no_gate_dev_mode() {
     let status = test_build.status();
     assert_eq!(status["gate"], "dev mode (unsigned app accepted)");
     assert_eq!(status["dev_features"], serde_json::json!(["gate-dev-mode"]));
+}
+
+#[test]
+fn a_release_build_has_no_fake_claude() {
+    // Every binary of the package that a release build makes, as `cargo build --release
+    // -p rlxd` makes them: fake-claude needs the test-only feature, so it is not one.
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--package",
+            "rlxd",
+            "--bins",
+            "--message-format=json-render-diagnostics",
+        ])
+        .current_dir(common::workspace())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("cargo runs");
+    assert!(output.status.success(), "cargo build --release failed");
+    let built: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact")
+        .filter(|message| message["executable"].is_string())
+        .filter_map(|message| message["target"]["name"].as_str().map(str::to_owned))
+        .collect();
+    assert!(built.iter().any(|name| name == "rlxd"), "{built:?}");
+    assert!(!built.iter().any(|name| name == "fake-claude"), "{built:?}");
 }

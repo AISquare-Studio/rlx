@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpaceEraseData",
+  "description": "`space.erase`'s reply: every path it removed. It refuses with `runs_live` while a run\nin the space is queued or running, and removes nothing then.\n\n```json\n{\"removed\": [\"/Users/u/.aisquare/spaces/default\",\n             \"/Users/u/.claude/projects/-Users-u--aisquare-spaces-default/<run_id>.jsonl\"]}\n```",
+  "type": "object",
+  "properties": {
+    "removed": {
+      "description": "The paths removed: the space's folder, its runs' session files, and rlxd's records\nof its runs.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "removed"
+  ]
+}
