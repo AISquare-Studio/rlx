@@ -69,7 +69,8 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     binary), and approves only the one `--request-id` names. A request whose client
     leaves is withdrawn, and a credential whose reply can't be delivered is revoked, so
     no device is left paired with a credential nobody received; an undelivered
-    re-pairing keeps the device's old credential. Device names are NFKC-normalized and
+    re-pairing keeps the device's old credential. That holds when rlxd stops with the
+    reply still unsent too. Device names are NFKC-normalized and
     trimmed, then may hold only spaces, and letters, digits, `.`, `_` and `-` that UTS
     #39 allows in identifiers (no combining letters or fillers), in one script, and
     must not look blank. Names that only look alike (by their UTS #39 skeleton, case and spacing

@@ -54,6 +54,9 @@ const START_WAIT: Duration = Duration::from_secs(15);
 /// How long a stopping rlxd gives its connections to finish.
 const FINISH_WAIT: Duration = Duration::from_secs(3);
 
+/// How long rlxd waits, at a stop, for the connections it aborted to be dropped.
+const ABORT_WAIT: Duration = Duration::from_secs(1);
+
 /// `rlxd serve`, in the foreground: logs to stderr too, unless `background`. With
 /// `gate_dev_mode`, or `gate.dev_mode` in the config, an unsigned app may be the gate.
 pub fn serve(background: bool, gate_dev_mode: bool) -> ExitCode {
@@ -200,6 +203,12 @@ async fn serve_until_stopped(
             FINISH_WAIT.as_secs()
         );
         connections.abort_all();
+        // An aborted connection drops what it was doing, which undoes a pairing whose
+        // reply it was still sending (`server::send_paired`): let that happen first.
+        let dropped = async { while connections.join_next().await.is_some() {} };
+        if tokio::time::timeout(ABORT_WAIT, dropped).await.is_err() {
+            warning!("connections still not closed after their abort");
+        }
     }
     daemon.flush();
     daemon.bus().close();

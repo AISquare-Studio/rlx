@@ -1128,3 +1128,84 @@ fn combining_letters_and_fillers_cannot_dodge_the_revoked_name_rule() {
     assert_eq!(home.rlxd(&["gate", "pair"]).data()["requests"], json!([]));
     assert_eq!(devices(&home).len(), 1, "only the test client");
 }
+
+/// A credential's SHA-256, as gate.json keeps it.
+fn sha256_of(credential: &str) -> String {
+    Sha256::digest(credential.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// macOS only: there a write waits whole once less than it is free in the send buffer,
+/// so a reply can be left stuck exactly. Linux waits only once its own accounting of
+/// the queued data reaches the buffer, which no reply size hits reliably; there the
+/// unit test `server::tests::a_pairing_whose_reply_is_dropped_mid_send_is_undone`
+/// covers the undo.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_re_pairing_reply_stuck_when_rlxd_stops_leaves_the_old_credential_paired() {
+    // Review #2068, r3 minor 3: rlxd's stop aborted a connection still sending a
+    // re-pairing's reply, so the new credential, which nobody received, stayed paired
+    // and the old one was locked out.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let home = TestHome::new();
+    home.start_dev();
+    let c1 = pair_test_client(&home);
+    let stream = UnixStream::connect(home.root().join("run").join("rlxd.sock")).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut ask = |frame: Value| {
+        writer.write_all(format!("{frame}\n").as_bytes()).unwrap();
+    };
+    let mut reply = String::new();
+    ask(json!({"id": 1, "method": "hello", "params": {
+        "token": home.token(), "protocol_version": 1, "client": "stuck",
+        "client_version": "0", "role": "app", "capabilities": [],
+        "gate_credential": c1,
+    }}));
+    reader.read_line(&mut reply).unwrap();
+    assert!(reply.contains(r#""ok":true"#), "{reply}");
+    // An unknown method's reply says the method's name: its length, besides the name.
+    reply.clear();
+    ask(json!({"id": 2, "method": "x"}));
+    reader.read_line(&mut reply).unwrap();
+    let besides_the_name = reply.len() - 1;
+    // Every reply read, the send buffer is free. One unread reply fills it to 64 bytes
+    // short, so the re-pairing's reply, about 165 bytes, waits.
+    let sendspace: usize = String::from_utf8(
+        std::process::Command::new("sysctl")
+            .args(["-n", "net.local.stream.sendspace"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let name = "x".repeat(sendspace - 64 - besides_the_name);
+    ask(json!({"id": 3, "method": name}));
+    ask(json!({"id": 4, "method": "gate.pair", "params": {"gate_credential": c1}}));
+    let old = sha256_of(&c1);
+    eventually("the re-pairing is written", || {
+        !std::fs::read_to_string(home.gate_json())
+            .unwrap()
+            .contains(&old)
+    });
+    home.stop();
+    assert!(
+        home.log().contains("never reached its client"),
+        "{}",
+        home.log()
+    );
+    assert!(
+        std::fs::read_to_string(home.gate_json())
+            .unwrap()
+            .contains(&old)
+    );
+    home.start_dev();
+    assert!(App::connect(&home, &c1).is_ok(), "the old credential works");
+    drop(reader);
+}
