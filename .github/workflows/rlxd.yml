@@ -209,8 +209,9 @@ jobs:
             and .data.pid == $pid and .data.socket == ($home + "/.aisquare/run/rlxd.sock")
             and .data.protocol_versions == [1]' running-ssh.json
 
-          # The README's command, as an app sends it: rlxd found in ~/.local/bin, which a
-          # non-login session's PATH lacks.
+          # The README's command, as an app sends it: rlxd found in ~/.local/bin by its
+          # absolute path, as on a host whose non-login PATH lacks that folder (this
+          # runner's has it, so the command runs it by path, not by name).
           snippet=$(python3 -c 'import re,sys; print(re.search(r"\n(sh -c .for d in .*?exit 127.)\n", open(sys.argv[1]).read()).group(1))' rlxd/README.md)
           mkdir -p ~/.local/bin
           cp "$rlxd" ~/.local/bin/rlxd
