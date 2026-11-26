@@ -31,7 +31,7 @@ fn serve_detach_starts_rlxd_and_status_describes_it() {
     assert_eq!(data["platform"], std::env::consts::OS);
     assert_eq!(data["protocol_version"], 1);
     assert!(data["capabilities"].is_array());
-    assert_eq!(data["seq"], 0);
+    assert_eq!(data["seq"], 1, "daemon.started, a new home's first event");
     assert_eq!(data["gate"], "signed app only");
     assert_eq!(data["paths"]["home"], home.root().display().to_string());
     assert_valid("status-reply.json", data);

@@ -20,6 +20,7 @@ pub struct TestHome {
     root: PathBuf,
     claude: Option<PathBuf>,
     envs: Vec<(String, String)>,
+    binary: Option<PathBuf>,
 }
 
 /// What one `rlxd` command did.
@@ -57,6 +58,25 @@ impl Run {
         assert_eq!(envelope["ok"], true, "{self:?}");
         envelope["data"].clone()
     }
+
+    /// stdout, one JSON document per line: `rlxd events`' events.
+    pub fn lines(&self) -> Vec<Value> {
+        self.stdout
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("a line is not JSON ({e}): {line:?} in {self:?}"))
+            })
+            .collect()
+    }
+
+    /// The error code of the envelope on stderr, `rlxd events`' one line of JSON.
+    pub fn stderr_code(&self) -> String {
+        let envelope: Value = serde_json::from_str(self.stderr.trim())
+            .unwrap_or_else(|e| panic!("stderr is not one JSON document ({e}): {self:?}"));
+        assert_eq!(envelope["ok"], false, "{self:?}");
+        envelope["error"]["code"].as_str().unwrap().to_owned()
+    }
 }
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -73,12 +93,19 @@ impl TestHome {
             root,
             claude: None,
             envs: Vec::new(),
+            binary: None,
         }
     }
 
     /// This home, every `rlxd` in it run with `name` set to `value`.
     pub fn with_env(mut self, name: &str, value: &str) -> Self {
         self.envs.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// This home, run by the rlxd at `binary` rather than this test build's.
+    pub fn with_binary(mut self, binary: PathBuf) -> Self {
+        self.binary = Some(binary);
         self
     }
 
@@ -104,6 +131,30 @@ impl TestHome {
         run(command, None)
     }
 
+    /// `rlxd args…` in this home, started and left running, with its stdout and stderr
+    /// piped: [`finish`] waits for it.
+    pub fn spawn(&self, args: &[&str]) -> Child {
+        let mut command = self.command(args);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().expect("rlxd starts")
+    }
+
+    /// `rlxd call debug.emit {count}`, which must succeed: the seqs of the first and the
+    /// last event it published.
+    pub fn emit(&self, count: u64) -> (u64, u64) {
+        let params = format!(r#"{{"count":{count}}}"#);
+        let run = self.rlxd(&["call", "debug.emit", &params]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        let data = run.data();
+        (
+            data["first"].as_u64().unwrap(),
+            data["last"].as_u64().unwrap(),
+        )
+    }
+
     /// `rlxd args…` in this home, with `stdin` on its stdin.
     pub fn rlxd_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Run {
         let mut command = self.command(args);
@@ -118,7 +169,11 @@ impl TestHome {
     /// The `rlxd` command, in this home: `AISQUARE_HOME` names it and `RLX_HOME` is
     /// unset, so neither a developer's home nor CI's is touched.
     pub fn command(&self, args: &[&str]) -> Command {
-        self.command_of(Path::new(env!("CARGO_BIN_EXE_rlxd")), args)
+        let binary = self
+            .binary
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_rlxd")));
+        self.command_of(&binary, args)
     }
 
     /// `program args…` in this home, as [`TestHome::command`] runs `rlxd`: for a copy of
@@ -225,6 +280,12 @@ pub fn run(mut command: Command, stdin: Option<&str>) -> Run {
         let mut pipe = child.stdin.take().unwrap();
         pipe.write_all(text.as_bytes()).unwrap();
     }
+    finish(child)
+}
+
+/// Waits for `child`, started with its stdout and stderr piped, to end, failing the test if
+/// it takes longer than [`COMMAND_LIMIT`].
+pub fn finish(mut child: Child) -> Run {
     let stdout = read_all(child.stdout.take().unwrap());
     let stderr = read_all(child.stderr.take().unwrap());
     let status = wait(&mut child);

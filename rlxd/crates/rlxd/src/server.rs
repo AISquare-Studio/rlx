@@ -9,31 +9,55 @@
 //!   check (`peer`; only the credential in gate dev mode), or it gets `not_gate`. A
 //!   refused hello closes the connection and is never counted.
 //! - **Requests.** A frame that is not a request gets `invalid_request` and the
-//!   connection goes on. An unknown method gets `unknown_method`.
+//!   connection goes on. An unknown method gets `unknown_method`, and params a method
+//!   cannot take get `invalid_params`.
+//! - **The event stream** (7.3). `events.subscribe` makes the connection carry the
+//!   stream: the events, then the subscribe's reply `{seq}`, which ends it. Without
+//!   `follow` the reply comes after the replay, and the connection goes on taking
+//!   requests; with it, when rlxd stops. Requests sent meanwhile are answered between
+//!   the events, but a second `events.subscribe` gets `invalid_request`: one stream per
+//!   connection, so event frames need no `id`; it is refused before its params are read.
+//!   Frames are read as they come, so a partial one holds up no event, but a slow request,
+//!   such as a `status` that asks Claude Code, delays that connection's events until it
+//!   is answered. A topic the bus does not carry gets `unknown_topic`, and a `since` past
+//!   the last event `since_ahead`, with `detail.head`. A stream without `follow` ends at
+//!   the last event published when it was asked for. How a slow client is kept from
+//!   holding up the rest is the bus's (`crate::bus`).
 //! - **The gate** (`gate`): `gate.pair`, `gate.pair_requests`, `gate.pair_answer`,
 //!   `gate.devices` and `gate.unpair`. An app connection whose credential is replaced, or
 //!   whose device is unpaired, gets a last `not_gate` envelope (with no `id`) and is
-//!   closed.
+//!   closed, also while it carries a stream: that envelope then ends the stream.
+//! - **Stopping.** `daemon.stopping {reason}` is published before any connection learns
+//!   of the stop, so every stream carries it before its reply.
+//! - **`debug.emit {count}`**, in test builds only (the `debug-methods` feature), publishes
+//!   `count` `daemon.debug {index, count}` events. A release build answers
+//!   `unknown_method`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, StatusData, VERSION, codes, methods,
+    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, StatusData, SubscribeParams,
+    VERSION, codes, event_types, methods, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
-use crate::gate::{self, Answer, AnswerError, Gate, Hold, Refused, Route, UnpairError};
+use crate::bus::{self, Bus, Cursor, Line, Topics};
+use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
 use crate::{claude, token};
+
+/// `daemon.stopping`'s `reason` when a client asked rlxd to stop.
+pub const STOP_REQUESTED: &str = "stop";
 
 /// The longest frame rlxd reads: 1 MiB. A longer one gets `invalid_request`, and the
 /// connection closes.
@@ -62,6 +86,8 @@ pub struct Daemon {
     pipe_acl: Option<&'static str>,
     clients: Mutex<Clients>,
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
+    bus: Bus,
+    stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
 }
@@ -82,34 +108,66 @@ struct Counted {
     role: Role,
 }
 
-/// What the connection does after a reply.
-#[derive(PartialEq, Eq)]
-enum Then {
+/// What a request gets.
+enum Answer {
+    /// A reply, and the connection goes on.
+    Reply(Envelope),
+    /// A reply, then rlxd stops.
+    Stop(Envelope),
+    /// A reply that carries a new gate credential: see [`Minted`].
+    Paired(Envelope, Minted),
+    /// The event stream, whose last frame is the reply.
+    Stream(Subscription),
+}
+
+/// A gate credential `gate.pair` minted for `device`, whose SHA-256 is `sha256`. If its
+/// reply can't be delivered, the pairing is undone, so nobody is left paired with a
+/// credential nobody received. With `close`, the connection's own credential was the one
+/// replaced: it closes after the reply.
+struct Minted {
+    device: String,
+    sha256: String,
+    replaced: Option<(String, String)>,
+    close: bool,
+}
+
+/// An `events.subscribe` that rlxd took: its reply's id, and its place, which ends at
+/// the stream's head now unless it follows.
+struct Subscription {
+    id: RequestId,
+    cursor: Cursor,
+}
+
+/// What the connection does once a stream has ended.
+enum Flow {
+    /// Takes the next request.
     GoOn,
-    Stop,
-    /// The reply carries a new gate credential for `device`, whose SHA-256 is `sha256`.
-    /// If it can't be delivered, the device is unpaired, so nobody is left paired with a
-    /// credential nobody received. With `close`, the connection's own credential was the
-    /// one replaced: it closes after the reply.
-    Paired {
-        device: String,
-        sha256: String,
-        replaced: Option<(String, String)>,
-        close: bool,
-    },
+    /// rlxd is stopping: waits for the client to close, then closes.
+    Linger,
+    /// The connection was dropped from the gate: says why, then closes.
+    Dropped,
+    /// The client has gone, or cannot be written to.
+    Close,
 }
 
 /// One frame, as read.
 enum Frame {
     Line(String),
+    Blank,
     NotText,
     TooLong,
 }
 
 impl Daemon {
-    /// An rlxd serving `home` with `token`. `pipe_acl` is what `status` says of the
-    /// pipe's DACL, on Windows.
-    pub fn new(home: Home, token: String, pipe_acl: Option<&'static str>, gate: Gate) -> Arc<Self> {
+    /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus`.
+    /// `pipe_acl` is what `status` says of the pipe's DACL, on Windows.
+    pub fn new(
+        home: Home,
+        token: String,
+        pipe_acl: Option<&'static str>,
+        gate: Gate,
+        bus: Bus,
+    ) -> Arc<Self> {
         Arc::new(Self {
             home,
             token,
@@ -117,16 +175,45 @@ impl Daemon {
             pipe_acl,
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
+            bus,
+            stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
             gate: Arc::new(gate),
         })
     }
 
-    /// Tells every task to stop: the accept loop and each connection.
-    pub fn stop(&self, why: &str) {
-        if !self.stop.send_replace(true) {
-            info!("stopping: {why}");
+    /// The home's event bus.
+    pub fn bus(&self) -> &Bus {
+        &self.bus
+    }
+
+    /// Publishes `daemon.started {version, pid}`, the first event of this rlxd's life.
+    pub fn started(&self) {
+        let data = object(&json!({"version": VERSION, "pid": self.pid}));
+        if let Err(e) = self
+            .bus
+            .publish(topics::DAEMON, event_types::DAEMON_STARTED, data)
+        {
+            warning!("daemon.started was not published: {e}");
         }
+    }
+
+    /// Tells every task to stop, the accept loop and each connection, once
+    /// `daemon.stopping {reason}` is published: `reason` is a snake_case word, such as
+    /// [`STOP_REQUESTED`] or `sigterm`.
+    pub fn stop(&self, reason: &str) {
+        if self.stopping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        info!("stopping: {reason}");
+        let data = object(&json!({ "reason": reason }));
+        if let Err(e) = self
+            .bus
+            .publish(topics::DAEMON, event_types::DAEMON_STOPPING, data)
+        {
+            warning!("daemon.stopping was not published: {e}");
+        }
+        self.stop.send_replace(true);
     }
 
     /// Writes what only memory holds, before rlxd exits: when each gate device was last
@@ -273,13 +360,14 @@ impl Daemon {
             .ok_or_else(|| "the gate_credential was replaced or unpaired meanwhile".to_owned())
     }
 
-    /// The reply to one request frame after `hello`.
-    async fn answer(&self, session: &Session, frame: &str) -> (Envelope, Then) {
+    /// What one request frame after `hello` gets. On a connection that carries a stream
+    /// already, `events.subscribe` gets `invalid_request`, whatever its params.
+    async fn answer(&self, session: &Session, frame: &str, streaming: bool) -> Answer {
         let value = match serde_json::from_str::<Value>(frame) {
             Ok(value) => value,
             Err(e) => {
                 let message = format!("the frame is not JSON: {e}");
-                return (reply_err(None, codes::INVALID_REQUEST, message), Then::GoOn);
+                return Answer::Reply(reply_err(None, codes::INVALID_REQUEST, message));
             }
         };
         let id = request_id(&value);
@@ -287,45 +375,109 @@ impl Daemon {
             Ok(request) => request,
             Err(e) => {
                 let message = format!("the frame is not a request: {e}");
-                return (reply_err(id, codes::INVALID_REQUEST, message), Then::GoOn);
+                return Answer::Reply(reply_err(id, codes::INVALID_REQUEST, message));
             }
         };
-        let id = Some(request.id);
-        let params = request.params;
-        let reply = |result: Result<Data, ErrorBody>, then| match result {
-            Ok(data) => (Envelope::ok(data).with_optional_id(id), then),
-            Err(error) => (Envelope::err(error).with_optional_id(id), Then::GoOn),
-        };
-        match request.method.as_str() {
-            methods::STATUS => reply(self.status(session).await, Then::GoOn),
-            methods::GATE_PAIR => {
-                let (result, then) = self.gate_pair(session, &params).await;
-                reply(result, then)
-            }
-            methods::GATE_PAIR_REQUESTS => reply(self.gate_pair_requests(session), Then::GoOn),
-            methods::GATE_PAIR_ANSWER => reply(self.gate_pair_answer(session, &params), Then::GoOn),
-            methods::GATE_DEVICES => {
-                let data = json!({"devices": self.gate.devices()});
-                reply(Ok(object(&data)), Then::GoOn)
-            }
-            methods::GATE_UNPAIR => reply(self.gate_unpair(session, &params), Then::GoOn),
+        let id = request.id;
+        let outcome = match request.method.as_str() {
+            methods::STATUS => self.status(session).await,
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
-                (Envelope::ok(data).with_optional_id(id), Then::Stop)
+                return Answer::Stop(Envelope::ok(data).with_id(id));
             }
-            methods::HELLO => {
-                let message = "hello was already said on this connection".to_owned();
-                (reply_err(id, codes::INVALID_REQUEST, message), Then::GoOn)
-            }
-            method => {
-                let error = error(
-                    codes::UNKNOWN_METHOD,
-                    &format!("rlxd has no method {method:?}"),
-                )
-                .with_hint(format!("The methods it serves: {}.", served().join(", ")));
-                (Envelope::err(error).with_optional_id(id), Then::GoOn)
-            }
+            methods::EVENTS_SUBSCRIBE if streaming => Err(error(
+                codes::INVALID_REQUEST,
+                "this connection carries an event stream already: open another for a second",
+            )),
+            methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
+                Ok(subscription) => return Answer::Stream(subscription),
+                Err(error) => Err(error),
+            },
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_EMIT => self.debug_emit(&request.params),
+            methods::GATE_PAIR => match self.gate_pair(session, &request.params).await {
+                Ok((data, minted)) => {
+                    return Answer::Paired(Envelope::ok(data).with_id(id), minted);
+                }
+                Err(error) => Err(error),
+            },
+            methods::GATE_PAIR_REQUESTS => self.gate_pair_requests(session),
+            methods::GATE_PAIR_ANSWER => self.gate_pair_answer(session, &request.params),
+            methods::GATE_DEVICES => Ok(object(&json!({"devices": self.gate.devices()}))),
+            methods::GATE_UNPAIR => self.gate_unpair(session, &request.params),
+            methods::HELLO => Err(error(
+                codes::INVALID_REQUEST,
+                "hello was already said on this connection",
+            )),
+            method => Err(error(
+                codes::UNKNOWN_METHOD,
+                &format!("rlxd has no method {method:?}"),
+            )
+            .with_hint(format!("The methods it serves: {}.", served().join(", ")))),
+        };
+        Answer::Reply(match outcome {
+            Ok(data) => Envelope::ok(data).with_id(id),
+            Err(error) => Envelope::err(error).with_id(id),
+        })
+    }
+
+    /// `events.subscribe`, taken: where its stream starts. Every topic named must be
+    /// one the bus carries, and `since` one it has reached.
+    fn subscribe(&self, id: RequestId, params: Params) -> Result<Subscription, ErrorBody> {
+        let invalid = |e: &dyn std::fmt::Display| {
+            error(
+                codes::INVALID_PARAMS,
+                &format!("events.subscribe's params are not valid: {e}"),
+            )
+        };
+        // A topic the bus does not carry is unknown_topic, whatever its spelling.
+        if let Some(Value::Array(names)) = params.get("topics")
+            && let Some(unknown) = names
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|name| !topics::ALL.contains(name))
+        {
+            return Err(unknown_topic(unknown));
         }
+        let params =
+            SubscribeParams::deserialize(Value::Object(params)).map_err(|e| invalid(&e))?;
+        let topics = match &params.topics {
+            None => Topics::ALL,
+            Some(names) => Topics::of(names.iter().map(String::as_str)).map_err(unknown_topic)?,
+        };
+        let cursor = self
+            .bus
+            .cursor(topics, params.since, params.follow)
+            .map_err(|head| ErrorBody::since_ahead(params.since.unwrap_or_default(), head))?;
+        Ok(Subscription { id, cursor })
+    }
+
+    /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
+    /// at a time. Test builds only.
+    #[cfg(feature = "debug-methods")]
+    fn debug_emit(&self, params: &Params) -> Result<Data, ErrorBody> {
+        const MOST: u64 = 100_000;
+        let count = params
+            .get("count")
+            .and_then(Value::as_u64)
+            .filter(|count| (1..=MOST).contains(count))
+            .ok_or_else(|| {
+                error(
+                    codes::INVALID_PARAMS,
+                    &format!("debug.emit takes {{\"count\": N}}, N from 1 to {MOST}"),
+                )
+            })?;
+        let mut first = None;
+        let mut last = 0;
+        for index in 1..=count {
+            let data = object(&json!({"index": index, "count": count}));
+            last = self
+                .bus
+                .publish(topics::DAEMON, "daemon.debug", data)
+                .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+            first.get_or_insert(last);
+        }
+        Ok(object(&json!({"first": first, "last": last})))
     }
 
     /// `status`'s reply data (7.4).
@@ -342,6 +494,7 @@ impl Daemon {
             .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
         status.protocol_version = session.protocol_version;
         status.capabilities = capabilities();
+        status.seq = self.bus.head();
         status.clients = *self.clients();
         status.clients.app = self.gate.app_connections();
         if self.gate.dev_mode() {
@@ -416,17 +569,15 @@ const NOT_GATE_HINT: &str = "Only rlx's app holds the gate. A paired app present
 impl Daemon {
     /// `gate.pair` (5.1): mints a device's credential, for a peer that passes the
     /// identity check (any peer of rlxd's user, in dev mode).
-    async fn gate_pair(&self, session: &Session, params: &Data) -> (Result<Data, ErrorBody>, Then) {
-        let params: PairParams = match parse(params) {
-            Ok(params) => params,
-            Err(error) => return (Err(error), Then::GoOn),
-        };
+    async fn gate_pair(
+        &self,
+        session: &Session,
+        params: &Data,
+    ) -> Result<(Data, Minted), ErrorBody> {
+        let params: PairParams = parse(params)?;
         let refuse = |message: String| {
             info!("gate.pair refused ({}): {message} (not_gate)", session.peer);
-            (
-                Err(error(codes::NOT_GATE, &message).with_hint(NOT_GATE_HINT)),
-                Then::GoOn,
-            )
+            Err(error(codes::NOT_GATE, &message).with_hint(NOT_GATE_HINT))
         };
         if let Some(route) = params.route.as_deref()
             && route != Route::Local.name()
@@ -439,9 +590,7 @@ impl Daemon {
         let device = match params.device.as_deref().map(gate::device_name) {
             None => None,
             Some(Ok(device)) => Some(device),
-            Some(Err(message)) => {
-                return (Err(error(codes::INVALID_REQUEST, &message)), Then::GoOn);
-            }
+            Some(Err(message)) => return Err(error(codes::INVALID_PARAMS, &message)),
         };
         if let Err(message) = session.peer.same_user() {
             return refuse(message);
@@ -486,7 +635,7 @@ impl Daemon {
             Err(Refused::NotGate(message)) => return refuse(message),
             Err(Refused::Failed(message)) => {
                 warning!("gate.pair failed: {message}");
-                return (Err(error(codes::INTERNAL, &message)), Then::GoOn);
+                return Err(error(codes::INTERNAL, &message));
             }
         };
         if params.gate_credential.is_some() {
@@ -508,13 +657,13 @@ impl Daemon {
             "device": paired.device,
             "route": paired.route.name(),
         });
-        let then = Then::Paired {
+        let minted = Minted {
             device: paired.device,
             sha256: paired.sha256,
             replaced: paired.replaced,
             close: paired.drop_caller,
         };
-        (Ok(object(&data)), then)
+        Ok((object(&data), minted))
     }
 
     /// Waits for a paired device or the user to approve a new device's pairing. The
@@ -543,8 +692,8 @@ impl Daemon {
         };
         match answered {
             // gate.pair_answer logged who approved it.
-            Some(Ok(Ok(Answer::Approved))) => Ok(()),
-            Some(Ok(Ok(Answer::Denied(by)))) => {
+            Some(Ok(Ok(gate::Answer::Approved))) => Ok(()),
+            Some(Ok(Ok(gate::Answer::Denied(by)))) => {
                 Err(format!("pairing device {device:?} was denied by {by}"))
             }
             Some(Ok(Err(_))) | None => Err("rlxd is stopping".to_owned()),
@@ -651,11 +800,11 @@ async fn verify(peer: &Arc<Peer>) -> Result<String, String> {
         .unwrap_or_else(|e| Err(format!("the peer check failed: {e}")))
 }
 
-/// A method's params, as `T`, or `invalid_request` saying why not.
+/// A method's params, as `T`, or `invalid_params` saying why not.
 fn parse<T: serde::de::DeserializeOwned>(params: &Data) -> Result<T, ErrorBody> {
     T::deserialize(Value::Object(params.clone())).map_err(|e| {
         error(
-            codes::INVALID_REQUEST,
+            codes::INVALID_PARAMS,
             &format!("the params are not valid: {e}"),
         )
     })
@@ -717,7 +866,7 @@ where
     let frame = match first {
         Ok(Ok(Some(Frame::Line(frame)))) => frame,
         Ok(Ok(None) | Err(_)) => return,
-        Ok(Ok(Some(Frame::NotText | Frame::TooLong))) => {
+        Ok(Ok(Some(Frame::Blank | Frame::NotText | Frame::TooLong))) => {
             let message = "the first frame must be a hello request, as JSON".to_owned();
             let reply = reply_err(None, codes::UNAUTHORIZED, message);
             return refuse(&mut frames, &mut writer, &reply).await;
@@ -737,21 +886,20 @@ where
         }
         Err(reply) => return refuse(&mut frames, &mut writer, &reply).await,
     };
-    // Frames the client sent while a request was still being answered, in order, and
-    // whether its sending half has ended (a half-close, or all of it).
-    let mut queued: VecDeque<std::io::Result<Option<Frame>>> = VecDeque::new();
-    let mut read_ended = false;
+    let mut watch = Watch {
+        hangup,
+        queued: VecDeque::new(),
+        read_ended: false,
+    };
     loop {
-        let frame = match queued.pop_front() {
-            Some(frame) => frame,
-            None => tokio::select! {
-                frame = frames.next() => frame,
-                () = daemon.stopped() => return linger(&mut frames).await,
-                () = kicked(&session) => return dropped(&session, &mut frames, &mut writer).await,
-            },
+        let frame = tokio::select! {
+            frame = watch.next_line(&mut frames) => frame,
+            () = daemon.stopped() => return linger(&mut frames).await,
+            () = kicked(&session) => return dropped(&session, &mut frames, &mut writer).await,
         };
         let frame = match frame {
             Ok(Some(Frame::Line(frame))) => frame,
+            Ok(Some(Frame::Blank)) => continue,
             Ok(Some(Frame::NotText)) => {
                 let message = "the frame is not UTF-8 text".to_owned();
                 if send(
@@ -772,65 +920,53 @@ where
             }
             Ok(None) | Err(_) => return,
         };
-        if session.app.as_ref().is_some_and(Hold::is_kicked) {
-            return dropped(&session, &mut frames, &mut writer).await;
-        }
-        // While the request is answered, which for a new device's gate.pair can take two
-        // minutes, the connection is still watched:
-        // - A kick aborts the request. Anything that acts as the gate (the gate task's
-        //   run.decide) must still check its hold when it acts.
-        // - A client that is gone, both ways, aborts it too, so a waiting pairing request
-        //   is withdrawn and never pairs a device nobody is there to receive.
-        // - A client that only half-closed, or sent more frames meanwhile, still gets
-        //   every reply. Frames are queued, up to QUEUED_MAX; past that, and after a
-        //   half-close, the hangup probe watches instead of a read.
-        let outcome = {
-            let answering = daemon.answer(&session, &frame);
-            tokio::pin!(answering);
-            loop {
-                let reading = !read_ended && queued.len() < QUEUED_MAX;
-                tokio::select! {
-                    answered = &mut answering => break Outcome::Answered(Box::new(answered)),
-                    () = kicked(&session) => break Outcome::Kicked,
-                    next = frames.next(), if reading => match next {
-                        Ok(None) | Err(_) if hangup.gone() => break Outcome::Left,
-                        Ok(None) | Err(_) => {
-                            read_ended = true;
-                            queued.push_back(Ok(None));
-                        }
-                        next => queued.push_back(next),
-                    },
-                    () = hangup.closed(), if !reading => break Outcome::Left,
+        let answer = match watch
+            .answer(&daemon, &session, &mut frames, &frame, false)
+            .await
+        {
+            Outcome::Answered(answer) => *answer,
+            Outcome::Kicked => return dropped(&session, &mut frames, &mut writer).await,
+            Outcome::Left => return,
+        };
+        match answer {
+            Answer::Reply(reply) => {
+                if send(&mut writer, &reply).await.is_err() {
+                    return;
                 }
             }
-        };
-        let (reply, then) = match outcome {
-            Outcome::Answered(answered) => *answered,
-            Outcome::Kicked => return dropped(&session, &mut frames, &mut writer).await,
-            Outcome::Left => {
-                info!("a client left before its request was answered; the request is dropped");
-                return;
+            Answer::Stop(reply) => {
+                if send(&mut writer, &reply).await.is_err() {
+                    return;
+                }
+                daemon.stop(STOP_REQUESTED);
             }
-        };
-        if send(&mut writer, &reply).await.is_err() {
-            if let Then::Paired {
-                device,
-                sha256,
-                replaced,
-                ..
-            } = &then
-            {
-                daemon
-                    .gate
-                    .undo_undelivered(device, sha256, replaced.as_ref());
+            Answer::Paired(reply, minted) => {
+                if send_paired(&daemon, &mut writer, &reply, &minted)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if minted.close {
+                    return dropped(&session, &mut frames, &mut writer).await;
+                }
             }
-            return;
-        }
-        match then {
-            Then::GoOn | Then::Paired { close: false, .. } => {}
-            Then::Stop => daemon.stop("a client asked"),
-            Then::Paired { close: true, .. } => {
-                return dropped(&session, &mut frames, &mut writer).await;
+            Answer::Stream(subscription) => {
+                let flow = send_stream(
+                    &daemon,
+                    &session,
+                    &mut frames,
+                    &mut writer,
+                    &mut watch,
+                    subscription,
+                )
+                .await;
+                match flow {
+                    Flow::GoOn => {}
+                    Flow::Linger => return linger(&mut frames).await,
+                    Flow::Dropped => return dropped(&session, &mut frames, &mut writer).await,
+                    Flow::Close => return,
+                }
             }
         }
     }
@@ -839,14 +975,236 @@ where
 /// The most frames queued while a request is answered.
 const QUEUED_MAX: usize = 16;
 
+/// What a connection watches while one of its requests is answered.
+struct Watch {
+    /// Whether the client is gone both ways, for when frames are not read.
+    hangup: Hangup,
+    /// Frames the client sent while a request was still being answered, in order.
+    queued: VecDeque<std::io::Result<Option<Frame>>>,
+    /// Whether the client's sending half has ended (a half-close, or all of it).
+    read_ended: bool,
+}
+
 /// How an in-flight request ended.
 enum Outcome {
-    /// It was answered: the reply, and what then.
-    Answered(Box<(Envelope, Then)>),
+    /// It was answered.
+    Answered(Box<Answer>),
     /// The connection was dropped from the gate meanwhile.
     Kicked,
     /// The client closed the connection, both ways, meanwhile.
     Left,
+}
+
+impl Watch {
+    /// The next line: one queued while a request was answered, else the next read.
+    /// Cancel safe, as [`Frames::next_line`] is.
+    async fn next_line<R: AsyncRead + Unpin>(
+        &mut self,
+        frames: &mut Frames<R>,
+    ) -> std::io::Result<Option<Frame>> {
+        match self.queued.pop_front() {
+            Some(frame) => frame,
+            None => frames.next_line().await,
+        }
+    }
+
+    /// Answers `frame`, still watching the connection while it is answered, which for a
+    /// new device's gate.pair can take two minutes:
+    /// - A kick aborts the request. Anything that acts as the gate (the gate task's
+    ///   run.decide) must still check its hold when it acts.
+    /// - A client that is gone, both ways, aborts it too, so a waiting pairing request
+    ///   is withdrawn and never pairs a device nobody is there to receive.
+    /// - A client that only half-closed, or sent more frames meanwhile, still gets every
+    ///   reply. Frames are queued, up to [`QUEUED_MAX`]; past that, and after a
+    ///   half-close, the hangup probe watches instead of a read.
+    async fn answer<R: AsyncRead + Unpin>(
+        &mut self,
+        daemon: &Daemon,
+        session: &Session,
+        frames: &mut Frames<R>,
+        frame: &str,
+        streaming: bool,
+    ) -> Outcome {
+        if session.app.as_ref().is_some_and(Hold::is_kicked) {
+            return Outcome::Kicked;
+        }
+        let answering = daemon.answer(session, frame, streaming);
+        tokio::pin!(answering);
+        let outcome = loop {
+            let reading = !self.read_ended && self.queued.len() < QUEUED_MAX;
+            tokio::select! {
+                answer = &mut answering => break Outcome::Answered(Box::new(answer)),
+                () = kicked(session) => break Outcome::Kicked,
+                next = frames.next_line(), if reading => match next {
+                    Ok(Some(Frame::Blank)) => {}
+                    Ok(None) | Err(_) if self.hangup.gone() => break Outcome::Left,
+                    Ok(None) | Err(_) => {
+                        self.read_ended = true;
+                        self.queued.push_back(Ok(None));
+                    }
+                    next => self.queued.push_back(next),
+                },
+                () = self.hangup.closed(), if !reading => break Outcome::Left,
+            }
+        };
+        if matches!(outcome, Outcome::Left) {
+            info!("a client left before its request was answered; the request is dropped");
+        }
+        outcome
+    }
+}
+
+/// Sends a reply that carries a minted gate credential. When it can't be delivered, the
+/// pairing is undone, and the error says the connection is done.
+async fn send_paired<W: AsyncWrite + Unpin>(
+    daemon: &Daemon,
+    writer: &mut W,
+    reply: &Envelope,
+    minted: &Minted,
+) -> std::io::Result<()> {
+    let sent = send(writer, reply).await;
+    if sent.is_err() {
+        daemon
+            .gate
+            .undo_undelivered(&minted.device, &minted.sha256, minted.replaced.as_ref());
+    }
+    sent
+}
+
+/// Sends `subscription`'s stream: the events after its place, a batch at a time, then
+/// live ones while it follows, then its reply. Answers the client's requests meanwhile:
+/// frames are read as they come, so a partial one holds up no event. An app connection
+/// dropped from the gate ends it with the `not_gate` envelope instead of the reply.
+async fn send_stream<R, W>(
+    daemon: &Arc<Daemon>,
+    session: &Session,
+    frames: &mut Frames<R>,
+    writer: &mut W,
+    watch: &mut Watch,
+    mut subscription: Subscription,
+) -> Flow
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut head = daemon.bus.watch();
+    let mut stopping = false;
+    loop {
+        loop {
+            let lines = daemon
+                .bus
+                .read(&mut subscription.cursor, bus::BATCH, bus::BATCH_BYTES);
+            if lines.is_empty() {
+                break;
+            }
+            if send_lines(writer, &lines).await.is_err() {
+                return Flow::Close;
+            }
+        }
+        if stopping || subscription.cursor.is_done() {
+            let data = object(&json!({"seq": subscription.cursor.after()}));
+            let reply = Envelope::ok(data).with_id(subscription.id);
+            if send(writer, &reply).await.is_err() {
+                return Flow::Close;
+            }
+            return if stopping { Flow::Linger } else { Flow::GoOn };
+        }
+        let after = subscription.cursor.after();
+        tokio::select! {
+            moved = async { head.wait_for(|&seq| seq > after).await.map(|_| ()) } => {
+                stopping = moved.is_err();
+            }
+            () = daemon.stopped() => stopping = true,
+            () = kicked(session) => return Flow::Dropped,
+            frame = watch.next_line(frames) => {
+                if let Some(flow) =
+                    answer_in_stream(daemon, session, frames, writer, watch, frame).await
+                {
+                    return flow;
+                }
+            }
+        }
+    }
+}
+
+/// Answers `frame`, read while the connection carries a stream. `None` when the stream
+/// goes on.
+async fn answer_in_stream<R, W>(
+    daemon: &Arc<Daemon>,
+    session: &Session,
+    frames: &mut Frames<R>,
+    writer: &mut W,
+    watch: &mut Watch,
+    frame: std::io::Result<Option<Frame>>,
+) -> Option<Flow>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let frame = match frame {
+        Ok(Some(Frame::Line(frame))) => frame,
+        Ok(Some(Frame::Blank)) => return None,
+        Ok(Some(Frame::NotText)) => {
+            let message = "the frame is not UTF-8 text".to_owned();
+            let reply = reply_err(None, codes::INVALID_REQUEST, message);
+            return send(writer, &reply).await.is_err().then_some(Flow::Close);
+        }
+        Ok(Some(Frame::TooLong)) => {
+            let message = format!("the frame is longer than {MAX_FRAME} bytes");
+            let reply = reply_err(None, codes::INVALID_REQUEST, message);
+            refuse(frames, writer, &reply).await;
+            return Some(Flow::Close);
+        }
+        Ok(None) | Err(_) => return Some(Flow::Close),
+    };
+    let answer = match watch.answer(daemon, session, frames, &frame, true).await {
+        Outcome::Answered(answer) => *answer,
+        Outcome::Kicked => return Some(Flow::Dropped),
+        Outcome::Left => return Some(Flow::Close),
+    };
+    match answer {
+        Answer::Reply(reply) => send(writer, &reply).await.is_err().then_some(Flow::Close),
+        Answer::Stop(reply) => {
+            if send(writer, &reply).await.is_err() {
+                return Some(Flow::Close);
+            }
+            daemon.stop(STOP_REQUESTED);
+            None
+        }
+        Answer::Paired(reply, minted) => {
+            if send_paired(daemon, writer, &reply, &minted).await.is_err() {
+                return Some(Flow::Close);
+            }
+            minted.close.then_some(Flow::Dropped)
+        }
+        Answer::Stream(_) => unreachable!("a streaming connection takes no second stream"),
+    }
+}
+
+/// Sends `lines`, each one event and its newline, as they are: vectored writes of the
+/// buffer's own lines, so a batch is never copied.
+async fn send_lines<W: AsyncWrite + Unpin>(writer: &mut W, lines: &[Line]) -> std::io::Result<()> {
+    let mut slices: Vec<std::io::IoSlice<'_>> = lines
+        .iter()
+        .map(|line| std::io::IoSlice::new(line))
+        .collect();
+    let mut rest = &mut slices[..];
+    while !rest.is_empty() {
+        let written = writer.write_vectored(rest).await?;
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        std::io::IoSlice::advance_slices(&mut rest, written);
+    }
+    writer.flush().await
+}
+
+fn unknown_topic(topic: &str) -> ErrorBody {
+    error(
+        codes::UNKNOWN_TOPIC,
+        &format!("rlxd carries no topic {topic:?}"),
+    )
+    .with_hint(format!("Its topics: {}.", topics::ALL.join(", ")))
 }
 
 /// Resolves once an app connection is dropped from the gate; never for another.
@@ -911,39 +1269,50 @@ async fn send<W: AsyncWrite + Unpin>(writer: &mut W, reply: &Envelope) -> std::i
 
 struct Frames<R> {
     reader: BufReader<R>,
-    /// The frame read so far, kept here so that `next` can be cancelled and called again
-    /// without losing it.
+    /// The frame read so far, until its newline comes.
     line: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> Frames<R> {
     /// The next frame, skipping blank lines, or `None` once the client has closed.
-    /// Cancel-safe: a frame read in part is kept for the next call.
     async fn next(&mut self) -> std::io::Result<Option<Frame>> {
-        let line = &mut self.line;
+        loop {
+            match self.next_line().await? {
+                Some(Frame::Blank) => {}
+                frame => return Ok(frame),
+            }
+        }
+    }
+
+    /// The next line, blank or not, or `None` once the client has closed.
+    ///
+    /// Cancel safe: what it has read of a frame is kept until the frame's newline comes,
+    /// so a `select!` can race it, and a client that sends part of a frame holds up
+    /// nothing else on its connection.
+    async fn next_line(&mut self) -> std::io::Result<Option<Frame>> {
         loop {
             let chunk = self.reader.fill_buf().await?;
             if chunk.is_empty() {
-                let line = std::mem::take(line);
+                let line = std::mem::take(&mut self.line);
                 return Ok((!is_blank(&line)).then(|| text(line)));
             }
             let (part, used, ended) = match chunk.iter().position(|&b| b == b'\n') {
                 Some(at) => (&chunk[..at], at + 1, true),
                 None => (chunk, chunk.len(), false),
             };
-            if line.len() + part.len() > MAX_FRAME {
+            if self.line.len() + part.len() > MAX_FRAME {
                 self.reader.consume(used);
-                line.clear();
+                self.line.clear();
                 return Ok(Some(Frame::TooLong));
             }
-            line.extend_from_slice(part);
+            self.line.extend_from_slice(part);
             self.reader.consume(used);
             if ended {
-                if is_blank(line) {
-                    line.clear();
-                    continue;
+                let line = std::mem::take(&mut self.line);
+                if is_blank(&line) {
+                    return Ok(Some(Frame::Blank));
                 }
-                return Ok(Some(text(std::mem::take(line))));
+                return Ok(Some(text(line)));
             }
         }
     }
@@ -973,15 +1342,20 @@ fn capabilities() -> Vec<String> {
 
 /// The methods this rlxd serves after `hello`.
 fn served() -> Vec<&'static str> {
-    vec![
+    let mut served = vec![
         methods::STATUS,
         methods::STOP,
+        methods::EVENTS_SUBSCRIBE,
         methods::GATE_PAIR,
         methods::GATE_PAIR_REQUESTS,
         methods::GATE_PAIR_ANSWER,
         methods::GATE_DEVICES,
         methods::GATE_UNPAIR,
-    ]
+    ];
+    if cfg!(feature = "debug-methods") {
+        served.push(methods::DEBUG_EMIT);
+    }
+    served
 }
 
 /// An error whose code and message are both non-empty, as every caller's are.

@@ -11,7 +11,7 @@ use std::process::{Child, Stdio};
 
 use common::{TestHome, assert_valid, eventually};
 use rlxd_client::proto::{HelloParams, Role};
-use rlxd_client::{Connection, Home};
+use rlxd_client::{Connection, Home, Incoming};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -931,7 +931,7 @@ fn look_alike_names_cannot_dodge_the_revoked_name_rule() {
         let params = json!({"device": name}).to_string();
         let run = home.rlxd(&["call", "gate.pair", &params]);
         assert_eq!(run.code(), Some(1), "{name:?}: {run:?}");
-        assert_eq!(run.error_code(), "invalid_request", "{name:?}");
+        assert_eq!(run.error_code(), "invalid_params", "{name:?}");
     }
     // Let in, but as the revoked name: a case apart, an I for an l, a trailing space.
     for (name, kept) in [
@@ -949,4 +949,74 @@ fn look_alike_names_cannot_dodge_the_revoked_name_rule() {
         assert_eq!(run.code(), Some(0), "{run:?}");
         assert_eq!(finish(waiting).0, Some(1));
     }
+}
+
+impl App {
+    /// Opens a following event stream, and returns once rlxd carries it: a request sent
+    /// after the subscribe is answered.
+    fn follow_events(&mut self) {
+        let follow = json!({"follow": true}).as_object().unwrap().clone();
+        self.connection.send("events.subscribe", follow).unwrap();
+        let status = self.connection.send("status", Default::default()).unwrap();
+        loop {
+            match self.connection.read_incoming().unwrap() {
+                Incoming::Reply(reply) if reply.envelope.id == Some(status) => {
+                    assert!(reply.is_ok(), "{}", reply.line);
+                    return;
+                }
+                Incoming::Reply(reply) => panic!("the stream ended: {}", reply.line),
+                Incoming::Event(_) => {}
+            }
+        }
+    }
+
+    /// The next reply on a connection that carries a stream, past its events.
+    fn next_reply(&mut self) -> Value {
+        loop {
+            match self.connection.read_incoming().unwrap() {
+                Incoming::Reply(reply) => return serde_json::from_str(&reply.line).unwrap(),
+                Incoming::Event(_) => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn an_app_connection_carrying_an_event_stream_is_dropped_from_the_gate_too() {
+    let home = TestHome::new();
+    home.start_dev();
+    let c1 = pair_test_client(&home);
+
+    // Unpaired while it streams: the not_gate envelope, with no id, ends its stream.
+    let mut streaming = App::connect(&home, &c1).unwrap();
+    streaming.follow_events();
+    let run = home.rlxd(&["gate", "unpair"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert_eq!(run.data()["dropped"], 1);
+    let last = streaming.next_reply();
+    assert_eq!(last["error"]["code"], "not_gate", "{last}");
+    assert!(last.get("id").is_none(), "{last}");
+    assert!(matches!(streaming.connection.read_line(), Ok(None)));
+
+    // Re-pairing itself while it streams: its reply, with the new credential, then the
+    // not_gate envelope, and the connection closes.
+    std::fs::remove_file(home.root().join("test-gate-credential")).unwrap();
+    let c2 = pair_test_client(&home);
+    let mut caller = App::connect(&home, &c2).unwrap();
+    caller.follow_events();
+    let pair = json!({"gate_credential": c2}).as_object().unwrap().clone();
+    let id = caller.connection.send("gate.pair", pair).unwrap();
+    let reply = caller.next_reply();
+    assert_eq!(reply["id"], json!(id), "{reply}");
+    assert_eq!(reply["ok"], true, "{reply}");
+    let c3 = reply["data"]["gate_credential"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(c3, c2);
+    let last = caller.next_reply();
+    assert_eq!(last["error"]["code"], "not_gate", "{last}");
+    assert!(matches!(caller.connection.read_line(), Ok(None)));
+    assert!(App::connect(&home, &c2).is_err());
+    assert!(App::connect(&home, &c3).is_ok());
 }

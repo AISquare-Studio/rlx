@@ -15,6 +15,14 @@ name = "rlxd"
 doc = false
 
 [features]
+# Test builds only. `debug-methods` adds the socket's debug.* methods (handoff 0.10.3,
+# 7.3: `debug.emit {count}`), which rlxd's own tests drive. Nothing turns it on but the
+# dev-dependency below, which cargo applies when it builds the tests (`cargo test`,
+# `cargo clippy --all-targets`), so a release build (`cargo build --release`) never has
+# it: tests/release_build.rs builds one and checks. Package exactly that build: with
+# `--all-targets` or `--tests`, or from `cargo test --release`, cargo builds the
+# dev-dependency, and the binary would have the debug methods.
+debug-methods = []
 # Tests only: lets RLXD_TEST_GATE_REQUIREMENT replace the gate peer's compiled-in identity
 # (handoff 0.10.3, 5.1), so the gate_peer_* tests can sign helpers with a test identity.
 # Release builds never enable it, and without it no config, variable or flag changes the
@@ -57,6 +65,9 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 jsonschema = { version = "0.63", default-features = false }
+# rlxd itself, with the debug methods, so the binary the tests run has them.
+rlxd = { path = ".", features = ["debug-methods"] }
+toml = "0.9"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = [

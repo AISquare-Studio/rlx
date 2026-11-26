@@ -6,12 +6,14 @@
 //! 2. takes `run/rlxd.lock`, or exits 1 with `already_running`;
 //! 3. opens the log, makes the token once, and reads the config and the paired gate
 //!    devices (`gate.json`);
-//! 4. listens on the socket or pipe;
-//! 5. registers in `<home>/daemons/` (4.1), with a heartbeat every 5 s;
-//! 6. serves until `stop`, SIGTERM or Ctrl-C.
+//! 4. opens the event bus, which numbers on from `rlxd/seq` (`crate::bus`);
+//! 5. listens on the socket or pipe;
+//! 6. registers in `<home>/daemons/` (4.1), with a heartbeat every 5 s;
+//! 7. publishes `daemon.started`, and serves until `stop`, SIGTERM or Ctrl-C.
 //!
-//! A stop removes the socket, leaves the registry, then lets the lock go, so once the lock
-//! is free everything else is done. `--detach` starts the same in the background and returns once it takes
+//! A stop publishes `daemon.stopping`, gives the connections a moment to send it, writes
+//! the bus's last seq, removes the socket, leaves the registry, then lets the lock go, so
+//! once the lock is free everything else is done. `--detach` starts the same in the background and returns once it takes
 //! a connection, printing its `status`.
 
 use std::fs;
@@ -27,6 +29,7 @@ use rlxd_client::{Home, Reply};
 use rlxd_proto::{VERSION, codes, methods};
 use tokio::task::JoinSet;
 
+use crate::bus::Bus;
 use crate::config::Config;
 use crate::gate::Gate;
 use crate::listener::Listener;
@@ -146,6 +149,7 @@ async fn serve_until_stopped(
     gate: Gate,
     flags: &'static [&'static str],
 ) -> Result<(), String> {
+    let bus = Bus::open(&home)?;
     let mut listener = Listener::bind(&home).map_err(|e| e.to_string())?;
     let endpoint = home.endpoint();
     let registration = match Registration::register(&home, flags) {
@@ -163,7 +167,8 @@ async fn serve_until_stopped(
         }
     };
     let keeper = Keeper::start(home.clone(), registration, flags);
-    let daemon = Daemon::new(home, token, listener.acl(), gate);
+    let daemon = Daemon::new(home, token, listener.acl(), gate, bus);
+    daemon.started();
     tokio::spawn(watch_signals(Arc::clone(&daemon)));
     info!("listening on {endpoint}");
     let mut connections = JoinSet::new();
@@ -197,6 +202,7 @@ async fn serve_until_stopped(
         connections.abort_all();
     }
     daemon.flush();
+    daemon.bus().close();
     keeper.stop();
     Ok(())
 }
@@ -260,8 +266,8 @@ async fn watch_signals(daemon: Arc<Daemon>) {
     };
     loop {
         tokio::select! {
-            _ = term.recv() => daemon.stop("SIGTERM"),
-            _ = interrupt.recv() => daemon.stop("SIGINT"),
+            _ = term.recv() => daemon.stop("sigterm"),
+            _ = interrupt.recv() => daemon.stop("sigint"),
             _ = hangup.recv() => info!("SIGHUP ignored: rlxd outlives its terminal"),
         }
     }
@@ -276,9 +282,9 @@ async fn watch_signals(daemon: Arc<Daemon>) {
     };
     loop {
         tokio::select! {
-            _ = c.recv() => daemon.stop("Ctrl-C"),
-            _ = brk.recv() => daemon.stop("Ctrl-Break"),
-            _ = close.recv() => daemon.stop("its console closed"),
+            _ = c.recv() => daemon.stop("ctrl_c"),
+            _ = brk.recv() => daemon.stop("ctrl_break"),
+            _ = close.recv() => daemon.stop("console_closed"),
         }
     }
 }
