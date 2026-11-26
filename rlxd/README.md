@@ -29,10 +29,12 @@ rlxd/
 rlxd serve [--detach] [--gate-dev-mode]  # run rlxd for this home; --detach returns once it takes connections
 rlxd status [--json]    # what it is, who is connected, the gate's mode, and Claude Code's sign-in
 rlxd stop               # stop it, and wait until it has
-rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T]
+rlxd call [--as-app] [--role R] [--client NAME]
+          [--gate-credential C | --gate-credential-file F] [--token T | --token-file F]
           [--protocol-version N] [--env JSON] [--socket PATH] [--raw] <method> [<params-json>]
 rlxd events [--as-app] [--topics a,b] [--since SEQ] [--follow] [--until TYPE[,TYPE…]]
-            [--limit N] [--timeout S] [--socket PATH] [--token T]
+            [--limit N] [--timeout S] [--socket PATH] [--token T | --token-file F]
+            [--gate-credential-file F]
 rlxd here [--json] [--start] [--show-token] [--protocols VERSIONS]
                         # what is installed and running here: rlx.app's probe over SSH
 rlxd gate devices       # the devices paired as the app gate: route, created, last seen
@@ -318,15 +320,34 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
    itself. With OpenSSH, `ssh -N -L <local socket>:<socket> host` makes a local socket
    whose every connection is one such channel.
 3. Speak the protocol on the channel as on the socket: `hello` with the token, then
-   requests and event streams. From a shell, through OpenSSH's local socket:
+   requests and event streams. From a shell, with OpenSSH:
 
    ```sh
-   rlxd call --socket <local socket> --token <token> status
-   rlxd events --socket <local socket> --token <token> --follow
+   dir=$(mktemp -d)   # 0700: no one else can bind the forward's path first or read the token
+   here=$(ssh host '<rlxd> here --json --start --show-token')
+   (umask 077 && printf '%s' "$here" | jq -r .data.auth.token > "$dir/token")
+   ssh -N -o ExitOnForwardFailure=yes \
+     -L "$dir/rlxd.sock:$(printf '%s' "$here" | jq -r .data.socket)" host &
+   rlxd call --socket "$dir/rlxd.sock" --token-file "$dir/token" status
+   rlxd events --socket "$dir/rlxd.sock" --token-file "$dir/token" --follow
    ```
 
-   `--socket` connects there instead of to the home's socket. The home's token file is
-   still the default token, so a client home with none needs `--token`.
+   `<rlxd>` is rlxd's absolute path on the host ([Finding it with no
+   profile](#finding-it-with-no-profile)). The forward's local socket goes in a folder
+   only you may enter, so no other local user can take its path before ssh does, and
+   `ExitOnForwardFailure=yes` makes ssh exit rather than run on without the forward when
+   it can't. `--token-file` keeps the host's token out of the command line, which other
+   local users can read (`ps`); `--token` works too, but shows it.
+
+   `--socket` connects there instead of to the home's socket. It sends nothing of the
+   local home's, and keeps nothing there:
+   - the token must be given, with `--token-file` or `--token`: without either,
+     `--socket` is a usage error (exit 2), and the home's token file is never read;
+   - `--as-app` needs `--gate-credential-file <file>` (or `--gate-credential`), where
+     the test client keeps its credential for the rlxd at `--socket`: the home's
+     `test-gate-credential` is never sent there, nor that rlxd's credential kept here;
+   - the socket must be a socket, not a link, that this user owns, as ssh makes it:
+     otherwise nothing is sent.
 
 - **sshd must allow it.** OpenSSH's default does (`AllowStreamLocalForwarding yes`). A host
   set to `AllowStreamLocalForwarding no` or `remote`, or `DisableForwarding yes`, refuses
@@ -338,18 +359,24 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
   too: the token, then for the app role the credential and the peer. A forwarded
   connection's peer is sshd, not rlx's app, so outside gate dev mode it can neither pair
   nor be the gate, until SSH pairing (hub q1) gives SSH devices a credential of their own
-  (see the gate's **SSH** note above). `rlxd call --socket … --as-app` pairs with the
-  rlxd at `--socket`, never with the local home's.
+  (see the gate's **SSH** note above). `rlxd call --socket … --as-app
+  --gate-credential-file <file>` pairs with the rlxd at `--socket`, never with the local
+  home's.
 - **Windows hosts** are an open question for the hub (q2): rlxd serves a named pipe there,
   not a socket. This is built and checked for macOS and Linux hosts.
 
 `.github/workflows/rlxd.yml`'s `ssh` job runs it on ubuntu through a real `ssh -N -L` to
-localhost, for `~/.aisquare` and for a home too deep for its own socket. The client side
-is a home with no rlxd and no token. Through the forward:
+localhost, for `~/.aisquare` and for a home too deep for its own socket. Its sshd allows
+nothing but this: `AllowStreamLocalForwarding local`, `AllowTcpForwarding no`, and no
+agent, X11 or tunnel forwarding, which `sshd -T` must show in effect. A remote (`-R`)
+streamlocal forward must be refused, and so must a TCP `-L`'s channel. The client side
+is a home with no rlxd and no token, and the host's token goes in a 0600 file for
+`--token-file`. Through the forward:
 
+- `--socket` with no token is a usage error;
 - `status` must answer, naming the host's socket and home;
-- the gate must refuse the unsigned test client: `--as-app`, a made-up credential and
-  `gate.pair` each get `not_gate`, and nothing is paired;
+- the gate must refuse the unsigned test client: `--as-app` (with a credential file), a
+  made-up credential and `gate.pair` each get `not_gate`, and nothing is paired or kept;
 - an `rlxd events --since 0 --until daemon.stopping` stream must replay this rlxd's
   `daemon.started`, stay open through 60 quiet seconds, and take `daemon.stopping` live
   when rlxd stops over ssh;
@@ -359,25 +386,41 @@ is a home with no rlxd and no token. Through the forward:
 ### Long homes: the short socket
 
 A socket's path must fit `sockaddr_un`'s `sun_path`: 107 bytes on Linux and 103 on macOS
-(`rlxd_client::SOCKET_PATH_MAX`). When `<home>/run/rlxd.sock`, made absolute, is longer,
-rlxd listens on `/tmp/rlxd-<uid>/<hash>.sock` instead, about 40 bytes. `<hash>` is the
-pipe name's, the first 16 hex digits of the SHA-256 of the home's canonical path.
-`rlxd_client::Home::socket` decides, so rlxd and every client agree. `status`'s
-`paths.socket` and `rlxd here`'s `socket` report the short path, and rlxd's log says why
-it uses it.
+(`rlxd_client::SOCKET_PATH_MAX`). `rlxd_client::Home::socket` decides where it is, so
+rlxd and every client agree, however each spells the home:
+
+- the home's `run/rlxd.sock`, by its **canonical** path (links, `.` and `..` resolved;
+  macOS's `/var` is `/private/var`), when that fits. rlxd binds it, and every client
+  connects to it, by that path, so a home reached through a link, or as `/var` and
+  `/private/var`, is one socket;
+- else `/tmp/rlxd-<uid>/<hash>.sock`, about 40 bytes. `<hash>` is the first 16 hex
+  digits of the SHA-256 of the home's canonical path, its bytes as they are, so two
+  homes whose paths aren't UTF-8 never share one.
+
+`status`'s `paths.socket` and `rlxd here`'s `socket` report the path in use, and rlxd's
+log says why it uses the short one.
 
 - **Why `/tmp`.** Every process of the user must name the same folder, whatever its
   environment holds: a desktop session, a non-login SSH session, `env -i`. `$TMPDIR`
   differs between them on macOS. logind removes `$XDG_RUNTIME_DIR` at the user's last
   logout, which an rlxd started over SSH outlives.
 - **Only its user's.** `/tmp` is shared, so another user can make `/tmp/rlxd-<uid>/`
-  first. rlxd makes the folder 0700. It refuses to start when that path is not a folder
-  (a link included) or is another user's, and narrows a wider mode on its own user's
-  folder to 0700. A client sends the token only to a socket its user owns, in a folder
+  first. rlxd makes the folder 0700, and refuses to start when that path is not a folder
+  (a link included), is another user's, or has any mode wider than 0700. It never
+  changes a folder it finds into shape: while it was wider, another user could have left
+  entries in it. The error names the folder; remove it once no rlxd uses it, and rlxd
+  makes it again. A client sends the token only to a socket its user owns, in a folder
   its user owns that no one else may enter. Otherwise it fails before it sends anything
   (`ConnectError::NotOurs`).
-- **A stop** removes the socket and leaves the folder, which other homes' sockets may
-  share.
+- **A sticky `/tmp`.** rlxd and its clients check the folder, then use it by path. That
+  is safe because `/tmp` is root's with the sticky bit set, so no other user can rename
+  or replace our folder in between. Both check that it is, and refuse otherwise. rlxd
+  also looks at the folder again after it binds, and refuses one that changed.
+- **Replacing a socket.** A socket rlxd finds at its path is replaced only when nothing
+  listens on it, such as one left by an rlxd that was killed. One that still takes a
+  connection is someone else's, and rlxd refuses to start rather than take it over.
+- **A stop** removes the socket only if it is still the one this rlxd made, and leaves
+  the folder, which other homes' sockets may share.
 
 ## Building and checking
 

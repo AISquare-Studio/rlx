@@ -73,8 +73,8 @@ impl fmt::Display for ConnectError {
             ),
             Self::NotOurs { endpoint } => write!(
                 f,
-                "{endpoint} or its folder is another user's, or others may enter the \
-                 folder: it is not this user's rlxd"
+                "{endpoint} is not this user's: another user owns it or its folder, or \
+                 others may enter its folder"
             ),
         }
     }
@@ -215,14 +215,17 @@ impl Connection {
     /// [`Connection::hello`] first.
     ///
     /// A short socket ([`Home::uses_short_socket`]) sits in `/tmp`, so before it connects
-    /// it checks that the socket and its folder are this user's and that no one else may
-    /// enter the folder, else [`ConnectError::NotOurs`].
+    /// it checks that `/tmp` is root's and sticky, and that the socket and its folder are
+    /// this user's and that no one else may enter the folder, else
+    /// [`ConnectError::NotOurs`].
     pub fn open(home: &Home) -> Result<Self, ConnectError> {
         #[cfg(unix)]
         if home.uses_short_socket() {
-            check_short_socket(&home.socket())?;
+            let socket = home.socket();
+            check_tmp(&socket)?;
+            check_short_socket(&socket)?;
         }
-        Self::open_at(home.endpoint())
+        Self::from_endpoint(Path::new(&home.endpoint()))
     }
 
     /// A connection to the rlxd at `endpoint`: a socket's path on macOS and Linux, a named
@@ -230,11 +233,20 @@ impl Connection {
     ///
     /// Over SSH, `endpoint` is the local end of a direct-streamlocal forward to the host's
     /// socket (`ssh -N -L <endpoint>:<socket> host`), and the token is the host's
-    /// (`rlxd here --show-token`, or its `auth.token_file` read over the session). Who
-    /// made the socket is not checked: the caller named it. On Windows, the pipe's server
-    /// must run as this user, as for [`Connection::open`].
+    /// (`rlxd here --show-token`, or its `auth.token_file` read over the session), never
+    /// this home's. On macOS and Linux the endpoint must be a socket, not a link to one,
+    /// that this user owns, as ssh makes the forward's local end: else
+    /// [`ConnectError::NotOurs`], before anything is sent. Keep it in a folder only this
+    /// user may enter, so no one else can bind its path first. On Windows, the pipe's
+    /// server must run as this user, as for [`Connection::open`].
     pub fn open_at(endpoint: impl AsRef<Path>) -> Result<Self, ConnectError> {
         let endpoint = endpoint.as_ref();
+        #[cfg(unix)]
+        check_own_socket(endpoint)?;
+        Self::from_endpoint(endpoint)
+    }
+
+    fn from_endpoint(endpoint: &Path) -> Result<Self, ConnectError> {
         let stream = open_stream(endpoint)?;
         let writer = stream.try_clone().map_err(|source| ConnectError::Io {
             endpoint: endpoint.display().to_string(),
@@ -378,6 +390,44 @@ fn open_stream(path: &Path) -> Result<Stream, ConnectError> {
     })
 }
 
+/// Checks that `socket`, the endpoint a caller named, is a socket that this user owns,
+/// read without following a link. A missing one is [`ConnectError::NotRunning`].
+#[cfg(unix)]
+fn check_own_socket(socket: &Path) -> Result<(), ConnectError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let endpoint = socket.display().to_string();
+    let found = match std::fs::symlink_metadata(socket) {
+        Ok(found) => found,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(ConnectError::NotRunning { endpoint, source });
+        }
+        Err(source) => return Err(ConnectError::Io { endpoint, source }),
+    };
+    if !found.file_type().is_socket() {
+        let source = io::Error::other("it is not a socket");
+        return Err(ConnectError::Io { endpoint, source });
+    }
+    if !crate::unix::is_owned(&found) {
+        return Err(ConnectError::NotOurs { endpoint });
+    }
+    Ok(())
+}
+
+/// Checks that the folder above the short socket's folder, `/tmp`, is root's and sticky,
+/// so the checks of [`check_short_socket`] still hold when it connects by path.
+#[cfg(unix)]
+fn check_tmp(socket: &Path) -> Result<(), ConnectError> {
+    let tmp = socket
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(Path::new("/tmp"));
+    crate::unix::check_sticky(tmp).map_err(|source| ConnectError::Io {
+        endpoint: socket.display().to_string(),
+        source,
+    })
+}
+
 /// Checks that the short socket `socket` and its folder are this user's, and that no one
 /// else may enter the folder, before the token goes to it. Neither is followed through a
 /// link. A missing folder or socket is [`ConnectError::NotRunning`].
@@ -517,6 +567,26 @@ mod tests {
             matches!(missing, Err(ConnectError::NotRunning { .. })),
             "{missing:?}"
         );
+    }
+
+    #[test]
+    fn open_at_refuses_a_file_or_a_link_where_a_socket_should_be() {
+        let (socket, _listener) = socket_in("open-at-not", 0o700);
+        let dir = socket.parent().unwrap();
+        let file = dir.join("file");
+        fs::write(&file, "").unwrap();
+        let link = dir.join("link.sock");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+        for path in [&file, &link] {
+            let refused = Connection::open_at(path);
+            assert!(
+                matches!(&refused, Err(ConnectError::Io { source, .. }) if source.to_string() == "it is not a socket"),
+                "{}: {:?}",
+                path.display(),
+                refused.err()
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

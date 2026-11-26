@@ -36,10 +36,67 @@ fn call_socket_reaches_an_rlxd_from_another_home_with_its_token() {
         served.root().display().to_string()
     );
 
-    // Without the token, the client home has none to read.
-    let run = client.rlxd(&["call", "--socket", &endpoint, "status"]);
-    assert_eq!(run.code(), Some(1), "{run:?}");
-    assert_eq!(run.error_code(), "unauthorized");
+    // The token from a file, out of the command line.
+    let token_file = client.root().join("host-token");
+    std::fs::write(&token_file, &token).unwrap();
+    let token_file = token_file.display().to_string();
+    let run = client.rlxd(&[
+        "call",
+        "--socket",
+        &endpoint,
+        "--token-file",
+        &token_file,
+        "status",
+    ]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+}
+
+#[test]
+fn socket_never_sends_this_homes_token_or_test_credential() {
+    // A home with an rlxd, a token and a kept test credential: --socket to another rlxd
+    // must use none of them, and keep nothing from it.
+    let local = TestHome::new();
+    local.start_dev();
+    let run = local.rlxd(&["call", "--as-app", "status"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let kept = local.test_credential().unwrap();
+    let served = TestHome::new();
+    served.start_dev();
+    let endpoint = Home::at(served.root()).endpoint();
+    for args in [
+        &["call", "--socket", &endpoint, "status"][..],
+        &["call", "--socket", &endpoint, "--as-app", "status"],
+        &[
+            "events", "--socket", &endpoint, "--since", "0", "--limit", "1",
+        ],
+    ] {
+        let run = local.rlxd(args);
+        assert_eq!(run.code(), Some(2), "a usage error: {args:?}: {run:?}");
+        assert!(run.stdout.is_empty(), "{run:?}");
+        assert!(
+            run.stderr.contains("--socket needs --token-file"),
+            "{run:?}"
+        );
+    }
+    let token = served.token();
+    for args in [
+        &[
+            "call", "--socket", &endpoint, "--token", &token, "--as-app", "status",
+        ][..],
+        &[
+            "events", "--socket", &endpoint, "--token", &token, "--as-app", "--since", "0",
+        ],
+    ] {
+        let run = local.rlxd(args);
+        assert_eq!(run.code(), Some(2), "a usage error: {args:?}: {run:?}");
+        assert!(run.stderr.contains("--gate-credential-file"), "{run:?}");
+    }
+    assert!(
+        !served.gate_json().exists(),
+        "nothing reached the other rlxd's gate"
+    );
+    assert_eq!(local.test_credential().as_deref(), Some(kept.as_str()));
+    assert_eq!(local.app_clients(), 0);
 }
 
 #[test]
@@ -70,9 +127,12 @@ fn events_socket_streams_from_an_rlxd_of_another_home() {
     assert_eq!(started["data"]["pid"], pid);
 
     let run = client.rlxd(&["events", "--socket", &endpoint, "--since", "0"]);
-    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.code(), Some(2), "{run:?}");
     assert!(run.stdout.is_empty(), "{run:?}");
-    assert!(run.stderr.contains("cannot read the token"), "{run:?}");
+    assert!(
+        run.stderr.contains("--socket needs --token-file"),
+        "{run:?}"
+    );
 }
 
 #[test]
@@ -84,13 +144,16 @@ fn the_gate_checks_a_connection_through_call_socket_as_any_other() {
     let endpoint = Home::at(served.root()).endpoint();
     let token = served.token();
     let client = TestHome::new();
+    // Where the client keeps its credential for that rlxd: not its home's.
+    let kept = client.root().join("served-credential");
+    let kept_arg = kept.display().to_string();
     let as_app = |extra: &[&str]| {
         let mut args = vec!["call", "--socket", &endpoint, "--token", &token];
         args.extend_from_slice(extra);
         client.rlxd(&args)
     };
     for extra in [
-        &["--as-app", "status"][..],
+        &["--as-app", "--gate-credential-file", &kept_arg, "status"][..],
         &["--role", "app", "--gate-credential", "made-up", "status"],
         &["gate.pair"],
     ] {
@@ -99,13 +162,13 @@ fn the_gate_checks_a_connection_through_call_socket_as_any_other() {
         assert_eq!(run.error_code(), "not_gate", "{extra:?}");
     }
     assert!(!served.gate_json().exists(), "nothing was paired");
-    assert_eq!(client.test_credential(), None);
+    assert!(!kept.exists());
 
-    // In dev mode, the test client pairs with that rlxd, keeps the credential in its own
-    // home, and is the gate there.
+    // In dev mode, the test client pairs with that rlxd, keeps the credential in the file
+    // it named, and is the gate there. Its home keeps nothing of that rlxd's.
     served.stop();
     served.start_dev();
-    let run = as_app(&["--as-app", "status"]);
+    let run = as_app(&["--as-app", "--gate-credential-file", &kept_arg, "status"]);
     assert_eq!(run.code(), Some(0), "{run:?}");
     assert_eq!(
         run.data()["clients"]["app"],
@@ -116,11 +179,19 @@ fn the_gate_checks_a_connection_through_call_socket_as_any_other() {
         served.gate_json().exists(),
         "paired with the rlxd at --socket"
     );
-    assert!(client.test_credential().is_some());
+    assert!(!std::fs::read_to_string(&kept).unwrap().trim().is_empty());
+    assert_eq!(
+        client.test_credential(),
+        None,
+        "nothing kept in the client's home"
+    );
     assert!(
         !client.gate_json().exists(),
         "the client home has no gate of its own"
     );
+    // The kept credential serves the next call, with no pairing.
+    let run = as_app(&["--as-app", "--gate-credential-file", &kept_arg, "status"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
     let run = as_app(&["--role", "app", "--gate-credential", "made-up", "status"]);
     assert_eq!(run.error_code(), "not_gate");
 }
@@ -160,9 +231,9 @@ mod deep {
     }
 
     impl HomeAt {
-        /// The home `below.root()/<name>`.
+        /// The home `<below.root(), resolved>/<name>`.
         fn below(below: TestHome, name: &str) -> Self {
-            let root = below.root().join(name);
+            let root = std::fs::canonicalize(below.root()).unwrap().join(name);
             std::fs::create_dir_all(&root).unwrap();
             Self { below, root }
         }
@@ -170,11 +241,11 @@ mod deep {
         /// A home whose `run/rlxd.sock`, absolute, is `len` bytes long.
         fn whose_socket_is(len: usize) -> Self {
             let below = TestHome::new();
-            let base = std::path::absolute(below.root()).unwrap();
+            let base = std::fs::canonicalize(below.root()).unwrap();
             let taken = base.join("x").join("run").join("rlxd.sock");
             let name = "h".repeat(len - (taken.as_os_str().len() - 1));
             let home = Self::below(below, &name);
-            let socket = std::path::absolute(home.layout().socket_in_home()).unwrap();
+            let socket = home.layout().socket_in_home();
             assert_eq!(socket.as_os_str().len(), len, "{}", socket.display());
             home
         }
@@ -289,6 +360,37 @@ mod deep {
             "status",
         ]);
         assert_eq!(run.error_code(), "not_gate");
+    }
+
+    /// `rlxd args…` with `AISQUARE_HOME` spelled `root`.
+    fn rlxd_as(home: &HomeAt, root: &Path, args: &[&str]) -> Run {
+        let mut command = home.below.command(args);
+        command.env("AISQUARE_HOME", root).stdin(Stdio::null());
+        common::run(command, None)
+    }
+
+    #[test]
+    fn every_spelling_of_a_home_reaches_its_one_rlxd() {
+        // The review's repro: a home whose own socket fits, and a link to it whose
+        // spelling would not. Both spellings decide on the resolved path, so they agree.
+        let home = HomeAt::below(TestHome::new(), "h");
+        let link = home.root.with_file_name("l".repeat(100));
+        std::os::unix::fs::symlink(&home.root, &link).unwrap();
+        assert!(link.join("run/rlxd.sock").as_os_str().len() > SOCKET_PATH_MAX);
+        let socket = home.layout().socket_in_home().display().to_string();
+        for (start, ask) in [(&link, &home.root), (&home.root, &link)] {
+            let run = rlxd_as(&home, start, &["serve", "--detach"]);
+            assert_eq!(run.code(), Some(0), "{run:?}");
+            assert_eq!(text(&run.data()["paths"]["socket"]), socket);
+            let run = rlxd_as(&home, ask, &["call", "status"]);
+            assert_eq!(run.code(), Some(0), "{run:?}");
+            assert_eq!(text(&run.data()["paths"]["socket"]), socket);
+            let run = rlxd_as(&home, ask, &["here", "--json"]);
+            assert_eq!(run.code(), Some(0), "{run:?}");
+            assert_eq!(text(&run.data()["socket"]), socket);
+            let run = rlxd_as(&home, ask, &["stop"]);
+            assert_eq!(run.code(), Some(0), "{run:?}");
+        }
     }
 
     #[test]

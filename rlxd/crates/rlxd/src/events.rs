@@ -2,11 +2,13 @@
 //! stream as JSON lines on stdout, one event envelope each.
 //!
 //! `rlxd events [--as-app] [--topics a,b] [--since SEQ] [--follow] [--until TYPE[,TYPE…]]
-//! [--limit N] [--timeout S] [--socket PATH] [--token T]`
+//! [--limit N] [--timeout S] [--socket PATH] [--token-file F | --token T]
+//! [--gate-credential-file F]`
 //!
-//! - **Where.** The home's rlxd with its token file's token, or with `--socket` and
-//!   `--token` another socket and token, such as an SSH forward's local end and the host's
-//!   token, as `rlxd call` takes them.
+//! - **Where.** The home's rlxd with its token file's token, or with `--socket` another
+//!   socket, such as an SSH forward's local end, with `--token-file` (or `--token`), the
+//!   host's token, as `rlxd call` takes them: `--socket` never sends this home's token or
+//!   test credential (`--as-app` then needs `--gate-credential-file`).
 //! - **What it prints.** With `--since`, every event rlxd holds after that seq first, with
 //!   a `daemon.gap` before them when rlxd holds none so old. With `--follow`, then every
 //!   later event as it happens, until rlxd stops; a reader too slow to keep up gets a
@@ -88,6 +90,9 @@ pub fn events(args: EventsArgs) -> ExitCode {
             ));
         }
     };
+    if let Err(message) = args.target.check(args.as_app) {
+        return out::usage(&message);
+    }
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => return cli::report_on_stderr(AskError::NotRunning(e.to_string())),

@@ -140,31 +140,42 @@ impl Home {
 
     /// `<home>/run/rlxd.sock`: the socket's place in the home, which [`Home::socket`] is
     /// unless its path is too long.
+    ///
+    /// On macOS and Linux it is spelled as every spelling of the home resolves it, so
+    /// rlxd binds and every client connects to one path, and they measure the same length:
+    /// under the canonical path of `run/` (links, `.` and `..` resolved), else of the home
+    /// while `run/` isn't there, else the path made absolute while neither is. On Windows,
+    /// as written.
     pub fn socket_in_home(&self) -> PathBuf {
-        self.run_dir().join("rlxd.sock")
+        let run = self.run_dir();
+        if cfg!(windows) {
+            return run.join("rlxd.sock");
+        }
+        let dir = std::fs::canonicalize(&run)
+            .or_else(|_| std::fs::canonicalize(&self.root).map(|root| root.join("run")))
+            .unwrap_or_else(|_| std::path::absolute(&run).unwrap_or(run));
+        dir.join("rlxd.sock")
     }
 
     /// Whether the socket in the home is too long for the OS, so clients connect to
-    /// [`Home::short_socket`]: its absolute path is longer than [`SOCKET_PATH_MAX`]
-    /// bytes. Never on Windows, where clients connect to a named pipe.
-    ///
-    /// The path is made absolute from the working directory, as `bind` and `connect`
-    /// read a relative one; nothing is resolved on disk.
+    /// [`Home::short_socket`]: [`Home::socket_in_home`] is longer than
+    /// [`SOCKET_PATH_MAX`] bytes. It is resolved first, so every spelling of a home
+    /// decides alike. Never on Windows, where clients connect to a named pipe.
     pub fn uses_short_socket(&self) -> bool {
-        if cfg!(windows) {
-            return false;
-        }
-        let socket = self.socket_in_home();
-        let absolute = std::path::absolute(&socket).unwrap_or(socket);
-        absolute.as_os_str().len() > SOCKET_PATH_MAX
+        !cfg!(windows) && self.socket_in_home().as_os_str().len() > SOCKET_PATH_MAX
     }
 
     /// `/tmp/rlxd-<uid>/<hash>.sock`: where clients connect when the home's own socket
-    /// path is too long ([`Home::uses_short_socket`]). The hash is the pipe name's, so two
-    /// spellings of one home share it. About 40 bytes, well inside every OS's limit.
+    /// path is too long ([`Home::uses_short_socket`]). The hash is the first 16 hex digits
+    /// of the SHA-256 of the home's canonical path, its bytes as they are, so two
+    /// spellings of one home share it and two homes never do, UTF-8 or not. About 40
+    /// bytes, well inside every OS's limit.
     #[cfg(unix)]
     pub fn short_socket(&self) -> PathBuf {
-        Self::short_socket_dir().join(format!("{}.sock", self.hash()))
+        use std::os::unix::ffi::OsStrExt;
+        let path = canonical(&self.root);
+        let name = hex16(&Sha256::digest(path.as_os_str().as_bytes()));
+        Self::short_socket_dir().join(format!("{name}.sock"))
     }
 
     /// `/tmp/rlxd-<uid>/`: the short sockets' folder, one per user, 0700. It is `/tmp`
@@ -188,12 +199,11 @@ impl Home {
         format!(r"\\.\pipe\rlxd-{}", self.hash())
     }
 
-    /// The first 16 hex digits of the SHA-256 of the home's canonical path, as UTF-8:
-    /// the pipe's name and the short socket's carry it.
+    /// The first 16 hex digits of the SHA-256 of the home's canonical path, as UTF-8, as
+    /// Python hashes it: the pipe's name carries it.
     fn hash(&self) -> String {
         let path = canonical(&self.root);
-        let digest = Sha256::digest(path.to_string_lossy().as_bytes());
-        digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+        hex16(&Sha256::digest(path.to_string_lossy().as_bytes()))
     }
 
     /// Where clients connect on this OS, as `status` reports it: the socket's path, or
@@ -249,6 +259,11 @@ impl Home {
     pub fn test_gate_credential(&self) -> PathBuf {
         self.root.join("test-gate-credential")
     }
+}
+
+/// The first 8 bytes of `digest`, as 16 hex digits.
+fn hex16(digest: &[u8]) -> String {
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `path` with a leading `~` replaced by the user's home directory. `~name` and every
@@ -398,6 +413,58 @@ mod tests {
         assert!(home.uses_short_socket() && spelled.uses_short_socket());
         assert_eq!(home.socket(), spelled.socket());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_spelling_of_a_home_decides_and_names_its_socket_alike() {
+        use std::os::unix::fs::symlink;
+        let base = std::fs::canonicalize(env::temp_dir())
+            .unwrap()
+            .join(format!("rlxd-spell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // A home whose own socket fits, reached through a link too long for it: both
+        // spellings name the resolved run/rlxd.sock.
+        let near = base.join("h");
+        std::fs::create_dir_all(near.join("run")).unwrap();
+        let long_link = base.join("l".repeat(SOCKET_PATH_MAX));
+        symlink(&near, &long_link).unwrap();
+        let spelled = long_link.join("run").join("rlxd.sock");
+        assert!(spelled.as_os_str().len() > SOCKET_PATH_MAX);
+        for home in [
+            Home::at(&near),
+            Home::at(&long_link),
+            Home::at(near.join(".")),
+        ] {
+            assert!(!home.uses_short_socket(), "{:?}", home.root());
+            assert_eq!(home.socket(), near.join("run").join("rlxd.sock"));
+        }
+        // A home too deep for its socket, reached through a short link: both spellings
+        // name one short socket.
+        let deep = base.join("d".repeat(SOCKET_PATH_MAX));
+        std::fs::create_dir_all(&deep).unwrap();
+        let short_link = base.join("s");
+        symlink(&deep, &short_link).unwrap();
+        assert!(short_link.join("run/rlxd.sock").as_os_str().len() <= SOCKET_PATH_MAX);
+        let (real, linked) = (Home::at(&deep), Home::at(&short_link));
+        assert!(real.uses_short_socket() && linked.uses_short_socket());
+        assert_eq!(real.socket(), linked.socket());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_short_socket_hashes_the_paths_bytes_as_they_are() {
+        use std::os::unix::ffi::OsStrExt;
+        // Two paths that differ only in bytes that aren't UTF-8 read alike lossily.
+        let a = Home::at(std::ffi::OsStr::from_bytes(b"/x/\xff"));
+        let b = Home::at(std::ffi::OsStr::from_bytes(b"/x/\xfe"));
+        assert_eq!(
+            a.pipe_name(),
+            b.pipe_name(),
+            "the pipe's name is the UTF-8 form's"
+        );
+        assert_ne!(a.short_socket(), b.short_socket());
     }
 
     #[cfg(windows)]

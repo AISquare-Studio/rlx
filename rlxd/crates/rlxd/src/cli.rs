@@ -11,7 +11,12 @@
 //! unsigned client do) and keeps the credential there. Like the app, it never pairs again
 //! on its own: once the file exists, a `not_gate` is the call's result. `rlxd events
 //! --as-app` presents the kept credential too, but never pairs: without one, it gets
-//! `not_gate`.
+//! `not_gate`. `--gate-credential-file` keeps it elsewhere.
+//!
+//! `--socket` connects to another rlxd's socket, such as an SSH forward's local end.
+//! Nothing of this home goes there, and nothing from there is kept in it: the token must
+//! be given (`--token-file`, or `--token`), and `--as-app` needs `--gate-credential-file`
+//! (or `--gate-credential`). Either missing is a usage error ([`Target::check`]).
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -47,11 +52,8 @@ pub struct CallArgs {
     pub client: Option<String>,
     /// `hello`'s `gate_credential`.
     pub gate_credential: Option<String>,
-    /// `hello`'s `token`, instead of the token file's.
-    pub token: Option<String>,
-    /// Connect to this socket or pipe instead of the home's, such as an SSH forward's
-    /// local end.
-    pub socket: Option<PathBuf>,
+    /// Where to connect, the token, and where `--as-app` keeps its credential.
+    pub target: Target,
     /// `hello`'s `protocol_version`, as JSON writes a number.
     pub protocol_version: Option<String>,
     /// `hello`'s `env`, a JSON object.
@@ -87,27 +89,83 @@ pub fn ask_with(home: &Home, method: &str, params: Data) -> Result<Reply, AskErr
         .map_err(|e| AskError::Failed(e.to_string()))
 }
 
-/// Where a client command connects and the token it says `hello` with: `--socket` and
-/// `--token` when given, else `home`'s socket and token file.
+/// Where a client command connects, and what it proves itself with: `--socket`,
+/// `--token` or `--token-file`, and `--gate-credential-file`, else the home's socket,
+/// token file and test credential.
+///
+/// With `--socket`, nothing of the home's goes there and nothing from there is kept in the
+/// home: the token must be given, and `--as-app` needs a credential file of its own
+/// ([`Target::check`]).
 #[derive(Debug, Default)]
 pub struct Target {
     /// The socket or pipe, such as an SSH forward's local end.
     pub socket: Option<PathBuf>,
-    /// The token.
+    /// The token, from the command line.
     pub token: Option<String>,
+    /// A file holding the token, so it is not in the command line.
+    pub token_file: Option<PathBuf>,
+    /// Where `--as-app` keeps its gate credential, instead of the home's
+    /// `test-gate-credential`.
+    pub gate_credential_file: Option<PathBuf>,
+}
+
+impl Target {
+    /// Refuses, as a usage error, what would send this home's token or test credential to
+    /// another socket, or keep another rlxd's credential in this home. `as_app` is
+    /// `--as-app` with no `--gate-credential`.
+    pub fn check(&self, as_app: bool) -> Result<(), String> {
+        if self.socket.is_none() {
+            return Ok(());
+        }
+        if self.token.is_none() && self.token_file.is_none() {
+            return Err(
+                "--socket needs --token-file (or --token): this home's token is \
+                        never sent to another socket"
+                    .to_owned(),
+            );
+        }
+        if as_app && self.gate_credential_file.is_none() {
+            return Err(
+                "--as-app with --socket needs --gate-credential-file, where this \
+                        client keeps its credential for the rlxd at --socket (or \
+                        --gate-credential): this home's test credential is never sent \
+                        there, nor that rlxd's kept here"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The token: `--token`, else `--token-file`'s, else, without `--socket`, the home's.
+    pub fn token(&self, home: &Home) -> Result<String, String> {
+        match (&self.token, &self.token_file, &self.socket) {
+            (Some(token), _, _) => Ok(token.clone()),
+            (None, Some(file), _) => read_secret(file, "token"),
+            (None, None, None) => read_token(home),
+            (None, None, Some(_)) => Err("--socket needs --token-file or --token".to_owned()),
+        }
+    }
+
+    /// Where `--as-app` keeps its gate credential: `--gate-credential-file`, else, without
+    /// `--socket`, `<home>/test-gate-credential`. None with `--socket` and no file.
+    pub fn credential_file(&self, home: &Home) -> Option<PathBuf> {
+        match (&self.gate_credential_file, &self.socket) {
+            (Some(file), _) => Some(file.clone()),
+            (None, None) => Some(home.test_gate_credential()),
+            (None, Some(_)) => None,
+        }
+    }
 }
 
 /// A connection to `target`, else `home`'s rlxd, that has said `hello` with its token: as
 /// `cli`, or with `as_app` as `app`, with the test gate credential when there is one.
 pub fn open(home: &Home, as_app: bool, target: &Target) -> Result<Connection, AskError> {
     let mut connection = connect(home, target.socket.as_deref())?;
-    let token = match &target.token {
-        Some(token) => token.clone(),
-        None => read_token(home).map_err(AskError::Failed)?,
-    };
+    let token = target.token(home).map_err(AskError::Failed)?;
     let role = if as_app { "app" } else { "cli" };
     let mut hello = hello_params(&token, &json!(PROTOCOL_VERSION), CLIENT, role);
-    if let Some(credential) = as_app.then(|| test_gate_credential(home)).flatten() {
+    let kept = as_app.then(|| target.credential_file(home)).flatten();
+    if let Some(credential) = kept.as_deref().and_then(read_credential) {
         hello.insert("gate_credential".to_owned(), Value::String(credential));
     }
     let reply = connection
@@ -126,7 +184,13 @@ pub fn call(args: CallArgs) -> ExitCode {
         Err(e) => return report(AskError::NotRunning(e.to_string())),
     };
     if args.raw {
-        return raw(&home, args.socket.as_deref());
+        return raw(&home, args.target.socket.as_deref());
+    }
+    if let Err(message) = args
+        .target
+        .check(args.as_app && args.gate_credential.is_none())
+    {
+        return out::usage(&message);
     }
     let Some(method) = args.method.as_deref() else {
         return out::usage("call needs a method, or --raw");
@@ -146,22 +210,28 @@ pub fn call(args: CallArgs) -> ExitCode {
             _ => return out::usage(&format!("--protocol-version {text} is not a number")),
         },
     };
-    let token = match args.token.clone().map_or_else(|| read_token(&home), Ok) {
+    let token = match args.target.token(&home) {
         Ok(token) => token,
         Err(message) => return out::fail(codes::UNAUTHORIZED, &message, None),
     };
+    let socket = args.target.socket.as_deref();
     let credential = match (args.gate_credential.clone(), args.as_app) {
         (Some(credential), _) => Some(credential),
-        (None, true) => match test_gate_credential(&home) {
-            Some(credential) => Some(credential),
-            None => match pair_test_client(&home, args.socket.as_deref(), &token) {
-                Ok(credential) => Some(credential),
-                Err(exit) => return exit,
-            },
-        },
+        (None, true) => {
+            let Some(file) = args.target.credential_file(&home) else {
+                return out::usage("--as-app with --socket needs --gate-credential-file");
+            };
+            match read_credential(&file) {
+                Some(credential) => Some(credential),
+                None => match pair_test_client(&home, socket, &token, &file) {
+                    Ok(credential) => Some(credential),
+                    Err(exit) => return exit,
+                },
+            }
+        }
         (None, false) => None,
     };
-    let mut connection = match connect(&home, args.socket.as_deref()) {
+    let mut connection = match connect(&home, socket) {
         Ok(connection) => connection,
         Err(e) => return report(e),
     };
@@ -195,10 +265,16 @@ pub fn call(args: CallArgs) -> ExitCode {
 }
 
 /// The test client's first pairing: `gate.pair` as `cli`, keeping the credential in
-/// `<home>/test-gate-credential` (0600). On a refusal, prints it and gives the exit. With
-/// `socket` (`--socket`), it pairs with the rlxd there, whose gate checks it as any other
-/// connection: through an SSH forward its peer is sshd.
-fn pair_test_client(home: &Home, socket: Option<&Path>, token: &str) -> Result<String, ExitCode> {
+/// `file` (0600): `<home>/test-gate-credential`, or `--gate-credential-file`. On a
+/// refusal, prints it and gives the exit. With `socket` (`--socket`), it pairs with the
+/// rlxd there, whose gate checks it as any other connection: through an SSH forward its
+/// peer is sshd.
+fn pair_test_client(
+    home: &Home,
+    socket: Option<&Path>,
+    token: &str,
+    file: &Path,
+) -> Result<String, ExitCode> {
     let mut connection = connect(home, socket).map_err(report)?;
     let hello = hello_params(token, &json!(PROTOCOL_VERSION), CLIENT, "cli");
     let reply = connection
@@ -218,11 +294,10 @@ fn pair_test_client(home: &Home, socket: Option<&Path>, token: &str) -> Result<S
     let Some(credential) = credential else {
         return Err(out::print_reply(&reply));
     };
-    files::write_private(&home.test_gate_credential(), &credential).map_err(|e| {
-        let path = home.test_gate_credential();
+    files::write_private(file, &credential).map_err(|e| {
         let message = format!(
             "paired, but cannot keep the credential in {}: {e}",
-            path.display()
+            file.display()
         );
         out::fail(codes::INTERNAL, &message, None)
     })?;
@@ -521,17 +596,20 @@ fn hello_params(token: &str, version: &Value, client: &str, role: &str) -> Data 
 }
 
 fn read_token(home: &Home) -> Result<String, String> {
-    let path = home.token();
-    std::fs::read_to_string(&path)
-        .map(|token| token.trim().to_owned())
-        .map_err(|e| format!("cannot read the token in {}: {e}", path.display()))
+    read_secret(&home.token(), "token")
 }
 
-/// The gate credential a test client's first `--as-app` call kept, if there is one.
-fn test_gate_credential(home: &Home) -> Option<String> {
-    let text = std::fs::read_to_string(home.test_gate_credential()).ok()?;
-    let credential = text.trim();
-    (!credential.is_empty()).then(|| credential.to_owned())
+/// The file `path`, trimmed: a token or a credential, which `what` names in the error.
+fn read_secret(path: &Path, what: &str) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map(|text| text.trim().to_owned())
+        .map_err(|e| format!("cannot read the {what} in {}: {e}", path.display()))
+}
+
+/// The gate credential kept in `file`, if there is one: `--as-app`'s, from its first call.
+fn read_credential(file: &Path) -> Option<String> {
+    let credential = read_secret(file, "gate credential").ok()?;
+    (!credential.is_empty()).then_some(credential)
 }
 
 /// `text`, a JSON object, or `None` when not given.
