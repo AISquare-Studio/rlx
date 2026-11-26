@@ -73,7 +73,7 @@ from aisquare.services.tmux_panes import TmuxReport
 from tests.fleet_fakes import list_agents_as
 from tests.test_claude_accounts import _sign_in
 from tests.test_ui_accounts import _overview, _status
-from tests.test_ui_shell import composited
+from tests.test_ui_shell import composited, to_the_sidebar
 from tests.ui_workers import settle_page, settle_until
 
 T = TypeVar("T")
@@ -669,6 +669,7 @@ def test_the_sidebar_names_no_aisquare_and_the_accounts_page_has_the_sign_in(
         )
         async with app.run_test(size=(width, 40)) as pilot:
             await settle_page(app)
+            await to_the_sidebar(app)  # below 70 columns, start on Welcome shows the other side
             return await go(pilot)
 
     sidebar, line, page = asyncio.run(run())

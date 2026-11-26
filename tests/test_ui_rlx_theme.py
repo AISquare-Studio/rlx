@@ -625,8 +625,8 @@ def test_the_top_left_is_r_backslash_x_bold_in_the_marks_colour_and_cut_where_rl
     """R23, the owner (2026-11-17): "rlx's logo is now r\\x: r, a backslash, x ... in place of
     'rlx'". As the screen paints it, under each look: the header's first three cells are r, a
     backslash and x, bold in the mark's colour. The rest of the row is what rlx's was. A
-    nine-digit count is cut in the 24-cell sidebar (38 to 60 columns), and it is cut in the
-    same cell."""
+    nine-digit count was cut in the 24-cell sidebar of a 38 to 60 column terminal; below 70
+    columns the sidebar is the whole row now (L2), so it is whole at every width here."""
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def body(pilot: Pilot[None]) -> LogoRows:
@@ -659,8 +659,7 @@ def test_the_top_left_is_r_backslash_x_bold_in_the_marks_colour_and_cut_where_rl
         assert cells == [("r", mark, True), ("\\", mark, True), ("x", mark, True)], (theme, cells)
         assert row.lstrip().startswith(f"{LOGO} · 123456789"), (theme, row)
         assert row == before[theme][0].replace("rlx", LOGO, 1), (theme, row, before[theme][0])
-    cut = width < 90
-    assert (" live" not in shown["rlx"][0]) is cut, shown["rlx"][0]
+    assert " live" in shown["rlx"][0], shown["rlx"][0]
 
 
 def test_a_theme_that_sets_the_mark_colours_it_apart_from_its_primary(

@@ -65,6 +65,13 @@ CONSENT_CHROME = 10
 """The question's rows that are not its text: border 2, padding 2, title and its margin 2,
 the buttons' margin and the buttons 4."""
 
+CONSENT_ROW_COLUMNS = 80
+"""The columns the three answers need on one row, the box's own width: under it they stack
+(``ConsentDialog.-narrow``), and the box is the screen's width (a 60-column phone or SSH, L2)."""
+
+STACKED_BUTTON_ROWS = 6
+"""What stacking adds to :data:`CONSENT_CHROME`: two more buttons of three rows each."""
+
 PING_TITLE = "Daily active ping (separate from usage sharing)"
 PING_ABOUT = (
     "Sent whether usage sharing is on or off: on each day you use rlx, one anonymous ping with "
@@ -443,8 +450,8 @@ class ConsentDialog(ModalScreen[str]):
     CSS = """
     ConsentDialog { align: center middle; }
     ConsentDialog #consent-box {
-        width: 80; height: auto; max-height: 90%; border: heavy $primary; background: $surface;
-        padding: 1 2;
+        width: 80; max-width: 100%; height: auto; max-height: 90%; border: heavy $primary;
+        background: $surface; padding: 1 2;
     }
     ConsentDialog #consent-title { height: 1; text-style: bold; margin-bottom: 1; }
     ConsentDialog #consent-scroll { height: auto; }
@@ -452,6 +459,10 @@ class ConsentDialog(ModalScreen[str]):
     ConsentDialog #consent-text { height: auto; }
     ConsentDialog #consent-buttons { height: auto; margin-top: 1; align: right middle; }
     ConsentDialog #consent-buttons Button { margin-left: 2; }
+    /* Under CONSENT_ROW_COLUMNS (a phone, SSH: L2) the three answers do not fit one row: one
+       per row, the whole box's width, so No thanks is never off the screen. */
+    ConsentDialog.-narrow #consent-buttons { layout: vertical; align: left top; }
+    ConsentDialog.-narrow #consent-buttons Button { margin-left: 0; width: 100%; }
     """
     BINDINGS: ClassVar = [("escape", "decline", "no thanks")]
 
@@ -477,7 +488,10 @@ class ConsentDialog(ModalScreen[str]):
         """The text scrolls in whatever room the box leaves it, so the answers always show: at
         80x24 the question is taller than the screen (border, padding, title and buttons take
         :data:`CONSENT_CHROME` rows of the box's 90%)."""
-        room = int(self.size.height * 0.9) - CONSENT_CHROME
+        narrow = self.size.width < CONSENT_ROW_COLUMNS
+        self.set_class(narrow, "-narrow")
+        chrome = CONSENT_CHROME + (STACKED_BUTTON_ROWS if narrow else 0)
+        room = int(self.size.height * 0.9) - chrome
         self.query_one("#consent-scroll", VerticalScroll).styles.max_height = max(3, room)
 
     def on_mount(self) -> None:
