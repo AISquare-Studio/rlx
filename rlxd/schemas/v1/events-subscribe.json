@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SubscribeParams",
+  "description": "`events.subscribe`'s params: which topics to stream, and from where.\n\n```json\n{\"topics\": [\"run\", \"needs_you\"], \"since\": 41, \"follow\": true}\n```\n\nThe stream that follows carries, in order:\n\n1. with `since`, every event rlxd still holds after it, oldest first;\n2. with `follow`, which is the default, every later event as it happens. Without it,\n   the stream ends at the last event published when rlxd took the subscribe.\n\nA `daemon.gap {from, to}` says that the events numbered `from` to `to` are gone, and\nthe client re-reads what it shows. It comes first when `since` is older than the\noldest event rlxd holds, and also anywhere later, when a client reads so slowly that\nrlxd drops events it has not read yet. It comes whatever the `topics`. Its own `seq`\nis its `to`, so resuming from it skips nothing it did not report.\n\nEvent frames carry no `id`: a connection carries at most one stream, and a frame with\n`ok` is a reply, any other an event. There is no \"subscribed\" reply first: to miss no\nevent of something you start, take `since` from `status`'s `seq` before starting it,\nor start it on the same connection after the subscribe. The request's reply comes\nlast and ends the stream, `{\"id\": …, \"ok\": true, \"data\": {\"seq\": …}}`, where `seq` is\nthe last one the stream covered, whatever its topics: keep it as the `since` to resume\nfrom. Without `follow`, it comes once the replay is done; with it, when rlxd stops. A\nsubscribe rlxd refuses gets its error reply and no events.",
+  "type": "object",
+  "properties": {
+    "follow": {
+      "description": "Go on with live events after the replay, until rlxd stops. `false` ends the stream\nat the last event published when rlxd took the subscribe.",
+      "type": "boolean",
+      "default": true
+    },
+    "since": {
+      "description": "Replay the events after this `seq` first, `0` for every event rlxd holds. Absent\nmeans live events only. A `seq` this rlxd has not reached yet gets the error\n`since_ahead`, with `detail.head`: it comes from another numbering, so re-read what\nyou show and subscribe again.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "topics": {
+      "description": "The topics to stream, such as `run` and `needs_you`. Absent means every topic. A\ntopic this rlxd does not carry gets the error `unknown_topic`.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "minItems": 1
+    }
+  }
+}

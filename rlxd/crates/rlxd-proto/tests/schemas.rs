@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
     InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request,
-    RequestId, Role, RunScope, SCHEMA_VERSION, StatusData, codes, daemon_kinds,
-    protocol_version_of, schema_version_of, schemas, topics,
+    RequestId, Role, RunScope, SCHEMA_VERSION, StatusData, SubscribeParams, codes, daemon_kinds,
+    event_types, methods, protocol_version_of, schema_version_of, schemas, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -159,6 +159,7 @@ fn every_schema_is_a_valid_draft_2020_12_schema() {
         "envelope.json",
         "event.json",
         "event-list.json",
+        "events-subscribe.json",
         "daemon-record.json",
         "here-reply.json",
     ] {
@@ -1501,6 +1502,142 @@ fn every_pid_is_one_kill_can_take() {
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value.pointer(pointer), Some(&max), "{schema}{pointer}");
     }
+}
+
+// --- events.subscribe -----------------------------------------------------------------------
+
+const SUBSCRIBE: &str = "events-subscribe.json";
+
+#[test]
+fn subscribe_params_validate_and_print_back_as_themselves() {
+    let whole = json!({"topics": ["run", "needs_you"], "since": 41, "follow": false});
+    assert_eq!(agrees::<SubscribeParams>(SUBSCRIBE, &whole), whole);
+    // Every field may be left out: every topic, live events only, until rlxd stops.
+    let printed = agrees::<SubscribeParams>(SUBSCRIBE, &json!({}));
+    assert_eq!(printed, json!({"follow": true}));
+    let empty: SubscribeParams = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(empty, SubscribeParams::new());
+    assert_eq!(empty, SubscribeParams::default());
+    for since in [0, 1, u64::MAX] {
+        agrees::<SubscribeParams>(SUBSCRIBE, &json!({ "since": since }));
+    }
+    for topic in topics::ALL {
+        agrees::<SubscribeParams>(SUBSCRIBE, &json!({ "topics": [topic] }));
+    }
+    // A topic this crate doesn't list is rlxd's to refuse, with unknown_topic, so that a
+    // later rlxd's topic needs no new types; an unknown field is ignored.
+    agrees::<SubscribeParams>(SUBSCRIBE, &json!({"topics": ["later"], "later": 1}));
+}
+
+#[test]
+fn subscribe_params_refuse_their_wrong_shapes() {
+    let u64_over: Value = serde_json::from_str("18446744073709551616").unwrap();
+    for wrong in [
+        json!({"topics": []}),
+        json!({"topics": null}),
+        json!({"topics": "run"}),
+        json!({"topics": ["Run"]}),
+        json!({"topics": ["run.text"]}),
+        json!({"topics": [""]}),
+        json!({"topics": [1]}),
+        json!({"since": -1}),
+        json!({"since": 1.5}),
+        json!({"since": "1"}),
+        json!({"since": null}),
+        json!({ "since": u64_over }),
+        json!({"follow": "yes"}),
+        json!({"follow": null}),
+        json!([]),
+        json!([["run"], 41]),
+        json!("run"),
+    ] {
+        both_refuse::<SubscribeParams>(SUBSCRIBE, wrong);
+    }
+}
+
+#[test]
+fn subscribe_params_builders_print_what_the_schema_accepts_and_refuse_the_rest() {
+    let built = SubscribeParams::new()
+        .with_topics(["daemon", "run"])
+        .unwrap()
+        .with_since(7)
+        .with_follow(false);
+    let printed = serde_json::to_value(&built).unwrap();
+    assert_eq!(
+        printed,
+        json!({"topics": ["daemon", "run"], "since": 7, "follow": false})
+    );
+    agrees::<SubscribeParams>(SUBSCRIBE, &printed);
+    let no_topics: [&str; 0] = [];
+    assert_eq!(
+        refused(SubscribeParams::new().with_topics(no_topics)),
+        "topics"
+    );
+    assert_eq!(
+        refused(SubscribeParams::new().with_topics(["Run"])),
+        "topics"
+    );
+    let mut broken = built;
+    broken.topics = Some(Vec::new());
+    assert!(serde_json::to_value(&broken).is_err());
+}
+
+#[test]
+fn the_stream_names_its_method_and_the_daemon_types_their_topic() {
+    assert_eq!(methods::EVENTS_SUBSCRIBE, "events.subscribe");
+    assert_eq!(methods::DEBUG_EMIT, "debug.emit");
+    for kind in [
+        event_types::DAEMON_STARTED,
+        event_types::DAEMON_STOPPING,
+        event_types::DAEMON_GAP,
+    ] {
+        let event = Event::new(1, TIME, topics::DAEMON, kind, Data::new()).unwrap();
+        agrees::<Event>("event.json", &serde_json::to_value(&event).unwrap());
+    }
+    for code in [
+        codes::INVALID_PARAMS,
+        codes::UNKNOWN_TOPIC,
+        codes::TIMED_OUT,
+        codes::STREAM_ENDED,
+    ] {
+        let reply = Envelope::err(ErrorBody::new(code, "m").unwrap()).with_id(id(1));
+        agrees::<Envelope>("envelope.json", &serde_json::to_value(&reply).unwrap());
+    }
+}
+
+#[test]
+fn since_ahead_always_says_the_last_seq() {
+    let reply = Envelope::err(ErrorBody::since_ahead(99, 4)).with_id(id(2));
+    let printed = serde_json::to_value(&reply).unwrap();
+    agrees::<Envelope>("envelope.json", &printed);
+    assert_eq!(printed["error"]["code"], "since_ahead");
+    assert_eq!(printed["error"]["detail"], json!({"since": 99, "head": 4}));
+    assert_eq!(
+        refused(ErrorBody::new(codes::SINCE_AHEAD, "m")),
+        "detail.head"
+    );
+    let base = with_error(&error_base(), "code", json!(codes::SINCE_AHEAD));
+    agrees::<Envelope>(
+        "envelope.json",
+        &with_error(&base, "detail", json!({"head": 4})),
+    );
+    both_refuse::<Envelope>("envelope.json", base.clone());
+    for detail in [
+        json!("text"),
+        json!({}),
+        json!({"since": 9}),
+        json!({"head": "4"}),
+        json!({"head": -1}),
+        json!({"head": 4, "since": "9"}),
+    ] {
+        both_refuse::<Envelope>("envelope.json", with_error(&base, "detail", detail));
+    }
+    // incompatible_protocol's rule still holds beside it.
+    let refused_version = example("envelope-incompatible-protocol.json");
+    both_refuse::<Envelope>(
+        "envelope.json",
+        with_error(&refused_version, "detail", json!({"head": 4})),
+    );
 }
 
 // --- here -----------------------------------------------------------------------------------

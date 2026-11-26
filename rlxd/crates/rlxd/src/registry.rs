@@ -63,8 +63,9 @@ pub struct Registration {
 }
 
 impl Registration {
-    /// Registers this rlxd in `home`'s registry.
-    pub fn register(home: &Home) -> io::Result<Self> {
+    /// Registers this rlxd in `home`'s registry. Its record's `argv`, which restarts it,
+    /// is `rlxd serve --detach` plus `flags`, the flags it was started with.
+    pub fn register(home: &Home, flags: &[&str]) -> io::Result<Self> {
         let dir = home.daemons();
         crate::serve::private_dir(&dir)?;
         let _gate = gate(&dir)?;
@@ -72,11 +73,12 @@ impl Registration {
         let lock = take(&dir.join(format!("{id}.lock")))?;
         let now = clock::now();
         let exe = std::env::current_exe()?;
-        let argv = vec![
+        let mut argv = vec![
             exe.display().to_string(),
             "serve".to_owned(),
             "--detach".to_owned(),
         ];
+        argv.extend(flags.iter().map(|&flag| flag.to_owned()));
         let mut record = DaemonRecord::new(
             id,
             daemon_kinds::RLXD,
@@ -204,7 +206,7 @@ fn fresh_id(dir: &Path) -> io::Result<String> {
     }
 }
 
-fn private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn private_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -225,7 +227,7 @@ fn remove(path: &Path) -> io::Result<()> {
 
 /// Runs `step`, again for up to [`RETRY`] while Windows refuses it because another handle
 /// has the file open.
-fn retry_refused(mut step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn retry_refused(mut step: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     /// ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
     const REFUSED: [i32; 2] = [5, 32];
     let deadline = Instant::now() + RETRY;

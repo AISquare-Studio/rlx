@@ -2,12 +2,17 @@
 //!
 //! The wire is newline-delimited JSON (handoff 0.10.3, 7.2): each frame is one line. A
 //! connection is blocking and does one thing at a time: a request, then its reply.
+//!
+//! `events.subscribe` (7.3) turns a connection into an event stream ([`Subscription`]):
+//! event frames, then the subscribe's reply, which ends the stream. A frame with `ok` is
+//! a reply, and any other is an event.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 use rlxd_proto::{
-    Data, Envelope, ErrorBody, HelloParams, Outcome, Params, Request, RequestId, methods,
+    Data, Envelope, ErrorBody, Event, HelloParams, Outcome, Params, Request, RequestId,
+    SubscribeParams, methods,
 };
 
 use crate::Home;
@@ -140,6 +145,63 @@ impl Reply {
     }
 }
 
+/// One event as it came on a stream: its line, and the event it holds.
+#[derive(Clone, Debug)]
+pub struct EventLine {
+    /// The event's line, without its newline.
+    pub line: String,
+    /// The line, read.
+    pub event: Event,
+}
+
+/// One frame read from a connection that may carry a stream.
+#[derive(Clone, Debug)]
+pub enum Incoming {
+    /// An event of the stream.
+    Event(EventLine),
+    /// A reply: to the request that opened the stream, which ends it, or to another.
+    Reply(Reply),
+}
+
+/// What a [`Subscription`] reads next.
+#[derive(Clone, Debug)]
+pub enum Next {
+    /// An event.
+    Event(EventLine),
+    /// The subscribe's reply, which ends the stream. `ok: false`, and before any event,
+    /// when rlxd refused the subscribe; `{seq}`, the last seq the stream covered, when it
+    /// ended after the replay (no `follow`) or because rlxd stopped.
+    End(Reply),
+}
+
+/// An event stream on a connection, opened by [`Connection::subscribe`].
+pub struct Subscription {
+    connection: Connection,
+    id: RequestId,
+}
+
+impl Subscription {
+    /// The next event, or the reply that ends the stream. Read no further after that
+    /// reply: the connection is free for requests again ([`Subscription::into_connection`]).
+    pub fn next_frame(&mut self) -> Result<Next, CallError> {
+        loop {
+            match self.connection.read_incoming()? {
+                Incoming::Event(event) => return Ok(Next::Event(event)),
+                Incoming::Reply(reply) if reply.envelope.id.is_none_or(|id| id == self.id) => {
+                    return Ok(Next::End(reply));
+                }
+                // A reply to some other request, which this connection did not send.
+                Incoming::Reply(_) => {}
+            }
+        }
+    }
+
+    /// The connection, once the stream has ended.
+    pub fn into_connection(self) -> Connection {
+        self.connection
+    }
+}
+
 impl Connection {
     /// A connection to the rlxd serving `home`. Sends nothing: say [`Connection::hello`]
     /// first.
@@ -198,6 +260,25 @@ impl Connection {
         }
     }
 
+    /// The next frame rlxd sends, a reply or an event: one with `ok` is a reply.
+    pub fn read_incoming(&mut self) -> Result<Incoming, CallError> {
+        let line = self.read_line()?.ok_or(CallError::Closed)?;
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(error) => return Err(CallError::Malformed { line, error }),
+        };
+        if value.get("ok").is_some() {
+            return match serde_json::from_value::<Envelope>(value) {
+                Ok(envelope) => Ok(Incoming::Reply(Reply { line, envelope })),
+                Err(error) => Err(CallError::Malformed { line, error }),
+            };
+        }
+        match serde_json::from_value::<Event>(value) {
+            Ok(event) => Ok(Incoming::Event(EventLine { line, event })),
+            Err(error) => Err(CallError::Malformed { line, error }),
+        }
+    }
+
     /// Sends `hello` and reads its reply. A refused hello's reply is `ok: false`, and rlxd
     /// then closes the connection.
     pub fn hello(&mut self, hello: &HelloParams) -> Result<Reply, CallError> {
@@ -216,6 +297,14 @@ impl Connection {
 
     /// Sends a request for `method` with `params`, and reads its reply.
     pub fn request(&mut self, method: &str, params: Params) -> Result<Reply, CallError> {
+        self.send(method, params)?;
+        self.read_reply()
+    }
+
+    /// Sends a request for `method` with `params` and reads nothing, returning its id.
+    /// Its reply, and a streaming method's events before it, come through
+    /// [`Connection::read_incoming`].
+    pub fn send(&mut self, method: &str, params: Params) -> Result<RequestId, CallError> {
         let id = RequestId::from(self.next_id);
         self.next_id += 1;
         let request = Request::new(id, method, params)
@@ -223,7 +312,27 @@ impl Connection {
         let line = serde_json::to_string(&request)
             .map_err(|e| CallError::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
         self.send_line(&line)?;
-        self.read_reply()
+        Ok(id)
+    }
+
+    /// Opens the event stream (7.3) after `hello`: sends `events.subscribe` with `params`.
+    /// Read the stream with [`Subscription::next_frame`]; a refusal is its first frame.
+    pub fn subscribe(mut self, params: &SubscribeParams) -> Result<Subscription, CallError> {
+        let params = match serde_json::to_value(params) {
+            Ok(serde_json::Value::Object(params)) => params,
+            Ok(_) => unreachable!("subscribe params print as an object"),
+            Err(error) => {
+                return Err(CallError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    error,
+                )));
+            }
+        };
+        let id = self.send(methods::EVENTS_SUBSCRIBE, params)?;
+        Ok(Subscription {
+            connection: self,
+            id,
+        })
     }
 }
 

@@ -14,6 +14,21 @@ publish.workspace = true
 name = "rlxd"
 doc = false
 
+[features]
+# Test builds only. `debug-methods` adds the socket's debug.* methods (handoff 0.10.3,
+# 7.3: `debug.emit {count}`), which rlxd's own tests drive. Nothing turns it on but the
+# dev-dependency below, which cargo applies when it builds the tests (`cargo test`,
+# `cargo clippy --all-targets`), so a release build (`cargo build --release`) never has
+# it: tests/release_build.rs builds one and checks. Package exactly that build: with
+# `--all-targets` or `--tests`, or from `cargo test --release`, cargo builds the
+# dev-dependency, and the binary would have the debug methods.
+debug-methods = []
+# Tests only: lets RLXD_TEST_GATE_REQUIREMENT replace the gate peer's compiled-in identity
+# (handoff 0.10.3, 5.1), so the gate_peer_* tests can sign helpers with a test identity.
+# Release builds never enable it, and without it no config, variable or flag changes the
+# identity.
+gate-test-requirement = []
+
 [dependencies]
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 getrandom = "0.3"
@@ -21,7 +36,12 @@ rlxd-client.workspace = true
 rlxd-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.11"
 tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+# Gate device names: NFKC, single script, and UTS #39 skeletons to compare look-alikes.
+unicode-normalization = "0.1"
+unicode-security = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -31,14 +51,22 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
 jsonschema = { version = "0.63", default-features = false }
+# rlxd itself, with the debug methods, so the binary the tests run has them.
+rlxd = { path = ".", features = ["debug-methods"] }
 toml = "0.9"
 
 [target.'cfg(windows)'.dev-dependencies]
@@ -49,6 +77,23 @@ windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
+
+# The gate's peer checks, one per OS (handoff 0.10.3, 5.1). Each signs or builds helpers
+# that the feature's test identity names, so cargo builds them only with the feature:
+# `cargo test -p rlxd --features gate-test-requirement --test gate_peer_<os>`. On another
+# OS each compiles to nothing. gate_peer_macos_release needs no feature, and checks the
+# compiled-in requirement.
+[[test]]
+name = "gate_peer_macos"
+required-features = ["gate-test-requirement"]
+
+[[test]]
+name = "gate_peer_linux"
+required-features = ["gate-test-requirement"]
+
+[[test]]
+name = "gate_peer_windows"
+required-features = ["gate-test-requirement"]
 
 [lints]
 workspace = true

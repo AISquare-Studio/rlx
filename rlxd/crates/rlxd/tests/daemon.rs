@@ -31,7 +31,7 @@ fn serve_detach_starts_rlxd_and_status_describes_it() {
     assert_eq!(data["platform"], std::env::consts::OS);
     assert_eq!(data["protocol_version"], 1);
     assert!(data["capabilities"].is_array());
-    assert_eq!(data["seq"], 0);
+    assert_eq!(data["seq"], 1, "daemon.started, a new home's first event");
     assert_eq!(data["gate"], "signed app only");
     assert_eq!(data["paths"]["home"], home.root().display().to_string());
     assert_valid("status-reply.json", data);
@@ -57,7 +57,9 @@ fn a_second_serve_exits_1_already_running() {
 
 #[test]
 fn role_app_is_refused_with_not_gate_and_never_counted() {
-    // Check 3a, and 5.1's refusals: no gate pairing yet, so every app hello is refused.
+    // Check 3a, and 5.1's refusals: outside dev mode the unsigned test client can neither
+    // pair nor present a credential, so every app hello is refused. tests/gate.rs has
+    // the rest of the gate.
     let home = TestHome::new();
     home.start();
     for args in [
