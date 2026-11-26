@@ -329,12 +329,6 @@ pub fn kill_recorded(_pid: u32, _started: &str) -> bool {
     false
 }
 
-/// Windows records no start time: the job kills the tree when rlxd exits.
-#[cfg(windows)]
-pub fn start_time(_pid: u32) -> Option<String> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
