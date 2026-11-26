@@ -77,6 +77,11 @@ impl Resolved {
     }
 }
 
+/// The program to run as `claude` on rlxd's own `PATH`, if there is one rlxd runs.
+pub fn resolve() -> Option<PathBuf> {
+    resolve_on(None).0.program().map(Path::to_path_buf)
+}
+
 /// Resolves `claude` now: `RLXD_CLAUDE_BIN` from rlxd's own environment when it is set,
 /// taken as it names, else the first `claude` on `path` (the app's `PATH`), or on rlxd's
 /// own `PATH` when the app set none. Entries that are empty or relative are skipped: a

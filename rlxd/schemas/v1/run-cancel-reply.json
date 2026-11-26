@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunCancelData",
+  "description": "`run.cancel`'s reply. A queued or running run ends `failed {reason: \"cancelled\"}`,\nits process tree killed and its partial text kept, and so does a `needs_you` one. A\nrun that had already ended is left as it was: `cancelled` is `false`, and `state` is\nhow it ended.\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\", \"cancelled\": true, \"state\": \"failed\"}\n```",
+  "type": "object",
+  "properties": {
+    "cancelled": {
+      "description": "Whether this call ended the run.",
+      "type": "boolean"
+    },
+    "run_id": {
+      "description": "The run's id.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "state": {
+      "description": "The run's state now.",
+      "$ref": "#/$defs/RunState"
+    }
+  },
+  "required": [
+    "run_id",
+    "cancelled",
+    "state"
+  ],
+  "$defs": {
+    "RunState": {
+      "description": "Where a run stands (7.5).",
+      "oneOf": [
+        {
+          "description": "Waiting for a place in its kind's pool.",
+          "type": "string",
+          "const": "queued"
+        },
+        {
+          "description": "Its Claude Code is running.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "It ended needing the user; `run.resume` goes on with it.",
+          "type": "string",
+          "const": "needs_you"
+        },
+        {
+          "description": "It ended with a result.",
+          "type": "string",
+          "const": "done"
+        },
+        {
+          "description": "It ended without one: `run.failed`'s `reason` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    }
+  }
+}
