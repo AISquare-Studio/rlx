@@ -763,7 +763,9 @@ pub fn ssh_refused(device: &str) -> String {
 /// [`name_key`] is not empty). Each character is a space, or a letter, a digit, `.`, `_`
 /// or `-` that UTS #39 allows in identifiers, all in one script (digits and those marks
 /// go with any). So zero-width and bidi controls, combining letters, fillers, other
-/// punctuation and mixed scripts are refused.
+/// punctuation and mixed scripts are refused, and so are the scripts UTS #39 marks
+/// Limited Use or Excluded, such as Cherokee or Tifinagh: a trade-off, accepted for the
+/// gate, against names that only look alike.
 pub fn device_name(raw: &str) -> Result<String, String> {
     use unicode_normalization::UnicodeNormalization;
     use unicode_security::MixedScript;
@@ -779,10 +781,17 @@ pub fn device_name(raw: &str) -> Result<String, String> {
         return Err(format!("the device name {name:?} looks blank"));
     }
     if let Some(c) = name.chars().find(|&c| !allowed_in_name(c)) {
-        return Err(format!(
-            "a device name has spaces, and letters, digits, '.', '_' and '-' that Unicode \
-             allows in identifiers (UTS #39), only, not {c:?}"
-        ));
+        return Err(if c.is_alphanumeric() {
+            format!(
+                "a device name has only letters and digits that UTS #39 allows in \
+                 identifiers, and {c:?} is not one: combining letters, fillers, and the \
+                 letters of the scripts it marks Limited Use or Excluded (such as \
+                 Cherokee, Inuktitut, Tifinagh or Javanese) are refused, a security \
+                 trade-off so that names can't only look alike"
+            )
+        } else {
+            format!("a device name has letters, digits, spaces, '.', '_' and '-' only, not {c:?}")
+        });
     }
     if !name.is_single_script() {
         return Err("a device name is written in one script".to_owned());
@@ -799,13 +808,20 @@ fn allowed_in_name(c: char) -> bool {
     c == ' ' || ((c.is_alphanumeric() || matches!(c, '.' | '_' | '-')) && c.identifier_allowed())
 }
 
-/// The form two device names are compared in: their UTS #39 confusable skeleton, lower-
-/// cased, with runs of spaces as one. Names that only look alike (Cyrillic for Latin,
-/// `I` for `l`, a case or a doubled space apart) have one key.
+/// The form two device names are compared in: NFKD with its combining marks dropped,
+/// then the UTS #39 confusable skeleton, lowercased, with runs of spaces as one. Names
+/// that only look alike (a diacritic, Cyrillic for Latin, `I` for `l`, a case or a
+/// doubled space apart) have one key.
 fn name_key(name: &str) -> String {
-    let skeleton: String = unicode_security::skeleton(name).collect();
+    use unicode_normalization::UnicodeNormalization;
+    use unicode_normalization::char::is_combining_mark;
+    let bare = |text: &str| -> String { text.nfkd().filter(|&c| !is_combining_mark(c)).collect() };
+    let skeleton: String = unicode_security::skeleton(&bare(name)).collect();
     let lower: String = unicode_security::skeleton(&skeleton.to_lowercase()).collect();
-    lower.split_whitespace().collect::<Vec<_>>().join(" ")
+    bare(&lower)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether two device names are one name, or look alike.
@@ -1103,13 +1119,13 @@ mod tests {
         // Review #2068, r3 minor 2: a combining Latin letter after a revoked name's last
         // letter made a new name that looks like it, and Hangul fillers a blank one.
         for (name, why) in [
-            ("laptop\u{0363}", "allows in identifiers"),
-            ("lapto\u{0369}p", "allows in identifiers"),
-            ("laptop\u{1DE7}", "allows in identifiers"),
+            ("laptop\u{0363}", "UTS #39"),
+            ("lapto\u{0369}p", "UTS #39"),
+            ("laptop\u{1DE7}", "UTS #39"),
             ("\u{3164}", "looks blank"),
             ("\u{FFA0}\u{FFA0}", "looks blank"),
             ("\u{115F}", "looks blank"),
-            ("laptop\u{3164}", "allows in identifiers"),
+            ("laptop\u{3164}", "UTS #39"),
         ] {
             let refused = device_name(name).expect_err(name);
             assert!(refused.contains(why), "{name:?}: {refused}");
@@ -1118,6 +1134,32 @@ mod tests {
         {
             assert!(device_name(name).is_ok(), "{name:?}");
             assert!(!name_key(name).is_empty(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn diacritics_do_not_tell_names_apart() {
+        // Review #2340: a diacritic made a name that looks like a revoked one.
+        for (a, b) in [
+            ("laptop", "lapt\u{1ECD}p"),
+            ("laptop", "lapto\u{0323}p"),
+            ("cafe", "caf\u{E9}"),
+            ("Muller", "M\u{FC}ller"),
+            ("laptop", "\u{1E37}apt\u{F6}p"),
+        ] {
+            assert!(same_name(a, b), "{a:?} and {b:?}");
+            assert!(device_name(b).is_ok(), "{b:?} is still a name");
+        }
+        assert!(!same_name("laptop", "desktop"));
+    }
+
+    #[test]
+    fn limited_use_scripts_are_refused_and_the_refusal_says_why() {
+        // Review #2340: accepted as a security trade-off, and said so.
+        for name in ["\u{13E3}\u{13B3}\u{13A9}", "\u{2D5C}\u{2D49}\u{2D3C}"] {
+            let refused = device_name(name).expect_err(name);
+            assert!(refused.contains("Limited Use"), "{name:?}: {refused}");
+            assert!(refused.contains("trade-off"), "{name:?}: {refused}");
         }
     }
 

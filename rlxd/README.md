@@ -70,12 +70,16 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     leaves is withdrawn, and a credential whose reply can't be delivered is revoked, so
     no device is left paired with a credential nobody received; an undelivered
     re-pairing keeps the device's old credential. That holds when rlxd stops with the
-    reply still unsent too. Device names are NFKC-normalized and
-    trimmed, then may hold only spaces, and letters, digits, `.`, `_` and `-` that UTS
-    #39 allows in identifiers (no combining letters or fillers), in one script, and
-    must not look blank. Names that only look alike (by their UTS #39 skeleton, case and spacing
-    aside) count as one, so they are unique, and a new device may take the name of one
-    the user unpaired, or a look-alike, only with `--force`.
+    reply still unsent too. Device names are NFKC-normalized and trimmed, then may hold
+    only spaces, and letters, digits, `.`, `_` and `-` that UTS #39 allows in
+    identifiers, in one script, and must not look blank. So combining letters and
+    fillers are refused, and so is every letter of the scripts UTS #39 marks Limited
+    Use or Excluded, such as Cherokee, Inuktitut, Tifinagh or Javanese: a security
+    trade-off, accepted for the gate, and the refusal says so. Names that only look
+    alike (by their UTS #39 skeleton, with diacritics, case and spacing aside, so
+    `laptọp` and `café` compare as `laptop` and `cafe`) count as one, so they are
+    unique, and a new device may take the name of one the user unpaired, or a
+    look-alike, only with `--force`.
     `rlxd gate unpair [<device>]` is the only reset; unpairing one device never touches
     another. A `hello {role: "app"}` without a paired device's credential (an empty one
     included) gets `not_gate`, and so does anything else the gate refuses. A client
@@ -338,6 +342,21 @@ cargo test -p rlxd --features gate-test-requirement --test gate_peer_macos \
   --test gate_peer_linux --test gate_peer_windows
 cargo test --release -p rlxd --test gate_peer_macos_release   # the compiled-in requirement
 ```
+
+Every `cargo test` builds rlxd with the dev-only cargo features `debug-methods` and
+`gate-dev-mode`, through rlxd's dev-dependency on itself, so the tests can start it with
+`--gate-dev-mode`; nothing else is needed. To run such an rlxd by hand, as the test
+client of the handoff's checks or an unsigned app build wants, build it with the
+feature, and check that its version says so:
+
+```sh
+cargo build -p rlxd --features gate-dev-mode
+target/debug/rlxd --version   # rlxd <version> (dev: gate-dev-mode)
+target/debug/rlxd serve --detach --gate-dev-mode
+```
+
+A plain `cargo build` or `cargo build --release` has no dev mode: `--gate-dev-mode`
+is then a usage error, and `tests/release_build.rs` checks a release build for it.
 
 Two tests cross into Python's side of the daemon registry (4.1):
 `crates/rlxd/tests/registry_interop.rs` (Python's `core.daemons` holds a record that

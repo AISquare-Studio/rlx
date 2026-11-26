@@ -13,7 +13,6 @@ use common::{TestHome, assert_valid, eventually};
 use rlxd_client::proto::{HelloParams, Role};
 use rlxd_client::{Connection, Home, Incoming};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 /// One app-role connection, held open.
 struct App {
@@ -853,9 +852,9 @@ fn a_client_that_half_closes_still_gets_its_last_reply() {
 }
 
 /// How many bytes of replies a client must leave unread for rlxd's end of the socket to
-/// stop being writable, while a reply that size is still written whole: half of what a
-/// write may queue on Linux (writable up to a quarter), and on macOS what it may queue
-/// less 1 KB (writable while 2 KB are free).
+/// stop being writable, while every one of them is still written whole: half of what a
+/// socket may queue on Linux (writable up to a quarter, `wmem_default`), and on macOS
+/// what it may queue less 1 KB (writable while 2 KB are free, `sendspace`).
 #[cfg(unix)]
 fn unwritable_but_not_blocked() -> usize {
     let read = |program: &str, args: &[&str]| -> usize {
@@ -888,14 +887,22 @@ fn a_half_closed_client_with_unread_replies_keeps_its_waiting_request() {
         "token": home.token(), "protocol_version": 1, "client": "unread",
         "client_version": "0", "role": "cli", "capabilities": [],
     }});
-    // hello's reply and an unknown_method's, which says the method's name, are about
-    // 400 bytes besides that name.
-    let name = "x".repeat(unwritable_but_not_blocked() - 400);
-    let filler = json!({"id": 2, "method": name});
-    let pair = json!({"id": 3, "method": "gate.pair", "params": {"device": "unread"}});
-    stream
-        .write_all(format!("{hello}\n{filler}\n{pair}\n").as_bytes())
-        .unwrap();
+    // Replies left unread, as many bytes in all as unwritable_but_not_blocked() says:
+    // hello's, about 150 bytes, then unknown_method ones of at most 32 KiB, which a
+    // frame always holds. Each says the method's name, and about 260 bytes besides.
+    let mut frames = format!("{hello}\n");
+    let mut left = unwritable_but_not_blocked() - 150;
+    let mut fillers = 0;
+    while left > 1024 {
+        let reply = left.min(32 * 1024);
+        fillers += 1;
+        let filler = json!({"id": 1 + fillers, "method": "x".repeat(reply - 260)});
+        frames.push_str(&format!("{filler}\n"));
+        left -= reply;
+    }
+    let pair = json!({"id": 2 + fillers, "method": "gate.pair", "params": {"device": "unread"}});
+    frames.push_str(&format!("{pair}\n"));
+    stream.write_all(frames.as_bytes()).unwrap();
     stream.shutdown(Shutdown::Write).unwrap();
     let request = until_requested(&home, "unread");
     // A client gone is noticed within 250 ms: give it time to be wrongly noticed.
@@ -907,12 +914,14 @@ fn a_half_closed_client_with_unread_replies_keeps_its_waiting_request() {
     let lines: Vec<String> = BufReader::new(stream).lines().map(Result::unwrap).collect();
     assert_eq!(
         lines.len(),
-        3,
-        "hello's reply, the filler's and gate.pair's"
+        2 + fillers,
+        "hello's reply, the fillers' and gate.pair's"
     );
-    let filled: Value = serde_json::from_str(&lines[1]).unwrap();
-    assert_eq!(filled["error"]["code"], "unknown_method");
-    let paired: Value = serde_json::from_str(&lines[2]).unwrap();
+    for line in &lines[1..=fillers] {
+        let filled: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(filled["error"]["code"], "unknown_method");
+    }
+    let paired: Value = serde_json::from_str(&lines[1 + fillers]).unwrap();
     assert_eq!(paired["ok"], true, "{paired}");
     assert_eq!(paired["data"]["device"], "unread");
     assert_eq!(devices(&home).len(), 2);
@@ -984,11 +993,13 @@ fn look_alike_names_cannot_dodge_the_revoked_name_rule() {
         assert_eq!(run.code(), Some(1), "{name:?}: {run:?}");
         assert_eq!(run.error_code(), "invalid_params", "{name:?}");
     }
-    // Let in, but as the revoked name: a case apart, an I for an l, a trailing space.
+    // Let in, but as the revoked name: a case apart, an I for an l, a trailing space, a
+    // diacritic (review #2340).
     for (name, kept) in [
         ("LAPTOP", "LAPTOP"),
         ("Iaptop", "Iaptop"),
         ("laptop ", "laptop"),
+        ("lapt\u{1ECD}p", "lapt\u{1ECD}p"),
     ] {
         let params = json!({"device": name}).to_string();
         let waiting = pair_in_background(&home, &params);
@@ -1115,7 +1126,9 @@ fn combining_letters_and_fillers_cannot_dodge_the_revoked_name_rule() {
 }
 
 /// A credential's SHA-256, as gate.json keeps it.
+#[cfg(target_os = "macos")]
 fn sha256_of(credential: &str) -> String {
+    use sha2::{Digest, Sha256};
     Sha256::digest(credential.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
