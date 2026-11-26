@@ -505,6 +505,56 @@ def test_a_tui_leaves_remote_and_nudges_to_the_service_and_takes_them_back_when_
     assert said.count(service_client.TAKEN_BACK) == 1, said
 
 
+def _client_of_a_live_service(
+    server: FakeServer, *, switch_on: bool
+) -> tuple[RemoteController, service_client.ServiceClient, list[str]]:
+    """A TUI's controller and service client, built with Remote's switch saved as given, while
+    a service of this release runs: the client's view, Remote served there or not."""
+    update_state("remote_enabled", switch_on)
+    controller = RemoteController(server=server, tunnel_factory=fake_tunnel_factory(url=PUBLIC))
+    said: list[str] = []
+    client = service_client.ServiceClient(controller, said.append)
+    me = instances.describe_this_process(kind="service")
+    client.note_hosting(service_host.Hosting(me, ServiceRemote(on=switch_on, public_origin=PUBLIC)))
+    return controller, client, said
+
+
+def test_a_take_back_after_the_services_auto_off_brings_no_remote_back(server: FakeServer) -> None:
+    """#1717 (a): a TUI client turns Remote on, so its own copy of the switch says on, and the
+    service serves it. The service's auto-off then runs out: it turns its Remote off and saves
+    the switch off. When the service dies, the take-back reads the switch as saved now, so no
+    public Remote and no ngrok come back here; it says it keeps the nudges, not Remote."""
+    controller, client, said = _client_of_a_live_service(server, switch_on=False)
+    controller.turn_on()  # the panel's switch, a client's: saved on, for the service to follow
+    assert controller.state.remote_enabled and not server.running
+    update_state("remote_enabled", False)  # the service's auto-off, as its controller saves it
+
+    client.note_hosting(None)  # the next frame: the service is gone
+    assert client.take_back()
+    controller.writes_done(5.0)  # a start would have gone through its writes by now
+
+    assert not server.running and "start_remote_server" not in server.calls
+    assert said == [service_client.TAKEN_BACK_NUDGES], said
+    assert controller.state.remote_enabled is False
+
+
+def test_a_take_back_honours_a_switch_another_window_turned_on(server: FakeServer) -> None:
+    """#1717 (b): a TUI client built while the switch was off; another rlx window turns Remote
+    on, and the service serves it. When the service dies, the take-back starts Remote here,
+    as the switch saved now says, and says so."""
+    controller, client, said = _client_of_a_live_service(server, switch_on=False)
+    update_state("remote_enabled", True)  # another window's switch, as it saves it
+
+    client.note_hosting(None)
+    assert client.take_back()
+    try:
+        _until(lambda: server.running, "Remote started here again", within=5.0)
+        assert said == [service_client.TAKEN_BACK], said
+    finally:
+        controller.shutdown_for_exit()
+        controller.wait_until_off(5.0)
+
+
 def test_the_cli_every_hook_imports_does_not_import_the_service() -> None:
     """``rlx service`` is registered with the CLI, which every hook imports: its module imports
     the service only when a command runs, so the hook path pays nothing for it."""

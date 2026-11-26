@@ -23,7 +23,12 @@ from aisquare.services.service_host import SERVICE, Hosting
 TAKEN_BACK = (
     f"the {SERVICE} stopped: this rlx keeps Remote and the fleet's nudges going while it is open"
 )
-"""What the TUI says, once, when it takes back what the service hosted."""
+"""What the TUI says, once, when it takes back what the service hosted, Remote's switch on."""
+TAKEN_BACK_NUDGES = (
+    f"the {SERVICE} stopped: this rlx keeps the fleet's nudges going while it is open"
+)
+"""The same, with Remote's switch off as the service left it (its auto-off, or a window that
+turned it off): there is no Remote to keep going."""
 
 
 class ServiceClient:
@@ -46,10 +51,17 @@ class ServiceClient:
 
     def take_back(self) -> bool:
         """On the housekeeping tick: if the service this TUI was the client of is gone, start
-        Remote here again (when its switch is on) and say so, once; whether it did."""
+        Remote here again (when its switch is on) and say so, once; whether it did.
+
+        The switch is the one saved now, not the one this TUI read at its start or last saved:
+        the service's auto-off saved it off, and the TUI's own copy still said on, so a dead
+        service's Remote came back here, public link and ngrok and all; a window that turned it
+        on meanwhile was missed, and the TUI said it kept Remote going while none ran (#1717)."""
         if not self._client or self.hosting is not None:
             return False
         self._client = False
+        self._remote.reload_switches()
+        on = self._remote.state.remote_enabled
         self._remote.restore(wait=False)
-        self._say(TAKEN_BACK)
+        self._say(TAKEN_BACK if on else TAKEN_BACK_NUDGES)
         return True

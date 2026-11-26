@@ -1423,6 +1423,14 @@ class RemoteController:
 
     # --- persistence -----------------------------------------------------------------------------
 
+    def reload_switches(self) -> None:
+        """The saved switches again, as ``state.json`` holds them now: what any rlx on this
+        home saved last, the rlx service's auto-off or another window's switch included. For
+        a step that acts on them after this controller was built (the take-back of a service
+        that died, ``cli.ui.service_client``); :attr:`state` is otherwise read once, at its
+        build, and what it says since is what this controller itself saved (#32, #1717)."""
+        self.state = load_remote_state()
+
     def _set_state(self, **changes: Any) -> None:
         """Take ``changes`` in hand, and save each switch that changed, on its own.
 
