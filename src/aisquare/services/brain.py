@@ -634,7 +634,7 @@ class Channel:
 
 def _say(message: str) -> None:
     """One line on the brain's log (its stderr, which rlxd keeps)."""
-    sys.stderr.write(f"rlx brain: {message}\n")
+    sys.stderr.write(f"brain: {message}\n")
     sys.stderr.flush()
 
 
