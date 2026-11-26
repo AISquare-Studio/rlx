@@ -40,6 +40,7 @@ import contextlib
 import hashlib
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -396,7 +397,8 @@ def config_unreadable() -> str | None:
     try:
         load_config()
     except Exception as exc:  # TOMLDecodeError, a ValidationError, an OSError: all say why
-        return f"config.toml cannot be read ({type(exc).__name__}: {str(exc).strip()})"
+        said = " ".join(str(exc).split())  # pydantic's is four lines: one, as a note is
+        return f"config.toml cannot be read ({type(exc).__name__}: {said})"
     return None
 
 
@@ -594,26 +596,70 @@ def unregister_at_login() -> AtLogin:
 
 
 def forget_at_login() -> bool:
-    """``rlx uninstall``'s step, and a move to a release with no service (``rlx upgrade``): the
-    login item taken away (or the OS would start a program that is gone, or a command that
-    release does not have, at every login, and that release has no way to take it away).
+    """``rlx uninstall``'s step, and a move to a release with no service (``rlx upgrade``):
+    EVERY home's login item taken away, as the install they all run goes or loses its service
+    (or the OS would start a program that is gone, or a command that release does not have,
+    at every login, and that release has no way to take one away; tester of #33, round 2, m1).
     Whether an item was there.
 
-    An ON choice goes with it, so a later install is on by default again; an OFF one stays,
-    as that release keeps a section it does not know: forgotten, the next init of a release
-    with the service would add the item back (reviewer of #33, round 2). One in a file that
-    cannot be read is left as it is. :class:`LoginError` when the item's file stays."""
+    This home's ON choice goes with it, so a later install is on by default again; an OFF one
+    stays, as that release keeps a section it does not know: forgotten, the next init of a
+    release with the service would add the item back (reviewer of #33, round 2). One in a file
+    that cannot be read is left as it is. :class:`LoginError` when an item's file stays."""
     try:
         how = login_how()
     except LoginError:
         return False  # nothing can be in place here
-    there = item_path(how).is_file()
-    _take_the_item_away(how)
+    there = _take_every_item_away(how)
     if read_choice() is True:
         # A config.toml it cannot write: the uninstall goes on without it.
         with contextlib.suppress(OSError):
             _keep_the_choice(None)
     return there
+
+
+def _every_item(how: How) -> list[tuple[Path, str]]:
+    """Every home's rlx login item in place, with the label (unit) it is loaded by: the
+    default home's and each named one's (``.<8 hex>``, ``rlx-<8 hex>.service``)."""
+    found: list[tuple[Path, str]] = []
+    if how == "launchd":
+        for item in sorted(launch_agents_dir().glob(f"{LABEL}*.plist")):
+            name = item.name.removesuffix(".plist")
+            if name == LABEL or _NAMED_SUFFIX.fullmatch(name.removeprefix(f"{LABEL}.")):
+                found.append((item, name))
+        return found
+    for item in sorted(systemd_user_dir().glob(f"{PRODUCT_NAME}*.service")):
+        stem = item.name.removesuffix(".service")
+        named = _NAMED_SUFFIX.fullmatch(stem.removeprefix(f"{PRODUCT_NAME}-"))
+        if (item.name == UNIT or named) and _ours(how, item.read_bytes()):
+            found.append((item, item.name))
+    return found
+
+
+def _take_every_item_away(how: How) -> bool:
+    """This home's item (booted out whether its file is there or not), then every other home's
+    (:func:`_every_item`). Whether any was there."""
+    there = item_path(how).is_file()
+    _take_the_item_away(how)
+    others = [(item, name) for item, name in _every_item(how) if item != item_path(how)]
+    for item, name in others:
+        if how == "launchd":
+            _service_manager(["launchctl", "bootout", f"{_domain()}/{name}"])
+        else:
+            _service_manager(["systemctl", "--user", "disable", "--now", name])
+        try:
+            item.unlink(missing_ok=True)
+        except OSError as exc:
+            raise LoginError(
+                f"could not remove {paths.shown(item)}: {exc.strerror or exc}"
+            ) from exc
+    if others and how == "systemd":
+        _service_manager(["systemctl", "--user", "daemon-reload"])
+    return there or bool(others)
+
+
+_NAMED_SUFFIX = re.compile(r"[0-9a-f]{8}")
+"""A named home's tag (:func:`home_tag`)."""
 
 
 def _take_the_item_away(how: How) -> None:
@@ -720,6 +766,22 @@ def decline_by_default() -> str:
     return state_line(at_login_state())
 
 
+def record_from_the_item() -> str:
+    """``rlx init --reinit --yes`` replaced a ``config.toml`` it could not read, and no choice
+    could be read from its text: for the default home, the choice recorded as the OS has it,
+    the item in place being on and none being off, so no later init adds one the person had
+    turned off (tester of #33, round 2). Nothing is added or taken away. What to say of it."""
+    try:
+        how = login_how()
+    except LoginError:
+        return state_line(at_login_state())
+    # The default home's alone: a named one never gets an item by itself, so nothing about it
+    # needs protecting, and its reset stays the defaults it asked for.
+    if _named_home() is None and read_choice() is None and config_unreadable() is None:
+        _keep_the_choice(item_path(how).is_file())
+    return state_line(at_login_state())
+
+
 def state_line(state: AtLogin) -> str:
     """How it stands, in one line for a person."""
     if state.on and state.item is not None:
@@ -810,6 +872,7 @@ __all__ = [
     "login_how",
     "plist_bytes",
     "read_choice",
+    "record_from_the_item",
     "refresh_the_item",
     "register_at_login",
     "register_by_default",

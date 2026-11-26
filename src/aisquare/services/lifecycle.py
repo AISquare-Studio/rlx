@@ -38,6 +38,7 @@ from aisquare.core.config import (
     ExplainabilitySettings,
     defaults_a_whole_file_reader_lacks,
     load_config,
+    salvaged_start_at_login,
     save_config,
     split_denied_tools,
 )
@@ -148,6 +149,9 @@ def initialize(
             existing: ExplainabilitySettings | None = loaded.explainability
             start_at_login = loaded.service.start_at_login
         except Exception as exc:
+            # Read from its text: the reset of a broken file must not lose an off (#33).
+            with contextlib.suppress(OSError):
+                start_at_login = salvaged_start_at_login(paths.config_path().read_bytes())
             # Nothing can say what it configures, so the reset needs consent
             # (UnreadableConfigResetRefused).
             existing, unreadable = None, str(exc)

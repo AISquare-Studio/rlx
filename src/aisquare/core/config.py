@@ -1904,12 +1904,38 @@ class _KeptByAReset(BaseModel):
 
 def _kept_by_a_reset(written: Path) -> bool | None:
     """What of the file at ``written`` a reset leaves in place: its ``[service]`` table's
-    ``start_at_login``, when it holds one; nothing from a file that does not parse."""
+    ``start_at_login``, when it holds one, read from its text when the file does not parse
+    (:func:`salvaged_start_at_login`): the reset rlx recommends for a broken file must not
+    lose an off (tester of #33, round 2)."""
     try:
-        data = _parse_toml(despite_windows_contention(written.read_bytes))
-    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        raw = despite_windows_contention(written.read_bytes)
+    except OSError:
         return None
+    try:
+        data = _parse_toml(raw)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return salvaged_start_at_login(raw)
     service = data.get("service")
     if not isinstance(service, dict) or not isinstance(service.get("start_at_login"), bool):
         return None
     return bool(service["start_at_login"])
+
+
+_SERVICE_TABLE = re.compile(r"^\s*\[\s*service\s*\]\s*(?:#.*)?$")
+_A_TABLE = re.compile(r"^\s*\[")
+_START_AT_LOGIN = re.compile(r"^\s*start_at_login\s*=\s*(true|false)\s*(?:#.*)?$")
+
+
+def salvaged_start_at_login(raw: bytes) -> bool | None:
+    """``[service] start_at_login`` read line by line from a ``config.toml`` that does not parse
+    as a whole (a syntax error elsewhere, bytes that are not UTF-8): ``None`` when it holds no
+    such line. What a reset or ``init --reinit --yes`` of a broken file carries over."""
+    in_service = False
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if _SERVICE_TABLE.match(line):
+            in_service = True
+        elif _A_TABLE.match(line):
+            in_service = False
+        elif in_service and (found := _START_AT_LOGIN.match(line)):
+            return found.group(1) == "true"
+    return None

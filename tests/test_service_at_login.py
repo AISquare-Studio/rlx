@@ -1059,3 +1059,120 @@ def test_service_refresh_rewrites_an_item_that_is_there_and_makes_none(
 
     assert json.loads(refreshed.stdout) == {"refreshed": True}
     assert plistlib.loads(_plist().read_bytes())["EnvironmentVariables"]["PATH"] == new_path
+
+
+# --- tester of #33, round 2 (#2230): MAJOR B, m1, m3 ---------------------------------------------
+
+
+def _garbage_config() -> None:
+    """A config.toml with no line left to read a choice from."""
+    path = paths.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("this is = not [toml\n", encoding="utf-8")
+
+
+def test_a_reinit_of_a_broken_file_keeps_an_off_read_from_its_text(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """MAJOR B (a): the reset rlx recommends for a broken file lost the off, and the next plain
+    init added the item. Read from the file's text, the off is carried."""
+    _init(tmp_path / "project", "--no-service")
+    _broken_config()
+    login_os.calls.clear()
+
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(tmp_path / "project"))
+    later = _init(tmp_path / "project")
+
+    assert again.exit_code == 0 and later.exit_code == 0, again.output + later.output
+    assert _choice() is False
+    assert not _plist().exists() and login_os.calls == []
+
+
+@pytest.mark.parametrize("on", [True, False], ids=["item-there", "no-item"])
+def test_a_reinit_of_a_file_with_nothing_to_read_records_what_the_os_has(
+    tmp_path: Path, login_os: LoginOs, on: bool
+) -> None:
+    """MAJOR B (a), nothing in the text: the choice is recorded as the OS has it (the item there
+    is on, none is off), adding and taking away nothing."""
+    _rlx("service", "install")
+    if not on:
+        _rlx("service", "uninstall")
+    _garbage_config()
+    login_os.calls.clear()
+    (tmp_path / "p").mkdir()
+
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(tmp_path / "p"))
+    later = _init(tmp_path / "p")
+
+    assert again.exit_code == 0 and later.exit_code == 0, again.output + later.output
+    assert _choice() is on and _plist().is_file() is on
+    assert login_os.changes() == []
+
+
+def test_a_config_reset_of_a_broken_file_keeps_an_off_read_from_its_text(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """MAJOR B (b): ``rlx config reset --yes`` kept nothing of a file that did not parse."""
+    _init(tmp_path / "project", "--no-service")
+    _broken_config()
+    login_os.calls.clear()
+
+    reset = _rlx("config", "reset", "--yes")
+    later = _init(tmp_path / "project")
+
+    assert reset.exit_code == 0 and later.exit_code == 0, reset.output + later.output
+    assert _choice() is False
+    assert not _plist().exists() and login_os.calls == []
+
+
+def test_a_move_back_takes_away_every_homes_item(
+    login_os: LoginOs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m1: the install every home runs loses its service, so every home's item would loop at
+    every login: a named home's goes too. Another program's file beside them stays."""
+    monkeypatch.setattr(service_login, "_named_home", lambda: Path("/srv/scratch-home"))
+    service_login.register_at_login()
+    named = service_login.label()
+    monkeypatch.setattr(service_login, "_named_home", lambda: None)
+    service_login.register_at_login()
+    theirs = service_login.launch_agents_dir() / f"{service_login.LABEL}.helper.plist"
+    theirs.write_bytes(plistlib.dumps({"Label": "studio.aisquare.rlx.service.helper"}))
+    login_os.calls.clear()
+
+    said, gone = lifecycle._no_login_item_for(service_login, "0.10.1")
+
+    assert gone is True and said is not None
+    assert sorted(path.name for path in service_login.launch_agents_dir().iterdir()) == [
+        theirs.name
+    ]
+    assert ("launchctl", "bootout", TARGET) in login_os.calls
+    assert ("launchctl", "bootout", f"{DOMAIN}/{named}") in login_os.calls
+
+
+def test_an_unreadable_configs_reason_is_one_line() -> None:
+    """m3: pydantic's ValidationError text is four lines; a note is one."""
+    path = paths.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[updates]\ncheck = "maybe"\n', encoding="utf-8")
+
+    why = service_login.config_unreadable()
+
+    assert why is not None and why.startswith("config.toml cannot be read (ValidationError")
+    assert "\n" not in why
+
+
+def test_a_reinit_of_a_broken_file_keeps_an_on_whose_item_was_removed_outside(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """Read from the text, an on is kept as it was (the item removed in the OS, so "turned off
+    outside rlx"), not rewritten as the OS has it (off in rlx); and no item is added back."""
+    _init(tmp_path / "project")
+    _plist().unlink()
+    _broken_config()
+    login_os.calls.clear()
+
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(tmp_path / "project"))
+
+    assert again.exit_code == 0, again.output
+    assert _choice() is True and not _plist().exists() and login_os.changes() == []
+    assert service_login.at_login_state().why_off == service_login.REMOVED

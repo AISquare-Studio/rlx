@@ -119,9 +119,11 @@ def init(
     # is, the item only refreshed. --no-service records the no, for every later init.
     with expected_config_write_errors():
         if unreadable_before is not None:
+            # Carried from its text when it held one (lifecycle.initialize); else recorded as
+            # the OS has it, so no later init adds an item the person had turned off.
             report.notes.append(
                 f"the {service_login.SERVICE}'s login item was left as it is: {unreadable_before}"
-                " before --reinit replaced it"
+                " before --reinit replaced it; " + service_login.record_from_the_item()
             )
         elif no_service:
             report.notes.append(service_login.decline_by_default())
