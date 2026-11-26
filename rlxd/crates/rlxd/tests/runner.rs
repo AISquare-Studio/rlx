@@ -984,7 +984,19 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
         of(&events, &a, Some("run.started")).is_empty(),
         "B ended while A's run.started was still being made durable: {events:#?}"
     );
-    // A goes on once its disk does.
+    // A cancel of the slow run waits for that run, and holds up nothing else meanwhile.
+    thread::scope(|scope| {
+        let cancel =
+            scope.spawn(|| home.rlxd(&["call", "run.cancel", &json!({"run_id": a}).to_string()]));
+        thread::sleep(Duration::from_millis(300));
+        quick("status during a cancel", &["call", "status"]);
+        quick(
+            "run.start during a cancel",
+            &["call", "run.start", &with_id(&task("hi"), &run_id())],
+        );
+        assert_eq!(cancel.join().unwrap().code(), Some(0));
+    });
+    // A ends, cancelled, once its disk lets it.
     wait_until(&home, since, 30, "A ends", |e| ended(e, &a));
 }
 
@@ -1045,4 +1057,105 @@ fn many_runs_at_once_get_one_seq_per_event_in_order() {
         let seen: Vec<Value> = mine.into_iter().cloned().collect();
         assert_eq!(logged, seen, "{id}");
     }
+}
+
+/// The run's guard, as its record names it (macOS and Linux).
+#[cfg(unix)]
+fn guard_of(home: &TestHome, r: &str) -> u64 {
+    let path = home
+        .root()
+        .join("rlxd")
+        .join("runs")
+        .join(r)
+        .join("run.json");
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    record["process"]["pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no process: {record:#}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_guard_killed_alone_takes_its_run_with_it_and_a_cancel_still_answers() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    common::kill_hard(guard_of(&home, &r));
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+    let events = wait_until(&home, since, 10, "the run ends", |e| ended(e, &r));
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert!(
+        last["data"]["message"].as_str().unwrap().contains("guard"),
+        "{last:#}"
+    );
+    let began = Instant::now();
+    let cancelled = home.rlxd(&["call", "run.cancel", &json!({"run_id": r}).to_string()]);
+    assert_eq!(cancelled.code(), Some(0), "{cancelled:?}");
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    // Its place in the pool was given back.
+    let next = run_id();
+    start(&home, &task("quick"), &next);
+    wait_until(&home, since, 20, "the next run ends", |e| ended(e, &next));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_with_a_timeout_whose_guard_dies_leaves_nothing_running() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    let mut params = task("take your time");
+    params["timeout_s"] = json!(3);
+    start(&home, &params, &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    common::kill_hard(guard_of(&home, &r));
+    wait_until(&home, since, 10, "the run ends", |e| ended(e, &r));
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+}
+
+#[test]
+fn rlxd_killed_alone_leaves_no_run_running() {
+    let home = home("slow");
+    let since = seq(&home);
+    let r = run_id();
+    start(&home, &task("take your time"), &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    common::kill_hard(home.status()["pid"].as_u64().unwrap());
+    common::eventually("nothing of the run is left", || {
+        processes_matching(&pattern(&home, "slow")) == 0
+    });
+}
+
+#[test]
+fn a_structured_output_too_large_for_run_done_still_ends_the_run() {
+    let home = home("huge");
+    let mut params = task("go");
+    params["output_schema"] = json!({"type": "object"});
+    let (r, _, events) = gated_start(&home, &params).wait();
+    let last = of(&events, &r, None).last().copied().unwrap().clone();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert!(
+        last["data"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("output_too_large"),
+        "{last:#}"
+    );
 }

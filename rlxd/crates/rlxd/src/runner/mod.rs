@@ -362,14 +362,17 @@ impl Runner {
         let run = self.find(id)?;
         let mut changes = run.state.subscribe();
         {
-            // Out of its queue first, under the runner's lock, so no place goes to it.
+            // Out of its queue first, under the runner's lock, so no place goes to it. No
+            // run's lock is taken under it: a run's may be held over a slow disk. (A run
+            // not waiting is not in the queue, and stays out of it.)
             let mut runs = self.runs();
-            let queued = run.inner().state == RunState::Queued;
-            if queued && let Some(pool) = runs.pools.get_mut(&run.params.kind) {
+            if let Some(pool) = runs.pools.get_mut(&run.params.kind) {
                 pool.waiting.retain(|waiting| !Arc::ptr_eq(waiting, &run));
             }
         }
-        let running = {
+        // The run's lock may be held over a slow disk: wait for it as blocking work, so no
+        // other task waits behind this one on its worker.
+        let decided = blocking(|| {
             let mut inner = run.inner();
             match inner.state {
                 state @ (RunState::Queued | RunState::NeedsYou) => {
@@ -383,7 +386,7 @@ impl Runner {
                     let placed = self.end(&run, &mut inner, End::Failed(failed));
                     drop(inner);
                     self.release_if(placed, run.params.kind);
-                    false
+                    Ok(false)
                 }
                 RunState::Running => {
                     inner.ending.get_or_insert(FailReason::Cancelled);
@@ -391,17 +394,19 @@ impl Runner {
                     if let Some(tree) = &inner.tree {
                         tree.kill();
                     }
-                    true
+                    Ok(true)
                 }
-                state @ (RunState::Done | RunState::Failed) => {
-                    return Ok(RunCancelData::new(id.clone(), false, state));
-                }
+                state @ (RunState::Done | RunState::Failed) => Err(state),
             }
-        };
-        if running {
-            let _ = tokio::time::timeout(CANCEL_WAIT, changes.wait_for(|s| !s.is_live())).await;
+        });
+        match decided {
+            Err(state) => return Ok(RunCancelData::new(id.clone(), false, state)),
+            Ok(true) => {
+                let _ = tokio::time::timeout(CANCEL_WAIT, changes.wait_for(|s| !s.is_live())).await;
+            }
+            Ok(false) => {}
         }
-        let now = run.inner().state;
+        let now = *run.state.borrow();
         Ok(RunCancelData::new(id.clone(), now == RunState::Failed, now))
     }
 
@@ -503,7 +508,10 @@ impl Runner {
             other => Err(format!("it did not print as an object: {other:?}")),
         };
         if let Err(why) = published {
-            // A run always gets its end: a small one, when its own can't be published.
+            // A run always gets its end: a small one, when its own can't be published. What
+            // the unpublished end said is not kept.
+            inner.session = None;
+            inner.structured_output = None;
             warning!(
                 "run {}: {type} was not published ({why}); it ends failed",
                 run.params.run_id
@@ -602,11 +610,14 @@ impl Runner {
         if let Some(reason) = ending {
             return ended_early(run, reason);
         }
+        let status_path = run.dir.status(attempt);
+        let _ = std::fs::remove_file(&status_path);
         let launch = Launch {
             program: program.clone(),
             args: argv::args(params, attempt, &settings),
             cwd: space,
             env: run_env(),
+            status: status_path.clone(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -677,10 +688,7 @@ impl Runner {
                     return ended_early(run, reason);
                 }
                 let said = stderr.await.unwrap_or_default();
-                let how = match status {
-                    Some(status) => format!("exited ({status})"),
-                    None => "closed its output".to_owned(),
-                };
+                let how = how_it_ended(status, &status_path);
                 let mut message = format!("Claude Code {how} before its result");
                 if !said.trim().is_empty() {
                     message.push_str(": ");
@@ -964,6 +972,28 @@ impl Run {
             boot: process::boot_id(),
             calls: Vec::new(),
         }
+    }
+}
+
+/// How Claude Code ended, for `run.failed`'s message: as its guard wrote it (macOS and
+/// Linux), else as the exit status of rlxd's child says.
+fn how_it_ended(status: Option<std::process::ExitStatus>, file: &std::path::Path) -> String {
+    #[cfg(unix)]
+    {
+        let written = std::fs::read_to_string(file).ok();
+        if let Some(ended) = written.as_deref().and_then(guard::read_status) {
+            return format!("exited ({ended})");
+        }
+        if let Some(status) = status {
+            // The guard ended before Claude Code did, and took the run's group with it.
+            return format!("was ended with its guard ({status})");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    match status {
+        Some(status) => format!("exited ({status})"),
+        None => "closed its output".to_owned(),
     }
 }
 

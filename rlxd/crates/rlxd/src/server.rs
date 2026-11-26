@@ -615,7 +615,10 @@ impl Daemon {
         match method {
             methods::RUN_START => {
                 let params = params_of::<RunStartParams>(method, params)?;
-                printed(&self.runner.start(params, &session.client, None)?)
+                // Blocking work: it may wait on a run's lock, or write the run's record.
+                printed(&off_worker(|| {
+                    self.runner.start(params, &session.client, None)
+                })?)
             }
             methods::RUN_CANCEL => {
                 let params = params_of::<RunRef>(method, params)?;

@@ -111,6 +111,11 @@ impl RunDir {
         self.dir.join(attempt.to_string()).join("settings.json")
     }
 
+    /// `<attempt>/exit`: how the attempt's Claude Code ended, as its guard writes it.
+    pub fn status(&self, attempt: u64) -> PathBuf {
+        self.dir.join(attempt.to_string()).join("exit")
+    }
+
     /// Writes `attempt`'s settings durably, and returns their path.
     pub fn write_settings(&self, attempt: u64, settings: &Value) -> io::Result<PathBuf> {
         let path = self.settings(attempt);
