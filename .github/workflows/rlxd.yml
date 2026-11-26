@@ -199,14 +199,14 @@ jobs:
       - name: cargo deny check
         run: cargo deny --locked check
 
-  # `rlxd here` over a real `ssh localhost` (the owner's remote brief, §3), as rlx.app runs
-  # it: by absolute path, in a non-login session that has not read the user's profile. It
-  # must give the answer `env -i HOME=$HOME rlxd here --json` gives locally, in each state.
-  # sshd is the runner's own. Its host key is pinned from its own file, not fetched over
-  # the connection, and both sides allow public-key auth only. Forwarding the socket over
-  # SSH (direct-streamlocal) can extend this job.
+  # rlx.app's way to a host over a real `ssh localhost` (the owner's remote brief, §3).
+  # First `rlxd here`, as rlx.app runs it: by absolute path, in a non-login session that
+  # has not read the user's profile. It must give the answer `env -i HOME=$HOME rlxd here
+  # --json` gives locally, in each state. Then rlxd's socket through a direct-streamlocal
+  # forward. sshd is the runner's own. Its host key is pinned from its own file, not
+  # fetched over the connection, and both sides allow public-key auth only.
   ssh:
-    name: rlxd here over ssh (ubuntu)
+    name: rlxd here and its socket over ssh (ubuntu)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -236,10 +236,29 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y -qq openssh-server
           fi
-          # The server takes public keys only.
-          printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' \
+          # The server takes public keys only, and forwards as little as rlx.app's channel
+          # allows: local (-L) only, no remote (-R) forward of either kind, no listening, and
+          # no agent, X11 or tunnel. OpenSSH's defaults allow both directions. Local TCP
+          # forwarding can't be refused: OpenSSH applies its local TCP forwarding permission
+          # to direct-streamlocal channels too, so AllowTcpForwarding no refuses rlx.app's
+          # channel as well (the next step shows it). sshd keeps the first value it reads for
+          # an option, and Ubuntu's sshd_config includes sshd_config.d/*.conf first; sshd -T
+          # checks what took effect.
+          printf '%s\n' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' \
+            'AllowStreamLocalForwarding local' 'AllowTcpForwarding local' 'PermitListen none' \
+            'AllowAgentForwarding no' 'X11Forwarding no' 'PermitTunnel no' \
             | sudo tee /etc/ssh/sshd_config.d/10-rlxd-ci.conf >/dev/null
           sudo systemctl restart ssh || sudo service ssh restart
+          # -C: what applies to this job's own connection, Match blocks included.
+          effective=$(sudo sshd -T -C "user=$(id -un),host=localhost,addr=127.0.0.1")
+          for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' \
+            'allowstreamlocalforwarding local' 'allowtcpforwarding local' 'permitlisten none' \
+            'allowagentforwarding no' 'x11forwarding no' 'permittunnel no'; do
+            if ! grep -Fxq "$want" <<< "$effective"; then
+              echo "::error::sshd -T: not '$want' but '$(grep -i "^${want%% *} " <<< "$effective")'"
+              exit 1
+            fi
+          done
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           chmod go-w ~
@@ -257,6 +276,63 @@ jobs:
           ssh -G localhost | grep -E '^(batchmode|stricthostkeychecking|preferredauthentications|hostkeyalgorithms) '
           ssh localhost true
           echo "a non-login session's PATH: $(ssh localhost 'echo $PATH')"
+
+      # What sshd refuses, beside what the forward step uses. Every remote (-R) forward,
+      # of a Unix socket or a TCP port. And, on a second sshd with AllowTcpForwarding no,
+      # the very -L to a Unix socket that port 22 serves: OpenSSH's session.c disables all
+      # local forwarding then, and channel_connect_to_path (direct-streamlocal) checks
+      # that permission too. So rlx.app's host must allow local TCP forwarding, and this
+      # fails, to say so, if OpenSSH ever stops tying the two together.
+      - name: sshd refuses every remote forward, and streamlocal needs local TCP forwarding
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          probe=$(mktemp -d)
+          refused_r() {
+            local what=$1 spec=$2 code=0
+            timeout 20 ssh -N -o ExitOnForwardFailure=yes -R "$spec" localhost \
+              2> "$probe/r.err" || code=$?
+            cat "$probe/r.err"
+            [ "$code" != 0 ] && [ "$code" != 124 ] || fail "ssh -R ($what) was not refused (exit $code)"
+            grep -q "remote port forwarding failed" "$probe/r.err" \
+              || fail "ssh -R ($what) failed, but not as a refused forward"
+          }
+          refused_r "a Unix socket" "$probe/remote.sock:$probe/none.sock"
+          [ ! -e "$probe/remote.sock" ] || fail "sshd made the -R socket"
+          refused_r "a TCP port" "127.0.0.1:47614:127.0.0.1:22"
+          ! ss -Htln "sport = :47614" | grep -q . || fail "sshd listens on the -R port"
+
+          # A Unix socket that answers "ok", and an -L to it through each sshd.
+          python3 -c 'import socket, sys, time
+          s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(4)
+          while True:
+              c, _ = s.accept(); c.sendall(b"ok\n"); c.close()' "$probe/target.sock" &
+          target=$!
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -p 2222 -o AllowTcpForwarding=no -o PidFile="$probe/sshd.pid"
+          printf '[localhost]:2222 %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" \
+            >> ~/.ssh/known_hosts
+          through() {
+            local port=$1 local_sock="$probe/via-$1.sock" forward said
+            ssh -p "$port" -N -o ExitOnForwardFailure=yes -L "$local_sock:$probe/target.sock" \
+              localhost 2> "$probe/via-$port.err" &
+            forward=$!
+            for _ in $(seq 100); do [ -S "$local_sock" ] && break; sleep 0.1; done
+            said=$(timeout 10 python3 -c 'import socket, sys
+          c = socket.socket(socket.AF_UNIX); c.connect(sys.argv[1]); print(c.recv(16).decode().strip())' \
+              "$local_sock" || true)
+            sleep 0.5
+            kill "$forward"
+            wait "$forward" || true
+            echo "through port $port: '$said'; ssh said: $(tr '\n' ' ' < "$probe/via-$port.err")" >&2
+            printf '%s' "$said"
+          }
+          [ "$(through 22)" = ok ] || fail "the -L through port 22 got no answer"
+          [ -z "$(through 2222)" ] || fail "AllowTcpForwarding no let a streamlocal -L through"
+          grep -q "open failed" "$probe/via-2222.err" \
+            || fail "the -L through port 2222 failed, but not as a refused channel"
+          sudo kill "$(sudo cat "$probe/sshd.pid")"
+          kill "$target"
+          rm -rf "$probe"
 
       # The step's shell is `bash -e`: an exit the check expects, 3, 5 or 127, is caught
       # with `|| code=$?`.
@@ -330,6 +406,136 @@ jobs:
 
           code=0; over_ssh "$snippet" > /dev/null || code=$?
           [ "$code" = 127 ] || { echo "::error::with nothing installed the command exits $code, not 127"; exit 1; }
+
+      # rlxd's socket as rlx.app reaches it: a direct-streamlocal channel, here OpenSSH's
+      # `ssh -N -L <local socket>:<host's socket>`, so nothing listens on TCP. The client
+      # side is a home with no rlxd and no token: `socket` and the token come from `rlxd
+      # here --start --show-token`, run inside the session. Through the forward: `status`,
+      # the gate refusing the unsigned test client (its peer is sshd), then an `rlxd
+      # events` stream that must live through a quiet wait and take rlxd's stop live.
+      # Two homes: ~/.aisquare, whose socket is its run/rlxd.sock, waiting 60 s, and one
+      # too deep for that, served on its short socket in /tmp/rlxd-<uid>/.
+      - name: rlxd's socket through an ssh direct-streamlocal forward
+        working-directory: .
+        run: |
+          rlxd="$PWD/rlxd/target/debug/rlxd"
+          client_home=$(mktemp -d)
+          forwards=$(mktemp -d)
+          uid=$(id -u)
+          # 20 folders of 21 bytes: run/rlxd.sock is far past Linux's 107 bytes.
+          deep="$HOME/$(printf 'a-folder-of-the-home/%.0s' $(seq 20))home"
+          fail() { echo "::error::$*"; exit 1; }
+
+          through_a_forward() {
+            local name=$1 home=$2 hold=$3 here remote token local_sock forward code
+            local pid events began elapsed token_file
+            here="$name-here.json"
+            code=0
+            ssh localhost "RLX_HOME='$home' '$rlxd' here --json --start --show-token" > "$here" \
+              || code=$?
+            token=$(jq -r '.data.auth.token // empty' "$here")
+            [ -z "$token" ] || echo "::add-mask::$token"
+            [ "$code" = 0 ] && jq -e '.ok and .data.running and .data.supported' "$here" > /dev/null \
+              || fail "$name: rlxd here --start exits $code: $(jq -c .error "$here")"
+            remote=$(jq -r .data.socket "$here")
+            echo "$name: the host's socket is $remote (${#remote} bytes)"
+            # The token goes in a file in the 0700 folder, not on a command line.
+            token_file="$forwards/$name.token"
+            (umask 077 && printf '%s\n' "$token" > "$token_file")
+
+            local_sock="$forwards/$name.sock"
+            ssh -N -o ExitOnForwardFailure=yes -L "$local_sock:$remote" localhost &
+            forward=$!
+            for _ in $(seq 100); do [ -S "$local_sock" ] && break; sleep 0.1; done
+            [ -S "$local_sock" ] || fail "$name: the forward made no local socket"
+
+            # Without a token of the host's, --socket is a usage error: the client home's
+            # would never be sent.
+            code=0
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" status 2> /dev/null || code=$?
+            [ "$code" = 2 ] || fail "$name: --socket with no token exits $code, not 2"
+
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token-file "$token_file" \
+              status > "$name-status.json" \
+              || fail "$name: status through the forward: $(cat "$name-status.json")"
+            jq -e --arg socket "$remote" --arg home "$home" \
+              '.ok and .data.paths.socket == $socket and .data.paths.home == $home' \
+              "$name-status.json" > /dev/null \
+              || fail "$name: status through the forward names another rlxd: $(jq -c .data.paths "$name-status.json")"
+            jq -c '.data | {pid, clients, paths}' "$name-status.json"
+
+            # The gate holds through the forward. rlxd runs outside gate dev mode, and the
+            # connection's peer is sshd, not rlx's signed app, so the unsigned test client
+            # can neither pair nor be the gate.
+            for args in "--as-app --gate-credential-file $forwards/$name.credential status" \
+              "--role app --gate-credential made-up status" gate.pair; do
+              code=0
+              # shellcheck disable=SC2086 # $args is words
+              RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" \
+                --token-file "$token_file" $args > "$name-gate.json" || code=$?
+              [ "$code" = 1 ] && jq -e '.error.code == "not_gate"' "$name-gate.json" > /dev/null \
+                || fail "$name: through the forward, call $args exits $code: $(cat "$name-gate.json")"
+            done
+            [ ! -e "$home/rlxd/gate.json" ] || fail "$name: a device was paired through the forward"
+            [ ! -e "$client_home/test-gate-credential" ] && [ ! -e "$forwards/$name.credential" ] \
+              || fail "$name: the client kept a credential"
+            rm "$name-gate.json"
+
+            # Nothing listens on TCP or UDP: not rlxd, not ssh.
+            if ss -Htulnp | grep -E 'users:\(\("(rlxd|ssh)"'; then
+              fail "$name: rlxd or ssh listens on a port"
+            fi
+
+            # A stream through the forward: this rlxd's daemon.started, replayed, then $hold
+            # quiet seconds, then daemon.stopping, live, when rlxd stops over ssh. The
+            # buffer is this rlxd's own, so no earlier rlxd's daemon.stopping is in it.
+            pid=$(jq .data.pid "$name-status.json")
+            began=$(date +%s)
+            RLX_HOME="$client_home" "$rlxd" events --socket "$local_sock" --token-file "$token_file" \
+              --since 0 --until daemon.stopping --timeout $((hold + 60)) \
+              > "$name-events.jsonl" 2> "$name-events.err" &
+            events=$!
+            sleep "$hold"
+            kill -0 "$events" 2> /dev/null \
+              || fail "$name: the stream ended within $hold s: $(cat "$name-events.err")"
+            ssh localhost "RLX_HOME='$home' '$rlxd' stop" > /dev/null
+            code=0
+            wait "$events" || code=$?
+            elapsed=$(( $(date +%s) - began ))
+            [ "$code" = 0 ] || fail "$name: rlxd events exits $code: $(cat "$name-events.err")"
+            [ "$elapsed" -ge "$hold" ] || fail "$name: the stream ended after $elapsed s"
+            jq -s -e --argjson pid "$pid" '
+              (map(.type == "daemon.started" and .data.pid == $pid) | index(true)) as $start
+              | $start != null and .[-1].type == "daemon.stopping" and .[-1].seq > .[$start].seq' \
+              "$name-events.jsonl" > /dev/null \
+              || fail "$name: the stream through the forward: $(jq -s -c 'map([.seq, .type])' "$name-events.jsonl")"
+            echo "$name: the stream lived $elapsed s: $(jq -s -c 'map(.type)' "$name-events.jsonl")"
+
+            kill "$forward"
+            wait "$forward" || true
+            code=0
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token-file "$token_file" \
+              status > /dev/null || code=$?
+            [ "$code" = 3 ] || fail "$name: with the forward gone the call exits $code, not 3"
+            rm "$here" "$token_file"
+          }
+
+          through_a_forward default "$HOME/.aisquare" 60
+          [ "$(jq -r .data.paths.socket default-status.json)" = "$HOME/.aisquare/run/rlxd.sock" ] \
+            || fail "the default home is not served on its run/rlxd.sock"
+
+          through_a_forward deep "$deep" 2
+          short=$(jq -r .data.paths.socket deep-status.json)
+          case "$short" in
+            "/tmp/rlxd-$uid/"?*.sock) ;;
+            *) fail "the deep home's socket is $short, not its short one in /tmp/rlxd-$uid/" ;;
+          esac
+          [ "$(stat -c '%a %u' "/tmp/rlxd-$uid")" = "700 $uid" ] \
+            || fail "/tmp/rlxd-$uid is $(stat -c '%a %u' "/tmp/rlxd-$uid"), not 700 $uid"
+          [ ! -e "$deep/run/rlxd.sock" ] || fail "the deep home has a socket of its own"
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/envelope.json -- *-status.json
+          for stream in *-events.jsonl; do jq -s . "$stream" > "${stream%.jsonl}.json"; done
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/event-list.json -- *-events.json
 
   # 1.2: rlxd and rlxd-hook for the five targets, as the artifact `rlxd-archives`,
   # installed by `rlx daemon install` on each OS (rlxd-release.yml). It attaches to a

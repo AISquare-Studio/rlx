@@ -111,15 +111,18 @@ enum Action {
     },
     /// Stop rlxd, and wait until it has stopped.
     Stop,
+    // Boxed: its options are the largest variant, more so on Windows, whose paths are
+    // wider (clippy::large_enum_variant).
     /// Send one request on a new connection, and print the reply envelope. A stream's
     /// events print one per line instead, and it exits 0 when the stream ends.
-    Call(CallOptions),
+    Call(Box<CallOptions>),
     /// The devices paired as the app gate: list, approve or unpair them.
     #[command(subcommand)]
     Gate(GateAction),
     /// Print the home's events as JSON lines: those rlxd holds after --since, then with
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
-    Events(EventsOptions),
+    // Boxed, as Call is.
+    Events(Box<EventsOptions>),
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -188,6 +191,21 @@ struct EventsOptions {
     /// Exit 4 when this many seconds have passed first.
     #[arg(long, value_name = "S")]
     timeout: Option<f64>,
+    /// Connect to this socket (a named pipe on Windows) instead of the home's, such as
+    /// the local end of `ssh -N -L <PATH>:<host's socket> host`. Needs --token-file or
+    /// --token, and with --as-app --gate-credential-file: this home's are never sent.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
+    /// The token to send, instead of the one in <home>/rlxd/token. Prefer --token-file:
+    /// a command line is visible to other users.
+    #[arg(long, value_name = "T")]
+    token: Option<String>,
+    /// Read the token to send from this file.
+    #[arg(long, value_name = "F", conflicts_with = "token")]
+    token_file: Option<std::path::PathBuf>,
+    /// Where --as-app finds its gate credential, instead of <home>/test-gate-credential.
+    #[arg(long, value_name = "F")]
+    gate_credential_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -204,9 +222,21 @@ struct CallOptions {
     /// The hello's gate credential.
     #[arg(long, value_name = "C")]
     gate_credential: Option<String>,
-    /// The token to send, instead of the one in <home>/rlxd/token.
+    /// The token to send, instead of the one in <home>/rlxd/token. Prefer --token-file:
+    /// a command line is visible to other users.
     #[arg(long, value_name = "T")]
     token: Option<String>,
+    /// Read the token to send from this file.
+    #[arg(long, value_name = "F", conflicts_with = "token")]
+    token_file: Option<std::path::PathBuf>,
+    /// Connect to this socket (a named pipe on Windows) instead of the home's, such as
+    /// the local end of `ssh -N -L <PATH>:<host's socket> host`. Needs --token-file or
+    /// --token, and with --as-app --gate-credential-file: this home's are never sent.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
+    /// Where --as-app keeps its gate credential, instead of <home>/test-gate-credential.
+    #[arg(long, value_name = "F", conflicts_with = "gate_credential")]
+    gate_credential_file: Option<std::path::PathBuf>,
     /// The hello's protocol version.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     protocol_version: Option<String>,
@@ -255,7 +285,12 @@ pub fn main() -> ExitCode {
             role: options.role,
             client: options.client,
             gate_credential: options.gate_credential,
-            token: options.token,
+            target: cli::Target {
+                socket: options.socket,
+                token: options.token,
+                token_file: options.token_file,
+                gate_credential_file: options.gate_credential_file,
+            },
             protocol_version: options.protocol_version,
             env: options.env,
             raw: options.raw,
@@ -277,6 +312,12 @@ pub fn main() -> ExitCode {
             until: options.until,
             limit: options.limit,
             timeout: options.timeout,
+            target: cli::Target {
+                socket: options.socket,
+                token: options.token,
+                token_file: options.token_file,
+                gate_credential_file: options.gate_credential_file,
+            },
         }),
     }
 }
