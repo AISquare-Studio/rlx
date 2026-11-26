@@ -54,6 +54,7 @@ mod serve;
 mod server;
 mod settings;
 mod token;
+pub mod vt;
 #[cfg(windows)]
 mod windows;
 
