@@ -381,6 +381,11 @@ later), and CI runs them there before packing them.
   refused (`ref_not_tag`), and so is a tag that has moved since (`tag_moved`), so what is
   attached is always built from the tag. After a failed release run, re-run its failed
   jobs instead: that run is the tag's.
+- **No test or dev features.** The build names its cargo features (`RELEASE_FEATURES`,
+  none) with `--no-default-features`, never `--all-features`, and refuses a list naming
+  a test or dev one. Gate dev mode is a cargo feature releases never enable (#24), and
+  `package` fails if any binary's `--version` carries its marker, `(dev: …)`, or is
+  anything but `<binary> <version>`.
 - **Signing.** None yet: notarization and Authenticode are an owner step, wired in at
   the marked step of the build job.
 

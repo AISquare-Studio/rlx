@@ -19,6 +19,7 @@ on:
       - "tests/stub_releases.py"
       - "tests/test_rlxd_install.py"
       - "tests/test_rlxd_release_attach.py"
+      - "tests/test_rlxd_release_features.py"
       - "pyproject.toml"
       - "src/aisquare/core/daemons.py"
       - "src/aisquare/core/locking.py"
