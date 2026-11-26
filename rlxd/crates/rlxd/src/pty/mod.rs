@@ -25,6 +25,7 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+pub use keys::paste;
 #[cfg(windows)]
 pub use windows::shim;
 
@@ -838,47 +839,9 @@ fn home_dir() -> String {
         })
 }
 
-/// `text` as tmux's `paste-buffer -p` sends it: each line made safe for a terminal, as
-/// `vis(VIS_SAFE | VIS_NOSLASH)` makes it (a control character but tab, backspace, bell
-/// and carriage return written as `^X`, delete as `^?`), each newline a carriage
-/// return, and the whole bracketed when the program asked for bracketed paste.
-pub fn paste(text: &str, bracketed: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() + 12);
-    if bracketed {
-        out.extend_from_slice(b"\x1b[200~");
-    }
-    for c in text.chars() {
-        match c {
-            '\n' => out.push(b'\r'),
-            '\t' | '\u{8}' | '\u{7}' | '\r' | ' '..='~' => out.push(c as u8),
-            '\u{7f}' => out.extend_from_slice(b"^?"),
-            c if (c as u32) < 0x20 => {
-                out.push(b'^');
-                out.push(c as u8 + b'@');
-            }
-            c => {
-                let mut utf8 = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
-            }
-        }
-    }
-    if bracketed {
-        out.extend_from_slice(b"\x1b[201~");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_paste_is_made_safe_and_bracketed_when_asked() {
-        assert_eq!(paste("a\nb", false), b"a\rb");
-        assert_eq!(paste("a\nb", true), b"\x1b[200~a\rb\x1b[201~");
-        assert_eq!(paste("\x1b[31m\x03\x7f\tok\\", false), b"^[[31m^C^?\tok\\");
-        assert_eq!(paste("中\r\n", false), "中\r\r".as_bytes());
-    }
 
     #[test]
     fn base64_goes_there_and_back() {

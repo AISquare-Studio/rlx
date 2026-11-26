@@ -832,8 +832,11 @@ impl Screen {
             self.resize(ox, oy, false);
         }
         if cursor && let Some((x, y)) = self.saved_cursor {
-            self.cx = x;
-            self.cy = y;
+            // rlxd's, not tmux's: the cursor was saved on the screen of its time, which a
+            // resize since may have made shorter or narrower (by ?47h, which doesn't save
+            // it anew). tmux restores it as it was and reads past its lines.
+            self.cx = x.min(self.sx());
+            self.cy = y.min(self.sy() - 1);
             if let Some(cell) = cell {
                 *cell = self.saved_cell.clone();
             }
@@ -858,6 +861,8 @@ impl Screen {
     /// history first. With `reflow`, wrapped lines rewrap to the new width.
     pub fn resize(&mut self, sx: u32, sy: u32, reflow: bool) {
         let (sx, sy) = (sx.max(1), sy.max(1));
+        // The cursor is always on the screen, but resizing counts on it: make sure.
+        self.cy = self.cy.min(self.sy() - 1);
         let mut cx = self.cx;
         let mut cy = self.grid.hsize + self.cy;
         let mut reflow = reflow;

@@ -39,8 +39,14 @@ use super::screen::{
 };
 use super::utf8::{Decoder, Step};
 
+use std::time::{Duration, Instant};
+
 /// The most bytes an OSC, DCS or APC string holds, as tmux's `input-buffer-size`.
 const INPUT_BUFFER_SIZE: usize = 1 << 20;
+
+/// How long a string (DCS, OSC, APC, a rename) may stay open before the parser gives up
+/// on it and goes back to ground: tmux's ground timer.
+pub const GROUND_TIMER: Duration = Duration::from_secs(5);
 /// The parameter bytes kept: tmux's 64-byte buffer, less its NUL.
 const PARAM_BUF: usize = 63;
 /// The intermediate bytes kept: tmux's 4-byte buffer, less its NUL.
@@ -254,6 +260,10 @@ pub struct Input {
     utf8_started: bool,
     utf8: Decoder,
     version: String,
+    /// When the open string began, for [`GROUND_TIMER`]; `None` when none is open.
+    string_since: Option<Instant>,
+    /// When the bytes being parsed came.
+    now: Instant,
 }
 
 impl Input {
@@ -295,12 +305,35 @@ impl Input {
             utf8_started: false,
             utf8: Decoder::default(),
             version: version.to_owned(),
+            string_since: None,
+            now: Instant::now(),
         }
     }
 
     /// Feeds `bytes` to the screen, adding any replies to `replies`, then writes what
     /// was collected, as tmux does at the end of each read.
-    pub fn parse(&mut self, screen: &mut Screen, bytes: &[u8], replies: &mut Vec<u8>) {
+    ///
+    /// `now` is when they came. tmux gives up on a string open [`GROUND_TIMER`] or more
+    /// when its timer fires; rlxd does when the next bytes come, which a capture can't
+    /// tell apart.
+    pub fn parse(
+        &mut self,
+        screen: &mut Screen,
+        bytes: &[u8],
+        replies: &mut Vec<u8>,
+        now: Instant,
+    ) {
+        self.now = now;
+        if self
+            .string_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= GROUND_TIMER)
+        {
+            // input_ground_timer_callback: input_reset(ictx, 0).
+            self.reset_pen();
+            self.clear();
+            self.state = State::Ground;
+            self.last_printed = false;
+        }
         for &ch in bytes {
             self.ch = ch;
             let (handler, next) = transition(self.state, ch);
@@ -331,13 +364,16 @@ impl Input {
             | State::RenameString
             | State::ConsumeSt => {
                 self.clear();
+                self.string_since = Some(self.now);
                 self.last_printed = false;
             }
+            State::Ground => self.string_since = None,
             _ => {}
         }
     }
 
     fn clear(&mut self) {
+        self.string_since = None;
         self.interm.clear();
         self.params.clear();
         self.string.clear();
@@ -409,7 +445,7 @@ impl Input {
         self.charset_attr();
         self.pen.cell.data = Utf8::one(self.ch);
         screen.collect_add(&self.pen.cell);
-        self.last = self.pen.cell.data.clone();
+        self.last = self.pen.cell.data;
         self.last_printed = true;
         self.pen.cell.attr &= !ATTR_CHARSET;
     }
@@ -434,7 +470,7 @@ impl Input {
         self.utf8_started = false;
         self.pen.cell.data = Utf8::new(self.utf8.bytes(), self.utf8.width());
         screen.collect_add(&self.pen.cell);
-        self.last = self.pen.cell.data.clone();
+        self.last = self.pen.cell.data;
         self.last_printed = true;
     }
 
@@ -800,7 +836,7 @@ impl Input {
                 let room = screen.sx().saturating_sub(screen.cx);
                 let n = (n as u32).min(room);
                 self.charset_attr();
-                self.pen.cell.data = self.last.clone();
+                self.pen.cell.data = self.last;
                 for _ in 0..n {
                     screen.collect_add(&self.pen.cell);
                 }
@@ -853,6 +889,13 @@ impl Input {
                     );
                 }
             }
+            // DSR's private form: 996 asks for the colour theme, which tmux reports from
+            // the terminal of the client it is attached to. rlxd has none, as tmux has
+            // none with no client, so neither replies.
+            (b'n', b"?") => {}
+            // XTSMGRAPHICS: tmux answers it only when built with sixel, which rlxd
+            // doesn't draw.
+            (b'S', b"?") => {}
             // Unknown: tmux returns before its end, keeping REP's last character.
             _ => return,
         }
@@ -1269,25 +1312,25 @@ impl Input {
     }
 
     /// OSC 8: a hyperlink for the cells written from now on, or none with an empty URI.
+    ///
+    /// On bytes, as tmux's `input_osc_8` is: a URI or id that isn't UTF-8 is kept, its
+    /// bytes escaped as the hyperlinks hold them.
     fn osc_8(&mut self, screen: &mut Screen, value: &[u8]) {
-        let Ok(value) = std::str::from_utf8(value) else {
-            return;
-        };
-        let mut id: Option<&str> = None;
+        let mut id: Option<&[u8]> = None;
         let mut start = 0;
         let uri_at = loop {
-            let Some(found) = value[start..].find([':', ';']) else {
+            let Some(found) = value[start..].iter().position(|&b| b == b':' || b == b';') else {
                 return;
             };
             let end = start + found;
             let part = &value[start..end];
-            if part.len() >= 4 && part.starts_with("id=") {
+            if part.len() >= 4 && part.starts_with(b"id=") {
                 if id.is_some() {
                     return;
                 }
                 id = Some(&part[3..]);
             }
-            if value.as_bytes()[end] == b';' {
+            if value[end] == b';' {
                 break end + 1;
             }
             start = end + 1;

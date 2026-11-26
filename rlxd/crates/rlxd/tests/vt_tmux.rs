@@ -228,6 +228,17 @@ fn fixtures() -> Vec<Fixture> {
             ),
         )
     });
+    // #2585: CSI ? n (996 asks for the colour theme, which no client gives) ends a
+    // repeat as any known sequence does. tmux 3.6 added it.
+    all.push(Fixture {
+        since: Some((3, 6)),
+        ..fixture("a private DSR ends a repeat", "a\x1b[?996n\x1b[3b|")
+    });
+    // #2585: a hyperlink that isn't UTF-8 is kept, its bytes escaped.
+    all.push(fixture(
+        "a hyperlink that isn't UTF-8",
+        &b"\x1b]8;;http://e\xe9\xff/\x1b\\link\x1b]8;id=\xc3;http://x\x07two\x1b]8;;\x07"[..],
+    ));
     all.push(Fixture {
         cols: 20,
         rows: 6,
@@ -451,6 +462,60 @@ fn tmux_or_skip() -> Option<Tmux> {
             None
         }
     }
+}
+
+/// #2585: a stray DCS swallows everything after it, ESC included, until tmux's ground
+/// timer gives it up five seconds on. tmux and the model are given the same writes six
+/// seconds apart.
+#[test]
+fn a_stray_dcs_is_given_up_after_five_seconds_as_tmux_does() {
+    let Some(tmux) = tmux_or_skip() else {
+        return;
+    };
+    let (first, second) = (&b"before\r\n\x1bPq"[..], &b"\x1b[32mhello\x1b[0m"[..]);
+    let one = tmux.dir.join("first.bin");
+    let two = tmux.dir.join("second.bin");
+    std::fs::write(&one, first).unwrap();
+    std::fs::write(&two, second).unwrap();
+    let command = format!(
+        "cat '{}'; sleep 6; cat '{}'; exec sleep 60",
+        one.display(),
+        two.display()
+    );
+    let start = Instant::now();
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "dcs",
+        "-x",
+        "40",
+        "-y",
+        "4",
+        &command,
+    ]);
+    std::thread::sleep(Duration::from_secs(7));
+    tmux.settle("dcs");
+    let expected = tmux.run(&["capture-pane", "-e", "-p", "-t", "dcs"]);
+    let cursor = tmux.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "dcs",
+        "#{cursor_x},#{cursor_y}",
+    ]);
+    let mut model = Terminal::new(40, 4, 2000, "test");
+    model.feed_at(first, start);
+    model.feed_at(second, start + Duration::from_secs(6));
+    let text = model.capture(0);
+    assert_eq!(
+        shown(&expected),
+        shown(text.as_bytes()),
+        "the frames differ {}",
+        first_difference(&expected, text.as_bytes())
+    );
+    let (x, y, _) = model.cursor();
+    assert_eq!(String::from_utf8_lossy(&cursor).trim(), format!("{x},{y}"));
 }
 
 #[test]

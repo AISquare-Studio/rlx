@@ -1,6 +1,11 @@
-// Ported from tmux 3.8's grid.c and grid-view.c, whose notice follows.
+// Ported from tmux 3.8's grid.c and grid-view.c; for the hyperlinks (`Hyperlinks` and
+// `vis`), its hyperlinks.c and utf8.c; and, for packing a character (`Utf8::pack` and
+// its table), its utf8.c. Their notices follow: the permission notice is the same for
+// each.
 //
 // Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
+// Copyright (c) 2021 Will <author@will.party>
+// Copyright (c) 2022 Jeff Chiang <pobomp@gmail.com>
 //
 // Permission to use, copy, modify, and distribute this software for any
 // purpose with or without fee is hereby granted, provided that the above
@@ -24,6 +29,8 @@
 //! isn't one byte of ASCII, an RGB colour, an underline colour, a hyperlink or a tab.
 
 use std::collections::HashMap;
+
+use super::utf8::{Decoder, Step};
 
 /// Bold (tmux's "bright").
 pub const ATTR_BRIGHT: u16 = 0x1;
@@ -99,45 +106,146 @@ pub fn colour_rgb(r: u8, g: u8, b: u8) -> u32 {
 /// The most bytes one cell's character holds, combining marks included.
 pub const UTF8_SIZE: usize = 32;
 
-/// One cell's character: its UTF-8 bytes and its width.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+/// One cell's character: its UTF-8 bytes, held in place, and its width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Utf8 {
-    bytes: Vec<u8>,
-    /// Cells it takes: 0, 1 or 2.
+    /// The bytes, then zeros.
+    data: [u8; UTF8_SIZE],
+    size: u8,
+    /// Cells it takes: 0, 1 or 2, or a tab's width.
     pub width: u8,
+}
+
+impl Default for Utf8 {
+    fn default() -> Self {
+        Self {
+            data: [0; UTF8_SIZE],
+            size: 0,
+            width: 0,
+        }
+    }
 }
 
 impl Utf8 {
     /// The one-byte character `byte`, one cell wide.
     pub fn one(byte: u8) -> Self {
-        Self {
-            bytes: vec![byte],
+        let mut one = Self {
             width: 1,
-        }
+            ..Self::default()
+        };
+        one.push(&[byte]);
+        one
     }
 
-    /// `bytes`, `width` cells wide.
+    /// `bytes`, `width` cells wide: at most [`UTF8_SIZE`] of them, as every caller
+    /// makes sure.
     pub fn new(bytes: &[u8], width: u8) -> Self {
-        Self {
-            bytes: bytes.to_vec(),
+        let mut new = Self {
             width,
-        }
+            ..Self::default()
+        };
+        new.push(bytes);
+        new
     }
 
     /// The character's bytes.
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.data[..usize::from(self.size)]
     }
 
     /// How many bytes it is.
     pub fn size(&self) -> usize {
-        self.bytes.len()
+        usize::from(self.size)
     }
 
-    /// `more` appended, as a combining character is.
+    /// `more` appended, as a combining character is, up to [`UTF8_SIZE`] in all.
     pub fn push(&mut self, more: &[u8]) {
-        self.bytes.extend_from_slice(more);
+        let at = usize::from(self.size);
+        let n = more.len().min(UTF8_SIZE - at);
+        self.data[at..at + n].copy_from_slice(&more[..n]);
+        self.size += n as u8;
     }
+
+    /// Packed into 32 bits, as tmux's `utf8_from_data` packs one into a `utf8_char`: up
+    /// to three bytes in place, a longer character by its number in [`ITEMS`]. The bits
+    /// are rlxd's own: the index in the low 24, the size in the next 6, the width in the
+    /// top 2 (tmux's 5 bits of size can't say 32).
+    fn pack(&self) -> u32 {
+        let size = u32::from(self.size);
+        let width = u32::from(self.width.min(2));
+        let index = if self.size <= 3 {
+            u32::from(self.data[0]) | u32::from(self.data[1]) << 8 | u32::from(self.data[2]) << 16
+        } else if let Some(index) = put_item(self.bytes()) {
+            index
+        } else {
+            // As tmux's utf8_from_data does when its table is full: spaces as wide as
+            // the character, which rlxd keeps as wide (tmux makes a wide one one cell).
+            return match width {
+                0 => 0,
+                1 => 1 << 24 | 1 << 30 | 0x20,
+                _ => 2 << 24 | 2 << 30 | 0x2020,
+            };
+        };
+        index | size << 24 | width << 30
+    }
+
+    /// The character `pack` packed, as tmux's `utf8_to_data` unpacks one.
+    fn unpack(packed: u32) -> Self {
+        let size = ((packed >> 24) & 0x3f) as usize;
+        let width = (packed >> 30) as u8;
+        let index = packed & 0x00ff_ffff;
+        if size <= 3 {
+            let bytes = index.to_le_bytes();
+            return Self::new(&bytes[..size], width);
+        }
+        match get_item(index) {
+            Some(bytes) => Self::new(&bytes, width),
+            None => Self::new(&[b' '; UTF8_SIZE][..size.min(UTF8_SIZE)], width),
+        }
+    }
+}
+
+/// The most characters of more than three bytes rlxd keeps numbers for, for all its
+/// PTYs: tmux keeps 2^24. Past them a new one is kept as spaces, as tmux keeps one.
+pub const MAX_ITEMS: usize = 1 << 18;
+
+/// tmux's `utf8_item` trees: each character too long to pack, by its number and by its
+/// bytes, never freed, for every screen alike (a line moves between screens).
+#[derive(Default)]
+struct Items {
+    by_index: Vec<std::sync::Arc<[u8]>>,
+    by_bytes: HashMap<std::sync::Arc<[u8]>, u32>,
+}
+
+static ITEMS: std::sync::LazyLock<std::sync::Mutex<Items>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn items() -> std::sync::MutexGuard<'static, Items> {
+    ITEMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `bytes`' number, a new one if it has none: tmux's `utf8_put_item`. `None` when
+/// [`MAX_ITEMS`] are kept.
+fn put_item(bytes: &[u8]) -> Option<u32> {
+    let mut items = items();
+    if let Some(&index) = items.by_bytes.get(bytes) {
+        return Some(index);
+    }
+    if items.by_index.len() >= MAX_ITEMS {
+        return None;
+    }
+    let index = items.by_index.len() as u32;
+    let kept: std::sync::Arc<[u8]> = bytes.into();
+    items.by_index.push(std::sync::Arc::clone(&kept));
+    items.by_bytes.insert(kept, index);
+    Some(index)
+}
+
+/// The bytes numbered `index`: tmux's `utf8_get_item`.
+fn get_item(index: u32) -> Option<std::sync::Arc<[u8]>> {
+    items().by_index.get(index as usize).cloned()
 }
 
 /// A cell, as it is read and written: tmux's `struct grid_cell`.
@@ -204,7 +312,7 @@ impl Cell {
     pub fn equals(&self, other: &Self) -> bool {
         self.looks_equal(other)
             && self.data.width == other.data.width
-            && self.data.bytes == other.data.bytes
+            && self.data.bytes() == other.data.bytes()
     }
 
     /// This cell made a tab `width` cells wide: `width` spaces, `FLAG_TAB`.
@@ -265,16 +373,32 @@ impl Entry {
     }
 }
 
-/// A line's extended cell.
-#[derive(Clone, Debug)]
+/// A line's extended cell, tmux's `grid_extd_entry`: 24 bytes.
+#[derive(Clone, Copy, Debug)]
 struct Extended {
-    data: Utf8,
-    attr: u16,
-    flags: u8,
+    /// The character, [`Utf8::pack`]ed; a tab's width for a tab, as tmux keeps it.
+    data: u32,
     fg: u32,
     bg: u32,
     us: u32,
     link: u32,
+    attr: u16,
+    flags: u8,
+}
+
+impl Extended {
+    /// A space with no colours or attributes, `flags` aside.
+    fn blank() -> Self {
+        Self {
+            data: Utf8::one(b' ').pack(),
+            fg: COLOUR_DEFAULT,
+            bg: COLOUR_DEFAULT,
+            us: COLOUR_DEFAULT,
+            link: 0,
+            attr: 0,
+            flags: 0,
+        }
+    }
 }
 
 /// One line: its cells as allocated, how many were used, and its flags.
@@ -300,8 +424,13 @@ impl Line {
             let Some(extended) = self.extended.get(entry.offset()) else {
                 return Cell::default();
             };
+            let tab = extended.flags & FLAG_TAB != 0;
             let mut cell = Cell {
-                data: extended.data.clone(),
+                data: if tab {
+                    Utf8::default()
+                } else {
+                    Utf8::unpack(extended.data)
+                },
                 attr: extended.attr,
                 flags: extended.flags,
                 fg: extended.fg,
@@ -309,9 +438,8 @@ impl Line {
                 us: extended.us,
                 link: extended.link,
             };
-            if cell.flags & FLAG_TAB != 0 {
-                let width = cell.data.width;
-                cell.set_tab(width);
+            if tab {
+                cell.set_tab(extended.data.min(UTF8_SIZE as u32) as u8);
             }
             return cell;
         }
@@ -336,15 +464,7 @@ impl Line {
 
     /// Points `px` at a new extended cell, keeping `flags`.
     fn new_extended(&mut self, px: usize, flags: u8) {
-        self.extended.push(Extended {
-            data: Utf8::one(b' '),
-            attr: 0,
-            flags: 0,
-            fg: COLOUR_DEFAULT,
-            bg: COLOUR_DEFAULT,
-            us: COLOUR_DEFAULT,
-            link: 0,
-        });
+        self.extended.push(Extended::blank());
         let entry = &mut self.cells[px];
         entry.set_offset(self.extended.len() - 1);
         entry.flags = flags | FLAG_EXTENDED;
@@ -362,7 +482,11 @@ impl Line {
         }
         let offset = self.cells[px].offset();
         self.extended[offset] = Extended {
-            data: cell.data.clone(),
+            data: if flags & FLAG_TAB != 0 {
+                u32::from(cell.data.width)
+            } else {
+                cell.data.pack()
+            },
             attr: cell.attr,
             flags,
             fg: cell.fg,
@@ -387,11 +511,17 @@ impl Line {
         if self.extended.is_empty() {
             return;
         }
-        let mut kept = Vec::new();
+        // Exactly as many as are used: a line in the history keeps them for good.
+        let used = self
+            .cells
+            .iter()
+            .filter(|entry| entry.flags & FLAG_EXTENDED != 0)
+            .count();
+        let mut kept = Vec::with_capacity(used);
         for entry in &mut self.cells {
             if entry.flags & FLAG_EXTENDED != 0 {
                 if let Some(extended) = self.extended.get(entry.offset()) {
-                    kept.push(extended.clone());
+                    kept.push(*extended);
                 }
                 entry.set_offset(kept.len().saturating_sub(1));
             }
@@ -446,6 +576,8 @@ impl Line {
         } else {
             sx
         };
+        // No more than the step asks for: a line keeps its cells.
+        self.cells.reserve_exact(sx as usize - self.cells.len());
         self.cells.resize(sx as usize, Entry::default());
         for xx in cellsize..sx {
             self.clear_cell(xx, bg, false);
@@ -483,11 +615,6 @@ impl Line {
     pub fn bytes(&self) -> usize {
         self.cells.capacity() * std::mem::size_of::<Entry>()
             + self.extended.capacity() * std::mem::size_of::<Extended>()
-            + self
-                .extended
-                .iter()
-                .map(|e| e.data.bytes.capacity())
-                .sum::<usize>()
     }
 }
 
@@ -729,9 +856,26 @@ impl Grid {
         }
     }
 
+    /// Room for one more line: doubling, as a `Vec` does, but never past what a full
+    /// history and the screen take, as tmux's exact reallocation never is.
+    fn reserve_line(&mut self) {
+        let len = self.lines.len();
+        if len < self.lines.capacity() {
+            return;
+        }
+        let full = (self.hlimit + self.sy) as usize + 1;
+        let more = if len < full {
+            len.max(8).min(full - len)
+        } else {
+            len.max(8)
+        };
+        self.lines.reserve_exact(more);
+    }
+
     /// Scrolls the whole screen up one line into the history, a new line at the bottom.
     pub fn scroll_history(&mut self, bg: u32) {
         let yy = self.hsize + self.sy;
+        self.reserve_line();
         self.lines.push(Line::default());
         self.empty_line(yy, bg);
         self.hscrolled += 1;
@@ -750,11 +894,14 @@ impl Grid {
     /// the history.
     pub fn scroll_history_region(&mut self, upper: u32, lower: u32, bg: u32) {
         let history = self.hsize as usize;
+        self.reserve_line();
         // The region's top line goes into the history, above every line of the screen;
         // the lines above the region stay as they were, and the rest of the region
-        // moves up over it.
+        // moves up over it. rlxd compacts it there too, as scroll_history does (tmux
+        // doesn't here), which changes no capture, only the memory it keeps.
         let top = self.lines.remove(upper as usize);
         self.lines.insert(history, top);
+        self.lines[history].compact();
         // A new line at the region's bottom: the lines below it move down one, onto
         // the line the history took from the screen's count.
         let lower = lower + 1;
@@ -787,6 +934,8 @@ impl Grid {
     /// it, or `u32::MAX` past its end, and which unwrapped line.
     pub fn wrap_position(&self, px: u32, py: u32) -> (u32, u32) {
         let (mut ax, mut ay) = (0u32, 0u32);
+        // rlxd's: a position past the lines is taken as on the last one.
+        let py = py.min(self.lines.len().saturating_sub(1) as u32);
         for yy in 0..py {
             let line = &self.lines[yy as usize];
             if line.flags & LINE_WRAPPED != 0 {
@@ -822,7 +971,7 @@ impl Grid {
             }
             wx = self.lines[yy as usize].cellused;
         } else {
-            while self.lines[yy as usize].flags & LINE_WRAPPED != 0 {
+            while yy < ey && self.lines[yy as usize].flags & LINE_WRAPPED != 0 {
                 if wx < self.lines[yy as usize].cellused {
                     break;
                 }
@@ -1184,12 +1333,12 @@ const MAX_HYPERLINK_ID: usize = MAX_HYPERLINK_URI;
 impl Hyperlinks {
     /// The number for `uri` with `id`: the same one again for a named link already
     /// held, a new one for an anonymous one. 0 when the URI is too long.
-    pub fn put(&mut self, uri: &str, id: Option<&str>) -> u32 {
+    pub fn put(&mut self, uri: &[u8], id: Option<&[u8]>) -> u32 {
         let uri = vis(uri);
         if uri.len() > MAX_HYPERLINK_URI {
             return 0;
         }
-        let mut id = vis(id.unwrap_or(""));
+        let mut id = vis(id.unwrap_or(b""));
         if id.len() > MAX_HYPERLINK_ID {
             return 0;
         }
@@ -1248,27 +1397,46 @@ impl Hyperlinks {
     }
 }
 
-/// `text` escaped as tmux's `utf8_stravis(VIS_OCTAL | VIS_CSTYLE)` escapes it: valid
-/// UTF-8 and printable ASCII as they are, a backslash doubled, C escapes for the usual
-/// controls and octal for any other byte.
-fn vis(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{7}' => out.push_str("\\a"),
-            '\u{b}' => out.push_str("\\v"),
-            '\u{c}' => out.push_str("\\f"),
-            '\0' => out.push_str("\\000"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\{:03o}", c as u32));
+/// `bytes` escaped as tmux's `utf8_stravis(VIS_OCTAL | VIS_CSTYLE)` escapes them: each
+/// whole, valid UTF-8 character as it is, printable ASCII as it is with a backslash
+/// doubled, C escapes for the usual controls, and octal for any other byte, such as one
+/// that starts no valid character.
+fn vis(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut decoder = Decoder::default();
+        if decoder.open(bytes[i]) == Step::More {
+            // utf8_strvis: append until the character is done or spoilt.
+            let mut j = i + 1;
+            let mut step = Step::More;
+            while j < bytes.len() && step == Step::More {
+                step = decoder.append(bytes[j]);
+                j += 1;
             }
-            c => out.push(c),
+            if step == Step::Done
+                && let Ok(character) = std::str::from_utf8(decoder.bytes())
+            {
+                out.push_str(character);
+                i = j;
+                continue;
+            }
         }
+        // Not the start of a whole character: this byte alone, then on from the next.
+        match bytes[i] {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x08 => out.push_str("\\b"),
+            0x07 => out.push_str("\\a"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            0x00 => out.push_str("\\000"),
+            b @ 0x20..=0x7e => out.push(char::from(b)),
+            b => out.push_str(&format!("\\{b:03o}")),
+        }
+        i += 1;
     }
     out
 }
@@ -1471,6 +1639,44 @@ pub fn string_cells(grid: &Grid, py: u32, last: &mut Cell, links: &Hyperlinks) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cell_takes_five_bytes_and_an_extended_one_24_more() {
+        // Terminal::memory's tests count on these.
+        assert_eq!(std::mem::size_of::<Entry>(), 5);
+        assert_eq!(std::mem::size_of::<Extended>(), 24);
+    }
+
+    #[test]
+    fn a_character_packs_and_unpacks_as_itself() {
+        for (bytes, width) in [
+            (&b" "[..], 1),
+            ("é".as_bytes(), 1),
+            ("中".as_bytes(), 2),
+            ("👍🏽".as_bytes(), 2),
+            ("e\u{301}\u{302}\u{303}".as_bytes(), 1),
+            (&[b'x'; UTF8_SIZE][..], 1),
+            (b"", 0),
+        ] {
+            let utf8 = Utf8::new(bytes, width);
+            assert_eq!(Utf8::unpack(utf8.pack()), utf8, "{bytes:?}");
+        }
+        // A long character's number is the same each time.
+        let long = Utf8::new("👍🏽".as_bytes(), 2);
+        assert_eq!(long.pack(), long.pack());
+    }
+
+    #[test]
+    fn a_tab_keeps_its_width_in_an_extended_cell() {
+        let mut line = Line::default();
+        line.expand(80, 80, COLOUR_DEFAULT);
+        let mut tab = Cell::default();
+        tab.set_tab(7);
+        line.set(3, &tab);
+        let got = line.get(3);
+        assert_eq!((got.data.width, got.data.bytes()), (7, &b"       "[..]));
+        assert_ne!(got.flags & FLAG_TAB, 0);
+    }
 
     #[test]
     fn a_line_grows_in_quarters_halves_then_the_whole_width() {

@@ -681,6 +681,14 @@ is renamed aside, and the next install removes it.
 
 MIT, as rlx is (`../LICENSE`).
 
-`crates/rlxd/src/vt/` is ported from tmux 3.8 (its grid, screen writes, input parser
-and UTF-8 handling), and stays under tmux's ISC licence: its copyright and permission
-notice heads each of those files.
+Parts of `crates/rlxd` are ported from tmux 3.8 and stay under tmux's ISC licence, so
+the crate's licence is `MIT AND ISC`:
+
+- `src/vt/` (its grid, screen writes, input parser, UTF-8 handling, hyperlinks and
+  `capture-pane`'s loop: grid.c, grid-view.c, screen.c, screen-write.c, input.c,
+  utf8.c, utf8-combined.c, hyperlinks.c and cmd-capture-pane.c);
+- `src/pty/keys.rs` (key names, the bytes for keys, and `paste-buffer -p`:
+  key-string.c, input-keys.c, cmd-send-keys.c and cmd-paste-buffer.c).
+
+Each of those files starts with the copyright lines and the permission notice of the
+tmux files it comes from.

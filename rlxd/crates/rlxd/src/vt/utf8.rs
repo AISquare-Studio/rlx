@@ -1,6 +1,8 @@
-// Ported in part from tmux 3.8's utf8.c and utf8-combined.c, whose notice follows.
+// Ported in part from tmux 3.8's utf8.c and utf8-combined.c, whose notices follow: the
+// permission notice is the same for each.
 //
 // Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
+// Copyright (c) 2023 Nicholas Marriott <nicholas.marriott@gmail.com>
 //
 // Permission to use, copy, modify, and distribute this software for any
 // purpose with or without fee is hereby granted, provided that the above

@@ -1,3 +1,20 @@
+// `Terminal::capture` is ported from the capture loop of tmux 3.8's cmd-capture-pane.c,
+// whose notice follows. The rest of this file is rlxd's own.
+//
+// Copyright (c) 2009 Jonathan Alvarado <radobobo@users.sourceforge.net>
+//
+// Permission to use, copy, modify, and distribute this software for any
+// purpose with or without fee is hereby granted, provided that the above
+// copyright notice and this permission notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+// WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+// ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+// WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
+// IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
+// OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 //! A VT screen model that prints its screen as tmux does (handoff 0.10.3, 1.4).
 //!
 //! `pty.screen`'s text must be byte for byte what `tmux capture-pane -e -p` prints for
@@ -79,16 +96,22 @@ impl Terminal {
     /// Takes in `bytes` the program wrote. What it returns goes back to the program: its
     /// queries' replies, such as the cursor's position.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.feed_at(bytes, std::time::Instant::now())
+    }
+
+    /// [`feed`](Self::feed), of bytes that came at `now`: a string the program opened
+    /// [`input::GROUND_TIMER`] before and never ended is given up first, as tmux does.
+    pub fn feed_at(&mut self, bytes: &[u8], now: std::time::Instant) -> Vec<u8> {
         let mut replies = Vec::new();
         #[cfg(feature = "debug-methods")]
         if self.test_panic == Some(TestPanic::Output) {
             // Half the bytes in, so the screen is left half-changed, as by a real bug.
             let half = bytes.len() / 2;
             self.input
-                .parse(&mut self.screen, &bytes[..half], &mut replies);
+                .parse(&mut self.screen, &bytes[..half], &mut replies, now);
             panic!("debug.pty_panic: the screen model panics on the program's output");
         }
-        self.input.parse(&mut self.screen, bytes, &mut replies);
+        self.input.parse(&mut self.screen, bytes, &mut replies, now);
         replies
     }
 
@@ -307,6 +330,10 @@ mod tests {
         );
     }
 
+    /// The seeded test's runs, and the writes in each.
+    const SEEDS: u64 = 50;
+    const STEPS: u32 = 60;
+
     /// A small deterministic generator, so a failure names the seed that made it.
     struct Rng(u64);
 
@@ -339,7 +366,7 @@ mod tests {
             "99999999999999999999",
         ];
         let finals = b"@ABCDEFGHJKLMPSTXZ`bcdfghlmnpqrstu";
-        match rng.below(12) {
+        match rng.below(14) {
             0 => (0..rng.below(4096)).map(|_| rng.next() as u8).collect(),
             1 => {
                 let n = rng.pick(&huge);
@@ -352,10 +379,27 @@ mod tests {
                     .collect();
                 format!("\x1b[{}m", params.join(";")).into_bytes()
             }
-            3 => format!("\x1b[38:2::{0}:{0}:{0}:{0}:{0}:{0}:{0}m", rng.pick(&huge)).into_bytes(),
+            // Colours in every form tmux takes, then text in them and an erase in them,
+            // so the cells that carry them are written and cleared.
+            3 => {
+                let (r, g, b) = (rng.below(256), rng.below(256), rng.below(256));
+                let colour = match rng.below(6) {
+                    0 => format!("38;2;{r};{g};{b}"),
+                    1 => format!("48:2::{r}:{g}:{b}"),
+                    2 => format!("38:2:{r}:{g}:{b}"),
+                    3 => format!("48;5;{r}"),
+                    4 => format!("58:2::{r}:{g}:{b};4:3"),
+                    _ => format!("9{};10{};1;3;7", r % 8, g % 8),
+                };
+                let erase = rng.pick(&["", "\x1b[K", "\x1b[2J", "\x1b[J", "\x1b[1K", "\x1b[5X"]);
+                let text = rng
+                    .pick(&["coloured ", "中文", "e\u{301}"])
+                    .repeat(rng.below(40) as usize);
+                format!("\x1b[{colour}m{text}{erase}").into_bytes()
+            }
             4 => {
                 let mut osc = b"\x1b]".to_vec();
-                osc.extend(std::iter::repeat_n(b'x', rng.below(3 << 20) as usize));
+                osc.extend(std::iter::repeat_n(b'x', rng.below(3 << 19) as usize));
                 if rng.below(2) == 0 {
                     osc.push(0x07);
                 }
@@ -375,12 +419,33 @@ mod tests {
                 "y".repeat(rng.below(5000) as usize)
             )
             .into_bytes(),
-            8 => format!(
-                "\x1b[?{}h\x1b[?{}l",
-                rng.pick(&["1049", "47", "1047", "6", "7", "2004", "1"]),
-                rng.pick(&["1049", "47", "6", "7"])
-            )
-            .into_bytes(),
+            // A move anywhere, even past the screen, then the alternate screen and the
+            // saved cursor in any order: the test resizes between such writes.
+            8 | 12 | 13 => {
+                let ops = [
+                    "\x1b[?1049h",
+                    "\x1b[?1049l",
+                    "\x1b[?47h",
+                    "\x1b[?47l",
+                    "\x1b[?1047h",
+                    "\x1b[?1047l",
+                    "\x1b[?1048h",
+                    "\x1b[?1048l",
+                    "\x1b7",
+                    "\x1b8",
+                    "\x1b[s",
+                    "\x1b[u",
+                    "\x1b[?6h",
+                    "\x1b[?6l",
+                    "\x1b[?7l",
+                    "\x1b[?7h",
+                ];
+                let mut out = format!("\x1b[{};{}H", rng.below(120), rng.below(320));
+                for _ in 0..1 + rng.below(3) {
+                    out.push_str(rng.pick(&ops));
+                }
+                out.into_bytes()
+            }
             9 => "中e\u{301}👍🏽🇬🇧\u{200d}\u{fe0f}\t"
                 .repeat(rng.below(200) as usize)
                 .into_bytes(),
@@ -394,36 +459,66 @@ mod tests {
                 rng.below(100)
             )
             .into_bytes(),
-            _ => format!("x\x1b[{}b\x1b#8\x1bc\x1b[3J\x1b[2J", rng.pick(&huge)).into_bytes(),
+            11 => format!("x\x1b[{}b\x1b#8\x1bc\x1b[3J\x1b[2J", rng.pick(&huge)).into_bytes(),
+            _ => unreachable!(),
         }
     }
 
     #[test]
     fn hostile_output_never_panics_and_memory_stays_bounded() {
-        for seed in 1..=40u64 {
+        // RLXD_VT_SEEDS=N runs N seeds instead, for a long run: `RLXD_VT_SEEDS=20000
+        // cargo test --release -p rlxd --lib hostile`.
+        // RLXD_VT_SEED=N runs seed N alone, to look into one a long run names.
+        let seeds = std::env::var("RLXD_VT_SEEDS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(SEEDS);
+        let one: Option<u64> = std::env::var("RLXD_VT_SEED")
+            .ok()
+            .and_then(|n| n.parse().ok());
+        for seed in one.map_or(1..=seeds, |n| n..=n) {
+            let run = std::panic::catch_unwind(|| hostile_run(seed));
+            if let Err(panic) = run {
+                let why = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
+                panic!("seed {seed}: {why}");
+            }
+        }
+    }
+
+    /// One seed's run of the seeded test.
+    fn hostile_run(seed: u64) {
+        {
             let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ seed);
             let (mut cols, mut rows) = (80u16, 24u16);
             let (mut widest, mut tallest) = (cols, rows);
             let mut terminal = Terminal::new(cols, rows, 500, "test");
-            for step in 0..60 {
-                let bytes = hostile(&mut rng);
-                // Cut anywhere, so a sequence spans writes, and a resize lands inside one.
-                let cut = rng.below(bytes.len() as u64 + 1) as usize;
-                terminal.feed(&bytes[..cut]);
-                if rng.below(4) == 0 {
-                    cols = 1 + rng.below(300) as u16;
-                    rows = 1 + rng.below(100) as u16;
-                    (widest, tallest) = (widest.max(cols), tallest.max(rows));
-                    terminal.resize(cols, rows);
+            for step in 0..STEPS {
+                // A few pieces, each cut anywhere, so a sequence spans writes, with a
+                // resize inside one or between two.
+                for _ in 0..1 + rng.below(3) {
+                    let bytes = hostile(&mut rng);
+                    let cut = rng.below(bytes.len() as u64 + 1) as usize;
+                    terminal.feed(&bytes[..cut]);
+                    if rng.below(3) == 0 {
+                        cols = 1 + rng.below(300) as u16;
+                        rows = 1 + rng.below(100) as u16;
+                        (widest, tallest) = (widest.max(cols), tallest.max(rows));
+                        terminal.resize(cols, rows);
+                    }
+                    terminal.feed(&bytes[cut..]);
                 }
-                terminal.feed(&bytes[cut..]);
                 let (_, y, _) = terminal.cursor();
                 assert!(y < rows, "seed {seed} step {step}: row {y} of {rows}");
                 // A narrower screen keeps the column as it was, as tmux's does when it
                 // doesn't rewrap (the alternate screen), and with autowrap off a character
                 // past the edge is dropped: only a move brings it back. A carriage return
-                // always does.
-                terminal.feed(b"\x1b\\\r");
+                // always does, once any string is ended: two STs end one even after an
+                // ESC inside a DCS, which takes the next byte as the string's.
+                terminal.feed(b"\x1b\\\x1b\\\r");
                 let (x, y, _) = terminal.cursor();
                 assert!(
                     x == 0 && y < rows,
@@ -431,10 +526,13 @@ mod tests {
                 );
                 assert_eq!(terminal.size(), (cols, rows));
                 // Every line as wide as the screen has been (a line keeps its cells), on
-                // both screens; then the parser's string, up to 1 MiB and its doubling, and
-                // the hyperlinks, at most 5000 of a 1 KiB URI and id each, held twice.
+                // both screens, each cell 5 bytes and 24 more when extended, which a screen
+                // line's can take twice of until it goes into the history; then the
+                // parser's string, up to 1 MiB and its doubling, and the hyperlinks, at
+                // most 5000 of a 1 KiB URI and id each, held twice.
                 let lines = 500 + 2 * usize::from(tallest);
-                let bound = lines * (usize::from(widest) * 16 + 256) + (2 << 20) + (21 << 20);
+                let cell = 5 + 2 * 24;
+                let bound = lines * (usize::from(widest) * cell + 256) + (2 << 20) + (21 << 20);
                 assert!(
                     terminal.memory() < bound,
                     "seed {seed} step {step}: {} bytes",
@@ -444,6 +542,107 @@ mod tests {
                 assert!(text.matches('\n').count() >= usize::from(rows));
             }
         }
+    }
+
+    #[test]
+    fn a_cursor_saved_on_a_taller_screen_is_restored_inside_the_screen() {
+        // #2585's sequence: the cursor ?1049h saves at row 22 of 24 outlives the
+        // alternate screen; ?47h after a shorter resize, then a wider one, then ?1049l
+        // restores it. tmux reads past its lines there; rlxd clamps it to the screen.
+        for (cols, rows) in [(100, 10), (80, 10)] {
+            let mut terminal = Terminal::new(80, 24, 100, "test");
+            terminal.feed(b"\x1b[22;1H\x1b[?1049h\x1b[?1049l");
+            terminal.resize(80, 10);
+            terminal.feed(b"\x1b[?47h");
+            terminal.resize(cols, rows);
+            terminal.feed(b"\x1b[?1049l");
+            let (_, y, _) = terminal.cursor();
+            assert!(y < rows, "row {y} of {rows}");
+            terminal.feed(b"\x1b[31mafter");
+            assert!(terminal.capture(0).contains("after"));
+        }
+    }
+
+    /// #2585: a full history of coloured or wide text, at most 1.5 times what tmux 3.8
+    /// took for the same, by the review's figures: 52,000 lines written at 80 columns,
+    /// with tmux's 50,000-line history, one process's RSS, in MiB.
+    #[test]
+    fn a_full_history_of_colour_or_wide_text_stays_near_tmuxs_memory() {
+        // And within 5% of what the layout itself takes: 5 bytes a cell, 24 more for one
+        // that is extended, and up to 128 a line for the line and its place in the grid.
+        for (what, line, tmux, extended) in [
+            ("ASCII", "x".repeat(80), 26, 0),
+            (
+                "an RGB foreground",
+                format!("\x1b[38;2;1;2;3m{}", "x".repeat(80)),
+                169,
+                80,
+            ),
+            ("wide characters", "中".repeat(40), 45, 40),
+        ] {
+            let mut terminal = Terminal::new(80, 24, 50_000, "test");
+            let mut bytes = Vec::with_capacity(52_000 * (line.len() + 2));
+            for _ in 0..52_000 {
+                bytes.extend_from_slice(line.as_bytes());
+                bytes.extend_from_slice(b"\r\n");
+            }
+            terminal.feed(&bytes);
+            assert!(
+                terminal.history() > 45_000,
+                "{what}: {}",
+                terminal.history()
+            );
+            let held = terminal.memory();
+            assert!(
+                held < (tmux << 20) * 3 / 2,
+                "{what}: {} MiB, where tmux takes {tmux}",
+                held >> 20
+            );
+            let lines = terminal.history() as usize + 24;
+            let layout = lines * (80 * 5 + extended * 24 + 128);
+            assert!(
+                held < layout * 21 / 20,
+                "{what}: {held} bytes, where its cells take {layout}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_string_left_open_is_given_up_after_five_seconds_as_tmux_does() {
+        // #2585's repro: a stray DCS, then output six seconds later. tests/vt_tmux.rs
+        // checks the same against tmux, in real time.
+        let start = std::time::Instant::now();
+        let later = |s: u64| start + std::time::Duration::from_secs(s);
+        let mut expected = Terminal::new(20, 3, 0, "test");
+        expected.feed(b"before\r\n\x1b[32mhello\x1b[0m");
+        // The review's own: a stray DCS, which swallows ESC, so only the timer ends it.
+        let mut terminal = Terminal::new(20, 3, 0, "test");
+        terminal.feed_at(b"before\r\n\x1bPq", start);
+        terminal.feed_at(b"\x1b[31mlost", later(4));
+        assert_eq!(terminal.capture(0), "before\n\n\n");
+        terminal.feed_at(b"\x1b[32mhello\x1b[0m", later(6));
+        assert_eq!(terminal.capture(0), expected.capture(0));
+        assert_eq!(terminal.cursor(), expected.cursor());
+        // Every string state has the timer: plain text is the string's until it fires.
+        for open in [
+            &b"\x1bPq"[..],
+            b"\x1b]0;title",
+            b"\x1b_apc",
+            b"\x1bkname",
+            b"\x1bX",
+        ] {
+            let mut terminal = Terminal::new(20, 3, 0, "test");
+            terminal.feed_at(open, start);
+            terminal.feed_at(b"lost", later(4));
+            assert_eq!(terminal.capture(0), "\n\n\n", "{open:?}");
+            terminal.feed_at(b"hello", later(6));
+            assert_eq!(terminal.capture(0), "hello\n\n\n", "{open:?}");
+        }
+        // A string that ends in time is not given up, however long the output after it.
+        let mut terminal = Terminal::new(20, 3, 0, "test");
+        terminal.feed_at(b"\x1bPq\x1b\\a", start);
+        terminal.feed_at(b"b", later(9));
+        assert_eq!(terminal.capture(0), "ab\n\n\n");
     }
 
     #[test]

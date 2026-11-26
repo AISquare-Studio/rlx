@@ -17,6 +17,8 @@ ignore = []
 # advisories, bans and sources checks.
 allow = [
     "Apache-2.0",
+    # rlxd's own parts ported from tmux (crates/rlxd's licence is "MIT AND ISC").
+    "ISC",
     "MIT",
     "Unicode-3.0",
 ]

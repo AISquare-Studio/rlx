@@ -4,7 +4,9 @@ description = "The rlx engine: a local daemon that hosts processes and pushes ev
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# MIT, as the workspace is, and ISC for the parts ported from tmux (crate::vt and
+# pty/keys.rs), whose notice each of those files keeps.
+license = "MIT AND ISC"
 repository.workspace = true
 publish.workspace = true
 
