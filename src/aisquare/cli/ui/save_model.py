@@ -46,6 +46,19 @@ PROBLEM_CLASS = "field-problem"
 """The line under a field that says why its value was refused."""
 
 
+class Stale:
+    """What an undo returns when what its change left is not there any more: changed since,
+    by another way in (another dialog, a shell). It acts on nothing; the page drops it, says
+    so, and the next ctrl+z reaches the older ones (the reviewer of #24, #1813)."""
+
+    def __repr__(self) -> str:
+        return "STALE"
+
+
+STALE = Stale()
+""":class:`Stale`'s one value."""
+
+
 @dataclass(frozen=True)
 class Change:
     """One kept change: what it was, said as the toast says it, and how to take it back — put
@@ -53,7 +66,8 @@ class Change:
 
     what: str
     undo: Callable[[], object]
-    """Puts the old value back; returns ``False`` when it could not (having said why)."""
+    """Puts the old value back; returns ``False`` when it could not (having said why), and
+    :data:`STALE` when what the change left has changed since."""
     key: object = None
     """What it changed, for :meth:`SavesAsYouGo.forget` (a persona's layer and name): ``None``
     when nothing else can make it stale."""
@@ -170,7 +184,10 @@ class SavesAsYouGo:
         """Every kept change to ``key`` dropped: an action that cannot be undone replaced what
         they would put back (an import over a persona of that name, a persona removed), and
         undoing them would act on what is there now: remove it, or write an older text over
-        it (the tester of #24, #1778)."""
+        it (the tester of #24, #1778). ``None`` (a change no later action can make stale)
+        forgets nothing."""
+        if key is None:
+            return
         self.changes[:] = [change for change in self.changes if change.key != key]
 
     def action_undo_change(self) -> None:
@@ -181,7 +198,17 @@ class SavesAsYouGo:
             self._app.notify("Nothing to undo here", timeout=3, markup=False)
             return
         change = self.changes[-1]
-        if change.undo() is False:
+        outcome = change.undo()
+        if outcome is STALE:
+            self.changes.remove(change)
+            self._app.notify(
+                f"Not undone: {change.what} has changed since, elsewhere",
+                severity="warning",
+                timeout=SAVED_SECONDS,
+                markup=False,
+            )
+            return
+        if outcome is False:
             self._app.notify(
                 f"Not undone: {change.what} · {UNDO_SAID} tries again",
                 severity="warning",

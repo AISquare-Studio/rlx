@@ -268,3 +268,41 @@ def test_no_settings_page_has_a_save_apply_or_cancel_button_but_the_listed_ones(
     found = _commit_buttons()
     assert found - EXCEPTIONS.keys() == set(), "a Save, Apply or Cancel button not listed"
     assert EXCEPTIONS.keys() - found == set(), "listed, but gone: take it off the list"
+
+
+def test_an_undo_whose_change_went_stale_is_dropped_and_the_older_one_follows() -> None:
+    """The reviewer of #24 (#1813): an undo whose change was replaced since, by another way
+    in, acts on nothing; it is dropped, said, and not left in front of the older ones."""
+    from aisquare.cli.ui.save_model import STALE
+
+    async def go(pilot: Any, app: Host, page: Page) -> tuple[list[str], list[str]]:
+        undone: list[str] = []
+        page.kept("the older", lambda: undone.append("the older"))
+        page.kept("the stale", lambda: STALE)
+        page.query_one(CommitInput).focus()  # the keys on the page
+        await pilot.press("ctrl+z")
+        await pilot.pause()
+        await pilot.press("ctrl+z")
+        await pilot.pause()
+        return undone, [n.message for n in app._notifications]
+
+    undone, toasts = drive(go)
+    assert undone == ["the older"], "the second ctrl+z reached the older change"
+    assert toasts[-2:] == [
+        "Not undone: the stale has changed since, elsewhere",
+        "Undone: the older",
+    ]
+
+
+def test_forgetting_none_forgets_nothing() -> None:
+    """Reviewer of #24, n1: forget(None) dropped every change kept with no key."""
+
+    async def go(pilot: Any, app: Host, page: Page) -> list[str]:
+        page.kept("unkeyed", lambda: None)
+        page.kept("keyed", lambda: None, key=("user", "pair"))
+        page.forget(None)
+        kept_before = [change.what for change in page.changes]
+        page.forget(("user", "pair"))
+        return kept_before + ["|"] + [change.what for change in page.changes]
+
+    assert drive(go) == ["unkeyed", "keyed", "|", "unkeyed"]

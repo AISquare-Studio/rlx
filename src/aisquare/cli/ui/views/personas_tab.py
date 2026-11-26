@@ -57,7 +57,7 @@ from aisquare.cli.ui.attach import (
     ReturnTo,
     Target,
 )
-from aisquare.cli.ui.save_model import UNDO_BINDING, SavesAsYouGo
+from aisquare.cli.ui.save_model import STALE, UNDO_BINDING, SavesAsYouGo, Stale
 from aisquare.cli.ui.spawn import SpawnCompleted, SpawnDialog
 from aisquare.core import personas as core
 from aisquare.core.agent_adapters import get_adapter
@@ -180,6 +180,27 @@ def details_text(entry: Entry) -> Text:
     for warning in core.warnings(persona):
         text.append(f"⚠ {warning}\n", style="yellow")
     return text
+
+
+Left = tuple[str | None, bytes | None]
+"""What a change left in a persona's folder: its SKILL.md's text and its ``.persona.json``."""
+
+
+def _left_on_disk(directory: Path) -> Left:
+    """What is in the persona folder ``directory`` now: its SKILL.md's text and its
+    ``.persona.json`` (an import's record, when and from where), ``None`` for one not there.
+    Kept when a change is kept, and read again before its undo acts: the persona may have been
+    changed since by another way in (the Spawn dialog's *Import…*, a shell), and an undo acting
+    on that would remove it, or write an older text over it (the reviewer of #24, #1813)."""
+    try:
+        text: str | None = (directory / core.SKILL_FILE).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        text = None
+    try:
+        record: bytes | None = (directory / core.PROVENANCE_FILE).read_bytes()
+    except OSError:
+        record = None
+    return text, record
 
 
 class PersonasTab(SavesAsYouGo, Vertical):
@@ -513,9 +534,10 @@ class PersonasTab(SavesAsYouGo, Vertical):
             self.forget((persona.layer, persona.name))
             self.notify(said, timeout=6, markup=False)
         else:
+            left = _left_on_disk(persona.path)
             self.kept(
                 f"the import of {persona.name}",
-                lambda: self._persona_take_back(persona.name, persona.layer),
+                lambda: self._persona_take_back(persona.name, persona.layer, persona.path, left),
                 said=said,
                 key=(persona.layer, persona.name),
             )
@@ -525,8 +547,13 @@ class PersonasTab(SavesAsYouGo, Vertical):
 
     # --- ctrl+z (M5): an import, a new persona or an edit taken back -------------------------
 
-    def _persona_take_back(self, name: str, layer: Layer) -> bool:
-        """Undo of an import or a *New*: the persona it made, removed again; whether it was."""
+    def _persona_take_back(
+        self, name: str, layer: Layer, directory: Path, left: Left
+    ) -> bool | Stale:
+        """Undo of an import or a *New*: the persona it made, removed again; whether it was. One
+        changed since it was made (:func:`_left_on_disk`) is not this page's to remove."""
+        if _left_on_disk(directory) != left:
+            return STALE
         try:
             personas_service.remove(name, layer=layer, root=self.root)
         except (PersonaError, OSError) as exc:
@@ -552,14 +579,18 @@ class PersonasTab(SavesAsYouGo, Vertical):
         through the one writer (``services.personas.save``), when the text did change."""
         if before is None or self._skill_text(entry) in (None, before):
             return
+        left = _left_on_disk(entry.path)
         self.kept(
             f"{entry.name}'s SKILL.md",
-            lambda: self._persona_put_text(entry, before),
+            lambda: self._persona_put_text(entry, before, left),
             key=(entry.layer, entry.name),
         )
 
-    def _persona_put_text(self, entry: Entry, text: str) -> bool:
-        """Undo of an edit: ``text`` written back; whether it was."""
+    def _persona_put_text(self, entry: Entry, text: str, left: Left) -> bool | Stale:
+        """Undo of an edit: ``text`` written back; whether it was. A SKILL.md changed since the
+        edit (:func:`_left_on_disk`) is not written over."""
+        if _left_on_disk(entry.path) != left:
+            return STALE
         try:
             personas_service.save(entry.name, text, root=self.root, layer=entry.layer)
         except (PersonaError, OSError) as exc:
@@ -576,9 +607,10 @@ class PersonasTab(SavesAsYouGo, Vertical):
     def _persona_created(self, created: dialogs.NewPersona | None) -> None:
         if created is None:
             return
+        left = _left_on_disk(created.path)
         self.kept(
             f"the new persona {created.name}",
-            lambda: self._persona_take_back(created.name, created.layer),
+            lambda: self._persona_take_back(created.name, created.layer, created.path, left),
             key=(created.layer, created.name),
         )
         self.reload(select=f"{created.layer}:{created.name}")

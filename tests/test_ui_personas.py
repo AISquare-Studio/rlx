@@ -20,6 +20,7 @@ tmux argv was issued at all.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 import threading
 from collections.abc import Callable, Coroutine, Iterator, Sequence
@@ -2061,3 +2062,102 @@ def test_a_removed_persona_leaves_no_undo_that_acts_on_it(
     assert not (user_layer() / "pair-programmer").exists(), "the premise: removed"
     assert said[-1] == "Nothing to undo here", said
     assert not any(m.startswith("Not undone") for m in said), said
+
+
+async def _a_new_pair_programmer(pilot: Pilot[None]) -> None:
+    """+ New pair-programmer on the page, the editor closed with the scaffold kept."""
+    await press(pilot, "#persona-new")
+    dialog = await wait_for(pilot, NewPersonaScreen)
+    dialog.query_one("#new-name", Input).value = "pair-programmer"
+    dialog.query_one("#new-description", Input).value = "Pairs, one keyboard."
+    await pilot.pause()
+    await press(pilot, "#new-create")
+    await wait_for(pilot, EditPersonaScreen)
+    await pilot.press("escape")
+    await settle(pilot)
+
+
+def test_an_import_over_it_from_the_spawn_dialog_leaves_the_new_personas_undo_acting_on_nothing(
+    project: ProjectInfo, repo: Path, skills: Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer of #24 (#1813): Spawn agent ▸ Advanced ▸ Import… is a second way into the
+    same Import dialog, Force and all, whose answer never reaches this page. A New made here,
+    then imported over from the Spawn dialog: ctrl+z on the page removed the import. Each undo
+    checks the persona is as its change left it; changed since, it says so and acts on
+    nothing, and the next ctrl+z goes on to what is older."""
+    from aisquare.cli.ui.spawn import SpawnDialog
+
+    imported = skill_text("Pairs, imported from the Spawn dialog.")
+
+    def answer(source: str, **options: object) -> personas_service.ImportResult:
+        directory = user_layer() / "pair-programmer"
+        (directory / "SKILL.md").write_text(imported, encoding="utf-8")
+        return result_for(directory).model_copy(update={"replaced": True})
+
+    monkeypatch.setattr(personas_service, "import_source", Recorder(answer))
+    monkeypatch.setattr(personas_service, "importable_skills", lambda root: [])
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Any]:
+        await _a_new_pair_programmer(pilot)
+        host.push_screen(SpawnDialog(project, accounts=None, defaults=None))
+        await wait_for(pilot, SpawnDialog)
+        await settle(pilot)
+        await pilot.click("#spawn-advanced CollapsibleTitle")
+        await settle(pilot)
+        await pilot.click("#spawn-import")
+        importer = await wait_for(pilot, ImportPersonaScreen)
+        importer.query_one("#import-source", Input).value = "./skills/pair-programmer"
+        importer.query_one("#import-force", Switch).value = True
+        await pilot.pause()
+        await press(pilot, "#import-submit")
+        await settle(pilot)
+        await pilot.press("escape")  # the spawn cancelled: back on Personas
+        await settle(pilot)
+        tab(host).focus()
+        for _ in range(2):
+            await pilot.press("ctrl+z")
+            await settle(pilot)
+        return [[m for m, _ in host.notices]]
+
+    [said] = drive(scenario, project=project)
+    skill = user_layer() / "pair-programmer" / "SKILL.md"
+    assert skill.exists(), f"ctrl+z removed the import made from the Spawn dialog: {said}"
+    assert skill.read_text(encoding="utf-8") == imported
+    assert said[-2:] == [
+        "Not undone: the new persona pair-programmer has changed since, elsewhere",
+        "Nothing to undo here",
+    ], said
+
+
+@pytest.mark.parametrize("elsewhere", ["rewritten", "removed"])
+def test_a_persona_changed_outside_the_page_is_not_undone_over(
+    project: ProjectInfo, repo: Path, skills: Recorder, elsewhere: str
+) -> None:
+    """A New made here, then changed outside the page (a shell rewriting its SKILL.md, or
+    removing it, while rlx is open): ctrl+z says it changed since and acts on nothing, and
+    is not left blocking the undos older than it."""
+    outside = skill_text("Pairs, from a shell.")
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Any]:
+        await _a_new_pair_programmer(pilot)
+        directory = user_layer() / "pair-programmer"
+        if elsewhere == "rewritten":
+            (directory / "SKILL.md").write_text(outside, encoding="utf-8")
+        else:
+            shutil.rmtree(directory)
+        tab(host).focus()
+        for _ in range(2):
+            await pilot.press("ctrl+z")
+            await settle(pilot)
+        return [[m for m, _ in host.notices]]
+
+    [said] = drive(scenario, project=project)
+    skill = user_layer() / "pair-programmer" / "SKILL.md"
+    if elsewhere == "rewritten":
+        assert skill.read_text(encoding="utf-8") == outside, "the shell's text stands"
+    else:
+        assert not skill.exists()
+    assert said[-2:] == [
+        "Not undone: the new persona pair-programmer has changed since, elsewhere",
+        "Nothing to undo here",
+    ], said
