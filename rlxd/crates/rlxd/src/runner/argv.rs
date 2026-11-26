@@ -282,11 +282,11 @@ mod tests {
 
     #[test]
     fn the_hook_is_never_a_bare_name() {
-        let hook = hook_beside(Some(Path::new("/opt/rlx/bin/rlxd"))).unwrap();
+        let rlxd = std::env::temp_dir().join("rlx").join("bin").join("rlxd");
+        let hook = hook_beside(Some(&rlxd)).unwrap();
         assert!(hook.ends_with("rlxd-hook") || hook.ends_with("rlxd-hook.exe"));
-        if !cfg!(windows) {
-            assert!(hook.is_absolute());
-        }
+        assert!(hook.is_absolute(), "{}", hook.display());
+        assert_eq!(hook.parent(), rlxd.parent());
         assert!(hook_beside(None).is_err());
         assert!(hook_beside(Some(Path::new("rlxd"))).is_err());
         assert!(hook_beside(Some(Path::new("bin/rlxd"))).is_err());
