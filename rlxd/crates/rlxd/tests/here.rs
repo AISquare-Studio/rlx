@@ -1,0 +1,299 @@
+//! `rlxd here`, the probe rlx.app runs over SSH (the owner's remote brief, §3; task #12's
+//! acceptance), each against a fresh home, on every OS rlxd.yml runs. Its answer over a
+//! real `ssh localhost` is rlxd.yml's `ssh` job's to check.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+
+use common::{Run, TestHome, assert_valid};
+use rlxd_client::Home;
+use serde_json::{Value, json};
+
+/// The version every crate of the workspace carries, which is rlx's.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `run`'s `rlxd here --json` envelope, which must be `ok` and valid against both
+/// schemas, and its exit code.
+fn answer(run: &Run) -> (Option<i32>, Value) {
+    let envelope = run.json();
+    assert_valid("envelope.json", &envelope);
+    assert_eq!(envelope["ok"], true, "{run:?}");
+    assert_valid("here-reply.json", &envelope["data"]);
+    (run.code(), envelope["data"].clone())
+}
+
+/// `rlxd here --json args…` in `home`.
+fn here(home: &TestHome, args: &[&str]) -> (Option<i32>, Value) {
+    let mut all = vec!["here", "--json"];
+    all.extend_from_slice(args);
+    answer(&home.rlxd(&all))
+}
+
+/// `path`, resolved, so two spellings of one file compare equal.
+fn real(path: impl AsRef<Path>) -> PathBuf {
+    std::fs::canonicalize(path.as_ref())
+        .unwrap_or_else(|e| panic!("{}: {e}", path.as_ref().display()))
+}
+
+#[test]
+fn stopped_then_started_then_running() {
+    // Acceptance 1.
+    let home = TestHome::new();
+    let endpoint = Home::at(home.root()).endpoint();
+    let (code, stopped) = here(&home, &[]);
+    assert_eq!(code, Some(3), "installed, not running: {stopped}");
+    assert_eq!(stopped["installed"], true);
+    assert_eq!(stopped["running"], false);
+    assert_eq!(stopped["started"], false);
+    assert_eq!(stopped["supported"], true);
+    assert_eq!(stopped.get("pid"), None);
+    assert_eq!(stopped["version"], VERSION);
+    assert_eq!(stopped["protocol_versions"], json!([1]));
+    assert_eq!(stopped["socket"], endpoint);
+    assert_eq!(stopped["home"], home.root().display().to_string());
+    assert_eq!(stopped["platform"], std::env::consts::OS);
+    let token = home.root().join("rlxd").join("token");
+    assert_eq!(
+        stopped["auth"],
+        json!({"token_file": token.display().to_string()})
+    );
+    assert_eq!(stopped["rlxd"]["version"], VERSION);
+    assert_eq!(stopped["rlxd"]["protocol_versions"], json!([1]));
+    let path = stopped["rlxd"]["path"].as_str().unwrap();
+    assert_eq!(real(path), real(env!("CARGO_BIN_EXE_rlxd")));
+    assert!(stopped["rlx"]["installed"].is_boolean());
+
+    let (code, started) = here(&home, &["--start"]);
+    assert_eq!(code, Some(0), "{started}");
+    assert_eq!(started["running"], true);
+    assert_eq!(started["started"], true);
+    assert!(
+        started["pid"].as_u64().is_some_and(|pid| pid > 0),
+        "{started}"
+    );
+
+    let (code, again) = here(&home, &[]);
+    assert_eq!(code, Some(0), "{again}");
+    assert_eq!(again["running"], true);
+    assert_eq!(again["started"], false);
+    assert_eq!(again["pid"], started["pid"]);
+    assert_eq!(again["socket"], endpoint);
+    assert_eq!(again["protocol_versions"], json!([1]));
+    assert_eq!(again["version"], VERSION);
+    assert_eq!(
+        home.status()["pid"],
+        again["pid"],
+        "status names the same rlxd"
+    );
+}
+
+#[test]
+fn start_on_a_running_rlxd_starts_nothing() {
+    let home = TestHome::new();
+    let first = home.start();
+    let (code, data) = here(&home, &["--start"]);
+    assert_eq!(code, Some(0), "{data}");
+    assert_eq!(data["running"], true);
+    assert_eq!(data["started"], false);
+    assert_eq!(data["pid"], first["pid"]);
+}
+
+#[test]
+fn a_caller_rlxd_cannot_serve_gets_exit_4_and_nothing_started() {
+    let home = TestHome::new();
+    let (code, data) = here(&home, &["--protocols", "2-3", "--start"]);
+    assert_eq!(code, Some(4), "{data}");
+    assert_eq!(data["supported"], false);
+    assert_eq!(data["running"], false);
+    assert_eq!(data["started"], false);
+    assert_eq!(
+        home.rlxd(&["status", "--json"]).code(),
+        Some(3),
+        "not started"
+    );
+
+    let pid = home.start()["pid"].clone();
+    let (code, data) = here(&home, &["--protocols", "2"]);
+    assert_eq!(code, Some(4), "{data}");
+    assert_eq!(data["running"], true);
+    assert_eq!(data["supported"], false);
+    assert_eq!(data["pid"], pid);
+    for speaks in ["1", "1-3", "3,1"] {
+        let (code, data) = here(&home, &["--protocols", speaks]);
+        assert_eq!(code, Some(0), "{speaks}: {data}");
+        assert_eq!(data["supported"], true);
+    }
+}
+
+#[test]
+fn the_token_is_shown_only_when_asked() {
+    let home = TestHome::new();
+    let (_, data) = here(&home, &["--show-token"]);
+    assert_eq!(data["auth"].get("token"), None, "no token file yet");
+    home.start();
+    let (_, data) = here(&home, &[]);
+    assert_eq!(data["auth"].get("token"), None);
+    let (_, data) = here(&home, &["--show-token"]);
+    let token = std::fs::read_to_string(home.root().join("rlxd").join("token")).unwrap();
+    assert_eq!(data["auth"]["token"], token.trim());
+}
+
+#[test]
+fn without_json_it_describes_and_exits_the_same() {
+    let home = TestHome::new();
+    let stopped = home.rlxd(&["here"]);
+    assert_eq!(stopped.code(), Some(3), "{stopped:?}");
+    assert!(stopped.stdout.contains("not running"), "{stopped:?}");
+    home.start();
+    let running = home.rlxd(&["here"]);
+    assert_eq!(running.code(), Some(0), "{running:?}");
+    assert!(running.stdout.contains("runs for"), "{running:?}");
+    let endpoint = Home::at(home.root()).endpoint();
+    assert!(running.stdout.contains(&endpoint), "{running:?}");
+    let unsupported = home.rlxd(&["here", "--protocols", "2"]);
+    assert_eq!(unsupported.code(), Some(4), "{unsupported:?}");
+    assert!(
+        unsupported.stdout.contains("unsupported"),
+        "{unsupported:?}"
+    );
+}
+
+/// Stops the rlxd of the home `env -i HOME=<dir>` names, when dropped.
+#[cfg(unix)]
+struct StopsWithNoEnvironment<'a>(&'a Path);
+
+#[cfg(unix)]
+impl StopsWithNoEnvironment<'_> {
+    /// `env -i HOME=<dir> rlxd args…`: no `PATH`, no home variable, nothing else.
+    fn rlxd(&self, args: &[&str]) -> Run {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_rlxd"));
+        command.env_clear().env("HOME", self.0).args(args);
+        common::run(command, None)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StopsWithNoEnvironment<'_> {
+    fn drop(&mut self) {
+        let _ = self.rlxd(&["stop"]);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn with_only_home_set_it_finds_the_default_home_and_starts_rlxd() {
+    // Acceptance 2: `env -i HOME=$HOME <absolute path> here --json`, with this test's
+    // folder as $HOME.
+    let user = TestHome::new();
+    let session = StopsWithNoEnvironment(user.root());
+    let default_home = user.root().join(".aisquare").display().to_string();
+    let (code, stopped) = answer(&session.rlxd(&["here", "--json"]));
+    assert_eq!(code, Some(3), "{stopped}");
+    assert_eq!(stopped["home"], default_home);
+    assert_eq!(stopped["running"], false);
+    let (code, started) = answer(&session.rlxd(&["here", "--json", "--start"]));
+    assert_eq!(code, Some(0), "{started}");
+    assert_eq!(started["started"], true);
+    let (code, running) = answer(&session.rlxd(&["here", "--json"]));
+    assert_eq!(code, Some(0), "{running}");
+    assert_eq!(running["running"], true);
+    assert_eq!(running["pid"], started["pid"]);
+    assert_eq!(running["home"], default_home);
+    assert_eq!(session.rlxd(&["stop"]).code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn rlx_beside_rlxd_is_found_and_asked_its_version() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TestHome::new();
+    let bin = home.root().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_rlxd"), bin.join("rlxd")).unwrap();
+    let rlx = bin.join("rlx");
+    // The copy, in this home, with no PATH: only the folder beside it holds an rlx
+    // before the install folders do.
+    let probe = || {
+        let mut command = std::process::Command::new(bin.join("rlxd"));
+        command
+            .args(["here", "--json"])
+            .env("AISQUARE_HOME", home.root())
+            .env_remove("RLX_HOME")
+            .env_remove("PATH");
+        answer(&common::run(command, None)).1
+    };
+    for (script, version) in [
+        ("#!/bin/sh\necho 'rlx 9.9.9'\n", json!("9.9.9")),
+        ("#!/bin/sh\nexit 1\n", Value::Null),
+    ] {
+        std::fs::write(&rlx, script).unwrap();
+        std::fs::set_permissions(&rlx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = probe();
+        assert_eq!(data["rlx"]["installed"], true, "{data}");
+        assert_eq!(real(data["rlx"]["path"].as_str().unwrap()), real(&rlx));
+        let said = data["rlx"].get("version").cloned().unwrap_or(Value::Null);
+        assert_eq!(said, version, "{data}");
+        assert_eq!(
+            real(data["rlxd"]["path"].as_str().unwrap()),
+            real(bin.join("rlxd"))
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_running_rlxd_of_other_protocols_is_running_and_unsupported() {
+    // A stand-in for a later rlxd that serves protocols 2 and 3 only: it refuses this
+    // probe's hello as rlxd refuses one it does not serve.
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let home = TestHome::new();
+    let layout = Home::at(home.root());
+    std::fs::create_dir_all(layout.run_dir()).unwrap();
+    std::fs::create_dir_all(layout.rlxd_dir()).unwrap();
+    std::fs::write(layout.token(), "t").unwrap();
+    let listener = UnixListener::bind(layout.socket()).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            let id = serde_json::from_str::<Value>(&line).map_or(json!(1), |r| r["id"].clone());
+            let reply = json!({"schema_version": 1, "id": id, "ok": false, "error": {
+                "code": "incompatible_protocol", "message": "protocol 1 is not served",
+                "detail": {"supported": [3, 2]}}});
+            let _ = writeln!(stream, "{reply}");
+        }
+    });
+    let (code, data) = here(&home, &[]);
+    assert_eq!(code, Some(4), "{data}");
+    assert_eq!(data["running"], true);
+    assert_eq!(data["supported"], false);
+    assert_eq!(data["protocol_versions"], json!([2, 3]));
+    assert_eq!(data.get("pid"), None, "no registry record to read it from");
+    assert_eq!(data.get("version"), None);
+    assert_eq!(data["rlxd"]["protocol_versions"], json!([1]));
+    let (code, data) = here(&home, &["--protocols", "2-3"]);
+    assert_eq!(code, Some(0), "{data}");
+    let (code, data) = here(&home, &["--start"]);
+    assert_eq!(code, Some(4), "{data}");
+    assert_eq!(data["started"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_rlxd_that_holds_the_lock_and_never_listens_fails_the_probe() {
+    let home = TestHome::new();
+    let layout = Home::at(home.root());
+    std::fs::create_dir_all(layout.run_dir()).unwrap();
+    let lock = std::fs::File::create(layout.lock()).unwrap();
+    lock.try_lock().unwrap();
+    for args in [&["here", "--json"][..], &["here", "--json", "--start"]] {
+        let run = home.rlxd(args);
+        assert_eq!(run.code(), Some(1), "{args:?}: {run:?}");
+        assert_eq!(run.error_code(), "disconnected", "{args:?}");
+        assert_valid("envelope.json", &run.json());
+    }
+    drop(lock);
+}

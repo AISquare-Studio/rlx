@@ -13,6 +13,7 @@
 //! is free everything else is done. `--detach` starts the same in the background and returns once it takes
 //! a connection, printing its `status`.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -22,7 +23,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rlxd_client::Home;
+use rlxd_client::{Home, Reply};
 use rlxd_proto::{VERSION, codes, methods};
 use tokio::task::JoinSet;
 
@@ -238,44 +239,70 @@ pub fn detach() -> ExitCode {
         Ok(home) => home,
         Err(e) => return out::fail(codes::START_FAILED, &e.to_string(), None),
     };
+    match start(&home, None) {
+        Ok(reply) => out::print_reply(&reply),
+        Err(StartError::AlreadyRunning) => already_running(&home),
+        Err(StartError::Failed { message, hint }) => {
+            out::fail(codes::START_FAILED, &message, hint.as_deref())
+        }
+    }
+}
+
+/// Why [`start`] gave no rlxd of its own.
+pub enum StartError {
+    /// An rlxd already runs for the home.
+    AlreadyRunning,
+    /// It could not start: what went wrong, and where to look.
+    Failed {
+        /// What went wrong.
+        message: String,
+        /// Where to look, such as the log.
+        hint: Option<String>,
+    },
+}
+
+/// Starts rlxd for `home` in the background, detached from this terminal, with `path` as
+/// its `PATH` when given, and returns its `status` reply once it takes a connection.
+pub fn start(home: &Home, path: Option<&OsStr>) -> Result<Reply, StartError> {
+    let failed = |message: String, hint: Option<String>| StartError::Failed { message, hint };
     match lock::is_held(&home.lock()) {
-        Ok(true) => return already_running(&home),
+        Ok(true) => return Err(StartError::AlreadyRunning),
         Ok(false) => {}
         Err(e) => {
             let message = format!("cannot read {}: {e}", home.lock().display());
-            return out::fail(codes::START_FAILED, &message, None);
+            return Err(failed(message, None));
         }
     }
-    let mut child = match background_command().and_then(|mut command| command.spawn()) {
+    let mut child = match background_command(path).and_then(|mut c| c.spawn()) {
         Ok(child) => child,
         Err(e) => {
             let message = format!("cannot start rlxd in the background: {e}");
-            return out::fail(codes::START_FAILED, &message, None);
+            return Err(failed(message, None));
         }
     };
     let deadline = Instant::now() + START_WAIT;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             if lock::is_held(&home.lock()).unwrap_or(false) {
-                return already_running(&home);
+                return Err(StartError::AlreadyRunning);
             }
             let mut message = format!("rlxd exited ({status}) before it took a connection");
-            if let Some(said) = last_error(&home) {
+            if let Some(said) = last_error(home) {
                 message = format!("{message}: {said}");
             }
-            return out::fail(codes::START_FAILED, &message, Some(&see_the_log(&home)));
+            return Err(failed(message, Some(see_the_log(home))));
         }
-        if let Ok(reply) = cli::ask(&home, methods::STATUS) {
+        if let Ok(reply) = cli::ask(home, methods::STATUS) {
             let pid = reply
                 .data()
                 .and_then(|data| data.get("pid"))
                 .and_then(serde_json::Value::as_u64);
             if pid == Some(u64::from(child.id())) {
-                return out::print_reply(&reply);
+                return Ok(reply);
             }
             if child.try_wait().ok().flatten().is_some() || pid.is_some() {
                 // Another rlxd took the home first; this one exits on its own.
-                return already_running(&home);
+                return Err(StartError::AlreadyRunning);
             }
         }
         if Instant::now() >= deadline {
@@ -284,7 +311,7 @@ pub fn detach() -> ExitCode {
                 "rlxd did not take a connection within {} s, and was stopped",
                 START_WAIT.as_secs()
             );
-            return out::fail(codes::START_FAILED, &message, Some(&see_the_log(&home)));
+            return Err(failed(message, Some(see_the_log(home))));
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -292,13 +319,17 @@ pub fn detach() -> ExitCode {
 
 /// `rlxd serve` in the background: no stdin, its output to nowhere (it logs to its file),
 /// in a process group or console of its own, so the terminal's signals do not reach it.
-fn background_command() -> io::Result<Command> {
+/// `path`, when given, is its `PATH`.
+fn background_command(path: Option<&OsStr>) -> io::Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["serve", BACKGROUND_FLAG])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
