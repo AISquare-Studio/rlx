@@ -1046,6 +1046,56 @@ def ngrok_config_path(name: str) -> Path:
     return _in_layout(("remote", name), (name,))
 
 
+# --- from the old layout to the new (#31, H2) ------------------------------------------------
+
+OLD_STORE = "context.db"
+"""The store's name at an old home's top (``rlx.db`` in the new layout)."""
+
+MOVES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (OLD_STORE, ("rlx.db",)),
+    (f"{OLD_STORE}-wal", ("rlx.db-wal",)),
+    (f"{OLD_STORE}-shm", ("rlx.db-shm",)),
+    ("log", ("logs",)),
+    ("credentials", ("accounts", "aisquare", "credentials")),
+    ("launch-seals", ("fleet", "launch-seals")),
+    ("fleet-tmux.conf", ("fleet", "tmux.conf")),
+    ("instances", ("run", "instances")),
+    ("usage-sweep.lock", ("run", "locks", "usage-sweep.lock")),
+    ("usage-share.lock", ("run", "locks", "usage-share.lock")),
+    ("active-ping.lock", ("run", "locks", "active-ping.lock")),
+    ("remote.json", ("remote", "remote.json")),
+    ("remote-audit.log", ("remote", "audit.log")),
+    ("remote-dist", ("remote", "dist")),
+    ("remote-needs.json", ("remote", "needs.json")),
+    ("remote-push.json", ("remote", "push.json")),
+    ("ngrok-authtoken", ("remote", "ngrok-authtoken")),
+)
+"""Each name at an old home's top that the new layout keeps elsewhere, and where, as the
+helpers above place it (docs/home-layout.md's table): what the home's move renames
+(``services.home_migration``). An agent's accounts folder and each ngrok config of ours are
+moved too, by their shape (:func:`new_place`). The store's sidecars go with it, though a
+move checkpoints the store first and leaves none."""
+
+_NGROK_CONFIG_PREFIX = "remote-ngrok-v"
+"""How our ngrok configs are named at either layout's place for them
+(``services.ngrok_tunnel._our_config_name``)."""
+
+
+def new_place(name: str) -> tuple[str, ...] | None:
+    """Where the new layout keeps what an old home has at its top as ``name``, below the home;
+    ``None`` for a name both layouts keep at the top (``config.toml``, ``projects``, ``cache``,
+    ``run`` and the rest)."""
+    for old, new in MOVES:
+        if name == old:
+            return new
+    agent = name.removesuffix(OLD_ACCOUNTS_SUFFIX)
+    if agent != name and agent:
+        return ("accounts", agent)
+    if name.startswith(_NGROK_CONFIG_PREFIX) and name.endswith(".yml"):
+        return ("remote", name)
+    return None
+
+
 NEW_LAYOUT_FOLDERS: tuple[tuple[str, ...], ...] = (
     ("cache",),
     ("logs",),

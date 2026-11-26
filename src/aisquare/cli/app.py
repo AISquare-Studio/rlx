@@ -27,6 +27,7 @@ from aisquare.cli import (
     enforce,
     explainability,
     fleet,
+    home,
     hook,
     launch,
     persona,
@@ -118,8 +119,10 @@ def main_callback(
 
 #: Commands that tools run for the user, on every prompt or for the life of a session: what
 #: they do is not a choice of the user's, so they are not counted as features used. And
-#: ``uninstall``, whose plan must change no file of the home and whose purge removes it.
-_NOT_FEATURES = frozenset({"hook", "serve", "inject", "uninstall"})
+#: ``uninstall``, whose plan must change no file of the home and whose purge removes it; and
+#: ``home``, the home's move, which ``rlx upgrade`` runs and which writes nothing into a home it
+#: refuses to move (#31).
+_NOT_FEATURES = frozenset({"hook", "serve", "inject", "uninstall", "home"})
 
 
 #: The detached shipper and the detached pinger themselves: not features, and neither may start
@@ -294,6 +297,8 @@ app.add_typer(captain.app, name="captain", hidden=True)
 app.command("ui")(fleet.ui)
 app.command("instances")(instances_cli.instances)
 app.add_typer(hook.app, name="hook", hidden=True)
+# `rlx upgrade` moves a home from before 0.10.2, in the new install, by this (#31).
+app.add_typer(home.app, name="home", hidden=True)
 # Visible: unlike the roadmap groups above, every leaf here does something on a
 # stock machine — `enable` is the one command that turns tracing on, and the
 # rest report or wire it. A surface an operator has to be told exists is not an

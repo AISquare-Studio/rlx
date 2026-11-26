@@ -1351,6 +1351,110 @@ def _keychain_problem(code: int, stderr: bytes) -> tuple[KeychainProblem, str]:
     return "failed", f"could not read the Keychain (security exited {code})"
 
 
+# --- an item copied to another name: the home's move (#31, H2) ----------------------------------
+#
+# A managed slot's item is named by its config dir (`keychain_service`), so a slot the home's
+# move takes elsewhere is signed out unless its item is copied to the name its new place
+# hashes to. Copied as Claude Code writes an item: `add-generic-password -U -a <account>
+# -s <service> -X <hex>`, given to `security -i` on its stdin, so the secret is never on a
+# command line, where any process of this user could read it. `security -i` reads a command
+# line of at most 4096 bytes; Claude Code keeps its own to 4,032, and so does this.
+
+KEYCHAIN_LINE_LIMIT = 4032
+"""The longest command :func:`add_keychain_item` gives ``security -i``: Claude Code's own limit."""
+_ITEM_NAME = re.compile(r"[A-Za-z0-9 ._-]+")
+"""What a service or account may hold to be quoted on ``security -i``'s line as it stands."""
+
+
+@dataclass(frozen=True)
+class KeychainItemData:
+    """What an item holds, as Claude Code's own lookup reads it (:func:`keychain_item_data`): its
+    bytes, ``None`` with no item; or why the Keychain would not say."""
+
+    data: bytes | None
+    printed: bytes = b""
+    """What ``security -w`` printed for it, as printed: a copy is the same item when the same
+    lookup prints the same."""
+    unreadable: str | None = None
+
+
+def keychain_item_data(service: str, account: str) -> KeychainItemData:
+    """The item ``service``/``account`` as Claude Code reads it, ``security
+    find-generic-password -a <account> -w -s <service>``, undecoded: the bytes ``-w`` printed,
+    or those of the hex it prints instead for data it will not print as it stands. Never
+    logged, never kept, never in a reason."""
+    done = _run_security(["find-generic-password", "-a", account, "-w", "-s", service])
+    if isinstance(done, str):
+        return KeychainItemData(None, unreadable=done)
+    code, stdout, stderr = done
+    if code == _ITEM_NOT_FOUND or code in _NO_KEYCHAIN:
+        return KeychainItemData(None)
+    if code != 0:
+        return KeychainItemData(None, unreadable=_keychain_problem(code, stderr)[1])
+    return KeychainItemData(_printed_item_bytes(stdout.removesuffix(b"\n")), printed=stdout)
+
+
+def _printed_item_bytes(printed: bytes) -> bytes:
+    """The data ``security -w`` printed as ``printed``: hex for data with a byte it will not
+    print (as :func:`_item_json` reads it), the bytes as printed else."""
+    text = printed.decode("ascii", "replace")
+    if not _HEX.fullmatch(text):
+        return printed
+    data = bytes.fromhex(text)
+    printable = all(0x20 <= byte < 0x7F or byte in (0x09, 0x0A, 0x0D) for byte in data)
+    return printed if printable else data
+
+
+def add_keychain_item(service: str, account: str, data: bytes) -> str | None:
+    """Write ``data`` as the item ``service``/``account``, as Claude Code writes one, through
+    ``security -i`` on its stdin (never a command line): ``None`` when ``security`` took it,
+    otherwise why not. What it took is to be read back (:func:`keychain_item_data`): ``security -i``
+    goes on past a command that failed."""
+    if not (_ITEM_NAME.fullmatch(service) and _ITEM_NAME.fullmatch(account)):
+        return "its name cannot be given to security as it stands"
+    line = f'add-generic-password -U -a "{account}" -s "{service}" -X "{data.hex()}"\n'
+    if len(line) > KEYCHAIN_LINE_LIMIT:
+        return f"it is {len(data):,} bytes, too long to copy without putting it on a command line"
+    done = _run_security(["-i"], stdin=line.encode("ascii"))
+    if isinstance(done, str):
+        return done
+    code, _stdout, stderr = done
+    return None if code == 0 else _keychain_problem(code, stderr)[1]
+
+
+def delete_keychain_item(service: str, account: str) -> str | None:
+    """Delete the item ``service``/``account``: ``None`` when it is gone (or was never
+    there), otherwise why not."""
+    done = _run_security(["delete-generic-password", "-a", account, "-s", service])
+    if isinstance(done, str):
+        return done
+    code, _stdout, stderr = done
+    if code in (0, _ITEM_NOT_FOUND) or code in _NO_KEYCHAIN:
+        return None
+    return _keychain_problem(code, stderr)[1]
+
+
+def _run_security(args: list[str], *, stdin: bytes | None = None) -> tuple[int, bytes, bytes] | str:
+    """``security <args>`` (:data:`KEYCHAIN_TOOL`, never a shell), given ``stdin``: its exit
+    code and what it printed, or why it did not run. What it printed is never logged."""
+    import subprocess
+
+    try:
+        done = subprocess.run(
+            [KEYCHAIN_TOOL, *args],
+            input=stdin,
+            stdin=None if stdin is not None else subprocess.DEVNULL,
+            capture_output=True,
+            timeout=KEYCHAIN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:  # carries what it printed so far: dropped here
+        return f"the Keychain gave no answer in {KEYCHAIN_TIMEOUT_SECONDS:g} s"
+    except OSError as exc:
+        return f"{KEYCHAIN_TOOL}: {exc.strerror or 'not run'}"
+    return done.returncode, done.stdout, done.stderr
+
+
 def token_state(creds: ClaudeCredentials | None, now: datetime | None = None) -> str:
     if creds is None:
         return "missing"

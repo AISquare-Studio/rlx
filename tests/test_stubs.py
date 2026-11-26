@@ -24,6 +24,10 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("status",),
     ("doctor",),
     ("upgrade",),
+    (
+        "home",
+        "migrate",
+    ),  # what `upgrade` runs in the new install (#31): tests/test_home_migration.py
     ("uninstall",),
     ("log",),
     ("note",),

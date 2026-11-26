@@ -109,6 +109,10 @@ def _plan_json(plan: lifecycle_service.UpgradePlan) -> dict[str, Any]:
         "tools_regained": list(plan.tools_regained),
         # The settings a move back reads from that release's defaults, not this one's.
         "config_defaults_lost": list(plan.config_defaults_lost),
+        # The move of a home from before 0.10.2 to ~/.rlx the run makes (#31), and why not.
+        "home_move": plan.home_move,
+        "home_refusal": plan.home_refusal,
+        "home_warning": plan.home_warning,
     }
 
 
@@ -212,6 +216,7 @@ def _emit_plan(plan: lifecycle_service.UpgradePlan) -> None:
         )
     _say(f"  install: {plan.route.describe()}")
     _say(f"  runs:    {plan.command}")
+    _home_plan_lines(plan)
     for site in plan.refresh:
         label = lifecycle_service.agent_label(site.agent)
         if site.hooks_off is None:
@@ -227,6 +232,41 @@ def _emit_plan(plan: lifecycle_service.UpgradePlan) -> None:
     _fleet_lines(plan)
     if plan.asqs_refusal is not None:
         _say(f"✗ it will not run: {plan.asqs_refusal}")
+
+
+def _home_plan_lines(plan: lifecycle_service.UpgradePlan) -> None:
+    """The home's move in the plan (#31): made before the hooks, only while nothing runs."""
+    if plan.home_move is not None and not plan.backwards:
+        _say(f"  then:    moves the home: {plan.home_move} (once nothing runs on it)")
+    if plan.home_refusal is not None:
+        _say(f"  leaves:  the home where it is — {plan.home_refusal}")
+
+
+def _home_lines(home: lifecycle_service.HomeMove) -> None:
+    """What the home's move did (#31), after the install's own line."""
+    if home.moved:
+        first, *rest = home.lines
+        _say(f"✓ {first}")
+        for line in rest:
+            _say(f"· {line}")
+    elif home.problem is not None:
+        then = (
+            "it is as it was: stop what runs, then run rlx upgrade again"
+            if home.rolled_back
+            else "run rlx upgrade again to finish it"
+        )
+        _say(f"✗ the home was not moved: {home.problem} — {then}")
+
+
+def _home_json(home: lifecycle_service.HomeMove | None) -> dict[str, Any] | None:
+    if home is None:
+        return None
+    return {
+        **(home.payload or {}),
+        "moved": home.moved,
+        "problem": home.problem,
+        "rolled_back": home.rolled_back if home.problem is not None else None,
+    }
 
 
 def _fleet_lines(plan: lifecycle_service.UpgradePlan, *, one_click: bool = False) -> None:
@@ -253,6 +293,8 @@ def _fleet_lines(plan: lifecycle_service.UpgradePlan, *, one_click: bool = False
         _say(f"⚠ {plan.config_warning}")
     if plan.store_warning is not None:
         _say(f"⚠ {plan.store_warning}")
+    if plan.home_warning is not None:
+        _say(f"⚠ {plan.home_warning}")
 
 
 def _emit_report(report: lifecycle_service.UpgradeReport) -> None:
@@ -288,6 +330,7 @@ def _emit_report(report: lifecycle_service.UpgradeReport) -> None:
                 "tools_regained": list(plan.tools_regained),
                 "config_defaults_lost": list(plan.config_defaults_lost),
                 "notes": list(report.notes),
+                "home": _home_json(report.home),
             }
         )
         return
@@ -298,6 +341,8 @@ def _emit_report(report: lifecycle_service.UpgradeReport) -> None:
         _say(f"✓ rlx {report.version} is the release uv picks for this install")
     else:
         _say(f"✓ rlx {report.version} (was {plan.current}) — checked in a new process")
+    if report.home is not None:
+        _home_lines(report.home)
     for hook in report.hooks:
         where = _place(hook.config_dir, hook.agent)
         if hook.ok and hook.hooks_off is not None:
@@ -339,6 +384,55 @@ def _emit_report(report: lifecycle_service.UpgradeReport) -> None:
         _say(f"· {note}")
 
 
+def _move_the_home(
+    plan: lifecycle_service.UpgradePlan,
+    *,
+    yes: bool,
+    dry_run: bool,
+    reopen: bool,
+    one_click: bool,
+    started: datetime | None,
+) -> None:
+    """``rlx upgrade`` on the latest release, with a home from before 0.10.2 to move (#31): the
+    release that moves homes is installed, by a release that did not (0.10.1's upgrade knows
+    no move), so its own upgrade makes the move. Asked first at a terminal, as an install is;
+    off one, a dry run unless ``--yes``."""
+    json_output = get_state().json_output
+    planned = dry_run or (not yes and (json_output or not _stdin_is_a_terminal()))
+    if planned:
+        if json_output:
+            _echo_json({"dry_run": True, "upgraded": False, "up_to_date": True, **_plan_json(plan)})
+            return
+        _say(f"rlx {plan.current} is up to date; its home would move: {plan.home_move}")
+        if not dry_run:
+            _say("dry run: nothing moved — re-run with --yes to move it")
+        return
+    if not yes and not typer.confirm(
+        f"rlx {plan.current} is up to date. Move its home, {plan.home_move}?", default=False
+    ):
+        _say("nothing changed")
+        _reopen(reopen, one_click=one_click, started=started)
+        return
+    home = lifecycle_service.move_home_here()
+    if json_output:
+        _echo_json(
+            {
+                "dry_run": False,
+                "upgraded": False,
+                "up_to_date": True,
+                "previous": plan.current,
+                "version": plan.current,
+                "home": _home_json(home),
+            }
+        )
+    else:
+        _say(f"rlx {plan.current} is up to date")
+        _home_lines(home)
+    if _home_not_moved(home):
+        raise _HomeNotMoved()
+    _reopen(reopen, one_click=one_click, installed=True, started=started)
+
+
 def _by_hand(version: str | None) -> str:
     """The command a person runs instead of ``--one-click``: asq's own flag is never told."""
     return install_route.command_line(
@@ -352,6 +446,15 @@ class _HooksFailed(typer.Exit):
 
     def __init__(self) -> None:
         super().__init__(1)
+
+
+class _HomeNotMoved(_HooksFailed):
+    """Exit 1 after an install that worked (or none was needed), whose move of an old home was
+    refused or stopped (#31): the release is in place, the home as the report says."""
+
+
+def _home_not_moved(home: lifecycle_service.HomeMove | None) -> bool:
+    return home is not None and not home.moved and home.problem is not None
 
 
 #: What ``upgrade --one-click`` opens asq as: the asq that reattaches the agents the press
@@ -606,6 +709,11 @@ def _upgrade(
             hint=plan.command or None,
             detail=plan.route.describe(),
         )
+    if plan.up_to_date and plan.home_move is not None:
+        _move_the_home(
+            plan, yes=yes, dry_run=dry_run, reopen=reopen, one_click=one_click, started=started
+        )
+        return
     if plan.up_to_date:
         if json_output:
             # Without --yes, or with --dry-run, this is the plan, as when something is newer:
@@ -713,6 +821,8 @@ def _upgrade(
     _emit_report(report)
     if any(not hook.ok for hook in report.hooks) and not plan.backwards:
         raise _HooksFailed()
+    if _home_not_moved(report.home):
+        raise _HomeNotMoved()
     _reopen(reopen, one_click=one_click, installed=True, started=started)
 
 
