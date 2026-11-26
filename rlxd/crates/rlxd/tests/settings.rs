@@ -286,16 +286,30 @@ fn keys_and_values_of_the_wrong_shape_are_refused_with_their_codes() {
         (json!({"key": "rlxapp.x", "value": null}), "invalid_params"),
         (json!({"key": "Theme", "value": "x"}), "invalid_params"),
         (json!({"key": "theme"}), "invalid_params"),
-        (
-            json!({"key": "rlxapp.huge", "value": "x".repeat(70_000)}),
-            "invalid_params",
-        ),
     ] {
         let run = set(&home, false, params.clone());
         assert_eq!(run.code(), Some(1), "{params}: {run:?}");
         assert_eq!(run.error_code(), code, "{params}");
         assert_valid("envelope.json", &run.json());
     }
+    // A value past 64 KiB, sent on a connection of the test's own: as an argument to
+    // `rlxd call` it would pass Windows' 32,767-character command line.
+    let huge = json!({"key": "rlxapp.huge", "value": "x".repeat(70_000)});
+    let reply = connect(&home)
+        .request("settings.set", huge.as_object().unwrap().clone())
+        .unwrap();
+    assert_eq!(
+        reply.error().unwrap().code,
+        "invalid_params",
+        "{}",
+        reply.line
+    );
+    assert!(
+        reply.error().unwrap().message.contains("65536"),
+        "{}",
+        reply.line
+    );
+
     let run = home.rlxd(&["call", "settings.get", r#"{"key":"nope"}"#]);
     assert_eq!(run.error_code(), "unknown_setting");
     assert!(
