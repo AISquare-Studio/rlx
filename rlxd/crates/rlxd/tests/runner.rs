@@ -454,7 +454,12 @@ fn structured_output_reaches_run_done_and_the_schema_reaches_claude() {
     let argv = argv_of(&home, &r);
     let given: Value = serde_json::from_str(after(&argv, "--json-schema").unwrap()).unwrap();
     assert_eq!(given, schema);
-    let path = common::workspace().join("tests/fixtures/fake-claude/structured/output.json");
+    let path = common::workspace()
+        .join("tests")
+        .join("fixtures")
+        .join("fake-claude")
+        .join("structured")
+        .join("output.json");
     let expected: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let done = of(&events, &r, Some("run.done"));
     assert_eq!(done.len(), 1, "{events:#?}");
@@ -685,12 +690,25 @@ fn stopping_rlxd_ends_a_running_run_engine_restarted_and_its_tree() {
         processes_matching(&pattern(&home, "slow")) == 0
     });
     let record: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.root().join("rlxd/runs").join(&r).join("run.json")).unwrap(),
+        &std::fs::read_to_string(
+            home.root()
+                .join("rlxd")
+                .join("runs")
+                .join(&r)
+                .join("run.json"),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(record["state"], "failed");
-    let log = std::fs::read_to_string(home.root().join("rlxd/runs").join(&r).join("events.jsonl"))
-        .unwrap();
+    let log = std::fs::read_to_string(
+        home.root()
+            .join("rlxd")
+            .join("runs")
+            .join(&r)
+            .join("events.jsonl"),
+    )
+    .unwrap();
     let last: Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     assert_eq!(last["type"], "run.failed");
     assert_eq!(last["data"]["reason"], "engine_restarted");
@@ -704,9 +722,11 @@ fn each_attempt_has_its_own_settings_with_the_absolute_hook() {
     let (r, _, _) = gated_start(&home, &params).wait();
     let path = home
         .root()
-        .join("rlxd/runs")
+        .join("rlxd")
+        .join("runs")
         .join(&r)
-        .join("1/settings.json");
+        .join("1")
+        .join("settings.json");
     let settings: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let hook = &settings["hooks"]["PreToolUse"][0];
     assert_eq!(hook["matcher"], "*");
@@ -729,7 +749,12 @@ fn each_attempt_has_its_own_settings_with_the_absolute_hook() {
     }
     assert_eq!(hook["hooks"][0]["timeout"], 11);
     assert_eq!(after(&argv_of(&home, &r), "--settings"), path.to_str());
-    let space = home.root().join("spaces/default/.claude/settings.json");
+    let space = home
+        .root()
+        .join("spaces")
+        .join("default")
+        .join(".claude")
+        .join("settings.json");
     let shared = std::fs::read_to_string(space).unwrap();
     assert!(
         !shared.contains(&r),
@@ -743,7 +768,12 @@ fn a_tool_result_block_is_run_tool_result_with_its_content() {
     let (r, _, events) = gated_start(&home, &task("search")).wait();
     let results = of(&events, &r, Some("run.tool_result"));
     assert_eq!(results.len(), 1, "{events:#?}");
-    let path = common::workspace().join("tests/fixtures/fake-claude/tool-result/content.json");
+    let path = common::workspace()
+        .join("tests")
+        .join("fixtures")
+        .join("fake-claude")
+        .join("tool-result")
+        .join("content.json");
     let expected: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let data = &results[0]["data"];
     assert_eq!(data["call_id"], "toolu_01FakeToolResult0000000001");
@@ -869,9 +899,11 @@ fn needs_you_then_resume_with_the_reply_as_attempt_2() {
     // A resumed attempt gets its own settings, naming it.
     let settings = home
         .root()
-        .join("rlxd/runs")
+        .join("rlxd")
+        .join("runs")
         .join(&r)
-        .join("2/settings.json");
+        .join("2")
+        .join("settings.json");
     assert_eq!(after(&second, "--settings"), settings.to_str());
     let text = std::fs::read_to_string(&settings).unwrap();
     assert!(text.contains(&format!("--run {r} --attempt 2")), "{text}");
@@ -1158,7 +1190,7 @@ fn space_erase_removes_the_space_its_sessions_and_rlxds_records() {
     assert!(removed.contains(&p.as_str()), "{erased:#}");
     assert!(sessions(&r).is_empty());
     assert!(!Path::new(&p).exists());
-    assert!(!home.root().join("rlxd/runs").join(&r).exists());
+    assert!(!home.root().join("rlxd").join("runs").join(&r).exists());
     let listed = call(&home, "run.list", &json!({}));
     assert!(
         !listed["runs"]
@@ -1187,7 +1219,7 @@ fn space_erase_refuses_while_a_run_in_the_space_is_live() {
     assert_eq!(run.error_code(), "runs_live");
     assert_eq!(run.json()["error"]["detail"]["run_ids"][0], r.as_str());
     assert!(
-        home.root().join("spaces/default").exists(),
+        home.root().join("spaces").join("default").exists(),
         "nothing was removed"
     );
     home.rlxd(&["call", "run.cancel", &json!({"run_id": r}).to_string()]);
@@ -1204,7 +1236,7 @@ fn space_erase_follows_no_link() {
     std::fs::create_dir_all(&elsewhere).unwrap();
     std::fs::write(elsewhere.join("keep"), "x").unwrap();
     std::fs::create_dir_all(home.root().join("spaces")).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, home.root().join("spaces/linked")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, home.root().join("spaces").join("linked")).unwrap();
     assert_eq!(
         refused(&home, "space.erase", &json!({"name": "linked"})),
         "link_refused"
