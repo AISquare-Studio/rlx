@@ -4136,9 +4136,7 @@ def test_new_account_from_a_codex_form_signs_codex_in_and_reopens_the_form_on_it
     the form on Codex with that slot selected."""
     project = register(tmp_path / "alpha", project_id="prj_a")
     slots = [(2, "claude-code")]
-    codex = ClaudeAccount(
-        slot=5, config_dir=tmp_path / "codex-accounts" / "5", agent="codex", managed=True
-    )
+    codex = ClaudeAccount(slot=5, config_dir=tmp_path / "slots" / "5", agent="codex", managed=True)
     begun: list[tuple[int | None, str]] = []
     opened: list[str] = []
     monkeypatch.setattr(accounts_view, "LOGIN_POLL_SECONDS", 3600.0)  # the tick is the test's

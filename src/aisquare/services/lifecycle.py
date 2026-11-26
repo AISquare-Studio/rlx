@@ -1898,8 +1898,11 @@ def custom_home(home: Path) -> bool:
     default (``~/.rlx``, or an existing ``~/.aisquare``)."""
     if paths.named_home() is None:
         return False
-    default = paths.home_of({}, user_home=_user_home())[0]
-    return agent_core.dir_identity(home) != agent_core.dir_identity(default)
+    user = _user_home()
+    defaults = {
+        agent_core.dir_identity(user / name) for name in (paths.HOME_NAME, paths.OLD_HOME_NAME)
+    }
+    return agent_core.dir_identity(home) not in defaults
 
 
 def purge_refusal(home: Path, *, custom: bool) -> str | None:

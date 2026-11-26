@@ -1859,7 +1859,7 @@ def _script_claude_sign_in(
     }
     account = ClaudeAccount(
         slot=2,
-        config_dir=tmp_path / "claude-accounts" / "2",
+        config_dir=tmp_path / "slots" / "2",
         tmp_dir=tmp_path / "cache" / "2",
         managed=True,
     )

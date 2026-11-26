@@ -1281,10 +1281,12 @@ def test_spawn_with_an_account_carries_the_callers_environment_into_the_window(
     # Windows, so `endswith("env")` asserted the POSIX spelling of a program the
     # product looks up on both.
     assert Path(command[0]).stem.lower() == "env"
-    assert command[1:5] == ["-u", "CLAUDE_CONFIG_DIR", "-u", "CLAUDE_CODE_TMPDIR"]
+    assert command[1:7] == [
+        "-u", "RLX_HOME", "-u", "CLAUDE_CONFIG_DIR", "-u", "CLAUDE_CODE_TMPDIR"
+    ]  # fmt: skip
     # …then the launcher exactly as it is built without a flag (interpreter switches and all).
     module = command.index("-m")
-    assert command[5] == sys.executable
+    assert command[7] == sys.executable
     assert command[module : module + 3] == ["-m", "aisquare", "launch"]
     assert _flag(command, "--account") == "1"
     # …and the aisquare home this process has is set, as an absolute path.
@@ -1296,7 +1298,7 @@ def test_spawn_with_an_account_carries_the_callers_environment_into_the_window(
     plain_command, plain_env = tmux.spawned[-1]["command"], tmux.spawned[-1]["env"]
     assert isinstance(plain_command, list) and isinstance(plain_env, dict)
     assert plain_command[0] == sys.executable  # no env prefix: the launcher comes first…
-    assert plain_command.index("-m") == module - 5  # …shaped exactly as the prefixed one after it
+    assert plain_command.index("-m") == module - 7  # …shaped exactly as the prefixed one after it
     assert "AISQUARE_HOME" not in plain_env
 
 

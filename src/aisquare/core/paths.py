@@ -19,7 +19,7 @@ A home from before it (``~/.aisquare``) keeps the layout it was made in until H2
 WHERE the home is: ``$RLX_HOME``, else ``$AISQUARE_HOME`` (the name before it, still honoured),
 else ``~/.rlx`` if it exists, else ``~/.aisquare`` if it exists, else ``~/.rlx`` (a new user).
 HOW it is laid out: a home a variable names is laid out by what is in it (``rlx.db``: the new
-layout; ``context.db``, ``claude-accounts/``, ``launch-seals/`` or ``instances/``: the old one;
+layout; ``context.db``, ``launch-seals/`` or ``instances/``: the old one;
 nothing yet: the new one), so the fleet's agents, which are handed the home as
 ``AISQUARE_HOME``, read it as the rlx that started them does. ``~/.aisquare`` with no ``~/.rlx``
 is the old layout. Every path under the home is built by a helper here, named for what it holds.
@@ -56,8 +56,10 @@ NEW: Layout = "rlx"
 OLD: Layout = "aisquare"
 NEW_LAYOUT_MARKERS = ("rlx.db",)
 """What only a home in the new layout has at its top."""
-OLD_LAYOUT_MARKERS = ("context.db", "claude-accounts", "launch-seals", "instances")
-"""What only a home in the old layout has at its top: one of them makes a home old."""
+OLD_LAYOUT_MARKERS = ("context.db", "launch-seals", "instances")
+"""What only a home in the old layout has at its top: one of them makes a home old. (Its
+accounts' folders are an agent's name, which only its adapter says; a home used at all has
+its store, ``context.db``, at the top anyway.)"""
 
 
 def restrict_to_owner(path: Path) -> bool:
@@ -1016,11 +1018,10 @@ def ngrok_config_path(name: str) -> Path:
 NEW_LAYOUT_FOLDERS: tuple[tuple[str, ...], ...] = (
     ("cache",),
     ("logs",),
-    ("accounts",),
+    ("accounts", "aisquare"),
     ("fleet",),
     ("run", "locks"),
     ("remote",),
-    ("projects",),
 )
 """The folders a home in the new layout is made with (docs/home-layout.md): what is filed
 under them finds its folder there, whoever writes it first."""

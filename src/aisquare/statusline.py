@@ -171,9 +171,7 @@ def _account(record: dict[str, Any], fleet: dict[str, Any]) -> str:
         path = Path(config_dir)
         # A managed slot's folder: ``accounts/claude/<n>`` (``core.paths``), or
         # ``claude-accounts/<n>`` in a home from before 0.10.2.
-        managed = path.parent.name == "claude-accounts" or (
-            path.parent.name == "claude" and path.parent.parent.name == "accounts"
-        )
+        managed = path.parent.name.endswith("-accounts") or path.parent.parent.name == "accounts"
         if path.name.isdigit() and managed:
             return f"acct {int(path.name)}"
     if isinstance(labels, dict) and isinstance(labels.get(""), str):

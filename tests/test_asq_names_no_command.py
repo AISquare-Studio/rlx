@@ -133,7 +133,7 @@ def test_a_fix_button_says_what_it_does_and_which_home_never_its_command() -> No
     connect = FixCommand("claude-code", ("agents", "connect", "claude-code"), "machine", "")
     # As a fix spells it on this platform, and with "/" after the home, as one written by
     # hand on Windows has it: both shown from "~", in this platform's separators (#517).
-    native = str(Path.home() / ".aisquare" / "codex-accounts" / "4")
+    native = str(Path.home() / ".rlx" / "accounts" / "codex" / "4")
     slot = FixCommand(
         "claude-code",
         ("agents", "connect", "codex", "--config-dir", f"{home}/.aisquare/codex-accounts/3"),

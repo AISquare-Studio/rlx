@@ -2393,8 +2393,7 @@ def test_the_plan_neither_migrates_the_store_nor_recreates_the_home(
     import sqlite3
 
     _initialised(runner, tmp_path)
-    home = paths.aisquare_home()
-    for directory in (home / "cache", home / "log"):
+    for directory in (paths.cache_dir(), paths.log_dir()):
         for child in sorted(directory.rglob("*"), reverse=True):
             child.unlink() if child.is_file() else child.rmdir()
         directory.rmdir()
@@ -2410,7 +2409,7 @@ def test_the_plan_neither_migrates_the_store_nor_recreates_the_home(
         after = connection.execute("PRAGMA user_version").fetchone()[0]
     connection.close()
     assert after == version - 1, "the plan migrated the store"
-    assert not (home / "cache").exists() and not (home / "log").exists()
+    assert not paths.cache_dir().exists() and not paths.log_dir().exists()
 
 
 def test_upgrade_and_uninstall_agree_on_which_uv_tools_they_touch(
@@ -3687,7 +3686,7 @@ def _codex_hooked(home: Path, program: Path | str, *, config: str | None = None)
 
 
 def _codex_account(slot: str) -> Path:
-    return paths.aisquare_home() / "codex-accounts" / slot
+    return paths.agent_accounts_dir("codex-accounts") / slot
 
 
 def _record_codex(*homes: Path) -> None:

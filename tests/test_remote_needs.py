@@ -3112,9 +3112,9 @@ def test_a_needs_file_a_write_cannot_read_whole_is_kept_aside_not_overwritten(
     path.write_bytes(body)
     with caplog.at_level(logging.WARNING, logger=remote_needs.log.name):
         record_needs_dismissal("ny_newest")
-    assert path.with_name("remote-needs.json.bad").read_bytes() == body
+    assert path.with_name(f"{path.name}.bad").read_bytes() == body
     assert set(load_needs_dismissals()) == {"ny_newest"}
-    assert "remote-needs.json.bad" in caplog.text
+    assert f"{path.name}.bad" in caplog.text
 
 
 def test_each_needs_file_kept_aside_is_kept_under_a_name_of_its_own(
@@ -3133,10 +3133,10 @@ def test_each_needs_file_kept_aside_is_kept_under_a_name_of_its_own(
             record_needs_dismissal("ny_newest")
     kept = [
         path.with_name(name)
-        for name in ("remote-needs.json.bad", *(f"remote-needs.json.bad.{n}" for n in (1, 2)))
+        for name in (f"{path.name}.bad", *(f"{path.name}.bad.{n}" for n in (1, 2)))
     ]
     assert [aside.read_bytes() for aside in kept] == bodies
-    assert "remote-needs.json.bad.2" in caplog.text
+    assert f"{path.name}.bad.2" in caplog.text
     assert set(load_needs_dismissals()) == {"ny_newest"}
 
 
@@ -3155,7 +3155,7 @@ def test_a_later_versions_needs_file_is_never_written_over() -> None:
         record_needs_dismissal("ny_newest")
     assert isinstance(remote_needs.LaterNeedsFile("x"), OSError), "said as a failed write"
     assert path.read_bytes() == body
-    assert not path.with_name("remote-needs.json.bad").exists()
+    assert not path.with_name(f"{path.name}.bad").exists()
     assert set(load_needs_dismissals()) == set(_KEPT_DISMISSED)
 
 
@@ -3190,7 +3190,7 @@ def test_a_needs_file_that_could_not_be_read_is_never_written(
         patched.setattr(Path, "read_text", failing)
         record_needs_dismissal("ny_newest")
     assert json.loads(path.read_text(encoding="utf-8")) == _KEPT_BEFORE
-    assert not path.with_name("remote-needs.json.bad").exists()
+    assert not path.with_name(f"{path.name}.bad").exists()
     record_needs_dismissal("ny_newest")  # the control: read whole, it is built on
     assert set(load_needs_dismissals()) == {*_KEPT_DISMISSED, "ny_newest"}
 
