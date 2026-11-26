@@ -1,0 +1,19 @@
+{
+  "installed": true,
+  "running": true,
+  "started": false,
+  "supported": true,
+  "version": "0.10.3",
+  "protocol_versions": [1],
+  "pid": 4242,
+  "socket": "/home/u/.aisquare/run/rlxd.sock",
+  "home": "/home/u/.aisquare",
+  "platform": "linux",
+  "auth": {"token_file": "/home/u/.aisquare/rlxd/token"},
+  "rlxd": {
+    "version": "0.10.3",
+    "path": "/home/u/.local/bin/rlxd",
+    "protocol_versions": [1]
+  },
+  "rlx": {"installed": true, "version": "0.10.3", "path": "/home/u/.local/bin/rlx"}
+}

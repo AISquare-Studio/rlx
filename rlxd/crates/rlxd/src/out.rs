@@ -1,7 +1,8 @@
 //! What rlxd's commands print, and their exit codes (handoff 0.10.3, "How to read the
 //! checks" and 7.2): one envelope on stdout, and 0 when it is `ok`, 1 when it is not, 2
-//! on a usage error and 3 when rlxd is not running. `rlxd events` prints events on
-//! stdout and any envelope on stderr, and exits 4 when its timeout runs out.
+//! on a usage error and 3 when rlxd is not running. `rlxd here` adds 4, unsupported.
+//! `rlxd events` prints events on stdout and any envelope on stderr, and exits 4 when its
+//! timeout runs out.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -15,7 +16,10 @@ pub const FAILED: u8 = 1;
 pub const USAGE: u8 = 2;
 /// No rlxd runs for this home.
 pub const NOT_RUNNING: u8 = 3;
-/// `rlxd events`: the timeout ran out first.
+/// `rlxd here`: rlxd serves none of the protocol versions the caller speaks.
+pub const UNSUPPORTED: u8 = 4;
+/// `rlxd events`: the timeout ran out first. The same number as [`UNSUPPORTED`], for
+/// another command.
 pub const TIMED_OUT: u8 = 4;
 
 /// Prints `line` and a newline on stdout. False when stdout is closed.
@@ -36,6 +40,11 @@ pub fn print_reply(reply: &Reply) -> ExitCode {
 /// Prints an `ok: true` envelope carrying `data`, exiting 0.
 pub fn succeed(data: Data) -> ExitCode {
     print_envelope(&Envelope::ok(data), 0)
+}
+
+/// Prints an `ok: true` envelope carrying `data`, exiting `status`.
+pub fn succeed_with(status: u8, data: Data) -> ExitCode {
+    print_envelope(&Envelope::ok(data), status)
 }
 
 /// Prints an `ok: false` envelope, exiting 1.

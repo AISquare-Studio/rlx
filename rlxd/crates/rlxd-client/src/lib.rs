@@ -7,6 +7,8 @@
 //! - [`Connection`] opens the home's socket, or named pipe on Windows, and sends requests
 //!   and reads their replies, one at a time.
 //! - [`Connection::subscribe`] opens the event stream (1.7, 7.3), a [`Subscription`].
+//! - [`install`] lists the folders rlx and rlxd install to, where a session whose `PATH`
+//!   lacks them still finds them.
 //!
 //! ```no_run
 //! use rlxd_client::{Connection, Home};
@@ -45,6 +47,7 @@
 
 mod connection;
 mod home;
+pub mod install;
 #[cfg(windows)]
 pub mod windows;
 

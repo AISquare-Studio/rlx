@@ -7,8 +7,9 @@
 //! wins a `Type::f` path over the trait's. These tests fail if one comes back.
 
 use rlxd_proto::{
-    DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, Paths, Request,
-    RequestId, Role, RunScope, StatusData, SubscribeParams,
+    Auth, DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
+    InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope, StatusData,
+    SubscribeParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +58,12 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
         "claude": {"installed": false, "signed_in": false}, "runs": {"live": 0, "queued": 0},
         "jobs": {"count": 0}, "paths": paths});
     assert!(StatusData::deserialize(status).is_err());
+    let here = json!({"installed": true, "running": false, "started": false,
+        "supported": true, "protocol_versions": [], "socket": "s", "home": "h",
+        "platform": "linux", "auth": {"token_file": "t"},
+        "rlxd": {"version": "v", "path": "p", "protocol_versions": [1]},
+        "rlx": {"installed": false}});
+    assert!(HereData::deserialize(here).is_err());
 
     assert!(SubscribeParams::deserialize(json!({"topics": []})).is_err());
     assert!(ErrorBody::deserialize(json!({"code": "since_ahead", "message": "m"})).is_err());
@@ -125,4 +132,11 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
     assert!(printed(&subscribe).is_ok());
     subscribe.topics = Some(vec!["Run".to_owned()]);
     assert!(printed(&subscribe).is_err());
+
+    let rlxd = InstalledRlxd::new("0.10.3", "/b/rlxd");
+    let auth = Auth::new("/h/rlxd/token");
+    let mut here = HereData::new(rlxd, InstalledRlx::missing(), "/h", "/s", "linux", auth).unwrap();
+    assert!(printed(&here).is_ok());
+    here.pid = Some(0);
+    assert!(printed(&here).is_err());
 }

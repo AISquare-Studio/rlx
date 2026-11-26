@@ -9,7 +9,8 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    DaemonRecord, Envelope, Event, HelloData, HelloParams, Request, StatusData, SubscribeParams,
+    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, Request, StatusData,
+    SubscribeParams,
 };
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
@@ -35,6 +36,7 @@ pub fn all() -> Vec<SchemaFile> {
         ),
         file::<HelloParams>("hello.json"),
         file::<HelloData>("hello-reply.json"),
+        file::<HereData>("here-reply.json"),
         file::<Request>("request.json"),
         file::<StatusData>("status-reply.json"),
     ];

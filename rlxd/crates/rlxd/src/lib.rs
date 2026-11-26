@@ -6,10 +6,13 @@
 //! rlxd runs per home, on a local socket or named pipe, and a client gets in with the
 //! shared token through `hello`. Every reply is the 7.2 envelope, and `events.subscribe`
 //! streams the home's events. The PTY host, the runner and the rest are later items,
-//! each a method on this socket, publishing on the bus.
+//! each a method on this socket, publishing on the bus. `rlxd here [--start]` is the
+//! probe rlx.app runs over SSH: what is installed, whether rlxd runs, and the protocol
+//! versions it serves.
 //!
 //! Exit codes: 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage error,
-//! 3 when rlxd is not running, and for `rlxd events` 4 when its `--timeout` runs out.
+//! 3 when rlxd is not running. `rlxd here` exits 3 and 4 (unsupported) with an `ok`
+//! envelope: see its module. `rlxd events` exits 4 when its `--timeout` runs out.
 //!
 //! The binary is [`main`]. The library exists for rlxd's own tests. [`registry`], rlxd's
 //! side of the daemon registry, is what `tests/registry_interop.rs` reads Python's
@@ -28,6 +31,7 @@ mod claude;
 mod cli;
 mod clock;
 mod events;
+mod here;
 mod host;
 mod listener;
 mod lock;
@@ -73,6 +77,23 @@ enum Action {
     /// Print the home's events as JSON lines: those rlxd holds after --since, then with
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
     Events(EventsOptions),
+    /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
+    /// Exits 0 running, 3 installed but not running, 4 unsupported.
+    Here {
+        /// Print one JSON envelope.
+        #[arg(long)]
+        json: bool,
+        /// Start rlxd when it is installed but not running.
+        #[arg(long)]
+        start: bool,
+        /// Put the client token in the answer (auth.token). It is a secret.
+        #[arg(long)]
+        show_token: bool,
+        /// The protocol versions the caller speaks, such as 1, 1-3 or 1,2. Exits 4 when
+        /// rlxd serves none of them. Default: this rlxd's.
+        #[arg(long, value_name = "VERSIONS")]
+        protocols: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -142,6 +163,17 @@ pub fn main() -> ExitCode {
         Action::Serve { background, .. } => serve::serve(background),
         Action::Status { json } => cli::status(json),
         Action::Stop => cli::stop(),
+        Action::Here {
+            json,
+            start,
+            show_token,
+            protocols,
+        } => here::here(here::HereArgs {
+            json,
+            start,
+            show_token,
+            protocols,
+        }),
         Action::Call(options) => cli::call(cli::CallArgs {
             as_app: options.as_app,
             role: options.role,

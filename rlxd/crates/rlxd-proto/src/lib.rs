@@ -12,6 +12,8 @@
 //! - [`SubscribeParams`] (7.3): `events.subscribe`'s params, which open the stream;
 //! - [`StatusData`] (7.4): `status`'s reply, what rlxd is and whether Claude Code is
 //!   installed and signed in;
+//! - [`HereData`]: `rlxd here`'s reply, the probe rlx.app runs over SSH: what rlx is
+//!   installed, whether its rlxd runs, and the protocol versions it serves;
 //! - [`DaemonRecord`] (4.1): one non-UI rlx process in `<home>/daemons/`, a file that
 //!   Python's registry and rlxd both write and read.
 //!
@@ -162,6 +164,7 @@ mod daemon;
 mod envelope;
 mod event;
 mod hello;
+mod here;
 mod marker;
 mod request;
 pub mod schemas;
@@ -173,6 +176,7 @@ pub use daemon::{DaemonRecord, kinds as daemon_kinds};
 pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};
 pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};
+pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
 pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
