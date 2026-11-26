@@ -162,7 +162,7 @@ def test_the_picker_lists_codex_slots_and_reads_a_binds_codex_home(
     assert shown["account:2"] == "2 · ✻ Claude Code · slot2@example.com · plan unknown"
     assert shown["account:5"] == "5 · >_ Codex · slot5@example.com · plan unknown"
     # The bind's account is read from its agent's home variable, not CLAUDE_CONFIG_DIR.
-    assert shown["bind:codex2"] == "codex2 · codex · account 5 · slot5@example.com"
+    assert shown["bind:codex2"] == "codex2 · codex · slot5@example.com"  # by its email (Q1)
     assert account == Target("account", "5", agent="codex", account="5")
     assert bind == Target("bind", "codex2", role="codex2", agent="codex", binary="codex")
 
@@ -301,7 +301,7 @@ def test_a_new_bind_on_a_codex_slot_carries_codex_home_and_its_agent(
             {"agent_bin": "codex", "env": {"CODEX_HOME": codex_home}, "args": [], "agent": "codex"},
         )
     ]
-    assert seen[4:] == ["bind:coder4", "coder4 · codex · account 5 · slot5@example.com"]
+    assert seen[4:] == ["bind:coder4", "coder4 · codex · slot5@example.com"]  # by email (Q1)
 
 
 def test_new_binds_binary_follows_the_agent_until_one_is_typed(project: ProjectInfo) -> None:
