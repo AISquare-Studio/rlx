@@ -146,8 +146,8 @@ struct Pending {
 /// How a pairing request was answered, and by whom.
 #[derive(Debug)]
 pub enum Answer {
-    /// Approved by the named device, or the user on the host.
-    Approved(String),
+    /// Approved: `gate.pair_answer` logged by whom.
+    Approved,
     /// Denied likewise.
     Denied(String),
 }
@@ -174,8 +174,11 @@ pub struct Paired {
     /// Whether the caller's own app connection used it, and so is dropped after the
     /// reply.
     pub drop_caller: bool,
-    /// The new credential's SHA-256, to revoke it if the reply can't be delivered.
+    /// The new credential's SHA-256, to undo it if the reply can't be delivered.
     pub sha256: String,
+    /// For a re-pairing, the credential it replaced: its SHA-256 and when it was made,
+    /// which an undelivered reply puts back.
+    pub replaced: Option<(String, String)>,
 }
 
 /// Why `gate.pair` did not pair.
@@ -322,7 +325,7 @@ impl Gate {
             let (new, sha256) = mint().map_err(Refused::Failed)?;
             let mut devices = state.devices.clone();
             let old = std::mem::replace(&mut devices[index].sha256, sha256);
-            devices[index].created = clock::now();
+            let old_created = std::mem::replace(&mut devices[index].created, clock::now());
             let sha256 = devices[index].sha256.clone();
             self.save(&devices, &state.revoked)
                 .map_err(|e| Refused::Failed(format!("cannot write gate.json: {e}")))?;
@@ -345,13 +348,16 @@ impl Gate {
                 dropped: dropped + usize::from(drop_caller),
                 drop_caller,
                 sha256,
+                replaced: Some((old, old_created)),
             });
         }
         let device = device.unwrap_or(DEFAULT_DEVICE);
-        if state.devices.iter().any(|d| d.device == device) {
+        if let Some(paired) = state.devices.iter().find(|d| same_name(&d.device, device)) {
             return Err(Refused::NotGate(format!(
-                "device {device:?} is paired already: re-pairing it needs its current \
-                 gate_credential"
+                "device {:?} is paired already{}: re-pairing it needs its current \
+                 gate_credential",
+                paired.device,
+                look_alike(&paired.device, device)
             )));
         }
         if !state.devices.is_empty() {
@@ -364,9 +370,9 @@ impl Gate {
     /// that name was paired meanwhile.
     pub fn pair_approved(&self, device: &str) -> Result<Paired, Refused> {
         let mut state = self.state();
-        if state.devices.iter().any(|d| d.device == device) {
+        if state.devices.iter().any(|d| same_name(&d.device, device)) {
             return Err(Refused::NotGate(format!(
-                "device {device:?} was paired by another request meanwhile"
+                "a device named like {device:?} was paired by another request meanwhile"
             )));
         }
         self.add(&mut state, device, Route::Local)
@@ -386,7 +392,7 @@ impl Gate {
         let revoked: Vec<String> = state
             .revoked
             .iter()
-            .filter(|name| *name != device)
+            .filter(|name| !same_name(name, device))
             .cloned()
             .collect();
         self.save(&devices, &revoked)
@@ -400,13 +406,24 @@ impl Gate {
             dropped: 0,
             drop_caller: false,
             sha256,
+            replaced: None,
         })
     }
 
-    /// Unpairs `device` if its credential is still the one whose SHA-256 is `sha256`: a
-    /// credential minted for a reply that never reached its client, which nobody holds.
-    /// So no device is ever left paired with a credential nobody received.
-    pub fn revoke_undelivered(&self, device: &str, sha256: &str) {
+    /// Undoes a pairing whose reply never reached its client, if `device`'s credential
+    /// is still the one minted for it (SHA-256 `sha256`), which nobody holds:
+    ///
+    /// - a re-pairing puts back the credential it `replaced`, so the device keeps the
+    ///   credential its app still holds, gate.json stays, and nothing is opened to a
+    ///   first pairing;
+    /// - a new device is unpaired, so none is left paired with a credential nobody
+    ///   received.
+    pub fn undo_undelivered(
+        &self,
+        device: &str,
+        sha256: &str,
+        replaced: Option<&(String, String)>,
+    ) {
         let mut state = self.state();
         let Some(index) = state
             .devices
@@ -416,19 +433,28 @@ impl Gate {
             return;
         };
         let mut devices = state.devices.clone();
-        devices.remove(index);
+        let undo = match replaced {
+            Some((old, created)) => {
+                devices[index].sha256.clone_from(old);
+                devices[index].created.clone_from(created);
+                "its previous credential is back"
+            }
+            None => {
+                devices.remove(index);
+                "the device is unpaired"
+            }
+        };
         match self.save(&devices, &state.revoked) {
             Ok(()) => {
                 state.devices = devices;
-                let dropped = kick(&mut state, |holder| holder.sha256 == sha256, None);
+                kick(&mut state, |holder| holder.sha256 == sha256, None);
                 warning!(
-                    "gate: device {device:?}'s new credential never reached its client, so \
-                     the device is unpaired ({dropped} app connection(s) dropped)"
+                    "gate: device {device:?}'s new credential never reached its client, so {undo}"
                 );
             }
             Err(e) => warning!(
                 "gate: device {device:?}'s new credential never reached its client, and \
-                 gate.json could not be written to unpair it: {e}"
+                 gate.json could not be written to undo it: {e}"
             ),
         }
     }
@@ -443,7 +469,7 @@ impl Gate {
         peer_image: Option<String>,
     ) -> Result<Request, Refused> {
         let mut state = self.state();
-        if state.pending.iter().any(|p| p.device == device) {
+        if state.pending.iter().any(|p| same_name(&p.device, device)) {
             return Err(Refused::NotGate(format!(
                 "a pairing request for device {device:?} is already waiting"
             )));
@@ -493,7 +519,7 @@ impl Gate {
                     "device": p.device,
                     "route": Route::Local.name(),
                     "peer": {"pid": p.peer_pid, "image": p.peer_image},
-                    "revoked": state.revoked.contains(&p.device),
+                    "revoked": state.revoked.iter().any(|r| same_name(r, &p.device)),
                     "requested_at": p.requested_at,
                     "expires_at": p.expires_at,
                 })
@@ -517,12 +543,12 @@ impl Gate {
             .position(|p| p.request_id == request_id)
             .ok_or(AnswerError::NoRequest)?;
         let device = &state.pending[index].device;
-        if approve && !force && state.revoked.contains(device) {
+        if approve && !force && state.revoked.iter().any(|r| same_name(r, device)) {
             return Err(AnswerError::Revoked(device.clone()));
         }
         let pending = state.pending.remove(index);
         let answer = if approve {
-            Answer::Approved(by.to_owned())
+            Answer::Approved
         } else {
             Answer::Denied(by.to_owned())
         };
@@ -731,19 +757,56 @@ pub fn ssh_refused(device: &str) -> String {
     )
 }
 
-/// Whether `name` may name a device: 1 to 64 characters, none of them control
-/// characters.
-pub fn valid_device(name: &str) -> Result<(), String> {
+/// `raw` as a device name, as rlxd keeps it, or why it can't be one. It is NFKC-
+/// normalized and trimmed, then must have 1 to 64 characters, each a letter, a digit, a
+/// space, `.`, `_` or `-`, all in one script (digits and those marks go with any). So
+/// zero-width and bidi controls, other punctuation and mixed scripts are refused.
+pub fn device_name(raw: &str) -> Result<String, String> {
+    use unicode_normalization::UnicodeNormalization;
+    use unicode_security::MixedScript;
+    let normalized: String = raw.nfkc().collect();
+    let name = normalized.trim();
     let count = name.chars().count();
     if count == 0 || count > DEVICE_MAX {
         return Err(format!(
             "a device name has 1 to {DEVICE_MAX} characters, not {count}"
         ));
     }
-    if name.chars().any(char::is_control) {
-        return Err("a device name has no control characters".to_owned());
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-')))
+    {
+        return Err(format!(
+            "a device name has letters, digits, spaces, '.', '_' and '-' only, not {c:?}"
+        ));
     }
-    Ok(())
+    if !name.is_single_script() {
+        return Err("a device name is written in one script".to_owned());
+    }
+    Ok(name.to_owned())
+}
+
+/// The form two device names are compared in: their UTS #39 confusable skeleton, lower-
+/// cased, with runs of spaces as one. Names that only look alike (Cyrillic for Latin,
+/// `I` for `l`, a case or a doubled space apart) have one key.
+fn name_key(name: &str) -> String {
+    let skeleton: String = unicode_security::skeleton(name).collect();
+    let lower: String = unicode_security::skeleton(&skeleton.to_lowercase()).collect();
+    lower.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether two device names are one name, or look alike.
+fn same_name(a: &str, b: &str) -> bool {
+    a == b || name_key(a) == name_key(b)
+}
+
+/// " (named like X)" when `asked` only looks like `paired`.
+fn look_alike(paired: &str, asked: &str) -> String {
+    if paired == asked {
+        String::new()
+    } else {
+        format!(", and {asked:?} looks like it")
+    }
 }
 
 /// Unpairs with rlxd stopped: edits gate.json at `path` directly. The caller holds
@@ -966,19 +1029,41 @@ mod tests {
     }
 
     #[test]
-    fn an_undelivered_credential_unpairs_its_device() {
-        let gate = gate("undelivered");
+    fn an_undelivered_re_pairing_keeps_the_old_credential_and_the_file() {
+        // Review #2031, N5: the last device, re-paired, its reply undelivered.
+        let gate = gate("undelivered-repair");
         let a = gate.pair(None, None, None).unwrap();
         let again = gate.pair(None, Some(&a.credential), None).unwrap();
-        gate.revoke_undelivered(&again.device, &a.sha256);
+        assert!(gate.attach(&a.credential).is_none(), "replaced at once");
+        gate.undo_undelivered(&again.device, &again.sha256, again.replaced.as_ref());
+        assert!(gate.attach(&a.credential).is_some(), "the old one is back");
+        assert!(gate.attach(&again.credential).is_none());
+        assert!(gate.path.exists(), "gate.json stays");
+        assert!(
+            matches!(gate.pair(None, None, None), Err(Refused::NotGate(_))),
+            "no first pairing reopens"
+        );
+        let reloaded = Gate::load(&gate.path, false).unwrap();
+        assert!(reloaded.device_of(&a.credential).is_some(), "and on disk");
+    }
+
+    #[test]
+    fn an_undelivered_new_device_is_unpaired() {
+        let gate = gate("undelivered-new");
+        let a = gate.pair(None, None, None).unwrap();
+        let request = gate.request("b", None, None).unwrap();
+        gate.answer(&request.request_id, true, false, "test")
+            .unwrap();
+        let b = gate.pair_approved("b").unwrap();
+        gate.undo_undelivered(&b.device, &a.sha256, None);
         assert_eq!(
             gate.devices().len(),
-            1,
-            "an older credential's hash changes nothing"
+            2,
+            "another credential's hash changes nothing"
         );
-        gate.revoke_undelivered(&again.device, &again.sha256);
-        assert!(gate.devices().is_empty());
-        assert!(!gate.path.exists());
+        gate.undo_undelivered(&b.device, &b.sha256, b.replaced.as_ref());
+        assert_eq!(gate.devices().len(), 1);
+        assert!(gate.attach(&a.credential).is_some());
     }
 
     #[test]
@@ -1002,9 +1087,35 @@ mod tests {
 
     #[test]
     fn a_device_name_is_short_and_printable() {
-        assert!(valid_device("Anmol's MacBook").is_ok());
-        assert!(valid_device("").is_err());
-        assert!(valid_device(&"x".repeat(65)).is_err());
-        assert!(valid_device("a\nb").is_err());
+        assert_eq!(
+            device_name("  Anmol MacBook Pro ").unwrap(),
+            "Anmol MacBook Pro"
+        );
+        assert_eq!(
+            device_name("Müller-PC_2.local").unwrap(),
+            "Müller-PC_2.local"
+        );
+        assert_eq!(
+            device_name("ｌａｐｔｏｐ").unwrap(),
+            "laptop",
+            "NFKC folds full-width"
+        );
+        for refused in [
+            "",
+            "   ",
+            "Anmol's MacBook",
+            "a\nb",
+            "lap\u{200B}top",
+            "lap\u{202E}top",
+            "l\u{0430}ptop",
+        ] {
+            assert!(device_name(refused).is_err(), "{refused:?}");
+        }
+        assert!(device_name(&"x".repeat(65)).is_err());
+        assert!(same_name("laptop", "LAPTOP"));
+        assert!(same_name("laptop", "Iaptop"), "I for l");
+        assert!(same_name("lap top", "lap  top"));
+        assert!(same_name("рсе", "pce"), "all-Cyrillic look-alike");
+        assert!(!same_name("laptop", "desktop"));
     }
 }

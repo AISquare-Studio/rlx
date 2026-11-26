@@ -61,11 +61,17 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     waiting request with its id, device name, route and the process that asked (pid and
     binary), and approves only the one `--request-id` names. A request whose client
     leaves is withdrawn, and a credential whose reply can't be delivered is revoked, so
-    no device is left paired with a credential nobody received. Device names are unique;
-    a new device may take the name of one the user unpaired only with `--force`.
+    no device is left paired with a credential nobody received; an undelivered
+    re-pairing keeps the device's old credential. Device names are NFKC-normalized and
+    trimmed, then may hold only letters, digits, spaces, `.`, `_` and `-`, in one
+    script. Names that only look alike (by their UTS #39 skeleton, case and spacing
+    aside) count as one, so they are unique, and a new device may take the name of one
+    the user unpaired, or a look-alike, only with `--force`.
     `rlxd gate unpair [<device>]` is the only reset; unpairing one device never touches
     another. A `hello {role: "app"}` without a paired device's credential (an empty one
-    included) gets `not_gate`, and so does anything else the gate refuses.
+    included) gets `not_gate`, and so does anything else the gate refuses. A client
+    that half-closes its connection still gets every reply; one that goes away entirely
+    withdraws its waiting request.
   - **The peer's identity**, checked for a device paired locally, on every gate hello
     and every `gate.pair`. macOS: the `LOCAL_PEERTOKEN` audit token, checked by
     Security.framework against a requirement compiled into rlxd (Apple's anchor, the
@@ -73,12 +79,16 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
     injection entitlements. Linux: `SO_PEERCRED`'s uid, the process pinned with
     `SO_PEERPIDFD`, and, where rlx's app is installed from a package, its binary.
     Windows: the pipe client's process, opened at once and held, its creation time,
-    its image path, and the Authenticode signature (revocation checked) of the file that
-    image is mapped from, whose signer's full subject must be rlx's publisher. **On
-    Linux and Windows this is
-    best-effort against code running as the same user; there the credential is the
-    real boundary.** `crates/rlxd/src/peer.rs` says why, and holds the expected
-    identity's constants.
+    its image path, and the Authenticode signature (revocation checked, offline from
+    the cache) of the file that image is mapped from, whose signer's full subject and
+    issuer must be rlx's publisher's. **On every OS this is best-effort against code
+    running as the same user, and the credential is the real boundary.** On macOS,
+    `LOCAL_PEERTOKEN` names the last process to act on the client's socket, so same-user
+    code can borrow a signed binary's write and pass as it; rlxd refuses a peer holding
+    the connection on its fd 0 to 2, but not every borrowing. On Linux and Windows such
+    code can hand the connection on and exec or inject into the app. **The exposure
+    window is the first pairing,** trust on first use, before any credential exists.
+    `crates/rlxd/src/peer.rs` says why, and holds the expected identity's constants.
   - **SSH.** Over SSH, a connection's peer is sshd, not the app, so a device paired
     inside an authenticated SSH session will be admitted by its credential alone: the
     SSH pairing plus the per-device credential is the boundary. SSH pairing is a later

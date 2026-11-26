@@ -171,7 +171,7 @@ impl SelfSigned {
             .arg(&config)
         });
         run("/usr/bin/openssl", |c| {
-            c.args(["pkcs12", "-export", "-passout", "pass:pw"])
+            c.args(["pkcs12", "-export", "-passout", "pass:pw", "-name", NAME])
                 .arg("-inkey")
                 .arg(&key)
                 .arg("-in")
@@ -235,12 +235,15 @@ impl SelfSigned {
                 "/usr/bin/codesign",
             ])
         });
+        // Only this identity's key, by its label: a keychain the caller gave may hold more.
         run("security", |c| {
             c.args([
                 "set-key-partition-list",
                 "-S",
                 "apple-tool:,apple:,codesign:",
                 "-s",
+                "-l",
+                NAME,
                 "-k",
                 &password,
             ])

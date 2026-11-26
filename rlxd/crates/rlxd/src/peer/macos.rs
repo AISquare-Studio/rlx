@@ -1,5 +1,12 @@
 //! macOS: the peer's audit token, checked by Security.framework against the compiled-in
 //! code requirement, plus the hardened runtime and no injection entitlements.
+//!
+//! `LOCAL_PEERTOKEN` names the last process to act on the client's end of the socket, not
+//! the one that connected. So same-user code can connect, then let a signed, hardened
+//! binary act on its socket last, and pass as that binary: the check is best-effort
+//! against same-user code here too (`peer`'s doc). The cheap case is refused: a peer that
+//! holds the connection on its standard input, output or error (fds 0 to 2), which is how
+//! such code would lend a binary its socket without the binary's help.
 #![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_void};
@@ -242,6 +249,17 @@ impl Peer {
     pub fn verify_identity(&self, expected: &Expected) -> Result<String, String> {
         let token = self.pinned_token()?;
         let pid = token[PID];
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or("LOCAL_PEERTOKEN: the socket could not be kept to check again")?;
+        if let Some(fd) = stdio_end(pid, socket.as_raw_fd())? {
+            return Err(format!(
+                "LOCAL_PEERTOKEN of pid {pid}: it holds this connection on its fd {fd}, a \
+                 standard stream: a process that was only lent the connection is not the \
+                 app"
+            ));
+        }
         let requirement = requirement(&expected.requirement)?;
         let guest = guest_of(&token)
             .map_err(|e| format!("LOCAL_PEERTOKEN of pid {pid}: no code for it: {e}"))?;
@@ -269,6 +287,70 @@ impl fmt::Display for Peer {
             Err(_) => f.write_str("an unknown pid"),
         }
     }
+}
+
+/// `proc_pidfdinfo`'s `PROC_PIDFDSOCKETINFO`, and its `struct socket_fdinfo`: its size,
+/// and the offsets of the fields read here (`<sys/proc_info.h>`, the same on arm64 and
+/// x86_64).
+const PROC_PIDFDSOCKETINFO: i32 = 3;
+const SOCKET_FDINFO_SIZE: usize = 792;
+/// `psi.soi_so` and `psi.soi_pcb`: the socket, and its protocol block.
+const SOI_SO: usize = 160;
+const SOI_PCB: usize = 168;
+/// `psi.soi_kind`, `SOCKINFO_UN` for a Unix socket.
+const SOI_KIND: usize = 256;
+const SOCKINFO_UN: i32 = 3;
+/// `psi.soi_proto.pri_un.unsi_conn_so` and `unsi_conn_pcb`: the socket it is connected to.
+const UNSI_CONN_SO: usize = 264;
+const UNSI_CONN_PCB: usize = 272;
+
+/// `fd` of process `pid`, as `PROC_PIDFDSOCKETINFO` describes it, when it is a socket.
+fn socket_info(pid: i32, fd: i32) -> Option<Vec<u8>> {
+    let mut info = vec![0u8; SOCKET_FDINFO_SIZE];
+    // SAFETY: `info` holds SOCKET_FDINFO_SIZE bytes, as the call is told.
+    let size = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            fd,
+            PROC_PIDFDSOCKETINFO,
+            info.as_mut_ptr().cast(),
+            SOCKET_FDINFO_SIZE as i32,
+        )
+    };
+    (usize::try_from(size).ok() == Some(SOCKET_FDINFO_SIZE)).then_some(info)
+}
+
+fn read_u64(info: &[u8], at: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&info[at..at + 8]);
+    u64::from_ne_bytes(bytes)
+}
+
+fn read_i32(info: &[u8], at: usize) -> i32 {
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&info[at..at + 4]);
+    i32::from_ne_bytes(bytes)
+}
+
+/// The fd, 0 to 2, on which process `pid` holds the other end of `socket`, rlxd's end of
+/// a connection: whether the connection is that process's standard stream.
+fn stdio_end(pid: u32, socket: RawFd) -> Result<Option<i32>, String> {
+    // SAFETY: getpid cannot fail.
+    let me = unsafe { libc::getpid() };
+    let ours = socket_info(me, socket).ok_or("rlxd's own socket can't be described")?;
+    let (so, pcb) = (read_u64(&ours, SOI_SO), read_u64(&ours, SOI_PCB));
+    let pid = i32::try_from(pid).map_err(|_| format!("pid {pid} is out of range"))?;
+    for fd in 0..3 {
+        let Some(theirs) = socket_info(pid, fd) else {
+            continue;
+        };
+        let connected = read_i32(&theirs, SOI_KIND) == SOCKINFO_UN
+            && (read_u64(&theirs, UNSI_CONN_SO) == so || read_u64(&theirs, UNSI_CONN_PCB) == pcb);
+        if connected {
+            return Ok(Some(fd));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether the code at `path`, on disk, satisfies `requirement`
@@ -450,6 +532,40 @@ mod tests {
     fn this_test_binary_does_not_satisfy_the_compiled_in_requirement() {
         let me = std::env::current_exe().unwrap();
         assert!(static_code_satisfies(&me, super::super::MACOS_REQUIREMENT).is_err());
+    }
+
+    #[test]
+    fn a_process_holding_the_connection_on_its_stdin_is_found() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::temp_dir().join(format!("rlxd-stdio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut lent = Command::new("/bin/sleep")
+            .arg("10")
+            .stdin(Stdio::from(OwnedFd::from(client.try_clone().unwrap())))
+            .spawn()
+            .unwrap();
+        let mut other = Command::new("/bin/sleep")
+            .arg("10")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let found = stdio_end(lent.id(), server.as_raw_fd());
+        let not = stdio_end(other.id(), server.as_raw_fd());
+        let _ = lent.kill();
+        let _ = other.kill();
+        let _ = lent.wait();
+        let _ = other.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found, Ok(Some(0)));
+        assert_eq!(not, Ok(None));
+        assert_eq!(stdio_end(std::process::id(), server.as_raw_fd()), Ok(None));
     }
 
     #[test]

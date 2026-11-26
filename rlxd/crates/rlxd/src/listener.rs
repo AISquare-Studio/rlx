@@ -11,9 +11,9 @@
 //! for the gate's identity check (handoff 0.10.3, 5.1).
 
 #[cfg(unix)]
-pub use unix::Listener;
+pub use unix::{Hangup, Listener};
 #[cfg(windows)]
-pub use windows::Listener;
+pub use windows::{Hangup, Listener};
 
 #[cfg(unix)]
 mod unix {
@@ -22,12 +22,53 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+    use std::time::Duration;
 
     use rlxd_client::Home;
     use tokio::net::{UnixListener, UnixStream};
 
     use crate::peer::Peer;
+
+    /// Whether a client has closed its connection both ways, not only its sending half.
+    /// A client that half-closes still gets its replies.
+    pub struct Hangup {
+        socket: Option<OwnedFd>,
+    }
+
+    impl Hangup {
+        fn of_socket(fd: BorrowedFd<'_>) -> Self {
+            Self {
+                socket: fd.try_clone_to_owned().ok(),
+            }
+        }
+
+        /// Once reading has ended: whether the client is gone, rather than half-closed.
+        /// A half-closed socket can still be written to; a closed one can't (`POLLOUT`
+        /// is gone, `POLLHUP` is set), on macOS and Linux alike.
+        #[allow(unsafe_code)]
+        pub fn gone(&self) -> bool {
+            let Some(socket) = &self.socket else {
+                return true;
+            };
+            let mut poll = libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd, and a zero timeout.
+            let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+            ready < 0 || poll.revents & libc::POLLOUT == 0 || poll.revents & libc::POLLHUP != 0
+        }
+
+        /// Resolves once the client is gone, checking a few times a second: for a
+        /// connection rlxd isn't reading, half-closed or with frames queued.
+        pub async fn closed(&self) {
+            while !self.gone() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
 
     /// The socket, listening.
     pub struct Listener {
@@ -56,11 +97,12 @@ mod unix {
             Ok(Self { listener, path })
         }
 
-        /// The next connection, and its peer.
-        pub async fn accept(&mut self) -> io::Result<(UnixStream, Peer)> {
+        /// The next connection, its peer, and its hangup probe.
+        pub async fn accept(&mut self) -> io::Result<(UnixStream, Peer, Hangup)> {
             let (stream, _) = self.listener.accept().await?;
             let peer = Peer::of_socket(stream.as_fd());
-            Ok((stream, peer))
+            let hangup = Hangup::of_socket(stream.as_fd());
+            Ok((stream, peer, hangup))
         }
 
         /// What `status` says of the endpoint's access list: nothing here, where the
@@ -102,6 +144,22 @@ mod windows {
 
     use crate::peer::{self, Peer};
 
+    /// A named pipe has no half-close: when reading ends, the client is gone. Unread, a
+    /// pipe can't be told apart from a quiet client.
+    pub struct Hangup;
+
+    impl Hangup {
+        /// Once reading has ended: the client is gone.
+        pub fn gone(&self) -> bool {
+            true
+        }
+
+        /// Never resolves: an unread pipe gives no sign that its client went.
+        pub async fn closed(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
     /// `ACCESS_ALLOWED_ACE_TYPE`.
     const ACCESS_ALLOWED: u8 = 0;
 
@@ -140,7 +198,7 @@ mod windows {
         /// An instance whose client went before it was connected is dropped for a fresh
         /// one too. The peer is pinned before anything else, so its pid can't be reused
         /// meanwhile.
-        pub async fn accept(&mut self) -> io::Result<(NamedPipeServer, Peer)> {
+        pub async fn accept(&mut self) -> io::Result<(NamedPipeServer, Peer, Hangup)> {
             let connected = connect_stamped(&self.next).await;
             let peer = connected
                 .as_ref()
@@ -150,7 +208,7 @@ mod windows {
             let used = mem::replace(&mut self.next, fresh);
             connected?;
             let peer = peer.expect("pinned when connected");
-            Ok((used, peer))
+            Ok((used, peer, Hangup))
         }
 
         /// What `status` says of the pipe's DACL: one entry, for this user, which

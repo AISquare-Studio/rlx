@@ -15,8 +15,21 @@
 //! 3. reads the mapped name again and requires it unchanged, so the image didn't move
 //!    while it was opened;
 //! 4. verifies the Authenticode signature of that held file (`WinVerifyTrust` with its
-//!    handle), with revocation checked across the chain (the root excepted), and requires
-//!    the signer's full subject to be rlx's publisher.
+//!    handle), and requires the signer's full subject and issuer to be rlx's publisher's.
+//!
+//! **Revocation** is checked across the chain, the root excepted, from what Windows has
+//! cached only, so a check never waits on the network. It hard-fails only on a revoked
+//! certificate. When the status can't be known (offline, nothing cached), it is allowed
+//! and logged: a soft fail.
+//!
+//! **What this can't see,** on top of the same-user limits in `peer`'s doc:
+//! - **Process herpaderping:** a file rewritten after its image section was made, so the
+//!   process runs code that is no longer in the file checked here;
+//! - **DLL planting:** a DLL put beside a per-user install, which the signed app then
+//!   loads into itself.
+//!
+//! **An elevated app is refused:** rlxd runs as the user, so it can't open an elevated
+//! process for the reads this check needs, and the check fails closed.
 #![allow(unsafe_code)]
 
 use std::fmt;
@@ -34,13 +47,13 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::WinTrust::{
     WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
-    WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, WTD_REVOKE_WHOLECHAIN,
-    WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE, WTHelperGetProvSignerFromChain,
-    WTHelperProvDataFromStateData, WinVerifyTrust,
+    WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+    WTD_REVOKE_NONE, WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
+    WTD_UI_NONE, WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData, WinVerifyTrust,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, GetFileInformationByHandle, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetMappedFileNameW};
@@ -131,7 +144,7 @@ impl Peer {
         if code != STILL_ACTIVE as u32 {
             return Err(format!("pid {pid} has exited"));
         }
-        let Some(publisher) = expected.publisher.as_deref() else {
+        let Some((subject, issuer)) = expected.publisher.as_ref() else {
             return Err(
                 "no Windows publisher is pinned for rlx's app yet, so no peer passes".to_owned(),
             );
@@ -151,16 +164,25 @@ impl Peer {
                 image.display()
             )
         })?;
-        if signer != publisher {
+        if signer.subject != *subject || signer.issuer != *issuer {
             return Err(format!(
-                "pid {pid}: {} is signed by {signer:?}, not rlx's publisher",
-                image.display()
+                "pid {pid}: {} is signed by {:?}, issued by {:?}, not rlx's publisher",
+                image.display(),
+                signer.subject,
+                signer.issuer
             ));
         }
         Ok(format!(
             "GetNamedPipeClientProcessId: pid {pid}, held open since the connection, runs {}, \
-             signed by {signer:?}",
-            image.display()
+             signed by {:?}, issued by {:?}{}",
+            image.display(),
+            signer.subject,
+            signer.issuer,
+            if signer.revocation_known {
+                ""
+            } else {
+                "; its revocation status is unknown (nothing cached), allowed"
+            }
         ))
     }
 }
@@ -312,18 +334,26 @@ fn open_held(path: &[u16], access: u32) -> Result<OwnedHandle, String> {
     Ok(unsafe { OwnedHandle::from_raw_handle(raw as _) })
 }
 
-/// The file's volume serial number and index: which file it is.
-fn identity(file: &OwnedHandle) -> Result<(u32, u64), String> {
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` is open; `info` is a live struct to fill.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+/// The file's 64-bit volume serial number and 128-bit file id (`FileIdInfo`, which ReFS
+/// needs): which file it is.
+fn identity(file: &OwnedHandle) -> Result<(u64, [u8; 16]), String> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `file` is open; `info` is a live FILE_ID_INFO of the size given.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if read == 0 {
         return Err(format!(
-            "GetFileInformationByHandle: {}",
+            "GetFileInformationByHandleEx: {}",
             std::io::Error::last_os_error()
         ));
     }
-    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
-    Ok((info.dwVolumeSerialNumber, index))
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
 }
 
 /// The file at `image`, held, once it is shown to be the file `process`'s main image is
@@ -358,10 +388,41 @@ fn same_path(a: &Path, b: &Path) -> bool {
     canonical(a) == canonical(b)
 }
 
-/// The full subject of the certificate that signed `file` (whose path is `path`), once
-/// `WinVerifyTrust` has verified its Authenticode signature to a trusted root, with
-/// revocation checked across the chain, the root excepted.
-fn authenticode_signer(file: &OwnedHandle, path: &Path) -> Result<String, String> {
+/// Who signed a file: the signer certificate's full subject and issuer, and whether its
+/// revocation status was known.
+struct Signer {
+    subject: String,
+    issuer: String,
+    revocation_known: bool,
+}
+
+/// `WinVerifyTrust`'s answers when a certificate's revocation status can't be known:
+/// `CERT_E_REVOCATION_FAILURE`, `CRYPT_E_NO_REVOCATION_CHECK` and
+/// `CRYPT_E_REVOCATION_OFFLINE`. `CRYPT_E_REVOKED` is not among them.
+const REVOCATION_UNKNOWN: [u32; 3] = [0x800B_010E, 0x8009_2012, 0x8009_2013];
+
+/// Who signed `file` (whose path is `path`), once `WinVerifyTrust` has verified its
+/// Authenticode signature to a trusted root. Revocation is checked across the chain, the
+/// root excepted, from the cache; an unknown status is a soft fail (see the module's
+/// doc), a revoked certificate a hard one.
+fn authenticode_signer(file: &OwnedHandle, path: &Path) -> Result<Signer, String> {
+    match verify_trust(file, path, true) {
+        Err(status) if REVOCATION_UNKNOWN.contains(&(status as u32)) => {
+            verify_trust(file, path, false).map_err(trust_error)
+        }
+        result => result.map_err(trust_error),
+    }
+}
+
+fn trust_error(status: i32) -> String {
+    format!(
+        "WinVerifyTrust: {}",
+        std::io::Error::from_raw_os_error(status)
+    )
+}
+
+/// One `WinVerifyTrust` of `file`, checking revocation or not: the signer, or its status.
+fn verify_trust(file: &OwnedHandle, path: &Path, revocation: bool) -> Result<Signer, i32> {
     let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     let mut info = WINTRUST_FILE_INFO {
         cbStruct: mem::size_of::<WINTRUST_FILE_INFO>() as u32,
@@ -369,11 +430,19 @@ fn authenticode_signer(file: &OwnedHandle, path: &Path) -> Result<String, String
         hFile: file.as_raw_handle() as HANDLE,
         pgKnownSubject: ptr::null_mut(),
     };
+    let (checks, flags) = if revocation {
+        (
+            WTD_REVOKE_WHOLECHAIN,
+            WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | WTD_CACHE_ONLY_URL_RETRIEVAL,
+        )
+    } else {
+        (WTD_REVOKE_NONE, WTD_CACHE_ONLY_URL_RETRIEVAL)
+    };
     let mut data = WINTRUST_DATA {
         cbStruct: mem::size_of::<WINTRUST_DATA>() as u32,
         dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_WHOLECHAIN,
-        dwProvFlags: WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+        fdwRevocationChecks: checks,
+        dwProvFlags: flags,
         dwUnionChoice: WTD_CHOICE_FILE,
         Anonymous: WINTRUST_DATA_0 { pFile: &mut info },
         dwStateAction: WTD_STATEACTION_VERIFY,
@@ -391,12 +460,13 @@ fn authenticode_signer(file: &OwnedHandle, path: &Path) -> Result<String, String
     };
     let signer = if status == 0 {
         // SAFETY: the state is open after a successful verify.
-        unsafe { signer_subject(data.hWVTStateData) }
+        unsafe { signer_names(data.hWVTStateData) }.map(|(subject, issuer)| Signer {
+            subject,
+            issuer,
+            revocation_known: revocation,
+        })
     } else {
-        Err(format!(
-            "WinVerifyTrust: {}",
-            std::io::Error::from_raw_os_error(status)
-        ))
+        Err(status)
     };
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     // SAFETY: closes the state the verify opened.
@@ -410,43 +480,50 @@ fn authenticode_signer(file: &OwnedHandle, path: &Path) -> Result<String, String
     signer
 }
 
-/// # Safety
-///
-/// `state` must be the open state of a successful `WinVerifyTrust`.
-unsafe fn signer_subject(state: HANDLE) -> Result<String, String> {
-    // SAFETY: the caller's promise.
-    let provider = unsafe { WTHelperProvDataFromStateData(state) };
-    if provider.is_null() {
-        return Err("no provider data".to_owned());
-    }
-    // SAFETY: `provider` is live while the state is open.
-    let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, 0, 0) };
-    // SAFETY: `signer`, when not null, is live while the state is open.
-    if signer.is_null() || unsafe { (*signer).csCertChain == 0 || (*signer).pasCertChain.is_null() }
-    {
-        return Err("no signer certificate".to_owned());
-    }
-    // SAFETY: the chain holds at least one certificate; the first is the signer's.
-    let certificate = unsafe { (*(*signer).pasCertChain).pCert };
-    // SAFETY: `certificate`, when not null, is live while the state is open.
-    if certificate.is_null() || unsafe { (*certificate).pCertInfo.is_null() } {
-        return Err("no signer certificate".to_owned());
-    }
-    // SAFETY: the certificate's info is live; its subject is an encoded name.
-    let subject = unsafe { &(*(*certificate).pCertInfo).Subject };
+/// `name`, an encoded X.500 name, as `CertNameToStrW` writes it (`CERT_X500_NAME_STR`).
+fn name_string(name: &windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB) -> String {
     let mut buffer = vec![0u16; 2048];
-    // SAFETY: `subject` is live; `buffer` holds its length in u16s.
+    // SAFETY: `name` is live; `buffer` holds its length in u16s.
     let length = unsafe {
         CertNameToStrW(
             X509_ASN_ENCODING,
-            subject,
+            name,
             CERT_X500_NAME_STR,
             buffer.as_mut_ptr(),
             buffer.len() as u32,
         )
     };
     let end = (length as usize).saturating_sub(1).min(buffer.len());
-    Ok(String::from_utf16_lossy(&buffer[..end]))
+    String::from_utf16_lossy(&buffer[..end])
+}
+
+/// # Safety
+///
+/// `state` must be the open state of a successful `WinVerifyTrust`.
+unsafe fn signer_names(state: HANDLE) -> Result<(String, String), i32> {
+    /// `TRUST_E_NOSIGNATURE`, for a signer that can't be read.
+    const NO_SIGNER: i32 = 0x800B_0100_u32 as i32;
+    // SAFETY: the caller's promise.
+    let provider = unsafe { WTHelperProvDataFromStateData(state) };
+    if provider.is_null() {
+        return Err(NO_SIGNER);
+    }
+    // SAFETY: `provider` is live while the state is open.
+    let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, 0, 0) };
+    // SAFETY: `signer`, when not null, is live while the state is open.
+    if signer.is_null() || unsafe { (*signer).csCertChain == 0 || (*signer).pasCertChain.is_null() }
+    {
+        return Err(NO_SIGNER);
+    }
+    // SAFETY: the chain holds at least one certificate; the first is the signer's.
+    let certificate = unsafe { (*(*signer).pasCertChain).pCert };
+    // SAFETY: `certificate`, when not null, is live while the state is open.
+    if certificate.is_null() || unsafe { (*certificate).pCertInfo.is_null() } {
+        return Err(NO_SIGNER);
+    }
+    // SAFETY: the certificate's info is live while the state is open.
+    let info = unsafe { &*(*certificate).pCertInfo };
+    Ok((name_string(&info.Subject), name_string(&info.Issuer)))
 }
 
 #[cfg(test)]

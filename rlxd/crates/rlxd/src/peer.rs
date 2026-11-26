@@ -30,14 +30,31 @@
 //!   instant would still pass, a window too short to aim at. Through the held handle the
 //!   process must still run, its image must be one of [`WINDOWS_BINARIES`], and the
 //!   Authenticode signature of the very file that image is mapped from must verify
-//!   (`WinVerifyTrust`, revocation checked) with [`WINDOWS_PUBLISHER`]'s full subject as
-//!   its signer (`peer::windows` says how the file is bound to the image).
+//!   (`WinVerifyTrust`, revocation checked from the cache, soft-failing when unknown)
+//!   with [`WINDOWS_PUBLISHER`]'s full subject and issuer on its signer (`peer::windows`
+//!   says how the file is bound to the image, and what the check can't see).
 //!
-//! **On Linux and Windows the peer check is best-effort against code running as the same
-//! user.** Such code can connect, hand the connection on and exec rlx's app, or inject into
-//! it. There, the gate credential, which only the app's OS secure store holds, is the
-//! real boundary. On macOS the code-signing check, with the hardened runtime and no
-//! injection entitlements, holds against same-user code too.
+//! **On every OS the peer check is best-effort against code running as the same user,
+//! and the gate credential, which only the app's OS secure store holds, is the real
+//! boundary.**
+//!
+//! - **macOS:** `LOCAL_PEERTOKEN` names the last process to act on the client's socket,
+//!   not the one that connected. So same-user code can connect, then let a signed,
+//!   hardened binary (rlx's app among them) act on its socket last, and pass as it. rlxd
+//!   refuses the cheap case, a peer holding the connection on its fd 0 to 2 (its stdio,
+//!   how such code would lend a binary its socket), but can't see every borrowing. The
+//!   check still keeps out unsigned and unhardened code acting on its own.
+//! - **Linux and Windows:** same-user code can connect, hand the connection on and exec
+//!   rlx's app, or inject into it (on Windows, process herpaderping or a planted DLL
+//!   too: `peer::windows`). Linux pins the process that connected (`SO_PEERPIDFD`) and
+//!   Windows the pipe's client process, so a borrowed write doesn't move the peer there,
+//!   and no fd 0 to 2 check is needed.
+//!
+//! **The exposure window is the first pairing.** Before any device is paired, trust on
+//! first use mints a credential for whichever peer passes this check first. After that,
+//! every hello and every re-pairing needs a credential that same-user code doesn't
+//! have, and a new device needs an approval (whose rule is the hub's open question, see
+//! `gate`).
 //!
 //! **A device paired over SSH** would be checked by its credential alone: its
 //! connection's peer is sshd, not the app, so the SSH-authenticated pairing plus that
@@ -47,8 +64,8 @@
 //!
 //! **Tests only.** With the cargo feature `gate-test-requirement`, one environment
 //! variable replaces what the peer must match: the macOS requirement, the Linux binary, or
-//! the Windows publisher's full subject and binary (`<subject>|<path>`, the subject as
-//! `CertNameToStrW` writes it with `CERT_X500_NAME_STR`). Release builds never enable
+//! the Windows publisher's full subject, issuer and binary (`<subject>|<issuer>|<path>`,
+//! names as `CertNameToStrW` writes them with `CERT_X500_NAME_STR`). Release builds never enable
 //! the feature, and in them no config key, variable or flag changes any of it.
 
 use std::fmt;
@@ -116,11 +133,19 @@ pub const WINDOWS_BINARIES: &[&str] = &[
     r"%ProgramFiles%\rlx\rlx.exe",
 ];
 
-/// The full subject of the certificate rlx's app's Windows executable is signed with,
-/// as `CertNameToStrW` writes it with `CERT_X500_NAME_STR` (such as `CN=…, O=…, C=…`).
-/// `None` until rlxapp's certificate exists: then no Windows peer passes outside dev
-/// mode, whatever certificate it carries.
-pub const WINDOWS_PUBLISHER: Option<&str> = None;
+/// Who signs rlx's app's Windows executable: its signer certificate's full subject and
+/// its issuer, each as `CertNameToStrW` writes it with `CERT_X500_NAME_STR` (such as
+/// `CN=…, O=…, C=…`).
+pub struct Publisher {
+    /// The signer certificate's subject.
+    pub subject: &'static str,
+    /// The signer certificate's issuer.
+    pub issuer: &'static str,
+}
+
+/// rlx's app's Windows publisher. `None` until rlxapp's certificate exists: then no
+/// Windows peer passes outside dev mode, whatever certificate it carries.
+pub const WINDOWS_PUBLISHER: Option<Publisher> = None;
 
 /// The process at the other end of one connection, pinned when rlxd accepted it.
 pub struct Peer {
@@ -194,9 +219,9 @@ pub(crate) struct Expected {
     /// not installed from a package, so that only the binary's file name is checked.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub binaries: Option<Vec<std::path::PathBuf>>,
-    /// Windows: the signer's full subject, or `None` when none is pinned.
+    /// Windows: the signer's full subject and issuer, or `None` when none is pinned.
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub publisher: Option<String>,
+    pub publisher: Option<(String, String)>,
 }
 
 #[cfg(feature = "gate-test-requirement")]
@@ -234,10 +259,16 @@ fn expected() -> Expected {
         _ => MACOS_REQUIREMENT.to_owned(),
     };
     let (publisher, binaries) = if cfg!(windows) {
-        match test.as_deref().and_then(|v| v.split_once('|')) {
-            Some((publisher, path)) => (Some(publisher.to_owned()), Some(vec![path.into()])),
-            None => (
-                WINDOWS_PUBLISHER.map(str::to_owned),
+        let parts: Option<Vec<&str>> = test.as_deref().map(|v| v.splitn(3, '|').collect());
+        match parts.as_deref() {
+            Some([subject, issuer, path]) => (
+                Some(((*subject).to_owned(), (*issuer).to_owned())),
+                Some(vec![(*path).into()]),
+            ),
+            _ => (
+                WINDOWS_PUBLISHER
+                    .as_ref()
+                    .map(|p| (p.subject.to_owned(), p.issuer.to_owned())),
                 Some(WINDOWS_BINARIES.iter().filter_map(|p| expand(p)).collect()),
             ),
         }

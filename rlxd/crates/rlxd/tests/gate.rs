@@ -775,3 +775,178 @@ fn a_kicked_connection_aborts_the_request_it_is_in() {
         home.rlxd(&["gate", "pair"]).data()["requests"] == json!([])
     });
 }
+
+/// Sends `hello` and one request on a new connection, half-closes it (shuts the sending
+/// side), and reads every reply until rlxd closes: the request's reply.
+#[cfg(unix)]
+fn ask_half_closed(home: &TestHome, method: &str, params: Value) -> Value {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(home.root().join("run").join("rlxd.sock")).unwrap();
+    let hello = json!({"id": 1, "method": "hello", "params": {
+        "token": home.token(), "protocol_version": 1, "client": "half-close",
+        "client_version": "0", "role": "cli", "capabilities": [],
+    }});
+    let request = json!({"id": 2, "method": method, "params": params});
+    stream
+        .write_all(format!("{hello}\n{request}\n").as_bytes())
+        .unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let lines: Vec<String> = BufReader::new(stream).lines().map(Result::unwrap).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "{method}: hello's reply, then its own: {lines:?}"
+    );
+    serde_json::from_str(&lines[1]).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_client_that_half_closes_still_gets_its_last_reply() {
+    // Review #2031, N2: every method class, each asked several times, as races showed.
+    let home = TestHome::new();
+    home.start_dev();
+    for _ in 0..10 {
+        assert_eq!(ask_half_closed(&home, "status", json!({}))["ok"], true);
+        assert_eq!(
+            ask_half_closed(&home, "gate.devices", json!({}))["ok"],
+            true
+        );
+        assert_eq!(
+            ask_half_closed(&home, "gate.pair_requests", json!({}))["ok"],
+            true
+        );
+        let answer = json!({"request_id": "none", "approve": true});
+        let reply = ask_half_closed(&home, "gate.pair_answer", answer);
+        assert_eq!(reply["error"]["code"], "no_pair_request", "{reply}");
+        let reply = ask_half_closed(&home, "no.such.method", json!({}));
+        assert_eq!(reply["error"]["code"], "unknown_method", "{reply}");
+    }
+    // A pairing that mints, a refused one, and an unpair.
+    let reply = ask_half_closed(&home, "gate.pair", json!({}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(
+        home.gate_json().exists(),
+        "a delivered credential stays paired"
+    );
+    let reply = ask_half_closed(&home, "gate.pair", json!({}));
+    assert_eq!(reply["error"]["code"], "not_gate", "{reply}");
+    // A new device's pairing waits for the approval, half-closed, and gets its credential.
+    let asking = {
+        let root = home.root().to_path_buf();
+        let token = home.token();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::Shutdown;
+            use std::os::unix::net::UnixStream;
+            let mut stream = UnixStream::connect(root.join("run").join("rlxd.sock")).unwrap();
+            let hello = json!({"id": 1, "method": "hello", "params": {
+                "token": token, "protocol_version": 1, "client": "half-close",
+                "client_version": "0", "role": "cli", "capabilities": [],
+            }});
+            let request = json!({"id": 2, "method": "gate.pair", "params": {"device": "later"}});
+            stream
+                .write_all(format!("{hello}\n{request}\n").as_bytes())
+                .unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let lines: Vec<String> = BufReader::new(stream).lines().map(Result::unwrap).collect();
+            serde_json::from_str::<Value>(lines.last().unwrap()).unwrap()
+        })
+    };
+    let request = until_requested(&home, "later");
+    let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let reply = asking.join().unwrap();
+    assert_eq!(reply["data"]["device"], "later", "{reply}");
+    assert_eq!(devices(&home).len(), 2);
+    let reply = ask_half_closed(&home, "gate.unpair", json!({"device": "later"}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    let reply = ask_half_closed(&home, "stop", json!({}));
+    assert_eq!(reply["ok"], true, "the stop too: {reply}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_client_gone_after_a_half_close_or_with_frames_queued_withdraws_its_request() {
+    // Review #2031, N6, and item 7 kept: a client that only half-closed is watched until
+    // it is gone, and so is one whose further frames are queued.
+    use std::io::Write;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let hello = json!({"id": 1, "method": "hello", "params": {
+        "token": home.token(), "protocol_version": 1, "client": "gone",
+        "client_version": "0", "role": "cli", "capabilities": [],
+    }});
+    for (device, half_close, extra) in [("halfgone", true, 0), ("queued", false, 3)] {
+        let mut stream = UnixStream::connect(home.root().join("run").join("rlxd.sock")).unwrap();
+        let mut frames = format!(
+            "{hello}\n{}\n",
+            json!({"id": 2, "method": "gate.pair", "params": {"device": device}})
+        );
+        for n in 0..extra {
+            frames.push_str(&format!("{}\n", json!({"id": 3 + n, "method": "status"})));
+        }
+        stream.write_all(frames.as_bytes()).unwrap();
+        if half_close {
+            stream.shutdown(Shutdown::Write).unwrap();
+        }
+        until_requested(&home, device);
+        drop(stream);
+        eventually(&format!("{device}'s request is withdrawn"), || {
+            home.rlxd(&["gate", "pair"]).data()["requests"] == json!([])
+        });
+    }
+    assert_eq!(devices(&home).len(), 1, "nothing was paired");
+}
+
+#[test]
+fn look_alike_names_cannot_dodge_the_revoked_name_rule() {
+    // Review #2031, N3.
+    let home = TestHome::new();
+    home.start_dev();
+    pair_test_client(&home);
+    let waiting = pair_in_background(&home, r#"{"device":"laptop"}"#);
+    let request = until_requested(&home, "laptop");
+    assert_eq!(
+        home.rlxd(&["gate", "pair", "--request-id", &id(&request)])
+            .code(),
+        Some(0)
+    );
+    assert_eq!(finish(waiting).0, Some(0));
+    assert_eq!(home.rlxd(&["gate", "unpair", "laptop"]).code(), Some(0));
+
+    // Refused outright: a zero-width space, a bidi control, Latin mixed with Cyrillic,
+    // and punctuation outside the set.
+    for name in [
+        "lap\u{200B}top",
+        "lap\u{202E}top",
+        "l\u{0430}ptop",
+        "laptop!",
+    ] {
+        let params = json!({"device": name}).to_string();
+        let run = home.rlxd(&["call", "gate.pair", &params]);
+        assert_eq!(run.code(), Some(1), "{name:?}: {run:?}");
+        assert_eq!(run.error_code(), "invalid_request", "{name:?}");
+    }
+    // Let in, but as the revoked name: a case apart, an I for an l, a trailing space.
+    for (name, kept) in [
+        ("LAPTOP", "LAPTOP"),
+        ("Iaptop", "Iaptop"),
+        ("laptop ", "laptop"),
+    ] {
+        let params = json!({"device": name}).to_string();
+        let waiting = pair_in_background(&home, &params);
+        let request = until_requested(&home, kept);
+        assert_eq!(request["revoked"], true, "{name:?}: {request}");
+        let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request)]);
+        assert_eq!(run.error_code(), "revoked_device", "{name:?}: {run:?}");
+        let run = home.rlxd(&["gate", "pair", "--request-id", &id(&request), "--deny"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        assert_eq!(finish(waiting).0, Some(1));
+    }
+}

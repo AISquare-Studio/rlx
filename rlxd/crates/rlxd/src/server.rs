@@ -15,6 +15,7 @@
 //!   whose device is unpaired, gets a last `not_gate` envelope (with no `id`) and is
 //!   closed.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::watch;
 
 use crate::gate::{self, Answer, AnswerError, Gate, Hold, Refused, Route, UnpairError};
+use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
 use crate::{claude, token};
@@ -92,6 +94,7 @@ enum Then {
     Paired {
         device: String,
         sha256: String,
+        replaced: Option<(String, String)>,
         close: bool,
     },
 }
@@ -433,11 +436,13 @@ impl Daemon {
                  SSH device pairs from inside its SSH session, never through the socket"
             ));
         }
-        if let Some(device) = params.device.as_deref()
-            && let Err(message) = gate::valid_device(device)
-        {
-            return (Err(error(codes::INVALID_REQUEST, &message)), Then::GoOn);
-        }
+        let device = match params.device.as_deref().map(gate::device_name) {
+            None => None,
+            Some(Ok(device)) => Some(device),
+            Some(Err(message)) => {
+                return (Err(error(codes::INVALID_REQUEST, &message)), Then::GoOn);
+            }
+        };
         if let Err(message) = session.peer.same_user() {
             return refuse(message);
         }
@@ -453,11 +458,9 @@ impl Daemon {
             }
         }
         let caller = session.app.as_ref().map(Hold::id);
-        let result = self.gate.pair(
-            params.device.as_deref(),
-            params.gate_credential.as_deref(),
-            caller,
-        );
+        let result = self
+            .gate
+            .pair(device.as_deref(), params.gate_credential.as_deref(), caller);
         let paired = match result {
             Ok(paired) => paired,
             Err(Refused::NeedsApproval(device)) => {
@@ -508,6 +511,7 @@ impl Daemon {
         let then = Then::Paired {
             device: paired.device,
             sha256: paired.sha256,
+            replaced: paired.replaced,
             close: paired.drop_caller,
         };
         (Ok(object(&data)), then)
@@ -538,10 +542,8 @@ impl Daemon {
             () = self.stopped() => None,
         };
         match answered {
-            Some(Ok(Ok(Answer::Approved(by)))) => {
-                info!("gate: pairing request {id} for {device:?} approved by {by}");
-                Ok(())
-            }
+            // gate.pair_answer logged who approved it.
+            Some(Ok(Ok(Answer::Approved))) => Ok(()),
             Some(Ok(Ok(Answer::Denied(by)))) => {
                 Err(format!("pairing device {device:?} was denied by {by}"))
             }
@@ -699,7 +701,7 @@ fn count_of(clients: &mut Clients, role: Role) -> Option<&mut u32> {
 
 /// Serves one connection, whose client is `peer`, until the client closes it, it is
 /// refused, it is dropped from the gate, or rlxd stops.
-pub async fn serve_connection<S>(daemon: Arc<Daemon>, stream: S, peer: Peer)
+pub async fn serve_connection<S>(daemon: Arc<Daemon>, stream: S, peer: Peer, hangup: Hangup)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -735,10 +737,12 @@ where
         }
         Err(reply) => return refuse(&mut frames, &mut writer, &reply).await,
     };
-    // A frame the client sent while its last request was still being answered.
-    let mut early = None;
+    // Frames the client sent while a request was still being answered, in order, and
+    // whether its sending half has ended (a half-close, or all of it).
+    let mut queued: VecDeque<std::io::Result<Option<Frame>>> = VecDeque::new();
+    let mut read_ended = false;
     loop {
-        let frame = match early.take() {
+        let frame = match queued.pop_front() {
             Some(frame) => frame,
             None => tokio::select! {
                 frame = frames.next() => frame,
@@ -772,26 +776,36 @@ where
             return dropped(&session, &mut frames, &mut writer).await;
         }
         // While the request is answered, which for a new device's gate.pair can take two
-        // minutes, the connection is still watched. A kick aborts the request: anything
-        // that acts as the gate (the gate task's run.decide) must still check its hold
-        // when it acts. A client that leaves aborts it too, so a waiting pairing request
-        // is withdrawn and never pairs a device nobody is there to receive.
+        // minutes, the connection is still watched:
+        // - A kick aborts the request. Anything that acts as the gate (the gate task's
+        //   run.decide) must still check its hold when it acts.
+        // - A client that is gone, both ways, aborts it too, so a waiting pairing request
+        //   is withdrawn and never pairs a device nobody is there to receive.
+        // - A client that only half-closed, or sent more frames meanwhile, still gets
+        //   every reply. Frames are queued, up to QUEUED_MAX; past that, and after a
+        //   half-close, the hangup probe watches instead of a read.
         let outcome = {
             let answering = daemon.answer(&session, &frame);
             tokio::pin!(answering);
             loop {
+                let reading = !read_ended && queued.len() < QUEUED_MAX;
                 tokio::select! {
-                    answered = &mut answering => break Outcome::Answered(answered),
+                    answered = &mut answering => break Outcome::Answered(Box::new(answered)),
                     () = kicked(&session) => break Outcome::Kicked,
-                    next = frames.next(), if early.is_none() => match next {
-                        Ok(None) | Err(_) => break Outcome::Left,
-                        next => early = Some(next),
+                    next = frames.next(), if reading => match next {
+                        Ok(None) | Err(_) if hangup.gone() => break Outcome::Left,
+                        Ok(None) | Err(_) => {
+                            read_ended = true;
+                            queued.push_back(Ok(None));
+                        }
+                        next => queued.push_back(next),
                     },
+                    () = hangup.closed(), if !reading => break Outcome::Left,
                 }
             }
         };
         let (reply, then) = match outcome {
-            Outcome::Answered(answered) => answered,
+            Outcome::Answered(answered) => *answered,
             Outcome::Kicked => return dropped(&session, &mut frames, &mut writer).await,
             Outcome::Left => {
                 info!("a client left before its request was answered; the request is dropped");
@@ -799,8 +813,16 @@ where
             }
         };
         if send(&mut writer, &reply).await.is_err() {
-            if let Then::Paired { device, sha256, .. } = &then {
-                daemon.gate.revoke_undelivered(device, sha256);
+            if let Then::Paired {
+                device,
+                sha256,
+                replaced,
+                ..
+            } = &then
+            {
+                daemon
+                    .gate
+                    .undo_undelivered(device, sha256, replaced.as_ref());
             }
             return;
         }
@@ -814,13 +836,16 @@ where
     }
 }
 
+/// The most frames queued while a request is answered.
+const QUEUED_MAX: usize = 16;
+
 /// How an in-flight request ended.
 enum Outcome {
     /// It was answered: the reply, and what then.
-    Answered((Envelope, Then)),
+    Answered(Box<(Envelope, Then)>),
     /// The connection was dropped from the gate meanwhile.
     Kicked,
-    /// The client closed the connection meanwhile.
+    /// The client closed the connection, both ways, meanwhile.
     Left,
 }
 

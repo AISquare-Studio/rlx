@@ -170,8 +170,13 @@ async fn serve_until_stopped(
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => {
-                    connections.spawn(server::serve_connection(Arc::clone(&daemon), stream, peer));
+                Ok((stream, peer, hangup)) => {
+                    connections.spawn(server::serve_connection(
+                        Arc::clone(&daemon),
+                        stream,
+                        peer,
+                        hangup,
+                    ));
                 }
                 Err(e) => {
                     warning!("a connection could not be taken: {e}");

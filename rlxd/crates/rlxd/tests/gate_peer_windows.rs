@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 /// The test signer's common name.
 const SIGNER: &str = "rlxd gate test";
 
-/// The expected publisher: the test signer's full subject, as rlxd reads it.
+/// The expected publisher: the test signer's full subject, and, self-signed, its issuer.
 const SUBJECT: &str = "CN=rlxd gate test";
 
 /// Set in the helper process: the parent's pid, to hand the pipe to.
@@ -133,7 +133,7 @@ fn powershell(script: &str) -> Result<String, String> {
 fn home_expecting(binary: &Path) -> TestHome {
     TestHome::new().with_env(
         "RLXD_TEST_GATE_REQUIREMENT",
-        &format!("{SUBJECT}|{}", binary.display()),
+        &format!("{SUBJECT}|{SUBJECT}|{}", binary.display()),
     )
 }
 
