@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -213,6 +214,22 @@ def test_a_layout_never_outlives_a_change_at_the_homes_top(
         _frozen(named, lambda: make(change))
     assert paths.layout_of(named) == after
     assert paths.home_of() == (named, after)
+
+
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="POSIX modes, not root")
+def test_a_home_under_a_folder_this_user_cannot_enter_reads_as_new_and_never_raises(
+    user_home: Path, tmp_path: Path
+) -> None:
+    """Nothing at its top can be looked at, so nothing makes it old; and asking must not raise
+    (``lifecycle``'s uninstall keeps such a home and says so)."""
+    shut = tmp_path / "shut"
+    (shut / "home").mkdir(parents=True)
+    (shut / "home" / "context.db").write_text("", encoding="utf-8")
+    shut.chmod(0)
+    try:
+        assert paths.layout_of(shut / "home") == paths.NEW
+    finally:
+        shut.chmod(0o700)
 
 
 def test_rlx_home_wins_over_aisquare_home(

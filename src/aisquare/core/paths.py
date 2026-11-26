@@ -453,9 +453,14 @@ def layout_of(root: Path) -> Layout:
     them for one with no marker yet. Nothing is kept, as a verdict kept by the folder's
     modification time outlived a marker made within one tick of it (NTFS's ~15.6 ms, a Linux
     jiffy): an old home given its ``rlx.db`` still read as old (#592's full matrix, Windows)."""
-    if any((root / marker).exists() for marker in NEW_LAYOUT_MARKERS):
-        return NEW
-    if any((root / marker).exists() for marker in OLD_LAYOUT_MARKERS) or _has_old_accounts(root):
+    try:
+        if any((root / marker).exists() for marker in NEW_LAYOUT_MARKERS):
+            return NEW
+        if any((root / marker).exists() for marker in OLD_LAYOUT_MARKERS):
+            return OLD
+    except OSError:
+        return NEW  # under a folder this user may not enter: nothing of it can be read
+    if _has_old_accounts(root):
         return OLD
     return NEW  # nothing there yet, or made and not used: a new home
 
