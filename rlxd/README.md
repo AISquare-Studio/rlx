@@ -69,9 +69,22 @@ cargo run -p rlxd-proto --bin gen-schemas -- --check
 cargo deny check            # licences and advisories (deny.toml)
 ```
 
-`.github/workflows/rlxd.yml` runs all of these on ubuntu, macOS and Windows. It runs for any PR
-that touches `rlxd/`, `pyproject.toml` or the workflow, for every push to `main` or
-`rc/**`, and by hand.
+Two tests cross into Python's side of the daemon registry (4.1):
+`crates/rlxd/tests/registry_interop.rs` (Python's `core.daemons` holds a record that
+rlxd must read as live) and `../tests/test_daemon_registry.py` (Python reads the real
+rlxd). They skip unless `RLXD_INTEROP_REQUIRED` or `RLXD_BIN` is set. With either set
+they need `uv`, and the pytest needs `RLXD_BIN` to name a built rlxd:
+
+```sh
+RLXD_INTEROP_REQUIRED=1 cargo test --workspace --locked
+cd .. && RLXD_BIN=rlxd/target/release/rlxd uv run --extra dev pytest tests/test_daemon_registry.py -q
+```
+
+`.github/workflows/rlxd.yml` runs all of these on ubuntu, macOS and Windows, with
+`RLXD_INTEROP_REQUIRED=1`, so a missing uv or rlxd fails there. It runs for any PR
+that touches `rlxd/`, `pyproject.toml`, the workflow, or the registry's Python side
+(`src/aisquare/core/{daemons,registry,locking}.py`, `tests/test_daemon_registry.py`),
+for every push to `main` or `rc/**`, and by hand.
 
 ## One version number
 

@@ -26,8 +26,10 @@ pub struct DaemonRecord {
     /// What the process is, such as `rlxd` or `watch`. A reader keeps kinds it does not know.
     #[schemars(length(min = 1))]
     pub kind: String,
-    /// Its process id.
-    #[schemars(range(min = 1))]
+    /// Its process id, from 1 to 2147483647 (2^31 - 1), as Python's
+    /// `core.registry.PID_MAX` bounds it: `os.kill` takes a C `int`, so a reader takes a
+    /// record with a larger pid for no pid at all.
+    #[schemars(range(min = 1, max = 2147483647))]
     pub pid: u32,
     /// The host it runs on.
     pub host: String,
@@ -89,9 +91,12 @@ pub mod kinds {
 }
 
 impl DaemonRecord {
+    /// The largest pid a record may say: 2^31 - 1, Python's `core.registry.PID_MAX`.
+    pub const PID_MAX: u32 = 2_147_483_647;
+
     /// A record with no `cwd`. Refuses what `daemon-record.json` refuses: an `id` that is
-    /// not 12 lowercase hex characters, an empty kind, pid 0, times that are not RFC
-    /// 3339, and an empty `argv`.
+    /// not 12 lowercase hex characters, an empty kind, a pid outside 1 to
+    /// [`PID_MAX`](Self::PID_MAX), times that are not RFC 3339, and an empty `argv`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: impl Into<String>,
@@ -140,6 +145,7 @@ impl DaemonRecord {
         }
         check::non_empty("kind", &self.kind)?;
         check::at_least("pid", u64::from(self.pid), 1)?;
+        check::at_most("pid", u64::from(self.pid), u64::from(Self::PID_MAX))?;
         check::date_time("started_at", &self.started_at)?;
         check::date_time("heartbeat_at", &self.heartbeat_at)?;
         if self.argv.is_empty() {

@@ -67,6 +67,16 @@ pub(crate) fn at_least(field: &str, value: u64, min: u64) -> Result<(), Invalid>
     Ok(())
 }
 
+pub(crate) fn at_most(field: &str, value: u64, max: u64) -> Result<(), Invalid> {
+    if value > max {
+        return Err(Invalid::new(
+            field,
+            format!("must be at most {max}, not {value}"),
+        ));
+    }
+    Ok(())
+}
+
 /// One snake_case name: a lowercase letter, then lowercase letters, digits and `_`.
 pub(crate) const SNAKE: &str = "[a-z][a-z0-9_]*";
 

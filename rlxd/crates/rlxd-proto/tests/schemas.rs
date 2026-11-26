@@ -1415,3 +1415,42 @@ fn a_status_refuses_its_wrong_shapes() {
         both_refuse::<StatusData>("status-reply.json", broken);
     }
 }
+
+#[test]
+fn a_daemon_records_pid_is_one_python_can_signal() {
+    // core.registry.PID_MAX: os.kill takes a C int, so Python reads a larger pid as none.
+    assert_eq!(DaemonRecord::PID_MAX, 2_147_483_647);
+    assert_eq!(DaemonRecord::PID_MAX, i32::MAX as u32);
+    let record = example("daemon-record.json");
+    let max = json!(DaemonRecord::PID_MAX);
+    assert_eq!(
+        agrees::<DaemonRecord>("daemon-record.json", &with(&record, "pid", max.clone())),
+        with(&record, "pid", max)
+    );
+    let error = both_refuse::<DaemonRecord>(
+        "daemon-record.json",
+        with(&record, "pid", json!(u64::from(DaemonRecord::PID_MAX) + 1)),
+    );
+    assert!(error.contains("pid"), "{error}");
+    let argv = vec!["rlx".to_owned()];
+    let built = DaemonRecord::new(
+        "0123456789ab",
+        "watch",
+        DaemonRecord::PID_MAX + 1,
+        "h",
+        "v",
+        "2026-11-25T12:00:00Z",
+        "2026-11-25T12:00:00Z",
+        argv,
+        false,
+    );
+    assert_eq!(refused(built), "pid");
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(schemas_dir().join("daemon-record.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        schema["properties"]["pid"]["maximum"],
+        json!(DaemonRecord::PID_MAX)
+    );
+}

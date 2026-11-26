@@ -39,10 +39,10 @@
       "minLength": 1
     },
     "pid": {
-      "description": "Its process id.",
+      "description": "Its process id, from 1 to 2147483647 (2^31 - 1), as Python's\n`core.registry.PID_MAX` bounds it: `os.kill` takes a C `int`, so a reader takes a\nrecord with a larger pid for no pid at all.",
       "type": "integer",
       "format": "uint32",
-      "maximum": 4294967295,
+      "maximum": 2147483647,
       "minimum": 1
     },
     "restartable": {
