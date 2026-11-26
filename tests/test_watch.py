@@ -600,16 +600,17 @@ def _on_file(app: Any) -> None:
     assert unsaved == [], unsaved
 
 
-async def _until(pilot: Any, holds: Any, *, what: str) -> None:
+async def _until(pilot: Any, holds: Any, *, what: str | Any) -> None:
     """Pause a frame at a time until ``holds()``, for 10 s at most, and fail there: what the
     test reads next must be true on screen, not merely after one frame. On a loaded Windows
     runner one pause returned before a resize's layout, or a scroll asked before the table had
-    measured its rows, and the test read a premise that was not there yet (#38)."""
+    measured its rows, and the test read a premise that was not there yet (#38). ``what`` may
+    be a callable, read when it fails, so it says what the screen shows then."""
     for _ in range(500):
         if holds():
             return
         await pilot.pause(0.02)
-    pytest.fail(f"never came, in 10 s: {what}")
+    pytest.fail(f"never came, in 10 s: {what() if callable(what) else what}")
 
 
 async def _mouse(pilot: Any, kind: Any, x: int, y: int) -> None:
@@ -1102,7 +1103,9 @@ def test_the_board_says_when_the_tasks_are_hidden(runner: CliRunner, work_dir: P
             await _until(
                 pilot,
                 lambda: TASKS_HIDDEN in str(feed.border_title),
-                what=f"the feed's title saying {TASKS_HIDDEN!r} (it says {feed.border_title!r})",
+                what=lambda: (
+                    f"the feed's title saying {TASKS_HIDDEN!r} (it says {feed.border_title!r})"
+                ),
             )
             hidden = str(feed.border_title)
             await pilot.press("b")
@@ -1250,10 +1253,9 @@ def test_a_time_from_another_day_shows_its_date(monkeypatch: pytest.MonkeyPatch)
     assert clock(last_year, now=now) == f"{last_year.astimezone():%Y-%m-%d %H:%M}"
 
 
-def test_the_tasks_keep_their_scroll_across_a_refresh(runner: CliRunner, work_dir: Path) -> None:
-    """B1 #7: each refresh rebuilt the table and put it back at its top, under the person
-    reading further down."""
-    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+def _tasks_keep_their_scroll() -> tuple[float, float, float]:
+    """Forty tasks, the table scrolled to row 12, a refresh: where the scroll is before and
+    after, and how far it can go."""
     from datetime import UTC, datetime
 
     from textual.widgets import DataTable
@@ -1282,9 +1284,14 @@ def test_the_tasks_keep_their_scroll_across_a_refresh(runner: CliRunner, work_di
             await pilot.pause()
             table = pilot.app.query_one("#tasks", DataTable)
             # The premise, waited for rather than assumed after one pause: the forty rows
-            # measured (a scroll asked before that is clamped to the top), then the table
-            # down at row 12. On a loaded Windows runner the scroll read 0 (#38).
-            await _until(pilot, lambda: table.max_scroll_y > 12, what="the rows measured")
+            # measured AND the table able to scroll, its scrollbar laid out, which comes a
+            # pass after the measure. A scroll asked before either is dropped, silently (the
+            # top, or nothing at all): on a loaded Windows runner the scroll read 0 (#38).
+            await _until(
+                pilot,
+                lambda: table.max_scroll_y > 12 and table.allow_vertical_scroll,
+                what="the rows measured and the table able to scroll",
+            )
             table.scroll_to(y=12, animate=False)
             await _until(pilot, lambda: table.scroll_y == 12, what="the table down at 12")
             before = table.scroll_y
@@ -1300,7 +1307,42 @@ def test_the_tasks_keep_their_scroll_across_a_refresh(runner: CliRunner, work_di
             await _until(pilot, lambda: table.scroll_y == before, what="the scroll put back")
             return before, table.scroll_y, table.max_scroll_y
 
-    before, after, most = asyncio.run(drive())
+    return asyncio.run(drive())
+
+
+def test_the_tasks_keep_their_scroll_across_a_refresh(runner: CliRunner, work_dir: Path) -> None:
+    """B1 #7: each refresh rebuilt the table and put it back at its top, under the person
+    reading further down."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    before, after, most = _tasks_keep_their_scroll()
+    assert most > 12 and before == 12, "the premise: the table scrolled down"
+    assert after == before
+
+
+def test_the_tasks_keep_their_scroll_when_the_scrollbar_comes_a_pass_late(
+    runner: CliRunner, work_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tester of #38 (#1961): the rows measured, the scrollbar laid out a pass later, and
+    a scroll asked in between dropped silently (Textual scrolls only what allows it), so
+    the table stayed at its top and the test failed. Forced here: the table does not allow a
+    scroll for 0.3 s after its rows are measured, as a slow runner's late pass would."""
+    pytest.importorskip("textual", reason="the [tui] extra is not installed")
+    import time
+
+    from textual.widgets import DataTable
+
+    allows = DataTable.allow_vertical_scroll
+    measured: dict[int, float] = {}
+
+    def late(self: DataTable[Any]) -> bool:
+        if self.id == "tasks" and self.max_scroll_y > 12:
+            first = measured.setdefault(id(self), time.monotonic())
+            if time.monotonic() - first < 0.3:  # the scrollbar not laid out yet
+                return False
+        return bool(allows.fget(self))  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(DataTable, "allow_vertical_scroll", property(late))
+    before, after, most = _tasks_keep_their_scroll()
     assert most > 12 and before == 12, "the premise: the table scrolled down"
     assert after == before
 
