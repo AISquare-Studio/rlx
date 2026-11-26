@@ -1324,8 +1324,8 @@ def _start_the_service_again(service_host: ModuleType) -> str:
     try:
         service = service_host.start_service()
     except service_host.ServiceError as exc:
-        return f"the rlx service did not start again: {exc}"
-    return f"the rlx service runs again (pid {service.pid}), on {service.version}"
+        return f"the {service_host.SERVICE} did not start again: {exc}"
+    return f"the {service_host.SERVICE} runs again (pid {service.pid}), on {service.version}"
 
 
 def _keep_the_numbers(plan: UpgradePlan) -> str | None:
