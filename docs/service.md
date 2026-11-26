@@ -29,8 +29,11 @@ rlx service run        # run it in this terminal instead (Ctrl-C stops it)
 part with its `state` (`ok`, `off`, `waiting` or `error`), a `detail` line and `last_run`. It
 exits 3 when no service runs.
 
-There is one service per home (`~/.aisquare`). Its status is in `~/.aisquare/service/`, and its
-log in `~/.aisquare/log/service.log`.
+There is one service per home (`~/.rlx`). Its status is in `~/.rlx/service/`, and its log in
+`~/.rlx/logs/service.log` (`log/` in a home from before 0.10.2).
+
+`rlx upgrade` stops the service before it replaces rlx and starts it again on the new release.
+`rlx uninstall` stops it. Neither refuses to run beside it, as they do beside an rlx window.
 
 ## With rlx windows open
 

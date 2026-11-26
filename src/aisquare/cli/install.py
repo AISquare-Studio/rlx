@@ -684,7 +684,12 @@ def _upgrade(
             else f"upgrading rlx {plan.current} → {plan.destination}"
         )
         _say(f"{move}: {plan.command}")
-    report = lifecycle_service.upgrade(plan, to_stderr=json_output)
+    try:
+        report = lifecycle_service.upgrade(plan, to_stderr=json_output)
+    except lifecycle_service.UpgradeRefused as refused:
+        # Refused at the last moment, before uv ran: the rlx service would not stop (#32).
+        _reopen(reopen)
+        fail(refused.reason, error="service_running")
     if not report.installed:
         # A run uv could not resolve (a cutoff in its settings that excludes even the release
         # that runs) leaves that release in place. The one-liner's own upgrade asks uv for
@@ -1119,7 +1124,10 @@ def uninstall(
             return
     if refusal is not None:
         fail(str(refusal), error=refusal.error, detail=str(refusal))
-    report = lifecycle_service.uninstall(plan)
+    try:
+        report = lifecycle_service.uninstall(plan)
+    except lifecycle_service.UninstallRefused as refused:  # the rlx service would not stop (#32)
+        fail(str(refused), error=refused.error, detail=str(refused))
     _emit_uninstall_report(report)
     if report.failed:
         raise typer.Exit(1)

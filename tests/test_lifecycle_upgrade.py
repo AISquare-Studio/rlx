@@ -4497,3 +4497,102 @@ def test_a_claude_only_move_back_writes_nothing_in_its_accounts_folder(
 
     assert ran.exit_code == 0, ran.output
     assert sorted(path.name for path in accounts_core.accounts_root().iterdir()) == before
+
+
+# --- the rlx service (#32): stopped before the code it runs is replaced, started after -----------
+
+
+def _a_service(pid: int, version: str) -> Any:
+    from dataclasses import replace
+
+    from aisquare.core import instances
+
+    return replace(instances.describe_this_process(kind="service"), pid=pid, version=version)
+
+
+def test_the_upgrade_stops_the_rlx_service_and_starts_it_again_on_the_new_release(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The service runs the code the installer replaces: it is stopped first, as a quit request
+    stops it, and started again after, a new process of the new install (#32)."""
+    from aisquare.services import service_host
+
+    order: list[tuple[str, int]] = []
+
+    def stop_service(**_: Any) -> bool:
+        order.append(("stop", len(machine.installs)))
+        return True
+
+    def start_service(**_: Any) -> Any:
+        order.append(("start", len(machine.installs)))
+        return _a_service(4242, machine.new_version)
+
+    monkeypatch.setattr(service_host, "stop_service", stop_service)
+    monkeypatch.setattr(service_host, "start_service", start_service)
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert order == [("stop", 0), ("start", 1)], "stopped before uv runs, started after"
+    notes = _one_object(result.stdout)["notes"]
+    assert f"the rlx service runs again (pid 4242), on {machine.new_version}" in notes, notes
+
+
+def test_a_service_that_does_not_stop_refuses_the_upgrade_before_uv_runs(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aisquare.services import service_host
+
+    def stop_service(**_: Any) -> bool:
+        raise service_host.ServiceError("the rlx service (pid 7) did not stop within 15 s")
+
+    monkeypatch.setattr(service_host, "stop_service", stop_service)
+
+    result = runner.invoke(app, ["upgrade", "--yes"])
+
+    assert result.exit_code == 1
+    assert "the rlx service (pid 7) did not stop within 15 s" in result.stderr, result.stderr
+    assert machine.installs == [], "nothing replaced under a running service"
+
+
+def test_no_service_running_the_upgrade_neither_stops_nor_starts_one(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aisquare.services import service_host
+
+    started: list[str] = []
+    monkeypatch.setattr(service_host, "start_service", lambda **_: started.append("start"))
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert started == []
+    assert not any("rlx service" in note for note in _one_object(result.stdout)["notes"])
+
+
+def test_the_service_is_not_an_rlx_the_upgrade_asks_to_quit() -> None:
+    """``upgrade`` and ``uninstall`` refuse beside another rlx a person must quit; the service
+    they stop and start themselves is not one (``running_asqs``)."""
+    from aisquare.core import instances
+
+    with instances.gate():
+        service = instances.register(instances.describe_this_process(kind="service"))
+    try:
+        assert lifecycle.running_asqs() == ()
+    finally:
+        service.deregister()
+
+
+def test_a_service_that_does_not_stop_refuses_the_uninstall_before_anything_goes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aisquare.services import service_host
+
+    def stop_service(**_: Any) -> bool:
+        raise service_host.ServiceError("the rlx service (pid 7) did not stop within 15 s")
+
+    monkeypatch.setattr(service_host, "stop_service", stop_service)
+    with pytest.raises(lifecycle.UninstallRefused) as refused:
+        lifecycle._stop_the_service_for_good()
+    assert refused.value.error == "service_running"
+    assert "nothing was removed" in str(refused.value)
