@@ -72,9 +72,12 @@ pub enum AskError {
     NotRunning(String),
     /// Nothing listens on `--socket`: a forward that is down, or no rlxd on the host.
     NotListening(String),
-    /// `--socket` took the connection, then closed it before rlxd replied: through an
-    /// SSH forward, the host's rlxd does not run, so sshd could not reach its socket.
+    /// `--socket` took the connection, then closed it without a whole reply to `hello`:
+    /// through an SSH forward, most likely the host's rlxd isn't running, or its sshd
+    /// doesn't allow socket forwarding.
     ForwardClosed(String),
+    /// The token could not be read: `unauthorized`, whatever runs in this home.
+    Unauthorized(String),
     /// `hello` was refused; the refusal.
     Refused(Box<Reply>),
     /// Anything else, said.
@@ -171,8 +174,18 @@ impl Target {
 /// A connection to `target`, else `home`'s rlxd, that has said `hello` with its token: as
 /// `cli`, or with `as_app` as `app`, with the test gate credential when there is one.
 pub fn open(home: &Home, as_app: bool, target: &Target) -> Result<Connection, AskError> {
+    // The token first, as `rlxd call` reads it: one the caller named (--token-file, or
+    // for --socket) is unauthorized when it can't be read, whatever runs here. Only the
+    // home's own, missing where no rlxd ever ran, says not running when none does.
+    let token = match target.token(home) {
+        Ok(token) => token,
+        Err(message) if target.token_is_the_homes() => {
+            connect(home, None)?;
+            return Err(AskError::Unauthorized(message));
+        }
+        Err(message) => return Err(AskError::Unauthorized(message)),
+    };
     let mut connection = connect(home, target.socket.as_deref())?;
-    let token = target.token(home).map_err(AskError::Failed)?;
     let role = if as_app { "app" } else { "cli" };
     let mut hello = hello_params(&token, &json!(PROTOCOL_VERSION), CLIENT, role);
     let kept = as_app.then(|| target.credential_file(home)).flatten();
@@ -280,7 +293,7 @@ pub fn call(args: CallArgs) -> ExitCode {
     }
     match connection.request(method, params) {
         Ok(reply) => out::print_reply(&reply),
-        Err(e) => report(socket_call_error(e, socket)),
+        Err(e) => report(call_error(e)),
     }
 }
 
@@ -305,7 +318,7 @@ fn pair_test_client(
     }
     let reply = connection
         .request(methods::GATE_PAIR, Data::new())
-        .map_err(|e| report(socket_call_error(e, socket)))?;
+        .map_err(|e| report(call_error(e)))?;
     let credential = reply
         .data()
         .and_then(|data| data.get("gate_credential"))
@@ -670,9 +683,11 @@ fn call_error(error: CallError) -> AskError {
     AskError::Failed(error.to_string())
 }
 
-/// [`call_error`], but a connection through `--socket` that closed before rlxd replied
-/// is [`AskError::ForwardClosed`]: through an SSH forward, ssh takes every connection,
-/// and closes it once sshd fails to reach the host's socket, as when no rlxd runs there.
+/// [`call_error`] for `hello`'s request, but a connection through `--socket` that closed
+/// without a whole reply to it is [`AskError::ForwardClosed`]: through an SSH forward, ssh
+/// takes every connection, and closes it once sshd fails to reach the host's socket, as
+/// when no rlxd runs there. Only for `hello`: after its reply, rlxd has answered on this
+/// connection, so a later close is a plain `disconnected`.
 fn socket_call_error(error: CallError, socket: Option<&Path>) -> AskError {
     let closed = match &error {
         CallError::Closed => true,
@@ -687,7 +702,7 @@ fn socket_call_error(error: CallError, socket: Option<&Path>) -> AskError {
     };
     match socket {
         Some(socket) if closed => AskError::ForwardClosed(format!(
-            "the connection through {} closed before rlxd replied",
+            "the connection through {} closed without a whole reply to hello",
             socket.display()
         )),
         _ => call_error(error),
@@ -695,10 +710,11 @@ fn socket_call_error(error: CallError, socket: Option<&Path>) -> AskError {
 }
 
 /// The hint for a connection through `--socket` that closed before rlxd replied.
-const FORWARD_CLOSED_HINT: &str = "Through an SSH forward, this is the host's rlxd not \
-                                   running: sshd could not reach its socket there. Start \
-                                   it on the host with `rlxd here --start` (over ssh), then \
-                                   try again.";
+const FORWARD_CLOSED_HINT: &str = "Through an SSH forward, this most likely means the \
+                                   host's rlxd isn't running (start it there with `rlxd here \
+                                   --start`, over ssh), or the host's sshd doesn't allow socket \
+                                   forwarding (AllowStreamLocalForwarding and \
+                                   AllowTcpForwarding must allow local).";
 
 /// The hint for nothing listening on `--socket`: not this home's rlxd to start.
 const NOT_LISTENING_HINT: &str = "Check that the forward to it is up (ssh -L), and run \
@@ -723,6 +739,7 @@ fn report(error: AskError) -> ExitCode {
         AskError::ForwardClosed(message) => {
             out::fail(codes::DISCONNECTED, &message, Some(FORWARD_CLOSED_HINT))
         }
+        AskError::Unauthorized(message) => out::fail(codes::UNAUTHORIZED, &message, None),
         AskError::Failed(message) => out::fail(codes::DISCONNECTED, &message, None),
     }
 }
@@ -750,6 +767,9 @@ pub fn report_on_stderr(error: AskError) -> ExitCode {
             &message,
             Some(FORWARD_CLOSED_HINT),
         ),
+        AskError::Unauthorized(message) => {
+            out::fail_on_stderr(out::FAILED, codes::UNAUTHORIZED, &message, None)
+        }
         AskError::Failed(message) => {
             out::fail_on_stderr(out::FAILED, codes::DISCONNECTED, &message, None)
         }
@@ -769,7 +789,9 @@ fn report_to_a_person(error: AskError) -> ExitCode {
             );
             (message, out::FAILED)
         }
-        AskError::Failed(message) | AskError::ForwardClosed(message) => (message, out::FAILED),
+        AskError::Failed(message)
+        | AskError::ForwardClosed(message)
+        | AskError::Unauthorized(message) => (message, out::FAILED),
     };
     eprintln!("rlxd: {message}");
     ExitCode::from(status)
