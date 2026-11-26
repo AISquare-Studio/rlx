@@ -336,6 +336,26 @@ def test_a_key_pattern_holds_its_glob_characters_as_themselves(store: ContextSto
     assert list(store.list_meta("signal/")) == ["signal/prj_ab/1"]
 
 
+@pytest.mark.parametrize("scope", ["as_fleet", "as_board"])
+def test_purging_a_project_removes_its_manager_seat_progress(
+    store: ContextStore, scope: str
+) -> None:
+    """Progress belongs to both the fleet that reads and the board it reads from."""
+    from aisquare.services import manager_seat
+
+    store.ensure_project(PROJECT)
+    peer = "prj_manager_seat_peer"
+    fleet, board = (PROJECT.id, peer) if scope == "as_fleet" else (peer, PROJECT.id)
+    urgent = manager_seat.progress_key(fleet, board, "urgent")
+    passed = manager_seat.progress_key(fleet, board, "pass")
+    unrelated = manager_seat.progress_key(peer, peer, "pass")
+    for key in (urgent, passed, unrelated):
+        store.set_meta(key, "value")
+    store.purge_project(PROJECT.id)
+    assert store.get_meta(urgent) is None and store.get_meta(passed) is None
+    assert store.get_meta(unrelated) == "value"
+
+
 @pytest.mark.parametrize("ref", ["*", "?", "[", "*?[", ""])
 def test_a_ref_with_nothing_left_once_its_glob_characters_go_names_nothing(
     store: ContextStore, ref: str

@@ -292,6 +292,33 @@ def test_a_shutdown_that_leaves_agents_keeps_the_watcher(
     assert stopped == [], "another project's agents still need it"
 
 
+@pytest.mark.parametrize("holder", [None, -1])
+def test_doctor_requires_a_watcher_for_scheduled_managers(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch, holder: int | None
+) -> None:
+    """Doctor distinguishes a missing watcher from a locked watcher with no known PID."""
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_wake", "schedule")
+    monkeypatch.setattr(watch_service, "running_pid", lambda: holder)
+    row = diagnostics._check_watcher()
+    if holder is None:
+        assert row.status.value == "fail" and "scheduled managers need the watcher" in row.detail
+    else:
+        assert row.status.value == "warn" and "watch lock holder unknown" in row.detail
+
+
+def test_doctor_reports_invalid_policy_and_a_missing_reserved_seat(project: ProjectInfo) -> None:
+    """Doctor exposes both the invalid value and the binding needed for a pass."""
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_wake", "unsupported")
+    rows = diagnostics._check_manager_policies()
+    assert len(rows) == 2 and all(row.name == f"manager policy {project.id}" for row in rows)
+    invalid, binding = rows
+    assert "using defaults for manager_wake" in invalid.detail
+    assert invalid.fix and "fleet manager-policy --project" in invalid.fix
+    assert "reserved manager expects no row" in binding.detail
+
+
 def test_the_doctor_row_shows_the_last_looks_age(monkeypatch: pytest.MonkeyPatch) -> None:
     watch_service.watch_dir().mkdir(parents=True, exist_ok=True)
     watch_service._save_watch_state(

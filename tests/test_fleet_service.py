@@ -16124,6 +16124,120 @@ def test_watcher_recovers_manager_pass_from_claude_transcript(
     assert [line for _, action, line in tmux.typed if action == "paste"] == [prompt]
 
 
+def test_manager_pass_cli_requeues_the_same_idle_range(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uncertain submission can be retried explicitly once the seat is idle."""
+    from aisquare.services import manager_pass, watch
+
+    sid = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_pass_minutes", "15")
+    watcher = watch.Watcher()
+    monkeypatch.setattr(watcher, "look_all", lambda *args: [])
+    now = datetime.now(UTC)
+    watcher.tick(now)
+    with store_session() as store:
+        pending = manager_pass.read(store, project.id, project.id)[1].pending
+        assert pending is not None and pending.attempted_at is not None
+        store.touch_session(sid, state="working")
+    command = ["--json", "fleet", "requeue-manager-pass", pending.id, "--project", project.id]
+    runner = CliRunner()
+    refused = runner.invoke(app, command)
+    assert refused.exit_code != 0 and "waiting prompt" in refused.output
+    with store_session() as store:
+        current = manager_pass.read(store, project.id, project.id)[1].pending
+        assert current == pending
+        store.touch_session(sid, state="waiting")
+    receipt = runner.invoke(app, command)
+    assert receipt.exit_code == 0, receipt.output
+    assert json.loads(receipt.stdout) == {"pass_id": pending.id}
+    team_service.add_note("outside the retry range", kind="decision", board_id=project.id)
+    watcher.tick(now + timedelta(seconds=1))
+    pastes = [line for _, action, line in tmux.typed if action == "paste"]
+    assert len(pastes) == 2 and pastes[0] == pastes[1]
+
+
+def test_manager_policy_cli_persists_only_a_verified_read_through_on_its_board(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verified manual baseline sets the next pass's exclusive lower bound once."""
+    from aisquare.services import manager_pass, watch
+
+    _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    floor = team_service.add_note("handled manually", kind="decision", board_id=project.id)
+    next_event = team_service.add_note("next pass", kind="decision", board_id=project.id)
+    argv = ["--json", "fleet", "manager-policy", "--project", project.id, "--read-through"]
+    runner = CliRunner()
+    invalid = runner.invoke(app, [*argv, str(next_event.seq + 1)])
+    assert invalid.exit_code != 0 and "verified boundary" in invalid.output
+    receipt = runner.invoke(app, [*argv, str(floor.seq)])
+    assert receipt.exit_code == 0, receipt.output
+    assert json.loads(receipt.stdout)["manager_wake"] == "schedule"
+    refused = runner.invoke(app, [*argv, str(next_event.seq)])
+    assert refused.exit_code != 0 and "already has a pass read position" in refused.output
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_pass_minutes", "15")
+    watcher = watch.Watcher()
+    monkeypatch.setattr(watcher, "look_all", lambda *args: [])
+    watcher.tick(datetime.now(UTC))
+    with store_session() as store:
+        pending = manager_pass.read(store, project.id, project.id)[1].pending
+    assert pending is not None and (pending.lower, pending.upper) == (floor.seq, next_event.seq)
+
+
+def test_manager_pass_timer_stays_manual_until_a_completed_pass_and_healthy_watcher(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manager start pack reflects completion and watcher health."""
+    from aisquare.services import manager_pass, watch
+
+    sid = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    now = datetime.now(UTC)
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_pass_minutes", "15")
+        manager = store.fleet_agent_by_label(project.id, "manager", live_only=True)
+        assert manager is not None
+    _become(manager, tmux, monkeypatch, pid=PANE_PID, role="manager")
+    monkeypatch.setattr(watch, "watch_status", lambda: watch.Status(123, now))
+    assert "Keep the manual board pass timer" in team_service.hook_session_start(
+        sid, project.root, "startup"
+    )
+    with store_session() as store:
+        assert manager_pass.save(
+            store, project.id, project.id, None, manager_pass.Progress(completed="finished")
+        )
+    assert "Retire the manual pass timer" in team_service.hook_session_start(
+        sid, project.root, "startup"
+    )
+    monkeypatch.setattr(watch, "watch_status", lambda: watch.Status(None, now))
+    assert "Keep the manual board pass timer" in team_service.hook_session_start(
+        sid, project.root, "startup"
+    )
+
+
+def test_manager_pass_prompt_uses_the_project_template_or_builtin(
+    project: ProjectInfo,
+) -> None:
+    """A missing or empty project prompt still produces a bounded pass command."""
+    from aisquare.services import manager_pass
+
+    pending = manager_pass.Pass(id="test-pass", lower=4, upper=9, session="bound-seat")
+    path = paths.aisquare_home() / "projects" / project.id / "manager" / "pass.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    missing, why = manager_pass.prompt(project.id, project.id, pending)
+    assert why is not None and "unavailable" in why
+    path.write_text("Follow up on unresolved decisions.")
+    customized, why = manager_pass.prompt(project.id, project.id, pending)
+    assert why is None and "Follow up on unresolved decisions." in customized
+    path.write_text(" ")
+    empty, why = manager_pass.prompt(project.id, project.id, pending)
+    assert empty == missing and why == "pass.md empty or too long"
+    for prompt in (missing, customized):
+        assert "team log --pass-id test-pass --since-seq 4 --through-seq 9 --as bound-seat" in prompt
+        assert "team complete-pass test-pass --as bound-seat" in prompt
+
+
 def test_manager_still_wakes_for_a_result_by_default(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
