@@ -165,6 +165,27 @@ pub struct Claude {
     )]
     #[schemars(transform = drop_null, length(min = 1))]
     pub path_source: Option<String>,
+    /// When the probe these values come from ended, RFC 3339 in UTC: `claude --version`
+    /// and `claude auth status --json`, run with the app's environment. Absent while the
+    /// first probe since rlxd started, or since the app's environment changed, is still
+    /// running: `status` never waits on one for long, so `signed_in` is then false.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null, length(min = 1))]
+    pub as_of: Option<String>,
+    /// Why that probe gave no answer, when it didn't: Claude Code would not start, did
+    /// not answer within its time, or printed no JSON. `signed_in` is then false. It
+    /// never holds what Claude Code printed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null, length(min = 1))]
+    pub error: Option<String>,
     /// Its version, such as `2.1.314`, when `claude --version` said one.
     #[serde(
         default,

@@ -139,6 +139,25 @@ program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/
 read from rlxd's own environment only, and wins over the app's `PATH` (see [The app's
 environment](#the-apps-environment-for-claude-code)).
 
+`status.claude` (7.4) comes from a probe in the background, so `status` never waits on
+Claude Code for long:
+
+- **The probe** runs the `claude` rlxd resolved, with the app's environment: `claude
+  --version` and `claude auth status --json`, at once, each given 5 s. `signed_in` is its
+  `loggedIn`. `account` is its `email`, and `plan` its `subscriptionType`. `auth_method` is
+  its `authMethod` (`claude.ai`, `api_key`, `oauth_token`), or for `third_party` the
+  provider it names (`bedrock`, `vertex`, `foundry`, …).
+- **When.** At rlxd's start, on every change to the app's environment (`env.set`, an app
+  `hello`'s `env`), and when `status` finds the last answer older than 30 s. A probe for an
+  older environment never overwrites a newer one's answer.
+- **What `status` gets.** The last answer, with `as_of`, when its probe ended. A probe
+  in flight is waited for at most 500 ms. Before the first one ends, there is no `as_of`,
+  and `signed_in` is false.
+- **A probe that fails** (Claude Code won't start, doesn't answer within its time, prints
+  no JSON) reads as signed out, with `error` saying why. `error` never holds what Claude
+  Code printed.
+- **Not installed** gives `installed: false`, with only `path_source` beside it.
+
 ## The event bus
 
 One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
