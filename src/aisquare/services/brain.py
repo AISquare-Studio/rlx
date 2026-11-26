@@ -14,12 +14,14 @@ one JSON object on one line, ASCII only, with a ``type``. The shapes are rlxd-pr
 (``rlxd/schemas/v1/brain-input.json`` and ``brain-output.json``):
 
 1. rlxd says ``{"type": "hello", "protocol": 1, "rlxd_version": "…", "env_allowlist":
-   […]}`` first.
+   […], "env_prefixes": […], "env_secret_words": […]}`` first.
 2. The brain answers ``{"type": "hello", "protocol": 1, "pid": …, "rlx_version": "…"}``,
-   or, when rlxd's ``env_allowlist`` is not :data:`ENV_NAMES` (rlxd-hook would send other
-   variables than the brain sets), ``{"type": "refused", "code": "env_allowlist_differs",
-   …}``, or, for a ``protocol`` it does not speak, ``{"type": "refused", "code":
-   "incompatible_protocol", "message": "…", "supported": [1]}`` and exits. rlxd refuses
+   or, when rlxd's ``env_allowlist``, ``env_prefixes`` and ``env_secret_words`` are not this
+   brain's (:data:`ENV_NAMES`, :data:`ENV_PREFIXES`, :data:`ENV_SECRET_WORDS`: rlxd-hook
+   would send other variables than the brain sets), ``{"type": "refused", "code":
+   "env_allowlist_differs", …}``, or, for a ``protocol`` it does not speak,
+   ``{"type": "refused", "code": "incompatible_protocol", "message": "…", "supported":
+   [1]}`` and exits. rlxd refuses
    a brain whose ``protocol`` it does not speak the same way. So an rlx and an rlxd of
    different releases fail loudly, with a named error in rlxd's ``status``, and never
    misread each other's frames.
@@ -53,11 +55,12 @@ exit_code}``: the bytes ``rlx hook`` would have written to its stdout and stderr
 exit status. ``pre-tool-use`` is the gate's (5.1), rlxd's own, and never reaches the brain.
 
 A hook runs in Claude Code's process, not rlxd's: its working directory, and its
-environment. rlxd-hook sends its working directory and the variables of :data:`ENV_NAMES`
-it has, the allowlist. For one request, the brain becomes that process:
+environment. rlxd-hook sends its working directory and the variables of the allowlist it
+has (:func:`forwarded`: :data:`ENV_NAMES`, and the agents' own by :data:`ENV_PREFIXES`). For
+one request, the brain becomes that process:
 
-- **Environment.** Each name in :data:`ENV_NAMES` is set to rlxd-hook's value, or removed
-  when rlxd-hook had none, so neither rlxd's value nor an earlier hook's leaks in, and
+- **Environment.** Each allowlisted variable is set to rlxd-hook's value, or removed when
+  rlxd-hook had none, so neither rlxd's value nor an earlier hook's leaks in, and
   ``TZ`` is read again (``time.tzset``). Every other variable is the brain's own, which
   rlxd started it with. What a process reads only as it starts is the brain's: the
   locale's ``LC_*`` set Python's own encodings then, and pass on to the hook's children
@@ -86,14 +89,15 @@ push, say) run on: ``rlx hook`` would wait for them at exit (``atexit``), and th
 which does not exit, lets them finish. The protocol's own fds are not inheritable, so no
 child holds the brain's pipes.
 
-The allowlist (:data:`ENV_NAMES`), which rlxd-hook sends and the brain applies:
+The allowlist, which rlxd-hook sends and the brain applies:
 
 - **rlx's own:** every ``AISQUARE_*`` variable rlx's code names, and ``RLX_HOME``: the role,
   the fleet agent and launch, the team, the broker's scope, the home. A test reads every
   ``AISQUARE_*`` name in ``src/aisquare`` and fails on one that is not here.
-- **The agents':** every ``CLAUDE*`` and ``CODEX_*`` variable rlx's code names, the config
-  dirs above all, but ``CLAUDE_CODE_OAUTH_TOKEN``, a credential no hook reads
-  (:data:`ENV_NOT_FORWARDED`). The same test holds these to the list.
+- **The agents':** every variable under an agent's own prefix (:data:`ENV_PREFIXES`, read
+  off the adapters: the first word of each one's home variable), its config dir above all,
+  but a credential's (:data:`ENV_SECRET_WORDS`: its token), which no hook reads. A test
+  holds every agent variable rlx's code names to that rule.
 - **tmux's:** ``TMUX``, ``TMUX_PANE``, ``TMUX_TMPDIR``: which pane the agent runs in.
 - **The process's:** ``PATH`` (which ``tmux``, ``git`` and ``claude`` a hook's children
   run), ``HOME`` and the user's names and folders (``USER``, ``LOGNAME``, ``USERNAME``,
@@ -262,38 +266,8 @@ _RLX_NAMES = (
     "RLX_HOME",
 )
 
-#: The coding agents' variables rlx's code names, but :data:`ENV_NOT_FORWARDED`'s.
-_AGENT_NAMES = (
-    "CLAUDECODE",
-    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL",
-    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-    "CLAUDE_CODE_TMPDIR",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_EFFORT",
-    "CLAUDE_PID",
-    "CLAUDE_PROJECT_DIR",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-    "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
-    "CODEX_CI",
-    "CODEX_HOME",
-    "CODEX_MANAGED_BY_NPM",
-    "CODEX_MANAGED_PACKAGE_ROOT",
-    "CODEX_PERMISSION_PROFILE",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CODEX_SESSION_ID",
-    "CODEX_THREAD_ID",
-    "CODEX_TOOL_CALL_ID",
-    "CODEX_VERSION",
-    "TMUX",
-    "TMUX_PANE",
-    "TMUX_TMPDIR",
-)
+#: tmux's, which say which pane the agent runs in.
+_TMUX_NAMES = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")
 
 #: The process's own: its programs, user, folders, time, locale, terminal and network.
 _PROCESS_NAMES = (
@@ -338,15 +312,43 @@ _PROCESS_NAMES = (
     "no_proxy",
 )
 
-#: The allowlist: the variables rlxd-hook sends with each hook, and the brain sets (or
+#: The allowlist's names: variables rlxd-hook sends with each hook, and the brain sets (or
 #: removes) for it. rlxd-proto's ``HOOK_ENV_NAMES`` is the same list, which rlxd names in
 #: its hello and the brain checks; see the module's doc.
-ENV_NAMES: tuple[str, ...] = tuple(sorted({*_RLX_NAMES, *_AGENT_NAMES, *_PROCESS_NAMES}))
+ENV_NAMES: tuple[str, ...] = tuple(sorted({*_RLX_NAMES, *_TMUX_NAMES, *_PROCESS_NAMES}))
+_ENV_SET = frozenset(ENV_NAMES)
 
-#: Variables rlx's code names that are never forwarded, and why.
-ENV_NOT_FORWARDED: dict[str, str] = {
-    "CLAUDE_CODE_OAUTH_TOKEN": "a credential; only `launch` and the account checks read it",
-}
+
+def _agent_prefixes() -> tuple[str, ...]:
+    from aisquare.core.agent_adapters import adapters
+
+    return tuple(sorted({a.home_env.split("_")[0] for a in adapters() if a.home_env}))
+
+
+#: The allowlist's prefixes: every coding agent's own variables, named by the first word of
+#: its home's variable, as its adapter declares it (Claude Code's ``CLAUDE``, Codex's
+#: ``CODEX``): its config dir, its pid, its session's marks, its effort. A new agent's come
+#: with its adapter. rlxd-proto's ``HOOK_ENV_PREFIXES`` is the same list.
+ENV_PREFIXES: tuple[str, ...] = _agent_prefixes()
+
+#: The words that make a variable under :data:`ENV_PREFIXES` a credential, which is never
+#: forwarded: no hook reads an agent's token (rlx's own launch and account checks do, in
+#: processes of their own). rlxd-proto's ``HOOK_ENV_SECRET_WORDS`` is the same list.
+ENV_SECRET_WORDS: tuple[str, ...] = ("CREDENTIALS", "KEY", "PASSWORD", "SECRET", "TOKEN")
+
+
+def is_credential(name: str) -> bool:
+    """Whether ``name`` is a credential's, by its words (:data:`ENV_SECRET_WORDS`)."""
+    return bool(set(name.upper().split("_")) & set(ENV_SECRET_WORDS))
+
+
+def forwarded(name: str) -> bool:
+    """Whether the variable ``name`` crosses from rlxd-hook to the brain: one of
+    :data:`ENV_NAMES`, or an agent's own (:data:`ENV_PREFIXES`) that is not a credential."""
+    if name in _ENV_SET:
+        return True
+    return name.upper().startswith(ENV_PREFIXES) and not is_credential(name)
+
 
 #: Variables the hook path reads that describe the brain's own process, not the hook's:
 #: the shell-completion switches of click and typer (a hook never completes), macOS's
@@ -400,12 +402,6 @@ def fresh_caches() -> int:
             setattr(holder, attribute, value)
     return emptied
 
-
-def _allowed(name: str) -> bool:
-    return name in _ENV_SET
-
-
-_ENV_SET = frozenset(ENV_NAMES)
 
 #: How Python makes ``sys.stdout`` and ``sys.stderr`` over a pipe, read from the brain's
 #: own before anything replaces them: ``(encoding, errors)`` of each.
@@ -476,11 +472,10 @@ def _as_the_hook(
     captured: dict[str, bytes] = {}
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         try:
-            for name in ENV_NAMES:
-                if name in env:
-                    os.environ[name] = env[name]
-                else:
+            for name in [*ENV_NAMES, *(name for name in os.environ if forwarded(name))]:
+                if name not in env:
                     os.environ.pop(name, None)
+            os.environ.update(env)
             _read_tz()
             if cwd:
                 try:
@@ -577,7 +572,7 @@ def _hook(params: Mapping[str, Any]) -> Result:
         isinstance(k, str) and isinstance(v, str) for k, v in raw_env.items()
     ):
         raise BrainError("invalid_params", "env must map names to strings")
-    env = {name: value for name, value in raw_env.items() if _allowed(name)}
+    env = {name: value for name, value in raw_env.items() if forwarded(name)}
     fresh_caches()
     argv = [sys.argv[0], "hook", str(event)]
     before = set(threading.enumerate())
@@ -666,13 +661,20 @@ def greet(channel: Channel, frame: Mapping[str, Any]) -> bool:
         )
         _say(message)
         return False
-    theirs = frame.get("env_allowlist")
-    if theirs != list(ENV_NAMES):
+    ours = {
+        "env_allowlist": list(ENV_NAMES),
+        "env_prefixes": list(ENV_PREFIXES),
+        "env_secret_words": list(ENV_SECRET_WORDS),
+    }
+    differ = [key for key, value in ours.items() if frame.get(key) != value]
+    if differ:
+        theirs = frame.get("env_allowlist")
         named = set(theirs) if isinstance(theirs, list) else set()
         message = (
-            f"rlxd sends other variables with a hook than this rlx {_rlx_version()} sets: "
-            f"only rlxd's {sorted(map(str, named - set(ENV_NAMES)))}, only rlx's "
-            f"{sorted(set(ENV_NAMES) - named)}; install the rlx and rlxd of one release"
+            f"rlxd sends other variables with a hook than this rlx {_rlx_version()} sets "
+            f"({', '.join(differ)} differ: only rlxd's names "
+            f"{sorted(map(str, named - set(ENV_NAMES)))}, only rlx's "
+            f"{sorted(set(ENV_NAMES) - named)}); install the rlx and rlxd of one release"
         )
         channel.write({"type": "refused", "code": "env_allowlist_differs", "message": message})
         _say(message)

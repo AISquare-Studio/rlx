@@ -9,7 +9,7 @@
 //!   hook's JSON (the directory rlxd-hook ran in when the JSON names none).
 //! - **The fleet's six** go to the resident brain (`crate::brain`), which runs `rlx hook
 //!   <event>`'s own code with the hook's stdin, directory and allowlisted environment
-//!   (`HOOK_ENV_NAMES`; any other name is dropped here), and answers the bytes for
+//!   (`hook_env_forwarded`; any other name is dropped here), and answers the bytes for
 //!   rlxd-hook's stdout and stderr. The brain must accept it within `accept_ms` (5 s
 //!   unless rlxd-hook says less) and finish it within `deadline_ms`.
 //! - **The fallback line** is the brain's `accepted`. A hook the brain never accepted
@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Data, ErrorBody, HOOK_ENV_NAMES, HookEventData, HookParams, HookReply, PRE_TOOL_USE, b64,
-    codes, deny_output, hook_codes, hook_event_type, topics,
+    Data, ErrorBody, HookEventData, HookParams, HookReply, PRE_TOOL_USE, b64, codes, deny_output,
+    hook_codes, hook_env_forwarded, hook_event_type, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,7 +66,7 @@ pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
     let env: serde_json::Map<String, Value> = params
         .env
         .iter()
-        .filter(|(name, _)| HOOK_ENV_NAMES.contains(&name.as_str()))
+        .filter(|(name, _)| hook_env_forwarded(name))
         .map(|(name, value)| (name.clone(), Value::String(value.clone())))
         .collect();
     let mut asked = json!({

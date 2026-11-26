@@ -9,8 +9,8 @@
 //!
 //! For a fleet hook (`session-start`, `user-prompt-submit`, `session-end`, `stop`,
 //! `stop-failure`, `notification`), it reads the hook's JSON on stdin and sends rlxd
-//! `hook`: those bytes, its working directory, and the variables of rlxd-proto's
-//! `HOOK_ENV_NAMES` it has. It says `hello` as a `cli` client named `rlxd-hook`, with the
+//! `hook`: those bytes, its working directory, and the variables it has that rlxd-proto's
+//! `hook_env_forwarded` allows (`HOOK_ENV_NAMES`, and each agent's own but its credentials). It says `hello` as a `cli` client named `rlxd-hook`, with the
 //! token every client uses, and sends nothing but `hook` (or `hook.ping`), for an event of
 //! its fixed list: no hook reaches a gate or app-only method. It writes rlxd's reply, the
 //! bytes `rlx hook <event>` would write, on its stdout and stderr, and exits 0.
@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use rlxd_client::proto::{
     Data, HOOK_ENV_NAMES, HOOK_EVENTS, HelloParams, HookParams, HookReply, PRE_TOOL_USE, Role,
-    VERSION, b64, deny_output, hook_codes, methods,
+    VERSION, b64, deny_output, hook_codes, hook_env_forwarded, methods,
 };
 use rlxd_client::{CallError, ConnectError, Connection, Home, install};
 use serde::Deserialize;
@@ -255,13 +255,25 @@ fn ask_in_time(event: &str, stdin: &[u8], run: Option<(String, u64)>, budget: Du
 
 /// `hook`'s params for this hook.
 fn params_of(event: &str, stdin: &[u8], run: Option<(String, u64)>) -> Result<Data, String> {
-    let env: BTreeMap<String, String> = HOOK_ENV_NAMES
+    // By name, as Windows looks one up whatever its case; and every other one the rule
+    // allows (an agent's), upper-case on Windows, as Python's os.environ has it there.
+    let mut env: BTreeMap<String, String> = HOOK_ENV_NAMES
         .iter()
-        .filter_map(|&name| {
-            let value = std::env::var(name).ok()?;
-            Some((name.to_owned(), value))
-        })
+        .filter_map(|&name| Some((name.to_owned(), std::env::var(name).ok()?)))
         .collect();
+    for (name, value) in std::env::vars_os() {
+        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+            continue;
+        };
+        let name = if cfg!(windows) {
+            name.to_ascii_uppercase()
+        } else {
+            name.to_owned()
+        };
+        if hook_env_forwarded(&name) && !env.contains_key(&name) {
+            env.insert(name, value.to_owned());
+        }
+    }
     let cwd = std::env::current_dir()
         .ok()
         .map(|dir| dir.display().to_string())

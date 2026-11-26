@@ -222,6 +222,8 @@ class Brain:
             "protocol": 1,
             "rlxd_version": "test",
             "env_allowlist": list(brain.ENV_NAMES),
+            "env_prefixes": list(brain.ENV_PREFIXES),
+            "env_secret_words": list(brain.ENV_SECRET_WORDS),
         }
         assert self._send(hello)["type"] == "hello"
 
@@ -236,7 +238,7 @@ class Brain:
 
     def hook(self, event: str, stdin: bytes, cwd: Path, env: dict[str, str]) -> dict[str, Any]:
         self.next_id += 1
-        allowed = {name: value for name, value in env.items() if name in brain.ENV_NAMES}
+        allowed = {name: value for name, value in env.items() if brain.forwarded(name)}
         params = {
             "event": event,
             "stdin_b64": base64.b64encode(stdin).decode(),
@@ -339,8 +341,8 @@ def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
 def test_every_variable_the_hooks_read_is_in_the_allowlist(parity: dict[str, Any]) -> None:
     unlisted = {
         name
-        for name in parity["reads"] - set(brain.ENV_NAMES) - brain.ENV_OF_THE_BRAIN
-        if not name.startswith(brain.ENV_OF_THE_INTERPRETER)
+        for name in parity["reads"] - brain.ENV_OF_THE_BRAIN
+        if not brain.forwarded(name) and not name.startswith(brain.ENV_OF_THE_INTERPRETER)
     }
     assert not unlisted, f"the hooks read variables the brain is not sent: {sorted(unlisted)}"
     assert {"AISQUARE_ROLE", "CLAUDE_CONFIG_DIR", "AISQUARE_FLEET_AGENT"} <= parity["reads"]
@@ -359,17 +361,27 @@ def test_every_variable_rlxs_code_names_is_forwarded_or_kept_out_on_purpose() ->
     for path in SRC.rglob("*.py"):
         found |= set(named.findall(path.read_text(encoding="utf-8")))
     assert len(found) > 50
-    missing = found - set(brain.ENV_NAMES) - set(brain.ENV_NOT_FORWARDED)
+    missing = {
+        name for name in found if not brain.forwarded(name) and not brain.is_credential(name)
+    }
     assert not missing, f"name these in services.brain's allowlist, or keep them out: {missing}"
-    assert not set(brain.ENV_NAMES) & set(brain.ENV_NOT_FORWARDED)
+    # A credential is kept out, and the rule says so of the one rlx's code names.
+    assert brain.is_credential("CLAUDE_CODE_OAUTH_TOKEN")
+    assert not brain.forwarded("CLAUDE_CODE_OAUTH_TOKEN")
 
 
 def test_rlxd_sends_the_same_list_the_brain_sets() -> None:
     source = (ROOT / "rlxd" / "crates" / "rlxd-proto" / "src" / "hook.rs").read_text(
         encoding="utf-8"
     )
-    block = source.split("pub const HOOK_ENV_NAMES: &[&str] = &[", 1)[1].split("];", 1)[0]
-    assert re.findall(r'"([^"]+)"', block) == list(brain.ENV_NAMES)
+
+    def listed(constant: str) -> list[str]:
+        block = source.split(f"pub const {constant}: &[&str] = &[", 1)[1].split("]", 1)[0]
+        return re.findall(r'"([^"]+)"', block)
+
+    assert listed("HOOK_ENV_NAMES") == list(brain.ENV_NAMES)
+    assert listed("HOOK_ENV_PREFIXES") == list(brain.ENV_PREFIXES)
+    assert listed("HOOK_ENV_SECRET_WORDS") == list(brain.ENV_SECRET_WORDS)
     assert list(brain.ENV_NAMES) == sorted(set(brain.ENV_NAMES))
 
 
@@ -429,7 +441,7 @@ def test_nothing_a_hook_starts_outlives_its_request_but_a_detached_worker(
     ``services.hooks`` detaches on purpose, as it would from ``rlx hook``."""
     template_home, project = template
     home = _copy(template_home, tmp_path / "in-process")
-    env = {name: os.environ[name] for name in brain.ENV_NAMES if name in os.environ}
+    env = {name: value for name, value in os.environ.items() if brain.forwarded(name)}
     env.update({"AISQUARE_HOME": str(home), "AISQUARE_ROLE": "coder"})
     for event in PAYLOADS:
         threads = {thread for thread in threading.enumerate() if not thread.daemon}

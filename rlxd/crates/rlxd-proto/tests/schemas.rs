@@ -9,14 +9,15 @@ use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
     Auth, BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, DaemonRecord, Data, Detail,
-    Envelope, ErrorBody, Event, HOOK_ENV_NAMES, HOOK_EVENTS, HelloData, HelloParams, HereData,
-    HookEventData, HookParams, HookReply, InstalledRlx, InstalledRlxd, Invalid, PRE_TOOL_USE,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, RunScope, SCHEMA_VERSION,
-    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
-    SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, b64, brain_codes, codes,
-    daemon_kinds, deny_output, event_types, hook_codes, hook_event_type, methods,
-    protocol_version_of, schema_version_of, schemas, send_safety_lowers, send_safety_modes,
-    setting_is_protected, setting_keys, topics,
+    Envelope, ErrorBody, Event, HOOK_ENV_NAMES, HOOK_ENV_PREFIXES, HOOK_ENV_SECRET_WORDS,
+    HOOK_EVENTS, HelloData, HelloParams, HereData, HookEventData, HookParams, HookReply,
+    InstalledRlx, InstalledRlxd, Invalid, PRE_TOOL_USE, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths,
+    Request, RequestId, Role, RunScope, SCHEMA_VERSION, Setting, SettingsChanged,
+    SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams,
+    StatusData, SubscribeParams, b64, brain_codes, codes, daemon_kinds, deny_output, event_types,
+    hook_codes, hook_env_forwarded, hook_event_type, methods, protocol_version_of,
+    schema_version_of, schemas, send_safety_lowers, send_safety_modes, setting_is_protected,
+    setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2234,7 +2235,8 @@ fn send_safety_mode_is_strict_for_a_writer_and_additive_for_a_reader() {
 fn brain_frames_validate_and_print_back_as_themselves() {
     for frame in [
         json!({"type": "hello", "protocol": 1, "rlxd_version": "0.10.3",
-               "env_allowlist": ["AISQUARE_ROLE", "PATH"]}),
+               "env_allowlist": ["AISQUARE_ROLE", "PATH"], "env_prefixes": ["CLAUDE"],
+               "env_secret_words": ["TOKEN"]}),
         json!({"type": "request", "id": 7, "method": "ping", "params": {}}),
         json!({"type": "request", "id": 8, "method": "hook", "params": {"event": "stop"}}),
     ] {
@@ -2310,7 +2312,8 @@ fn the_brain_builders_print_what_the_schema_accepts() {
     assert_eq!(
         printed,
         json!({"type": "hello", "protocol": BRAIN_PROTOCOL, "rlxd_version": "0.10.3",
-               "env_allowlist": HOOK_ENV_NAMES})
+               "env_allowlist": HOOK_ENV_NAMES, "env_prefixes": HOOK_ENV_PREFIXES,
+               "env_secret_words": HOOK_ENV_SECRET_WORDS})
     );
     assert!(BRAIN_PROTOCOLS.contains(&BRAIN_PROTOCOL));
     let request = BrainInput::request(3, "ping", Data::new()).unwrap();
@@ -2471,6 +2474,6 @@ fn the_hooks_name_their_events_methods_and_codes() {
     let deny: Value = serde_json::from_str(&deny_output("r")).unwrap();
     assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
     assert!(HOOK_ENV_NAMES.contains(&"AISQUARE_ROLE"));
-    assert!(HOOK_ENV_NAMES.contains(&"CLAUDE_CONFIG_DIR"));
-    assert!(!HOOK_ENV_NAMES.contains(&"CLAUDE_CODE_OAUTH_TOKEN"));
+    assert!(hook_env_forwarded("CLAUDE_CONFIG_DIR"));
+    assert!(!hook_env_forwarded("CLAUDE_CODE_OAUTH_TOKEN"));
 }

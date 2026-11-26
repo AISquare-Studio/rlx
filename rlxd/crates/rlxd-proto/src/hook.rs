@@ -2,7 +2,8 @@
 //! Claude Code's hooks, what rlxd answers, and the `hook.*` event each publishes (7.3).
 //!
 //! `rlxd-hook <event>` reads the hook's JSON on stdin and sends `hook` ([`HookParams`]):
-//! the bytes, its working directory, and the variables of [`HOOK_ENV_NAMES`] it has. For
+//! the bytes, its working directory, and the variables it has that
+//! [`hook_env_forwarded`] allows. For
 //! the six fleet events rlxd asks the resident brain (1.6), which runs `rlx hook <event>`'s
 //! own code as that process would, and answers [`HookReply`]: the bytes for rlxd-hook to
 //! write on its stdout and stderr. `pre-tool-use` is the gate's (5.1): rlxd answers it
@@ -37,11 +38,12 @@ pub const HOOK_EVENTS: &[&str] = &[
 /// The gate's hook (5.1), which never falls back to `rlx hook`.
 pub const PRE_TOOL_USE: &str = "pre-tool-use";
 
-/// The variables rlxd-hook sends with a hook, and the brain sets for it (or removes, when
-/// rlxd-hook had none): the allowlist of `aisquare.services.brain.ENV_NAMES`, whose doc says
-/// why each is here. rlxd names it in its hello to the brain, which refuses an rlxd whose
-/// list is not its own (`env_allowlist_differs`, so `brain_incompatible` in `status`).
-/// Sorted.
+/// The variables rlxd-hook sends with a hook by name, and the brain sets for it (or
+/// removes, when rlxd-hook had none): the allowlist's names, `aisquare.services.brain.
+/// ENV_NAMES`, whose doc says why each is here. With [`HOOK_ENV_PREFIXES`] and
+/// [`HOOK_ENV_SECRET_WORDS`], rlxd names it in its hello to the brain, which refuses an rlxd
+/// whose lists are not its own (`env_allowlist_differs`, so `brain_incompatible` in
+/// `status`). Sorted. [`hook_env_forwarded`] is the whole rule.
 pub const HOOK_ENV_NAMES: &[&str] = &[
     "AISQUARE_ACCOUNTS_SHARED",
     "AISQUARE_AGENT_BIN",
@@ -104,32 +106,6 @@ pub const HOOK_ENV_NAMES: &[&str] = &[
     "AISQUARE_WATCH_DETACHED",
     "ALL_PROXY",
     "APPDATA",
-    "CLAUDECODE",
-    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL",
-    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-    "CLAUDE_CODE_TMPDIR",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_EFFORT",
-    "CLAUDE_PID",
-    "CLAUDE_PROJECT_DIR",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-    "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
-    "CODEX_CI",
-    "CODEX_HOME",
-    "CODEX_MANAGED_BY_NPM",
-    "CODEX_MANAGED_PACKAGE_ROOT",
-    "CODEX_PERMISSION_PROFILE",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CODEX_SESSION_ID",
-    "CODEX_THREAD_ID",
-    "CODEX_TOOL_CALL_ID",
-    "CODEX_VERSION",
     "COLORTERM",
     "COLUMNS",
     "FORCE_COLOR",
@@ -172,6 +148,30 @@ pub const HOOK_ENV_NAMES: &[&str] = &[
     "https_proxy",
     "no_proxy",
 ];
+
+/// The allowlist's prefixes: every coding agent's own variables, by the first word of its
+/// home's variable (`aisquare.services.brain.ENV_PREFIXES`, which reads them off the agent
+/// adapters): Claude Code's and Codex's.
+pub const HOOK_ENV_PREFIXES: &[&str] = &["CLAUDE", "CODEX"];
+
+/// The words that make an agent's variable a credential, which is never sent: its token.
+pub const HOOK_ENV_SECRET_WORDS: &[&str] = &["CREDENTIALS", "KEY", "PASSWORD", "SECRET", "TOKEN"];
+
+/// Whether rlxd-hook sends the variable `name` with a hook, and the brain sets it: one of
+/// [`HOOK_ENV_NAMES`], or one under [`HOOK_ENV_PREFIXES`] none of whose words is one of
+/// [`HOOK_ENV_SECRET_WORDS`]. Names are read upper-case, as Windows compares them.
+pub fn hook_env_forwarded(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if HOOK_ENV_NAMES.contains(&upper.as_str()) || HOOK_ENV_NAMES.contains(&name) {
+        return true;
+    }
+    HOOK_ENV_PREFIXES
+        .iter()
+        .any(|prefix| upper.starts_with(prefix))
+        && !upper
+            .split('_')
+            .any(|word| HOOK_ENV_SECRET_WORDS.contains(&word))
+}
 
 /// The `hook.*` event type of a hook named as rlxd-hook's command line names it:
 /// `session-start` is `hook.session_start`.
@@ -488,6 +488,29 @@ mod tests {
         );
         assert_eq!(event_type("codex"), None);
         assert_eq!(HOOK_EVENTS.len(), 7);
+    }
+
+    #[test]
+    fn an_agents_variables_go_and_its_credentials_do_not() {
+        for name in [
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDECODE",
+            "CODEX_HOME",
+            "PATH",
+            "Path",
+            "TMUX_PANE",
+        ] {
+            assert!(hook_env_forwarded(name), "{name}");
+        }
+        for name in [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CODEX_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "SECRET",
+            "EDITOR",
+        ] {
+            assert!(!hook_env_forwarded(name), "{name}");
+        }
     }
 
     #[test]
