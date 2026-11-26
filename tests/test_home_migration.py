@@ -318,7 +318,8 @@ def test_an_old_home_moves_to_rlx_in_the_new_layout_signed_in_sealed_and_linked(
     )
     # The store's paths resolve, every one.
     with store_session() as store:
-        assert store.get_project("prj_home").root == new / "captain"
+        home_project = store.get_project("prj_home")
+        assert home_project is not None and home_project.root == new / "captain"
         coder = store.get_fleet_agent("agt-coder")
         assert coder is not None and coder.cwd.is_dir()
         rows = _store_rows(new, "rlx.db")
@@ -428,7 +429,9 @@ def test_a_crash_between_two_renames_resumes_or_rolls_back(
     at: int,
 ) -> None:
     before = _tree(old_home)
-    renames = len(home_migration.planned_move().renames) + 1  # and the root's
+    found = home_migration.planned_move()
+    assert found is not None
+    renames = len(found.renames) + 1  # and the root's
     stop = at if at > 0 else renames
     made: list[int] = []
     real = home_migration._rename_once
@@ -807,8 +810,8 @@ def test_each_accounts_hooks_name_its_new_place(
     assert home_migration.move_home() is not None
 
     new = user_home / ".rlx"
-    for agent, slot in (("claude-code", "claude/2"), ("codex", "codex/3")):
-        commands = agent_core.hook_commands(agent, new / "accounts" / slot)
+    for agent, place in (("claude-code", "claude/2"), ("codex", "codex/3")):
+        commands = agent_core.hook_commands(agent, new / "accounts" / place)
         assert commands, agent
         assert not any(str(old_home) in command for command in commands), commands
     codex_hooks = agent_core.hook_commands("codex", new / "accounts" / "codex" / "3")
