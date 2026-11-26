@@ -32,8 +32,8 @@ pub struct Signing<'a> {
     pub runtime: bool,
     /// Entitlements granted, each `true`.
     pub entitlements: &'a [&'a str],
-    /// A keychain and identity name to sign with, else ad hoc.
-    pub identity: Option<(&'a Path, &'a str)>,
+    /// A self-signed identity to sign with, else ad hoc.
+    pub identity: Option<&'a SelfSigned>,
 }
 
 /// A copy of `rlxd` at `dir/name`, signed as `signing` says.
@@ -44,12 +44,12 @@ pub fn helper(dir: &Path, name: &str, signing: &Signing<'_>) -> PathBuf {
     let mut command = Command::new("codesign");
     command.args(["--force", "--identifier", signing.identifier]);
     match signing.identity {
-        Some((keychain, name)) => {
+        Some(identity) => {
             command
                 .arg("--sign")
-                .arg(name)
+                .arg(&identity.sha1)
                 .arg("--keychain")
-                .arg(keychain);
+                .arg(&identity.keychain);
         }
         None => {
             command.args(["--sign", "-"]);
@@ -77,8 +77,17 @@ pub fn helper(dir: &Path, name: &str, signing: &Signing<'_>) -> PathBuf {
         .unwrap();
         command.arg("--entitlements").arg(&plist);
     }
-    command.arg(&path);
-    let out = command.stdin(Stdio::null()).output().unwrap();
+    command.arg(&path).stdin(Stdio::null());
+    let mut out = command.output().unwrap();
+    if let Some(identity) = signing.identity
+        && !out.status.success()
+        && String::from_utf8_lossy(&out.stderr).contains("no identity found")
+    {
+        // Some macOS releases search only the keychains on the user's search list, even
+        // with --keychain: list it for this one signing, then put the list back.
+        let _listed = identity.listed();
+        out = command.output().unwrap();
+    }
     assert!(
         out.status.success(),
         "codesign {}: {}",
@@ -93,7 +102,13 @@ pub fn helper(dir: &Path, name: &str, signing: &Signing<'_>) -> PathBuf {
 /// touched: signing names this keychain.
 pub struct SelfSigned {
     pub keychain: PathBuf,
-    pub name: &'static str,
+    /// The certificate's SHA-1 fingerprint, which names the identity to `codesign`.
+    pub sha1: String,
+}
+
+/// The user's keychain search list with a throwaway keychain added, until dropped.
+pub struct Listed {
+    before: Vec<String>,
 }
 
 impl SelfSigned {
@@ -132,13 +147,22 @@ impl SelfSigned {
                 .arg("-out")
                 .arg(&p12)
         });
+        let fingerprint = output("/usr/bin/openssl", |c| {
+            c.args(["x509", "-noout", "-fingerprint", "-sha1", "-in"])
+                .arg(&cert)
+        });
+        let sha1: String = fingerprint
+            .split_once('=')
+            .map(|(_, hex)| hex.trim().replace(':', ""))
+            .unwrap_or_default();
+        assert_eq!(sha1.len(), 40, "{fingerprint}");
         let keychain = dir.join("gate-test.keychain-db");
         run("security", |c| {
             c.args(["create-keychain", "-p", "kpw"]).arg(&keychain)
         });
         let made = Self {
             keychain: keychain.clone(),
-            name: NAME,
+            sha1,
         };
         run("security", |c| {
             c.args(["unlock-keychain", "-p", "kpw"]).arg(&keychain)
@@ -166,6 +190,34 @@ impl SelfSigned {
     }
 }
 
+impl SelfSigned {
+    /// Adds this keychain to the user's search list until the guard drops.
+    pub fn listed(&self) -> Listed {
+        let before: Vec<String> = output("security", |c| c.args(["list-keychains", "-d", "user"]))
+            .lines()
+            .map(|line| line.trim().trim_matches('"').to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        run("security", |c| {
+            c.args(["list-keychains", "-d", "user", "-s"])
+                .arg(&self.keychain)
+                .args(&before)
+        });
+        Listed { before }
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        let _ = Command::new("security")
+            .args(["list-keychains", "-d", "user", "-s"])
+            .args(&self.before)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 impl Drop for SelfSigned {
     fn drop(&mut self) {
         let _ = Command::new("security")
@@ -178,6 +230,11 @@ impl Drop for SelfSigned {
 }
 
 fn run(program: &str, args: impl FnOnce(&mut Command) -> &mut Command) {
+    output(program, args);
+}
+
+/// Runs `program`, which must succeed: its stdout.
+fn output(program: &str, args: impl FnOnce(&mut Command) -> &mut Command) -> String {
     let mut command = Command::new(program);
     args(&mut command);
     let out = command.stdin(Stdio::null()).output().unwrap();
@@ -187,4 +244,5 @@ fn run(program: &str, args: impl FnOnce(&mut Command) -> &mut Command) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }

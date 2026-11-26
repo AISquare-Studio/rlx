@@ -56,10 +56,22 @@ impl TestSigner {
              -ErrorAction Stop | Out-Null }} catch {{ Remove-Item Cert:\\CurrentUser\\My\\$($c.Thumbprint); \
              Remove-Item $f; throw }}; Remove-Item $f; $c.Thumbprint"
         ));
-        match made {
-            Ok(thumbprint) => Some(Self {
-                thumbprint: thumbprint.trim().to_owned(),
-            }),
+        // PowerShell may print more before it; the thumbprint is the last line.
+        let thumbprint = made.map(|out| {
+            out.lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty())
+                .unwrap_or_default()
+                .to_owned()
+        });
+        match thumbprint {
+            Ok(thumbprint) => {
+                assert!(
+                    thumbprint.len() == 40 && thumbprint.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "not a thumbprint: {thumbprint:?}"
+                );
+                Some(Self { thumbprint })
+            }
             Err(why) => {
                 assert!(
                     std::env::var_os("RLXD_GATE_PEER_REQUIRED").is_none(),
@@ -218,9 +230,10 @@ fn a_pipe_whose_client_has_exited_is_refused() {
         "the helper: {stdout}{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The test harness may print on the same line first.
     let handle: usize = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("PIPE "))
+        .find_map(|line| line.split_once("PIPE ").map(|(_, handle)| handle))
         .unwrap_or_else(|| panic!("the helper handed no pipe: {stdout}"))
         .trim()
         .parse()
@@ -317,5 +330,5 @@ fn helper_hands_its_pipe_to_its_parent() {
         "DuplicateHandle: {}",
         std::io::Error::last_os_error()
     );
-    println!("PIPE {}", duplicate as usize);
+    println!("\nPIPE {}", duplicate as usize);
 }

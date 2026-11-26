@@ -72,7 +72,7 @@ fn a_self_signed_helper_with_the_identifier_and_team_is_refused_for_want_of_appl
             identifier: "studio.aisquare.rlx",
             runtime: true,
             entitlements: &[],
-            identity: Some((&identity.keychain, identity.name)),
+            identity: Some(&identity),
         },
     );
     // The control: it satisfies the very same requirement without the anchor, so the
