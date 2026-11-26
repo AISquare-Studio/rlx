@@ -65,7 +65,7 @@ pub fn attach(args: AttachArgs) -> ExitCode {
         Ok(home) => home,
         Err(e) => return cli::report_on_stderr(AskError::NotRunning(e.to_string())),
     };
-    let mut input = match cli::open_as(&home, "tui") {
+    let mut input = match cli::open_as(&home, "tui", &cli::Target::default()) {
         Ok(connection) => connection,
         Err(e) => return cli::report_on_stderr(e),
     };
@@ -75,7 +75,7 @@ pub fn attach(args: AttachArgs) -> ExitCode {
     {
         return code;
     }
-    let stream = match cli::open_as(&home, "tui") {
+    let stream = match cli::open_as(&home, "tui", &cli::Target::default()) {
         Ok(connection) => connection,
         Err(e) => return cli::report_on_stderr(e),
     };

@@ -11,9 +11,15 @@
 //! unsigned client do) and keeps the credential there. Like the app, it never pairs again
 //! on its own: once the file exists, a `not_gate` is the call's result. `rlxd events
 //! --as-app` presents the kept credential too, but never pairs: without one, it gets
-//! `not_gate`.
+//! `not_gate`. `--gate-credential-file` keeps it elsewhere.
+//!
+//! `--socket` connects to another rlxd's socket, such as an SSH forward's local end.
+//! Nothing of this home goes there, and nothing from there is kept in it: the token must
+//! be given (`--token-file`, or `--token`), and `--as-app` needs `--gate-credential-file`
+//! (or `--gate-credential`). Either missing is a usage error ([`Target::check`]).
 
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,8 +52,8 @@ pub struct CallArgs {
     pub client: Option<String>,
     /// `hello`'s `gate_credential`.
     pub gate_credential: Option<String>,
-    /// `hello`'s `token`, instead of the token file's.
-    pub token: Option<String>,
+    /// Where to connect, the token, and where `--as-app` keeps its credential.
+    pub target: Target,
     /// `hello`'s `protocol_version`, as JSON writes a number.
     pub protocol_version: Option<String>,
     /// `hello`'s `env`, a JSON object.
@@ -64,6 +70,8 @@ pub struct CallArgs {
 pub enum AskError {
     /// No rlxd runs for this home.
     NotRunning(String),
+    /// Nothing listens on `--socket`: a forward that is down, or no rlxd on the host.
+    NotListening(String),
     /// `hello` was refused; the refusal.
     Refused(Box<Reply>),
     /// Anything else, said.
@@ -78,25 +86,94 @@ pub fn ask(home: &Home, method: &str) -> Result<Reply, AskError> {
 
 /// [`ask`], with `params`.
 pub fn ask_with(home: &Home, method: &str, params: Data) -> Result<Reply, AskError> {
-    open(home, false)?
+    open(home, false, &Target::default())?
         .request(method, params)
         .map_err(|e| AskError::Failed(e.to_string()))
 }
 
-/// A connection to `home`'s rlxd that has said `hello` with the token file's token: as
-/// `cli`, or with `as_app` as `app`, with the test gate credential when there is one.
-pub fn open(home: &Home, as_app: bool) -> Result<Connection, AskError> {
-    open_as(home, if as_app { "app" } else { "cli" })
+/// Where a client command connects, and what it proves itself with: `--socket`,
+/// `--token` or `--token-file`, and `--gate-credential-file`, else the home's socket,
+/// token file and test credential.
+///
+/// With `--socket`, nothing of the home's goes there and nothing from there is kept in the
+/// home: the token must be given, and `--as-app` needs a credential file of its own
+/// ([`Target::check`]).
+#[derive(Debug, Default)]
+pub struct Target {
+    /// The socket or pipe, such as an SSH forward's local end.
+    pub socket: Option<PathBuf>,
+    /// The token, from the command line.
+    pub token: Option<String>,
+    /// A file holding the token, so it is not in the command line.
+    pub token_file: Option<PathBuf>,
+    /// Where `--as-app` keeps its gate credential, instead of the home's
+    /// `test-gate-credential`.
+    pub gate_credential_file: Option<PathBuf>,
 }
 
-/// Says `hello` as `role` to `home`'s rlxd, with the token file's token, and with the test
-/// gate credential when the role is `app` and there is one.
-pub fn open_as(home: &Home, role: &str) -> Result<Connection, AskError> {
+impl Target {
+    /// Refuses, as a usage error, what would send this home's token or test credential to
+    /// another socket, or keep another rlxd's credential in this home. `as_app` is
+    /// `--as-app` with no `--gate-credential`.
+    pub fn check(&self, as_app: bool) -> Result<(), String> {
+        if self.socket.is_none() {
+            return Ok(());
+        }
+        if self.token.is_none() && self.token_file.is_none() {
+            return Err(
+                "--socket needs --token-file (or --token): this home's token is \
+                        never sent to another socket"
+                    .to_owned(),
+            );
+        }
+        if as_app && self.gate_credential_file.is_none() {
+            return Err(
+                "--as-app with --socket needs --gate-credential-file, where this \
+                        client keeps its credential for the rlxd at --socket (or \
+                        --gate-credential): this home's test credential is never sent \
+                        there, nor that rlxd's kept here"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The token: `--token`, else `--token-file`'s, else, without `--socket`, the home's.
+    pub fn token(&self, home: &Home) -> Result<String, String> {
+        match (&self.token, &self.token_file, &self.socket) {
+            (Some(token), _, _) => Ok(token.clone()),
+            (None, Some(file), _) => read_secret(file, "token"),
+            (None, None, None) => read_token(home),
+            (None, None, Some(_)) => Err("--socket needs --token-file or --token".to_owned()),
+        }
+    }
+
+    /// Where `--as-app` keeps its gate credential: `--gate-credential-file`, else, without
+    /// `--socket`, `<home>/test-gate-credential`. None with `--socket` and no file.
+    pub fn credential_file(&self, home: &Home) -> Option<PathBuf> {
+        match (&self.gate_credential_file, &self.socket) {
+            (Some(file), _) => Some(file.clone()),
+            (None, None) => Some(home.test_gate_credential()),
+            (None, Some(_)) => None,
+        }
+    }
+}
+
+/// A connection to `target`, else `home`'s rlxd, that has said `hello` with its token: as
+/// `cli`, or with `as_app` as `app`, with the test gate credential when there is one.
+pub fn open(home: &Home, as_app: bool, target: &Target) -> Result<Connection, AskError> {
+    open_as(home, if as_app { "app" } else { "cli" }, target)
+}
+
+/// A connection to `target`, else `home`'s rlxd, that has said `hello` as `role` with its
+/// token, and with the test gate credential when the role is `app` and there is one.
+pub fn open_as(home: &Home, role: &str, target: &Target) -> Result<Connection, AskError> {
     let as_app = role == "app";
-    let mut connection = Connection::open(home).map_err(|e| connect_error(home, e))?;
-    let token = read_token(home).map_err(AskError::Failed)?;
+    let mut connection = connect(home, target.socket.as_deref())?;
+    let token = target.token(home).map_err(AskError::Failed)?;
     let mut hello = hello_params(&token, &json!(PROTOCOL_VERSION), CLIENT, role);
-    if let Some(credential) = as_app.then(|| test_gate_credential(home)).flatten() {
+    let kept = as_app.then(|| target.credential_file(home)).flatten();
+    if let Some(credential) = kept.as_deref().and_then(read_credential) {
         hello.insert("gate_credential".to_owned(), Value::String(credential));
     }
     let reply = connection
@@ -115,7 +192,13 @@ pub fn call(args: CallArgs) -> ExitCode {
         Err(e) => return report(AskError::NotRunning(e.to_string())),
     };
     if args.raw {
-        return raw(&home);
+        return raw(&home, args.target.socket.as_deref());
+    }
+    if let Err(message) = args
+        .target
+        .check(args.as_app && args.gate_credential.is_none())
+    {
+        return out::usage(&message);
     }
     let Some(method) = args.method.as_deref() else {
         return out::usage("call needs a method, or --raw");
@@ -135,7 +218,7 @@ pub fn call(args: CallArgs) -> ExitCode {
             _ => return out::usage(&format!("--protocol-version {text} is not a number")),
         },
     };
-    let token = match args.token.clone().map_or_else(|| read_token(&home), Ok) {
+    let token = match args.target.token(&home) {
         Ok(token) => token,
         // No token file, most likely as no rlxd ever ran here: not running, if it isn't.
         Err(message) => {
@@ -145,20 +228,26 @@ pub fn call(args: CallArgs) -> ExitCode {
             };
         }
     };
+    let socket = args.target.socket.as_deref();
     let credential = match (args.gate_credential.clone(), args.as_app) {
         (Some(credential), _) => Some(credential),
-        (None, true) => match test_gate_credential(&home) {
-            Some(credential) => Some(credential),
-            None => match pair_test_client(&home, &token) {
-                Ok(credential) => Some(credential),
-                Err(exit) => return exit,
-            },
-        },
+        (None, true) => {
+            let Some(file) = args.target.credential_file(&home) else {
+                return out::usage("--as-app with --socket needs --gate-credential-file");
+            };
+            match read_credential(&file) {
+                Some(credential) => Some(credential),
+                None => match pair_test_client(&home, socket, &token, &file) {
+                    Ok(credential) => Some(credential),
+                    Err(exit) => return exit,
+                },
+            }
+        }
         (None, false) => None,
     };
-    let mut connection = match Connection::open(&home) {
+    let mut connection = match connect(&home, socket) {
         Ok(connection) => connection,
-        Err(e) => return report(connect_error(&home, e)),
+        Err(e) => return report(e),
     };
     let role = if args.as_app {
         "app"
@@ -190,9 +279,17 @@ pub fn call(args: CallArgs) -> ExitCode {
 }
 
 /// The test client's first pairing: `gate.pair` as `cli`, keeping the credential in
-/// `<home>/test-gate-credential` (0600). On a refusal, prints it and gives the exit.
-fn pair_test_client(home: &Home, token: &str) -> Result<String, ExitCode> {
-    let mut connection = Connection::open(home).map_err(|e| report(connect_error(home, e)))?;
+/// `file` (0600): `<home>/test-gate-credential`, or `--gate-credential-file`. On a
+/// refusal, prints it and gives the exit. With `socket` (`--socket`), it pairs with the
+/// rlxd there, whose gate checks it as any other connection: through an SSH forward its
+/// peer is sshd.
+fn pair_test_client(
+    home: &Home,
+    socket: Option<&Path>,
+    token: &str,
+    file: &Path,
+) -> Result<String, ExitCode> {
+    let mut connection = connect(home, socket).map_err(report)?;
     let hello = hello_params(token, &json!(PROTOCOL_VERSION), CLIENT, "cli");
     let reply = connection
         .request(methods::HELLO, hello)
@@ -211,11 +308,10 @@ fn pair_test_client(home: &Home, token: &str) -> Result<String, ExitCode> {
     let Some(credential) = credential else {
         return Err(out::print_reply(&reply));
     };
-    files::write_private(&home.test_gate_credential(), &credential).map_err(|e| {
-        let path = home.test_gate_credential();
+    files::write_private(file, &credential).map_err(|e| {
         let message = format!(
             "paired, but cannot keep the credential in {}: {e}",
-            path.display()
+            file.display()
         );
         out::fail(codes::INTERNAL, &message, None)
     })?;
@@ -354,7 +450,7 @@ fn print_stream(mut connection: Connection, method: &str, params: Data) -> ExitC
 
 /// `rlxd call --raw`: stdin's frames, sent as they are with no `hello`, and each reply
 /// printed as it came. Exits as the last reply says.
-fn raw(home: &Home) -> ExitCode {
+fn raw(home: &Home, socket: Option<&Path>) -> ExitCode {
     let mut input = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut input) {
         return out::usage(&format!("cannot read stdin: {e}"));
@@ -363,9 +459,9 @@ fn raw(home: &Home) -> ExitCode {
     if frames.is_empty() {
         return out::usage("--raw sends stdin's frames, and stdin has none");
     }
-    let mut connection = match Connection::open(home) {
+    let mut connection = match connect(home, socket) {
         Ok(connection) => connection,
-        Err(e) => return report(connect_error(home, e)),
+        Err(e) => return report(e),
     };
     for frame in &frames {
         // rlxd closes the connection on a refused first frame: what it already sent
@@ -514,17 +610,20 @@ fn hello_params(token: &str, version: &Value, client: &str, role: &str) -> Data 
 }
 
 fn read_token(home: &Home) -> Result<String, String> {
-    let path = home.token();
-    std::fs::read_to_string(&path)
-        .map(|token| token.trim().to_owned())
-        .map_err(|e| format!("cannot read the token in {}: {e}", path.display()))
+    read_secret(&home.token(), "token")
 }
 
-/// The gate credential a test client's first `--as-app` call kept, if there is one.
-fn test_gate_credential(home: &Home) -> Option<String> {
-    let text = std::fs::read_to_string(home.test_gate_credential()).ok()?;
-    let credential = text.trim();
-    (!credential.is_empty()).then(|| credential.to_owned())
+/// The file `path`, trimmed: a token or a credential, which `what` names in the error.
+fn read_secret(path: &Path, what: &str) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map(|text| text.trim().to_owned())
+        .map_err(|e| format!("cannot read the {what} in {}: {e}", path.display()))
+}
+
+/// The gate credential kept in `file`, if there is one: `--as-app`'s, from its first call.
+fn read_credential(file: &Path) -> Option<String> {
+    let credential = read_secret(file, "gate credential").ok()?;
+    (!credential.is_empty()).then_some(credential)
 }
 
 /// `text`, a JSON object, or `None` when not given.
@@ -536,6 +635,19 @@ fn parse_object(text: Option<&str>, what: &str) -> Result<Option<Data>, String> 
         Ok(Value::Object(object)) => Ok(Some(object)),
         Ok(_) => Err(format!("{what} must be a JSON object")),
         Err(e) => Err(format!("{what} is not JSON: {e}")),
+    }
+}
+
+/// A connection to `socket` when given (`--socket`), else to `home`'s rlxd.
+pub fn connect(home: &Home, socket: Option<&Path>) -> Result<Connection, AskError> {
+    match socket {
+        Some(socket) => Connection::open_at(socket).map_err(|error| match error {
+            ConnectError::NotRunning { .. } => {
+                AskError::NotListening(format!("no rlxd listens on {}", socket.display()))
+            }
+            other => AskError::Failed(other.to_string()),
+        }),
+        None => Connection::open(home).map_err(|error| connect_error(home, error)),
     }
 }
 
@@ -552,6 +664,10 @@ fn call_error(error: CallError) -> AskError {
     AskError::Failed(error.to_string())
 }
 
+/// The hint for nothing listening on `--socket`: not this home's rlxd to start.
+const NOT_LISTENING_HINT: &str = "Check that the forward to it is up (ssh -L), and run \
+                                  `rlxd here --start` on the host it leads to.";
+
 /// Prints the envelope for `error`, with its exit code.
 fn report(error: AskError) -> ExitCode {
     match error {
@@ -560,6 +676,12 @@ fn report(error: AskError) -> ExitCode {
             codes::NOT_RUNNING,
             &message,
             Some("Start it with `rlxd serve --detach`."),
+        ),
+        AskError::NotListening(message) => out::fail_with(
+            out::NOT_RUNNING,
+            codes::NOT_RUNNING,
+            &message,
+            Some(NOT_LISTENING_HINT),
         ),
         AskError::Refused(reply) => out::print_reply(&reply),
         AskError::Failed(message) => out::fail(codes::DISCONNECTED, &message, None),
@@ -576,6 +698,12 @@ pub fn report_on_stderr(error: AskError) -> ExitCode {
             &message,
             Some("Start it with `rlxd serve --detach`."),
         ),
+        AskError::NotListening(message) => out::fail_on_stderr(
+            out::NOT_RUNNING,
+            codes::NOT_RUNNING,
+            &message,
+            Some(NOT_LISTENING_HINT),
+        ),
         AskError::Refused(reply) => out::print_reply_on_stderr(&reply),
         AskError::Failed(message) => {
             out::fail_on_stderr(out::FAILED, codes::DISCONNECTED, &message, None)
@@ -586,7 +714,9 @@ pub fn report_on_stderr(error: AskError) -> ExitCode {
 /// `error`, on stderr, for a person, with its exit code.
 fn report_to_a_person(error: AskError) -> ExitCode {
     let (message, status) = match error {
-        AskError::NotRunning(message) => (message, out::NOT_RUNNING),
+        AskError::NotRunning(message) | AskError::NotListening(message) => {
+            (message, out::NOT_RUNNING)
+        }
         AskError::Refused(reply) => {
             let message = reply.error().map_or_else(
                 || reply.line.clone(),
