@@ -48,14 +48,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from aisquare.core import atomic, paths
+from aisquare.core import atomic, paths, spawn
 from aisquare.core import program as prog
+from aisquare.core.config import load_config, save_config
 from aisquare.core.version import PRODUCT_NAME
 
 LABEL = "studio.aisquare.rlx.service"
 """The default home's LaunchAgent label, and its file's name (``<label>.plist``)."""
 UNIT = f"{PRODUCT_NAME}.service"
 """The default home's systemd user unit."""
+SERVICE = f"{PRODUCT_NAME} service"
+"""What it is called in what it says (``service_host.SERVICE``)."""
 RUN_ARGS: tuple[str, ...] = ("service", "run", "--at-login")
 """What the OS runs: ``rlx service run`` in the foreground, as launchd and systemd expect, told
 it was started at login, where a refusal (one runs already) is no crash to restart
@@ -115,8 +118,6 @@ class OsReply:
 def _service_manager(argv: Sequence[str]) -> OsReply:
     """The one place rlx runs ``launchctl``, ``systemctl`` or ``loginctl`` (``core.spawn.
     SEAMS``). Never raises: a tool that is missing or hangs is an answer too."""
-    from aisquare.core import spawn
-
     try:
         done = subprocess.run(
             list(argv),
@@ -177,8 +178,26 @@ def login_how() -> How:
 
 
 def _named_home() -> Path | None:
-    """The home a variable names (``paths.named_home``); ``None`` for the default home."""
-    return paths.named_home()
+    """The home a variable names (``paths.named_home``); ``None`` for the default home, and
+    for a variable that names the default home's own path, as the captain's windows are given
+    (``services.fleet``): that IS the default home, with its one item (review of #33, m2)."""
+    named = paths.named_home()
+    if named is None:
+        return None
+    unnamed = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in (paths.RLX_HOME_ENV, paths.HOME_ENV_VAR)
+    }
+    default, _ = paths.home_of(unnamed)
+    return None if _same_path(named, default) else named
+
+
+def _same_path(one: Path, other: Path) -> bool:
+    try:
+        return one.expanduser().resolve() == other.expanduser().resolve()
+    except OSError:
+        return one.expanduser().absolute() == other.expanduser().absolute()
 
 
 def _named_by() -> str:
@@ -341,8 +360,11 @@ def _stderr_path() -> Path:
 
 def item_body(how: How) -> bytes:
     """What this home's item holds when written now. :class:`LoginError` when there is no
-    installed rlx to run (:func:`entry_point`)."""
+    installed rlx to run (:func:`entry_point`). The default home's carries no home variable,
+    even one that names it: the item reads the same whichever shell wrote it."""
     argv, env = service_argv(), service_env()
+    if _named_home() is None:
+        env = {name: value for name, value in env.items() if name == "PATH"}
     if how == "launchd":
         return plist_bytes(argv, env, stderr=_stderr_path())
     return unit_text(argv, env).encode()
@@ -364,11 +386,29 @@ def _ours(how: How, body: bytes) -> bool:
 # --- the person's choice -------------------------------------------------------------------------
 
 
+class ConfigUnreadable(LoginError):
+    """``config.toml`` cannot be read, so the choice cannot be: nothing is added, refreshed or
+    taken away until it can (tester of #33, B1). The message is the line to show."""
+
+
+def config_unreadable() -> str | None:
+    """Why ``config.toml`` cannot be read, or ``None`` when it can (or is not there)."""
+    try:
+        load_config()
+    except Exception as exc:  # TOMLDecodeError, a ValidationError, an OSError: all say why
+        return f"config.toml cannot be read ({type(exc).__name__}: {str(exc).strip()})"
+    return None
+
+
+def _readable_or_refused() -> None:
+    why = config_unreadable()
+    if why is not None:
+        raise ConfigUnreadable(f"{why}: the login item is left as it is until it can be read")
+
+
 def read_choice() -> bool | None:
     """``[service] start_at_login``; ``None`` while nothing was chosen, or the file cannot be
-    read (then nothing is decided, and nothing is written either)."""
-    from aisquare.core.config import load_config
-
+    read (shown as undecided; every writer here refuses first, :class:`ConfigUnreadable`)."""
     try:
         return load_config().service.start_at_login
     except Exception:  # an unreadable config.toml: the form and doctor say so
@@ -378,8 +418,6 @@ def read_choice() -> bool | None:
 def _keep_the_choice(on: bool | None) -> None:
     """``[service] start_at_login`` written (``None``: taken away). Raises what ``save_config``
     raises (``PermissionError``: the CLI's ``expected_config_write_errors``)."""
-    from aisquare.core.config import load_config, save_config
-
     config = load_config()
     if config.service.start_at_login is on:
         return
@@ -472,6 +510,7 @@ def register_at_login(*, linger: bool = False) -> Registered:
     :class:`NotHere` on native Windows (nothing recorded), :class:`LoginError` when it cannot be
     added, or its file cannot be written; what ``save_config`` raises for the choice."""
     how = login_how()
+    _readable_or_refused()
     body = item_body(how)
     notes = _add_launch_agent(body) if how == "launchd" else _add_user_unit(body)
     if how == "systemd" and linger:
@@ -517,46 +556,70 @@ def _add_launch_agent(body: bytes) -> list[str]:
 
 
 def _add_user_unit(body: bytes) -> list[str]:
-    _write_item(item_path("systemd"), body)
+    """The unit written, loaded and enabled; one systemd will not take is taken away again, so
+    nothing reads as on (review of #33, m1)."""
+    item = item_path("systemd")
+    existed = item.is_file()
+    _write_item(item, body)
     reloaded = _service_manager(["systemctl", "--user", "daemon-reload"])
     if not reloaded.ok:
+        _back_out(item, existed)
         raise LoginError(f"systemd's user manager did not answer: {reloaded.said or reloaded.code}")
     enabled = _service_manager(["systemctl", "--user", "enable", "--now", unit_name()])
     if not enabled.ok:
+        _back_out(item, existed)
+        _service_manager(["systemctl", "--user", "daemon-reload"])
         raise LoginError(f"systemd did not enable {unit_name()}: {enabled.said or enabled.code}")
     return []
+
+
+def _back_out(item: Path, existed: bool) -> None:
+    """A unit this install wrote, removed after systemd refused it: one that was there before
+    (refreshed, then refused) is left for the person, as it was theirs to remove."""
+    if not existed:
+        with contextlib.suppress(OSError):
+            item.unlink(missing_ok=True)
 
 
 def unregister_at_login() -> AtLogin:
     """Take this home's login item away, stopping the service the OS runs from it, and record
     the choice as off. :class:`NotHere` on native Windows (nothing recorded), :class:`LoginError`
     when its file stays; what ``save_config`` raises for the choice."""
-    _take_the_item_away(login_how())
+    how = login_how()
+    _readable_or_refused()
+    _take_the_item_away(how)
     _keep_the_choice(False)
     return at_login_state()
 
 
-def forget_at_login() -> None:
-    """``rlx uninstall``'s step: the login item taken away with the package (or the OS would
-    start a program that is gone at every login), and the choice with it, so an install after
-    it is on by default again. :class:`LoginError` when the item's file stays."""
+def forget_at_login() -> bool:
+    """``rlx uninstall``'s step, and a move to a release with no service (``rlx upgrade``): the
+    login item taken away (or the OS would start a program that is gone, or a command that
+    release does not have, at every login, and that release has no way to take it away), and
+    the choice with it, so a later install is on by default again. Whether there was an item
+    or a choice. :class:`LoginError` when the item's file stays."""
     try:
         how = login_how()
     except LoginError:
-        return  # nothing can be in place here
+        return False  # nothing can be in place here
+    there = item_path(how).is_file()
     _take_the_item_away(how)
-    if read_choice() is not None:
-        # A config.toml it cannot write: the uninstall goes on without it.
+    chosen = read_choice() is not None
+    if chosen:
+        # A config.toml it cannot write: the uninstall goes on without it. One it cannot read
+        # reads as no choice, and is left as it is.
         with contextlib.suppress(OSError):
             _keep_the_choice(None)
+    return there or chosen
 
 
 def _take_the_item_away(how: How) -> None:
+    """Booted out (disabled and stopped) whether its file is there or not: a job loaded from a
+    file deleted since stays loaded until logout (tester of #33). "Not loaded" is no failure."""
     item = item_path(how)
     if how == "launchd":
-        if item.is_file():
-            _service_manager(["launchctl", "bootout", _target()])
-    elif item.is_file():
+        _service_manager(["launchctl", "bootout", _target()])
+    else:
         _service_manager(["systemctl", "--user", "disable", "--now", unit_name()])
     try:
         item.unlink(missing_ok=True)
@@ -574,7 +637,7 @@ def refresh_the_item() -> bool:
     try:
         how = login_how()
         item = item_path(how)
-        if not item.is_file():
+        if not item.is_file() or config_unreadable() is not None:
             return False
         old = item.read_bytes()
         new = item_body(how)
@@ -602,6 +665,11 @@ def register_by_default(*, by_installer: bool = False) -> str:
         return f"the {PRODUCT_NAME} service does not start at login: {exc}"
     except LoginError:
         pass  # said below, from how it stands
+    unreadable = config_unreadable()
+    if unreadable is not None:
+        # The choice cannot be read, so it cannot be told from no choice: nothing is added,
+        # refreshed or taken away (tester of #33, B1).
+        return f"the {PRODUCT_NAME} service's login item was left as it is: {unreadable}"
     if read_choice() is not None:
         refresh_the_item()
         return state_line(at_login_state())
@@ -698,11 +766,13 @@ __all__ = [
     "RUN_ARGS",
     "UNIT",
     "AtLogin",
+    "ConfigUnreadable",
     "LoginError",
     "NotHere",
     "OsReply",
     "Registered",
     "at_login_state",
+    "config_unreadable",
     "entry_point",
     "forget_at_login",
     "home_tag",

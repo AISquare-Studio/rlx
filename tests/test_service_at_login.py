@@ -36,6 +36,8 @@ from tests.test_ui_app_settings import AppHost, drive
 
 REAL_ENTRY_POINT = service_login.entry_point
 """The real one, which the suite's stub replaces in every test."""
+REAL_NAMED_HOME = service_login._named_home
+"""The real one, which :func:`default_home` replaces in every test here."""
 DOMAIN = "gui/501"
 TARGET = f"{DOMAIN}/{service_login.LABEL}"
 NOT_LOADED = "Could not find service in domain for user gui: 501"
@@ -598,6 +600,9 @@ def test_rlx_uninstall_takes_the_agent_away_and_forgets_the_choice(
 # --- starting it: through the OS when it is set up ------------------------------------------------
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="service_host.start_service refuses on native Windows"
+)
 def test_start_goes_through_the_os_when_the_item_is_set_up(
     login_os: LoginOs, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -765,3 +770,181 @@ def test_where_it_cannot_start_at_login_the_switch_is_off_and_says_why(
 
     assert (on, disabled) == (False, True)
     assert line == f"Off: {service_login.NO_SYSTEMD_IN_WSL}."
+
+
+# --- review of #33 (#2103): m1, m2, and Reset all ---------------------------------------------
+
+
+@pytest.mark.usefixtures("linux")
+@pytest.mark.parametrize("refused", ["daemon-reload", "enable"], ids=["reload", "enable"])
+def test_a_unit_systemd_refuses_is_taken_away_and_never_reads_as_on(
+    login_os: LoginOs, refused: str
+) -> None:
+    """m1: a failed install left the unit file, and status and the switch said "yes"."""
+    login_os.reply("systemctl", "--user", refused, code=1, said="Failed to connect to bus")
+
+    result = _rlx("service", "install")
+
+    assert result.exit_code != 0
+    assert "Failed to connect to bus" in result.output, result.output
+    assert not _unit().exists()
+    assert _choice() is None
+    state = service_login.at_login_state()
+    assert state.on is False and state.why_off == service_login.NEVER_ON
+
+
+def test_a_variable_that_names_the_default_homes_own_path_is_the_default_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m2: the captain's windows are given the home by its variable (``services.fleet``): the
+    default home's own path there is the default home, with its one item and label, so an
+    uninstall from a plain shell takes away the item it started from."""
+    monkeypatch.setattr(service_login, "_named_home", REAL_NAMED_HOME)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("RLX_HOME", raising=False)
+
+    monkeypatch.setenv("AISQUARE_HOME", str(tmp_path / ".rlx"))
+    assert service_login.home_tag() is None
+    assert service_login.label() == service_login.LABEL
+    assert service_login.unit_name() == "rlx.service"
+
+    monkeypatch.setenv("AISQUARE_HOME", str(tmp_path / "scratch-home"))
+    assert service_login.home_tag() is not None
+    assert service_login.label() != service_login.LABEL
+
+
+def test_the_default_homes_item_carries_no_home_variable(
+    login_os: LoginOs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whichever shell wrote it, the default home's item reads the same: PATH alone."""
+    monkeypatch.setenv("AISQUARE_HOME", str(paths.aisquare_home()))
+
+    agent = plistlib.loads(service_login.item_body("launchd"))
+
+    assert set(agent["EnvironmentVariables"]) == {"PATH"}
+
+
+def test_reset_all_keeps_the_choice_and_a_file_with_only_it_holds_nothing_to_reset(
+    login_os: LoginOs,
+) -> None:
+    """The manager's decision on #33: a settings reset must not re-enable a login item the
+    person turned off, as the next init would once [service] was forgotten."""
+    from aisquare.services import settings as settings_service
+
+    _rlx("service", "install")
+    _rlx("service", "uninstall")
+    settings_service.set_value("fleet.escape_key", "f11")
+
+    backup = settings_service.reset_settings()
+
+    assert backup is not None and "f11" in backup.read_text(encoding="utf-8")
+    assert _choice() is False
+    assert load_config().fleet.escape_key != "f11"
+    assert settings_service.anything_to_reset() is False
+    assert settings_service.reset_settings() is None
+
+
+# --- tester of #33 (#2110): B1, B2, m2b, and a job loaded from a file deleted since -----------
+
+
+def _broken_config() -> None:
+    path = paths.config_path()
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n[ui]\nthis is = not [toml\n", encoding="utf-8"
+    )
+
+
+def test_an_unreadable_config_touches_no_login_item_and_says_so(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """B1: "cannot read" read as undecided, so the installer's step and init added back an item
+    the person had turned off, then died in a traceback. Now nothing is added, refreshed or
+    taken away, one line says why, and the installer's step still exits 0."""
+    _rlx("service", "install")
+    _rlx("service", "uninstall")
+    _broken_config()
+    login_os.calls.clear()
+
+    by_installer = _rlx("service", "install", "--if-undecided")
+    init = _init(tmp_path / "project")
+    explicit = _rlx("service", "install")
+
+    assert by_installer.exit_code == 0, by_installer.output
+    assert init.exit_code == 0, init.output
+    for said in (by_installer.output, init.output):
+        assert "login item was left as it is: config.toml cannot be read" in said, said
+        assert "Traceback" not in said, said
+    assert explicit.exit_code != 0 and "Traceback" not in explicit.output, explicit.output
+    assert "config.toml cannot be read" in explicit.output, explicit.output
+    assert not _plist().exists()
+    assert login_os.calls == []
+
+
+def test_init_reinit_keeps_the_choice_and_adds_back_no_item(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """B2 and the manager's ruling: --reinit saved a fresh config, [service] with it, and the
+    same init then found nothing chosen and added the item back. The choice is carried now."""
+    _init(tmp_path / "project")
+    _rlx("service", "uninstall")
+    login_os.calls.clear()
+
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(tmp_path / "project"))
+
+    assert again.exit_code == 0, again.output
+    assert _choice() is False
+    assert not _plist().exists() and login_os.changes() == []
+    assert f"does not start at login: {service_login.OFF_IN_RLX}" in again.output
+
+
+def test_init_reinit_keeps_a_removal_in_the_os(tmp_path: Path, login_os: LoginOs) -> None:
+    _init(tmp_path / "project")
+    _plist().unlink()
+    login_os.calls.clear()
+
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(tmp_path / "project"))
+
+    assert again.exit_code == 0, again.output
+    assert _choice() is True and not _plist().exists() and login_os.changes() == []
+
+
+def test_uninstall_boots_out_a_job_whose_file_was_deleted_since(login_os: LoginOs) -> None:
+    """Loaded from a file deleted since, the job runs until logout unless booted out."""
+    _rlx("service", "install")
+    _plist().unlink()
+    login_os.calls.clear()
+
+    result = _rlx("service", "uninstall")
+
+    assert result.exit_code == 0, result.output
+    assert ("launchctl", "bootout", TARGET) in login_os.changes()
+
+
+def test_a_switch_macos_keeps_off_says_where_to_turn_it_on_and_offers_no_undo(
+    login_os: LoginOs,
+) -> None:
+    """m2b: turned on while Login Items keeps it off, it said "rlx starts at login · Undo", and
+    that ctrl+z would have taken the item away."""
+    login_os.reply("launchctl", "print-disabled", DOMAIN, said=DISABLED)
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[bool, str, list[str]]:
+        await _on_preferences(pilot, host)
+        _switch(host).value = True
+        await _until(pilot, _plist().is_file, "the agent written")
+        await _until(
+            pilot,
+            lambda: any(message == service_login.TURN_IT_ON_THERE for message, _ in host.notices),
+            "where to turn it on",
+        )
+        await pilot.press("ctrl+z")
+        await pilot.pause()
+        return _switch(host).value, _about(host), [message for message, _ in host.notices]
+
+    on, line, notices = drive(scenario)
+
+    assert on is False
+    assert line == f"Off: {service_login.OFF_IN_LOGIN_ITEMS}."
+    assert not any("Undo" in notice for notice in notices), notices
+    assert ("launchctl", "bootout", TARGET) not in login_os.calls
+    assert _plist().is_file()

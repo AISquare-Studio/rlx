@@ -139,9 +139,14 @@ def initialize(
 
     discarded: str | None = None
     unreadable: str | None = None
+    # The rlx service's login choice (S2): carried across a reset, as Reset all carries it,
+    # or the init after it would add back a login item the person turned off (#33's ruling).
+    start_at_login: bool | None = None
     if reinit and paths.config_path().exists():
         try:
-            existing: ExplainabilitySettings | None = load_config().explainability
+            loaded = load_config()
+            existing: ExplainabilitySettings | None = loaded.explainability
+            start_at_login = loaded.service.start_at_login
         except Exception as exc:
             # Nothing can say what it configures, so the reset needs consent
             # (UnreadableConfigResetRefused).
@@ -154,7 +159,9 @@ def initialize(
                 raise ExplainabilityResetRefused(discarded)
 
     if reinit or not paths.config_path().exists():
-        save_config(AppConfig(), discard_unreadable=unreadable is not None)
+        fresh = AppConfig()
+        fresh.service.start_at_login = start_at_login
+        save_config(fresh, discard_unreadable=unreadable is not None)
 
     project = ProjectInfo(id=project_id_for(root), root=root, linked_repos=[])
     with store_session() as store:
@@ -784,6 +791,13 @@ def lacks_refresh_hooks(release: str) -> bool:
     return install_route.is_newer(FIRST_REFRESH_HOOKS, release) is True
 
 
+def lacks_the_service(release: str) -> bool:
+    """Whether ``release`` predates ``rlx service`` (:data:`FIRST_SERVICE`): its login item
+    would run ``service run --at-login`` there, exit 2 on "No such command", and be started
+    again by the OS every few seconds at every login (review of #33, M1)."""
+    return install_route.is_newer(FIRST_SERVICE, release) is True
+
+
 def lacks_agent_hooks(agent: str, release: str) -> bool:
     """Whether ``release`` has no hooks for ``agent`` to write: one up to the adapter's
     ``capabilities.hookless_through`` (Codex's 0.8.2). Claude Code's have been there since
@@ -1256,9 +1270,13 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     if plan.reason is not None:
         raise UpgradeRefused(plan.reason, plan.command)
     unkept = _keep_the_numbers(plan)
-    from aisquare.services import service_host  # before the installer: nothing is imported after
+    # Before the installer: nothing is imported after.
+    from aisquare.services import service_host, service_login
 
     service_ran = _stop_the_service(plan.command)
+    # Into a release with no service, its login item goes first: there it would run a command
+    # that release does not have at every login, and nothing there could take it away (M1).
+    item_said = _no_login_item_for(service_login, plan.target or plan.latest_version)
     code = install_route.run_installer(plan.argv, env=plan.env, to_stderr=to_stderr)
     if code != 0:
         # Asked too: uv resolves before it replaces anything (measured, uv 0.12.19), so a
@@ -1271,15 +1289,20 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
             exit_code=code,
             version=kept,
             problem=f"{plan.argv[0]} exited {code}",
-            notes=(service_said,) if service_said else (),
+            notes=tuple(note for note in (item_said, service_said) if note),
         )
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
+    if version is not None and lacks_the_service(version):
+        item_said = item_said or _no_login_item_for(service_login, version)
+    else:
+        # Only ever refreshed, never made (design #1875): a new path to rlx, a new PATH.
+        service_login.refresh_the_item()
     service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
     if problem is not None:
-        said = (service_said,) if service_said else ()
+        said = tuple(note for note in (item_said, service_said) if note)
         return UpgradeReport(plan, exit_code=code, version=version, problem=problem, notes=said)
-    notes: list[str] = [service_said] if service_said else []
+    notes: list[str] = [note for note in (item_said, service_said) if note]
     latest = plan.latest_version
     moved_elsewhere = latest is not None and not install_route.same_version(version or "", latest)
     pypis = plan.latest is not None and plan.latest.cutoff is None
@@ -1305,6 +1328,22 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         return UpgradeReport(plan, exit_code=code, version=version, notes=tuple(notes))
     hooks = tuple(_refresh(site, plan.route.facts) for site in plan.refresh)
     return UpgradeReport(plan, exit_code=code, version=version, hooks=hooks, notes=tuple(notes))
+
+
+def _no_login_item_for(service_login: ModuleType, release: str | None) -> str | None:
+    """The rlx service's login item taken away, and its choice forgotten, on a move to
+    ``release`` when it has no service (:func:`lacks_the_service`); what to say of it, or
+    ``None`` when there was nothing to take away or ``release`` has the service."""
+    if release is None or not lacks_the_service(release):
+        return None
+    service = service_login.SERVICE
+    try:
+        gone = service_login.forget_at_login()
+    except service_login.LoginError as exc:
+        return f"the {service}'s login item could not be taken away ({exc}): {release} has none"
+    if not gone:
+        return None
+    return f"the {service} no longer starts at login: {release} has no {service}"
 
 
 def _stop_the_service(command: str) -> bool:
@@ -1466,6 +1505,9 @@ FIRST_ENV_FILES = "0.8.1"
 #: The first release whose store keeps the accounts' order in a table of its own
 #: (``account_rank``, store v50): a release before it orders them by what it writes itself.
 FIRST_ACCOUNT_RANK = "0.10.0"
+#: The first release with ``rlx service`` (S1) and its login item (S2): a release before it
+#: has no command for the item to run, and none to take it away.
+FIRST_SERVICE = "0.10.2.dev0"
 
 
 def refresh_hooks_argv(agent: str = HOOK_AGENT) -> tuple[str, ...]:

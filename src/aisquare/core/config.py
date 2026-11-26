@@ -18,6 +18,7 @@ import errno
 import os
 import re
 import shutil
+import stat
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -1418,6 +1419,9 @@ def holds_a_setting(path: Path | None = None) -> bool:
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
         return True
     _migrate(data)
+    # [service] is not a reset's to undo (``services.settings.reset_settings`` keeps it): a
+    # file that holds nothing else holds no setting a reset would undo.
+    data.pop("service", None)
     return bool(_overrides(data, system_defaults()))
 
 
@@ -1859,11 +1863,17 @@ def reset_config(path: Path | None = None) -> Path | None:
     Through a symlink the file it points at is copied aside and emptied, never the link
     moved: moved, the next save would put a regular file where it was, the severed
     dotfiles link :func:`save_config` takes care never to make.
+
+    But ``[service]``, which the reset leaves in place (:func:`_kept_by_a_reset`): the
+    person's choice about the rlx service's login item, not a setting of rlx's. Forgotten,
+    the next ``rlx init`` would add back an item they had turned off (the manager's decision
+    on #33). The new file holds that table and ``config_version`` alone.
     """
     target = path or paths.config_path()
     written = Path(os.path.realpath(target))
     if not written.is_file() or not holds_a_setting(target):
         return None
+    kept = _kept_by_a_reset(written)
     stamp = datetime.now(UTC).strftime(_BACKUP_STAMP)
     backup = target.with_name(f"{target.name}.bak-{stamp}")
     counter = 1
@@ -1876,4 +1886,22 @@ def reset_config(path: Path | None = None) -> Path | None:
         # copy2: the mode too, so a config tightened to 0600 is not copied out readable.
         despite_windows_contention(lambda: shutil.copy2(written, backup))
         write_replacing(written, "", keep_mode=True)
+    if kept:
+        body = tomli_w.dumps({"config_version": CONFIG_VERSION, "service": kept})
+        write_replacing(written, body, keep_mode=True)
+        with contextlib.suppress(OSError):  # the mode the user's file had, 0600 kept 0600
+            written.chmod(stat.S_IMODE(backup.stat().st_mode))
     return backup
+
+
+def _kept_by_a_reset(written: Path) -> dict[str, Any]:
+    """What of the file at ``written`` a reset leaves in place: its ``[service]`` table's
+    ``start_at_login``, when it holds one; nothing from a file that does not parse."""
+    try:
+        data = _parse_toml(despite_windows_contention(written.read_bytes))
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return {}
+    service = data.get("service")
+    if not isinstance(service, dict) or not isinstance(service.get("start_at_login"), bool):
+        return {}
+    return {"start_at_login": service["start_at_login"]}

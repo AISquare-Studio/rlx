@@ -3941,8 +3941,12 @@ def test_the_refresh_runs_after_init_only_with_an_agent(
     result = sh(f"parse_args {flags}; DRY_RUN=0; init_home", path=f"{cli}:{base_path(tmp_path)}")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    # Less the probe of whether this release has the rlx service's login item (S2, #33).
-    ran = [line for line in calls.read_text(encoding="utf-8").splitlines() if line != "init --help"]
+    # Less the rlx service's login item (S2, #33): its probe and its step.
+    ran = [
+        line
+        for line in calls.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("service install")
+    ]
     assert ran[0].startswith("init --local --yes"), ran
     assert (ran[1:] == ["agents refresh-hooks --recorded"]) is refreshed, ran
     assert any("refresh-hooks" in line for line in ran) is refreshed, ran
@@ -4777,13 +4781,12 @@ def test_the_word_a_line_tells_a_person_to_type_is_rlx_while_rlx_is_ours(
 
 
 def _an_init(tmp_path: Path, *, has_no_service: bool) -> tuple[Path, Path]:
-    """An ``aisquare`` that logs what it is asked, and whose init does or does not have
-    --no-service (0.10.2's, or a release before it)."""
+    """An ``aisquare`` that logs what it is asked, and that has the rlx service's login item
+    (0.10.2's: ``service install --help`` exits 0) or not (a release before it, exit 2)."""
     calls = tmp_path / "calls.log"
-    helped = "  --no-service  Do not set the rlx service to start at login"
     body = (
         f'printf "%s\\n" "$*" >> "{calls}"\n'
-        f'[ "$*" = "init --help" ] && printf "%s\\n" "{helped if has_no_service else ""}"\n'
+        f'[ "$*" = "service install --help" ] && exit {0 if has_no_service else 2}\n'
         "exit 0"
     )
     return stub_dir(tmp_path, "cli", "aisquare", body=body), calls
@@ -4819,20 +4822,38 @@ def test_the_installer_sets_the_service_at_login_unless_no_service_says_not_to(
         assert ran.index("service install --if-undecided") > ran.index(init), ran
 
 
-@pytest.mark.parametrize(
-    ("flags", "line"),
-    [
-        ("", "  start    the rlx service, now and at each login (unless turned off before)\n"),
-        (" --no-service", "  skip     the rlx service at login (--no-service)\n"),
-    ],
-    ids=["by-default", "no-service"],
+_STARTS = "  start    the rlx service, now and at each login (unless turned off before)\n"
+_NAMED = (
+    "  skip     the rlx service at login (a home RLX_HOME or AISQUARE_HOME names: "
+    "`rlx service install` there sets it)\n"
 )
-def test_the_plan_says_the_service_starts_at_login(tmp_path: Path, flags: str, line: str) -> None:
+
+
+@pytest.mark.parametrize(
+    ("flags", "named", "line"),
+    [
+        ("", "", _STARTS),
+        (" --no-service", "", "  skip     the rlx service at login (--no-service)\n"),
+        ("", "{home}/.rlx", _STARTS),
+        ("", "{home}/scratch-home", _NAMED),
+    ],
+    ids=["by-default", "no-service", "the-default-home-by-name", "a-named-home"],
+)
+def test_the_plan_says_the_service_starts_at_login(
+    tmp_path: Path, flags: str, named: str, line: str
+) -> None:
+    """The plan promises the login item only where it is set up by itself: the default home,
+    named by its own path or not (review of #33: not a home a variable names elsewhere)."""
     home = tmp_path / "home"
     home.mkdir()
     result = sh(
         f"main --dry-run --yes --no-project --offline --no-agent --no-system-deps{flags}",
-        env={"AISQUARE_INSTALL_VERSION": "", "HOME": str(home), "AISQUARE_HOME": ""},
+        env={
+            "AISQUARE_INSTALL_VERSION": "",
+            "HOME": str(home),
+            "AISQUARE_HOME": named.format(home=home),
+            "RLX_HOME": "",
+        },
         path=f"{_machine(tmp_path, _ABSENT)}:{base_path(tmp_path)}",
     )
 

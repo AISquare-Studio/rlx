@@ -292,6 +292,16 @@ aisquare_home_dir() {
     fi
     printf '%s' "${_ah_dir%/}"
 }
+
+# Whether RLX_HOME or AISQUARE_HOME names a home other than the default one (~/.rlx, or an
+# existing ~/.aisquare): no login item is set up for that home by itself (S2, #33).
+named_home_elsewhere() {
+    _nh_named=${RLX_HOME:-${AISQUARE_HOME:-}}
+    [ -n "$_nh_named" ] || return 1
+    _nh_named=${_nh_named%/}
+    [ "$_nh_named" != "$HOME/.rlx" ] && [ "$_nh_named" != "$HOME/.aisquare" ]
+}
+
 aisquare_home_shown() {
     shown_path "$(aisquare_home_dir)"
 }
@@ -1400,10 +1410,12 @@ banner() {
     # Its own line: init connects the hooks with or without a project, and not
     # at all under --no-agent.
     [ "$WANT_AGENT" = 1 ] && _plan="$_plan$_bn_nl  connect  $(agents_connected_shown) hooks"
-    if [ "$WANT_SERVICE" = 1 ]; then
-        _plan="$_plan$_bn_nl  start    the rlx service, now and at each login (unless turned off before)"
-    else
+    if [ "$WANT_SERVICE" = 0 ]; then
         _plan="$_plan$_bn_nl  skip     the rlx service at login (--no-service)"
+    elif named_home_elsewhere; then
+        _plan="$_plan$_bn_nl  skip     the rlx service at login (a home RLX_HOME or AISQUARE_HOME names: \`rlx service install\` there sets it)"
+    else
+        _plan="$_plan$_bn_nl  start    the rlx service, now and at each login (unless turned off before)"
     fi
 
     # As text: as the format a % in a path was a conversion, and under %b a \c
@@ -2528,18 +2540,19 @@ codex_installer_sh() {
 # 15  init (§3.4) — NEVER --reinit
 # ---------------------------------------------------------------------------
 
+# Whether the installed aisquare has the rlx service's login item (0.10.2 on): its init
+# has --no-service, and `service install` its --if-undecided. Asked by the exit code, never
+# by grepping the help, which Rich shortens to `--no-…` on a terminal under 60 columns.
+has_the_login_item() {
+    aisquare service install --help >/dev/null 2>&1
+}
+
 # A tilde inside quotes does not expand — which is exactly what is wanted here:
 # these strings are DISPLAY TEXT telling a person where things went, and `~` is
 # how a person writes that. shellcheck cannot tell a path being used from a path
 # being described, so the rule is switched off for the printing functions only
 # (never file-wide, where a real `cd "~/x"` bug would then hide).
 # shellcheck disable=SC2088
-# Whether the installed aisquare has the rlx service's login item (0.10.2 on): its init
-# has --no-service, and `service install` its --if-undecided.
-has_the_login_item() {
-    aisquare init --help 2>/dev/null | grep -q -e '--no-service'
-}
-
 init_home() {
     step "Setting up $(aisquare_home_shown)"
 

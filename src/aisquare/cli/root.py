@@ -56,7 +56,7 @@ def init(
         typer.Option(
             "--reinit",
             help="Re-run setup, resetting config.toml to defaults. Discards role "
-            "bindings made with team bind.",
+            "bindings made with team bind; keeps whether the rlx service starts at login.",
         ),
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Answer yes to every prompt.")] = False,

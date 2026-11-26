@@ -36,7 +36,8 @@ def reset_settings() -> Path | None:
 
     ``None`` when there was nothing to reset — no file, or one that holds no setting —
     and nothing moved: every setting is at its default already. See
-    ``core.config.reset_config``.
+    ``core.config.reset_config``, which keeps ``[service]``: the person's choice about the
+    rlx service's login item (the manager's decision on #33).
     """
     return core_config.reset_config()
 

@@ -120,7 +120,8 @@ when you log in, the one at login exits quietly, and is not started again either
 One login item per home. Only the default home's is set up by itself. A home named by `RLX_HOME`
 or `AISQUARE_HOME` (a scratch home, a test's) gets one only from `rlx service install` run with
 that variable set: its item is `studio.aisquare.rlx.service.<8 hex>` (`rlx-<8 hex>.service` on
-Linux), so two homes never share one. `rlx init` sets nothing up under CI, and says so; the
+Linux), so two homes never share one. A variable that names the default home's own path, as the
+captain's windows are given, still means the default home and its one item. `rlx init` sets nothing up under CI, and says so; the
 installers still do, since installing is your act.
 
 ### Turning it off
@@ -140,8 +141,11 @@ PATH), never make one. So a removal in the OS's settings stays removed. Only `rl
 install`, or the switch in App settings, adds it back; on macOS, an item turned off under Login
 Items has to be turned on there, and `rlx service install` says so. `rlx init --no-service`, and
 the installers' `--no-service`, leave it off from the start. App settings' *Reset all settings*
-forgets this choice with every other one, so the next `rlx init` or installer run sets it up
-again, as on a new install. `rlx uninstall` takes the login item away too.
+and `rlx init --reinit` keep this choice: it is about a login item, not a setting of rlx's.
+While `config.toml` cannot be read, rlx leaves the login item as it is (it adds none, refreshes
+none and takes none away) and says why. `rlx uninstall` takes the
+login item away too, and so does `rlx upgrade` to a release before the service (0.10.1 and
+earlier), which has no command for it to run and none to take it away.
 
 `rlx service status` says whether it starts at login, and if not, why.
 

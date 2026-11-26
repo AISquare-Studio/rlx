@@ -19,6 +19,7 @@ import io
 import itertools
 import json
 import os
+import plistlib
 import re
 import sys
 from collections.abc import Iterator, Mapping
@@ -4647,6 +4648,28 @@ def test_a_move_to_a_release_with_no_service_leaves_it_stopped_and_says_so(
     monkeypatch.setattr(service_host, "stop_service", lambda **_: True)
     monkeypatch.setattr(service_host, "start_service", lambda **kw: started.append(kw))
 
+    # Set to start at login (S2, #33): on that release, its item would run a command it does
+    # not have at every login, and the OS would start it again every few seconds (M1).
+    from aisquare.services import service_login
+
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    assert item.is_file()
+    forget = service_login.forget_at_login
+    install = install_route.run_installer
+    order: list[str] = []
+
+    def forget_in_order() -> bool:
+        order.append("forget")
+        return forget()
+
+    def install_in_order(argv: Any, **kw: Any) -> int:
+        order.append("install")
+        return install(argv, **kw)
+
+    monkeypatch.setattr(service_login, "forget_at_login", forget_in_order)
+    monkeypatch.setattr(install_route, "run_installer", install_in_order)
+
     result = runner.invoke(app, ["--json", "upgrade", "--yes"])
 
     assert result.exit_code == 0, result.output
@@ -4654,3 +4677,30 @@ def test_a_move_to_a_release_with_no_service_leaves_it_stopped_and_says_so(
     notes = _one_object(result.stdout)["notes"]
     said = f"the rlx service stays stopped: {machine.new_version} has no rlx service"
     assert said in notes, notes
+    assert not item.exists(), "the login item goes with the move back"
+    assert service_login.read_choice() is None
+    assert order[:2] == ["forget", "install"], order
+    gone = f"the rlx service no longer starts at login: {machine.new_version} has no rlx service"
+    assert gone in notes, notes
+
+
+def test_a_move_forward_refreshes_the_login_item_and_keeps_it(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every path but an explicit install only refreshes the login item (design #1875): the
+    upgrade rewrites one that is there with the PATH it runs under, and leaves the choice."""
+    from aisquare.services import service_login
+
+    machine.latest = LatestRelease("0.10.2")
+    machine.new_version = "0.10.2"
+    monkeypatch.setenv("PATH", os.pathsep.join(("/opt/before", "/usr/bin")))
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    monkeypatch.setenv("PATH", os.pathsep.join(("/opt/after", "/usr/bin")))
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    agent = plistlib.loads(item.read_bytes())
+    assert agent["EnvironmentVariables"]["PATH"] == os.pathsep.join(("/opt/after", "/usr/bin"))
+    assert service_login.read_choice() is True

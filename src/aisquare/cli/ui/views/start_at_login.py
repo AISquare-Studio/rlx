@@ -10,6 +10,8 @@ Items reads as off. What it writes goes through ``services.service_login``, as
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
@@ -17,7 +19,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Label, Static, Switch
 from textual.worker import Worker, WorkerState
 
-from aisquare.cli.ui.save_model import page_of
+from aisquare.cli.ui.save_model import SAVED_SECONDS, page_of
 from aisquare.core.version import PRODUCT_NAME
 from aisquare.services import service_login
 
@@ -38,11 +40,21 @@ ON = (
     "usage reads go on with no window open."
 )
 TURNED_ON = f"{PRODUCT_NAME} starts at login"
-TURNED_OFF = f"{PRODUCT_NAME} no longer starts at login; the service running now keeps going"
+TURNED_OFF = f"{PRODUCT_NAME} no longer starts at login, and the service it started stops"
 
 
 def off_line(why: str | None) -> str:
     return f"Off: {why}." if why else "Off."
+
+
+class Written(NamedTuple):
+    """What a write of the switch's left: asked on or off, as an undo or not, how it stands
+    after (or why it could not be done), and what the OS's answer adds."""
+
+    on: bool
+    undo: bool
+    outcome: service_login.AtLogin | str
+    notes: tuple[str, ...] = ()
 
 
 class StartAtLogin(Vertical):
@@ -99,15 +111,16 @@ class StartAtLogin(Vertical):
         self._start_at_login_set(event.value, undo=False)
 
     def _start_at_login_set(self, on: bool, *, undo: bool) -> None:
-        def start_at_login_written() -> tuple[bool, bool, service_login.AtLogin | str]:
+        def start_at_login_written() -> Written:
             try:
                 if on:
-                    return on, undo, service_login.register_at_login().state
-                return on, undo, service_login.unregister_at_login()
+                    done = service_login.register_at_login()
+                    return Written(on, undo, done.state, done.notes)
+                return Written(on, undo, service_login.unregister_at_login())
             except service_login.LoginError as exc:
-                return on, undo, str(exc)
+                return Written(on, undo, str(exc))
             except OSError as exc:  # config.toml that cannot be written: said, as a field's is
-                return on, undo, f"could not save the choice: {exc.strerror or exc}"
+                return Written(on, undo, f"could not save the choice: {exc.strerror or exc}")
 
         self.run_worker(
             start_at_login_written,
@@ -141,9 +154,9 @@ class StartAtLogin(Vertical):
         if isinstance(result, service_login.AtLogin):
             self._paint(result)
             return
-        if not isinstance(result, tuple):
+        if not isinstance(result, Written):
             return
-        on, undo, outcome = result
+        on, outcome = result.on, result.outcome
         page = page_of(self)
         if isinstance(outcome, str):
             self._paint_failed(outcome)
@@ -152,7 +165,13 @@ class StartAtLogin(Vertical):
         if page is None:
             return
         page.accept(self.query_one(f"#{SWITCH}", Switch))
-        if undo:
+        if on and not outcome.on:
+            # In place, but the OS keeps it off (macOS's Login Items): said where to turn it on,
+            # and nothing to take back, which would take the item away (tester of #33, m2b).
+            said = " · ".join(result.notes) or off_line(outcome.why_off)
+            self.app.notify(said, timeout=SAVED_SECONDS, markup=False)
+            return
+        if result.undo:
             return
         page.kept(
             LABEL,
