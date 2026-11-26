@@ -388,14 +388,16 @@ jobs:
           shasum -a 256 -c rlxd-SHA256SUMS
 
       # --clobber, as installers.yml's, so a rerun of a failed job replaces what it
-      # attached.
+      # attached. Only an explicit "false" uploads: a published release's event gives
+      # one, and so does dry_run=false by hand. Anything else, an empty or unexpected
+      # value included, is a dry run, so this step fails closed.
       - name: Upload to the release (a dry run prints it)
         working-directory: r
         run: |
           files=(rlxd-*.tar.gz rlxd-*.zip rlxd-SHA256SUMS)
           cmd=(gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY")
-          if [ "$DRY_RUN" = true ]; then
-            echo "DRY RUN, nothing attached. Would run: ${cmd[*]}"
+          if [ "$DRY_RUN" != false ]; then
+            echo "DRY RUN (dry_run=$DRY_RUN), nothing attached. Would run: ${cmd[*]}"
             {
               echo "## Dry run: nothing attached to $TAG"
               echo '```'
