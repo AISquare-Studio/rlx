@@ -6,9 +6,6 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Write};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{TestHome, assert_valid, eventually, finish, kill_hard};
@@ -560,44 +557,43 @@ fn a_stream_without_follow_ends_where_the_stream_was_when_it_was_asked_for() {
     assert_eq!(end.data().unwrap()["seq"], head);
 }
 
-/// A connection written byte by byte, for frames rlxd-client would not send, and read
-/// on a thread, so a line that never comes fails the test rather than hang it.
+/// A connection written byte by byte, for frames rlxd-client would not send. It is
+/// tokio's, whose socket and pipe client can read and write at once (a synchronous
+/// Windows pipe cannot), and every read has a time limit, so a line that never comes
+/// fails the test rather than hang it.
 struct Raw {
-    writer: RawStream,
-    lines: mpsc::Receiver<String>,
+    runtime: tokio::runtime::Runtime,
+    reader: tokio::io::BufReader<tokio::io::ReadHalf<RawStream>>,
+    writer: tokio::io::WriteHalf<RawStream>,
 }
 
 #[cfg(unix)]
-type RawStream = std::os::unix::net::UnixStream;
+type RawStream = tokio::net::UnixStream;
 #[cfg(windows)]
-type RawStream = std::fs::File;
+type RawStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 impl Raw {
     fn open(home: &TestHome) -> Self {
         let home = Home::at(home.root());
-        #[cfg(unix)]
-        let stream = RawStream::connect(home.socket()).unwrap();
-        #[cfg(windows)]
-        let stream = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(home.pipe_name())
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        let reader = BufReader::new(stream.try_clone().unwrap());
-        let (to, lines) = mpsc::channel();
-        thread::spawn(move || {
-            for line in reader.lines() {
-                let Ok(line) = line else { return };
-                if to.send(line).is_err() {
-                    return;
-                }
-            }
-        });
-        let token = std::fs::read_to_string(home.token()).unwrap();
+        #[cfg(unix)]
+        let stream = runtime.block_on(RawStream::connect(home.socket())).unwrap();
+        #[cfg(windows)]
+        let stream = runtime
+            .block_on(async {
+                tokio::net::windows::named_pipe::ClientOptions::new().open(home.pipe_name())
+            })
+            .unwrap();
+        let (reader, writer) = tokio::io::split(stream);
         let mut raw = Self {
-            writer: stream,
-            lines,
+            runtime,
+            reader: tokio::io::BufReader::new(reader),
+            writer,
         };
+        let token = std::fs::read_to_string(home.token()).unwrap();
         let hello = json!({"id": 1, "method": "hello", "params": {"token": token.trim(),
             "protocol_version": 1, "client": "raw", "client_version": "0", "role": "cli",
             "capabilities": []}});
@@ -607,16 +603,28 @@ impl Raw {
     }
 
     fn write(&mut self, text: &str) {
-        self.writer.write_all(text.as_bytes()).unwrap();
-        self.writer.flush().unwrap();
+        use tokio::io::AsyncWriteExt;
+        let Self {
+            runtime, writer, ..
+        } = self;
+        runtime.block_on(async {
+            writer.write_all(text.as_bytes()).await.unwrap();
+            writer.flush().await.unwrap();
+        });
     }
 
     /// The next line rlxd sends, within 10 s.
-    fn next(&self) -> Value {
-        let line = self
-            .lines
-            .recv_timeout(Duration::from_secs(10))
-            .expect("rlxd sent a line within 10 s");
+    fn next(&mut self) -> Value {
+        use tokio::io::AsyncBufReadExt;
+        let Self {
+            runtime, reader, ..
+        } = self;
+        let mut line = String::new();
+        let read = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line)).await
+        });
+        let length = read.expect("rlxd sent a line within 10 s").unwrap();
+        assert!(length > 0, "rlxd closed the connection");
         serde_json::from_str(&line).unwrap()
     }
 }
