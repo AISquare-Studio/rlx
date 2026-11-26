@@ -1933,3 +1933,131 @@ def test_an_import_that_replaced_a_persona_offers_no_undo_that_would_lose_it(
     assert not any("Undo" in message for message, _ in notices)
     assert ("Nothing to undo here", "information") in notices
     assert still_there, "ctrl+z left the persona the import made"
+
+
+async def _import_through_the_dialog(pilot: Pilot[None], name: str, *, force: bool) -> None:
+    """Import ``name`` as the Personas tab's *Import* does (the service is scripted)."""
+    await press(pilot, "#persona-import")
+    dialog = await wait_for(pilot, ImportPersonaScreen)
+    dialog.query_one("#import-source", Input).value = f"./skills/{name}"
+    dialog.query_one("#import-force", Switch).value = force
+    await pilot.pause()
+    await press(pilot, "#import-submit")
+    await settle(pilot)
+
+
+def test_an_import_over_one_this_page_imported_leaves_no_undo_that_removes_it(
+    project: ProjectInfo,
+    catalogue: dict[str, Path],
+    skills: Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tester of #24 (#1778, A): fresh-one imported, then imported again with force over
+    it. The first import's Undo (remove what it made) stayed on the page, and ctrl+z removed
+    the second import too: the persona was gone. The forced import drops the undos that would
+    act on what it replaced; ctrl+z has nothing to take back, and fresh-one stays, as forced."""
+    second = skill_text("Fresh, the second.")
+
+    def answer(source: str, **options: object) -> personas_service.ImportResult:
+        if options.get("force"):
+            directory = user_layer() / "fresh-one"
+            (directory / "SKILL.md").write_text(second, encoding="utf-8")
+            return result_for(directory).model_copy(update={"replaced": True})
+        return result_for(write_persona(user_layer(), "fresh-one", skill_text("Fresh.")))
+
+    monkeypatch.setattr(personas_service, "import_source", Recorder(answer))
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Any]:
+        await _import_through_the_dialog(pilot, "fresh-one", force=False)
+        await _import_through_the_dialog(pilot, "fresh-one", force=True)
+        tab(host).focus()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        return [[m for m, _ in host.notices]]
+
+    [said] = drive(scenario, project=project)
+    skill = user_layer() / "fresh-one" / "SKILL.md"
+    assert skill.exists(), f"ctrl+z removed the forced import: {said}"
+    assert skill.read_text(encoding="utf-8") == second
+    assert said[-1] == "Nothing to undo here", said
+
+
+def test_an_import_over_a_new_persona_leaves_no_undo_that_writes_over_it(
+    project: ProjectInfo, repo: Path, skills: Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tester of #24 (#1778, B): pair-programmer made with + New and an edit saved, then
+    imported with force over it. ctrl+z wrote the New scaffold over the import (a SKILL.md of
+    neither), and again removed it. The forced import drops those undos: ctrl+z has nothing
+    to take back, and the import stays as it came."""
+    edited = skill_text("Pairs, edited.")
+    imported = skill_text("Pairs, imported.")
+
+    def answer(source: str, **options: object) -> personas_service.ImportResult:
+        directory = user_layer() / "pair-programmer"
+        (directory / "SKILL.md").write_text(imported, encoding="utf-8")
+        return result_for(directory).model_copy(update={"replaced": True})
+
+    monkeypatch.setattr(personas_service, "import_source", Recorder(answer))
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Any]:
+        await press(pilot, "#persona-new")
+        dialog = await wait_for(pilot, NewPersonaScreen)
+        dialog.query_one("#new-name", Input).value = "pair-programmer"
+        dialog.query_one("#new-description", Input).value = "Pairs, one keyboard."
+        await pilot.pause()
+        await press(pilot, "#new-create")
+        editor = await wait_for(pilot, EditPersonaScreen)
+        area = editor.query_one("#edit-text", TextArea)
+        area.clear()
+        area.insert(edited)
+        button = editor.query_one("#edit-save", Button)
+        await settle_until_held(
+            pilot.app, lambda: not button.disabled, what="Save enabled on the valid text"
+        )
+        await press(pilot, "#edit-save")
+        await settle(pilot)
+        await _import_through_the_dialog(pilot, "pair-programmer", force=True)
+        tab(host).focus()
+        for _ in range(2):
+            await pilot.press("ctrl+z")
+            await settle(pilot)
+        return [[m for m, _ in host.notices]]
+
+    [said] = drive(scenario, project=project)
+    skill = user_layer() / "pair-programmer" / "SKILL.md"
+    assert skill.exists(), f"ctrl+z removed the forced import: {said}"
+    assert skill.read_text(encoding="utf-8") == imported, "the import as it came, not the scaffold"
+    assert said[-2:] == ["Nothing to undo here", "Nothing to undo here"], said
+
+
+def test_a_removed_persona_leaves_no_undo_that_acts_on_it(
+    project: ProjectInfo, repo: Path, skills: Recorder
+) -> None:
+    """A persona made here (+ New) and then removed: the New's Undo (remove what it made) would
+    act on nothing now and fail at every ctrl+z. Remove drops the undos for that persona:
+    ctrl+z has nothing to take back."""
+
+    async def scenario(pilot: Pilot[None], host: Host) -> list[Any]:
+        await press(pilot, "#persona-new")
+        dialog = await wait_for(pilot, NewPersonaScreen)
+        dialog.query_one("#new-name", Input).value = "pair-programmer"
+        dialog.query_one("#new-description", Input).value = "Pairs, one keyboard."
+        await pilot.pause()
+        await press(pilot, "#new-create")
+        await wait_for(pilot, EditPersonaScreen)
+        await pilot.press("escape")  # the editor closed, the scaffold kept
+        await settle(pilot)
+        await select_row(pilot, host, "user:pair-programmer")
+        await press(pilot, "#persona-remove")
+        await wait_for(pilot, ConfirmRemoveScreen)
+        await press(pilot, "#remove-confirm")
+        await settle(pilot)
+        tab(host).focus()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        return [[m for m, _ in host.notices]]
+
+    [said] = drive(scenario, project=project)
+    assert not (user_layer() / "pair-programmer").exists(), "the premise: removed"
+    assert said[-1] == "Nothing to undo here", said
+    assert not any(m.startswith("Not undone") for m in said), said

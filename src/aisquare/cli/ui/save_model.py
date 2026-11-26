@@ -54,6 +54,9 @@ class Change:
     what: str
     undo: Callable[[], object]
     """Puts the old value back; returns ``False`` when it could not (having said why)."""
+    key: object = None
+    """What it changed, for :meth:`SavesAsYouGo.forget` (a persona's layer and name): ``None``
+    when nothing else can make it stale."""
 
 
 class CommitInput(Input):
@@ -152,13 +155,23 @@ class SavesAsYouGo:
         assert isinstance(self, Widget), "SavesAsYouGo is mixed into a widget"
         return self.app
 
-    def kept(self, what: str, undo: Callable[[], object], *, said: str | None = None) -> None:
+    def kept(
+        self, what: str, undo: Callable[[], object], *, said: str | None = None, key: object = None
+    ) -> None:
         """A change is on disk: say so (``Saved <what>``, or the page's own ``said``), with the
-        key that takes it back, and remember how."""
-        self.changes.append(Change(what, undo))
+        key that takes it back, and remember how (by ``key``, what it changed, when a later
+        action can make the undo wrong: :meth:`forget`)."""
+        self.changes.append(Change(what, undo, key))
         self._app.notify(
             f"{said or f'Saved {what}'} · Undo: {UNDO_SAID}", timeout=SAVED_SECONDS, markup=False
         )
+
+    def forget(self, key: object) -> None:
+        """Every kept change to ``key`` dropped: an action that cannot be undone replaced what
+        they would put back (an import over a persona of that name, a persona removed), and
+        undoing them would act on what is there now: remove it, or write an older text over
+        it (the tester of #24, #1778)."""
+        self.changes[:] = [change for change in self.changes if change.key != key]
 
     def action_undo_change(self) -> None:
         """:data:`UNDO_KEY`: the page's last change taken back, on disk and on screen. An undo

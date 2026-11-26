@@ -508,13 +508,16 @@ class PersonasTab(SavesAsYouGo, Vertical):
         said = f"✓ imported {persona.name} ({result.engine})"
         if result.replaced:
             # It took the place of a persona of that name, which rlx keeps no copy of: ctrl+z
-            # removing the import would lose both, so this one is not offered.
+            # removing the import would lose both, so none is offered, and the page's earlier
+            # undos for that persona go too: each would act on the import now in its place.
+            self.forget((persona.layer, persona.name))
             self.notify(said, timeout=6, markup=False)
         else:
             self.kept(
                 f"the import of {persona.name}",
                 lambda: self._persona_take_back(persona.name, persona.layer),
                 said=said,
+                key=(persona.layer, persona.name),
             )
         for warning in result.warnings:
             self.notify(warning, severity="warning", timeout=8, markup=False)
@@ -549,7 +552,11 @@ class PersonasTab(SavesAsYouGo, Vertical):
         through the one writer (``services.personas.save``), when the text did change."""
         if before is None or self._skill_text(entry) in (None, before):
             return
-        self.kept(f"{entry.name}'s SKILL.md", lambda: self._persona_put_text(entry, before))
+        self.kept(
+            f"{entry.name}'s SKILL.md",
+            lambda: self._persona_put_text(entry, before),
+            key=(entry.layer, entry.name),
+        )
 
     def _persona_put_text(self, entry: Entry, text: str) -> bool:
         """Undo of an edit: ``text`` written back; whether it was."""
@@ -572,6 +579,7 @@ class PersonasTab(SavesAsYouGo, Vertical):
         self.kept(
             f"the new persona {created.name}",
             lambda: self._persona_take_back(created.name, created.layer),
+            key=(created.layer, created.name),
         )
         self.reload(select=f"{created.layer}:{created.name}")
         made = Entry(created.name, created.layer, created.path)
@@ -670,6 +678,7 @@ class PersonasTab(SavesAsYouGo, Vertical):
             except (PersonaError, OSError) as exc:
                 self.notify(dialogs.failure(exc), severity="error", timeout=8, markup=False)
             else:
+                self.forget((entry.layer, entry.name))  # their undos would act on nothing now
                 self.notify(f"✓ removed {removed}", timeout=6, markup=False)
             self.reload()
 
