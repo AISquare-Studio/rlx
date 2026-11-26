@@ -1403,10 +1403,19 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         )
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
-    service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
     if problem is not None:
+        service_said = (
+            _start_the_service_again(service_host, plan, version) if service_ran else None
+        )
         said = (service_said,) if service_said else ()
         return UpgradeReport(plan, exit_code=code, version=version, problem=problem, notes=said)
+    home = None
+    if plan.home_move is not None and not plan.backwards:
+        # The new install moves the home after it said its version, while the service is still
+        # stopped and before any hook is rewritten (#31): the service then starts on the home
+        # where it now is, and the sites are read again at their new places.
+        home = move_home_in(_new_install_script(plan.route.facts))
+    service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
     notes: list[str] = [service_said] if service_said else []
     latest = plan.latest_version
     moved_elsewhere = latest is not None and not install_route.same_version(version or "", latest)
@@ -1431,13 +1440,7 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         # A move back to a release before `agents refresh-hooks`: the plan left every site,
         # each saying so with its remedy.
         return UpgradeReport(plan, exit_code=code, version=version, notes=tuple(notes))
-    sites, home = plan.refresh, None
-    if plan.home_move is not None and not plan.backwards:
-        # The new install moves the home, after it said its version and before it rewrites
-        # any hook (#31): the sites are read again then, at their new places.
-        home = move_home_in(_new_install_script(plan.route.facts))
-        if home.moved:
-            sites = _sites_after_move(plan)
+    sites = _sites_after_move(plan) if home is not None and home.moved else plan.refresh
     hooks = tuple(_refresh(site, plan.route.facts) for site in sites)
     return UpgradeReport(
         plan, exit_code=code, version=version, hooks=hooks, notes=tuple(notes), home=home

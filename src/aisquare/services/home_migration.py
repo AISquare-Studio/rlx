@@ -562,6 +562,46 @@ def move_home(
     found = planned_move()
     if found is None:
         return None
+    stopped = _stop_the_service()
+    try:
+        moved = _move_quiet_home(found, drop_cache=drop_cache, say=say)
+    except (MigrationRefused, MigrationFailed) as exc:
+        if stopped:
+            exc.reason = f"{exc.reason}; {_start_the_service_again()}"
+            exc.args = (exc.reason,)
+        raise
+    if stopped:
+        moved.notes.append(_start_the_service_again())
+    return moved
+
+
+def _stop_the_service() -> bool:
+    """Stop the rlx service (``services.service_host``) for the move, as a quit request does:
+    whether one ran. It lives on the home the move renames, so the move stops it first and
+    starts it again after (the owner's brief, item 4), on the home where the move left it.
+    :class:`MigrationRefused` when it will not stop."""
+    from aisquare.services import service_host
+
+    try:
+        return service_host.stop_service()
+    except service_host.ServiceError as exc:
+        raise MigrationRefused(f"{exc}: the home was not moved") from exc
+
+
+def _start_the_service_again() -> str:
+    """Start the rlx service :func:`_stop_the_service` stopped, by this install: what the move
+    says of it."""
+    from aisquare.services import service_host
+
+    try:
+        service = service_host.start_service()
+    except service_host.ServiceError as exc:
+        return f"the {service_host.SERVICE} did not start again: {exc}"
+    return f"the {service_host.SERVICE} runs again (pid {service.pid})"
+
+
+def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None]) -> Moved:
+    """:func:`move_home` once the service is stopped: refused unless the home is quiet."""
     try:
         running = running_on_home()
     except Exception as exc:  # a home that cannot be told quiet is not moved

@@ -1095,3 +1095,103 @@ def test_an_install_rlx_does_not_upgrade_says_how_to_move_its_home(
     assert f"Move its home ({MOVE}) with: {prog.word()} move-home" in result.output.replace(
         "\n", " "
     )
+
+
+# --- the rlx service (#32): stopped for the move, started again after (the brief, item 4) --------
+
+
+@pytest.fixture
+def a_service(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The rlx service as the move meets it: running until asked to stop, then started again;
+    each ask kept, in order, beside each rename the move makes."""
+    from types import SimpleNamespace
+
+    from aisquare.services import service_host
+
+    calls: list[str] = []
+
+    def stop(*, timeout: float = 0) -> bool:
+        calls.append("stop")
+        return True
+
+    def start(*, timeout: float = 0, argv: Any = None) -> Any:
+        calls.append("start")
+        return SimpleNamespace(pid=4321)
+
+    real = home_migration._rename_once
+
+    def rename(source: Path, target: Path) -> None:
+        calls.append("rename")
+        real(source, target)
+
+    monkeypatch.setattr(service_host, "stop_service", stop)
+    monkeypatch.setattr(service_host, "start_service", start)
+    monkeypatch.setattr(home_migration, "_rename_once", rename)
+    return calls
+
+
+def test_the_move_stops_the_service_first_and_starts_it_again_after(
+    old_home: Path, user_home: Path, a_service: list[str]
+) -> None:
+    moved = home_migration.move_home()
+
+    assert moved is not None
+    assert a_service[0] == "stop" and a_service[-1] == "start", a_service
+    assert a_service.count("stop") == a_service.count("start") == 1
+    assert "rename" in a_service[1:-1], "every rename between the stop and the start"
+    assert "the rlx service runs again (pid 4321)" in moved.notes
+    assert paths.home_of() == (user_home / ".rlx", paths.NEW)
+
+
+def test_a_refused_move_starts_the_service_again_and_says_so(
+    old_home: Path, user_home: Path, a_service: list[str]
+) -> None:
+    named = _an_instance(old_home)
+
+    with pytest.raises(home_migration.MigrationRefused) as refused:
+        home_migration.move_home()
+
+    assert a_service == ["stop", "start"]
+    assert any(named in line for line in refused.value.running)
+    assert "the rlx service runs again (pid 4321)" in refused.value.reason
+    assert not os.path.lexists(user_home / ".rlx")
+
+
+def test_a_service_that_will_not_stop_refuses_the_move_and_nothing_moves(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from aisquare.services import service_host
+
+    def stuck(*, timeout: float = 0) -> bool:
+        raise service_host.ServiceError("the rlx service (pid 7) did not stop within 30 s")
+
+    monkeypatch.setattr(service_host, "stop_service", stuck)
+    before = _tree(old_home)
+
+    with pytest.raises(home_migration.MigrationRefused, match="did not stop within 30 s"):
+        home_migration.move_home()
+
+    assert _tree(old_home) == before and not os.path.lexists(user_home / ".rlx")
+
+
+def test_an_upgrade_starts_the_service_again_only_once_the_home_has_moved(
+    old_home: Path, user_home: Path, installed: Installed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upgrade stops the service before its installer (#32); it starts it again after the
+    new install moved the home, so it runs on ~/.rlx. Mutant: started again right after the
+    version check, it was running when the move looked, and the move refused."""
+    installed.latest = "0.10.3"
+    monkeypatch.setattr(lifecycle, "_stop_the_service", lambda command: True)
+
+    def start(service_host: Any, plan: Any, version: Any) -> str:
+        installed.captured.append(["rlx", "service", "start"])
+        return "the rlx service runs again (pid 9)"
+
+    monkeypatch.setattr(lifecycle, "_start_the_service_again", start)
+
+    result = CliRunner().invoke(app, ["upgrade", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    verbs = [argv[1:] for argv in installed.captured]
+    assert verbs.index(["--json", "move-home"]) < verbs.index(["service", "start"]), verbs
+    assert "✓ the home moved" in result.output
