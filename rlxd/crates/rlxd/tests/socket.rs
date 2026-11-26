@@ -76,6 +76,56 @@ fn events_socket_streams_from_an_rlxd_of_another_home() {
 }
 
 #[test]
+fn the_gate_checks_a_connection_through_call_socket_as_any_other() {
+    // Outside dev mode, the unsigned test client can't pair or be the gate through
+    // --socket either: pairing and the gate hello go to the rlxd at --socket.
+    let served = TestHome::new();
+    served.start();
+    let endpoint = Home::at(served.root()).endpoint();
+    let token = served.token();
+    let client = TestHome::new();
+    let as_app = |extra: &[&str]| {
+        let mut args = vec!["call", "--socket", &endpoint, "--token", &token];
+        args.extend_from_slice(extra);
+        client.rlxd(&args)
+    };
+    for extra in [
+        &["--as-app", "status"][..],
+        &["--role", "app", "--gate-credential", "made-up", "status"],
+        &["gate.pair"],
+    ] {
+        let run = as_app(extra);
+        assert_eq!(run.code(), Some(1), "{extra:?}: {run:?}");
+        assert_eq!(run.error_code(), "not_gate", "{extra:?}");
+    }
+    assert!(!served.gate_json().exists(), "nothing was paired");
+    assert_eq!(client.test_credential(), None);
+
+    // In dev mode, the test client pairs with that rlxd, keeps the credential in its own
+    // home, and is the gate there.
+    served.stop();
+    served.start_dev();
+    let run = as_app(&["--as-app", "status"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert_eq!(
+        run.data()["clients"]["app"],
+        1,
+        "the asking app counts itself"
+    );
+    assert!(
+        served.gate_json().exists(),
+        "paired with the rlxd at --socket"
+    );
+    assert!(client.test_credential().is_some());
+    assert!(
+        !client.gate_json().exists(),
+        "the client home has no gate of its own"
+    );
+    let run = as_app(&["--role", "app", "--gate-credential", "made-up", "status"]);
+    assert_eq!(run.error_code(), "not_gate");
+}
+
+#[test]
 fn call_socket_where_nothing_listens_is_not_running() {
     let home = TestHome::new();
     let nowhere = if cfg!(windows) {
@@ -190,6 +240,55 @@ mod deep {
         let run = home.rlxd(&["here", "--json"]);
         assert_eq!(run.code(), Some(3), "{run:?}");
         assert_eq!(text(&run.data()["socket"]), shown, "where it will listen");
+    }
+
+    #[test]
+    fn the_gate_holds_on_the_short_socket() {
+        let home = HomeAt::whose_socket_is(SOCKET_PATH_MAX + 1);
+        assert!(home.layout().uses_short_socket());
+        let gate_json = home.layout().gate();
+        let run = home.rlxd(&["serve", "--detach"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        assert_eq!(run.data()["gate"], "signed app only");
+        for args in [
+            &["call", "--as-app", "status"][..],
+            &[
+                "call",
+                "--role",
+                "app",
+                "--gate-credential",
+                "made-up",
+                "status",
+            ],
+            &["call", "gate.pair"],
+        ] {
+            let run = home.rlxd(args);
+            assert_eq!(run.code(), Some(1), "{args:?}: {run:?}");
+            assert_eq!(run.error_code(), "not_gate", "{args:?}");
+        }
+        assert!(!gate_json.exists(), "nothing was paired");
+
+        // Dev mode skips only the peer check: pairing and the credential still hold.
+        assert_eq!(home.rlxd(&["stop"]).code(), Some(0));
+        let run = home.rlxd(&["serve", "--detach", "--gate-dev-mode"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        let run = home.rlxd(&["call", "--as-app", "status"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        assert_eq!(run.data()["clients"]["app"], 1);
+        assert_eq!(
+            text(&run.data()["paths"]["socket"]),
+            home.layout().short_socket().display().to_string()
+        );
+        assert!(gate_json.exists());
+        let run = home.rlxd(&[
+            "call",
+            "--role",
+            "app",
+            "--gate-credential",
+            "made-up",
+            "status",
+        ]);
+        assert_eq!(run.error_code(), "not_gate");
     }
 
     #[test]

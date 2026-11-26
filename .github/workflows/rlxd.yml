@@ -53,9 +53,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     # The registry's interop tests skip where neither this nor RLXD_BIN is set (the
     # Python suite, a checkout with no uv). Here they must run: a missing uv or rlxd
-    # fails them.
+    # fails them. Likewise the gate's peer checks that need `sudo -n` (Linux) or an
+    # administrator (Windows) skip elsewhere, and must run here.
     env:
       RLXD_INTEROP_REQUIRED: "1"
+      RLXD_GATE_PEER_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -88,14 +90,49 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      # The macOS gate tests sign a helper with a self-signed identity. macOS 15's
+      # codesign finds identities only in keychains on the search list, which the tests
+      # never write (tests/macos_signing). So this throwaway runner lists a keychain of
+      # its own, and hands it to them.
+      - name: A keychain for the gate's signing tests (macOS)
+        if: runner.os == 'macOS'
+        working-directory: .
+        run: |
+          kc="$RUNNER_TEMP/rlxd-gate-test.keychain-db"
+          security create-keychain -p rlxd-gate-test "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p rlxd-gate-test "$kc"
+          existing=$(security list-keychains -d user | tr -d '"')
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$kc" $existing
+          echo "RLXD_GATE_TEST_KEYCHAIN=$kc" >> "$GITHUB_ENV"
+          echo "RLXD_GATE_TEST_KEYCHAIN_PASSWORD=rlxd-gate-test" >> "$GITHUB_ENV"
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The gate's peer tests build only with the test-identity feature.
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --locked
 
+      # 5.1: the gate's peer identity check, against helpers signed or built with a test
+      # identity that only the gate-test-requirement feature lets rlxd accept. Each test
+      # compiles to nothing on the other OSes.
+      - name: cargo test, the gate's peer checks (gate-test-requirement)
+        run: >-
+          cargo test -p rlxd --features gate-test-requirement --locked
+          --test gate_peer_macos --test gate_peer_linux --test gate_peer_windows
+
       - name: cargo build --release
         run: cargo build --workspace --release --locked
+
+      # 5.1: the shipped build's compiled-in requirement, which nothing can replace.
+      - name: the gate's compiled-in requirement (macOS, release)
+        if: runner.os == 'macOS'
+        run: cargo test --release -p rlxd --locked --test gate_peer_macos_release
 
       # --release reuses the build above rather than building gen-schemas again.
       - name: schemas/v1 matches rlxd-proto
@@ -268,8 +305,8 @@ jobs:
       # `ssh -N -L <local socket>:<host's socket>`, so nothing listens on TCP. The client
       # side is a home with no rlxd and no token: `socket` and the token come from `rlxd
       # here --start --show-token`, run inside the session. Through the forward: `status`,
-      # then an `rlxd events` stream that must live through a quiet wait and take rlxd's
-      # stop live. Two homes: ~/.aisquare, whose socket is its run/rlxd.sock, waiting 60 s,
+      # the gate refusing the unsigned test client (its peer is sshd), then an `rlxd
+      # events` stream that must live through a quiet wait and take rlxd's stop live. Two homes: ~/.aisquare, whose socket is its run/rlxd.sock, waiting 60 s,
       # and one too deep for that, served on its short socket in /tmp/rlxd-<uid>/.
       - name: rlxd's socket through an ssh direct-streamlocal forward
         working-directory: .
@@ -309,6 +346,21 @@ jobs:
               "$name-status.json" > /dev/null \
               || fail "$name: status through the forward names another rlxd: $(jq -c .data.paths "$name-status.json")"
             jq -c '.data | {pid, clients, paths}' "$name-status.json"
+
+            # The gate holds through the forward. rlxd runs outside gate dev mode, and the
+            # connection's peer is sshd, not rlx's signed app, so the unsigned test client
+            # can neither pair nor be the gate.
+            for args in "--as-app status" "--role app --gate-credential made-up status" gate.pair; do
+              code=0
+              # shellcheck disable=SC2086 # $args is words
+              RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token "$token" $args \
+                > "$name-gate.json" || code=$?
+              [ "$code" = 1 ] && jq -e '.error.code == "not_gate"' "$name-gate.json" > /dev/null \
+                || fail "$name: through the forward, call $args exits $code: $(cat "$name-gate.json")"
+            done
+            [ ! -e "$home/rlxd/gate.json" ] || fail "$name: a device was paired through the forward"
+            [ ! -e "$client_home/test-gate-credential" ] || fail "$name: the client kept a credential"
+            rm "$name-gate.json"
 
             # Nothing listens on TCP or UDP: not rlxd, not ssh.
             if ss -Htulnp | grep -E 'users:\(\("(rlxd|ssh)"'; then

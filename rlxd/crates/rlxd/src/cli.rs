@@ -1,8 +1,17 @@
-//! The client commands, `rlxd call`, `rlxd status` and `rlxd stop` (handoff 0.10.3, "How
-//! to read the checks", 1.3 and 7.2). Each opens a new connection to this home's rlxd,
-//! says `hello`, sends one request and prints the reply envelope. For a streaming method,
-//! `events.subscribe`, `rlxd call` prints each event as a JSON line instead, and exits 0
-//! when the stream ends (`crate::events` is `rlxd events`).
+//! The client commands, `rlxd call`, `rlxd status`, `rlxd stop` and `rlxd gate …`
+//! (handoff 0.10.3, "How to read the checks", 1.3, 5.1 and 7.2). Each opens a new
+//! connection to this home's rlxd, says `hello`, sends one request and prints the reply
+//! envelope. For a streaming method, `events.subscribe`, `rlxd call` prints each event as
+//! a JSON line instead, and exits 0 when the stream ends (`crate::events` is `rlxd
+//! events`).
+//!
+//! `rlxd call --as-app` is the test client of "How to read the checks": with no
+//! `--gate-credential`, it presents the one kept in `<home>/test-gate-credential`. When
+//! that file is missing, it pairs first (`gate.pair`, which only gate dev mode lets an
+//! unsigned client do) and keeps the credential there. Like the app, it never pairs again
+//! on its own: once the file exists, a `not_gate` is the call's result. `rlxd events
+//! --as-app` presents the kept credential too, but never pairs: without one, it gets
+//! `not_gate`.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -15,7 +24,8 @@ use rlxd_proto::{Data, PROTOCOL_VERSION, StatusData, VERSION, codes, methods};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{lock, out};
+use crate::log::warning;
+use crate::{files, gate, lock, log, out};
 
 /// The `client` a `hello` from these commands names, unless `--client` says otherwise.
 const CLIENT: &str = "rlxd-cli";
@@ -67,8 +77,13 @@ pub enum AskError {
 /// Says `hello` as `cli` to `home`'s rlxd, with the token file's token, then asks
 /// `method` with no params. The reply may be `ok: false`.
 pub fn ask(home: &Home, method: &str) -> Result<Reply, AskError> {
+    ask_with(home, method, Data::new())
+}
+
+/// [`ask`], with `params`.
+pub fn ask_with(home: &Home, method: &str, params: Data) -> Result<Reply, AskError> {
     open(home, false, &Target::default())?
-        .request(method, Data::new())
+        .request(method, params)
         .map_err(|e| AskError::Failed(e.to_string()))
 }
 
@@ -131,13 +146,24 @@ pub fn call(args: CallArgs) -> ExitCode {
             _ => return out::usage(&format!("--protocol-version {text} is not a number")),
         },
     };
-    let mut connection = match connect(&home, args.socket.as_deref()) {
-        Ok(connection) => connection,
-        Err(e) => return report(e),
-    };
     let token = match args.token.clone().map_or_else(|| read_token(&home), Ok) {
         Ok(token) => token,
         Err(message) => return out::fail(codes::UNAUTHORIZED, &message, None),
+    };
+    let credential = match (args.gate_credential.clone(), args.as_app) {
+        (Some(credential), _) => Some(credential),
+        (None, true) => match test_gate_credential(&home) {
+            Some(credential) => Some(credential),
+            None => match pair_test_client(&home, args.socket.as_deref(), &token) {
+                Ok(credential) => Some(credential),
+                Err(exit) => return exit,
+            },
+        },
+        (None, false) => None,
+    };
+    let mut connection = match connect(&home, args.socket.as_deref()) {
+        Ok(connection) => connection,
+        Err(e) => return report(e),
     };
     let role = if args.as_app {
         "app"
@@ -146,10 +172,6 @@ pub fn call(args: CallArgs) -> ExitCode {
     };
     let client = args.client.as_deref().unwrap_or(CLIENT);
     let mut hello = hello_params(&token, &version, client, role);
-    let credential = args
-        .gate_credential
-        .clone()
-        .or_else(|| args.as_app.then(|| test_gate_credential(&home)).flatten());
     if let Some(credential) = credential {
         hello.insert("gate_credential".to_owned(), Value::String(credential));
     }
@@ -170,6 +192,144 @@ pub fn call(args: CallArgs) -> ExitCode {
         Ok(reply) => out::print_reply(&reply),
         Err(e) => report(call_error(e)),
     }
+}
+
+/// The test client's first pairing: `gate.pair` as `cli`, keeping the credential in
+/// `<home>/test-gate-credential` (0600). On a refusal, prints it and gives the exit. With
+/// `socket` (`--socket`), it pairs with the rlxd there, whose gate checks it as any other
+/// connection: through an SSH forward its peer is sshd.
+fn pair_test_client(home: &Home, socket: Option<&Path>, token: &str) -> Result<String, ExitCode> {
+    let mut connection = connect(home, socket).map_err(report)?;
+    let hello = hello_params(token, &json!(PROTOCOL_VERSION), CLIENT, "cli");
+    let reply = connection
+        .request(methods::HELLO, hello)
+        .map_err(|e| report(call_error(e)))?;
+    if !reply.is_ok() {
+        return Err(out::print_reply(&reply));
+    }
+    let reply = connection
+        .request(methods::GATE_PAIR, Data::new())
+        .map_err(|e| report(call_error(e)))?;
+    let credential = reply
+        .data()
+        .and_then(|data| data.get("gate_credential"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(credential) = credential else {
+        return Err(out::print_reply(&reply));
+    };
+    files::write_private(&home.test_gate_credential(), &credential).map_err(|e| {
+        let path = home.test_gate_credential();
+        let message = format!(
+            "paired, but cannot keep the credential in {}: {e}",
+            path.display()
+        );
+        out::fail(codes::INTERNAL, &message, None)
+    })?;
+    Ok(credential)
+}
+
+/// `rlxd gate devices`: the paired devices, from rlxd, or from gate.json when it is
+/// stopped.
+pub fn gate_devices() -> ExitCode {
+    let home = match Home::from_env() {
+        Ok(home) => home,
+        Err(e) => return report(AskError::NotRunning(e.to_string())),
+    };
+    match ask(&home, methods::GATE_DEVICES) {
+        Ok(reply) => out::print_reply(&reply),
+        Err(AskError::NotRunning(_)) => match gate::devices_offline(&home.gate()) {
+            Ok(devices) => {
+                let mut data = Data::new();
+                data.insert("devices".to_owned(), Value::Array(devices));
+                out::succeed(data)
+            }
+            Err(message) => out::fail(codes::INTERNAL, &message, None),
+        },
+        Err(error) => report(error),
+    }
+}
+
+/// `rlxd gate pair [--request-id ID [--deny | --force]]`, as the user on this host:
+/// without an id, the waiting requests, each with the process that asked; with one, its
+/// answer. A request is never approved without its id.
+pub fn gate_pair(request_id: Option<String>, approve: bool, force: bool) -> ExitCode {
+    let home = match Home::from_env() {
+        Ok(home) => home,
+        Err(e) => return report(AskError::NotRunning(e.to_string())),
+    };
+    let Some(request_id) = request_id else {
+        return match ask(&home, methods::GATE_PAIR_REQUESTS) {
+            Ok(reply) => out::print_reply(&reply),
+            Err(error) => report(error),
+        };
+    };
+    let mut params = Data::new();
+    params.insert("request_id".to_owned(), Value::String(request_id));
+    params.insert("approve".to_owned(), Value::Bool(approve));
+    params.insert("force".to_owned(), Value::Bool(force));
+    match ask_with(&home, methods::GATE_PAIR_ANSWER, params) {
+        Ok(reply) => out::print_reply(&reply),
+        Err(error) => report(error),
+    }
+}
+
+/// `rlxd gate unpair [<device>]`: unpairs through rlxd, which drops the device's app
+/// connections; with rlxd stopped, edits gate.json under rlxd's lock.
+pub fn gate_unpair(device: Option<String>) -> ExitCode {
+    let home = match Home::from_env() {
+        Ok(home) => home,
+        Err(e) => return report(AskError::NotRunning(e.to_string())),
+    };
+    let mut params = Data::new();
+    if let Some(device) = &device {
+        params.insert("device".to_owned(), Value::String(device.clone()));
+    }
+    match ask_with(&home, methods::GATE_UNPAIR, params) {
+        Ok(reply) => out::print_reply(&reply),
+        Err(AskError::NotRunning(_)) => unpair_offline(&home, device.as_deref()),
+        Err(error) => report(error),
+    }
+}
+
+fn unpair_offline(home: &Home, device: Option<&str>) -> ExitCode {
+    let _held = if home.run_dir().is_dir() {
+        match lock::acquire(&home.lock(), Duration::ZERO) {
+            Ok(Some(held)) => Some(held),
+            Ok(None) => {
+                let message = "rlxd is starting or stopping; try again".to_owned();
+                return out::fail(codes::ALREADY_RUNNING, &message, None);
+            }
+            Err(e) => {
+                let message = format!("cannot take {}: {e}", home.lock().display());
+                return out::fail(codes::INTERNAL, &message, None);
+            }
+        }
+    } else {
+        None
+    };
+    let names = match gate::unpair_offline(&home.gate(), device) {
+        Ok(names) => names,
+        Err(gate::UnpairError::Unknown(name)) => {
+            let message = format!("no device {name:?} is paired");
+            let hint = "`rlxd gate devices` lists the paired devices.";
+            return out::fail(codes::UNKNOWN_DEVICE, &message, Some(hint));
+        }
+        Err(gate::UnpairError::Failed(message)) => {
+            return out::fail(codes::INTERNAL, &message, None);
+        }
+    };
+    if home.logs().is_dir() && log::open(&home.log_file(), false).is_ok() {
+        let which = device.map_or_else(
+            || format!("every device ({})", names.join(", ")),
+            |name| format!("device {name:?}"),
+        );
+        warning!("gate unpaired: {which}, by the user, with rlxd stopped");
+    }
+    let mut data = Data::new();
+    data.insert("unpaired".to_owned(), json!(names));
+    data.insert("dropped".to_owned(), json!(0));
+    out::succeed(data)
 }
 
 /// Sends a streaming method's request, and prints each event of its stream as it came.
@@ -324,7 +484,7 @@ fn describe(reply: &Reply) -> ExitCode {
     let c = status.clients;
     let text = format!(
         "rlxd {} running, pid {}, on {}\nhome: {}\nsocket: {}\nclients: app {}, tui {}, \
-         remote {}, cli {}\nclaude: {claude}",
+         remote {}, cli {}\ngate: {}\nclaude: {claude}",
         status.version,
         status.pid,
         status.platform,
@@ -333,7 +493,8 @@ fn describe(reply: &Reply) -> ExitCode {
         c.app,
         c.tui,
         c.remote,
-        c.cli
+        c.cli,
+        status.gate
     );
     if out::print_line(&text) {
         ExitCode::SUCCESS

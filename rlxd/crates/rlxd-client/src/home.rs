@@ -6,6 +6,8 @@
 //!   run/rlxd.sock     the socket clients connect to (macOS, Linux); 0700 dir, 0600 socket
 //!   run/rlxd.lock     held while rlxd runs: one rlxd per home
 //!   rlxd/token        the shared client token (0600)
+//!   rlxd/gate.json    the paired gate devices, each credential's SHA-256 only (0600)
+//!   rlxd/config.toml  rlxd's config, such as `gate.dev_mode` (optional)
 //!   rlxd/logs/        rlxd's logs, rotated
 //!   daemons/          the registry of non-UI rlx processes (4.1)
 //! ```
@@ -214,6 +216,18 @@ impl Home {
         self.rlxd_dir().join("token")
     }
 
+    /// `<home>/rlxd/gate.json`: the devices paired as the app gate, with the SHA-256 of
+    /// each one's gate credential, never the credential itself (0600, handoff 0.10.3, 1.3
+    /// and 5.1).
+    pub fn gate(&self) -> PathBuf {
+        self.rlxd_dir().join("gate.json")
+    }
+
+    /// `<home>/rlxd/config.toml`: rlxd's config. It is optional, and read when rlxd starts.
+    pub fn config(&self) -> PathBuf {
+        self.rlxd_dir().join("config.toml")
+    }
+
     /// `<home>/rlxd/logs/`.
     pub fn logs(&self) -> PathBuf {
         self.rlxd_dir().join("logs")
@@ -331,6 +345,8 @@ mod tests {
         assert_eq!(home.socket_in_home(), at(&["run", "rlxd.sock"]));
         assert_eq!(home.lock(), at(&["run", "rlxd.lock"]));
         assert_eq!(home.token(), at(&["rlxd", "token"]));
+        assert_eq!(home.gate(), at(&["rlxd", "gate.json"]));
+        assert_eq!(home.config(), at(&["rlxd", "config.toml"]));
         assert_eq!(home.logs(), at(&["rlxd", "logs"]));
         assert_eq!(home.log_file(), at(&["rlxd", "logs", "rlxd.log"]));
         assert_eq!(home.daemons(), at(&["daemons"]));
