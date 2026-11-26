@@ -149,6 +149,9 @@ class Machine:
     """The manager each wait on its trust answer was for, by label."""
     waited_for: list[str] = field(default_factory=list)
     """…and the project whose manager it was, by id."""
+    trust_by: dict[str, threading.Event] = field(default_factory=dict)
+    """Each project's own manager's answer, by project id, where one is scripted: it releases
+    that manager's wait alone (else :attr:`trust` answers for all)."""
     after_choice: list[ClaudeState] = field(default_factory=list)
     """What the looks answer once a pick is saved; the current answers when empty."""
     starts: list[tuple[str, bool, int]] = field(default_factory=list)
@@ -223,7 +226,7 @@ class Machine:
         def trust(manager: FleetAgent, cancelled: Callable[[], bool]) -> bool:
             self.waited.append(manager.label)
             self.waited_for.append(manager.project_id)
-            answer = self.trust
+            answer = self.trust_by.get(manager.project_id, self.trust)
             if answer is None:
                 return False
             while not answer.wait(0.05):  # a bounded poll on the answer itself
@@ -846,6 +849,98 @@ def test_a_start_fleet_after_change_waits_on_its_own_managers_trust_answer(
     assert "the coders start on their own" in seen["card"], seen["card"]
     assert seen["before"] == [(alpha.id, True, 0), (beta.id, True, 0)], "no coder before"
     assert seen["after"] == [*seen["before"], (beta.id, False, first_run.CODERS)], seen
+
+
+@dataclass
+class OwnIds(Machine):
+    """A machine whose agents have ids of their own per project, as the store mints them (the
+    plain one names each by its label, so two projects' managers would be one row)."""
+
+    def spawn(self, project: ProjectInfo, role: str, **kwargs: Any) -> fleet_service.SpawnReceipt:
+        receipt = super().spawn(project, role, **kwargs)
+        own = receipt.agent.model_copy(update={"id": f"agt_{project.id}_{receipt.agent.label}"})
+        self.live[self.live.index(receipt.agent)] = own
+        return dataclasses.replace(receipt, agent=own)
+
+
+def test_a_card_promises_its_coders_only_while_its_own_manager_is_waited_on(
+    captain: str | None,
+    scripted: Callable[[Machine], None],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The round-3 tester of #570, in the real shell: *Start fleet* on alpha, *Change*, *Start
+    fleet* on beta (alpha's wait is cancelled, beta's manager waited on), then *Change* back.
+    Alpha's card said "the coders start on their own once it is answered" while the one wait
+    was beta's, and alpha's answer started nothing. Now a card promises that only while its
+    own manager is the one waited on; alpha's says *Start the coders* is the user's. Each
+    project's answer releases its own manager's wait alone."""
+    alpha = ProjectInfo(id="prj_alpha", root=tmp_path / "alpha", onboarded_at=T0)
+    beta = ProjectInfo(id="prj_beta", root=tmp_path / "beta", onboarded_at=T0)
+    for each in (alpha, beta):
+        each.root.mkdir()
+    machine = OwnIds(
+        claude=[READY],
+        found=Candidates(
+            items=(here(alpha.root, alpha), Candidate(root=beta.root, is_git=True, project=beta))
+        ),
+        trust_by={alpha.id: threading.Event(), beta.id: threading.Event()},
+    )
+    listed_by(machine, alpha, monkeypatch)
+    listed_by(machine, beta, monkeypatch)
+    scripted(machine)
+    group = welcome.WORKER_GROUP  # the waits on the answers are held on purpose: not settled
+
+    async def go(pilot: Pilot[None], app: FleetApp, page: WelcomeView) -> dict[str, Any]:
+        async def start_fleet(project: ProjectInfo) -> None:
+            await settle_until(app, lambda: visible(page, "fleet-manager"), group=group)
+            page.query_one("#fleet-manager", Button).press()
+            await settle_until(
+                app,
+                lambda: project.id in machine.waited_for and app.content.current != "welcome",
+                group=group,
+            )
+            await app.action_welcome()  # `w`, from the manager's pane it opened
+            await frame_read(app)
+            await settle_page(app, group=group)
+
+        async def change_to(project: ProjectInfo) -> None:
+            page.query_one("#welcome-change", Button).press()
+            await settle_page(app, group=group)
+            page.choose(project.root, project)
+            await settle_until(app, lambda: page.project == project, group=group)
+            await settle_page(app, group=group)
+
+        await start_fleet(alpha)
+        await change_to(beta)
+        await start_fleet(beta)
+        await change_to(alpha)
+        seen: dict[str, Any] = {"waited": list(machine.waited_for)}
+        seen["alpha"] = card(page, "fleet-status")
+        seen["alpha coders"] = visible(page, "fleet-coders")
+        machine.trust_by[alpha.id].set()  # answered in alpha's pane: its wait was cancelled
+        for _ in range(3):
+            await pilot.pause()
+            await settle_page(app, group=group)
+        seen["after alpha's answer"] = list(machine.starts)
+        await change_to(beta)
+        seen["beta"] = card(page, "fleet-status")
+        machine.trust_by[beta.id].set()  # beta's own answer: its wait is the one running
+        await settle_until(app, lambda: len(machine.starts) > 2)
+        await settle_page(app)
+        seen["after beta's answer"] = list(machine.starts)
+        return seen
+
+    seen = in_shell(machine, go)
+    started = [(alpha.id, True, 0), (beta.id, True, 0)]
+    promise = "the coders start on their own once it is answered"
+    assert seen["waited"] == [alpha.id, beta.id], seen
+    assert promise not in seen["alpha"], seen["alpha"]
+    assert "back here to start the coders" in seen["alpha"], seen["alpha"]
+    assert seen["alpha coders"], "Start the coders is alpha's way, and it is offered"
+    assert seen["after alpha's answer"] == started, "its wait was cancelled: nothing started"
+    assert promise in seen["beta"], seen["beta"]
+    assert seen["after beta's answer"] == [*started, (beta.id, False, first_run.CODERS)], seen
 
 
 def test_choose_another_is_not_undone_by_a_return_to_the_page(tmp_path: Path) -> None:

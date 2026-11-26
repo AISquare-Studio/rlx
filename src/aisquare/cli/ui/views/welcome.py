@@ -1268,6 +1268,15 @@ class WelcomeView(VerticalScroll):
         self._trust_worker = self._run("trust", work)
         self.paint()
 
+    def _waiting_here(self) -> bool:
+        """Whether the coders wait on THIS card's manager: the page's one wait on a trust
+        answer (``trust`` in :attr:`busy`) is for the chosen project. *Start fleet* on alpha,
+        *Change*, *Start fleet* on beta, then *Change* back: the wait is beta's, and alpha's
+        card promised a start that nothing would make (the round-3 tester of #570). It then
+        says that *Start the coders* is the user's, as after a wait that ended."""
+        project = self.project
+        return "trust" in self.busy and project is not None and self._trust_for == project.id
+
     def _trusted(self, result: Any, error: BaseException | None) -> None:
         """The wait for the manager's trust answer ended: the coders start on an answer, as
         *Start the coders* starts them; with none, that button is the user's."""
@@ -1618,7 +1627,7 @@ class WelcomeView(VerticalScroll):
                     "reap its row; Start the coders then starts a new one in its place.",
                     style="dim",
                 )
-            elif "trust" in self.busy:
+            elif self._waiting_here():
                 status.append(
                     f"\nOpen the manager and {self._folder_question()}{self._hooks_review()}: "
                     "the coders start on their own once it is answered.",
