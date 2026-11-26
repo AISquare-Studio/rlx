@@ -42,7 +42,7 @@ from aisquare.core.spawn import (
     tmux_client_env,
     tool_shell_homes,
 )
-from aisquare.core.store import damaged_store_recovery, store_session
+from aisquare.core.store import ContextStore, damaged_store_recovery, store_session
 from aisquare.core.stubs import stub
 from aisquare.core.terminal import outer_terminal
 from aisquare.core.version import DISTRIBUTION, __version__
@@ -3117,38 +3117,63 @@ def _check_fleet_capacity() -> DoctorCheck:
 
 def _check_manager_policies() -> list[DoctorCheck]:
     """Report invalid policy, the reserved binding and pass recovery status."""
+    if _uncreated_home("manager policy") is not None or not paths.db_path().is_file():
+        return []
+    try:
+        with store_session() as store:
+            return _manager_policy_rows(store)
+    except Exception as exc:  # diagnostics must report an unreadable store without crashing
+        return [_warn("manager policy", f"not evaluated ({exc})", "Check the store.")]
+
+
+def _manager_policy_rows(store: ContextStore) -> list[DoctorCheck]:
+    """Read the per-project binding and pass status from an existing store."""
     from aisquare.services import manager_pass, manager_seat
 
     rows: list[DoctorCheck] = []
-    with store_session() as store:
-        projects = set(store.project_settings(manager_seat.WAKE))
-        projects.update(store.project_settings(manager_seat.PASS_MINUTES))
-        for project in sorted(projects):
-            name = f"manager policy {project}"
-            settings = manager_seat.policy(store, project)
-            if settings.invalid:
-                rows.append(_warn(name, f"using defaults for {', '.join(settings.invalid)}",
-                                  f"{prog.word()} fleet manager-policy --project {project}"))
-            row = store.fleet_agent_by_label(project, manager_seat.LABEL, live_only=True)
-            session = manager_seat.bound(store, row) if row is not None else None
-            if session is None:
-                expected = f"{row.session_id} on {row.board or row.project_id}" if row else "no row"
-                actual = store.get_session(row.session_id) if row and row.session_id else None
-                detail = f"{actual.role} on {actual.project_id}" if actual else "no live session"
-                rows.append(_warn(name, f"reserved manager expects {expected}; found {detail}",
-                                  "Bind the reserved manager row to its board manager session."))
-                continue
-            if settings.wake == "schedule" and not settings.pass_minutes:
-                rows.append(_warn(name, "schedule active, watcher passes are off",
-                                  "Keep the manual pass timer until the watcher completes a pass."))
-            if settings.pass_minutes:
-                _, progress = manager_pass.read(store, project, session.project_id)
-                _, template_note = manager_pass.template(project)
-                if template_note:
-                    rows.append(_warn(name, template_note, "The built-in pass prompt is used."))
-                if progress.pending:
-                    status = "acknowledged" if progress.pending.acknowledged_at else "pending"
-                    rows.append(_ok(name, f"pass {progress.pending.id} {status}"))
+    projects = set(store.project_settings(manager_seat.WAKE))
+    projects.update(store.project_settings(manager_seat.PASS_MINUTES))
+    for project in sorted(projects):
+        name = f"manager policy {project}"
+        settings = manager_seat.policy(store, project)
+        if settings.invalid:
+            rows.append(
+                _warn(
+                    name,
+                    f"using defaults for {', '.join(settings.invalid)}",
+                    f"{prog.word()} fleet manager-policy --project {project}",
+                )
+            )
+        row = store.fleet_agent_by_label(project, manager_seat.LABEL, live_only=True)
+        session = manager_seat.bound(store, row) if row is not None else None
+        if session is None:
+            expected = f"{row.session_id} on {row.board or row.project_id}" if row else "no row"
+            actual = store.get_session(row.session_id) if row and row.session_id else None
+            detail = f"{actual.role} on {actual.project_id}" if actual else "no live session"
+            rows.append(
+                _warn(
+                    name,
+                    f"reserved manager expects {expected}; found {detail}",
+                    "Bind the reserved manager row to its board manager session.",
+                )
+            )
+            continue
+        if settings.wake == "schedule" and not settings.pass_minutes:
+            rows.append(
+                _warn(
+                    name,
+                    "schedule active, watcher passes are off",
+                    "Keep the manual pass timer until the watcher completes a pass.",
+                )
+            )
+        if settings.pass_minutes:
+            _, progress = manager_pass.read(store, project, session.project_id)
+            _, template_note = manager_pass.template(project)
+            if template_note:
+                rows.append(_warn(name, template_note, "The built-in pass prompt is used."))
+            if progress.pending:
+                status = "acknowledged" if progress.pending.acknowledged_at else "pending"
+                rows.append(_ok(name, f"pass {progress.pending.id} {status}"))
     return rows
 
 
@@ -3167,21 +3192,29 @@ def _check_watcher() -> DoctorCheck:
         every = load_config().watch.interval_seconds
         from aisquare.services import manager_seat
 
-        with store_session() as store:
-            needed = "schedule" in store.project_settings(manager_seat.WAKE).values() or any(
-                raw != "0" for raw in store.project_settings(manager_seat.PASS_MINUTES).values()
-            )
+        needed = False
+        if paths.db_path().is_file():
+            with store_session() as store:
+                needed = "schedule" in store.project_settings(manager_seat.WAKE).values() or any(
+                    raw != "0" for raw in store.project_settings(manager_seat.PASS_MINUTES).values()
+                )
     except Exception as exc:  # diagnostics must never crash
         return _ok(name, f"not evaluated ({exc})")
     age = found.age()
     looked = f"last look {int(age.total_seconds())} s ago" if age is not None else "no look yet"
     if found.pid == -1:
-        return _warn(name, f"watch lock holder unknown ({looked})",
-                     "Identify the holder before restarting the watcher.")
+        return _warn(
+            name,
+            f"watch lock holder unknown ({looked})",
+            "Identify the holder before restarting the watcher.",
+        )
     if found.pid is None:
         if needed:
-            return _fail(name, f"scheduled managers need the watcher ({looked})",
-                         f"{prog.word()} watch --detach")
+            return _fail(
+                name,
+                f"scheduled managers need the watcher ({looked})",
+                f"{prog.word()} watch --detach",
+            )
         return _ok(
             name,
             f"not running ({looked})"

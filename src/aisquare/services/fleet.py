@@ -152,7 +152,6 @@ from aisquare.models import (
     TeamSession,
     TeamTask,
 )
-from aisquare.services import manager_pass, manager_seat
 from aisquare.services import (
     agent_events,
     agent_launch,
@@ -162,6 +161,8 @@ from aisquare.services import (
     explainability_ops,
     handoff,
     install_route,
+    manager_pass,
+    manager_seat,
     model_memory,
     pane_idle,
 )
@@ -19547,11 +19548,17 @@ def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str |
         board = session.project_id
         raw, progress = manager_pass.read(store, project, board)
         pending = progress.pending
+        if pending is not None and manager_pass.observe_transcript(session, pending):
+            return pending.id, None
         if pending is None and not manager_pass.due(progress, policy.pass_minutes, now):
             return None, None
         if pending is not None and not manager_pass.retryable(pending, session):
             delivery_state = "acknowledged" if pending.acknowledged_at else "submission uncertain"
-            return None, f"{project}: pass {pending.id} {delivery_state}, awaiting completion"
+            return None, (
+                f"{project}: pass {pending.id} {delivery_state}. "
+                f"If idle and recovery is needed, use {prog.word()} fleet requeue-manager-pass "
+                f"{pending.id} --project {project}"
+            )
         if _team().standby_of(store, session) is not None or _team().wake_pending(store, session):
             return None, None
         target = _manager_placement(store, project, board)
@@ -19584,21 +19591,58 @@ def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str |
             )
 
         result = pane.deliver_typed(
-            text, MANAGER_LABEL, press="press Enter in its pane", acked=acknowledged,
-            reads_box=_input_box_of(adapter) is not None, what="the manager pass",
-            guard=settings().draft_quiet_seconds, re_press=(), origin=prompt_origin.WAKE,
+            text,
+            MANAGER_LABEL,
+            press="press Enter in its pane",
+            acked=acknowledged,
+            reads_box=_input_box_of(adapter) is not None,
+            what="the manager pass",
+            guard=settings().draft_quiet_seconds,
+            re_press=(),
+            origin=prompt_origin.WAKE,
             gap=_enter_gap(adapter),
         )
-        if not result.presses and not result.in_box and not acknowledged():
+        if (
+            result.told.typed == "no"
+            and not result.presses
+            and not result.in_box
+            and not acknowledged()
+        ):
             retry = attempt.model_copy(update={"attempted_at": None})
             manager_pass.save(
-                store, project, board, sending.model_dump_json(),
+                store,
+                project,
+                board,
+                sending.model_dump_json(),
                 sending.model_copy(update={"pending": retry}),
             )
             return None, why
         if not acknowledged():
             return None, f"{project}: pass {attempt.id} submission uncertain. {why or ''}".rstrip()
         return attempt.id, why
+
+
+def requeue_manager_pass(project: str, pass_id: str) -> None:
+    """Requeue the exact unfinished range after verifying its pane is idle."""
+    with manager_seat.reserve(project), store_session() as store:
+        target = _manager_placement(store, project, None)
+        if target is None:
+            raise ValueError("the manager seat has no verified pane")
+        placement, session = target
+        board = session.project_id
+        raw, progress = manager_pass.read(store, project, board)
+        pending = progress.pending
+        if pending is None or pending.id != pass_id:
+            raise ValueError("no matching unfinished pass")
+        if not _waiting_manager_pane(placement, session, _now()):
+            raise ValueError("the manager is not at its waiting prompt")
+        if quiet_prompt_refusal(placement.agent) is not None:
+            raise ValueError("the manager's composer or dialog is occupied")
+        retry = pending.model_copy(update={"attempted_at": None, "acknowledged_at": None})
+        if not manager_pass.save(
+            store, project, board, raw, progress.model_copy(update={"pending": retry})
+        ):
+            raise ValueError("pass changed during recovery")
 
 
 def retry_deferred_nudges() -> int:

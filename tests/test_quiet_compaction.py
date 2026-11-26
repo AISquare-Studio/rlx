@@ -518,15 +518,50 @@ def test_a_later_turn_that_asks_supersedes_the_worker_an_earlier_one_armed(
     assert _check(manager, third) == "compacted"
 
 
-
 def test_schedule_compacts_past_held_results_but_refuses_urgent_work(manager: Manager) -> None:
     """Scheduled compaction sees the same urgency as pane delivery."""
     with store_session() as store:
         store.set_project_setting(manager.project.id, "manager_wake", "schedule")
         store.touch_session(manager.sid, state="waiting")
     team_service.add_note("held result", kind="result", board_id=manager.project.id)
-    assert manager.refusal() is None
+    with store_session() as store:
+        session = manager.session()
+        assert quiet_compact.refusal(
+            store, session, manager.agent, session.cursor, load_config().fleet
+        ) is None
     team_service.add_note(
         "urgent question", kind="question", to_role=manager.sid, board_id=manager.project.id
     )
-    assert (manager.refusal() or "").startswith("a question is pending")
+    with store_session() as store:
+        session = manager.session()
+        why = quiet_compact.refusal(
+            store, session, manager.agent, session.cursor, load_config().fleet
+        )
+    assert (why or "").startswith("a question is pending")
+
+
+
+def test_scheduled_compaction_uses_the_completed_pass_decision_watermark(manager: Manager) -> None:
+    """A decision only makes the state file stale after its pass completes."""
+    from aisquare.services import manager_pass
+
+    manager.write_state(ago=timedelta(minutes=5))
+    now = datetime.now(UTC)
+    decision = team_service.add_note("decision for the next pass", kind="decision",
+                                     board_id=manager.project.id)
+    with store_session() as store:
+        store.set_project_setting(manager.project.id, "manager_wake", "schedule")
+        store.touch_session(manager.sid, state="waiting")
+        session = manager.session()
+        settings = load_config().fleet
+        assert quiet_compact.refusal(store, session, manager.agent, session.cursor, settings) is None
+        progress = manager_pass.Progress(
+            pending=manager_pass.Pass(
+                id="verified", lower=0, upper=decision.seq, session=manager.sid,
+                attempted_at=now, acknowledged_at=now,
+            ),
+        )
+        assert manager_pass.save(store, manager.project.id, manager.project.id, None, progress)
+        manager_pass.complete(store, session, "verified")
+        why = quiet_compact.refusal(store, session, manager.agent, session.cursor, settings)
+    assert why == "its state file predates the last decision it was woken for"

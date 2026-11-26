@@ -427,7 +427,6 @@ class Watcher:
                 ]
         return report
 
-
     def _manager_passes(self, report: TickReport) -> None:
         """Send due passes while the watcher state lock is held."""
         from aisquare.services import fleet, manager_seat
@@ -437,10 +436,13 @@ class Watcher:
             schedules = store.project_settings(manager_seat.WAKE)
         for project in dict.fromkeys([*passes, *schedules]):
             try:
-                if schedules.get(project) == "schedule" and project not in report.nudged:
-                    if fleet.nudge_manager(project, reason="scheduled urgency"):
-                        report.nudged.append(project)
-                        continue
+                if (
+                    schedules.get(project) == "schedule"
+                    and project not in report.nudged
+                    and fleet.nudge_manager(project, reason="scheduled urgency")
+                ):
+                    report.nudged.append(project)
+                    continue
                 if passes.get(project) in (None, "0"):
                     continue
                 pass_id, note = fleet.deliver_manager_pass(project, report.at)

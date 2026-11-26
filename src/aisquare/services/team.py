@@ -571,7 +571,10 @@ class _ManagerAddresses:
         }
 
     def resolve(
-        self, address: str | None, writer: str | None, root: Path | _Nowhere,
+        self,
+        address: str | None,
+        writer: str | None,
+        root: Path | _Nowhere,
         explicit_project: str | None = None,
     ) -> str | None:
         """Resolve IDs first, then aliases and contextual manager addresses."""
@@ -617,27 +620,34 @@ def manager_wakes(
     wake, project = mode if mode is not None else manager_seat.mode(store, me)
     if wake == "blocked" or me.id in (event.actor, event.session_id):
         return False
-    meta = event.meta or {}
-    if manager_seat.EVENT_PROJECT in meta and meta[manager_seat.EVENT_PROJECT] != project:
-        return False
     if wake == "every_write":
         return (
             wake_class(event, me) == "wake"
             and not is_echo(store, event, me)
             and (standby is None or not held_in_standby(event))
         )
+    meta = event.meta or {}
+    target = meta.get(manager_seat.EVENT_PROJECT)
+    if target is not None and target != project:
+        return False
     if event.kind == "question" or (
         event.kind == "note" and event.session_id is None and (event.to_role or "").strip()
     ):
         if manager_seat.EVENT_PROJECT in meta:
-            return True
+            return target == project
         if addresses is None:
             addresses = _ManagerAddresses(store, me.project_id)
         return addresses.resolve(event.to_role, event.session_id, NOWHERE) == project
+    if event.kind in _SCHEDULED_SYSTEM_WAKES | {"agent_exited", "watch"} and target is None:
+        source = store.fleet_agent_for_session(event.session_id) if event.session_id else None
+        if source is not None and source.project_id != project:
+            return False
     if event.kind == "watch":
         return not held_in_standby(event)
     if event.kind == "agent_exited":
-        return exit_wakes(event.meta if event.meta is not None else _exit_meta_from_text(event.text))
+        return exit_wakes(
+            event.meta if event.meta is not None else _exit_meta_from_text(event.text)
+        )
     return event.kind in _SCHEDULED_SYSTEM_WAKES
 
 
@@ -1748,8 +1758,14 @@ def log_events(
             if task is None:
                 raise KeyError(task_ref)
             task_id = task.id
-        if (author is None and since is None and since_seq is None and through_seq is None
-                and kind is None and not task_id):
+        if (
+            author is None
+            and since is None
+            and since_seq is None
+            and through_seq is None
+            and kind is None
+            and not task_id
+        ):
             return store.recent_events(board.id, limit=limit)
         return store.filtered_events(
             board.id,
@@ -2260,10 +2276,10 @@ def add_note(
             recipient = _ManagerAddresses(store, board.id).resolve(
                 to_role, writer, (cwd or Path.cwd()).resolve(), project_id
             )
+            meta = {manager_seat.EVENT_PROJECT: recipient}
             if recipient is not None and not manager_seat.policy(store, recipient).configured:
                 recipient = None
-            elif recipient is not None:
-                meta = {manager_seat.EVENT_PROJECT: recipient}
+                meta = None
         event = _emit(
             store,
             board.id,
@@ -2277,6 +2293,13 @@ def add_note(
         _route_up(store, event)
         wakes = kind in ("result", "question") or _addressed_to_manager(to_role)
         manager = recipient or (_nudge_target(store, writer, board.id, cwd) if wakes else None)
+        if (
+            manager is not None
+            and recipient is None
+            and scheduled_kind
+            and manager_seat.policy(store, manager).wake == "schedule"
+        ):
+            manager = None
     stored = _record_delivery(event, board)
     if manager is not None:
         reason = kind if kind in ("result", "question") else f"{kind}_to_manager"
@@ -3576,8 +3599,10 @@ def hook_prompt_heartbeat(
         # delivered: dropped after it, a run of audit lines was the whole page, prompt
         # after prompt, with a coder's result behind it (review of #240, finding 11).
         reads, relevant = _board_reading(store, session)
-        mode, project = manager_seat.mode(store, session) if session.role == MANAGER_ROLE else (
-            "every_write", None
+        mode, project = (
+            manager_seat.mode(store, session)
+            if session.role == MANAGER_ROLE
+            else ("every_write", None)
         )
         scheduled = mode == "schedule" and project is not None
         if scheduled and project is not None:
@@ -3838,7 +3863,11 @@ def _count(raw: str | None) -> int:
 
 
 def _wake_candidates(
-    store: ContextStore, me: TeamSession, relevant: Relevance | None = None
+    store: ContextStore,
+    me: TeamSession,
+    relevant: Relevance | None = None,
+    *,
+    limit: int = _DELTA_LIMIT * 3 + 1,
 ) -> list[TeamEvent]:
     """The board since a manager's cursor, exactly as its next prompt would read it.
 
@@ -3865,7 +3894,7 @@ def _wake_candidates(
         exclude_kinds=HUMAN_BOARD_KINDS,
         exclude_actor=me.id,
         relevant=relevant,
-        limit=_DELTA_LIMIT * 3 + 1,
+        limit=limit,
     )
 
 
@@ -3903,7 +3932,9 @@ def _scheduled_wake_candidates(
     return urgent
 
 
-def pending_wakes(store: ContextStore, me: TeamSession) -> list[TeamEvent]:
+def pending_wakes(
+    store: ContextStore, me: TeamSession, *, limit: int = _DELTA_LIMIT * 3 + 1
+) -> list[TeamEvent]:
     """Return the same pending urgency used by pane delivery and Stop."""
     mode = manager_seat.mode(store, me)
     if mode[0] == "blocked":
@@ -3912,7 +3943,8 @@ def pending_wakes(store: ContextStore, me: TeamSession) -> list[TeamEvent]:
         return _scheduled_wake_candidates(store, me, mode[1])
     standby = standby_of(store, me)
     return [
-        event for event in _wake_candidates(store, me)
+        event
+        for event in _wake_candidates(store, me, limit=limit)
         if manager_wakes(store, event, me, standby, mode=mode)
     ]
 
@@ -4026,7 +4058,8 @@ def _wakeup(
     return StopDecision(
         reason=_render_wakeup(
             shown, authors, truncated=truncated, board=board, numbers=numbers, act=act
-        ) + _held_pointer(store, scheduled_project, me.project_id),
+        )
+        + _held_pointer(store, scheduled_project, me.project_id),
         cursor=shown[-1].seq,
     )
 
@@ -4391,7 +4424,11 @@ def hook_handover_failed(
             else _nudge_target(store, None, session.project_id if session else project_id)
         )
         _emit(
-            store, project_id, "handover_failed", text, session_id=session_id,
+            store,
+            project_id,
+            "handover_failed",
+            text,
+            session_id=session_id,
             meta={manager_seat.EVENT_PROJECT: agent.project_id} if agent is not None else None,
         )
     if manager is not None:
@@ -5178,7 +5215,9 @@ def _start_pack(
         watcher = watch.watch_status()
         age = watcher.age()
         healthy = (
-            watcher.pid is not None and watcher.pid > 0 and age is not None
+            watcher.pid is not None
+            and watcher.pid > 0
+            and age is not None
             and age.total_seconds() <= 3 * load_config().watch.interval_seconds
         )
         if policy.pass_minutes and state.completed and healthy:
@@ -5230,7 +5269,7 @@ def _open_items(
             on = f" #{number}" if number is not None else ""
             slot = f" [account {agent.account_slot}]" if agent.account_slot is not None else ""
             lines.append(f"  - {agent.label} {agent.role} {state}{on}{slot}")
-    pending = pending_wakes(store, me)
+    pending = pending_wakes(store, me, limit=500)
     lines.append(f"wake events pending past your cursor: {len(pending)}")
     return lines
 

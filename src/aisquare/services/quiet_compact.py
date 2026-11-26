@@ -212,7 +212,7 @@ def refusal(
         pending = manager_pass.read(store, agent.project_id, session.project_id)[1].pending
         if pending is not None and pending.attempted_at is not None:
             return f"manager pass {pending.id} is outstanding"
-    wakes = team_service.pending_wakes(store, session)
+    wakes = team_service.pending_wakes(store, session, limit=500)
     if wakes:
         return f"a {wakes[0].kind} is pending (#{wakes[0].seq})"
     reader = _reader(session)
@@ -292,6 +292,11 @@ def _check_reserved(session_id: str, cursor: int, token: str, settings: FleetSet
         why = fleet_service.quiet_prompt_refusal(agent)
         if why is not None:
             return _refuse(store, session_id, why)
+        if manager_seat.policy(store, agent.project_id).configured:
+            current = store.get_session(session.id)
+            why = refusal(store, current, agent, cursor, settings)
+            if why is not None:
+                return _refuse(store, session_id, why)
         typed_at = _now()
         team_service.write_quiet_mark(store, session_id, team_service.QuietMark(typed_at, None))
 

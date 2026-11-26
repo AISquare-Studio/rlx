@@ -9,20 +9,20 @@ from typing import Literal
 
 from aisquare.core import locking, paths
 from aisquare.core.store import ContextStore
-from aisquare.models import FleetAgent, TeamSession
+from aisquare.models import FleetAgent, ManagerWake, TeamSession
 
 LABEL = "manager"
 WAKE = "manager_wake"
 PASS_MINUTES = "manager_pass_minutes"
 EVENT_PROJECT = "manager_project"
-WakeMode = Literal["every_write", "schedule", "blocked"]
+WakeMode = ManagerWake | Literal["blocked"]
 
 
 @dataclass(frozen=True)
 class Policy:
     """The project's runtime policy and any invalid stored keys."""
 
-    wake: WakeMode = "every_write"
+    wake: ManagerWake = "every_write"
     pass_minutes: int = 0
     configured: bool = False
     invalid: tuple[str, ...] = ()

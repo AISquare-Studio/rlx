@@ -6311,7 +6311,10 @@ def test_a_managers_own_stop_says_so_and_nudges_nobody_and_a_kill_by_anyone_else
     exits = {e.text.split(" ")[0]: e for e in _board_events(project, "agent_exited")}
     assert exits["coder-a"].actor == manager.session_id
     assert exits["coder-a"].meta == {
-        "status": None, "force": True, "released": 0, "why": None,
+        "status": None,
+        "force": True,
+        "released": 0,
+        "why": None,
         "manager_project": project.id,
     }
     assert exits["coder-a"].text == "coder-a exited (?) — stopped by manager (--force)"
@@ -15707,8 +15710,14 @@ def test_scheduled_manager_waits_for_routine_writes(
 @pytest.mark.parametrize(
     "kind",
     [
-        "question", "unaddressed", "note", "limited", "handover_failed", "watch",
-        "agent_exited", "prompt_unsent",
+        "question",
+        "unaddressed",
+        "note",
+        "limited",
+        "handover_failed",
+        "watch",
+        "agent_exited",
+        "prompt_unsent",
     ],
 )
 def test_scheduled_manager_wakes_for_urgent_events(
@@ -15810,6 +15819,8 @@ def test_scheduled_managers_isolate_urgent_wakes_on_a_shared_hub(
             store.set_project_setting(project.id, "manager_wake", "schedule")
     other, sid = _spawned(second, "manager", None, first.tmux, first.monkeypatch)
     team_service.hook_session_start(sid, second.root, "startup")
+    first.tmux.set_command(first.manager.pane_id, "claude")
+    first.tmux.set_command(other.pane_id, "claude")
     first.monkeypatch.setattr(fleet_service, "nudge_manager", first.nudge)
     intended, wrong = (first.manager_sid, sid) if producer == "alias" else (sid, first.manager_sid)
     intended_pane = first.manager.pane_id if producer == "alias" else other.pane_id
@@ -15820,7 +15831,7 @@ def test_scheduled_managers_isolate_urgent_wakes_on_a_shared_hub(
     if producer == "watch":
         watch._deliver(
             second.id,
-            [watch.WatchItem("urgent", second.id, "second", "dialog", "permission")],
+            [watch.WatchItem("needs:urgent", second.id, "second", "dialog", "permission")],
             tmp_path / "watch.json",
         )
         expected = "watch:"
@@ -15843,13 +15854,17 @@ def test_scheduled_managers_isolate_urgent_wakes_on_a_shared_hub(
     assert team_service.hook_stop(wrong, root) is None
 
 
-def test_scheduled_activation_replays_and_replacement_resumes_urgent_progress(hubbed: _Hubbed) -> None:
+def test_scheduled_activation_replays_and_replacement_resumes_urgent_progress(
+    hubbed: _Hubbed,
+) -> None:
     """A seat ignores the new session's board-head cursor and resumes its unread urgency."""
     from aisquare.services import manager_seat
 
     first = hubbed
     ask = team_service.add_note(
-        "retained direct question", kind="question", to_role=first.manager_sid,
+        "retained direct question",
+        kind="question",
+        to_role=first.manager_sid,
         session_ref=first.coder_sid,
     )
     with store_session() as store:
@@ -15858,7 +15873,9 @@ def test_scheduled_activation_replays_and_replacement_resumes_urgent_progress(hu
     decision = team_service.hook_stop(first.manager_sid, first.fleet.root)
     assert decision is not None and "retained direct question" in decision.reason
     another = team_service.add_note(
-        "question survives replacement", kind="question", to_role=first.manager_sid,
+        "question survives replacement",
+        kind="question",
+        to_role=first.manager_sid,
         session_ref=first.coder_sid,
     )
     _become(first.manager, first.tmux, first.monkeypatch, pid=PANE_PID, role="manager")
@@ -15906,7 +15923,10 @@ def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
     assert [event.text for event in page if event.kind == "decision"] == ["held decision"]
     with pytest.raises(ValueError, match="upper sequence"):
         team_service.log_events(
-            session_ref=sid, pass_id=pending.id, since_seq=0, through_seq=pending.upper + 1,
+            session_ref=sid,
+            pass_id=pending.id,
+            since_seq=0,
+            through_seq=pending.upper + 1,
         )
     team_service.complete_manager_pass(pending.id, sid)
     team_service.complete_manager_pass(pending.id, sid)

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from pydantic import BaseModel
 
 from aisquare.core import harness, paths, program
+from aisquare.core.agent_adapters import recorded_adapter, transcripts
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import TeamSession
 from aisquare.services import manager_seat
@@ -75,11 +77,15 @@ def new_range(store: ContextStore, session: TeamSession, progress: Progress) -> 
 def template(project: str) -> tuple[str, str | None]:
     """Read the project template safely, or return the built-in text and a reason."""
     try:
-        found = paths.read_below(
-            paths.aisquare_home(),
-            ("projects", project, "manager", "pass.md"),
-            harness.STATE_FILE_MAX * 4,
-        ).data.decode("utf-8").strip()
+        found = (
+            paths.read_below(
+                paths.aisquare_home(),
+                ("projects", project, "manager", "pass.md"),
+                harness.STATE_FILE_MAX * 4,
+            )
+            .data.decode("utf-8")
+            .strip()
+        )
     except (OSError, UnicodeError) as exc:
         return _DEFAULT, f"pass.md unavailable ({type(exc).__name__})"
     if not found or len(found) > harness.STATE_FILE_MAX:
@@ -96,7 +102,8 @@ def prompt(project: str, board: str, pending: Pass) -> tuple[str, str | None]:
         f"Board {board}. Read after #{pending.lower} through #{pending.upper}:\n"
         f"{cli} --json team log --pass-id {pending.id} --since-seq {pending.lower} "
         f"--through-seq {pending.upper} --as {pending.session}\n"
-        "Continue paging from the last seq until the range is exhausted. After reading and acting, run:\n"
+        "Continue paging from the last seq until the range is exhausted. "
+        "After reading and acting, run:\n"
         f"{cli} team complete-pass {pending.id} --as {pending.session}",
         why,
     )
@@ -145,9 +152,54 @@ def acknowledge(session_id: str, text: str | None, now: datetime) -> bool:
             return True
         pending = pending.model_copy(update={"acknowledged_at": now})
         return save(
-            store, project, session.project_id, raw,
+            store,
+            project,
+            session.project_id,
+            raw,
             progress.model_copy(update={"pending": pending, "delivered_at": now}),
         )
+
+
+def observe_transcript(session: TeamSession, pending: Pass) -> bool:
+    """Recover an acknowledgement from the bound session's submitted transcript turn."""
+    if pending.attempted_at is None or pending.acknowledged_at is not None:
+        return False
+    if pending.session != session.id or not session.transcript_path:
+        return False
+    adapter = recorded_adapter(session.agent)
+    reader = adapter.transcript_reader() if adapter is not None else None
+    if reader is None:
+        return False
+    path = Path(session.transcript_path)
+    try:
+        lines = transcripts.lines_backwards(
+            path, path.stat().st_size, budget=transcripts.TAIL_BUDGET
+        )
+        for _, record in reader.records(lines):
+            if record is None:
+                continue
+            submitted = transcripts.record_time(record)
+            if submitted is None or submitted < pending.attempted_at:
+                continue
+            rendered = reader.page_lines(record, width=harness.STATE_FILE_MAX * 2)
+            if (
+                len(rendered) > 1 and rendered[0] == transcripts.YOU
+                and rendered[1].strip() == _PREFIX + pending.id
+            ):
+                return acknowledge(session.id, rendered[1].strip(), submitted)
+    except OSError:
+        return False
+    return False
+
+
+def baseline(store: ContextStore, project: str, board: str, seq: int) -> None:
+    """Set an operator-verified completed boundary before any pass starts."""
+    event = store.get_event_by_seq(seq) if seq > 0 else None
+    if seq < 0 or (seq > 0 and (event is None or event.project_id != board)):
+        raise ValueError("the verified boundary must be on this board")
+    raw, _ = read(store, project, board)
+    if raw is not None or not save(store, project, board, None, Progress(read=seq)):
+        raise ValueError("this seat already has a pass read position")
 
 
 def complete(store: ContextStore, session: TeamSession, pass_id: str) -> None:
@@ -159,7 +211,9 @@ def complete(store: ContextStore, session: TeamSession, pass_id: str) -> None:
         return
     pending = progress.pending
     if (
-        pending is None or pending.id != pass_id or pending.session != session.id
+        pending is None
+        or pending.id != pass_id
+        or pending.session != session.id
         or pending.acknowledged_at is None
     ):
         raise ValueError("no acknowledged pass with that ID for this manager session")
@@ -170,10 +224,15 @@ def complete(store: ContextStore, session: TeamSession, pass_id: str) -> None:
         else progress.decision_at
     )
     if not save(
-        store, project, board, raw,
+        store,
+        project,
+        board,
+        raw,
         progress.model_copy(
             update={
-                "pending": None, "read": pending.upper, "completed": pass_id,
+                "pending": None,
+                "read": pending.upper,
+                "completed": pass_id,
                 "decision_at": decision_at,
             }
         ),

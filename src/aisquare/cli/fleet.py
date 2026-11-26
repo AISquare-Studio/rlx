@@ -435,11 +435,16 @@ def manager_policy(
     key: Annotated[str | None, typer.Argument(help="manager_wake or manager_pass_minutes.")] = None,
     value: Annotated[str | None, typer.Argument(help="Value to set.")] = None,
     project: Annotated[str | None, typer.Option("--project", help="Fleet project or ID.")] = None,
-    clear: Annotated[bool, typer.Option("--clear", help="Restore the selected key's default.")] = False,
+    clear: Annotated[
+        bool, typer.Option("--clear", help="Restore the selected key's default.")
+    ] = False,
+    read_through: Annotated[
+        int | None, typer.Option("--read-through", min=0, help="Verified last manual pass sequence.")
+    ] = None,
 ) -> None:
     """Read, set, or clear the project's manager scheduling policy."""
     from aisquare.core.store import store_session
-    from aisquare.services import manager_seat
+    from aisquare.services import manager_pass, manager_seat
 
     target = _project(project)
     if key not in (None, manager_seat.WAKE, manager_seat.PASS_MINUTES):
@@ -448,7 +453,18 @@ def manager_policy(
         raise typer.BadParameter("select a manager policy key")
     if clear and value is not None:
         raise typer.BadParameter("--clear cannot be combined with a value")
+    if read_through is not None and (key is not None or value is not None or clear):
+        raise typer.BadParameter("--read-through must be set separately from policy changes")
     with store_session() as store:
+        if read_through is not None:
+            row = store.fleet_agent_by_label(target.id, manager_seat.LABEL, live_only=True)
+            session = manager_seat.bound(store, row) if row is not None else None
+            if session is None:
+                raise typer.BadParameter("the project needs a live bound manager")
+            try:
+                manager_pass.baseline(store, target.id, session.project_id, read_through)
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
         if key is not None and clear:
             store.clear_project_setting(target.id, key)
         if key is not None and value is not None:
@@ -461,6 +477,19 @@ def manager_policy(
     typer.echo(f"{target.id} manager_wake={policy.wake} manager_pass_minutes={policy.pass_minutes}")
     if policy.invalid:
         typer.echo(f"Using defaults for invalid settings: {', '.join(policy.invalid)}", err=True)
+
+
+@app.command("requeue-manager-pass")
+def requeue_manager_pass(
+    pass_id: str,
+    project: Annotated[str | None, typer.Option("--project", help="Fleet project or ID.")] = None,
+) -> None:
+    """Requeue an unfinished pass after confirming its pane is idle."""
+    try:
+        fleet_service.requeue_manager_pass(_project(project).id, pass_id)
+    except (ValueError, TimeoutError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Requeued manager pass {pass_id}.")
 
 
 @app.command("ls")

@@ -7482,8 +7482,11 @@ go with the row (:func:`_fleet_meta_terms`): nothing else expires a ``first-prom
 ``fleet-stopped:`` or ``launch-refused:`` key."""
 
 _PROJECT_META: tuple[str, ...] = (
-    "signal/{}/*", "nudge-owed:{}", "broker-refused:{}:*",
-    "manager-seat/{}/*", "manager-seat/*/{}/*",
+    "signal/{}/*",
+    "nudge-owed:{}",
+    "broker-refused:{}:*",
+    "manager-seat/{}/*",
+    "manager-seat/*/{}/*",
 )
 """The ``team_meta`` keys kept per project, as GLOBs of its id: its signals, the nudge a board
 write owed its manager (``services.fleet.NUDGE_OWED``) and the once-per-launch-and-kind marks

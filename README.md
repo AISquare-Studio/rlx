@@ -92,7 +92,10 @@ manager replacement and is removed by a fleet fresh.
 Use `rlx fleet manager-policy --project <project>` to read settings. Use
 `--clear` with a key to restore its default: `every_write` for wakes and
 `0` for watcher passes. Keep the manual timer until the watcher is healthy
-and its first acknowledged pass is complete.
+and its first acknowledged pass is complete. To initialize the completed
+read position from an operator-verified manual pass, run
+`rlx fleet manager-policy --read-through <seq> --project <project>` before
+the first watcher pass.
 
 ## Accounts
 
