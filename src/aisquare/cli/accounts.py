@@ -273,8 +273,22 @@ def _short(path: object) -> str:
     return "~" + text[len(home) :] if home and text.startswith(home) else text
 
 
-def _overview_json(overview: AccountsOverview) -> str:
-    return json.dumps(overview.model_dump(mode="json"))
+def _keychain_codes(overview: AccountsOverview) -> list[core.KeychainCode]:
+    """Each slot's ``keychain`` (``core.keychain_code``: ``none`` off macOS), for an app that
+    never reads the Keychain, from the reads :func:`accounts_service.overview` just made.
+    Asked before ``--usage``, whose forced refresh forgets them and asks again only for the
+    signed-in slots, and whose fetch can outlast their memo: asked after it, an unsigned
+    slot's item was asked twice (a second unlock dialog), and a row's code could disagree
+    with its ``signed_in`` and ``token_state`` (review of #583, and its tester's note)."""
+    return [core.keychain_code(status.account) for status in overview.accounts]
+
+
+def _overview_json(overview: AccountsOverview, keychain: Sequence[core.KeychainCode]) -> str:
+    """``accounts list --json``: the overview, each slot with its ``keychain`` beside it."""
+    payload = overview.model_dump(mode="json")
+    for row, code in zip(payload["accounts"], keychain, strict=True):
+        row["keychain"] = code
+    return json.dumps(payload)
 
 
 def _emit_overview(overview: AccountsOverview, *, with_usage: bool) -> None:
@@ -503,6 +517,7 @@ def list_(
 ) -> None:
     """List the accounts: slot, who is signed in, plan, hooks; --usage adds the limits."""
     overview = accounts_service.overview()
+    keychain = _keychain_codes(overview) if get_state().json_output else []
     if usage:
         # One concurrent, RECORDING read for every signed-in slot that has no
         # reading younger than five minutes (#146; review of #205, third round):
@@ -515,7 +530,7 @@ def list_(
             status.usage = readings.get(status.account.slot)
         _say_why(overview.accounts)
     if get_state().json_output:
-        typer.echo(_overview_json(overview))
+        typer.echo(_overview_json(overview, keychain))
         return
     _emit_overview(overview, with_usage=usage)
     if usage:
