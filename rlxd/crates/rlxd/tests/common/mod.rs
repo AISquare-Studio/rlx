@@ -19,6 +19,7 @@ const COMMAND_LIMIT: Duration = Duration::from_secs(60);
 pub struct TestHome {
     root: PathBuf,
     claude: Option<PathBuf>,
+    envs: Vec<(String, String)>,
 }
 
 /// What one `rlxd` command did.
@@ -68,7 +69,17 @@ impl TestHome {
         let root = std::env::temp_dir().join(format!("rlxd-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        Self { root, claude: None }
+        Self {
+            root,
+            claude: None,
+            envs: Vec::new(),
+        }
+    }
+
+    /// This home, every `rlxd` in it run with `name` set to `value`.
+    pub fn with_env(mut self, name: &str, value: &str) -> Self {
+        self.envs.push((name.to_owned(), value.to_owned()));
+        self
     }
 
     /// This home, its rlxd running `program` as Claude Code.
@@ -86,6 +97,13 @@ impl TestHome {
         self.rlxd_with_stdin(args, None)
     }
 
+    /// `program args…` in this home, run to its end.
+    pub fn run_of(&self, program: &Path, args: &[&str]) -> Run {
+        let mut command = self.command_of(program, args);
+        command.stdin(Stdio::null());
+        run(command, None)
+    }
+
     /// `rlxd args…` in this home, with `stdin` on its stdin.
     pub fn rlxd_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Run {
         let mut command = self.command(args);
@@ -100,9 +118,16 @@ impl TestHome {
     /// The `rlxd` command, in this home: `AISQUARE_HOME` names it and `RLX_HOME` is
     /// unset, so neither a developer's home nor CI's is touched.
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_rlxd"));
+        self.command_of(Path::new(env!("CARGO_BIN_EXE_rlxd")), args)
+    }
+
+    /// `program args…` in this home, as [`TestHome::command`] runs `rlxd`: for a copy of
+    /// rlxd, such as a signed helper, or a wrapper that runs it.
+    pub fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .args(args)
+            .envs(self.envs.iter().map(|(k, v)| (k, v)))
             .env("AISQUARE_HOME", &self.root)
             .env_remove("RLX_HOME")
             .env(
@@ -116,9 +141,58 @@ impl TestHome {
 
     /// `rlxd serve --detach`, which must succeed.
     pub fn start(&self) -> Value {
-        let run = self.rlxd(&["serve", "--detach"]);
+        self.start_with(&[])
+    }
+
+    /// `rlxd serve --detach --gate-dev-mode`, which must succeed.
+    pub fn start_dev(&self) -> Value {
+        self.start_with(&["--gate-dev-mode"])
+    }
+
+    /// `rlxd serve --detach flags…`, which must succeed.
+    pub fn start_with(&self, flags: &[&str]) -> Value {
+        let mut args = vec!["serve", "--detach"];
+        args.extend_from_slice(flags);
+        let run = self.rlxd(&args);
         assert_eq!(run.code(), Some(0), "{run:?}");
         run.data()
+    }
+
+    /// `rlxd stop`, which must succeed.
+    pub fn stop(&self) {
+        let run = self.rlxd(&["stop"]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+    }
+
+    /// rlxd's log, as it is now.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.root.join("rlxd").join("logs").join("rlxd.log"))
+            .unwrap_or_default()
+    }
+
+    /// `<home>/rlxd/gate.json`.
+    pub fn gate_json(&self) -> PathBuf {
+        self.root.join("rlxd").join("gate.json")
+    }
+
+    /// The test client's kept credential, `<home>/test-gate-credential`.
+    pub fn test_credential(&self) -> Option<String> {
+        std::fs::read_to_string(self.root.join("test-gate-credential"))
+            .ok()
+            .map(|text| text.trim().to_owned())
+    }
+
+    /// The shared client token.
+    pub fn token(&self) -> String {
+        std::fs::read_to_string(self.root.join("rlxd").join("token"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    /// `rlxd call status`'s `clients.app`.
+    pub fn app_clients(&self) -> u64 {
+        self.status()["clients"]["app"].as_u64().unwrap()
     }
 
     /// `rlxd call status`'s data, which must be `ok`.

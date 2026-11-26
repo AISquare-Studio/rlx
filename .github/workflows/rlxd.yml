@@ -53,9 +53,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     # The registry's interop tests skip where neither this nor RLXD_BIN is set (the
     # Python suite, a checkout with no uv). Here they must run: a missing uv or rlxd
-    # fails them.
+    # fails them. Likewise the gate's peer checks that need `sudo -n` (Linux) or an
+    # administrator (Windows) skip elsewhere, and must run here.
     env:
       RLXD_INTEROP_REQUIRED: "1"
+      RLXD_GATE_PEER_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -91,11 +93,28 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The gate's peer tests build only with the test-identity feature.
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
       - name: cargo test
         run: cargo test --workspace --locked
 
+      # 5.1: the gate's peer identity check, against helpers signed or built with a test
+      # identity that only the gate-test-requirement feature lets rlxd accept. Each test
+      # compiles to nothing on the other OSes.
+      - name: cargo test, the gate's peer checks (gate-test-requirement)
+        run: >-
+          cargo test -p rlxd --features gate-test-requirement --locked
+          --test gate_peer_macos --test gate_peer_linux --test gate_peer_windows
+
       - name: cargo build --release
         run: cargo build --workspace --release --locked
+
+      # 5.1: the shipped build's compiled-in requirement, which nothing can replace.
+      - name: the gate's compiled-in requirement (macOS, release)
+        if: runner.os == 'macOS'
+        run: cargo test --release -p rlxd --locked --test gate_peer_macos_release
 
       # --release reuses the build above rather than building gen-schemas again.
       - name: schemas/v1 matches rlxd-proto

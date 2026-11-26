@@ -6,6 +6,9 @@
 //!   entry, for the user rlxd runs as. rlxd makes its first instance, so a pipe someone
 //!   else made first under that name fails the start, and it reads the DACL back from
 //!   the live pipe before it takes a connection. Remote clients are refused.
+//!
+//! Each connection comes with its [`Peer`](crate::peer::Peer), pinned as it is accepted,
+//! for the gate's identity check (handoff 0.10.3, 5.1).
 
 #[cfg(unix)]
 pub use unix::Listener;
@@ -19,8 +22,12 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    use std::os::fd::AsFd;
+
     use rlxd_client::Home;
     use tokio::net::{UnixListener, UnixStream};
+
+    use crate::peer::Peer;
 
     /// The socket, listening.
     pub struct Listener {
@@ -49,9 +56,11 @@ mod unix {
             Ok(Self { listener, path })
         }
 
-        /// The next connection.
-        pub async fn accept(&mut self) -> io::Result<UnixStream> {
-            self.listener.accept().await.map(|(stream, _)| stream)
+        /// The next connection, and its peer.
+        pub async fn accept(&mut self) -> io::Result<(UnixStream, Peer)> {
+            let (stream, _) = self.listener.accept().await?;
+            let peer = Peer::of_socket(stream.as_fd());
+            Ok((stream, peer))
         }
 
         /// What `status` says of the endpoint's access list: nothing here, where the
@@ -73,7 +82,7 @@ mod unix {
 mod windows {
     use std::io;
     use std::mem;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsHandle, AsRawHandle};
     use std::ptr;
 
     use rlxd_client::Home;
@@ -90,6 +99,8 @@ mod windows {
         DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, PSECURITY_DESCRIPTOR,
         SECURITY_ATTRIBUTES,
     };
+
+    use crate::peer::{self, Peer};
 
     /// `ACCESS_ALLOWED_ACE_TYPE`.
     const ACCESS_ALLOWED: u8 = 0;
@@ -125,13 +136,20 @@ mod windows {
             })
         }
 
-        /// The next connection, with a fresh instance made for the one after. An instance
-        /// whose client went before it was connected is dropped for a fresh one too.
-        pub async fn accept(&mut self) -> io::Result<NamedPipeServer> {
+        /// The next connection and its peer, with a fresh instance made for the one after.
+        /// An instance whose client went before it was connected is dropped for a fresh
+        /// one too. The peer is pinned before anything else, so its pid can't be reused
+        /// meanwhile.
+        pub async fn accept(&mut self) -> io::Result<(NamedPipeServer, Peer)> {
             let connected = self.next.connect().await;
+            let peer = connected
+                .is_ok()
+                .then(|| Peer::of_pipe(self.next.as_handle(), peer::connected_now()));
             let fresh = self.security.create(&self.name, false)?;
             let used = mem::replace(&mut self.next, fresh);
-            connected.map(|()| used)
+            connected?;
+            let peer = peer.expect("pinned when connected");
+            Ok((used, peer))
         }
 
         /// What `status` says of the pipe's DACL: one entry, for this user, which

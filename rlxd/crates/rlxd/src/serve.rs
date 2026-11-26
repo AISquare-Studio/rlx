@@ -4,7 +4,8 @@
 //!
 //! 1. makes the home's `run/`, `rlxd/` and `rlxd/logs/` (each 0700);
 //! 2. takes `run/rlxd.lock`, or exits 1 with `already_running`;
-//! 3. opens the log, and makes the token once;
+//! 3. opens the log, makes the token once, and reads the config and the paired gate
+//!    devices (`gate.json`);
 //! 4. listens on the socket or pipe;
 //! 5. registers in `<home>/daemons/` (4.1), with a heartbeat every 5 s;
 //! 6. serves until `stop`, SIGTERM or Ctrl-C.
@@ -26,14 +27,19 @@ use rlxd_client::Home;
 use rlxd_proto::{VERSION, codes, methods};
 use tokio::task::JoinSet;
 
+use crate::config::Config;
+use crate::gate::Gate;
 use crate::listener::Listener;
 use crate::log::{error, info, warning};
 use crate::registry::{self, Registration};
 use crate::server::{self, Daemon};
-use crate::{cli, lock, log, out, token};
+use crate::{cli, lock, log, out, peer, token};
 
 /// The hidden flag a detached rlxd is started with: log to the file only.
 pub const BACKGROUND_FLAG: &str = "--background";
+
+/// The flag for gate dev mode (handoff 0.10.3, 5.1), passed on to a detached rlxd.
+pub const GATE_DEV_MODE_FLAG: &str = "--gate-dev-mode";
 
 /// How long a start waits for the lock while another process holds it: a probe takes it
 /// for an instant (`lock::is_held`), and must not make a start fail.
@@ -45,8 +51,9 @@ const START_WAIT: Duration = Duration::from_secs(15);
 /// How long a stopping rlxd gives its connections to finish.
 const FINISH_WAIT: Duration = Duration::from_secs(3);
 
-/// `rlxd serve`, in the foreground: logs to stderr too, unless `background`.
-pub fn serve(background: bool) -> ExitCode {
+/// `rlxd serve`, in the foreground: logs to stderr too, unless `background`. With
+/// `gate_dev_mode`, or `gate.dev_mode` in the config, an unsigned app may be the gate.
+pub fn serve(background: bool, gate_dev_mode: bool) -> ExitCode {
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => return out::fail(codes::START_FAILED, &e.to_string(), None),
@@ -77,7 +84,16 @@ pub fn serve(background: bool) -> ExitCode {
     );
     let result = token::ensure(&home.token())
         .map_err(|e| format!("cannot make {}: {e}", home.token().display()))
-        .and_then(|token| run(home, token));
+        .and_then(|token| {
+            let config = Config::load(&home.config())?;
+            let gate = open_gate(&home, gate_dev_mode || config.gate_dev_mode)?;
+            let flags: &'static [&'static str] = if gate_dev_mode {
+                &[GATE_DEV_MODE_FLAG]
+            } else {
+                &[]
+            };
+            run(home, token, gate, flags)
+        });
     drop(held);
     match result {
         Ok(()) => {
@@ -91,22 +107,48 @@ pub fn serve(background: bool) -> ExitCode {
     }
 }
 
+/// The gate, as gate.json says, logging loudly when it runs in dev mode.
+fn open_gate(home: &Home, dev_mode: bool) -> Result<Gate, String> {
+    let gate = Gate::load(&home.gate(), dev_mode)?;
+    if dev_mode {
+        warning!(
+            "gate dev mode is ON: an unsigned app is accepted as the gate. The gate \
+             credential is still required, but before the first pairing any local client \
+             can pair. It is for development and CI only; never run rlx like this."
+        );
+    } else {
+        info!("gate: signed app only");
+    }
+    peer::log_test_override();
+    Ok(gate)
+}
+
 /// Serves until a stop, on a runtime of its own.
-fn run(home: Home, token: String) -> Result<(), String> {
+fn run(
+    home: Home,
+    token: String,
+    gate: Gate,
+    flags: &'static [&'static str],
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| format!("cannot start the runtime: {e}"))?;
-    let result = runtime.block_on(serve_until_stopped(home, token));
+    let result = runtime.block_on(serve_until_stopped(home, token, gate, flags));
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
 }
 
-async fn serve_until_stopped(home: Home, token: String) -> Result<(), String> {
+async fn serve_until_stopped(
+    home: Home,
+    token: String,
+    gate: Gate,
+    flags: &'static [&'static str],
+) -> Result<(), String> {
     let mut listener = Listener::bind(&home).map_err(|e| e.to_string())?;
     let endpoint = home.endpoint();
-    let registration = match Registration::register(&home) {
+    let registration = match Registration::register(&home, flags) {
         Ok(registration) => {
             info!(
                 "registered in {} as {}",
@@ -120,16 +162,16 @@ async fn serve_until_stopped(home: Home, token: String) -> Result<(), String> {
             None
         }
     };
-    let keeper = Keeper::start(home.clone(), registration);
-    let daemon = Daemon::new(home, token, listener.acl());
+    let keeper = Keeper::start(home.clone(), registration, flags);
+    let daemon = Daemon::new(home, token, listener.acl(), gate);
     tokio::spawn(watch_signals(Arc::clone(&daemon)));
     info!("listening on {endpoint}");
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok(stream) => {
-                    connections.spawn(server::serve_connection(Arc::clone(&daemon), stream));
+                Ok((stream, peer)) => {
+                    connections.spawn(server::serve_connection(Arc::clone(&daemon), stream, peer));
                 }
                 Err(e) => {
                     warning!("a connection could not be taken: {e}");
@@ -149,6 +191,7 @@ async fn serve_until_stopped(home: Home, token: String) -> Result<(), String> {
         );
         connections.abort_all();
     }
+    daemon.flush();
     keeper.stop();
     Ok(())
 }
@@ -161,7 +204,11 @@ struct Keeper {
 }
 
 impl Keeper {
-    fn start(home: Home, mut registration: Option<Registration>) -> Self {
+    fn start(
+        home: Home,
+        mut registration: Option<Registration>,
+        flags: &'static [&'static str],
+    ) -> Self {
         let (stop, stopped) = mpsc::channel();
         let thread = thread::spawn(move || {
             while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(registry::HEARTBEAT) {
@@ -171,7 +218,7 @@ impl Keeper {
                             warning!("the heartbeat could not be written: {e}");
                         }
                     }
-                    None => match Registration::register(&home) {
+                    None => match Registration::register(&home, flags) {
                         Ok(registered) => {
                             info!("registered as {}", registered.id());
                             registration = Some(registered);
@@ -233,7 +280,7 @@ async fn watch_signals(daemon: Arc<Daemon>) {
 
 /// `rlxd serve --detach`: starts rlxd in the background, detached from this terminal,
 /// and returns once it takes a connection, printing its `status`.
-pub fn detach() -> ExitCode {
+pub fn detach(gate_dev_mode: bool) -> ExitCode {
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => return out::fail(codes::START_FAILED, &e.to_string(), None),
@@ -246,7 +293,8 @@ pub fn detach() -> ExitCode {
             return out::fail(codes::START_FAILED, &message, None);
         }
     }
-    let mut child = match background_command().and_then(|mut command| command.spawn()) {
+    let command = background_command(gate_dev_mode);
+    let mut child = match command.and_then(|mut command| command.spawn()) {
         Ok(child) => child,
         Err(e) => {
             let message = format!("cannot start rlxd in the background: {e}");
@@ -292,10 +340,13 @@ pub fn detach() -> ExitCode {
 
 /// `rlxd serve` in the background: no stdin, its output to nowhere (it logs to its file),
 /// in a process group or console of its own, so the terminal's signals do not reach it.
-fn background_command() -> io::Result<Command> {
+fn background_command(gate_dev_mode: bool) -> io::Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
+    command.args(["serve", BACKGROUND_FLAG]);
+    if gate_dev_mode {
+        command.arg(GATE_DEV_MODE_FLAG);
+    }
     command
-        .args(["serve", BACKGROUND_FLAG])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

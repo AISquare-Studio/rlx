@@ -124,6 +124,23 @@ pub mod methods {
     /// Stops rlxd: no params in, `{pid}` out. rlxd answers, then stops taking connections,
     /// cleans up and exits.
     pub const STOP: &str = "stop";
+    /// Pairs a device as the app gate (5.1): `{device?, gate_credential?}` in,
+    /// `{gate_credential, device, route}` out. The credential is shown this once.
+    pub const GATE_PAIR: &str = "gate.pair";
+    /// The pairing requests waiting for a paired device or the user to answer them: no
+    /// params in, `{requests: [{request_id, device, route, peer, requested_at,
+    /// expires_at}]}` out.
+    pub const GATE_PAIR_REQUESTS: &str = "gate.pair_requests";
+    /// Answers a waiting pairing request: `{request_id? | device?, approve}` in,
+    /// `{request_id, device, approved}` out. Only a paired app, or a command-line client
+    /// on the host (`rlxd gate pair`), may answer.
+    pub const GATE_PAIR_ANSWER: &str = "gate.pair_answer";
+    /// The paired devices: no params in, `{devices: [{device, route, created, last_seen,
+    /// connections}]}` out.
+    pub const GATE_DEVICES: &str = "gate.devices";
+    /// Unpairs one device, or every device: `{device?}` in, `{unpaired, dropped}` out.
+    /// The user runs it (`rlxd gate unpair`); it is not part of the app contract.
+    pub const GATE_UNPAIR: &str = "gate.unpair";
 }
 
 impl Request {

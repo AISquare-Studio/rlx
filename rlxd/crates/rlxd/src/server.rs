@@ -4,11 +4,16 @@
 //! - **`hello`.** A `protocol_version` this rlxd does not serve gets
 //!   `incompatible_protocol`, read from the raw params before anything else, so even a
 //!   hello this rlxd cannot parse gets it. Anything but a valid hello with the token gets
-//!   `unauthorized`. A valid one with `role: app` gets `not_gate`: gate pairing is not
-//!   here yet, so no connection may be the gate (fail closed). A refused hello closes the
-//!   connection and is never counted.
+//!   `unauthorized`. A valid one with `role: app` also needs a paired device's
+//!   `gate_credential` and, for a device paired locally, a peer that passes the identity
+//!   check (`peer`; only the credential in gate dev mode), or it gets `not_gate`. A
+//!   refused hello closes the connection and is never counted.
 //! - **Requests.** A frame that is not a request gets `invalid_request` and the
 //!   connection goes on. An unknown method gets `unknown_method`.
+//! - **The gate** (`gate`): `gate.pair`, `gate.pair_requests`, `gate.pair_answer`,
+//!   `gate.devices` and `gate.unpair`. An app connection whose credential is replaced, or
+//!   whose device is unpaired, gets a last `not_gate` envelope (with no `id`) and is
+//!   closed.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -23,7 +28,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
+use crate::gate::{self, Answer, Gate, Hold, Refused, Route, UnpairError};
 use crate::log::{info, warning};
+use crate::peer::Peer;
 use crate::{claude, token};
 
 /// The longest frame rlxd reads: 1 MiB. A longer one gets `invalid_request`, and the
@@ -54,12 +61,17 @@ pub struct Daemon {
     clients: Mutex<Clients>,
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
     stop: watch::Sender<bool>,
+    gate: Arc<Gate>,
 }
 
 /// What a connection was let in as.
 struct Session {
     protocol_version: u32,
-    _counted: Counted,
+    role: Role,
+    peer: Arc<Peer>,
+    /// For `role: app`: its hold on the gate. App connections are counted by the gate.
+    app: Option<Hold>,
+    _counted: Option<Counted>,
 }
 
 /// A connection counted in `status`'s `clients` while it is open.
@@ -73,6 +85,8 @@ struct Counted {
 enum Then {
     GoOn,
     Stop,
+    /// Close this connection: its own gate credential was just replaced.
+    Close,
 }
 
 /// One frame, as read.
@@ -85,7 +99,7 @@ enum Frame {
 impl Daemon {
     /// An rlxd serving `home` with `token`. `pipe_acl` is what `status` says of the
     /// pipe's DACL, on Windows.
-    pub fn new(home: Home, token: String, pipe_acl: Option<&'static str>) -> Arc<Self> {
+    pub fn new(home: Home, token: String, pipe_acl: Option<&'static str>, gate: Gate) -> Arc<Self> {
         Arc::new(Self {
             home,
             token,
@@ -94,6 +108,7 @@ impl Daemon {
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
             stop: watch::Sender::new(false),
+            gate: Arc::new(gate),
         })
     }
 
@@ -102,6 +117,12 @@ impl Daemon {
         if !self.stop.send_replace(true) {
             info!("stopping: {why}");
         }
+    }
+
+    /// Writes what only memory holds, before rlxd exits: when each gate device was last
+    /// seen.
+    pub fn flush(&self) {
+        self.gate.flush();
     }
 
     /// Resolves once [`Daemon::stop`] was called.
@@ -117,7 +138,11 @@ impl Daemon {
     }
 
     /// What `hello` makes of the first frame: a session and its reply, or the refusal.
-    fn hello(self: &Arc<Self>, frame: &str) -> Result<(Session, Envelope), Envelope> {
+    async fn hello(
+        self: &Arc<Self>,
+        frame: &str,
+        peer: Arc<Peer>,
+    ) -> Result<(Session, Envelope), Envelope> {
         let refuse = |id, message: String| {
             info!("hello refused: {message}");
             Err(reply_err(id, codes::UNAUTHORIZED, message))
@@ -157,33 +182,79 @@ impl Daemon {
             let error = error(codes::UNAUTHORIZED, "the token is wrong").with_hint(hint);
             return Err(Envelope::err(error).with_optional_id(id));
         }
-        if hello.role == Role::App {
-            info!("hello refused: role app, from {} (not_gate)", hello.client);
-            let error = error(
-                codes::NOT_GATE,
-                "this rlxd lets no connection be the gate: gate pairing is not available yet",
-            )
-            .with_hint("Connect with role tui, remote or cli.");
-            return Err(Envelope::err(error).with_optional_id(id));
-        }
-        let Some(counted) = Counted::new(self, hello.role) else {
-            let message = format!("role {} is not one this rlxd serves", role_name(hello.role));
-            return refuse(id, message);
+        let (app, counted) = if hello.role == Role::App {
+            match self.admit_app(&hello, &peer).await {
+                Ok(hold) => (Some(hold), None),
+                Err(message) => {
+                    info!(
+                        "hello refused: role app, from {} ({peer}): {message} (not_gate)",
+                        hello.client
+                    );
+                    let error = error(codes::NOT_GATE, &message).with_hint(NOT_GATE_HINT);
+                    return Err(Envelope::err(error).with_optional_id(id));
+                }
+            }
+        } else {
+            let Some(counted) = Counted::new(self, hello.role) else {
+                let message = format!("role {} is not one this rlxd serves", role_name(hello.role));
+                return refuse(id, message);
+            };
+            (None, Some(counted))
         };
         info!(
-            "hello: {} {} as {}",
+            "hello: {} {} as {}{}",
             hello.client,
             hello.client_version,
-            role_name(hello.role)
+            role_name(hello.role),
+            app.as_ref()
+                .map(|hold| format!(", device {:?}", hold.device()))
+                .unwrap_or_default()
         );
         let reply = HelloData::new(PROTOCOL_VERSION, VERSION, capabilities())
             .map(|data| Envelope::ok(object(&data)).with_id(request.id))
             .map_err(|e| reply_err(id, codes::INTERNAL, e.to_string()))?;
         let session = Session {
             protocol_version: hello.protocol_version,
+            role: hello.role,
+            peer,
+            app,
             _counted: counted,
         };
         Ok((session, reply))
+    }
+
+    /// Whether a `hello {role: "app"}` may hold the gate: a paired device's credential,
+    /// a peer of rlxd's user, and for a device paired locally, a peer that passes the
+    /// identity check (outside dev mode). Its hold, or why not.
+    async fn admit_app(&self, hello: &HelloParams, peer: &Arc<Peer>) -> Result<Hold, String> {
+        let Some(credential) = hello.gate_credential.as_deref() else {
+            return Err("role app needs a gate_credential, which gate.pair mints".to_owned());
+        };
+        let Some((device, route)) = self.gate.device_of(credential) else {
+            return Err(
+                "the gate_credential is not one this rlxd paired: it is wrong, was \
+                        replaced, or its device was unpaired"
+                    .to_owned(),
+            );
+        };
+        peer.same_user()?;
+        match route {
+            Route::Ssh => info!(
+                "gate: device {device:?} paired over SSH: its peer is sshd, so its \
+                 credential alone admits it"
+            ),
+            Route::Local if self.gate.dev_mode() => warning!(
+                "gate dev mode: hello role app from device {device:?} ({peer}) let in \
+                 without the peer identity check"
+            ),
+            Route::Local => {
+                let how = verify(peer).await?;
+                info!("gate: device {device:?}: {how}");
+            }
+        }
+        self.gate
+            .attach(credential)
+            .ok_or_else(|| "the gate_credential was replaced or unpaired meanwhile".to_owned())
     }
 
     /// The reply to one request frame after `hello`.
@@ -204,11 +275,24 @@ impl Daemon {
             }
         };
         let id = Some(request.id);
+        let params = request.params;
+        let reply = |result: Result<Data, ErrorBody>, then| match result {
+            Ok(data) => (Envelope::ok(data).with_optional_id(id), then),
+            Err(error) => (Envelope::err(error).with_optional_id(id), Then::GoOn),
+        };
         match request.method.as_str() {
-            methods::STATUS => match self.status(session).await {
-                Ok(data) => (Envelope::ok(data).with_optional_id(id), Then::GoOn),
-                Err(error) => (Envelope::err(error).with_optional_id(id), Then::GoOn),
-            },
+            methods::STATUS => reply(self.status(session).await, Then::GoOn),
+            methods::GATE_PAIR => {
+                let (result, then) = self.gate_pair(session, &params).await;
+                reply(result, then)
+            }
+            methods::GATE_PAIR_REQUESTS => reply(self.gate_pair_requests(session), Then::GoOn),
+            methods::GATE_PAIR_ANSWER => reply(self.gate_pair_answer(session, &params), Then::GoOn),
+            methods::GATE_DEVICES => {
+                let data = json!({"devices": self.gate.devices()});
+                reply(Ok(object(&data)), Then::GoOn)
+            }
+            methods::GATE_UNPAIR => reply(self.gate_unpair(session, &params), Then::GoOn),
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
                 (Envelope::ok(data).with_optional_id(id), Then::Stop)
@@ -243,6 +327,10 @@ impl Daemon {
         status.protocol_version = session.protocol_version;
         status.capabilities = capabilities();
         status.clients = *self.clients();
+        status.clients.app = self.gate.app_connections();
+        if self.gate.dev_mode() {
+            StatusData::GATE_DEV_MODE.clone_into(&mut status.gate);
+        }
         status.claude = self.claude().await;
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {
@@ -265,6 +353,260 @@ impl Daemon {
         *cached = Some((Instant::now(), claude.clone()));
         claude
     }
+}
+
+/// What `gate.pair` and `gate.pair_answer` take.
+#[derive(Deserialize)]
+struct PairParams {
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    gate_credential: Option<String>,
+    #[serde(default)]
+    route: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnswerParams {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    device: Option<String>,
+    approve: bool,
+}
+
+#[derive(Deserialize)]
+struct UnpairParams {
+    #[serde(default)]
+    device: Option<String>,
+}
+
+/// What a `not_gate` refusal says to do.
+const NOT_GATE_HINT: &str = "Only rlx's app holds the gate. A paired app presents its \
+    gate_credential; to pair again, the user runs `rlxd gate unpair` on this host first.";
+
+impl Daemon {
+    /// `gate.pair` (5.1): mints a device's credential, for a peer that passes the
+    /// identity check (any peer of rlxd's user, in dev mode).
+    async fn gate_pair(&self, session: &Session, params: &Data) -> (Result<Data, ErrorBody>, Then) {
+        let params: PairParams = match parse(params) {
+            Ok(params) => params,
+            Err(error) => return (Err(error), Then::GoOn),
+        };
+        let refuse = |message: String| {
+            info!("gate.pair refused ({}): {message} (not_gate)", session.peer);
+            (
+                Err(error(codes::NOT_GATE, &message).with_hint(NOT_GATE_HINT)),
+                Then::GoOn,
+            )
+        };
+        if let Some(route) = params.route.as_deref()
+            && route != Route::Local.name()
+        {
+            return refuse(format!(
+                "a connection to rlxd's socket pairs only route local, not {route:?}: an \
+                 SSH device pairs from inside its SSH session, never through the socket"
+            ));
+        }
+        if let Some(device) = params.device.as_deref()
+            && let Err(message) = gate::valid_device(device)
+        {
+            return (Err(error(codes::INVALID_REQUEST, &message)), Then::GoOn);
+        }
+        if let Err(message) = session.peer.same_user() {
+            return refuse(message);
+        }
+        if self.gate.dev_mode() {
+            warning!(
+                "gate dev mode: gate.pair from {} without the peer identity check",
+                session.peer
+            );
+        } else {
+            match verify(&session.peer).await {
+                Ok(how) => info!("gate.pair: {how}"),
+                Err(message) => return refuse(message),
+            }
+        }
+        let caller = session.app.as_ref().map(Hold::id);
+        let result = self.gate.pair(
+            params.device.as_deref(),
+            params.gate_credential.as_deref(),
+            caller,
+        );
+        let paired = match result {
+            Ok(paired) => paired,
+            Err(Refused::NeedsApproval(device)) => {
+                match self.await_approval(&device, &session.peer).await {
+                    Ok(paired) => paired,
+                    Err(message) => return refuse(message),
+                }
+            }
+            Err(Refused::NotGate(message)) => return refuse(message),
+            Err(Refused::Failed(message)) => {
+                warning!("gate.pair failed: {message}");
+                return (Err(error(codes::INTERNAL, &message)), Then::GoOn);
+            }
+        };
+        if params.gate_credential.is_some() {
+            warning!(
+                "gate: device {:?} paired again; its old credential is refused from now on, \
+                 and {} app connection(s) that used it were dropped",
+                paired.device,
+                paired.dropped
+            );
+        } else {
+            info!(
+                "gate: device {:?} paired, route {}",
+                paired.device,
+                paired.route.name()
+            );
+        }
+        let data = json!({
+            "gate_credential": paired.credential,
+            "device": paired.device,
+            "route": paired.route.name(),
+        });
+        let then = if paired.drop_caller {
+            Then::Close
+        } else {
+            Then::GoOn
+        };
+        (Ok(object(&data)), then)
+    }
+
+    /// Waits for a paired device or the user to approve a new device's pairing.
+    async fn await_approval(&self, device: &str, peer: &Peer) -> Result<gate::Paired, String> {
+        let request = match self.gate.request(device, &peer.to_string()) {
+            Ok(request) => request,
+            Err(Refused::NotGate(message) | Refused::Failed(message)) => return Err(message),
+            Err(Refused::NeedsApproval(_)) => unreachable!("a request never needs another"),
+        };
+        let id = request.request_id.clone();
+        warning!(
+            "gate: device {device:?} ({peer}) asks to pair as request {id}; a paired device \
+             approves it, or the user runs `rlxd gate pair --device {device:?}` on this host, \
+             within {} s",
+            gate::PAIR_WAIT.as_secs()
+        );
+        let answered = tokio::select! {
+            answered = tokio::time::timeout(gate::PAIR_WAIT, request.answer) => Some(answered),
+            () = self.stopped() => None,
+        };
+        self.gate.withdraw(&id);
+        match answered {
+            Some(Ok(Ok(Answer::Approved(by)))) => {
+                info!("gate: pairing request {id} for {device:?} approved by {by}");
+                self.gate
+                    .pair_approved(device)
+                    .map_err(|refused| match refused {
+                        Refused::NotGate(message) | Refused::Failed(message) => message,
+                        Refused::NeedsApproval(_) => "it needs another approval".to_owned(),
+                    })
+            }
+            Some(Ok(Ok(Answer::Denied(by)))) => {
+                Err(format!("pairing device {device:?} was denied by {by}"))
+            }
+            Some(Ok(Err(_))) | None => Err("rlxd is stopping".to_owned()),
+            Some(Err(_)) => Err(format!(
+                "pairing device {device:?} needs an approval: a paired device, or `rlxd gate \
+                 pair --device {device:?}` on this host, within {} s, and none came",
+                gate::PAIR_WAIT.as_secs()
+            )),
+        }
+    }
+
+    /// `gate.pair_requests`: for a paired app, or the user (a cli or tui client).
+    fn gate_pair_requests(&self, session: &Session) -> Result<Data, ErrorBody> {
+        self.may_answer(session)?;
+        Ok(object(&json!({"requests": self.gate.requests()})))
+    }
+
+    /// `gate.pair_answer`: a paired app, or the user (a cli or tui client), approves or
+    /// denies a waiting request.
+    fn gate_pair_answer(&self, session: &Session, params: &Data) -> Result<Data, ErrorBody> {
+        let by = self.may_answer(session)?;
+        let params: AnswerParams = parse(params)?;
+        let (request_id, device) = self
+            .gate
+            .answer(
+                params.request_id.as_deref(),
+                params.device.as_deref(),
+                params.approve,
+                &by,
+            )
+            .ok_or_else(|| {
+                let waiting = self.gate.requests().len();
+                error(
+                    codes::NO_PAIR_REQUEST,
+                    &format!("no pairing request of that id or device waits ({waiting} wait)"),
+                )
+            })?;
+        Ok(object(&json!({
+            "request_id": request_id,
+            "device": device,
+            "approved": params.approve,
+        })))
+    }
+
+    /// Who answers for `session`: its device, or the user. `not_gate` for anyone else.
+    fn may_answer(&self, session: &Session) -> Result<String, ErrorBody> {
+        if let Some(hold) = &session.app {
+            return Ok(format!("device {:?}", hold.device()));
+        }
+        match session.role {
+            Role::Cli | Role::Tui => Ok("the user on this host".to_owned()),
+            _ => Err(error(
+                codes::NOT_GATE,
+                "only a paired app, or the user on this host, answers pairing requests",
+            )),
+        }
+    }
+
+    /// `gate.unpair`: the user's (a cli or tui client), never the app's.
+    fn gate_unpair(&self, session: &Session, params: &Data) -> Result<Data, ErrorBody> {
+        if !matches!(session.role, Role::Cli | Role::Tui) {
+            return Err(error(
+                codes::NOT_GATE,
+                "gate.unpair is the user's: run `rlxd gate unpair` on this host",
+            ));
+        }
+        let params: UnpairParams = parse(params)?;
+        let (names, dropped) = self
+            .gate
+            .unpair(params.device.as_deref())
+            .map_err(|e| match e {
+                UnpairError::Unknown(name) => error(
+                    codes::UNKNOWN_DEVICE,
+                    &format!("no device {name:?} is paired"),
+                )
+                .with_hint("`rlxd gate devices` lists the paired devices."),
+                UnpairError::Failed(message) => error(codes::INTERNAL, &message),
+            })?;
+        let which = match params.device.as_deref() {
+            Some(name) => format!("device {name:?}"),
+            None => format!("every device ({})", names.join(", ")),
+        };
+        warning!("gate unpaired: {which}, by the user; {dropped} app connection(s) dropped");
+        Ok(object(&json!({"unpaired": names, "dropped": dropped})))
+    }
+}
+
+/// Checks `peer`'s identity off the async runtime.
+async fn verify(peer: &Arc<Peer>) -> Result<String, String> {
+    let peer = Arc::clone(peer);
+    tokio::task::spawn_blocking(move || peer.verify_identity())
+        .await
+        .unwrap_or_else(|e| Err(format!("the peer check failed: {e}")))
+}
+
+/// A method's params, as `T`, or `invalid_request` saying why not.
+fn parse<T: serde::de::DeserializeOwned>(params: &Data) -> Result<T, ErrorBody> {
+    T::deserialize(Value::Object(params.clone())).map_err(|e| {
+        error(
+            codes::INVALID_REQUEST,
+            &format!("the params are not valid: {e}"),
+        )
+    })
 }
 
 impl Counted {
@@ -296,7 +638,8 @@ fn role_name(role: Role) -> String {
 
 fn count_of(clients: &mut Clients, role: Role) -> Option<&mut u32> {
     match role {
-        Role::App => Some(&mut clients.app),
+        // App connections are the gate's holders, which `Gate` counts.
+        Role::App => None,
         Role::Tui => Some(&mut clients.tui),
         Role::Remote => Some(&mut clients.remote),
         Role::Cli => Some(&mut clients.cli),
@@ -304,8 +647,9 @@ fn count_of(clients: &mut Clients, role: Role) -> Option<&mut u32> {
     }
 }
 
-/// Serves one connection until the client closes it, it is refused, or rlxd stops.
-pub async fn serve_connection<S>(daemon: Arc<Daemon>, stream: S)
+/// Serves one connection, whose client is `peer`, until the client closes it, it is
+/// refused, it is dropped from the gate, or rlxd stops.
+pub async fn serve_connection<S>(daemon: Arc<Daemon>, stream: S, peer: Peer)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -331,7 +675,7 @@ where
             return refuse(&mut frames, &mut writer, &reply).await;
         }
     };
-    let session = match daemon.hello(&frame) {
+    let session = match daemon.hello(&frame, Arc::new(peer)).await {
         Ok((session, reply)) => {
             if send(&mut writer, &reply).await.is_err() {
                 return;
@@ -344,6 +688,7 @@ where
         let frame = tokio::select! {
             frame = frames.next() => frame,
             () = daemon.stopped() => return linger(&mut frames).await,
+            () = kicked(&session) => return dropped(&session, &mut frames, &mut writer).await,
         };
         let frame = match frame {
             Ok(Some(Frame::Line(frame))) => frame,
@@ -367,14 +712,45 @@ where
             }
             Ok(None) | Err(_) => return,
         };
+        if session.app.as_ref().is_some_and(Hold::is_kicked) {
+            return dropped(&session, &mut frames, &mut writer).await;
+        }
         let (reply, then) = daemon.answer(&session, &frame).await;
         if send(&mut writer, &reply).await.is_err() {
             return;
         }
-        if then == Then::Stop {
-            daemon.stop("a client asked");
+        match then {
+            Then::GoOn => {}
+            Then::Stop => daemon.stop("a client asked"),
+            Then::Close => return dropped(&session, &mut frames, &mut writer).await,
         }
     }
+}
+
+/// Resolves once an app connection is dropped from the gate; never for another.
+async fn kicked(session: &Session) {
+    match &session.app {
+        Some(hold) => hold.kicked().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Tells an app connection dropped from the gate why, then closes it.
+async fn dropped<R, W>(session: &Session, frames: &mut Frames<R>, writer: &mut W)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let device = session.app.as_ref().map_or("", Hold::device);
+    info!(
+        "gate: dropping an app connection of device {device:?}: its credential was replaced or unpaired"
+    );
+    let message = format!(
+        "this connection no longer holds the gate: device {device:?}'s gate credential was \
+         replaced, or the device was unpaired"
+    );
+    let error = error(codes::NOT_GATE, &message).with_hint(NOT_GATE_HINT);
+    refuse(frames, writer, &Envelope::err(error)).await;
 }
 
 /// Sends `reply`, then waits a moment for the client to read it and close.
@@ -469,7 +845,15 @@ fn capabilities() -> Vec<String> {
 
 /// The methods this rlxd serves after `hello`.
 fn served() -> Vec<&'static str> {
-    vec![methods::STATUS, methods::STOP]
+    vec![
+        methods::STATUS,
+        methods::STOP,
+        methods::GATE_PAIR,
+        methods::GATE_PAIR_REQUESTS,
+        methods::GATE_PAIR_ANSWER,
+        methods::GATE_DEVICES,
+        methods::GATE_UNPAIR,
+    ]
 }
 
 /// An error whose code and message are both non-empty, as every caller's are.

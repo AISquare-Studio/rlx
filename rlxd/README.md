@@ -6,9 +6,10 @@ events to its clients: the TUI, rlxapp and Remote. Python stays the orchestratio
 brain and the TUI. The plan is `docs/plans/0.10.3-handoff.md`, section 1.
 
 This is the daemon's core (1.3, 7.2, 7.4): one rlxd per home, on a local socket or a
-named pipe, a token `hello`, the envelope on every reply, and `status`. The event bus,
-the PTY host, the runner and the rest arrive with later items, each a method on this
-socket. `rlxd-hook` answers `--version` only for now.
+named pipe, a token `hello`, the envelope on every reply, and `status`, plus the app
+gate's authentication (5.1): per-device gate credentials and the peer identity check.
+The event bus, the PTY host, the runner and the rest arrive with later items, each a
+method on this socket. `rlxd-hook` answers `--version` only for now.
 
 ```
 rlxd/
@@ -23,11 +24,14 @@ rlxd/
 ## The daemon
 
 ```sh
-rlxd serve [--detach]   # run rlxd for this home; --detach returns once it takes connections
-rlxd status [--json]    # what it is, who is connected, and Claude Code's sign-in
+rlxd serve [--detach] [--gate-dev-mode]  # run rlxd for this home; --detach returns once it takes connections
+rlxd status [--json]    # what it is, who is connected, the gate's mode, and Claude Code's sign-in
 rlxd stop               # stop it, and wait until it has
 rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T]
           [--protocol-version N] [--env JSON] [--raw] <method> [<params-json>]
+rlxd gate devices       # the devices paired as the app gate: route, created, last seen
+rlxd gate pair [--device NAME] [--deny]  # approve (or deny) a device's waiting pairing
+rlxd gate unpair [<device>]              # unpair one device, or every device
 ```
 
 - **The home** is `RLX_HOME`, else `AISQUARE_HOME`, else `~/.aisquare`, as rlx resolves
@@ -45,8 +49,39 @@ rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T
   (4.1), in the format of Python's `core.registry` and `core.daemons`: held by its
   `<id>.lock`, rewritten every 5 s, removed on stop. After a kill its lock is free, so it
   reads as dead.
-- **The gate.** No connection may be the gate yet: every `hello {role: "app"}` gets
-  `not_gate` until gate pairing lands (5.1).
+- **The gate** (5.1). Only rlx's app may hold the gate role, proven two ways:
+  - **A per-device gate credential**, separate from the token. `gate.pair {device?,
+    gate_credential?}` mints a named device's credential and returns it once; rlxd keeps
+    only its SHA-256 in `<home>/rlxd/gate.json` (0600), with the device's route
+    (`local`), when it was made and when it was last seen. The first pairing is trust
+    on first use. Re-pairing a device needs its current credential, and drops every
+    connection that used the old one. A new device, once one is paired, waits up to
+    120 s for an approval: a paired app answers `gate.pair_answer` (it lists them with
+    `gate.pair_requests`), or the user runs `rlxd gate pair --device NAME` on the host.
+    `rlxd gate unpair [<device>]` is the only reset; unpairing one device never touches
+    another. A `hello {role: "app"}` without a paired device's credential gets
+    `not_gate`, and so does anything else the gate refuses.
+  - **The peer's identity**, checked for a device paired locally, on every gate hello
+    and every `gate.pair`. macOS: the `LOCAL_PEERTOKEN` audit token, checked by
+    Security.framework against a requirement compiled into rlxd (Apple's anchor, the
+    identifier `studio.aisquare.rlx` and the team), plus the hardened runtime and no
+    injection entitlements. Linux: `SO_PEERCRED`'s uid, the process pinned with
+    `SO_PEERPIDFD`, and, where rlx's app is installed from a package, its binary.
+    Windows: the pipe client's process, opened at once and held, its creation time,
+    its image path and that file's Authenticode signer. **On Linux and Windows this is
+    best-effort against code running as the same user; there the credential is the
+    real boundary.** `crates/rlxd/src/peer.rs` says why, and holds the expected
+    identity's constants.
+  - **SSH.** Over SSH, a connection's peer is sshd, not the app, so a device paired
+    inside an authenticated SSH session is admitted by its credential alone: the SSH
+    pairing plus the per-device credential is the boundary. A connection that only
+    reaches the socket never pairs that route. (SSH pairing itself is a later item.)
+  - **Gate dev mode** (`--gate-dev-mode`, or `gate.dev_mode = true` in
+    `<home>/rlxd/config.toml`) is for unsigned dev and CI builds of the app, and never
+    the default. It skips only the peer identity check; the credential and every
+    pairing rule still hold. rlxd logs it at start and on each gate hello, and `status`
+    says `gate: "dev mode (unsigned app accepted)"` instead of `"signed app only"`. No
+    config key, variable or flag changes the identity a release build expects.
 - **Logs** are `<home>/rlxd/logs/rlxd.log`, rotated at 5 MiB, three kept.
 - **Exit codes:** 0 when the envelope printed is `ok`, 1 when it is not, 2 on a usage
   error, 3 when rlxd is not running for the home.
@@ -67,6 +102,18 @@ cargo test --workspace --locked
 cargo build --release
 cargo run -p rlxd-proto --bin gen-schemas -- --check
 cargo deny check            # licences and advisories (deny.toml)
+```
+
+The gate's peer checks sign or build helpers with a test identity, which only the
+`gate-test-requirement` feature lets rlxd accept, so they are their own runs. Each test
+compiles to nothing on another OS. The Linux other-uid check and the Windows tests need
+`sudo -n` or an administrator: they skip with a note elsewhere, and
+`RLXD_GATE_PEER_REQUIRED=1` (CI) makes them fail instead.
+
+```sh
+cargo test -p rlxd --features gate-test-requirement --test gate_peer_macos \
+  --test gate_peer_linux --test gate_peer_windows
+cargo test --release -p rlxd --test gate_peer_macos_release   # the compiled-in requirement
 ```
 
 Two tests cross into Python's side of the daemon registry (4.1):
