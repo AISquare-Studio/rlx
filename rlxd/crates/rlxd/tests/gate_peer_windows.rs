@@ -239,10 +239,18 @@ fn an_image_renamed_away_while_it_runs_is_refused() {
     let reply: Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("{e}: {stdout}{}", String::from_utf8_lossy(&out.stderr)));
     assert_eq!(reply["error"]["code"], "not_gate", "{reply}");
+    // Refused for the file it runs, wherever that now is: the image's name follows the
+    // rename on current Windows, so the path check refuses it, and the file binding is
+    // the check behind that one.
+    let log = home.log();
+    let refusal = log
+        .lines()
+        .find(|l| l.contains("hello refused: role app"))
+        .unwrap_or_else(|| panic!("{log}"));
     assert!(
-        home.log().contains("its image was moved or replaced"),
-        "{}",
-        home.log()
+        refusal.contains("rlx-unsigned-running.exe")
+            || refusal.contains("its image was moved or replaced"),
+        "{refusal}"
     );
     // The control: the signed file, now back at the path, still passes when it runs.
     let app = [

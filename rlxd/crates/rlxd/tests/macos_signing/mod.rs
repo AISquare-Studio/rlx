@@ -5,10 +5,19 @@
 //! assert that too.
 //!
 //! **The user's keychain search list is never written.** A self-signed identity lives
-//! in a throwaway keychain file that each signing names with `--keychain`. If this macOS
-//! can't sign from a keychain off the search list, or `security create-keychain` puts
-//! the new keychain on the list, the test that needs the identity is skipped (and fails
-//! in CI, where `RLXD_GATE_PEER_REQUIRED` is set). Ad-hoc signing needs no keychain.
+//! in a keychain file that each signing names with `--keychain`:
+//!
+//! - **`RLXD_GATE_TEST_KEYCHAIN`**, when set, with its password in
+//!   `RLXD_GATE_TEST_KEYCHAIN_PASSWORD`: a keychain the caller made and listed. CI does,
+//!   on its throwaway runner (rlxd.yml), because macOS 15's `codesign` finds identities
+//!   only in listed keychains. The test imports its identity there and removes it after.
+//! - **Otherwise** a throwaway keychain of the test's own, which it never lists. Some
+//!   macOS releases (27, for one) sign from it; where `codesign` can't, or `security
+//!   create-keychain` would list it, the test is skipped (and fails where
+//!   `RLXD_GATE_PEER_REQUIRED` is set, as in CI).
+//!
+//! Every keychain step reads the list before and after, and fails if it changed. Ad-hoc
+//! signing needs no keychain.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -122,13 +131,15 @@ pub fn skip_or_fail(why: &str) {
     eprintln!("skipped: {why}");
 }
 
-/// A throwaway keychain file holding a self-signed code-signing identity whose
-/// certificate's OU is `ou`. Dropping it deletes the keychain. It is never put on the
-/// user's keychain search list: signing names its file.
+/// A self-signed code-signing identity whose certificate's OU is `ou`, in a keychain
+/// file that signing names (see the module's doc). Dropping it deletes a throwaway
+/// keychain, or removes the identity from the given one.
 pub struct SelfSigned {
     pub keychain: PathBuf,
     /// The certificate's SHA-1 fingerprint, which names the identity to `codesign`.
     pub sha1: String,
+    /// Whether the keychain is the test's own, to delete.
+    own: bool,
 }
 
 impl SelfSigned {
@@ -177,16 +188,29 @@ impl SelfSigned {
             .map(|(_, hex)| hex.trim().replace(':', ""))
             .unwrap_or_default();
         assert_eq!(sha1.len(), 40, "{fingerprint}");
-        let keychain = dir.join("gate-test.keychain-db");
         let before = search_list();
-        run("security", |c| {
-            c.args(["create-keychain", "-p", "kpw"]).arg(&keychain)
-        });
+        let given = std::env::var_os("RLXD_GATE_TEST_KEYCHAIN").map(PathBuf::from);
+        let (keychain, password) = match given {
+            Some(keychain) => {
+                let password = std::env::var("RLXD_GATE_TEST_KEYCHAIN_PASSWORD")
+                    .map_err(|_| "RLXD_GATE_TEST_KEYCHAIN_PASSWORD is unset".to_owned())?;
+                (keychain, password)
+            }
+            None => {
+                let keychain = dir.join("gate-test.keychain-db");
+                run("security", |c| {
+                    c.args(["create-keychain", "-p", "kpw"]).arg(&keychain)
+                });
+                (keychain, "kpw".to_owned())
+            }
+        };
+        let own = std::env::var_os("RLXD_GATE_TEST_KEYCHAIN").is_none();
         let made = Self {
             keychain: keychain.clone(),
             sha1,
+            own,
         };
-        if search_list() != before {
+        if own && search_list() != before {
             // This macOS lists a new keychain: deleting it unlists it again.
             drop(made);
             assert_eq!(
@@ -201,7 +225,7 @@ impl SelfSigned {
             );
         }
         run("security", |c| {
-            c.args(["unlock-keychain", "-p", "kpw"]).arg(&keychain)
+            c.args(["unlock-keychain", "-p", &password]).arg(&keychain)
         });
         run("security", |c| {
             c.arg("import").arg(&p12).arg("-k").arg(&keychain).args([
@@ -218,7 +242,7 @@ impl SelfSigned {
                 "apple-tool:,apple:,codesign:",
                 "-s",
                 "-k",
-                "kpw",
+                &password,
             ])
             .arg(&keychain)
         });
@@ -229,12 +253,15 @@ impl SelfSigned {
 
 impl Drop for SelfSigned {
     fn drop(&mut self) {
-        let _ = Command::new("security")
-            .arg("delete-keychain")
-            .arg(&self.keychain)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let mut command = Command::new("security");
+        if self.own {
+            command.arg("delete-keychain").arg(&self.keychain);
+        } else {
+            command
+                .args(["delete-identity", "-Z", &self.sha1])
+                .arg(&self.keychain);
+        }
+        let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 }
 

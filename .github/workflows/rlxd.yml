@@ -90,6 +90,24 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
+      # The macOS gate tests sign a helper with a self-signed identity. macOS 15's
+      # codesign finds identities only in keychains on the search list, which the tests
+      # never write (tests/macos_signing). So this throwaway runner lists a keychain of
+      # its own, and hands it to them.
+      - name: A keychain for the gate's signing tests (macOS)
+        if: runner.os == 'macOS'
+        working-directory: .
+        run: |
+          kc="$RUNNER_TEMP/rlxd-gate-test.keychain-db"
+          security create-keychain -p rlxd-gate-test "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p rlxd-gate-test "$kc"
+          existing=$(security list-keychains -d user | tr -d '"')
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$kc" $existing
+          echo "RLXD_GATE_TEST_KEYCHAIN=$kc" >> "$GITHUB_ENV"
+          echo "RLXD_GATE_TEST_KEYCHAIN_PASSWORD=rlxd-gate-test" >> "$GITHUB_ENV"
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
