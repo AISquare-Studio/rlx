@@ -3,8 +3,10 @@
 //! user.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
+
+use crate::files::{restrict, write_private};
 
 /// The token's random bytes: 32, written as 64 hex digits.
 const BYTES: usize = 32;
@@ -32,45 +34,11 @@ pub fn matches(token: &str, given: &str) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
-fn random_hex() -> io::Result<String> {
+/// `BYTES` random bytes, as hex.
+pub fn random_hex() -> io::Result<String> {
     let mut bytes = [0u8; BYTES];
     getrandom::fill(&mut bytes).map_err(|e| io::Error::other(format!("no random bytes: {e}")))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Writes `text` to `path` whole: a 0600 sibling, flushed to disk, renamed over it.
-fn write_private(path: &Path, text: &str) -> io::Result<()> {
-    let temporary = path.with_extension("tmp");
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    restrict(&temporary)?;
-    file.write_all(text.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temporary, path)
-}
-
-#[cfg(unix)]
-fn restrict(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
-    if mode != 0o600 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-/// On Windows the file takes its folder's ACL, which is the user's profile's.
-#[cfg(not(unix))]
-fn restrict(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

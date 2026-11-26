@@ -6,11 +6,14 @@
 //!   entry, for the user rlxd runs as. rlxd makes its first instance, so a pipe someone
 //!   else made first under that name fails the start, and it reads the DACL back from
 //!   the live pipe before it takes a connection. Remote clients are refused.
+//!
+//! Each connection comes with its [`Peer`](crate::peer::Peer), pinned as it is accepted,
+//! for the gate's identity check (handoff 0.10.3, 5.1).
 
 #[cfg(unix)]
-pub use unix::Listener;
+pub use unix::{Hangup, Listener};
 #[cfg(windows)]
-pub use windows::Listener;
+pub use windows::{Hangup, Listener};
 
 #[cfg(unix)]
 mod unix {
@@ -19,8 +22,53 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+    use std::time::Duration;
+
     use rlxd_client::Home;
     use tokio::net::{UnixListener, UnixStream};
+
+    use crate::peer::Peer;
+
+    /// Whether a client has closed its connection both ways, not only its sending half.
+    /// A client that half-closes still gets its replies.
+    pub struct Hangup {
+        socket: Option<OwnedFd>,
+    }
+
+    impl Hangup {
+        fn of_socket(fd: BorrowedFd<'_>) -> Self {
+            Self {
+                socket: fd.try_clone_to_owned().ok(),
+            }
+        }
+
+        /// Once reading has ended: whether the client is gone, rather than half-closed.
+        /// A half-closed socket can still be written to; a closed one can't (`POLLOUT`
+        /// is gone, `POLLHUP` is set), on macOS and Linux alike.
+        #[allow(unsafe_code)]
+        pub fn gone(&self) -> bool {
+            let Some(socket) = &self.socket else {
+                return true;
+            };
+            let mut poll = libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd, and a zero timeout.
+            let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+            ready < 0 || poll.revents & libc::POLLOUT == 0 || poll.revents & libc::POLLHUP != 0
+        }
+
+        /// Resolves once the client is gone, checking a few times a second: for a
+        /// connection rlxd isn't reading, half-closed or with frames queued.
+        pub async fn closed(&self) {
+            while !self.gone() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
 
     /// The socket, listening.
     pub struct Listener {
@@ -49,9 +97,12 @@ mod unix {
             Ok(Self { listener, path })
         }
 
-        /// The next connection.
-        pub async fn accept(&mut self) -> io::Result<UnixStream> {
-            self.listener.accept().await.map(|(stream, _)| stream)
+        /// The next connection, its peer, and its hangup probe.
+        pub async fn accept(&mut self) -> io::Result<(UnixStream, Peer, Hangup)> {
+            let (stream, _) = self.listener.accept().await?;
+            let peer = Peer::of_socket(stream.as_fd());
+            let hangup = Hangup::of_socket(stream.as_fd());
+            Ok((stream, peer, hangup))
         }
 
         /// What `status` says of the endpoint's access list: nothing here, where the
@@ -73,7 +124,7 @@ mod unix {
 mod windows {
     use std::io;
     use std::mem;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsHandle, AsRawHandle};
     use std::ptr;
 
     use rlxd_client::Home;
@@ -90,6 +141,24 @@ mod windows {
         DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, PSECURITY_DESCRIPTOR,
         SECURITY_ATTRIBUTES,
     };
+
+    use crate::peer::{self, Peer};
+
+    /// A named pipe has no half-close: when reading ends, the client is gone. Unread, a
+    /// pipe can't be told apart from a quiet client.
+    pub struct Hangup;
+
+    impl Hangup {
+        /// Once reading has ended: the client is gone.
+        pub fn gone(&self) -> bool {
+            true
+        }
+
+        /// Never resolves: an unread pipe gives no sign that its client went.
+        pub async fn closed(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
 
     /// `ACCESS_ALLOWED_ACE_TYPE`.
     const ACCESS_ALLOWED: u8 = 0;
@@ -125,13 +194,21 @@ mod windows {
             })
         }
 
-        /// The next connection, with a fresh instance made for the one after. An instance
-        /// whose client went before it was connected is dropped for a fresh one too.
-        pub async fn accept(&mut self) -> io::Result<NamedPipeServer> {
-            let connected = self.next.connect().await;
+        /// The next connection and its peer, with a fresh instance made for the one after.
+        /// An instance whose client went before it was connected is dropped for a fresh
+        /// one too. The peer is pinned before anything else, so its pid can't be reused
+        /// meanwhile.
+        pub async fn accept(&mut self) -> io::Result<(NamedPipeServer, Peer, Hangup)> {
+            let connected = connect_stamped(&self.next).await;
+            let peer = connected
+                .as_ref()
+                .ok()
+                .map(|at| Peer::of_pipe(self.next.as_handle(), *at));
             let fresh = self.security.create(&self.name, false)?;
             let used = mem::replace(&mut self.next, fresh);
-            connected.map(|()| used)
+            connected?;
+            let peer = peer.expect("pinned when connected");
+            Ok((used, peer, Hangup))
         }
 
         /// What `status` says of the pipe's DACL: one entry, for this user, which
@@ -139,6 +216,59 @@ mod windows {
         pub fn acl(&self) -> Option<&'static str> {
             Some(StatusData::PIPE_ACL_CURRENT_USER)
         }
+    }
+
+    /// Waits for a client to connect to `pipe`, and returns when it did, as a `FILETIME`
+    /// count: when the connection's waker last fired, before this task ran again, or
+    /// when it was found connected at once. The peer check refuses a process created
+    /// after this time (a reused pid), so it is the latest wake: never before the
+    /// connection, and as close to it as the runtime lets rlxd see.
+    async fn connect_stamped(pipe: &NamedPipeServer) -> io::Result<u64> {
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Stamp {
+            at: Arc<AtomicU64>,
+            inner: Waker,
+        }
+
+        impl Wake for Stamp {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.at.store(peer::connected_now(), Ordering::SeqCst);
+                self.inner.wake_by_ref();
+            }
+        }
+
+        let at = Arc::new(AtomicU64::new(0));
+        let connect = pipe.connect();
+        tokio::pin!(connect);
+        std::future::poll_fn(|cx| {
+            let waker = Waker::from(Arc::new(Stamp {
+                at: Arc::clone(&at),
+                inner: cx.waker().clone(),
+            }));
+            match connect.as_mut().poll(&mut Context::from_waker(&waker)) {
+                Poll::Ready(result) => {
+                    let stamped = match at.load(Ordering::SeqCst) {
+                        0 => peer::connected_now(),
+                        stamped => stamped,
+                    };
+                    Poll::Ready(result.map(|()| stamped))
+                }
+                Poll::Pending => {
+                    // A wake that left it pending was not the connection.
+                    at.store(0, Ordering::SeqCst);
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     /// A security descriptor whose DACL admits one user, and the attributes that carry
