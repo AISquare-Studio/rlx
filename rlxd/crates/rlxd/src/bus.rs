@@ -959,6 +959,25 @@ mod tests {
 
     #[test]
     fn run_events_numbered_by_their_runs_and_plain_events_from_many_threads_get_one_seq_each() {
+        // Bounded: a bus that gives a seq twice may leave a reader going round for ever,
+        // and that must fail the test, not hang it.
+        let (done, finished) = mpsc::channel();
+        let check = thread::spawn(move || {
+            many_threads_get_one_seq_each();
+            let _ = done.send(());
+        });
+        match finished.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => check.join().unwrap(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the check did not end within 60 s: a reader went round for ever")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::panic::resume_unwind(check.join().unwrap_err())
+            }
+        }
+    }
+
+    fn many_threads_get_one_seq_each() {
         let dir = Dir::new();
         let bus = Arc::new(dir.bus(CAPACITY));
         let mut everything = follower(&bus, Some(0));
