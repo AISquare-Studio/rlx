@@ -7,8 +7,8 @@
 //! wins a `Type::f` path over the trait's. These tests fail if one comes back.
 
 use rlxd_proto::{
-    DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, Request, RequestId,
-    Role, RunScope,
+    DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, Paths, Request,
+    RequestId, Role, RunScope, StatusData,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -50,6 +50,13 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
     let empty_code = json!({"schema_version": 1, "ok": false,
         "error": {"code": "", "message": "m"}});
     assert!(Envelope::deserialize(empty_code).is_err());
+    let paths = json!({"home": "h", "socket": "s", "lock": "l", "token": "t", "logs": "g"});
+    let status = json!({"version": "", "pid": 1, "platform": "linux", "protocol_version": 1,
+        "capabilities": [], "seq": 0, "clients": {"app": 0, "tui": 0, "remote": 0, "cli": 0},
+        "gate": "g", "brain": {"restarts": 0, "handled": 0},
+        "claude": {"installed": false, "signed_in": false}, "runs": {"live": 0, "queued": 0},
+        "jobs": {"count": 0}, "paths": paths});
+    assert!(StatusData::deserialize(status).is_err());
 
     // And they still read what is valid.
     assert!(Request::deserialize(json!({"id": 1, "method": "status"})).is_ok());
@@ -104,4 +111,10 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
     assert!(printed(&record).is_ok());
     record.started_at = "2026-11-25T12:00:60Z".to_owned();
     assert!(printed(&record).is_err());
+
+    let paths = Paths::new("h", "s", "l", "t", "g");
+    let mut status = StatusData::new("0.10.1", 1, "linux", paths).unwrap();
+    assert!(printed(&status).is_ok());
+    status.pid = 0;
+    assert!(printed(&status).is_err());
 }

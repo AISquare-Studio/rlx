@@ -1,11 +1,12 @@
 name: rlxd
 
 # The rlxd Cargo workspace (rlxd/), on the three OSes it ships for (handoff 0.10.3,
-# 1.1). ci.yml runs the Python suite; this runs the Rust one. A PR gets it when it
-# touches rlxd/ (Cargo.lock included), this file, or pyproject.toml, whose version
-# rlxd/crates/rlxd/tests/version.rs holds rlxd's to. Every push to main or an
-# rc/** branch runs it whatever changed, as does a run by hand
-# (`gh workflow run rlxd.yml --ref <branch>`).
+# 1.1). ci.yml runs the Python suite; this runs the Rust one, plus the daemon
+# registry's two cross-language tests (4.1), which need both. A PR gets it when it
+# touches rlxd/ (Cargo.lock included), this file, pyproject.toml, whose version
+# rlxd/crates/rlxd/tests/version.rs holds rlxd's to, or the Python side of the
+# registry's shared format. Every push to main or an rc/** branch runs it whatever
+# changed, as does a run by hand (`gh workflow run rlxd.yml --ref <branch>`).
 on:
   pull_request:
     paths:
@@ -18,6 +19,10 @@ on:
       - "tests/stub_releases.py"
       - "tests/test_rlxd_install.py"
       - "pyproject.toml"
+      - "src/aisquare/core/daemons.py"
+      - "src/aisquare/core/locking.py"
+      - "src/aisquare/core/registry.py"
+      - "tests/test_daemon_registry.py"
   push:
     branches: [main, "rc/**"]
   workflow_dispatch:
@@ -64,6 +69,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    # The registry's interop tests skip where neither this nor RLXD_BIN is set (the
+    # Python suite, a checkout with no uv). Here they must run: a missing uv or rlxd
+    # fails them.
+    env:
+      RLXD_INTEROP_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -81,6 +91,18 @@ jobs:
         with:
           workspaces: rlxd -> target
 
+      # For the registry's interop tests: registry_interop (in cargo test) runs Python's
+      # registry through `uv run python`, and the last step runs its pytest. Pinned as
+      # ci.yml pins it.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
@@ -96,6 +118,14 @@ jobs:
       # --release reuses the build above rather than building gen-schemas again.
       - name: schemas/v1 matches rlxd-proto
         run: cargo run --release --locked -p rlxd-proto --bin gen-schemas -- --check
+
+      # 4.1: Python's registry reads the real rlxd as live while it runs, and as dead
+      # after a stop or a kill.
+      - name: Python's registry reads rlxd (test_daemon_registry.py)
+        working-directory: .
+        env:
+          RLXD_BIN: ${{ github.workspace }}/rlxd/target/release/rlxd${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: uv run --extra dev pytest tests/test_daemon_registry.py -q -p no:cacheprovider
 
   # Licences and RustSec advisories, once: the dependency graph is the same on every
   # OS, since cargo-deny reads every target's dependencies wherever it runs.

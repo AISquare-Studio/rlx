@@ -1,3 +1,6 @@
 # LF everywhere under rlxd/, whatever core.autocrlf says. Windows runners check out
 # with autocrlf on, and `gen-schemas --check` compares schemas/v1 byte for byte.
 * text=auto eol=lf
+
+# cmd.exe misreads labels in a batch file with bare LF line endings.
+*.cmd text eol=crlf

@@ -100,10 +100,10 @@ pub struct Request {
     pub params: Params,
 }
 
-/// Request's fields as serde reads and writes them, unchecked. It is private, so the only
-/// way in or out of a Request is through Request's own `Serialize` and `Deserialize`, which run
-/// `validate()`. (`remote = "Self"` on Request itself would make these unchecked functions
-/// public, as `Request::serialize` and `Request::deserialize`.)
+/// The serde code of `Request`'s fields, unchecked. It is private, so the only way in or out
+/// of the type is its own `Serialize` and `Deserialize`, which run `validate()`.
+/// (`remote = "Self"` would make these unchecked functions public, as
+/// `Request::serialize` and `Request::deserialize`.)
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Request")]
 struct UncheckedRequest {
@@ -118,6 +118,12 @@ pub mod methods {
     /// The first frame on every connection: [`HelloParams`](crate::HelloParams) in,
     /// [`HelloData`](crate::HelloData) out.
     pub const HELLO: &str = "hello";
+    /// What this rlxd is and how it is doing: no params in,
+    /// [`StatusData`](crate::StatusData) out (7.4).
+    pub const STATUS: &str = "status";
+    /// Stops rlxd: no params in, `{pid}` out. rlxd answers, then stops taking connections,
+    /// cleans up and exits.
+    pub const STOP: &str = "stop";
 }
 
 impl Request {
