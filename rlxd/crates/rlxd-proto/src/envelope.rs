@@ -321,6 +321,15 @@ pub mod codes {
     /// A setting key without a `.` that this rlxd does not know. Dotted keys,
     /// `<namespace>.<name>`, are always free to use.
     pub const UNKNOWN_SETTING: &str = "unknown_setting";
+    /// `env.set` or `hello`'s `env` named a key that is not `PATH`, `CLAUDE_CONFIG_DIR` or
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3). Nothing changed.
+    pub const BAD_ENV_KEY: &str = "bad_env_key";
+    /// A run could not start: no `claude` on the app's `PATH` (4.3), or rlxd's own when
+    /// the app set none, and `RLXD_CLAUDE_BIN` names none. Agreed with the runner (7.5).
+    pub const CLAUDE_NOT_FOUND: &str = "claude_not_found";
+    /// A run could not start: the `claude` found first is a batch file, such as npm's
+    /// `claude.cmd` shim on Windows, which rlxd does not run through `cmd` (4.3).
+    pub const CLAUDE_NOT_RUNNABLE: &str = "claude_not_runnable";
 }
 
 impl Envelope {

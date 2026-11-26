@@ -195,6 +195,14 @@ jobs:
       - name: cargo deny check
         run: cargo deny --locked check
 
+      # 4.3: rlx keeps /usr/bin/security as the only Keychain reader, so rlxd links no
+      # Keychain crate, on any target. The Accept's line, as written.
+      - name: no Keychain crate in rlxd (4.3)
+        working-directory: .
+        run: >-
+          cargo tree --manifest-path rlxd/Cargo.toml --target all -e normal > tree.txt
+          && test -s tree.txt && ! grep -qE 'security-framework|keyring' tree.txt
+
   # rlx.app's way to a host over a real `ssh localhost` (the owner's remote brief, §3).
   # First `rlxd here`, as rlx.app runs it: by absolute path, in a non-login session that
   # has not read the user's profile. It must give the answer `env -i HOME=$HOME rlxd here

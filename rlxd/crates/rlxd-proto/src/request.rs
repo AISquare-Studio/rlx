@@ -162,6 +162,12 @@ pub mod methods {
     /// [`SettingsDeleteParams`](crate::SettingsDeleteParams) in, [`Setting`](crate::Setting)
     /// out at version 0, and `settings.deleted` on the stream.
     pub const SETTINGS_DELETE: &str = "settings.delete";
+    /// Sets the app's environment for Claude Code (4.3): [`EnvValues`](crate::EnvValues)
+    /// in, every value now out. Only an app-role connection that holds the gate.
+    pub const ENV_SET: &str = "env.set";
+    /// The app's environment for Claude Code: [`EnvValues`](crate::EnvValues) out. Every
+    /// client.
+    pub const ENV_GET: &str = "env.get";
 }
 
 impl Request {

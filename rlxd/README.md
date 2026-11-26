@@ -135,7 +135,9 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
   an `ok` envelope: see below. `rlxd events` exits 4 when its `--timeout` runs out.
 
 The `status` reply's shape is `schemas/v1/status-reply.json`. `RLXD_CLAUDE_BIN` names the
-program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/`.
+program rlxd runs as Claude Code; tests point it at `tests/fixtures/fake-claude/`. It is
+read from rlxd's own environment only, and wins over the app's `PATH` (see [The app's
+environment](#the-apps-environment-for-claude-code)).
 
 ## The event bus
 
@@ -224,6 +226,51 @@ token reads every one.
   paired, whose credential its `hello` carries. One whose device is unpaired, or whose
   credential is replaced, can no longer change a protected key.
   `crates/rlxd/tests/settings.rs` pairs a device for real, in gate dev mode.
+
+## The app's environment for Claude Code
+
+A GUI app's `PATH` lacks the user's shell `PATH`, so rlx.app reads `PATH`,
+`CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` once from a login shell and
+hands them to rlxd (handoff 0.10.3, 4.3). They decide which `claude` every gated run
+starts and where it reads its settings, so only the gate holder sets them.
+
+```sh
+rlxd call --as-app env.set '{"CLAUDE_CONFIG_DIR":"/Users/u/.claude-work"}'
+rlxd call --as-app --env '{"PATH":"/opt/homebrew/bin:/usr/bin:/bin"}' status
+rlxd call env.get
+```
+
+- **`env.set {<key>: <value>, …}`**, and `env` in a `hello`, are taken only from an
+  app-role connection that holds the gate (5.1). Anything else gets `not_gate`, and
+  nothing changes: an `env.set` from a `cli` or `tui` client, a `hello` with `env` that
+  doesn't take the app role, or an app `hello` the gate refuses. **`env.get`** is open
+  to every client. Each replies with every value now: `schemas/v1/env.json`.
+- **Keys.** Exactly the three. Any other key gets `bad_env_key`, and so does the whole
+  request, valid keys included: nothing changes. A key the request doesn't name keeps
+  its value, and an empty value removes its key.
+- **Values** are strings of at most 64 KiB with no NUL (`invalid_params` otherwise),
+  kept as sent: a relative `CLAUDE_CONFIG_DIR` stays relative.
+- **`<home>/rlxd/env.json`** (0600) keeps them, written whole and durably (a 0600
+  sibling, fsynced, renamed over it), so an rlxd started at login has them too. One that
+  can't be read (not JSON, a key this rlxd doesn't know, a value too long) is moved
+  aside whole to `env.json.unreadable-<time>`, logged as an error, and rlxd starts with
+  no app environment, as the settings do. If it can't be moved either, every change is
+  refused until it is fixed and rlxd restarted.
+- **`claude`** is resolved when the values are taken in (`env.set`, an app `hello`'s
+  `env`) and when rlxd starts, never when a run starts: the first `claude` on the app's
+  `PATH`, in order, else on rlxd's own `PATH` when the app set none. Empty and relative
+  entries are skipped. The path is kept as found, an absolute path with links
+  unresolved. `RLXD_CLAUDE_BIN`, from rlxd's own environment only, wins over both.
+  `status.claude` reports it: `installed`, and `path`, the program a run starts.
+  - **Windows** tries `claude` with each of `PATHEXT`'s extensions, so `claude.exe`. A
+    batch file found first, such as npm's `claude.cmd` shim, isn't run: Rust starts one
+    through `cmd`, whose rules no escaping makes safe for a prompt. `status` then says
+    Claude Code isn't installed.
+- **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
+  links no Keychain crate: `rlxd.yml`'s `deny` job fails when `cargo tree --target all
+  -e normal` holds `security-framework` or `keyring`.
+
+`crates/rlxd/tests/env.rs` runs 4.3's Accept lines that start no run, on three OSes.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 

@@ -1,11 +1,15 @@
 //! Which Claude Code rlxd runs, and whether it is signed in: `status`'s `claude` (handoff
 //! 0.10.3, 7.4).
 //!
-//! - **Which program.** `RLXD_CLAUDE_BIN` when it is set: a stand-in in tests
-//!   (`rlxd/tests/fixtures/fake-claude/<scenario>`), and nothing else when it names no
-//!   program. Otherwise `claude` on `PATH`. On Windows a name without an extension is
-//!   tried with each of `PATHEXT`'s, as `cmd` and `where` do, since Windows runs no
-//!   file without one.
+//! - **Which program.** `RLXD_CLAUDE_BIN` when it is set, read from rlxd's own
+//!   environment only: a stand-in in tests (`rlxd/tests/fixtures/fake-claude/<scenario>`),
+//!   and nothing else when it names no program. Otherwise the first `claude` on the app's
+//!   `PATH` (4.3, [`resolve_on`]), else on rlxd's own, in order, skipping empty and
+//!   relative entries. The path is kept as found, an absolute path with its links
+//!   unresolved. On Windows a name without an extension is tried with each of `PATHEXT`'s,
+//!   as `cmd` and `where` do, since Windows runs no file without one. A batch file found
+//!   first, such as npm's `claude.cmd` shim, is not run ([`Resolved::NotRunnable`]): Rust
+//!   starts one through `cmd`, whose rules no argument escaping makes safe for a prompt.
 //! - **What it says.** `claude --version` names the version. `claude auth status --json`
 //!   says whether it is signed in (`loggedIn`), how (`authMethod`), as whom (`email`) and
 //!   on which plan (`subscriptionType`).
@@ -15,7 +19,7 @@
 //! (4.3): it asks Claude Code, which reads its own.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -30,16 +34,76 @@ pub const BIN_ENV: &str = "RLXD_CLAUDE_BIN";
 /// How long each of the two commands may take.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What Claude Code says about itself now.
-pub async fn probe() -> Claude {
+/// Where `claude` resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// The program: an absolute path, as it was found.
+    Found(PathBuf),
+    /// No `claude` on the `PATH` searched, and `RLXD_CLAUDE_BIN` names none.
+    NotFound,
+    /// Windows: a batch file, such as npm's `claude.cmd` shim, which rlxd doesn't run.
+    NotRunnable(PathBuf),
+}
+
+impl Resolved {
+    /// The program, when one was found that rlxd runs.
+    pub fn program(&self) -> Option<&Path> {
+        match self {
+            Self::Found(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves `claude` now: `RLXD_CLAUDE_BIN` from rlxd's own environment when it is set,
+/// else the first `claude` on `path` (the app's `PATH`), or on rlxd's own `PATH` when the
+/// app set none. Entries that are empty or relative are skipped: a relative one would
+/// depend on rlxd's working directory. The path is kept as found, never canonicalized.
+pub fn resolve_on(path: Option<&OsStr>) -> Resolved {
+    let pathext = env::var_os("PATHEXT");
+    let found = if let Some(named) = env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
+        program_at(Path::new(&named), pathext.as_deref())
+            .and_then(|program| std::path::absolute(program).ok())
+    } else {
+        let own = env::var_os("PATH");
+        let Some(path) = path.or(own.as_deref()) else {
+            return Resolved::NotFound;
+        };
+        find_on(path, pathext.as_deref())
+    };
+    match found {
+        Some(program) if is_batch_file(&program) => Resolved::NotRunnable(program),
+        Some(program) => Resolved::Found(program),
+        None => Resolved::NotFound,
+    }
+}
+
+/// The first `claude` in `path`'s entries, in order, skipping empty and relative ones.
+fn find_on(path: &OsStr, pathext: Option<&OsStr>) -> Option<PathBuf> {
+    env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute())
+        .find_map(|dir| program_at(&dir.join("claude"), pathext))
+}
+
+/// Whether Windows would start `program` through `cmd`: a `.cmd` or `.bat` file.
+fn is_batch_file(program: &Path) -> bool {
+    cfg!(windows)
+        && program
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+/// What the Claude Code `resolved` names says about itself now.
+pub async fn probe_at(resolved: &Resolved) -> Claude {
     let mut claude = Claude::default();
-    let Some(program) = resolve() else {
+    let Some(program) = resolved.program() else {
         return claude;
     };
     claude.installed = true;
+    claude.path = Some(program.display().to_string());
     let (version, auth) = tokio::join!(
-        output(&program, &["--version"]),
-        output(&program, &["auth", "status", "--json"]),
+        output(program, &["--version"]),
+        output(program, &["auth", "status", "--json"]),
     );
     claude.version = version.as_deref().and_then(parse_version);
     if let Some(status) = auth
@@ -49,18 +113,6 @@ pub async fn probe() -> Claude {
         read_auth_status(&mut claude, &status);
     }
     claude
-}
-
-/// The program to run as `claude`, if there is one.
-pub fn resolve() -> Option<PathBuf> {
-    let pathext = env::var_os("PATHEXT");
-    if let Some(named) = env::var_os(BIN_ENV).filter(|value| !value.is_empty()) {
-        return program_at(Path::new(&named), pathext.as_deref());
-    }
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .find_map(|dir| program_at(&dir.join("claude"), pathext.as_deref()))
 }
 
 /// The program `path` names, if it names one this OS can run.
@@ -174,6 +226,48 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn path_is_walked_in_order_skipping_empty_and_relative_entries_and_kept_as_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("rlxd-find-on-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (rel, first, second) = (base.join("rel"), base.join("first"), base.join("second"));
+        let target = base.join("program");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for dir in [&rel, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::os::unix::fs::symlink(&target, dir.join("claude")).unwrap();
+        }
+        std::fs::create_dir_all(&first).unwrap();
+        // `rel`, spelled relative to the working directory: it holds a claude, and is
+        // skipped all the same.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let relative = format!("{up}{}", rel.strip_prefix("/").unwrap().display());
+        assert!(Path::new(&relative).join("claude").exists(), "{relative}");
+        let path = format!(":{relative}:{}:{}", first.display(), second.display());
+        let found = find_on(OsStr::new(&path), None).unwrap();
+        assert_eq!(found, second.join("claude"), "the link, as found");
+        assert_eq!(find_on(OsStr::new(&relative), None), None);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_batch_file_is_one_only_on_windows() {
+        assert_eq!(
+            is_batch_file(Path::new(r"C:\npm\claude.cmd")),
+            cfg!(windows)
+        );
+        assert_eq!(
+            is_batch_file(Path::new(r"C:\npm\CLAUDE.BAT")),
+            cfg!(windows)
+        );
+        assert!(!is_batch_file(Path::new(r"C:\bin\claude.exe")));
+    }
 
     #[test]
     fn the_version_is_the_first_word_when_it_is_a_number() {

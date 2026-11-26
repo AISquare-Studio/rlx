@@ -142,8 +142,18 @@ pub struct Brain {
 #[non_exhaustive]
 pub struct Claude {
     /// Whether rlxd found the program: `RLXD_CLAUDE_BIN` when it is set, else `claude`
-    /// on `PATH`.
+    /// on the app's `PATH` (4.3), else on rlxd's own.
     pub installed: bool,
+    /// The program rlxd starts as Claude Code, an absolute path as it was found, links
+    /// kept: resolved when the app sets `PATH` and when rlxd starts, never at a run's
+    /// start (4.3). Absent when it is not installed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null, length(min = 1))]
+    pub path: Option<String>,
     /// Its version, such as `2.1.314`, when `claude --version` said one.
     #[serde(
         default,

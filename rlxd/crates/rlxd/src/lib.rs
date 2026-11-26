@@ -39,6 +39,7 @@ mod cli;
 mod clock;
 mod config;
 mod durable;
+mod env;
 mod events;
 mod files;
 mod gate;

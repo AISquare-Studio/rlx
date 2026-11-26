@@ -175,6 +175,7 @@
 
 mod check;
 mod daemon;
+mod env;
 mod envelope;
 mod event;
 mod hello;
@@ -188,6 +189,7 @@ mod subscribe;
 
 pub use check::Invalid;
 pub use daemon::{DaemonRecord, kinds as daemon_kinds};
+pub use env::{EnvChange, EnvRefusal, EnvValues, MAX_VALUE as ENV_MAX_VALUE, keys as env_keys};
 pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};
 pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};

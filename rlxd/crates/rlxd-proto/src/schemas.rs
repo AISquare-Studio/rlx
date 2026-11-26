@@ -9,7 +9,7 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, Request, Setting,
+    DaemonRecord, EnvValues, Envelope, Event, HelloData, HelloParams, HereData, Request, Setting,
     SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
     SettingsSetParams, StatusData, SubscribeParams,
 };
@@ -27,6 +27,7 @@ pub struct SchemaFile {
 pub fn all() -> Vec<SchemaFile> {
     let mut files = vec![
         file::<DaemonRecord>("daemon-record.json"),
+        file::<EnvValues>("env.json"),
         file::<Envelope>("envelope.json"),
         file::<Event>("event.json"),
         file::<SubscribeParams>("events-subscribe.json"),
