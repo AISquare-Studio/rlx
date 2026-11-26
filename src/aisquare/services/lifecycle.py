@@ -1276,13 +1276,16 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     service_ran = _stop_the_service(plan.command)
     # Into a release with no service, its login item goes first: there it would run a command
     # that release does not have at every login, and nothing there could take it away (M1).
-    item_said = _no_login_item_for(service_login, plan.target or plan.latest_version)
+    item_said, item_gone = _no_login_item_for(service_login, plan.target or plan.latest_version)
     code = install_route.run_installer(plan.argv, env=plan.env, to_stderr=to_stderr)
     if code != 0:
         # Asked too: uv resolves before it replaces anything (measured, uv 0.12.19), so a
         # run it could not resolve, as under a cutoff that excludes even the release that
         # runs, leaves that release installed, and no reinstall from nothing is needed.
         kept, _ = _installed_version(plan)
+        if item_gone and (kept is None or not lacks_the_service(kept)):
+            # The move did not happen: the release still here gets its login item back.
+            item_said = _put_the_login_item_back(service_login)
         service_said = _start_the_service_again(service_host, plan, kept) if service_ran else None
         return UpgradeReport(
             plan,
@@ -1294,10 +1297,11 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
     if version is not None and lacks_the_service(version):
-        item_said = item_said or _no_login_item_for(service_login, version)
-    else:
-        # Only ever refreshed, never made (design #1875): a new path to rlx, a new PATH.
-        service_login.refresh_the_item()
+        item_said = item_said or _no_login_item_for(service_login, version)[0]
+    elif version is not None:
+        # Only ever refreshed, never made (design #1875), by the install now in place, as its
+        # hooks are: a new path to rlx, a new PATH.
+        _refresh_the_login_item(plan)
     service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
     if problem is not None:
         said = tuple(note for note in (item_said, service_said) if note)
@@ -1330,20 +1334,42 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     return UpgradeReport(plan, exit_code=code, version=version, hooks=hooks, notes=tuple(notes))
 
 
-def _no_login_item_for(service_login: ModuleType, release: str | None) -> str | None:
-    """The rlx service's login item taken away, and its choice forgotten, on a move to
-    ``release`` when it has no service (:func:`lacks_the_service`); what to say of it, or
-    ``None`` when there was nothing to take away or ``release`` has the service."""
+def _no_login_item_for(service_login: ModuleType, release: str | None) -> tuple[str | None, bool]:
+    """The rlx service's login item taken away on a move to ``release`` when it has no service
+    (:func:`lacks_the_service`), an ON choice with it and an OFF one kept
+    (``service_login.forget_at_login``); what to say of it, and whether an item went."""
     if release is None or not lacks_the_service(release):
-        return None
+        return None, False
     service = service_login.SERVICE
     try:
         gone = service_login.forget_at_login()
     except service_login.LoginError as exc:
-        return f"the {service}'s login item could not be taken away ({exc}): {release} has none"
+        return (
+            f"the {service}'s login item could not be taken away ({exc}): {release} has none",
+            False,
+        )
     if not gone:
-        return None
-    return f"the {service} no longer starts at login: {release} has no {service}"
+        return None, False
+    return f"the {service} no longer starts at login: {release} has no {service}", True
+
+
+def _put_the_login_item_back(service_login: ModuleType) -> str:
+    """The login item :func:`_no_login_item_for` took away, put back after an install that
+    failed, which left this release, with its service, in place (reviewer of #33)."""
+    service = service_login.SERVICE
+    try:
+        service_login.register_at_login()
+    except (service_login.LoginError, OSError) as exc:
+        return f"the {service}'s login item, taken away for the move, could not be put back: {exc}"
+    return f"the {service} still starts at login: its login item was put back"
+
+
+def _refresh_the_login_item(plan: UpgradePlan) -> None:
+    """The install now in place rewrites the login item that is there (``rlx service refresh``,
+    which never makes one), as its own hooks are rewritten by its own process. Best effort:
+    an item left as it was still starts the service."""
+    command = [str(plan.route.facts.executable), "-P", "-m", "aisquare", "service", "refresh"]
+    install_route.run_captured(command, timeout=VERSION_CHECK_TIMEOUT_SECONDS)
 
 
 def _stop_the_service(command: str) -> bool:

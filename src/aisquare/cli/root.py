@@ -79,6 +79,11 @@ def init(
     ] = False,
 ) -> None:
     """Set up rlx on this machine and connect your agents."""
+    from aisquare.services import service_login
+
+    # What --reinit --yes replaces with the defaults: a file it could not read held a choice
+    # about the login item nobody can tell now, so that item is left as it is (#33, round 2).
+    unreadable_before = service_login.config_unreadable() if reinit else None
     try:
         with expected_config_write_errors():
             report = lifecycle_service.initialize(
@@ -112,10 +117,13 @@ def init(
     # On by default (S2, #33): the first init of the default home adds the login item, not
     # under CI; a choice on record, a removal in the OS's own settings with it, is left as it
     # is, the item only refreshed. --no-service records the no, for every later init.
-    from aisquare.services import service_login
-
     with expected_config_write_errors():
-        if no_service:
+        if unreadable_before is not None:
+            report.notes.append(
+                f"the {service_login.SERVICE}'s login item was left as it is: {unreadable_before}"
+                " before --reinit replaced it"
+            )
+        elif no_service:
             report.notes.append(service_login.decline_by_default())
         else:
             report.notes.append(service_login.register_by_default())

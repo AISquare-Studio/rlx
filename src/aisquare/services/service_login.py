@@ -462,7 +462,8 @@ def at_login_state() -> AtLogin:
         return AtLogin(None, False, None, choice, str(exc))
     item = item_path(how)
     if not item.is_file():
-        why = NEVER_ON if choice is None else REMOVED if choice else OFF_IN_RLX
+        unreadable = config_unreadable() if choice is None else None
+        why = unreadable or (NEVER_ON if choice is None else REMOVED if choice else OFF_IN_RLX)
         return AtLogin(how, False, item, choice, why)
     off = _turned_off_by_the_os(how)
     if off is not None and choice is False:
@@ -595,22 +596,24 @@ def unregister_at_login() -> AtLogin:
 def forget_at_login() -> bool:
     """``rlx uninstall``'s step, and a move to a release with no service (``rlx upgrade``): the
     login item taken away (or the OS would start a program that is gone, or a command that
-    release does not have, at every login, and that release has no way to take it away), and
-    the choice with it, so a later install is on by default again. Whether there was an item
-    or a choice. :class:`LoginError` when the item's file stays."""
+    release does not have, at every login, and that release has no way to take it away).
+    Whether an item was there.
+
+    An ON choice goes with it, so a later install is on by default again; an OFF one stays,
+    as that release keeps a section it does not know: forgotten, the next init of a release
+    with the service would add the item back (reviewer of #33, round 2). One in a file that
+    cannot be read is left as it is. :class:`LoginError` when the item's file stays."""
     try:
         how = login_how()
     except LoginError:
         return False  # nothing can be in place here
     there = item_path(how).is_file()
     _take_the_item_away(how)
-    chosen = read_choice() is not None
-    if chosen:
-        # A config.toml it cannot write: the uninstall goes on without it. One it cannot read
-        # reads as no choice, and is left as it is.
+    if read_choice() is True:
+        # A config.toml it cannot write: the uninstall goes on without it.
         with contextlib.suppress(OSError):
             _keep_the_choice(None)
-    return there or chosen
+    return there
 
 
 def _take_the_item_away(how: How) -> None:

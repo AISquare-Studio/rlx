@@ -747,8 +747,9 @@ def test_the_switch_turns_it_on_and_off_and_ctrl_z_takes_it_back(login_os: Login
 
     assert seen[0] == f"Off: {service_login.NEVER_ON}."
     assert seen[1] == f"Off: {service_login.OFF_IN_RLX}."
-    assert f"{start_at_login.TURNED_ON} · Undo: ctrl+z" in seen
-    assert f"{start_at_login.TURNED_OFF} · Undo: ctrl+z" in seen
+    assert "rlx starts at login · Undo: ctrl+z" in seen
+    # Its words, not the constant: bootout stops the service the OS started (#2103 m3).
+    assert "rlx no longer starts at login, and the service it started stops · Undo: ctrl+z" in seen
     assert ("launchctl", "bootout", TARGET) in login_os.calls
     assert _choice() is True
 
@@ -884,9 +885,9 @@ def test_reset_all_keeps_the_choice_and_a_file_with_only_it_holds_nothing_to_res
 
 def _broken_config() -> None:
     path = paths.config_path()
-    path.write_text(
-        path.read_text(encoding="utf-8") + "\n[ui]\nthis is = not [toml\n", encoding="utf-8"
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    before = path.read_text(encoding="utf-8") if path.exists() else ""
+    path.write_text(before + "\n[ui]\nthis is = not [toml\n", encoding="utf-8")
 
 
 def test_an_unreadable_config_touches_no_login_item_and_says_so(
@@ -982,3 +983,79 @@ def test_a_switch_macos_keeps_off_says_where_to_turn_it_on_and_offers_no_undo(
     assert not any("Undo" in notice for notice in notices), notices
     assert ("launchctl", "bootout", TARGET) not in login_os.calls
     assert _plist().is_file()
+
+
+# --- reviewer of #33, round 2 (#2140) -------------------------------------------------------------
+
+
+def test_a_move_back_keeps_an_off_choice_and_says_nothing_of_an_item_never_there(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """The MAJOR: a move back made an OFF choice undecided, so the next init of a release with
+    the service added the item. An off is kept now, and nothing is said of an item that was
+    never there."""
+    _init(tmp_path / "project", "--no-service")
+    login_os.calls.clear()
+
+    said, gone = lifecycle._no_login_item_for(service_login, "0.10.1")
+
+    assert (said, gone) == (None, False)
+    assert _choice() is False
+    again = _init(tmp_path / "project")
+    assert again.exit_code == 0, again.output
+    assert not _plist().exists() and login_os.changes() == [("launchctl", "bootout", TARGET)]
+
+
+def test_a_move_back_forgets_an_on_choice_with_its_item(login_os: LoginOs) -> None:
+    _rlx("service", "install")
+
+    said, gone = lifecycle._no_login_item_for(service_login, "0.10.1")
+
+    assert gone is True and not _plist().exists() and _choice() is None
+    assert said == "the rlx service no longer starts at login: 0.10.1 has no rlx service"
+
+
+def test_init_reinit_over_an_unreadable_config_touches_no_login_item(
+    tmp_path: Path, login_os: LoginOs
+) -> None:
+    """--reinit --yes replaced a file it could not read, and the init then found nothing chosen
+    and added the item back (reviewer, live: 4 launchctl calls)."""
+    _rlx("service", "install")
+    _rlx("service", "uninstall")
+    _broken_config()
+    login_os.calls.clear()
+
+    (tmp_path / "p").mkdir()
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(tmp_path / "p"))
+
+    assert again.exit_code == 0, again.output
+    assert "login item was left as it is: config.toml cannot be read" in again.output
+    assert not _plist().exists() and login_os.calls == []
+
+
+def test_status_says_an_unreadable_config_is_why_it_cannot_say(login_os: LoginOs) -> None:
+    _broken_config()
+
+    result = _rlx("--json", "service", "status")
+
+    assert result.exit_code == 3, result.output
+    why = json.loads(result.stdout)["at_login"]["why_off"]
+    assert why.startswith("config.toml cannot be read"), why
+
+
+def test_service_refresh_rewrites_an_item_that_is_there_and_makes_none(
+    tmp_path: Path, login_os: LoginOs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The upgrade's step, run by the install it put in place (``lifecycle``)."""
+    none_there = _rlx("--json", "service", "refresh")
+    assert json.loads(none_there.stdout) == {"refreshed": False}
+    assert not _plist().exists()
+
+    _rlx("service", "install")
+    new_path = os.pathsep.join((str(tmp_path / "new-bin"), "/usr/bin"))
+    monkeypatch.setenv("PATH", new_path)
+
+    refreshed = _rlx("--json", "service", "refresh")
+
+    assert json.loads(refreshed.stdout) == {"refreshed": True}
+    assert plistlib.loads(_plist().read_bytes())["EnvironmentVariables"]["PATH"] == new_path

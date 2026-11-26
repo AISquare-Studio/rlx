@@ -226,6 +226,20 @@ def _ask_to_linger() -> bool:
     )
 
 
+@app.command("refresh", hidden=True)
+def service_refresh() -> None:
+    """The upgrade's step, run by the install it put in place: this home's login item rewritten
+    as this install writes it (its path to rlx, its PATH), when one is there and rlx's. Never
+    makes one, and touches nothing while config.toml cannot be read."""
+    from aisquare.services import service_login
+
+    refreshed = service_login.refresh_the_item()
+    _say(
+        {"refreshed": refreshed},
+        "the login item was refreshed" if refreshed else "the login item was left as it is",
+    )
+
+
 @app.command("uninstall")
 def service_uninstall() -> None:
     """Stop starting the service at login: its login item is taken away, and the service the OS

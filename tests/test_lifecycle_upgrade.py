@@ -19,7 +19,6 @@ import io
 import itertools
 import json
 import os
-import plistlib
 import re
 import sys
 from collections.abc import Iterator, Mapping
@@ -4701,6 +4700,28 @@ def test_a_move_forward_refreshes_the_login_item_and_keeps_it(
     result = runner.invoke(app, ["--json", "upgrade", "--yes"])
 
     assert result.exit_code == 0, result.output
-    agent = plistlib.loads(item.read_bytes())
-    assert agent["EnvironmentVariables"]["PATH"] == os.pathsep.join(("/opt/after", "/usr/bin"))
+    # By the install now in place, in a process of its own, as its hooks are (#2140, nit).
+    python = str(tool.facts.executable)
+    assert [python, "-P", "-m", "aisquare", "service", "refresh"] in machine.captured
+    assert service_login.read_choice() is True
+    assert item.is_file()
+
+
+def test_a_move_back_that_fails_puts_the_login_item_back(
+    runner: CliRunner, tool: Tool, machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The item goes before the installer; an installer that fails leaves this release, with
+    its service, in place, and so its item comes back (reviewer of #33, round 2)."""
+    from aisquare.services import service_login
+
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    machine.installer_exit = 1
+    machine.new_version = "0.10.2"  # what the failed install left: this release
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code != 0
+    assert _one_object(result.stdout)["error"] == "upgrade_failed", result.stdout
+    assert item.is_file(), "the item taken away for the move is back"
     assert service_login.read_choice() is True

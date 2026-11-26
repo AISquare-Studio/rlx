@@ -4835,9 +4835,10 @@ _NAMED = (
         ("", "", _STARTS),
         (" --no-service", "", "  skip     the rlx service at login (--no-service)\n"),
         ("", "{home}/.rlx", _STARTS),
+        ("", "{home}/.rlx/", _STARTS),
         ("", "{home}/scratch-home", _NAMED),
     ],
-    ids=["by-default", "no-service", "the-default-home-by-name", "a-named-home"],
+    ids=["by-default", "no-service", "the-default-home-by-name", "with-a-slash", "a-named-home"],
 )
 def test_the_plan_says_the_service_starts_at_login(
     tmp_path: Path, flags: str, named: str, line: str
@@ -4863,3 +4864,35 @@ def test_the_plan_says_the_service_starts_at_login(
     assert ("--no-service" in init.split()) is bool(flags), init
     step = "would run: aisquare service install --if-undecided\n"
     assert (step in result.stdout) is not bool(flags), result.stdout
+
+
+@pytest.mark.parametrize(
+    ("folders", "named", "elsewhere"),
+    [
+        ((".rlx",), "{home}/.rlx", False),
+        ((".aisquare",), "{home}/.aisquare", False),
+        ((".rlx", ".aisquare"), "{home}/.aisquare", True),
+        ((".rlx",), "{home}/via-a-link", False),
+        ((), "{home}/scratch-home", True),
+        ((), "", False),
+    ],
+    ids=["rlx", "aisquare", "aisquare-beside-rlx", "a-link-to-it", "scratch", "none-named"],
+)
+def test_named_home_elsewhere_decides_as_the_cli_does(
+    tmp_path: Path, folders: tuple[str, ...], named: str, elsewhere: bool
+) -> None:
+    """The plan line's rule is the CLI's (``service_login._named_home``): the default home is
+    ~/.rlx if it is there, else ~/.aisquare if it is, else ~/.rlx, compared by the folder a
+    link leads to (reviewer of #33, round 2, nit)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for folder in folders:
+        (home / folder).mkdir()
+    (home / "via-a-link").symlink_to(home / ".rlx")
+    result = sh(
+        "if named_home_elsewhere; then echo ELSEWHERE; else echo DEFAULT; fi",
+        env={"HOME": str(home), "AISQUARE_HOME": named.format(home=home), "RLX_HOME": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ("ELSEWHERE" if elsewhere else "DEFAULT"), result.stdout

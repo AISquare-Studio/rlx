@@ -293,13 +293,31 @@ aisquare_home_dir() {
     printf '%s' "${_ah_dir%/}"
 }
 
-# Whether RLX_HOME or AISQUARE_HOME names a home other than the default one (~/.rlx, or an
-# existing ~/.aisquare): no login item is set up for that home by itself (S2, #33).
+# Whether RLX_HOME or AISQUARE_HOME names a home other than the default one, as the CLI
+# decides it (services/service_login.py _named_home): the default is ~/.rlx if it is there,
+# else ~/.aisquare if it is, else ~/.rlx, and each side is compared by the folder a link
+# leads to. No login item is set up for another home by itself (S2, #33).
 named_home_elsewhere() {
     _nh_named=${RLX_HOME:-${AISQUARE_HOME:-}}
     [ -n "$_nh_named" ] || return 1
-    _nh_named=${_nh_named%/}
-    [ "$_nh_named" != "$HOME/.rlx" ] && [ "$_nh_named" != "$HOME/.aisquare" ]
+    if [ -d "$HOME/.rlx" ]; then
+        _nh_default=$HOME/.rlx
+    elif [ -d "$HOME/.aisquare" ]; then
+        _nh_default=$HOME/.aisquare
+    else
+        _nh_default=$HOME/.rlx
+    fi
+    [ "$(real_folder "$_nh_named")" != "$(real_folder "$_nh_default")" ]
+}
+
+# A folder by the path its links lead to (`pwd -P`), or as written, less a trailing /, when
+# it is not there.
+real_folder() {
+    if [ -d "$1" ]; then
+        (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "${1%/}"
+    else
+        printf '%s' "${1%/}"
+    fi
 }
 
 aisquare_home_shown() {

@@ -1886,22 +1886,30 @@ def reset_config(path: Path | None = None) -> Path | None:
         # copy2: the mode too, so a config tightened to 0600 is not copied out readable.
         despite_windows_contention(lambda: shutil.copy2(written, backup))
         write_replacing(written, "", keep_mode=True)
-    if kept:
-        body = tomli_w.dumps({"config_version": CONFIG_VERSION, "service": kept})
+    if kept is not None:
+        left = _KeptByAReset(service=ServiceSettings(start_at_login=kept))
+        body = tomli_w.dumps(left.model_dump(mode="json", exclude_none=True))
         write_replacing(written, body, keep_mode=True)
         with contextlib.suppress(OSError):  # the mode the user's file had, 0600 kept 0600
             written.chmod(stat.S_IMODE(backup.stat().st_mode))
     return backup
 
 
-def _kept_by_a_reset(written: Path) -> dict[str, Any]:
+class _KeptByAReset(BaseModel):
+    """What a reset leaves in ``config.toml``: its version, and ``[service]``."""
+
+    config_version: int = CONFIG_VERSION
+    service: ServiceSettings
+
+
+def _kept_by_a_reset(written: Path) -> bool | None:
     """What of the file at ``written`` a reset leaves in place: its ``[service]`` table's
     ``start_at_login``, when it holds one; nothing from a file that does not parse."""
     try:
         data = _parse_toml(despite_windows_contention(written.read_bytes))
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
-        return {}
+        return None
     service = data.get("service")
     if not isinstance(service, dict) or not isinstance(service.get("start_at_login"), bool):
-        return {}
-    return {"start_at_login": service["start_at_login"]}
+        return None
+    return bool(service["start_at_login"])

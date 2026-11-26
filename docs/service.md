@@ -143,10 +143,13 @@ Items has to be turned on there, and `rlx service install` says so. `rlx init --
 the installers' `--no-service`, leave it off and keep that: later runs of `rlx init` and the
 installers never add it (a choice made before stays as it is). App settings' *Reset all settings*
 and `rlx init --reinit` keep this choice: it is about a login item, not a setting of rlx's.
-While `config.toml` cannot be read, rlx leaves the login item as it is (it adds none, refreshes
-none and takes none away) and says why. `rlx uninstall` takes the
+While `config.toml` cannot be read, `rlx init`, the installers, `rlx service install` and
+`uninstall` and the switch leave the login item as it is (they add none, refresh none and take
+none away) and say why; `rlx uninstall` and a move back to a release before the service still
+take it away, as that release could not. `rlx uninstall` takes the
 login item away too, and so does `rlx upgrade` to a release before the service (0.10.1 and
-earlier), which has no command for it to run and none to take it away.
+earlier), which has no command for it to run and none to take it away: a choice of on is
+forgotten with it, so a later release sets it up again, and a choice of off is kept.
 
 `rlx service status` says whether it starts at login, and if not, why.
 
