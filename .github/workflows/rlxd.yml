@@ -11,10 +11,28 @@ on:
     paths:
       - "rlxd/**"
       - ".github/workflows/rlxd.yml"
+      - ".github/workflows/rlxd-release.yml"
+      - "scripts/rlxd_archive.py"
+      - "src/aisquare/services/rlxd_install.py"
+      - "src/aisquare/cli/daemon.py"
+      - "tests/stub_releases.py"
+      - "tests/test_rlxd_install.py"
       - "pyproject.toml"
   push:
     branches: [main, "rc/**"]
   workflow_dispatch:
+    # rlxd-release.yml's attach, by hand (1.2): a dry run unless dry_run is unticked.
+    inputs:
+      release_tag:
+        description: Also attach the archives to this GitHub Release (vX.Y.Z, pyproject.toml's version on this ref). Empty builds and packages only.
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: With release_tag, check everything and print the upload instead of running it.
+        required: false
+        type: boolean
+        default: true
 
 # Cancel superseded runs on the same branch/PR, grouped by event as ci.yml's are, so a
 # run by hand never cancels a push's run or the other way round.
@@ -99,3 +117,17 @@ jobs:
 
       - name: cargo deny check
         run: cargo deny --locked check
+
+  # 1.2: rlxd and rlxd-hook for the five targets, as the artifact `rlxd-archives`,
+  # installed by `rlx daemon install` on each OS (rlxd-release.yml). It attaches to a
+  # release only with a release_tag given by hand, and then only if dry_run is off.
+  # contents: write is for that attach job alone; rlxd-release.yml holds every other
+  # job to read.
+  release:
+    name: release
+    uses: ./.github/workflows/rlxd-release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ inputs.release_tag || '' }}
+      dry_run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}

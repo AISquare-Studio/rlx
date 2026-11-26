@@ -52,6 +52,30 @@ together:
 `.github/workflows/rlxd.yml` also runs for a PR that changes only `pyproject.toml`, so
 a bump on one side alone fails before it merges.
 
+## Release archives
+
+rlxd ships with rlx releases (handoff 0.10.3, 1.2). `.github/workflows/rlxd-release.yml`
+builds `rlxd` and `rlxd-hook` for five targets and packs each flat
+(`../scripts/rlxd_archive.py`): `rlxd-<target>.tar.gz` for aarch64 and x86_64 macOS
+and Linux (glibc), `rlxd-x86_64-pc-windows-msvc.zip` with the `.exe`s, and
+`rlxd-SHA256SUMS` over them, which `shasum -a 256 -c` reads.
+
+- **Every head.** rlxd.yml calls it, so each run uploads the artifact `rlxd-archives`,
+  and installs it with `rlx daemon install` on ubuntu, macOS and Windows.
+- **A release.** Publishing GitHub Release `vX.Y.Z` attaches the five archives and the
+  sums to it. The tag must be `v` + `pyproject.toml`'s version.
+- **By hand.** `gh workflow run rlxd.yml --ref <branch> -f release_tag=vX.Y.Z` does a
+  dry run of that attach: every check, then the `gh release upload` it would run, printed.
+  Add `-f dry_run=false` to attach for real, to re-attach after a failed release run.
+- **Signing.** None yet: notarization and Authenticode are an owner step, wired in at
+  the marked step of the build job.
+
+`rlx daemon install` (`../src/aisquare/services/rlxd_install.py`) fetches
+`rlxd-SHA256SUMS` and this machine's archive for `rlx --version` from
+`https://github.com/AISquare-Studio/rlx/releases/download/v<version>/`, or from
+`$AISQUARE_RELEASES_URL/v<version>/` when that is set. It checks the sha256 before it
+writes anything, then installs both binaries into `uv tool dir --bin`, beside `rlx`.
+
 ## Licence
 
 MIT, as rlx is (`../LICENSE`).
