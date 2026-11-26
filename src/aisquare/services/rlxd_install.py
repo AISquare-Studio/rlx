@@ -27,7 +27,7 @@ either hook.
 The bin directory is decided as ``uv tool dir --bin`` decides it (:func:`uv_tool_bin_dir`),
 without running uv. ``RLX_HOME`` and ``AISQUARE_HOME`` play no part.
 
-The network is reached through :func:`open_url` alone, so a test can replace it; the
+The network is reached through :func:`open_release_url` alone, so a test can replace it; the
 standard-library modules are imported inside, off the path every command pays to start.
 scripts/rlxd_archive.py makes the archives and the sums, by the same names as here.
 """
@@ -173,7 +173,7 @@ def asset_url(base: str, version: str, name: str) -> str:
 # --- the network --------------------------------------------------------------------------
 
 
-def open_url(request: Any, *, timeout: float) -> Any:
+def open_release_url(request: Any, *, timeout: float) -> Any:
     """``urllib.request.urlopen`` through ``core.tls``: the one network call here."""
     from aisquare.core.tls import urlopen
 
@@ -188,7 +188,7 @@ def _fetch(url: str, *, limit: int, missing: InstallError) -> bytes:
 
     request = Request(url, headers={"User-Agent": f"{DISTRIBUTION}/{__version__}"})
     try:
-        with open_url(request, timeout=TIMEOUT_SECONDS) as response:
+        with open_release_url(request, timeout=TIMEOUT_SECONDS) as response:
             body: bytes = response.read(limit + 1)
     except HTTPError as exc:
         if exc.code == 404:

@@ -11,15 +11,16 @@ name: rlxd release
 # `rlxd-hook.exe`, and rlxd-SHA256SUMS lists every archive as `shasum -a 256 -c`
 # reads it (scripts/rlxd_archive.py makes both).
 #
-#   build    the five targets, each on a runner of its own OS and architecture, so
-#            every binary but one runs where it is built and answers `--version`
-#            (x86_64-apple-darwin runs under Rosetta on the arm64 macOS runner).
-#            aarch64 Linux builds natively on GitHub's arm runner rather than with a
-#            cross-linker: free on this public repo, no extra toolchain to pin, and
-#            the binary is run, not only linked. Both Linux targets build on
-#            ubuntu-24.04, named rather than ubuntu-latest so the glibc they link
-#            against does not move with the image; a step holds them to the oldest
-#            glibc they must run on.
+#   build    the five targets, on the three standard runners only (owner decision
+#            2026-10-25, tests/test_ci_runs_on_standard_runners.py): both macOS
+#            targets on macos-latest (x86_64 by `rustup target add`, run under
+#            Rosetta), both Linux targets on ubuntu-latest, Windows on
+#            windows-latest. aarch64 Linux is therefore cross-linked
+#            (gcc-aarch64-linux-gnu) rather than built on an arm runner, which that
+#            rule excludes, and it is run under qemu-user, so every binary answers
+#            `--version` before it is packed. A step holds the Linux binaries to the
+#            oldest glibc they must run on, since ubuntu-latest's glibc moves with
+#            the image.
 #   package  rlxd-SHA256SUMS, the handoff's check run over the result, and the
 #            artifact `rlxd-archives`: the pre-release form of the release assets.
 #   install  on ubuntu, macOS and Windows: `rlx daemon install` of the tree, from a
@@ -78,9 +79,10 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-latest
+            run: qemu-aarch64 -L /usr/aarch64-linux-gnu
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     # rustup reads rlxd/rust-toolchain.toml only when cargo runs inside rlxd/.
@@ -93,6 +95,9 @@ jobs:
       # The C runtime linked into rlxd.exe, so it runs without the Visual C++
       # Redistributable installed.
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      # aarch64 Linux: cross-linked on the x86_64 runner, and run under qemu-user.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      RUN: ${{ matrix.run }}
       # Ubuntu 22.04's and Debian 12's era: the newest glibc symbol version the
       # Linux binaries may need.
       GLIBC_OLDEST: "2.35"
@@ -104,6 +109,13 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
+
+      - name: The aarch64 Linux cross-linker and qemu-user
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
 
       - name: Install the pinned toolchain and the target
         run: |
@@ -134,8 +146,12 @@ jobs:
             case "$TARGET" in
               aarch64-apple-darwin) test "$(lipo -archs "$path")" = arm64 ;;
               x86_64-apple-darwin) test "$(lipo -archs "$path")" = x86_64 ;;
+              aarch64-unknown-linux-gnu) readelf -h "$path" | grep -q 'Machine:.*AArch64' ;;
+              x86_64-unknown-linux-gnu) readelf -h "$path" | grep -q 'Machine:.*X86-64' ;;
             esac
-            got=$("$path" --version)
+            # $RUN is empty but for aarch64 Linux's qemu, so it is left unquoted.
+            # shellcheck disable=SC2086
+            got=$($RUN "$path" --version)
             if [ "$got" != "$b $V" ]; then
               echo "::error::$b --version printed '$got', not '$b $V'"
               exit 1
@@ -146,7 +162,7 @@ jobs:
       - name: The Linux binaries run on glibc ${{ env.GLIBC_OLDEST }}
         if: endsWith(matrix.target, '-linux-gnu')
         run: |
-          need=$(objdump -T "target/$TARGET/release/rlxd" "target/$TARGET/release/rlxd-hook" \
+          need=$(for b in rlxd rlxd-hook; do readelf -W --dyn-syms "target/$TARGET/release/$b"; done \
             | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1)
           echo "the newest glibc symbol version they need: ${need:-none}"
           test -n "$need"

@@ -261,8 +261,10 @@ def test_sums_that_do_not_list_this_archive_are_refused(stub: Stub) -> None:
 
 
 def test_a_listed_archive_that_is_missing_is_refused(stub: Stub) -> None:
-    (stub.release / rlxd_install.archive_name(HOST)).unlink()
-    _refused(stub, "archive_not_found")
+    archive = rlxd_install.archive_name(HOST)
+    (stub.release / archive).unlink()
+    data = _refused(stub, "archive_not_found")
+    assert str(data["detail"]).endswith(f"/v{__version__}/{archive}")
 
 
 def _resum(stub: Stub, target: str, data: bytes) -> None:
@@ -309,7 +311,7 @@ def test_an_archive_that_is_not_exactly_the_two_binaries_is_refused(
 ) -> None:
     rlxd, hook = rlxd_install.binary_names(HOST)
     _resum(stub, HOST, _archive(HOST, shape(rlxd, hook)))
-    _refused(stub, "bad_archive")
+    assert _refused(stub, "bad_archive")["error"] == "bad_archive"
 
 
 def test_a_link_in_place_of_a_binary_is_refused() -> None:
@@ -328,14 +330,16 @@ def test_a_link_in_place_of_a_binary_is_refused() -> None:
 
 def test_garbage_that_matches_its_sum_is_refused_as_a_bad_archive(stub: Stub) -> None:
     _resum(stub, HOST, b"not an archive")
-    _refused(stub, "bad_archive")
+    assert _refused(stub, "bad_archive")["error"] == "bad_archive"
+    assert stub.requested()[-1] == f"/v{__version__}/{rlxd_install.archive_name(HOST)}"
 
 
 def test_an_unreachable_server_is_download_failed(
     stub: Stub, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(rlxd_install.RELEASES_URL_ENV, "http://127.0.0.1:9")
-    _refused(stub, "download_failed")
+    assert _refused(stub, "download_failed")["detail"]
+    assert stub.requested() == []  # nothing reached the stub: the request went to port 9
 
 
 def test_an_unsupported_machine_is_refused_by_name() -> None:
