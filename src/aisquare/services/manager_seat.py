@@ -81,10 +81,8 @@ def mode(store: ContextStore, session: TeamSession) -> tuple[WakeMode, str | Non
     row = store.fleet_agent_for_session(session.id)
     project = row.project_id if row is not None else session.project_id
     settings = policy(store, project)
-    if not settings.configured:
-        return "every_write", None
     if row is None or bound(store, row) is None:
-        return "blocked", project
+        return ("blocked", project) if settings.configured else ("every_write", None)
     return settings.wake, project
 
 

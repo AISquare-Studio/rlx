@@ -2277,7 +2277,11 @@ def add_note(
                 to_role, writer, (cwd or Path.cwd()).resolve(), project_id
             )
             meta = {manager_seat.EVENT_PROJECT: recipient}
-            if recipient is not None and not manager_seat.policy(store, recipient).configured:
+            if (
+                recipient is not None
+                and not (to_role or "").strip()
+                and not manager_seat.policy(store, recipient).configured
+            ):
                 recipient = None
                 meta = None
         event = _emit(

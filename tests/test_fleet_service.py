@@ -15858,6 +15858,47 @@ def test_scheduled_managers_isolate_urgent_wakes_on_a_shared_hub(
     assert team_service.hook_stop(wrong, root) is None
 
 
+@pytest.mark.parametrize("to_default", [True, False])
+def test_explicit_questions_route_across_a_hub_with_an_implicit_default(
+    hubbed: _Hubbed, tmp_path: Path, to_default: bool
+) -> None:
+    """An explicit addressee wins even when its peer has no project policy."""
+    root = tmp_path / "implicit-default"
+    root.mkdir()
+    with store_session() as store:
+        other = store.onboard_project(team_project(root))
+        store.set_project_setting(hubbed.fleet.id, "manager_wake", "schedule")
+    default, default_sid = _spawned(other, "manager", None, hubbed.tmux, hubbed.monkeypatch)
+    team_service.hook_session_start(default_sid, root, "startup")
+    _, coder_sid = _spawned(other, "coder", None, hubbed.tmux, hubbed.monkeypatch)
+    team_service.hook_session_start(coder_sid, root, "startup")
+    hubbed.tmux.set_command(hubbed.manager.pane_id, "claude")
+    hubbed.tmux.set_command(default.pane_id, "claude")
+    hubbed.monkeypatch.setattr(fleet_service, "nudge_manager", hubbed.nudge)
+    if to_default:
+        intended, wrong, writer = default, hubbed.manager, hubbed.coder_sid
+    else:
+        intended, wrong, writer = hubbed.manager, default, coder_sid
+    assert wrong.session_id is not None and intended.session_id is not None
+    with store_session() as store:
+        head = store.latest_seq(hubbed.hub.id)
+        store.touch_session(intended.session_id, state="waiting", cursor=head)
+        store.touch_session(wrong.session_id, state="working", cursor=head)
+    hubbed.tmux.typed.clear()
+    team_service.add_note(
+        "question for the other fleet",
+        kind="question",
+        to_role=intended.session_id,
+        session_ref=writer,
+    )
+    assert [
+        (pane, line) for pane, action, line in hubbed.tmux.typed if action == "paste"
+    ] == [(intended.pane_id, NUDGE_TEXT)]
+    assert team_service.hook_stop(wrong.session_id, root) is None
+    delivery = team_service.hook_prompt_heartbeat(intended.session_id, root)
+    assert "question for the other fleet" in delivery
+
+
 def test_scheduled_activation_replays_and_replacement_resumes_urgent_progress(
     hubbed: _Hubbed,
 ) -> None:
