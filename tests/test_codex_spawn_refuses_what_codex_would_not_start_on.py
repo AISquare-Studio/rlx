@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from aisquare.core.agent_adapters import get_adapter
+from aisquare.core.agent_adapters.types import BadEffortError
 from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, load_config, save_config
 from aisquare.models import ProjectInfo
 from aisquare.services import fleet as fleet_service
@@ -44,11 +45,13 @@ def _holds(command: list[str], run: list[str]) -> bool:
     ("bound", "role", "own", "said"),
     [
         (
-            ["--effort", "high"],
+            ["--chrome"],
             [],
             [],
-            "team.profiles.coder.args: --effort is a Claude Code flag",
+            "team.profiles.coder.args: --chrome is a Claude Code flag Codex has no equivalent "
+            "for: Codex's browser is its own browser_use feature, not Chrome",
         ),
+        ([], ["--effort"], [], "fleet.roles.coder.agent_args.codex: --effort is given no level"),
         (
             [],
             ["--disallowedTools=Edit"],
@@ -70,7 +73,14 @@ def _holds(command: list[str], run: list[str]) -> bool:
             "team.profiles.coder.args: --add-dir takes one folder",
         ),
     ],
-    ids=["binding-effort", "role-disallowed", "own-no-folder", "role-two", "binding-two"],
+    ids=[
+        "binding-chrome",
+        "role-no-effort",
+        "role-disallowed",
+        "own-no-folder",
+        "role-two",
+        "binding-two",
+    ],
 )
 def test_a_codex_spawn_is_refused_naming_the_list_and_opens_no_window(
     tmux: FakeTmux,  # noqa: F811
@@ -145,7 +155,10 @@ def test_a_codex_spawn_opens_its_window_with_its_own_arguments_in_order(
 @pytest.mark.parametrize(
     ("args", "may_prompt", "said"),
     [
-        (["--effort=high"], True, "--effort is a Claude Code flag"),
+        (["--effort=high"], True, None),
+        (["--effort", "--search"], True, "--effort is given no level"),
+        (["--effort", "a b"], True, "Codex reasoning effort must be a level name"),
+        (["--disallowedTools=Edit"], True, "--disallowedTools is a Claude Code flag"),
         (["--add-dir="], True, "--add-dir is given no folder"),
         (["--add-dir", "--search"], True, "--add-dir is given no folder"),
         (["--add-dir=/a", "/b"], False, "write --add-dir /a --add-dir /b"),
@@ -162,3 +175,215 @@ def test_codex_args_refusal_reads_up_to_its_separator(
     """``said`` is in the refusal, or ``None`` is answered where ``said`` is ``None``."""
     refusal = CODEX.args_refusal(args, may_prompt=may_prompt)
     assert refusal is None if said is None else refusal is not None and said in refusal, refusal
+
+
+#: The three ways a Claude Code flag reaches Codex (``CodexAdapter.native_args`` and
+#: ``args_refusal``): in Codex's form, as it is (Codex reads it the same), or refused with why.
+MAPPED, PASSED, REFUSED = "mapped", "passed through", "refused"
+NO_TOOL_LISTS = "Codex has no tool lists; its sandbox and approvals decide what its tools may do"
+BROWSER = "Codex's browser is its own browser_use feature, not Chrome"
+SESSIONS = "Codex resumes and forks with its own commands, which rlx's Restart and Fork give it"
+SYSTEM_PROMPT = (
+    "Codex's developer_instructions replace its instructions, rlx's persona among them, rather "
+    "than add to them"
+)
+MCP_SERVERS = "Codex's MCP servers are its config's mcp_servers table"
+SETTINGS = "Codex's settings are its config.toml, a --profile and -c key=value"
+PRINT_MODE = "Codex runs without a window only as its exec command, which a fleet window never runs"
+CONTINUE = (
+    "-c without key=value is Claude Code's --continue, which Codex has no equivalent for: "
+    + SESSIONS
+)
+PRINT = (
+    "-p without a profile name is Claude Code's --print, which Codex has no equivalent for: "
+    + PRINT_MODE
+    + "; Codex's is --profile <name>"
+)
+
+
+def _foreign(flag: str, why: str) -> str:
+    return f"{flag} is a Claude Code flag Codex has no equivalent for: {why}"
+
+
+#: Every Claude Code flag rlx writes for it, or its roles and docs suggest (each one its adapter
+#: declares, ``test_the_table_holds_every_flag_claude_codes_adapter_declares``): the flag, a
+#: list holding it, what Codex is given, and the list Codex starts on (``MAPPED``) or the one
+#: line its refusal says (``REFUSED``).
+TABLE: list[tuple[str, list[str], str, object]] = [
+    ("--effort", ["--effort", "high"], MAPPED, ["-c", 'model_reasoning_effort="high"']),
+    ("--effort", ["--effort=xhigh"], MAPPED, ["-c", 'model_reasoning_effort="xhigh"']),
+    ("--effort", ["--effort", "ultracode"], MAPPED, ["-c", 'model_reasoning_effort="max"']),
+    (
+        "--effort",
+        ["--search", "--effort", "Low", "--add-dir", "/a"],
+        MAPPED,
+        ["--search", "-c", 'model_reasoning_effort="low"', "--add-dir", "/a"],
+    ),
+    ("--model", ["--model", "gpt-5.5"], PASSED, None),
+    ("-m", ["-m", "gpt-5.5"], PASSED, None),
+    ("--add-dir", ["--add-dir", "/a", "--add-dir=/b"], PASSED, None),
+    ("-c", ["-c", 'model_reasoning_effort="high"'], PASSED, None),
+    ("-c", ["-c", "features.hooks=false", "--search"], PASSED, None),
+    ("-p", ["-p", "work"], PASSED, None),
+    ("-p", ["-p", "team.review-2"], PASSED, None),
+    ("-c", ["-c"], REFUSED, CONTINUE),
+    ("-c", ["-c", "--search"], REFUSED, CONTINUE),
+    ("-c", ["-c", "fix the bug"], REFUSED, CONTINUE),
+    ("-p", ["-p"], REFUSED, PRINT),
+    ("-p", ["-p", "--search"], REFUSED, PRINT),
+    ("-p", ["-p", "fix the bug"], REFUSED, PRINT),
+    ("-p", ["-p", '"work"'], REFUSED, PRINT),
+    ("--allowedTools", ["--allowedTools", "Bash(git:*)"], REFUSED, NO_TOOL_LISTS),
+    ("--allowed-tools", ["--allowed-tools=Read"], REFUSED, NO_TOOL_LISTS),
+    ("--disallowedTools", ["--disallowedTools", "Edit"], REFUSED, NO_TOOL_LISTS),
+    ("--disallowed-tools", ["--disallowed-tools", "Edit"], REFUSED, NO_TOOL_LISTS),
+    ("--tools", ["--tools", "Read,Grep"], REFUSED, NO_TOOL_LISTS),
+    (
+        "--permission-mode",
+        ["--permission-mode", "acceptEdits"],
+        REFUSED,
+        "Codex's permissions are the role's sandbox and approval_policy settings",
+    ),
+    (
+        "--dangerously-skip-permissions",
+        ["--dangerously-skip-permissions"],
+        REFUSED,
+        "Codex's nearest, --dangerously-bypass-approvals-and-sandbox, drops its sandbox too; "
+        "choose that in the role's sandbox and approval_policy settings",
+    ),
+    ("--chrome", ["--chrome"], REFUSED, BROWSER),
+    ("--no-chrome", ["--no-chrome"], REFUSED, BROWSER),
+    ("--resume", ["--resume", "0b1c"], REFUSED, SESSIONS),
+    ("-r", ["-r", "0b1c"], REFUSED, SESSIONS),
+    ("--continue", ["--continue"], REFUSED, SESSIONS),
+    ("--session-id", ["--session-id=0b1c"], REFUSED, SESSIONS),
+    ("--fork-session", ["--fork-session"], REFUSED, SESSIONS),
+    ("--append-system-prompt", ["--append-system-prompt", "Be brief"], REFUSED, SYSTEM_PROMPT),
+    (
+        "--append-system-prompt-file",
+        ["--append-system-prompt-file", "p.md"],
+        REFUSED,
+        SYSTEM_PROMPT,
+    ),
+    ("--system-prompt", ["--system-prompt", "Be brief"], REFUSED, SYSTEM_PROMPT),
+    ("--mcp-config", ["--mcp-config", "mcp.json"], REFUSED, MCP_SERVERS),
+    ("--strict-mcp-config", ["--strict-mcp-config"], REFUSED, MCP_SERVERS),
+    ("--settings", ["--settings", "s.json"], REFUSED, SETTINGS),
+    ("--setting-sources", ["--setting-sources", "user"], REFUSED, SETTINGS),
+    ("--name", ["--name", "coder-1"], REFUSED, "Codex shows no session name"),
+    ("--verbose", ["--verbose"], REFUSED, "Codex has no verbose switch"),
+    ("--print", ["--print"], REFUSED, PRINT_MODE),
+    ("--output-format", ["--output-format", "json"], REFUSED, PRINT_MODE),
+    ("--input-format", ["--input-format", "text"], REFUSED, PRINT_MODE),
+    ("--json-schema", ["--json-schema", "{}"], REFUSED, PRINT_MODE),
+    ("--max-turns", ["--max-turns", "3"], REFUSED, PRINT_MODE),
+    ("--no-session-persistence", ["--no-session-persistence"], REFUSED, PRINT_MODE),
+    ("--bare", ["--bare"], REFUSED, PRINT_MODE),
+]
+
+
+def _row_id(row: tuple[str, list[str], str, object]) -> str:
+    return f"{row[2]}: {' '.join(row[1])}"
+
+
+@pytest.mark.parametrize(("flag", "args", "verdict", "codex"), TABLE, ids=map(_row_id, TABLE))
+def test_codex_maps_passes_or_refuses_each_claude_code_flag_as_the_table_says(
+    flag: str, args: list[str], verdict: str, codex: object
+) -> None:
+    """A mapped flag becomes its Codex form in its place (which Codex's own ``native_args`` keeps
+    as it is) and one passed through stays as written, neither refused in any list; a refused
+    flag's refusal is its one line, in every list, and ``native_args`` leaves the flag as it is
+    (not dropped, not rewritten): the refusal is what stops it."""
+    native = CODEX.native_args(list(args))
+    if verdict == REFUSED:
+        assert isinstance(codex, str)
+        said = codex if flag in ("-c", "-p") else _foreign(flag, codex)
+        for may_prompt in (False, True):
+            assert CODEX.args_refusal(args, may_prompt=may_prompt) == said
+        assert "\n" not in said
+        assert native == args
+        return
+    assert native == (codex if verdict == MAPPED else args)
+    assert CODEX.native_args(list(native)) == native
+    for may_prompt in (False, True):
+        assert CODEX.args_refusal(args, may_prompt=may_prompt) is None, args
+
+
+def test_the_table_holds_every_flag_claude_codes_adapter_declares() -> None:
+    """Each flag Claude Code's adapter names (its vocabulary, its options, its session flags)
+    and ``-p`` has a row: a flag it declares later fails here until the table says what Codex
+    makes of it."""
+    claude = get_adapter("claude-code").capabilities
+    sessions = claude.session_flags
+    assert sessions is not None
+    declared = {
+        *claude.vocabulary.flags,
+        *claude.value_options,
+        *claude.switch_options,
+        sessions.names,
+        *sessions.resumes,
+        *sessions.continues,
+        *sessions.forks,
+        "-p",
+    }
+    assert declared - {flag for flag, *_rest in TABLE} == set()
+
+
+@pytest.mark.parametrize(("flag", "args", "verdict", "codex"), TABLE, ids=map(_row_id, TABLE))
+def test_claude_code_passes_every_flag_of_the_table_through_as_it_did(
+    flag: str, args: list[str], verdict: str, codex: object
+) -> None:
+    """Claude Code's adapter is unchanged: every list of the table reaches it as written, and
+    it refuses none."""
+    claude = get_adapter("claude-code")
+    assert claude.native_args(list(args)) == args
+    for may_prompt in (False, True):
+        assert claude.args_refusal(args, may_prompt=may_prompt) is None
+
+
+def test_codex_reads_rlxs_effort_as_the_setting_it_becomes_the_last_winning() -> None:
+    """``native_choice`` reads ``--effort`` where ``native_args`` puts its ``-c``: the last of
+    the two is the effort Codex runs, and the one rlx records. After Codex's ``--`` it is
+    the prompt's, mapped by neither."""
+    low = ["-c", 'model_reasoning_effort="low"']
+    assert CODEX.native_choice([*low, "--effort", "high"]).effort == "high"
+    assert CODEX.native_choice(["--effort", "high", *low]).effort == "low"
+    assert CODEX.native_choice(["--effort=ultracode"]).effort == "ultracode"
+    assert CODEX.native_choice(["--", "--effort", "high"]).effort is None
+    assert CODEX.native_args(["--", "--effort", "high"]) == ["--", "--effort", "high"]
+
+
+@pytest.mark.parametrize("args", [["--effort="], ["--effort", "a b"]])
+def test_codex_native_args_refuse_an_effort_that_is_no_level(args: list[str]) -> None:
+    """A hand ``rlx launch`` reports ``bad_effort`` rather than starting Codex on a value it
+    cannot take."""
+    with pytest.raises(BadEffortError):
+        CODEX.native_args(args)
+
+
+@pytest.mark.parametrize(
+    ("bound", "role", "own", "native"),
+    [
+        (["--effort", "high"], [], [], 'model_reasoning_effort="high"'),
+        ([], ["--effort=ultracode"], [], 'model_reasoning_effort="max"'),
+        ([], [], ["--effort", "low"], 'model_reasoning_effort="low"'),
+    ],
+    ids=["binding", "role", "own"],
+)
+def test_a_codex_spawn_opens_its_window_with_rlxs_effort_in_codexs_form(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+    bound: list[str],
+    role: list[str],
+    own: list[str],
+    native: str,
+) -> None:
+    """A Claude Code binding's ``--effort``, the role's, or the spawn's own: one window, whose
+    line gives Codex the level as ``-c model_reasoning_effort`` and no ``--effort``."""
+    _configure(bound, role)
+    fleet_service.spawn(project, "coder", agent="codex", agent_args=own)
+    command = _command(tmux)
+    line = command[command.index("--") + 1 :]
+    assert len(tmux.spawned) == 1 and _holds(line, ["-c", native]), command
+    assert not [word for word in line if word.partition("=")[0] == "--effort"], command

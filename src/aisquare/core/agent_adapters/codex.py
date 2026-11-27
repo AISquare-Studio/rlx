@@ -56,6 +56,7 @@ from aisquare.core.agent_adapters.types import (
     config_assignment,
     config_home,
     executable_name,
+    is_config_assignment,
     option_occurrences,
     option_values,
     package_version,
@@ -86,8 +87,70 @@ APPROVAL_POLICIES = ("on-request", "never")
 _APPROVAL_SWITCHES = frozenset(
     {"--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "--yolo"}
 )
-#: Claude Code's flags that rlx itself writes for it, which stock Codex has no option for.
-FOREIGN_FLAGS = ("--effort", "--disallowedTools", "--allowedTools", "--permission-mode", "--chrome")
+#: rlx's own effort flag (Claude Code's), which Codex takes as ``-c model_reasoning_effort``
+#: (:meth:`CodexAdapter.native_args`).
+EFFORT_FLAG = harness.EFFORT_FLAG
+_NO_TOOL_LISTS = "Codex has no tool lists; its sandbox and approvals decide what its tools may do"
+_BROWSER = "Codex's browser is its own browser_use feature, not Chrome"
+_SESSIONS = "Codex resumes and forks with its own commands, which rlx's Restart and Fork give it"
+_SYSTEM_PROMPT = (
+    "Codex's developer_instructions replace its instructions, rlx's persona among them, rather "
+    "than add to them"
+)
+_MCP_SERVERS = "Codex's MCP servers are its config's mcp_servers table"
+_SETTINGS = "Codex's settings are its config.toml, a --profile and -c key=value"
+_PRINT_MODE = (
+    "Codex runs without a window only as its exec command, which a fleet window never runs"
+)
+#: Claude Code's flags (its adapter's ``capabilities``) that Codex has no equivalent for, or
+#: one it reads differently, each with why (:meth:`CodexAdapter.args_refusal`). Its
+#: ``--effort`` is mapped (:data:`EFFORT_FLAG`); ``--model``/``-m`` and one ``--add-dir``
+#: folder are Codex's too, with the same meaning; ``-c`` and ``-p`` are :data:`SHARED_SHORT`.
+FOREIGN_FLAGS: Mapping[str, str] = MappingProxyType(
+    {
+        "--allowedTools": _NO_TOOL_LISTS,
+        "--allowed-tools": _NO_TOOL_LISTS,
+        "--disallowedTools": _NO_TOOL_LISTS,
+        "--disallowed-tools": _NO_TOOL_LISTS,
+        "--tools": _NO_TOOL_LISTS,
+        "--permission-mode": (
+            "Codex's permissions are the role's sandbox and approval_policy settings"
+        ),
+        "--dangerously-skip-permissions": (
+            "Codex's nearest, --dangerously-bypass-approvals-and-sandbox, drops its sandbox too; "
+            "choose that in the role's sandbox and approval_policy settings"
+        ),
+        "--chrome": _BROWSER,
+        "--no-chrome": _BROWSER,
+        "--resume": _SESSIONS,
+        "-r": _SESSIONS,
+        "--continue": _SESSIONS,
+        "--session-id": _SESSIONS,
+        "--fork-session": _SESSIONS,
+        "--append-system-prompt": _SYSTEM_PROMPT,
+        "--append-system-prompt-file": _SYSTEM_PROMPT,
+        "--system-prompt": _SYSTEM_PROMPT,
+        "--mcp-config": _MCP_SERVERS,
+        "--strict-mcp-config": _MCP_SERVERS,
+        "--settings": _SETTINGS,
+        "--setting-sources": _SETTINGS,
+        "--name": "Codex shows no session name",
+        "--verbose": "Codex has no verbose switch",
+        "--print": _PRINT_MODE,
+        "--output-format": _PRINT_MODE,
+        "--input-format": _PRINT_MODE,
+        "--json-schema": _PRINT_MODE,
+        "--max-turns": _PRINT_MODE,
+        "--no-session-persistence": _PRINT_MODE,
+        "--bare": _PRINT_MODE,
+    }
+)
+#: The short spellings Claude Code and Codex share, each Claude Code's switch and the value that
+#: makes it Codex's option: ``-c key=value`` is Codex's config and ``-p <name>`` its profile;
+#: given none, the word is Claude Code's ``--continue`` or ``--print``.
+SHARED_SHORT: Mapping[str, str] = MappingProxyType({"-c": "--continue", "-p": "--print"})
+#: A Codex profile's name: a word after ``-p`` with spaces or quotes is a prompt, a flag none.
+_PROFILE_NAME = re.compile(r"\w[\w.-]*")
 #: Its model option's spellings (``CodexAdapter.model_flags``).
 MODEL_FLAGS = ("--model", "-m")
 #: The options with a value Codex refuses given twice, each with its spellings: 0.164.0 does
@@ -1084,9 +1147,14 @@ class CodexAdapter:
 
     def native_choice(self, args: Sequence[str]) -> NativeChoice:
         """``-c model=…``/``-c model_reasoning_effort=…``, and ``--model``/``-m`` over both.
-        The effort is a native config value, Codex's to validate: no ``effort_index``."""
+        The effort is a native config value, Codex's to validate: no ``effort_index``. rlx's
+        ``--effort`` is read as the ``-c model_reasoning_effort`` it becomes (:meth:`native_args`),
+        the last of the two winning."""
         model = effort = None
-        for item in option_occurrences(args, "-c", "--config"):
+        for item in option_occurrences(args, "-c", "--config", EFFORT_FLAG):
+            if args[item.index].partition("=")[0] == EFFORT_FLAG:
+                effort = item.value
+                continue
             parsed = config_assignment(item.value)
             if parsed is None:
                 continue
@@ -1099,6 +1167,27 @@ class CodexAdapter:
         return NativeChoice(models[-1] if models else model, effort)
 
     def native_args(self, args: list[str]) -> list[str]:
+        """``args`` with each rlx ``--effort <level>`` before Codex's ``--`` (a Claude Code
+        binding's, a role's) as Codex's ``-c model_reasoning_effort="<level>"`` in its place,
+        the level through :meth:`reasoning_effort` (``ultracode`` is ``max``; a value that is
+        no level name raises :class:`BadEffortError`), and an effort alias given natively made
+        native."""
+
+        def level(value: str) -> str:
+            native = self.reasoning_effort(value)
+            if native is None:
+                raise BadEffortError(
+                    f"{EFFORT_FLAG} requires a reasoning level, not an empty value"
+                )
+            return native
+
+        args = list(args)
+        for item in reversed(list(option_occurrences(args, EFFORT_FLAG))):
+            args[item.index : item.value_index + 1] = [
+                "-c",
+                f'model_reasoning_effort="{level(item.value)}"',
+            ]
+
         def config(value: str) -> str:
             parsed = config_assignment(value)
             if parsed is not None:
@@ -1395,17 +1484,39 @@ class CodexAdapter:
         ]
 
     def args_refusal(self, args: Sequence[str], *, may_prompt: bool) -> str | None:
-        """Up to Codex's ``--``: a flag of :data:`FOREIGN_FLAGS`, an ``--add-dir`` with no
-        folder, and unless ``may_prompt`` a word after its folder, which Codex would read as
-        its prompt. Every other option is Codex's to refuse."""
+        """Up to Codex's ``--``: a flag of :data:`FOREIGN_FLAGS`, with why, and a short one of
+        :data:`SHARED_SHORT` without Codex's value (Claude Code's); an ``--effort``
+        :meth:`native_args` cannot make Codex's (no level, or no level name); an ``--add-dir``
+        with no folder, and unless ``may_prompt`` a word after its folder, which Codex would
+        read as its prompt. Every other option is Codex's to refuse."""
         head = _before_separator(args)
         for at, arg in enumerate(head):
             name, inline, folder = arg.partition("=")
+            if arg in SHARED_SHORT:
+                given = head[at + 1] if at + 1 < len(head) else None
+                if arg == "-c" and (given is None or not is_config_assignment(given)):
+                    return (
+                        "-c without key=value is Claude Code's --continue, which Codex has no "
+                        f"equivalent for: {FOREIGN_FLAGS['--continue']}"
+                    )
+                if arg == "-p" and (given is None or not _PROFILE_NAME.fullmatch(given)):
+                    return (
+                        "-p without a profile name is Claude Code's --print, which Codex has no "
+                        f"equivalent for: {FOREIGN_FLAGS['--print']}; Codex's is "
+                        "--profile <name>"
+                    )
+                continue
             if name in FOREIGN_FLAGS:
-                return (
-                    f"{name} is a Claude Code flag; a role's Codex flags go in its "
-                    "agent_args.codex, and Codex's effort is -c model_reasoning_effort=<level>"
-                )
+                why = FOREIGN_FLAGS[name]
+                return f"{name} is a Claude Code flag Codex has no equivalent for: {why}"
+            if name == EFFORT_FLAG:
+                given = folder if inline else head[at + 1] if at + 1 < len(head) else ""
+                try:
+                    if self.reasoning_effort("" if given.startswith("-") else given) is None:
+                        return f"{EFFORT_FLAG} is given no level"
+                except BadEffortError as exc:
+                    return str(exc)
+                continue
             if name != "--add-dir":
                 continue
             if not inline:
