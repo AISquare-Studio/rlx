@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sys
 import traceback
 from collections import Counter
@@ -32,6 +33,13 @@ from aisquare.core.version import __version__
 from aisquare.services import install_route, upgrade_daemons
 from aisquare.services import lifecycle as lifecycle_service
 from aisquare.services import updates as updates_service
+
+
+def _finite_minutes(value: float | None) -> float | None:
+    """``--wait-runs``' check that its range cannot make: ``nan`` passes any comparison."""
+    if value is not None and not math.isfinite(value):
+        raise typer.BadParameter("takes a number of minutes")
+    return value
 
 
 def _stdin_is_a_terminal() -> bool:
@@ -544,6 +552,8 @@ def upgrade(
             "--wait-runs",
             metavar="MINUTES",
             min=0,
+            max=upgrade_daemons.WAIT_RUNS_MAX_MINUTES,
+            callback=_finite_minutes,
             help="Wait up to MINUTES for rlxd's runs in flight to end, instead of refusing.",
         ),
     ] = None,
@@ -639,7 +649,9 @@ def _upgrade(
     json_output = get_state().json_output
     try:
         plan = lifecycle_service.upgrade_plan(version, check=check)
-        plan = upgrade_daemons.with_package(plan, lifecycle_service)
+        plan, wheel = upgrade_daemons.with_package(
+            plan, lifecycle_service, pinned=version is not None
+        )
     except lifecycle_service.InvalidVersion as exc:
         fail(
             # The release that runs: it exists, so a copied example asks uv for nothing
@@ -649,12 +661,17 @@ def _upgrade(
         )
     except upgrade_daemons.Refused as refused:
         fail(refused.message, error=refused.code, detail=refused.detail)
+    if wheel is not None:  # CI's second build, as install.sh says it
+        stderr_console().print(
+            f"· installing from {wheel} ({upgrade_daemons.PACKAGE_ENV})",
+            markup=False,
+            highlight=False,
+        )
     if check:
         _emit_check(plan)
         return
-    # A run, asked at a terminal or with --yes: not a dry run, nor --json's plan.
-    installs = not dry_run and (yes or not json_output)
-    around = _daemons_around(plan, daemons or upgrade_daemons.Options(), installs)
+    options = daemons or upgrade_daemons.Options()
+    windows = plan.route.facts.platform == "win32"
     if not plan.runnable and not (plan.target is not None and plan.up_to_date):
         # The command goes in the MESSAGE: `fail` shows a human nothing else; there is none
         # for a pin the route cannot pick (a later review of #257).
@@ -666,6 +683,17 @@ def _upgrade(
         # That command too would replace another program's rlx or relax without a word.
         taken = lifecycle_service.taken_refusal("upgrade", plan.commands_taken, again="run it")
         command += f" {taken}" if taken else ""
+        # 4.2: on Windows the daemons that hold rlx's files too are named, with the command.
+        on_windows = (
+            upgrade_daemons.windows_refusal(options, plan.command or None) if windows else None
+        )
+        if on_windows is not None:
+            fail(
+                on_windows.message,
+                error=on_windows.code,
+                hint=plan.command or None,
+                detail=on_windows.detail,
+            )
         fail(
             f"rlx does not upgrade this install itself ({plan.reason}).{command}",
             error="upgrade_unsupported_route",
@@ -750,87 +778,111 @@ def _upgrade(
             else f"upgrading rlx {plan.current} → {plan.destination}"
         )
         _say(f"{move}: {plan.command}")
+    # The daemons are counted, refused and waited for only now, for an upgrade that runs
+    # (4.2; review M6: after the route, up-to-date, asq and confirm checks).
+    around = _daemons_around(plan, options, windows=windows)
     try:
-        report = lifecycle_service.upgrade(plan, to_stderr=json_output, around=around)
+        # Whatever ends it from here, Ctrl-C and SIGTERM included, what was stopped starts
+        # again (review M2): the guard holds the stop, the install and the restart.
+        with upgrade_daemons.guarded(around, sigterm=options.restart_daemons):
+            report = lifecycle_service.upgrade(plan, to_stderr=json_output, around=around)
+            if not report.installed:
+                # A run uv could not resolve (a cutoff in its settings that excludes even the
+                # release that runs) leaves that release in place. The one-liner's own upgrade
+                # asks uv for @latest, which under the same cutoff moves the install BACK
+                # (sweep of #257).
+                kept = report.version is not None and install_route.same_version(
+                    report.version, plan.current
+                )
+                then = (
+                    f"rlx {plan.current} is still installed. Run it again by hand: {plan.command}"
+                    if kept
+                    else _fallback(plan)
+                )
+                fail(
+                    f"the upgrade failed: {report.problem} (its output is above). {then}",
+                    error="upgrade_failed",
+                    hint=plan.command,
+                    detail=report.problem,
+                )
+            if not report.upgraded:
+                fail(
+                    f"the upgrade could not be confirmed: {report.problem}. {_fallback(plan)}",
+                    error="upgrade_not_confirmed",
+                    hint=plan.command,
+                    detail=report.problem,
+                )
+            _emit_report(report)
+            around.finish(report.hooks)  # the daemons stopped start again (4.2)
     except upgrade_daemons.Refused as stopped:  # a daemon would not stop: nothing installed
         _reopen(reopen)
         fail(stopped.message, error=stopped.code, detail=stopped.detail)
-    if not report.installed:
-        # A run uv could not resolve (a cutoff in its settings that excludes even the release
-        # that runs) leaves that release in place. The one-liner's own upgrade asks uv for
-        # @latest, which under the same cutoff moves the install BACK (sweep of #257).
-        kept = report.version is not None and install_route.same_version(
-            report.version, plan.current
-        )
-        then = (
-            f"rlx {plan.current} is still installed. Run it again by hand: {plan.command}"
-            if kept
-            else _fallback(plan)
-        )
+    except upgrade_daemons.Interrupted:
+        _reopen(reopen)
         fail(
-            f"the upgrade failed: {report.problem} (its output is above). {then}",
-            error="upgrade_failed",
-            hint=plan.command,
-            detail=report.problem,
+            "the upgrade was ended (SIGTERM); the daemons it stopped run again", error="interrupted"
         )
-    if not report.upgraded:
-        fail(
-            f"the upgrade could not be confirmed: {report.problem}. {_fallback(plan)}",
-            error="upgrade_not_confirmed",
-            hint=plan.command,
-            detail=report.problem,
-        )
-    _emit_report(report)
-    if around is not None:
-        around.finish(report.hooks)  # the daemons stopped start again (4.2)
-        if around.failure is not None:
-            failure = around.failure
-            fail(failure.message, error=failure.code, detail=failure.detail)
+    if around.failure is not None:
+        failure = around.failure
+        fail(failure.message, error=failure.code, detail=failure.detail)
     if any(not hook.ok for hook in report.hooks) and not plan.backwards:
         raise _HooksFailed()
     _reopen(reopen, one_click=one_click, installed=True, started=started)
 
 
 def _daemons_around(
-    plan: lifecycle_service.UpgradePlan, options: upgrade_daemons.Options, running: bool
-) -> upgrade_daemons.Around | None:
-    """The daemons' part of an upgrade that runs (4.2): refused first, as 7.8's check step
-    says (``daemon_running``, ``ptys_live``, ``runs_in_flight``), after ``--wait-runs``; the
-    mixed-releases warning said. ``None`` for a plan that only shows."""
-    if not running:
-        return None
-    found = upgrade_daemons.census()
-    rlxd = upgrade_daemons.find_rlxd(found.daemons)
+    plan: lifecycle_service.UpgradePlan, options: upgrade_daemons.Options, *, windows: bool
+) -> upgrade_daemons.Around:
+    """The daemons' part of an upgrade about to run (4.2), after every other check and the
+    question: counted, refused as 7.8's check step says (``daemon_running``, ``ptys_live``,
+    ``runs_in_flight``; ``network`` before a restart), after ``--wait-runs``; the
+    mixed-releases warning said."""
     events = upgrade_daemons.Events(json_lines=False)
     try:
-        refused = upgrade_daemons.refusal(found, options, windows=sys.platform == "win32")
-        if refused is not None:
-            raise refused
-        found = upgrade_daemons.wait_for_runs(found, options, rlxd, events)
+        offline = upgrade_daemons.network_refusal(plan) if options.restart_daemons else None
+        if offline is not None:
+            raise offline
+        around = upgrade_daemons.prepare(plan, options, events, windows=windows)
     except upgrade_daemons.Refused as refused:
         fail(refused.message, error=refused.code, detail=refused.detail)
-    warning = upgrade_daemons.mixed_releases(found, options)
-    if warning is not None:
-        stderr_console().print(f"! {warning}", markup=False, highlight=False)
-    return upgrade_daemons.Around(
-        found, options, events, rlxd, new_install=upgrade_daemons.new_install_command(plan)
-    )
+    if around.mixed is not None:
+        stderr_console().print(f"! {around.mixed}", markup=False, highlight=False)
+    return around
 
 
 def _upgrade_json_lines(version: str | None, options: upgrade_daemons.Options) -> int:
     """``upgrade --yes --json-lines`` (7.8): the upgrade, each step said as a JSON line on
     stdout and nothing else there (the installer's output and every line for a person go to
-    stderr); its exit code. Refusals come first, in the check step."""
+    stderr); its exit code. Refusals come first, in the check step. Whatever ends it, it
+    ends with ``upgrade.done`` or ``upgrade.error``: SIGTERM and Ctrl-C as ``interrupted``,
+    anything unexpected as ``internal``, after what was stopped started again."""
     events = upgrade_daemons.Events(json_lines=True, out=sys.stdout)
     events.step("check", "started")
-    try:
-        with contextlib.redirect_stdout(sys.stderr):
-            plan = _json_lines_plan(version)
-            report, around = _json_lines_run(plan, options, events)
-    except upgrade_daemons.Refused as refused:
-        events.step("check" if refused.code in _CHECK_CODES else "install", "failed", refused.code)
-        events.error(refused)
-        return 1
+    with upgrade_daemons.terminating():
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                plan, wheel = _json_lines_plan(version)
+                report, around = _json_lines_run(plan, options, events, wheel)
+        except upgrade_daemons.Refused as refused:
+            return _json_lines_error(events, refused)
+        except (KeyboardInterrupt, upgrade_daemons.Interrupted) as exc:
+            said = "SIGTERM" if isinstance(exc, upgrade_daemons.Interrupted) else "Ctrl-C"
+            return _json_lines_error(
+                events,
+                upgrade_daemons.Refused(
+                    "interrupted", f"the upgrade was ended ({said}); what it stopped runs again"
+                ),
+            )
+        except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
+            return _json_lines_error(
+                events,
+                upgrade_daemons.Refused(
+                    "internal",
+                    f"the upgrade stopped on an error: {type(exc).__name__}: {exc}",
+                    type(exc).__name__,
+                ),
+            )
     current = plan.current
     if around is None:  # nothing newer: nothing to do
         events.done(current, current, [])
@@ -847,47 +899,43 @@ def _upgrade_json_lines(version: str | None, options: upgrade_daemons.Options) -
     return 0 if ended is None else 1
 
 
-#: The codes the check step refuses with, before anything stops or installs.
-_CHECK_CODES = frozenset(
-    {
-        "daemon_running",
-        "ptys_live",
-        "runs_in_flight",
-        "asq_running",
-        "launcher_running",
-        "command_taken",
-        "invalid_version",
-        "upgrade_unsupported_route",
-    }
-)
+def _json_lines_error(events: upgrade_daemons.Events, refused: upgrade_daemons.Refused) -> int:
+    """The end of a ``--json-lines`` upgrade that failed: the step still open, then the
+    error; exit 1."""
+    events.end_open_step(refused.code)
+    events.error(refused)
+    return 1
 
 
-def _json_lines_plan(version: str | None) -> lifecycle_service.UpgradePlan:
+def _json_lines_plan(
+    version: str | None,
+) -> tuple[lifecycle_service.UpgradePlan, Path | None]:
     """The plan :func:`_upgrade_json_lines` runs, :data:`upgrade_daemons.PACKAGE_ENV`'s wheel
-    in it when set. :class:`upgrade_daemons.Refused` for a version it can't take."""
+    in it when set, and that wheel. :class:`upgrade_daemons.Refused` for a version or a
+    package it can't take."""
     try:
         plan = lifecycle_service.upgrade_plan(version)
     except lifecycle_service.InvalidVersion as exc:
         raise upgrade_daemons.Refused(
             "invalid_version", f"--version takes a version such as {__version__}, not {exc}"
         ) from exc
-    return upgrade_daemons.with_package(plan, lifecycle_service)
+    return upgrade_daemons.with_package(plan, lifecycle_service, pinned=version is not None)
 
 
 def _json_lines_run(
     plan: lifecycle_service.UpgradePlan,
     options: upgrade_daemons.Options,
     events: upgrade_daemons.Events,
+    wheel: Path | None,
 ) -> tuple[lifecycle_service.UpgradeReport | None, upgrade_daemons.Around | None]:
     """:func:`_upgrade_json_lines`' run: ``(report, around)``, ``around`` ``None`` when nothing
-    is newer. :class:`upgrade_daemons.Refused` for anything that stops it."""
-    found = upgrade_daemons.census()
-    rlxd = upgrade_daemons.find_rlxd(found.daemons)
-    refused = upgrade_daemons.refusal(found, options, windows=sys.platform == "win32")
-    if refused is not None:
-        raise refused
-    found = upgrade_daemons.wait_for_runs(found, options, rlxd, events)
+    is newer. The route, up-to-date, asq and network checks first; the daemons only for an
+    upgrade that runs. :class:`upgrade_daemons.Refused` for anything that stops it."""
+    windows = plan.route.facts.platform == "win32"
     if not plan.runnable and not (plan.target is not None and plan.up_to_date):
+        held = upgrade_daemons.windows_refusal(options, plan.command or None) if windows else None
+        if held is not None:
+            raise held
         command = f" Upgrade it with: {plan.command}" if plan.argv else ""
         raise upgrade_daemons.Refused(
             "upgrade_unsupported_route",
@@ -907,25 +955,27 @@ def _json_lines_run(
             plan.asqs_refusal,
             ", ".join((*plan.asqs, *plan.launchers, *map(str, plan.commands_taken))),
         )
-    events.step("check", "done", upgrade_daemons.mixed_releases(found, options))
-    around = upgrade_daemons.Around(
-        found, options, events, rlxd, new_install=upgrade_daemons.new_install_command(plan)
-    )
-    try:
-        report = lifecycle_service.upgrade(plan, to_stderr=True, around=around)
-    except lifecycle_service.UpgradeRefused as exc:
-        raise upgrade_daemons.Refused("upgrade_unsupported_route", str(exc)) from exc
-    if not report.installed:
-        raise upgrade_daemons.Refused(
-            "upgrade_failed", f"the upgrade failed: {report.problem}", report.problem
-        )
-    if not report.upgraded:
-        raise upgrade_daemons.Refused(
-            "upgrade_not_confirmed",
-            f"the upgrade could not be confirmed: {report.problem}",
-            report.problem,
-        )
-    around.finish(report.hooks)
+    offline = upgrade_daemons.network_refusal(plan)
+    if offline is not None:
+        raise offline
+    source = f"installing from {wheel} ({upgrade_daemons.PACKAGE_ENV})" if wheel else None
+    around = upgrade_daemons.prepare(plan, options, events, windows=windows, said=(source,))
+    with upgrade_daemons.guarded(around, sigterm=False):  # SIGTERM: _upgrade_json_lines'
+        try:
+            report = lifecycle_service.upgrade(plan, to_stderr=True, around=around)
+        except lifecycle_service.UpgradeRefused as exc:
+            raise upgrade_daemons.Refused("upgrade_unsupported_route", str(exc)) from exc
+        if not report.installed:
+            raise upgrade_daemons.Refused(
+                "upgrade_failed", f"the upgrade failed: {report.problem}", report.problem
+            )
+        if not report.upgraded:
+            raise upgrade_daemons.Refused(
+                "upgrade_not_confirmed",
+                f"the upgrade could not be confirmed: {report.problem}",
+                report.problem,
+            )
+        around.finish(report.hooks)
     return report, around
 
 

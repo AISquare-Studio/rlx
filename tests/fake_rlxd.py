@@ -5,8 +5,10 @@ Run as ``python tests/fake_rlxd.py <command> …`` with ``FAKE_RLXD_DIR`` naming
 - ``serve --background`` is the daemon: it registers in this home's daemon registry
   (``core.daemons``, kind ``rlxd``, restartable, its argv this very command), reads its
   version from ``<dir>/version`` (the "binary" a swap replaces), and runs until
-  ``<dir>/stop-<kind>`` appears or it is signalled, which it ignores while
-  ``<dir>/stuck-<kind>`` is there. ``watch`` is the same, as a ``watch`` daemon.
+  ``<dir>/stop-<kind>`` appears or it is signalled. As real rlxd does, it always finishes a
+  stop it was asked for: while ``<dir>/stuck-<kind>`` is there it keeps running, and it
+  stops once that is gone. ``<dir>/teardown`` ends every one of them, for good (a test's
+  end). ``watch`` is the same, as a ``watch`` daemon.
 - ``status --json``, ``call <method> [params]`` and ``stop`` answer as rlxd's command line:
   one JSON envelope (``ok``, ``data`` or ``error``). The runs and PTYs are
   ``<dir>/state.json``'s, which a test writes; ``pty.kill`` marks one exited.
@@ -51,12 +53,11 @@ def _live() -> daemons.Daemon | None:
 
 
 def _daemon(kind: str) -> None:
-    stopping = False
+    asked = False
 
     def stop(signum: int, frame: object) -> None:
-        nonlocal stopping
-        if not (DIR / f"stuck-{kind}").exists():
-            stopping = True
+        nonlocal asked
+        asked = True  # taken, and finished once not stuck
 
     signal.signal(signal.SIGTERM, stop)
     version = (DIR / "version").read_text(encoding="utf-8").strip()
@@ -66,10 +67,12 @@ def _daemon(kind: str) -> None:
     state[kind] = {"pid": os.getpid(), "version": version}
     _save(state)
     try:
-        while not stopping:
+        while not (DIR / "teardown").exists():
             flag = DIR / f"stop-{kind}"
-            if flag.exists() and not (DIR / f"stuck-{kind}").exists():
-                flag.unlink()
+            if flag.exists():
+                flag.unlink(missing_ok=True)
+                asked = True
+            if asked and not (DIR / f"stuck-{kind}").exists():
                 break
             time.sleep(0.05)
     finally:

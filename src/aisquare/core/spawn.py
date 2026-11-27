@@ -56,10 +56,10 @@ otherwise inherit a live identity:
     our own. A background worker of ours is not an agent session and has no
     business wearing one's identity; it also outlives the pane whose hook
     started it, which is the whole point of detaching it.
-  * ``services/upgrade_daemons.py::spawn_daemon`` — one of rlx's own daemons
+  * ``services/upgrade_daemons.py::spawn_detached`` — one of rlx's own daemons
     (rlxd, ``watch``, ``serve``) started again from its recorded argv after
-    ``upgrade --restart-daemons``. Not an agent session, and it outlives the
-    upgrade.
+    ``upgrade --restart-daemons``, or the helper that starts one again once it
+    has stopped. Not an agent session, and it outlives the upgrade.
   * ``services/upgrade_daemons.py::_run`` — rlxd's own command line
     (``rlxd status``, ``rlxd call``, ``rlxd stop``) asked by ``upgrade``. The
     engine's CLI talking to its daemon, no model process.
@@ -467,11 +467,11 @@ SEAMS: dict[str, Seam] = {
         "`upgrade` (4.2): the engine's CLI talking to its daemon, no model process",
         strips_identity=True,
     ),
-    "aisquare/services/upgrade_daemons.py::spawn_daemon": Seam(
+    "aisquare/services/upgrade_daemons.py::spawn_detached": Seam(
         EXCLUDED,
         "one of rlx's own daemons (rlxd, `watch`, `serve`) started again from its recorded "
-        "argv after `upgrade --restart-daemons` (4.2): not an agent session, and it outlives "
-        "the upgrade",
+        "argv after `upgrade --restart-daemons` (4.2), or the helper that starts one again "
+        "once it has stopped: not an agent session, and it outlives the upgrade",
         strips_identity=True,
     ),
     "aisquare/services/install_route.py::exec_replace": Seam(

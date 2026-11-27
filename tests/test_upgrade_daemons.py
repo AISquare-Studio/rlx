@@ -13,11 +13,12 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sys
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -102,10 +103,20 @@ def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Daemons]:
     world.version("1.0.0")
     world.state()
     monkeypatch.setenv("FAKE_RLXD_DIR", str(folder))
-    monkeypatch.setenv("FAKE_RLXD_STOP_WAIT", "2")
-    monkeypatch.setattr(upgrade_daemons, "find_rlxd", lambda live: world.rlxd)
+    monkeypatch.setenv("FAKE_RLXD_STOP_WAIT", "1")  # `rlxd stop` gives up after 1 s
+    monkeypatch.setattr(upgrade_daemons, "find_rlxd", lambda: world.rlxd)
     monkeypatch.setattr(upgrade_daemons, "installed_rlxd", lambda: folder / "rlxd")
-    monkeypatch.setattr(upgrade_daemons, "STOP_TIMEOUT_SECONDS", 15.0)
+    real_prefix = upgrade_daemons.restart_prefix
+    monkeypatch.setattr(
+        upgrade_daemons,
+        "restart_prefix",
+        lambda kind: (
+            (sys.executable, str(FAKE.resolve()), "serve") if kind == "rlxd" else real_prefix(kind)
+        ),
+    )
+    monkeypatch.setattr(upgrade_daemons, "STOP_TIMEOUT_SECONDS", 8.0)
+    monkeypatch.setattr(upgrade_daemons, "RESTART_WHEN_GONE_SECONDS", 60.0)
+    monkeypatch.setattr(upgrade_daemons, "RESTART_GRACE_SECONDS", 1.0)
 
     def run_captured(argv: Any, *, timeout: float) -> Captured:
         argv = list(argv)
@@ -123,6 +134,7 @@ def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Daemons]:
     monkeypatch.setattr(install_route, "run_captured", run_captured)
     (folder / "next").write_text("2.0.0", encoding="utf-8")
     yield world
+    (folder / "teardown").write_text("", encoding="utf-8")  # every fake ends, for good
     (folder / "stuck-rlxd").unlink(missing_ok=True)
     for kind in ("rlxd", "watch"):
         (folder / f"stop-{kind}").write_text("", encoding="utf-8")
@@ -244,7 +256,8 @@ def test_wait_runs_waits_for_the_runs_to_end_and_refuses_once_its_minutes_pass(
     fake.start()
     fake.state(runs=[{"run_id": "r1", "kind": "task", "state": "running"}])
     monkeypatch.setattr(upgrade_daemons, "WAIT_POLL_SECONDS", 0.1)
-    events = Events(json_lines=True, out=io.StringIO())
+    out = io.StringIO()
+    events = Events(json_lines=True, out=out, err=io.StringIO())
     found = upgrade_daemons.census(fake.rlxd)
 
     with pytest.raises(Refused) as refused:
@@ -252,8 +265,10 @@ def test_wait_runs_waits_for_the_runs_to_end_and_refuses_once_its_minutes_pass(
     assert refused.value.code == "runs_in_flight"
 
     threading.Timer(1.0, lambda: fake.state(runs=[])).start()
-    waited = upgrade_daemons.wait_for_runs(found, Options(wait_runs=0.5), fake.rlxd, events)
+    waited, said = upgrade_daemons.wait_for_runs(found, Options(wait_runs=0.5), fake.rlxd, events)
     assert waited.runs == ()
+    assert said is not None and said.startswith("waited ")
+    assert _events(out) == [], "said on stderr: no second `check started` (review n1)"
 
 
 # --- around the install --------------------------------------------------------------------
@@ -279,6 +294,7 @@ def test_restart_daemons_stops_them_swaps_rlxd_and_starts_them_on_the_new_releas
     assert around.restarted == ["rlxd", "watch"]
     assert around.failure is None
     assert _steps(_events(out)) == [
+        ("check", "done"),
         ("stop_daemons", "started"),
         ("stop_daemons", "done"),
         ("install", "started"),
@@ -307,16 +323,17 @@ def test_end_ptys_ends_each_live_pty_before_rlxd_stops(fake: Daemons) -> None:
     around.finish(())
 
 
-def test_without_end_ptys_no_pty_is_ended_or_said_to_be(fake: Daemons) -> None:
+def test_without_end_ptys_a_live_pty_refuses_at_the_stop_and_none_is_ended(
+    fake: Daemons,
+) -> None:
     fake.start()
     fake.state(ptys=[{"pty_id": "p1", "exited": False}])
     around, out = _around(fake, Options(restart_daemons=True))
-    around.before_install()
+    with pytest.raises(Refused) as refused:
+        around.before_install()
+    assert refused.value.code == "ptys_live"
     assert "killed" not in fake.read_state()
-    stopped = [e["data"] for e in _events(out) if e["data"].get("step") == "stop_daemons"]
-    assert stopped[-1]["detail"] == "stopped: rlxd"
-    around.installed("2.0.0", None)
-    around.finish(())
+    assert _steps(_events(out)) == [("check", "failed")]
 
 
 def test_a_tampered_archive_keeps_the_old_rlxd_and_starts_it_again(fake: Daemons) -> None:
@@ -355,20 +372,48 @@ def test_a_failed_install_starts_the_old_daemons_again_at_once(fake: Daemons) ->
 def test_a_stop_that_fails_installs_nothing_and_starts_again_what_it_stopped(
     fake: Daemons,
 ) -> None:
-    fake.start()
+    """M1 of #626's review (its probe P1): rlxd took the stop and finishes it only after the
+    upgrade gave up on it. Nothing is installed; the watch, stopped first, runs again; rlxd
+    runs meanwhile, and once it has ended a helper starts it again: some rlxd always runs."""
+    old = fake.start()
     watch = fake.start("watch")
-    (fake.dir / "stuck-rlxd").write_text("", encoding="utf-8")  # rlxd ignores its stop
+    (fake.dir / "stuck-rlxd").write_text("", encoding="utf-8")  # rlxd's stop takes long
     around, out = _around(fake, Options(restart_daemons=True))
 
     with pytest.raises(Refused) as refused:
         around.before_install()
 
     assert refused.value.code == "daemon_stop_failed"
-    assert len(fake.live("rlxd")) == 1, "rlxd never stopped"
-    (fake.dir / "stuck-rlxd").unlink()
-    # The watch, stopped first, runs again.
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid], "it still runs"
     assert fake.wait_live("watch", not_pid=watch.pid).pid != watch.pid
-    assert ("stop_daemons", "failed") in _steps(_events(out))
+    assert around.later == ["rlxd"]
+    steps = _steps(_events(out))
+    assert ("stop_daemons", "failed") in steps
+    assert not any(step == "install" for step, _ in steps), "the install never started"
+    (fake.dir / "stuck-rlxd").unlink()  # rlxd finishes the stop it was asked for
+    again = fake.wait_live("rlxd", not_pid=old.pid)
+    assert fake.rlxd.daemon_status() == {"pid": again.pid, "version": "1.0.0"}
+
+
+def test_an_rlxd_that_ends_after_its_command_line_gave_up_counts_as_stopped(
+    fake: Daemons,
+) -> None:
+    """M1: `rlxd stop` gives up after its 1 s here, while rlxd finishes the stop it took; the
+    upgrade waits for the lock and the process to go, and goes on."""
+    old = fake.start()
+    (fake.dir / "stuck-rlxd").write_text("", encoding="utf-8")
+    threading.Timer(2.5, lambda: (fake.dir / "stuck-rlxd").unlink(missing_ok=True)).start()
+    around, _ = _around(fake, Options(restart_daemons=True))
+
+    around.before_install()
+
+    assert fake.live("rlxd") == [], "stopped, late"
+    assert [d.pid for d in around.stopped] == [old.pid]
+    around.installed("2.0.0", None)
+    around.finish(())
+    new = fake.wait_live("rlxd", not_pid=old.pid)
+    assert fake.rlxd.daemon_status() == {"pid": new.pid, "version": "2.0.0"}
+    assert around.failure is None
 
 
 def test_without_restart_daemons_nothing_stops_and_rlxds_binaries_are_still_swapped(
@@ -382,7 +427,7 @@ def test_without_restart_daemons_nothing_stops_and_rlxds_binaries_are_still_swap
     around.finish(())
     assert len(fake.swaps) == 1
     assert around.restarted == []
-    assert _steps(_events(out))[0] == ("stop_daemons", "skipped")
+    assert _steps(_events(out))[:2] == [("check", "done"), ("stop_daemons", "skipped")]
 
 
 # --- events and the package ------------------------------------------------------------------
@@ -504,17 +549,511 @@ def test_json_lines_refuses_with_its_code_and_stops_nothing(
     assert [d.pid for d in fake.live("rlxd")] == [old.pid], "nothing stopped"
 
 
+def _on_windows(tool: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    facts = install_route.facts()
+    monkeypatch.setattr(install_route, "facts", lambda: replace(facts, platform="win32"))
+
+
 def test_on_windows_a_running_daemon_refuses_a_plain_upgrade(
     fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """4.2's Windows Accept line. rlx can't replace itself there (its route refuses), so the
+    refusal names the daemons too, with the command to run by hand, and never advises
+    --restart-daemons, which could not help (review M6)."""
     fake.start()
-    monkeypatch.setattr(sys, "platform", "win32")
+    _on_windows(tool, monkeypatch)
     result = CliRunner().invoke(app, ["upgrade", "--yes", "--json-lines"])
     assert result.exit_code == 1, result.output
     last = json.loads(result.stdout.splitlines()[-1])
     assert last["type"] == "upgrade.error" and last["data"]["code"] == "daemon_running"
+    assert "uv tool install" in last["data"]["message"]
+    assert "--restart-daemons" not in last["data"]["message"]
+    restarted = CliRunner().invoke(app, ["upgrade", "--yes", "--restart-daemons", "--json-lines"])
+    last = json.loads(restarted.stdout.splitlines()[-1])
+    assert last["data"]["code"] == "upgrade_unsupported_route"
+    plain = CliRunner().invoke(app, ["--json", "upgrade", "--yes"])
+    assert plain.exit_code == 1
+    assert json.loads(plain.stdout)["error"] == "daemon_running"
 
 
 def test_json_lines_needs_yes() -> None:
     result = CliRunner().invoke(app, ["upgrade", "--json-lines"])
     assert result.exit_code == 2
+
+
+# --- the review of #626 (#2826): its probes and minors ------------------------------------
+
+posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows can't replace a running rlx: its route refuses"
+)
+
+
+def _lines(result: Any) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def _upgrade(*flags: str) -> Any:
+    return CliRunner().invoke(app, ["upgrade", "--yes", *flags, "--json-lines"])
+
+
+@posix_only
+@pytest.mark.parametrize("json_lines", [True, False])
+def test_ctrl_c_in_the_installer_starts_what_was_stopped_again(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch, json_lines: bool
+) -> None:
+    """M2 (probe P2): a Ctrl-C during uv's run unwinds through the guard."""
+    old = fake.start()
+
+    def interrupted(argv: Any, **kwargs: Any) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(install_route, "run_installer", interrupted)
+    flags = ["--json-lines"] if json_lines else []
+    result = CliRunner().invoke(app, ["upgrade", "--yes", "--restart-daemons", *flags])
+    assert result.exit_code != 0
+    new = fake.wait_live("rlxd", not_pid=old.pid)
+    assert fake.rlxd.daemon_status() == {"pid": new.pid, "version": "1.0.0"}
+    if json_lines:
+        lines = _lines(result)
+        assert lines[-1]["type"] == "upgrade.error"
+        assert lines[-1]["data"]["code"] == "interrupted"
+        steps = _steps(lines)
+        assert steps.index(("install", "failed")) < steps.index(("start_daemons", "started"))
+
+
+@posix_only
+def test_sigterm_under_json_lines_starts_what_was_stopped_and_says_interrupted(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2: the app's SIGTERM is an exception there, not the end of the process."""
+    old = fake.start()
+    before = signal.getsignal(signal.SIGTERM)
+
+    def terminated(argv: Any, **kwargs: Any) -> int:
+        signal.raise_signal(signal.SIGTERM)
+        return 0
+
+    monkeypatch.setattr(install_route, "run_installer", terminated)
+    result = _upgrade("--restart-daemons")
+    assert result.exit_code == 1, result.output
+    assert _lines(result)[-1]["data"]["code"] == "interrupted"
+    new = fake.wait_live("rlxd", not_pid=old.pid)
+    assert fake.rlxd.daemon_status() == {"pid": new.pid, "version": "1.0.0"}
+    assert signal.getsignal(signal.SIGTERM) == before, "SIGTERM's handler put back"
+
+
+@posix_only
+def test_an_unexpected_error_ends_with_upgrade_error_internal_and_rlxd_running(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = fake.start()
+
+    def broken(argv: Any, **kwargs: Any) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(install_route, "run_installer", broken)
+    result = _upgrade("--restart-daemons")
+    assert result.exit_code == 1
+    last = _lines(result)[-1]
+    assert last["type"] == "upgrade.error" and last["data"]["code"] == "internal"
+    assert last["data"]["detail"] == "RuntimeError"
+    assert fake.wait_live("rlxd", not_pid=old.pid).pid != old.pid
+
+
+@posix_only
+def test_a_pty_opened_while_waiting_for_runs_refuses_and_nothing_stops(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3 (probe P3): counted again right before the stop."""
+    monkeypatch.setattr(upgrade_daemons, "WAIT_POLL_SECONDS", 0.1)
+    old = fake.start()
+    fake.state(runs=[{"run_id": "r1", "state": "running"}], ptys=[])
+    opened = {"runs": [], "ptys": [{"pty_id": "p-new", "exited": False}]}
+    threading.Timer(1.0, lambda: fake.state(**opened)).start()
+    result = _upgrade("--restart-daemons", "--wait-runs", "1")
+    assert result.exit_code == 1, result.output
+    lines = _lines(result)
+    assert lines[-1]["data"]["code"] == "ptys_live", lines[-1]
+    assert ("check", "failed") in _steps(lines)
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid], "nothing stopped"
+
+
+def test_a_run_started_after_the_count_refuses_at_the_stop(fake: Daemons) -> None:
+    """M3: a run that appeared since the count refuses as before, nothing stopped."""
+    old = fake.start()
+    around, out = _around(fake, Options(restart_daemons=True))
+    fake.state(runs=[{"run_id": "r2", "state": "queued"}])
+    with pytest.raises(Refused) as refused:
+        around.before_install()
+    assert refused.value.code == "runs_in_flight" and refused.value.detail == "r2"
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid]
+    around.start_again()
+    assert _steps(_events(out)) == [("check", "failed")], "nothing to start again"
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("flags", "code"),
+    [(["--restart-daemons"], "ptys_live"), ([], "runs_in_flight")],
+)
+def test_runs_and_ptys_that_cant_be_read_refuse_and_rlxd_is_not_stopped(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch, flags: list[str], code: str
+) -> None:
+    """M4 (probe P5): the census fails closed."""
+    old = fake.start()
+    real_call = upgrade_daemons.Rlxd.call
+
+    def call(self: Any, method: str, params: Any = None) -> Any:
+        if method in ("run.list", "pty.list"):
+            raise upgrade_daemons.RlxdError("unreachable", "timed out after 30 s")
+        return real_call(self, method, params)
+
+    monkeypatch.setattr(upgrade_daemons.Rlxd, "call", call)
+    result = _upgrade(*flags)
+    last = _lines(result)[-1]
+    assert last["type"] == "upgrade.error" and last["data"]["code"] == code, last
+    assert last["data"]["detail"] == "timed out after 30 s"
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid]
+
+
+def test_unknown_runs_and_ptys_refuse_as_some_would() -> None:
+    found = _census(rlxd_error="unreachable")
+    restart = upgrade_daemons.refusal(found, Options(restart_daemons=True), windows=False)
+    assert restart is not None and restart.code == "ptys_live"
+    plain = upgrade_daemons.refusal(found, Options(), windows=False)
+    assert plain is not None and plain.code == "runs_in_flight"
+    ended = Options(restart_daemons=True, end_ptys=True)
+    refused = upgrade_daemons.refusal(found, ended, windows=False)
+    assert refused is not None and refused.code == "runs_in_flight"
+
+
+@posix_only
+def test_rlxd_started_again_at_another_version_than_swapped_fails_the_upgrade(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M5 (probe P4): `daemon install` says it swapped, but the rlxd the record runs is
+    still 1.0.0: no upgrade.done."""
+    fake.start()
+
+    def run_captured(argv: Any, *, timeout: float) -> Captured:
+        argv = list(argv)
+        if argv[-2:] == ["daemon", "install"]:
+            return Captured(0, json.dumps({"version": "2.0.0"}))  # wrote elsewhere
+        if argv[-1] == "--version":
+            return Captured(0, "aisquare 2.0.0\n")
+        return Captured(0, "connected\n")
+
+    monkeypatch.setattr(install_route, "run_captured", run_captured)
+    result = _upgrade("--restart-daemons")
+    assert result.exit_code == 1
+    last = _lines(result)[-1]
+    assert last["type"] == "upgrade.error" and last["data"]["code"] == "daemon_start_failed"
+    assert "reports 1.0.0, not 2.0.0" in last["data"]["message"]
+    assert (fake.rlxd.daemon_status() or {}).get("version") == "1.0.0", "an rlxd runs"
+
+
+@posix_only
+def test_an_up_to_date_upgrade_is_nothing_to_do_whatever_runs(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6 (probe P6): the daemons are reckoned with only for an upgrade that runs."""
+    monkeypatch.setattr(install_route, "fetch_latest", lambda *a, **k: LatestRelease("1.0.0"))
+    fake.start()
+    fake.state(runs=[{"run_id": "r1", "state": "running"}])
+    plain = CliRunner().invoke(app, ["upgrade", "--yes"])
+    assert plain.exit_code == 0, plain.output
+    assert "nothing to do" in plain.output
+    lines = _lines(_upgrade("--restart-daemons"))
+    assert lines[-1] == {**lines[-1], "type": "upgrade.done"}
+    assert lines[-1]["data"] == {"from": "1.0.0", "to": "1.0.0", "restarted": []}
+
+
+@posix_only
+def test_off_a_terminal_without_yes_it_is_a_dry_run_whatever_runs(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M6: off a terminal, no question and no refusal: today's dry run."""
+    from aisquare.cli import install as install_cli
+
+    monkeypatch.setattr(install_cli, "_stdin_is_a_terminal", lambda: False)
+    fake.start()
+    fake.state(runs=[{"run_id": "r1", "state": "running"}])
+    result = CliRunner().invoke(app, ["upgrade", "--wait-runs", "5"])
+    assert result.exit_code == 0, result.output
+    assert "dry run" in result.output
+
+
+@pytest.mark.parametrize("minutes", ["nan", "inf", "-1", "1441"])
+def test_wait_runs_takes_a_bounded_number_of_minutes(minutes: str) -> None:
+    """m6 (probe P7)."""
+    result = CliRunner().invoke(app, ["--json", "upgrade", "--check", "--wait-runs", minutes])
+    assert result.exit_code == 2, result.output
+    with pytest.raises(ValueError):
+        Options(wait_runs=float(minutes))
+
+
+# --- what the upgrade stops and runs (m1, m2, m4) --------------------------------------------
+
+
+def _record(**values: Any) -> daemons_core.Daemon:
+    return replace(_census().daemons[0], **values)
+
+
+def test_only_rlxs_own_commands_are_stopped_and_run_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m1: the record's argv is checked before it is ever run."""
+    rlxd = tmp_path / "bin" / "rlxd"
+    rlxd.parent.mkdir()
+    rlxd.write_text("", encoding="utf-8")
+    monkeypatch.setattr(upgrade_daemons, "installed_rlxd", lambda: rlxd)
+    daemons_core.registry_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    good = _record(argv=(str(rlxd), "serve", "--detach", "--log", "x"))
+    assert upgrade_daemons.restart_refusal(good) is None
+    other = tmp_path / "rlxd-dev"
+    other.write_text("", encoding="utf-8")
+    cases = [
+        (_record(argv=good.argv, restartable=False), "not restartable"),
+        (_record(kind="later_kind", argv=good.argv), "rlx doesn't restart a later_kind"),
+        (_record(kind="brain", argv=good.argv), "rlx doesn't restart a brain"),
+        (_record(argv=("rlxd", "serve", "--detach")), "its program rlxd is not a file"),
+        (_record(argv=(str(rlxd), "call", "stop")), "its command is not rlx's"),
+        (_record(argv=(str(other), "serve", "--detach")), f"it runs {other}, not {rlxd}"),
+    ]
+    for record, why in cases:
+        assert upgrade_daemons.restart_refusal(record) == why
+    python = _record(kind="watch", argv=(sys.executable, "-m", "aisquare", "watch"))
+    assert upgrade_daemons.restart_refusal(python) is None
+
+
+@posix_only
+def test_a_registry_open_to_others_names_nothing_to_run(tmp_path: Path) -> None:
+    folder = daemons_core.registry_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o755)
+    python = _record(kind="watch", argv=(sys.executable, "-m", "aisquare", "watch"))
+    said = upgrade_daemons.restart_refusal(python)
+    assert said is not None and "open to others" in said
+    folder.chmod(0o700)
+    assert upgrade_daemons.restart_refusal(python) is None
+
+
+def test_a_record_naming_another_program_is_left_running_and_said(
+    fake: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = fake.start()
+    elsewhere = ("/nowhere/rlxd", "serve", "--detach")
+    monkeypatch.setattr(upgrade_daemons, "restart_prefix", lambda kind: elsewhere)
+    around, out = _around(fake, Options(restart_daemons=True))
+    around.before_install()
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid]
+    assert around.stopped == []
+    done = [e["data"] for e in _events(out) if e["data"].get("step") == "stop_daemons"]
+    assert "left running: rlxd (" in done[-1]["detail"]
+
+
+@posix_only
+def test_check_runs_no_program_a_record_names(tool: Path, tmp_path: Path) -> None:
+    """m1: rlxd is asked through the one installed beside rlx (none here), never a record's
+    argv[0]."""
+    ran = tmp_path / "ran"
+    program = tmp_path / "rlxd"
+    program.write_text(f"#!/bin/sh\ntouch {ran}\n", encoding="utf-8")
+    program.chmod(0o755)
+    registration = daemons_core.register(
+        "rlxd", argv=[str(program), "serve", "--detach"], restartable=True
+    )
+    try:
+        result = CliRunner().invoke(app, ["--json", "upgrade", "--check"])
+    finally:
+        registration.deregister()
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["rlxd_error"] == (
+        "rlxd runs, but no rlxd is installed beside rlx to ask"
+    )
+    assert not ran.exists()
+
+
+def test_a_held_record_that_cant_be_read_is_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """m2: counted as a daemon of this host that can't be restarted."""
+    unread = registry.Unreadable(
+        id="abcdefabcdef",
+        path=Path("abcdefabcdef.json"),
+        written_at=None,
+        held=True,
+        said={"kind": "watch", "pid": 77},
+    )
+    free = replace(unread, id="0000000000ff", held=False)
+    roll: registry.Roll[daemons_core.Daemon] = registry.Roll(
+        live=[], unreadable=[unread, free], pruned=[]
+    )
+    monkeypatch.setattr(daemons_core, "roll", lambda **k: roll)
+    found = upgrade_daemons.census()
+    assert found.unreadable == (unread,)
+    shown = found.as_json()["daemons"]
+    assert shown == [
+        {
+            "id": "abcdefabcdef",
+            "kind": "watch",
+            "pid": 77,
+            "host": None,
+            "version": None,
+            "restartable": False,
+            "argv": [],
+            "started_at": None,
+            "readable": False,
+        }
+    ]
+    refused = upgrade_daemons.refusal(found, Options(), windows=True)
+    assert refused is not None and refused.code == "daemon_running"
+    assert "not readable" in (upgrade_daemons.mixed_releases(found, Options()) or "")
+
+
+def test_a_daemon_started_again_is_its_own_new_record(fake: Daemons) -> None:
+    """m4: another live daemon of its kind does not stand in for one that never came up."""
+    other = fake.start("watch")
+    gone = replace(other, id="0123456789ab", pid=other.pid + 100000)
+    said = upgrade_daemons._wait_started(gone, upgrade_daemons._live_ids(), None, None, 1.0)
+    assert said == "did not come up in 1 s"
+    before = upgrade_daemons._live_ids()
+    fake.start("watch")
+    assert upgrade_daemons._wait_started(gone, before, None, None, 10.0) is None
+
+
+# --- the package (m3, n2) ----------------------------------------------------------------------
+
+
+def _wheel(tmp_path: Path, version: str = "2.0.0") -> Path:
+    wheel = tmp_path / f"aisquare_cli-{version}-py3-none-any.whl"
+    wheel.write_bytes(b"")
+    return wheel
+
+
+def test_the_package_is_a_local_wheel_and_nothing_else(
+    tool: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = lifecycle.upgrade_plan(None)
+    for value in (
+        "https://example.com/aisquare_cli-2.0.0-py3-none-any.whl",
+        "file:///tmp/aisquare_cli-2.0.0-py3-none-any.whl",
+        str(tmp_path / "missing-2.0.0-py3-none-any.whl"),
+        str(tmp_path),
+    ):
+        monkeypatch.setenv(upgrade_daemons.PACKAGE_ENV, value)
+        with pytest.raises(Refused) as refused:
+            upgrade_daemons.with_package(plan, lifecycle, pinned=False)
+        assert refused.value.code == "invalid_version", value
+    monkeypatch.setenv(upgrade_daemons.PACKAGE_ENV, str(_wheel(tmp_path)))
+    with pytest.raises(Refused, match="give one of them"):
+        upgrade_daemons.with_package(plan, lifecycle, pinned=True)
+    planned, wheel = upgrade_daemons.with_package(plan, lifecycle, pinned=False)
+    assert wheel == _wheel(tmp_path).resolve()
+    assert planned.target == "2.0.0" and planned.reason is None
+    assert planned.argv[-1] == f"aisquare-cli[serve] @ {wheel.as_uri()}"
+    # n2: the reinstall's own prefix, held together with install_route's.
+    spec = install_route._uv_spec(plan.route, None, plan.current)
+    assert (
+        list(planned.argv[:-1])
+        == install_route._uv_install_argv(plan.route, None, plan.current)[: -len(spec)]
+    )
+    assert upgrade_daemons.with_package(plan, lifecycle, pinned=False)[1] is not None
+    monkeypatch.delenv(upgrade_daemons.PACKAGE_ENV)
+    assert upgrade_daemons.with_package(plan, lifecycle, pinned=True) == (plan, None)
+
+
+def test_the_package_keeps_the_routes_own_refusals(
+    tool: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(install_route, "find_uv", lambda: None)
+    monkeypatch.setenv(upgrade_daemons.PACKAGE_ENV, str(_wheel(tmp_path)))
+    planned, _ = upgrade_daemons.with_package(lifecycle.upgrade_plan(None), lifecycle, pinned=False)
+    assert planned.reason == "uv is not on PATH"
+    result = CliRunner().invoke(app, ["--json", "upgrade", "--yes"])
+    assert json.loads(result.stdout)["error"] == "upgrade_unsupported_route"
+
+
+def test_the_package_is_said(tool: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    wheel = _wheel(tmp_path)
+    monkeypatch.setenv(upgrade_daemons.PACKAGE_ENV, str(wheel))
+    result = CliRunner().invoke(app, ["--json", "upgrade", "--check"])
+    assert result.exit_code == 0, result.output
+    assert f"installing from {wheel.resolve()} ({upgrade_daemons.PACKAGE_ENV})" in result.stderr
+    assert json.loads(result.stdout)["current"] == "1.0.0"
+
+
+# --- network, the swap, the order of steps (m5, m7, n1) ---------------------------------------
+
+
+@posix_only
+def test_a_pypi_that_cant_be_asked_refuses_before_anything_stops(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m5: 7.8's `network`, in the check step."""
+    offline = LatestRelease(None, error="no network")
+    monkeypatch.setattr(install_route, "fetch_latest", lambda *a, **k: offline)
+    old = fake.start()
+    lines = _lines(_upgrade("--restart-daemons"))
+    assert lines[-1]["data"]["code"] == "network"
+    assert _steps(lines) == [("check", "started"), ("check", "failed")]
+    interactive = CliRunner().invoke(app, ["--json", "upgrade", "--yes", "--restart-daemons"])
+    assert json.loads(interactive.stdout)["error"] == "network"
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid]
+
+
+@posix_only
+def test_a_failed_rlxd_swap_without_restart_daemons_warns_and_the_upgrade_stands(
+    fake: Daemons, tool: Path
+) -> None:
+    """m7: rlx is upgraded; rlxd is not, which is said, and the run ends upgrade.done."""
+    old = fake.start()
+    fake.swap_fails = True
+    result = _upgrade()
+    assert result.exit_code == 0, result.output
+    lines = _lines(result)
+    assert ("rlxd", "failed") in _steps(lines)
+    assert lines[-1]["type"] == "upgrade.done" and lines[-1]["data"]["to"] == "2.0.0"
+    assert "rlx is upgraded to 2.0.0, but rlxd is not (checksum_mismatch)" in result.stderr
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid]
+
+
+@posix_only
+def test_json_lines_says_each_step_once_in_order(fake: Daemons, tool: Path) -> None:
+    """n1."""
+    fake.start()
+    lines = _lines(_upgrade("--restart-daemons"))
+    assert _steps(lines) == [
+        ("check", "started"),
+        ("check", "done"),
+        ("stop_daemons", "started"),
+        ("stop_daemons", "done"),
+        ("install", "started"),
+        ("install", "done"),
+        ("rlxd", "started"),
+        ("rlxd", "done"),
+        ("refresh_hooks", "done"),
+        ("start_daemons", "started"),
+        ("start_daemons", "done"),
+    ]
+    assert lines[-1]["type"] == "upgrade.done"
+
+
+@posix_only
+def test_after_a_failed_stop_or_install_no_step_is_said_twice(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """n1: no `install failed` for an install that never started, nor a second one."""
+    old = fake.start()
+    (fake.dir / "stuck-rlxd").write_text("", encoding="utf-8")
+    stopped = _lines(_upgrade("--restart-daemons"))
+    assert stopped[-1]["data"]["code"] == "daemon_stop_failed"
+    assert not any(step == "install" for step, _ in _steps(stopped))
+    (fake.dir / "stuck-rlxd").unlink()
+    again = fake.wait_live("rlxd", not_pid=old.pid)  # started again by the helper
+    deadline = time.monotonic() + 20
+    while (fake.rlxd.daemon_status() or {}).get("pid") != again.pid:
+        assert time.monotonic() < deadline, "the rlxd started again never answered"
+        time.sleep(0.05)
+    monkeypatch.setattr(install_route, "run_installer", lambda argv, **k: 1)
+    failed = _lines(_upgrade("--restart-daemons"))
+    assert failed[-1]["data"]["code"] == "upgrade_failed"
+    assert _steps(failed).count(("install", "failed")) == 1
