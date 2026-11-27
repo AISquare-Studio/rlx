@@ -2,32 +2,36 @@
 //! fails closed.
 //!
 //! - **A hook request is bound to its run.** It must name the run's live attempt, carry
-//!   that attempt's key (`RLXD_HOOK_KEY`, random at each attempt's start, in Claude Code's
-//!   environment and so its hooks'), and come from a process inside the run: on macOS and
-//!   Linux one in the run's process group (the guard leads a session of its own, so no
-//!   process outside the run can join it), on Windows one in the run's Job Object. Any
-//!   other request is denied at once, with no event and no ledger entry, so a guessed
-//!   run id from outside the run reaches nothing. The key is inherited by every process
-//!   Claude Code starts, not only its hooks, so a process inside the run can ask about a
-//!   call of its own making: it gets the app's answer to that call only, never an allow
-//!   for one of Claude Code's (each call is its own `call_id`, decided once), and it can't
-//!   reach another run. The key is never logged, published or written to disk.
+//!   that attempt's key (`RLXD_HOOK_KEY`, 256 random bits made at each attempt's start, in
+//!   Claude Code's environment and so its hooks'), and come from a process inside the run
+//!   ([`process::holds`]): on macOS and Linux a descendant of the run's guard by its parent
+//!   chain, each step checked against a reused pid (Claude Code starts hooks detached, in a
+//!   session of their own), on Windows a process in the run's Job Object, through the
+//!   handle pinned when it connected. Any other request is denied at once, with no event
+//!   and no ledger entry, so a guessed run id from outside the run reaches nothing. The
+//!   key is inherited by every process Claude Code starts, not only its hooks, so a
+//!   process inside the run can ask about a call of its own making: it gets the app's
+//!   answer to that call only, never an allow for one of Claude Code's (each call is its
+//!   own `call_id`, decided once), and it can't reach another run. The key is never
+//!   logged, published or written to disk.
 //! - **rlxd's own rules come first,** and deny `by: "rlxd"`: the mount, the kind and the
-//!   pinned call ([`rlxd_rule`]). A tool's read-only hint is [`read_only`]'s alone.
+//!   pinned call ([`rlxd_rule`]). A tool's server is the one MCP server of the attempt's
+//!   `system/init` whose name, as Claude Code writes it, the tool's name starts with
+//!   ([`claude_server_name`]); none, or more than one, is a deny. A tool's read-only hint
+//!   is [`read_only`]'s alone.
 //! - **Every other call goes to the app** as `run.tool_call`, and only `run.decide` from an
 //!   app-role connection answers it; the first answer wins. With no app connected it is
 //!   denied `by: "unreachable"` at once. Pending when the last app leaves, it is held
 //!   until its deadline, then denied `by: "timeout"`. Nothing a run writes (its text, a
 //!   tool's result, a prompt) can decide a call: a reason is data only.
 //! - **The ledger** in `run.json` holds every call: `decided`, and `executing` for an
-//!   allow, written and fsynced before the hook gets its answer; `ok` or `error` from the
-//!   call's `tool_result`; `unknown` when the run ends with it still executing.
+//!   allow, written and fsynced before the hook gets its answer, and an allow whose entry
+//!   can't be written is a deny `by: "rlxd"`; `ok` or `error` from the call's
+//!   `tool_result`; `unknown` when the run ends with it still executing.
 //!
 //! Until rlxd-hook's own pre-tool-use is wired to [`Runner::pre_tool_use`] (with #617, at
-//! rc/0.10.3's merge), only test builds reach the hook side, through `debug.pre_tool_use`.
-
-// Until then, a release build makes no hook request: its hook side is unused there.
-#![cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+//! rc/0.10.3's merge), only test builds reach the hook side, through `debug.pre_tool_use`:
+//! the items marked so are unused in a release build until then.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,17 +53,27 @@ pub const PINNED_CALL_USED: &str = "pinned_call_used";
 /// The name of the variable that holds an attempt's hook key.
 pub const HOOK_KEY_ENV: &str = "RLXD_HOOK_KEY";
 
-/// How long `run.decide` waits for its decision to be written before it answers anyway.
-const DECIDE_WAIT: Duration = Duration::from_secs(30);
+/// The reason of a call still open as its run ends.
+const RUN_ENDED: &str = "the run ended before the call was decided";
+
+/// The reason of an allow whose ledger entry could not be written: it is a deny.
+const LEDGER_UNWRITTEN: &str = "rlxd could not write the call to the run's ledger";
+
+/// The reason of a call made after the app ended the run on a denial (`stop: true`).
+const STOPPED: &str = "the app stopped the run";
+
+/// The reason of a call the app didn't answer before its deadline.
+const TIMED_OUT: &str = "no answer came from the app before the call's deadline";
 
 /// A hook request: what `rlxd-hook pre-tool-use` sends for one call.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub struct Ask {
     pub run_id: String,
     pub attempt: u64,
     /// The attempt's key, as the hook got it in its environment.
     pub key: String,
-    /// The connecting process, as the socket or pipe pins it.
-    pub peer: Option<u32>,
+    /// The connecting process, pinned when its connection was accepted.
+    pub peer: Arc<crate::peer::Peer>,
     /// Claude Code's PreToolUse input: `tool_name`, `tool_input`, `tool_use_id`, ….
     pub stdin: Value,
 }
@@ -67,7 +81,8 @@ pub struct Ask {
 /// Where a call the gate is deciding stands, by `call_id`.
 pub(super) enum Status {
     /// Not decided yet: waiting for the app, whose answer goes to `answer`, or, `answer`
-    /// taken, the app's answer being written.
+    /// taken, the app's answer on its way to the call.
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     Open {
         tool: String,
         sha256: String,
@@ -77,26 +92,48 @@ pub(super) enum Status {
     Decided(DecidedBy),
 }
 
-/// The reason of a call still open as its run ends.
-const RUN_ENDED: &str = "the run ended before the call was decided";
-
 /// The app's `run.decide`, handed to the call waiting for it.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub(super) struct AppAnswer {
     decision: Decision,
     reason: String,
     draft_id: Option<String>,
     stop: bool,
-    /// Told the decision taken once it is written: the app's, or rlxd's deny when the
-    /// app allowed a pinned call that another call used meanwhile.
+    /// Told the decision taken once it is written: the app's, or rlxd's deny (a pinned
+    /// call another call used meanwhile, a ledger that could not be written).
     written: oneshot::Sender<Decision>,
 }
 
 /// One call, as the gate reads it.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 struct Call {
     id: String,
     tool: String,
     input: Value,
     sha256: String,
+}
+
+/// A decision as taken, and its reason.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+struct Taken {
+    decision: Decision,
+    reason: String,
+}
+
+impl Taken {
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+    fn output(&self) -> String {
+        output(self.decision, &self.reason)
+    }
+}
+
+/// What a waiting call got.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+enum Came {
+    Answer(AppAnswer),
+    Deadline,
+    /// Its answer's sender went without an answer: the run's end settled it.
+    Gone,
 }
 
 impl Runner {
@@ -107,6 +144,7 @@ impl Runner {
         }
     }
 
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     fn app_present(&self) -> bool {
         self.apps.get().is_some_and(|apps| *apps.borrow() > 0)
     }
@@ -114,6 +152,7 @@ impl Runner {
     /// Ends every hook connection waiting on the gate, as a dropped connection would:
     /// each one's call is denied, and its hook gets no answer (test builds' `debug.
     /// drop_hook_connections`). How many there were.
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     pub fn drop_hooks(&self) -> u64 {
         let waiting = *self.hooks_waiting.borrow();
         self.hooks_dropped.send_modify(|n| *n += 1);
@@ -123,12 +162,14 @@ impl Runner {
     /// The gate's answer to one hook request: Claude Code's hook JSON, allow or deny.
     /// `None` when its connection was dropped (`debug.drop_hook_connections`): the hook
     /// then gets no answer, and denies.
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     pub async fn pre_tool_use(self: &Arc<Self>, ask: Ask) -> Option<String> {
         let (run, call) = match self.bind(&ask) {
             Ok(bound) => bound,
             Err(why) => {
+                // As the caller sent it: quoted, so it can't forge a line of the log.
                 warning!(
-                    "gate: a hook request for run {} was refused: {why}",
+                    "gate: a hook request for run {:?} was refused: {why}",
                     ask.run_id
                 );
                 let reason = format!("rlxd refused the hook request: {why}");
@@ -146,36 +187,27 @@ impl Runner {
                 let reason = "rlxd already decided a call of this id";
                 return Some(output(Decision::Deny, reason));
             }
-            if let Some(reason) = rlxd_rule(
+            let at_once = if inner.stopped.is_some() {
+                Some((DecidedBy::Rlxd, STOPPED.to_owned()))
+            } else if let Some(reason) = rlxd_rule(
                 &run.params,
                 inner.pinned_call_used,
                 &inner.hints,
+                &inner.servers,
                 &call.tool,
                 &call.sha256,
             ) {
-                self.decide_now(
-                    &run,
-                    &mut inner,
-                    &call,
-                    Decision::Deny,
-                    DecidedBy::Rlxd,
-                    &reason,
-                    None,
-                );
-                return Some(output(Decision::Deny, &reason));
-            }
-            if !self.app_present() {
-                let reason = "no app is connected to decide the call";
-                self.decide_now(
-                    &run,
-                    &mut inner,
-                    &call,
-                    Decision::Deny,
-                    DecidedBy::Unreachable,
-                    reason,
-                    None,
-                );
-                return Some(output(Decision::Deny, reason));
+                Some((DecidedBy::Rlxd, reason))
+            } else if !self.app_present() {
+                let reason = "no app is connected to decide the call".to_owned();
+                Some((DecidedBy::Unreachable, reason))
+            } else {
+                None
+            };
+            if let Some((by, reason)) = at_once {
+                let taken =
+                    self.decide_now(&run, &mut inner, &call, Decision::Deny, by, &reason, None);
+                return Some(taken.output());
             }
             let (answer, waiting) = oneshot::channel();
             let open = Status::Open {
@@ -197,107 +229,121 @@ impl Runner {
         let mut guard = Unanswered::new(self, &run, call);
         let mut dropped = self.hooks_dropped.subscribe();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
-        let answered = tokio::select! {
-            answer = &mut waiting => answer.ok(),
-            () = tokio::time::sleep_until(deadline) => {
-                // The deadline came: unless the app's answer is on its way, it is a timeout.
-                let racing = {
-                    let mut inner = run.inner();
-                    let call_id = guard.call_id();
-                    match inner.gate.get(call_id) {
-                        Some(Status::Open { answer: Some(_), .. }) => {
-                            let timeout = Status::Decided(DecidedBy::Timeout);
-                            inner.gate.insert(call_id.to_owned(), timeout);
-                            false
-                        }
-                        _ => true,
-                    }
-                };
-                if racing { waiting.await.ok() } else { None }
-            }
+        let mut came = tokio::select! {
+            answer = &mut waiting => answer.map_or(Came::Gone, Came::Answer),
+            () = tokio::time::sleep_until(deadline) => Came::Deadline,
             _ = dropped.changed() => {
                 // Denied by its end: the guard writes it.
                 drop(guard);
                 return None;
             }
         };
-        let call = guard
-            .call
-            .take()
-            .expect("the call is the guard's until here");
+        if matches!(came, Came::Deadline) {
+            // Still waiting: a timeout, decided under this one lock, so neither an answer
+            // nor the run's end can come between.
+            let timed_out = {
+                let mut inner = run.inner();
+                let waiting = matches!(
+                    inner.gate.get(guard.call_id()),
+                    Some(Status::Open {
+                        answer: Some(_),
+                        ..
+                    })
+                );
+                waiting.then(|| {
+                    let call = guard.take();
+                    self.decide_now(
+                        &run,
+                        &mut inner,
+                        &call,
+                        Decision::Deny,
+                        DecidedBy::Timeout,
+                        TIMED_OUT,
+                        None,
+                    )
+                })
+            };
+            if let Some(taken) = timed_out {
+                return Some(taken.output());
+            }
+            // The app's answer was taken as the deadline came: it is on its way.
+            came = waiting.await.map_or(Came::Gone, Came::Answer);
+        }
+        let call = guard.take();
         let mut inner = run.inner();
         if inner.calls.iter().any(|c| c.call_id == call.id) {
-            // The run ended first, and denied it.
-            return Some(output(Decision::Deny, RUN_ENDED));
+            // The run ended first, or the app stopped it, and rlxd denied it.
+            let reason = if inner.stopped.is_some() {
+                STOPPED
+            } else {
+                RUN_ENDED
+            };
+            return Some(output(Decision::Deny, reason));
         }
-        match answered {
-            // A pinned call is allowed once: two calls waiting together (Claude Code's
-            // parallel calls) can't both be.
-            Some(answer)
-                if answer.decision == Decision::Allow
-                    && run.params.pinned_call.is_some()
-                    && inner.pinned_call_used =>
-            {
-                self.decide_now(
-                    &run,
-                    &mut inner,
-                    &call,
-                    Decision::Deny,
-                    DecidedBy::Rlxd,
-                    PINNED_CALL_USED,
-                    None,
-                );
-                let _ = answer.written.send(Decision::Deny);
-                Some(output(Decision::Deny, PINNED_CALL_USED))
-            }
-            Some(answer) => {
-                let decision = answer.decision;
-                self.decide_now(
-                    &run,
-                    &mut inner,
-                    &call,
-                    decision,
-                    DecidedBy::App,
-                    &answer.reason,
-                    answer.draft_id,
-                );
-                let _ = answer.written.send(decision);
-                if answer.stop && decision != Decision::Allow {
-                    // The run ends needing the user, once the hook has its deny.
-                    inner.stopped = Some(call.id.clone());
-                    if let Some(tree) = inner.tree.clone() {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            tree.kill();
-                        });
-                    }
-                }
-                info!(
-                    "gate: run {} call {}: {} by the app",
-                    run.params.run_id,
-                    call.id,
-                    decision.as_str()
-                );
-                Some(output(decision, &answer.reason))
-            }
-            None => {
-                let reason = "no answer came from the app before the call's deadline";
-                self.decide_now(
-                    &run,
-                    &mut inner,
-                    &call,
-                    Decision::Deny,
-                    DecidedBy::Timeout,
-                    reason,
-                    None,
-                );
-                Some(output(Decision::Deny, reason))
+        let Came::Answer(answer) = came else {
+            // No answer, yet not settled: denied all the same.
+            let taken = self.decide_now(
+                &run,
+                &mut inner,
+                &call,
+                Decision::Deny,
+                DecidedBy::Rlxd,
+                RUN_ENDED,
+                None,
+            );
+            return Some(taken.output());
+        };
+        // A pinned call is allowed once: two calls waiting together (Claude Code's
+        // parallel calls) can't both be.
+        let taken = if answer.decision == Decision::Allow
+            && run.params.pinned_call.is_some()
+            && inner.pinned_call_used
+        {
+            self.decide_now(
+                &run,
+                &mut inner,
+                &call,
+                Decision::Deny,
+                DecidedBy::Rlxd,
+                PINNED_CALL_USED,
+                None,
+            )
+        } else {
+            self.decide_now(
+                &run,
+                &mut inner,
+                &call,
+                answer.decision,
+                DecidedBy::App,
+                &answer.reason,
+                answer.draft_id,
+            )
+        };
+        let _ = answer.written.send(taken.decision);
+        if answer.stop && taken.decision != Decision::Allow {
+            // The run ends needing the user, once the hook has its deny; rlxd denies its
+            // other calls itself, those waiting and those to come.
+            inner.stopped = Some(call.id.clone());
+            self.settle(&run, &mut inner, STOPPED);
+            if let Some(tree) = inner.tree.clone() {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tree.kill();
+                });
             }
         }
+        info!(
+            "gate: run {} call {:?}: {}",
+            run.params.run_id,
+            call.id,
+            taken.decision.as_str()
+        );
+        Some(taken.output())
     }
 
     /// The run and the call a hook request is about, when it is bound to the run's live
-    /// attempt (binding a and b in the module's doc, and c when the peer is known).
+    /// attempt: its key, and a process inside the run (the module's doc).
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     fn bind(&self, ask: &Ask) -> Result<(Arc<Run>, Call), String> {
         let id =
             rlxd_proto::RunId::new(ask.run_id.clone()).map_err(|_| "no such run".to_owned())?;
@@ -309,19 +355,16 @@ impl Runner {
         let key_matches = inner
             .hook_key
             .as_deref()
-            .is_some_and(|key| equal(key.as_bytes(), ask.key.as_bytes()));
+            .is_some_and(|key| !key.is_empty() && equal(key.as_bytes(), ask.key.as_bytes()));
         if !key_matches {
             return Err("its key is not the attempt's".to_owned());
         }
-        let Some(pid) = ask.peer else {
-            return Err("the OS did not say which process asked".to_owned());
-        };
         let inside = inner
             .tree
             .as_ref()
-            .is_some_and(|tree| process::holds(tree, pid));
+            .is_some_and(|tree| process::holds(tree, &ask.peer));
         if !inside {
-            return Err(format!("process {pid} is not inside the run"));
+            return Err("the process that asked is not inside the run".to_owned());
         }
         drop(inner);
         let tool = ask.stdin["tool_name"]
@@ -353,7 +396,9 @@ impl Runner {
 
     /// Writes `call`'s decision to the ledger, durably (and `executing` for an allow, and
     /// the pinned call used), then publishes `run.tool_decided`: all before the hook gets
-    /// its answer.
+    /// its answer. An allow whose entry can't be written is a deny `by: "rlxd"` instead
+    /// (the pinned call stays used): never an allow without its entry on disk.
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     fn decide_now(
         &self,
@@ -364,39 +409,76 @@ impl Runner {
         by: DecidedBy,
         reason: &str,
         draft_id: Option<String>,
-    ) {
+    ) -> Taken {
+        let entry = |decision, by, state| {
+            RunCall::new(
+                call.id.clone(),
+                call.tool.clone(),
+                call.sha256.clone(),
+                decision,
+                by,
+                state,
+            )
+        };
         inner.gate.insert(call.id.clone(), Status::Decided(by));
         let state = if decision == Decision::Allow {
             CallState::Executing
         } else {
             CallState::Decided
         };
-        inner.calls.push(RunCall::new(
-            call.id.clone(),
-            call.tool.clone(),
-            call.sha256.clone(),
-            decision,
-            by,
-            state,
-        ));
+        inner.calls.push(entry(decision, by, state));
         if decision == Decision::Allow && run.params.pinned_call.is_some() {
             inner.pinned_call_used = true;
         }
-        let record = run.record(inner);
-        if let Err(e) = blocking(|| run.dir.write_record(&record)) {
-            warning!(
-                "gate: run {}: the ledger was not written: {e}",
-                run.params.run_id
-            );
-        }
+        let (decision, by, reason, draft_id) = match self.write_ledger(run, inner) {
+            Ok(()) => (decision, by, reason, draft_id),
+            Err(e) => {
+                warning!(
+                    "gate: run {}: the ledger was not written: {e}",
+                    run.params.run_id
+                );
+                if decision == Decision::Allow {
+                    let denied = entry(Decision::Deny, DecidedBy::Rlxd, CallState::Decided);
+                    if let Some(last) = inner.calls.last_mut() {
+                        *last = denied;
+                    }
+                    inner
+                        .gate
+                        .insert(call.id.clone(), Status::Decided(DecidedBy::Rlxd));
+                    let _ = self.write_ledger(run, inner);
+                    (Decision::Deny, DecidedBy::Rlxd, LEDGER_UNWRITTEN, None)
+                } else {
+                    (decision, by, reason, draft_id)
+                }
+            }
+        };
         let data =
             RunToolDecidedData::new(call.id.clone(), decision, by, reason).with_draft(draft_id);
         self.emit(run, inner, run_types::TOOL_DECIDED, &data);
+        Taken {
+            decision,
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// Writes `run`'s record, and so its ledger, durably. Test builds fail it for the
+    /// space `RLXD_TEST_FAIL_LEDGER` names.
+    fn write_ledger(&self, run: &Run, inner: &RunInner) -> std::io::Result<()> {
+        if self.fail_ledger.as_deref() == Some(run.params.space.as_str()) {
+            return Err(std::io::Error::other("refused, as the test asked"));
+        }
+        let record = run.record(inner);
+        blocking(|| run.dir.write_record(&record))
     }
 
     /// Denies, by rlxd, every call of `run` still open as it ends: into the ledger and the
     /// stream before the run's end, which writes the ledger. Each call's hook gets a deny.
     pub(super) fn settle_open(&self, run: &Run, inner: &mut RunInner) {
+        self.settle(run, inner, RUN_ENDED);
+    }
+
+    /// Denies, by rlxd for `reason`, every call of `run` still open.
+    fn settle(&self, run: &Run, inner: &mut RunInner, reason: &str) {
         let open: Vec<(String, String, String)> = inner
             .gate
             .iter()
@@ -419,12 +501,13 @@ impl Runner {
                 DecidedBy::Rlxd,
                 CallState::Decided,
             ));
-            let data = RunToolDecidedData::new(id, Decision::Deny, DecidedBy::Rlxd, RUN_ENDED);
+            let data = RunToolDecidedData::new(id, Decision::Deny, DecidedBy::Rlxd, reason);
             self.emit(run, inner, run_types::TOOL_DECIDED, &data);
         }
     }
 
-    /// `run.decide`: the app's answer to a pending call. The first answer wins.
+    /// `run.decide`: the app's answer to a pending call. The first answer wins. Its reply
+    /// says the decision taken once it is written: the app's, or rlxd's deny.
     pub async fn decide(&self, params: RunDecideParams) -> Result<RunDecideData, ErrorBody> {
         let run = self.find(&params.run_id)?;
         let written = {
@@ -476,13 +559,9 @@ impl Runner {
                 }
             }
         };
-        let taken = match tokio::time::timeout(DECIDE_WAIT, written).await {
-            Ok(Ok(taken)) => taken,
-            // Its hook's connection ended, or the run did, before the answer was used.
-            Ok(Err(_)) => return Err(already(&params.call_id)),
-            // Not written in time: the answer is the call's, and is written when it can be.
-            Err(_) => params.decision,
-        };
+        // The waiting call takes it at once and writes it; it drops the answer unused only
+        // when its hook's connection or the run ended first.
+        let taken = written.await.map_err(|_| already(&params.call_id))?;
         Ok(RunDecideData::new(params.run_id, params.call_id, taken))
     }
 
@@ -501,8 +580,7 @@ impl Runner {
         } else {
             CallState::Ok
         };
-        let record = run.record(inner);
-        if let Err(e) = blocking(|| run.dir.write_record(&record)) {
+        if let Err(e) = self.write_ledger(run, inner) {
             warning!(
                 "gate: run {}: the ledger was not written: {e}",
                 run.params.run_id
@@ -513,12 +591,14 @@ impl Runner {
 
 /// A call waiting for the app whose hook connection ended before it was decided: denied
 /// by rlxd, so the ledger and the stream say so.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 struct Unanswered {
     runner: Arc<Runner>,
     run: Arc<Run>,
     call: Option<Call>,
 }
 
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 impl Unanswered {
     /// Holds `call` of `run`, counted among the hook connections waiting on the gate.
     fn new(runner: &Arc<Runner>, run: &Arc<Run>, call: Call) -> Self {
@@ -532,6 +612,13 @@ impl Unanswered {
 
     fn call_id(&self) -> &str {
         self.call.as_ref().map_or("", |call| call.id.as_str())
+    }
+
+    /// The call, taken back to be decided by its caller.
+    fn take(&mut self) -> Call {
+        self.call
+            .take()
+            .expect("the call is the guard's until it is taken")
     }
 }
 
@@ -560,12 +647,15 @@ impl Drop for Unanswered {
     }
 }
 
-/// rlxd's own rules (5.1), in order: the mount, the kind, the pinned call. The reason a
-/// call is denied, or `None` when the app is to decide it.
+/// rlxd's own rules (5.1), in order: the mount, the kind, the pinned call. `servers` are
+/// the MCP servers the attempt's `system/init` listed. The reason a call is denied, or
+/// `None` when the app is to decide it.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub fn rlxd_rule(
     params: &RunStartParams,
     pinned_call_used: bool,
     hints: &HashMap<String, bool>,
+    servers: &[String],
     tool: &str,
     input_sha256: &str,
 ) -> Option<String> {
@@ -574,19 +664,27 @@ pub fn rlxd_rule(
             return Some("the run's mount is no_tools: it makes no tool calls".to_owned());
         }
         Mount::Connectors { connectors } => {
-            let server = tool
-                .strip_prefix("mcp__")
-                .and_then(|rest| rest.split_once("__"))
-                .map(|(server, _)| server);
-            let named = server.is_some_and(|server| {
-                connectors
-                    .iter()
-                    .any(|connector| server_name(connector) == server)
-            });
-            if !named {
-                return Some(format!(
-                    "{tool} is not a tool of the connectors the run's mount names"
-                ));
+            // Every listed server whose name, as Claude Code writes it, begins the tool's.
+            let of: Vec<&String> = servers
+                .iter()
+                .filter(|server| {
+                    tool.strip_prefix("mcp__")
+                        .and_then(|rest| rest.strip_prefix(claude_server_name(server).as_str()))
+                        .is_some_and(|rest| rest.starts_with("__"))
+                })
+                .collect();
+            match of.as_slice() {
+                [server] if connectors.iter().any(|connector| connector == *server) => {}
+                [_, _, ..] => {
+                    return Some(format!(
+                        "{tool} could be a tool of more than one of the run's MCP servers"
+                    ));
+                }
+                _ => {
+                    return Some(format!(
+                        "{tool} is not a tool of the connectors the run's mount names"
+                    ));
+                }
             }
         }
     }
@@ -616,27 +714,39 @@ pub fn rlxd_rule(
 /// `system/init` (tools listed as `{name, annotations: {readOnlyHint}}`). `None` when no
 /// hint is known, which every rule counts as a write (fail closed). The one place the hint
 /// comes from (hub question #2718).
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub fn read_only(hints: &HashMap<String, bool>, tool: &str) -> Option<bool> {
     hints.get(tool).copied()
 }
 
-/// A connector's name as Claude Code writes it in its tools' names (`mcp__<server>__<tool>`):
-/// each character but an ASCII letter, a digit, `_` or `-` as `_` (`claude.ai Slack` is
-/// `claude_ai_Slack`).
-fn server_name(connector: &str) -> String {
-    connector
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// An MCP server's name as Claude Code writes it in its tools' names
+/// (`mcp__<server>__<tool>`), as Claude Code 2.1 makes it: each UTF-16 unit but an ASCII
+/// letter, a digit, `_` or `-` as `_`; and for a claude.ai connector (a name that begins
+/// `claude.ai `), runs of `_` as one, and none at either end. So `claude.ai Slack` is
+/// `claude_ai_Slack`, and `claude.ai Slack (Beta)` is `claude_ai_Slack_Beta`.
+pub fn claude_server_name(name: &str) -> String {
+    let mut written = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            written.push(c);
+        } else {
+            written.extend(std::iter::repeat_n('_', c.len_utf16()));
+        }
+    }
+    if !name.starts_with("claude.ai ") {
+        return written;
+    }
+    let mut collapsed = String::with_capacity(written.len());
+    for c in written.chars() {
+        if !(c == '_' && collapsed.ends_with('_')) {
+            collapsed.push(c);
+        }
+    }
+    collapsed.trim_matches('_').to_owned()
 }
 
 /// Claude Code's PreToolUse hook output for `decision`, with `reason`.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub fn output(decision: Decision, reason: &str) -> String {
     let permission = if decision == Decision::Allow {
         "allow"
@@ -652,6 +762,7 @@ pub fn output(decision: Decision, reason: &str) -> String {
 }
 
 /// Whether `a` and `b` are equal, in time that doesn't depend on where they differ.
+#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 fn equal(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -673,14 +784,12 @@ fn too_late(call_id: &str) -> ErrorBody {
     )
 }
 
-/// A new attempt's hook key: 256 random bits, in hex.
-pub fn new_key() -> String {
+/// A new attempt's hook key: 256 random bits, in hex. `None` when the OS gives no
+/// randomness: then the attempt doesn't start.
+pub fn new_key() -> Option<String> {
     let mut bytes = [0_u8; 32];
-    if getrandom::fill(&mut bytes).is_err() {
-        // No randomness: no key any hook could match.
-        return String::new();
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut bytes).ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -699,10 +808,19 @@ mod tests {
         params
     }
 
-    fn slack() -> Mount {
+    fn mount(connectors: &[&str]) -> Mount {
         Mount::Connectors {
-            connectors: vec!["claude.ai Slack".to_owned()],
+            connectors: connectors.iter().map(|c| (*c).to_owned()).collect(),
         }
+    }
+
+    fn slack() -> Mount {
+        mount(&["claude.ai Slack"])
+    }
+
+    /// The servers an attempt's init listed.
+    fn servers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
     }
 
     const SEND: &str = "mcp__claude_ai_Slack__slack_send_message";
@@ -711,10 +829,11 @@ mod tests {
     #[test]
     fn the_mount_comes_first() {
         let none = HashMap::new();
+        let listed = servers(&["claude.ai Slack", "claude.ai Gmail"]);
         let no_tools = params(RunKind::Task, Mount::NoTools);
-        assert!(rlxd_rule(&no_tools, false, &none, READ, "h").is_some());
+        assert!(rlxd_rule(&no_tools, false, &none, &listed, READ, "h").is_some());
         let task = params(RunKind::Task, slack());
-        assert_eq!(rlxd_rule(&task, false, &none, SEND, "h"), None);
+        assert_eq!(rlxd_rule(&task, false, &none, &listed, SEND, "h"), None);
         for other in [
             "Bash",
             "mcp__claude_ai_Gmail__send",
@@ -722,15 +841,72 @@ mod tests {
             "mcp__x",
         ] {
             assert!(
-                rlxd_rule(&task, false, &none, other, "h").is_some(),
+                rlxd_rule(&task, false, &none, &listed, other, "h").is_some(),
                 "{other}"
             );
+        }
+        // No init seen yet: no server is known, so nothing passes the mount.
+        assert!(rlxd_rule(&task, false, &none, &[], SEND, "h").is_some());
+    }
+
+    #[test]
+    fn a_tool_is_its_one_servers_and_a_look_alike_server_is_denied() {
+        let none = HashMap::new();
+        let task = params(RunKind::Task, slack());
+        let rule = |listed: &[&str], tool: &str| {
+            rlxd_rule(&task, false, &none, &servers(listed), tool, "h")
+        };
+        // A local server whose name holds `__`, or is the connector's as written: two
+        // servers could own the tool, and the call is denied.
+        let nested = ["claude.ai Slack", "claude_ai_Slack__x"];
+        let reason = rule(&nested, "mcp__claude_ai_Slack__x__send").unwrap();
+        assert!(reason.contains("more than one"), "{reason}");
+        assert!(rule(&nested, SEND).is_none(), "only the connector's");
+        let same = ["claude.ai Slack", "claude_ai_Slack"];
+        assert!(
+            rule(&same, "mcp__claude_ai_Slack__post")
+                .unwrap()
+                .contains("more than one")
+        );
+        // A local server alone, its name the connector's as written: not the mount's.
+        assert!(rule(&["claude_ai_Slack"], "mcp__claude_ai_Slack__post").is_some());
+        // A connector whose name collapses: its own tools pass.
+        let beta = params(RunKind::Task, mount(&["claude.ai Slack (Beta)"]));
+        let listed = servers(&["claude.ai Slack (Beta)"]);
+        assert_eq!(
+            rlxd_rule(
+                &beta,
+                false,
+                &none,
+                &listed,
+                "mcp__claude_ai_Slack_Beta__send",
+                "h"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn server_names_are_written_as_claude_code_writes_them() {
+        for (name, written) in [
+            ("claude.ai Slack", "claude_ai_Slack"),
+            ("claude.ai Slack (Beta)", "claude_ai_Slack_Beta"),
+            ("claude.ai  Google  Drive ", "claude_ai_Google_Drive"),
+            ("claude_ai_Slack__x", "claude_ai_Slack__x"),
+            ("my server (local)", "my_server__local_"),
+            ("a-b_c.d", "a-b_c_d"),
+            // One UTF-16 unit each, or two: an emoji is two.
+            ("caf\u{e9}", "caf_"),
+            ("x\u{1f600}y", "x__y"),
+        ] {
+            assert_eq!(claude_server_name(name), written, "{name}");
         }
     }
 
     #[test]
     fn a_kind_that_reads_only_needs_a_read_only_hint() {
         let hints = HashMap::from([(READ.to_owned(), true), (SEND.to_owned(), false)]);
+        let listed = servers(&["claude.ai Slack"]);
         for kind in [RunKind::WidgetRefresh, RunKind::Watch] {
             let mut run = params(kind, slack());
             if kind == RunKind::Watch {
@@ -739,14 +915,18 @@ mod tests {
                     input_sha256: "h".to_owned(),
                 });
             }
-            assert_eq!(rlxd_rule(&run, false, &hints, READ, "h"), None, "{kind}");
+            assert_eq!(
+                rlxd_rule(&run, false, &hints, &listed, READ, "h"),
+                None,
+                "{kind}"
+            );
             assert!(
-                rlxd_rule(&run, false, &hints, SEND, "h").is_some(),
+                rlxd_rule(&run, false, &hints, &listed, SEND, "h").is_some(),
                 "{kind}"
             );
             // No hint is a write.
             assert!(
-                rlxd_rule(&run, false, &HashMap::new(), READ, "h").is_some(),
+                rlxd_rule(&run, false, &HashMap::new(), &listed, READ, "h").is_some(),
                 "{kind}"
             );
         }
@@ -757,7 +937,7 @@ mod tests {
         ] {
             let run = params(kind, Mount::NoTools);
             assert!(
-                rlxd_rule(&run, false, &hints, READ, "h").is_some(),
+                rlxd_rule(&run, false, &hints, &listed, READ, "h").is_some(),
                 "{kind}"
             );
         }
@@ -771,17 +951,18 @@ mod tests {
             input_sha256: "h1".to_owned(),
         });
         let none = HashMap::new();
-        assert_eq!(rlxd_rule(&send, false, &none, SEND, "h1"), None);
+        let listed = servers(&["claude.ai Slack"]);
+        assert_eq!(rlxd_rule(&send, false, &none, &listed, SEND, "h1"), None);
         assert!(
-            rlxd_rule(&send, false, &none, SEND, "h2").is_some(),
+            rlxd_rule(&send, false, &none, &listed, SEND, "h2").is_some(),
             "another input"
         );
         assert!(
-            rlxd_rule(&send, false, &none, READ, "h1").is_some(),
+            rlxd_rule(&send, false, &none, &listed, READ, "h1").is_some(),
             "another tool"
         );
         assert_eq!(
-            rlxd_rule(&send, true, &none, SEND, "h1").as_deref(),
+            rlxd_rule(&send, true, &none, &listed, SEND, "h1").as_deref(),
             Some(PINNED_CALL_USED)
         );
     }
@@ -791,9 +972,8 @@ mod tests {
         assert!(equal(b"abc", b"abc"));
         assert!(!equal(b"abc", b"abd"));
         assert!(!equal(b"abc", b"abcd"));
-        let (a, b) = (new_key(), new_key());
+        let (a, b) = (new_key().unwrap(), new_key().unwrap());
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
-        assert_eq!(server_name("claude.ai Slack"), "claude_ai_Slack");
     }
 }

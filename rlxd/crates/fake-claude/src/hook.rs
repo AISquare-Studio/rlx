@@ -221,6 +221,33 @@ fn words(command: &str) -> Vec<String> {
     words
 }
 
+/// Starts `command` as Claude Code starts a hook (Node's `detached: true`): on macOS and
+/// Linux in a session and process group of its own (`setsid`), on Windows detached from
+/// the console in a process group of its own, so only the hook's ancestry ties it to the
+/// run.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn detached(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid(2) is async-signal-safe, and the child runs nothing else before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(windows)]
+fn detached(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
 /// `words`, with the run or the attempt changed as `tamper` says.
 fn tampered(mut words: Vec<String>, tamper: &Tamper) -> Vec<String> {
     let (flag, value) = match tamper {
@@ -255,6 +282,7 @@ fn run(words: &[String], tamper: &Tamper, stdin: &Value, timeout: Duration) -> A
     if let Tamper::Key(key) = tamper {
         command.env(HOOK_KEY_ENV, key);
     }
+    detached(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return none(format!("the hook did not start: {e}")),

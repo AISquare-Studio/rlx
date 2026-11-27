@@ -573,6 +573,11 @@ fn with_no_app_a_call_is_denied_unreachable_even_a_read() {
     let calls = ledger(&home, &r);
     assert_eq!(entry(&calls, CALL_ID)["by"], "unreachable");
     assert_eq!(entry(&calls, CALL_ID)["input_sha256"], READ_SHA256);
+    // rlxd's own rules come before the app is looked for: no app, and still by rlxd.
+    let mut no_tools = task("slack-read");
+    no_tools["mount"] = json!({"kind": "no_tools"});
+    let reason = denied_by_rlxd(&home, &no_tools);
+    assert!(reason.contains("no_tools"), "{reason}");
 }
 
 #[test]
@@ -799,6 +804,164 @@ fn parallel_calls_on_a_pinned_run_get_one_allow() {
     assert_eq!(entry(&calls, SECOND_CALL_ID)["by"], "rlxd");
 }
 
+#[test]
+fn a_tool_of_a_look_alike_server_is_not_the_mounted_connectors() {
+    let home = home();
+    let _app = App::open(&home);
+    // A local server listed beside the connector (or alone) whose name Claude Code writes
+    // as the connector's, or as its with more after `__`: denied by rlxd, never the app's.
+    for scenario in [
+        "lookalike-nested",
+        "lookalike-evil",
+        "lookalike-same",
+        "lookalike-local",
+    ] {
+        let reason = denied_by_rlxd(&home, &task(scenario));
+        assert!(
+            reason.contains("more than one") || reason.contains("not a tool of the connectors"),
+            "{scenario}: {reason}"
+        );
+    }
+    // A connector whose name Claude Code collapses (`claude_ai_Slack_Beta`) is its own.
+    let since = seq(&home);
+    let mut beta = task("beta-send");
+    beta["mount"] = json!({"kind": "connectors", "connectors": ["claude.ai Slack (Beta)"]});
+    let r = start(&home, &beta);
+    let events = calls_out(&home, since, &r, 1);
+    let tool = &of(&events, &r, Some("run.tool_call"))[0]["data"]["tool"];
+    assert_eq!(tool, "mcp__claude_ai_Slack_Beta__send");
+    assert_eq!(
+        decide(&home, &r, CALL_ID, "deny", "not now").code(),
+        Some(0)
+    );
+    end_of(&home, since, &r);
+}
+
+#[test]
+fn an_allow_whose_ledger_entry_cant_be_written_is_a_deny() {
+    let home = home_with(&[("RLXD_TEST_FAIL_LEDGER", "ledgerless")]);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let mut params = task("slack-send");
+    params["space"] = json!("ledgerless");
+    let r = start(&home, &params);
+    calls_out(&home, since, &r, 1);
+    let reply = decide(&home, &r, CALL_ID, "allow", "send it");
+    assert_eq!(reply.code(), Some(0), "{reply:?}");
+    assert_eq!(
+        reply.data()["decision"],
+        "deny",
+        "rlxd's deny was taken: {reply:?}"
+    );
+    let events = end_of(&home, since, &r);
+    let decisions = decided(&events, &r);
+    assert_eq!(decisions.len(), 1, "{events:#?}");
+    assert_eq!(decisions[0]["data"]["decision"], "deny");
+    assert_eq!(decisions[0]["data"]["by"], "rlxd");
+    assert!(
+        decisions[0]["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ledger"),
+        "{events:#?}"
+    );
+    assert_eq!(replies(&home, &r)[0]["decision"], "deny");
+    assert_eq!(tool_runs(&home, &r), 0);
+    assert!(home.log().contains("the ledger was not written"));
+
+    // A pinned run: its pinned call stays used, so the next call is denied too.
+    let since = seq(&home);
+    let pinned = json!({"kind": "send_executor", "prompt": "send-twice", "space": "ledgerless",
+        "mount": {"kind": "connectors", "connectors": ["claude.ai Slack"]},
+        "pinned_call": {"tool": SEND, "input_sha256": INPUT_SHA256}});
+    let p = start(&home, &pinned);
+    calls_out(&home, since, &p, 1);
+    assert_eq!(
+        decide(&home, &p, CALL_ID, "allow", "send it").data()["decision"],
+        "deny"
+    );
+    let events = end_of(&home, since, &p);
+    assert_eq!(
+        of(&events, &p, Some("run.tool_call")).len(),
+        1,
+        "{events:#?}"
+    );
+    let decisions = decided(&events, &p);
+    assert_eq!(
+        decisions[1]["data"]["reason"], "pinned_call_used",
+        "{events:#?}"
+    );
+    assert_eq!(tool_runs(&home, &p), 0);
+}
+
+#[test]
+fn a_pinned_call_used_before_a_restart_stays_used_in_a_resumed_attempt() {
+    let home = home();
+    let app = App::open(&home);
+    let since = seq(&home);
+    let params = json!({"kind": "watch", "prompt": "slack-read", "persist_session": true,
+        "mount": {"kind": "connectors", "connectors": ["claude.ai Slack"]},
+        "pinned_call": {"tool": READ, "input_sha256": READ_SHA256}});
+    let r = start(&home, &params);
+    calls_out(&home, since, &r, 1);
+    assert_eq!(
+        decide(&home, &r, CALL_ID, "allow", "read it").code(),
+        Some(0)
+    );
+    end_of(&home, since, &r);
+    drop(app);
+    home.stop();
+    home.start_dev();
+    // The record held it, and so does the rlxd that read it: attempt 2's call never
+    // reaches the app.
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let resumed = call(
+        &home,
+        "run.resume",
+        &json!({"run_id": r, "reply": "slack-read"}),
+    );
+    assert_eq!(resumed["attempt"], 2);
+    let events = wait_until(&home, since, 60, "attempt 2's end", |e| {
+        of(e, &r, Some("run.done")).len() == 1
+    });
+    assert!(
+        of(&events, &r, Some("run.tool_call")).is_empty(),
+        "{events:#?}"
+    );
+    let decisions = decided(&events, &r);
+    assert_eq!(decisions.len(), 1, "{events:#?}");
+    assert_eq!(decisions[0]["data"]["call_id"], RESUMED_CALL_ID);
+    assert_eq!(decisions[0]["data"]["reason"], "pinned_call_used");
+    assert_eq!(tool_runs(&home, &r), 1, "only attempt 1's call ran");
+}
+
+/// The tester's live repro: the run's folder made read-only while its call waits, so the
+/// ledger can't be written as the app allows it.
+#[cfg(unix)]
+#[test]
+fn an_allow_is_a_deny_when_the_runs_folder_takes_no_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = home();
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = start(&home, &task("tool-hang"));
+    calls_out(&home, since, &r, 1);
+    let folder = home.root().join("rlxd").join("runs").join(&r);
+    let set = |mode| std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode));
+    set(0o500).unwrap();
+    let reply = decide(&home, &r, CALL_ID, "allow", "send it");
+    set(0o700).unwrap();
+    assert_eq!(reply.code(), Some(0), "{reply:?}");
+    assert_eq!(reply.data()["decision"], "deny", "{reply:?}");
+    let events = end_of(&home, since, &r);
+    let decisions = decided(&events, &r);
+    assert_eq!(decisions[0]["data"]["by"], "rlxd", "{events:#?}");
+    assert_eq!(replies(&home, &r)[0]["decision"], "deny");
+    assert_eq!(tool_runs(&home, &r), 0, "the tool never ran");
+}
+
 // --- Failing closed ----------------------------------------------------------------------------
 
 #[test]
@@ -810,6 +973,15 @@ fn a_hook_connection_dropped_mid_call_fails_closed() {
     calls_out(&home, since, &r, 1);
     let dropped = call(&home, "debug.drop_hook_connections", &json!({}));
     assert_eq!(dropped["dropped"], 1, "{dropped}");
+    // Decided by rlxd as the connection ends, not left for the run's end.
+    let events = wait_until(&home, since, 30, "the dropped call's decision", |e| {
+        !decided(e, &r).is_empty()
+    });
+    let decisions = decided(&events, &r);
+    assert_eq!(
+        decisions[0]["data"]["reason"], "the hook's connection ended before the call was decided",
+        "{events:#?}"
+    );
     let events = end_of(&home, since, &r);
     let decisions = decided(&events, &r);
     assert_eq!(decisions.len(), 1, "{events:#?}");
@@ -869,9 +1041,45 @@ fn a_call_waiting_as_its_run_is_cancelled_is_denied_first() {
     assert_eq!(decisions[0]["data"]["by"], "rlxd");
     let at = |e: &Value| events.iter().position(|each| each == e).unwrap();
     assert!(at(decisions[0]) < at(end), "denied before the run's end");
+    // Claude Code starts its hooks detached: on macOS and Linux the hook outlives the
+    // run's process group, its connection still open, and the run's end denies its call.
+    // On Windows the job takes it, and its connection's end may deny the call first.
+    if cfg!(unix) {
+        assert_eq!(
+            decisions[0]["data"]["reason"], "the run ended before the call was decided",
+            "{events:#?}"
+        );
+    }
     let late = decide(&home, &r, CALL_ID, "allow", "after the end");
     assert_eq!(late.error_code(), "already_decided", "{late:?}");
     assert_eq!(entry(&ledger(&home, &r), CALL_ID)["state"], "decided");
+    assert_eq!(tool_runs(&home, &r), 0);
+}
+
+#[test]
+fn a_stop_denies_the_runs_other_waiting_calls_too() {
+    let home = home();
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = start(&home, &task("send-parallel"));
+    calls_out(&home, since, &r, 2);
+    let params = json!({"run_id": r, "call_id": CALL_ID, "decision": "deny",
+        "reason": "ask me first", "stop": true});
+    assert_eq!(as_app(&home, "run.decide", &params).code(), Some(0));
+    let events = end_of(&home, since, &r);
+    let end = end_event(&events, &r);
+    assert_eq!(end["type"], "run.needs_you", "{events:#?}");
+    assert_eq!(end["data"]["call_id"], CALL_ID);
+    let decisions = decided(&events, &r);
+    assert_eq!(decisions.len(), 2, "{events:#?}");
+    let second = decisions
+        .iter()
+        .find(|d| d["data"]["call_id"] == SECOND_CALL_ID)
+        .unwrap();
+    assert_eq!(second["data"]["by"], "rlxd");
+    assert_eq!(second["data"]["reason"], "the app stopped the run");
+    let late = decide(&home, &r, SECOND_CALL_ID, "allow", "too late");
+    assert_eq!(late.error_code(), "already_decided", "{late:?}");
     assert_eq!(tool_runs(&home, &r), 0);
 }
 
@@ -904,8 +1112,11 @@ fn kill_9_of_rlxd_with_a_tool_hanging_leaves_the_call_unknown() {
         assert!(Instant::now() < deadline, "the tool never ran");
         thread::sleep(Duration::from_millis(50));
     }
-    // Executing, and so on disk, before the hook had its answer.
-    assert_eq!(record(&home, &r)["calls"][0]["state"], "executing");
+    // Executing, and so on disk, before the hook had its answer. The gate's write keeps the
+    // run's last state event, which the record holds until the log is fsynced (7.5).
+    let written = record(&home, &r);
+    assert_eq!(written["calls"][0]["state"], "executing");
+    assert_eq!(written["last_event"]["type"], "run.started", "{written:#}");
     let pid = home.status()["pid"].as_u64().unwrap();
     drop(app);
     common::kill_hard(pid);

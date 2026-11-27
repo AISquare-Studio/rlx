@@ -59,7 +59,9 @@ rlxd-client.workspace = true
 rlxd-proto.workspace = true
 serde.workspace = true
 # raw_value: the settings file is read key by key, so one bad value is set aside alone.
-serde_json = { workspace = true, features = ["raw_value"] }
+# float_roundtrip: a number is read as the exact double its text names, as RFC 8785's
+# input hashes need (the tool-call gate, 5.1).
+serde_json = { workspace = true, features = ["raw_value", "float_roundtrip"] }
 sha2 = "0.11"
 tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }

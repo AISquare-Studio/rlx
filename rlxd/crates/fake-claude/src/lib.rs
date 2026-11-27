@@ -259,8 +259,21 @@ impl Fake {
 
     /// [`Fake::begin`], `system/init` listing `tools` and `mcp_servers`.
     pub fn begin_with(&mut self, tools: Value, mcp_servers: Value) -> Option<Value> {
+        let message = self.first_message()?;
+        self.init(tools, mcp_servers);
+        Some(message)
+    }
+
+    /// Waits for the run's first user message, and keeps it for the session file: `None`
+    /// when stdin closed with none. [`Fake::init`] follows it.
+    pub fn first_message(&mut self) -> Option<Value> {
         let message = self.next_user_message()?;
         self.remember(&message);
+        Some(message)
+    }
+
+    /// Writes `system/init`, listing `tools` and `mcp_servers`.
+    pub fn init(&mut self, tools: Value, mcp_servers: Value) {
         let strict = self.flag("--strict-mcp-config");
         let init = json!({
             "type": "system", "subtype": "init", "cwd": self.cwd,
@@ -276,7 +289,6 @@ impl Fake {
             &json!({"type": "fake_future_event", "subtype": "probe", "uuid": uuid(),
             "session_id": self.session_id}),
         );
-        Some(message)
     }
 
     /// Writes an assistant text message, with its text deltas first under

@@ -19,6 +19,17 @@
 //!   [`CALL_ID`] as Claude Code would. (Only the forged request can get an allow.)
 //! - `bad-hooks`: asks the hook from inside the run with a wrong key, a wrong attempt, and
 //!   the run named in `./other-run` (when the space holds one), then makes a real call.
+//! - `lookalike-nested`, `lookalike-evil`, `lookalike-same`, `lookalike-local`: init also
+//!   (or only) lists a local server whose name Claude Code writes as `claude_ai_Slack__x`,
+//!   `claude_ai_Slack__evil` or `claude_ai_Slack`, and the call is to a tool that could be
+//!   its.
+//!
+//! Resumed, each scenario that makes one call makes it as [`RESUMED_CALL_ID`].
+//! - `beta-send`: init lists `claude.ai Slack (Beta)` (written `claude_ai_Slack_Beta`),
+//!   and the call is to its tool.
+//!
+//! Each is a scenario of its own name, and `gate` plays the one its prompt names, so one
+//! home runs any of them. Each starts its hook detached, as Claude Code does.
 
 use serde_json::{Value, json};
 
@@ -61,10 +72,29 @@ fn input() -> Value {
     serde_json::from_str(INPUT).expect("gate/input.json is JSON")
 }
 
-/// `system/init`, with the gate's tools: the run's first message, or `None` when stdin
-/// closed with none. With `FAKE_CLAUDE_KEY_OUT` set (to a file outside the home), the
-/// attempt's hook key is added to that file, for the check that rlxd writes it nowhere.
-fn begin(fake: &mut Fake) -> Option<Value> {
+/// The MCP servers a gate scenario's `system/init` lists: the Slack connector, and for
+/// the look-alike scenarios, servers whose names Claude Code writes as the connector's,
+/// or as its with more after `__`.
+fn servers_of(name: &str) -> Value {
+    let names: &[&str] = match name {
+        "lookalike-nested" => &["claude.ai Slack", "claude_ai_Slack__x"],
+        "lookalike-evil" => &["claude.ai Slack", "claude_ai_Slack__evil"],
+        "lookalike-same" => &["claude.ai Slack", "claude_ai_Slack"],
+        "lookalike-local" => &["claude_ai_Slack"],
+        "beta-send" => &["claude.ai Slack (Beta)"],
+        _ => &["claude.ai Slack"],
+    };
+    names
+        .iter()
+        .map(|name| json!({"name": name, "status": "connected"}))
+        .collect()
+}
+
+/// `system/init`, with the gate's tools, once the run's first message came: the scenario
+/// played, `name` or else the one the message names, or `None` when stdin closed with
+/// none. With `FAKE_CLAUDE_KEY_OUT` set (to a file outside the home), the attempt's hook
+/// key is added to that file, for the check that rlxd writes it nowhere.
+fn begin(fake: &mut Fake, name: Option<&str>) -> Option<String> {
     if let Some(out) = std::env::var_os("FAKE_CLAUDE_KEY_OUT").filter(|v| !v.is_empty()) {
         let key = std::env::var(crate::hook::HOOK_KEY_ENV).unwrap_or_default();
         let kept = std::fs::OpenOptions::new()
@@ -84,8 +114,10 @@ fn begin(fake: &mut Fake) -> Option<Value> {
         {"name": READ, "annotations": {"readOnlyHint": true}},
         {"name": UNHINTED},
     ]);
-    let servers = json!([{"name": "claude.ai Slack", "status": "connected"}]);
-    fake.begin_with(tools, servers)
+    let message = fake.first_message()?;
+    let name = name.map_or_else(|| Fake::text_of(&message).trim().to_owned(), str::to_owned);
+    fake.init(tools, servers_of(&name));
+    Some(name)
 }
 
 /// The assistant message that makes call `call_id`.
@@ -169,8 +201,13 @@ fn finish(fake: &mut Fake, ran: &[bool]) -> i32 {
 /// Each gate scenario's turn, once `system/init` is out, by name.
 const BODIES: &[(&str, super::Scenario)] = &[
     ("bad-hooks", bad_hooks),
+    ("beta-send", beta_send),
     ("crash-in-call", crash_in_call),
     ("forge", forge),
+    ("lookalike-evil", lookalike_evil),
+    ("lookalike-local", lookalike_post),
+    ("lookalike-nested", lookalike_nested),
+    ("lookalike-same", lookalike_post),
     ("send-fails", send_fails),
     ("send-parallel", send_parallel),
     ("send-twice", send_twice),
@@ -185,8 +222,13 @@ pub fn named(name: &str) -> Option<super::Scenario> {
     // A plain fn per name: the table holds no closures.
     Some(match name {
         "bad-hooks" => |fake| play(fake, "bad-hooks"),
+        "beta-send" => |fake| play(fake, "beta-send"),
         "crash-in-call" => |fake| play(fake, "crash-in-call"),
         "forge" => |fake| play(fake, "forge"),
+        "lookalike-evil" => |fake| play(fake, "lookalike-evil"),
+        "lookalike-local" => |fake| play(fake, "lookalike-local"),
+        "lookalike-nested" => |fake| play(fake, "lookalike-nested"),
+        "lookalike-same" => |fake| play(fake, "lookalike-same"),
         "send-fails" => |fake| play(fake, "send-fails"),
         "send-parallel" => |fake| play(fake, "send-parallel"),
         "send-twice" => |fake| play(fake, "send-twice"),
@@ -201,19 +243,18 @@ pub fn named(name: &str) -> Option<super::Scenario> {
 /// `gate`: the gate scenario the prompt names, so one home runs any of them. A prompt
 /// that names none is `slack-send`.
 pub fn by_prompt(fake: &mut Fake) -> i32 {
-    let Some(message) = begin(fake) else {
+    let Some(name) = begin(fake, None) else {
         return super::NO_PROMPT;
     };
-    let prompt = Fake::text_of(&message);
     let body = BODIES
         .iter()
-        .find(|(name, _)| *name == prompt.trim())
+        .find(|(each, _)| *each == name)
         .map_or(slack_send as super::Scenario, |(_, body)| *body);
     body(fake)
 }
 
 fn play(fake: &mut Fake, name: &str) -> i32 {
-    if begin(fake).is_none() {
+    if begin(fake, Some(name)).is_none() {
         return super::NO_PROMPT;
     }
     let body = BODIES
@@ -224,9 +265,14 @@ fn play(fake: &mut Fake, name: &str) -> i32 {
     body(fake)
 }
 
-/// One call, as [`CALL_ID`], then the answer.
+/// One call, as [`CALL_ID`] (resumed, [`RESUMED_CALL_ID`]), then the answer.
 fn one(fake: &mut Fake, tool: &str, input: &Value, then: Then) -> i32 {
-    one_as(fake, CALL_ID, tool, input, then)
+    let id = if fake.resumed() {
+        RESUMED_CALL_ID
+    } else {
+        CALL_ID
+    };
+    one_as(fake, id, tool, input, then)
 }
 
 fn one_as(fake: &mut Fake, call_id: &str, tool: &str, input: &Value, then: Then) -> i32 {
@@ -244,6 +290,42 @@ fn slack_send(fake: &mut Fake) -> i32 {
         CALL_ID
     };
     one_as(fake, id, SEND, &input(), Then::Runs)
+}
+
+/// A tool of the server `claude_ai_Slack__x`, or the connector's own as Claude Code
+/// would write it.
+fn lookalike_nested(fake: &mut Fake) -> i32 {
+    one(
+        fake,
+        "mcp__claude_ai_Slack__x__send_message",
+        &input(),
+        Then::Runs,
+    )
+}
+
+/// A tool of the server `claude_ai_Slack__evil`.
+fn lookalike_evil(fake: &mut Fake) -> i32 {
+    one(
+        fake,
+        "mcp__claude_ai_Slack__evil__delete_everything",
+        &input(),
+        Then::Runs,
+    )
+}
+
+/// A tool of a server Claude Code writes as `claude_ai_Slack`.
+fn lookalike_post(fake: &mut Fake) -> i32 {
+    one(fake, "mcp__claude_ai_Slack__post", &input(), Then::Runs)
+}
+
+/// A tool of the connector `claude.ai Slack (Beta)`.
+fn beta_send(fake: &mut Fake) -> i32 {
+    one(
+        fake,
+        "mcp__claude_ai_Slack_Beta__send",
+        &input(),
+        Then::Runs,
+    )
 }
 
 fn slack_read(fake: &mut Fake) -> i32 {

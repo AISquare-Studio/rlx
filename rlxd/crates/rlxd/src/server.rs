@@ -918,7 +918,7 @@ impl Daemon {
             run_id: params.run_id,
             attempt: params.attempt,
             key: params.key,
-            peer: session.peer.pid(),
+            peer: Arc::clone(&session.peer),
             stdin: params.stdin,
         };
         Ok(self

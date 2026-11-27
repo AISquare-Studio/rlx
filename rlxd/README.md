@@ -400,24 +400,39 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
 `crate::runner::gate` module, and it fails closed.
 
 - **A hook request is bound to its run.** It must name the run's running attempt, carry
-  that attempt's key, and come from a process inside the run: on macOS and Linux one in
-  the run's process group, on Windows one in the run's Job Object. The key is 256 random
-  bits made at each attempt's start and given to Claude Code as `RLXD_HOOK_KEY`, so its
-  hooks inherit it; it is compared in constant time, and never logged, published or
-  written (not in `run.json`, the run's log, its settings, or rlxd's log). Any other
-  request is denied at once, with no event and no ledger entry.
+  that attempt's key, and come from a process inside the run. The key is 256 random bits
+  made at each attempt's start (an attempt with no randomness doesn't start) and given to
+  Claude Code as `RLXD_HOOK_KEY`, so its hooks inherit it; it is compared in constant
+  time, and never logged, published or written (not in `run.json`, the run's log, its
+  settings, or rlxd's log). Any other request is denied at once, with no event and no
+  ledger entry.
+- **Inside the run** is by ancestry, not process group: Claude Code starts each hook
+  detached, in a session and process group of its own. On macOS and Linux the asking
+  process must descend from the run's guard by its parent chain, each step up checked
+  to be the real parent (a parent never started after its child, so a pid given to
+  another process since fails), and the asking process itself is the one pinned when
+  the connection was accepted: Linux holds its pidfd across the check, macOS requires
+  the process at its pid to have started before the connection was accepted. On Windows
+  it must be in the run's Job Object, checked through the process handle pinned when the
+  pipe connected. fake-claude starts its hooks detached the same way.
 - **What the key does not stop.** Every process Claude Code starts inherits the key, not
   only its hooks, so a process inside a run (a tool's shell, say) can send a request for
   its own run. It only ever gets the app's answer to its own request: each call is its
   `tool_use_id`, decided once, so a forged request can't get an allow for Claude Code's
   real call (a real call whose id was decided already is denied), and it can't reach
   another run, whose key and process group or job it doesn't have.
-- **rlxd's own rules come first** and deny `by: "rlxd"`: the mount (`no_tools`, or a tool
-  of a connector the mount doesn't name), the kind (`check`, `parse_instruction` and
+- **rlxd's own rules come first**, before the app is looked for, and deny `by: "rlxd"`:
+  the mount (`no_tools`, or a tool of a connector the mount doesn't name), the kind (`check`, `parse_instruction` and
   `widget_author` make no calls; `widget_refresh` and `watch` make read calls only), and
   the pinned call (`send_executor` and `watch`: the pinned tool with the pinned
   `input_sha256` only, and once: then every call is denied `pinned_call_used`, which
-  `run.json` keeps across attempts and restarts). A tool is read-only only when its
+  `run.json` keeps across attempts and restarts). A tool's server is the one MCP server
+  of the attempt's `system/init` whose name, as Claude Code writes it in tool names
+  (each UTF-16 unit but a letter, a digit, `_` or `-` as `_`; for a `claude.ai `
+  connector, runs of `_` as one and none at the ends), begins the tool's name before a
+  `__`. When none does, or more than one does (a local server named `claude_ai_Slack` or
+  `claude_ai_Slack__x` beside the `claude.ai Slack` connector), the call is denied. A
+  tool is read-only only when its
   `system/init` entry says `annotations.readOnlyHint: true`; a hint that isn't there
   (`null`) counts as a write, in one function, `read_only`, until the hub decides
   otherwise (#2718).
@@ -430,7 +445,9 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
   `deny` and `draft` are a deny to Claude Code, with the app's reason. `stop: true` on a
   deny also ends the run `run.needs_you {reason: "denied", call_id}`, which `run.resume`
   goes on with as a new attempt, gated as the first was. Each decision is published as
-  `run.tool_decided {call_id, decision, by, reason}`. Nothing a run writes (its text, a
+  `run.tool_decided {call_id, decision, by, reason}`, and `run.decide`'s reply says the
+  decision taken (rlxd's deny, when it overrode an allow). Once the app stops a run, its
+  other calls, waiting or to come, are denied by rlxd. Nothing a run writes (its text, a
   tool's result) decides a call.
 - **No app, a lost app.** With no app connected, a call is denied `by: "unreachable"` at
   once, a read too. A call pending when the app leaves is held until its deadline, for
@@ -439,16 +456,20 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
   A hook connection that ends before its call is decided (the hook killed, rlxd
   stopping) denies it `by: "rlxd"`, and a hook that can't reach rlxd denies.
 - **The ledger**, `run.json`'s `calls` and `run.get`'s, holds each call: `decided`, or
-  `executing` for an allow, written and fsynced before the hook gets its answer; `ok` or
-  `error` from the call's `tool_result`; `unknown` when the run ends, or rlxd restarts,
-  with it still executing (it may have sent). A call still waiting as its run ends is
-  denied `by: "rlxd"` first.
+  `executing` for an allow, written and fsynced before the hook gets its answer, and an
+  allow whose entry can't be written is a deny `by: "rlxd"` instead (a pinned call stays
+  used); `ok` or `error` from the call's `tool_result`; `unknown` when the run ends, or
+  rlxd restarts, with it still executing (it may have sent). A call still waiting as its
+  run ends is denied `by: "rlxd"` first. The gate's writes of `run.json` keep the run's
+  last state event in it, as every record write does.
 - **Out of the gate:** PTYs (`pty.*`) are the user's own terminals, and are not gated.
 - **Test builds** have `debug.pre_tool_use {run_id, attempt, key, stdin}`, a hook request
   from the connection's own process, and `debug.drop_hook_connections`, which ends every
   hook connection waiting on the gate. With `RLXD_TEST_HOOK` set, each run's settings name
   rlxd itself as the hook (the hidden `rlxd __test-hook pre-tool-use`, which asks
   `debug.pre_tool_use`), so fake-claude's gate scenarios run a real hook command.
+  `RLXD_TEST_FAIL_LEDGER=<space>` fails the ledger writes of that space's runs. A
+  release build has none of these, nor their names.
 
 ## The scheduler
 

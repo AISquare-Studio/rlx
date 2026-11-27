@@ -43,8 +43,10 @@ the same files.
 
 **The gate's scenarios** (5.1) make a tool call as Claude Code does: the `tool_use`, then
 the PreToolUse hook the run's `--settings` names, run with the call as JSON on its stdin
-(split into words, no shell), then the tool only on an explicit `allow`, else the hook's
-reason as the call's error result. Each answer is added to `hook_replies` (never the
+(split into words, no shell) and started detached as Claude Code starts it (a session and
+process group of its own; on Windows, detached from the console in a group of its own),
+then the tool only on an explicit `allow`, else the hook's reason as the call's error
+result. Each answer is added to `hook_replies` (never the
 key), and each tool run to `tool_runs`. `system/init` lists the send tool
 (`readOnlyHint: false`), the read tool (`true`) and one with no annotations (`null`).
 Each is a scenario of its own name, and `gate` plays the one its prompt names, so one
@@ -63,6 +65,11 @@ adds its `RLXD_HOOK_KEY` there, for the check that rlxd writes it nowhere.
 | `tool-hang` | Calls the send tool; allowed, the tool hangs two minutes |
 | `forge` | First asks the hook itself about a call of its own with the real call's id, then makes the real call |
 | `bad-hooks` | Asks the hook with a wrong key, no key, a wrong attempt, and the run named in `./other-run`, then makes a real call |
+| `lookalike-nested`, `lookalike-evil` | Init lists the Slack connector and a local server `claude_ai_Slack__x` (or `__evil`); the call is to a tool of the local one |
+| `lookalike-same`, `lookalike-local` | Init lists a local server `claude_ai_Slack` beside the connector, or alone; the call is to `mcp__claude_ai_Slack__post` |
+| `beta-send` | Init lists `claude.ai Slack (Beta)`; the call is to its tool, `mcp__claude_ai_Slack_Beta__send` |
+
+Resumed, a scenario that makes one call makes it under another id.
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for

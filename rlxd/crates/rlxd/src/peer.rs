@@ -195,6 +195,24 @@ impl Peer {
     pub fn image(&self) -> Option<String> {
         self.inner.image()
     }
+
+    /// Runs `check` on the pid of the process that connected, only while that very
+    /// process runs: the pin is checked before `check` and again after it, so a pid that
+    /// names another process meanwhile fails. `false` when the OS gave no pin or the
+    /// process has gone. For the tool-call gate's binding (5.1), which never trusts a
+    /// bare pid: Linux holds a pidfd; macOS requires the process at the pid to have
+    /// started before the connection was accepted.
+    #[cfg(unix)]
+    pub fn while_pinned(&self, check: impl FnOnce(u32) -> bool) -> bool {
+        self.inner.while_pinned(check)
+    }
+
+    /// Whether the process that connected, through the handle held since it connected,
+    /// still runs and is in `job`: the tool-call gate's binding on Windows (5.1).
+    #[cfg(windows)]
+    pub fn in_job(&self, job: std::os::windows::io::BorrowedHandle<'_>) -> bool {
+        self.inner.in_job(job)
+    }
 }
 
 /// Now, as a `FILETIME` count, for [`Peer::of_pipe`]'s `connected_at`.

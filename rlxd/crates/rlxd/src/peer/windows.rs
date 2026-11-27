@@ -55,6 +55,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
     FILE_SHARE_READ, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
+use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModules, K32GetMappedFileNameW};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
@@ -116,6 +117,26 @@ impl Peer {
 
     pub fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// [`super::Peer::in_job`]: through the handle pinned when the pipe connected.
+    pub fn in_job(&self, job: BorrowedHandle<'_>) -> bool {
+        let Ok(pinned) = self.pinned.as_ref() else {
+            return false;
+        };
+        if !created_before(pinned.created, pinned.connected) {
+            return false;
+        }
+        let process = pinned.process.as_raw_handle() as HANDLE;
+        let mut code = 0u32;
+        // SAFETY: `process` is a process handle we hold open; `code` is a live u32.
+        if unsafe { GetExitCodeProcess(process, &mut code) } == 0 || code != STILL_ACTIVE as u32 {
+            return false;
+        }
+        let mut inside = 0;
+        // SAFETY: both handles are open for this call; `inside` is a live BOOL.
+        let asked = unsafe { IsProcessInJob(process, job.as_raw_handle() as HANDLE, &mut inside) };
+        asked != 0 && inside != 0
     }
 
     pub fn image(&self) -> Option<String> {
