@@ -4,7 +4,8 @@
 (``services.claude_accounts.overview``), and asks each slot's ``.claude.json`` for its identity
 several times a read; Claude Code keeps tens of KB to tens of MB in that file.
 ``claude_accounts.read_identity`` reads it here. :func:`parsed` keeps the parser's answer under the
-file's stat signature (its ``st_mtime_ns``, ``st_size`` and ``st_ino``): a call whose ``os.stat``
+file's stat signature (its ``st_mtime_ns``, ``st_ctime_ns``, ``st_size`` and ``st_ino``): a call
+whose ``os.stat``
 gives the signature of the answer kept for its path is handed that answer without opening the file;
 any other call reads and parses it (the owner's decision on rlx#557: the file was read and hashed at
 every tick, and is now only stat'ed).
@@ -17,14 +18,19 @@ Kept only when the signature can be trusted:
 - **Of the bytes read.** The signature is the ``fstat`` of the file the bytes came from, kept only
   when ``os.stat`` of the path still gives it after the parse: a link moved, or a file replaced or
   written while it was read, keeps nothing, and the next call reads again.
-- **Settled.** A file written less than :data:`RACY_NS` before it was read could be written again
-  inside its timestamp's granularity at the same size, which no stat tells apart, so its answer is
-  not kept until it has aged (git's "racily clean" rule): a file still being written is read at
-  every call.
+- **Settled.** A file written or changed less than :data:`RACY_NS` before it was read (the later
+  of its ``st_mtime_ns`` and ``st_ctime_ns``, against the clock read as the read begins) could be
+  written again inside its timestamps' granularity at the same size, which no stat tells apart, so
+  its answer is not kept until it has aged (git's "racily clean" rule): a file still being written
+  is read at every call.
+
+The status-change time is what sees a rewrite that puts the old modification time back: any write
+or ``utime`` moves it, and nothing sets it back (review of #51).
 
 Limits:
 
-- A rewrite that keeps the size and inode and puts the old modification time back, done after the
+- On Windows, ``st_ctime_ns`` is the file's creation time, which an in-place write leaves. There, a
+  rewrite that keeps the size and inode and puts the old modification time back, done after the
   file settled, is not seen until something else of its stat changes. Claude Code never writes so;
   an editor's in-place save does not restore the time.
 - A read that raises (no file there, any other ``OSError``) and a parse that raises (bytes that are
@@ -59,8 +65,8 @@ RACY_NS = 2_000_000_000
 """How long after its last write a file's answer is not kept: two seconds, past the coarsest
 modification-time granularity a home is on (FAT's), nanoseconds as ``st_mtime_ns`` counts them."""
 
-Signature = tuple[int, int, int]
-"""A file's ``(st_mtime_ns, st_size, st_ino)``."""
+Signature = tuple[int, int, int, int]
+"""A file's ``(st_mtime_ns, st_ctime_ns, st_size, st_ino)``."""
 _Key = tuple[Path, Callable[..., object]]
 _KEPT: OrderedDict[_Key, tuple[Signature, object]] = OrderedDict()
 _LOCK = threading.Lock()
@@ -69,7 +75,12 @@ _clock: Callable[[], int] = time.time_ns
 
 
 def _stat_signature(stat: os.stat_result) -> Signature:
-    return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+
+
+def _stat(path: Path) -> Signature:
+    """The signature ``os.stat`` gives the path now."""
+    return _stat_signature(os.stat(path))
 
 
 def _read(path: Path) -> tuple[Signature, bytes]:
@@ -94,19 +105,20 @@ def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
     answer."""
     key = (path, parse)
     try:
-        now = _stat_signature(os.stat(path))
+        now = _stat(path)
         with _LOCK:
             kept = _KEPT.get(key)
             if kept is not None and kept[0] == now:
                 _KEPT.move_to_end(key)
                 return cast(T, kept[1])
+        reading = _clock()  # as the read begins: a slow parse ages no file (review of #51)
         read, body = _read(path)
         value = parse(path, body.decode("utf-8"))
-        after = _stat_signature(os.stat(path))
+        after = _stat(path)
     except Exception:
         _forget(key)
         raise
-    settled = _clock() - read[0] >= RACY_NS
+    settled = reading - max(read[0], read[1]) >= RACY_NS
     with _LOCK:
         if read == after and settled:
             _KEPT[key] = (read, value)

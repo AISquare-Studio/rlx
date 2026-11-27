@@ -2,13 +2,15 @@
 
 The status line and the Accounts page follow ``claude_accounts.overview``, which ``asq`` reads
 after every fleet frame. ``read_identity`` keeps its parse of each ``.claude.json`` under the file's
-stat signature (``core.parsed_files``: ``st_mtime_ns``, ``st_size``, ``st_ino``): a lookup whose
-stat is unchanged opens nothing, and any other reads and parses (rlx#557, by Vaibhav; the stat rule
-is the owner's decision on its takeover, #51). These tests count the identity reads and parses,
-read what the read after each kind of change shows, and read what the cache keeps.
+stat signature (``core.parsed_files``: ``st_mtime_ns``, ``st_ctime_ns``, ``st_size``, ``st_ino``):
+a lookup whose stat is unchanged opens nothing, and any other reads and parses (rlx#557, by
+Vaibhav; the stat rule is the owner's decision on its takeover, #51). These tests count the
+identity reads and parses, read what the read after each kind of change shows, and read what the
+cache keeps.
 
 Every file here is old enough to be kept (:func:`settled`) unless a test says otherwise: a file
-written less than ``parsed_files.RACY_NS`` before it was read is read again at every lookup.
+written or changed less than ``parsed_files.RACY_NS`` before it was read is read again at every
+lookup.
 """
 
 from __future__ import annotations
@@ -187,8 +189,9 @@ def _settled_at(path: Path, seconds_ago: float) -> int:
 def test_a_change_in_each_key_of_the_stat_is_read_again(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    """Each of ``st_mtime_ns``, ``st_size`` and ``st_ino`` changed alone (the other two as they
-    were) has the next lookup read and parse the file again, and show what it holds."""
+    """Each of ``st_mtime_ns``, ``st_size`` and ``st_ino`` changed on disk, the other two as they
+    were, has the next lookup read and parse the file again, and show what it holds. (On POSIX
+    ``st_ctime_ns`` moves with each: the test below moves each key of the signature alone.)"""
     path = core.claude_json_path(slots[1])
     _write_email(path, "first@example.com")
     mtime = _settled_at(path, 3600)
@@ -218,14 +221,54 @@ def test_a_change_in_each_key_of_the_stat_is_read_again(
     assert read == [path] and parsed == [path]
 
 
+KEYS = ("mtime", "ctime", "size", "inode")
+"""The signature's keys, in its order (``parsed_files.Signature``)."""
+
+
+def _signature(values: list[int]) -> parsed_files.Signature:
+    mtime, ctime, size, inode = values
+    return (mtime, ctime, size, inode)
+
+
+@pytest.mark.parametrize("key", KEYS)
+def test_a_change_in_any_one_key_of_the_signature_alone_is_read_again(
+    slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """Each of the signature's four keys moved alone, the bytes as they were, has the next lookup
+    read and parse the file again. The path is stat'ed through a stand-in
+    (``parsed_files._stat``, and ``_read``'s signature): no file system moves ``st_ctime_ns``
+    alone, or the other three without it."""
+    path = core.claude_json_path(slots[1])
+    _write_email(path, "first@example.com")
+    moved = list(parsed_files._stat(path))
+    stat, read_file = parsed_files._stat, parsed_files._read
+
+    def statting(target: Path) -> parsed_files.Signature:
+        return _signature(moved) if target == path else stat(target)
+
+    def reading(target: Path) -> tuple[parsed_files.Signature, bytes]:
+        signature, body = read_file(target)
+        return (_signature(moved) if target == path else signature), body
+
+    monkeypatch.setattr(parsed_files, "_stat", statting)
+    monkeypatch.setattr(parsed_files, "_read", reading)
+    assert _email(path) == "first@example.com"
+    assert _kept(path) != []
+    moved[KEYS.index(key)] += 1
+    with identity_io(monkeypatch) as (read, parsed):
+        assert _email(path) == "first@example.com"
+    assert read == [path] and parsed == [path]
+
+
 def test_a_file_written_moments_ago_is_read_at_every_lookup_until_it_settles(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Git's "racily clean" rule: a file read inside its timestamp's granularity of its last write
     could be written again with the same stat, so nothing is kept for it, and each lookup reads.
     Here, a rewrite of the same size given the first one's modification time back, made while
-    the file is fresh, shows at once. Once :data:`~aisquare.core.parsed_files.RACY_NS` has
-    passed, its answer is kept."""
+    the file is fresh, shows at once. Its answer is kept once
+    :data:`~aisquare.core.parsed_files.RACY_NS` has passed since the later of its modification and
+    status-change times, and not a nanosecond before."""
     now = time.time_ns()
     monkeypatch.setattr(parsed_files, "_clock", lambda: now)
     path = core.claude_json_path(slots[1])
@@ -235,8 +278,13 @@ def test_a_file_written_moments_ago_is_read_at_every_lookup_until_it_settles(
     assert _kept(path) == []
     _write_email(path, "again@example.com")
     os.utime(path, ns=(now, now))
-    assert _email(path) == "again@example.com", "the same stat, read again while fresh"
-    monkeypatch.setattr(parsed_files, "_clock", lambda: now + parsed_files.RACY_NS)
+    assert _email(path) == "again@example.com", "the same mtime and size, read again while fresh"
+    written = os.stat(path)
+    settles = max(written.st_mtime_ns, written.st_ctime_ns) + parsed_files.RACY_NS
+    monkeypatch.setattr(parsed_files, "_clock", lambda: settles - 1)
+    assert _email(path) == "again@example.com"
+    assert _kept(path) == []
+    monkeypatch.setattr(parsed_files, "_clock", lambda: settles)
     assert _email(path) == "again@example.com"
     assert _kept(path) != []
     with identity_io(monkeypatch) as (read, _parsed):
@@ -244,23 +292,81 @@ def test_a_file_written_moments_ago_is_read_at_every_lookup_until_it_settles(
     assert read == []
 
 
-def test_a_settled_rewrite_holding_the_stat_of_the_file_it_replaced_is_not_seen(
+def _a_later_ctime(path: Path, than: int, mtime: int) -> os.stat_result:
+    """``path``'s stat once its ``st_ctime_ns`` is past ``than``, its modification time put back
+    to ``mtime`` again until it is: a file system that stamps from a coarse clock (ext4's, a tick
+    of milliseconds) can give a write the status-change time of the change before it."""
+    deadline = time.monotonic() + 5.0
+    while (now := os.stat(path)).st_ctime_ns <= than:
+        assert time.monotonic() < deadline, "the status-change time never moved"
+        time.sleep(0.01)
+        os.utime(path, ns=(mtime, mtime))
+    return now
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="st_ctime_ns is the creation time on Windows")
+def test_a_settled_rewrite_that_puts_its_old_mtime_back_is_seen_by_its_ctime(
     slots: list[ClaudeAccount],
 ) -> None:
-    """The stat rule's one blind spot, pinned so a change to it is deliberate: once the file has
-    settled, a rewrite in place at the same size that puts the old modification time back keeps
-    every key of the stat, and the kept answer stands until something else of it changes. (The
-    digest rule this replaced saw it, by reading the file at every lookup; Claude Code never
-    writes so.)"""
+    """The blind spot of a signature of ``st_mtime_ns``, ``st_size`` and ``st_ino`` alone, closed
+    (review of #51): once the file has settled, a rewrite in place at the same size that puts the
+    old modification time back keeps those three, and moves ``st_ctime_ns``, which nothing sets
+    back. The next lookup reads it."""
     path = core.claude_json_path(slots[1])
     _write_email(path, "first@example.com")
     mtime = _settled_at(path, 3600)
     assert _email(path) == "first@example.com"
+    before = os.stat(path)
     _write_email(path, "again@example.com")
     os.utime(path, ns=(mtime, mtime))
+    after = _a_later_ctime(path, before.st_ctime_ns, mtime)
+    held = (after.st_mtime_ns, after.st_size, after.st_ino)
+    assert held == (before.st_mtime_ns, before.st_size, before.st_ino), "the premise"
+    assert _email(path) == "again@example.com"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="elsewhere st_ctime_ns sees it (test above)")
+def test_on_windows_a_settled_rewrite_holding_every_key_of_the_stat_is_not_seen(
+    slots: list[ClaudeAccount],
+) -> None:
+    """The stat rule's one blind spot left, pinned so a change to it is deliberate: on Windows
+    ``st_ctime_ns`` is the creation time, which a rewrite in place leaves, so once the file has
+    settled, a rewrite at the same size that puts the old modification time back keeps every key
+    of the signature, and the kept answer stands until something else of it changes. Claude Code
+    never writes so."""
+    path = core.claude_json_path(slots[1])
+    _write_email(path, "first@example.com")
+    mtime = _settled_at(path, 3600)
+    assert _email(path) == "first@example.com"
+    before = parsed_files._stat(path)
+    _write_email(path, "again@example.com")
+    os.utime(path, ns=(mtime, mtime))
+    assert parsed_files._stat(path) == before, "the premise: every key held"
     assert _email(path) == "first@example.com"
     _settled_at(path, 1800)
     assert _email(path) == "again@example.com", "any key changed: read again"
+
+
+def test_a_parse_that_outlasts_the_racy_window_keeps_nothing_of_a_file_fresh_when_read(
+    slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The settled check reads the clock as the read begins, not once the parse is done (review
+    of #51): a file read while fresh could be written again within its timestamps' granularity
+    after the read, so its answer is not kept however long the parse took."""
+    path = core.claude_json_path(slots[1])
+    _write_email(path, "first@example.com")
+    written = os.stat(path)
+    clock = [max(written.st_mtime_ns, written.st_ctime_ns)]
+    monkeypatch.setattr(parsed_files, "_clock", lambda: clock[0])
+    json_object = parsed_files.json_object
+
+    def slow(target: Path, text: str) -> Any:
+        clock[0] += 3600 * 10**9  # an hour passes while it parses
+        return json_object(target, text)
+
+    monkeypatch.setattr(core, "json_object", slow)
+    assert _email(path) == "first@example.com"
+    assert _kept(path) == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a symlink needs a privilege on Windows")
