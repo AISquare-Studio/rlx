@@ -27,10 +27,16 @@ use rlxd_proto::{ConnectorState, ConnectorStatus, McpServer};
 /// The most tries an attempt makes.
 pub const TRIES: u32 = 3;
 
-/// What a settle adds for Claude Code to come up. rlxd can't see when Claude Code has
-/// started: it counts from the spawn, which on macOS and Linux is the guard's start, the
-/// guard then starting Claude Code. So Claude Code itself has the whole settle, the
-/// fixtures' `stdin[0].at >= 5000` with it, however slowly a loaded machine starts it.
+/// What a settle adds for Claude Code to come up (accepted in #2729).
+///
+/// The settle is for Claude Code: its connectors load from when it starts, with stdin
+/// open. rlxd can't see that moment. It can only count from the spawn, and the spawn is
+/// earlier: on macOS and Linux it starts the guard (rlxd itself, re-run), which then
+/// starts Claude Code, and on every OS the program takes a moment to load before it runs.
+/// Counted from the spawn alone, the fixtures' check that the first message comes 5 s or
+/// more after Claude Code's start (`stdin[0].at >= 5000`) held by only 12-39 ms locally,
+/// and failed once with the tests run side by side. Half a second covers a loaded
+/// machine's start with room to spare, and costs a try no more than that.
 pub const START_ALLOWANCE: Duration = Duration::from_millis(500);
 
 /// The wait after try `done`, before the next: 2 s after the first, 5 s after the second.

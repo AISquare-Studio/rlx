@@ -21,6 +21,7 @@ import typer
 
 from aisquare.cli.common import fail
 from aisquare.core.console import stdout_console
+from aisquare.core.program import words as program_words
 from aisquare.core.state import get_state
 from aisquare.services import connectors as connectors_service
 
@@ -64,7 +65,8 @@ def call_rlxd(method: str) -> dict[str, Any]:
     program = rlxd_program()
     if program is None:
         fail(
-            "rlxd was not found: run `rlx daemon install`, or name it in RLX_RLXD_BIN",
+            f"rlxd was not found: run `{program_words('daemon', 'install')}`, or name it in "
+            f"{RLXD_BIN_ENV}",
             error="rlxd_not_found",
         )
     try:
