@@ -4,15 +4,18 @@ and the switches in App settings.
 
 No real tray runs (``tests/conftest.py::no_real_tray``): the service part's spawn, the tray's
 commands and terminals, and the backends are stubs here; the Linux item is driven with
-jeepney's own messages against no bus, and the macOS one is never imported.
+jeepney's own messages against no bus, and the macOS half, where pyobjc is installed, builds its
+menu and image in memory: neither OS's ``run`` reaches a status item or a bus here.
 """
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shlex
 import shutil
+import signal
 import stat
 import sys
 from collections.abc import Mapping
@@ -302,6 +305,20 @@ def test_a_terminal_setting_that_will_not_split_is_said_not_raised(
     assert spawned["terminal"] == []
 
 
+def test_a_terminal_choice_of_only_spaces_is_no_choice() -> None:
+    """Nit 1: only a hand-edited config.toml has one; it split into nothing, and Open rlx ran
+    rlx with no terminal at all."""
+    found = {"xdg-terminal-exec"}
+    argv = terminal_argv(
+        "linux",
+        rlx=["rlx"],
+        choice="   ",
+        env={},
+        which=lambda name: name if name in found else None,
+    )
+    assert argv == ["xdg-terminal-exec", "rlx"]
+
+
 def test_an_unreadable_status_is_a_menu_that_says_so() -> None:
     def broken() -> Mapping[str, Any]:
         raise PermissionError("status.json")
@@ -464,14 +481,54 @@ def test_the_part_starts_the_tray_and_says_which_agents_run() -> None:
     assert spawner.children[0].terminated
 
 
-def test_an_exit_that_means_no_tray_here_is_never_retried() -> None:
+def test_the_part_names_twenty_agents_and_counts_them_all() -> None:
+    """m1, the service's half: the status keeps 20 names for the menu, and the count of every
+    agent running."""
+    many = [f"coder-{n} (repo)" for n in range(25)]
+    health = _part(Spawner(), agents=lambda: many).tick_part()
+    assert health.extra == {"agents": many[:20], "agents_running": 25}
+
+
+def test_quit_asks_with_three_names_and_the_count_past_twenty() -> None:
+    given = _status([f"coder-{n}" for n in range(20)])
+    given["parts"]["tray"]["agents_running"] = 25
+    title, detail = Recorder(given).question()
+    assert title == "Quit rlx?"
+    assert detail.startswith("coder-0, coder-1, coder-2 and 22 more keep running"), detail
+
+
+@pytest.mark.parametrize(
+    "code",
+    [service_tray.EXIT_NO_EXTRA, service_tray.EXIT_NO_HOST, service_tray.EXIT_NOT_HERE],
+    ids=["no-extra", "no-host", "not-here"],
+)
+def test_rlx_service_tray_says_why_there_is_no_tray(
+    code: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nit 2: its exits 3, 4 and 5 were silent (the reason an INFO log the CLI shows nowhere)."""
+    from typer.testing import CliRunner
+
+    from aisquare.cli.app import app
+
+    monkeypatch.setattr(tray, "backend_for", lambda *_args, **_kwargs: code)
+    done = CliRunner().invoke(app, ["service", "tray"])
+    assert done.exit_code == code
+    assert f"No tray: {service_tray.NO_TRAY_EXITS[code]}." in done.stderr
+
+
+@pytest.mark.parametrize(
+    "code",
+    [service_tray.EXIT_NO_EXTRA, service_tray.EXIT_NO_HOST, service_tray.EXIT_NOT_HERE],
+    ids=["no-extra", "no-host", "not-here"],
+)
+def test_an_exit_that_means_no_tray_here_is_never_retried(code: int) -> None:
     spawner = Spawner()
     part = _part(spawner)
     part.tick_part()
-    spawner.children[0].returncode = service_tray.EXIT_NO_HOST
+    spawner.children[0].returncode = code
     health = part.tick_part()
-    assert (health.state, health.detail) == ("off", "this session has no place for a tray icon")
-    part.tick_part()
+    assert (health.state, health.detail) == ("off", service_tray.NO_TRAY_EXITS[code])
+    assert part.tick_part() == health, "off for the rest of the run"
     assert len(spawner.children) == 1
 
 
@@ -485,8 +542,9 @@ def test_a_crashed_tray_is_started_again_up_to_its_limit() -> None:
     spawner.children[-1].returncode = 1
     health = part.tick_part()
     assert health.state == "error" and "stopped 5 times" in (health.detail or "")
-    assert len(spawner.children) == service_tray.TRAY_TRIES
-    part.tick_part()
+    assert len(spawner.children) == service_tray.TRAY_TRIES, "five starts, the first included"
+    later = part.tick_part()  # 30 s on: `rlx service status` still says error, not off
+    assert (later.state, later.detail) == (health.state, health.detail)
     assert len(spawner.children) == service_tray.TRAY_TRIES
 
 
@@ -831,6 +889,46 @@ def test_the_part_follows_the_file(tmp_path: Path) -> None:
 
 
 # --- macOS: its half defines, and draws its image, with no status item ----------------------------
+
+
+@pytest.mark.parametrize("gone", [True, False])
+def test_the_macos_half_ends_with_the_service_it_was_handed(
+    gone: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """m2, macOS: its check every 30 s compares the parent with the pid the service passed,
+    not with whatever parent it has now (its own, in a test). In memory: no status item."""
+    pytest.importorskip("objc")
+    from PyObjCTools import AppHelper
+
+    from aisquare.services import tray_macos
+
+    stopped: list[bool] = []
+    monkeypatch.setattr(AppHelper, "stopEventLoop", lambda: stopped.append(True))
+    service = os.getppid() + 7 if gone else os.getppid()
+    tray_macos.delegate_for(Tray(platform="darwin", service_pid=service)).check_(None)
+    assert stopped == ([True] if gone else [])
+
+
+def test_the_linux_half_shows_nothing_once_the_service_it_was_handed_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """m2, Linux: the pid the service passed, not this process's parent, decides; a tray whose
+    service died while it loaded returns before it opens the bus."""
+    asked: list[tuple[Any, ...]] = []
+
+    class Libc:
+        def prctl(self, *args: Any) -> int:
+            asked.append(args)
+            return 0
+
+    def no_bus(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("the tray opened the session bus")
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: Libc())
+    monkeypatch.setattr(tray_linux, "open_dbus_connection", no_bus)
+    gone = Tray(platform="linux", service_pid=os.getppid() + 7)
+    assert tray_linux.LinuxTray().run(gone, icon="backslash") == 0
+    assert asked == [(tray_linux.PR_SET_PDEATHSIG, signal.SIGTERM)]
 
 
 def test_the_macos_half_defines_and_draws_the_menu_bar_image() -> None:

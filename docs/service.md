@@ -111,12 +111,14 @@ A running service follows a change within half a minute.
 - Not on Windows in this release, native or in WSL.
 
 **What it needs:** the `tray` extra. On macOS and Linux the installer adds it, and so does an
-upgrade (`rlx upgrade`, or Update in the app) of an install made before it. With uv by hand:
-`uv tool install 'aisquare-cli[tray]'`. Without it, the service runs as before, and `rlx service
-status` says the tray needs the extra.
+upgrade (`rlx upgrade`, or Update in the app) of a uv install from PyPI made before it. A pipx,
+pip or uvx install, one from a checkout, a folder or git, and one from another index keep the
+extras they had: add it by hand, with uv `uv tool install 'aisquare-cli[tray]'`. Without it,
+the service runs as before, and `rlx service status` says the tray needs the extra.
 
-**How it runs:** in a process of its own, which the service starts, restarts after a crash (at
-most five times per service start) and stops with itself. The service, the rlx commands and the
+**How it runs:** in a process of its own, which the service starts, starts again after a crash
+(it starts it at most five times per service start) and stops with itself. After the fifth
+crash `rlx service status` shows the `tray` part as an error until the service starts again. The service, the rlx commands and the
 hooks import nothing of the tray. `rlx service status` lists it as the `tray` part.
 
 ### Idle cost

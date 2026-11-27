@@ -12,8 +12,9 @@ The part, every :data:`TRAY_SECONDS`:
   release, the ``tray`` extra installed, a session with a place for an icon) and none runs;
 - says, in the child's health, which agents run, for the menu's line and *Quit rlx*'s
   question: the one count upgrade and uninstall act on (``lifecycle.running_fleet``);
-- starts it again after a crash, at most :data:`TRAY_TRIES` times a service run, and never
-  after an exit that means there is no tray here (``tray.NO_TRAY_EXITS``);
+- starts it again after a crash, but starts it at most :data:`TRAY_TRIES` times per service
+  start, the first start included; and never again after an exit that means there is no tray
+  here (``tray.NO_TRAY_EXITS``);
 - follows App settings: a change to ``[tray]`` stops the child, and the next tick starts one
   that reads it, or none when it was switched off;
 - stops it with the service.
@@ -45,7 +46,8 @@ TRAY_SECONDS = 30.0
 TRAY_FIRST_SECONDS = 2.0
 """The child's start after the service's: Remote and the usage reads first."""
 TRAY_TRIES = 5
-"""Starts after a crash in one service run; then the part says so and leaves it."""
+"""How many times the part starts the tray per service start, the first start included: at the
+fifth crash it says so (``error``) and leaves it, until the service starts again."""
 STOP_WAIT_SECONDS = 3.0
 AGENTS_KEPT = 20
 """Agents' names the status holds for the menu, which names three and counts the rest."""
@@ -176,9 +178,10 @@ class TrayPart:
         starts one that reads the new settings (or none, switched off)."""
         self._child: subprocess.Popen[bytes] | None = None
         self._crashes = 0
-        self._left: str | None = None
-        """Why the part gave the tray up for this service run: no tray here, or too many
-        crashes."""
+        self._left: PartHealth | None = None
+        """Why the part gave the tray up for this service run, as its health: ``off`` for an
+        exit that means no tray here, ``error`` for too many crashes, for the rest of the
+        run."""
 
     def start_part(self) -> None:
         return None
@@ -187,19 +190,20 @@ class TrayPart:
         from aisquare.services.service_host import PartHealth
 
         if self._left is not None:
-            return PartHealth("off", self._left)
+            return self._left
         child = self._child
         if child is not None and child.poll() is not None:
             self._child = None
             code = child.returncode
             if code in NO_TRAY_EXITS:
-                self._left = NO_TRAY_EXITS[code]
-                return PartHealth("off", self._left)
+                self._left = PartHealth("off", NO_TRAY_EXITS[code])
+                return self._left
             self._crashes += 1
             _log.warning("the tray stopped (exit %s), %s time(s)", code, self._crashes)
             if self._crashes >= TRAY_TRIES:
-                self._left = f"the tray stopped {self._crashes} times; it starts with the service"
-                return PartHealth("error", self._left)
+                gave_up = f"the tray stopped {self._crashes} times; it starts with the service"
+                self._left = PartHealth("error", gave_up)
+                return self._left
         if self._child is not None and self._settings() != self._started_with:
             self.stop_part()  # App settings changed it: the next child reads it, or none runs
         if self._child is None:

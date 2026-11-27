@@ -13,8 +13,9 @@ The service ends this process with ``SIGTERM``, whose default ends it at once; a
 :data:`PARENT_SECONDS` ends it too if the service died without one. In the login session only:
 a service started over SSH has no menu bar, and starts no tray (``service_tray.why_no_tray``).
 
-Imported by ``services.tray.backend_for`` alone, in ``rlx service tray``. The suite never
-imports it: no test may start a real status item.
+Imported by ``services.tray.backend_for`` alone, in the tray's process. The suite imports it
+where pyobjc is installed, to build its menu and image in memory and check its parent; no test
+starts its status item or its event loop (``MacTray.run``).
 """
 
 from __future__ import annotations

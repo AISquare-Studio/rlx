@@ -236,8 +236,8 @@ def terminal_argv(
         if choice:
             return ["open", "-a", choice, str(command_file)]
         return ["open", str(command_file)]
-    if choice:
-        words = shlex.split(choice)
+    words = shlex.split(choice) if choice else []
+    if words:  # a choice of only spaces, in a hand-edited config.toml, is none
         known = dict(TERMINALS)
         lead = known.get(Path(words[0]).name, ("-e",)) if len(words) == 1 else ()
         return [*words, *lead, *rlx]

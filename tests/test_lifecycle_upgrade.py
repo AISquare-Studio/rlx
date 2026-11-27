@@ -111,7 +111,7 @@ def _uv_cache(root: Path) -> Path:
 def an_os_without_the_tray(monkeypatch: pytest.MonkeyPatch) -> None:
     """The pins here are an upgrade's own command on an OS with no tray: on macOS and Linux an
     upgrade of a PyPI install also adds the ``tray`` extra (#34, M2), which
-    ``tests/test_tray.py`` pins for each platform."""
+    ``tests/test_tray_upgrade.py`` pins for each platform and each other route."""
     monkeypatch.setattr(install_route, "tray_extra_here", lambda *_args, **_kwargs: False)
 
 

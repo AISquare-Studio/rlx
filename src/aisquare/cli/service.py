@@ -101,12 +101,16 @@ def service_tray() -> None:
     (``service_tray.NO_TRAY_EXITS``)."""
     from aisquare.core.config import TraySettings, load_config
     from aisquare.services import tray
+    from aisquare.services.service_tray import NO_TRAY_EXITS
 
     try:
         settings = load_config().tray
     except Exception:  # a broken config.toml: the tray in its defaults
         settings = TraySettings()
-    raise typer.Exit(tray.run_tray(icon=settings.icon, terminal=settings.terminal))
+    code = tray.run_tray(icon=settings.icon, terminal=settings.terminal)
+    if code in NO_TRAY_EXITS:  # said, not only logged: the CLI has no log handler
+        typer.echo(f"No tray: {NO_TRAY_EXITS[code]}.", err=True)
+    raise typer.Exit(code)
 
 
 @app.command("stop")
