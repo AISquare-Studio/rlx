@@ -61,6 +61,11 @@ serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = "0.11"
 tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+# The scheduler's clock: UTC instants, cron in IANA time zones, its tz database bundled so
+# DST is the same on every OS (jiff-tzdb's data is public domain).
+jiff = { version = "1.0", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# The scheduler's store, <home>/rlxd/rlxd.db: SQLite built in (bundled; public domain).
+rusqlite = { version = "0.43", features = ["bundled"] }
 # Gate device names: NFKC, single script, and UTS #39 skeletons to compare look-alikes.
 unicode-normalization = "0.1"
 unicode-security = "0.1"

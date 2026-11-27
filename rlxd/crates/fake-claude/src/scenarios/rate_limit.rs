@@ -1,5 +1,5 @@
-//! `rate-limit`: a `rate_limit_event` warning that the five-hour limit is near, an hour
-//! before it resets, then an answer.
+//! `rate-limit`: a `rate_limit_event` warning that the five-hour limit is near, five
+//! minutes before it resets (as 7.6's rate-limit check has it), then an answer.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,7 @@ pub fn run(fake: &mut Fake) -> i32 {
         .map(|d| d.as_secs())
         .unwrap_or_default();
     let event = json!({"type": "rate_limit_event", "rate_limit_info": {
-        "status": "allowed_warning", "resetsAt": now + 3600, "rateLimitType": "five_hour",
+        "status": "allowed_warning", "resetsAt": now + 300, "rateLimitType": "five_hour",
         "utilization": 0.91, "isUsingOverage": false},
         "uuid": uuid(), "session_id": fake.session_id()});
     fake.emit(&event);

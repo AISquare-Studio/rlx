@@ -19,6 +19,10 @@ allow = [
     "Apache-2.0",
     "MIT",
     "Unicode-3.0",
+    # foldhash (hashbrown's default hasher, under rusqlite's hashlink, for the scheduler's
+    # rlxd.db): the zlib licence asks only that its origin isn't misrepresented and that
+    # altered sources say so. Permissive, OSI approved, fine in MIT binaries.
+    "Zlib",
 ]
 confidence-threshold = 0.93
 

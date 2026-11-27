@@ -54,6 +54,7 @@ mod out;
 pub mod peer;
 pub mod registry;
 mod runner;
+pub(crate) mod scheduler;
 mod serve;
 mod server;
 mod settings;

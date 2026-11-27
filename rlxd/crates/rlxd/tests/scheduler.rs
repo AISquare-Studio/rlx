@@ -1,0 +1,728 @@
+//! The scheduler's rules (handoff 0.10.3, 2.3 and 7.6), fast: each rlxd runs on a test
+//! clock (`RLXD_TEST_CLOCK`), which only `debug.clock_advance` and `debug.clock_set` move,
+//! and which answer once every decision due by then is made. So a minute's schedule takes
+//! a call, not a minute. The 7.6 Accept lines on real one-minute schedules are in
+//! `scheduler_accept.rs`.
+//!
+//! Each test gets a fresh home with its own `CLAUDE_CONFIG_DIR` and user home, fake-claude
+//! standing in for Claude Code, and gate dev mode, so the test client can hold the app
+//! role: an "app connected" is a `rlxd events --as-app --follow` left running.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::time::{Duration, Instant};
+
+use common::{TestHome, assert_valid};
+use serde_json::{Value, json};
+
+/// The test clock's start, for most tests.
+const T0: &str = "2027-01-01T00:00:00Z";
+
+/// fake-claude, linked (or copied) to `<home>/bin/fake-claude/<scenario>`.
+fn link(root: &Path, scenario: &str) -> PathBuf {
+    let dir = root.join("bin").join("fake-claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = if cfg!(windows) {
+        format!("{scenario}.exe")
+    } else {
+        scenario.to_owned()
+    };
+    let path = dir.join(name);
+    let binary = Path::new(env!("CARGO_BIN_EXE_fake-claude"));
+    if std::fs::hard_link(binary, &path).is_err() {
+        std::fs::copy(binary, &path).unwrap();
+    }
+    dir.join(scenario)
+}
+
+/// A home whose rlxd runs fake-claude `scenario` on a test clock at `clock`, not started.
+fn unstarted(scenario: &str, clock: &str) -> TestHome {
+    let home = TestHome::new();
+    let claude = link(home.root(), scenario);
+    let config = home.root().join("claude-config");
+    std::fs::create_dir_all(&config).unwrap();
+    let user = home.root().join("user-home");
+    std::fs::create_dir_all(&user).unwrap();
+    home.with_claude(claude)
+        .with_env("CLAUDE_CONFIG_DIR", config.to_str().unwrap())
+        .with_env("HOME", user.to_str().unwrap())
+        .with_env("USERPROFILE", user.to_str().unwrap())
+        .with_env("RLXD_TEST_CLOCK", clock)
+}
+
+/// [`unstarted`], started in gate dev mode, the test client paired as the app.
+fn home_at(scenario: &str, clock: &str) -> TestHome {
+    let home = unstarted(scenario, clock);
+    start(&home);
+    home
+}
+
+fn start(home: &TestHome) {
+    home.start_dev();
+    let paired = home.rlxd(&["call", "--as-app", "status"]);
+    assert_eq!(paired.code(), Some(0), "{paired:?}");
+}
+
+/// An app gate client, connected until dropped.
+struct App<'a> {
+    home: &'a TestHome,
+    child: Child,
+}
+
+impl Drop for App<'_> {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        common::eventually("the app is gone", || self.home.app_clients() == 0);
+    }
+}
+
+fn app(home: &TestHome) -> App<'_> {
+    let since = seq(home).to_string();
+    let child = home.spawn(&[
+        "events", "--as-app", "--topics", "daemon", "--since", &since, "--follow",
+    ]);
+    common::eventually("the app is connected", || home.app_clients() == 1);
+    App { home, child }
+}
+
+fn seq(home: &TestHome) -> u64 {
+    home.status()["seq"].as_u64().unwrap()
+}
+
+fn call(home: &TestHome, method: &str, params: &Value) -> Value {
+    let run = home.rlxd(&["call", method, &params.to_string()]);
+    assert_eq!(run.code(), Some(0), "{method}: {run:?}");
+    run.data()
+}
+
+/// The error code `method` is refused with.
+fn refused(home: &TestHome, method: &str, params: &Value) -> String {
+    let run = home.rlxd(&["call", method, &params.to_string()]);
+    assert_eq!(run.code(), Some(1), "{method}: {run:?}");
+    run.error_code()
+}
+
+/// A run job `id` of fake-claude's prompt `prompt`, on `schedule`.
+fn job(id: &str, schedule: Value, catch_up: &str) -> Value {
+    json!({"job_id": id, "type": "run", "schedule": schedule,
+        "run": {"kind": "task", "prompt": "hi", "mount": {"kind": "no_tools"},
+                "space": "default"},
+        "catch_up": catch_up, "enabled": true})
+}
+
+fn every_minute(id: &str, catch_up: &str) -> Value {
+    job(id, json!({"every_minutes": 1}), catch_up)
+}
+
+fn put(home: &TestHome, job: &Value) {
+    let put = call(home, "job.put", job);
+    assert_eq!(put["job_id"], job["job_id"]);
+}
+
+/// Moves the test clock on `seconds`, and back with every decision made.
+fn advance(home: &TestHome, seconds: u64) -> String {
+    let now = call(home, "debug.clock_advance", &json!({"seconds": seconds}));
+    now["now"].as_str().unwrap().to_owned()
+}
+
+/// The job and run events since `since`.
+fn events(home: &TestHome, since: u64) -> Vec<Value> {
+    let run = home.rlxd(&[
+        "events",
+        "--topics",
+        "job,run",
+        "--since",
+        &since.to_string(),
+    ]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    run.lines()
+}
+
+/// Events since `since` until `done` holds of them, for up to `seconds`.
+fn wait_until(
+    home: &TestHome,
+    since: u64,
+    seconds: u64,
+    what: &str,
+    done: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let seen = events(home, since);
+        if done(&seen) {
+            return seen;
+        }
+        assert!(Instant::now() < deadline, "never: {what}: {seen:#?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `events` of `type`, for job `job` (or any job).
+fn typed<'a>(events: &'a [Value], r#type: &str, job: Option<&str>) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|e| e["type"] == r#type)
+        .filter(|e| job.is_none_or(|job| e["data"]["job_id"] == job))
+        .collect()
+}
+
+/// The skips of job `job`, by reason.
+fn skips(events: &[Value], job: &str) -> Vec<String> {
+    typed(events, "job.skipped", Some(job))
+        .iter()
+        .map(|e| e["data"]["reason"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn listed(home: &TestHome, job: &str) -> Value {
+    let list = call(home, "job.list", &json!({}));
+    list["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["job_id"] == job)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn run_ended(events: &[Value], run_id: &Value) -> bool {
+    events.iter().any(|e| {
+        ["run.done", "run.failed", "run.needs_you"].contains(&e["type"].as_str().unwrap_or(""))
+            && e["data"]["run_id"] == *run_id
+    })
+}
+
+#[test]
+fn a_job_fires_with_the_app_connected_and_its_run_ends() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("t1", "skip"));
+    assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:01:00Z");
+    advance(&home, 59);
+    assert!(
+        typed(&events(&home, since), "job.fired", None).is_empty(),
+        "not yet"
+    );
+    advance(&home, 1);
+    let seen = events(&home, since);
+    let fired = typed(&seen, "job.fired", Some("t1"));
+    assert_eq!(fired.len(), 1, "{seen:#?}");
+    let data = &fired[0]["data"];
+    assert_eq!(data["scheduled_for"], "2027-01-01T00:01:00Z");
+    assert_eq!(data["cause"], "due");
+    let run_id = data["run_id"].clone();
+    let seen = wait_until(&home, since, 30, "the fired run ends", |e| {
+        run_ended(e, &run_id)
+    });
+    let done = seen
+        .iter()
+        .find(|e| e["type"] == "run.done" && e["data"]["run_id"] == run_id)
+        .unwrap_or_else(|| panic!("{seen:#?}"));
+    assert_eq!(done["data"]["job_id"], "t1", "7.5's job_id on run events");
+    for event in typed(&seen, "job.put", None)
+        .into_iter()
+        .chain(typed(&seen, "job.fired", None))
+    {
+        assert_valid("job-event.json", event);
+    }
+    let after = listed(&home, "t1");
+    assert_eq!(after["last_run_id"], run_id);
+    assert_eq!(after["last_fire_at"], "2027-01-01T00:01:00Z");
+    assert_eq!(after["next_fire_at"], "2027-01-01T00:02:00Z");
+    common::eventually("the run's end is the job's last state", || {
+        listed(&home, "t1")["last_state"] == "done"
+    });
+}
+
+#[test]
+fn with_no_app_a_due_fire_is_skipped_app_absent_and_nothing_runs() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    put(&home, &every_minute("t1", "once"));
+    advance(&home, 60);
+    let seen = events(&home, since);
+    assert_eq!(skips(&seen, "t1"), ["app_absent"], "{seen:#?}");
+    assert!(typed(&seen, "job.fired", None).is_empty());
+    assert!(typed(&seen, "run.started", None).is_empty());
+    assert_eq!(listed(&home, "t1")["skipped_count"], 1);
+    for event in typed(&seen, "job.skipped", None) {
+        assert_valid("job-event.json", event);
+    }
+}
+
+#[test]
+fn run_now_needs_the_app_and_then_fires_at_once() {
+    let home = home_at("hello", T0);
+    put(&home, &every_minute("t1", "skip"));
+    assert_eq!(
+        refused(&home, "job.run_now", &json!({"job_id": "t1"})),
+        "app_absent"
+    );
+    let since = seq(&home);
+    let _app = app(&home);
+    let now = call(&home, "job.run_now", &json!({"job_id": "t1"}));
+    assert!(now["run_id"].is_string(), "{now:#}");
+    let seen = wait_until(&home, since, 30, "the run ends", |e| {
+        run_ended(e, &now["run_id"])
+    });
+    let fired = typed(&seen, "job.fired", Some("t1"));
+    assert_eq!(fired[0]["data"]["cause"], "run_now");
+    assert_eq!(
+        refused(&home, "job.run_now", &json!({"job_id": "nope"})),
+        "unknown_job"
+    );
+}
+
+#[test]
+fn catch_up_once_fires_once_when_the_app_comes_back_and_skip_waits() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    put(&home, &every_minute("once", "once"));
+    put(&home, &every_minute("skip", "skip"));
+    advance(&home, 60);
+    advance(&home, 60);
+    let seen = events(&home, since);
+    assert_eq!(skips(&seen, "once"), ["app_absent", "app_absent"]);
+    assert_eq!(skips(&seen, "skip"), ["app_absent", "app_absent"]);
+    let back = seq(&home);
+    let _app = app(&home);
+    wait_until(&home, back, 10, "the owed fire", |e| {
+        !typed(e, "job.fired", Some("once")).is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let seen = events(&home, back);
+    let once = typed(&seen, "job.fired", Some("once"));
+    assert_eq!(once.len(), 1, "once, for both skips: {seen:#?}");
+    assert_eq!(once[0]["data"]["cause"], "catch_up");
+    assert_eq!(once[0]["data"]["scheduled_for"], "2027-01-01T00:02:00Z");
+    assert!(
+        typed(&seen, "job.fired", Some("skip")).is_empty(),
+        "skip waits for its next time"
+    );
+    // Which comes at 00:03.
+    advance(&home, 60);
+    assert_eq!(
+        typed(&events(&home, back), "job.fired", Some("skip")).len(),
+        1
+    );
+}
+
+#[test]
+fn a_job_survives_a_restart() {
+    let home = home_at("hello", T0);
+    put(&home, &every_minute("t1", "skip"));
+    let before = listed(&home, "t1");
+    home.stop();
+    start(&home);
+    let after = listed(&home, "t1");
+    assert_eq!(after, before);
+}
+
+#[test]
+fn a_second_put_replaces_the_job_and_starts_its_schedule_again() {
+    let home = home_at("hello", T0);
+    put(&home, &every_minute("t1", "skip"));
+    advance(&home, 30);
+    put(&home, &job("t1", json!({"every_minutes": 5}), "skip"));
+    let list = call(&home, "job.list", &json!({}));
+    assert_eq!(list["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:05:30Z");
+    assert_eq!(listed(&home, "t1")["schedule"], json!({"every_minutes": 5}));
+}
+
+#[test]
+fn a_paused_job_skips_paused_and_fires_again_once_resumed() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("t1", "skip"));
+    call(&home, "job.pause", &json!({"job_id": "t1"}));
+    assert_eq!(listed(&home, "t1")["paused"], true);
+    advance(&home, 60);
+    assert_eq!(skips(&events(&home, since), "t1"), ["paused"]);
+    call(&home, "job.resume", &json!({"job_id": "t1"}));
+    advance(&home, 60);
+    let seen = events(&home, since);
+    assert_eq!(typed(&seen, "job.fired", Some("t1")).len(), 1, "{seen:#?}");
+    for r#type in ["job.paused", "job.resumed"] {
+        assert_eq!(typed(&seen, r#type, Some("t1")).len(), 1, "{type}");
+    }
+}
+
+#[test]
+fn a_deleted_job_is_gone_and_never_fires() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("t1", "skip"));
+    call(&home, "job.delete", &json!({"job_id": "t1"}));
+    assert_eq!(listed(&home, "t1"), Value::Null);
+    advance(&home, 120);
+    let seen = events(&home, since);
+    assert!(typed(&seen, "job.fired", None).is_empty(), "{seen:#?}");
+    assert_eq!(typed(&seen, "job.deleted", Some("t1")).len(), 1);
+    assert_eq!(
+        refused(&home, "job.delete", &json!({"job_id": "t1"})),
+        "unknown_job"
+    );
+}
+
+#[test]
+fn a_job_never_overlaps_itself() {
+    let home = home_at("slow", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    let mut slow = every_minute("t1", "skip");
+    slow["run"]["prompt"] = json!("take your time");
+    put(&home, &slow);
+    advance(&home, 60);
+    let first = typed(&events(&home, since), "job.fired", Some("t1"))[0]["data"]["run_id"].clone();
+    wait_until(&home, since, 20, "the run starts", |e| {
+        e.iter()
+            .any(|e| e["type"] == "run.started" && e["data"]["run_id"] == first)
+    });
+    advance(&home, 60);
+    assert_eq!(skips(&events(&home, since), "t1"), ["overlap"]);
+    assert_eq!(
+        refused(&home, "job.run_now", &json!({"job_id": "t1"})),
+        "job_running"
+    );
+    call(&home, "run.cancel", &json!({"run_id": first}));
+}
+
+#[test]
+fn a_rate_limited_run_holds_its_jobs_fires_until_the_reset() {
+    // The fixture's reset is five minutes from the real time: the test clock starts there.
+    let real_now = jiff_now();
+    let home = home_at("rate-limit", &real_now);
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("t1", "skip"));
+    advance(&home, 60);
+    let run_id = typed(&events(&home, since), "job.fired", Some("t1"))[0]["data"]["run_id"].clone();
+    wait_until(&home, since, 30, "the run ends", |e| run_ended(e, &run_id));
+    // The scheduler has heard of the limit once the run's end is in.
+    std::thread::sleep(Duration::from_millis(300));
+    advance(&home, 60);
+    assert_eq!(skips(&events(&home, since), "t1"), ["rate_limited"]);
+    let run = home.rlxd(&["call", "job.run_now", r#"{"job_id":"t1"}"#]);
+    assert_eq!(run.error_code(), "rate_limited", "{run:?}");
+    assert!(run.json()["error"]["detail"]["resets_at"].is_string());
+    // Minute by minute, it is held until the reset, five minutes on, then fires again.
+    let mut minutes = 0;
+    while typed(&events(&home, since), "job.fired", Some("t1")).len() < 2 {
+        minutes += 1;
+        assert!(minutes <= 8, "{:#?}", events(&home, since));
+        advance(&home, 60);
+    }
+    assert!(
+        skips(&events(&home, since), "t1")
+            .iter()
+            .all(|r| r == "rate_limited")
+    );
+}
+
+/// Now, as RFC 3339 in UTC, to the second.
+fn jiff_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let days = secs / 86_400;
+    let (year, month, day) = civil(days);
+    let of_day = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        of_day / 3600,
+        of_day / 60 % 60,
+        of_day % 60
+    )
+}
+
+/// Days since 1970-01-01 as a civil date (Howard Hinnant's algorithm).
+fn civil(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// A job due while rlxd was down: rlxd restarts with its test clock past the fire.
+fn missed(catch_up: &str) -> (TestHome, u64) {
+    let mut home = home_at("hello", T0);
+    put(&home, &every_minute("t1", catch_up));
+    home.stop();
+    home.set_env("RLXD_TEST_CLOCK", "2027-01-01T00:05:30Z");
+    // Not start(): its pairing call is an app connection, which would decide the fire.
+    home.start_dev();
+    // The restarted rlxd's buffer holds only its own events: all of them.
+    (home, 0)
+}
+
+#[test]
+fn a_fire_missed_while_rlxd_was_down_follows_catch_up_once_an_app_connects() {
+    for (catch_up, fired, reason) in [("skip", 0, Some("missed")), ("once", 1, None)] {
+        let (home, since) = missed(catch_up);
+        let _app = app(&home);
+        wait_until(&home, since, 15, "the missed fire is decided", |e| {
+            !typed(e, "job.fired", Some("t1")).is_empty()
+                || !typed(e, "job.skipped", Some("t1")).is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let seen = events(&home, since);
+        assert_eq!(
+            typed(&seen, "job.fired", Some("t1")).len(),
+            fired,
+            "{catch_up}: {seen:#?}"
+        );
+        let skipped = skips(&seen, "t1");
+        assert_eq!(skipped.first().map(String::as_str), reason, "{catch_up}");
+        // And the next is on the grid after now.
+        assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:06:00Z");
+    }
+}
+
+#[test]
+fn a_fire_missed_while_rlxd_was_down_with_no_app_is_app_absent() {
+    let (home, since) = missed("once");
+    // The missed fire waits ten seconds for an app; none comes.
+    advance(&home, 9);
+    assert!(skips(&events(&home, since), "t1").is_empty());
+    advance(&home, 2);
+    assert_eq!(skips(&events(&home, since), "t1"), ["app_absent"]);
+}
+
+#[test]
+fn a_clock_jump_is_one_decision_for_every_fire_it_passed() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("once", "once"));
+    put(&home, &every_minute("skip", "skip"));
+    advance(&home, 3 * 3600 + 30);
+    let seen = events(&home, since);
+    let fired = typed(&seen, "job.fired", Some("once"));
+    assert_eq!(fired.len(), 1, "{seen:#?}");
+    assert_eq!(fired[0]["data"]["cause"], "catch_up");
+    assert_eq!(skips(&seen, "skip"), ["missed"]);
+    for id in ["once", "skip"] {
+        assert_eq!(
+            listed(&home, id)["next_fire_at"],
+            "2027-01-01T03:01:00Z",
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn every_minutes_keeps_its_grid_when_a_fire_is_late() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("t1", "skip"));
+    // Due at 00:01, decided at 00:01:30: on time still, and the next stays at 00:02.
+    advance(&home, 90);
+    let fired = typed(&events(&home, since), "job.fired", Some("t1"))
+        .iter()
+        .map(|e| e["data"]["scheduled_for"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(fired, [json!("2027-01-01T00:01:00Z")]);
+    assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:02:00Z");
+}
+
+#[test]
+fn cron_fires_at_its_matches_and_a_dst_gap_once_at_its_end() {
+    let home = home_at("hello", "2027-03-28T00:40:00Z");
+    let since = seq(&home);
+    let _app = app(&home);
+    put(
+        &home,
+        &job("c", json!({"cron": "* * * * *", "tz": "UTC"}), "skip"),
+    );
+    assert_eq!(listed(&home, "c")["next_fire_at"], "2027-03-28T00:41:00Z");
+    // London's 01:30 doesn't happen on 2027-03-28: it fires once, at 02:00 BST.
+    put(
+        &home,
+        &job(
+            "london",
+            json!({"cron": "30 1 * * *", "tz": "Europe/London"}),
+            "skip",
+        ),
+    );
+    assert_eq!(
+        listed(&home, "london")["next_fire_at"],
+        "2027-03-28T01:00:00Z"
+    );
+    call(&home, "job.delete", &json!({"job_id": "c"}));
+    call(
+        &home,
+        "debug.clock_set",
+        &json!({"at": "2027-03-28T01:00:00Z"}),
+    );
+    let seen = events(&home, since);
+    assert_eq!(
+        typed(&seen, "job.fired", Some("london")).len(),
+        1,
+        "{seen:#?}"
+    );
+    assert_eq!(
+        listed(&home, "london")["next_fire_at"],
+        "2027-03-29T00:30:00Z"
+    );
+}
+
+#[test]
+fn loud_is_echoed_on_job_fired_and_on_the_runs_end() {
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    let mut loud = every_minute("t1", "skip");
+    loud["loud"] = json!(true);
+    put(&home, &loud);
+    assert_eq!(listed(&home, "t1")["loud"], true);
+    advance(&home, 60);
+    let fired = typed(&events(&home, since), "job.fired", Some("t1"))[0].clone();
+    assert_eq!(fired["data"]["loud"], true);
+    let run_id = fired["data"]["run_id"].clone();
+    let seen = wait_until(&home, since, 30, "the run ends", |e| run_ended(e, &run_id));
+    let done = typed(&seen, "run.done", None)
+        .into_iter()
+        .find(|e| e["data"]["run_id"] == run_id)
+        .unwrap();
+    assert_eq!(done["data"]["loud"], true, "{done:#}");
+}
+
+#[test]
+fn loud_is_echoed_on_the_runs_needs_you() {
+    let home = home_at("asks", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    let mut asks = every_minute("t1", "skip");
+    asks["loud"] = json!(true);
+    asks["run"]["prompt"] = json!("post the standup");
+    asks["run"]["needs_you_when"] =
+        json!({"pointer": "/status", "equals": "needs_you", "question_pointer": "/question"});
+    put(&home, &asks);
+    advance(&home, 60);
+    let run_id = typed(&events(&home, since), "job.fired", Some("t1"))[0]["data"]["run_id"].clone();
+    let seen = wait_until(&home, since, 30, "the run needs you", |e| {
+        run_ended(e, &run_id)
+    });
+    let needs = typed(&seen, "run.needs_you", None)
+        .into_iter()
+        .find(|e| e["data"]["run_id"] == run_id)
+        .unwrap_or_else(|| panic!("{seen:#?}"));
+    assert_eq!(needs["data"]["loud"], true, "{needs:#}");
+}
+
+#[test]
+fn a_template_run_start_would_refuse_is_refused_at_put() {
+    let home = home_at("hello", T0);
+    let with = |field: &str, value: Value| {
+        let mut bad = every_minute("bad", "skip");
+        bad["run"][field] = value;
+        bad
+    };
+    for (bad, code) in [
+        (
+            with(
+                "mount",
+                json!({"kind": "connectors", "connectors": ["claude.ai Slack"]}),
+            )
+            .pipe(|mut b| {
+                b["run"]["kind"] = json!("check");
+                b
+            }),
+            "kind_mount_mismatch",
+        ),
+        (with("kind", json!("send_executor")), "pinned_call_required"),
+        (with("space", json!("../x")), "invalid_params"),
+        (
+            with("needs_connectors", json!(["claude.ai Slack"])),
+            "not_implemented",
+        ),
+        (
+            with("run_id", json!("0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f")),
+            "invalid_params",
+        ),
+        (
+            job("bad", json!({"cron": "61 * * * *", "tz": "UTC"}), "skip"),
+            "invalid_params",
+        ),
+        (
+            job(
+                "bad",
+                json!({"cron": "* * * * *", "tz": "Mars/Olympus"}),
+                "skip",
+            ),
+            "invalid_params",
+        ),
+        (
+            every_minute("bad", "skip").pipe(|mut b| {
+                b["run_when"] = json!("always");
+                b
+            }),
+            "invalid_params",
+        ),
+        (
+            json!({"job_id": "bad", "type": "watch", "schedule": {"every_minutes": 5},
+                "connector": "claude.ai GitHub", "tool": "x", "input": {},
+                "catch_up": "skip"}),
+            "not_implemented",
+        ),
+    ] {
+        assert_eq!(refused(&home, "job.put", &bad), code, "{bad:#}");
+    }
+    assert_eq!(listed(&home, "bad"), Value::Null, "nothing was stored");
+}
+
+trait Pipe: Sized {
+    fn pipe(self, f: impl FnOnce(Self) -> Self) -> Self {
+        f(self)
+    }
+}
+impl Pipe for Value {}
+
+#[test]
+fn a_corrupt_database_is_set_aside_reported_and_replaced() {
+    let home = unstarted("hello", T0);
+    let dir = home.root().join("rlxd");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("rlxd.db"), "not a database").unwrap();
+    start(&home);
+    let jobs = home.status()["jobs"].clone();
+    assert_eq!(jobs["db"], "set_aside", "{jobs:#}");
+    assert!(
+        jobs["set_aside"]
+            .as_str()
+            .unwrap()
+            .contains("rlxd.db.unreadable-"),
+        "{jobs:#}"
+    );
+    put(&home, &every_minute("t1", "skip"));
+    assert_eq!(home.status()["jobs"]["count"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_database_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = home_at("hello", T0);
+    put(&home, &every_minute("t1", "skip"));
+    let dir = home.root().join("rlxd");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    for name in ["rlxd.db", "rlxd.db-wal", "rlxd.db-shm"] {
+        assert_eq!(mode(&dir.join(name)), 0o600, "{name}");
+    }
+}

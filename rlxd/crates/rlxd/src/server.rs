@@ -40,11 +40,12 @@ use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, RunEventsParams, RunListParams,
-    RunRef, RunResumeParams, RunStartParams, SettingsDeleteParams, SettingsGetParams,
-    SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceParams, StatusData,
-    SubscribeParams, VERSION, codes, event_types, methods, setting_keys, topics,
+    Claude, Clients, Data, Envelope, ErrorBody, HelloData, HelloParams, JobListParams,
+    JobPutParams, JobRef, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, Request, RequestId,
+    Role, RunEventsParams, RunListParams, RunRef, RunResumeParams, RunStartParams,
+    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
+    SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
+    methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -57,6 +58,7 @@ use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
 use crate::runner::{Replay, Runner};
+use crate::scheduler::Scheduler;
 use crate::settings::{self, Settings};
 use crate::{claude, spaces, token};
 
@@ -92,6 +94,8 @@ pub struct Daemon {
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
     bus: Arc<Bus>,
     runner: Arc<Runner>,
+    /// The scheduler, or why it couldn't start (its database couldn't be made).
+    scheduler: Result<Arc<Scheduler>, String>,
     settings: Settings,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
@@ -183,6 +187,14 @@ impl Daemon {
     ) -> Arc<Self> {
         let bus = Arc::new(bus);
         let runner = Runner::new(home.clone(), Arc::clone(&bus));
+        let gate = Arc::new(gate);
+        let scheduler = Scheduler::new(&home, Arc::clone(&bus), Arc::clone(&runner), gate.apps());
+        match &scheduler {
+            Ok(scheduler) => {
+                tokio::spawn(Arc::clone(scheduler).run(runner.notes()));
+            }
+            Err(why) => crate::log::error!("scheduler: not started: {why}"),
+        }
         Arc::new(Self {
             home,
             token,
@@ -192,10 +204,11 @@ impl Daemon {
             claude: tokio::sync::Mutex::new(None),
             bus,
             runner,
+            scheduler,
             settings,
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
-            gate: Arc::new(gate),
+            gate,
         })
     }
 
@@ -245,6 +258,9 @@ impl Daemon {
     /// seen. Ends the runs in flight first, killing their process trees: runs don't
     /// outlive rlxd.
     pub fn flush(&self) {
+        if let Ok(scheduler) = &self.scheduler {
+            scheduler.shutdown();
+        }
         self.runner.shutdown();
         self.gate.flush();
     }
@@ -433,6 +449,16 @@ impl Daemon {
             }
             #[cfg(feature = "debug-methods")]
             methods::DEBUG_RUN_START => self.debug_run_start(session, request.params),
+            methods::JOB_PUT
+            | methods::JOB_LIST
+            | methods::JOB_DELETE
+            | methods::JOB_PAUSE
+            | methods::JOB_RESUME
+            | methods::JOB_RUN_NOW => self.jobs(&request.method, request.params),
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_CLOCK_ADVANCE | methods::DEBUG_CLOCK_SET => {
+                self.debug_clock(&request.method, request.params)
+            }
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
@@ -599,6 +625,15 @@ impl Daemon {
         status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
         (status.runs.live, status.runs.queued) = self.runner.counts();
+        status.jobs = match &self.scheduler {
+            Ok(scheduler) => scheduler.status(),
+            Err(why) => {
+                let mut jobs = rlxd_proto::Jobs::default();
+                jobs.db = Some("unavailable".to_owned());
+                jobs.set_aside = Some(why.clone());
+                jobs
+            }
+        };
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {
             Ok(Value::Object(data)) => Ok(data),
@@ -636,8 +671,79 @@ impl Daemon {
         };
         let params = params_of::<RunStartParams>(methods::DEBUG_RUN_START, params)?;
         printed(&off_worker(|| {
-            self.runner.start(params, &session.client, Some(job_id))
+            self.runner.start(
+                params,
+                &session.client,
+                Some(crate::runner::JobTag {
+                    job_id,
+                    loud: false,
+                }),
+            )
         })?)
+    }
+
+    /// The scheduler's methods (handoff 0.10.3, 7.6): `job.put`, `job.list`, `job.delete`,
+    /// `job.pause`, `job.resume` and `job.run_now`. They write its store: blocking work.
+    fn jobs(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
+        let scheduler = self.scheduler.as_ref().map_err(|why| {
+            error(
+                codes::INTERNAL,
+                &format!("the scheduler is not running: {why}"),
+            )
+        })?;
+        match method {
+            methods::JOB_PUT => {
+                let params = params_of::<JobPutParams>(method, params)?;
+                printed(&off_worker(|| scheduler.put(params))?)
+            }
+            methods::JOB_LIST => {
+                params_of::<JobListParams>(method, params)?;
+                printed(&off_worker(|| scheduler.list()))
+            }
+            methods::JOB_DELETE => {
+                let job = params_of::<JobRef>(method, params)?;
+                printed(&off_worker(|| scheduler.delete(&job))?)
+            }
+            methods::JOB_PAUSE | methods::JOB_RESUME => {
+                let job = params_of::<JobRef>(method, params)?;
+                let paused = method == methods::JOB_PAUSE;
+                printed(&off_worker(|| scheduler.pause(&job, paused))?)
+            }
+            methods::JOB_RUN_NOW => {
+                let job = params_of::<JobRef>(method, params)?;
+                printed(&off_worker(|| scheduler.run_now(&job))?)
+            }
+            _ => Err(error(codes::UNKNOWN_METHOD, method)),
+        }
+    }
+
+    /// Test builds only: `debug.clock_advance {seconds}` and `debug.clock_set {at}` move
+    /// the scheduler's test clock, and answer `{now}` once every decision due by then is
+    /// made.
+    #[cfg(feature = "debug-methods")]
+    fn debug_clock(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
+        let scheduler = self.scheduler.as_ref().map_err(|why| {
+            error(
+                codes::INTERNAL,
+                &format!("the scheduler is not running: {why}"),
+            )
+        })?;
+        let at = if method == methods::DEBUG_CLOCK_ADVANCE {
+            let params = params_of::<rlxd_proto::ClockAdvanceParams>(method, params)?;
+            let seconds = i64::try_from(params.seconds).unwrap_or(i64::MAX);
+            scheduler
+                .now()
+                .checked_add(jiff::SignedDuration::from_secs(seconds))
+                .map_err(|e| error(codes::INVALID_PARAMS, &e.to_string()))?
+        } else {
+            let params = params_of::<rlxd_proto::ClockSetParams>(method, params)?;
+            params
+                .at
+                .parse::<jiff::Timestamp>()
+                .map_err(|e| error(codes::INVALID_PARAMS, &format!("at: {e}")))?
+        };
+        let now = off_worker(|| scheduler.clock_to(at))?;
+        Ok(object(&json!({"now": now.to_string()})))
     }
 
     /// The runner's methods (handoff 0.10.3, 5.4 and 7.5) and spaces' (2.5): `run.start`,
@@ -1717,10 +1823,18 @@ fn served() -> Vec<&'static str> {
         methods::RUN_EVENTS,
         methods::SPACE_ENSURE,
         methods::SPACE_ERASE,
+        methods::JOB_PUT,
+        methods::JOB_LIST,
+        methods::JOB_DELETE,
+        methods::JOB_PAUSE,
+        methods::JOB_RESUME,
+        methods::JOB_RUN_NOW,
     ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);
         served.push(methods::DEBUG_RUN_START);
+        served.push(methods::DEBUG_CLOCK_ADVANCE);
+        served.push(methods::DEBUG_CLOCK_SET);
     }
     served
 }

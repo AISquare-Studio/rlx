@@ -216,6 +216,14 @@
           "format": "uint64",
           "maximum": 18446744073709551615,
           "minimum": 0
+        },
+        "db": {
+          "description": "The scheduler's database, `<home>/rlxd/rlxd.db`: `ok`, or `set_aside` when rlxd\nfound one it could not read (corrupt, or from a newer rlxd), moved it aside and\nbegan a fresh one. Absent: `ok`.",
+          "type": "string"
+        },
+        "set_aside": {
+          "description": "Where a database it could not read was moved, with why.",
+          "type": "string"
         }
       },
       "required": [

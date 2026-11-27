@@ -9,9 +9,10 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, Request, RunCancelData,
-    RunEvent, RunEventsData, RunEventsParams, RunGetData, RunListData, RunListParams, RunRef,
-    RunResumeData, RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
+    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, JobEvent, JobListData,
+    JobListParams, JobPutParams, JobRef, JobRunNowData, Request, RunCancelData, RunEvent,
+    RunEventsData, RunEventsParams, RunGetData, RunListData, RunListParams, RunRef, RunResumeData,
+    RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
     SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, SpaceEnsureData,
     SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
 };
@@ -40,6 +41,12 @@ pub fn all() -> Vec<SchemaFile> {
         file::<HelloParams>("hello.json"),
         file::<HelloData>("hello-reply.json"),
         file::<HereData>("here-reply.json"),
+        file::<JobEvent>("job-event.json"),
+        file::<JobListParams>("job-list.json"),
+        file::<JobListData>("job-list-reply.json"),
+        file::<JobPutParams>("job-put.json"),
+        file::<JobRef>("job-ref.json"),
+        file::<JobRunNowData>("job-run-now-reply.json"),
         file::<Request>("request.json"),
         file::<RunCancelData>("run-cancel-reply.json"),
         file::<RunEvent>("run-event.json"),
