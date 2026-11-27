@@ -19,7 +19,8 @@ Kept only when the signature can be trusted:
   when ``os.stat`` of the path still gives it after the parse: a link moved, or a file replaced or
   written while it was read, keeps nothing, and the next call reads again.
 - **Settled.** A file written or changed less than :data:`RACY_NS` before it was read (the later
-  of its ``st_mtime_ns`` and ``st_ctime_ns``, against the clock read as the read begins) could be
+  of its ``st_mtime_ns`` and, where it is a key (:data:`CTIME_IN_SIGNATURE`; not on Windows), its
+  ``st_ctime_ns``, against the clock read as the read begins) could be
   written again inside its timestamps' granularity at the same size, which no stat tells apart, so
   its answer is not kept until it has aged (git's "racily clean" rule): a file still being written
   is read at every call.

@@ -280,6 +280,13 @@ def test_a_change_in_any_one_key_of_the_signature_alone_is_read_again(
     assert read == [path] and parsed == [path]
 
 
+def test_ctime_is_a_key_of_the_signature_everywhere_but_windows() -> None:
+    """Pinned per platform (review #3531): on macOS and Linux st_ctime_ns is what sees a settled
+    rewrite that puts the old mtime back, and the tests that show it skip when it is off, so
+    turning it off there must fail here, not pass in silence. On Windows it is off (round 3)."""
+    assert parsed_files.CTIME_IN_SIGNATURE is (sys.platform != "win32")
+
+
 def test_the_signature_of_the_bytes_read_is_the_signature_of_the_path(
     slots: list[ClaudeAccount],
 ) -> None:
