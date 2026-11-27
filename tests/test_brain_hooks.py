@@ -558,6 +558,10 @@ def test_an_agents_variables_come_from_its_adapter_and_no_credential_goes() -> N
         "CLAUDE_CODE_OAUTHTOKEN",
         "CODEX_AUTH_JSON",
         "CLAUDEAI_SESSION",
+        # Exact names, case and all (tester #2645): a variant is not the variable.
+        "aisquare_role",
+        "Path",
+        "Aisquare_Home",
     ):
         assert not brain.forwarded(name), name
 

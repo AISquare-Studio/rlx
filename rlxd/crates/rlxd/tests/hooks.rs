@@ -357,6 +357,31 @@ fn a_session_end_waits_out_a_busy_store_as_rlx_hook_does() {
     assert_ne!(ended_at(), "", "the session's row is ended");
 }
 
+/// A hook the brain took and stalled on before rlxd read that it had (its `accepted` still
+/// in the pipe when the accept wait ends) may have run: rlxd says `hook_timeout`, and
+/// rlxd-hook runs nothing more, so the prompt is not logged a second time by `rlx hook`
+/// (review #2555 M1, tester #2645). With refuse()'s drain removed, rlxd says
+/// `hook_not_delivered` and rlxd-hook runs `rlx hook`: logged once.
+#[test]
+fn a_hook_the_brain_took_unread_never_runs_again() {
+    let Some(rlx) = real_rlx() else { return };
+    let seeded = Seeded::with(fake_brain("accepts-unterminated"), rlx);
+    seeded.home.start();
+    let payload = seeded.payload(
+        "UserPromptSubmit",
+        json!({"prompt": "accepted-unread-probe"}),
+    );
+    let (printed, stderr) = seeded.rlxd_hook_with("user-prompt-submit", &payload, &[]);
+    assert!(printed.is_empty(), "{}", String::from_utf8_lossy(&printed));
+    assert!(stderr.contains("hook_timeout"), "{stderr}");
+    assert!(stderr.contains("stalled"), "the message says how: {stderr}");
+    assert_eq!(
+        seeded.logged("accepted-unread-probe"),
+        0,
+        "the brain took it: no fallback ran it"
+    );
+}
+
 #[test]
 fn rlxd_hook_ping_is_quick() {
     let Some(seeded) = Seeded::new() else { return };
@@ -443,6 +468,16 @@ fn hook_is_for_command_line_clients_only() {
         assert_eq!(refused.error_code(), "role_not_allowed", "{refused:?}");
         assert_eq!(refused.json()["error"]["detail"]["method"], "hook");
         assert_eq!(refused.json()["error"]["detail"]["role"], role);
+    }
+    // A raw call naming a variable off the list, a case variant included, is refused, not
+    // passed on (tester #2645): rlxd-hook never sends one.
+    for env in [
+        json!({"AISQUARE_HOME": own, "aisquare_role": "coder"}),
+        json!({"AISQUARE_HOME": own, "ANTHROPIC_API_KEY": "k"}),
+    ] {
+        let params = hook_params(&home, "stop", env.clone());
+        let refused = home.rlxd(&["call", "hook", &params]);
+        assert_eq!(refused.error_code(), "invalid_params", "{env}: {refused:?}");
     }
     let events = home.rlxd(&["events", "--topics", "hook", "--since", "0"]);
     assert!(

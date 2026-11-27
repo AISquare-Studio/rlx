@@ -350,8 +350,9 @@ ENV_READ_ELSEWHERE: dict[str, str] = {
 
 def forwarded(name: str) -> bool:
     """Whether the variable ``name`` crosses from rlxd-hook to the brain: one of
-    :data:`ENV_NAMES`, as Windows compares names, whatever their case."""
-    return name.upper() in _ENV_SET or name in _ENV_SET
+    :data:`ENV_NAMES`, by its exact name, case and all (``aisquare_role`` is not
+    ``AISQUARE_ROLE``; rlxd refuses a hook that names another, and the brain drops it)."""
+    return name in _ENV_SET
 
 
 #: Variables the hook path reads that describe the brain's own process or machine, not the

@@ -111,10 +111,14 @@ pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
             &format!("the brain took the hook, then failed: {}", why.message),
             &why,
         )),
+        // Either the brain took it and ran past its deadline, or it stalled with the hook
+        // taken before rlxd read that it had (its accept wait, then a kill): both may have
+        // run it.
         Err(CallError::TimedOut) => Err(error(
             hook_codes::HOOK_TIMED_OUT,
             &format!(
-                "the brain took the hook and did not finish it within {} ms",
+                "the brain took the hook and did not answer: it stalled, or ran past the {} ms \
+                 it had",
                 deadline.as_millis()
             ),
         )),

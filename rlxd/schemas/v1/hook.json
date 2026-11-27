@@ -31,7 +31,7 @@
       "minimum": 1
     },
     "env": {
-      "description": "The variables of the allowlist rlxd-hook has, by name. A name off the list is\nignored. No value is longer than [`HOOK_ENV_VALUE_MOST`] (32 KiB).",
+      "description": "The variables of the allowlist rlxd-hook has, by their exact names. A name off the\nlist is refused. No value is longer than [`HOOK_ENV_VALUE_MOST`] (32 KiB).",
       "type": "object",
       "additionalProperties": {
         "type": "string",

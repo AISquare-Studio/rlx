@@ -100,10 +100,11 @@ pub const HOOK_ENV_VALUE_MOST: usize = 32 << 10;
 pub const HOOK_FRAME_MOST: usize = 1 << 20;
 
 /// Whether rlxd-hook sends the variable `name` with a hook, and the brain sets it: one of
-/// [`HOOK_ENV_NAMES`], by its exact name, which Windows compares upper-case. Nothing else
-/// is, whatever it is called.
+/// [`HOOK_ENV_NAMES`], by its exact name, case and all (rlxd-hook looks each up by that
+/// name, which Windows matches whatever the case it is set in). Nothing else is, whatever
+/// it is called: `aisquare_role` is not `AISQUARE_ROLE`.
 pub fn hook_env_forwarded(name: &str) -> bool {
-    HOOK_ENV_NAMES.contains(&name) || HOOK_ENV_NAMES.contains(&name.to_ascii_uppercase().as_str())
+    HOOK_ENV_NAMES.contains(&name)
 }
 
 /// The `hook.*` event type of a hook named as rlxd-hook's command line names it:
@@ -167,8 +168,8 @@ pub struct HookParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, length(min = 1))]
     pub cwd: Option<String>,
-    /// The variables of the allowlist rlxd-hook has, by name. A name off the list is
-    /// ignored. No value is longer than [`HOOK_ENV_VALUE_MOST`] (32 KiB).
+    /// The variables of the allowlist rlxd-hook has, by their exact names. A name off the
+    /// list is refused. No value is longer than [`HOOK_ENV_VALUE_MOST`] (32 KiB).
     #[serde(default)]
     #[schemars(extend("additionalProperties" = {"type": "string", "maxLength": 32768}))]
     pub env: BTreeMap<String, String>,
@@ -350,6 +351,12 @@ impl HookParams {
         if let Some(cwd) = &self.cwd {
             check::non_empty("cwd", cwd)?;
         }
+        if let Some(name) = self.env.keys().find(|name| !hook_env_forwarded(name)) {
+            return Err(Invalid::new(
+                "env",
+                format!("{name:?} is not a variable a hook sends (HOOK_ENV_NAMES, exactly)"),
+            ));
+        }
         if let Some((name, value)) = self
             .env
             .iter()
@@ -462,7 +469,6 @@ mod tests {
             "CLAUDE_EFFORT",
             "AISQUARE_ROLE",
             "PATH",
-            "Path",
             "TMUX_PANE",
             // An agent's home and the plain copies a slot's launch keeps, and a traced
             // launch's marker: paths, a name and a key id (review #2562 round 2).
@@ -488,6 +494,10 @@ mod tests {
             "EDITOR",
             "AISQUARE_ROLE_X",
             "claude_config",
+            // Exact names, case and all (tester #2645): a variant is not the variable.
+            "Path",
+            "aisquare_role",
+            "Aisquare_Home",
         ] {
             assert!(!hook_env_forwarded(name), "{name}");
         }

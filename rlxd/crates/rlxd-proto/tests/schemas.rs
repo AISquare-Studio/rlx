@@ -2398,10 +2398,13 @@ fn hook_documents_refuse_their_wrong_shapes() {
     let longest = json!({"event": "stop", "stdin_b64": "",
                          "env": {"PATH": "a".repeat(HOOK_ENV_VALUE_MOST)}});
     assert_eq!(agrees::<HookParams>("hook.json", &longest), longest);
-    // What the schema cannot say: the event is one rlxd-hook takes, and the bytes base64.
+    // What the schema cannot say: the event is one rlxd-hook takes, the bytes base64, and
+    // each variable one of the list, by its exact name.
     for params in [
         json!({"event": "codex", "stdin_b64": ""}),
         json!({"event": "stop", "stdin_b64": "not base64!"}),
+        json!({"event": "stop", "stdin_b64": "", "env": {"aisquare_role": "coder"}}),
+        json!({"event": "stop", "stdin_b64": "", "env": {"ANTHROPIC_API_KEY": "k"}}),
     ] {
         assert!(
             serde_json::from_value::<HookParams>(params.clone()).is_err(),
