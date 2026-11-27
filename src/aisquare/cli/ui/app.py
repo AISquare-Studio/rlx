@@ -6,7 +6,9 @@ the first ``+``, Accounts on the first click of its section
 (docs/plans/claude-accounts.md), one ``ProjectView`` / ``AgentView`` per
 selection, created the first time it is asked for and kept (a view hosts a live
 terminal pane; re-creating it on every click would restart that pane's render
-loop).
+loop). An agent's view is kept while its agent lives: once the agent has stopped or
+left the fleet's list and its view is off screen, the view goes, its pane with it,
+and opening the agent again builds it anew (#43, ``FleetApp._views_left``).
 
 **The TUI holds no state that matters** (§2). Projects come from the store,
 agents from the fleet service, both re-read every two seconds exactly as
@@ -704,6 +706,11 @@ def _folded(projects: list[ProjectInfo], groups: list[ProjectGroup]) -> set[str]
     Pinned section shows (``project_groups.arrange``)."""
     collapsed = {group.id for group in groups if group.collapsed}
     return {p.id for p in projects if p.pinned_at is None and p.group_id in collapsed}
+
+
+def _inside(node: object, view: Widget) -> bool:
+    """Whether ``node`` (the focused widget, a worker's node) is ``view`` or inside it."""
+    return node is view or (isinstance(node, DOMNode) and view in node.ancestors)
 
 
 def _read_captain(read: _FleetRead) -> _FleetRead:
@@ -2307,6 +2314,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         )
         sidebar.show_live_total(read.live_total)
         self._feed_open_views(self.snapshot)
+        if self._views_stopped_off_screen():
+            self.call_later(self._remove_views_left)
         if asked is None or self._accounts_began < asked:
             self.refresh_accounts()
 
@@ -2539,6 +2548,98 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 snapshot.agents.get(fresh_project.id, []),
                 fleet_paused=fresh_project.id in snapshot.fleet_paused,
             )
+
+    def _views_stopped_off_screen(self) -> list[AgentView]:
+        """The agent views off screen whose agent has stopped (#43): its row is no longer
+        ``ALIVE_STATES`` (exited, lost or paused), or it has left the list of a project this
+        frame read. Each is to go, its pane and the rows it rendered with it, and opening the
+        agent again builds it anew; :meth:`_views_left` says which may go now. The owner's
+        TUI had built about 414 agent views in three days, a new agent id on every launch,
+        and removed none but with its project.
+
+        Not the view shown, whatever its agent does: it goes once it is left. Nor a view of a
+        project this frame did not answer for, folded away and not read or read and failed
+        (a notice): not read is not "gone", as :meth:`_feed_open_views` keeps what such a
+        view has."""
+        snapshot = self.snapshot
+        if snapshot is None:
+            return []
+        shown = self.current_view()
+        stopped: list[AgentView] = []
+        for view in self.content.query_children(AgentView):
+            agent = view.status.agent
+            if view is shown or agent.project_id not in snapshot.agents:
+                continue
+            if snapshot.notices.get(agent.project_id) is not None:
+                continue
+            row = snapshot.agent(agent.project_id, agent.id)
+            if row is None or row.state not in ALIVE_STATES:
+                stopped.append(view)
+        return stopped
+
+    def _views_left(self) -> list[AgentView]:
+        """The views of :meth:`_views_stopped_off_screen` that may go now. A later frame takes
+        the others, once what keeps each is over:
+
+        - a worker of its own (or of a widget in it) still running: Pause, Restart, Move,
+          the labels' or the task's read, a pane's paste. Textual cancels a removed widget's
+          workers, and a cancelled worker's answer is never handled: a pause's toast would be
+          lost, and a quit would no longer wait for its write. The frame that brings the
+          stopped row starts the labels' and the task's reads itself (``refresh_status``), so
+          the view goes at the frame after it;
+        - a message still queued on it or in it: a worker that has just finished has its
+          answer waiting there, and a Restart's or a Move's answer is the shell's
+          ``AgentRestarted``, which the view posts as it handles it;
+        - the keyboard in it while a dialog is up: the dialog gives the keyboard back to it
+          as it closes. With no dialog up, the keyboard leaves it first
+          (:meth:`_keyboard_from`).
+        """
+        content = self.content
+        under_a_dialog = content.screen.focused if self.screen is not content.screen else None
+        busy = [worker.node for worker in self.workers if not worker.is_finished]
+        return [
+            view
+            for view in self._views_stopped_off_screen()
+            if not any(_inside(node, view) for node in (under_a_dialog, *busy))
+            and not any(node.message_queue_size for node in view.walk_children(with_self=True))
+        ]
+
+    async def _remove_views_left(self) -> None:
+        """Remove what :meth:`_views_left` finds now, not what the frame that asked found: this
+        runs after that frame's handler, and a view opened or shown since is no longer left.
+        Awaited here, in the app's own turn, so no click on the agent's row lands between
+        the look and the removal and opens a view on its way out."""
+        views = self._views_left()
+        self._keyboard_from(views)
+        await self._remove_views(views)
+
+    def _keyboard_from(self, views: Sequence[Widget]) -> None:
+        """The keyboard out of ``views``, which are going, so it is never left on a removed
+        widget: put where showing the side shown puts it.
+
+        A view that is not shown can still hold it: after Stop pressed in an agent's view,
+        ``stop_finished`` shows the project and the keyboard stays behind in the hidden
+        view (on its Restart button, measured). With both sides shown, or the
+        sidebar alone, the sidebar takes it, as the click on a project's title a stop goes
+        back by gives it; with the content alone, the view shown, as
+        ``Panes.show_content`` gives it."""
+        screen = self.content.screen
+        if not any(_inside(screen.focused, view) for view in views):
+            return
+        panes = self.query_one(Panes)
+        if panes.one_pane and panes.side == CONTENT_SIDE:
+            screen.set_focus(None)
+            panes._focus_content()
+        else:
+            screen.set_focus(self.sidebar)
+
+    async def _remove_views(self, views: Sequence[Widget]) -> None:
+        """Take ``views`` off the content switcher: a removed project's (:meth:`_leave_forgotten`)
+        and the agent views no longer needed (:meth:`_remove_views_left`). A pane goes with its
+        view, its timers, its control client and its selection with it
+        (``TerminalPane.on_unmount``)."""
+        if views:
+            await self.content.remove_children(views)
 
     # --- doctor -------------------------------------------------------------------------
 
@@ -3736,8 +3837,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 await self.on_project_selected(ProjectSelected(listed[0]))
             else:
                 await self.action_welcome()
-        for view in views:
-            await view.remove()
+        await self._remove_views(views)
 
     def on_paste(self, event: events.Paste) -> None:
         """A paste no focused widget took (#288): into the one live pane on screen.
