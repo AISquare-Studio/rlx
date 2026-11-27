@@ -1149,7 +1149,7 @@ def unfinished_home_move_at(root: Path) -> Path | None:
     """
     journal = root.joinpath(*MOVE_JOURNAL)
     try:
-        text = journal.read_text(encoding="utf-8")
+        text = read_regular_text(journal)
     except ValueError:
         return journal  # a journal that cannot be read is one that has not finished
     except OSError:
@@ -1162,6 +1162,28 @@ def unfinished_home_move_at(root: Path) -> Path | None:
         return journal
     steps = data.get("steps") if isinstance(data, dict) else None
     return None if isinstance(steps, list) and "done" in steps else journal
+
+
+def read_regular_text(path: Path) -> str:
+    """``path``'s text, read only when it is a regular file: never through a link, and never a
+    FIFO, a device or a socket, whose open or read can block for good (the tester's NB1 on
+    #31: a FIFO at the move's journal hung every command and the hook). Opened without
+    blocking and without following a link, then asked by ``fstat``, so nothing can change in
+    between. ``OSError`` when it is not one or cannot be read; ``ValueError`` (a
+    ``UnicodeDecodeError``) for bytes that are not UTF-8."""
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_BINARY"):
+        flags |= getattr(os, name, 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        chunks: list[bytes] = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
 
 
 def _maybe_a_journal(root: Path, journal: Path) -> bool:

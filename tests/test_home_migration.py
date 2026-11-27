@@ -1272,8 +1272,9 @@ def test_a_drop_of_the_cache_holds_the_home_s_move_lock_and_removes_it_renamed_a
     (cache / "old").mkdir(parents=True, exist_ok=True)
     (cache.with_name("cache.dropping-1")).mkdir()  # one a crashed drop left aside
 
+    key, named = home_migration._move_lock_key()
     with (
-        home_migration._one_at_a_time(home_migration._move_lock_key()),
+        home_migration._one_at_a_time(key, named=named),
         pytest.raises(home_migration.MigrationRefused, match="a drop of its cache"),
     ):
         home_migration.drop_cache()
@@ -2198,16 +2199,17 @@ def _mode_000(journal: Path, patch: pytest.MonkeyPatch) -> None:
 
 
 def _an_io_error(journal: Path, patch: pytest.MonkeyPatch) -> None:
-    """A disk that fails the read: each reader of the journal reads it through ``read_text``."""
+    """A disk that fails the read: each reader of the journal reads it through
+    ``paths.read_regular_text``."""
     journal.write_text(OPEN_JOURNAL, encoding="utf-8")
-    real = Path.read_text
+    real = paths.read_regular_text
 
-    def read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-        if self == journal:
-            raise OSError(errno.EIO, os.strerror(errno.EIO), str(self))
-        return real(self, *args, **kwargs)
+    def read(path: Path) -> str:
+        if path == journal:
+            raise OSError(errno.EIO, os.strerror(errno.EIO), str(path))
+        return real(path)
 
-    patch.setattr(Path, "read_text", read_text)
+    patch.setattr(paths, "read_regular_text", read)
 
 
 @pytest.mark.parametrize("moved", [False, True], ids=["before-the-move", "after-the-move"])
@@ -2223,7 +2225,7 @@ def _an_io_error(journal: Path, patch: pytest.MonkeyPatch) -> None:
             "cannot read (UnicodeDecodeError)",
         ),
         (_bytes(TOO_DEEP), "cannot read (RecursionError)"),
-        (_a_folder, "cannot read (Is a directory)"),
+        (_a_folder, "cannot read (not a regular file)"),
         (_a_link_to_nothing, "cannot read (a link to nothing)"),
         (_mode_000, "cannot read (Permission denied)"),
         (_an_io_error, f"cannot read ({os.strerror(errno.EIO)})"),
@@ -2356,6 +2358,67 @@ def test_only_a_home_whose_root_cannot_be_looked_at_reads_as_no_move(
 
     assert runner.invoke(app, ["move-home"]).exit_code == 0, "readable again: it finishes"
     assert paths.home_of() == (new, paths.NEW) and paths.unfinished_home_move() is None
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["before-the-move", "after-the-move"])
+def test_a_fifo_at_the_journal_s_path_is_refused_and_hangs_nothing(
+    old_home: Path, user_home: Path, moved: bool
+) -> None:
+    """The tester's NB1 (round 5): a FIFO at the journal's path hung every command and the hook
+    in its open. Only a regular file is read; anything else there is unreadable, so unfinished,
+    and refused with the way out."""
+    import threading
+
+    if moved:
+        assert home_migration.move_home() is not None
+    journal = (user_home / ".rlx" if moved else old_home).joinpath(*paths.MOVE_JOURNAL)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.unlink(missing_ok=True)
+    journal.with_name(home_migration.JOURNAL_COPY).unlink(missing_ok=True)
+    if sys.platform != "win32":  # the file is POSIX-only; mypy's win32 run is told so
+        os.mkfifo(journal)
+    answers: list[object] = []
+
+    def read() -> None:
+        answers.append(paths.unfinished_home_move())
+        answers.append(home_migration.journal_refusal(journal))
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(10)
+
+    assert not reader.is_alive(), "a read of the FIFO blocked"
+    assert answers[0] == journal and "cannot read (not a regular file)" in str(answers[1])
+    runner = CliRunner()
+    for command in (["fleet", "ls"], ["move-home"], ["move-home", "--rollback"]):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1 and "not a regular file" in result.output, result.output
+    hook = runner.invoke(app, ["hook", "session-start"], input=json.dumps({"session_id": SESSION}))
+    assert hook.exit_code == 0 and hook.output == ""
+
+
+def test_a_named_home_s_move_lock_holds_against_another_spelling_of_it(
+    user_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tester's NB2 (round 5): a named home's lock was keyed by its spelling, so the same
+    home through a link took a lock of its own and could run a second move beside the first.
+    It is keyed by the real path."""
+    real = make_old_home(tmp_path / "named-user")
+    named = tmp_path / "named-home"
+    real.rename(named)
+    link = tmp_path / "a-link-to-it"
+    link.symlink_to(named)
+    monkeypatch.setenv(paths.RLX_HOME_ENV, str(link))
+    found = home_migration.planned_move()
+    assert found is not None and found.named and found.old_root == link
+
+    with home_migration._one_at_a_time(str(named), named=True):
+        with pytest.raises(home_migration.MigrationRefused, match="another move of this home"):
+            home_migration.move_home()
+        with pytest.raises(home_migration.MigrationRefused, match="a drop of its cache"):
+            home_migration.drop_cache()
+
+    assert not named.joinpath(*paths.MOVE_JOURNAL).exists(), "nothing began"
 
 
 def _stopped_at_rename(n: int) -> None:

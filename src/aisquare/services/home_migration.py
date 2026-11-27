@@ -276,7 +276,7 @@ def _save_move_journal(journal: Journal) -> None:
 def _read_journal(path: Path) -> Journal | None:
     """The journal at ``path``, or ``None`` when it cannot be read as one."""
     try:
-        return Journal.model_validate_json(path.read_text(encoding="utf-8"))
+        return Journal.model_validate_json(paths.read_regular_text(path))
     except (OSError, ValueError, RecursionError):  # a ValidationError is a ValueError
         return None
 
@@ -306,7 +306,7 @@ def journal_refusal(path: Path) -> str | None:
     """Why the unfinished move whose journal is ``path`` cannot be taken up by this rlx, with
     the way out; ``None`` for one it can finish or roll back."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = paths.read_regular_text(path)  # a FIFO there never blocks
         loaded: Any = json.loads(text)
     except (OSError, ValueError, RecursionError) as exc:  # bytes not UTF-8 are a ValueError
         return _unless_its_copy_reads(path, exc)
@@ -697,10 +697,16 @@ class Moved:
 
 
 @contextlib.contextmanager
-def _one_at_a_time(old_root: str) -> Iterator[None]:
+def _one_at_a_time(old_root: str, *, named: bool) -> Iterator[None]:
     """Hold this home's move lock, outside the home (its folders are renamed under it, and
-    Windows renames no folder with a file open in it); refuse while another move holds it."""
-    digest = hashlib.sha256(old_root.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    Windows renames no folder with a file open in it); refuse while another move holds it.
+
+    A home a variable names is keyed by its real path, so a link to it or another spelling of
+    it is the same home (the tester's NB2 on #31). The default home keeps its own spelling,
+    ``~/.aisquare``: its real path is ``~/.rlx`` once linked, so a run that came after the link
+    and before the move was done would have held another lock."""
+    key = os.path.realpath(old_root) if named else old_root
+    digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     lock = Path(tempfile.gettempdir()) / f"rlx-home-migration-{digest}.lock"
     try:
         with holding(lock, wait_s=0, mode=0o600):
@@ -814,7 +820,7 @@ def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None
         ) from exc
     if running:
         raise MigrationRefused(f"{len(running)} thing(s) run on this home", running)
-    with _one_at_a_time(str(found.old_root)):
+    with _one_at_a_time(str(found.old_root), named=found.named):
         journal = found.journal
         if journal is None:
             journal = Journal(
@@ -1435,7 +1441,7 @@ def roll_back_move(journal: Journal | None = None) -> bool:
             ) from exc
         if running:
             raise MigrationRefused(f"{len(running)} thing(s) run on this home", running)
-        with _one_at_a_time(str(found.old_root)):
+        with _one_at_a_time(str(found.old_root), named=found.named):
             return _roll_back_move(found.journal)
 
 
@@ -1632,18 +1638,20 @@ def drop_cache() -> None:
     after a move (``rlx upgrade``). It holds the home's move lock, as a move does, so neither a
     move nor another drop runs beside it (the reviewer's n4, round 4); a move's own drop is
     made under the lock the move holds."""
-    with _one_at_a_time(_move_lock_key()):
+    key, named = _move_lock_key()
+    with _one_at_a_time(key, named=named):
         _drop_the_cache()
 
 
-def _move_lock_key() -> str:
-    """What a move of this process's home holds its lock by (:func:`_one_at_a_time`): the
-    home's root before any move, ``~/.aisquare`` for the default home and the folder a
-    variable names for any other, as :func:`planned_move` plans it."""
+def _move_lock_key() -> tuple[str, bool]:
+    """What a move of this process's home holds its lock by (:func:`_one_at_a_time`), and
+    whether a variable names it: the home's root before any move, ``~/.aisquare`` for the
+    default home and the folder a variable names for any other, as :func:`planned_move` plans
+    it."""
     named = paths.named_home()
     if named is not None and not _names_the_default_home():
-        return str(named)
-    return str(Path.home() / paths.OLD_HOME_NAME)
+        return str(named), True
+    return str(Path.home() / paths.OLD_HOME_NAME), False
 
 
 def _drop_the_cache() -> None:
