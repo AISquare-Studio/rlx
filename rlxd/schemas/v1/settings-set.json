@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SettingsSetParams",
+  "description": "`settings.set`'s params: the new value, and, for a write that must not overwrite\nanother device's, the version it was made from.\n\n```json\n{\"key\": \"theme\", \"value\": \"rlx_light\", \"expected_version\": 3}\n```",
+  "type": "object",
+  "properties": {
+    "expected_version": {
+      "description": "Write only if the key's version is this now, else get `conflict`: `0` for a key\nthat has never been set. Absent writes whatever the version.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "key": {
+      "description": "The setting's key, such as `theme` or `rlxapp.sidebar`.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "value": {
+      "description": "The new value. A known key's has that key's shape; a dotted key's is any JSON\nvalue but `null`.",
+      "not": {
+        "type": "null"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "theme"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "layout"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "agent_sign_off"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "maxLength": 512
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "key": {
+            "const": "send_safety_mode"
+          }
+        },
+        "required": [
+          "key"
+        ]
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "object",
+            "properties": {
+              "connectors": {
+                "type": "object",
+                "additionalProperties": {
+                  "enum": [
+                    "draft",
+                    "standing_approval",
+                    "auto"
+                  ]
+                },
+                "propertyNames": {
+                  "minLength": 1
+                }
+              },
+              "default": {
+                "enum": [
+                  "draft",
+                  "standing_approval",
+                  "auto"
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "default"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "required": [
+    "key",
+    "value"
+  ]
+}

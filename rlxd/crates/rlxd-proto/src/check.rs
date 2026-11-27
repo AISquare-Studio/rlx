@@ -86,7 +86,7 @@ pub(crate) fn pid(field: &str, value: u32) -> Result<(), Invalid> {
 /// One snake_case name: a lowercase letter, then lowercase letters, digits and `_`.
 pub(crate) const SNAKE: &str = "[a-z][a-z0-9_]*";
 
-fn is_snake(name: &str) -> bool {
+pub(crate) fn is_snake(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_lowercase())
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')

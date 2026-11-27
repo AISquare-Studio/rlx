@@ -2,8 +2,13 @@
 //! stream as JSON lines on stdout, one event envelope each.
 //!
 //! `rlxd events [--as-app] [--topics a,b] [--since SEQ] [--follow] [--until TYPE[,TYPE…]]
-//! [--limit N] [--timeout S]`
+//! [--limit N] [--timeout S] [--socket PATH] [--token-file F | --token T]
+//! [--gate-credential-file F]`
 //!
+//! - **Where.** The home's rlxd with its token file's token, or with `--socket` another
+//!   socket, such as an SSH forward's local end, with `--token-file` (or `--token`), the
+//!   host's token, as `rlxd call` takes them: `--socket` never sends this home's token or
+//!   test credential (`--as-app` then needs `--gate-credential-file`).
 //! - **What it prints.** With `--since`, every event rlxd holds after that seq first, with
 //!   a `daemon.gap` before them when rlxd holds none so old. With `--follow`, then every
 //!   later event as it happens, until rlxd stops; a reader too slow to keep up gets a
@@ -53,6 +58,8 @@ pub struct EventsArgs {
     pub limit: Option<u64>,
     /// How many seconds to run at most.
     pub timeout: Option<f64>,
+    /// Where to connect and the token to send, when not the home's.
+    pub target: cli::Target,
 }
 
 /// What the reader thread passes on.
@@ -83,6 +90,9 @@ pub fn events(args: EventsArgs) -> ExitCode {
             ));
         }
     };
+    if let Err(message) = args.target.check(args.as_app) {
+        return out::usage(&message);
+    }
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => return cli::report_on_stderr(AskError::NotRunning(e.to_string())),
@@ -101,7 +111,8 @@ pub fn events(args: EventsArgs) -> ExitCode {
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let (to, from) = mpsc::sync_channel(READ_AHEAD);
     let as_app = args.as_app;
-    thread::spawn(move || read(&home, as_app, params, &to));
+    let target = args.target;
+    thread::spawn(move || read(&home, as_app, &target, params, &to));
     let mut printed = 0;
     loop {
         let message = match deadline {
@@ -146,8 +157,8 @@ pub fn events(args: EventsArgs) -> ExitCode {
 
 /// Connects, says `hello`, subscribes with `params`, and passes on the stream until its
 /// reply, or a failure.
-fn read(home: &Home, as_app: bool, params: Data, to: &SyncSender<Message>) {
-    let mut connection = match cli::open(home, as_app) {
+fn read(home: &Home, as_app: bool, target: &cli::Target, params: Data, to: &SyncSender<Message>) {
+    let mut connection = match cli::open(home, as_app, target) {
         Ok(connection) => connection,
         Err(error) => {
             let _ = to.send(Message::Failed(error));

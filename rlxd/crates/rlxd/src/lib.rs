@@ -5,10 +5,14 @@
 //! [--gate-dev-mode]`, `rlxd status [--json]`, `rlxd stop`, `rlxd call` and `rlxd
 //! events`. One rlxd runs per home, on a local socket or named pipe, and a client gets in
 //! with the shared token through `hello`. Every reply is the 7.2 envelope, and
-//! `events.subscribe` streams the home's events. The PTY host, the runner and the rest
-//! are later items, each a method on this socket, publishing on the bus. `rlxd here
-//! [--start]` is the probe rlx.app runs over SSH: what is installed, whether rlxd runs,
-//! and the protocol versions it serves.
+//! `events.subscribe` streams the home's events. `settings.get`, `settings.set` and
+//! `settings.list` serve the app settings every device shares. `run.start`,
+//! `run.cancel`, `run.resume`, `run.get`, `run.list` and `run.events` drive the headless
+//! runner and its durable log (2.1, 5.4, 7.5), and `space.ensure` and `space.erase` the
+//! spaces its runs work in (2.5). The PTY host and the rest are later items, each a method on this
+//! socket, publishing on the bus.
+//! `rlxd here [--start]` is the probe rlx.app runs over SSH: what is installed, whether
+//! rlxd runs, and the protocol versions it serves.
 //!
 //! The app gate (5.1) is here too: only rlx's app holds it, proven by a per-device gate
 //! credential and, for a device paired locally, by the peer's identity ([`peer`]). The
@@ -32,11 +36,17 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+/// rlxd/THIRD_PARTY_NOTICES: tmux's copyright and ISC permission notice for each file
+/// ported from it, which every rlxd binary carries and `rlxd licenses` prints.
+pub const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES");
+
+mod attach;
 pub mod bus;
 mod claude;
 mod cli;
 mod clock;
 mod config;
+mod durable;
 mod events;
 mod files;
 mod gate;
@@ -47,10 +57,18 @@ mod lock;
 mod log;
 mod out;
 pub mod peer;
+pub mod pty;
 pub mod registry;
+mod runner;
+pub(crate) mod scheduler;
 mod serve;
 mod server;
+mod settings;
+mod spaces;
+#[cfg(feature = "debug-methods")]
+mod test_hook;
 mod token;
+pub mod vt;
 #[cfg(windows)]
 mod windows;
 
@@ -107,15 +125,68 @@ enum Action {
     },
     /// Stop rlxd, and wait until it has stopped.
     Stop,
+    // Boxed: its options are the largest variant, more so on Windows, whose paths are
+    // wider (clippy::large_enum_variant).
     /// Send one request on a new connection, and print the reply envelope. A stream's
     /// events print one per line instead, and it exits 0 when the stream ends.
-    Call(CallOptions),
+    Call(Box<CallOptions>),
     /// The devices paired as the app gate: list, approve or unpair them.
     #[command(subcommand)]
     Gate(GateAction),
     /// Print the home's events as JSON lines: those rlxd holds after --since, then with
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
-    Events(EventsOptions),
+    // Boxed, as Call is.
+    Events(Box<EventsOptions>),
+    /// Put a PTY in this terminal, as `tmux attach` puts a pane in it. Ctrl-] detaches.
+    Attach {
+        /// The PTY, as `pty.spawn` named it and `pty.list` lists it.
+        pty_id: String,
+        /// Watch only: send no keys, and leave its size alone.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// On Windows, the process a PTY's ConPTY starts: joins the PTY's job, then runs the
+    /// program in it. rlxd starts it; nothing else should.
+    #[cfg(windows)]
+    #[command(name = "__pty-shim", hide = true)]
+    PtyShim {
+        /// The job's name.
+        #[arg(long)]
+        job: String,
+        /// The program and its arguments.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Runs one run's Claude Code and ends its whole process group with it (macOS and
+    /// Linux). rlxd starts it; nobody else does.
+    #[command(name = "__run-guard", hide = true)]
+    RunGuard {
+        /// Claude Code and its arguments, after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 1..,
+            value_parser = clap::value_parser!(std::ffi::OsString)
+        )]
+        argv: Vec<std::ffi::OsString>,
+    },
+    /// Test builds only: a run's hook, as rlxd-hook's will be: asks rlxd's gate about the
+    /// call on stdin (`debug.pre_tool_use`), and prints its answer, or a deny.
+    #[cfg(feature = "debug-methods")]
+    #[command(name = "__test-hook", hide = true)]
+    TestHook {
+        /// The hook's event: `pre-tool-use`.
+        event: String,
+        /// The run.
+        #[arg(long)]
+        run: String,
+        /// The run's attempt.
+        #[arg(long)]
+        attempt: u64,
+    },
+    /// Print the notices of what rlxd carries from others: tmux's ISC licence, for the
+    /// parts of rlxd ported from tmux.
+    Licenses,
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -184,6 +255,21 @@ struct EventsOptions {
     /// Exit 4 when this many seconds have passed first.
     #[arg(long, value_name = "S")]
     timeout: Option<f64>,
+    /// Connect to this socket (a named pipe on Windows) instead of the home's, such as
+    /// the local end of `ssh -N -L <PATH>:<host's socket> host`. Needs --token-file or
+    /// --token, and with --as-app --gate-credential-file: this home's are never sent.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
+    /// The token to send, instead of the one in <home>/rlxd/token. Prefer --token-file:
+    /// a command line is visible to other users.
+    #[arg(long, value_name = "T")]
+    token: Option<String>,
+    /// Read the token to send from this file.
+    #[arg(long, value_name = "F", conflicts_with = "token")]
+    token_file: Option<std::path::PathBuf>,
+    /// Where --as-app finds its gate credential, instead of <home>/test-gate-credential.
+    #[arg(long, value_name = "F")]
+    gate_credential_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -200,9 +286,21 @@ struct CallOptions {
     /// The hello's gate credential.
     #[arg(long, value_name = "C")]
     gate_credential: Option<String>,
-    /// The token to send, instead of the one in <home>/rlxd/token.
+    /// The token to send, instead of the one in <home>/rlxd/token. Prefer --token-file:
+    /// a command line is visible to other users.
     #[arg(long, value_name = "T")]
     token: Option<String>,
+    /// Read the token to send from this file.
+    #[arg(long, value_name = "F", conflicts_with = "token")]
+    token_file: Option<std::path::PathBuf>,
+    /// Connect to this socket (a named pipe on Windows) instead of the home's, such as
+    /// the local end of `ssh -N -L <PATH>:<host's socket> host`. Needs --token-file or
+    /// --token, and with --as-app --gate-credential-file: this home's are never sent.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
+    /// Where --as-app keeps its gate credential, instead of <home>/test-gate-credential.
+    #[arg(long, value_name = "F", conflicts_with = "gate_credential")]
+    gate_credential_file: Option<std::path::PathBuf>,
     /// The hello's protocol version.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     protocol_version: Option<String>,
@@ -235,6 +333,10 @@ pub fn main() -> ExitCode {
         } => serve::serve(background, gate_dev_mode),
         Action::Status { json } => cli::status(json),
         Action::Stop => cli::stop(),
+        Action::Licenses => {
+            print!("{THIRD_PARTY_NOTICES}");
+            ExitCode::SUCCESS
+        }
         Action::Here {
             json,
             start,
@@ -251,7 +353,12 @@ pub fn main() -> ExitCode {
             role: options.role,
             client: options.client,
             gate_credential: options.gate_credential,
-            token: options.token,
+            target: cli::Target {
+                socket: options.socket,
+                token: options.token,
+                token_file: options.token_file,
+                gate_credential_file: options.gate_credential_file,
+            },
             protocol_version: options.protocol_version,
             env: options.env,
             raw: options.raw,
@@ -265,6 +372,21 @@ pub fn main() -> ExitCode {
             force,
         }) => cli::gate_pair(request_id, !deny, force),
         Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
+        #[cfg(windows)]
+        Action::PtyShim { job, argv } => pty::shim(&job, &argv),
+        Action::Attach { pty_id, read_only } => {
+            attach::attach(attach::AttachArgs { pty_id, read_only })
+        }
+        #[cfg(feature = "debug-methods")]
+        Action::TestHook {
+            event,
+            run,
+            attempt,
+        } => test_hook::main(&event, &run, attempt),
+        #[cfg(unix)]
+        Action::RunGuard { argv } => runner::guard::main(&argv),
+        #[cfg(not(unix))]
+        Action::RunGuard { .. } => ExitCode::from(2),
         Action::Events(options) => events::events(events::EventsArgs {
             as_app: options.as_app,
             topics: options.topics,
@@ -273,6 +395,12 @@ pub fn main() -> ExitCode {
             until: options.until,
             limit: options.limit,
             timeout: options.timeout,
+            target: cli::Target {
+                socket: options.socket,
+                token: options.token,
+                token_file: options.token_file,
+                gate_credential_file: options.gate_credential_file,
+            },
         }),
     }
 }

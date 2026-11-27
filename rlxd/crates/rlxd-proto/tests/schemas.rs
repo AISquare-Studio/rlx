@@ -9,9 +9,13 @@ use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Detail, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
-    InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request,
-    RequestId, Role, RunScope, SCHEMA_VERSION, StatusData, SubscribeParams, codes, daemon_kinds,
-    event_types, methods, protocol_version_of, schema_version_of, schemas, topics,
+    InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, PtyCursor,
+    PtyExited, PtyInfo, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen,
+    PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role,
+    RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams,
+    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, codes,
+    daemon_kinds, event_types, methods, protocol_version_of, schema_version_of, schemas,
+    send_safety_lowers, send_safety_modes, setting_is_protected, setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1825,4 +1829,769 @@ fn a_here_reply_refuses_its_wrong_shapes() {
         broken[inner][field] = value;
         both_refuse::<HereData>("here-reply.json", broken);
     }
+}
+
+// --- settings -----------------------------------------------------------------------------
+
+#[test]
+fn settings_documents_validate_and_print_back_as_themselves() {
+    for key in [
+        "theme",
+        "rlxapp.sidebar",
+        "rlxapp.sidebar.width",
+        "later_known_key",
+    ] {
+        let get = json!({ "key": key });
+        assert_eq!(agrees::<SettingsGetParams>("settings-get.json", &get), get);
+    }
+    let set = json!({"key": "theme", "value": "rlx_light", "expected_version": 3});
+    assert_eq!(agrees::<SettingsSetParams>("settings-set.json", &set), set);
+    let long_theme = "é".repeat(64);
+    let long_sign_off = "—".repeat(512);
+    for (key, value) in [
+        ("theme", json!(long_theme)),
+        (
+            "layout",
+            json!({"panes": [1, 2], "sidebar": {"open": true}}),
+        ),
+        ("agent_sign_off", json!("— Ava, Sam's AI Agent")),
+        ("agent_sign_off", json!("")),
+        ("agent_sign_off", json!(long_sign_off)),
+        ("send_safety_mode", json!({"default": "draft"})),
+        (
+            "send_safety_mode",
+            json!({"default": "standing_approval", "connectors": {"claude.ai Slack": "auto"}}),
+        ),
+        ("rlxapp.sidebar", json!(240)),
+        ("rlxapp.flags", json!([true, "x", {"y": null}])),
+        ("rlxapp.note", json!("")),
+        // A bare key a later rlxd may know: its shape is that rlxd's to check.
+        ("later_known_key", json!("anything")),
+    ] {
+        agrees::<SettingsSetParams>("settings-set.json", &json!({"key": key, "value": value}));
+    }
+    for list in [
+        json!({}),
+        json!({"prefix": "rlxapp."}),
+        json!({"prefix": ""}),
+    ] {
+        agrees::<SettingsListParams>("settings-list.json", &list);
+    }
+
+    let set_one = json!({"key": "theme", "version": 4, "value": "rlx_light",
+        "updated_at": TIME, "by_device": "Sam's MacBook"});
+    assert_eq!(agrees::<Setting>("setting.json", &set_one), set_one);
+    let unset = json!({"key": "send_safety_mode", "version": 0});
+    assert_eq!(agrees::<Setting>("setting.json", &unset), unset);
+    let list = json!({"settings": [set_one, without(&set_one, "by_device")]});
+    assert_eq!(
+        agrees::<SettingsList>("settings-list-reply.json", &list),
+        list
+    );
+    agrees::<SettingsList>("settings-list-reply.json", &json!({"settings": []}));
+    let changed = json!({"key": "theme", "version": 4, "by_device": "Sam's MacBook"});
+    assert_eq!(
+        agrees::<SettingsChanged>("settings-changed.json", &changed),
+        changed
+    );
+    agrees::<SettingsChanged>("settings-changed.json", &without(&changed, "by_device"));
+    // What a client does not know is ignored.
+    agrees::<Setting>("setting.json", &with(&set_one, "later", json!(1)));
+    agrees::<SettingsChanged>("settings-changed.json", &with(&changed, "later", json!(1)));
+}
+
+#[test]
+fn settings_documents_refuse_their_wrong_shapes() {
+    for key in [
+        json!(""),
+        json!("Theme"),
+        json!("a..b"),
+        json!(".a"),
+        json!("a."),
+        json!("x".repeat(129)),
+        json!(1),
+        json!(null),
+    ] {
+        both_refuse::<SettingsGetParams>("settings-get.json", json!({ "key": key }));
+    }
+    both_refuse::<SettingsGetParams>("settings-get.json", json!({}));
+    both_refuse::<SettingsGetParams>("settings-get.json", json!(["theme"]));
+
+    let long_theme = "x".repeat(65);
+    let long_sign_off = "x".repeat(513);
+    for (key, value) in [
+        ("theme", json!("")),
+        ("theme", json!(long_theme)),
+        ("theme", json!(1)),
+        ("layout", json!("wide")),
+        ("layout", json!([1])),
+        ("agent_sign_off", json!(long_sign_off)),
+        ("agent_sign_off", json!(null)),
+        ("send_safety_mode", json!("draft")),
+        ("send_safety_mode", json!({"default": "yolo"})),
+        ("send_safety_mode", json!({"connectors": {"s": "auto"}})),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": {"": "auto"}}),
+        ),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": {"s": "nope"}}),
+        ),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": ["auto"]}),
+        ),
+        // A policy is strict: a field it doesn't know is refused, not ignored.
+        ("send_safety_mode", json!({"default": "auto", "extra": 1})),
+        (
+            "send_safety_mode",
+            json!({"default": "draft", "connectors": {}, "later": true}),
+        ),
+        ("rlxapp.sidebar", json!(null)),
+    ] {
+        both_refuse::<SettingsSetParams>("settings-set.json", json!({"key": key, "value": value}));
+    }
+    for wrong in [
+        json!({"key": "theme"}),
+        json!({"key": "theme", "value": "x", "expected_version": -1}),
+        json!({"key": "theme", "value": "x", "expected_version": null}),
+        json!({"value": "x"}),
+        json!([]),
+    ] {
+        both_refuse::<SettingsSetParams>("settings-set.json", wrong);
+    }
+    both_refuse::<SettingsListParams>("settings-list.json", json!({ "prefix": "x".repeat(129) }));
+    both_refuse::<SettingsListParams>("settings-list.json", json!({"prefix": null}));
+    both_refuse::<SettingsListParams>("settings-list.json", json!([]));
+
+    let set_one = json!({"key": "theme", "version": 4, "value": "rlx_light",
+        "updated_at": TIME});
+    for wrong in [
+        with(
+            &json!({"key": "theme", "version": 0}),
+            "value",
+            json!("rlx"),
+        ),
+        with(
+            &json!({"key": "theme", "version": 0}),
+            "updated_at",
+            json!(TIME),
+        ),
+        with(
+            &json!({"key": "theme", "version": 0}),
+            "by_device",
+            json!("d"),
+        ),
+        without(&set_one, "value"),
+        without(&set_one, "updated_at"),
+        with(&set_one, "updated_at", json!("yesterday")),
+        with(&set_one, "value", json!(7)),
+        with(&set_one, "value", json!(null)),
+        with(&set_one, "by_device", json!("")),
+        with(&set_one, "version", json!(-1)),
+    ] {
+        both_refuse::<Setting>("setting.json", wrong);
+    }
+    both_refuse::<SettingsList>(
+        "settings-list-reply.json",
+        json!({"settings": [without(&set_one, "value")]}),
+    );
+    for wrong in [
+        json!({"key": "theme", "version": 0}),
+        json!({"key": "theme", "version": 1, "by_device": ""}),
+        json!({"key": "Theme", "version": 1}),
+    ] {
+        both_refuse::<SettingsChanged>("settings-changed.json", wrong);
+    }
+}
+
+#[test]
+fn settings_builders_print_what_their_schemas_accept() {
+    let set = SettingsSetParams::new(setting_keys::THEME, json!("rlx"))
+        .unwrap()
+        .expecting(0);
+    let printed = serde_json::to_value(&set).unwrap();
+    assert_eq!(
+        printed,
+        json!({"key": "theme", "value": "rlx", "expected_version": 0})
+    );
+    agrees::<SettingsSetParams>("settings-set.json", &printed);
+    assert_eq!(refused(SettingsSetParams::new("theme", json!(1))), "value");
+    assert_eq!(refused(SettingsSetParams::new("a..b", json!(1))), "key");
+    assert_eq!(refused(SettingsGetParams::new("")), "key");
+    let list = SettingsListParams::new().with_prefix("rlxapp.");
+    agrees::<SettingsListParams>("settings-list.json", &serde_json::to_value(&list).unwrap());
+
+    let unset = Setting::unset(setting_keys::SEND_SAFETY_MODE).unwrap();
+    agrees::<Setting>("setting.json", &serde_json::to_value(&unset).unwrap());
+    let mode = json!({"default": send_safety_modes::DRAFT});
+    let set_one = Setting::new("send_safety_mode", 2, mode, TIME, Some("d".to_owned())).unwrap();
+    agrees::<Setting>("setting.json", &serde_json::to_value(&set_one).unwrap());
+    assert_eq!(
+        refused(Setting::new("theme", 0, json!("x"), TIME, None)),
+        "version"
+    );
+    assert_eq!(
+        refused(Setting::new("theme", 1, json!("x"), "now", None)),
+        "updated_at"
+    );
+    let listed = SettingsList::new(vec![set_one.clone(), unset]).unwrap();
+    agrees::<SettingsList>(
+        "settings-list-reply.json",
+        &serde_json::to_value(&listed).unwrap(),
+    );
+
+    let changed = SettingsChanged::new("theme", 3, None).unwrap();
+    let data = changed.to_data().unwrap();
+    assert_eq!(
+        Value::Object(data.clone()),
+        json!({"key": "theme", "version": 3})
+    );
+    let event = Event::new(
+        9,
+        TIME,
+        topics::SETTINGS,
+        event_types::SETTINGS_CHANGED,
+        data,
+    )
+    .unwrap();
+    agrees::<Event>("event.json", &serde_json::to_value(&event).unwrap());
+    assert_eq!(refused(SettingsChanged::new("theme", 0, None)), "version");
+    // The settings topic's types start with it, as every topic's must.
+    let wrong = json!({"schema_version": 1, "seq": 1, "time": TIME, "topic": "settings",
+        "type": "daemon.started", "data": {}});
+    both_refuse::<Event>("event.json", wrong);
+}
+
+#[test]
+fn the_settings_api_names_its_methods_codes_and_gated_keys() {
+    assert_eq!(methods::SETTINGS_GET, "settings.get");
+    assert_eq!(methods::SETTINGS_SET, "settings.set");
+    assert_eq!(methods::SETTINGS_LIST, "settings.list");
+    assert!(topics::ALL.contains(&topics::SETTINGS));
+    assert_eq!(methods::SETTINGS_DELETE, "settings.delete");
+    assert_eq!(event_types::SETTINGS_DELETED, "settings.deleted");
+    for key in [
+        "send_safety_mode",
+        "policy.app_absent",
+        "policy.connectors.slack",
+    ] {
+        assert!(setting_is_protected(key), "{key}");
+    }
+    for key in [
+        "theme",
+        "layout",
+        "agents.ava",
+        "rlxapp.policy",
+        "policyx.y",
+        "policy",
+    ] {
+        assert!(!setting_is_protected(key), "{key}");
+    }
+    for key in setting_keys::KNOWN {
+        assert!(
+            !key.contains('.'),
+            "known keys are bare; dotted ones are free"
+        );
+    }
+    for code in [codes::CONFLICT, codes::UNKNOWN_SETTING] {
+        let reply = Envelope::err(ErrorBody::new(code, "m").unwrap()).with_id(id(1));
+        agrees::<Envelope>("envelope.json", &serde_json::to_value(&reply).unwrap());
+    }
+}
+
+#[test]
+fn send_safety_lowers_compares_every_connectors_mode() {
+    let lowers = |before: Option<Value>, after: Value| send_safety_lowers(before.as_ref(), &after);
+    assert!(
+        lowers(None, json!({"default": "auto"})),
+        "never set reads as draft"
+    );
+    assert!(!lowers(None, json!({"default": "draft"})));
+    assert!(!lowers(
+        Some(json!({"default": "auto"})),
+        json!({"default": "draft"})
+    ));
+    // The floor stays auto, but gmail goes from draft (the default) to auto.
+    assert!(lowers(
+        Some(json!({"default": "draft", "connectors": {"slack": "auto"}})),
+        json!({"default": "draft", "connectors": {"slack": "auto", "gmail": "auto"}})
+    ));
+    // A connector's own mode removed: it falls back to a less safe default.
+    assert!(lowers(
+        Some(json!({"default": "auto", "connectors": {"slack": "draft"}})),
+        json!({"default": "auto"})
+    ));
+    // Raised for one, the same for the rest.
+    assert!(!lowers(
+        Some(json!({"default": "standing_approval", "connectors": {"slack": "auto"}})),
+        json!({"default": "standing_approval", "connectors": {"slack": "draft"}})
+    ));
+    assert!(!lowers(
+        Some(json!({"default": "draft"})),
+        json!("not a mode")
+    ));
+    assert_eq!(
+        send_safety_modes::ALL,
+        ["draft", "standing_approval", "auto"]
+    );
+}
+
+#[test]
+fn a_setting_value_nests_at_most_32_deep_and_the_types_say_so() {
+    let nested = |depth: usize| -> Value {
+        serde_json::from_str(&format!("{}1{}", "[".repeat(depth), "]".repeat(depth))).unwrap()
+    };
+    let ok = SettingsSetParams::new("rlxapp.deep", nested(32));
+    assert!(ok.is_ok(), "{ok:?}");
+    assert_eq!(
+        refused(SettingsSetParams::new("rlxapp.deep", nested(33))),
+        "value"
+    );
+    let objects = |depth: usize| (0..depth).fold(json!(1), |inner, _| json!({ "a": inner }));
+    assert!(SettingsSetParams::new("layout", objects(32)).is_ok());
+    assert_eq!(
+        refused(SettingsSetParams::new("layout", objects(33))),
+        "value"
+    );
+    // The schema can't count depth: it takes what the type refuses, as documented.
+    let deep = json!({"key": "rlxapp.deep", "value": nested(40)});
+    assert_valid("settings-set.json", &deep);
+    assert!(serde_json::from_value::<SettingsSetParams>(deep).is_err());
+    let stored = json!({"key": "rlxapp.deep", "version": 1, "value": nested(40),
+        "updated_at": TIME});
+    assert!(serde_json::from_value::<Setting>(stored).is_err());
+}
+
+#[test]
+fn settings_delete_params_validate_and_refuse_their_wrong_shapes() {
+    let whole = json!({"key": "rlxapp.sidebar", "expected_version": 3});
+    assert_eq!(
+        agrees::<SettingsDeleteParams>("settings-delete.json", &whole),
+        whole
+    );
+    agrees::<SettingsDeleteParams>("settings-delete.json", &json!({"key": "policy.app_absent"}));
+    for wrong in [
+        json!({}),
+        json!({"key": ""}),
+        json!({"key": "A"}),
+        json!({"key": "theme", "expected_version": -1}),
+        json!({"key": "theme", "expected_version": null}),
+        json!([]),
+    ] {
+        both_refuse::<SettingsDeleteParams>("settings-delete.json", wrong);
+    }
+    let built = SettingsDeleteParams::new("theme").unwrap().expecting(2);
+    assert_eq!(
+        serde_json::to_value(&built).unwrap(),
+        json!({"key": "theme", "expected_version": 2})
+    );
+    assert_eq!(refused(SettingsDeleteParams::new("a..b")), "key");
+}
+
+#[test]
+fn send_safety_mode_is_strict_for_a_writer_and_additive_for_a_reader() {
+    // A later rlxd's field, in what a client reads: taken, and printed back with it, so a
+    // new field never costs an older client its settings.list.
+    let later = json!({"default": "draft", "connectors": {"slack": "auto"}, "later": 1});
+    let setting = json!({"key": "send_safety_mode", "version": 7, "value": later,
+                         "updated_at": "2026-11-26T12:00:00.000Z", "by_device": "Sam MacBook"});
+    assert_eq!(agrees::<Setting>("setting.json", &setting), setting);
+    let list = json!({ "settings": [setting] });
+    assert_eq!(
+        agrees::<SettingsList>("settings-list-reply.json", &list),
+        list
+    );
+    assert!(rlxd_proto::check_setting_value("value", "send_safety_mode", &later).is_ok());
+    assert!(!send_safety_lowers(
+        Some(&json!({"default": "draft"})),
+        &json!({"default": "draft", "later": 1})
+    ));
+
+    // What a writer sends: refused, by the schema and the type alike.
+    let error = both_refuse::<SettingsSetParams>(
+        "settings-set.json",
+        json!({"key": "send_safety_mode", "value": later}),
+    );
+    assert!(error.contains("no other field"), "{error}");
+    assert!(rlxd_proto::check_setting_value_to_write("value", "send_safety_mode", &later).is_err());
+    // A reader still refuses a value that is not a policy at all.
+    both_refuse::<Setting>(
+        "setting.json",
+        json!({"key": "send_safety_mode", "version": 7, "value": {"default": "often"},
+               "updated_at": "2026-11-26T12:00:00.000Z"}),
+    );
+}
+
+const PTY: &str = "6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b";
+
+#[test]
+fn pty_documents_validate_and_print_back_as_themselves() {
+    for spawn in [
+        json!({"argv": ["sh", "-c", "echo ready; sleep 30"], "cols": 80, "rows": 24}),
+        json!({"argv": ["claude", ""], "cols": 1, "rows": 1000, "cwd": "/Users/sam/code",
+               "env": {"FOO": "1", "BAR": null, "EMPTY": ""}, "label": "coder · Ava"}),
+    ] {
+        assert_eq!(agrees::<PtySpawnParams>("pty-spawn.json", &spawn), spawn);
+    }
+    let one = json!({ "pty_id": PTY });
+    assert_eq!(agrees::<PtyRef>("pty-ref.json", &one), one);
+    assert_eq!(agrees::<PtyKillParams>("pty-kill.json", &one), one);
+    assert_eq!(agrees::<PtyScreenParams>("pty-screen.json", &one), one);
+    for write in [
+        json!({"pty_id": PTY, "text": "hello\u{3}"}),
+        json!({"pty_id": PTY, "text": ""}),
+        json!({"pty_id": PTY, "keys": ["C-c", "Enter", "S-Enter", "M-é", "PageDown", "y"]}),
+        json!({"pty_id": PTY, "paste": "two\nlines"}),
+    ] {
+        assert_eq!(agrees::<PtyWriteParams>("pty-write.json", &write), write);
+    }
+    let resize = json!({"pty_id": PTY, "cols": 1000, "rows": 1});
+    assert_eq!(
+        agrees::<PtyResizeParams>("pty-resize.json", &resize),
+        resize
+    );
+    let screen = json!({"pty_id": PTY, "scrollback": 50_000});
+    assert_eq!(
+        agrees::<PtyScreenParams>("pty-screen.json", &screen),
+        screen
+    );
+    for read_only in [true, false] {
+        let subscribe = json!({"pty_id": PTY, "read_only": read_only});
+        assert_eq!(
+            agrees::<PtySubscribeParams>("pty-subscribe.json", &subscribe),
+            subscribe
+        );
+    }
+
+    let live = json!({"pty_id": PTY, "text": "\u{1b}[31mred\u{1b}[39m plain\n\n",
+        "cursor": {"x": 80, "y": 0, "visible": false}, "cols": 80, "rows": 2,
+        "alternate": true, "history": 50_000, "exited": false, "seq": 0});
+    assert_eq!(agrees::<PtyScreen>("pty-screen-reply.json", &live), live);
+    let ended = json!({"pty_id": PTY, "text": "", "cursor": {"x": 0, "y": 0, "visible": true},
+        "cols": 80, "rows": 24, "alternate": false, "history": 0, "exited": true,
+        "status": 137, "signal": 9, "seq": 41});
+    assert_eq!(agrees::<PtyScreen>("pty-screen-reply.json", &ended), ended);
+    // A PTY whose screen model failed: named while rlxd ends it, and after.
+    for (exited, status) in [(false, None), (true, Some(129))] {
+        let mut failed = json!({"pty_id": PTY, "text": "\n", "cursor": {"x": 0, "y": 0,
+            "visible": true}, "cols": 80, "rows": 1, "alternate": false, "history": 0,
+            "exited": exited, "error": "screen_failed", "seq": 9});
+        if let Some(status) = status {
+            failed["status"] = json!(status);
+            failed["signal"] = json!(1);
+        }
+        assert_eq!(
+            agrees::<PtyScreen>("pty-screen-reply.json", &failed),
+            failed
+        );
+    }
+
+    let list = json!({"ptys": [
+        {"pty_id": PTY, "label": "coder", "argv": ["sh"], "cwd": "/Users/sam", "pid": 4242,
+         "cols": 80, "rows": 24, "started_at": TIME, "exited": false},
+        {"pty_id": "0".repeat(32), "argv": ["cmd", "/c", "exit 3"], "cwd": "C:\\Users\\sam",
+         "pid": 1, "cols": 80, "rows": 24, "started_at": TIME, "exited": true,
+         "status": 4_294_967_295_u32},
+        {"pty_id": "1".repeat(32), "argv": ["sh"], "cwd": "/", "pid": 7, "cols": 80,
+         "rows": 24, "started_at": TIME, "exited": true, "status": 129, "signal": 1,
+         "error": "screen_failed"},
+    ]});
+    assert_eq!(agrees::<PtyList>("pty-list-reply.json", &list), list);
+    agrees::<PtyList>("pty-list-reply.json", &json!({"ptys": []}));
+
+    let output = json!({"pty_id": PTY, "bytes_b64": "cmVhZHkNCg=="});
+    assert_eq!(agrees::<PtyOutput>("pty-output.json", &output), output);
+    for bytes in ["AA==", "AAA=", "AAAA", "+/+/"] {
+        agrees::<PtyOutput>(
+            "pty-output.json",
+            &json!({"pty_id": PTY, "bytes_b64": bytes}),
+        );
+    }
+    for exited in [
+        json!({"pty_id": PTY, "status": 3}),
+        json!({"pty_id": PTY, "status": 143, "signal": 15}),
+        json!({"pty_id": PTY, "status": 129, "signal": 1, "error": "screen_failed"}),
+        json!({"pty_id": PTY, "status": 1, "error": "a_later_reason"}),
+    ] {
+        assert_eq!(agrees::<PtyExited>("pty-exited.json", &exited), exited);
+    }
+
+    // The events carry them, on the topic v1 lists.
+    let event = json!({"schema_version": 1, "seq": 7, "time": TIME, "topic": "pty",
+        "type": "pty.output", "data": output});
+    agrees::<Event>("event.json", &event);
+}
+
+#[test]
+fn pty_documents_refuse_their_wrong_shapes() {
+    for id in [
+        json!(PTY.to_uppercase()),
+        json!(&PTY[1..]),
+        json!(format!("{PTY}0")),
+        json!(""),
+        json!(1),
+    ] {
+        both_refuse::<PtyRef>("pty-ref.json", json!({ "pty_id": id }));
+        both_refuse::<PtyKillParams>("pty-kill.json", json!({ "pty_id": id }));
+    }
+    for wrong in [
+        json!({"argv": [], "cols": 80, "rows": 24}),
+        json!({"argv": [""], "cols": 80, "rows": 24}),
+        json!({"argv": ["sh", "a\u{0}b"], "cols": 80, "rows": 24}),
+        json!({"argv": ["sh"], "cols": 0, "rows": 24}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 1001}),
+        json!({"argv": ["sh"], "cols": 80}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "cwd": ""}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "cwd": "/a\u{0}"}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "cwd": null}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"A=B": "1"}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"": "1"}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"A": "1\u{0}"}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"A": 1}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "label": ""}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "label": "a\nb"}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "label": "x".repeat(129)}),
+        json!(["sh"]),
+    ] {
+        both_refuse::<PtySpawnParams>("pty-spawn.json", wrong);
+    }
+    for wrong in [
+        json!({ "pty_id": PTY }),
+        json!({"pty_id": PTY, "text": "a", "paste": "b"}),
+        json!({"pty_id": PTY, "text": "a", "keys": ["Enter"]}),
+        json!({"pty_id": PTY, "keys": []}),
+        json!({"pty_id": PTY, "keys": [""]}),
+        json!({"pty_id": PTY, "keys": ["C c"]}),
+        json!({"pty_id": PTY, "keys": ["\u{1b}"]}),
+        json!({"pty_id": PTY, "keys": ["x".repeat(33)]}),
+        json!({"pty_id": PTY, "text": null}),
+    ] {
+        both_refuse::<PtyWriteParams>("pty-write.json", wrong);
+    }
+    both_refuse::<PtyResizeParams>(
+        "pty-resize.json",
+        json!({"pty_id": PTY, "cols": 80, "rows": 0}),
+    );
+    both_refuse::<PtyScreenParams>(
+        "pty-screen.json",
+        json!({"pty_id": PTY, "scrollback": 50_001}),
+    );
+    both_refuse::<PtySubscribeParams>("pty-subscribe.json", json!({ "pty_id": PTY }));
+
+    let screen = |extra: Value| {
+        let mut screen = json!({"pty_id": PTY, "text": "", "cursor": {"x": 0, "y": 0,
+            "visible": true}, "cols": 80, "rows": 24, "alternate": false, "history": 0,
+            "exited": false, "seq": 1});
+        for (k, v) in extra.as_object().unwrap() {
+            screen[k] = v.clone();
+        }
+        screen
+    };
+    for wrong in [
+        screen(json!({"exited": true})),
+        screen(json!({"status": 0})),
+        screen(json!({"exited": true, "status": 1, "signal": 0})),
+        screen(json!({"exited": true, "status": 1, "signal": 128})),
+        screen(json!({"signal": 9})),
+        screen(json!({"history": 50_001})),
+        screen(json!({"cols": 0})),
+    ] {
+        both_refuse::<PtyScreen>("pty-screen-reply.json", wrong);
+    }
+    let info = |extra: Value| {
+        let mut info = json!({"pty_id": PTY, "argv": ["sh"], "cwd": "/", "pid": 4242,
+            "cols": 80, "rows": 24, "started_at": TIME, "exited": false});
+        for (k, v) in extra.as_object().unwrap() {
+            info[k] = v.clone();
+        }
+        json!({ "ptys": [info] })
+    };
+    for wrong in [
+        info(json!({"pid": 0})),
+        info(json!({"started_at": "yesterday"})),
+        info(json!({"argv": []})),
+        info(json!({"exited": true})),
+        info(json!({"label": "a\u{7}"})),
+    ] {
+        both_refuse::<PtyList>("pty-list-reply.json", wrong);
+    }
+    // An error is a name: 1 to 64 lowercase letters and underscores, never null.
+    let long = "e".repeat(65);
+    for error in [
+        json!(""),
+        json!("Screen_Failed"),
+        json!("screen failed"),
+        json!(long),
+        json!(null),
+        json!(1),
+    ] {
+        both_refuse::<PtyScreen>("pty-screen-reply.json", screen(json!({ "error": error })));
+        both_refuse::<PtyList>("pty-list-reply.json", info(json!({ "error": error })));
+        both_refuse::<PtyExited>(
+            "pty-exited.json",
+            json!({"pty_id": PTY, "status": 1, "error": error}),
+        );
+    }
+    for bytes in ["", "abc", "ab=c", "a===", "ab c", "é123"] {
+        both_refuse::<PtyOutput>(
+            "pty-output.json",
+            json!({"pty_id": PTY, "bytes_b64": bytes}),
+        );
+    }
+    for wrong in [
+        json!({ "pty_id": PTY }),
+        json!({"pty_id": PTY, "status": 1, "signal": 200}),
+        json!({"pty_id": PTY, "status": -1}),
+    ] {
+        both_refuse::<PtyExited>("pty-exited.json", wrong);
+    }
+}
+
+#[test]
+fn a_write_carries_at_most_128_kib_and_the_types_count_its_bytes() {
+    let most = "x".repeat(rlxd_proto::MAX_PTY_WRITE);
+    for field in ["text", "paste"] {
+        agrees::<PtyWriteParams>("pty-write.json", &json!({"pty_id": PTY, field: most}));
+        // Past the cap in bytes, not in characters: the schema can't count bytes.
+        let over = "é".repeat(rlxd_proto::MAX_PTY_WRITE / 2 + 1);
+        let instance = json!({"pty_id": PTY, field: over});
+        assert_valid("pty-write.json", &instance);
+        let error = serde_json::from_value::<PtyWriteParams>(instance).unwrap_err();
+        assert!(error.to_string().contains("more than 131072"), "{error}");
+    }
+}
+
+#[test]
+fn pty_builders_print_what_their_schemas_accept_and_refuse_the_rest() {
+    let spawn = PtySpawnParams::new(vec!["sh".to_owned()], 80, 24)
+        .unwrap()
+        .in_dir("/tmp")
+        .with_env("FOO", Some("1".to_owned()))
+        .with_env("BAR", None)
+        .labelled("coder");
+    assert_valid("pty-spawn.json", &serde_json::to_value(&spawn).unwrap());
+    assert!(PtySpawnParams::new(Vec::new(), 80, 24).is_err());
+    assert!(PtySpawnParams::new(vec!["sh".to_owned()], 80, 0).is_err());
+    let broken = spawn.labelled("");
+    assert!(
+        serde_json::to_value(&broken).is_err(),
+        "a broken value never prints"
+    );
+
+    for write in [
+        PtyWriteParams::text(PTY, "hi").unwrap(),
+        PtyWriteParams::keys(PTY, vec!["Enter".to_owned()]).unwrap(),
+        PtyWriteParams::paste(PTY, "a\nb").unwrap(),
+    ] {
+        assert_valid("pty-write.json", &serde_json::to_value(&write).unwrap());
+    }
+    assert!(PtyWriteParams::keys(PTY, Vec::new()).is_err());
+    assert!(PtyWriteParams::text("nope", "hi").is_err());
+    assert_eq!(
+        PtyWriteParams::keys(PTY, vec!["Up".to_owned()])
+            .unwrap()
+            .input(),
+        rlxd_proto::PtyInput::Keys(&["Up".to_owned()])
+    );
+
+    let screen = PtyScreen::new(PTY, "ready\n", PtyCursor::new(0, 1, true), 80, 24, 9)
+        .unwrap()
+        .with_state(false, 12)
+        .unwrap()
+        .with_exit(3, None)
+        .unwrap();
+    assert_valid(
+        "pty-screen-reply.json",
+        &serde_json::to_value(&screen).unwrap(),
+    );
+    let snapshot = screen.to_data().unwrap();
+    assert_eq!(snapshot["status"], 3);
+    assert!(
+        PtyScreen::new(PTY, "", PtyCursor::new(0, 0, true), 80, 24, 0)
+            .unwrap()
+            .with_exit(1, Some(0))
+            .is_err()
+    );
+
+    let info = PtyInfo::new(PTY, vec!["sh".to_owned()], "/", 4242, 80, 24, TIME)
+        .unwrap()
+        .with_label(Some("coder".to_owned()))
+        .unwrap()
+        .with_exit(143, Some(15))
+        .unwrap();
+    let list = PtyList::new(vec![info]).unwrap();
+    assert_valid("pty-list-reply.json", &serde_json::to_value(&list).unwrap());
+    assert!(PtyInfo::new(PTY, vec!["sh".to_owned()], "/", 0, 80, 24, TIME).is_err());
+
+    let output = PtyOutput::new(PTY, "cmVhZHkNCg==")
+        .unwrap()
+        .to_data()
+        .unwrap();
+    assert_valid("pty-output.json", &Value::Object(output));
+    let exited = PtyExited::new(PTY, 3, None).unwrap().to_data().unwrap();
+    assert_valid("pty-exited.json", &Value::Object(exited));
+    assert!(PtyExited::new(PTY, 1, Some(128)).is_err());
+    assert!(PtyResizeParams::new(PTY, 1001, 24).is_err());
+    assert!(
+        PtyScreenParams::new(PTY)
+            .unwrap()
+            .with_scrollback(50_001)
+            .validate()
+            .is_err()
+    );
+    assert!(PtySubscribeParams::new(PTY, true).is_ok());
+    assert!(PtyKillParams::new("").is_err());
+    assert!(PtyRef::new(PTY).is_ok());
+}
+
+#[test]
+fn the_pty_host_names_its_methods_codes_and_event_types() {
+    assert_eq!(
+        [
+            methods::PTY_SPAWN,
+            methods::PTY_WRITE,
+            methods::PTY_RESIZE,
+            methods::PTY_SCREEN,
+            methods::PTY_SUBSCRIBE,
+            methods::PTY_KILL,
+            methods::PTY_LIST,
+        ],
+        [
+            "pty.spawn",
+            "pty.write",
+            "pty.resize",
+            "pty.screen",
+            "pty.subscribe",
+            "pty.kill",
+            "pty.list"
+        ]
+    );
+    assert_eq!(
+        [
+            codes::ROLE_NOT_ALLOWED,
+            codes::TOO_MANY_PTYS,
+            codes::UNKNOWN_PTY,
+            codes::READ_ONLY,
+            codes::PTY_EXITED,
+            codes::SPAWN_FAILED,
+        ],
+        [
+            "role_not_allowed",
+            "too_many_ptys",
+            "unknown_pty",
+            "read_only",
+            "pty_exited",
+            "spawn_failed"
+        ]
+    );
+    for r#type in [
+        event_types::PTY_OUTPUT,
+        event_types::PTY_EXITED,
+        event_types::PTY_SNAPSHOT,
+    ] {
+        assert!(r#type.starts_with("pty."), "{type}");
+    }
+    assert!(topics::ALL.contains(&topics::PTY));
 }

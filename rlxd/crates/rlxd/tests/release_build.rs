@@ -3,10 +3,14 @@
 //! itself turns on, and checks against the test build the other tests run:
 //!
 //! - check 7 of task #22 (handoff 0.10.3, 7.3): no test-only methods, so `debug.emit` is
-//!   `unknown_method`;
+//!   `unknown_method`, and so is `debug.pty_panic` (#2479);
 //! - handoff 0.10.3 rev 7, 5.1, "No dev mode in a release build": no `--gate-dev-mode`
 //!   flag, `gate.dev_mode` in the config ignored, no marker in `rlxd --version` or in
-//!   status, and not even the feature's name in the binary.
+//!   status, and not even the feature's name in the binary;
+//! - no `fake-claude`: the runner tests' stand-in for Claude Code is a binary only the
+//!   test-only `fake-claude` feature builds;
+//! - no scheduler test clock: no `debug.clock_advance` or `debug.clock_set`, and
+//!   `RLXD_TEST_CLOCK` is not read, so its jobs run on the system's clock.
 
 mod common;
 
@@ -19,6 +23,9 @@ fn check_7_a_release_build_has_no_debug_methods() {
     let run = release.rlxd(&["call", "debug.emit", r#"{"count":1}"#]);
     assert_eq!(run.code(), Some(1), "{run:?}");
     assert_eq!(run.error_code(), "unknown_method");
+    // Nor the method that makes a PTY's screen model panic.
+    let panic = release.rlxd(&["call", "debug.pty_panic", r#"{"pty_id":"0","at":"output"}"#]);
+    assert_eq!(panic.error_code(), "unknown_method", "{panic:?}");
     let hint = run.json()["error"]["hint"].as_str().unwrap().to_owned();
     assert!(
         hint.contains("events.subscribe") && !hint.contains("debug"),
@@ -30,10 +37,146 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "it published daemon.started only"
     );
 
+    // Nor the runner's test-only start with a scheduler job_id, nor the scheduler's
+    // test clock.
+    let run = release.rlxd(&["call", "debug.run_start", r#"{"job_id":"j"}"#]);
+    assert_eq!(run.error_code(), "unknown_method", "{run:?}");
+    for (method, params) in [
+        ("debug.clock_advance", r#"{"seconds":60}"#),
+        ("debug.clock_set", r#"{"at":"2030-01-01T00:00:00Z"}"#),
+    ] {
+        let run = release.rlxd(&["call", method, params]);
+        assert_eq!(run.error_code(), "unknown_method", "{method}: {run:?}");
+    }
+
+    // Nor the tool-call gate's test-only hook route: its methods, the hidden hook
+    // subcommand, the variables that turn them on (5.1). Not even their names.
+    for (method, params) in [
+        (
+            "debug.pre_tool_use",
+            r#"{"run_id":"r","attempt":1,"key":"k","stdin":{}}"#,
+        ),
+        ("debug.drop_hook_connections", "{}"),
+    ] {
+        let run = release.rlxd(&["call", method, params]);
+        assert_eq!(run.error_code(), "unknown_method", "{method}: {run:?}");
+    }
+    let hook = release.rlxd(&[
+        "__test-hook",
+        "pre-tool-use",
+        "--run",
+        "r",
+        "--attempt",
+        "1",
+    ]);
+    assert_eq!(hook.code(), Some(2), "no such subcommand: {hook:?}");
+    let bytes = std::fs::read(release_rlxd()).unwrap();
+    for needle in [
+        "debug.pre_tool_use",
+        "debug.drop_hook_connections",
+        "__test-hook",
+        "RLXD_TEST_HOOK",
+        "RLXD_TEST_FAIL_LEDGER",
+    ] {
+        let found = bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle.as_bytes())
+            .count();
+        assert_eq!(found, 0, "{needle} is in the release build");
+    }
+
     let test_build = TestHome::new();
     test_build.start();
     let run = test_build.rlxd(&["call", "debug.emit", r#"{"count":1}"#]);
     assert_eq!(run.code(), Some(0), "the test build has it: {run:?}");
+    let run = test_build.rlxd(&["call", "debug.pty_panic", r#"{"pty_id":"0","at":"output"}"#]);
+    assert_eq!(
+        run.error_code(),
+        "unknown_pty",
+        "the test build has it: {run:?}"
+    );
+}
+
+/// The manager's decision on #2641's licence note: every rlxd binary carries tmux's ISC
+/// notice for each file ported from it, and `rlxd licenses` prints it, a release
+/// build's as a test build's. Each file that says it is ported from tmux is named in it.
+#[test]
+fn a_release_build_carries_tmuxs_notice_for_every_ported_file() {
+    let notices = std::fs::read_to_string(common::workspace().join("THIRD_PARTY_NOTICES")).unwrap();
+    for binary in [
+        release_rlxd(),
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_rlxd")),
+    ] {
+        let run = TestHome::new()
+            .with_binary(binary.clone())
+            .rlxd(&["licenses"]);
+        assert_eq!(run.code(), Some(0), "{binary:?}: {run:?}");
+        assert_eq!(
+            run.stdout, notices,
+            "{binary:?} prints THIRD_PARTY_NOTICES as it is"
+        );
+    }
+    let src = common::workspace().join("crates/rlxd/src");
+    let mut ported = Vec::new();
+    let mut dirs = vec![src.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if std::fs::read_to_string(&path).is_ok_and(|text| {
+                text.lines().take(3).any(|line| {
+                    line.contains("from tmux 3.8")
+                        || line.contains("ported from the capture loop of tmux")
+                })
+            }) {
+                ported.push(path);
+            }
+        }
+    }
+    assert!(ported.len() >= 6, "{ported:?}");
+    for path in ported {
+        let name = path
+            .strip_prefix(common::workspace())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            notices.contains(&format!("- rlxd/{name}:")),
+            "{name} is not in THIRD_PARTY_NOTICES"
+        );
+    }
+    for holder in [
+        "Copyright (c) 2007 Nicholas Marriott",
+        "Copyright (c) 2021 Will",
+        "Copyright (c) 2022 Jeff Chiang",
+        "Copyright (c) 2009 Jonathan Alvarado",
+        "Copyright (c) 2023 Nicholas Marriott",
+    ] {
+        assert!(notices.contains(holder), "{holder}");
+    }
+    assert_eq!(
+        notices.matches("Permission to use, copy, modify").count(),
+        13
+    );
+}
+
+#[test]
+fn a_release_builds_scheduler_ignores_a_test_clock() {
+    let release = TestHome::new()
+        .with_binary(release_rlxd())
+        .with_env("RLXD_TEST_CLOCK", "2030-01-01T00:00:00Z");
+    release.start();
+    let job = r#"{"job_id":"t1","type":"run","schedule":{"every_minutes":1},
+        "run":{"kind":"task","prompt":"hi","mount":{"kind":"no_tools"}},"catch_up":"skip"}"#;
+    let put = release.rlxd(&["call", "job.put", job]);
+    assert_eq!(put.code(), Some(0), "{put:?}");
+    let list = release.rlxd(&["call", "job.list", "{}"]);
+    let next = list.data()["jobs"][0]["next_fire_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!next.starts_with("2030"), "the system's clock: {next}");
 }
 
 #[test]
@@ -87,4 +230,36 @@ fn a_release_build_has_no_gate_dev_mode() {
     let status = test_build.status();
     assert_eq!(status["gate"], "dev mode (unsigned app accepted)");
     assert_eq!(status["dev_features"], serde_json::json!(["gate-dev-mode"]));
+}
+
+#[test]
+fn a_release_build_has_no_fake_claude() {
+    // Every binary of the package that a release build makes, as `cargo build --release
+    // -p rlxd` makes them: fake-claude needs the test-only feature, so it is not one.
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--package",
+            "rlxd",
+            "--bins",
+            "--message-format=json-render-diagnostics",
+        ])
+        .current_dir(common::workspace())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("cargo runs");
+    assert!(output.status.success(), "cargo build --release failed");
+    let built: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact")
+        .filter(|message| message["executable"].is_string())
+        .filter_map(|message| message["target"]["name"].as_str().map(str::to_owned))
+        .collect();
+    assert!(built.iter().any(|name| name == "rlxd"), "{built:?}");
+    assert!(!built.iter().any(|name| name == "fake-claude"), "{built:?}");
 }

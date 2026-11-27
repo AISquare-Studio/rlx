@@ -665,3 +665,59 @@ fn a_partial_frame_holds_up_no_event_on_its_connection() {
     let (seq, _) = home.emit(1);
     assert_eq!(raw.next()["seq"], seq, "and the stream goes on");
 }
+
+/// `<home>/rlxd/seq`, holding `mark`.
+fn write_mark(home: &TestHome, mark: u64) {
+    let dir = Home::at(home.root()).rlxd_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("seq"), format!("{mark}\n")).unwrap();
+}
+
+#[test]
+fn a_home_whose_numbering_is_used_up_refuses_events_and_still_stops() {
+    let home = TestHome::new();
+    let reserve = rlxd::bus::RESERVE;
+    write_mark(&home, u64::MAX - reserve);
+    home.start();
+    let (_, last) = home.emit(reserve - 1);
+    assert_eq!(last, u64::MAX, "daemon.started, then every seq left");
+    let run = home.rlxd(&["call", "debug.emit", r#"{"count":1}"#]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert!(
+        run.json()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("every seq is used")
+    );
+    // daemon.stopping can't be numbered, and rlxd stops all the same.
+    let stop = home.rlxd(&["stop"]);
+    assert_eq!(stop.code(), Some(0), "{stop:?}");
+    assert_eq!(home.rlxd(&["status", "--json"]).code(), Some(3));
+    let log = std::fs::read_to_string(Home::at(home.root()).log_file()).unwrap();
+    assert!(log.contains("daemon.stopping was not published"), "{log}");
+    assert!(!log.contains("panicked"), "{log}");
+}
+
+#[test]
+fn a_start_that_fails_says_its_own_reason_not_an_earlier_one() {
+    let home = TestHome::new();
+    let dir = Home::at(home.root()).rlxd_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("seq"), "abc\n").unwrap();
+    let first = home.rlxd(&["serve", "--detach"]);
+    assert_eq!(first.error_code(), "start_failed");
+    assert!(first.stdout.contains("abc"), "{first:?}");
+    write_mark(&home, u64::MAX);
+    let second = home.rlxd(&["serve", "--detach"]);
+    assert_eq!(second.code(), Some(1), "{second:?}");
+    assert_eq!(second.error_code(), "start_failed");
+    let message = second.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("so few seqs are left"), "{message}");
+    assert!(
+        !message.contains("abc"),
+        "not the last start's reason: {message}"
+    );
+}

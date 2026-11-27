@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SettingsDeleteParams",
+  "description": "`settings.delete`'s params: the key to set back to never set, and, for a delete that\nmust not undo another device's write, the version it was made from.\n\n```json\n{\"key\": \"rlxapp.sidebar\", \"expected_version\": 3}\n```\n\nA version is never given twice in a home, so a stale `expected_version` from before a\ndelete and a re-create gets `conflict`.",
+  "type": "object",
+  "properties": {
+    "expected_version": {
+      "description": "Delete only if the key's version is this now, else get `conflict`. Absent deletes\nwhatever the version.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "key": {
+      "description": "The setting's key, such as `theme` or `rlxapp.sidebar`.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    }
+  },
+  "required": [
+    "key"
+  ]
+}

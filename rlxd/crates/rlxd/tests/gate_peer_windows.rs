@@ -110,10 +110,20 @@ impl TestSigner {
     /// The binary's test signer, or `None` (with a note) where no root can be trusted.
     ///
     /// One for every test: run 45852371615 attempt 1 failed while three tests each made
-    /// one, with the same subject, at the same moment on a cold runner.
+    /// one, with the same subject, at the same moment on a cold runner. CertEnroll refuses
+    /// a key made while another is made ("CX509Enrollment::_CreateRequest: Access is
+    /// denied", rc's 9be6cfb7), so a refused one is tried once more, in case another
+    /// process held it.
     fn shared() -> Option<&'static Self> {
         let made = SHARED.get_or_init(|| {
-            let made = Self::create(&unique_subject("signer"), "");
+            let mut made = Self::create(&unique_subject("signer"), "");
+            if let Err(why) = &made
+                && why.contains("Access is denied")
+            {
+                let _ = writeln!(std::io::stderr(), "gate_peer_windows: once more: {why}");
+                std::thread::sleep(Duration::from_secs(2));
+                made = Self::create(&unique_subject("signer"), "");
+            }
             // Past the harness's capture, so that every run's log shows the one signer.
             let _ = match &made {
                 Ok(signer) => writeln!(

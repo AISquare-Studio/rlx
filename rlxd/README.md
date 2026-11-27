@@ -8,9 +8,9 @@ brain and the TUI. The plan is `docs/plans/0.10.3-handoff.md`, section 1.
 This is the daemon's core (1.3, 7.2, 7.4), its event bus (1.7, 7.3) and the app gate's
 authentication (5.1): one rlxd per home, on a local socket or a named pipe, a token
 `hello`, the envelope on every reply, `status`, `events.subscribe`, and per-device gate
-credentials with the peer identity check. The PTY host, the runner and the rest arrive
-with later items, each a method on this socket that publishes on the bus. `rlxd-hook`
-answers `--version` only for now.
+credentials with the peer identity check, and the headless runner with its spaces (2.1,
+2.5, 7.5). The PTY host and the rest arrive with later items, each a method on this
+socket that publishes on the bus. `rlxd-hook` answers `--version` only for now.
 
 ```
 rlxd/
@@ -19,6 +19,7 @@ rlxd/
                        call, subscribe
   crates/rlxd/         the daemon: serve, status, stop, call, events, and the bus
   crates/rlxd-hook/    the tiny hook client (`--version` only for now)
+  crates/fake-claude/  the tests' stand-in for Claude Code (a test-only binary)
   schemas/v1/          generated from rlxd-proto and checked in; CI fails on drift
   tests/fixtures/      fake-claude scenarios
 ```
@@ -29,10 +30,12 @@ rlxd/
 rlxd serve [--detach] [--gate-dev-mode]  # run rlxd for this home; --detach returns once it takes connections (--gate-dev-mode: dev builds only)
 rlxd status [--json]    # what it is, who is connected, the gate's mode, and Claude Code's sign-in
 rlxd stop               # stop it, and wait until it has
-rlxd call [--as-app] [--role R] [--client NAME] [--gate-credential C] [--token T]
-          [--protocol-version N] [--env JSON] [--raw] <method> [<params-json>]
+rlxd call [--as-app] [--role R] [--client NAME]
+          [--gate-credential C | --gate-credential-file F] [--token T | --token-file F]
+          [--protocol-version N] [--env JSON] [--socket PATH] [--raw] <method> [<params-json>]
 rlxd events [--as-app] [--topics a,b] [--since SEQ] [--follow] [--until TYPE[,TYPE…]]
-            [--limit N] [--timeout S]
+            [--limit N] [--timeout S] [--socket PATH] [--token T | --token-file F]
+            [--gate-credential-file F]
 rlxd here [--json] [--start] [--show-token] [--protocols VERSIONS]
                         # what is installed and running here: rlx.app's probe over SSH
 rlxd gate devices       # the devices paired as the app gate: route, created, last seen
@@ -46,8 +49,9 @@ rlxd gate unpair [<device>]              # unpair one device, or every device
   primitive Python's `core.locking` takes: `flock` on POSIX, `LockFileEx` on byte 0 on
   Windows. A second `rlxd serve` exits 1 with `already_running`.
 - **Where clients connect.** On macOS and Linux, `<home>/run/rlxd.sock` (0600, in a 0700
-  folder). Its path must fit the OS's socket path limit, about 100 bytes, so a deeply
-  nested home is refused with a message naming the path. On Windows, the named pipe
+  folder). For a home nested too deep for that path to fit the OS's socket path limit,
+  the short socket `/tmp/rlxd-<uid>/<hash of home>.sock` instead: see
+  [Long homes](#long-homes-the-short-socket). On Windows, the named pipe
   `\\.\pipe\rlxd-<hash of home>`, whose DACL holds one entry, for the user rlxd runs as.
   A client checks that the pipe's server runs as its own user before it sends the token.
 - **The token,** `<home>/rlxd/token` (0600), is made once. `hello` must carry it.
@@ -150,7 +154,9 @@ One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
   so slowly that the buffer drops events it hasn't read gets one mid-stream. Gaps come
   whatever the topics.
 - **Runs.** Run events also carry `run_seq`, per run. The bus indexes them by run, and
-  a run's replay from the buffer says the home seq to follow on from.
+  a run's replay from the buffer says the home seq to follow on from. The runner writes
+  each run event to the run's log on disk before the bus publishes it: the seq is held
+  meanwhile, and later publishers wait for it, never subscribers.
 - **The buffer** holds the last 10,000 events, at most 64 MiB of them, none older than
   24 hours. One event may be at most 16 MiB, the longest line a client reads.
 - **`events.subscribe {topics?, since?, follow?}`** replays what the buffer holds after
@@ -179,6 +185,386 @@ One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
   `cargo test --release` would carry `debug-methods` and `gate-dev-mode`, because cargo
   then builds the dev-dependency. `rlxd --version` says which: a release build's is
   `rlxd <version>` alone.
+
+## Settings
+
+App settings kept in the rlx home and served to every device (the owner's multi-device
+brief, §4), the `crate::settings` module. They are not for secrets: every client with the
+token reads every one.
+
+- **The methods:** `settings.get {key}`, `settings.set {key, value, expected_version?}`,
+  `settings.list {prefix?}` and `settings.delete {key, expected_version?}`, each through
+  `rlxd call`. A stale `expected_version` gets `conflict`, with `detail.version`.
+  Versions come from one count for the whole home, so a key's only rises, even across
+  a delete and a re-create.
+- **The keys:** `theme`, `layout`, `agent_sign_off`, `send_safety_mode`, and any dotted
+  key, `<namespace>.<name>`, for later needs. Their shapes are in `schemas/v1/README.md`.
+- **Protected keys:** `send_safety_mode` and every key under `policy.`. Only an app-role
+  connection may set or delete them; any other gets `not_gate`. Every other key, agents
+  and preferences included, any client may change, so a CLI or TUI user with no app can
+  too.
+- **The log.** Every change is logged with who made it. A `send_safety_mode` change that
+  lowers send safety for any connector is logged as a warning. It needs no confirm in
+  rlxd yet; that is with the hub.
+- **Events:** each change, once on disk, is `settings.changed` or `settings.deleted
+  {key, version, by_device?}` on the `settings` topic.
+- **Limits:**
+  - a value is at most 64 KiB of JSON and 32 arrays or objects deep;
+  - a home holds at most 512 settings and 8 MiB of keys and values, so
+    `settings.list` always fits the 16 MiB line a client reads.
+- **The file** is `<home>/rlxd/settings.json`: 0600, even over a stale temporary file
+  left by a crash, compact JSON, written whole and durably. A change rewrites it as
+  blocking work, so no other connection waits on the disk.
+  - It is read key by key. A key rlxd can't hold, such as a value nested too deep or
+    over 64 KiB, is set aside alone, to a new `settings.json.unreadable-<time>`, and the
+    rest are kept. If that file can't be written, the key stays as it was, unserved.
+  - A key a newer rlxd wrote is kept as it is, and not served.
+  - A file rlxd can't read, or one that isn't a settings document at all, is moved to
+    such a file whole and logged as an error, and rlxd starts with no settings. If it
+    can't be moved either, rlxd refuses every change until a restart, so it never
+    writes over a file it could not read.
+- **An app-role connection** is one that holds the gate (5.1): a device `gate.pair`
+  paired, whose credential its `hello` carries. One whose device is unpaired, or whose
+  credential is replaced, can no longer change a protected key.
+  `crates/rlxd/tests/settings.rs` pairs a device for real, in gate dev mode.
+
+## PTYs
+
+rlxd holds processes on pseudo-terminals (handoff 1.4), as tmux held the fleet's panes:
+ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the screen.
+
+- **The methods:** `pty.spawn {argv, cols, rows, cwd?, env?, label?}`, `pty.write
+  {pty_id, text | keys | paste}`, `pty.resize`, `pty.screen {pty_id, scrollback?}`,
+  `pty.subscribe {pty_id, read_only}`, `pty.kill` and `pty.list`, each through `rlxd
+  call` but the stream. Their shapes are in `schemas/v1/README.md`.
+- **The stream:** `pty.subscribe` sends the screen (`pty.snapshot`), then the PTY's
+  `pty.output` and `pty.exited`. A client too slow to keep up gets a fresh snapshot
+  instead of what it missed; the PTY never waits for it. `pty.output` has a partition of
+  the bus to itself (20,000 events, 32 MiB), so it never pushes another topic's events
+  out.
+- **The screen is tmux's.** `pty.screen`'s `text` is what `tmux capture-pane -e -p`
+  prints for the same screen, byte for byte. `crate::vt` is tmux 3.8's own grid, screen
+  writes and input parser, ported. Each ported file keeps tmux's ISC notice.
+  `tests/vt_tmux.rs` checks it against tmux itself on 41 screens, and `tests/pty.rs`
+  runs the handoff's own `cmp`.
+- **A program's output can't take rlxd down.** The model parses what a program writes,
+  so it takes hostile bytes too; a seeded random test feeds it such bytes, with resizes
+  in the middle of sequences, and checks it never panics and its memory stays bounded.
+  Should it panic anyway, that PTY alone ends: rlxd catches the panic, ends the
+  process's group, and the PTY's screen (blank from then on), list entry and
+  `pty.exited` say `error: "screen_failed"`. rlxd, its other PTYs and every connection
+  go on. Unlike tmux, a hyperlink whose id is over 1 KiB is dropped, as one whose URI is:
+  tmux keeps up to 5,000 ids of any length.
+- **A PTY outlives every client,** and one any connection spawned is in every
+  connection's `pty.list`. A process that ends keeps its screen and exit status until
+  `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `rlxd stop` ends them all.
+- **`rlxd attach <pty_id> [--read-only]`** puts a PTY in this terminal, as `tmux -L asq
+  attach` did: its screen, then its output; this terminal's keys sent by name and its
+  pastes as pastes, so rlxd sends them as the program's modes need; the PTY sized to
+  this terminal. Ctrl-] detaches. `--read-only` sends nothing and leaves the size alone.
+- **`pty.kill`** ends the process's whole group: SIGHUP and SIGTERM, then SIGKILL after
+  two seconds. It replies once the group is gone.
+- **On Windows** each PTY's processes are in a Job Object that rlxd makes, named with
+  128 random bits, with `KILL_ON_JOB_CLOSE`; `pty.kill` ends the job. The ConPTY's
+  process is rlxd itself in a hidden mode, `rlxd __pty-shim`, which joins the job before
+  it starts the program, so nothing the program starts escapes it, and exits with the
+  program's exit code, all 32 bits. The shim lives through Ctrl-C and Ctrl-Break, which
+  the console sends the program too, and turns Ctrl-C back on for the program first: a
+  detached rlxd's process group ignores it, and every process would inherit that.
+  `pty.list`'s `pid` there is the shim's.
+- **Who may do what:** `cli` and `tui` every method; `remote` the reads and
+  `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
+- **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;
+  128 KiB a write, so the longest one fits a frame however it is escaped. A longer write
+  gets `write_too_large`, and a frame over 1 MiB `frame_too_large`; the connection stays
+  open for both. A paste over 128 KiB would need a paste in parts: §1.8's to decide.
+- **The terminal** is `TERM=xterm-256color`, `COLORTERM=truecolor`, unless `env` says
+  otherwise.
+- **The environment** is rlxd's, less what the fleet's tmux server takes out of a
+  window's (`core/spawn.py`'s `tmux_client_env`) and tmux's own `TMUX`, `TMUX_PANE`,
+  `TERM_PROGRAM` and `TERM_PROGRAM_VERSION` (`src/pty/env.rs`). `tests/pty.rs` checks
+  the lists against Python's through `uv run`, so they can't drift.
+- **A process that ends** stays a zombie until `pty.kill` or `rlxd stop` reaps it, after
+  signalling its group, so the group's id is never another's by then.
+
+## The runner and spaces
+
+rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.5 and
+7.5), the `crate::runner` and `crate::spaces` modules.
+
+- **`run.start`** (`schemas/v1/run-start.json`) takes the app's `run_id`, a lower-case
+  UUID that is also Claude Code's `--session-id`, and refuses `run_exists`,
+  `kind_mount_mismatch`, `pinned_call_required` and, until 5.5, `not_implemented` for a
+  non-empty `needs_connectors`. Each kind has its own pool (tasks 2, refreshes and
+  watches 1, the rest 2); over it, a run waits as `run.queued {position}`.
+- **The command line** is 2.1's exactly: `-p --output-format stream-json --verbose
+  --input-format stream-json --session-id <run_id> [--no-session-persistence] --tools ""
+  [--strict-mcp-config] [--json-schema …] [--append-system-prompt …]
+  [--include-partial-messages] --settings <home>/rlxd/runs/<run_id>/<attempt>/settings.json
+  --setting-sources project --permission-mode dontAsk`, never `--allowedTools` or `--bare`.
+  Claude Code is resolved to an absolute path when each attempt starts
+  (`RLXD_CLAUDE_BIN`, from rlxd's own environment only, else `claude` on rlxd's `PATH`).
+  Its environment is rlxd's own until 4.3 passes the app's.
+- **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
+  pre-tool-use --run <run_id> --attempt <n>` by the absolute path of the `rlxd-hook`
+  beside rlxd (quoted when it must be; on Windows in forward slashes, always quoted),
+  with a timeout of `deadline_ms / 1000 + 10` s. When rlxd can't name that path,
+  `run.start` refuses `hook_not_found`; it never falls back to a name on `PATH`. Its
+  requests are decided by the tool-call gate below; until rlxd-hook's pre-tool-use is
+  wired to it, `rlxd-hook` denies every call.
+- **Stdin stays open**: the prompt is a stream-json user message, and stdin closes only
+  after the `result`. Each stream-json line becomes `run.started`, `run.text` (and
+  partial chunks under `partial`), `run.tool_result` (content up to 1 MiB, then
+  `truncated`), `run.rate_limited`, `run.done` or `run.failed {reason}`. Types and fields
+  rlxd doesn't know are ignored. A line over 16 MiB fails the run (`line_too_long`)
+  without rlxd holding it, and a result or structured output over 1 MiB fails it
+  (`output_too_large`), so a run always gets its end.
+- **The process tree.** On macOS and Linux Claude Code runs under a guard, the hidden
+  `rlxd __run-guard`, which leads a new session and process group (ids: its pid, which
+  stays held while it is unreaped); Claude Code and what it starts run in that group,
+  with no terminal. The guard kills the group when Claude Code exits (what it left
+  running goes with it), and when rlxd dies (it checks its parent every 100 ms; on Linux
+  its parent-death signal too, and Claude Code's from the guard). rlxd kills the group
+  on a cancel or a timeout, and as soon as it sees the guard exit, before it reaps it,
+  so a guard killed alone leaves nothing. The guard tells rlxd how Claude Code ended
+  (`exit 1`, `signal 6`) over an inherited pipe, for `run.failed`'s message, and never
+  re-raises the signal. On Windows Claude Code is started suspended inside a Job Object
+  with `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
+  "engine_restarted"}`.
+- **The log** of each run is `<home>/rlxd/runs/<run_id>/`: `run.json`, rewritten whole and
+  durably, and `events.jsonl`, each event as published. The runner numbers each run's
+  events itself, under that run's own lock: an event that changes the run's state
+  (`run.started`, `run.needs_you`, each end) is written into `run.json`, after the log so
+  far is fsynced, before it is published; any other event is published, then appended,
+  and fsynced with the run's next state event or every 64. No fsync happens under the
+  bus's lock or the runner's, so a slow disk under one run holds up no other run and no
+  other topic.
+- **The lifecycle** (5.4). `run.get {run_id}` and `run.list {states?, job_id?, limit?}`
+  read the runs rlxd knows, those from before a restart too: rlxd reads every run's record
+  when it starts. `run.events {run_id, from_run_seq}` replays a run's log from disk,
+  never from the bus's buffer, then follows a live run until it ends; `rlxd call` prints
+  each event as a line and exits 0 when the stream closes.
+- **Needs-you and resume.** A finished run whose output matches `needs_you_when` ends
+  `run.needs_you {reason: "question", question}`, after `needs_you.raised` on the
+  `needs_you` topic. `run.resume {run_id, reply?}` goes on with a run that has no live
+  process as a new attempt (`--resume <run_id>`, its own settings file, the reply as its
+  first message), and `needs_you.cleared` follows, after a restart too. It refuses
+  `run_alive`, `not_resumable` (a `send_executor`) and `no_session`, also for a run that
+  never reached `run.started` (cancelled while queued, failed before it started), which
+  has no session to resume.
+- **After a crash or a `kill -9`,** the guard has already ended the run's process group.
+  Should the guard have died with rlxd (`killall -9 rlxd`), the next rlxd, in the same
+  boot only, kills the guard's group if the guard still runs with the recorded pid and
+  start time. Otherwise the group is the run's only when one of its processes, in the
+  guard's session and started at or after the run, carries `RLXD_RUN_ID=<run_id>`, which
+  every process of a run inherits (a group's id can't be taken while one of its
+  processes lives); then each such process is killed. On macOS an Apple binary's
+  environment is hidden, even from its own user, so a run whose leftovers are all
+  Apple's (a Bash tool's `zsh`, `sleep` or `tail -f`, with Claude Code gone) can't be
+  told from another group, and is left: the sweep never kills what it can't tell is the
+  run's. On Linux Claude Code dies with the guard (its parent-death signal), and
+  `/proc` shows the environment of each of the user's own processes. It cuts a torn last line from the run's log,
+  puts back a state event its record holds that the log lost, and ends the run `failed
+  {reason: "engine_restarted"}`, numbered on from its log.
+- **`job_id`** is set by rlxd alone, for the scheduler (7.6). Test builds have
+  `debug.run_start`, `run.start`'s params plus a `job_id`.
+- **Spaces.** `space.ensure {name}` makes `<home>/spaces/<name>/` with an empty project
+  `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
+  not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
+  separator, no `..` and no leading dot. `space.erase {name}` deletes the folder, the
+  Claude Code session files of its runs, and rlxd's records of them. Session files are
+  `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
+  (every account's config directory once the brain serves rlx's list), the space dir
+  encoded as Claude Code does: no other project folder is touched.
+  It refuses `runs_live` while a run in the space is queued, running, being started or
+  being resumed, and `link_refused` (`detail.paths`) when a link, a junction or a mount
+  point is below a root on the way: `spaces/`, the space itself, a config directory's
+  `projects/`, or the space's folder there; nothing is removed then. `<home>` and each
+  config directory are roots, taken as they resolve once (a `~/.claude` kept in dotfiles
+  is fine), and the config directories are only gone into when the space has runs. Every folder on the way is
+  opened once without following a link, and checked and removed through what was opened
+  (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
+  from being renamed meanwhile), so a link put there after the check is never followed.
+  A link inside the space goes as a link and is named in `links`, every one, under the
+  space's resolved path. A mount point inside the space (another filesystem, or on Linux
+  a bind mount of the same one) is never gone into, and a tree more than 256 folders
+  deep is not removed past that: either fails the erase `erase_incomplete`, naming it.
+  A second erase of a space being erased gets `erase_in_progress`. Paths it can't remove
+  fail it `erase_incomplete` (`detail {removed, failed}`, each failure named under the
+  space's resolved path), the runs concerned keep their records, and erasing again
+  finishes.
+
+## The tool-call gate
+
+Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
+`crate::runner::gate` module, and it fails closed.
+
+- **A hook request is bound to its run.** It must name the run's running attempt, carry
+  that attempt's key, and come from a process inside the run. The key is 256 random bits
+  made at each attempt's start (an attempt with no randomness doesn't start) and given to
+  Claude Code as `RLXD_HOOK_KEY`, so its hooks inherit it; it is compared in constant
+  time, and never logged, published or written (not in `run.json`, the run's log, its
+  settings, or rlxd's log). Any other request is denied at once, with no event and no
+  ledger entry.
+- **Inside the run** is by ancestry, not process group: Claude Code starts each hook
+  detached, in a session and process group of its own. On macOS and Linux the asking
+  process must descend from the run's guard by its parent chain, each step up checked
+  to be the real parent (a parent never started after its child, so a pid given to
+  another process since fails), and the asking process itself is the one pinned when
+  the connection was accepted: Linux holds its pidfd across the check, macOS requires
+  the process at its pid to have started before the connection was accepted. macOS has
+  no public handle on a process, so its pin is a pid and a start time, with two windows
+  left open: a peer that exits between its `connect` and rlxd's `accept`, its pid reused
+  in that instant, and a process started after the wall clock was stepped back past the
+  accept. Neither is in reach: macOS hands out pids in order, and a pid that passes must
+  also be inside the run, whose processes hold the key already. On Windows it must be in
+  the run's Job Object, checked through the process handle pinned when the pipe
+  connected. fake-claude starts its hooks detached the same way.
+- **What the key does not stop.** Every process Claude Code starts inherits the key, not
+  only its hooks, so a process inside a run (a tool's shell, say) can send a request for
+  its own run. It only ever gets the app's answer to its own request: each call is its
+  `tool_use_id`, decided once, so a forged request can't get an allow for Claude Code's
+  real call (a real call whose id was decided already is denied), and it can't reach
+  another run, whose key it doesn't have and whose guard (or job) it isn't under.
+- **rlxd's own rules come first**, before the app is looked for, and deny `by: "rlxd"`:
+  the mount (`no_tools`, or a tool of a connector the mount doesn't name), the kind
+  (`check`, `parse_instruction` and `widget_author` make no calls; `widget_refresh` and
+  `watch` make read calls only), and the pinned call (`send_executor` and `watch`: the pinned tool with the pinned
+  `input_sha256` only, and once: then every call is denied `pinned_call_used`, which
+  `run.json` keeps across attempts and restarts).
+- **A connectors run's calls are to tools its init listed.** A call reaches the app only
+  when its tool's exact name is in the attempt's `system/init` tools, and the tool is
+  one mounted server's; otherwise it is denied `by: "rlxd"`, a tool the init didn't list
+  with the reason `tool_not_in_init`. A connector still connecting when the init is
+  written has no tools in it, so its calls are denied: that is what 5.5's
+  `needs_connectors` is for, since a run that names a connector there starts its first
+  turn only once it is connected, so its tools are in the init. A tool's server is the
+  one MCP server of the attempt's `system/init` whose name, as Claude Code writes it in
+  tool names (each UTF-16 unit but a letter, a digit, `_` or `-` as `_`; for a
+  `claude.ai ` connector, runs of `_` as one and none at the ends), begins the tool's
+  name before a `__`. When none does, or more than one does (a local server named
+  `claude_ai_Slack` or `claude_ai_Slack__x` beside the `claude.ai Slack` connector), the
+  call is denied. A mount's `claude.ai ` connector is only a server whose init `source`
+  is `claudeai`: a local, user, project or plugin server named exactly `claude.ai Slack`
+  never passes as it.
+- **Read-only.** A tool is read-only only when its `system/init` entry says `annotations.readOnlyHint: true`; a hint that isn't there
+  (`null`) counts as a write, in one function, `read_only`, until the hub decides
+  otherwise (#2718).
+- **Every other call goes to the app** as `run.tool_call {call_id, tool, input,
+  input_sha256, deadline_ms}`, `input_sha256` being the SHA-256 of the input as RFC 8785
+  canonical JSON. Only `run.decide {run_id, call_id, decision, reason, draft_id?, stop?}`
+  from an app-role connection holding the gate answers it (any other gets `not_gate`);
+  the first answer wins, a later one gets `already_decided`, one after the deadline
+  `too_late`, one for a call the run never made `unknown_call`. `allow` lets the tool run;
+  `deny` and `draft` are a deny to Claude Code, with the app's reason. `stop: true` on a
+  deny also ends the run `run.needs_you {reason: "denied", call_id}`, which `run.resume`
+  goes on with as a new attempt, gated as the first was. Each decision is published as
+  `run.tool_decided {call_id, decision, by, reason}`, and `run.decide`'s reply says the
+  decision taken (rlxd's deny, when it overrode an allow). Once the app stops a run, its
+  other calls, waiting or to come, are denied by rlxd. Nothing a run writes (its text, a
+  tool's result) decides a call.
+- **No app, a lost app.** With no app connected, a call is denied `by: "unreachable"` at
+  once, a read too. A call pending when the app leaves is held until its deadline, for
+  the app to decide when it reconnects; then it is denied `by: "timeout"`. The hook's
+  timeout in the run's settings is the deadline plus 10 s, so rlxd always answers first.
+  A hook connection that ends before its call is decided (the hook killed, rlxd
+  stopping) denies it `by: "rlxd"`, and a hook that can't reach rlxd denies.
+- **The ledger**, `run.json`'s `calls` and `run.get`'s, holds each call: `decided`, or
+  `executing` for an allow, written and fsynced before the hook gets its answer, and an
+  allow whose entry can't be written is a deny `by: "rlxd"` instead (a pinned call stays
+  used); `ok` or `error` from the call's `tool_result`; `unknown` when the run ends, or
+  rlxd restarts, with it still executing (it may have sent). A call still waiting as its
+  run ends is denied `by: "rlxd"` first. The gate's writes of `run.json` keep the run's
+  last state event in it, as every record write does.
+- **Out of the gate:** PTYs (`pty.*`) are the user's own terminals, and are not gated.
+- **Test builds** have `debug.pre_tool_use {run_id, attempt, key, stdin}`, a hook request
+  from the connection's own process, and `debug.drop_hook_connections`, which ends every
+  hook connection waiting on the gate. With `RLXD_TEST_HOOK` set, each run's settings name
+  rlxd itself as the hook (the hidden `rlxd __test-hook pre-tool-use`, which asks
+  `debug.pre_tool_use`), so fake-claude's gate scenarios run a real hook command.
+  `RLXD_TEST_FAIL_LEDGER=<space>` fails the ledger writes of that space's runs. A
+  release build has none of these, nor their names.
+
+## The scheduler
+
+rlxapp's jobs (handoff 0.10.3, 2.3 and 7.6). The app owns their definitions and pushes
+them by `job_id`; rlxd keeps a definition only to fire it, and records what each fire did.
+
+- **Methods.** `job.put` creates or replaces a job, idempotently: `{job_id, type: "run",
+  schedule, run, catch_up, enabled?, loud?}`. `schedule` is `{"every_minutes": N}` or
+  `{"cron": "*/15 * * * *", "tz": "Europe/London"}`. `run` is a `run.start` template
+  without `run_id`, checked as `run.start` checks its params, so a template it would
+  refuse is refused at `job.put`, with the same code. The job's own unknown fields are
+  refused; the template's follow `run.start`'s rule, which ignores them. The same
+  definition put again (the app pushes its jobs on each connect) changes nothing. A
+  replace starts the schedule again from now only when its `schedule` changes or it is
+  enabled again; otherwise it keeps where the schedule is, a fire it owes, and a missed
+  fire waiting for an app. A replace keeps the job's record and whether it is paused. `job.list`, `job.delete`, `job.pause`, `job.resume`, and `job.run_now`, which
+  fires the job now. `job.run_now` needs an app gate client (`app_absent` otherwise);
+  `paused` doesn't stop it, a live run of the job (`job_running`) or its rate limit
+  (`rate_limited`, `detail.resets_at`) do. `job.list`'s `last_state` is the job's last run's state as the runner has it now.
+- **When.** `every_minutes` fires on a grid from `job.put`, so a late fire never drifts
+  it. Cron matches civil minutes in its IANA zone (jiff's bundled tz database, the same
+  on every OS), each once: a time a DST gap skips fires once at the gap's end, and a time
+  a fold repeats fires once, at its first occurrence.
+- **Whether.** One function decides each fire, in this order: a paused job's due fire is
+  skipped `paused`; with no app gate client connected, `app_absent` (2.3); while the
+  job's last run is queued or running, `overlap`; while a run of the job hit its rate
+  limit (a `run.rate_limited` whose `status` isn't `allowed` or `allowed_warning`, until
+  its `resets_at`, else 5 minutes; a warning holds nothing), `rate_limited`. A fire
+  rlxd couldn't make on time (it was down, or the clock jumped) is one decision however
+  many it passed: `catch_up: "once"` fires once, `"skip"` records `missed`. A fire missed
+  while rlxd was down waits 10 s after rlxd starts for an app to connect, then is
+  `app_absent`. Each `app_absent` skip is owed: when an app connects, `once` fires it
+  once, and `skip` waits for the next time.
+- **A fire** is a run of the template with a fresh `run_id`, the job's `job_id` on all
+  its events, and the job's `loud`, which rlxd only echoes, on `job.fired` and on the
+  run's `run.done` and `run.needs_you`. Events on topic `job`: `job.put`, `job.deleted`,
+  `job.paused`, `job.resumed`, `job.fired {job_id, run_id, scheduled_for, fired_at,
+  cause, loud}`, `job.skipped {job_id, scheduled_for, reason, code?}` and
+  `job.watch_result`. `job.fired`
+  goes out once the run has started, so its first run events may come before it. A run
+  that can't start is `job.skipped {reason: "start_failed", code}`, `code` being
+  `run.start`'s refusal.
+- **Watch jobs** (`"type": "watch"`, with `connector`, `tool` and an object `input`) make
+  one pinned call per tick, with no prompt of the job's; the tool must read as one of the
+  connector's (`mcp__<connector as Claude Code writes it>__…`), else `invalid_params` at
+  `job.put`. Every fire is a `watch` run with an rlxd-picked `run_id`, gated like any run
+  (5.1): an app must be connected (else `app_absent`, as for any job) and must allow the
+  call. Until `connectors.call` (5.3) exists, the run is the fallback,
+  `scheduler::watch_job`'s one route: Claude Code with rlxd's fixed prompt, "Call this
+  tool once with exactly this input; do nothing else", as its appended system prompt (so
+  its command line carries it) and as its message, which quotes the connector, the tool
+  and the input as canonical JSON in a fence, as data, and nothing of the job's as text.
+  Its mount is the connector, and its `pinned_call` is the tool and the input's RFC 8785
+  SHA-256, so a connector's text can't steer the call, and a second call, even the
+  identical one, is denied `pinned_call_used`. The allowed call's raw result is
+  `job.watch_result {job_id, run_id, tool, input_sha256, content, is_error, truncated}`
+  (`content` as `run.tool_result` carries it, up to 1 MiB): the app evaluates `match`
+  itself, never on an error or a cut result. A denied call gives none, and so does a run
+  job, even one whose template is a pinned `watch` run. When 5.3 lands,
+  `connectors.call` becomes a second route there, with the same `run_id`, gate and
+  result.
+- **Once.** Before a fire's run starts, the job (its schedule moved past the fire) and a
+  `starting` record of the fire, with its `run_id`, are written in one transaction. So
+  a crash while the run starts never fires that time again: the next rlxd settles the
+  fire as `job.fired` when the run was made, or `job.skipped start_failed
+  (engine_restarted)` when it wasn't.
+- **Storage.** `<home>/rlxd/rlxd.db`, SQLite (built in): one writer, WAL, `synchronous =
+  FULL`, migrations numbered in `schema_migrations`. The folder is 0700 and the database,
+  its `-wal` and its `-shm` 0600 on macOS and Linux (the templates hold prompts). One that
+  can't be read (corrupt, or from a newer rlxd) is moved to `rlxd.db.unreadable-<time>`,
+  logged, and reported in `status` (`jobs.db: "set_aside"`, `jobs.set_aside`), and a fresh
+  one begun; it is never reset in place. Another failure to open it (busy, locked, no
+  access) is tried three times, then the scheduler doesn't start (`jobs.db:
+  "unavailable"`, and why) and the file is left as it is. Each job keeps its last 1000
+  fire records.
+- **Tests.** Test builds have a test clock: `RLXD_TEST_CLOCK=<RFC 3339>` starts the
+  scheduler there, and `debug.clock_advance {seconds}` and `debug.clock_set {at}` move it,
+  answering once every decision due by then is made (`tests/scheduler.rs`). A release
+  build has neither. 7.6's Accept lines run on real one-minute schedules in
+  `tests/scheduler_accept.rs`, `#[ignore]`d in the test job and run by rlxd.yml's
+  `scheduler accept` job: `cargo test -p rlxd --test scheduler_accept -- --ignored`.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 
@@ -280,8 +666,9 @@ also exits 3, with `ok: false` and `not_running`.)
   free, it is not running, whatever sits at the socket's path, and `--start` replaces it.
 - **`rlxd`** is the program that answered. It can differ from the running one after an
   upgrade that has not restarted it.
-- **`socket`** is where to connect. Over SSH, the app forwards a direct-streamlocal
-  channel to it.
+- **`socket`** is where to connect: the home's `run/rlxd.sock`, or its short socket in
+  `/tmp/rlxd-<uid>/` for a deep home. Over SSH, the app forwards a direct-streamlocal
+  channel to it ([Over SSH](#over-ssh-the-socket-through-a-direct-streamlocal-channel)).
 - **`auth`**: `hello`'s `token` is the contents of `auth.token_file`, which the app reads
   inside the authenticated SSH session, or takes from `auth.token` with `--show-token`.
   The per-device gate credential (5.1) will be added here.
@@ -320,6 +707,148 @@ session).
 on ubuntu, with the host key pinned and public-key auth only. It checks that each answer
 matches the local one and that the started rlxd has no `SSH_*` variables. It also runs the
 command above in all three of its cases: rlxd, rlx only (exit 5) and nothing (exit 127).
+
+## Over SSH: the socket through a direct-streamlocal channel
+
+rlx.app reaches a host's rlxd as VS Code Remote-SSH reaches its server: through the SSH
+connection itself, on a direct-streamlocal channel to rlxd's socket (the owner's remote
+brief, §3). Nothing listens on a TCP port, on the host or on the device.
+
+1. Inside the authenticated session, run the probe: `rlxd here --json --start`, with
+   `--show-token`, or read `auth.token_file` over the session. Its `socket` is the path to
+   open the channel to, and the token is `hello`'s.
+2. Open a direct-streamlocal channel to `socket`. sshd connects to the socket as the user
+   who logged in, whom its 0600 mode admits. rlx.app's SSH client opens the channel
+   itself. With OpenSSH, `ssh -N -L <local socket>:<socket> host` makes a local socket
+   whose every connection is one such channel.
+3. Speak the protocol on the channel as on the socket: `hello` with the token, then
+   requests and event streams. From a shell, with OpenSSH:
+
+   ```sh
+   dir=$(mktemp -d)   # 0700: no one else can bind the forward's path first or read the token
+   here=$(ssh host '<rlxd> here --json --start --show-token')
+   (umask 077 && printf '%s' "$here" | jq -r .data.auth.token > "$dir/token")
+   ssh -f -N -o ExitOnForwardFailure=yes \
+     -L "$dir/rlxd.sock:$(printf '%s' "$here" | jq -r .data.socket)" host
+   rlxd call --socket "$dir/rlxd.sock" --token-file "$dir/token" status
+   rlxd events --socket "$dir/rlxd.sock" --token-file "$dir/token" --follow
+   ```
+
+   `<rlxd>` is rlxd's absolute path on the host ([Finding it with no
+   profile](#finding-it-with-no-profile)). The forward's local socket goes in a folder
+   only you may enter, so no other local user can take its path before ssh does.
+   `ExitOnForwardFailure=yes` makes ssh exit rather than run on without the forward when
+   it can't, and with it `-f` puts ssh in the background only once the forward is up, so
+   the next command finds the socket. `--token-file` keeps the host's token out of the command line, which other
+   local users can read (`ps`); `--token` works too, but shows it.
+
+   `--socket` connects there instead of to the home's socket. It sends nothing of the
+   local home's, and keeps nothing there:
+   - the token must be given, with `--token-file` or `--token`: without either,
+     `--socket` is a usage error (exit 2), and the home's token file is never read;
+   - `--as-app` needs `--gate-credential-file <file>` (or `--gate-credential`), where
+     the test client keeps its credential for the rlxd at `--socket`: the home's
+     `test-gate-credential` is never sent there, nor that rlxd's credential kept here;
+   - the socket must be a socket, not a link, that this user owns, as ssh makes it, and
+     the process listening on it must run as this user, read from the connection
+     itself (`getpeereid`, `SO_PEERCRED`): otherwise nothing is sent. A connection to
+     the home's own socket is checked the same way;
+   - when nothing listens there, the hint is the forward and `rlxd here --start` on
+     the host, never this home's `rlxd serve`.
+
+- **sshd must allow it,** as OpenSSH's defaults do. The channel needs local forwarding
+  allowed twice: `AllowStreamLocalForwarding` `yes` or `local`, and
+  `AllowTcpForwarding` `yes` or `local` with `PermitOpen any` (the default), because
+  OpenSSH applies its local TCP forwarding permission to direct-streamlocal channels too
+  (`session.c` disables all local forwarding for `AllowTcpForwarding no`, and
+  `channel_connect_to_path` checks it). So a host hardened with `AllowTcpForwarding no`,
+  a `PermitOpen` list, `AllowStreamLocalForwarding no` or `remote`, or
+  `DisableForwarding yes` refuses the channel, and ssh says `open failed`. The narrowest
+  setting that works is `AllowStreamLocalForwarding local` with `AllowTcpForwarding
+  local`: no remote forwards of either kind, and no listening.
+- **An rlxd that does not run** shows through the channel as a connection that closes
+  before `hello`'s reply: sshd could not connect to the socket, and ssh says `connect
+  failed`. Run `rlxd here --start` first, and again when a connection closes. An sshd
+  that refuses socket forwarding closes the channel the same way. So when a connection
+  through `--socket` closes without a whole reply to `hello`, `rlxd call` and `rlxd
+  events` say `disconnected` (exit 1), with a hint naming both likely causes: the host's
+  rlxd isn't running, or its sshd doesn't allow socket forwarding. A close after
+  `hello`'s reply is rlxd's own, and a plain `disconnected` with no such hint. When
+  nothing listens at `--socket` at all, as when the forward is down, it is
+  `not_running` (exit 3), with a hint to check the forward.
+- **A missing token.** With `--socket` or `--token-file`, a token file that can't be
+  read is `unauthorized` (exit 1), from `rlxd call` and `rlxd events` alike, whatever
+  runs in this home: each reads the token before it connects. Only the home's own token
+  file, missing where no rlxd runs, reads as `not_running`.
+- **The gate** checks a forwarded connection as it checks any other, on the short socket
+  too: the token, then for the app role the credential and the peer. A forwarded
+  connection's peer is sshd, not rlx's app, so outside gate dev mode it can neither pair
+  nor be the gate, until SSH pairing (hub q1) gives SSH devices a credential of their own
+  (see the gate's **SSH** note above). `rlxd call --socket … --as-app
+  --gate-credential-file <file>` pairs with the rlxd at `--socket`, never with the local
+  home's.
+- **Windows hosts** are an open question for the hub (q2): rlxd serves a named pipe there,
+  not a socket. This is built and checked for macOS and Linux hosts.
+
+`.github/workflows/rlxd.yml`'s `ssh` job runs it on ubuntu through a real `ssh -N -L` to
+localhost, for `~/.aisquare` and for a home too deep for its own socket. Its sshd is that
+narrowest setting, `AllowStreamLocalForwarding local`, `AllowTcpForwarding local` and
+`PermitListen none`, with no agent, X11 or tunnel forwarding, which `sshd -T` must show
+in effect for the job's own connection (`-C user=…,host=localhost,addr=127.0.0.1`, so a
+`Match` block counts). A remote (`-R`) forward of a Unix socket and of a TCP port must
+each be refused. A second sshd with `AllowTcpForwarding no` must refuse the very `-L` to a
+Unix socket that the first one serves, which shows the constraint above and fails if
+OpenSSH ever drops it. The client side is a home with no rlxd and no token, and the
+host's token goes in a 0600 file for `--token-file`. Through the forward:
+
+- `--socket` with no token is a usage error;
+- `status` must answer, naming the host's socket and home;
+- the gate must refuse the unsigned test client: `--as-app` (with a credential file), a
+  made-up credential and `gate.pair` each get `not_gate`, and nothing is paired or kept;
+- an `rlxd events --since 0 --until daemon.stopping` stream must replay this rlxd's
+  `daemon.started`, stay open through 60 quiet seconds, and take `daemon.stopping` live
+  when rlxd stops over ssh;
+- neither rlxd nor ssh may listen on TCP or UDP;
+- once the forward is gone, the same call exits 3.
+
+### Long homes: the short socket
+
+A socket's path must fit `sockaddr_un`'s `sun_path`: 107 bytes on Linux and 103 on macOS
+(`rlxd_client::SOCKET_PATH_MAX`). `rlxd_client::Home::socket` decides where it is, so
+rlxd and every client agree, however each spells the home:
+
+- the home's `run/rlxd.sock`, by its **canonical** path (links, `.` and `..` resolved;
+  macOS's `/var` is `/private/var`), when that fits. rlxd binds it, and every client
+  connects to it, by that path, so a home reached through a link, or as `/var` and
+  `/private/var`, is one socket;
+- else `/tmp/rlxd-<uid>/<hash>.sock`, about 40 bytes. `<hash>` is the first 16 hex
+  digits of the SHA-256 of the home's canonical path, its bytes as they are, so two
+  homes whose paths aren't UTF-8 never share one.
+
+`status`'s `paths.socket` and `rlxd here`'s `socket` report the path in use, and rlxd's
+log says why it uses the short one.
+
+- **Why `/tmp`.** Every process of the user must name the same folder, whatever its
+  environment holds: a desktop session, a non-login SSH session, `env -i`. `$TMPDIR`
+  differs between them on macOS. logind removes `$XDG_RUNTIME_DIR` at the user's last
+  logout, which an rlxd started over SSH outlives.
+- **Only its user's.** `/tmp` is shared, so another user can make `/tmp/rlxd-<uid>/`
+  first. rlxd makes the folder 0700, and refuses to start when that path is not a folder
+  (a link included), is another user's, or has any mode wider than 0700. It never
+  changes a folder it finds into shape: while it was wider, another user could have left
+  entries in it. The error names the folder; remove it once no rlxd uses it, and rlxd
+  makes it again. A client sends the token only to a socket its user owns, in a folder
+  its user owns that no one else may enter. Otherwise it fails before it sends anything
+  (`ConnectError::NotOurs`).
+- **A sticky `/tmp`.** rlxd and its clients check the folder, then use it by path. That
+  is safe because `/tmp` is root's with the sticky bit set, so no other user can rename
+  or replace our folder in between. Both check that it is, and refuse otherwise. rlxd
+  also looks at the folder again after it binds, and refuses one that changed.
+- **Replacing a socket.** A socket rlxd finds at its path is replaced only when nothing
+  listens on it, such as one left by an rlxd that was killed. One that still takes a
+  connection is someone else's, and rlxd refuses to start rather than take it over.
+- **A stop** removes the socket only if it is still the one this rlxd made, and leaves
+  the folder, which other homes' sockets may share.
 
 ## Building and checking
 
@@ -441,3 +970,20 @@ is renamed aside, and the next install removes it.
 ## Licence
 
 MIT, as rlx is (`../LICENSE`).
+
+Parts of `crates/rlxd` are ported from tmux 3.8 and stay under tmux's ISC licence, so
+the crate's licence is `MIT AND ISC`:
+
+- `src/vt/` (its grid, screen writes, input parser, UTF-8 handling, hyperlinks and
+  `capture-pane`'s loop: grid.c, grid-view.c, screen.c, screen-write.c, input.c,
+  utf8.c, utf8-combined.c, hyperlinks.c and cmd-capture-pane.c);
+- `src/pty/keys.rs` (key names, the bytes for keys, and `paste-buffer -p`:
+  key-string.c, input-keys.c, cmd-send-keys.c and cmd-paste-buffer.c).
+
+Each of those files starts with the copyright lines and the permission notice of the
+tmux files it comes from.
+
+Every rlxd binary carries those notices too: `THIRD_PARTY_NOTICES` here holds tmux's
+copyright and permission notice for each file ported from it, rlxd embeds it when it is
+built, and `rlxd licenses` prints it. The release archives hold just `rlxd` and
+`rlxd-hook`, so the notice travels inside the binary.
