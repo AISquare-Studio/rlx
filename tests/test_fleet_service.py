@@ -16374,9 +16374,10 @@ def test_manager_pass_timer_stays_manual_until_a_completed_pass_and_healthy_watc
 
 def test_manager_pass_prompt_uses_the_project_template_or_builtin(project: ProjectInfo) -> None:
     """A missing or empty project prompt still produces a bounded pass command."""
+    from aisquare.core import program
     from aisquare.services import manager_pass
 
-    assert manager_pass.program.word() == "rlx"
+    assert program.word() == "rlx"
     pending = manager_pass.Pass(id="test-pass", lower=4, upper=9, session="bound-seat")
     path = paths.aisquare_home() / "projects" / project.id / "manager" / "pass.md"
     path.parent.mkdir(parents=True, exist_ok=True)
