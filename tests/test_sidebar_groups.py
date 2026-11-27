@@ -40,6 +40,7 @@ from aisquare.cli.ui.project_menu import (
     ProjectMenu,
     RemoveRow,
 )
+from aisquare.cli.ui.save_model import CommitInput
 from aisquare.cli.ui.sidebar import (
     GROUP_EMPTY,
     MENU_GLYPH,
@@ -70,6 +71,7 @@ from tests.test_ui_shell import (
 )
 from tests.test_ui_shell import no_real_tmux as _no_real_tmux
 from tests.test_ui_shell import script as _script
+from tests.ui_workers import settle_until
 
 #: Re-exported so pytest collects them here (the guard is autouse there, and here).
 no_real_tmux = _no_real_tmux
@@ -676,16 +678,17 @@ def test_ctrl_z_in_the_sidebar_never_reaches_a_settings_pages_undo(
         await app._open_settings("prj_a")
         await settle(app)
         page = app.content.get_child_by_id("project-prj_a").query_one(SettingsView)
-        field = page.query_one("#nickname", Input)
+        field = page.query_one("#nickname", CommitInput)
         field.focus()
         await pilot.pause()
         seen: dict[str, object] = {"focused": app.focused is field}
         await pilot.press(*"Auth", "enter")  # kept on Enter (M5), in the page's worker
-        for _ in range(200):  # a bounded wait on the store itself
-            if nickname() == "Auth":
-                break
-            await pilot.pause(0.01)
-        seen["kept"] = nickname()
+        # Kept is the PAGE having heard the save (the field's ``kept``), not the store written:
+        # the worker's thread writes the store first, and on windows-latest (run 46048849599)
+        # focus left the field before the page heard, so leaving it committed "Auth" again and
+        # the page's last change put back "Auth". A bounded wait on what the page holds.
+        await settle_until(app, lambda: field.kept == "Auth")
+        seen["kept"] = (nickname(), field.kept, len(page.changes))
         await highlight(pilot, app, "tools")
         await pilot.press("space")
         await settle(app)
@@ -702,7 +705,7 @@ def test_ctrl_z_in_the_sidebar_never_reaches_a_settings_pages_undo(
 
     seen = drive(go)
     assert seen["focused"] is True
-    assert seen["kept"] == "Auth"
+    assert seen["kept"] == ("Auth", "Auth", 1), "one change on the page to take back"
     assert seen["folded"] is True
     assert seen["sidebar ctrl+z"] == (False, "Auth"), "the layout's undo, and only it"
     assert seen["page ctrl+z"] is None, "the page's own undo still takes its change back"
