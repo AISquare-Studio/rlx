@@ -103,9 +103,12 @@ fn capture(home: &TestHome, app: bool, topics: &str, s: &str, until: &str, t: u6
         "--timeout",
         &t,
     ]);
-    let child = home.spawn(&args);
+    let mut child = home.spawn(&args);
     if app {
-        common::eventually("the app is connected", || home.app_clients() >= 1);
+        // Connected, or done already: an owed fire may come, and end the capture, at once.
+        common::eventually("the app is connected", || {
+            home.app_clients() >= 1 || child.try_wait().is_ok_and(|done| done.is_some())
+        });
     }
     child
 }
