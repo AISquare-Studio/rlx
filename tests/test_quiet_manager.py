@@ -420,17 +420,25 @@ def test_standby_is_a_managers_alone(runner: CliRunner, board: str) -> None:
 
 
 @pytest.mark.parametrize("status", ["doing", "review"])
-def test_standby_is_refused_while_work_is_in_flight(
-    status: str, runner: CliRunner, board: str
-) -> None:
+def test_standby_holds_while_work_is_in_flight(status: str, runner: CliRunner, board: str) -> None:
+    """#551 (#41): `team standby` was refused while a task was in flight, which in a big fleet is
+    always. It holds now, and still holds watch's routine lines alone."""
     _task(runner, status)
     said = runner.invoke(app, ["--json", "team", "standby", "--as", MANAGER[:8]])
-    assert said.exit_code != 0 and "standby_refused" in said.output
+    assert said.exit_code == 0, said.output
+    standby = _standby()
+    assert standby is not None and standby.why == "explicit"
+    _read_all(board)
+    _watch_line(board, [_item("stale", agent="coder-x", quiet=True)])
+    assert not _wakes(), "a routine watch line is held"
 
 
-def test_standby_never_strands_a_working_fleet(runner: CliRunner, board: str) -> None:
-    """Work coming back ends standby for good, and while a task is in flight nothing is held:
-    a fleet at work always reaches its manager."""
+def test_an_explicit_standby_holds_through_work_coming_back_until_off(
+    runner: CliRunner, board: str
+) -> None:
+    """#551 (#41): the manager asked for quiet, so work coming back no longer ends it; --off
+    (or its person's next prompt) does, and the line it held wakes it then. What the fleet's
+    work says that wakes a manager (a result, a question, a task's move) still does."""
     _task(runner, "todo")
     assert runner.invoke(app, ["team", "standby", "--as", MANAGER[:8]]).exit_code == 0
     _read_all(board)
@@ -440,9 +448,9 @@ def test_standby_never_strands_a_working_fleet(runner: CliRunner, board: str) ->
         task = store.team_tasks(board)[0]
     claimed = runner.invoke(app, ["task", "claim", task.id, "--as", SESSIONS["coder"][:8]])
     assert claimed.exit_code == 0, claimed.output
-    assert _standby() is None, "work came back: standby is over"
-    with store_session() as store:
-        assert store.get_meta(team_service.STANDBY_META + MANAGER) is None
+    assert _standby() is not None, "work came back, and the standby it asked for holds"
+    assert runner.invoke(app, ["team", "standby", "--off", "--as", MANAGER[:8]]).exit_code == 0
+    assert _standby() is None
     assert _wakes(), "the line it held wakes it now"
 
 
@@ -778,19 +786,21 @@ def test_a_fleet_prompt_does_not_end_standby(
     assert _standby() is not None, f"a fleet {prompt} keeps it"
 
 
-def test_standby_holds_nothing_while_work_is_in_flight(runner: CliRunner, board: str) -> None:
-    """standby_of itself: a standby begun before a task was in flight holds nothing while one
-    is, even with no work-returns event to end it (a task added already in doing)."""
-    with store_session() as store:
-        team_service.begin_standby(store, _manager(), why="explicit")
-        assert team_service.standby_of(store, _manager()) is not None
+def test_only_the_standby_watch_infers_holds_nothing_while_work_is_in_flight(
+    runner: CliRunner, board: str
+) -> None:
+    """standby_of itself: the one watch inferred from a question to its person (``asked``)
+    holds nothing while a task is in flight, even with no work-returns event to end it (a task
+    added already in doing); the one the manager asked for (``explicit``) holds (#551, #41)."""
     _task(runner, "doing")
     with store_session() as store:
-        store.delete_meta(team_service.STANDBY_META + MANAGER)
-        team_service.begin_standby(store, _manager(), why="explicit")  # after the claim
         assert team_service.work_in_flight(store, board)
+        team_service.begin_standby(store, _manager(), why="asked")
         assert team_service.standby_of(store, _manager()) is None
         assert team_service.standby_on_its_question(store, _manager()) is None
+        store.delete_meta(team_service.STANDBY_META + MANAGER)
+        team_service.begin_standby(store, _manager(), why="explicit")
+        assert team_service.standby_of(store, _manager()) is not None
 
 
 # the manager's rulings on the reopen (seq 12616)
