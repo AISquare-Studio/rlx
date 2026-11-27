@@ -823,6 +823,9 @@ class BoardPanel(Vertical):
         self._reader_authors: set[str] = set()
         """The sessions the open reader's history names: read with the board's while it is
         open, so it names each as the board does (#44)."""
+        self._not_on_board: set[str] = set()
+        """Sessions asked for on demand that the board does not have (another board's, one
+        deleted): asked once, not at every pick (review of #44, n1)."""
         self._read_project: ProjectInfo | None = project
         """The board the last refresh read: ``project``, or the one it resolved to."""
         self.needs = NeedsYou()
@@ -1054,6 +1057,16 @@ class BoardPanel(Vertical):
         self._show_lane()
         self.post_message(self.Refreshed(project))
 
+    def _unread(self, ids: set[str]) -> set[str]:
+        """Of ``ids``, those the board has not read and has not found missing before."""
+        return ids - self._sessions.keys() - self._not_on_board
+
+    def _read_on_demand(self, ids: set[str]) -> None:
+        """Read now, with the board's, sessions something about to show names (#44); one the
+        board does not have is remembered, so the next pick asks nothing (review of #44, n1)."""
+        self.refresh_data()
+        self._not_on_board |= ids - self._sessions.keys()
+
     def _shown_sessions(self) -> set[str]:
         """The sessions the board shows beyond the live ones and those its read names (#44):
         the authors of the Stream's lines, the one the detail's moment is (``o`` opens its
@@ -1227,9 +1240,13 @@ class BoardPanel(Vertical):
         self.folds.symmetric_difference_update({group})
         if group == "done" and group not in self.folds and not self._closed_read:
             self.refresh_data()  # rebuilds the table, the archive in it
-            if self._closed_read:
-                self._remember_view()
+            if not self._closed_read:
+                # The store did not answer: Done stays folded, as the board keeps its last
+                # frame, rather than open on no rows until a tick (review of #44, n2).
+                self.folds.add(group)
                 return
+            self._remember_view()
+            return
         self._refresh_tasks(self._all_tasks)
         self._remember_view()
 
@@ -1518,6 +1535,7 @@ class BoardPanel(Vertical):
         self._last_seq = 0
         self._terminal_by_task = {}
         self._terminal_fetched = False
+        self._not_on_board = set()
         self._following = True
         self.unseen = 0
         self._show_unseen()
@@ -1571,11 +1589,13 @@ class BoardPanel(Vertical):
         # Read on the pick, never on a tick: one indexed query, and it fails open (B1 #3).
         why = team_service.stopped_because(task) if task.status in watch.STOPPED_BECAUSE else None
         done_event = self._done_event_for(task.id) if task.status in CLOSED_STATUSES else None
-        if done_event is not None and done_event.session_id not in self._sessions:
+        closer = done_event.session_id if done_event is not None else None
+        if done_event is not None and closer and self._unread({closer}):
             # Who closed it may be a session nothing else here shows: read with the board's
-            # (#44), so it is named as the board names it and ``o`` finds its transcript.
-            self.detail_moment = (done_event.session_id, done_event.created_at)
-            self.refresh_data()
+            # (#44), so it is named as the board names it and ``o`` finds its transcript. One
+            # the person closed names none.
+            self.detail_moment = (closer, done_event.created_at)
+            self._read_on_demand({closer})
         detail = watch._task_detail(task, self._statuses, self._names, why=why)
         if done_event is not None:
             who = (
@@ -1713,11 +1733,11 @@ class BoardPanel(Vertical):
         if task is not None and isinstance(event.worker.result, list):
             history: list[TeamEvent] = event.worker.result
             authors = {e.session_id for e in history if e.session_id}
-            if authors - self._sessions.keys():
+            if self._unread(authors):
                 # Its history names sessions the board does not show: read with the board's
                 # (#44), so each is named as the board names it.
                 self._reader_authors = authors
-                self.refresh_data()
+                self._read_on_demand(authors)
             self._render_reader(task, history)
 
     def action_back(self) -> None:

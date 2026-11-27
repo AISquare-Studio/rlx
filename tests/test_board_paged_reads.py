@@ -126,7 +126,7 @@ def build_board(root: Path, *, done: int, old: int, now: datetime) -> ProjectInf
     root.mkdir(parents=True, exist_ok=True)
     transcript = root / "old-closer.jsonl"
     transcript.write_text("{}\n", encoding="utf-8")
-    base = now - timedelta(days=3)
+    base = (now - timedelta(days=3)).replace(second=0, microsecond=0)  # its minutes whole
     with store_session() as store:
         store.onboard_project(project)
         olds: list[str] = []
@@ -166,6 +166,20 @@ def build_board(root: Path, *, done: int, old: int, now: datetime) -> ProjectInf
         pair = base + timedelta(hours=21)
         for sid in ("ses-pair-a", "ses-pair-b"):
             _session(store, project, sid, label="pair", started=pair, seen=pair, ended=pair)
+        # A claimer only its claim names on the board (no line of its own), and a newer round
+        # of its name nothing names at all, which keeps the name: the claim reads
+        # "coder-7 (HH:MM)" (review of #44, m1).
+        for sid, hours in (("ses-claimer", 1), ("ses-claim-newer", 2)):
+            started = base + timedelta(hours=hours, minutes=3)
+            _session(
+                store, project, sid, label="coder-7", started=started,
+                seen=started + timedelta(minutes=9), ended=started + timedelta(minutes=9),
+            )  # fmt: skip
+        # A live session that says nothing and claims nothing: the team block lists it.
+        _session(
+            store, project, "ses-silent", label="tester-2", started=now - timedelta(hours=4),
+            seen=now - timedelta(hours=3), ended=None,
+        )  # fmt: skip
         # Live: the manager, a coder waiting on the person, one on a usage limit for hours, a
         # reviewer at work.
         live = now - timedelta(seconds=30)
@@ -217,7 +231,7 @@ def build_board(root: Path, *, done: int, old: int, now: datetime) -> ProjectInf
         review = _task(store, project, first + 4, status="review", claimed_by="ses-rev")
         gated = _task(store, project, first + 5, status="review", claimed_by=olds[6])
         _task(store, project, first + 6, status="blocked", detail="no key")
-        _task(store, project, first + 7)
+        _task(store, project, first + 7, status="doing", claimed_by="ses-claimer")
         _say(store, project, "ses-rev", "task_review", "please look", review.id)
         _say(store, project, olds[6], "task_review", "ready", gated.id)
         _say(store, project, "ses-man", "result", "ok", gated.id)
@@ -303,7 +317,7 @@ def _shown(panel: BoardPanel) -> dict[str, Any]:
 @pytest.fixture
 def now(monkeypatch: pytest.MonkeyPatch) -> datetime:
     """One clock for both boards: a card's age and a line's time read it, never the wall's."""
-    fixed = datetime.now(UTC).replace(microsecond=0)
+    fixed = datetime.now(UTC).replace(second=0, microsecond=0)  # whole: the fixture's minutes
     monkeypatch.setattr(board_mod, "_now", lambda: fixed)
     monkeypatch.setattr(event_time, "_now", lambda: fixed)
     return fixed
@@ -390,6 +404,9 @@ def test_a_paged_board_shows_what_the_board_showed_through_ticks_and_the_archive
     assert twin and "tester-1 (ses-twin" in twin[0], twin
     older = [line for _id, line in first["stream"] if "the older row" in line]
     assert older and " pair (" in older[0], "a tie: the newer row keeps the name"
+    claimed = [cells for key, cells in first["work"] if key == "tsk_00457"]
+    assert claimed and "coder-7 (" in claimed[0][3], "the claim names it as the board does"
+    assert "tester-2" in first["team"], "the silent live session is in the team block"
 
 
 # --- what a tick reads -----------------------------------------------------------------------
@@ -418,7 +435,7 @@ def test_a_tick_reads_the_open_tasks_and_the_sessions_it_shows(
     big: ProjectInfo, rows_read: dict[str, int]
 ) -> None:
     """Acceptance 2, rows read: with Done folded a tick reads the 8 open tasks, never the 450
-    done; and the live sessions, those its feed names and their namesakes, never all 130 when
+    done; and the live sessions, those its feed names and their namesakes, never all 133 when
     nothing the board shows names them. The archive is read while it is unfolded."""
     project = big
     shown: dict[str, int] = {}
@@ -502,3 +519,86 @@ def test_task_reads_count_and_name_without_reading_the_archive(big: ProjectInfo)
     assert [t.id for t in open_] == [t.id for t in every if t.status not in ("done", "dropped")]
     assert counts == {"done": 360, "dropped": 90}
     assert statuses == {t.id: t.status for t in every}
+
+
+# --- review of #44 (#3026): n1, n2 -------------------------------------------------------------
+
+
+def _reads(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Every ``board_read`` the panels make, by its arguments."""
+    asked: list[dict[str, Any]] = []
+    read = team_service.board_read
+
+    def counted(**kwargs: Any) -> team_service.BoardRead:
+        asked.append(kwargs)
+        return read(**kwargs)
+
+    monkeypatch.setattr(team_service, "board_read", counted)
+    return asked
+
+
+def test_a_pick_reads_no_closer_for_a_card_the_person_closed_and_asks_once_for_one_elsewhere(
+    big: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """n1: a pick of a card whose closer the board had not read read the board again, and so
+    did every pick of one the person closed (no session) or one closed by a session the board
+    does not have: each pick, a read. Now the person's reads nothing, and the other is asked
+    for once."""
+    with store_session() as store:
+        _task(store, big, 900, status="done")
+        _say(store, big, None, "task_done", "by hand", "tsk_00900")
+        _task(store, big, 901, status="done")
+        _say(store, big, "ses-on-another-board", "task_done", "elsewhere", "tsk_00901")
+    picks: dict[str, int] = {}
+
+    async def go() -> None:
+        app = TwoBoards(big)
+        async with app.run_test(size=(300, 60)):
+            await settle_page(app)
+            paged, _before = _both(app)
+            paged.action_toggle_done()
+            await settle_page(app)
+            asked = _reads(monkeypatch)
+            for _ in range(3):
+                paged._show_task_detail("tsk_00900")
+            picks["by the person"] = len(asked)
+            for _ in range(3):
+                paged._show_task_detail("tsk_00901")
+            picks["elsewhere"] = len(asked) - picks["by the person"]
+
+    asyncio.run(go())
+
+    assert picks == {"by the person": 0, "elsewhere": 1}
+
+
+def test_a_failed_read_as_done_unfolds_leaves_it_folded(
+    big: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """n2: with the store busy as Done unfolded, it showed open with no rows until a tick read
+    them. It stays folded, as the board keeps its last frame, and opens at the next ``d``."""
+    shown: list[tuple[bool, str]] = []
+
+    async def go() -> None:
+        app = TwoBoards(big)
+        async with app.run_test(size=(300, 60)):
+            await settle_page(app)
+            paged, _before = _both(app)
+            read = team_service.board_read
+
+            def busy(**_kwargs: Any) -> team_service.BoardRead:
+                raise RuntimeError("database is locked")
+
+            monkeypatch.setattr(team_service, "board_read", busy)
+            paged.action_toggle_done()
+            await settle_page(app)
+            heading = dict(_shown(paged)["work"])["group:done"][1]
+            shown.append(("done" in paged.folds, heading))
+            monkeypatch.setattr(team_service, "board_read", read)
+            paged.action_toggle_done()
+            await settle_page(app)
+            heading = dict(_shown(paged)["work"])["group:done"][1]
+            shown.append(("done" in paged.folds, heading))
+
+    asyncio.run(go())
+
+    assert shown == [(True, "[bold]▸[/bold]"), (False, "[bold]▾[/bold]")]

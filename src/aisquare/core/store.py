@@ -3684,7 +3684,7 @@ class SqliteStore:
     def team_sessions(self, project_id: str) -> list[TeamSession]:
         rows = self._conn.execute(
             f"SELECT {_SESSION_COLUMNS} FROM team_session "
-            "WHERE project_id = ? ORDER BY last_seen_at DESC",
+            "WHERE project_id = ? ORDER BY last_seen_at DESC, rowid DESC",
             (project_id,),
         ).fetchall()
         return [_row_to_session(row) for row in rows]
