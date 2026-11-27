@@ -49,8 +49,8 @@ from types import MappingProxyType, ModuleType
 from typing import Any, Literal, NoReturn
 
 from aisquare.core import agents as agent_core
-from aisquare.core import claude_accounts as claude_accounts_core
 from aisquare.core import (
+    cachedir,
     claude_screen,
     claude_sharing,
     codenames,
@@ -66,6 +66,7 @@ from aisquare.core import (
     selfcli,
     shell_line,
 )
+from aisquare.core import claude_accounts as claude_accounts_core
 from aisquare.core import load as load_core
 from aisquare.core import memory as memory_core
 from aisquare.core import names as names_core
@@ -3190,16 +3191,61 @@ def _pushed(root: Path, rev: str, default: str) -> bool:
     return remote.returncode == 0 and bool(remote.stdout.strip())
 
 
+def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
+    """``tree``'s status read once: why git could not say (else ``None``), the untracked
+    entries whose every file lies inside a ``CACHEDIR.TAG`` directory (``core.cachedir``:
+    build output by its own tag, whatever the language), and whether anything else is
+    changed or untracked.
+
+    Untracked files are asked for by name: ``status.showUntrackedFiles=no`` hides them from a
+    plain ``status``, and ``git worktree remove`` honours it too, so the tree read clean and
+    the file went with it."""
+    status = _git(tree, "status", "--porcelain=v1", "-z", "--untracked-files=normal")
+    if status.returncode != 0:
+        return f"git status failed there ({status.stderr.strip() or status.returncode})", [], True
+    caches: list[Path] = []
+    other = False
+    fields = iter(status.stdout.split("\0"))
+    for entry in fields:
+        if not entry:
+            continue
+        code, name = entry[:2], entry[3:]
+        if "R" in code or "C" in code:
+            next(fields, None)  # a rename's or copy's other path
+        if code == "??" and cachedir.only_caches(tree / name.rstrip("/")):
+            caches.append(tree / name.rstrip("/"))
+        else:
+            other = True
+    return None, caches, other
+
+
+def _remove_untracked_caches(tree: Path) -> list[Path]:
+    """Delete the ``CACHEDIR.TAG`` directories in ``tree``'s untracked entries that hold
+    nothing else (:func:`_untracked_caches`); the ones deleted. One that will not go is left
+    for ``git worktree remove`` to refuse, which says so."""
+    _failed, caches, _other = _untracked_caches(tree)
+    removed: list[Path] = []
+    for entry in caches:
+        for tagged in cachedir.cache_dirs(entry):
+            try:
+                cachedir.remove_dir(tagged)
+            except OSError:
+                continue  # left in the tree: git's own refusal names it
+            removed.append(tagged)
+    return removed
+
+
 def _why_kept(root: Path, tree: Path, default: str) -> str | None:
     """Why ``tree`` must stay — what in it exists only there — or ``None`` when nothing does.
 
-    Untracked files are asked for by name: ``status.showUntrackedFiles=no`` hides them
-    from a plain ``status``, and ``git worktree remove`` honours it too, so the tree read
-    clean and the file went with it."""
-    status = _git(tree, "status", "--porcelain", "--untracked-files=normal")
-    if status.returncode != 0:
-        return f"git status failed there ({status.stderr.strip() or status.returncode})"
-    if status.stdout.strip():
+    An untracked directory holding nothing but ``CACHEDIR.TAG`` output (a ``target/`` on a
+    branch with no ``.gitignore`` for it) is no work: it does not keep the tree, and
+    :func:`_reap_tree` deletes it before the tree goes (the owner's disk tidy, #58). Anything
+    else changed or untracked does."""
+    failed, _caches, other = _untracked_caches(tree)
+    if failed is not None:
+        return failed
+    if other:
         return "uncommitted changes"
     head = _git(tree, "rev-parse", "--verify", "--quiet", "HEAD")
     if head.returncode != 0 or not head.stdout.strip():
@@ -3247,6 +3293,63 @@ def _remove_finished_worktrees(
     asked on every reap of a project an agent with a tree has ended in, whether or not a tree
     was removed.
     """
+    trees = ended_trees(store, project)
+    if trees is None:
+        return
+    if isinstance(trees, RootUnseen):
+        report.worktrees_kept.append((trees.root, trees.why))
+        return
+    for agent in trees.candidates:
+        try:
+            if not _present(agent.cwd):
+                continue
+        except OSError as exc:
+            report.worktrees_kept.append((agent.cwd, f"not looked at: {_why(exc)}"))
+            continue
+        removed, kept = _reap_tree(
+            store, project, agent, trees.default, trees.common, trees.read_at
+        )
+        if removed:
+            report.worktrees_removed.append(agent.cwd)
+        elif kept is not None:
+            report.worktrees_kept.append((agent.cwd, kept))
+    report.worktrees_kept.extend(_unplaced_trees_kept(trees.placed, trees.owners, trees.in_use))
+    # Read again: the branches recorded just now are the ones the sweep asks about.
+    _sweep_fleet_branches(
+        trees.root, trees.common, trees.default, store.fleet_agents(project.id), report
+    )
+
+
+@dataclass(frozen=True)
+class RootUnseen:
+    """A project root reap could not look at, kept with why (:func:`ended_trees`)."""
+
+    root: Path
+    why: str
+
+
+@dataclass(frozen=True)
+class EndedTrees:
+    """The ended agents' trees of one project that reap may remove, as :func:`ended_trees`
+    selects them, and what reap needs beside them."""
+
+    root: Path
+    read_at: datetime
+    """When the rows were read: :func:`_reap_tree` removes no tree a row reached since."""
+    default: str
+    common: Path
+    candidates: list[FleetAgent]
+    """The newest row at each tree, ended and not paused, its tree in no live row's use, in
+    the order reap asks: whether the tree is still there is asked as each comes."""
+    placed: list[Placement]
+    owners: dict[Path, FleetAgent]
+    in_use: set[Path]
+
+
+def ended_trees(store: ContextStore, project: ProjectInfo) -> EndedTrees | RootUnseen | None:
+    """Which ended agents' trees :func:`_remove_finished_worktrees` asks about, chosen once,
+    for reap and for ``rlx tidy``'s dry run alike, so the two cannot drift (#58). ``None``
+    where none can be: no ended agent ever had a tree here, or no git."""
     root = project.root
     read_at = _now()
     rows = store.fleet_agents(project.id)
@@ -3254,18 +3357,17 @@ def _remove_finished_worktrees(
         # No ended agent ever had a tree here — a project no agent ran in, the captured
         # directories `reap()` walks included: no tree and no branch is the fleet's to take,
         # and git is not asked (review of #259, round 16).
-        return
+        return None
     try:
         if not _present(root / ".git"):  # `is_git_project`, asked alike on every Python
-            return
+            return None
     except OSError as exc:
-        report.worktrees_kept.append((root, f"not looked at, nor any tree in it: {_why(exc)}"))
-        return
+        return RootUnseen(root, f"not looked at, nor any tree in it: {_why(exc)}")
     try:
         default = _default_branch(root)
         common = _git_common_dir(root)  # once: the branch lock is taken for each tree
     except FleetError:
-        return  # no git here: nothing can be removed safely, so nothing is
+        return None  # no git here: nothing can be removed safely, so nothing is
     # Each row at the tree its launch record names; one no record places is at none.
     config = settings()
     placed = [resolve_place(row, config=config) for row in rows]
@@ -3281,23 +3383,13 @@ def _remove_finished_worktrees(
     owners = {here: agent for here, agent in trees if here is not None and agent.worktree}
     in_use = {here for here, agent in trees if here is not None and agent.ended_at is None}
     in_use.add(root.resolve())
-    for path, agent in owners.items():
-        if path in in_use or agent.ended_at is None or _paused_row(agent):
-            continue  # a paused agent's tree is where `fleet resume` starts it again
-        try:
-            if not _present(agent.cwd):
-                continue
-        except OSError as exc:
-            report.worktrees_kept.append((agent.cwd, f"not looked at: {_why(exc)}"))
-            continue
-        removed, kept = _reap_tree(store, project, agent, default, common, read_at)
-        if removed:
-            report.worktrees_removed.append(agent.cwd)
-        elif kept is not None:
-            report.worktrees_kept.append((agent.cwd, kept))
-    report.worktrees_kept.extend(_unplaced_trees_kept(placed, owners, in_use))
-    # Read again: the branches recorded just now are the ones the sweep asks about.
-    _sweep_fleet_branches(root, common, default, store.fleet_agents(project.id), report)
+    candidates = [
+        agent
+        for path, agent in owners.items()
+        # a paused agent's tree is where `fleet resume` starts it again
+        if not (path in in_use or agent.ended_at is None or _paused_row(agent))
+    ]
+    return EndedTrees(root, read_at, default, common, candidates, placed, owners, in_use)
 
 
 def unplaced_trees_kept(project: ProjectInfo, rows: Sequence[FleetAgent]) -> list[tuple[Path, str]]:
@@ -3435,6 +3527,9 @@ def _reap_tree(
             if any(row.id != agent.id and _tree_at(row.cwd) == here for row in since):
                 return False, None
             _record_the_branch(store, agent)
+            # Its build output first, whether or not the tree stays: regenerable by its own tag,
+            # and deleted only here, under the lock, once no other agent is at the tree (#58).
+            _remove_untracked_caches(tree)
             if kept is not None:
                 return False, kept
             removal = _git(project.root, "worktree", "remove", str(tree))

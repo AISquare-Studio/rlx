@@ -44,6 +44,7 @@ from aisquare.cli import config as config_cli
 from aisquare.cli import instances as instances_cli
 from aisquare.cli import metrics as metrics_cli
 from aisquare.cli import outcomes as outcomes_cli
+from aisquare.cli import tidy as tidy_cli
 from aisquare.cli.global_flags import DISPATCHED_WORDS, GlobalFlagsGroup
 from aisquare.core import feature_use, sharing
 from aisquare.core.state import RuntimeState, get_state, set_state
@@ -297,6 +298,7 @@ app.add_typer(persona.app, name="persona")
 app.add_typer(captain.app, name="captain", hidden=True)
 app.command("ui")(fleet.ui)
 app.command("instances")(instances_cli.instances)
+app.command("tidy")(tidy_cli.tidy)
 app.add_typer(hook.app, name="hook", hidden=True)
 # Visible: unlike the roadmap groups above, every leaf here does something on a
 # stock machine — `enable` is the one command that turns tracing on, and the
