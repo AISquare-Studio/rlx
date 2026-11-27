@@ -427,10 +427,8 @@ def test_every_job_has_a_timeout() -> None:
     for name, job in workflow()["jobs"].items():
         assert "timeout-minutes" in job, f"{name} has no timeout"
     test = str(workflow()["jobs"]["test"]["timeout-minutes"])
-    # Coverage's leg (py3.12) as long as Windows': its shards run 9.5-12 minutes under --cov.
-    assert test == "${{ (matrix.os == 'windows-latest' || matrix.leg == 'py3.12') && 25 || 15 }}", (
-        test
-    )
+    # About twice a shard's time: Linux and Windows 25, the coverage leg (py3.12) 35 (#47).
+    assert test == "${{ matrix.leg == 'py3.12' && 35 || 25 }}", test
 
 
 def test_ci_ok_needs_every_job_and_fails_unless_all_passed() -> None:
