@@ -2258,14 +2258,27 @@ def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywher
     reading as a traceback from every command, the hook's exit 1 failing each of Claude Code's
     hook events, in the old home and in the moved one alike. And the manager's ruling on N2
     (#2948): anything at the journal's path that cannot be read is unfinished, in both readers:
-    a folder, a link to nothing, a file that cannot be opened, a read that fails."""
+    a folder, a link to nothing, a file that cannot be opened, a read that fails.
+
+    Round 6 (the reviewer's MAJOR 1, round 5): with its copy gone too, the way out is the one
+    the home's state allows. Only a home that shows nothing moved is told to move the journal
+    aside. A moved one is told to leave the home as it is, and one this user may not read is
+    told to make it readable again."""
     if moved:
         assert home_migration.move_home() is not None
     journal = (user_home / ".rlx" if moved else old_home).joinpath(*paths.MOVE_JOURNAL)
     journal.parent.mkdir(parents=True, exist_ok=True)
     journal.unlink(missing_ok=True)
+    journal.with_name(home_migration.JOURNAL_COPY).unlink(missing_ok=True)
     make(journal, monkeypatch)
     runner = CliRunner()
+    newer = "a newer rlx" in said
+    if "Permission denied" in said:
+        advice = ["readable again"]
+    elif moved:
+        advice = [] if newer else ["made, though maybe not finished", "leave the home as it is"]
+    else:
+        advice = ["aside"] if newer else ["nothing moved yet", "aside"]
 
     for command in (
         ["fleet", "ls"],
@@ -2278,7 +2291,8 @@ def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywher
         assert result.exit_code == 1, (command, result.output)
         assert isinstance(result.exception, SystemExit), (command, result.exception)
         out = result.output.replace("\n", " ")
-        assert said in out and "aside" in out and "A journal rlx cannot read" in out, (command, out)
+        assert said in out and all(words in out for words in advice), (command, out)
+        assert not moved or "aside" not in out, (command, out)
     as_json = runner.invoke(app, ["--json", "status"])
     assert as_json.exit_code == 1 and json.loads(as_json.stdout)["error"] == "home_mid_move"
     check = runner.invoke(app, ["upgrade", "--check"])
@@ -2290,29 +2304,167 @@ def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywher
     assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
 
 
-def test_nothing_at_the_journal_s_path_or_a_path_that_cannot_be_looked_at_is_no_move(
-    old_home: Path, user_home: Path
+def test_only_a_home_whose_root_cannot_be_looked_at_reads_as_no_move(
+    old_home: Path, user_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The manager's ruling on N2 (#2948): nothing there is no move, and so is a path behind a
-    folder this user cannot enter. Read as unfinished, it refused every command on such a home,
-    `uninstall` too, which keeps it and must never raise (round 19 of #257,
-    test_lifecycle_uninstall)."""
+    """The manager's narrowing (#31 round 6, the reviewer's m1): a move stopped before its
+    rewrite, then backups/ at mode 000, read as no move: commands ran on the half-moved home,
+    and the move said there was nothing to do. A folder inside the home that cannot be looked
+    into is unfinished, refused with the way out; only a home whose ROOT cannot be looked at
+    is no move, as uninstall keeps such a home (round 19 of #257)."""
     if getattr(os, "geteuid", lambda: 1)() == 0:
         pytest.skip("root looks into any folder")
     assert paths.unfinished_home_move() is None
     (user_home / "no-backups-folder").mkdir()
     (user_home / "no-backups-folder" / "backups").write_text("", encoding="utf-8")
     assert paths.unfinished_home_move_at(user_home / "no-backups-folder") is None
-    journal = old_home.joinpath(*paths.MOVE_JOURNAL)
-    journal.parent.mkdir(parents=True)
-    journal.write_text(OPEN_JOURNAL, encoding="utf-8")
-    journal.parent.chmod(0)
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "rewrite", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+    new = user_home / ".rlx"
+    journal = new.joinpath(*paths.MOVE_JOURNAL)
+    runner = CliRunner()
+    for folder in (new / "backups", journal.parent):
+        folder.chmod(0)
+        try:
+            assert paths.unfinished_home_move() == journal, folder
+            refused = runner.invoke(app, ["fleet", "ls"])
+            move = runner.invoke(app, ["move-home"])
+            hook = runner.invoke(
+                app, ["hook", "session-start"], input=json.dumps({"session_id": SESSION})
+            )
+        finally:
+            folder.chmod(0o700)
+        for result in (refused, move):
+            out = result.output.replace("\n", " ")
+            assert result.exit_code == 1 and "(Permission denied)" in out, out
+            assert "readable again" in out and "aside" not in out, out
+        assert hook.exit_code == 0 and hook.output == ""
+
+    # #257's case: the home's root itself behind a folder this user cannot enter.
+    locked = tmp_path / "locked"
+    named = locked / "inner" / "home"
+    named.joinpath(*paths.MOVE_JOURNAL[:-1]).mkdir(parents=True)
+    named.joinpath(*paths.MOVE_JOURNAL).write_text(OPEN_JOURNAL, encoding="utf-8")
+    locked.chmod(0)
     try:
-        assert paths.unfinished_home_move() is None
-        assert CliRunner().invoke(app, ["fleet", "ls"]).exit_code == 0
+        assert paths.unfinished_home_move_at(named) is None
     finally:
-        journal.parent.chmod(0o700)
-    assert paths.unfinished_home_move() == journal, "once it can be looked at, it is open"
+        locked.chmod(0o700)
+    assert paths.unfinished_home_move_at(named) == named.joinpath(*paths.MOVE_JOURNAL)
+
+    assert runner.invoke(app, ["move-home"]).exit_code == 0, "readable again: it finishes"
+    assert paths.home_of() == (new, paths.NEW) and paths.unfinished_home_move() is None
+
+
+def _stopped_at_rename(n: int) -> None:
+    """A move run until its ``n``-th rename is made (0: none) and stopped there, before the
+    journal writes it down."""
+    made: list[int] = []
+    real = home_migration._rename_once
+
+    def rename(source: Path, target: Path) -> None:
+        real(source, target)
+        made.append(1)
+        if len(made) == n:
+            raise Crash(f"after rename {n}")
+
+    with pytest.MonkeyPatch.context() as crash:
+        if n == 0:
+            _crash_in(crash, "move", "before")
+        else:
+            crash.setattr(home_migration, "_rename_once", rename)
+        with pytest.raises(Crash):
+            home_migration.move_home()
+
+
+def _whole(user_home: Path) -> None:
+    """The home moved and whole: in the new layout, linked, every slot signed in."""
+    assert paths.home_of() == (user_home / ".rlx", paths.NEW)
+    assert (user_home / ".aisquare").is_symlink()
+    assert paths.unfinished_home_move() is None and home_migration.planned_move() is None
+    accounts_core.forget_keychain_reads()
+    for slot in (2, 4):
+        assert accounts_core.signed_in(accounts_core._managed(slot), fresh=True), slot
+    assert _accepted() == {"agt-captain", "agt-coder"}
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 5, 8])
+def test_a_journal_unreadable_after_a_stop_inside_the_renames_is_finished_from_its_copy(
+    old_home: Path, user_home: Path, n: int
+) -> None:
+    """The reviewer's MAJOR 1 (round 5), its probe: a move stopped at rename #n, its journal
+    then unreadable. The docs' "nothing moved" matched from #3 on, and following it (the
+    journal aside) lost every slot from rlx's view and locked every later move out. The
+    journal's copy takes it up: never "nothing moved", and `rlx move-home` ends whole."""
+    _stopped_at_rename(n)
+    journal = paths.unfinished_home_move()
+    assert journal is not None
+    journal.write_bytes(b"\xff\xfe not a journal")
+    runner = CliRunner()
+
+    refused = runner.invoke(app, ["fleet", "ls"])
+
+    out = refused.output.replace("\n", " ")
+    assert refused.exit_code == 1 and "part-way through its move" in out, out
+    assert "nothing moved" not in out and "aside" not in out, out
+    done = runner.invoke(app, ["move-home"])
+    assert done.exit_code == 0, done.output
+    _whole(user_home)
+    moved = (user_home / ".rlx").joinpath(*paths.MOVE_JOURNAL)
+    copy = moved.with_name(home_migration.JOURNAL_COPY)
+    assert json.loads(moved.read_text(encoding="utf-8")) == json.loads(
+        copy.read_text(encoding="utf-8")
+    ), "the journal written whole again"
+
+
+@pytest.mark.parametrize("n", [0, 1, 3, 8])
+def test_with_both_copies_unreadable_only_a_home_that_shows_nothing_moved_is_told_aside(
+    old_home: Path, user_home: Path, n: int
+) -> None:
+    """Both the journal and its copy unreadable: the way out is the one the home shows. Only
+    nothing moved gets "move that file aside", and following it then ends whole; part-way is
+    never called nothing moved, and is never told to move its journal aside."""
+    _stopped_at_rename(n)
+    journal = paths.unfinished_home_move()
+    assert journal is not None
+    journal.write_bytes(b"\xff\xfe")
+    journal.with_name(home_migration.JOURNAL_COPY).write_bytes(b"\xff\xfe")
+    runner = CliRunner()
+
+    refused = runner.invoke(app, ["fleet", "ls"])
+
+    out = refused.output.replace("\n", " ")
+    assert refused.exit_code == 1 and "cannot read (UnicodeDecodeError)" in out, out
+    if n == 0:
+        assert "nothing moved yet" in out and "aside" in out, out
+        journal.rename(journal.with_name("journal.json.aside"))
+        done = runner.invoke(app, ["move-home"])
+        assert done.exit_code == 0, done.output
+        _whole(user_home)
+    else:
+        assert "the move part-way" in out and "nothing moved" not in out, out
+        assert "aside" not in out and "leave the home as it is" in out, out
+
+
+def test_a_finished_move_whose_journal_rotted_is_written_whole_again_by_move_home(
+    old_home: Path, user_home: Path
+) -> None:
+    """The journal is kept until the next release. Rotted after the move finished, its copy
+    says done: every command says the move is part-way until `rlx move-home` writes the
+    journal again from the copy, and rlx runs."""
+    assert home_migration.move_home() is not None
+    journal = (user_home / ".rlx").joinpath(*paths.MOVE_JOURNAL)
+    journal.write_bytes(b"\x00\x00")
+    runner = CliRunner()
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 1
+
+    assert runner.invoke(app, ["move-home"]).exit_code == 0
+
+    assert paths.unfinished_home_move() is None
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+    _whole(user_home)
 
 
 @pytest.mark.parametrize(

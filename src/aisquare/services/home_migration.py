@@ -86,6 +86,12 @@ FOLDER: tuple[str, ...] = paths.MOVE_JOURNAL[:-1]
 """The move's own folder under the home: its journal, the store's copy from before it, and each
 file it rewrote as it was. Kept until the next release (the manager's condition 6 on #31)."""
 JOURNAL_NAME = paths.MOVE_JOURNAL[-1]
+JOURNAL_COPY = "journal-copy.json"
+"""A second copy of the journal beside it, written after it each time. A journal that cannot be
+read (a disk's rot, another writer) is taken up from its copy, which is the journal as it was or
+one write behind it: the home as after a crash just before that write, which every step resumes
+from (the reviewer's MAJOR 1, round 5: ``rlx move-home`` finishes it, so no one is told to move
+a part-way move's journal aside)."""
 STEPS = ("backup", "keychain", "move", "rewrite", "check", "hooks", "link", "forget", "done")
 """The journal's steps, in order (the module's docstring)."""
 UNDO_PHASES = ("link", "aside", "store", "root", "renames", "made", "keychain", "folder")
@@ -262,7 +268,17 @@ def _move_journal_path(root: Path) -> Path:
 def _save_move_journal(journal: Journal) -> None:
     path = _move_journal_path(journal.root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_replacing(path, journal.model_dump_json(indent=1) + "\n", keep_mode=False)
+    body = journal.model_dump_json(indent=1) + "\n"
+    write_replacing(path, body, keep_mode=False)
+    write_replacing(path.with_name(JOURNAL_COPY), body, keep_mode=False)
+
+
+def _read_journal(path: Path) -> Journal | None:
+    """The journal at ``path``, or ``None`` when it cannot be read as one."""
+    try:
+        return Journal.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):  # a ValidationError is a ValueError
+        return None
 
 
 def _unfinished_move(root: Path) -> Journal | None:
@@ -278,7 +294,12 @@ def _unfinished_move(root: Path) -> Journal | None:
     why = journal_refusal(path)
     if why is not None:
         raise MigrationRefused(why)
-    return Journal.model_validate_json(path.read_text(encoding="utf-8"))
+    # Readable, or else its copy is (:data:`JOURNAL_COPY`): the run that takes it up writes the
+    # journal again from it (:func:`_move_quiet_home`).
+    journal = _read_journal(path) or _read_journal(path.with_name(JOURNAL_COPY))
+    if journal is None:  # gone unreadable since: refused as it now reads
+        raise MigrationRefused(journal_refusal(path) or "the move's journal could not be read")
+    return journal
 
 
 def journal_refusal(path: Path) -> str | None:
@@ -288,37 +309,98 @@ def journal_refusal(path: Path) -> str | None:
         text = path.read_text(encoding="utf-8")
         loaded: Any = json.loads(text)
     except (OSError, ValueError, RecursionError) as exc:  # bytes not UTF-8 are a ValueError
-        return _unreadable_journal(path, exc)
+        return _unless_its_copy_reads(path, exc)
     version = loaded.get("version") if isinstance(loaded, dict) else None
     if isinstance(version, int) and version > JOURNAL_VERSION:
         # Read before its shape: a newer release's journal may hold what this one lacks.
-        return (
+        said = (
             f"a newer rlx's move of this home is unfinished (its journal is version "
-            f"{version}): finish it with that release, or, if the home shows the move finished "
-            f"or nothing moved ({JOURNAL_DOCS}), move {paths.shown(path)} aside"
+            f"{version}): finish it with that release"
         )
+        if _home_shows(path) == NOTHING_MOVED:
+            said += (
+                f"; the home shows nothing moved yet, so moving {paths.shown(path)} aside "
+                "also lets this rlx run"
+            )
+        return said
     try:
         Journal.model_validate_json(text)
     except ValidationError as exc:
-        return _unreadable_journal(path, exc)
+        return _unless_its_copy_reads(path, exc)
     return None
+
+
+def _unless_its_copy_reads(path: Path, exc: Exception) -> str | None:
+    """``None`` when the journal's copy (:data:`JOURNAL_COPY`) can be taken up in its place;
+    else why the move cannot be, with the way out the home's state allows."""
+    if _read_journal(path.with_name(JOURNAL_COPY)) is not None:
+        return None
+    return _unreadable_journal(path, exc)
 
 
 #: Where a person reads how to tell, from the home itself, whether a move finished.
 JOURNAL_DOCS = "docs/home-layout.md, “A journal rlx cannot read”"
 
 
+NOTHING_MOVED, PART_WAY, MOVED = "nothing moved", "part-way", "moved"
+"""What a home shows of its move, read from its top (:func:`_home_shows`)."""
+
+_NEW_FOLDERS = ("accounts", "logs", "remote")
+"""Folders at a home's top that only the new layout has. ``run/``, ``fleet/``, ``cache/`` and
+``backups/`` are made in both layouts, so they tell nothing."""
+
+
+def _home_shows(path: Path) -> str | None:
+    """What the home whose move journal is ``path`` shows: :data:`NOTHING_MOVED` (no rename's
+    target there, and no folder only the new layout has), :data:`PART_WAY` (that, and old names
+    still at its top), :data:`MOVED` (no old name left: renamed, though a step after the
+    renames may be left); ``None`` when its top cannot be listed. Each rename's target is there
+    from the first rename on, a lock file into ``run/locks`` included (the reviewer's MAJOR 1,
+    round 5: the store renames last, so its name told nothing)."""
+    root = path.parents[len(FOLDER)]
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    old = any(paths.new_place(name) is not None for name in names)
+    new = any(os.path.lexists(root.joinpath(*place)) for _, place in paths.MOVES) or any(
+        os.path.isdir(root / folder) for folder in _NEW_FOLDERS
+    )
+    if not new:
+        return NOTHING_MOVED
+    return PART_WAY if old else MOVED
+
+
 def _unreadable_journal(path: Path, exc: Exception) -> str:
+    """Why neither the journal nor its copy can be taken up, and the one way out that is safe
+    for what the home shows: only a home that shows nothing moved is told to move it aside."""
     if os.path.islink(path) and not os.path.exists(path):  # neither raises
         why = "a link to nothing"
     elif isinstance(exc, OSError) and exc.strerror:
         why = exc.strerror
     else:
         why = type(exc).__name__
-    return (
-        f"the home's move left a journal this rlx cannot read ({why}): {paths.shown(path)}. "
-        f"If the home shows the move finished or nothing moved ({JOURNAL_DOCS} says how to "
-        "tell), move that file aside, and rlx runs again"
+    said = f"the home's move left a journal this rlx cannot read ({why}): {paths.shown(path)}. "
+    if isinstance(exc, PermissionError):
+        return said + (
+            f"This user may not read it: make {paths.shown(path.parent)} readable again, and "
+            "rlx takes the move up from it"
+        )
+    shows = _home_shows(path)
+    if shows == NOTHING_MOVED:
+        return said + (
+            "The home shows nothing moved yet (no name in the new layout's places): move that "
+            "file aside, and rlx runs again"
+        )
+    if shows is None:
+        return said + (
+            f"rlx cannot look into the home to tell how far the move got: see {JOURNAL_DOCS}"
+        )
+    state = "part-way" if shows == PART_WAY else "made, though maybe not finished"
+    return said + (
+        f"The home shows the move {state}, and its journal's copy cannot be read either, so "
+        f"rlx cannot finish it or put it back by itself: leave the home as it is, and see "
+        f"{JOURNAL_DOCS}"
     )
 
 
@@ -753,6 +835,9 @@ def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None
             _roll_back_move(journal)
             raise MigrationFailed("a roll-back a crash stopped was finished", rolled_back=True)
         else:
+            # Written again first: one taken up from its copy has its journal whole again, even
+            # when every step is done and no step writes it (:data:`JOURNAL_COPY`).
+            _save_move_journal(journal)
             say(f"resuming the home's move: {found.shown}")
         try:
             _run_move_steps(journal, say)

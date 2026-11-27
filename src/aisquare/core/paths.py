@@ -1141,10 +1141,11 @@ def unfinished_home_move_at(root: Path) -> Path | None:
     manager's ruling on N2, #2948): bytes that are not UTF-8 (``UnicodeDecodeError``, a
     ``ValueError``), nesting too deep for the parser (``RecursionError``), a folder, a link to
     nothing, a file that cannot be opened (mode 000, an I/O error). Let out of here, the first
-    two were a traceback from every command and the hook (round 4's tester). Nothing there is
-    no move, and so is a path that cannot even be looked at, behind a folder this user cannot
-    enter: read as unfinished, it refused every command on such a home, ``uninstall`` too,
-    which keeps it and must never raise (round 19 of #257).
+    two were a traceback from every command and the hook (round 4's tester). So is a folder on
+    the way inside the home that cannot be looked into (:func:`_maybe_a_journal`). Nothing
+    there is no move, and so is anything in a home whose root cannot be looked at, behind a
+    folder this user cannot enter: read as unfinished, it refused every command on such a home,
+    ``uninstall`` too, which keeps it and must never raise (round 19 of #257).
     """
     journal = root.joinpath(*MOVE_JOURNAL)
     try:
@@ -1152,7 +1153,7 @@ def unfinished_home_move_at(root: Path) -> Path | None:
     except ValueError:
         return journal  # a journal that cannot be read is one that has not finished
     except OSError:
-        return journal if os.path.lexists(journal) else None  # lstat finds a dangling link
+        return journal if _maybe_a_journal(root, journal) else None
     import json
 
     try:
@@ -1161,6 +1162,25 @@ def unfinished_home_move_at(root: Path) -> Path | None:
         return journal
     steps = data.get("steps") if isinstance(data, dict) else None
     return None if isinstance(steps, list) and "done" in steps else journal
+
+
+def _maybe_a_journal(root: Path, journal: Path) -> bool:
+    """Whether a journal may be at ``journal``, which could not be read: something ``lstat``
+    finds there (a link to nothing included), or a folder on the way inside the home that
+    cannot be looked into. Not there, or under a file, is no journal; and so is any path of a
+    home whose ROOT cannot be looked at (round 19 of #257; the manager's narrowing, #31 round
+    6: a backups/ at mode 000 hid a half-moved home)."""
+    try:
+        os.lstat(journal)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        try:
+            os.lstat(root)
+        except OSError:
+            return False
+        return True
+    return True
 
 
 def _default_home_environment() -> dict[str, str] | None:

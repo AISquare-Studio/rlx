@@ -209,19 +209,31 @@ store where the old one was, and the move could not be finished.
 
 ### A journal rlx cannot read
 
-When the move's journal (`backups/home-migration/journal.json`) cannot be read, rlx cannot tell
-how far that move got, so every command stops and names the file. The home itself tells:
+The move writes its journal (`backups/home-migration/journal.json`) twice: the journal itself,
+then a copy beside it (`journal-copy.json`). When the journal cannot be read and its copy can,
+nothing is lost. Every command says the move is part-way, and `rlx move-home` finishes it from
+the copy, writing the journal whole again.
 
-- **The default home.** The move finished if `~/.aisquare` is a link to `~/.rlx` and `~/.rlx`
-  holds `rlx.db`. Nothing moved if `~/.aisquare` is a folder that holds `context.db` and there is
-  no `~/.rlx`.
-- **A home `RLX_HOME` or `AISQUARE_HOME` names** (moved in place). The move finished if the home
-  holds `rlx.db` and none of `context.db`, `log/`, `launch-seals/`, `instances/` or
-  `claude-accounts/` at its top. Nothing moved if it holds `context.db` and no `rlx.db`.
+When neither can be read, rlx cannot tell from them how far the move got. Every command stops,
+names the file, and says what the home itself shows:
 
-In either of those cases, move the journal aside and rlx runs again. Any other mix is a move that
-stopped part-way. Leave the journal's folder as it is: it holds the store as it was before the
-move (`context.db`). Then run the release that began the move, which reads its own journal.
+- **Nothing moved yet:** no name is in the new layout's places (the table above), and there is
+  no `accounts/`, `logs/` or `remote/` at the home's top. Move the journal aside, and rlx runs
+  again; `rlx upgrade` then moves the home from the start.
+- **Part-way:** names in both layouts' places. A move renames one name at a time, so this is a
+  move stopped in the middle. Do not move the journal aside: rlx would then read a home with
+  some of its folders gone (an account's logins among them), and no later move could finish
+  it. Leave the home as it is. The journal's folder holds the store as it was before the move
+  (`context.db`).
+- **Moved:** every name in its new place, though a step after the renames (the paths stored in
+  the home, the hooks, the link from `~/.aisquare`) may be left. Leave it as it is too.
+
+In those last two cases rlx cannot finish the move or put it back by itself. Report it at
+[issues](https://github.com/AISquare-Studio/rlx/issues), with what the home's top holds; the
+home itself is not changed meanwhile.
+
+If this user may not read the journal (its permissions changed), rlx says so: make the file and
+its folders readable again, and rlx takes the move up from it.
 
 An install rlx does not upgrade itself (Homebrew, pipx) has its home moved by `rlx upgrade`
 too, which then says how that install upgrades.
