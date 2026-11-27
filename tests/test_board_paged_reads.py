@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar, Self
 
 import pytest
 from textual.app import App, ComposeResult
@@ -26,8 +27,11 @@ from textual.containers import Horizontal
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable, OptionList, Static
 
+from aisquare.cli import board_names as board_names_mod
 from aisquare.cli import watch
 from aisquare.cli.ui import board as board_mod
+from aisquare.cli.ui import board_parts as board_parts_mod
+from aisquare.cli.ui import needs_you_bar as needs_you_bar_mod
 from aisquare.cli.ui.board import BoardPanel
 from aisquare.cli.ui.board_parts import NeedsYouLane
 from aisquare.cli.ui.needs_you_bar import read_needs
@@ -36,7 +40,7 @@ from aisquare.core import store as store_mod
 from aisquare.core.store import FLEET_HELD, store_session
 from aisquare.models import FleetAgent, ProjectInfo, TeamSession, TeamTask
 from aisquare.services import team as team_service
-from tests.ui_workers import settle_page
+from tests.ui_workers import settle_page, settle_until
 
 NAMES = ("coder-1", "coder-2", "reviewer-1", "tester-1", "coder-3")
 """The labels the old sessions take in turn: every one of them shared, as restarts leave them."""
@@ -314,18 +318,63 @@ def _shown(panel: BoardPanel) -> dict[str, Any]:
     }
 
 
+class _WallClock(datetime):
+    """The wall clock 61 s on at every read, its reads counted: put in each module the board's
+    text is drawn from, so a read of a clock the ``now`` fixture does not pin is caught at once
+    (manager #3342). Two panels drawn moments apart would read minutes apart."""
+
+    reads: ClassVar[int] = 0
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> Self:
+        _WallClock.reads += 1
+        return cls.fromtimestamp(time.time() + 61 * _WallClock.reads, tz)
+
+
+BOARD_TEXT_MODULES = (
+    board_mod,
+    board_parts_mod,
+    needs_you_bar_mod,
+    watch,
+    board_names_mod,
+    event_time,
+)
+"""The modules the board's text is drawn from: none may read the wall clock in these tests."""
+
+
 @pytest.fixture
 def now(monkeypatch: pytest.MonkeyPatch) -> datetime:
-    """One clock for both boards: a card's age and a line's time read it, never the wall's."""
+    """One clock for both boards: a card's age, a line's time and the team block's ages read it,
+    never the wall's. The team block reads ``datetime.now`` in ``cli.watch``: on the wall's, the
+    panel that drew it later could show ``1m`` where the other showed ``0m`` (CI 46051022680,
+    py3.12-captain-off shard 1/4, at "a closer from the archive": only the paged panel reads
+    that closer, and so draws again)."""
     fixed = datetime.now(UTC).replace(second=0, microsecond=0)  # whole: the fixture's minutes
+
+    class Pinned(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            return cls.fromtimestamp(fixed.timestamp(), tz)
+
     monkeypatch.setattr(board_mod, "_now", lambda: fixed)
     monkeypatch.setattr(event_time, "_now", lambda: fixed)
+    monkeypatch.setattr(watch, "datetime", Pinned)
+    monkeypatch.setattr(_WallClock, "reads", 0)
+    for module in BOARD_TEXT_MODULES:  # every other clock there: the wall's, jumping and counted
+        if getattr(module, "datetime", None) is datetime:
+            monkeypatch.setattr(module, "datetime", _WallClock)
     return fixed
 
 
 @pytest.fixture
 def big(tmp_path: Path, now: datetime) -> ProjectInfo:
     return build_board(tmp_path / "board", done=450, old=120, now=now)
+
+
+def _has_its_history(panel: BoardPanel) -> bool:
+    """Whether the panel's open reader shows its history, which a worker thread reads
+    (``HISTORY_WORKER``): ``reading…`` until it answers."""
+    return panel.reader_text != "" and "reading…" not in panel.reader_text
 
 
 def _both(app: TwoBoards) -> tuple[BoardPanel, BoardPanel]:
@@ -348,11 +397,21 @@ def test_a_paged_board_shows_what_the_board_showed_through_ticks_and_the_archive
             await settle_page(app)
             paged, before = _both(app)
 
-            async def step(name: str, act: Callable[[BoardPanel], object] | None = None) -> None:
+            async def step(
+                name: str,
+                act: Callable[[BoardPanel], object] | None = None,
+                *,
+                until: Callable[[BoardPanel], bool] | None = None,
+            ) -> None:
                 for panel in (paged, before):
                     if act is not None:
                         act(panel)
                 await settle_page(app)
+                if until is not None:
+                    # Each panel's worker answers in its own time, so one panel's reader could be
+                    # drawn before the other's (tester #3131, 1 run in 36): compared once both are.
+                    ready = until
+                    await settle_until(app, lambda: ready(paged) and ready(before))
                 await pilot.pause()
                 steps.append((name, _shown(paged), _shown(before)))
 
@@ -379,9 +438,15 @@ def test_a_paged_board_shows_what_the_board_showed_through_ticks_and_the_archive
             )
             held.append("ses-archivist" in paged._sessions)
             held.append("ses-historian" in paged._sessions)
-            await step("a history", lambda panel: panel.open_reader("tsk_00003"))
+            await step(
+                "a history", lambda panel: panel.open_reader("tsk_00003"), until=_has_its_history
+            )
             held.append("ses-historian" in paged._sessions)
-            await step("a tick with the reader open", lambda panel: panel.refresh_data())
+            await step(
+                "a tick with the reader open",
+                lambda panel: panel.refresh_data(),
+                until=_has_its_history,
+            )
             await step("back", lambda panel: panel.action_close_reader())
             await step("the archive folded", lambda panel: panel.action_toggle_done())
             await step("a last tick", lambda panel: panel.refresh_data())
@@ -399,6 +464,9 @@ def test_a_paged_board_shows_what_the_board_showed_through_ticks_and_the_archive
     assert "done by coder-3 (" in picked["detail"] and picked["moment"] is not None, picked
     assert held == [False, True, False, True], "each read for what shows it, and only then"
     assert "reviewer-1 (" in steps[5][2]["reader"], "the history names it as the board does"
+    for name, paged, before in steps[5:7]:
+        assert "reading…" not in paged["reader"] + before["reader"], f"{name}: compared unread"
+    assert _WallClock.reads == 0, "the board's text read a clock the now fixture does not pin"
     assert "coder-1 (" in str(steps[1][2]["stream"]), "the newest coder-1 renamed the rest"
     twin = [line for _id, line in first["stream"] if "one of two" in line]
     assert twin and "tester-1 (ses-twin" in twin[0], twin
@@ -407,6 +475,26 @@ def test_a_paged_board_shows_what_the_board_showed_through_ticks_and_the_archive
     claimed = [cells for key, cells in first["work"] if key == "tsk_00457"]
     assert claimed and "coder-7 (" in claimed[0][3], "the claim names it as the board does"
     assert "tester-2" in first["team"], "the silent live session is in the team block"
+
+
+def test_a_board_text_read_off_the_wall_clock_differs_between_the_panels_at_once(
+    big: ProjectInfo, now: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check the ``now`` fixture installs, at work: with the team block's clock unpinned
+    (``watch``'s, as it was until #634's round 4), the two panels' first frames already show
+    different ages, and the reads are counted. CI 46051022680 failed so in one of its jobs."""
+    monkeypatch.setattr(watch, "datetime", _WallClock)
+
+    async def go() -> tuple[str, str]:
+        app = TwoBoards(big)
+        async with app.run_test(size=(300, 60)):
+            await settle_page(app)
+            paged, before = _both(app)
+            return _shown(paged)["team"], _shown(before)["team"]
+
+    paged, before = asyncio.run(go())
+    assert paged != before
+    assert _WallClock.reads > 0
 
 
 # --- what a tick reads -----------------------------------------------------------------------
