@@ -19639,8 +19639,9 @@ def requeue_manager_pass(project: str, pass_id: str) -> None:
             raise ValueError("no matching unfinished pass")
         if not _waiting_manager_pane(placement, session, _now()):
             raise ValueError("the manager is not at its waiting prompt")
-        if quiet_prompt_refusal(placement.agent) is not None:
-            raise ValueError("the manager's composer or dialog is occupied")
+        refusal = quiet_prompt_refusal(placement.agent)
+        if refusal is not None:
+            raise ValueError(refusal)
         retry = pending.model_copy(update={"attempted_at": None, "acknowledged_at": None})
         if not manager_pass.save(
             store, project, board, raw, progress.model_copy(update={"pending": retry})

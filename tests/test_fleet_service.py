@@ -16142,15 +16142,31 @@ def test_manager_pass_cli_requeues_the_same_idle_range(
     with store_session() as store:
         pending = manager_pass.read(store, project.id, project.id)[1].pending
         assert pending is not None and pending.attempted_at is not None
+        manager = store.fleet_agent_by_label(project.id, "manager", live_only=True)
+        assert manager is not None
         store.touch_session(sid, state="working")
     command = ["--json", "fleet", "requeue-manager-pass", pending.id, "--project", project.id]
     runner = CliRunner()
     refused = runner.invoke(app, command)
-    assert refused.exit_code != 0 and "waiting prompt" in refused.output
+    assert refused.exit_code == 1
+    assert json.loads(refused.stdout) == {
+        "error": "requeue_refused",
+        "detail": "the manager is not at its waiting prompt",
+    }
     with store_session() as store:
         current = manager_pass.read(store, project.id, project.id)[1].pending
         assert current == pending
         store.touch_session(sid, state="waiting")
+    tmux.screens[manager.pane_id] = [INPUT_BOX[0], f"{MARK} a draft", *INPUT_BOX[2:]]
+    occupied = runner.invoke(app, command)
+    assert occupied.exit_code == 1
+    assert json.loads(occupied.stdout) == {
+        "error": "requeue_refused",
+        "detail": "a draft is in its input box",
+    }
+    with store_session() as store:
+        assert manager_pass.read(store, project.id, project.id)[1].pending == pending
+    tmux.screens[manager.pane_id] = list(INPUT_BOX)
     receipt = runner.invoke(app, command)
     assert receipt.exit_code == 0, receipt.output
     assert json.loads(receipt.stdout) == {"pass_id": pending.id}
