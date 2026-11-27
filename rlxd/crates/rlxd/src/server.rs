@@ -40,12 +40,13 @@ use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Claude, Clients, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Params, Paths, PtyKillParams, PtyResizeParams, PtyScreenParams,
-    PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role, RunEventsParams,
-    RunListParams, RunRef, RunResumeParams, RunStartParams, SettingsDeleteParams,
-    SettingsGetParams, SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceParams,
-    StatusData, SubscribeParams, VERSION, codes, event_types, methods, setting_keys, topics,
+    Claude, Clients, ConnectorsListParams, ConnectorsLoginParams, Data, Envelope, ErrorBody, Event,
+    HelloData, HelloParams, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams,
+    PtyResizeParams, PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request,
+    RequestId, Role, RunEventsParams, RunListParams, RunRef, RunResumeParams, RunStartParams,
+    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
+    SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
+    methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -53,6 +54,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::watch;
 
 use crate::bus::{self, Bus, Cursor, Line, Topics};
+use crate::connectors::Connectors;
 use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
 use crate::log::{info, warning};
@@ -85,8 +87,8 @@ const LINGER: Duration = Duration::from_secs(1);
 /// start Claude Code several times a second.
 const CLAUDE_FRESH: Duration = Duration::from_secs(5);
 
-/// What this rlxd can do, by name, for `hello`'s reply and `status`. The later items add
-/// theirs.
+/// What this rlxd can do, by name, for `hello`'s reply and `status`, beside what its
+/// connectors add ([`Connectors::capabilities`]). The later items add theirs.
 const CAPABILITIES: &[&str] = &[];
 
 /// One running rlxd: what every connection shares.
@@ -99,8 +101,9 @@ pub struct Daemon {
     claude: tokio::sync::Mutex<Option<(Instant, Claude)>>,
     bus: Arc<Bus>,
     runner: Arc<Runner>,
+    connectors: Arc<Connectors>,
     settings: Settings,
-    ptys: Host,
+    ptys: Arc<Host>,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
@@ -200,7 +203,8 @@ impl Daemon {
         settings: Settings,
     ) -> Arc<Self> {
         let bus = Arc::new(bus);
-        let runner = Runner::new(home.clone(), Arc::clone(&bus));
+        let connectors = Connectors::new(home.clone(), Arc::clone(&bus));
+        let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&connectors));
         Arc::new(Self {
             home,
             token,
@@ -208,9 +212,10 @@ impl Daemon {
             pipe_acl,
             clients: Mutex::new(Clients::default()),
             claude: tokio::sync::Mutex::new(None),
-            ptys: Host::new(Arc::clone(&bus)),
+            ptys: Arc::new(Host::new(Arc::clone(&bus))),
             bus,
             runner,
+            connectors,
             settings,
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
@@ -364,7 +369,7 @@ impl Daemon {
                 .map(|hold| format!(", device {:?}", hold.device()))
                 .unwrap_or_default()
         );
-        let reply = HelloData::new(PROTOCOL_VERSION, VERSION, capabilities())
+        let reply = HelloData::new(PROTOCOL_VERSION, VERSION, self.capabilities())
             .map(|data| Envelope::ok(object(&data)).with_id(request.id))
             .map_err(|e| reply_err(id, codes::INTERNAL, e.to_string()))?;
         let session = Session {
@@ -497,6 +502,8 @@ impl Daemon {
             methods::GATE_PAIR_REQUESTS => self.gate_pair_requests(session),
             methods::GATE_PAIR_ANSWER => self.gate_pair_answer(session, &request.params),
             methods::GATE_DEVICES => Ok(object(&json!({"devices": self.gate.devices()}))),
+            methods::CONNECTORS_LIST => self.connectors_list(request.params).await,
+            methods::CONNECTORS_LOGIN => self.connectors_login(session, request.params),
             methods::GATE_UNPAIR => self.gate_unpair(session, &request.params),
             methods::HELLO => Err(error(
                 codes::INVALID_REQUEST,
@@ -765,7 +772,7 @@ impl Daemon {
         let mut status = StatusData::new(VERSION, self.pid, std::env::consts::OS, paths)
             .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
         status.protocol_version = session.protocol_version;
-        status.capabilities = capabilities();
+        status.capabilities = self.capabilities();
         status.seq = self.bus.head();
         status.clients = *self.clients();
         status.clients.app = self.gate.app_connections();
@@ -1871,8 +1878,53 @@ fn request_id(frame: &Value) -> Option<RequestId> {
         .and_then(|id| RequestId::deserialize(id).ok())
 }
 
-fn capabilities() -> Vec<String> {
-    CAPABILITIES.iter().map(|&c| c.to_owned()).collect()
+impl Daemon {
+    /// What this rlxd can do, by name.
+    fn capabilities(&self) -> Vec<String> {
+        CAPABILITIES
+            .iter()
+            .copied()
+            .chain(self.connectors.capabilities())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `connectors.list {refresh?, allow_turn?}`: the latest `system/init`'s connectors.
+    /// A refresh needs a route with no turn, which there is not yet: `no_route`, unless
+    /// `allow_turn` lets rlxd run its one-turn probe (5.3).
+    async fn connectors_list(&self, params: Params) -> Result<Data, ErrorBody> {
+        let params = params_of::<ConnectorsListParams>(methods::CONNECTORS_LIST, params)?;
+        if !params.refresh() {
+            return printed(&self.connectors.list(0));
+        }
+        if !params.allow_turn() {
+            return Err(error(
+                codes::NO_ROUTE,
+                "rlxd has no route to the connectors that makes no model turn yet \
+                 (capability connectors.no_turn)",
+            )
+            .with_hint(
+                "List without refresh for the latest run's connectors, or pass allow_turn: \
+                 true to let rlxd run a one-turn probe.",
+            ));
+        }
+        self.runner.probe_connectors().await?;
+        printed(&self.connectors.list(1))
+    }
+
+    /// `connectors.login {id}`: for `app`, `cli` and `tui`; `remote` is refused.
+    fn connectors_login(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let method = methods::CONNECTORS_LOGIN;
+        if !matches!(session.role, Role::App | Role::Cli | Role::Tui) {
+            return Err(role_refused(
+                session.role,
+                method,
+                "app, cli and tui may sign a connector in; remote may not.",
+            ));
+        }
+        let params = params_of::<ConnectorsLoginParams>(method, params)?;
+        printed(&self.connectors.login(&self.ptys, &params.id))
+    }
 }
 
 /// Runs `work`, which may block on a lock or on the disk, as blocking work: the runtime
@@ -1972,6 +2024,16 @@ fn pty_allowed(role: Role, method: &str) -> bool {
 }
 
 fn role_not_allowed(role: Role, method: &str) -> ErrorBody {
+    role_refused(
+        role,
+        method,
+        "cli and tui may use every pty method; remote may list, read, subscribe read-only \
+         and write; app may list, read and subscribe read-only.",
+    )
+}
+
+/// `role_not_allowed` for `method`, with `hint` saying who may call it.
+fn role_refused(role: Role, method: &str, hint: &str) -> ErrorBody {
     let name = role_name(role);
     let mut detail = Data::new();
     detail.insert("role".to_owned(), Value::from(name.clone()));
@@ -1980,10 +2042,7 @@ fn role_not_allowed(role: Role, method: &str) -> ErrorBody {
         codes::ROLE_NOT_ALLOWED,
         &format!("a {name} connection may not call {method}"),
     )
-    .with_hint(
-        "cli and tui may use every pty method; remote may list, read, subscribe read-only \
-         and write; app may list, read and subscribe read-only.",
-    )
+    .with_hint(hint)
     .with_detail(detail)
     .expect("role_not_allowed's detail is an object")
 }
@@ -2109,6 +2168,8 @@ fn served() -> Vec<&'static str> {
         methods::RUN_EVENTS,
         methods::SPACE_ENSURE,
         methods::SPACE_ERASE,
+        methods::CONNECTORS_LIST,
+        methods::CONNECTORS_LOGIN,
     ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);

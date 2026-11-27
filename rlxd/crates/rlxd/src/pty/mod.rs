@@ -86,6 +86,20 @@ pub enum Refused {
     ScreenFailed(String),
 }
 
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooMany => write!(f, "the home holds {MAX_PTYS} ptys, the most it may"),
+            Self::Unknown(id) => write!(f, "no pty {id}"),
+            Self::Exited(id) => write!(f, "pty {id}'s process has ended"),
+            Self::SpawnFailed(why)
+            | Self::Invalid(why)
+            | Self::Busy(why)
+            | Self::ScreenFailed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// How a PTY's process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Exit {

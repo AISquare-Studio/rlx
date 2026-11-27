@@ -14,6 +14,8 @@ use rlxd_client::Home;
 use rlxd_proto::daemon_kinds;
 use serde_json::Value;
 
+pub mod runs;
+
 /// How long one `rlxd` command may take before the test fails.
 const COMMAND_LIMIT: Duration = Duration::from_secs(60);
 

@@ -46,6 +46,7 @@ mod claude;
 mod cli;
 mod clock;
 mod config;
+mod connectors;
 mod durable;
 mod events;
 mod files;
@@ -167,6 +168,11 @@ enum Action {
         )]
         argv: Vec<std::ffi::OsString>,
     },
+    /// The connectors' probe's hook (handoff 0.10.3, 5.3): denies the tool call Claude
+    /// Code hands it, by rlxd, and opens no connection. rlxd's probe names it; nobody
+    /// else does.
+    #[command(name = "__probe-deny", hide = true)]
+    ProbeDeny,
     /// Print the notices of what rlxd carries from others: tmux's ISC licence, for the
     /// parts of rlxd ported from tmux.
     Licenses,
@@ -316,6 +322,7 @@ pub fn main() -> ExitCode {
         } => serve::serve(background, gate_dev_mode),
         Action::Status { json } => cli::status(json),
         Action::Stop => cli::stop(),
+        Action::ProbeDeny => runner::probe_deny(),
         Action::Licenses => {
             print!("{THIRD_PARTY_NOTICES}");
             ExitCode::SUCCESS

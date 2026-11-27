@@ -294,8 +294,7 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
 
 - **`run.start`** (`schemas/v1/run-start.json`) takes the app's `run_id`, a lower-case
   UUID that is also Claude Code's `--session-id`, and refuses `run_exists`,
-  `kind_mount_mismatch`, `pinned_call_required` and, until 5.5, `not_implemented` for a
-  non-empty `needs_connectors`. Each kind has its own pool (tasks 2, refreshes and
+  `kind_mount_mismatch` and `pinned_call_required`. Each kind has its own pool (tasks 2, refreshes and
   watches 1, the rest 2); over it, a run waits as `run.queued {position}`.
 - **The command line** is 2.1's exactly: `-p --output-format stream-json --verbose
   --input-format stream-json --session-id <run_id> [--no-session-persistence] --tools ""
@@ -392,6 +391,51 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   fail it `erase_incomplete` (`detail {removed, failed}`, each failure named under the
   space's resolved path), the runs concerned keep their records, and erasing again
   finishes.
+
+## Connectors
+
+The user's Claude Code connectors, the claude.ai MCP servers (handoff 0.10.3, 2.4, 5.3's
+listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::gate`.
+
+- **The gate.** A run with `needs_connectors` makes up to 3 tries, each its own Claude
+  Code, with backoffs of 2 s and 5 s, and starts no turn until each named connector is
+  `connected`. On route 2, the default, a try holds stdin open for `connector_settle_s`
+  (5 s, from the spawn plus half a second for Claude Code to come up), sends the prompt,
+  and reads the `system/init` that follows; on a miss it is ended at once, and nothing
+  it wrote reaches a client. Route 1 (capability `connectors.gate_before_turn`, which a
+  release build doesn't announce until the probe finds it, and a test build with
+  `RLXD_TEST_CONNECTOR_ROUTE=1` does) waits up to `connector_wait_s` (10 s) for the
+  states before it sends the prompt. A `needs-auth` or `failed` connector stops the gate
+  at once. When it gives up, the run ends `run.failed {reason: "connectors", connectors:
+  [{id, status}]}`, after `needs_you.raised {reason: "auth"}` when a connector's sign-in
+  lapsed. Before the next try of a run whose session persists, the ended try's session
+  file is removed, so the next starts it anew.
+- **The cache.** Each `system/init` rlxd takes as a run's truth updates the list: an
+  ungated run's (not `no_tools`, which lists none), a gated run's once confirmed, the
+  last try's of one that failed, and a refresh's. It is kept in
+  `<home>/rlxd/connectors.json` (0600). Each change is an event on the `connector`
+  topic: `connector.added`, `connector.removed`, and `connector.changed {id, status,
+  previous_status}` once for each real change.
+- **`connectors.list {refresh?, allow_turn?}`** gives the cache (`from: "init"`,
+  `model_turns: 0`), to every role. `refresh` is `no_route` until there is a route with
+  no turn (`connectors.no_turn`), unless `allow_turn`: then rlxd runs its own one-turn
+  probe, not a run, with the user's MCP servers loaded and every tool call it attempts
+  denied by rlxd itself (its settings' hook is `rlxd __probe-deny`, which opens no
+  connection), and reports `model_turns: 1`. rlxd's log says when each probe ran, and
+  holds neither its prompt nor what it listed.
+- **`read_only_hint`** is each tool's MCP `readOnlyHint` when `system/init` lists the
+  tool with annotations, else `null`: Claude Code 2.1 lists names only.
+- **`connectors.login {id}`**, for `app`, `cli` and `tui` (`remote` gets
+  `role_not_allowed`), runs `claude mcp login <id>` in an rlxd PTY, by Claude Code's
+  absolute path, and returns `{login_id}`. It reads the PTY's screen for the first URL:
+  an `https://` one is `connector.login.open_url` then `connector.login.waiting`, and
+  the login's exit 0 is `connector.login.done {status: "connected"}`; anything else is
+  `connector.login.error {code}` (`not_https`, `no_url`, `failed`, `timed_out`,
+  `claude_not_found`). No URL's query, where a login's secrets are, is ever in rlxd's
+  log. The PTY is killed when the login ends.
+- **The probe.** `rlxd/tests/probes/connectors_route.sh` is the owner-run check of what
+  only the real Claude Code can say: the route, whether `system/init` carries
+  annotations, `claude mcp login`'s output, and the handoff's `[real]` lines.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 
