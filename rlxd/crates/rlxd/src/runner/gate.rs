@@ -50,6 +50,20 @@ use crate::log::{info, warning};
 /// The reason of a pinned run's every call after its pinned call was allowed once.
 pub const PINNED_CALL_USED: &str = "pinned_call_used";
 
+/// The reason of a call to a tool the attempt's `system/init` didn't list.
+pub const TOOL_NOT_IN_INIT: &str = "tool_not_in_init";
+
+/// What an attempt's `system/init` listed, which rlxd's rules decide by.
+#[derive(Clone, Debug, Default)]
+pub struct Listed {
+    /// Its tools, by their exact names.
+    pub tools: std::collections::HashSet<String>,
+    /// Its MCP servers, by name.
+    pub servers: Vec<String>,
+    /// Each tool's `readOnlyHint`, where its entry carried one.
+    pub hints: HashMap<String, bool>,
+}
+
 /// The name of the variable that holds an attempt's hook key.
 pub const HOOK_KEY_ENV: &str = "RLXD_HOOK_KEY";
 
@@ -192,8 +206,7 @@ impl Runner {
             } else if let Some(reason) = rlxd_rule(
                 &run.params,
                 inner.pinned_call_used,
-                &inner.hints,
-                &inner.servers,
+                &inner.listed,
                 &call.tool,
                 &call.sha256,
             ) {
@@ -647,15 +660,20 @@ impl Drop for Unanswered {
     }
 }
 
-/// rlxd's own rules (5.1), in order: the mount, the kind, the pinned call. `servers` are
-/// the MCP servers the attempt's `system/init` listed. The reason a call is denied, or
-/// `None` when the app is to decide it.
+/// rlxd's own rules (5.1), in order: the mount, the kind, the pinned call. `listed` is
+/// what the attempt's `system/init` listed. The reason a call is denied, or `None` when
+/// the app is to decide it.
+///
+/// Under a `connectors` mount, a call reaches the app only when its tool is one the init
+/// listed, by its exact name, and is a tool of exactly one listed MCP server, one the
+/// mount names. A connector still connecting when the init is written has no tools in it,
+/// so its calls are denied: a run that names it in `needs_connectors` starts its first
+/// turn only once it is connected (5.5).
 #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub fn rlxd_rule(
     params: &RunStartParams,
     pinned_call_used: bool,
-    hints: &HashMap<String, bool>,
-    servers: &[String],
+    listed: &Listed,
     tool: &str,
     input_sha256: &str,
 ) -> Option<String> {
@@ -664,8 +682,12 @@ pub fn rlxd_rule(
             return Some("the run's mount is no_tools: it makes no tool calls".to_owned());
         }
         Mount::Connectors { connectors } => {
+            if !listed.tools.contains(tool) {
+                return Some(TOOL_NOT_IN_INIT.to_owned());
+            }
             // Every listed server whose name, as Claude Code writes it, begins the tool's.
-            let of: Vec<&String> = servers
+            let of: Vec<&String> = listed
+                .servers
                 .iter()
                 .filter(|server| {
                     tool.strip_prefix("mcp__")
@@ -693,7 +715,7 @@ pub fn rlxd_rule(
         return Some(format!("a {kind} run makes no tool calls"));
     }
     if matches!(kind, RunKind::WidgetRefresh | RunKind::Watch)
-        && read_only(hints, tool) != Some(true)
+        && read_only(&listed.hints, tool) != Some(true)
     {
         return Some(format!(
             "a {kind} run makes read calls only, and {tool} is not marked read-only"
@@ -818,22 +840,36 @@ mod tests {
         mount(&["claude.ai Slack"])
     }
 
-    /// The servers an attempt's init listed.
-    fn servers(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| (*n).to_owned()).collect()
-    }
-
     const SEND: &str = "mcp__claude_ai_Slack__slack_send_message";
     const READ: &str = "mcp__claude_ai_Slack__slack_search_public";
 
+    /// What an init listed: `tools`, `servers`, and `hints` for its tools.
+    fn listed(tools: &[&str], servers: &[&str], hints: &[(&str, bool)]) -> Listed {
+        Listed {
+            tools: tools.iter().map(|t| (*t).to_owned()).collect(),
+            servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+            hints: hints.iter().map(|(t, h)| ((*t).to_owned(), *h)).collect(),
+        }
+    }
+
+    /// Slack's two tools, the send a write and the search a read.
+    fn slack_listed() -> Listed {
+        listed(
+            &[SEND, READ, "Bash"],
+            &["claude.ai Slack"],
+            &[(READ, true), (SEND, false)],
+        )
+    }
+
     #[test]
     fn the_mount_comes_first() {
-        let none = HashMap::new();
-        let listed = servers(&["claude.ai Slack", "claude.ai Gmail"]);
+        let mut both = slack_listed();
+        both.servers.push("claude.ai Gmail".to_owned());
+        both.tools.insert("mcp__claude_ai_Gmail__send".to_owned());
         let no_tools = params(RunKind::Task, Mount::NoTools);
-        assert!(rlxd_rule(&no_tools, false, &none, &listed, READ, "h").is_some());
+        assert!(rlxd_rule(&no_tools, false, &both, READ, "h").is_some());
         let task = params(RunKind::Task, slack());
-        assert_eq!(rlxd_rule(&task, false, &none, &listed, SEND, "h"), None);
+        assert_eq!(rlxd_rule(&task, false, &both, SEND, "h"), None);
         for other in [
             "Bash",
             "mcp__claude_ai_Gmail__send",
@@ -841,20 +877,43 @@ mod tests {
             "mcp__x",
         ] {
             assert!(
-                rlxd_rule(&task, false, &none, &listed, other, "h").is_some(),
+                rlxd_rule(&task, false, &both, other, "h").is_some(),
                 "{other}"
             );
         }
-        // No init seen yet: no server is known, so nothing passes the mount.
-        assert!(rlxd_rule(&task, false, &none, &[], SEND, "h").is_some());
+        // No init seen yet: nothing is listed, so nothing passes the mount.
+        assert_eq!(
+            rlxd_rule(&task, false, &Listed::default(), SEND, "h").as_deref(),
+            Some(TOOL_NOT_IN_INIT)
+        );
+    }
+
+    #[test]
+    fn a_tool_the_init_did_not_list_is_denied_though_its_name_reads_as_the_connectors() {
+        let task = params(RunKind::Task, slack());
+        let evil = "mcp__claude_ai_Slack__evil__delete_everything";
+        // Only the connector is listed, and the tool isn't: denied.
+        assert_eq!(
+            rlxd_rule(&task, false, &slack_listed(), evil, "h").as_deref(),
+            Some(TOOL_NOT_IN_INIT)
+        );
+        // A tool the init listed, of the one server whose name it reads as: the app's.
+        let mut with = slack_listed();
+        with.tools.insert(evil.to_owned());
+        assert_eq!(rlxd_rule(&task, false, &with, evil, "h"), None);
     }
 
     #[test]
     fn a_tool_is_its_one_servers_and_a_look_alike_server_is_denied() {
-        let none = HashMap::new();
         let task = params(RunKind::Task, slack());
-        let rule = |listed: &[&str], tool: &str| {
-            rlxd_rule(&task, false, &none, &servers(listed), tool, "h")
+        let rule = |servers: &[&str], tool: &str| {
+            rlxd_rule(
+                &task,
+                false,
+                &listed(&[tool, SEND], servers, &[]),
+                tool,
+                "h",
+            )
         };
         // A local server whose name holds `__`, or is the connector's as written: two
         // servers could own the tool, and the call is denied.
@@ -872,18 +931,9 @@ mod tests {
         assert!(rule(&["claude_ai_Slack"], "mcp__claude_ai_Slack__post").is_some());
         // A connector whose name collapses: its own tools pass.
         let beta = params(RunKind::Task, mount(&["claude.ai Slack (Beta)"]));
-        let listed = servers(&["claude.ai Slack (Beta)"]);
-        assert_eq!(
-            rlxd_rule(
-                &beta,
-                false,
-                &none,
-                &listed,
-                "mcp__claude_ai_Slack_Beta__send",
-                "h"
-            ),
-            None
-        );
+        let tool = "mcp__claude_ai_Slack_Beta__send";
+        let seen = listed(&[tool], &["claude.ai Slack (Beta)"], &[]);
+        assert_eq!(rlxd_rule(&beta, false, &seen, tool, "h"), None);
     }
 
     #[test]
@@ -905,8 +955,7 @@ mod tests {
 
     #[test]
     fn a_kind_that_reads_only_needs_a_read_only_hint() {
-        let hints = HashMap::from([(READ.to_owned(), true), (SEND.to_owned(), false)]);
-        let listed = servers(&["claude.ai Slack"]);
+        let seen = slack_listed();
         for kind in [RunKind::WidgetRefresh, RunKind::Watch] {
             let mut run = params(kind, slack());
             if kind == RunKind::Watch {
@@ -915,18 +964,13 @@ mod tests {
                     input_sha256: "h".to_owned(),
                 });
             }
-            assert_eq!(
-                rlxd_rule(&run, false, &hints, &listed, READ, "h"),
-                None,
-                "{kind}"
-            );
-            assert!(
-                rlxd_rule(&run, false, &hints, &listed, SEND, "h").is_some(),
-                "{kind}"
-            );
+            assert_eq!(rlxd_rule(&run, false, &seen, READ, "h"), None, "{kind}");
+            assert!(rlxd_rule(&run, false, &seen, SEND, "h").is_some(), "{kind}");
             // No hint is a write.
+            let mut unhinted = seen.clone();
+            unhinted.hints.clear();
             assert!(
-                rlxd_rule(&run, false, &HashMap::new(), &listed, READ, "h").is_some(),
+                rlxd_rule(&run, false, &unhinted, READ, "h").is_some(),
                 "{kind}"
             );
         }
@@ -936,10 +980,7 @@ mod tests {
             RunKind::WidgetAuthor,
         ] {
             let run = params(kind, Mount::NoTools);
-            assert!(
-                rlxd_rule(&run, false, &hints, &listed, READ, "h").is_some(),
-                "{kind}"
-            );
+            assert!(rlxd_rule(&run, false, &seen, READ, "h").is_some(), "{kind}");
         }
     }
 
@@ -950,19 +991,18 @@ mod tests {
             tool: SEND.to_owned(),
             input_sha256: "h1".to_owned(),
         });
-        let none = HashMap::new();
-        let listed = servers(&["claude.ai Slack"]);
-        assert_eq!(rlxd_rule(&send, false, &none, &listed, SEND, "h1"), None);
+        let seen = slack_listed();
+        assert_eq!(rlxd_rule(&send, false, &seen, SEND, "h1"), None);
         assert!(
-            rlxd_rule(&send, false, &none, &listed, SEND, "h2").is_some(),
+            rlxd_rule(&send, false, &seen, SEND, "h2").is_some(),
             "another input"
         );
         assert!(
-            rlxd_rule(&send, false, &none, &listed, READ, "h1").is_some(),
+            rlxd_rule(&send, false, &seen, READ, "h1").is_some(),
             "another tool"
         );
         assert_eq!(
-            rlxd_rule(&send, true, &none, &listed, SEND, "h1").as_deref(),
+            rlxd_rule(&send, true, &seen, SEND, "h1").as_deref(),
             Some(PINNED_CALL_USED)
         );
     }

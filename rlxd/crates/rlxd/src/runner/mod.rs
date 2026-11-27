@@ -285,10 +285,9 @@ struct RunInner {
     pinned_call_used: bool,
     /// The running attempt's hook key ([`gate`]): in memory only, never logged or written.
     hook_key: Option<String>,
-    /// Each tool's `readOnlyHint`, from the attempt's `system/init`.
-    hints: HashMap<String, bool>,
-    /// The MCP servers the attempt's `system/init` listed, by name: whose tool a call is.
-    servers: Vec<String>,
+    /// What the attempt's `system/init` listed: its tools, its MCP servers and each
+    /// tool's `readOnlyHint`, which rlxd's rules decide by. Empty until the init comes.
+    listed: gate::Listed,
     /// The run's last state event, as its record keeps it until its log line is fsynced
     /// (`last_event`): every record written keeps it, the gate's too.
     last_state_event: Option<Value>,
@@ -527,8 +526,7 @@ impl Runner {
                         .collect(),
                     pinned_call_used: record.pinned_call_used,
                     hook_key: None,
-                    hints: HashMap::new(),
-                    servers: Vec::new(),
+                    listed: gate::Listed::default(),
                     last_state_event: record.last_event.clone(),
                     gate: HashMap::new(),
                     stopped: None,
@@ -733,8 +731,7 @@ impl Runner {
                 calls: Vec::new(),
                 pinned_call_used: false,
                 hook_key: None,
-                hints: HashMap::new(),
-                servers: Vec::new(),
+                listed: gate::Listed::default(),
                 last_state_event: None,
                 gate: HashMap::new(),
                 stopped: None,
@@ -1626,8 +1623,7 @@ impl Runner {
         {
             let mut inner = run.inner();
             inner.hook_key = Some(key);
-            inner.hints.clear();
-            inner.servers.clear();
+            inner.listed = gate::Listed::default();
             inner.stopped = None;
         }
         let launch = Launch {
@@ -1812,8 +1808,11 @@ impl Runner {
                 match parsed {
                     Line::Init(init) if !started => {
                         started = true;
-                        inner.hints.clone_from(&init.hints);
-                        inner.servers = init.mcp_servers.iter().map(|s| s.name.clone()).collect();
+                        inner.listed = gate::Listed {
+                            tools: init.tools.iter().cloned().collect(),
+                            servers: init.mcp_servers.iter().map(|s| s.name.clone()).collect(),
+                            hints: init.hints.clone(),
+                        };
                         let data = RunStartedData::new(init.cwd, init.model, init.claude_version)
                             .with_tools(init.tools, init.mcp_servers)
                             .resumed(attempt > 1);

@@ -27,6 +27,10 @@
 //! Resumed, each scenario that makes one call makes it as [`RESUMED_CALL_ID`].
 //! - `beta-send`: init lists `claude.ai Slack (Beta)` (written `claude_ai_Slack_Beta`),
 //!   and the call is to its tool.
+//! - `evil-unlisted`: init lists only the Slack connector and its tools, and the call is
+//!   to [`EVIL_TOOL`], which the init doesn't list.
+//!
+//! Each look-alike scenario's init lists its own tool, as Claude Code would.
 //!
 //! Each is a scenario of its own name, and `gate` plays the one its prompt names, so one
 //! home runs any of them. Each starts its hook detached, as Claude Code does.
@@ -44,6 +48,19 @@ pub const READ: &str = "mcp__claude_ai_Slack__slack_search_public";
 
 /// A tool with no annotations: its hint is `null`, a write.
 pub const UNHINTED: &str = "mcp__claude_ai_Slack__slack_read_canvas";
+
+/// `lookalike-nested`'s tool, of the local server `claude_ai_Slack__x`.
+pub const NESTED_TOOL: &str = "mcp__claude_ai_Slack__x__send_message";
+
+/// `lookalike-evil`'s and `evil-unlisted`'s tool, as a server `claude_ai_Slack__evil`
+/// would name it.
+pub const EVIL_TOOL: &str = "mcp__claude_ai_Slack__evil__delete_everything";
+
+/// `lookalike-same`'s and `lookalike-local`'s tool, of a server written `claude_ai_Slack`.
+pub const POST_TOOL: &str = "mcp__claude_ai_Slack__post";
+
+/// `beta-send`'s tool, of the connector `claude.ai Slack (Beta)`.
+pub const BETA_TOOL: &str = "mcp__claude_ai_Slack_Beta__send";
 
 /// The first call's `tool_use_id`.
 pub const CALL_ID: &str = "toolu_01FakeGateCall000000000001";
@@ -108,16 +125,31 @@ fn begin(fake: &mut Fake, name: Option<&str>) -> Option<String> {
             eprintln!("fake-claude: FAKE_CLAUDE_KEY_OUT: {e}");
         }
     }
-    let tools = json!([
-        "Bash",
-        {"name": SEND, "annotations": {"readOnlyHint": false}},
-        {"name": READ, "annotations": {"readOnlyHint": true}},
-        {"name": UNHINTED},
-    ]);
     let message = fake.first_message()?;
     let name = name.map_or_else(|| Fake::text_of(&message).trim().to_owned(), str::to_owned);
-    fake.init(tools, servers_of(&name));
+    fake.init(tools_of(&name), servers_of(&name));
     Some(name)
+}
+
+/// The tools a gate scenario's `system/init` lists: Slack's send ([`SEND`], a write), its
+/// search ([`READ`], read-only) and [`UNHINTED`] (no hint), and the look-alike
+/// scenarios' own tools. `evil-unlisted` calls a tool its init doesn't list.
+fn tools_of(name: &str) -> Value {
+    let mut tools = vec![
+        json!("Bash"),
+        json!({"name": SEND, "annotations": {"readOnlyHint": false}}),
+        json!({"name": READ, "annotations": {"readOnlyHint": true}}),
+        json!({"name": UNHINTED}),
+    ];
+    let own = match name {
+        "lookalike-nested" => Some(NESTED_TOOL),
+        "lookalike-evil" => Some(EVIL_TOOL),
+        "lookalike-same" | "lookalike-local" => Some(POST_TOOL),
+        "beta-send" => Some(BETA_TOOL),
+        _ => None,
+    };
+    tools.extend(own.map(|tool| json!({"name": tool})));
+    Value::Array(tools)
 }
 
 /// The assistant message that makes call `call_id`.
@@ -203,6 +235,7 @@ const BODIES: &[(&str, super::Scenario)] = &[
     ("bad-hooks", bad_hooks),
     ("beta-send", beta_send),
     ("crash-in-call", crash_in_call),
+    ("evil-unlisted", lookalike_evil),
     ("forge", forge),
     ("lookalike-evil", lookalike_evil),
     ("lookalike-local", lookalike_post),
@@ -224,6 +257,7 @@ pub fn named(name: &str) -> Option<super::Scenario> {
         "bad-hooks" => |fake| play(fake, "bad-hooks"),
         "beta-send" => |fake| play(fake, "beta-send"),
         "crash-in-call" => |fake| play(fake, "crash-in-call"),
+        "evil-unlisted" => |fake| play(fake, "evil-unlisted"),
         "forge" => |fake| play(fake, "forge"),
         "lookalike-evil" => |fake| play(fake, "lookalike-evil"),
         "lookalike-local" => |fake| play(fake, "lookalike-local"),
@@ -295,37 +329,22 @@ fn slack_send(fake: &mut Fake) -> i32 {
 /// A tool of the server `claude_ai_Slack__x`, or the connector's own as Claude Code
 /// would write it.
 fn lookalike_nested(fake: &mut Fake) -> i32 {
-    one(
-        fake,
-        "mcp__claude_ai_Slack__x__send_message",
-        &input(),
-        Then::Runs,
-    )
+    one(fake, NESTED_TOOL, &input(), Then::Runs)
 }
 
 /// A tool of the server `claude_ai_Slack__evil`.
 fn lookalike_evil(fake: &mut Fake) -> i32 {
-    one(
-        fake,
-        "mcp__claude_ai_Slack__evil__delete_everything",
-        &input(),
-        Then::Runs,
-    )
+    one(fake, EVIL_TOOL, &input(), Then::Runs)
 }
 
 /// A tool of a server Claude Code writes as `claude_ai_Slack`.
 fn lookalike_post(fake: &mut Fake) -> i32 {
-    one(fake, "mcp__claude_ai_Slack__post", &input(), Then::Runs)
+    one(fake, POST_TOOL, &input(), Then::Runs)
 }
 
 /// A tool of the connector `claude.ai Slack (Beta)`.
 fn beta_send(fake: &mut Fake) -> i32 {
-    one(
-        fake,
-        "mcp__claude_ai_Slack_Beta__send",
-        &input(),
-        Then::Runs,
-    )
+    one(fake, BETA_TOOL, &input(), Then::Runs)
 }
 
 fn slack_read(fake: &mut Fake) -> i32 {

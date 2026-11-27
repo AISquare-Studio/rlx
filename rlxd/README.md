@@ -420,14 +420,22 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
   its own run. It only ever gets the app's answer to its own request: each call is its
   `tool_use_id`, decided once, so a forged request can't get an allow for Claude Code's
   real call (a real call whose id was decided already is denied), and it can't reach
-  another run, whose key and process group or job it doesn't have.
+  another run, whose key it doesn't have and whose guard (or job) it isn't under.
 - **rlxd's own rules come first**, before the app is looked for, and deny `by: "rlxd"`:
-  the mount (`no_tools`, or a tool of a connector the mount doesn't name), the kind (`check`, `parse_instruction` and
-  `widget_author` make no calls; `widget_refresh` and `watch` make read calls only), and
-  the pinned call (`send_executor` and `watch`: the pinned tool with the pinned
+  the mount (`no_tools`, or a tool of a connector the mount doesn't name), the kind
+  (`check`, `parse_instruction` and `widget_author` make no calls; `widget_refresh` and
+  `watch` make read calls only), and the pinned call (`send_executor` and `watch`: the pinned tool with the pinned
   `input_sha256` only, and once: then every call is denied `pinned_call_used`, which
-  `run.json` keeps across attempts and restarts). A tool's server is the one MCP server
-  of the attempt's `system/init` whose name, as Claude Code writes it in tool names
+  `run.json` keeps across attempts and restarts).
+- **A connectors run's calls are to tools its init listed.** A call reaches the app only
+  when its tool's exact name is in the attempt's `system/init` tools, and the tool is
+  one mounted server's; otherwise it is denied `by: "rlxd"`, a tool the init didn't list
+  with the reason `tool_not_in_init`. A connector still connecting when the init is
+  written has no tools in it, so its calls are denied: that is what 5.5's
+  `needs_connectors` is for, since a run that names a connector there starts its first
+  turn only once it is connected, so its tools are in the init. A tool's server is the
+  one MCP server of the attempt's `system/init` whose name, as Claude Code writes it in
+  tool names
   (each UTF-16 unit but a letter, a digit, `_` or `-` as `_`; for a `claude.ai `
   connector, runs of `_` as one and none at the ends), begins the tool's name before a
   `__`. When none does, or more than one does (a local server named `claude_ai_Slack` or

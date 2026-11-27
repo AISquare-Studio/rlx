@@ -838,6 +838,29 @@ fn a_tool_of_a_look_alike_server_is_not_the_mounted_connectors() {
 }
 
 #[test]
+fn a_tool_the_runs_init_did_not_list_is_denied_tool_not_in_init() {
+    let home = home();
+    let _app = App::open(&home);
+    // Only `claude.ai Slack` is listed, and the call's tool, though its name reads as a
+    // Slack tool's, isn't in the init's tools: rlxd denies it, the app never sees it.
+    let reason = denied_by_rlxd(&home, &task("evil-unlisted"));
+    assert_eq!(reason, "tool_not_in_init");
+    // A tool the init listed, of the mounted connector, reaches the app.
+    let since = seq(&home);
+    let r = start(&home, &task("slack-send"));
+    let events = calls_out(&home, since, &r, 1);
+    assert_eq!(
+        of(&events, &r, Some("run.tool_call"))[0]["data"]["tool"],
+        SEND
+    );
+    assert_eq!(
+        decide(&home, &r, CALL_ID, "deny", "not now").code(),
+        Some(0)
+    );
+    end_of(&home, since, &r);
+}
+
+#[test]
 fn an_allow_whose_ledger_entry_cant_be_written_is_a_deny() {
     let home = home_with(&[("RLXD_TEST_FAIL_LEDGER", "ledgerless")]);
     let _app = App::open(&home);
