@@ -2391,8 +2391,9 @@ fn needs_you(params: &RunStartParams, done: &RunDoneData) -> Option<RunNeedsYouD
 
 /// The environment a run's Claude Code gets beyond rlxd's own, which it inherits: the
 /// app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3), raw, those
-/// it set. A run takes the values current when its attempt starts.
-fn run_env(values: &EnvValues) -> Vec<(OsString, OsString)> {
+/// it set. A run takes the values current when its attempt starts, and the brain those
+/// current when it starts (`crate::brain`).
+pub(crate) fn run_env(values: &EnvValues) -> Vec<(OsString, OsString)> {
     values
         .pairs()
         .into_iter()

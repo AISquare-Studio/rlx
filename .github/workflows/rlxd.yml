@@ -4,8 +4,9 @@ name: rlxd
 # 1.1). ci.yml runs the Python suite; this runs the Rust one, plus the daemon
 # registry's two cross-language tests (4.1), which need both. A PR gets it when it
 # touches rlxd/ (Cargo.lock included), this file, pyproject.toml, whose version
-# rlxd/crates/rlxd/tests/version.rs holds rlxd's to, or the Python side of the
-# registry's shared format. Every push to main or an rc/** branch runs it whatever
+# rlxd/crates/rlxd/tests/version.rs holds rlxd's to, the Python side of the
+# registry's shared format, or the resident brain rlxd runs (`rlx brain --stdio`, 1.6),
+# whose real process rlxd/crates/rlxd/tests/brain.rs starts. Every push to main or an rc/** branch runs it whatever
 # changed, as does a run by hand (`gh workflow run rlxd.yml --ref <branch>`).
 on:
   pull_request:
@@ -25,6 +26,8 @@ on:
       - "src/aisquare/core/locking.py"
       - "src/aisquare/core/registry.py"
       - "tests/test_daemon_registry.py"
+      - "src/aisquare/cli/brain.py"
+      - "src/aisquare/services/brain.py"
   push:
     branches: [main, "rc/**"]
   workflow_dispatch:
@@ -81,7 +84,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     # The registry's interop tests skip where neither this nor RLXD_BIN is set (the
     # Python suite, a checkout with no uv). Here they must run: a missing uv or rlxd
-    # fails them. Likewise the gate's peer checks that need `sudo -n` (Linux) or an
+    # fails them. So must the brain's (tests/brain.rs), which run the checkout's own
+    # `rlx brain --stdio` through `uv run`. Likewise the gate's peer checks that need `sudo -n` (Linux) or an
     # administrator (Windows) skip elsewhere, and must run here.
     env:
       RLXD_INTEROP_REQUIRED: "1"

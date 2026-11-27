@@ -306,6 +306,12 @@ rlxd call env.get
   `claude_not_found` when no `claude` was found where rlxd looked, and
   `claude_not_runnable` when the one found is a batch file. The message says where it
   looked.
+- **The brain** (`rlx brain --stdio`) runs with the values raw on top of rlxd's own
+  environment too, as they are when it starts. A change that alters them starts it again
+  with the new values once it is idle: the request it runs ends first, and the next one,
+  queued or not, runs on the new brain. It is stopped as rlxd's stop stops it and started
+  at once, with no backoff and no `error`; `status.brain.restarts` counts it. A change to
+  the values it already has doesn't restart it.
 - **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
   links no Keychain crate: `rlxd.yml`'s `deny` job fails when `cargo tree --target all
   -e normal` holds `security-framework` or `keyring`.

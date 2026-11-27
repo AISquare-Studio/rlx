@@ -350,10 +350,19 @@ async fn output(
         // starts would open a window of its own.
         command.creation_flags(0x0800_0000);
     }
-    let output = tokio::time::timeout(timeout, command.output())
+    // Started as no other program of rlxd's starts (`crate::spawn`): the brain must not
+    // inherit this probe's stdout, nor this probe the brain's stdin. Only the start is
+    // held, never the wait.
+    let child = {
+        let _alone = crate::spawn::alone();
+        command
+            .spawn()
+            .map_err(|e| format!("could not start: {e}"))?
+    };
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| format!("did not answer within {} ms", timeout.as_millis()))?
-        .map_err(|e| format!("could not start: {e}"))?;
+        .map_err(|e| format!("could not be read: {e}"))?;
     String::from_utf8(output.stdout).map_err(|_| "printed text that is not UTF-8".to_owned())
 }
 

@@ -295,7 +295,12 @@ fn spawn(launch: Launch) -> io::Result<(Child, Tree)> {
             Ok(())
         });
     }
-    let child = command.spawn()?;
+    // One program start at a time across rlxd (`crate::spawn`): only the start, never the
+    // wait, so no other start inherits this one's pipes, nor it theirs.
+    let child = {
+        let _alone = crate::spawn::alone();
+        command.spawn()?
+    };
     // Only the guard holds the write end now: the pipe ends with it.
     drop(writer);
     let pid = child
@@ -729,7 +734,11 @@ fn spawn(launch: Launch) -> io::Result<(Child, Tree)> {
     let mut command = command(launch);
     // Suspended until it is in the job; no console window of its own.
     command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-    let mut child = command.spawn()?;
+    // One program start at a time across rlxd (`crate::spawn`): only the start.
+    let mut child = {
+        let _alone = crate::spawn::alone();
+        command.spawn()?
+    };
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("the run's process has no pid"))?;

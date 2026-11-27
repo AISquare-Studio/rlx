@@ -34,14 +34,7 @@
     },
     "needs_you_when": {
       "description": "When the finished run is `needs_you` rather than `done`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/NeedsYouWhen"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/NeedsYouWhen"
     },
     "output_schema": {
       "description": "A JSON Schema the final output must match (`--json-schema`); `run.done` then\ncarries `structured_output`.",

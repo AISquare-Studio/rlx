@@ -53,6 +53,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
+use crate::brain::Brain;
 use crate::bus::{self, Bus, Cursor, Line, Topics};
 use crate::env::Env;
 use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
@@ -109,6 +110,7 @@ pub struct Daemon {
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
+    brain: Arc<Brain>,
 }
 
 /// What a connection was let in as.
@@ -197,9 +199,11 @@ enum Frame {
 }
 
 impl Daemon {
-    /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus` and
-    /// serving `settings`.
+    /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus`,
+    /// serving `settings` and the app's environment `env`, and asking `brain`, which runs
+    /// with `env`.
     /// `pipe_acl` is what `status` says of the pipe's DACL, on Windows.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         home: Home,
         token: String,
@@ -207,8 +211,9 @@ impl Daemon {
         gate: Gate,
         bus: Bus,
         settings: Settings,
+        env: Arc<Env>,
+        brain: Arc<Brain>,
     ) -> Arc<Self> {
-        let env = Arc::new(Env::open(&home));
         let bus = Arc::new(bus);
         let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
         let gate = Arc::new(gate);
@@ -236,7 +241,13 @@ impl Daemon {
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
             gate,
+            brain,
         })
+    }
+
+    /// The resident Python brain.
+    pub fn brain(&self) -> &Brain {
+        &self.brain
     }
 
     /// The home's event bus.
@@ -537,6 +548,10 @@ impl Daemon {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
             }
+            methods::HOOK_PING => match cli_only(session, methods::HOOK_PING) {
+                Ok(()) => crate::brain::ping(&self.brain).await,
+                Err(refused) => Err(refused),
+            },
             methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
                 Ok(subscription) => return Answer::Stream(subscription),
                 Err(error) => Err(error),
@@ -866,6 +881,7 @@ impl Daemon {
         }
         status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
+        status.brain = self.brain.status();
         (status.runs.live, status.runs.queued) = self.runner.counts();
         status.jobs = match &self.scheduler {
             Ok(scheduler) => scheduler.status(),
@@ -1353,6 +1369,21 @@ impl Daemon {
         warning!("gate unpaired: {which}, by the user; {dropped} app connection(s) dropped");
         Ok(object(&json!({"unpaired": names, "dropped": dropped})))
     }
+}
+
+/// `role_not_allowed {role, method}` unless `session` is a `cli` client: the hook methods
+/// are rlxd-hook's, a command-line client (1.5).
+fn cli_only(session: &Session, method: &str) -> Result<(), ErrorBody> {
+    if session.role == Role::Cli && session.app.is_none() {
+        return Ok(());
+    }
+    let role = role_name(session.role);
+    let refused = error(
+        codes::ROLE_NOT_ALLOWED,
+        &format!("{method} is for command-line clients, such as rlxd-hook, not role {role}"),
+    );
+    let detail = object(&json!({"role": role, "method": method}));
+    Err(refused.clone().with_detail(detail).unwrap_or(refused))
 }
 
 /// Checks `peer`'s identity off the async runtime.
@@ -2302,6 +2333,7 @@ fn served() -> Vec<&'static str> {
     let mut served = vec![
         methods::STATUS,
         methods::STOP,
+        methods::HOOK_PING,
         methods::EVENTS_SUBSCRIBE,
         methods::SETTINGS_GET,
         methods::SETTINGS_SET,
