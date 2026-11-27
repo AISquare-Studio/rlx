@@ -26,6 +26,8 @@ const OUTPUT_LIMIT: Duration = Duration::from_secs(20);
 /// marks them close-on-exec only after it has made them: a command another thread starts
 /// in between inherits them, and the rlxd it starts with them, holding the first
 /// command's output open. Starting one command at a time, none inherits another's pipes.
+/// It is held too while a test writes a program it will start ([`place`]), so that no
+/// command inherits that program open for writing.
 static SPAWNING: Mutex<()> = Mutex::new(());
 
 /// Starts `command`, as no other thread of the test starts one ([`SPAWNING`]).
@@ -38,6 +40,49 @@ pub fn launch(command: &mut Command) -> std::io::Result<Child> {
 pub fn pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
     let _alone = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
     std::io::pipe().expect("a pipe")
+}
+
+/// Puts a program holding `contents` at `path`, for a command to start ([`place`]).
+#[cfg(unix)]
+pub fn put_executable(path: &Path, contents: &str) {
+    place(path, |partial| std::fs::write(partial, contents));
+}
+
+/// Puts a copy of the program `from` at `to`, for a command to start ([`place`]).
+#[cfg(unix)]
+pub fn copy_executable(from: &Path, to: &Path) {
+    place(to, |partial| std::fs::copy(from, partial).map(drop));
+}
+
+/// Makes a program at `path` with `make`, as no command starts ([`SPAWNING`]): under a
+/// temporary name beside it, then made executable, synced, closed and renamed into place.
+///
+/// On Linux a program can't start while any process has it open for writing: "Text file
+/// busy" (ETXTBSY), as in runs 45843894810 and 45872911004. A command another thread
+/// starts while the file is open inherits that descriptor, and holds it until its own
+/// program runs. Here none starts while the file is open, and [`launch`] returns only once
+/// its command's program runs, which closes what it inherited. The rename means a
+/// half-written program is never at `path`, and an old one there is replaced, not
+/// written over.
+#[cfg(unix)]
+fn place(path: &Path, make: impl FnOnce(&Path) -> std::io::Result<()>) {
+    use std::os::unix::fs::PermissionsExt;
+    static PLACED: AtomicU32 = AtomicU32::new(0);
+    let name = path.file_name().expect("a file name").to_string_lossy();
+    let partial = path.with_file_name(format!(
+        ".{name}.{}.{}.partial",
+        std::process::id(),
+        PLACED.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _alone = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+    let placed = make(&partial)
+        .and_then(|()| std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::File::open(&partial)?.sync_all())
+        .and_then(|()| std::fs::rename(&partial, path));
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&partial);
+        panic!("cannot put the program {}: {e}", path.display());
+    }
 }
 
 /// A fresh home, under the system's temporary folder with a short name so the socket's

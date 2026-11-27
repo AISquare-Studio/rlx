@@ -212,11 +212,78 @@ fn with_only_home_set_it_finds_the_default_home_and_starts_rlxd() {
 #[cfg(unix)]
 #[test]
 fn rlx_beside_rlxd_is_found_and_asked_its_version() {
-    use std::os::unix::fs::PermissionsExt;
+    rlx_beside_rlxd();
+}
+
+/// [`rlx_beside_rlxd_is_found_and_asked_its_version`] 50 times, 4 at once, as two more
+/// threads start commands without pause, alongside this binary's other tests. Each run
+/// copies rlxd and puts its stand-in rlx, then starts them, while other threads start
+/// processes. On Linux a program that any process still has open for writing can't start
+/// ("Text file busy", ETXTBSY), which failed that test in runs 45843894810 and
+/// 45872911004 ([`common::copy_executable`]).
+#[cfg(unix)]
+#[test]
+fn rlx_beside_rlxd_holds_fifty_times_as_other_threads_start_commands() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    const RUNS: usize = 50;
+    const AT_ONCE: usize = 4;
+    let next = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let starters: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut started = 0_u64;
+                    while !done.load(Ordering::Relaxed) {
+                        let mut command = std::process::Command::new("/bin/sh");
+                        command
+                            .args(["-c", "exit 0"])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        let mut child = common::launch(&mut command).expect("sh starts");
+                        child.wait().expect("sh ends");
+                        started += 1;
+                    }
+                    started
+                })
+            })
+            .collect();
+        let runners: Vec<_> = (0..AT_ONCE)
+            .map(|_| {
+                scope.spawn(|| {
+                    while next.fetch_add(1, Ordering::Relaxed) < RUNS {
+                        rlx_beside_rlxd();
+                    }
+                })
+            })
+            .collect();
+        // Every runner ends, a failed one too, before the starters are told to stop.
+        let ran: Vec<_> = runners.into_iter().map(|runner| runner.join()).collect();
+        done.store(true, Ordering::Relaxed);
+        let started: u64 = starters
+            .into_iter()
+            .map(|starter| starter.join().expect("a starter"))
+            .sum();
+        for outcome in ran {
+            if let Err(panic) = outcome {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        assert!(started > 0, "no command started alongside the runs");
+        eprintln!("{RUNS} runs, {AT_ONCE} at once, alongside {started} other commands");
+    });
+}
+
+/// rlxd, copied to a folder of a fresh home with no PATH, finds the rlx beside it before
+/// the install folders' and asks its version: of a stand-in rlx that says one, one that
+/// fails, and one that leaves a process holding its output open.
+#[cfg(unix)]
+fn rlx_beside_rlxd() {
     let home = TestHome::new();
     let bin = home.root().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_rlxd"), bin.join("rlxd")).unwrap();
+    common::copy_executable(Path::new(env!("CARGO_BIN_EXE_rlxd")), &bin.join("rlxd"));
     let rlx = bin.join("rlx");
     // The copy, in this home, with no PATH: only the folder beside it holds an rlx
     // before the install folders do.
@@ -236,8 +303,7 @@ fn rlx_beside_rlxd_is_found_and_asked_its_version() {
         ("#!/bin/sh\necho 'rlx 9.9.8'\nsleep 20 &\n", json!("9.9.8")),
     ] {
         let began = std::time::Instant::now();
-        std::fs::write(&rlx, script).unwrap();
-        std::fs::set_permissions(&rlx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        common::put_executable(&rlx, script);
         let data = probe();
         assert_eq!(data["rlx"]["installed"], true, "{data}");
         assert_eq!(real(data["rlx"]["path"].as_str().unwrap()), real(&rlx));
@@ -460,7 +526,6 @@ fn readme_command() -> String {
 #[cfg(unix)]
 #[test]
 fn the_readme_command_runs_rlxd_else_says_rlx_else_nothing() {
-    use std::os::unix::fs::PermissionsExt;
     // Folders every user shares: an rlx or rlxd there would answer instead of this test's.
     let shared = [
         "/opt/homebrew/bin",
@@ -498,13 +563,12 @@ fn the_readme_command_runs_rlxd_else_says_rlx_else_nothing() {
     assert_eq!(nothing.code(), Some(127), "{nothing:?}");
 
     let rlx = bin.join("rlx");
-    std::fs::write(&rlx, "#!/bin/sh\necho 'rlx 0.10.1'\n").unwrap();
-    std::fs::set_permissions(&rlx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    common::put_executable(&rlx, "#!/bin/sh\necho 'rlx 0.10.1'\n");
     let old = send();
     assert_eq!(old.code(), Some(5), "{old:?}");
     assert_eq!(old.stdout.trim(), "rlx 0.10.1");
 
-    std::fs::copy(env!("CARGO_BIN_EXE_rlxd"), bin.join("rlxd")).unwrap();
+    common::copy_executable(Path::new(env!("CARGO_BIN_EXE_rlxd")), &bin.join("rlxd"));
     let (code, started) = answer(&send());
     assert_eq!(code, Some(0), "{started}");
     assert_eq!(started["started"], true);
