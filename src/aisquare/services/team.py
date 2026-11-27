@@ -53,6 +53,7 @@ from aisquare.core.store import (
     AmbiguousIdError,
     ContextStore,
     Relevance,
+    SessionNameRow,
     store_session,
     unmet_needs,
 )
@@ -1500,11 +1501,19 @@ def board_data_in(
     )
 
 
+OPEN_STATUSES: frozenset[TaskStatus] = frozenset({"todo", "doing", "review", "blocked"})
+"""Every status but :data:`CLOSED_STATUSES`: the tasks a paged board reads at each tick."""
+
+
 class BoardRead(NamedTuple):
     """What a painted board shows: :func:`board_data`'s four, the ``fleet switch`` of each
     limited session's chip (:func:`fleet_switches`), and each session's fleet row's label, live
     or ended (:func:`fleet_labels`), which names it as asq's left pane does
-    (``cli.board_names``, #140)."""
+    (``cli.board_names``, #140); then the status of each task the read names, by id, and how
+    many tasks are in each of :data:`CLOSED_STATUSES` (one left out has none).
+
+    A paged read (:func:`board_read`'s ``sessions`` or ``closed=False``) holds only what a
+    board's tick shows, and ``statuses`` and ``closed`` say what it does not hold (#44)."""
 
     project: ProjectInfo
     sessions: list[TeamSession]
@@ -1512,6 +1521,8 @@ class BoardRead(NamedTuple):
     events: list[TeamEvent]
     switches: dict[str, str]
     fleet_labels: dict[str, str] = {}  # noqa: RUF012 — a NamedTuple default, never mutated
+    statuses: dict[str, str] = {}  # noqa: RUF012 — a NamedTuple default, never mutated
+    closed: dict[str, int] = {}  # noqa: RUF012 — a NamedTuple default, never mutated
 
 
 def board_read(
@@ -1521,6 +1532,9 @@ def board_read(
     since_seq: int | None = None,
     project: ProjectInfo | None = None,
     exclude_kinds: Collection[str] = (),
+    closed: bool = True,
+    sessions: Collection[str] | None = None,
+    task_ids: Collection[str] = (),
 ) -> BoardRead:
     """:func:`board_data` for a board that paints its sessions, with their chips' switches,
     in its one store session.
@@ -1530,18 +1544,166 @@ def board_read(
     connection, the migration check and the presence pass, on the event loop, at every 2 s
     tick of every visible board for as long as a session stayed limited, which is hours
     (review of #259, round 23). ``exclude_kinds`` as in :func:`board_data`.
+
+    **Paged, at each tick (#44).** By default it reads every task and session the project
+    ever had, as :func:`board_data` does. A board's tick asks for less, and it shows the
+    same:
+
+    - ``closed=False``: the open tasks alone (:data:`OPEN_STATUSES`), the done archive
+      counted (``closed``) and read when it is unfolded.
+    - ``sessions``: the live sessions, these, those the events read name and those the tasks
+      read are claimed by, and every session called what one of them is called
+      (:func:`board_sessions`), not every session ever.
+    - ``statuses`` holds the status of every task read, every task their ``needs`` name,
+      every task the events read name, and ``task_ids``: what a line shows of a task it
+      names, the feed's earlier lines' among them, which the board passes.
     """
     _require_enabled()
     with store_session() as store:
-        read = _read_board(
+        if closed and sessions is None:
+            read = _read_board(
+                store,
+                cwd,
+                events=events,
+                since_seq=since_seq,
+                project=project,
+                exclude_kinds=exclude_kinds,
+            )
+            tasks = read[2]
+            return BoardRead(
+                *read,
+                fleet_switches(store, read[1]),
+                fleet_labels(store, read[1]),
+                {task.id: str(task.status) for task in tasks},
+                _closed_counts(tasks),
+            )
+        return _paged_board(
             store,
             cwd,
             events=events,
             since_seq=since_seq,
             project=project,
             exclude_kinds=exclude_kinds,
+            closed=closed,
+            sessions=sessions or (),
+            task_ids=task_ids,
         )
-        return BoardRead(*read, fleet_switches(store, read[1]), fleet_labels(store, read[1]))
+
+
+def _closed_counts(tasks: Sequence[TeamTask]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in tasks:
+        if task.status in CLOSED_STATUSES:
+            counts[task.status] = counts.get(task.status, 0) + 1
+    return counts
+
+
+def _paged_board(
+    store: ContextStore,
+    cwd: Path | None,
+    *,
+    events: int,
+    since_seq: int | None,
+    project: ProjectInfo | None,
+    exclude_kinds: Collection[str],
+    closed: bool,
+    sessions: Collection[str],
+    task_ids: Collection[str],
+) -> BoardRead:
+    """:func:`board_read`'s paged read: what one tick of a board shows, and no more (#44)."""
+    resolved = project if project is not None else _project(store, cwd)
+    if since_seq is None:
+        fetched = store.recent_events(resolved.id, exclude_kinds=exclude_kinds, limit=events)
+    else:
+        fetched = store.events_since(
+            resolved.id, since_seq, exclude_kinds=exclude_kinds, limit=events
+        )
+    if closed:
+        tasks = store.team_tasks(resolved.id)
+        counts = _closed_counts(tasks)
+    else:
+        tasks = store.team_tasks_in(resolved.id, OPEN_STATUSES)
+        counts = store.team_task_counts(resolved.id, CLOSED_STATUSES)
+    statuses: dict[str, str] = {task.id: task.status for task in tasks}
+    named = {*task_ids, *(event.task_id for event in fetched if event.task_id)}
+    named.update(need for task in tasks for need in task.needs)
+    statuses.update(store.team_task_statuses(resolved.id, named - statuses.keys()))
+    wanted = {*sessions, *(event.session_id for event in fetched if event.session_id)}
+    wanted.update(task.claimed_by for task in tasks if task.claimed_by)
+    read_sessions, labels = board_sessions(store, resolved.id, wanted)
+    return BoardRead(
+        resolved,
+        read_sessions,
+        tasks,
+        fetched,
+        fleet_switches(store, read_sessions),
+        labels,
+        statuses,
+        counts,
+    )
+
+
+def board_sessions(
+    store: ContextStore, project_id: str, ids: Collection[str]
+) -> tuple[list[TeamSession], dict[str, str]]:
+    """The sessions a paged board reads (#44), in :meth:`ContextStore.team_sessions`' order,
+    with their fleet rows' labels (:func:`fleet_labels`): the live ones, those in ``ids``, and
+    of their namesakes the few that decide what the board calls them.
+
+    ``cli.board_names`` tells sessions of one name apart by all of them: the live one, else the
+    newest started, keeps the name, and every other gets the time it started, or its short id
+    where another of the name started in that minute. So an earlier round's agent of the same
+    label, ended and named by nothing on the board, still decides whether the board shows its
+    namesake as ``coder-1`` or ``coder-1 (14:02)``. Every namesake is read by the columns that
+    decide it (:meth:`ContextStore.session_name_rows`), and only those that do are read whole:
+    the one that keeps a name, and those that started in a minute one read here started in.
+    Names are told apart within a name, never across, so each is named as a read of every
+    session would name it."""
+    read = store.board_sessions(project_id, ids)
+    labels = fleet_labels(store, read)
+    names = {board_name(session, labels) for session in read}
+    have = {session.id for session in read}
+    namesakes = store.session_ids_called(project_id, names) - have
+    if not namesakes:
+        return read, labels
+    their_labels = _fleet_labels_of(store, namesakes)
+    every = {**labels, **their_labels}
+    rows = store.session_name_rows(project_id, have | namesakes)
+    groups: dict[str, list[SessionNameRow]] = {}
+    for row in rows:
+        name = every.get(row.id) or row.label or row.role
+        if name in names:
+            groups.setdefault(name, []).append(row)
+    wanted: set[str] = set()
+    for group in groups.values():
+        # As ``cli.board_names`` keeps a name: sorted stably, in team_sessions' order.
+        kept, *others = sorted(group, key=lambda row: (not row.ended, row.started_at), reverse=True)
+        wanted.add(kept.id)
+        minutes = {_minute(row) for row in others if row.id in have}
+        wanted.update(row.id for row in others if _minute(row) in minutes)
+    wanted -= have
+    if not wanted:
+        return read, labels
+    order = {row.id: index for index, row in enumerate(rows)}
+    more = store.team_sessions_seen_since(project_id, None, ids=sorted(wanted))
+    sessions = sorted([*read, *more], key=lambda session: order.get(session.id, -1))
+    labels.update({sid: label for sid, label in their_labels.items() if sid in wanted})
+    return sessions, labels
+
+
+def _minute(row: SessionNameRow) -> str:
+    """The minute a session started, as ``cli.board_names`` tells namesakes apart by it."""
+    return f"{row.started_at.astimezone():%H:%M}"
+
+
+def _fleet_labels_of(store: ContextStore, session_ids: Collection[str]) -> dict[str, str]:
+    """:func:`fleet_labels`, by id: a read that fails costs the names, never the board."""
+    try:
+        found = store.fleet_labels_for_sessions(sorted(session_ids))
+    except Exception as exc:
+        _log.warning("the board's namesakes are named by their own labels (%s)", exc)
+        return {}
+    return {sid: label.removeprefix(RETIRED_LABEL) for sid, label in found.items()}
 
 
 def _read_board(

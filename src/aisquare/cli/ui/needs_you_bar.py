@@ -128,8 +128,14 @@ def read_needs(projects: Sequence[ProjectInfo]) -> list[Need]:
     needs: list[Need] = []
     for project in projects:
         try:
+            # Paged (#44): the open tasks and the sessions these events and tasks name, all
+            # ``project_needs`` reads, not every task and session the board ever had.
             read = team_service.board_read(
-                events=200, project=project, exclude_kinds=team_service.CAPTAIN_AUDIT_KINDS
+                events=200,
+                project=project,
+                exclude_kinds=team_service.CAPTAIN_AUDIT_KINDS,
+                closed=False,
+                sessions=(),
             )
         except Exception:
             continue

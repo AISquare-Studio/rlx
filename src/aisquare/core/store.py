@@ -1870,6 +1870,9 @@ class ContextStore(Protocol):
     def team_sessions_seen_since(
         self, project_id: str, since: datetime | None, *, ids: Sequence[str] = ()
     ) -> list[TeamSession]: ...
+    def board_sessions(self, project_id: str, ids: Collection[str]) -> list[TeamSession]: ...
+    def session_name_rows(self, project_id: str, ids: Collection[str]) -> list[SessionNameRow]: ...
+    def session_ids_called(self, project_id: str, names: Collection[str]) -> set[str]: ...
     def update_session(
         self,
         session_id: str,
@@ -1901,6 +1904,13 @@ class ContextStore(Protocol):
         self, project_id: str, *, status: TaskStatus | None = None
     ) -> list[TeamTask]: ...
     def has_team_task_in(self, project_id: str, statuses: Collection[TaskStatus]) -> bool: ...
+    def team_tasks_in(
+        self, project_id: str, statuses: Collection[TaskStatus]
+    ) -> list[TeamTask]: ...
+    def team_task_statuses(self, project_id: str, task_ids: Collection[str]) -> dict[str, str]: ...
+    def team_task_counts(
+        self, project_id: str, statuses: Collection[TaskStatus]
+    ) -> dict[str, int]: ...
     def claim_task(self, task_id: str, session_ref: str, lease_until: datetime) -> bool: ...
     def renew_leases(self, session_id: str, lease_until: datetime) -> None: ...
     def set_task_status(self, task_id: str, status: TaskStatus) -> TeamTask: ...
@@ -2709,6 +2719,18 @@ _ACTIVITY = {
     "team_event": "SELECT project_id, created_at FROM team_event",
     "fleet_agent": "SELECT project_id, created_at FROM fleet_agent",
 }
+
+
+class SessionNameRow(NamedTuple):
+    """What a board calls a session and tells it from its namesakes by, read alone
+    (:meth:`SqliteStore.session_name_rows`): its own label and role (its fleet row's label is
+    read beside it), when it started, and whether it has ended."""
+
+    id: str
+    label: str | None
+    role: str
+    started_at: datetime
+    ended: bool
 
 
 class SqliteStore:
@@ -3697,6 +3719,90 @@ class SqliteStore:
         sessions = {row["id"]: _row_to_session(row) for row in rows}
         return sorted(sessions.values(), key=lambda session: session.last_seen_at, reverse=True)
 
+    def board_sessions(self, project_id: str, ids: Collection[str]) -> list[TeamSession]:
+        """The project's live sessions and those named in ``ids``, ended or not, in
+        :meth:`team_sessions`' order: what a board reads at each tick in place of every
+        session the project ever had (#44, ``services.team.board_read``).
+
+        That order is ``team_session_project`` walked backwards, so sessions seen at the same
+        moment come newest row first: rebuilt here from ``last_seen_at`` as stored and the
+        rowid, whichever reads found them, so a board lists and names them as before."""
+        rows: list[sqlite3.Row] = self._conn.execute(
+            f"SELECT rowid AS row_number, {_SESSION_COLUMNS} FROM team_session "
+            "WHERE project_id = ? AND ended_at IS NULL",
+            (project_id,),
+        ).fetchall()
+        named = sorted(set(ids) - {row["id"] for row in rows})
+        for start in range(0, len(named), 500):  # well under SQLite's bound on parameters
+            chunk = named[start : start + 500]
+            rows += self._conn.execute(
+                f"SELECT rowid AS row_number, {_SESSION_COLUMNS} FROM team_session "
+                f"WHERE project_id = ? AND id IN ({', '.join('?' * len(chunk))})",
+                (project_id, *chunk),
+            ).fetchall()
+        rows.sort(key=lambda row: (row["last_seen_at"], row["row_number"]), reverse=True)
+        return [_row_to_session(row) for row in rows]
+
+    def session_name_rows(self, project_id: str, ids: Collection[str]) -> list[SessionNameRow]:
+        """What a board names each of ``ids`` by, and tells it apart from its namesakes by
+        (``cli.board_names``), in :meth:`team_sessions`' order: four columns of each, never the
+        session read whole (#44, ``services.team.board_sessions``)."""
+        named = sorted(set(ids))
+        rows: list[sqlite3.Row] = []
+        for start in range(0, len(named), 500):  # well under SQLite's bound on parameters
+            chunk = named[start : start + 500]
+            rows += self._conn.execute(
+                "SELECT rowid AS row_number, id, label, role, started_at, last_seen_at, "
+                "ended_at IS NOT NULL AS ended FROM team_session "
+                f"WHERE project_id = ? AND id IN ({', '.join('?' * len(chunk))})",
+                (project_id, *chunk),
+            ).fetchall()
+        rows.sort(key=lambda row: (row["last_seen_at"], row["row_number"]), reverse=True)
+        return [
+            SessionNameRow(
+                row["id"],
+                row["label"],
+                row["role"],
+                datetime.fromisoformat(row["started_at"]),
+                bool(row["ended"]),
+            )
+            for row in rows
+        ]
+
+    def session_ids_called(self, project_id: str, names: Collection[str]) -> set[str]:
+        """Every session of the project a board could call by one of ``names``, and maybe a
+        few more: its own label or role is one, or a fleet row named one (or retired from one,
+        ``~login-fix``) records it, as :meth:`fleet_labels_for_sessions` finds a session's row.
+        ``services.team.board_sessions`` keeps those its names say are; a board tells two
+        sessions of one name apart by all of them (``cli.board_names``), so a read that left
+        one out could name the rest otherwise (#44)."""
+        wanted = sorted(set(names))
+        found: set[str] = set()
+        for start in range(0, len(wanted), 250):  # each name twice for a fleet row: < 500
+            chunk = wanted[start : start + 250]
+            marks = ", ".join("?" * len(chunk))
+            labels = (*chunk, *(f"{RETIRED_LABEL}{name}" for name in chunk))
+            label_marks = ", ".join("?" * len(labels))
+            rows = self._conn.execute(
+                "SELECT id FROM team_session WHERE project_id = ? "
+                f"AND (label IN ({marks}) OR role IN ({marks}))",
+                (project_id, *chunk, *chunk),
+            ).fetchall()
+            rows += self._conn.execute(
+                "SELECT owned AS id FROM (SELECT COALESCE(session_id, (SELECT value FROM "
+                "team_meta WHERE key = 'fleet-session:' || fleet_agent.id)) AS owned, label "
+                f"FROM fleet_agent) WHERE owned IS NOT NULL AND label IN ({label_marks})",
+                labels,
+            ).fetchall()
+            rows += self._conn.execute(
+                "SELECT substr(held.key, ?) AS id FROM team_meta AS held "
+                "JOIN fleet_agent ON fleet_agent.id = held.value "
+                f"WHERE held.key >= ? AND held.key < ? AND fleet_agent.label IN ({label_marks})",
+                (len(FLEET_HELD) + 1, FLEET_HELD, _just_past(FLEET_HELD), *labels),
+            ).fetchall()
+            found |= {str(row["id"]) for row in rows}
+        return found
+
     @_session_write
     def update_session(
         self,
@@ -4148,6 +4254,47 @@ class SqliteStore:
             (project_id, *wanted),
         ).fetchone()
         return bool(row[0])
+
+    def team_tasks_in(self, project_id: str, statuses: Collection[TaskStatus]) -> list[TeamTask]:
+        """The board's tasks in ``statuses``, by id as :meth:`team_tasks` orders them: a
+        board's open ones at each tick, never the done archive with them (#44)."""
+        wanted = sorted(statuses)
+        if not wanted:
+            return []
+        rows = self._conn.execute(
+            f"SELECT {_TASK_COLUMNS} FROM team_task WHERE project_id = ? "
+            f"AND status IN ({', '.join('?' * len(wanted))}) ORDER BY id",
+            (project_id, *wanted),
+        ).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+    def team_task_statuses(self, project_id: str, task_ids: Collection[str]) -> dict[str, str]:
+        """Each of ``task_ids``' status, by id, of those on the board: what a board's lines
+        show of a task they name, read without the rest of it (#44)."""
+        named = sorted(set(task_ids))
+        statuses: dict[str, str] = {}
+        for start in range(0, len(named), 500):  # well under SQLite's bound on parameters
+            chunk = named[start : start + 500]
+            rows = self._conn.execute(
+                "SELECT id, status FROM team_task WHERE project_id = ? "
+                f"AND id IN ({', '.join('?' * len(chunk))})",
+                (project_id, *chunk),
+            ).fetchall()
+            statuses.update({row["id"]: row["status"] for row in rows})
+        return statuses
+
+    def team_task_counts(self, project_id: str, statuses: Collection[TaskStatus]) -> dict[str, int]:
+        """How many of the board's tasks are in each of ``statuses`` (none: left out), counted
+        on the ``(project_id, status)`` index: the done archive's size, unread (#44)."""
+        wanted = sorted(statuses)
+        if not wanted:
+            return {}
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) AS tasks FROM team_task WHERE project_id = ? "
+            f"AND status IN ({', '.join('?' * len(wanted))}) GROUP BY status",
+            (project_id, *wanted),
+        ).fetchall()
+        return {row["status"]: row["tasks"] for row in rows}
 
     @_session_write
     def claim_task(self, task_id: str, session_ref: str, lease_until: datetime) -> bool:
@@ -7418,6 +7565,12 @@ before the row moved to another (a ``/clear``, a hand-over:
 :meth:`SqliteStore.adopt_fleet_agent_session`). The board names such a session as that row
 is labelled (:meth:`SqliteStore.fleet_labels_for_sessions`, #140); nothing else reads it. It
 goes with the session (:data:`_SESSION_META_KINDS`)."""
+
+
+def _just_past(prefix: str) -> str:
+    """The first key past every key that starts with ``prefix``: ``key >= prefix AND key <
+    _just_past(prefix)`` is the prefix's keys, as a range the primary key answers."""
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
 _FLEET_LABEL_MOVES: tuple[str, ...] = ("before-limit:", "before-limit-warned:", "fleet-launched:")
