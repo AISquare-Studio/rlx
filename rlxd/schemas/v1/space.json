@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpaceParams",
+  "description": "`space.ensure`'s and `space.erase`'s params: the space, by name.\n\n```json\n{\"name\": \"default\"}\n```",
+  "type": "object",
+  "properties": {
+    "name": {
+      "description": "The space: 1 to 64 lower-case letters, digits, `-`, `_` and `.`, starting with a\nletter or digit, with no `..`, no `.` at the end, and not a Windows device name\nsuch as `con` or `nul`.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9_-]*(\\.[a-z0-9_-]+)*$"
+    }
+  },
+  "required": [
+    "name"
+  ]
+}

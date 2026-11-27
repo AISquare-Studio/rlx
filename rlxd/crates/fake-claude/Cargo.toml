@@ -1,0 +1,21 @@
+[package]
+name = "fake-claude"
+description = "A stand-in for Claude Code in rlxd's tests: it replays recorded stream-json and logs what it was given."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# A library only. Its binary is rlxd's `fake-claude` [[bin]], which only rlxd's tests
+# build (crates/rlxd/Cargo.toml, the `fake-claude` feature), so no release build or
+# archive ever holds it.
+[lib]
+doctest = false
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

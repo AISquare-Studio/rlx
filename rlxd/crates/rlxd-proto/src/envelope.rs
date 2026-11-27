@@ -345,6 +345,24 @@ pub mod codes {
     /// for, is longer than the longest line a client reads (16 MiB). Ask for less
     /// `scrollback`. A stream whose new snapshot is that long ends with it.
     pub const SCREEN_TOO_LONG: &str = "screen_too_long";
+    /// `run.start`: rlxd already knows a run of that `run_id`, live or ended.
+    pub const RUN_EXISTS: &str = "run_exists";
+    /// `run.start`: a `check`, `parse_instruction` or `widget_author` run whose mount is
+    /// not `no_tools`.
+    pub const KIND_MOUNT_MISMATCH: &str = "kind_mount_mismatch";
+    /// `run.start`: a `send_executor` or `watch` run without `pinned_call`.
+    pub const PINNED_CALL_REQUIRED: &str = "pinned_call_required";
+    /// The request asks for something this rlxd does not do yet; the message names it.
+    pub const NOT_IMPLEMENTED: &str = "not_implemented";
+    /// No run of that `run_id` is known.
+    pub const UNKNOWN_RUN: &str = "unknown_run";
+    /// rlxd could not start the run, such as when Claude Code is not installed; the
+    /// message says why.
+    pub const RUN_START_FAILED: &str = "run_start_failed";
+    /// `run.start`: rlxd can't name the absolute path of the `rlxd-hook` beside it, which
+    /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
+    /// why.
+    pub const HOOK_NOT_FOUND: &str = "hook_not_found";
 }
 
 impl Envelope {

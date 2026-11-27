@@ -187,6 +187,16 @@ pub mod methods {
     pub const PTY_KILL: &str = "pty.kill";
     /// Every PTY of the home: no params, [`PtyList`](crate::PtyList) out.
     pub const PTY_LIST: &str = "pty.list";
+    /// Starts a run (7.5): [`RunStartParams`](crate::RunStartParams) in,
+    /// [`RunRef`](crate::RunRef) out, then the run's events on the `run` topic.
+    pub const RUN_START: &str = "run.start";
+    /// Cancels a run, queued or running, killing its process tree:
+    /// [`RunRef`](crate::RunRef) in, [`RunCancelData`](crate::RunCancelData) out.
+    pub const RUN_CANCEL: &str = "run.cancel";
+    /// Makes a space's folder if it is not there (2.5):
+    /// [`SpaceParams`](crate::SpaceParams) in, [`SpaceEnsureData`](crate::SpaceEnsureData)
+    /// out.
+    pub const SPACE_ENSURE: &str = "space.ensure";
 }
 
 impl Request {

@@ -273,6 +273,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fake-claude"
+version = "0.10.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -786,6 +793,7 @@ version = "0.10.1"
 dependencies = [
  "clap",
  "crossterm",
+ "fake-claude",
  "getrandom 0.3.4",
  "jsonschema",
  "libc",

@@ -11,9 +11,10 @@ use serde_json::Value;
 use crate::{
     DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, PtyExited, PtyKillParams,
     PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
-    PtySubscribeParams, PtyWriteParams, Request, Setting, SettingsChanged, SettingsDeleteParams,
-    SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, StatusData,
-    SubscribeParams,
+    PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunEvent, RunRef, RunStartParams,
+    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
+    SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceEraseData, SpaceParams,
+    StatusData, SubscribeParams,
 };
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
@@ -52,6 +53,16 @@ pub fn all() -> Vec<SchemaFile> {
         file::<PtySubscribeParams>("pty-subscribe.json"),
         file::<PtyWriteParams>("pty-write.json"),
         file::<Request>("request.json"),
+        file::<RunCancelData>("run-cancel-reply.json"),
+        file::<RunEvent>("run-event.json"),
+        list_of::<RunEvent>(
+            "run-event-list.json",
+            "RunEventList",
+            "A run's events as a JSON array, such as `jq -s .` makes of a capture of the \
+             run and needs_you topics, or of `run.events`.",
+        ),
+        file::<RunRef>("run-ref.json"),
+        file::<RunStartParams>("run-start.json"),
         file::<StatusData>("status-reply.json"),
         file::<Setting>("setting.json"),
         file::<SettingsChanged>("settings-changed.json"),
@@ -60,6 +71,9 @@ pub fn all() -> Vec<SchemaFile> {
         file::<SettingsListParams>("settings-list.json"),
         file::<SettingsList>("settings-list-reply.json"),
         file::<SettingsSetParams>("settings-set.json"),
+        file::<SpaceEnsureData>("space-ensure-reply.json"),
+        file::<SpaceEraseData>("space-erase-reply.json"),
+        file::<SpaceParams>("space.json"),
     ];
     files.sort_by_key(|file| file.name);
     files

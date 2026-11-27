@@ -5,7 +5,7 @@
 > 0.10.3 on, v1 changes only additively.
 
 These are JSON Schemas (draft 2020-12) for rlxd's wire format, following handoff 0.10.3
-rev 7: 7.2, 7.3, 7.4, 5.1, 4.1 and 1.4. They are generated from the types in
+rev 6 and 7: 7.2, 7.3, 7.4, 7.5, 5.1, 2.5, 4.1 and 1.4. They are generated from the types in
 `rlxd/crates/rlxd-proto`.
 
 **Don't edit them by hand.** Change the types, then regenerate and commit:
@@ -63,6 +63,14 @@ bound both validators agree on.
 | `pty-list-reply.json` | `pty.list`'s reply: `{ptys: [{pty_id, label?, argv, cwd, pid, cols, rows, started_at, exited, status?, signal?, error?}]}`, in the order they started |
 | `pty-output.json` | `pty.output`'s data, on the `pty` topic: `{pty_id, bytes_b64}`, the process's bytes in standard base64 |
 | `pty-exited.json` | `pty.exited`'s data, on the `pty` topic: `{pty_id, status, signal?, error?}` |
+| `run-start.json` | `run.start`'s params (7.5): `{run_id, kind, prompt?, mount, needs_connectors?, output_schema?, persist_session?, space?, append_system_prompt?, partial?, timeout_s?, deadline_ms?, pinned_call?, needs_you_when?, job_id?}`. `run_id` is a lower-case UUID, Claude Code's session id; `space` follows the space name rule |
+| `run-ref.json` | One run by id, `{run_id}`: `run.start`'s reply, and `run.cancel`'s params |
+| `run-cancel-reply.json` | `run.cancel`'s reply: `{run_id, cancelled, state}`. A run that had ended stays as it was, `cancelled: false` |
+| `run-event.json` | One event of a run's stream: `event.json`, plus each 7.5 run event type's `data` (`run.queued`, `run.started`, `run.text`, `run.tool_result`, `run.rate_limited`, `run.needs_you`, `run.done`, `run.failed`). Other types need only `event.json` |
+| `run-event-list.json` | A JSON array of them, as `jq -s .` makes of a capture of the `run` and `needs_you` topics |
+| `space.json` | `space.ensure`'s and `space.erase`'s params: `{name}`, 1 to 64 lower-case letters, digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, no `.` at the end, not a Windows device name |
+| `space-ensure-reply.json` | `space.ensure`'s reply: `{name, path}`, the space's folder, absolute and resolved |
+| `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path]}` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 
