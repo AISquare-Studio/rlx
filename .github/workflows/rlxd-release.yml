@@ -607,7 +607,10 @@ jobs:
           mkdir -p "$root/v$W"
           uv run --locked --extra dev python scripts/rlxd_archive.py pack --target "$TARGET" \
             --bin-dir "$target/release" --out "$root/v$W"
-          uv run --locked --extra dev python scripts/rlxd_archive.py sums --dir "$root/v$W"
+          # Sums for this host's archive alone: `rlxd_archive.py sums` refuses a release
+          # missing any of the five targets, as it must for a real one, and `rlx daemon
+          # install` reads only its own target's line.
+          (cd "$root/v$W" && shasum -a 256 "rlxd-$TARGET.tar.gz" > rlxd-SHA256SUMS)
           (cd "$tree2/rlxd" && CARGO_TARGET_DIR="$target" cargo build --release -p rlxd --features fake-claude --bin fake-claude)
           fc="$RUNNER_TEMP/fake-claude"; mkdir -p "$fc"; cp "$target/release/fake-claude" "$fc/slow"
           git worktree remove --force "$tree2"
