@@ -189,6 +189,28 @@ fn an_event_it_does_not_take_is_a_usage_error() {
     }
 }
 
+/// `pre-tool-use` whose other arguments are not UTF-8 still denies (review #2562 round 2,
+/// m4): the command line is rlx's own, but no path of the gate's hook may print nothing.
+#[cfg(unix)]
+#[test]
+fn pre_tool_use_with_an_argument_that_is_not_utf8_still_denies() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rlxd-hook"))
+        .arg("pre-tool-use")
+        .arg("--run")
+        .arg(OsStr::from_bytes(b"r\xff"))
+        .args(["--attempt", "1"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("usage: rlxd-hook"));
+}
+
 /// A stand-in for rlxd in `here`'s home: it says ok to the hello and answers every `hook`
 /// as it is told, as a wrong rlxd or brain could, counting them. It stops listening when
 /// dropped.

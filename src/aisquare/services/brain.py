@@ -65,7 +65,11 @@ has (:data:`ENV_NAMES`). For one request, the brain becomes that process:
   read again (``time.tzset``), and so is the temporary folder (``tempfile.tempdir``).
   Every other variable is the brain's own, which rlxd started it with. What a process
   reads only as it starts is the brain's: the locale's ``LC_*`` set Python's own encodings
-  then, and pass on to the hook's children only.
+  then, and pass on to the hook's children only. So a worker a hook detaches
+  (``services.hooks._detach``, the hand-over) starts from the brain's environment with the
+  allowlist's values, not from the agent's whole one: the agent's ``LANG``, proxies or
+  ``ANTHROPIC_BASE_URL`` are not its, as only the allowlist's names, none a credential,
+  cross from rlxd-hook.
 - **Directory.** ``os.chdir`` to rlxd-hook's working directory (the brain's own when that
   one is gone, as it can be by the time the hook runs).
 - **Process.** ``sys.argv`` is ``[<this rlx>, "hook", <event>]``. ``sys.stdin`` reads the
@@ -84,10 +88,11 @@ for the next.
 **The end of a hook is a process's end.** The brain waits for each non-daemon thread the
 hook started; runs the exit handlers it registered (``atexit.register`` is the brain's
 for the hook), the last first, then those rlx's modules register at import
-(:data:`EXIT_HANDLERS`: a Remote push the hook began is sent, tmux control clients close);
-then gives the daemon threads the hook started :data:`DAEMON_WAIT` to end, and logs any
-still running, which an exit would have stopped. All of it inside the hook, so what they
-print is the hook's. Then it collects the children the hook let go of
+(:data:`EXIT_HANDLERS`: a Remote push the hook began is sent, tmux control clients close).
+All of it inside the hook, so what they print is the hook's. It does not wait for the
+daemon threads the hook started, as an exit waits for none: those still running are named
+on the brain's log, never in the hook's stderr (``rlx hook``'s exit says nothing of them),
+and run on in the brain until they end. Then it collects the children the hook let go of
 (``subprocess``'s own record), and only those. A child still running after a hook is a
 detached worker (``services.hooks._detach``), which leaves ``rlx hook`` behind on purpose
 (the code index's refresh, a hand-over): on POSIX in a session of its own, outside the
@@ -125,25 +130,40 @@ Module state (the staleness audit)
 A brain lives for days; ``rlx hook`` starts from its modules as they are imported, every
 time. So the brain keeps that state as it is before its first request
 (:func:`take_baseline`: every module-level value of every ``aisquare`` module, and a copy
-of each container's content), and before each hook puts it back (:func:`fresh_state`):
+of each container's content), and before each hook puts it back (:func:`fresh_state`).
+The baseline is taken once the hook path is imported (:func:`_import_the_hook_path`: the CLI,
+and every module of the agents' adapters, whose transcript readers and usage tallies a Stop
+loads lazily), so no module a hook loads is first imported, and kept, after it.
 
 - every ``functools`` cache is emptied: whatever it held is computed again from this
   hook's environment and files;
 - every module-level name is bound to its object again, so state written with ``global``
   is back (``core.config._LAST_PARSE``, ``core.state._state``, ``core.program._in_app``,
-  ``core.instances._this``, ``core.tmux._boot``, ``services.native_telemetry.
-  _config_stamp``…);
+  ``core.instances._this``, ``core.tmux._boot``…);
 - every module-level container's content is put back in place, so state mutated where it
   lies is back too: ``core.launch_seal._SEEN`` (the session facts a hook was handed, which
   a later hook's ``adopted`` would otherwise act on), ``core.orchestrator._WARNED_HUBS``
-  (a warning each ``rlx hook`` prints once), ``core.process_table``'s held lookups,
-  ``services.remote_push``'s pushes said, the accounts' read-through caches;
+  (a warning each ``rlx hook`` prints once), ``core.process_table``'s held lookups, the
+  accounts' read-through caches;
 - a name a hook added at module level is removed (a submodule it imported stays).
+
+**State that outlives a request.** What a hook leaves running is the brain's from then on,
+as it would have been the dying process's: a non-daemon thread is joined before the reply,
+a daemon thread runs on until it ends (named on the log), a detached worker is the OS's.
+The registries that track such threads and locks are containers like any other, so before
+the next hook they are empty, as a fresh ``rlx hook`` process has them, while what they held
+lives on in the brain: ``core.process_table._STUCK`` (a stuck ``ps``/``lsof`` thread: each
+hook may start its own four, as each ``rlx hook`` process may, and does not wait for them),
+``services.remote_push._push_in_flight``, and the locks of ``services.claude_accounts.
+_FETCH_LOCKS`` and ``core.claude_accounts._KEYCHAIN_ASKING`` / ``_ITEM_ASKING`` (a thread of
+an earlier hook still holding one no longer excludes the next hook's caller, as it would not
+exclude another ``rlx hook`` process's). That is the fresh process's behaviour, by design.
 
 Tests hold it: after the six events, every module-level value is its baseline's and every
 container's content equals it; the session facts and the hub warning are shown back; and
-the six events import no module of rlx's the baseline lacks (one imported later would keep
-its state across hooks).
+the six events, with real payloads (a Stop's ``transcript_path``) for an agent on a managed
+slot, import no module of rlx's the baseline lacks (one imported later would keep its state
+across hooks).
 
 Module-level values computed from the environment at import would be stale too: none on the
 hook path is (no module of ``aisquare`` reads the environment, the directory or ``argv`` at
@@ -216,7 +236,8 @@ HOOK_EVENTS: tuple[str, ...] = (
 
 #: rlx's own variables the hook path reads: the home, the role, the fleet agent and its
 #: launch, the team and its hub, the broker's scope, the persona, the store's wait, the
-#: captain's switch.
+#: captain's switch, and a traced launch's marker (its pipeline, agent name and Run key,
+#: which session-start's join to the gateway's Run records, ``services.explainability``).
 _RLX_NAMES = (
     "AISQUARE_BOARD_CONTEXT",
     "AISQUARE_BROKER",
@@ -231,10 +252,12 @@ _RLX_NAMES = (
     "AISQUARE_PERSONA",
     "AISQUARE_PIPELINE_ID",
     "AISQUARE_ROLE",
+    "AISQUARE_RUN_TRACE_ID",
     "AISQUARE_TEAM",
     "AISQUARE_TEAM_DELTA",
     "AISQUARE_TEAM_HUB",
     "AISQUARE_TEAM_LEASE_MIN",
+    "AISQUARE_TRACE_AGENT_NAME",
     "RLX_HOME",
 )
 
@@ -264,10 +287,22 @@ _PROCESS_NAMES = (
 
 
 def _agent_names() -> set[str]:
-    """Each agent's own, which only its adapter may name (``AgentAdapter.hook_env``)."""
+    """Each agent's own, which only its adapter may name: what its hooks read
+    (``AgentAdapter.hook_env``), and its accounts' variables, read off them so the list
+    never drifts from them (``AgentAccounts``: its home's, each slot's others, and the
+    copies a launch onto a slot keeps of the shell's own, ``plain_vars``, which tell the
+    hook path a slot from the plain home, ``core.claude_accounts.plain_environment``)."""
     from aisquare.core.agent_adapters import adapters
 
-    return {name for adapter in adapters() for name in adapter.hook_env}
+    names: set[str] = set()
+    for adapter in adapters():
+        names.update(adapter.hook_env)
+        accounts = adapter.accounts
+        if accounts is not None:
+            names.add(accounts.home_env)
+            names.update(accounts.extra_env)
+            names.update(accounts.plain_vars.values())
+    return names
 
 
 #: The allowlist, exact names only: the variables rlxd-hook sends with each hook, and the
@@ -350,9 +385,6 @@ EXIT_HANDLERS: tuple[tuple[str, str], ...] = (
     ("aisquare.core.tmux_control", "_tidy_up"),
 )
 
-#: How long the brain waits, after a hook's exit handlers, for daemon threads the hook
-#: started; one still running after it is logged (an exit would have stopped it).
-DAEMON_WAIT = 2.0
 
 #: The containers a module-level value can be, whose content :func:`fresh_state` puts back.
 _CONTAINERS = (dict, list, set, collections.deque, bytearray)
@@ -403,13 +435,37 @@ def _copy(value: object, memo: dict[int, object] | None = None) -> object:
     return value
 
 
+#: The modules the hook path loads (:func:`_import_the_hook_path`), imported before the
+#: baseline so their state is put back like the rest: the CLI, which imports the handlers,
+#: and every module of the agents' adapters, which load their transcript readers and usage
+#: tallies only when a Stop with a ``transcript_path`` first asks. The parity test holds the
+#: six events, with real payloads, to importing none the baseline lacks.
+HOOK_PATH_MODULES: tuple[str, ...] = ("aisquare.cli.app",)
+HOOK_PATH_PACKAGES: tuple[str, ...] = ("aisquare.core.agent_adapters",)
+
+
+def _import_the_hook_path() -> None:
+    """Imports what the six hooks load, before the baseline: :data:`HOOK_PATH_MODULES`, and
+    each module of :data:`HOOK_PATH_PACKAGES` (no module there registers anything as it is
+    imported; the package's own ``__init__`` registers the adapters)."""
+    import importlib
+    import pkgutil
+
+    for name in HOOK_PATH_MODULES:
+        importlib.import_module(name)
+    for package_name in HOOK_PATH_PACKAGES:
+        package = importlib.import_module(package_name)
+        for found in pkgutil.iter_modules(package.__path__, f"{package_name}."):
+            with contextlib.suppress(ImportError):  # one an optional dependency lacks
+                importlib.import_module(found.name)
+
+
 def take_baseline() -> None:
     """Keeps every module-level value of every rlx module loaded, and a copy of the content
     of each container among them: the state a fresh ``rlx hook`` starts from, which
     :func:`fresh_state` puts back before each hook. :func:`serve` takes it after the hello,
     before any request."""
-    import aisquare.cli.app  # noqa: F401  (the hook path's entry, and every module it loads)
-
+    _import_the_hook_path()
     _BASELINE.clear()
     _BASELINE_MODULES.clear()
     for name, module in list(sys.modules.items()):
@@ -674,12 +730,12 @@ def _run_rlx() -> int:
 def _end_as_a_process(
     before: set[threading.Thread],
     handlers: list[ExitHandler],
-    event: str,
-) -> None:
+) -> list[str]:
     """What a process does as it exits, for the hook: waits for each non-daemon thread it
-    started, runs the exit handlers it registered (the last first), then rlx's own
-    (:data:`EXIT_HANDLERS`), as ``atexit`` does, and gives the daemon threads it started
-    :data:`DAEMON_WAIT` to end. What they all print is the hook's."""
+    started, then runs the exit handlers it registered (the last first), then rlx's own
+    (:data:`EXIT_HANDLERS`), as ``atexit`` does. What they print is the hook's. A daemon
+    thread is not waited for, as an exit waits for none: the names of those the hook
+    started that still run, for the brain's log."""
     current = threading.current_thread()
     for thread in threading.enumerate():
         if thread not in before and not thread.daemon and thread is not current:
@@ -696,13 +752,11 @@ def _end_as_a_process(
         except Exception:  # as atexit prints it, and goes on
             print(f"Exception ignored in atexit callback {function!r}:", file=sys.stderr)
             traceback.print_exc()
-    deadline = time.monotonic() + DAEMON_WAIT
-    for thread in threading.enumerate():
-        if thread not in before and thread.daemon and thread is not current:
-            thread.join(max(0.0, deadline - time.monotonic()))
-    left = [t.name for t in threading.enumerate() if t not in before and t.is_alive()]
-    if left:
-        _say(f"hook {event}: daemon threads {left} still run after it (an exit stops them)")
+    return [
+        thread.name
+        for thread in threading.enumerate()
+        if thread not in before and thread is not current and thread.is_alive()
+    ]
 
 
 def _reap_abandoned() -> None:
@@ -737,7 +791,10 @@ def _hook(params: Mapping[str, Any]) -> Result:
     hook_cwd = cwd if isinstance(cwd, str) else None
     with _as_the_hook(env, hook_cwd, argv, stdin) as (captured, handlers):
         code = _run_rlx()
-        _end_as_a_process(before, handlers, str(event))
+        left = _end_as_a_process(before, handlers)
+    # On the brain's log, not the hook's stderr: rlx hook's exit would say nothing of them.
+    if left:
+        _say(f"hook {event}: daemon threads {left} still run after it (an exit stops them)")
     _reap_abandoned()
     return {
         "stdout_b64": base64.b64encode(captured["stdout"]).decode("ascii"),

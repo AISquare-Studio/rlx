@@ -97,6 +97,11 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let words: Vec<&str> = args.iter().filter_map(|arg| arg.to_str()).collect();
     if words.len() != args.len() {
+        // The gate's hook still denies, whatever else its command line holds: an exit 0
+        // with nothing printed would let Claude Code ask no one.
+        if args.first().is_some_and(|first| first == PRE_TOOL_USE) {
+            write_out(deny_output(MISRUN).as_bytes());
+        }
         return usage();
     }
     match words.as_slice() {

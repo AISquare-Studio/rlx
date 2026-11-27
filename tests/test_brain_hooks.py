@@ -52,8 +52,10 @@ PAYLOADS: dict[str, dict[str, Any]] = {
     "session-end": {"hook_event_name": "SessionEnd", "reason": "exit"},
 }
 
-#: The store's tables the six hooks write.
-TABLES = ("prompt", "metric", "team_event", "team_session")
+#: Where each environment's transcript is in its home: the Stop reads it for the turn's
+#: usage, and its path names the account slot it ran on.
+TRANSCRIPT = "transcripts/t1.jsonl"
+SLOT_TRANSCRIPT = "claude-accounts/2/projects/-proj/t1.jsonl"
 
 #: Columns whose values are times, durations or fresh ids, the same nowhere twice.
 _MASKED = {"id", "trace_id", "wall_ms", "round_trip_ms", "server_ms"}
@@ -63,8 +65,25 @@ _TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 _SPAN = re.compile(r"\b(?:\d+h )?\d+m\b")
 
 
+#: Now, as a time inside a value (a JSON record's ``"at"``): fractional seconds, as a clock
+#: reading has and a computed time (a reset's ``"until"``) does not.
+_NOW_IN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+(?:[+-]\d{2}:\d{2}|Z)?")
+#: Now, as seconds since the epoch.
+_EPOCH = re.compile(r"^\d{10}\.\d+$")
+
+
 def _no_spans(value: Any) -> Any:
     return _SPAN.sub("<span>", value) if isinstance(value, str) else value
+
+
+def _in_home(value: Any, home: Path) -> Any:
+    """A stored value with the run's own home said as ``<home>`` (each run has a copy of the
+    template's), and the clock's readings in it masked."""
+    if not isinstance(value, str):
+        return value
+    for spelling in sorted({str(home.resolve()), str(home)}, key=len, reverse=True):
+        value = value.replace(spelling, "<home>")
+    return _NOW_IN.sub("<now>", _no_spans(value))
 
 
 def _program(name: str) -> str:
@@ -74,8 +93,47 @@ def _program(name: str) -> str:
     return found
 
 
-def _payload(event: str, cwd: Path) -> bytes:
-    return json.dumps({"session_id": "t1", "cwd": str(cwd), **PAYLOADS[event]}).encode()
+def _payload(event: str, cwd: Path, transcript: Path | None = None) -> bytes:
+    """``event``'s JSON, with a ``transcript_path`` as Claude Code sends every hook one."""
+    payload: dict[str, Any] = {"session_id": "t1", "cwd": str(cwd), **PAYLOADS[event]}
+    if transcript is not None:
+        payload["transcript_path"] = str(transcript)
+    return json.dumps(payload).encode()
+
+
+def _transcript_lines(project: Path) -> str:
+    """A turn of Claude Code's transcript: the prompt, and two replies with their usage."""
+    lines: list[dict[str, Any]] = [
+        {
+            "type": "user",
+            "sessionId": "t1",
+            "cwd": str(project),
+            "timestamp": "2026-10-23T09:59:58Z",
+            "message": {"role": "user", "content": "hook-parity-probe"},
+        }
+    ]
+    for message_id in ("m1", "m2"):
+        lines.append(
+            {
+                "type": "assistant",
+                "sessionId": "t1",
+                "cwd": str(project),
+                "timestamp": "2026-10-23T10:00:00Z",
+                "message": {
+                    "id": message_id,
+                    "model": "claude-sonnet-5-5",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 5,
+                        "cache_creation_input_tokens": 100,
+                        "cache_read_input_tokens": 1000,
+                        "output_tokens": 50,
+                    },
+                },
+            }
+        )
+    return "".join(json.dumps(line) + "\n" for line in lines)
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +166,9 @@ def template(tmp_path: Path) -> tuple[Path, Path]:
         check=True,
         capture_output=True,
     )
+    for where in (TRANSCRIPT, SLOT_TRANSCRIPT):
+        (home / where).parent.mkdir(parents=True, exist_ok=True)
+        (home / where).write_text(_transcript_lines(project), encoding="utf-8")
     return home, project
 
 
@@ -117,32 +178,60 @@ def _copy(template: Path, to: Path) -> Path:
 
 
 def _rows(home: Path) -> dict[str, list[dict[str, Any]]]:
-    """The rows the hooks wrote, their times and fresh ids masked."""
+    """Every table's rows, their times and fresh ids masked: the store's whole state, usage
+    included (``session_usage``, ``turn_usage``), and the join log
+    (``explainability/joins.jsonl``), whose ids and keys are compared as they are."""
     with sqlite3.connect(home / "context.db") as db:
         db.row_factory = sqlite3.Row
         dumped: dict[str, list[dict[str, Any]]] = {}
-        for table in TABLES:
+        tables = [
+            name
+            for (name,) in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                " ORDER BY name"
+            )
+        ]
+        for table in tables:
             rows = []
-            for row in db.execute(f"SELECT * FROM {table} ORDER BY rowid"):
+            try:
+                found = db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            except sqlite3.OperationalError:  # WITHOUT ROWID: read in its key's order
+                found = db.execute(f"SELECT * FROM {table}").fetchall()
+            for row in found:
                 rows.append(
                     {
                         key: "<masked>"
                         if key in _MASKED
-                        or key.endswith("_at")
-                        or (isinstance(row[key], str) and _TIME.match(row[key]))
-                        else _no_spans(row[key])
+                        or key.endswith(("_at", "_ms"))
+                        or (
+                            isinstance(row[key], str)
+                            and (_TIME.match(row[key]) or _EPOCH.match(row[key]))
+                        )
+                        else _in_home(row[key], home)
                         for key in row.keys()  # noqa: SIM118 (a Row has no __iter__ of keys)
                     }
                 )
             dumped[table] = rows
+    joins = home / "explainability" / "joins.jsonl"
+    dumped["joins.jsonl"] = [
+        {
+            key: "<masked>"
+            if key.endswith("_at") or key in {"ts", "at", "time"}
+            else _in_home(value, home)
+            for key, value in json.loads(line).items()
+        }
+        for line in (joins.read_text(encoding="utf-8").splitlines() if joins.exists() else [])
+    ]
     return dumped
 
 
 def _environments(tmp_path: Path) -> dict[str, dict[str, str]]:
-    """Five hooks' environments, each its own role, config dir, agent ids and zone; the
-    third names none of them, so whatever an earlier one set must be gone; the last two name
-    the same relative hub, which every fresh process warns of, so the brain must warn of it
-    in both."""
+    """Six hooks' environments, each its own role, config dir, agent ids and zone; the
+    third names none of them, so whatever an earlier one set must be gone; the fourth and
+    fifth name the same relative hub, which every fresh process warns of, so the brain must
+    warn of it in both; the sixth is the fleet's usual agent: traced, and on a managed
+    account slot, whose plain copies (``plain_vars``) tell it from the plain home. ``{home}``
+    is each run's own home, ``{tmp}`` the test's folder."""
     return {
         "a": {
             "AISQUARE_ROLE": "coder",
@@ -163,7 +252,25 @@ def _environments(tmp_path: Path) -> dict[str, dict[str, str]]:
         # so the brain must too (``core.orchestrator._WARNED_HUBS``, put back per hook).
         "d": {"AISQUARE_ROLE": "coder", "AISQUARE_TEAM_HUB": "relative-hub"},
         "e": {"AISQUARE_ROLE": "coder", "AISQUARE_TEAM_HUB": "relative-hub"},
+        "f": {
+            "AISQUARE_ROLE": "coder",
+            "AISQUARE_FLEET_AGENT": "agt_parity_f",
+            "AISQUARE_PIPELINE_ID": "pl_parity",
+            "AISQUARE_TRACE_AGENT_NAME": "agent-parity",
+            "AISQUARE_RUN_TRACE_ID": "tr_parity",
+            "CLAUDE_CONFIG_DIR": "{home}/claude-accounts/2",
+            "CLAUDE_CODE_TMPDIR": "{home}/cache/claude-accounts/2",
+            "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR": "{tmp}/cc-plain",
+            "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR": "{tmp}/cc-plain-tmp",
+            "CODEX_HOME": "{home}/codex-accounts/3",
+            "AISQUARE_PLAIN_CODEX_HOME": "{tmp}/codex-plain",
+            "TZ": "UTC",
+        },
     }
+
+
+def _transcript_of(name: str, home: Path) -> Path:
+    return home / (SLOT_TRANSCRIPT if name == "f" else TRANSCRIPT)
 
 
 #: What rlxd's own environment holds that no hook of these does: each must stay out.
@@ -172,13 +279,22 @@ BRAIN_ONLY = {
     "AISQUARE_FLEET_AGENT": "agt_rlxd",
     "AISQUARE_PERSONA": "rlxd-persona",
     "TZ": "Asia/Kolkata",
+    # rlxd started from a traced agent's shell, on a slot of its own: none of it may reach
+    # a hook's join or its plain home.
+    "AISQUARE_PIPELINE_ID": "pl_rlxd",
+    "AISQUARE_TRACE_AGENT_NAME": "rlxd-agent",
+    "AISQUARE_RUN_TRACE_ID": "tr_rlxd",
+    "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR": "/rlxd/plain-claude",
+    "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR": "/rlxd/plain-tmp",
+    "CODEX_HOME": "/rlxd/codex",
 }
 
 
 def _hook_env(base: dict[str, str], home: Path, extra: dict[str, str]) -> dict[str, str]:
     env = {key: value for key, value in base.items() if key not in BRAIN_ONLY}
     env.pop("CLAUDE_CONFIG_DIR", None)
-    return {**env, "AISQUARE_HOME": str(home), **extra}
+    filled = {key: value.format(home=home, tmp=home.parent) for key, value in extra.items()}
+    return {**env, "AISQUARE_HOME": str(home), **filled}
 
 
 def _normal(text: bytes, home: Path) -> bytes:
@@ -314,7 +430,7 @@ def parity(tmp_path: Path, template: tuple[Path, Path]) -> Iterator[dict[str, An
         for event in PAYLOADS:
             done = subprocess.run(
                 [_program("aisquare"), "hook", event],
-                input=_payload(event, project),
+                input=_payload(event, project, _transcript_of(name, home)),
                 env=env,
                 cwd=project,
                 capture_output=True,
@@ -340,7 +456,8 @@ def parity(tmp_path: Path, template: tuple[Path, Path]) -> Iterator[dict[str, An
             env = _hook_env(base, home, extra)
             printed = {}
             for event in PAYLOADS:
-                result = running.hook(event, _payload(event, project), project, env)
+                stdin = _payload(event, project, _transcript_of(name, home))
+                result = running.hook(event, stdin, project, env)
                 printed[event] = (
                     result["exit_code"],
                     _normal(base64.b64decode(result["stdout_b64"]), home),
@@ -362,7 +479,7 @@ def parity(tmp_path: Path, template: tuple[Path, Path]) -> Iterator[dict[str, An
 def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
     parity: dict[str, Any],
 ) -> None:
-    for name in ("a", "b", "c", "d", "e"):
+    for name in ("a", "b", "c", "d", "e", "f"):
         fresh_printed, fresh_rows = parity["fresh"][name]
         brain_printed, brain_rows = parity["brain"][name]
         for event in PAYLOADS:
@@ -380,6 +497,15 @@ def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
     for name in ("d", "e"):
         start_err = parity["brain"][name][0]["session-start"][2]
         assert b"RELATIVE" in start_err, f"{name}: the brain warns of the hub each time"
+    # The traced agent on slot 2: its join names it and its Run (review #2562 round 2, M1),
+    # and the Stop recorded its turn's usage, on its slot.
+    f_rows = parity["fresh"]["f"][1]
+    assert [
+        (join.get("pipeline_id"), join.get("agent_name"), join.get("trace_id"))
+        for join in f_rows["joins.jsonl"]
+    ] == [("pl_parity", "agent-parity", "tr_parity")]
+    assert f_rows["usage_session"], "the Stop read the transcript"
+    assert f_rows["usage_session"][0]["account_slot"] == 2
 
 
 def test_the_allowlist_is_what_the_hooks_read_and_nothing_else(parity: dict[str, Any]) -> None:
@@ -397,6 +523,15 @@ def test_the_allowlist_is_what_the_hooks_read_and_nothing_else(parity: dict[str,
     )
     assert set(brain.ENV_READ_ELSEWHERE) <= set(brain.ENV_NAMES)
     assert {"AISQUARE_ROLE", "CLAUDE_CONFIG_DIR", "AISQUARE_FLEET_AGENT", "HOME"} <= read
+    # The fleet's real paths ran, a traced session's join and a slot agent's Stop: what they
+    # read is read here (review #2562 round 2: the list had dropped these five).
+    assert {
+        "AISQUARE_TRACE_AGENT_NAME",
+        "AISQUARE_RUN_TRACE_ID",
+        "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR",
+        "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR",
+        "CODEX_HOME",
+    } <= read
 
 
 def test_an_agents_variables_come_from_its_adapter_and_no_credential_goes() -> None:
@@ -606,27 +741,40 @@ def test_an_exit_handler_a_hook_registers_runs_at_its_end_as_its_own(
     assert atexit._ncallbacks() == before
 
 
-def test_a_daemon_thread_the_hook_started_is_given_time_to_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_daemon_thread_the_hook_started_is_not_waited_for_and_named_on_the_brains_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """As an exit waits for no daemon thread: the hook's reply does not wait for one, and the
+    brain names it on its own log, never in the hook's stderr, which ``rlx hook``'s exit
+    leaves empty of it (review #2562 round 2, m1)."""
     import time
 
     from aisquare.services import agent_events
 
     handle = agent_events.handle
+    release = threading.Event()
 
     def handle_and_leave_a_daemon(*args: Any, **kwargs: Any) -> str:
-        def late() -> None:
-            time.sleep(0.3)
-            print("printed by a daemon thread of the hook's", flush=True)
-
-        threading.Thread(target=late, name="hook-daemon", daemon=True).start()
+        threading.Thread(target=lambda: release.wait(60), name="hook-daemon", daemon=True).start()
         return handle(*args, **kwargs)
 
+    _stop_hook(tmp_path)  # once without, for the time a Stop takes here
+    started = time.monotonic()
+    plain = _stop_hook(tmp_path)
+    took_plain = time.monotonic() - started
+    capsys.readouterr()
     monkeypatch.setattr(agent_events, "handle", handle_and_leave_a_daemon)
-    result = _stop_hook(tmp_path)
-    assert not [thread for thread in threading.enumerate() if thread.name == "hook-daemon"]
-    assert b"printed by a daemon thread" in base64.b64decode(result["stdout_b64"])
+    try:
+        started = time.monotonic()
+        result = _stop_hook(tmp_path)
+        took = time.monotonic() - started
+        assert [t for t in threading.enumerate() if t.name == "hook-daemon"], "it runs on"
+        assert took < took_plain + 1.0, f"the hook waited for it: {took:.2f}s"
+        assert base64.b64decode(result["stderr_b64"]) == base64.b64decode(plain["stderr_b64"])
+        log = capsys.readouterr().err
+        assert "daemon threads ['hook-daemon'] still run" in log
+    finally:
+        release.set()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX: Windows keeps no zombies")

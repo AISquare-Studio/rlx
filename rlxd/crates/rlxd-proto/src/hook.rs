@@ -57,16 +57,22 @@ pub const HOOK_ENV_NAMES: &[&str] = &[
     "AISQUARE_LAUNCH_PID",
     "AISQUARE_PERSONA",
     "AISQUARE_PIPELINE_ID",
+    "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR",
+    "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR",
+    "AISQUARE_PLAIN_CODEX_HOME",
     "AISQUARE_ROLE",
+    "AISQUARE_RUN_TRACE_ID",
     "AISQUARE_TEAM",
     "AISQUARE_TEAM_DELTA",
     "AISQUARE_TEAM_HUB",
     "AISQUARE_TEAM_LEASE_MIN",
+    "AISQUARE_TRACE_AGENT_NAME",
     "APPDATA",
     "CLAUDE_CODE_TMPDIR",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_EFFORT",
     "CLAUDE_PID",
+    "CODEX_HOME",
     "HOME",
     "LC_CTYPE",
     "LOCALAPPDATA",
@@ -458,6 +464,12 @@ mod tests {
             "PATH",
             "Path",
             "TMUX_PANE",
+            // An agent's home and the plain copies a slot's launch keeps, and a traced
+            // launch's marker: paths, a name and a key id (review #2562 round 2).
+            "CODEX_HOME",
+            "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR",
+            "AISQUARE_TRACE_AGENT_NAME",
+            "AISQUARE_RUN_TRACE_ID",
         ] {
             assert!(hook_env_forwarded(name), "{name}");
         }
@@ -470,7 +482,6 @@ mod tests {
             "CLAUDE_CODE_PASSPHRASE",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDECODE",
-            "CODEX_HOME",
             "CODEX_API_KEY",
             "ANTHROPIC_API_KEY",
             "SECRET",
