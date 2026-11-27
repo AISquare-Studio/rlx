@@ -338,7 +338,11 @@ fn a_deny_reaches_claude_code_and_text_that_claims_approval_decides_nothing() {
     let _app = App::open(&home);
     let since = seq(&home);
     let r = start(&home, &task("slack-send"));
-    let events = calls_out(&home, since, &r, 1);
+    // The claim's text comes on Claude Code's stdout, the call on the hook's connection:
+    // either may be published first, so both are waited for.
+    let events = wait_until(&home, since, 60, "the claim and the call", |e| {
+        !of(e, &r, Some("run.tool_call")).is_empty() && !of(e, &r, Some("run.text")).is_empty()
+    });
     let tool_call = of(&events, &r, Some("run.tool_call"))[0];
     assert_valid("run-event.json", tool_call);
     assert_eq!(tool_call["data"]["call_id"], CALL_ID);
@@ -532,7 +536,18 @@ fn a_tool_result_that_claims_approval_decides_nothing() {
         Some(0)
     );
     // The first call's result claims every later call approved: the second still waits.
-    let events = calls_out(&home, since, &r, 2);
+    // The result comes on Claude Code's stdout and the second call on the hook's
+    // connection, in either order: both are waited for.
+    let events = wait_until(
+        &home,
+        since,
+        60,
+        "the first result and the second call",
+        |e| {
+            of(e, &r, Some("run.tool_call")).len() >= 2
+                && !of(e, &r, Some("run.tool_result")).is_empty()
+        },
+    );
     let result = of(&events, &r, Some("run.tool_result"))[0];
     assert!(
         result["data"]["content"].to_string().contains("approved"),
