@@ -116,7 +116,7 @@ def test_the_whitelist_is_the_one_the_docs_list() -> None:
     docs = store_broker.__doc__ or ""
     section = docs[docs.index("### The broker's whitelist") :]
     listed = {
-        tuple(found.split()) for found in re.findall(r"^- `aisquare ([a-z ]+)`", section, re.M)
+        tuple(found.split()) for found in re.findall(r"^- `aisquare ([a-z -]+)`", section, re.M)
     }
     assert listed == set(store_broker.WHITELIST)
 

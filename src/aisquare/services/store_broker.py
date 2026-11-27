@@ -94,6 +94,7 @@ this list to it, and every board call a role's cycle teaches to it:
 - `aisquare team focus`
 - `aisquare team standby` (a manager waiting on its person, R12)
 - `aisquare team log`
+- `aisquare team complete-pass`
 - `aisquare team verify`
 - `aisquare team show` (the event on its own board an update line points at)
 - `aisquare team signal` (not the fleet's own)
