@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -578,6 +579,8 @@ def test_the_system_temp_dir_is_found_without_this_processs_tmpdir(
     the system keeps temp files, never where this process's TMPDIR points. The real lookup,
     asked only for the path: nothing there is listed or read."""
     own = tmp_path / "an-agents-own"
+    own.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", None)  # tempfile's own answer, asked afresh
     monkeypatch.setenv("TMPDIR", str(own))
     monkeypatch.setenv("TEMP", str(own))
     monkeypatch.setenv("TMP", str(own))
