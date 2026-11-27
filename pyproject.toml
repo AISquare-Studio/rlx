@@ -213,6 +213,18 @@ experiment = [
   # the OpenTelemetry work that closes the token-accounting gap has somewhere
   # to land without changing how anyone installs.
 ]
+tray = [
+  # The rlx service's menu bar / tray icon (#34, services/tray.py), in a process of the
+  # service's own (`rlx service tray`); install.sh adds it on macOS and Linux, install.ps1
+  # does not (no tray on Windows in 0.10.2). Without it the service runs as it does, and
+  # `rlx service status` says the tray needs it. macOS: the menu bar's NSStatusItem through
+  # pyobjc's AppKit (Cocoa alone: no Quartz, no imaging library; the glyph is drawn by
+  # core/glyph.py). Linux: a StatusNotifierItem and its dbusmenu on the session bus through
+  # jeepney, pure Python, which needs no PyGObject or system library (a uv tool venv sees
+  # none), so the icon works on KDE, and on GNOME with the AppIndicator extension.
+  "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
+  "jeepney>=0.8; sys_platform == 'linux'",
+]
 dev = [
   "pytest>=9.1.1",
   # The [code] extra's parsers, so tests/test_code_index.py exercises the
@@ -259,6 +271,13 @@ dev = [
   "types-jsonschema>=4.18",
   # PyYAML ships no py.typed; mypy runs strict over src and tests.
   "types-PyYAML>=6.0",
+  # The `tray` extra, so its halves are tested (#34). jeepney on every OS: pure Python, so the
+  # StatusNotifierItem's and dbusmenu's messages (services/tray_linux.py) are built and checked
+  # on each runner, against no bus. pyobjc on macOS: services/tray_macos.py is imported and its
+  # menu bar image drawn (a helper pyobjc took for a selector failed only at import), and no
+  # test starts a status item.
+  "jeepney>=0.8",
+  "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
   # The `llm` extra's SDK, so mypy --strict checks the persona import's api engine
   # against the real `messages.parse` signature (the `mcp`/`serve` precedent).
   # Tests never call it: they install a fake `anthropic` module.
@@ -345,6 +364,12 @@ plugins = ["pydantic.mypy"]
 # dev extra does not install them (faster-whisper drags in ctranslate2 and av); mypy
 # still walks the import lines. Untyped here, checked for real under [voice].
 module = ["faster_whisper", "faster_whisper.*", "numpy", "segno"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The tray's halves (#34): pyobjc (services/tray_macos.py) ships no stubs, and the dev
+# extra installs it on macOS only; jeepney (services/tray_linux.py) ships no py.typed.
+module = ["AppKit", "Foundation", "objc", "PyObjCTools", "PyObjCTools.*", "jeepney", "jeepney.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

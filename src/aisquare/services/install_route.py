@@ -1095,11 +1095,49 @@ def runs_from_uv_cache() -> bool:
 # --- what upgrades it -------------------------------------------------------------------
 
 
+TRAY_EXTRA = "tray"
+"""The extra the rlx service's tray needs (#34). An upgrade of a uv tool installed from PyPI
+adds it where there is a tray, to every extra the receipt had: an install made before the tray
+(0.10.1) gets it as one made by install.sh does (``cli_package``). The ruling on #34, M2."""
+
+_OWN_INDEX_FLAGS = frozenset({"--index-url", "--default-index", "--no-index"})
+"""Receipt options that resolve the install from an index of its own instead of PyPI: a mirror,
+or a folder of wheels and no index at all. Its upgrade keeps the extras it had: the tray's
+packages (pyobjc, jeepney) may not be there, and the upgrade would then fail to resolve."""
+
+
+def tray_extra_here(platform: str | None = None, env: Mapping[str, str] | None = None) -> bool:
+    """Whether ``platform`` (this process's by default) has the tray: macOS, and Linux outside
+    WSL, as ``env`` (this process's by default) says; none on Windows in 0.10.2."""
+    from aisquare.core.clipboard import in_wsl
+
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        return True
+    return platform.startswith("linux") and not in_wsl(os.environ if env is None else env)
+
+
+def _gets_the_tray(route: InstallRoute, receipt: UvReceipt, names: Sequence[str]) -> bool:
+    """Whether an upgrade adds :data:`TRAY_EXTRA` to the extras ``names`` the receipt had: a uv
+    tool installed from PyPI (no source, no index of its own: :data:`_OWN_INDEX_FLAGS`) that
+    lacks it, on an OS with the tray (the route's, as every other choice of the route reads
+    it). A source keeps the extras its developer chose (#34)."""
+    return (
+        receipt.source is None
+        and TRAY_EXTRA not in names
+        and not _OWN_INDEX_FLAGS.intersection(receipt.options)
+        and tray_extra_here(route.facts.platform)
+    )
+
+
 def _uv_spec(route: InstallRoute, target: str | None, current: str) -> list[str]:
     """The package argument(s) for ``uv tool install``: ``name[extras]@target``, the latest
     release no older than ``current`` (``name[extras]>=current``), or a source."""
     receipt = route.receipt or UvReceipt()
-    extras = f"[{','.join(receipt.extras)}]" if receipt.extras else ""
+    names = list(receipt.extras)
+    if _gets_the_tray(route, receipt, names):
+        names.append(TRAY_EXTRA)
+    extras = f"[{','.join(names)}]" if names else ""
     if receipt.source is None:
         floor = _floor(current) if target is None else None
         if floor is not None:
