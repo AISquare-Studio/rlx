@@ -14,6 +14,16 @@ publish.workspace = true
 name = "rlxd"
 doc = false
 
+# The stand-in for Claude Code that the runner's tests start (handoff 0.10.3, "How to read
+# the checks"). Only the `fake-claude` feature builds it, which only the dev-dependency
+# below turns on, so `cargo test` gives the tests its path (CARGO_BIN_EXE_fake-claude) and
+# no release build has it: tests/release_build.rs checks.
+[[bin]]
+name = "fake-claude"
+path = "src/bin/fake-claude.rs"
+doc = false
+required-features = ["fake-claude"]
+
 [features]
 # Test builds only. `debug-methods` adds the socket's debug.* methods (handoff 0.10.3,
 # 7.3: `debug.emit {count}`), which rlxd's own tests drive. Nothing turns it on but the
@@ -35,8 +45,12 @@ gate-dev-mode = []
 # Release builds never enable it, and without it no config, variable or flag changes the
 # identity.
 gate-test-requirement = []
+# Tests only: builds the fake-claude binary above. Like debug-methods, only the
+# dev-dependency below turns it on.
+fake-claude = ["dep:fake-claude"]
 
 [dependencies]
+fake-claude = { path = "../fake-claude", optional = true }
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 getrandom = "0.3"
 rlxd-client.workspace = true
@@ -64,6 +78,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
@@ -76,7 +91,7 @@ windows-sys = { workspace = true, features = [
 jsonschema = { version = "0.63", default-features = false }
 # rlxd itself, with the debug methods and gate dev mode, so the binary the tests run has
 # them.
-rlxd = { path = ".", features = ["debug-methods", "gate-dev-mode"] }
+rlxd = { path = ".", features = ["debug-methods", "gate-dev-mode", "fake-claude"] }
 toml = "0.9"
 
 [target.'cfg(windows)'.dev-dependencies]

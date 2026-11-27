@@ -6,8 +6,10 @@
 //! events`. One rlxd runs per home, on a local socket or named pipe, and a client gets in
 //! with the shared token through `hello`. Every reply is the 7.2 envelope, and
 //! `events.subscribe` streams the home's events. `settings.get`, `settings.set` and
-//! `settings.list` serve the app settings every device shares. The PTY host, the runner
-//! and the rest are later items, each a method on this socket, publishing on the bus.
+//! `settings.list` serve the app settings every device shares. `run.start` and
+//! `run.cancel` drive the headless runner (2.1, 7.5), and `space.ensure` the spaces its
+//! runs work in (2.5). The PTY host and the rest are later items, each a method on this
+//! socket, publishing on the bus.
 //! `rlxd here [--start]` is the probe rlx.app runs over SSH: what is installed, whether
 //! rlxd runs, and the protocol versions it serves.
 //!
@@ -51,9 +53,11 @@ mod log;
 mod out;
 pub mod peer;
 pub mod registry;
+mod runner;
 mod serve;
 mod server;
 mod settings;
+mod spaces;
 mod spawn;
 mod token;
 #[cfg(windows)]
@@ -124,6 +128,19 @@ enum Action {
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
     // Boxed, as Call is.
     Events(Box<EventsOptions>),
+    /// Runs one run's Claude Code and ends its whole process group with it (macOS and
+    /// Linux). rlxd starts it; nobody else does.
+    #[command(name = "__run-guard", hide = true)]
+    RunGuard {
+        /// Claude Code and its arguments, after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 1..,
+            value_parser = clap::value_parser!(std::ffi::OsString)
+        )]
+        argv: Vec<std::ffi::OsString>,
+    },
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -305,6 +322,10 @@ pub fn main() -> ExitCode {
             force,
         }) => cli::gate_pair(request_id, !deny, force),
         Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
+        #[cfg(unix)]
+        Action::RunGuard { argv } => runner::guard::main(&argv),
+        #[cfg(not(unix))]
+        Action::RunGuard { .. } => ExitCode::from(2),
         Action::Events(options) => events::events(events::EventsArgs {
             as_app: options.as_app,
             topics: options.topics,

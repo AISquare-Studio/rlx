@@ -216,6 +216,123 @@ fn call_socket_where_nothing_listens_is_not_running() {
     );
 }
 
+#[test]
+fn a_missing_token_file_is_unauthorized_whatever_this_home_runs() {
+    // Review #2460: "not running" for a missing token is for the home's own token file
+    // only, as no rlxd may ever have run here. A --token-file that is missing, with
+    // --socket or without, says so as it is, from rlxd call and rlxd events alike, and
+    // whether or not this home runs an rlxd (review #2498).
+    let served = TestHome::new();
+    served.start();
+    let endpoint = Home::at(served.root()).endpoint();
+    let client = TestHome::new();
+    let missing = client.root().join("no-such-token").display().to_string();
+    let nowhere = client.root().join("nothing.sock").display().to_string();
+    for home in [&client, &served] {
+        for socket in [Some(endpoint.as_str()), Some(nowhere.as_str()), None] {
+            let mut call = vec!["call"];
+            let mut events = vec!["events"];
+            if let Some(socket) = socket {
+                call.extend(["--socket", socket]);
+                events.extend(["--socket", socket]);
+            }
+            call.extend(["--token-file", &missing, "status"]);
+            events.extend(["--token-file", &missing, "--since", "0"]);
+            let run = home.rlxd(&call);
+            assert_eq!(run.code(), Some(1), "{call:?}: {run:?}");
+            assert_eq!(run.error_code(), "unauthorized", "{call:?}");
+            let message = text(&run.json()["error"]["message"]).to_owned();
+            assert!(message.contains("cannot read the token"), "{message}");
+            let run = home.rlxd(&events);
+            assert_eq!(run.code(), Some(1), "{events:?}: {run:?}");
+            assert_eq!(run.stderr_code(), "unauthorized", "{events:?}");
+            assert!(run.stdout.is_empty(), "{run:?}");
+        }
+    }
+    // The home's own token, missing with no rlxd here: not running, as before.
+    let run = client.rlxd(&["call", "status"]);
+    assert_eq!(run.code(), Some(3), "{run:?}");
+    assert_eq!(run.error_code(), "not_running");
+    let run = client.rlxd(&["events", "--since", "0"]);
+    assert_eq!(run.code(), Some(3), "{run:?}");
+    assert_eq!(run.stderr_code(), "not_running");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_forward_whose_host_runs_no_rlxd_says_to_start_it_there() {
+    // ssh takes every connection to a forward's local socket, then closes it when sshd
+    // can't reach the host's socket, as when no rlxd runs there. A stand-in that does
+    // the same: every connection taken, then dropped unanswered.
+    let client = TestHome::new();
+    let forward = client.root().join("fwd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&forward).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    let forward = forward.display().to_string();
+    let run = client.rlxd(&["call", "--socket", &forward, "--token", "t", "status"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "disconnected");
+    let hint = text(&run.json()["error"]["hint"]).to_owned();
+    for cause in [
+        "host's rlxd",
+        "rlxd here --start",
+        "sshd",
+        "AllowTcpForwarding",
+    ] {
+        assert!(hint.contains(cause), "{cause}: {hint}");
+    }
+    assert!(
+        hint.contains("host's rlxd") && hint.contains("rlxd here --start"),
+        "{hint}"
+    );
+    let run = client.rlxd(&[
+        "events", "--socket", &forward, "--token", "t", "--since", "0",
+    ]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.stderr_code(), "disconnected");
+    assert!(run.stderr.contains("rlxd here --start"), "{run:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_close_after_hello_was_answered_is_no_forward_hint() {
+    // Review #2498: once rlxd has answered hello on this connection, a close is rlxd's
+    // own (a panic, a stop mid-call), not a host with no rlxd: a plain disconnected.
+    use std::io::{BufRead, BufReader, Write};
+    let client = TestHome::new();
+    let forward = client.root().join("answers.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&forward).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            let id = serde_json::from_str::<serde_json::Value>(&line)
+                .map_or(serde_json::json!(1), |hello| hello["id"].clone());
+            let reply = serde_json::json!({"schema_version": 1, "id": id, "ok": true, "data": {}});
+            let _ = writeln!(stream, "{reply}");
+            // Then gone, before the next request's reply.
+        }
+    });
+    let forward = forward.display().to_string();
+    let run = client.rlxd(&["call", "--socket", &forward, "--token", "t", "status"]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "disconnected");
+    assert!(
+        run.json()["error"].get("hint").is_none(),
+        "no forward hint: {run:?}"
+    );
+    let run = client.rlxd(&[
+        "events", "--socket", &forward, "--token", "t", "--since", "0",
+    ]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert!(!run.stderr.contains("rlxd here --start"), "{run:?}");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_home_whose_path_is_not_utf8_reaches_its_rlxd() {
