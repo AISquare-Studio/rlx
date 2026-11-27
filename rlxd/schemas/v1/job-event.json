@@ -119,6 +119,25 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.watch_result"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobWatchResultData"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -577,6 +596,49 @@
         "job_id",
         "scheduled_for",
         "reason"
+      ]
+    },
+    "JobWatchResultData": {
+      "description": "`job.watch_result`: a watch job's call's raw result, from the fire's run.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "The call's result, exactly as Claude Code gave it, up to 1 MiB of JSON; past that,\nits first 1 MiB as a string (`truncated`)."
+        },
+        "input_sha256": {
+          "description": "The SHA-256 of the call's input as RFC 8785 JSON: the job's pinned call.",
+          "type": "string"
+        },
+        "is_error": {
+          "description": "Whether the call failed: then `content` is its error, not a result to match on.",
+          "type": "boolean"
+        },
+        "job_id": {
+          "description": "The job's id.",
+          "$ref": "#/$defs/JobId"
+        },
+        "run_id": {
+          "description": "The fire's run, as `job.fired` named it.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "tool": {
+          "description": "The tool called.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Whether `content` was cut: then it is no result to match on either.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "job_id",
+        "run_id",
+        "tool",
+        "input_sha256",
+        "content",
+        "is_error",
+        "truncated"
       ]
     },
     "SkipReason": {

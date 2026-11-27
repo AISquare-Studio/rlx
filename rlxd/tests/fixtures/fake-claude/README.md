@@ -76,6 +76,13 @@ server carries its `source` as Claude Code 2.1.332 writes it (`claudeai` for a c
 
 Resumed, a scenario that makes one call makes it under another id.
 
+**`watch-call`** plays a watch job's run (7.6) as a model would. It reads the connector,
+the tool and the input from the JSON rlxd quotes in its message, lists that tool
+(read-only, of that connector, from claude.ai) in `system/init`, and makes the call through
+the hook. Allowed, the tool gives `watch-call/content.json`, which `job.watch_result`
+carries; for the input `{"ref": "missing"}` an error, and for `{"ref": "huge"}` 2 MiB of
+text, as a tool would. Then it tries the identical call again, which rlxd denies `pinned_call_used`.
+
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for
 `-p --output-format stream-json` without `--verbose`, waits for its first stream-json user
