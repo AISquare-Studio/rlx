@@ -69,6 +69,11 @@ spending tokens without losing them, *⚙ Settings ▸ Fleet ▸ Pause all…* e
 each one and keeps its task, worktree and session; *Resume all…* brings each
 back where it was.
 
+In a Claude Code or Codex pane, press `Ctrl+J` to add a line. Claude Code also
+accepts a backslash followed by `Enter`. `Shift+Enter` works when your terminal
+reports it through the kitty keyboard protocol. In Terminal.app, `Shift+Enter`
+and `Option+Enter` with *Use Option as Meta key* can submit the prompt.
+
 ### Manager wake schedule
 
 By default a fleet's manager is woken by every board write that concerns it. A busy
