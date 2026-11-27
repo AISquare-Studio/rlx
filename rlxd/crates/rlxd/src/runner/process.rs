@@ -807,6 +807,114 @@ fn kill_tree(tree: &Tree) {
     unsafe { TerminateJobObject(tree.job.as_raw_handle(), 1) };
 }
 
+/// Whether the process that made a hook connection, `peer`, is one of `tree`'s: the
+/// gate's third binding (5.1), so a hook connection from outside the run is never the
+/// run's hook.
+///
+/// - **macOS and Linux:** a descendant of the run's guard, by its parent chain. Claude
+///   Code starts each hook detached, in a session and process group of its own, so the
+///   group can't tell; the chain can. Each step up must be the real parent, not a process
+///   given a gone parent's pid since: a parent never starts after its child. The guard is
+///   rlxd's unreaped child, so its pid is the run's while the run lives: its `reaped`
+///   lock is held across the walk, so it can't be reaped meanwhile. The peer itself is
+///   held through its pin ([`crate::peer::Peer::while_pinned`]): Linux's pidfd; on
+///   macOS a pid and a start time, open to a connect-to-accept window and to the wall
+///   clock's steps (`peer::macos` says why neither is in reach).
+/// - **Windows:** in the run's Job Object, through the process handle the peer was
+///   pinned with when it connected (Claude Code's detached children stay in the job).
+#[cfg(unix)]
+pub fn holds(tree: &Tree, peer: &crate::peer::Peer) -> bool {
+    let reaped = tree.reaped.lock().unwrap_or_else(|p| p.into_inner());
+    !*reaped && peer.while_pinned(|pid| descends(pid, tree.pid))
+}
+
+#[cfg(windows)]
+pub fn holds(tree: &Tree, peer: &crate::peer::Peer) -> bool {
+    use std::os::windows::io::AsHandle;
+
+    let reaped = tree.reaped.lock().unwrap_or_else(|p| p.into_inner());
+    !*reaped && peer.in_job(tree.job.as_handle())
+}
+
+/// How many steps up a parent chain [`descends`] looks.
+#[cfg(unix)]
+const MAX_DEPTH: usize = 64;
+
+/// Whether `pid` is `ancestor` or below it, each step up checked to be the real parent.
+#[cfg(unix)]
+fn descends(pid: u32, ancestor: u32) -> bool {
+    descends_by(pid, ancestor, parent_of)
+}
+
+/// [`descends`], with `parent_of` telling each process's parent and start.
+#[cfg(unix)]
+fn descends_by(
+    pid: u32,
+    ancestor: u32,
+    parent_of: impl Fn(u32) -> Option<(u32, (u64, u64))>,
+) -> bool {
+    let mut at = pid;
+    let Some((mut parent, mut started)) = parent_of(at) else {
+        return false;
+    };
+    for _ in 0..MAX_DEPTH {
+        if at == ancestor {
+            return true;
+        }
+        if parent <= 1 {
+            return false;
+        }
+        let Some((grandparent, parent_started)) = parent_of(parent) else {
+            return false;
+        };
+        // Still its parent once the parent was read: a parent that went would have left
+        // `at` another parent before its pid could be given out again, so what was read
+        // is the real parent's, even where start times tie (Linux counts in ticks).
+        if parent_of(at).map(|(again, _)| again) != Some(parent) {
+            return false;
+        }
+        // A process that started after its "child" was given a gone parent's pid.
+        if parent_started > started {
+            return false;
+        }
+        (at, parent, started) = (parent, grandparent, parent_started);
+    }
+    false
+}
+
+/// Process `pid`'s parent's pid, and when `pid` started, as an ordered pair:
+/// `proc_pidinfo`'s on macOS (seconds and microseconds).
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn parent_of(pid: u32) -> Option<(u32, (u64, u64))> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: proc_bsdinfo is plain integers and byte arrays, for which zero is valid.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes, as PROC_PIDTBSDINFO
+    // fills.
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then_some((info.pbi_ppid, (info.pbi_start_tvsec, info.pbi_start_tvusec)))
+}
+
+/// [`parent_of`] on Linux: `/proc/<pid>/stat`'s `ppid` and `starttime` (clock ticks).
+#[cfg(target_os = "linux")]
+fn parent_of(pid: u32) -> Option<(u32, (u64, u64))> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after the command name, which is in parentheses and may hold spaces: ppid
+    // is field 4, starttime field 22.
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let started = fields.nth(17)?.parse().ok()?;
+    Some((ppid, (started, 0)))
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn parent_of(_pid: u32) -> Option<(u32, (u64, u64))> {
+    None
+}
+
 /// Windows needs no sweep: a job whose last handle closes kills its processes.
 #[cfg(windows)]
 pub fn sweep(_pid: u32, _started: &str, _run_id: &str) -> bool {
@@ -889,6 +997,47 @@ mod tests {
     }
 
     use super::*;
+
+    /// A hook's chain up to the guard: hook 40, its shell 30, Claude Code 20, guard 10.
+    #[cfg(unix)]
+    fn table(pid: u32) -> Option<(u32, (u64, u64))> {
+        match pid {
+            40 => Some((30, (100, 4))),
+            30 => Some((20, (100, 3))),
+            20 => Some((10, (100, 2))),
+            10 => Some((1, (100, 1))),
+            // A process that took a gone parent's pid: it started after its "child".
+            70 => Some((60, (200, 0))),
+            60 => Some((20, (300, 0))),
+            // Reparented to init: its parent is gone.
+            80 => Some((1, (100, 5))),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_descends_from_the_guard_by_its_real_parents_only() {
+        assert!(descends_by(40, 10, table));
+        assert!(descends_by(10, 10, table), "the guard itself");
+        assert!(!descends_by(40, 99, table), "another run's guard");
+        assert!(
+            !descends_by(70, 10, table),
+            "a parent younger than its child"
+        );
+        assert!(!descends_by(80, 10, table), "an orphan");
+        assert!(!descends_by(55, 10, table), "no such process");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_process_descends_from_its_parent() {
+        let me = std::process::id();
+        let parent = parent_of(me).expect("this process has a parent").0;
+        assert!(descends(me, parent));
+        assert!(descends(me, me));
+        assert!(!descends(parent, me));
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]

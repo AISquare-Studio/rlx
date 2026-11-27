@@ -161,6 +161,30 @@ pub struct Peer {
     uid: Result<u32, String>,
     /// The socket, kept open to read its peer token again at each check.
     socket: Option<OwnedFd>,
+    /// When rlxd accepted the connection, as seconds and microseconds since the epoch:
+    /// a process at the token's pid that started later is not the peer.
+    accepted: (u64, u64),
+}
+
+/// Now, as seconds and microseconds since the epoch.
+fn now() -> (u64, u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.as_secs(), u64::from(now.subsec_micros()))
+}
+
+/// When process `pid` started, as seconds and microseconds since the epoch.
+fn started(pid: u32) -> Option<(u64, u64)> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: proc_bsdinfo is plain integers and byte arrays, for which zero is valid.
+    let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
+    let size = libc::c_int::try_from(mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes, as PROC_PIDTBSDINFO
+    // fills.
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
 /// The socket's `LOCAL_PEERTOKEN`.
@@ -199,7 +223,31 @@ impl Peer {
         } else {
             Err(format!("getpeereid: {}", std::io::Error::last_os_error()))
         };
-        Self { token, uid, socket }
+        Self {
+            token,
+            uid,
+            socket,
+            accepted: now(),
+        }
+    }
+
+    /// [`super::Peer::while_pinned`]: the process at the token's pid must have started
+    /// before rlxd accepted the connection, before `check` and after it.
+    ///
+    /// A pid and a start time, not a held handle: macOS's live pid version is in no public
+    /// API. Two windows stay open. A peer that exits between its `connect` and rlxd's
+    /// `accept`, its pid reused within that instant, passes as the new process; and both
+    /// times are the wall clock, so a process started after the clock was stepped back
+    /// past the accept passes too. Neither is in reach: macOS hands out pids in order up to
+    /// 99,999, so no one can aim a reused pid at a backlog window of under a millisecond,
+    /// and a pid that passes the gate must also lie inside the run, whose processes hold
+    /// the key already.
+    pub fn while_pinned(&self, check: impl FnOnce(u32) -> bool) -> bool {
+        let Some(pid) = self.pid() else {
+            return false;
+        };
+        let the_peer = || started(pid).is_some_and(|start| start <= self.accepted);
+        the_peer() && check(pid) && the_peer()
     }
 
     pub fn pid(&self) -> Option<u32> {
