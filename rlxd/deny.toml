@@ -17,9 +17,16 @@ ignore = []
 # advisories, bans and sources checks.
 allow = [
     "Apache-2.0",
+    # rlxd's own parts ported from tmux (crates/rlxd's licence is "MIT AND ISC").
+    "ISC",
     "MIT",
     "Unicode-3.0",
 ]
+# foldhash alone (hashbrown's default hasher, under rusqlite's hashlink, for the
+# scheduler's rlxd.db) is under the zlib licence, which asks only that its origin isn't
+# misrepresented and that altered sources say so: permissive, OSI approved, fine in MIT
+# binaries. Allowed for it, not the graph.
+exceptions = [{ allow = ["Zlib"], crate = "foldhash" }]
 confidence-threshold = 0.93
 
 [bans]

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtyRef",
+  "description": "One PTY, named: `pty.spawn`'s reply, and `pty.write`'s, `pty.resize`'s and\n`pty.kill`'s.\n\n```json\n{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\"}\n```",
+  "type": "object",
+  "properties": {
+    "pty_id": {
+      "description": "The PTY: 128 random bits, as 32 lowercase hex digits.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    }
+  },
+  "required": [
+    "pty_id"
+  ]
+}

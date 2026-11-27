@@ -4,7 +4,9 @@ description = "The rlx engine: a local daemon that hosts processes and pushes ev
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# MIT, as the workspace is, and ISC for the parts ported from tmux (crate::vt and
+# pty/keys.rs), whose notice each of those files keeps.
+license = "MIT AND ISC"
 repository.workspace = true
 publish.workspace = true
 
@@ -57,13 +59,26 @@ rlxd-client.workspace = true
 rlxd-proto.workspace = true
 serde.workspace = true
 # raw_value: the settings file is read key by key, so one bad value is set aside alone.
-serde_json = { workspace = true, features = ["raw_value"] }
+# float_roundtrip: a number is read as the exact double its text names, as RFC 8785's
+# input hashes need (the tool-call gate, 5.1).
+serde_json = { workspace = true, features = ["raw_value", "float_roundtrip"] }
 sha2 = "0.11"
 tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+# The scheduler's clock: UTC instants, cron in IANA time zones, its tz database bundled so
+# DST is the same on every OS (jiff-tzdb's data is public domain).
+jiff = { version = "1.0", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# The scheduler's store, <home>/rlxd/rlxd.db: SQLite built in (bundled; public domain).
+rusqlite = { version = "0.43", features = ["bundled"] }
 # Gate device names: NFKC, single script, and UTS #39 skeletons to compare look-alikes.
 unicode-normalization = "0.1"
 unicode-security = "0.1"
+# The PTY screen model's character widths (handoff 0.10.3, 1.4).
+unicode-width = "0.2"
+# The PTY host (handoff 0.10.3, 1.4): pseudo-terminals, ConPTY on Windows.
+portable-pty = "0.9"
+# `rlxd attach`: the user's terminal in raw mode, its keys, pastes and size.
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste", "windows"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -78,6 +93,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",

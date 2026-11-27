@@ -27,6 +27,10 @@ pub mod run_types {
     pub const STARTED: &str = "run.started";
     /// Assistant text, or a partial chunk of it.
     pub const TEXT: &str = "run.text";
+    /// A tool call the app must decide with `run.decide` (5.1).
+    pub const TOOL_CALL: &str = "run.tool_call";
+    /// How a tool call was decided, and by whom (5.1).
+    pub const TOOL_DECIDED: &str = "run.tool_decided";
     /// A tool's result, as Claude Code gave it.
     pub const TOOL_RESULT: &str = "run.tool_result";
     /// Claude Code was rate limited, or warned it soon will be.
@@ -37,6 +41,10 @@ pub mod run_types {
     pub const DONE: &str = "run.done";
     /// The run ended without one.
     pub const FAILED: &str = "run.failed";
+    /// On the `needs_you` topic: something needs the user.
+    pub const NEEDS_YOU_RAISED: &str = "needs_you.raised";
+    /// On the `needs_you` topic: it no longer does.
+    pub const NEEDS_YOU_CLEARED: &str = "needs_you.cleared";
 }
 
 /// A run's id: a UUID, lower-case and hyphenated, as `uuidgen | tr A-Z a-z` prints one.
@@ -678,6 +686,208 @@ impl RunTextData {
     }
 }
 
+/// `run.tool_call` (5.1): a call of the run's that only the app can decide, with
+/// `run.decide` before `deadline_ms`. It replays through `run.events`, so an app that
+/// reconnects while it is pending sees it again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RunToolCallData {
+    /// Claude Code's `tool_use_id`, which the call's other events share.
+    pub call_id: String,
+    /// The tool, such as `mcp__claude_ai_Slack__slack_send_message`.
+    pub tool: String,
+    /// The tool's input, as Claude Code gave it.
+    pub input: Value,
+    /// The SHA-256, in hex, of the input's RFC 8785 canonical JSON.
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub input_sha256: String,
+    /// How long the app has to decide, in milliseconds, from this event.
+    pub deadline_ms: u64,
+}
+
+impl RunToolCallData {
+    /// Call `call_id` of `tool` with `input`, whose hash is `input_sha256`.
+    pub fn new(
+        call_id: impl Into<String>,
+        tool: impl Into<String>,
+        input: Value,
+        input_sha256: impl Into<String>,
+        deadline_ms: u64,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            input,
+            input_sha256: input_sha256.into(),
+            deadline_ms,
+        }
+    }
+}
+
+/// What a tool call was decided (5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    /// It runs.
+    Allow,
+    /// It doesn't.
+    Deny,
+    /// It doesn't, and the app saved it as a draft (`draft_id`).
+    Draft,
+}
+
+impl Decision {
+    /// Its name on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Draft => "draft",
+        }
+    }
+}
+
+/// Who decided a tool call (5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecidedBy {
+    /// The app, with `run.decide`.
+    App,
+    /// rlxd's own rules: the mount, the kind, the pinned call.
+    Rlxd,
+    /// No answer came before the deadline.
+    Timeout,
+    /// No app-role connection was there to ask.
+    Unreachable,
+}
+
+impl DecidedBy {
+    /// Its name on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Rlxd => "rlxd",
+            Self::Timeout => "timeout",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// `run.tool_decided` (5.1): how a call was decided, and by whom.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RunToolDecidedData {
+    /// Claude Code's `tool_use_id`.
+    pub call_id: String,
+    /// `allow`, `deny` or `draft`.
+    pub decision: Decision,
+    /// `app`, `rlxd`, `timeout` or `unreachable`.
+    pub by: DecidedBy,
+    /// Why: the app's reason, or rlxd's. Data only: it decides nothing.
+    pub reason: String,
+    /// For `draft`: the app's draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub draft_id: Option<String>,
+}
+
+impl RunToolDecidedData {
+    /// Call `call_id`, decided `decision` by `by`, for `reason`.
+    pub fn new(
+        call_id: impl Into<String>,
+        decision: Decision,
+        by: DecidedBy,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            decision,
+            by,
+            reason: reason.into(),
+            draft_id: None,
+        }
+    }
+
+    /// This decision, a draft saved as `draft_id`.
+    #[must_use]
+    pub fn with_draft(mut self, draft_id: Option<String>) -> Self {
+        self.draft_id = draft_id;
+        self
+    }
+}
+
+/// `run.decide`'s params (5.1), from an app-role connection only: the app's answer to a
+/// `run.tool_call`. The first answer wins.
+///
+/// rlxd refuses, by error code: `not_gate` from any other connection; `unknown_run`,
+/// `unknown_call`; `already_decided` once the call is decided; `too_late` once its
+/// deadline passed (it was denied `by: "timeout"`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "RunDecideParams")]
+#[non_exhaustive]
+pub struct RunDecideParams {
+    /// The run.
+    pub run_id: RunId,
+    /// The call: its `run.tool_call`'s `call_id`.
+    #[schemars(length(min = 1))]
+    pub call_id: String,
+    /// `allow`, `deny` or `draft`.
+    pub decision: Decision,
+    /// Why, as Claude Code is told (`permissionDecisionReason`).
+    pub reason: String,
+    /// For `draft`: the app's draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub draft_id: Option<String>,
+    /// End the run, as `run.needs_you {reason: "denied"}`, once the call is denied.
+    #[serde(default)]
+    pub stop: bool,
+}
+
+impl RunDecideParams {
+    /// The app's `decision` on call `call_id` of run `run_id`, for `reason`.
+    pub fn new(
+        run_id: RunId,
+        call_id: impl Into<String>,
+        decision: Decision,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id,
+            call_id: call_id.into(),
+            decision,
+            reason: reason.into(),
+            draft_id: None,
+            stop: false,
+        }
+    }
+}
+
+/// `run.decide`'s reply: the decision taken.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "RunDecideData")]
+#[non_exhaustive]
+pub struct RunDecideData {
+    /// The run.
+    pub run_id: RunId,
+    /// The call.
+    pub call_id: String,
+    /// The decision.
+    pub decision: Decision,
+}
+
+impl RunDecideData {
+    /// `decision` taken on call `call_id` of run `run_id`.
+    pub fn new(run_id: RunId, call_id: impl Into<String>, decision: Decision) -> Self {
+        Self {
+            run_id,
+            call_id: call_id.into(),
+            decision,
+        }
+    }
+}
+
 /// `run.tool_result`: a `tool_result` block in a stream-json `user` message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
@@ -765,6 +975,32 @@ pub struct RunNeedsYouData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub call_id: Option<String>,
+    /// For a run a scheduler job fired: the job's `loud`, opaque to rlxd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub loud: Option<bool>,
+}
+
+impl RunNeedsYouData {
+    /// A run the app stopped (`run.decide` with `stop: true`) when it denied call `call_id`.
+    pub fn denied(call_id: impl Into<String>) -> Self {
+        Self {
+            reason: NeedsYouReason::Denied,
+            question: None,
+            call_id: Some(call_id.into()),
+            loud: None,
+        }
+    }
+
+    /// A run whose output asked the user `question`.
+    pub fn question(question: Option<String>) -> Self {
+        Self {
+            reason: NeedsYouReason::Question,
+            question,
+            call_id: None,
+            loud: None,
+        }
+    }
 }
 
 /// Tokens a run used.
@@ -809,6 +1045,10 @@ pub struct RunDoneData {
     pub duration_ms: u64,
     /// How many turns it took.
     pub num_turns: u64,
+    /// For a run a scheduler job fired: the job's `loud`, opaque to rlxd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub loud: Option<bool>,
 }
 
 impl RunDoneData {
@@ -822,6 +1062,7 @@ impl RunDoneData {
             cost_usd: None,
             duration_ms: 0,
             num_turns: 0,
+            loud: None,
         }
     }
 
@@ -911,6 +1152,531 @@ impl RunFailedData {
     }
 }
 
+// --- needs_you, from runs (7.3) ---------------------------------------------------------
+
+/// Where something that needs the user comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedsYouSource {
+    /// A run (`run_id`).
+    Run,
+    /// A fleet agent (`agent_id`), after the fleet moves onto rlxd (1.8).
+    Fleet,
+}
+
+/// `needs_you.raised`, on the `needs_you` topic: something needs the user. A run raises
+/// one with its `run.needs_you`, and `needs_you.cleared` with the same `id` follows when
+/// it is resumed or cancelled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct NeedsYouRaisedData {
+    /// What `needs_you.cleared` names: `run:<run_id>:<attempt>` for a run.
+    #[schemars(length(min = 1))]
+    pub id: String,
+    /// Where it comes from.
+    pub source: NeedsYouSource,
+    /// The run, for `source: "run"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub run_id: Option<String>,
+    /// The agent, for `source: "fleet"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub agent_id: Option<String>,
+    /// Why: for a run, `run.needs_you`'s `reason`.
+    pub reason: String,
+    /// What to show the user: the question, when there is one.
+    pub text: String,
+}
+
+impl NeedsYouRaisedData {
+    /// A run's: `id`, for `run_id`, needing the user for `reason`, saying `text`.
+    pub fn run(
+        id: impl Into<String>,
+        run_id: impl Into<String>,
+        reason: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            source: NeedsYouSource::Run,
+            run_id: Some(run_id.into()),
+            agent_id: None,
+            reason: reason.into(),
+            text: text.into(),
+        }
+    }
+}
+
+/// `needs_you.cleared`, on the `needs_you` topic: what `needs_you.raised` named no longer
+/// needs the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct NeedsYouClearedData {
+    /// The `id` it was raised with.
+    #[schemars(length(min = 1))]
+    pub id: String,
+}
+
+impl NeedsYouClearedData {
+    /// Clears `id`.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+
+// --- run.resume, run.get, run.list, run.events (5.4, 7.5) -------------------------------
+
+/// `run.resume`'s params: go on with a run that has no live process, as a new attempt
+/// with the same `run_id` (`--resume <run_id>`). `reply`, when given, is the new
+/// attempt's first user message; without it, Claude Code is told to continue.
+///
+/// ```json
+/// {"run_id": "0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f", "reply": "#dev"}
+/// ```
+///
+/// It resumes a run that needs the user, is done, or failed (`engine_restarted`
+/// included), and refuses: a queued or running run (`run_alive`), a session-less one
+/// (`no_session`), and a `send_executor` (`not_resumable`): a send is never retried.
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[schemars(title = "RunResumeParams")]
+#[non_exhaustive]
+pub struct RunResumeParams {
+    /// The run.
+    pub run_id: RunId,
+    /// The user's reply, sent as the new attempt's first message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub reply: Option<String>,
+}
+
+/// The serde code of `RunResumeParams`'s fields, unchecked: see `UncheckedRunStart`.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "RunResumeParams")]
+struct UncheckedRunResume {
+    run_id: RunId,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    reply: Option<String>,
+}
+
+impl RunResumeParams {
+    /// Resumes `run_id`, with `reply` when given.
+    pub fn new(run_id: RunId, reply: Option<String>) -> Self {
+        Self { run_id, reply }
+    }
+}
+
+impl Serialize for RunResumeParams {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        UncheckedRunResume::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunResumeParams {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let object = Data::deserialize(deserializer)?;
+        UncheckedRunResume::deserialize(Value::Object(object)).map_err(de::Error::custom)
+    }
+}
+
+/// `run.resume`'s reply: the run, and the attempt it is now on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "RunResumeData")]
+#[non_exhaustive]
+pub struct RunResumeData {
+    /// The run.
+    pub run_id: RunId,
+    /// Its new attempt, from 2.
+    #[schemars(range(min = 2))]
+    pub attempt: u64,
+}
+
+impl RunResumeData {
+    /// `run_id`, now on `attempt`.
+    pub fn new(run_id: RunId, attempt: u64) -> Self {
+        Self { run_id, attempt }
+    }
+}
+
+/// `run.list`'s params: which runs, of every run rlxd knows, live or ended, from before
+/// an app or rlxd restart too.
+///
+/// ```json
+/// {"states": ["running", "queued"], "job_id": "j1", "limit": 50}
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(title = "RunListParams")]
+#[non_exhaustive]
+pub struct RunListParams {
+    /// Only runs in these states. Absent: every state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub states: Option<Vec<RunState>>,
+    /// Only the runs this scheduler job fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, length(min = 1))]
+    pub job_id: Option<String>,
+    /// At most this many, the latest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, range(min = 1))]
+    pub limit: Option<u32>,
+}
+
+/// The serde code of `RunListParams`'s fields, unchecked: see `UncheckedRunStart`.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "RunListParams")]
+struct UncheckedRunList {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    states: Option<Vec<RunState>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    job_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    limit: Option<u32>,
+}
+
+impl RunListParams {
+    /// Whether these params keep every rule of `run-list.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        if let Some(job_id) = &self.job_id {
+            check::non_empty("job_id", job_id)?;
+        }
+        if let Some(limit) = self.limit {
+            check::at_least("limit", u64::from(limit), 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for RunListParams {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        UncheckedRunList::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunListParams {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let object = Data::deserialize(deserializer)?;
+        let params =
+            UncheckedRunList::deserialize(Value::Object(object)).map_err(de::Error::custom)?;
+        params.validate().map_err(de::Error::custom)?;
+        Ok(params)
+    }
+}
+
+/// One run in `run.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RunSummary {
+    /// The run.
+    pub run_id: RunId,
+    /// Its kind.
+    pub kind: RunKind,
+    /// Its state now.
+    pub state: RunState,
+    /// When `run.start` took it.
+    #[schemars(extend("format" = "date-time"))]
+    pub started_at: String,
+    /// When it last ended, if it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, extend("format" = "date-time"))]
+    pub ended_at: Option<String>,
+    /// Its last event's `run_seq`, 0 before its first.
+    pub last_run_seq: u64,
+    /// The scheduler job that fired it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub job_id: Option<String>,
+    /// The `client` of the connection that started it.
+    pub client: String,
+    /// Its attempt, from 1.
+    #[schemars(range(min = 1))]
+    pub attempt: u64,
+    /// Its space.
+    pub space: String,
+}
+
+impl RunSummary {
+    /// The `kind` run `run_id`, in `state`, started at `started_at`: on its first
+    /// attempt, in the default space, with no events, and no client named.
+    pub fn new(
+        run_id: RunId,
+        kind: RunKind,
+        state: RunState,
+        started_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id,
+            kind,
+            state,
+            started_at: started_at.into(),
+            ended_at: None,
+            last_run_seq: 0,
+            job_id: None,
+            client: String::new(),
+            attempt: 1,
+            space: crate::space::DEFAULT_SPACE.to_owned(),
+        }
+    }
+}
+
+/// `run.list`'s reply: the runs, the latest started first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "RunListData")]
+#[non_exhaustive]
+pub struct RunListData {
+    /// The runs.
+    pub runs: Vec<RunSummary>,
+}
+
+impl RunListData {
+    /// The list of `runs`.
+    pub fn new(runs: Vec<RunSummary>) -> Self {
+        Self { runs }
+    }
+}
+
+/// A gated call's ledger state (5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CallState {
+    /// Decided, and not allowed to run.
+    Decided,
+    /// Allowed, and running.
+    Executing,
+    /// It ran and succeeded: sent.
+    Ok,
+    /// It ran and failed: not sent.
+    Error,
+    /// It was running when its run ended: it may have sent.
+    Unknown,
+}
+
+/// One gated call of a run (5.1): what `run.get` tells the app about a send.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RunCall {
+    /// Claude Code's `tool_use_id`.
+    pub call_id: String,
+    /// The tool.
+    pub tool: String,
+    /// The SHA-256 of the call's input as RFC 8785 JSON.
+    pub input_sha256: String,
+    /// `allow`, `deny` or `draft`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub decision: Option<String>,
+    /// Who decided: `app`, `rlxd`, `timeout` or `unreachable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub by: Option<String>,
+    /// Where it stands.
+    pub state: CallState,
+}
+
+impl RunCall {
+    /// Call `call_id` of `tool`, whose input hashes to `input_sha256`, as `decision` by
+    /// `by` decided it, now `state`.
+    pub fn new(
+        call_id: impl Into<String>,
+        tool: impl Into<String>,
+        input_sha256: impl Into<String>,
+        decision: Decision,
+        by: DecidedBy,
+        state: CallState,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            input_sha256: input_sha256.into(),
+            decision: Some(decision.as_str().to_owned()),
+            by: Some(by.as_str().to_owned()),
+            state,
+        }
+    }
+}
+
+/// `run.get`'s reply: one run, durably: its state, structured output and end survive an
+/// rlxd restart.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "RunGetData")]
+#[non_exhaustive]
+pub struct RunGetData {
+    /// The run.
+    pub run_id: RunId,
+    /// Its kind.
+    pub kind: RunKind,
+    /// Its state now.
+    pub state: RunState,
+    /// Its attempt, from 1.
+    #[schemars(range(min = 1))]
+    pub attempt: u64,
+    /// Its space.
+    pub space: String,
+    /// The `client` of the connection that started it.
+    pub client: String,
+    /// The scheduler job that fired it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub job_id: Option<String>,
+    /// When `run.start` took it.
+    #[schemars(extend("format" = "date-time"))]
+    pub started_at: String,
+    /// When it last ended, if it has: `finished_at` too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, extend("format" = "date-time"))]
+    pub ended_at: Option<String>,
+    /// When it last ended, if it has (the hub's name for `ended_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, extend("format" = "date-time"))]
+    pub finished_at: Option<String>,
+    /// Its last event's `run_seq`, 0 before its first.
+    pub last_run_seq: u64,
+    /// Its last event, as the stream carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub last_event: Option<Event>,
+    /// The session to resume, or `null` for a session-less run or one not done yet.
+    pub session: Option<String>,
+    /// Its structured output, once it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub structured_output: Option<Value>,
+    /// Every gated call's ledger record (5.1).
+    pub calls: Vec<RunCall>,
+}
+
+impl RunGetData {
+    /// The `kind` run `run_id`, in `state`, started at `started_at`: on its first
+    /// attempt, in the default space, with no events, no session and no calls.
+    pub fn new(
+        run_id: RunId,
+        kind: RunKind,
+        state: RunState,
+        started_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id,
+            kind,
+            state,
+            attempt: 1,
+            space: crate::space::DEFAULT_SPACE.to_owned(),
+            client: String::new(),
+            job_id: None,
+            started_at: started_at.into(),
+            ended_at: None,
+            finished_at: None,
+            last_run_seq: 0,
+            last_event: None,
+            session: None,
+            structured_output: None,
+            calls: Vec::new(),
+        }
+    }
+}
+
+/// `run.events`'s params: replay a run's durable log from `from_run_seq`, then, for a
+/// live run, follow it until it ends. The stream is event frames, then the reply
+/// `{run_id, last_run_seq}`, which ends it.
+///
+/// ```json
+/// {"run_id": "0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f", "from_run_seq": 2}
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[schemars(title = "RunEventsParams")]
+#[non_exhaustive]
+pub struct RunEventsParams {
+    /// The run.
+    pub run_id: RunId,
+    /// The first `run_seq` to send. Absent: 1, the run's first event.
+    #[serde(default = "first_run_seq")]
+    #[schemars(range(min = 1))]
+    pub from_run_seq: u64,
+}
+
+fn first_run_seq() -> u64 {
+    1
+}
+
+/// The serde code of `RunEventsParams`'s fields, unchecked: see `UncheckedRunStart`.
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "RunEventsParams")]
+struct UncheckedRunEvents {
+    run_id: RunId,
+    #[serde(default = "first_run_seq")]
+    from_run_seq: u64,
+}
+
+impl RunEventsParams {
+    /// `run_id`'s events from `from_run_seq`.
+    pub fn new(run_id: RunId, from_run_seq: u64) -> Self {
+        Self {
+            run_id,
+            from_run_seq,
+        }
+    }
+
+    /// Whether these params keep every rule of `run-events.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        check::at_least("from_run_seq", self.from_run_seq, 1)
+    }
+}
+
+impl Serialize for RunEventsParams {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        UncheckedRunEvents::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunEventsParams {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let object = Data::deserialize(deserializer)?;
+        let params =
+            UncheckedRunEvents::deserialize(Value::Object(object)).map_err(de::Error::custom)?;
+        params.validate().map_err(de::Error::custom)?;
+        Ok(params)
+    }
+}
+
+/// `run.events`'s reply, which ends its stream: the last `run_seq` it sent, or would
+/// have.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "RunEventsData")]
+#[non_exhaustive]
+pub struct RunEventsData {
+    /// The run.
+    pub run_id: RunId,
+    /// The run's last `run_seq` when the stream ended.
+    pub last_run_seq: u64,
+}
+
+impl RunEventsData {
+    /// The end of `run_id`'s stream, at `last_run_seq`.
+    pub fn new(run_id: RunId, last_run_seq: u64) -> Self {
+        Self {
+            run_id,
+            last_run_seq,
+        }
+    }
+}
+
 /// An event of a run's stream, as `run.events` and a capture of the `run` and
 /// `needs_you` topics give them: `event.json`, plus 7.5's `data` for each run event type
 /// this version describes. `run-event-list.json` is an array of them. A type it does not
@@ -935,6 +1701,14 @@ impl JsonSchema for RunEvent {
             ),
             (run_types::TEXT, generator.subschema_for::<RunTextData>()),
             (
+                run_types::TOOL_CALL,
+                generator.subschema_for::<RunToolCallData>(),
+            ),
+            (
+                run_types::TOOL_DECIDED,
+                generator.subschema_for::<RunToolDecidedData>(),
+            ),
+            (
                 run_types::TOOL_RESULT,
                 generator.subschema_for::<RunToolResultData>(),
             ),
@@ -950,6 +1724,14 @@ impl JsonSchema for RunEvent {
             (
                 run_types::FAILED,
                 generator.subschema_for::<RunFailedData>(),
+            ),
+            (
+                run_types::NEEDS_YOU_RAISED,
+                generator.subschema_for::<NeedsYouRaisedData>(),
+            ),
+            (
+                run_types::NEEDS_YOU_CLEARED,
+                generator.subschema_for::<NeedsYouClearedData>(),
             ),
         ];
         let mut rules = vec![Value::from(generator.subschema_for::<Event>())];

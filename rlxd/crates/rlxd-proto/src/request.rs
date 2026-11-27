@@ -159,6 +159,11 @@ pub mod methods {
     /// seqs) out, so a test can fill the event buffer. A release build has no such method
     /// and answers `unknown_method`.
     pub const DEBUG_EMIT: &str = "debug.emit";
+    /// Test builds only: makes a PTY's screen model panic the next time rlxd calls it,
+    /// `{pty_id, at}` in with `at` one of `output`, `screen` and `resize`, `{pty_id}` out,
+    /// so a test can show a panic there ends that PTY alone. A release build has no such
+    /// method and answers `unknown_method`.
+    pub const DEBUG_PTY_PANIC: &str = "debug.pty_panic";
     /// One app setting: [`SettingsGetParams`](crate::SettingsGetParams) in,
     /// [`Setting`](crate::Setting) out.
     pub const SETTINGS_GET: &str = "settings.get";
@@ -172,6 +177,26 @@ pub mod methods {
     /// [`SettingsDeleteParams`](crate::SettingsDeleteParams) in, [`Setting`](crate::Setting)
     /// out at version 0, and `settings.deleted` on the stream.
     pub const SETTINGS_DELETE: &str = "settings.delete";
+    /// Starts a process on a new PTY: [`PtySpawnParams`](crate::PtySpawnParams) in,
+    /// [`PtyRef`](crate::PtyRef) out. Never gated by the app.
+    pub const PTY_SPAWN: &str = "pty.spawn";
+    /// Types text, presses keys or pastes into a PTY:
+    /// [`PtyWriteParams`](crate::PtyWriteParams) in, [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_WRITE: &str = "pty.write";
+    /// Resizes a PTY: [`PtyResizeParams`](crate::PtyResizeParams) in,
+    /// [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_RESIZE: &str = "pty.resize";
+    /// A PTY's screen, as `tmux capture-pane -e -p` prints it:
+    /// [`PtyScreenParams`](crate::PtyScreenParams) in, [`PtyScreen`](crate::PtyScreen) out.
+    pub const PTY_SCREEN: &str = "pty.screen";
+    /// Streams a PTY's screen, then its output:
+    /// [`PtySubscribeParams`](crate::PtySubscribeParams) in; the reply ends the stream.
+    pub const PTY_SUBSCRIBE: &str = "pty.subscribe";
+    /// Ends a PTY's process and every process in its group or job, and frees the PTY:
+    /// [`PtyKillParams`](crate::PtyKillParams) in, [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_KILL: &str = "pty.kill";
+    /// Every PTY of the home: no params, [`PtyList`](crate::PtyList) out.
+    pub const PTY_LIST: &str = "pty.list";
     /// Starts a run (7.5): [`RunStartParams`](crate::RunStartParams) in,
     /// [`RunRef`](crate::RunRef) out, then the run's events on the `run` topic.
     pub const RUN_START: &str = "run.start";
@@ -182,6 +207,62 @@ pub mod methods {
     /// [`SpaceParams`](crate::SpaceParams) in, [`SpaceEnsureData`](crate::SpaceEnsureData)
     /// out.
     pub const SPACE_ENSURE: &str = "space.ensure";
+    /// Goes on with a run that has no live process, as a new attempt:
+    /// [`RunResumeParams`](crate::RunResumeParams) in,
+    /// [`RunResumeData`](crate::RunResumeData) out.
+    pub const RUN_RESUME: &str = "run.resume";
+    /// One run, from its durable record: [`RunRef`](crate::RunRef) in,
+    /// [`RunGetData`](crate::RunGetData) out.
+    pub const RUN_GET: &str = "run.get";
+    /// Every run rlxd knows: [`RunListParams`](crate::RunListParams) in,
+    /// [`RunListData`](crate::RunListData) out.
+    pub const RUN_LIST: &str = "run.list";
+    /// A run's events from its durable log, then live until it ends:
+    /// [`RunEventsParams`](crate::RunEventsParams) in, event frames, then
+    /// [`RunEventsData`](crate::RunEventsData), which ends the stream.
+    pub const RUN_EVENTS: &str = "run.events";
+    /// Deletes a space, its runs' Claude Code sessions and rlxd's records of its runs:
+    /// [`SpaceParams`](crate::SpaceParams) in, [`SpaceEraseData`](crate::SpaceEraseData)
+    /// out.
+    pub const SPACE_ERASE: &str = "space.erase";
+    /// Test builds only: `run.start` with a scheduler `job_id`, which no other client can
+    /// set: [`RunStartParams`](crate::RunStartParams) plus `job_id` in,
+    /// [`RunRef`](crate::RunRef) out. A release build answers `unknown_method`.
+    pub const DEBUG_RUN_START: &str = "debug.run_start";
+    /// The app's answer to a `run.tool_call`, from an app-role connection only (5.1):
+    /// [`RunDecideParams`](crate::RunDecideParams) in,
+    /// [`RunDecideData`](crate::RunDecideData) out.
+    pub const RUN_DECIDE: &str = "run.decide";
+    /// Test builds only: a run's PreToolUse hook request, as `rlxd-hook pre-tool-use` will
+    /// send it, decided by the gate: `{run_id, attempt, key, stdin}` in, `{output}` (the
+    /// hook's JSON for Claude Code) out. A release build answers `unknown_method`.
+    pub const DEBUG_PRE_TOOL_USE: &str = "debug.pre_tool_use";
+    /// Test builds only: drops every hook connection waiting on the gate, as a crash of
+    /// the connection would (5.1): `{}` in, `{dropped}` out.
+    pub const DEBUG_DROP_HOOK_CONNECTIONS: &str = "debug.drop_hook_connections";
+    /// Creates or replaces a scheduler job by `job_id` (7.6):
+    /// [`JobPutParams`](crate::JobPutParams) in, [`JobRef`](crate::JobRef) out.
+    pub const JOB_PUT: &str = "job.put";
+    /// Every job: [`JobListParams`](crate::JobListParams) in,
+    /// [`JobListData`](crate::JobListData) out.
+    pub const JOB_LIST: &str = "job.list";
+    /// Deletes a job: [`JobRef`](crate::JobRef) in and out.
+    pub const JOB_DELETE: &str = "job.delete";
+    /// Pauses a job: its due fires are skipped `paused`. [`JobRef`](crate::JobRef) in and
+    /// out.
+    pub const JOB_PAUSE: &str = "job.pause";
+    /// Resumes a paused job: [`JobRef`](crate::JobRef) in and out.
+    pub const JOB_RESUME: &str = "job.resume";
+    /// Fires a job now, which needs an app gate client: [`JobRef`](crate::JobRef) in,
+    /// [`JobRunNowData`](crate::JobRunNowData) out.
+    pub const JOB_RUN_NOW: &str = "job.run_now";
+    /// Test builds only: moves the scheduler's test clock on, and answers once every
+    /// decision due by then is made: [`ClockAdvanceParams`](crate::ClockAdvanceParams) in,
+    /// `{now}` out. A release build answers `unknown_method`.
+    pub const DEBUG_CLOCK_ADVANCE: &str = "debug.clock_advance";
+    /// Test builds only: sets the scheduler's test clock, as `debug.clock_advance` moves
+    /// it: [`ClockSetParams`](crate::ClockSetParams) in, `{now}` out.
+    pub const DEBUG_CLOCK_SET: &str = "debug.clock_set";
 }
 
 impl Request {

@@ -8,10 +8,11 @@
 //! - a probe or any other program holding the brain's stdin keeps the brain from seeing
 //!   rlxd go.
 //!
-//! So every program rlxd starts is started holding [`alone`]: the brain
-//! (`crate::brain`) and Claude Code's probes (`crate::claude`). A later item that starts
-//! programs in rlxd (the runner, the PTY host) takes it too. Only the start itself is
-//! held, never the wait for the program's end.
+//! So a program rlxd starts is started holding [`alone`]: the brain (`crate::brain`),
+//! Claude Code's probes (`crate::claude`), and the runner's runs (`crate::runner::process`,
+//! its guard on POSIX and the run itself on Windows). Only the start itself is held, never
+//! the wait for the program's end. The PTY host's start (`crate::pty`, `spawn_command`)
+//! does not take it yet.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtyResizeParams",
+  "description": "`pty.resize`'s params: the terminal's new size.\n\n```json\n{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\", \"cols\": 120, \"rows\": 40}\n```",
+  "type": "object",
+  "properties": {
+    "cols": {
+      "description": "The new width, in cells.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 1000,
+      "minimum": 1
+    },
+    "pty_id": {
+      "description": "The PTY.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "rows": {
+      "description": "The new height, in cells.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 1000,
+      "minimum": 1
+    }
+  },
+  "required": [
+    "pty_id",
+    "cols",
+    "rows"
+  ]
+}

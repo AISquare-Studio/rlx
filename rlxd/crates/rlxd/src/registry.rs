@@ -11,10 +11,13 @@
 //!   instant), then `<id>.json` written. rlxd reads none of the others: one rlxd per home
 //!   is `run/rlxd.lock`'s to enforce, and pruning is the readers'. When the gate cannot
 //!   be had, nothing is written and rlxd runs unregistered, trying again at each beat.
-//! - **The record** is [`DaemonRecord`], `kind: "rlxd"`, written whole: `<id>.json.tmp`,
-//!   fsynced, renamed over `<id>.json`. rlxd also registers the brain it supervises
-//!   (`kind: "brain"`, [`Registration::register_process`]), holding that record's lock
-//!   itself: see `crate::brain`.
+//! - **The record** is [`DaemonRecord`], `kind: "rlxd"`, written whole and durably
+//!   ([`crate::durable::write`]): a 0600 sibling of a random name (`<id>.json.<random>.tmp`),
+//!   made new, so nothing put at a name beforehand (a FIFO, a link) is ever opened or
+//!   written through; fsynced, then renamed over `<id>.json`.
+//!   rlxd also registers the brain it supervises (`kind: "brain"`,
+//!   [`Registration::register_process`]), holding that record's lock itself: see
+//!   `crate::brain`.
 //! - **The heartbeat**, every 5 s, rewrites it with a new `heartbeat_at`. First it checks
 //!   that `<id>.lock` is still the file it holds (POSIX: the same device and inode), and
 //!   takes it again under the gate when someone deleted or replaced it. On Windows a held
@@ -30,7 +33,7 @@
 //! `core.daemons`' rule, the lock alone. It deletes nothing; pruning is Python's.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -148,7 +151,6 @@ impl Registration {
         let record = self.path("json");
         let lock = self.path("lock");
         let _ = remove(&record);
-        let _ = remove(&self.path("json.tmp"));
         drop(self.lock);
         let _ = remove(&lock);
     }
@@ -157,17 +159,13 @@ impl Registration {
         self.dir.join(format!("{}.{extension}", self.record.id))
     }
 
-    /// Writes the record whole: a sibling written and fsynced, then renamed over it.
+    /// Writes the record whole and durably, through a sibling of a random name made new
+    /// ([`crate::durable::write`]).
     fn write(&self) -> io::Result<()> {
         let mut text = serde_json::to_vec(&self.record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         text.push(b'\n');
-        let temporary = self.path("json.tmp");
-        let mut file = private_file(&temporary)?;
-        file.write_all(&text)?;
-        file.sync_all()?;
-        drop(file);
-        retry_refused(|| fs::rename(&temporary, self.path("json")))
+        crate::durable::write(&self.path("json"), &text)
     }
 
     #[cfg(unix)]
@@ -230,28 +228,6 @@ fn fresh_id(dir: &Path) -> io::Result<String> {
             return Ok(id);
         }
     }
-}
-
-/// `path`, opened to be written from empty, and 0600 on POSIX however it was before: the
-/// mode `open` sets applies only to a file it creates, so a stale one left 0644 is
-/// narrowed here, before anything is written to it.
-pub(crate) fn private_file(path: &Path) -> io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-    }
-    Ok(file)
 }
 
 /// Deletes `path`; a file already gone is fine.

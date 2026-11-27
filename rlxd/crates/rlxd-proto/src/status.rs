@@ -218,11 +218,27 @@ pub struct Runs {
 }
 
 /// Scheduler jobs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
 pub struct Jobs {
     /// Jobs defined.
     pub count: u64,
+    /// The scheduler's database, `<home>/rlxd/rlxd.db`. Absent: `ok`. `set_aside`: rlxd
+    /// found one it could not read (corrupt, or from a newer rlxd), moved it aside
+    /// (`set_aside` says where) and began a fresh one. `unavailable`: it could not be
+    /// opened for another reason (busy, locked, no access), so the scheduler isn't running
+    /// and the file is as it was (`reason` says why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = crate::check::drop_null)]
+    pub db: Option<String>,
+    /// For `set_aside`: where the database it could not read was moved, with why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = crate::check::drop_null)]
+    pub set_aside: Option<String>,
+    /// For `unavailable`: why the database could not be opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = crate::check::drop_null)]
+    pub reason: Option<String>,
 }
 
 /// Where this rlxd keeps what it serves and writes, as it resolved them from the home.

@@ -1,7 +1,7 @@
 //! The client commands, `rlxd call`, `rlxd status`, `rlxd stop` and `rlxd gate …`
 //! (handoff 0.10.3, "How to read the checks", 1.3, 5.1 and 7.2). Each opens a new
 //! connection to this home's rlxd, says `hello`, sends one request and prints the reply
-//! envelope. For a streaming method, `events.subscribe`, `rlxd call` prints each event as
+//! envelope. For a streaming method, `events.subscribe` or `run.events`, `rlxd call` prints each event as
 //! a JSON line instead, and exits 0 when the stream ends (`crate::events` is `rlxd
 //! events`).
 //!
@@ -39,7 +39,11 @@ const CLIENT: &str = "rlxd-cli";
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// The methods whose reply ends a stream of events, which `rlxd call` prints instead.
-const STREAMING: &[&str] = &[methods::EVENTS_SUBSCRIBE];
+const STREAMING: &[&str] = &[
+    methods::EVENTS_SUBSCRIBE,
+    methods::PTY_SUBSCRIBE,
+    methods::RUN_EVENTS,
+];
 
 /// `rlxd call`'s options, as the command line gave them.
 #[derive(Debug, Default)]
@@ -174,6 +178,13 @@ impl Target {
 /// A connection to `target`, else `home`'s rlxd, that has said `hello` with its token: as
 /// `cli`, or with `as_app` as `app`, with the test gate credential when there is one.
 pub fn open(home: &Home, as_app: bool, target: &Target) -> Result<Connection, AskError> {
+    open_as(home, if as_app { "app" } else { "cli" }, target)
+}
+
+/// A connection to `target`, else `home`'s rlxd, that has said `hello` as `role` with its
+/// token, and with the test gate credential when the role is `app` and there is one.
+pub fn open_as(home: &Home, role: &str, target: &Target) -> Result<Connection, AskError> {
+    let as_app = role == "app";
     // The token first, as `rlxd call` reads it: one the caller named (--token-file, or
     // for --socket) is unauthorized when it can't be read, whatever runs here. Only the
     // home's own, missing where no rlxd ever ran, says not running when none does.
@@ -186,7 +197,6 @@ pub fn open(home: &Home, as_app: bool, target: &Target) -> Result<Connection, As
         Err(message) => return Err(AskError::Unauthorized(message)),
     };
     let mut connection = connect(home, target.socket.as_deref())?;
-    let role = if as_app { "app" } else { "cli" };
     let mut hello = hello_params(&token, &json!(PROTOCOL_VERSION), CLIENT, role);
     let kept = as_app.then(|| target.credential_file(home)).flatten();
     if let Some(credential) = kept.as_deref().and_then(read_credential) {
