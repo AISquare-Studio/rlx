@@ -16099,7 +16099,7 @@ def test_watch_sends_only_a_scheduled_managers_held_wake(
         ] == [manager.id]
 
 
-@pytest.mark.parametrize("producer", ["id", "alias", "watch"])
+@pytest.mark.parametrize("producer", ["id", "alias", "person", "watch"])
 @pytest.mark.parametrize("path", ["pane", "stop"])
 def test_scheduled_managers_on_one_hub_wake_only_for_their_own(
     hubbed: _Hubbed, tmp_path: Path, producer: str, path: str
@@ -16120,8 +16120,9 @@ def test_scheduled_managers_on_one_hub_wake_only_for_their_own(
     first.tmux.set_command(first.manager.pane_id, "claude")
     first.tmux.set_command(other.pane_id, "claude")
     first.monkeypatch.setattr(fleet_service, "nudge_manager", first.nudge)
-    intended, wrong = (first.manager_sid, sid) if producer == "alias" else (sid, first.manager_sid)
-    intended_pane = first.manager.pane_id if producer == "alias" else other.pane_id
+    ours = producer in ("alias", "person")  # the first fleet's: its coder's, or from its folder
+    intended, wrong = (first.manager_sid, sid) if ours else (sid, first.manager_sid)
+    intended_pane = first.manager.pane_id if ours else other.pane_id
     with store_session() as store:
         head = store.latest_seq(first.hub.id)
         for session in (intended, wrong):
@@ -16136,6 +16137,16 @@ def test_scheduled_managers_on_one_hub_wake_only_for_their_own(
             tmp_path / "watch.json",
         )
         expected = "watch:"
+    elif producer == "person":
+        # No session: the fleet it is for is stamped as the nudge picked it (its folder).
+        team_service.add_note(
+            "scoped question",
+            kind="question",
+            to_role="manager",
+            board_id=first.hub.id,
+            cwd=first.fleet.root,
+        )
+        expected = "scoped question"
     else:
         team_service.add_note(
             "scoped question",
@@ -16153,6 +16164,29 @@ def test_scheduled_managers_on_one_hub_wake_only_for_their_own(
         decision = team_service.hook_stop(intended, root)
         assert decision is not None and expected in decision.reason
     assert team_service.hook_stop(wrong, root) is None
+
+
+def test_a_turn_end_holds_the_routine_news_its_prompt_left_for_the_next_page(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """The person's prompt reads a page of 50 held results; the 10 left are not due (that
+    prompt was the last read) and the hold the prompt made moot is dropped. The turn's end
+    holds them again, after that prompt, for the tickers to send when they fall due."""
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    with store_session() as store:
+        for n in range(60):
+            team_service._emit(
+                store, project.id, "result", f"routine {n}", session_id=coder.session_id
+            )
+    fleet_service.nudge_manager(project.id, reason="result")
+    assert _pastes(tmux) == [] and _held(manager)
+    team_service.hook_prompt_heartbeat(manager, project.root)  # the person's, 50 lines
+    with store_session() as store:
+        assert fleet_service.deferred_nudge_targets(store) == [], "moot: it read the board"
+    assert team_service.hook_stop(manager, project.root) is None
+    with store_session() as store:
+        assert [row.session_id for row in fleet_service.deferred_nudge_targets(store)] == [manager]
 
 
 def test_nudge_types_one_fixed_line_into_a_waiting_manager(
