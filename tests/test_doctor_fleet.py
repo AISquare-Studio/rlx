@@ -1432,6 +1432,46 @@ def test_the_fleet_terminal_row_names_the_terminal_its_protocol_and_ctrl_j(
     assert "ctrl+j" in detail
 
 
+@pytest.mark.parametrize(
+    ("env", "name"),
+    [
+        ({"KITTY_WINDOW_ID": "1"}, "kitty"),
+        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2"),
+        ({"WT_SESSION": "x"}, "Windows Terminal"),
+        ({"TERM": "xterm-256color"}, "unknown (TERM=xterm-256color)"),
+    ],
+    ids=["kitty", "iterm2", "windows-terminal", "unrecognised"],
+)
+def test_a_terminal_with_unproven_shift_enter_is_given_the_ctrl_j_line(
+    env: dict[str, str], name: str
+) -> None:
+    """rlx#558: where Shift+Enter is not proven to reach an agent (the terminal's sign leaves
+    its keyboard protocol unknown, or no sign names it), the row's first part is the ctrl+j
+    line, which works in every terminal, and no longer "try shift+enter in a pane"."""
+    detail = _terminal_row(FakeServer(absent=True), env).detail
+
+    assert detail.split("; ")[0] == (
+        f"outer terminal {name} (protocol unknown, use ctrl+j for a newline)"
+    )
+    assert "try shift+enter" not in detail
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"GHOSTTY_RESOURCES_DIR": "/x"}, {"TERM_PROGRAM": "ghostty"}, {"TERM": "xterm-ghostty"}],
+    ids=["ghostty-resources", "ghostty-term-program", "ghostty-term"],
+)
+def test_a_terminal_with_proven_shift_enter_keeps_its_line(env: dict[str, str]) -> None:
+    """rlx#558 leaves a terminal whose every release speaks the kitty keyboard protocol as it
+    was: Shift+Enter reaches agents there, and the row gives no newline advice."""
+    detail = _terminal_row(FakeServer(absent=True), env).detail
+
+    assert detail.split("; ")[0] == (
+        "outer terminal ghostty (kitty keyboard protocol: shift+enter reaches agents)"
+    )
+    assert "ctrl+j" not in detail
+
+
 def test_the_fleet_terminal_row_comes_after_the_actionable_checks() -> None:
     """It can warn (a server's kept prefix), and the not-ok rows are read in doctor
     order (the fleet sidebar showed only the first three): inserted beside
