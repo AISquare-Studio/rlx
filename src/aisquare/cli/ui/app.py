@@ -77,23 +77,31 @@ from aisquare.cli.ui.groups import (
     GroupPicker,
     GroupProjects,
     MoveRow,
+    OpenGroupMenu,
+    RenameGroup,
     ToggleCollapse,
     TogglePin,
     UndoLayout,
 )
 from aisquare.cli.ui.needs_you_bar import BAR_WORKER, OPEN_KEY, NeedsYouBar
 from aisquare.cli.ui.project_menu import (
+    COLLAPSE,
+    DELETE,
     FRESH,
+    MOVE_DOWN,
+    MOVE_UP,
     PAUSE,
     PIN,
     REMOVE,
     RENAME,
     RESUME,
     SETTINGS,
+    GroupMenu,
     ProjectMenu,
 )
 from aisquare.cli.ui.receiver import listen_for_ui, stop_listening_for_ui
 from aisquare.cli.ui.remote_control import SWITCHES, RemoteController, ngrok_ends_with
+from aisquare.cli.ui.save_model import UNDO_SAID
 from aisquare.cli.ui.service_client import ServiceClient
 from aisquare.cli.ui.sidebar import (
     ALIVE_STATES,
@@ -131,6 +139,7 @@ from aisquare.cli.ui.sidebar import (
     UsageStatsSelected,
     ViewSelected,
     agent_name,
+    group_name_refusal,
     rename_refusal_words,
 )
 from aisquare.cli.ui.spawn import SpawnCompleted, SpawnDialog
@@ -823,7 +832,7 @@ class HelpScreen(ModalScreen[None]):
             # Arranging the sidebar (#140): every one of these has a CLI twin.
             ("shift+↑ ↓", "move the highlighted row one place"),
             ("g p space", "group · pin · fold the highlighted row"),
-            ("u", "undo the last arrangement; a toast says what"),
+            ("u ctrl+z", "undo the last arrangement; a toast says what"),
             ("m", "mark the highlighted card, as shift+click does"),
             ("shift+g", "group the marked cards; Esc clears the marks"),
             ("drag title", "move a card or a group header to a new place"),
@@ -840,6 +849,11 @@ class HelpScreen(ModalScreen[None]):
             (
                 ". ⋯ r-click",
                 "on an agent's row, its menu: Pause or Resume, Stop, Restart, Rename",
+            ),
+            (
+                ". ⋯ r-click",
+                "on a group's header, its menu: rename, pin, fold, move, delete the group "
+                "(its projects stay); F2 renames it in place",
             ),
             (self.escape_key.upper(), "hand focus from an agent's pane back to the sidebar"),
             (
@@ -2981,26 +2995,28 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     # --- groups, pins and order (#140) -------------------------------------------------
 
-    def _layout(self, what: Callable[[ContextStore], project_groups.UndoEntry], said: str) -> None:
-        """Apply one gesture through the service, remember its way back, repaint, say so."""
+    def _layout(self, what: Callable[[ContextStore], project_groups.UndoEntry], said: str) -> bool:
+        """Apply one gesture through the service, remember its way back, repaint, say so;
+        whether it was applied."""
         try:
             with store_session() as store:
                 entry = what(store)
         except KeyError as exc:
             self.notify(f"nothing to do: {exc.args[0]!r} is gone", severity="warning", timeout=4)
-            return
+            return False
         except ValueError as exc:
             self.notify(str(exc), severity="error", timeout=6, markup=False)
-            return
+            return False
         except Exception as exc:  # the store said no: the frame stands, the gesture is lost
             self.notify(f"could not {said}: {exc}", severity="error", timeout=6, markup=False)
-            return
+            return False
         if entry.projects or entry.groups:
             # A gesture that touched no row ("nothing to move": a step at an end,
             # a pinned row) is no step back — `u` would undo nothing and say it did.
             self._undo.append(entry)
             del self._undo[:-UNDO_DEPTH]
         self.refresh_data()
+        return True
 
     def on_move_row(self, event: MoveRow) -> None:
         # One step is one row ON SCREEN: the captured rows count only while `a` shows them,
@@ -3092,6 +3108,43 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.sidebar.action_clear_marks()
 
         self.push_screen(GroupPicker(groups, len(ids)), chosen)
+
+    def on_open_group_menu(self, event: OpenGroupMenu) -> None:
+        """⋯, ``.`` or a right-click on a group's header (#39): its menu, then what was chosen,
+        each through the gesture's own handler, onto the one undo stack."""
+        group_id, name = event.group.id, event.group.name
+
+        def chosen(choice: str | None) -> None:
+            if choice == RENAME:
+                # Once the menu has gone: closing it hands the focus back to the sidebar.
+                self.call_after_refresh(self.sidebar.open_group_rename, group_id)
+            elif choice == PIN:
+                self.on_toggle_pin(TogglePin("group", group_id))
+            elif choice == COLLAPSE:
+                self.on_toggle_collapse(ToggleCollapse(group_id))
+            elif choice in (MOVE_UP, MOVE_DOWN):
+                self.on_move_row(MoveRow("group", group_id, -1 if choice == MOVE_UP else 1))
+            elif choice == DELETE and self._layout(
+                lambda s: project_groups.delete_group(s, group_id), "delete the group"
+            ):
+                self.notify(f"Deleted group {name} · Undo: {UNDO_SAID}", timeout=6, markup=False)
+
+        menu = GroupMenu(event.group, event.anchor, count=event.count, up=event.up, down=event.down)
+        self.push_screen(menu, chosen)
+
+    def on_rename_group(self, event: RenameGroup) -> None:
+        """A group header's name field was saved (#39). A name another shell took since the
+        frame was read is refused in the sidebar's words (``group_name_refusal``, asked of the
+        store's groups now), and the field opens again with what was typed."""
+
+        def rename(store: ContextStore) -> project_groups.UndoEntry:
+            refusal = group_name_refusal(event.typed, event.group_id, store.project_groups())
+            if refusal is not None:
+                raise ValueError(f"not renamed: {refusal}")
+            return project_groups.rename_group(store, event.group_id, event.typed)
+
+        if not self._layout(rename, "rename"):
+            self.sidebar.open_group_rename(event.group_id, event.typed)
 
     def on_undo_layout(self, event: UndoLayout) -> None:
         if not self._undo:
