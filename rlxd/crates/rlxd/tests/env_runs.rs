@@ -243,6 +243,10 @@ fn run_start_and_resume_refuse_when_the_apps_path_has_no_claude() {
     let run = home.rlxd(&["call", "run.resume", &resume]);
     assert_eq!(run.code(), Some(1), "{run:?}");
     assert_eq!(run.error_code(), "claude_not_found", "{run:?}");
+    // A run rlxd doesn't know is that first, whatever the claude.
+    let unknown = json!({ "run_id": run_id() }).to_string();
+    let run = home.rlxd(&["call", "run.resume", &unknown]);
+    assert_eq!(run.error_code(), "unknown_run", "{run:?}");
 
     // Windows: npm's claude.cmd shim, found first, is not run.
     #[cfg(windows)]

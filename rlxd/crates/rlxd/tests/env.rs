@@ -145,6 +145,25 @@ fn only_the_app_sets_them() {
             r#"{"PATH":"/tmp"}"#,
             "status",
         ],
+        // Refused by the gate, or not the app: not_gate before any look at the keys (7.2).
+        &[
+            "call",
+            "--role",
+            "app",
+            "--gate-credential",
+            "made-up",
+            "--env",
+            r#"{"HOME":"x"}"#,
+            "status",
+        ],
+        &[
+            "call",
+            "--role",
+            "tui",
+            "--env",
+            r#"{"HOME":"x"}"#,
+            "status",
+        ],
     ] {
         let run = home.rlxd(args);
         assert_eq!(run.code(), Some(1), "{args:?}: {run:?}");
