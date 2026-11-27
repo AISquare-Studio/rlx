@@ -441,8 +441,9 @@ def test_an_empty_or_taken_name_is_refused_in_our_words_and_the_field_stays_open
 def test_a_rename_the_store_refuses_is_said_and_the_field_opens_again_with_it(
     tmp_path: Path, script: Script
 ) -> None:
-    """Another shell took the name after the sidebar's frame was read: the store refuses it,
-    the shell says why, and the field opens again with what was typed, to correct."""
+    """Another shell took the name after the sidebar's frame was read: the shell refuses it in
+    the sidebar's words, as the field itself would have (tester of #39, #3042), and the field
+    opens again with what was typed, to correct."""
     seed(tmp_path, *THREE)
     with store_session() as store:
         groups_service.create_group(store, "tools", ["prj_b"])
@@ -462,7 +463,7 @@ def test_a_rename_the_store_refuses_is_said_and_the_field_opens_again_with_it(
 
     value, told = drive(go)
     assert value == "infra"
-    assert told == ["a group named 'infra' already exists"], told
+    assert told == ["not renamed: another group is called infra"], told
     assert stored_names() == {"tools", "infra"}
 
 
@@ -750,6 +751,45 @@ def test_ctrl_z_typed_in_an_open_name_field_undoes_no_arrangement(
     assert during == {"tools"}, "ctrl+z in the field brought no group back"
     assert typed == (True, True), "the field is still open, with what was typed"
     assert after == {"tools", "old"}, "ctrl+z from the sidebar still takes the delete back"
+
+
+@pytest.mark.parametrize("field", ["group name", "card nickname"])
+def test_ctrl_z_while_typing_a_name_leaves_a_fold_folded(
+    tmp_path: Path, script: Script, field: str
+) -> None:
+    """The tester's repro of #39 (#3042, B1): web folded, then a name typed and ctrl+z
+    pressed in the field. web stays folded, no 'undid' toast is raised, and the field still
+    holds what was typed."""
+    seed(tmp_path, *THREE)
+    with store_session() as store:
+        groups_service.create_group(store, "tools", ["prj_b"])
+        groups_service.create_group(store, "web", ["prj_c"])
+
+    async def go(pilot: Pilot[None]) -> tuple[bool | None, list[str], str]:
+        app = fleet_app(pilot)
+        told = toast_log.record(app)
+        await highlight(pilot, app, "web")
+        await pilot.press("space")
+        await settle(app)
+        assert stored_group("web").collapsed is True  # type: ignore[union-attr]
+        if field == "group name":
+            await highlight(pilot, app, "tools")
+            await pilot.press("f2")
+            typed = "infra"
+        else:
+            app.sidebar.open_rename("prj_a")
+            typed = "Auth"
+        await settle(app)
+        focused = app.focused
+        assert isinstance(focused, Input), type(focused).__name__
+        await pilot.press(*typed, "ctrl+z")
+        await settle(app)
+        return stored_group("web").collapsed, told, focused.value  # type: ignore[union-attr]
+
+    folded, told, value = drive(go)
+    assert folded is True
+    assert not [t for t in told if t.startswith("undid")], told
+    assert value.endswith("infra" if field == "group name" else "Auth")
 
 
 # --- parity with the CLI ---------------------------------------------------------------------

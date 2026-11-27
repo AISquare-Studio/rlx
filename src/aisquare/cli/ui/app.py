@@ -139,6 +139,7 @@ from aisquare.cli.ui.sidebar import (
     UsageStatsSelected,
     ViewSelected,
     agent_name,
+    group_name_refusal,
     rename_refusal_words,
 )
 from aisquare.cli.ui.spawn import SpawnCompleted, SpawnDialog
@@ -3132,11 +3133,17 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.push_screen(menu, chosen)
 
     def on_rename_group(self, event: RenameGroup) -> None:
-        """A group header's name field was saved (#39). The store's refusal (a name another
-        shell just took) is said, and the field opens again with what was typed."""
-        if not self._layout(
-            lambda s: project_groups.rename_group(s, event.group_id, event.typed), "rename"
-        ):
+        """A group header's name field was saved (#39). A name another shell took since the
+        frame was read is refused in the sidebar's words (``group_name_refusal``, asked of the
+        store's groups now), and the field opens again with what was typed."""
+
+        def rename(store: ContextStore) -> project_groups.UndoEntry:
+            refusal = group_name_refusal(event.typed, event.group_id, store.project_groups())
+            if refusal is not None:
+                raise ValueError(f"not renamed: {refusal}")
+            return project_groups.rename_group(store, event.group_id, event.typed)
+
+        if not self._layout(rename, "rename"):
             self.sidebar.open_group_rename(event.group_id, event.typed)
 
     def on_undo_layout(self, event: UndoLayout) -> None:
