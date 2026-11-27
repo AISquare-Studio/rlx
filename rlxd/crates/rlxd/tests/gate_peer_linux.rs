@@ -145,7 +145,7 @@ fn without_a_packaged_install_the_uid_and_the_binarys_name_are_checked() {
     let dir = home.root().join("helpers");
     std::fs::create_dir_all(&dir).unwrap();
     let app = dir.join(rlxd::peer::LINUX_APP_NAME);
-    std::fs::copy(env!("CARGO_BIN_EXE_rlxd"), &app).unwrap();
+    common::copy_executable(Path::new(env!("CARGO_BIN_EXE_rlxd")), &app);
     home.start();
     let run = home.rlxd(&["call", "gate.pair"]);
     assert_eq!(run.error_code(), "not_gate", "rlxd's own client: {run:?}");
