@@ -228,6 +228,29 @@ pub mod methods {
     /// set: [`RunStartParams`](crate::RunStartParams) plus `job_id` in,
     /// [`RunRef`](crate::RunRef) out. A release build answers `unknown_method`.
     pub const DEBUG_RUN_START: &str = "debug.run_start";
+    /// Creates or replaces a scheduler job by `job_id` (7.6):
+    /// [`JobPutParams`](crate::JobPutParams) in, [`JobRef`](crate::JobRef) out.
+    pub const JOB_PUT: &str = "job.put";
+    /// Every job: [`JobListParams`](crate::JobListParams) in,
+    /// [`JobListData`](crate::JobListData) out.
+    pub const JOB_LIST: &str = "job.list";
+    /// Deletes a job: [`JobRef`](crate::JobRef) in and out.
+    pub const JOB_DELETE: &str = "job.delete";
+    /// Pauses a job: its due fires are skipped `paused`. [`JobRef`](crate::JobRef) in and
+    /// out.
+    pub const JOB_PAUSE: &str = "job.pause";
+    /// Resumes a paused job: [`JobRef`](crate::JobRef) in and out.
+    pub const JOB_RESUME: &str = "job.resume";
+    /// Fires a job now, which needs an app gate client: [`JobRef`](crate::JobRef) in,
+    /// [`JobRunNowData`](crate::JobRunNowData) out.
+    pub const JOB_RUN_NOW: &str = "job.run_now";
+    /// Test builds only: moves the scheduler's test clock on, and answers once every
+    /// decision due by then is made: [`ClockAdvanceParams`](crate::ClockAdvanceParams) in,
+    /// `{now}` out. A release build answers `unknown_method`.
+    pub const DEBUG_CLOCK_ADVANCE: &str = "debug.clock_advance";
+    /// Test builds only: sets the scheduler's test clock, as `debug.clock_advance` moves
+    /// it: [`ClockSetParams`](crate::ClockSetParams) in, `{now}` out.
+    pub const DEBUG_CLOCK_SET: &str = "debug.clock_set";
 }
 
 impl Request {

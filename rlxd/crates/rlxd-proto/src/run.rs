@@ -769,6 +769,10 @@ pub struct RunNeedsYouData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub call_id: Option<String>,
+    /// For a run a scheduler job fired: the job's `loud`, opaque to rlxd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub loud: Option<bool>,
 }
 
 impl RunNeedsYouData {
@@ -778,6 +782,7 @@ impl RunNeedsYouData {
             reason: NeedsYouReason::Question,
             question,
             call_id: None,
+            loud: None,
         }
     }
 }
@@ -824,6 +829,10 @@ pub struct RunDoneData {
     pub duration_ms: u64,
     /// How many turns it took.
     pub num_turns: u64,
+    /// For a run a scheduler job fired: the job's `loud`, opaque to rlxd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub loud: Option<bool>,
 }
 
 impl RunDoneData {
@@ -837,6 +846,7 @@ impl RunDoneData {
             cost_usd: None,
             duration_ms: 0,
             num_turns: 0,
+            loud: None,
         }
     }
 

@@ -390,6 +390,20 @@ pub mod codes {
     pub const ERASE_INCOMPLETE: &str = "erase_incomplete";
     /// `space.erase`: the space is being erased already, by another call; wait for it.
     pub const ERASE_IN_PROGRESS: &str = "erase_in_progress";
+    /// `job.*`: rlxd holds no job of that `job_id`.
+    pub const UNKNOWN_JOB: &str = "unknown_job";
+    /// `job.run_now`: no app gate client is connected, and jobs fire only while one is
+    /// (2.3).
+    pub const APP_ABSENT: &str = "app_absent";
+    /// `job.run_now`: the job's last run is still queued or running; a job never
+    /// overlaps itself.
+    pub const JOB_RUNNING: &str = "job_running";
+    /// `job.run_now`: the job is disabled (`enabled: false`), and a disabled job never
+    /// fires.
+    pub const JOB_DISABLED: &str = "job_disabled";
+    /// `job.run_now`: a run of the job was rate-limited, and the limit hasn't reset;
+    /// `detail.resets_at` says when it does.
+    pub const RATE_LIMITED: &str = "rate_limited";
     /// `run.start`: rlxd can't name the absolute path of the `rlxd-hook` beside it, which
     /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
     /// why.

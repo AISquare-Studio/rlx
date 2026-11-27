@@ -437,6 +437,68 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::gate
   only the real Claude Code can say: the route, whether `system/init` carries
   annotations, `claude mcp login`'s output, and the handoff's `[real]` lines.
 
+## The scheduler
+
+rlxapp's jobs (handoff 0.10.3, 2.3 and 7.6). The app owns their definitions and pushes
+them by `job_id`; rlxd keeps a definition only to fire it, and records what each fire did.
+
+- **Methods.** `job.put` creates or replaces a job, idempotently: `{job_id, type: "run",
+  schedule, run, catch_up, enabled?, loud?}`. `schedule` is `{"every_minutes": N}` or
+  `{"cron": "*/15 * * * *", "tz": "Europe/London"}`. `run` is a `run.start` template
+  without `run_id`, checked as `run.start` checks its params, so a template it would
+  refuse is refused at `job.put`, with the same code. The job's own unknown fields are
+  refused; the template's follow `run.start`'s rule, which ignores them. The same
+  definition put again (the app pushes its jobs on each connect) changes nothing. A
+  replace starts the schedule again from now only when its `schedule` changes or it is
+  enabled again; otherwise it keeps where the schedule is, a fire it owes, and a missed
+  fire waiting for an app. A replace keeps the job's record and whether it is paused. `job.list`, `job.delete`, `job.pause`, `job.resume`, and `job.run_now`, which
+  fires the job now. `job.run_now` needs an app gate client (`app_absent` otherwise);
+  `paused` doesn't stop it, a live run of the job (`job_running`) or its rate limit
+  (`rate_limited`, `detail.resets_at`) do. `watch` jobs come with the tool gate (5.1).
+  `job.list`'s `last_state` is the job's last run's state as the runner has it now.
+- **When.** `every_minutes` fires on a grid from `job.put`, so a late fire never drifts
+  it. Cron matches civil minutes in its IANA zone (jiff's bundled tz database, the same
+  on every OS), each once: a time a DST gap skips fires once at the gap's end, and a time
+  a fold repeats fires once, at its first occurrence.
+- **Whether.** One function decides each fire, in this order: a paused job's due fire is
+  skipped `paused`; with no app gate client connected, `app_absent` (2.3); while the
+  job's last run is queued or running, `overlap`; while a run of the job hit its rate
+  limit (a `run.rate_limited` whose `status` isn't `allowed` or `allowed_warning`, until
+  its `resets_at`, else 5 minutes; a warning holds nothing), `rate_limited`. A fire
+  rlxd couldn't make on time (it was down, or the clock jumped) is one decision however
+  many it passed: `catch_up: "once"` fires once, `"skip"` records `missed`. A fire missed
+  while rlxd was down waits 10 s after rlxd starts for an app to connect, then is
+  `app_absent`. Each `app_absent` skip is owed: when an app connects, `once` fires it
+  once, and `skip` waits for the next time.
+- **A fire** is a run of the template with a fresh `run_id`, the job's `job_id` on all
+  its events, and the job's `loud`, which rlxd only echoes, on `job.fired` and on the
+  run's `run.done` and `run.needs_you`. Events on topic `job`: `job.put`, `job.deleted`,
+  `job.paused`, `job.resumed`, `job.fired {job_id, run_id, scheduled_for, fired_at,
+  cause, loud}` and `job.skipped {job_id, scheduled_for, reason, code?}`. `job.fired`
+  goes out once the run has started, so its first run events may come before it. A run
+  that can't start is `job.skipped {reason: "start_failed", code}`, `code` being
+  `run.start`'s refusal.
+- **Once.** Before a fire's run starts, the job (its schedule moved past the fire) and a
+  `starting` record of the fire, with its `run_id`, are written in one transaction. So
+  a crash while the run starts never fires that time again: the next rlxd settles the
+  fire as `job.fired` when the run was made, or `job.skipped start_failed
+  (engine_restarted)` when it wasn't.
+- **Storage.** `<home>/rlxd/rlxd.db`, SQLite (built in): one writer, WAL, `synchronous =
+  FULL`, migrations numbered in `schema_migrations`. The folder is 0700 and the database,
+  its `-wal` and its `-shm` 0600 on macOS and Linux (the templates hold prompts). One that
+  can't be read (corrupt, or from a newer rlxd) is moved to `rlxd.db.unreadable-<time>`,
+  logged, and reported in `status` (`jobs.db: "set_aside"`, `jobs.set_aside`), and a fresh
+  one begun; it is never reset in place. Another failure to open it (busy, locked, no
+  access) is tried three times, then the scheduler doesn't start (`jobs.db:
+  "unavailable"`, and why) and the file is left as it is. Each job keeps its last 1000
+  fire records.
+- **Tests.** Test builds have a test clock: `RLXD_TEST_CLOCK=<RFC 3339>` starts the
+  scheduler there, and `debug.clock_advance {seconds}` and `debug.clock_set {at}` move it,
+  answering once every decision due by then is made (`tests/scheduler.rs`). A release
+  build has neither. 7.6's Accept lines run on real one-minute schedules in
+  `tests/scheduler_accept.rs`, `#[ignore]`d in the test job and run by rlxd.yml's
+  `scheduler accept` job: `cargo test -p rlxd --test scheduler_accept -- --ignored`.
+
 ## `rlxd here`: what rlx.app asks a host before it connects
 
 rlx.app runs `rlxd here --json --start` on a host over SSH, inside the authenticated

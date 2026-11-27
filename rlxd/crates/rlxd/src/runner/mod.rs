@@ -97,6 +97,33 @@ const PARTIAL_TEXT: usize = 1 << 20;
 /// How long `run.cancel` waits for a running run to end before it answers.
 const CANCEL_WAIT: Duration = Duration::from_secs(10);
 
+/// The scheduler job a run was fired for (7.6): its id, and its `loud`, which rlxd only
+/// echoes on the run's `run.done` and `run.needs_you`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobTag {
+    pub job_id: String,
+    pub loud: bool,
+}
+
+/// What a run a scheduler job fired did that the scheduler acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunNote {
+    /// A `rate_limit_event`: until `resets_at` (RFC 3339), in `status` (Claude Code's
+    /// word: `allowed_warning` lets the run go on, `rejected` means the limit is hit).
+    RateLimited {
+        job_id: String,
+        run_id: RunId,
+        resets_at: Option<String>,
+        status: Option<String>,
+    },
+    /// The run's attempt ended in `state`.
+    Ended {
+        job_id: String,
+        run_id: RunId,
+        state: RunState,
+    },
+}
+
 /// The runner of one rlxd.
 pub struct Runner {
     home: Home,
@@ -136,6 +163,8 @@ pub struct Runner {
     probing: tokio::sync::Mutex<()>,
     /// The probe's tree while it runs, for rlxd's stop to end.
     probe_tree: Mutex<Option<Arc<Tree>>>,
+    /// Where notes on runs scheduler jobs fired go ([`Runner::notes`]).
+    notes: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<RunNote>>,
 }
 
 #[derive(Default)]
@@ -162,6 +191,8 @@ struct Run {
     params: RunStartParams,
     /// The scheduler job that fired the run (7.6), which only rlxd sets.
     job_id: Option<String>,
+    /// The job's `loud`, for a run a scheduler job fired.
+    loud: Option<bool>,
     client: String,
     dir: RunDir,
     inner: Mutex<RunInner>,
@@ -359,6 +390,7 @@ impl Runner {
             stopping: AtomicBool::new(false),
             probing: tokio::sync::Mutex::new(()),
             probe_tree: Mutex::new(None),
+            notes: std::sync::OnceLock::new(),
         });
         runner.load();
         runner
@@ -469,6 +501,7 @@ impl Runner {
                 .then(|| format!("run:{id}:{}", record.attempt));
             let run = Arc::new(Run {
                 job_id: record.job_id.clone(),
+                loud: record.loud,
                 client: record.client.clone(),
                 dir,
                 inner: Mutex::new(RunInner {
@@ -542,6 +575,31 @@ impl Runner {
         }
     }
 
+    /// Notes on the runs scheduler jobs fire, from now on: for the scheduler, once.
+    pub fn notes(&self) -> tokio::sync::mpsc::UnboundedReceiver<RunNote> {
+        let (send, notes) = tokio::sync::mpsc::unbounded_channel();
+        if self.notes.set(send).is_err() {
+            warning!("runner: a second follower of job runs' notes is ignored");
+        }
+        notes
+    }
+
+    fn note(&self, note: RunNote) {
+        if let Some(notes) = self.notes.get() {
+            let _ = notes.send(note);
+        }
+    }
+
+    /// Whether run `id` is queued or running, without its lock: for a job's overlap.
+    pub fn live(&self, id: &RunId) -> bool {
+        self.state(id).is_some_and(RunState::is_live)
+    }
+
+    /// Run `id`'s state now, without its lock; `None` for a run rlxd doesn't know.
+    pub fn state(&self, id: &RunId) -> Option<RunState> {
+        self.runs().by_id.get(id).map(|run| *run.state.borrow())
+    }
+
     fn runs(&self) -> MutexGuard<'_, Runs> {
         self.runs.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -573,26 +631,24 @@ impl Runner {
         self: &Arc<Self>,
         params: RunStartParams,
         client: &str,
-        job_id: Option<String>,
+        job: Option<JobTag>,
     ) -> Result<RunRef, ErrorBody> {
-        if params.kind.needs_no_tools() && params.mount != Mount::NoTools {
-            return Err(refusal(
-                codes::KIND_MOUNT_MISMATCH,
-                format!(
-                    "a {} run takes only mount {{\"kind\": \"no_tools\"}}",
-                    params.kind
-                ),
-            ));
-        }
-        if params.kind.needs_pinned_call() && params.pinned_call.is_none() {
-            return Err(refusal(
-                codes::PINNED_CALL_REQUIRED,
-                format!(
-                    "a {} run needs pinned_call {{tool, input_sha256}}",
-                    params.kind
-                ),
-            ));
-        }
+        check_start(&params)?;
+        let (job_id, loud) = match job {
+            Some(job) => (Some(job.job_id), Some(job.loud)),
+            None => (None, None),
+        };
+        self.start_checked(params, client, job_id, loud)
+    }
+
+    /// [`Runner::start`], its params checked.
+    fn start_checked(
+        self: &Arc<Self>,
+        params: RunStartParams,
+        client: &str,
+        job_id: Option<String>,
+        loud: Option<bool>,
+    ) -> Result<RunRef, ErrorBody> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(refusal(
                 codes::RUN_START_FAILED,
@@ -642,6 +698,7 @@ impl Runner {
         let started_at = clock::now();
         let run = Arc::new(Run {
             job_id,
+            loud,
             client: client.to_owned(),
             dir,
             inner: Mutex::new(RunInner {
@@ -1453,6 +1510,13 @@ impl Runner {
         run.state.send_replace(state);
         run.show(inner);
         run.ended_as(inner.attempt, state);
+        if let Some(job_id) = &run.job_id {
+            self.note(RunNote::Ended {
+                job_id: job_id.clone(),
+                run_id: run.params.run_id.clone(),
+                state,
+            });
+        }
         info!("run {}: {state}", run.params.run_id);
         std::mem::take(&mut inner.placed)
     }
@@ -2035,8 +2099,16 @@ impl Runner {
                     Line::RateLimit { resets_at, status } => {
                         let resets_at =
                             resets_at.map(|s| clock::format(UNIX_EPOCH + Duration::from_secs(s)));
-                        let data = RunRateLimitedData::new(resets_at, status);
+                        let data = RunRateLimitedData::new(resets_at.clone(), status.clone());
                         self.emit(run, &mut inner, run_types::RATE_LIMITED, &data);
+                        if let Some(job_id) = &run.job_id {
+                            self.note(RunNote::RateLimited {
+                                job_id: job_id.clone(),
+                                run_id: run.params.run_id.clone(),
+                                resets_at,
+                                status,
+                            });
+                        }
                     }
                     Line::Result(outcome) => return Streamed::Result(outcome, stdin),
                     Line::Init(_) | Line::Partial(_) | Line::Other => {}
@@ -2258,6 +2330,7 @@ impl Run {
             structured_output: inner.structured_output.clone(),
             process: inner.process.clone(),
             job_id: self.job_id.clone(),
+            loud: self.loud,
             last_event: None,
             boot: process::boot_id(),
             session_started: inner.session_started,
@@ -2436,8 +2509,12 @@ fn outcome_of(run: &Run, outcome: stream::Outcome) -> End {
         .with_turns(outcome.duration_ms, outcome.num_turns);
     done.structured_output = outcome.structured_output;
     done.cost_usd = outcome.cost_usd;
+    done.loud = run.loud;
     match needs_you(&run.params, &done) {
-        Some(needs) => End::NeedsYou(needs, done),
+        Some(mut needs) => {
+            needs.loud = run.loud;
+            End::NeedsYou(needs, done)
+        }
         None => End::Done(done),
     }
 }
@@ -2562,6 +2639,32 @@ pub(crate) fn project_folder(path: &std::path::Path) -> String {
         }
     }
     folder
+}
+
+/// What `run.start` refuses of its params before it looks at anything else, with its own
+/// codes: `kind_mount_mismatch` and `pinned_call_required`. A `needs_connectors` passes:
+/// the gate (5.5) serves it at each start. The scheduler checks a run job's template with it at
+/// `job.put`, so a template `run.start` would refuse is refused then, not at each fire.
+pub fn check_start(params: &RunStartParams) -> Result<(), ErrorBody> {
+    if params.kind.needs_no_tools() && params.mount != Mount::NoTools {
+        return Err(refusal(
+            codes::KIND_MOUNT_MISMATCH,
+            format!(
+                "a {} run takes only mount {{\"kind\": \"no_tools\"}}",
+                params.kind
+            ),
+        ));
+    }
+    if params.kind.needs_pinned_call() && params.pinned_call.is_none() {
+        return Err(refusal(
+            codes::PINNED_CALL_REQUIRED,
+            format!(
+                "a {} run needs pinned_call {{tool, input_sha256}}",
+                params.kind
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// An error body for a refused runner call.
