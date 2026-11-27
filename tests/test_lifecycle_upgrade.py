@@ -4778,7 +4778,22 @@ def test_a_failed_move_back_turns_on_no_item_the_os_had_off(
     assert enables == [], enables
 
 
-@pytest.mark.parametrize("ran", [False, True], ids=["stopped", "running"])
+@pytest.mark.parametrize(
+    "ran",
+    [
+        pytest.param(False, id="stopped"),
+        # Only a start that runs reaches the OS, and service_host.start_service refuses on
+        # native Windows before it asks (as test_service_at_login's start through the OS).
+        pytest.param(
+            True,
+            id="running",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="service_host.start_service refuses on native Windows",
+            ),
+        ),
+    ],
+)
 def test_a_failed_move_back_starts_the_service_only_if_the_upgrade_stopped_it(
     runner: CliRunner,
     tool: Tool,
