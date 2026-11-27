@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtyScreenParams",
+  "description": "`pty.screen`'s params, and `pty.kill`'s and `pty.subscribe`'s are alike.\n\n```json\n{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\", \"scrollback\": 100}\n```",
+  "type": "object",
+  "properties": {
+    "pty_id": {
+      "description": "The PTY.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "scrollback": {
+      "description": "Lines of history to put above the screen, at most 50,000, as `capture-pane -S -n`\ndoes: fewer when the PTY holds fewer. Absent is none.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 50000,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "pty_id"
+  ]
+}

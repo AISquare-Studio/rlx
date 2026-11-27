@@ -119,6 +119,9 @@ struct State {
     devices: Vec<Device>,
     revoked: Vec<String>,
     holders: HashMap<u64, Holder>,
+    /// How many app connections hold the gate, as it changes: what the scheduler follows
+    /// for "an app gate client is connected" (2.3).
+    apps: watch::Sender<u32>,
     pending: Vec<Pending>,
     next: u64,
     /// A `last_seen` changed since gate.json was written.
@@ -282,6 +285,7 @@ impl Gate {
                 kick,
             },
         );
+        state.recount();
         Some(Hold {
             gate: Arc::clone(self),
             id,
@@ -293,6 +297,11 @@ impl Gate {
     /// The app connections holding the gate now: `status`'s `clients.app`.
     pub fn app_connections(&self) -> u32 {
         u32::try_from(self.state().holders.len()).unwrap_or(u32::MAX)
+    }
+
+    /// [`Gate::app_connections`], as it changes.
+    pub fn apps(&self) -> watch::Receiver<u32> {
+        self.state().apps.subscribe()
     }
 
     /// `gate.pair`, for a caller whose peer already passed the identity check (or in dev
@@ -341,6 +350,7 @@ impl Gate {
             let dropped = kick(&mut state, |holder| holder.sha256 == old, caller);
             if drop_caller {
                 state.holders.remove(&caller.unwrap_or_default());
+                state.recount();
             }
             return Ok(Paired {
                 credential: new,
@@ -647,7 +657,9 @@ impl Gate {
     }
 
     fn detach(&self, id: u64) {
-        self.state().holders.remove(&id);
+        let mut state = self.state();
+        state.holders.remove(&id);
+        state.recount();
     }
 }
 
@@ -699,7 +711,20 @@ fn kick(state: &mut State, drop: impl Fn(&Holder) -> bool, keep: Option<u64>) ->
             holder.kick.send_replace(true);
         }
     }
+    state.recount();
     ids.len()
+}
+
+impl State {
+    /// Sends the app connections' count on, when it changed.
+    fn recount(&mut self) {
+        let now = u32::try_from(self.holders.len()).unwrap_or(u32::MAX);
+        self.apps.send_if_modified(|count| {
+            let changed = *count != now;
+            *count = now;
+            changed
+        });
+    }
 }
 
 /// The index of the device whose credential is `credential`.

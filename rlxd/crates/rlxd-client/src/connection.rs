@@ -12,8 +12,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use rlxd_proto::{
-    Data, Envelope, ErrorBody, Event, HelloParams, Outcome, Params, Request, RequestId,
-    SubscribeParams, methods,
+    Data, Envelope, ErrorBody, Event, HelloParams, Outcome, Params, PtySubscribeParams, Request,
+    RequestId, SubscribeParams, methods,
 };
 
 use crate::Home;
@@ -207,6 +207,19 @@ impl Subscription {
     /// The connection, once the stream has ended.
     pub fn into_connection(self) -> Connection {
         self.connection
+    }
+
+    /// The next frame as it comes: an event, the stream's reply, or the reply to a request
+    /// sent meanwhile ([`Subscription::send`]).
+    pub fn next_incoming(&mut self) -> Result<Incoming, CallError> {
+        self.connection.read_incoming()
+    }
+
+    /// Sends a request on the stream's connection, as rlxd answers them meanwhile; its
+    /// reply comes between the events, and [`Subscription::next_frame`] passes it over.
+    /// Its id.
+    pub fn send(&mut self, method: &str, params: Params) -> Result<RequestId, CallError> {
+        self.connection.send(method, params)
     }
 }
 
@@ -404,6 +417,27 @@ impl Connection {
             }
         };
         let id = self.send(methods::EVENTS_SUBSCRIBE, params)?;
+        Ok(Subscription {
+            connection: self,
+            id,
+        })
+    }
+
+    /// Opens a PTY's stream (handoff 1.4) after `hello`: sends `pty.subscribe` with
+    /// `params`. Its first event is the screen, `pty.snapshot`, then the PTY's output and
+    /// end; the reply ends it once the PTY is killed. Read it as an event stream.
+    pub fn subscribe_pty(mut self, params: &PtySubscribeParams) -> Result<Subscription, CallError> {
+        let params = match serde_json::to_value(params) {
+            Ok(serde_json::Value::Object(params)) => params,
+            Ok(_) => unreachable!("pty.subscribe params print as an object"),
+            Err(error) => {
+                return Err(CallError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    error,
+                )));
+            }
+        };
+        let id = self.send(methods::PTY_SUBSCRIBE, params)?;
         Ok(Subscription {
             connection: self,
             id,

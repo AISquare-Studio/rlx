@@ -32,12 +32,12 @@ the same files.
 | `hello` | One answer, then a successful result |
 | `slow` | Says it is working, then takes `FAKE_CLAUDE_SLOW_MS` (default 60,000) before it answers; the prompt `quick` makes it answer at once. It ignores stdin closing, so only rlxd ending its tree ends it |
 | `structured` | With `--json-schema`, its result's `structured_output` is `structured/output.json` |
-| `rate-limit` | A `rate_limit_event` an hour before the limit resets, then an answer |
+| `rate-limit` | A `rate_limit_event` saying the limit is hit (`rejected`; `FAKE_CLAUDE_RATE_STATUS` gives another, such as `allowed_warning`), five minutes before it resets, then an answer |
 | `asks` | Ends with the output `{"status":"needs_you","question":"Which channel?"}`; resumed, it reads the reply and ends `{"status":"done","channel":<reply>}` |
 | `crash` | Says part of an answer, then exits 1 with no result |
 | `persist` | `hello`, named for the erase check: every scenario writes its session file where Claude Code does unless `--no-session-persistence` |
 | `orphan` | Starts a process of its own that would linger a minute, answers, and exits: the run's end must take that process too |
-| `abort` | Says part of an answer, then dies of `SIGABRT` (an abort), so rlxd reports the signal |
+| `abort` | Says part of an answer, waits `FAKE_CLAUDE_ABORT_AFTER_MS` (default 0), then dies of `SIGABRT` (an abort), so rlxd reports the signal |
 | `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
 | `print-env` | Answers with the app's environment it got (4.3): `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` and `PATH`, those set, as JSON. Started by a name that is no scenario, such as `bin/claude`, fake-claude follows the name's links to its scenario, else takes `FAKE_CLAUDE_SCENARIO` (Windows, where the tests copy it) |

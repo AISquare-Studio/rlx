@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Detail, EnvValues, Envelope, ErrorBody, Event, HelloData,
     HelloParams, HereData, InstalledRlx, InstalledRlxd, Invalid, PROTOCOL_VERSION,
-    PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, RunScope, SCHEMA_VERSION, Setting,
-    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
-    SettingsSetParams, StatusData, SubscribeParams, codes, daemon_kinds, env_keys, event_types,
-    methods, protocol_version_of, schema_version_of, schemas, send_safety_lowers,
-    send_safety_modes, setting_is_protected, setting_keys, topics,
+    PROTOCOL_VERSIONS, Paths, PtyCursor, PtyExited, PtyInfo, PtyKillParams, PtyList, PtyOutput,
+    PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams, PtySubscribeParams,
+    PtyWriteParams, Request, RequestId, Role, RunScope, SCHEMA_VERSION, Setting, SettingsChanged,
+    SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams,
+    StatusData, SubscribeParams, codes, daemon_kinds, env_keys, event_types, methods,
+    protocol_version_of, schema_version_of, schemas, send_safety_lowers, send_safety_modes,
+    setting_is_protected, setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2258,4 +2260,376 @@ fn env_documents_and_the_env_type_agree() {
             "CLAUDE_SECURESTORAGE_CONFIG_DIR"
         ]
     );
+}
+
+const PTY: &str = "6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b";
+
+#[test]
+fn pty_documents_validate_and_print_back_as_themselves() {
+    for spawn in [
+        json!({"argv": ["sh", "-c", "echo ready; sleep 30"], "cols": 80, "rows": 24}),
+        json!({"argv": ["claude", ""], "cols": 1, "rows": 1000, "cwd": "/Users/sam/code",
+               "env": {"FOO": "1", "BAR": null, "EMPTY": ""}, "label": "coder · Ava"}),
+    ] {
+        assert_eq!(agrees::<PtySpawnParams>("pty-spawn.json", &spawn), spawn);
+    }
+    let one = json!({ "pty_id": PTY });
+    assert_eq!(agrees::<PtyRef>("pty-ref.json", &one), one);
+    assert_eq!(agrees::<PtyKillParams>("pty-kill.json", &one), one);
+    assert_eq!(agrees::<PtyScreenParams>("pty-screen.json", &one), one);
+    for write in [
+        json!({"pty_id": PTY, "text": "hello\u{3}"}),
+        json!({"pty_id": PTY, "text": ""}),
+        json!({"pty_id": PTY, "keys": ["C-c", "Enter", "S-Enter", "M-é", "PageDown", "y"]}),
+        json!({"pty_id": PTY, "paste": "two\nlines"}),
+    ] {
+        assert_eq!(agrees::<PtyWriteParams>("pty-write.json", &write), write);
+    }
+    let resize = json!({"pty_id": PTY, "cols": 1000, "rows": 1});
+    assert_eq!(
+        agrees::<PtyResizeParams>("pty-resize.json", &resize),
+        resize
+    );
+    let screen = json!({"pty_id": PTY, "scrollback": 50_000});
+    assert_eq!(
+        agrees::<PtyScreenParams>("pty-screen.json", &screen),
+        screen
+    );
+    for read_only in [true, false] {
+        let subscribe = json!({"pty_id": PTY, "read_only": read_only});
+        assert_eq!(
+            agrees::<PtySubscribeParams>("pty-subscribe.json", &subscribe),
+            subscribe
+        );
+    }
+
+    let live = json!({"pty_id": PTY, "text": "\u{1b}[31mred\u{1b}[39m plain\n\n",
+        "cursor": {"x": 80, "y": 0, "visible": false}, "cols": 80, "rows": 2,
+        "alternate": true, "history": 50_000, "exited": false, "seq": 0});
+    assert_eq!(agrees::<PtyScreen>("pty-screen-reply.json", &live), live);
+    let ended = json!({"pty_id": PTY, "text": "", "cursor": {"x": 0, "y": 0, "visible": true},
+        "cols": 80, "rows": 24, "alternate": false, "history": 0, "exited": true,
+        "status": 137, "signal": 9, "seq": 41});
+    assert_eq!(agrees::<PtyScreen>("pty-screen-reply.json", &ended), ended);
+    // A PTY whose screen model failed: named while rlxd ends it, and after.
+    for (exited, status) in [(false, None), (true, Some(129))] {
+        let mut failed = json!({"pty_id": PTY, "text": "\n", "cursor": {"x": 0, "y": 0,
+            "visible": true}, "cols": 80, "rows": 1, "alternate": false, "history": 0,
+            "exited": exited, "error": "screen_failed", "seq": 9});
+        if let Some(status) = status {
+            failed["status"] = json!(status);
+            failed["signal"] = json!(1);
+        }
+        assert_eq!(
+            agrees::<PtyScreen>("pty-screen-reply.json", &failed),
+            failed
+        );
+    }
+
+    let list = json!({"ptys": [
+        {"pty_id": PTY, "label": "coder", "argv": ["sh"], "cwd": "/Users/sam", "pid": 4242,
+         "cols": 80, "rows": 24, "started_at": TIME, "exited": false},
+        {"pty_id": "0".repeat(32), "argv": ["cmd", "/c", "exit 3"], "cwd": "C:\\Users\\sam",
+         "pid": 1, "cols": 80, "rows": 24, "started_at": TIME, "exited": true,
+         "status": 4_294_967_295_u32},
+        {"pty_id": "1".repeat(32), "argv": ["sh"], "cwd": "/", "pid": 7, "cols": 80,
+         "rows": 24, "started_at": TIME, "exited": true, "status": 129, "signal": 1,
+         "error": "screen_failed"},
+    ]});
+    assert_eq!(agrees::<PtyList>("pty-list-reply.json", &list), list);
+    agrees::<PtyList>("pty-list-reply.json", &json!({"ptys": []}));
+
+    let output = json!({"pty_id": PTY, "bytes_b64": "cmVhZHkNCg=="});
+    assert_eq!(agrees::<PtyOutput>("pty-output.json", &output), output);
+    for bytes in ["AA==", "AAA=", "AAAA", "+/+/"] {
+        agrees::<PtyOutput>(
+            "pty-output.json",
+            &json!({"pty_id": PTY, "bytes_b64": bytes}),
+        );
+    }
+    for exited in [
+        json!({"pty_id": PTY, "status": 3}),
+        json!({"pty_id": PTY, "status": 143, "signal": 15}),
+        json!({"pty_id": PTY, "status": 129, "signal": 1, "error": "screen_failed"}),
+        json!({"pty_id": PTY, "status": 1, "error": "a_later_reason"}),
+    ] {
+        assert_eq!(agrees::<PtyExited>("pty-exited.json", &exited), exited);
+    }
+
+    // The events carry them, on the topic v1 lists.
+    let event = json!({"schema_version": 1, "seq": 7, "time": TIME, "topic": "pty",
+        "type": "pty.output", "data": output});
+    agrees::<Event>("event.json", &event);
+}
+
+#[test]
+fn pty_documents_refuse_their_wrong_shapes() {
+    for id in [
+        json!(PTY.to_uppercase()),
+        json!(&PTY[1..]),
+        json!(format!("{PTY}0")),
+        json!(""),
+        json!(1),
+    ] {
+        both_refuse::<PtyRef>("pty-ref.json", json!({ "pty_id": id }));
+        both_refuse::<PtyKillParams>("pty-kill.json", json!({ "pty_id": id }));
+    }
+    for wrong in [
+        json!({"argv": [], "cols": 80, "rows": 24}),
+        json!({"argv": [""], "cols": 80, "rows": 24}),
+        json!({"argv": ["sh", "a\u{0}b"], "cols": 80, "rows": 24}),
+        json!({"argv": ["sh"], "cols": 0, "rows": 24}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 1001}),
+        json!({"argv": ["sh"], "cols": 80}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "cwd": ""}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "cwd": "/a\u{0}"}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "cwd": null}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"A=B": "1"}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"": "1"}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"A": "1\u{0}"}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "env": {"A": 1}}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "label": ""}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "label": "a\nb"}),
+        json!({"argv": ["sh"], "cols": 80, "rows": 24, "label": "x".repeat(129)}),
+        json!(["sh"]),
+    ] {
+        both_refuse::<PtySpawnParams>("pty-spawn.json", wrong);
+    }
+    for wrong in [
+        json!({ "pty_id": PTY }),
+        json!({"pty_id": PTY, "text": "a", "paste": "b"}),
+        json!({"pty_id": PTY, "text": "a", "keys": ["Enter"]}),
+        json!({"pty_id": PTY, "keys": []}),
+        json!({"pty_id": PTY, "keys": [""]}),
+        json!({"pty_id": PTY, "keys": ["C c"]}),
+        json!({"pty_id": PTY, "keys": ["\u{1b}"]}),
+        json!({"pty_id": PTY, "keys": ["x".repeat(33)]}),
+        json!({"pty_id": PTY, "text": null}),
+    ] {
+        both_refuse::<PtyWriteParams>("pty-write.json", wrong);
+    }
+    both_refuse::<PtyResizeParams>(
+        "pty-resize.json",
+        json!({"pty_id": PTY, "cols": 80, "rows": 0}),
+    );
+    both_refuse::<PtyScreenParams>(
+        "pty-screen.json",
+        json!({"pty_id": PTY, "scrollback": 50_001}),
+    );
+    both_refuse::<PtySubscribeParams>("pty-subscribe.json", json!({ "pty_id": PTY }));
+
+    let screen = |extra: Value| {
+        let mut screen = json!({"pty_id": PTY, "text": "", "cursor": {"x": 0, "y": 0,
+            "visible": true}, "cols": 80, "rows": 24, "alternate": false, "history": 0,
+            "exited": false, "seq": 1});
+        for (k, v) in extra.as_object().unwrap() {
+            screen[k] = v.clone();
+        }
+        screen
+    };
+    for wrong in [
+        screen(json!({"exited": true})),
+        screen(json!({"status": 0})),
+        screen(json!({"exited": true, "status": 1, "signal": 0})),
+        screen(json!({"exited": true, "status": 1, "signal": 128})),
+        screen(json!({"signal": 9})),
+        screen(json!({"history": 50_001})),
+        screen(json!({"cols": 0})),
+    ] {
+        both_refuse::<PtyScreen>("pty-screen-reply.json", wrong);
+    }
+    let info = |extra: Value| {
+        let mut info = json!({"pty_id": PTY, "argv": ["sh"], "cwd": "/", "pid": 4242,
+            "cols": 80, "rows": 24, "started_at": TIME, "exited": false});
+        for (k, v) in extra.as_object().unwrap() {
+            info[k] = v.clone();
+        }
+        json!({ "ptys": [info] })
+    };
+    for wrong in [
+        info(json!({"pid": 0})),
+        info(json!({"started_at": "yesterday"})),
+        info(json!({"argv": []})),
+        info(json!({"exited": true})),
+        info(json!({"label": "a\u{7}"})),
+    ] {
+        both_refuse::<PtyList>("pty-list-reply.json", wrong);
+    }
+    // An error is a name: 1 to 64 lowercase letters and underscores, never null.
+    let long = "e".repeat(65);
+    for error in [
+        json!(""),
+        json!("Screen_Failed"),
+        json!("screen failed"),
+        json!(long),
+        json!(null),
+        json!(1),
+    ] {
+        both_refuse::<PtyScreen>("pty-screen-reply.json", screen(json!({ "error": error })));
+        both_refuse::<PtyList>("pty-list-reply.json", info(json!({ "error": error })));
+        both_refuse::<PtyExited>(
+            "pty-exited.json",
+            json!({"pty_id": PTY, "status": 1, "error": error}),
+        );
+    }
+    for bytes in ["", "abc", "ab=c", "a===", "ab c", "é123"] {
+        both_refuse::<PtyOutput>(
+            "pty-output.json",
+            json!({"pty_id": PTY, "bytes_b64": bytes}),
+        );
+    }
+    for wrong in [
+        json!({ "pty_id": PTY }),
+        json!({"pty_id": PTY, "status": 1, "signal": 200}),
+        json!({"pty_id": PTY, "status": -1}),
+    ] {
+        both_refuse::<PtyExited>("pty-exited.json", wrong);
+    }
+}
+
+#[test]
+fn a_write_carries_at_most_128_kib_and_the_types_count_its_bytes() {
+    let most = "x".repeat(rlxd_proto::MAX_PTY_WRITE);
+    for field in ["text", "paste"] {
+        agrees::<PtyWriteParams>("pty-write.json", &json!({"pty_id": PTY, field: most}));
+        // Past the cap in bytes, not in characters: the schema can't count bytes.
+        let over = "é".repeat(rlxd_proto::MAX_PTY_WRITE / 2 + 1);
+        let instance = json!({"pty_id": PTY, field: over});
+        assert_valid("pty-write.json", &instance);
+        let error = serde_json::from_value::<PtyWriteParams>(instance).unwrap_err();
+        assert!(error.to_string().contains("more than 131072"), "{error}");
+    }
+}
+
+#[test]
+fn pty_builders_print_what_their_schemas_accept_and_refuse_the_rest() {
+    let spawn = PtySpawnParams::new(vec!["sh".to_owned()], 80, 24)
+        .unwrap()
+        .in_dir("/tmp")
+        .with_env("FOO", Some("1".to_owned()))
+        .with_env("BAR", None)
+        .labelled("coder");
+    assert_valid("pty-spawn.json", &serde_json::to_value(&spawn).unwrap());
+    assert!(PtySpawnParams::new(Vec::new(), 80, 24).is_err());
+    assert!(PtySpawnParams::new(vec!["sh".to_owned()], 80, 0).is_err());
+    let broken = spawn.labelled("");
+    assert!(
+        serde_json::to_value(&broken).is_err(),
+        "a broken value never prints"
+    );
+
+    for write in [
+        PtyWriteParams::text(PTY, "hi").unwrap(),
+        PtyWriteParams::keys(PTY, vec!["Enter".to_owned()]).unwrap(),
+        PtyWriteParams::paste(PTY, "a\nb").unwrap(),
+    ] {
+        assert_valid("pty-write.json", &serde_json::to_value(&write).unwrap());
+    }
+    assert!(PtyWriteParams::keys(PTY, Vec::new()).is_err());
+    assert!(PtyWriteParams::text("nope", "hi").is_err());
+    assert_eq!(
+        PtyWriteParams::keys(PTY, vec!["Up".to_owned()])
+            .unwrap()
+            .input(),
+        rlxd_proto::PtyInput::Keys(&["Up".to_owned()])
+    );
+
+    let screen = PtyScreen::new(PTY, "ready\n", PtyCursor::new(0, 1, true), 80, 24, 9)
+        .unwrap()
+        .with_state(false, 12)
+        .unwrap()
+        .with_exit(3, None)
+        .unwrap();
+    assert_valid(
+        "pty-screen-reply.json",
+        &serde_json::to_value(&screen).unwrap(),
+    );
+    let snapshot = screen.to_data().unwrap();
+    assert_eq!(snapshot["status"], 3);
+    assert!(
+        PtyScreen::new(PTY, "", PtyCursor::new(0, 0, true), 80, 24, 0)
+            .unwrap()
+            .with_exit(1, Some(0))
+            .is_err()
+    );
+
+    let info = PtyInfo::new(PTY, vec!["sh".to_owned()], "/", 4242, 80, 24, TIME)
+        .unwrap()
+        .with_label(Some("coder".to_owned()))
+        .unwrap()
+        .with_exit(143, Some(15))
+        .unwrap();
+    let list = PtyList::new(vec![info]).unwrap();
+    assert_valid("pty-list-reply.json", &serde_json::to_value(&list).unwrap());
+    assert!(PtyInfo::new(PTY, vec!["sh".to_owned()], "/", 0, 80, 24, TIME).is_err());
+
+    let output = PtyOutput::new(PTY, "cmVhZHkNCg==")
+        .unwrap()
+        .to_data()
+        .unwrap();
+    assert_valid("pty-output.json", &Value::Object(output));
+    let exited = PtyExited::new(PTY, 3, None).unwrap().to_data().unwrap();
+    assert_valid("pty-exited.json", &Value::Object(exited));
+    assert!(PtyExited::new(PTY, 1, Some(128)).is_err());
+    assert!(PtyResizeParams::new(PTY, 1001, 24).is_err());
+    assert!(
+        PtyScreenParams::new(PTY)
+            .unwrap()
+            .with_scrollback(50_001)
+            .validate()
+            .is_err()
+    );
+    assert!(PtySubscribeParams::new(PTY, true).is_ok());
+    assert!(PtyKillParams::new("").is_err());
+    assert!(PtyRef::new(PTY).is_ok());
+}
+
+#[test]
+fn the_pty_host_names_its_methods_codes_and_event_types() {
+    assert_eq!(
+        [
+            methods::PTY_SPAWN,
+            methods::PTY_WRITE,
+            methods::PTY_RESIZE,
+            methods::PTY_SCREEN,
+            methods::PTY_SUBSCRIBE,
+            methods::PTY_KILL,
+            methods::PTY_LIST,
+        ],
+        [
+            "pty.spawn",
+            "pty.write",
+            "pty.resize",
+            "pty.screen",
+            "pty.subscribe",
+            "pty.kill",
+            "pty.list"
+        ]
+    );
+    assert_eq!(
+        [
+            codes::ROLE_NOT_ALLOWED,
+            codes::TOO_MANY_PTYS,
+            codes::UNKNOWN_PTY,
+            codes::READ_ONLY,
+            codes::PTY_EXITED,
+            codes::SPAWN_FAILED,
+        ],
+        [
+            "role_not_allowed",
+            "too_many_ptys",
+            "unknown_pty",
+            "read_only",
+            "pty_exited",
+            "spawn_failed"
+        ]
+    );
+    for r#type in [
+        event_types::PTY_OUTPUT,
+        event_types::PTY_EXITED,
+        event_types::PTY_SNAPSHOT,
+    ] {
+        assert!(r#type.starts_with("pty."), "{type}");
+    }
+    assert!(topics::ALL.contains(&topics::PTY));
 }

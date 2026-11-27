@@ -7,6 +7,7 @@ use crate::Fake;
 
 mod abort;
 mod asks;
+mod big;
 mod crash;
 mod hello;
 mod huge;
@@ -27,6 +28,7 @@ pub type Scenario = fn(&mut Fake) -> i32;
 pub const ALL: &[(&str, Scenario)] = &[
     ("abort", abort::run),
     ("asks", asks::run),
+    ("big", big::run),
     ("crash", crash::run),
     ("hello", hello::run),
     ("huge", huge::run),

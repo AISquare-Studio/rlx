@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JobRef",
+  "description": "`{job_id}`: `job.delete`'s, `job.pause`'s and `job.resume`'s params, `job.put`'s,\n`job.delete`'s, `job.pause`'s and `job.resume`'s reply, and `job.run_now`'s params.",
+  "type": "object",
+  "properties": {
+    "job_id": {
+      "description": "The job's id.",
+      "$ref": "#/$defs/JobId"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "job_id"
+  ],
+  "$defs": {
+    "JobId": {
+      "description": "A job's id, which the app picks: 1 to 128 ASCII letters, digits, `.`, `_`, `-` and\n`:`, starting with a letter or a digit.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

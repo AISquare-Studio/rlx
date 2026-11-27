@@ -1,7 +1,7 @@
 //! 4.3's Accept lines that start a run (handoff 0.10.3): the app's environment reaches
 //! Claude Code raw, and every run starts the absolute `claude` rlxd resolved when the app
-//! set `PATH`, never one looked up when the run starts. `run.start` refuses
-//! `claude_not_found` when the app's `PATH` has none. fake-claude's `print-env` stands
+//! set `PATH`, never one looked up when the run starts. `run.start` and `run.resume`
+//! refuse `claude_not_found` when the app's `PATH` has none. fake-claude's `print-env` stands
 //! in, on every OS: linked as `bin/claude` on macOS and Linux, as the Accept does, and
 //! copied as `bin\claude.exe` on Windows, with `FAKE_CLAUDE_SCENARIO` naming the scenario.
 //!
@@ -214,8 +214,24 @@ fn a_run_starts_the_claude_resolved_when_the_app_set_path() {
 }
 
 #[test]
-fn run_start_refuses_when_the_apps_path_has_no_claude() {
+fn run_start_and_resume_refuse_when_the_apps_path_has_no_claude() {
     let home = home_without_claude_bin();
+    // A run that ended, while the app's PATH had a claude.
+    let root = home.root().to_path_buf();
+    let f = place(
+        &root.join("bin").join("fake-claude").join(if cfg!(windows) {
+            "print-env.exe"
+        } else {
+            "print-env"
+        }),
+    );
+    let bin = root.join("bin");
+    claude_in(&bin, &f);
+    let set = json!({"PATH": bin.to_str().unwrap()}).to_string();
+    let run = home.rlxd(&["call", "--as-app", "env.set", &set]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let (ended, _) = run_to_its_end(&home);
+
     let empty = home.root().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
     let set = json!({"PATH": empty.to_str().unwrap()}).to_string();
@@ -226,6 +242,11 @@ fn run_start_refuses_when_the_apps_path_has_no_claude() {
     assert_eq!(run.error_code(), "claude_not_found");
     let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
     assert!(message.contains("on the app's PATH"), "{message}");
+    // A resume starts an attempt as a start does: refused the same.
+    let resume = json!({ "run_id": ended }).to_string();
+    let run = home.rlxd(&["call", "run.resume", &resume]);
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "claude_not_found", "{run:?}");
 
     // Windows: npm's claude.cmd shim, found first, is not run.
     #[cfg(windows)]

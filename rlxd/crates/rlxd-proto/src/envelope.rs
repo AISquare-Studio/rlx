@@ -280,9 +280,12 @@ pub mod codes {
     /// and the approver did not say `force`.
     pub const REVOKED_DEVICE: &str = "revoked_device";
     /// A frame after `hello` that is not a request: not JSON, not an object, no `method`,
-    /// params that are not an object, or a second `hello`. A frame longer than rlxd
-    /// reads also gets it, and then the connection closes.
+    /// params that are not an object, or a second `hello`.
     pub const INVALID_REQUEST: &str = "invalid_request";
+    /// A frame after `hello` longer than the 1 MiB rlxd reads. rlxd reads none of it past
+    /// that, skips it to its newline, and goes on: the connection stays open. The reply
+    /// has no `id`, which was not read; `detail.max` is the limit.
+    pub const FRAME_TOO_LARGE: &str = "frame_too_large";
     /// A method failed in a way its caller cannot fix, such as a file rlxd could not
     /// read. The message says what.
     pub const INTERNAL: &str = "internal";
@@ -321,6 +324,34 @@ pub mod codes {
     /// A setting key without a `.` that this rlxd does not know. Dotted keys,
     /// `<namespace>.<name>`, are always free to use.
     pub const UNKNOWN_SETTING: &str = "unknown_setting";
+    /// The connection's role may not call that method, such as an `app` connection's
+    /// `pty.write`. `detail` names the `role` and the `method`.
+    pub const ROLE_NOT_ALLOWED: &str = "role_not_allowed";
+    /// `pty.spawn`: the home holds as many PTYs as it may, the live and the exited ones.
+    /// `pty.kill` one first. `detail.max` is the cap.
+    pub const TOO_MANY_PTYS: &str = "too_many_ptys";
+    /// No PTY of that `pty_id`: there never was one, or it was killed.
+    pub const UNKNOWN_PTY: &str = "unknown_pty";
+    /// `pty.write`: this connection subscribed to the PTY read-only.
+    pub const READ_ONLY: &str = "read_only";
+    /// `pty.write` or `pty.resize`: the PTY's process has ended. Its screen stays until
+    /// `pty.kill`.
+    pub const PTY_EXITED: &str = "pty_exited";
+    /// `pty.spawn`: the process could not be started, such as a program that isn't there
+    /// or a `cwd` that isn't a directory. The message says why.
+    pub const SPAWN_FAILED: &str = "spawn_failed";
+    /// `pty.write`: the program isn't reading its input, and rlxd holds as much of it
+    /// for the program as it may (16 MiB). Nothing of this write was taken: try again
+    /// once the program reads.
+    pub const PTY_BUSY: &str = "pty_busy";
+    /// `pty.write`: its `text`, `paste` or key names are more than the 128 KiB one write
+    /// may carry. Nothing of it was taken. `detail.max` is the limit and `detail.bytes`
+    /// the write's size.
+    pub const WRITE_TOO_LARGE: &str = "write_too_large";
+    /// `pty.screen`, or `pty.subscribe`'s snapshot: the screen, with the history asked
+    /// for, is longer than the longest line a client reads (16 MiB). Ask for less
+    /// `scrollback`. A stream whose new snapshot is that long ends with it.
+    pub const SCREEN_TOO_LONG: &str = "screen_too_long";
     /// `run.start`: rlxd already knows a run of that `run_id`, live or ended.
     pub const RUN_EXISTS: &str = "run_exists";
     /// `run.start`: a `check`, `parse_instruction` or `widget_author` run whose mount is
@@ -335,6 +366,44 @@ pub mod codes {
     /// rlxd could not start the run, such as when Claude Code is not installed; the
     /// message says why.
     pub const RUN_START_FAILED: &str = "run_start_failed";
+    /// `run.resume`: the run is queued or running; only a run with no live process
+    /// resumes.
+    pub const RUN_ALIVE: &str = "run_alive";
+    /// `run.resume`: the run kept no session (`persist_session: false`), so there is
+    /// nothing to resume.
+    pub const NO_SESSION: &str = "no_session";
+    /// `run.resume`: a `send_executor` run is never resumed, since a send is never
+    /// retried.
+    pub const NOT_RESUMABLE: &str = "not_resumable";
+    /// `space.erase`: a run in the space is queued or running. `detail.run_ids` names
+    /// them.
+    pub const RUNS_LIVE: &str = "runs_live";
+    /// `space.erase`: a link (a junction on Windows) or a mount point is on the way to what
+    /// it removes: `<home>/spaces`, the space, a Claude Code config directory's `projects`,
+    /// or the space's folder there. rlxd does not go through one; `detail.paths` names
+    /// them, and nothing was removed. (`<home>` and a config directory are roots, taken as
+    /// they resolve, a link included.)
+    pub const LINK_REFUSED: &str = "link_refused";
+    /// `space.erase`: some paths could not be removed. `detail.removed` and
+    /// `detail.failed[{path, error}]` say which; the runs whose files remain keep their
+    /// records, so erasing again finishes the job.
+    pub const ERASE_INCOMPLETE: &str = "erase_incomplete";
+    /// `space.erase`: the space is being erased already, by another call; wait for it.
+    pub const ERASE_IN_PROGRESS: &str = "erase_in_progress";
+    /// `job.*`: rlxd holds no job of that `job_id`.
+    pub const UNKNOWN_JOB: &str = "unknown_job";
+    /// `job.run_now`: no app gate client is connected, and jobs fire only while one is
+    /// (2.3).
+    pub const APP_ABSENT: &str = "app_absent";
+    /// `job.run_now`: the job's last run is still queued or running; a job never
+    /// overlaps itself.
+    pub const JOB_RUNNING: &str = "job_running";
+    /// `job.run_now`: the job is disabled (`enabled: false`), and a disabled job never
+    /// fires.
+    pub const JOB_DISABLED: &str = "job_disabled";
+    /// `job.run_now`: a run of the job was rate-limited, and the limit hasn't reset;
+    /// `detail.resets_at` says when it does.
+    pub const RATE_LIMITED: &str = "rate_limited";
     /// `run.start`: rlxd can't name the absolute path of the `rlxd-hook` beside it, which
     /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
     /// why.
