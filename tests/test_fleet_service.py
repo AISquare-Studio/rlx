@@ -16264,6 +16264,73 @@ def test_watcher_recovers_manager_pass_from_claude_transcript(
     assert [line for _, action, line in tmux.typed if action == "paste"] == [prompt]
 
 
+def test_watcher_recovers_the_current_manager_pass_attempt_after_clock_rollback(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A restarted watcher recovers only the current attempt, even after a clock rollback."""
+    from aisquare.services import manager_pass, watch
+
+    sid = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    now = datetime.now(UTC)
+    earlier_prompt = now - timedelta(hours=1)
+    retry_time = now - timedelta(hours=2)
+    submitted = now - timedelta(hours=3)
+    transcript = tmp_path / "manager-pass.jsonl"
+    boundary = team_service.add_note("held decision", kind="decision", board_id=project.id)
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_pass_minutes", "15")
+        store.set_transcript_path(sid, str(transcript))
+        store.mark_prompted(sid, earlier_prompt)
+    monkeypatch.setattr(watch.Watcher, "look_all", lambda *args: [])
+    watch.Watcher().tick(now)
+    first_prompt = next(line for _, action, line in tmux.typed if action == "paste")
+    with store_session() as store:
+        first = manager_pass.read(store, project.id, project.id)[1].pending
+        assert first is not None and first.attempt_id is not None
+        store.mark_prompted(sid, retry_time)
+    assert team_service.hook_stop(sid, project.root) is None
+    watch.Watcher().tick(retry_time)
+    pastes = [line for _, action, line in tmux.typed if action == "paste"]
+    assert len(pastes) == 2
+    current_prompt = pastes[-1]
+    with store_session() as store:
+        retry = manager_pass.read(store, project.id, project.id)[1].pending
+    assert retry is not None and retry.attempt_id != first.attempt_id
+    assert (retry.id, retry.lower, retry.upper, retry.session) == (first.id, 0, boundary.seq, sid)
+
+    def record(text: str, timestamp: datetime) -> str:
+        turn = {
+            "type": "user",
+            "timestamp": timestamp.isoformat(),
+            "message": {"role": "user", "content": text},
+        }
+        return json.dumps(turn) + "\n"
+
+    foreign_prompt = current_prompt.replace(retry.id, "different-range", 1)
+    transcript.write_text(record(foreign_prompt, now) + record(first_prompt, now))
+    assert not manager_pass.acknowledge(sid, first_prompt, submitted)
+    assert watch.Watcher().tick(submitted).passed == {}
+    with pytest.raises(ValueError, match="no acknowledged pass"):
+        team_service.complete_manager_pass(retry.id, sid)
+
+    with transcript.open("a") as turns:
+        turns.write(record(current_prompt, submitted))
+    recovered = watch.Watcher().tick(submitted)
+    assert recovered.passed == {project.id: retry.id}, recovered.notes
+    with store_session() as store:
+        progress = manager_pass.read(store, project.id, project.id)[1]
+        assert progress.pending == retry.model_copy(update={"acknowledged_at": submitted})
+    assert [line for _, action, line in tmux.typed if action == "paste"] == pastes
+    team_service.complete_manager_pass(retry.id, sid)
+    with store_session() as store:
+        progress = manager_pass.read(store, project.id, project.id)[1]
+    assert progress.pending is None and progress.read == boundary.seq
+
+
 def test_manager_pass_cli_requeues_the_same_idle_range(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -16279,7 +16346,7 @@ def test_manager_pass_cli_requeues_the_same_idle_range(
     watcher.tick(now)
     with store_session() as store:
         pending = manager_pass.read(store, project.id, project.id)[1].pending
-        assert pending is not None and pending.attempted_at is not None
+        assert pending is not None and pending.attempt_id is not None
         manager = store.fleet_agent_by_label(project.id, "manager", live_only=True)
         assert manager is not None
         store.touch_session(sid, state="working")
@@ -16311,7 +16378,14 @@ def test_manager_pass_cli_requeues_the_same_idle_range(
     team_service.add_note("outside the retry range", kind="decision", board_id=project.id)
     watcher.tick(now + timedelta(seconds=1))
     pastes = [line for _, action, line in tmux.typed if action == "paste"]
-    assert len(pastes) == 2 and pastes[0] == pastes[1]
+    assert len(pastes) == 2
+    first_header, _, first_body = pastes[0].partition("\n")
+    retry_header, _, retry_body = pastes[1].partition("\n")
+    assert first_header != retry_header and retry_body == first_body
+    with store_session() as store:
+        retried = manager_pass.read(store, project.id, project.id)[1].pending
+        assert retried is not None and retried.id == pending.id
+        assert (retried.lower, retried.upper) == (pending.lower, pending.upper)
 
 
 def test_manager_policy_cli_persists_only_a_verified_read_through_on_its_board(
@@ -16393,7 +16467,9 @@ def test_manager_pass_prompt_uses_the_project_template_or_builtin(project: Proje
     from aisquare.services import manager_pass
 
     assert program.word() == "rlx"
-    pending = manager_pass.Pass(id="test-pass", lower=4, upper=9, session="bound-seat")
+    pending = manager_pass.Pass(
+        id="test-pass", lower=4, upper=9, session="bound-seat", attempt_id="test-attempt"
+    )
     path = paths.aisquare_home() / "projects" / project.id / "manager" / "pass.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     missing, why = manager_pass.prompt(project.id, project.id, pending)

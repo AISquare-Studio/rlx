@@ -19586,9 +19586,7 @@ def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str |
         if _team().wake_pending(store, session):
             return None, None
         pending = pending or manager_pass.new_range(store, session, progress)
-        attempt = pending.model_copy(
-            update={"session": session.id, "attempted_at": now, "acknowledged_at": None}
-        )
+        attempt = pending.start_attempt(verified)
         sending = progress.model_copy(update={"pending": attempt})
         if not manager_pass.save(store, project, board, raw, sending):
             return None, None
@@ -19598,7 +19596,7 @@ def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str |
             _, current = manager_pass.read(store, project, board)
             return current.completed == attempt.id or (
                 current.pending is not None
-                and current.pending.id == attempt.id
+                and current.pending.attempt_id == attempt.attempt_id
                 and current.pending.acknowledged_at is not None
             )
 
@@ -19620,7 +19618,7 @@ def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str |
             and not result.in_box
             and not acknowledged()
         ):
-            retry = attempt.model_copy(update={"attempted_at": None})
+            retry = attempt.clear_attempt()
             manager_pass.save(
                 store,
                 project,
@@ -19651,7 +19649,7 @@ def requeue_manager_pass(project: str, pass_id: str) -> None:
         refusal = quiet_prompt_refusal(placement.agent)
         if refusal is not None:
             raise ValueError(refusal)
-        retry = pending.model_copy(update={"attempted_at": None, "acknowledged_at": None})
+        retry = pending.clear_attempt()
         if not manager_pass.save(
             store, project, board, raw, progress.model_copy(update={"pending": retry})
         ):

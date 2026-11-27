@@ -26,8 +26,30 @@ class Pass(BaseModel):
     lower: int
     upper: int
     session: str
-    attempted_at: datetime | None = None
+    attempt_id: str | None = None
+    prompted_before_attempt: datetime | None = None
     acknowledged_at: datetime | None = None
+
+    def start_attempt(self, session: TeamSession) -> Pass:
+        """Bind a fresh delivery attempt without changing the board range."""
+        return self.model_copy(
+            update={
+                "session": session.id,
+                "attempt_id": uuid4().hex,
+                "prompted_before_attempt": session.prompted_at,
+                "acknowledged_at": None,
+            }
+        )
+
+    def clear_attempt(self) -> Pass:
+        """Keep the board range ready for a new delivery attempt."""
+        return self.model_copy(
+            update={"attempt_id": None, "prompted_before_attempt": None, "acknowledged_at": None}
+        )
+
+    def prompt_header(self) -> str:
+        """Identify the range and its current attempt in the submitted prompt."""
+        return f"{_PREFIX}{self.id} attempt {self.attempt_id}"
 
 
 class Progress(BaseModel):
@@ -117,7 +139,7 @@ def prompt(project: str, board: str, pending: Pass) -> tuple[str, str | None]:
         [program.PROTOCOL, "team", "complete-pass", pending.id, "--as", pending.session]
     )
     return (
-        f"{_PREFIX}{pending.id}\n{body}\n\n"
+        f"{pending.prompt_header()}\n{body}\n\n"
         f"Board {board}. Read after #{pending.lower} through #{pending.upper}:\n"
         f"{read}\n"
         "Continue paging from the last seq until the range is exhausted. "
@@ -162,8 +184,8 @@ def acknowledge(session_id: str, text: str | None, now: datetime) -> bool:
         if (
             pending is None
             or pending.session != session.id
-            or pending.attempted_at is None
-            or first != _PREFIX + pending.id
+            or pending.attempt_id is None
+            or first != pending.prompt_header()
         ):
             return False
         if pending.acknowledged_at is not None:
@@ -180,7 +202,7 @@ def acknowledge(session_id: str, text: str | None, now: datetime) -> bool:
 
 def observe_transcript(session: TeamSession, pending: Pass) -> bool:
     """Recover an acknowledgement from the bound session's submitted transcript turn."""
-    if pending.attempted_at is None or pending.acknowledged_at is not None:
+    if pending.attempt_id is None or pending.acknowledged_at is not None:
         return False
     if pending.session != session.id or not session.transcript_path:
         return False
@@ -195,13 +217,13 @@ def observe_transcript(session: TeamSession, pending: Pass) -> bool:
             if record is None:
                 continue
             submitted = transcripts.record_time(record)
-            if submitted is None or submitted < pending.attempted_at:
+            if submitted is None:
                 continue
             rendered = reader.page_lines(record, width=harness.STATE_FILE_MAX * 2)
             if (
                 len(rendered) > 1
                 and rendered[0] == transcripts.YOU
-                and rendered[1].strip() == _PREFIX + pending.id
+                and rendered[1].strip() == pending.prompt_header()
             ):
                 return acknowledge(session.id, rendered[1].strip(), submitted)
     except OSError:
@@ -259,11 +281,11 @@ def complete(store: ContextStore, session: TeamSession, pass_id: str) -> None:
 
 def retryable(pending: Pass, session: TeamSession) -> bool:
     """Hold acknowledged passes until completion, replacement or explicit recovery."""
-    if pending.session != session.id or pending.attempted_at is None:
+    if pending.session != session.id or pending.attempt_id is None:
         return True
     return (
         pending.acknowledged_at is None
         and session.state == "waiting"
         and session.prompted_at is not None
-        and session.prompted_at >= pending.attempted_at
+        and session.prompted_at != pending.prompted_before_attempt
     )
