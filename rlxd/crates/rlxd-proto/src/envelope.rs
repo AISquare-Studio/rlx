@@ -280,9 +280,12 @@ pub mod codes {
     /// and the approver did not say `force`.
     pub const REVOKED_DEVICE: &str = "revoked_device";
     /// A frame after `hello` that is not a request: not JSON, not an object, no `method`,
-    /// params that are not an object, or a second `hello`. A frame longer than rlxd
-    /// reads also gets it, and then the connection closes.
+    /// params that are not an object, or a second `hello`.
     pub const INVALID_REQUEST: &str = "invalid_request";
+    /// A frame after `hello` longer than the 1 MiB rlxd reads. rlxd reads none of it past
+    /// that, skips it to its newline, and goes on: the connection stays open. The reply
+    /// has no `id`, which was not read; `detail.max` is the limit.
+    pub const FRAME_TOO_LARGE: &str = "frame_too_large";
     /// A method failed in a way its caller cannot fix, such as a file rlxd could not
     /// read. The message says what.
     pub const INTERNAL: &str = "internal";
@@ -321,6 +324,34 @@ pub mod codes {
     /// A setting key without a `.` that this rlxd does not know. Dotted keys,
     /// `<namespace>.<name>`, are always free to use.
     pub const UNKNOWN_SETTING: &str = "unknown_setting";
+    /// The connection's role may not call that method, such as an `app` connection's
+    /// `pty.write`. `detail` names the `role` and the `method`.
+    pub const ROLE_NOT_ALLOWED: &str = "role_not_allowed";
+    /// `pty.spawn`: the home holds as many PTYs as it may, the live and the exited ones.
+    /// `pty.kill` one first. `detail.max` is the cap.
+    pub const TOO_MANY_PTYS: &str = "too_many_ptys";
+    /// No PTY of that `pty_id`: there never was one, or it was killed.
+    pub const UNKNOWN_PTY: &str = "unknown_pty";
+    /// `pty.write`: this connection subscribed to the PTY read-only.
+    pub const READ_ONLY: &str = "read_only";
+    /// `pty.write` or `pty.resize`: the PTY's process has ended. Its screen stays until
+    /// `pty.kill`.
+    pub const PTY_EXITED: &str = "pty_exited";
+    /// `pty.spawn`: the process could not be started, such as a program that isn't there
+    /// or a `cwd` that isn't a directory. The message says why.
+    pub const SPAWN_FAILED: &str = "spawn_failed";
+    /// `pty.write`: the program isn't reading its input, and rlxd holds as much of it
+    /// for the program as it may (16 MiB). Nothing of this write was taken: try again
+    /// once the program reads.
+    pub const PTY_BUSY: &str = "pty_busy";
+    /// `pty.write`: its `text`, `paste` or key names are more than the 128 KiB one write
+    /// may carry. Nothing of it was taken. `detail.max` is the limit and `detail.bytes`
+    /// the write's size.
+    pub const WRITE_TOO_LARGE: &str = "write_too_large";
+    /// `pty.screen`, or `pty.subscribe`'s snapshot: the screen, with the history asked
+    /// for, is longer than the longest line a client reads (16 MiB). Ask for less
+    /// `scrollback`. A stream whose new snapshot is that long ends with it.
+    pub const SCREEN_TOO_LONG: &str = "screen_too_long";
     /// `run.start`: rlxd already knows a run of that `run_id`, live or ended.
     pub const RUN_EXISTS: &str = "run_exists";
     /// `run.start`: a `check`, `parse_instruction` or `widget_author` run whose mount is

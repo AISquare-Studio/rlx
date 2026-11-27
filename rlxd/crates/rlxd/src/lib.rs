@@ -36,6 +36,11 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+/// rlxd/THIRD_PARTY_NOTICES: tmux's copyright and ISC permission notice for each file
+/// ported from it, which every rlxd binary carries and `rlxd licenses` prints.
+pub const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES");
+
+mod attach;
 pub mod bus;
 mod claude;
 mod cli;
@@ -52,6 +57,7 @@ mod lock;
 mod log;
 mod out;
 pub mod peer;
+pub mod pty;
 pub mod registry;
 mod runner;
 pub(crate) mod scheduler;
@@ -60,6 +66,7 @@ mod server;
 mod settings;
 mod spaces;
 mod token;
+pub mod vt;
 #[cfg(windows)]
 mod windows;
 
@@ -128,6 +135,26 @@ enum Action {
     /// --follow every later one. Exits 0 at --until or --limit, 4 at --timeout.
     // Boxed, as Call is.
     Events(Box<EventsOptions>),
+    /// Put a PTY in this terminal, as `tmux attach` puts a pane in it. Ctrl-] detaches.
+    Attach {
+        /// The PTY, as `pty.spawn` named it and `pty.list` lists it.
+        pty_id: String,
+        /// Watch only: send no keys, and leave its size alone.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// On Windows, the process a PTY's ConPTY starts: joins the PTY's job, then runs the
+    /// program in it. rlxd starts it; nothing else should.
+    #[cfg(windows)]
+    #[command(name = "__pty-shim", hide = true)]
+    PtyShim {
+        /// The job's name.
+        #[arg(long)]
+        job: String,
+        /// The program and its arguments.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
     /// Runs one run's Claude Code and ends its whole process group with it (macOS and
     /// Linux). rlxd starts it; nobody else does.
     #[command(name = "__run-guard", hide = true)]
@@ -141,6 +168,9 @@ enum Action {
         )]
         argv: Vec<std::ffi::OsString>,
     },
+    /// Print the notices of what rlxd carries from others: tmux's ISC licence, for the
+    /// parts of rlxd ported from tmux.
+    Licenses,
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -287,6 +317,10 @@ pub fn main() -> ExitCode {
         } => serve::serve(background, gate_dev_mode),
         Action::Status { json } => cli::status(json),
         Action::Stop => cli::stop(),
+        Action::Licenses => {
+            print!("{THIRD_PARTY_NOTICES}");
+            ExitCode::SUCCESS
+        }
         Action::Here {
             json,
             start,
@@ -322,6 +356,11 @@ pub fn main() -> ExitCode {
             force,
         }) => cli::gate_pair(request_id, !deny, force),
         Action::Gate(GateAction::Unpair { device }) => cli::gate_unpair(device),
+        #[cfg(windows)]
+        Action::PtyShim { job, argv } => pty::shim(&job, &argv),
+        Action::Attach { pty_id, read_only } => {
+            attach::attach(attach::AttachArgs { pty_id, read_only })
+        }
         #[cfg(unix)]
         Action::RunGuard { argv } => runner::guard::main(&argv),
         #[cfg(not(unix))]

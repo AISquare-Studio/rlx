@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtySubscribeParams",
+  "description": "`pty.subscribe`'s params: which PTY to stream, and whether this connection may still\nwrite to it.\n\n```json\n{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\", \"read_only\": true}\n```\n\nThe stream that follows carries, in order:\n\n1. `pty.snapshot`, the screen as [`PtyScreen`], whose `seq` the stream goes on from;\n2. the PTY's `pty.output` events, then its `pty.exited` when its process ends.\n\nA client that reads too slowly to keep up never holds the PTY back: the output it\nmissed is dropped, and it gets a new `pty.snapshot` instead. The reply, `{seq}`, comes\nlast, once the PTY is killed or rlxd stops.",
+  "type": "object",
+  "properties": {
+    "pty_id": {
+      "description": "The PTY.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "read_only": {
+      "description": "Watch only: this connection's `pty.write` to the PTY gets `read_only`. An `app`\nor `remote` connection must say `true`.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "pty_id",
+    "read_only"
+  ]
+}

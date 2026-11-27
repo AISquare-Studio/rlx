@@ -149,6 +149,11 @@ pub mod methods {
     /// seqs) out, so a test can fill the event buffer. A release build has no such method
     /// and answers `unknown_method`.
     pub const DEBUG_EMIT: &str = "debug.emit";
+    /// Test builds only: makes a PTY's screen model panic the next time rlxd calls it,
+    /// `{pty_id, at}` in with `at` one of `output`, `screen` and `resize`, `{pty_id}` out,
+    /// so a test can show a panic there ends that PTY alone. A release build has no such
+    /// method and answers `unknown_method`.
+    pub const DEBUG_PTY_PANIC: &str = "debug.pty_panic";
     /// One app setting: [`SettingsGetParams`](crate::SettingsGetParams) in,
     /// [`Setting`](crate::Setting) out.
     pub const SETTINGS_GET: &str = "settings.get";
@@ -162,6 +167,26 @@ pub mod methods {
     /// [`SettingsDeleteParams`](crate::SettingsDeleteParams) in, [`Setting`](crate::Setting)
     /// out at version 0, and `settings.deleted` on the stream.
     pub const SETTINGS_DELETE: &str = "settings.delete";
+    /// Starts a process on a new PTY: [`PtySpawnParams`](crate::PtySpawnParams) in,
+    /// [`PtyRef`](crate::PtyRef) out. Never gated by the app.
+    pub const PTY_SPAWN: &str = "pty.spawn";
+    /// Types text, presses keys or pastes into a PTY:
+    /// [`PtyWriteParams`](crate::PtyWriteParams) in, [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_WRITE: &str = "pty.write";
+    /// Resizes a PTY: [`PtyResizeParams`](crate::PtyResizeParams) in,
+    /// [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_RESIZE: &str = "pty.resize";
+    /// A PTY's screen, as `tmux capture-pane -e -p` prints it:
+    /// [`PtyScreenParams`](crate::PtyScreenParams) in, [`PtyScreen`](crate::PtyScreen) out.
+    pub const PTY_SCREEN: &str = "pty.screen";
+    /// Streams a PTY's screen, then its output:
+    /// [`PtySubscribeParams`](crate::PtySubscribeParams) in; the reply ends the stream.
+    pub const PTY_SUBSCRIBE: &str = "pty.subscribe";
+    /// Ends a PTY's process and every process in its group or job, and frees the PTY:
+    /// [`PtyKillParams`](crate::PtyKillParams) in, [`PtyRef`](crate::PtyRef) out.
+    pub const PTY_KILL: &str = "pty.kill";
+    /// Every PTY of the home: no params, [`PtyList`](crate::PtyList) out.
+    pub const PTY_LIST: &str = "pty.list";
     /// Starts a run (7.5): [`RunStartParams`](crate::RunStartParams) in,
     /// [`RunRef`](crate::RunRef) out, then the run's events on the `run` topic.
     pub const RUN_START: &str = "run.start";
