@@ -118,9 +118,9 @@ def captain_environment() -> dict[str, str]:
 
 def remote_off() -> str:
     """The line ``rlx remote`` refuses with while Remote is off."""
-    return (
-        "Remote is experimental and off; turn it on in Settings > App settings > Experimental, "
-        f"or with {prog.word()} config set experimental.remote true, or {REMOTE_ENV}=1"
+    where = "Settings > App settings > Experimental"
+    return f"Remote is experimental and off; turn it on in {where}" + prog.shell_advice(
+        f", or with {prog.word()} config set experimental.remote true, or {REMOTE_ENV}=1"
     )
 
 
