@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from aisquare.cli import launch
+from aisquare.core import claude_accounts as accounts_core
 from aisquare.core.agent_adapters import get_adapter
+from aisquare.core.agent_adapters.codex import _codex_home
 from aisquare.core.agent_adapters.types import BadEffortError
 from aisquare.core.config import FleetRoleSettings, RoleLaunchProfile, load_config, save_config
 from aisquare.models import ProjectInfo
@@ -188,6 +191,7 @@ SYSTEM_PROMPT = (
     "than add to them"
 )
 MCP_SERVERS = "Codex's MCP servers are its config's mcp_servers table"
+REMOTE_CONTROL = "Codex has no Remote Control"
 SETTINGS = "Codex's settings are its config.toml, a --profile and -c key=value"
 PRINT_MODE = "Codex runs without a window only as its exec command, which a fleet window never runs"
 CONTINUE = (
@@ -271,6 +275,8 @@ TABLE: list[tuple[str, list[str], str, object]] = [
     ("--settings", ["--settings", "s.json"], REFUSED, SETTINGS),
     ("--setting-sources", ["--setting-sources", "user"], REFUSED, SETTINGS),
     ("--name", ["--name", "coder-1"], REFUSED, "Codex shows no session name"),
+    ("--remote-control", ["--remote-control", "rlx · coder"], REFUSED, REMOTE_CONTROL),
+    ("--rc", ["--rc"], REFUSED, REMOTE_CONTROL),
     ("--verbose", ["--verbose"], REFUSED, "Codex has no verbose switch"),
     ("--print", ["--print"], REFUSED, PRINT_MODE),
     ("--output-format", ["--output-format", "json"], REFUSED, PRINT_MODE),
@@ -310,9 +316,9 @@ def test_codex_maps_passes_or_refuses_each_claude_code_flag_as_the_table_says(
 
 
 def test_the_table_holds_every_flag_claude_codes_adapter_declares() -> None:
-    """Each flag Claude Code's adapter names (its vocabulary, its options, its session flags)
-    and ``-p`` has a row: a flag it declares later fails here until the table says what Codex
-    makes of it."""
+    """Each flag Claude Code's adapter names (its vocabulary, its options, its session flags),
+    the Remote Control flags rlx itself puts on Claude Code's line, and ``-p``, has a row: a
+    flag declared later fails here until the table says what Codex makes of it."""
     claude = get_adapter("claude-code").capabilities
     sessions = claude.session_flags
     assert sessions is not None
@@ -324,6 +330,7 @@ def test_the_table_holds_every_flag_claude_codes_adapter_declares() -> None:
         *sessions.resumes,
         *sessions.continues,
         *sessions.forks,
+        *launch._REMOTE_CONTROL_FLAGS,  # rlx's own on Claude Code's line (#289)
         "-p",
     }
     assert declared - {flag for flag, *_rest in TABLE} == set()
@@ -387,3 +394,63 @@ def test_a_codex_spawn_opens_its_window_with_rlxs_effort_in_codexs_form(
     line = command[command.index("--") + 1 :]
     assert len(tmux.spawned) == 1 and _holds(line, ["-c", native]), command
     assert not [word for word in line if word.partition("=")[0] == "--effort"], command
+
+
+def _no_profile(name: str) -> str:
+    return (
+        f"-p {name} names no Codex profile (no {name}.config.toml in its Codex home), so it is "
+        f"Claude Code's --print, which Codex has no equivalent for: {PRINT_MODE}; Codex's is "
+        "--profile <name>"
+    )
+
+
+def test_p_and_one_word_is_a_codex_profile_only_where_its_file_is_in_the_home(
+    tmp_path: Path,
+) -> None:
+    """Once the home is known (the spawn's account chosen), ``-p <one word>`` is Codex's
+    ``--profile`` only where ``<word>.config.toml`` is in it; else it is Claude Code's
+    ``--print`` with a one-word prompt. With no home yet, its shape alone is read. Claude Code
+    refuses neither."""
+    (tmp_path / "work.config.toml").write_text("", encoding="utf-8")
+    assert CODEX.args_refusal(["-p", "work"], may_prompt=False, home=tmp_path) is None
+    for may_prompt in (False, True):
+        refusal = CODEX.args_refusal(["-p", "summarize"], may_prompt=may_prompt, home=tmp_path)
+        assert refusal == _no_profile("summarize")
+    assert CODEX.args_refusal(["-p", "summarize"], may_prompt=True) is None
+    claude = get_adapter("claude-code")
+    assert claude.args_refusal(["-p", "summarize"], may_prompt=True, home=tmp_path) is None
+
+
+def test_a_codex_spawn_reads_its_p_profile_in_the_home_its_window_runs_in(
+    tmux: FakeTmux,  # noqa: F811
+    codex_on_path: Path,  # noqa: F811
+    project: ProjectInfo,  # noqa: F811
+) -> None:
+    """The role's ``-p work`` is refused, naming the list and opening no window, while the home
+    the window runs in holds no ``work.config.toml``, and passed once it does. The home read is
+    the account's the spawn chose: the file is written there alone, and the default home this
+    shell's Codex reads is never made."""
+    _configure([], ["-p", "work"])
+    said = f"fleet.roles.coder.agent_args.codex: {_no_profile('work')}"
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.spawn(project, "coder", agent="codex")
+    assert str(refused.value) == said
+    slot = accounts_core.create_account("codex")
+    with pytest.raises(fleet_service.FleetError) as refused:
+        fleet_service.spawn(project, "coder", agent="codex", account=str(slot.slot))
+    assert str(refused.value) == said
+    assert tmux.spawned == []
+
+    (slot.config_dir / "work.config.toml").write_text("", encoding="utf-8")
+    fleet_service.spawn(project, "coder", agent="codex", account=str(slot.slot))
+    assert len(tmux.spawned) == 1 and _holds(_command(tmux), ["-p", "work"]), _command(tmux)
+    assert not (_codex_home(None) / "work.config.toml").exists()
+
+
+def test_codex_records_rlxs_effort_lowercased_and_through_its_alias() -> None:
+    """``--effort HIGH`` runs ``high`` and rlx records ``high``; ``ULTRACODE`` is read as
+    ``ultracode``, which the effort mapping makes ``max`` (with its note)."""
+    assert CODEX.native_choice(["--effort", "HIGH"]).effort == "high"
+    assert CODEX.native_args(["--effort", "HIGH"]) == ["-c", 'model_reasoning_effort="high"']
+    read = CODEX.native_choice(["--effort= ULTRACODE "]).effort
+    assert read == "ultracode" and CODEX.effort_alias(read) == "max"

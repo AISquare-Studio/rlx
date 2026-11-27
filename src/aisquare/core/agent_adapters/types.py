@@ -1916,10 +1916,14 @@ class AgentAdapter(Protocol):
         """A fleet spawn's flags from the role's native permission settings, and its label."""
         ...
 
-    def args_refusal(self, args: Sequence[str], *, may_prompt: bool) -> str | None:
+    def args_refusal(
+        self, args: Sequence[str], *, may_prompt: bool, home: Path | None = None
+    ) -> str | None:
         """Why the agent would not start on ``args``, one list of a fleet launch's, which the
         fleet refuses naming the list before a window opens; ``None`` leaves them to the agent.
-        ``may_prompt``: a word after the options there may be the agent's prompt."""
+        ``may_prompt``: a word after the options there may be the agent's prompt. ``home``: the
+        agent's home the launch runs under, once its account is chosen (a Codex profile is a
+        file there); ``None`` before, where what only the home can say is not asked."""
         ...
 
     def label_args(self, label: str) -> LaunchPart:

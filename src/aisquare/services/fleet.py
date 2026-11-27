@@ -5710,13 +5710,12 @@ def spawn(
             positional=selected.adapter.capabilities.positional_prompt, setting=config.first_prompt
         )
         prompt_in_argv = prompt_way == "argv" and bool(prompt or (task_id is not None and kickoff))
-        for source, args, may_prompt in (
-            (f"team.profiles.{role}.args", bound, False),
-            (f"fleet.roles.{role}.agent_args.{selected.adapter.id}", role_args, False),
-            ("the spawn's own arguments", extra, not prompt_in_argv),
-        ):
-            if refusal := selected.adapter.args_refusal(args, may_prompt=may_prompt):
-                raise FleetError(f"{source}: {refusal}")
+        launch_lists = (
+            (f"team.profiles.{role}.args", list(bound), False),
+            (f"fleet.roles.{role}.agent_args.{selected.adapter.id}", list(role_args), False),
+            ("the spawn's own arguments", list(extra), not prompt_in_argv),
+        )
+        _refuse_what_the_agent_would_not_start_on(selected.adapter, launch_lists)
         # The binding's first for an agent that keeps 0.9.2's order (`binding_args_first`):
         # the window's line opens with them (`agent_launch.BOUND_IN_LINE_FLAG`), so the
         # window's own flags and the user's come later and win, as on 0.9.2 (R8, F-bound).
@@ -6023,6 +6022,14 @@ def spawn(
         raise FleetError(
             f"--account selects an account, and {selected.adapter.label} has no account slots"
         )
+    # The lists again, under the home the window runs in now that its account is chosen: what
+    # only that home can say (a Codex profile is a file there) is asked of it, still before
+    # the codename and the worktree.
+    _refuse_what_the_agent_would_not_start_on(
+        selected.adapter,
+        launch_lists,
+        home=choice.account.config_dir if choice.account is not None else selected.config_dir,
+    )
     if experimental.captain_role(role):
         # Asked of the home the window runs under, the account's, else this process's,
         # which the window is given below: its operator's own MCP servers are the ones the
@@ -15399,6 +15406,20 @@ def _hooks_installed_first(
             f"{adapter.label}'s hooks were not installed in {home} — installed them before it "
             "started there"
         )
+
+
+def _refuse_what_the_agent_would_not_start_on(
+    adapter: AgentAdapter,
+    lists: Sequence[tuple[str, Sequence[str], bool]],
+    *,
+    home: Path | None = None,
+) -> None:
+    """Each list a fleet launch gives the agent (the setting it came from, its words, whether a
+    word after its options may be the prompt) refused, naming that setting, where the agent
+    would not start on it (:meth:`AgentAdapter.args_refusal`), read in ``home`` once known."""
+    for source, args, may_prompt in lists:
+        if refusal := adapter.args_refusal(args, may_prompt=may_prompt, home=home):
+            raise FleetError(f"{source}: {refusal}")
 
 
 def _refuse_an_install_the_sandbox_writes(

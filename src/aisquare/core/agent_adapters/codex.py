@@ -98,6 +98,7 @@ _SYSTEM_PROMPT = (
     "than add to them"
 )
 _MCP_SERVERS = "Codex's MCP servers are its config's mcp_servers table"
+_REMOTE_CONTROL = "Codex has no Remote Control"
 _SETTINGS = "Codex's settings are its config.toml, a --profile and -c key=value"
 _PRINT_MODE = (
     "Codex runs without a window only as its exec command, which a fleet window never runs"
@@ -135,6 +136,8 @@ FOREIGN_FLAGS: Mapping[str, str] = MappingProxyType(
         "--settings": _SETTINGS,
         "--setting-sources": _SETTINGS,
         "--name": "Codex shows no session name",
+        "--remote-control": _REMOTE_CONTROL,
+        "--rc": _REMOTE_CONTROL,
         "--verbose": "Codex has no verbose switch",
         "--print": _PRINT_MODE,
         "--output-format": _PRINT_MODE,
@@ -1153,7 +1156,7 @@ class CodexAdapter:
         model = effort = None
         for item in option_occurrences(args, "-c", "--config", EFFORT_FLAG):
             if args[item.index].partition("=")[0] == EFFORT_FLAG:
-                effort = item.value
+                effort = item.value.strip().lower()
                 continue
             parsed = config_assignment(item.value)
             if parsed is None:
@@ -1483,9 +1486,13 @@ class CodexAdapter:
             *(self._sandbox(_SCOPES.get(sandbox, "full"), native) if sandbox else []),
         ]
 
-    def args_refusal(self, args: Sequence[str], *, may_prompt: bool) -> str | None:
+    def args_refusal(
+        self, args: Sequence[str], *, may_prompt: bool, home: Path | None = None
+    ) -> str | None:
         """Up to Codex's ``--``: a flag of :data:`FOREIGN_FLAGS`, with why, and a short one of
-        :data:`SHARED_SHORT` without Codex's value (Claude Code's); an ``--effort``
+        :data:`SHARED_SHORT` without Codex's value (Claude Code's), ``-p <name>`` included where
+        ``home`` holds no ``<name>.config.toml`` (none asked while ``home`` is ``None``); an
+        ``--effort``
         :meth:`native_args` cannot make Codex's (no level, or no level name); an ``--add-dir``
         with no folder, and unless ``may_prompt`` a word after its folder, which Codex would
         read as its prompt. Every other option is Codex's to refuse."""
@@ -1504,6 +1511,16 @@ class CodexAdapter:
                         "-p without a profile name is Claude Code's --print, which Codex has no "
                         f"equivalent for: {FOREIGN_FLAGS['--print']}; Codex's is "
                         "--profile <name>"
+                    )
+                if (
+                    arg == "-p"
+                    and home is not None
+                    and not (home / f"{given}.config.toml").is_file()
+                ):
+                    return (
+                        f"-p {given} names no Codex profile (no {given}.config.toml in its Codex "
+                        "home), so it is Claude Code's --print, which Codex has no equivalent "
+                        f"for: {FOREIGN_FLAGS['--print']}; Codex's is --profile <name>"
                     )
                 continue
             if name in FOREIGN_FLAGS:
