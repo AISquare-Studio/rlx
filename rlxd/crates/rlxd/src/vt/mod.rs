@@ -102,16 +102,31 @@ impl Terminal {
     /// [`feed`](Self::feed), of bytes that came at `now`: a string the program opened
     /// [`input::GROUND_TIMER`] before and never ended is given up first, as tmux does.
     pub fn feed_at(&mut self, bytes: &[u8], now: std::time::Instant) -> Vec<u8> {
+        self.feed_inner(bytes, now, None)
+    }
+
+    /// [`feed`](Self::feed), stopping early once `stop` is set: the rest is not taken.
+    pub fn feed_unless(&mut self, bytes: &[u8], stop: &std::sync::atomic::AtomicBool) -> Vec<u8> {
+        self.feed_inner(bytes, std::time::Instant::now(), Some(stop))
+    }
+
+    fn feed_inner(
+        &mut self,
+        bytes: &[u8],
+        now: std::time::Instant,
+        stop: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Vec<u8> {
         let mut replies = Vec::new();
         #[cfg(feature = "debug-methods")]
         if self.test_panic == Some(TestPanic::Output) {
             // Half the bytes in, so the screen is left half-changed, as by a real bug.
             let half = bytes.len() / 2;
             self.input
-                .parse(&mut self.screen, &bytes[..half], &mut replies, now);
+                .parse(&mut self.screen, &bytes[..half], &mut replies, now, stop);
             panic!("debug.pty_panic: the screen model panics on the program's output");
         }
-        self.input.parse(&mut self.screen, bytes, &mut replies, now);
+        self.input
+            .parse(&mut self.screen, bytes, &mut replies, now, stop);
         replies
     }
 

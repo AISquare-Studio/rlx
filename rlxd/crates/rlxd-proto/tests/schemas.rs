@@ -2450,7 +2450,7 @@ fn pty_documents_refuse_their_wrong_shapes() {
 }
 
 #[test]
-fn a_write_carries_at_most_1_mib_and_the_types_count_its_bytes() {
+fn a_write_carries_at_most_128_kib_and_the_types_count_its_bytes() {
     let most = "x".repeat(rlxd_proto::MAX_PTY_WRITE);
     for field in ["text", "paste"] {
         agrees::<PtyWriteParams>("pty-write.json", &json!({"pty_id": PTY, field: most}));
@@ -2459,7 +2459,7 @@ fn a_write_carries_at_most_1_mib_and_the_types_count_its_bytes() {
         let instance = json!({"pty_id": PTY, field: over});
         assert_valid("pty-write.json", &instance);
         let error = serde_json::from_value::<PtyWriteParams>(instance).unwrap_err();
-        assert!(error.to_string().contains("more than 1048576"), "{error}");
+        assert!(error.to_string().contains("more than 131072"), "{error}");
     }
 }
 

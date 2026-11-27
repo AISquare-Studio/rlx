@@ -434,6 +434,77 @@ fn check_4_pty_kill_leaves_no_process_of_the_tree() {
     assert_eq!(list(&home)["ptys"], json!([]));
 }
 
+/// `ps`'s state for `pid`: "" once there is no such process.
+#[cfg(unix)]
+fn process_state(pid: u64) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// #2574 major 2: a process that ended stays a zombie until `pty.kill`, so its pid and
+/// group id can be no one else's when the kill signals the group; then it is reaped.
+/// `rlxd stop` reaps the ones it holds too.
+#[cfg(unix)]
+#[test]
+fn an_ended_leader_stays_a_zombie_until_pty_kill_reaps_it() {
+    let home = TestHome::new();
+    home.start();
+    let mut pids = Vec::new();
+    for code in [3, 4] {
+        let argv = json!(["sh", "-c", format!("exit {code}")]);
+        let id = spawn(&home, json!({"argv": argv, "cols": 80, "rows": 24}));
+        eventually("it ends", || screen(&home, &id)["exited"] == true);
+        let pid = list(&home)["ptys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pty| pty["pty_id"] == id.as_str())
+            .unwrap()["pid"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            process_state(pid).starts_with('Z'),
+            "{}",
+            process_state(pid)
+        );
+        pids.push((id, pid));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        process_state(pids[0].1).starts_with('Z'),
+        "kept, not reaped"
+    );
+    let run = call(&home, "pty.kill", &json!({ "pty_id": pids[0].0 }));
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert_eq!(process_state(pids[0].1), "", "reaped by pty.kill");
+    assert!(process_state(pids[1].1).starts_with('Z'));
+    home.stop();
+    assert_eq!(process_state(pids[1].1), "", "reaped by rlxd stop");
+}
+
+/// #2585 minor 7: `pty.kill` doesn't wait for the screen to take a heavy write. rlxd
+/// signals the group before it takes the PTY's lock, and the reader lets go within 64
+/// bytes. ESC#8 fills the whole screen: at 1000x1000, a million cells for three bytes.
+#[cfg(unix)]
+#[test]
+fn pty_kill_is_quick_while_the_screen_takes_a_heavy_write() {
+    let home = TestHome::new();
+    home.start();
+    let fill = "\\033#8".repeat(16);
+    let argv = json!(["sh", "-c", format!("while :; do printf '{fill}'; done")]);
+    let id = spawn(&home, json!({"argv": argv, "cols": 1000, "rows": 1000}));
+    // Deep in it by now: the program writes far faster than the screen takes it.
+    std::thread::sleep(Duration::from_secs(2));
+    let start = Instant::now();
+    let run = call(&home, "pty.kill", &json!({ "pty_id": id }));
+    let took = start.elapsed();
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    assert!(took < Duration::from_secs(5), "pty.kill took {took:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn rlxd_stop_ends_every_pty() {
@@ -533,6 +604,125 @@ fn check_6_each_role_gets_what_it_may() {
     );
 }
 
+/// #2574 minor 5: the longest write there is, of control characters, which JSON writes
+/// in six bytes each, fits a frame, and one byte more is refused, with the connection
+/// left open for the next request.
+#[cfg(unix)]
+#[test]
+fn the_longest_write_fits_a_frame_and_a_longer_one_is_refused() {
+    let home = TestHome::new();
+    home.start();
+    let id = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "stty raw -echo; cat > /dev/null"], "cols": 80, "rows": 24}),
+    );
+    let mut connection = connect(&home, Role::Cli);
+    let most = "\u{1}".repeat(rlxd_proto::MAX_PTY_WRITE);
+    let reply = request(
+        &mut connection,
+        "pty.write",
+        json!({"pty_id": id, "text": most}),
+    );
+    assert!(reply.is_ok(), "{reply:?}");
+    let over = "\u{1}".repeat(rlxd_proto::MAX_PTY_WRITE + 1);
+    let reply = request(
+        &mut connection,
+        "pty.write",
+        json!({"pty_id": id, "text": over}),
+    );
+    assert_eq!(reply.error().unwrap().code, "invalid_params", "{reply:?}");
+    let reply = request(&mut connection, "pty.list", json!({}));
+    assert!(reply.is_ok(), "the connection goes on: {reply:?}");
+}
+
+/// #2574 minor 6: a program that never reads its input fills rlxd's queue for it, and
+/// then a write gets `pty_busy`, a code of its own, not `internal`.
+#[cfg(unix)]
+#[test]
+fn a_program_that_reads_nothing_makes_a_write_busy() {
+    let home = TestHome::new();
+    home.start();
+    let id = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "stty raw -echo; sleep 60"], "cols": 80, "rows": 24}),
+    );
+    let mut connection = connect(&home, Role::Cli);
+    let most = "x".repeat(rlxd_proto::MAX_PTY_WRITE);
+    let busy = (0..200).find_map(|_| {
+        let reply = request(
+            &mut connection,
+            "pty.write",
+            json!({"pty_id": id, "text": most}),
+        );
+        reply.error().cloned()
+    });
+    let busy = busy.expect("a write is refused once 16 MiB wait");
+    assert_eq!(busy.code, "pty_busy", "{busy:?}");
+}
+
+/// #2574 minor 8: a screen with more history than a client reads in one line (16 MiB,
+/// which JSON's escapes reach sooner) is refused as `screen_too_long`, and the screen
+/// without its history still comes.
+#[cfg(unix)]
+#[test]
+fn a_screen_longer_than_a_client_reads_is_refused() {
+    let home = TestHome::new();
+    home.start();
+    // Each cell another colour pair: the capture writes both for every cell.
+    let program = r#"
+import sys
+a = "\x1b[38;2;200;10;10;48;2;10;200;10mx"
+b = "\x1b[38;2;10;10;200;48;2;200;200;10my"
+line = (a + b) * 40 + "\x1b[0m\r\n"
+sys.stdout.write(line * 7000)
+sys.stdout.flush()
+print("done")
+import time; time.sleep(60)
+"#;
+    let id = spawn(
+        &home,
+        json!({"argv": ["python3", "-c", program], "cols": 80, "rows": 24}),
+    );
+    eventually("the history fills", || {
+        let shown = screen(&home, &id);
+        shown["history"].as_u64().unwrap() >= 6900
+            && shown["text"].as_str().unwrap().contains("done")
+    });
+    let all = call(
+        &home,
+        "pty.screen",
+        &json!({"pty_id": id, "scrollback": 50_000}),
+    );
+    assert_eq!(all.error_code(), "screen_too_long", "{all:?}");
+    let some = call(
+        &home,
+        "pty.screen",
+        &json!({"pty_id": id, "scrollback": 100}),
+    );
+    assert_eq!(some.code(), Some(0), "{some:?}");
+}
+
+/// The #28 tester's minor: `rlxd call pty.subscribe` prints the stream, a
+/// `pty.snapshot` first, as `rlxd call events.subscribe` does, and ends with the PTY.
+#[test]
+fn rlxd_call_prints_a_pty_stream() {
+    let home = TestHome::new();
+    home.start();
+    let id = spawn(&home, json!({"argv": ready_argv(), "cols": 80, "rows": 24}));
+    let params = json!({"pty_id": id, "read_only": true}).to_string();
+    let stream = home.spawn(&["call", "pty.subscribe", &params]);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        call(&home, "pty.kill", &json!({ "pty_id": id })).code(),
+        Some(0)
+    );
+    let run = common::finish(stream);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let first: Value = serde_json::from_str(run.stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(first["type"], "pty.snapshot", "{run:?}");
+    assert!(run.stdout.contains("\"pty.exited\""), "{run:?}");
+}
+
 #[test]
 fn a_home_holds_at_most_64_ptys_exited_ones_included() {
     let home = TestHome::new();
@@ -603,6 +793,175 @@ fn spawn_sets_the_terminal_and_the_environment_asked_for() {
         text.contains("T=xterm-256color C=truecolor X=1 H=\n")
             && text.contains(&dir.to_string_lossy().to_string())
     });
+}
+
+/// #2574 major 3: a PTY's process doesn't inherit what ties rlxd's starter to a session,
+/// a board, an agent or a tmux server, as the fleet's tmux server gives a window none of
+/// it; `env` can put it back.
+#[test]
+fn spawn_leaves_out_what_ties_rlxds_starter_to_a_session() {
+    if cfg!(windows) {
+        return;
+    }
+    let mut home = TestHome::new();
+    for (name, value) in [
+        ("CLAUDECODE", "1"),
+        ("TERM_PROGRAM", "vscode"),
+        ("TERM_PROGRAM_VERSION", "1.99"),
+        ("TMUX", "/private/tmp/tmux-501/asq,1,0"),
+        ("TMUX_PANE", "%9"),
+        ("AISQUARE_PERSONA", "Ava"),
+        ("AISQUARE_BROKERED_SCOPE", "x"),
+        ("ANTHROPIC_CUSTOM_HEADERS", "x-run: 1"),
+        ("CODEX_THREAD_ID", "t1"),
+        ("CODEX_HOME", "/somewhere/codex"),
+        ("RLXD_KEPT", "yes"),
+    ] {
+        home = home.with_env(name, value);
+    }
+    home.start();
+    let names = "CLAUDECODE TERM_PROGRAM TERM_PROGRAM_VERSION TMUX TMUX_PANE AISQUARE_PERSONA \
+                 AISQUARE_BROKERED_SCOPE ANTHROPIC_CUSTOM_HEADERS CODEX_THREAD_ID CODEX_HOME \
+                 RLXD_KEPT";
+    let script = format!("for v in {names}; do eval \"echo $v=\\${{$v-unset}}\"; done; sleep 30");
+    let id = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", script], "cols": 80, "rows": 24,
+               "env": {"TMUX_PANE": "%1"}}),
+    );
+    let expected = [
+        "CLAUDECODE=unset",
+        "TERM_PROGRAM=unset",
+        "TERM_PROGRAM_VERSION=unset",
+        "TMUX=unset",
+        "TMUX_PANE=%1",
+        "AISQUARE_PERSONA=unset",
+        "AISQUARE_BROKERED_SCOPE=unset",
+        "ANTHROPIC_CUSTOM_HEADERS=unset",
+        "CODEX_THREAD_ID=unset",
+        "CODEX_HOME=unset",
+        "RLXD_KEPT=yes",
+    ];
+    let shown = || screen(&home, &id)["text"].as_str().unwrap().to_owned();
+    eventually("the program prints its environment", || {
+        shown().contains("RLXD_KEPT=")
+    });
+    let lines: Vec<String> = shown().lines().map(str::to_owned).collect();
+    assert_eq!(lines[..expected.len()], expected, "{lines:?}");
+}
+
+/// The lists rlxd takes out of a PTY's environment (`rlxd::pty::env`) are the fleet's,
+/// as core/spawn.py has them, and both leave the same of one environment: checked
+/// against Python's own, through `uv run python`, so the two can't drift. It skips
+/// unless `RLXD_INTEROP_REQUIRED` or `RLXD_BIN` is set, as registry_interop.rs does.
+#[test]
+fn the_environment_rlxd_takes_out_is_the_fleets() {
+    use rlxd::pty::env;
+    if !["RLXD_INTEROP_REQUIRED", "RLXD_BIN"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+    {
+        eprintln!("skipped: set RLXD_INTEROP_REQUIRED=1 to run Python's side (rlxd.yml does)");
+        return;
+    }
+    const PYTHON: &str = r#"
+import json, sys
+from aisquare.core import spawn
+from aisquare.core.agent_adapters import adapters
+bases = json.loads(sys.stdin.read())
+print(json.dumps({
+    "identity": list(spawn.IDENTITY_ENV_VARS),
+    "team": list(spawn.TEAM_ENV_VARS),
+    "agent": list(spawn.agent_identity_env_vars()),
+    "homes": [[a.home_env, [n for n in (a.capabilities.tool_shell_env, *a.capabilities.tool_shell_vars) if n]]
+              for a in adapters() if a.home_env],
+    "kept": [sorted(spawn.tmux_client_env(base)) for base in bases],
+}))
+"#;
+    let names: Vec<&str> = [env::IDENTITY, env::TEAM, env::AGENT, env::TERMINAL]
+        .concat()
+        .into_iter()
+        .chain(
+            env::HOMES
+                .iter()
+                .flat_map(|(home, markers)| std::iter::once(*home).chain(markers.iter().copied())),
+        )
+        .chain([
+            "AISQUARE_BROKERED_X",
+            "AISQUARE_HOME",
+            "AISQUARE_TEAM",
+            "PATH",
+            "RLXD_KEPT",
+        ])
+        .collect();
+    // One as a person's shell is, one as a Codex tool shell is.
+    let plain: serde_json::Map<String, Value> = names
+        .iter()
+        .filter(|name| !name.starts_with("CODEX_") || **name == "CODEX_HOME")
+        .map(|name| ((*name).to_owned(), json!("v")))
+        .collect();
+    let codex: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|name| ((*name).to_owned(), json!("v")))
+        .collect();
+    let bases = vec![plain, codex];
+    let repo = common::workspace().parent().unwrap().to_path_buf();
+    let mut python = Command::new("uv")
+        .args(["run", "--quiet", "python", "-c", PYTHON])
+        .current_dir(&repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("uv must run here (RLXD_INTEROP_REQUIRED is set): {e}"));
+    use std::io::Write as _;
+    python
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&bases).unwrap().as_bytes())
+        .unwrap();
+    let out = python.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let python: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        python["identity"],
+        json!(env::IDENTITY),
+        "IDENTITY_ENV_VARS"
+    );
+    assert_eq!(python["team"], json!(env::TEAM), "TEAM_ENV_VARS");
+    assert_eq!(
+        python["agent"],
+        json!(env::AGENT),
+        "agent_identity_env_vars()"
+    );
+    let homes: Vec<Value> = env::HOMES
+        .iter()
+        .map(|(home, markers)| json!([home, markers]))
+        .collect();
+    assert_eq!(python["homes"], json!(homes), "tool_shell_homes's agents");
+    for (n, base) in bases.iter().enumerate() {
+        let ours: Vec<String> = env::inherited(
+            base.iter()
+                .map(|(k, v)| (k.into(), v.as_str().unwrap().into())),
+        )
+        .into_iter()
+        .map(|(k, _)| k.into_string().unwrap())
+        .collect();
+        let mut theirs: Vec<String> = python["kept"][n]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap().to_owned())
+            .filter(|k| !env::TERMINAL.contains(&k.as_str()))
+            .collect();
+        let mut ours = ours;
+        ours.sort();
+        theirs.sort();
+        assert_eq!(
+            ours, theirs,
+            "base {n}: rlxd keeps what tmux_client_env keeps, less tmux's own"
+        );
+    }
 }
 
 /// The handoff's own check, with `cmp`: tmux and rlxd show the same frame for the same
@@ -858,19 +1217,30 @@ fn a_read_only_watcher_may_not_write_and_only_cli_and_tui_may_watch_to_write() {
     }
     let pair = call(&home, "gate.pair", &json!({"device": "Sam MacBook"}));
     let credential = pair.data()["gate_credential"].as_str().unwrap().to_owned();
-    let app = {
+    let app = || {
         let home = Home::at(home.root());
         let token = std::fs::read_to_string(home.token()).unwrap();
         let mut connection = Connection::open(&home).unwrap();
         let hello = HelloParams::new(token.trim(), "pty-test", "0", Role::App)
             .unwrap()
-            .with_gate_credential(credential)
+            .with_gate_credential(credential.clone())
             .unwrap();
         assert!(connection.hello(&hello).unwrap().is_ok());
         connection
     };
+    // #2574's nit: remote and app may watch read-only, and get the screen first.
+    for (role, connection) in [("remote", connect(&home, Role::Remote)), ("app", app())] {
+        let mut watching = connection.subscribe_pty(&params).unwrap();
+        match watching.next_frame().unwrap() {
+            Next::Event(event) => {
+                let event: Value = serde_json::from_str(&event.line).unwrap();
+                assert_eq!(event["type"], "pty.snapshot", "{role}");
+            }
+            Next::End(reply) => panic!("{role} may watch read-only: {}", reply.line),
+        }
+    }
     let writable = PtySubscribeParams::new(&id, false).unwrap();
-    let mut refused = app.subscribe_pty(&writable).unwrap();
+    let mut refused = app().subscribe_pty(&writable).unwrap();
     match refused.next_frame().unwrap() {
         Next::End(reply) => assert_eq!(reply.error().unwrap().code, "role_not_allowed"),
         Next::Event(event) => panic!("the app watched to write: {}", event.line),
@@ -1069,6 +1439,21 @@ fn rlxd_attach_puts_a_pty_in_a_terminal_and_types_into_it() {
             .count();
         inside >= 2 && shown >= 2
     });
+    // #2574 minor 4: a no-break space or an ideographic space, which no key name
+    // holds, goes as text, and attach goes on.
+    for params in [
+        json!({"pty_id": outer, "text": "a\u{a0}b\u{3000}c"}),
+        json!({"pty_id": outer, "keys": ["Enter"]}),
+    ] {
+        assert_eq!(call(&home, "pty.write", &params).code(), Some(0));
+    }
+    eventually("cat gets the spaces", || {
+        screen(&home, &inner)["text"]
+            .as_str()
+            .unwrap()
+            .contains("a\u{a0}b\u{3000}c")
+    });
+    assert_eq!(screen(&home, &outer)["exited"], false, "attach goes on");
     assert_eq!(
         call(
             &home,
@@ -1083,6 +1468,26 @@ fn rlxd_attach_puts_a_pty_in_a_terminal_and_types_into_it() {
     });
     let ended = screen(&home, &outer);
     assert_eq!(ended["status"], 0, "{ended}");
+    // #2574's nit: a PTY that ended before attach came is said to have, at once.
+    let done = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "exit 3"], "cols": 80, "rows": 24}),
+    );
+    eventually("it ends", || screen(&home, &done)["exited"] == true);
+    let mut argv = vec![rlxd, "attach"];
+    argv.push(&done);
+    let late = spawn(
+        &home,
+        json!({"argv": argv, "cols": 100, "rows": 30, "env": {"RLX_HOME": root}}),
+    );
+    eventually("attach says it ended", || {
+        let shown = screen(&home, &late);
+        shown["exited"] == true
+            && shown["text"]
+                .as_str()
+                .unwrap()
+                .contains("[the process exited, status 3]")
+    });
     assert!(
         ended["text"].as_str().unwrap().contains("[detached]"),
         "{ended}"

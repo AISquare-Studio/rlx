@@ -22,7 +22,7 @@ three places JSON Schema can't reach:
 
 - A float with a zero fraction, such as `1.0` where an integer belongs, passes the
   schema and fails to parse.
-- A `pty.write`'s 1 MiB of `text`, `paste` or key names is counted in bytes. JSON Schema
+- A `pty.write`'s 128 KiB of `text`, `paste` or key names is counted in bytes. JSON Schema
   counts a string's length in characters, so only the types check it.
 - An event's `type` must start with its `topic`. The schema can't compare one field
   with another, so it checks that only for the topics v1 lists: 7.3's, plus 7.8's
@@ -121,6 +121,9 @@ For a client:
   older than the oldest event rlxd holds. It can also come anywhere later, when a client
   reads so slowly that rlxd drops events it hasn't read. It comes whatever the topics.
   Its own `seq` is `to`, so seqs still strictly increase and resuming from it is right.
+- **A `daemon.gap {from, to, topics: ["pty"]}`** is narrower: only `pty.output` events
+  in that span are gone. Every other event in it still comes, before the gap. Only a
+  stream that asked for `pty` gets one.
 - **After a restart:**
   - resuming from the last reply's `seq` after a clean stop gives no gap;
   - from an older seq, or after a crash, expect one gap;
@@ -220,8 +223,10 @@ every connection's `pty.list`.
   The reply, `{seq}`, ends the stream once the PTY is killed or rlxd stops.
 - **Output is kept apart.** rlxd keeps `pty.output` events in a budget of their own, so
   a busy PTY never pushes another topic's events out. A stream that asked for `pty` gets
-  a `daemon.gap` when output it hadn't read was dropped; a stream that didn't ask for it
-  never gets a gap on its account. `pty.exited` is kept with the other events.
+  a `daemon.gap {from, to, topics: ["pty"]}` when output it hadn't read was dropped, and
+  still every other event of that span; a stream that didn't ask for it never gets a gap
+  on its account. `pty.exited` is kept with the other events, so a replay of `pty` still
+  has it after a flood of output.
 - **Who may do what.**
 
   | Role | `pty.list`, `pty.screen`, `pty.subscribe {read_only: true}` | `pty.write` | `pty.spawn`, `pty.resize`, `pty.kill`, `pty.subscribe {read_only: false}` |
@@ -235,10 +240,22 @@ every connection's `pty.list`.
   `pty.spawn` never waits on the app gate, and a PTY keeps working with the app quit.
 - **Limits.** A home holds at most 64 PTYs, the exited ones included, else
   `too_many_ptys`. Each keeps at most 50,000 lines of history. A `pty.write` carries at
-  most 1 MiB.
+  most 128 KiB: an eighth of a frame, so even one of control characters, six bytes of
+  JSON each, fits one, and a longer one is refused rather than closing the connection.
+  A program that reads none of its input gets 16 MiB of it queued, then `pty_busy`:
+  nothing of that write was taken, so write it again once the program reads. A
+  `pty.screen` (or a stream's snapshot) longer than the 16 MiB line a client reads gets
+  `screen_too_long`: ask for less `scrollback`.
 - **The terminal** a process sees is `TERM=xterm-256color` with `COLORTERM=truecolor`,
   unless `env` says otherwise. The fleet's tmux sets `tmux-256color`, which macOS's
   terminfo lacks.
+- **The environment** is rlxd's own, as the fleet's tmux server gives a window its own:
+  less what ties a process to one session, board or agent (`core/spawn.py`'s
+  `tmux_client_env`: the tracing identity, `AISQUARE_BROKERED*`, the board's
+  variables, each agent's process identity, and `CODEX_HOME` from a Codex tool shell),
+  and less tmux's own (`TMUX`, `TMUX_PANE`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`).
+  `pty-spawn.json` lists every name. `env` can put any back. For §1.8: a tmux pane gets
+  `TERM_PROGRAM=tmux` and its own `TMUX`; an rlxd PTY gets neither.
 
 ## Versioning
 

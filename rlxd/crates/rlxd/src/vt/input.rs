@@ -316,12 +316,16 @@ impl Input {
     /// `now` is when they came. tmux gives up on a string open [`GROUND_TIMER`] or more
     /// when its timer fires; rlxd does when the next bytes come, which a capture can't
     /// tell apart.
+    ///
+    /// It stops early once `stop` is set, which it looks at every 64 bytes: a PTY that
+    /// is ending takes no more of its output, however much work each byte makes.
     pub fn parse(
         &mut self,
         screen: &mut Screen,
         bytes: &[u8],
         replies: &mut Vec<u8>,
         now: Instant,
+        stop: Option<&std::sync::atomic::AtomicBool>,
     ) {
         self.now = now;
         if self
@@ -334,7 +338,12 @@ impl Input {
             self.state = State::Ground;
             self.last_printed = false;
         }
-        for &ch in bytes {
+        for (i, &ch) in bytes.iter().enumerate() {
+            if i % 64 == 0
+                && stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire))
+            {
+                break;
+            }
             self.ch = ch;
             let (handler, next) = transition(self.state, ch);
             if handler != Handler::Print {

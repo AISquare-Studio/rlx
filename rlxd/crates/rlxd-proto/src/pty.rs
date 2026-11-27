@@ -37,8 +37,12 @@ use crate::envelope::Data;
 /// The widest and tallest a PTY may be, in cells.
 pub const MAX_SIZE: u16 = 1000;
 
-/// The most bytes one `pty.write` carries: its `text`, its `paste`, or its keys' names.
-pub const MAX_WRITE: usize = 1 << 20;
+/// The most bytes one `pty.write` carries: its `text`, its `paste`, or its keys' names:
+/// 128 KiB, an eighth of the 1 MiB frame rlxd reads (#2574 minor 5). JSON takes at most
+/// six bytes for one (`\u001b`), so the longest write there is, its envelope with it,
+/// fits a frame, and one past it is refused with `invalid_params` rather than ending
+/// the connection as a frame too long would.
+pub const MAX_WRITE: usize = 128 << 10;
 
 /// The most lines of history a PTY keeps above its screen, as the fleet's tmux keeps
 /// (`history-limit 50000`).
@@ -74,8 +78,21 @@ pub mod errors {
 ///  "cwd": "/Users/sam/code", "env": {"FOO": "1", "BAR": null}, "label": "coder"}
 /// ```
 ///
-/// The process gets rlxd's environment, with `TERM=xterm-256color` and
-/// `COLORTERM=truecolor`, then `env` over it.
+/// The process gets rlxd's environment, as the fleet's tmux server gives a window its
+/// own, with what ties a process to one session, board or agent taken out: the tracing
+/// identity and run marker (`ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`,
+/// `AISQUARE_PIPELINE_ID`, `AISQUARE_TRACE_AGENT_NAME`, `AISQUARE_RUN_TRACE_ID`,
+/// `AISQUARE_LAUNCH_ID`, `AISQUARE_LAUNCH_AGENT`, `AISQUARE_FLEET_AGENT`, and every
+/// `AISQUARE_BROKERED*`); the board's (`AISQUARE_TEAM_HUB`, `AISQUARE_ROLE`,
+/// `AISQUARE_PERSONA`, `AISQUARE_BOARD_CONTEXT`); each agent's process identity
+/// (`CLAUDE_PID`, `CLAUDECODE`, and Codex's `CODEX_THREAD_ID`, `CODEX_SESSION_ID`,
+/// `CODEX_TOOL_CALL_ID`, `CODEX_CI`, `CODEX_SANDBOX_NETWORK_DISABLED`,
+/// `CODEX_PERMISSION_PROFILE`, `CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS`,
+/// `CODEX_VERSION`, `CODEX_MANAGED_BY_NPM`, `CODEX_MANAGED_PACKAGE_ROOT`);
+/// `CODEX_HOME` when rlxd runs in a Codex tool shell; and tmux's own (`TMUX`,
+/// `TMUX_PANE`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`). These are the fleet's
+/// (`core/spawn.py`'s `tmux_client_env`) plus tmux's. Then `TERM=xterm-256color` and
+/// `COLORTERM=truecolor`, then `env` over it all, which can put any of them back.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "PtySpawnParams")]
 #[non_exhaustive]
@@ -168,7 +185,7 @@ struct UncheckedRef {
 /// - `paste` goes as `paste-buffer -p` sends it: each newline as a carriage return, and
 ///   bracketed (`ESC [200~` … `ESC [201~`) when the program turned bracketed paste on.
 ///
-/// At most 1 MiB of text, of paste, or of key names.
+/// At most 128 KiB of text, of paste, or of key names.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "PtyWriteParams", transform = one_input)]
 #[non_exhaustive]

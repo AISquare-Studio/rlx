@@ -67,6 +67,10 @@ pub const STOP_REQUESTED: &str = "stop";
 /// connection closes.
 pub const MAX_FRAME: usize = 1 << 20;
 
+// The longest `pty.write` fits a frame however it is escaped: six bytes of JSON for each
+// of its bytes at most, and room for the envelope.
+const _: () = assert!(6 * rlxd_proto::MAX_PTY_WRITE + 64 * 1024 <= MAX_FRAME);
+
 /// How long a new connection has to send its `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -585,7 +589,14 @@ impl Daemon {
             }
             methods::PTY_SCREEN => {
                 let params = params_of::<PtyScreenParams>(method, params)?;
-                printed(&off_worker(|| self.ptys.screen(&params)).map_err(pty_refused)?)
+                let data =
+                    printed(&off_worker(|| self.ptys.screen(&params)).map_err(pty_refused)?)?;
+                let long = serde_json::to_vec(&data).map_or(usize::MAX, |data| data.len());
+                // The reply's envelope around it, an id among it, takes far less than this.
+                if long + 4096 > bus::MAX_EVENT {
+                    return Err(screen_too_long(long));
+                }
+                Ok(data)
             }
             methods::PTY_KILL => {
                 let params = params_of::<PtyKillParams>(method, params)?;
@@ -650,6 +661,9 @@ impl Daemon {
         .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
         let mut line =
             serde_json::to_vec(&event).map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        if line.len() >= bus::MAX_EVENT {
+            return Err(screen_too_long(line.len()));
+        }
         line.push(b'\n');
         Ok((Line::from(line), screen.seq))
     }
@@ -1803,13 +1817,26 @@ fn pty_refused(refused: pty::Refused) -> ErrorBody {
         }
         pty::Refused::SpawnFailed(why) => error(codes::SPAWN_FAILED, &why),
         pty::Refused::Invalid(why) => error(codes::INVALID_PARAMS, &why),
-        pty::Refused::Busy(why) => error(codes::INTERNAL, &why),
+        pty::Refused::Busy(why) => error(codes::PTY_BUSY, &why)
+            .with_hint("Nothing of it was taken: write again once the program reads its input."),
         pty::Refused::ScreenFailed(id) => error(
             codes::PTY_EXITED,
             &format!("pty {id}'s screen model failed, so rlxd is ending its process"),
         )
         .with_hint("Its screen says error: screen_failed, and stays, blank, until pty.kill."),
     }
+}
+
+/// A screen of `long` bytes, longer than a client reads.
+fn screen_too_long(long: usize) -> ErrorBody {
+    error(
+        codes::SCREEN_TOO_LONG,
+        &format!(
+            "the screen is {long} bytes, longer than the {} a client reads",
+            bus::MAX_EVENT
+        ),
+    )
+    .with_hint("Ask for less scrollback.")
 }
 
 /// The methods this rlxd serves after `hello`.

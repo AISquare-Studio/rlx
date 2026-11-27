@@ -272,9 +272,15 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
 - **Who may do what:** `cli` and `tui` every method; `remote` the reads and
   `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
 - **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;
-  1 MiB a write.
+  128 KiB a write, so the longest one fits a frame however it is escaped.
 - **The terminal** is `TERM=xterm-256color`, `COLORTERM=truecolor`, unless `env` says
   otherwise.
+- **The environment** is rlxd's, less what the fleet's tmux server takes out of a
+  window's (`core/spawn.py`'s `tmux_client_env`) and tmux's own `TMUX`, `TMUX_PANE`,
+  `TERM_PROGRAM` and `TERM_PROGRAM_VERSION` (`src/pty/env.rs`). `tests/pty.rs` checks
+  the lists against Python's through `uv run`, so they can't drift.
+- **A process that ends** stays a zombie until `pty.kill` or `rlxd stop` reaps it, after
+  signalling its group, so the group's id is never another's by then.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 

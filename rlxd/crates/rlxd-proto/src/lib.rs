@@ -47,8 +47,8 @@
 //!   documents writes integers that way.
 //! - It cannot count how deep a value nests: a setting's value is at most 32 arrays or
 //!   objects deep ([`MAX_SETTING_DEPTH`]).
-//! - It counts a string's length in characters, so a `pty.write`'s 1 MiB, which the types
-//!   count in bytes, isn't in the schema.
+//! - It counts a string's length in characters, so a `pty.write`'s 128 KiB, which the
+//!   types count in bytes, isn't in the schema.
 //! - It cannot compare one field with another. So the schema checks that an event's
 //!   `type` starts with its `topic` only for the topics v1 lists (7.3's and 7.8's), while
 //!   the types check it for every topic.
@@ -137,6 +137,9 @@
 //! `from` to `to` are gone. It starts the stream when `since` is older than the oldest
 //! event rlxd holds, and can also come anywhere later, for a client so slow that rlxd
 //! drops events it has not read. It comes whatever the topics, and its own `seq` is `to`.
+//! One with `topics: ["pty"]` is narrower: rlxd keeps `pty.output` apart, and dropped
+//! only those, so every other event in that span still comes, before the gap (a
+//! subscriber that didn't ask for `pty` never gets one).
 //! A `since` past the last event gets [`codes::SINCE_AHEAD`], with `detail.head`.
 //!
 //! # Versioning

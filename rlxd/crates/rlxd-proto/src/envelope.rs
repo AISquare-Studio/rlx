@@ -337,6 +337,14 @@ pub mod codes {
     /// `pty.spawn`: the process could not be started, such as a program that isn't there
     /// or a `cwd` that isn't a directory. The message says why.
     pub const SPAWN_FAILED: &str = "spawn_failed";
+    /// `pty.write`: the program isn't reading its input, and rlxd holds as much of it
+    /// for the program as it may (16 MiB). Nothing of this write was taken: try again
+    /// once the program reads.
+    pub const PTY_BUSY: &str = "pty_busy";
+    /// `pty.screen`, or `pty.subscribe`'s snapshot: the screen, with the history asked
+    /// for, is longer than the longest line a client reads (16 MiB). Ask for less
+    /// `scrollback`. A stream whose new snapshot is that long ends with it.
+    pub const SCREEN_TOO_LONG: &str = "screen_too_long";
 }
 
 impl Envelope {

@@ -6,8 +6,9 @@
 //!   snapshot.
 //! - **Input** goes as tmux's goes: the terminal's keys are read as keys and sent by
 //!   name (`pty.write {keys}`), so rlxd sends each one as the program's modes need, as
-//!   tmux's server does for its clients; a paste goes as a paste. With `--read-only`,
-//!   nothing is sent.
+//!   tmux's server does for its clients; a character with no Ctrl or Alt goes as text,
+//!   which is what `send-keys` sends for it; a paste goes as a paste. Input rlxd
+//!   refuses rings the bell, and attach goes on. With `--read-only`, nothing is sent.
 //! - **The size** follows this terminal, as tmux's `window-size latest` does: the PTY is
 //!   resized to it at the start and whenever it changes, unless `--read-only`.
 //! - **Ctrl-]** detaches, as in telnet. Attach ends too when the PTY's process ends, or
@@ -29,7 +30,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use rlxd_client::{Connection, Home, Next, Reply};
-use rlxd_proto::{Data, PtySubscribeParams, check_pty_id, event_types, methods};
+use rlxd_proto::{Data, PtySubscribeParams, check_pty_id, codes, event_types, methods};
 use serde_json::{Value, json};
 
 use crate::cli::{self, AskError};
@@ -71,7 +72,7 @@ pub fn attach(args: AttachArgs) -> ExitCode {
     };
     if !args.read_only
         && let Ok((cols, rows)) = terminal::size()
-        && let Err(code) = resize(&mut input, &args.pty_id, cols, rows)
+        && let Err(code) = resize(&mut input, &args.pty_id, cols, rows, true)
     {
         return code;
     }
@@ -94,8 +95,14 @@ pub fn attach(args: AttachArgs) -> ExitCode {
     };
     let screen = Screen::take(args.read_only);
     let mut stdout = std::io::stdout();
-    if let Ok(event) = serde_json::from_str::<Value>(&first.line) {
-        draw(&mut stdout, &event["data"]);
+    let first: Value = serde_json::from_str(&first.line).unwrap_or_default();
+    draw(&mut stdout, &first["data"]);
+    if first["data"]["exited"] == true {
+        // Ended before attach came: its pty.exited is older than the snapshot.
+        drop(screen);
+        let status = first["data"]["status"].as_u64().unwrap_or(0);
+        println!("[the process exited, status {status}]");
+        return ExitCode::SUCCESS;
     }
     // The stream on a thread of its own; this one reads the keyboard.
     let (ended_tx, ended_rx) = mpsc::channel::<Ended>();
@@ -219,22 +226,52 @@ fn read_keys(input: &mut Connection, args: &AttachArgs, ended: &mpsc::Receiver<E
             continue;
         }
         let sent = match event {
-            Event::Key(key) => match key_name(&key) {
-                Some(name) => write(input, &args.pty_id, json!({ "keys": [name] })),
-                None => Ok(()),
+            Event::Key(key) => match input_of(&key) {
+                Some(params) => write(input, &args.pty_id, params),
+                None => Sent::Yes,
             },
             Event::Paste(text) => write(input, &args.pty_id, json!({ "paste": text })),
-            Event::Resize(cols, rows) => resize(input, &args.pty_id, cols, rows).map_err(|_| ()),
-            _ => Ok(()),
+            Event::Resize(cols, rows) => match resize(input, &args.pty_id, cols, rows, false) {
+                Ok(()) => Sent::Yes,
+                Err(_) => Sent::Ended,
+            },
+            _ => Sent::Yes,
         };
-        if sent.is_err() {
-            // The stream says why, an exit or the PTY's end: let it.
-            if let Ok(ended) = ended.recv_timeout(Duration::from_secs(2)) {
-                return ended;
+        match sent {
+            Sent::Yes => {}
+            // rlxd took none of it (too long a paste, a program that reads nothing):
+            // the bell says so, and this goes on.
+            Sent::Refused => {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(b"\x07");
+                let _ = stdout.flush();
             }
-            return Ended::Lost("rlxd refused the input".to_owned());
+            Sent::Ended => {
+                // The stream says why, an exit or the PTY's end: let it.
+                if let Ok(ended) = ended.recv_timeout(Duration::from_secs(2)) {
+                    return ended;
+                }
+                return Ended::Lost("rlxd took no more input".to_owned());
+            }
         }
     }
+}
+
+/// What `pty.write` sends for `key`: a character with no Ctrl or Alt as text, which is
+/// what `send-keys` sends for it and is never refused (a no-break space, an ideographic
+/// space), any other key by its tmux name.
+fn input_of(key: &KeyEvent) -> Option<Value> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if let KeyCode::Char(c) = key.code
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return Some(json!({ "text": c.to_string() }));
+    }
+    key_name(key).map(|name| json!({ "keys": [name] }))
 }
 
 /// Ctrl-], which a terminal sends as GS (0x1d) and crossterm reads as Ctrl-5.
@@ -291,21 +328,47 @@ pub fn key_name(key: &KeyEvent) -> Option<String> {
     Some(name)
 }
 
-fn write(input: &mut Connection, pty_id: &str, mut params: Value) -> Result<(), ()> {
+/// How a write went.
+enum Sent {
+    Yes,
+    /// rlxd refused it, and the PTY goes on.
+    Refused,
+    /// The PTY has ended or gone, or the connection with it.
+    Ended,
+}
+
+fn write(input: &mut Connection, pty_id: &str, mut params: Value) -> Sent {
     params["pty_id"] = json!(pty_id);
     let params: Data = params.as_object().cloned().unwrap_or_default();
     match input.request(methods::PTY_WRITE, params) {
-        Ok(reply) if reply.is_ok() => Ok(()),
-        _ => Err(()),
+        Ok(reply) if reply.is_ok() => Sent::Yes,
+        Ok(reply) => {
+            let code = reply.error().map(|e| e.code.as_str()).unwrap_or_default();
+            if matches!(code, codes::PTY_EXITED | codes::UNKNOWN_PTY) {
+                Sent::Ended
+            } else {
+                Sent::Refused
+            }
+        }
+        Err(_) => Sent::Ended,
     }
 }
 
-fn resize(input: &mut Connection, pty_id: &str, cols: u16, rows: u16) -> Result<(), ExitCode> {
+/// Sizes the PTY to `cols` by `rows`. `first`, at attach's start: one whose process has
+/// ended takes no size, and attach still shows its last screen.
+fn resize(
+    input: &mut Connection,
+    pty_id: &str,
+    cols: u16,
+    rows: u16,
+    first: bool,
+) -> Result<(), ExitCode> {
     let params =
         json!({"pty_id": pty_id, "cols": cols.clamp(1, 1000), "rows": rows.clamp(1, 1000)});
     let params: Data = params.as_object().cloned().unwrap_or_default();
     match input.request(methods::PTY_RESIZE, params) {
         Ok(reply) if reply.is_ok() => Ok(()),
+        Ok(reply) if first && reply.error().is_some_and(|e| e.code == codes::PTY_EXITED) => Ok(()),
         Ok(reply) => Err(refused(&reply)),
         Err(e) => Err(cli::report_on_stderr(AskError::Failed(e.to_string()))),
     }

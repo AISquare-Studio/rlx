@@ -39,7 +39,7 @@ const CLIENT: &str = "rlxd-cli";
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// The methods whose reply ends a stream of events, which `rlxd call` prints instead.
-const STREAMING: &[&str] = &[methods::EVENTS_SUBSCRIBE];
+const STREAMING: &[&str] = &[methods::EVENTS_SUBSCRIBE, methods::PTY_SUBSCRIBE];
 
 /// `rlxd call`'s options, as the command line gave them.
 #[derive(Debug, Default)]

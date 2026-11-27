@@ -518,6 +518,74 @@ fn a_stray_dcs_is_given_up_after_five_seconds_as_tmux_does() {
     assert_eq!(String::from_utf8_lossy(&cursor).trim(), format!("{x},{y}"));
 }
 
+/// Bytes to write, then a size to take, if any.
+type Stage = (&'static [u8], Option<(u16, u16)>);
+
+/// The #28 tester's (B), and #2585's major 1: a cursor ?1049h saved at row 20 outlives the
+/// alternate screen; ?1047h after a shorter resize, another resize, then ?1049l restores
+/// it. tmux reads past its lines there and lives; rlxd clamps the cursor to the screen.
+/// Both are given the same writes with the same resizes between them.
+#[test]
+fn a_stale_saved_cursor_comes_back_as_tmux_shows_it() {
+    let Some(tmux) = tmux_or_skip() else {
+        return;
+    };
+    let stages: [Stage; 3] = [
+        (b"\x1b[20;1H\x1b[?1049h\x1b[?1049l", Some((80, 10))),
+        (b"\x1b[?1047h", Some((40, 12))),
+        (b"\x1b[?1049lafter\r\n", None),
+    ];
+    let mut files = Vec::new();
+    for (n, (bytes, _)) in stages.iter().enumerate() {
+        let file = tmux.dir.join(format!("stage{n}.bin"));
+        std::fs::write(&file, bytes).unwrap();
+        files.push(format!("cat '{}'", file.display()));
+    }
+    let command = format!("{}; exec sleep 60", files.join("; sleep 2; "));
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "stale",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        &command,
+    ]);
+    // Each resize lands between two writes: at 1 s and 3 s, the writes at 0, 2 and 4.
+    std::thread::sleep(Duration::from_secs(1));
+    tmux.run(&["resize-window", "-t", "stale", "-x", "80", "-y", "10"]);
+    std::thread::sleep(Duration::from_secs(2));
+    tmux.run(&["resize-window", "-t", "stale", "-x", "40", "-y", "12"]);
+    std::thread::sleep(Duration::from_millis(2500));
+    tmux.settle("stale");
+    let expected = tmux.run(&["capture-pane", "-e", "-p", "-t", "stale"]);
+    let cursor = tmux.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "stale",
+        "#{cursor_x},#{cursor_y}",
+    ]);
+    let mut model = Terminal::new(80, 24, 2000, "test");
+    for (bytes, resize) in stages {
+        model.feed(&onlcr(bytes));
+        if let Some((cols, rows)) = resize {
+            model.resize(cols, rows);
+        }
+    }
+    let text = model.capture(0);
+    assert_eq!(
+        shown(&expected),
+        shown(text.as_bytes()),
+        "the frames differ {}",
+        first_difference(&expected, text.as_bytes())
+    );
+    let (x, y, _) = model.cursor();
+    assert_eq!(String::from_utf8_lossy(&cursor).trim(), format!("{x},{y}"));
+}
+
 #[test]
 fn every_fixture_captures_as_tmux_captures_it() {
     let Some(tmux) = tmux_or_skip() else {

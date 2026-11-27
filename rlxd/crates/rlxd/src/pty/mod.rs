@@ -19,6 +19,7 @@
 //! - **Limits:** [`MAX_PTYS`] PTYs a home, the exited ones included, and
 //!   [`SCROLLBACK`] lines of history each.
 
+pub mod env;
 pub mod keys;
 #[cfg(unix)]
 mod unix;
@@ -32,7 +33,7 @@ pub use windows::shim;
 use std::io::{Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -148,6 +149,11 @@ struct Pty {
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     input: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     queued: Arc<AtomicUsize>,
+    /// The process has ended: known without the state's lock, which the reader can hold
+    /// a while on a heavy write.
+    exited: AtomicBool,
+    /// rlxd is ending the PTY: the reader takes no more of its output.
+    ending: AtomicBool,
     /// The Job Object that holds the PTY's processes.
     #[cfg(windows)]
     job: windows::Job,
@@ -295,6 +301,12 @@ impl Host {
             command
         };
         command.cwd(&cwd);
+        // rlxd's own environment, less what the fleet's tmux server would take out of a
+        // window's (env.rs), then the terminal, then what the caller asked for.
+        command.env_clear();
+        for (name, value) in env::inherited(std::env::vars_os()) {
+            command.env(name, value);
+        }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         for (name, value) in params.env.iter().flatten() {
@@ -354,6 +366,8 @@ impl Host {
             master: Mutex::new(Some(pair.master)),
             input: Mutex::new(Some(input)),
             queued: Arc::clone(&queued),
+            exited: AtomicBool::new(false),
+            ending: AtomicBool::new(false),
             #[cfg(windows)]
             job,
         });
@@ -508,6 +522,7 @@ impl Host {
         // ends with the PTY.
         end(&pty);
         self.ptys().retain(|held| !Arc::ptr_eq(held, &pty));
+        free(&pty);
         self.gone.send_modify(|n| *n += 1);
         info!("pty {} killed, by {who}", pty.id);
         PtyRef::new(&pty.id).map_err(|e| Refused::Invalid(e.to_string()))
@@ -530,7 +545,12 @@ impl Host {
         }
         let handles: Vec<_> = ptys
             .into_iter()
-            .map(|pty| std::thread::spawn(move || end(&pty)))
+            .map(|pty| {
+                std::thread::spawn(move || {
+                    end(&pty);
+                    free(&pty);
+                })
+            })
             .collect();
         for handle in handles {
             let _ = handle.join();
@@ -540,17 +560,24 @@ impl Host {
 }
 
 /// Ends `pty`'s process and its group, then closes the terminal.
+///
+/// It takes none of the PTY's locks before the signals: the reader can hold the state's
+/// a while on a heavy write, and `ending` makes it let go within 64 bytes. On macOS and
+/// Linux the leader is a zombie from its end until it is reaped here, after the group's
+/// signals, so the group's id is never another's when they are sent.
 fn end(pty: &Pty) {
+    pty.ending.store(true, Ordering::Release);
     #[cfg(unix)]
     {
-        if pty.state().exit.is_none() {
+        if !pty.exited.load(Ordering::Acquire) {
             unix::signal_group(pty.pid, unix::SIGHUP);
             unix::signal_group(pty.pid, unix::SIGTERM);
-            wait_until(pty, KILL_GRACE, |state| state.exit.is_some());
+            wait_for(KILL_GRACE, || pty.exited.load(Ordering::Acquire));
         }
-        if unix::group_alive(pty.pid) {
-            unix::signal_group(pty.pid, unix::SIGKILL);
-        }
+        // Whatever of the group is left, a process that ignores both or one the leader
+        // left behind: its id is still the zombie leader's.
+        unix::signal_group(pty.pid, unix::SIGKILL);
+        wait_for(KILL_GRACE, || pty.exited.load(Ordering::Acquire));
     }
     #[cfg(windows)]
     {
@@ -558,7 +585,7 @@ fn end(pty: &Pty) {
         if let Err(e) = pty.job.terminate(1) {
             warning!("pty {}: cannot end its job: {e}", pty.id);
         }
-        wait_until(pty, KILL_GRACE, |state| state.exit.is_some());
+        wait_for(KILL_GRACE, || pty.exited.load(Ordering::Acquire));
         let deadline = Instant::now() + KILL_GRACE;
         while pty.job.active().is_ok_and(|n| n > 0) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -567,10 +594,15 @@ fn end(pty: &Pty) {
             warning!("pty {}: processes of its job still run", pty.id);
         }
     }
+    // pty.exited is published before the PTY goes.
+    wait_until(pty, KILL_GRACE, |state| state.exit.is_some());
     pty.input.lock().unwrap_or_else(|p| p.into_inner()).take();
     pty.master.lock().unwrap_or_else(|p| p.into_inner()).take();
     #[cfg(unix)]
     {
+        if !unix::reap(pty.pid, KILL_GRACE) {
+            warning!("pty {}: pid {} could not be reaped", pty.id, pty.pid);
+        }
         let deadline = Instant::now() + KILL_GRACE;
         while unix::group_alive(pty.pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -596,6 +628,21 @@ fn ending(pty: &Arc<Pty>) {
             pty.id
         );
         end(pty);
+    }
+}
+
+/// Frees a PTY rlxd let go of: its screen and history, which its reader would keep for
+/// as long as a process that left the group holds the terminal open.
+fn free(pty: &Pty) {
+    let blank = Terminal::new(1, 1, 0, VERSION);
+    drop(std::mem::replace(&mut pty.state().terminal, blank));
+}
+
+/// Waits up to `timeout` for `done`, which needs no lock, to hold.
+fn wait_for(timeout: Duration, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !done() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -652,17 +699,21 @@ fn read_output(pty: &Arc<Pty>, mut reader: Box<dyn Read + Send>, bus: &Bus) {
             // The screen takes the bytes and the bus numbers them under one lock, so a
             // snapshot taken under it holds exactly the output up to the bus's head.
             let mut state = pty.state();
-            if state.error.is_some() {
-                // The screen failed and the PTY is ending: the rest is drained, unread.
+            if state.error.is_some() || pty.ending.load(Ordering::Acquire) {
+                // The PTY is ending: the rest is drained, unread.
                 continue;
             }
-            let Some(replies) =
-                state.on_screen(&pty.id, "on the program's output", |t| t.feed(chunk))
-            else {
+            let Some(replies) = state.on_screen(&pty.id, "on the program's output", |t| {
+                t.feed_unless(chunk, &pty.ending)
+            }) else {
                 drop(state);
                 ending(pty);
                 continue;
             };
+            if pty.ending.load(Ordering::Acquire) {
+                // Cut short as the PTY ends: no one is to see this output.
+                continue;
+            }
             let data = PtyOutput::new(&pty.id, base64(chunk)).and_then(|o| o.to_data());
             let published = match data {
                 Ok(data) => bus
@@ -690,6 +741,7 @@ fn read_output(pty: &Arc<Pty>, mut reader: Box<dyn Read + Send>, bus: &Bus) {
 /// Waits for the program to end, keeps how it ended, and publishes `pty.exited`.
 fn wait_for_end(pty: &Pty, child: Box<dyn portable_pty::Child + Send + Sync>, bus: &Bus) {
     let exit = ended(pty, child);
+    pty.exited.store(true, Ordering::Release);
     // The last output can still be on its way: let it reach the screen first.
     wait_until(pty, DRAIN, |state| state.drained);
     let mut state = pty.state();
@@ -728,7 +780,8 @@ fn wait_for_end(pty: &Pty, child: Box<dyn portable_pty::Child + Send + Sync>, bu
 
 #[cfg(unix)]
 fn ended(pty: &Pty, child: Box<dyn portable_pty::Child + Send + Sync>) -> Exit {
-    // `child` is std's, which would report a signal as code 1: reap by pid instead.
+    // `child` is std's, which would report a signal as code 1: wait by pid instead,
+    // leaving a zombie for end() to reap.
     drop(child);
     match unix::wait(pty.pid) {
         Ok(ended) => Exit {
