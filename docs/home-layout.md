@@ -212,7 +212,9 @@ store where the old one was, and the move could not be finished.
 The move writes its journal (`backups/home-migration/journal.json`) twice: the journal itself,
 then a copy beside it (`journal-copy.json`). When the journal cannot be read and its copy can,
 nothing is lost. Every command says the move is part-way, and `rlx move-home` finishes it from
-the copy, writing the journal whole again.
+the copy, writing the journal whole again. Something at either place that is not a file (a
+folder, a link) is renamed aside first, as `journal.json.unreadable-<when>`, and kept. A copy a
+newer rlx wrote is that release's move: finish it, or roll it back, with that release.
 
 When neither can be read, rlx cannot tell from them how far the move got. Every command stops,
 names the file, and says what the home itself shows:

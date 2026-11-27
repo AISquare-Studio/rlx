@@ -2511,6 +2511,188 @@ def test_with_both_copies_unreadable_only_a_home_that_shows_nothing_moved_is_tol
         assert "aside" not in out and "leave the home as it is" in out, out
 
 
+def _asides(folder: Path) -> list[str]:
+    """What the move set aside in its folder (``ASIDE_MARK``), by name."""
+    return sorted(p.name for p in folder.iterdir() if home_migration.ASIDE_MARK in p.name)
+
+
+@pytest.mark.parametrize("then", ["move-home", "rollback"])
+def test_a_folder_at_the_journal_s_path_part_way_is_set_aside_and_the_way_out_works(
+    old_home: Path, user_home: Path, then: str
+) -> None:
+    """The tester's repro A (round 6): a folder at journal.json with the copy readable. Every
+    command said `rlx move-home` finishes it, and move-home and --rollback each ended in an
+    IsADirectoryError traceback, run after run. The folder is set aside, never deleted, and
+    each way out ends whole, or as it was."""
+    before = _tree(old_home)
+    _stopped_at_rename(3)
+    journal = paths.unfinished_home_move()
+    assert journal is not None
+    journal.unlink()
+    journal.mkdir()
+    runner = CliRunner()
+    assert "part-way through its move" in runner.invoke(app, ["fleet", "ls"]).output
+
+    result = runner.invoke(
+        app, ["move-home"] if then == "move-home" else ["move-home", "--rollback"]
+    )
+
+    assert result.exit_code == 0 and result.exception is None, (result.output, result.exception)
+    if then == "move-home":
+        _whole(user_home)
+        assert _asides((user_home / ".rlx").joinpath(*paths.MOVE_JOURNAL[:-1])), "kept aside"
+    else:
+        assert _same_but_store(_tree(old_home), before) and not (user_home / ".rlx").exists()
+        assert _asides(old_home.joinpath(*paths.MOVE_JOURNAL[:-1])), "kept aside"
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+
+
+def test_a_folder_at_a_finished_move_s_journal_is_set_aside_by_move_home(
+    old_home: Path, user_home: Path
+) -> None:
+    """Repro A after a finished move: fleet ls stayed refused, and move-home was a traceback."""
+    assert home_migration.move_home() is not None
+    journal = (user_home / ".rlx").joinpath(*paths.MOVE_JOURNAL)
+    journal.unlink()
+    journal.mkdir()
+    runner = CliRunner()
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 1
+
+    done = runner.invoke(app, ["move-home"])
+
+    assert done.exit_code == 0 and done.exception is None, (done.output, done.exception)
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+    assert _asides(journal.parent) and journal.is_file()
+    _whole(user_home)
+
+
+def test_a_folder_at_the_copy_s_path_before_any_move_is_set_aside_and_the_home_moves(
+    old_home: Path, user_home: Path
+) -> None:
+    """The tester's repro B: a folder at journal-copy.json on a home never moved. The move
+    refused, left journal.json behind, and every later run was a traceback."""
+    folder = old_home.joinpath(*paths.MOVE_JOURNAL[:-1])
+    (folder / home_migration.JOURNAL_COPY).mkdir(parents=True)
+    runner = CliRunner()
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+
+    done = runner.invoke(app, ["move-home"])
+
+    assert done.exit_code == 0 and done.exception is None, (done.output, done.exception)
+    _whole(user_home)
+    assert _asides((user_home / ".rlx").joinpath(*paths.MOVE_JOURNAL[:-1])), "kept aside"
+
+
+def _failing_writes(
+    patch: pytest.MonkeyPatch, errno_: int, *, names: tuple[str, ...], after: int = 0
+) -> None:
+    """A FAKE writer for the journal: each write of a file named in ``names`` past the first
+    ``after`` of them fails with ``errno_``, as a full disk or a bad sector would (never by
+    filling a disk). Every other write is the real one."""
+    from aisquare.core.atomic import write_replacing as real
+
+    seen = [0]
+
+    def write(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if Path(path).name in names:
+            seen[0] += 1
+            if seen[0] > after:
+                raise OSError(errno_, os.strerror(errno_), str(path))
+        return real(path, *args, **kwargs)
+
+    patch.setattr(home_migration, "write_replacing", write)
+
+
+JOURNALS = (paths.MOVE_JOURNAL[-1], home_migration.JOURNAL_COPY)
+
+
+@pytest.mark.parametrize("errno_", [errno.ENOSPC, errno.EIO], ids=["ENOSPC", "EIO"])
+def test_a_fresh_move_whose_copy_cannot_be_written_leaves_no_journal_and_is_not_moved(
+    old_home: Path, user_home: Path, errno_: int
+) -> None:
+    """The tester's round-6 note: the copy's write failing left journal.json behind, so the
+    home read part-way though 'the home was not moved', and the next run was a traceback."""
+    before = _tree(old_home)
+    runner = CliRunner()
+    with pytest.MonkeyPatch.context() as disk:
+        _failing_writes(disk, errno_, names=(home_migration.JOURNAL_COPY,))
+        refused = runner.invoke(app, ["move-home"])
+
+    out = refused.output.replace("\n", " ")
+    assert refused.exit_code == 1 and isinstance(refused.exception, SystemExit), out
+    assert "the home was not moved" in out and os.strerror(errno_) in out, out
+    assert paths.unfinished_home_move() is None and _tree(old_home) == before
+    assert not old_home.joinpath(*paths.MOVE_JOURNAL[:-1]).exists()
+    assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+    assert runner.invoke(app, ["move-home"]).exit_code == 0
+    _whole(user_home)
+
+
+@pytest.mark.parametrize("errno_", [errno.ENOSPC, errno.EIO], ids=["ENOSPC", "EIO"])
+def test_a_resume_that_cannot_write_its_journal_names_the_file_and_the_next_run_finishes(
+    old_home: Path, user_home: Path, errno_: int
+) -> None:
+    _stopped_at_rename(3)
+    runner = CliRunner()
+    with pytest.MonkeyPatch.context() as disk:
+        _failing_writes(disk, errno_, names=JOURNALS)
+        refused = runner.invoke(app, ["move-home"])
+
+    out = refused.output.replace("\n", " ")
+    assert refused.exit_code == 1 and isinstance(refused.exception, SystemExit), out
+    assert "journal.json could not be written" in out and os.strerror(errno_) in out, out
+    assert "run the move again: it goes on from where it stopped" in out, out
+    done = runner.invoke(app, ["move-home"])
+    assert done.exit_code == 0, done.output
+    _whole(user_home)
+
+
+@pytest.mark.parametrize("after", [0, 2], ids=["its-first-write", "a-later-write"])
+def test_a_roll_back_that_cannot_write_names_the_file_and_the_next_finishes_it(
+    old_home: Path, user_home: Path, after: int
+) -> None:
+    before = _tree(old_home)
+    _stopped_at_rename(3)
+    runner = CliRunner()
+    with pytest.MonkeyPatch.context() as disk:
+        _failing_writes(disk, errno.EIO, names=JOURNALS, after=after)
+        refused = runner.invoke(app, ["move-home", "--rollback"])
+
+    out = refused.output.replace("\n", " ")
+    assert refused.exit_code == 1 and isinstance(refused.exception, SystemExit), out
+    assert "was not rolled back" in out and "could not be written (Input/output error)" in out
+    assert "roll it back again: it goes on from where it stopped" in out, out
+    undone = runner.invoke(app, ["move-home", "--rollback"])
+    assert undone.exit_code == 0, undone.output
+    assert _same_but_store(_tree(old_home), before) and not (user_home / ".rlx").exists()
+
+
+def test_a_newer_rlx_s_copy_is_refused_as_its_move_never_resumed(
+    old_home: Path, user_home: Path
+) -> None:
+    """The reviewer's m1 (round 6): an unreadable journal and a copy a newer rlx wrote. The
+    copy was taken up and the newer release's move resumed by this one, its newer fields
+    dropped. It is that release's move: refused, with its way out."""
+    _stopped_at_rename(3)
+    journal = paths.unfinished_home_move()
+    assert journal is not None
+    copy = journal.with_name(home_migration.JOURNAL_COPY)
+    newer = json.loads(copy.read_text(encoding="utf-8"))
+    newer["version"] = 99
+    copy.write_text(json.dumps(newer), encoding="utf-8")
+    journal.write_bytes(b"\xff\xfe")
+    held = copy.read_bytes()
+    runner = CliRunner()
+
+    for command in (["fleet", "ls"], ["move-home"], ["move-home", "--rollback"]):
+        result = runner.invoke(app, command)
+        out = result.output.replace("\n", " ")
+        assert result.exit_code == 1 and "a newer rlx's move" in out, (command, out)
+        assert "finish it with that release" in out and "finishes it" not in out, out
+
+    assert copy.read_bytes() == held and journal.read_bytes() == b"\xff\xfe", "never resumed"
+
+
 def test_a_finished_move_whose_journal_rotted_is_written_whole_again_by_move_home(
     old_home: Path, user_home: Path
 ) -> None:

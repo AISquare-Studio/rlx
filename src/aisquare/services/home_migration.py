@@ -61,6 +61,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -269,16 +270,39 @@ def _save_move_journal(journal: Journal) -> None:
     path = _move_journal_path(journal.root)
     path.parent.mkdir(parents=True, exist_ok=True)
     body = journal.model_dump_json(indent=1) + "\n"
-    write_replacing(path, body, keep_mode=False)
-    write_replacing(path.with_name(JOURNAL_COPY), body, keep_mode=False)
+    for target in (path, path.with_name(JOURNAL_COPY)):
+        _set_aside_unless_a_file(target)
+        write_replacing(target, body, keep_mode=False)
+
+
+ASIDE_MARK = ".unreadable-"
+"""What a non-file at a journal's path is renamed aside with: ``journal.json.unreadable-<when>``."""
+
+
+def _set_aside_unless_a_file(path: Path) -> None:
+    """Whatever is at ``path`` that is not a regular file (a folder, a link, a FIFO) renamed
+    aside beside it, ``<name>.unreadable-<when>``, and never deleted: no replace can go over
+    it (``IsADirectoryError``), and the other of the two paths holds the journal (the tester's
+    round-6 repros, #3173)."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(mode):
+        return
+    when = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    os.rename(path, path.with_name(f"{path.name}{ASIDE_MARK}{when}"))
 
 
 def _read_journal(path: Path) -> Journal | None:
     """The journal at ``path``, or ``None`` when it cannot be read as one."""
     try:
-        return Journal.model_validate_json(paths.read_regular_text(path))
+        journal = Journal.model_validate_json(paths.read_regular_text(path))
     except (OSError, ValueError, RecursionError):  # a ValidationError is a ValueError
         return None
+    # A newer rlx's is not this one's to take up (the reviewer's m1, round 6): its fields
+    # past this release's are dropped in the reading, and it would be resumed without them.
+    return None if journal.version > JOURNAL_VERSION else journal
 
 
 def _unfinished_move(root: Path) -> Journal | None:
@@ -313,16 +337,7 @@ def journal_refusal(path: Path) -> str | None:
     version = loaded.get("version") if isinstance(loaded, dict) else None
     if isinstance(version, int) and version > JOURNAL_VERSION:
         # Read before its shape: a newer release's journal may hold what this one lacks.
-        said = (
-            f"a newer rlx's move of this home is unfinished (its journal is version "
-            f"{version}): finish it with that release"
-        )
-        if _home_shows(path) == NOTHING_MOVED:
-            said += (
-                f"; the home shows nothing moved yet, so moving {paths.shown(path)} aside "
-                "also lets this rlx run"
-            )
-        return said
+        return _newer_rlx_s(path, version)
     try:
         Journal.model_validate_json(text)
     except ValidationError as exc:
@@ -330,10 +345,33 @@ def journal_refusal(path: Path) -> str | None:
     return None
 
 
+def _newer_rlx_s(path: Path, version: int) -> str:
+    """The refusal of a newer rlx's unfinished move: never taken up by this one."""
+    said = (
+        f"a newer rlx's move of this home is unfinished (its journal is version "
+        f"{version}): finish it with that release, or roll it back with it"
+    )
+    if _home_shows(path) == NOTHING_MOVED:
+        said += (
+            f"; the home shows nothing moved yet, so moving {paths.shown(path)} aside also "
+            "lets this rlx run"
+        )
+    return said
+
+
 def _unless_its_copy_reads(path: Path, exc: Exception) -> str | None:
     """``None`` when the journal's copy (:data:`JOURNAL_COPY`) can be taken up in its place;
-    else why the move cannot be, with the way out the home's state allows."""
-    if _read_journal(path.with_name(JOURNAL_COPY)) is not None:
+    else why the move cannot be, with the way out the home's state allows. A newer rlx's copy
+    is that release's move, refused as one (the reviewer's m1, round 6)."""
+    copy = path.with_name(JOURNAL_COPY)
+    try:
+        loaded: Any = json.loads(paths.read_regular_text(copy))
+    except (OSError, ValueError, RecursionError):
+        loaded = None
+    version = loaded.get("version") if isinstance(loaded, dict) else None
+    if isinstance(version, int) and version > JOURNAL_VERSION:
+        return _newer_rlx_s(path, version)
+    if _read_journal(copy) is not None:
         return None
     return _unreadable_journal(path, exc)
 
@@ -833,17 +871,23 @@ def _move_quiet_home(found: Plan, *, drop_cache: bool, say: Callable[[str], None
             try:
                 _save_move_journal(journal)
             except OSError as exc:
+                _forget_a_journal_never_begun(journal)
                 raise MigrationRefused(
                     f"its journal could not be written ({_why_stopped(exc)})"
                 ) from exc
             say(f"moving the home: {found.shown}")
         elif journal.rolling_back:
-            _roll_back_move(journal)
+            _roll_back_or_refuse(journal)
             raise MigrationFailed("a roll-back a crash stopped was finished", rolled_back=True)
         else:
             # Written again first: one taken up from its copy has its journal whole again, even
             # when every step is done and no step writes it (:data:`JOURNAL_COPY`).
-            _save_move_journal(journal)
+            try:
+                _save_move_journal(journal)
+            except OSError as exc:
+                raise MigrationRefused(
+                    _stopped_writing(exc, journal, "run the move again")
+                ) from exc
             say(f"resuming the home's move: {found.shown}")
         try:
             _run_move_steps(journal, say)
@@ -1429,7 +1473,7 @@ def roll_back_move(journal: Journal | None = None) -> bool:
     here is finished by the next run."""
     with _as_the_default_home():
         if journal is not None:
-            return _roll_back_move(journal)
+            return _roll_back_or_refuse(journal)
         found = planned_move()
         if found is None or found.journal is None:
             return False
@@ -1442,7 +1486,41 @@ def roll_back_move(journal: Journal | None = None) -> bool:
         if running:
             raise MigrationRefused(f"{len(running)} thing(s) run on this home", running)
         with _one_at_a_time(str(found.old_root), named=found.named):
-            return _roll_back_move(found.journal)
+            return _roll_back_or_refuse(found.journal)
+
+
+def _roll_back_or_refuse(journal: Journal) -> bool:
+    """:func:`_roll_back_move`, a file it could not write said, with the way out, never a
+    traceback (the tester's round-6 repros, #3173): each undo is written down as it is done,
+    so the next roll-back goes on from where this one stopped."""
+    try:
+        return _roll_back_move(journal)
+    except OSError as exc:
+        raise MigrationRefused(_stopped_writing(exc, journal, "roll it back again")) from exc
+
+
+def _stopped_writing(exc: OSError, journal: Journal, again: str) -> str:
+    """Why a run stopped at a file it could not write, and the way out: the file named."""
+    where = Path(exc.filename) if exc.filename else _move_journal_path(journal.root)
+    why = exc.strerror or type(exc).__name__  # the file is named already
+    return (
+        f"{paths.shown(where)} could not be written ({why}): free space on its "
+        f"disk, or make its folder writable, then {again}: it goes on from where it stopped"
+    )
+
+
+def _forget_a_journal_never_begun(journal: Journal) -> None:
+    """A fresh move whose journal (or its copy) could not be written: whichever was written
+    taken away again, so the home reads as never moved, as the refusal says. Best effort:
+    what stays is said by the next command (an unfinished journal)."""
+    path = _move_journal_path(journal.root)
+    for target in (path, path.with_name(JOURNAL_COPY)):
+        with contextlib.suppress(OSError):
+            if stat.S_ISREG(os.lstat(target).st_mode):
+                target.unlink()
+    for folder in (path.parent, path.parent.parent):  # backups/home-migration, backups/
+        with contextlib.suppress(OSError):
+            folder.rmdir()
 
 
 def _roll_back_move(journal: Journal | None = None) -> bool:
@@ -1566,7 +1644,7 @@ def _undo_folder(journal: Journal) -> None:
     folder = _move_folder(Path(journal.old_root))
     record = _move_journal_path(Path(journal.old_root))
     for entry in list(folder.iterdir()) if folder.is_dir() else []:
-        if entry == record:
+        if entry == record or ASIDE_MARK in entry.name:  # set aside, never deleted
             continue
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry, ignore_errors=True)
