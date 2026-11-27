@@ -1039,3 +1039,50 @@ fn a_database_it_cannot_open_leaves_the_scheduler_unavailable_with_why() {
     assert!(jobs.get("set_aside").is_none(), "{jobs:#}");
     assert!(db.exists(), "the file stays where it is");
 }
+
+#[test]
+fn a_real_schedule_change_lets_an_owed_fire_go() {
+    // Tester r2's surviving mutant R4: a changed schedule starts again from now, and
+    // what the old one owed goes with it.
+    let home = home_at("hello", T0);
+    put(&home, &every_minute("t1", "once"));
+    advance(&home, 60);
+    put(&home, &job("t1", json!({"every_minutes": 5}), "once"));
+    let back = seq(&home);
+    let _app = app(&home);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        typed(&events(&home, back), "job.fired", None).is_empty(),
+        "{:#?}",
+        events(&home, back)
+    );
+    assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:06:00Z");
+}
+
+#[test]
+fn a_clock_set_back_counts_the_next_fire_from_now() {
+    // Tester r2's surviving mutant R12: rlxd restarted with its clock earlier than the
+    // job's next fire (NTP, or set by hand) counts it again from now, on the job's grid,
+    // whether the job has fired or not, before its anchor too.
+    let mut home = home_at("hello", T0);
+    put(&home, &job("fired", json!({"every_minutes": 5}), "skip"));
+    put(&home, &job("never", json!({"every_minutes": 5}), "skip"));
+    call(&home, "job.pause", &json!({"job_id": "never"}));
+    advance(&home, 600);
+    assert_eq!(
+        listed(&home, "fired")["next_fire_at"],
+        "2027-01-01T00:15:00Z"
+    );
+    home.stop();
+    home.set_env("RLXD_TEST_CLOCK", "2027-01-01T00:02:00Z");
+    home.start_dev();
+    common::eventually("the next fire counted from now", || {
+        listed(&home, "fired")["next_fire_at"] == "2027-01-01T00:05:00Z"
+    });
+    home.stop();
+    home.set_env("RLXD_TEST_CLOCK", "2026-12-31T23:31:00Z");
+    home.start_dev();
+    common::eventually("before the anchor, on its grid", || {
+        listed(&home, "fired")["next_fire_at"] == "2026-12-31T23:35:00Z"
+    });
+}
