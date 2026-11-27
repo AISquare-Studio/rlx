@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import textwrap
 import threading
 from collections.abc import Iterator
@@ -76,20 +77,39 @@ def _no_spans(value: Any) -> Any:
     return _SPAN.sub("<span>", value) if isinstance(value, str) else value
 
 
+#: Windows' paths are one path whatever the case of their letters (``os.path.normcase``
+#: lowers them).
+_PATH_CASE = re.IGNORECASE if sys.platform == "win32" else 0
+
+
+def _home_said(text: str, home: Path) -> str:
+    """``text`` with the run's own home said as ``<home>``, however it spells it: as given
+    and resolved (Windows: a short ``RUNNER~1`` and its long name), with ``/`` for its
+    separator, and with each ``\\`` doubled, as a JSON string (``usage_session.state``) or a
+    ``repr`` (an ``OSError``'s message) writes it. On POSIX the three are one."""
+    spellings: set[str] = set()
+    for path in (home, home.resolve()):
+        spellings |= {str(path), path.as_posix(), str(path).replace("\\", "\\\\")}
+    for spelling in sorted(spellings, key=len, reverse=True):
+        text = re.sub(re.escape(spelling), "<home>", text, flags=_PATH_CASE)
+    return text
+
+
 def _in_home(value: Any, home: Path) -> Any:
     """A stored value with the run's own home said as ``<home>`` (each run has a copy of the
     template's), and the clock's readings in it masked."""
     if not isinstance(value, str):
         return value
-    for spelling in sorted({str(home.resolve()), str(home)}, key=len, reverse=True):
-        value = value.replace(spelling, "<home>")
-    return _NOW_IN.sub("<now>", _no_spans(value))
+    return _NOW_IN.sub("<now>", _no_spans(_home_said(value, home)))
 
 
 def _program(name: str) -> str:
-    """The console script ``name`` of this checkout's environment."""
-    found = shutil.which(name, path=str(Path(sys.executable).parent))
-    assert found, f"no {name} beside {sys.executable}"
+    """The console script ``name`` of this checkout's environment: in sysconfig's scripts
+    folder, ``<prefix>\\Scripts`` on Windows (CI's ``uv pip install --system``), beside the
+    interpreter in a POSIX environment, where the two are one."""
+    folders = (sysconfig.get_path("scripts"), str(Path(sys.executable).parent))
+    found = shutil.which(name, path=os.pathsep.join(folders))
+    assert found, f"no {name} in {' or '.join(folders)}"
     return found
 
 
@@ -298,13 +318,10 @@ def _hook_env(base: dict[str, str], home: Path, extra: dict[str, str]) -> dict[s
 
 
 def _normal(text: bytes, home: Path) -> bytes:
-    """``text`` with the run's own home, which each run has a copy of, said as ``<home>``,
-    and its spans from now masked (:data:`_SPAN`)."""
-    for spelling in {str(home.resolve()), str(home)}:
-        text = text.replace(spelling.encode(), b"<home>")
-    return _SPAN.sub("<span>", text.decode("utf-8", "surrogateescape")).encode(
-        "utf-8", "surrogateescape"
-    )
+    """``text`` with the run's own home, which each run has a copy of, said as ``<home>``
+    (:func:`_home_said`), and its spans from now masked (:data:`_SPAN`)."""
+    said = _home_said(text.decode("utf-8", "surrogateescape"), home)
+    return _SPAN.sub("<span>", said).encode("utf-8", "surrogateescape")
 
 
 class Brain:
@@ -522,7 +539,9 @@ def test_the_allowlist_is_what_the_hooks_read_and_nothing_else(parity: dict[str,
         "ENV_READ_ELSEWHERE where they are read"
     )
     assert set(brain.ENV_READ_ELSEWHERE) <= set(brain.ENV_NAMES)
-    assert {"AISQUARE_ROLE", "CLAUDE_CONFIG_DIR", "AISQUARE_FLEET_AGENT", "HOME"} <= read
+    # The user's home, as Path.home() reads it: HOME, and on Windows USERPROFILE (ntpath).
+    user_home = "USERPROFILE" if sys.platform == "win32" else "HOME"
+    assert {"AISQUARE_ROLE", "CLAUDE_CONFIG_DIR", "AISQUARE_FLEET_AGENT", user_home} <= read
     # The fleet's real paths ran, a traced session's join and a slot agent's Stop: what they
     # read is read here (review #2562 round 2: the list had dropped these five).
     assert {
