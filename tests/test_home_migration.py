@@ -10,6 +10,7 @@ boundary on #31). POSIX only where the fake runs: it is a script, as the real on
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -19,7 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1208,6 +1209,92 @@ def test_a_service_that_will_not_stop_refuses_the_move_and_nothing_moves(
     assert _tree(old_home) == before and not os.path.lexists(user_home / ".rlx")
 
 
+def test_a_drop_of_the_cache_stops_the_service_and_starts_it_again_refused_or_not(
+    old_home: Path, user_home: Path, a_service: list[str]
+) -> None:
+    """The reviewer's m4: untested, a drop that never stopped the service, or never started it
+    again, survived. It stops it, as the move does, and starts it again after, refused or not."""
+    assert home_migration.move_home() is not None
+    a_service.clear()
+    scratch = paths.cache_dir() / "scratch.txt"
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    scratch.write_text("a session's", encoding="utf-8")
+    named = _an_instance(user_home / ".rlx")
+
+    with pytest.raises(home_migration.MigrationRefused) as refused:
+        home_migration.drop_cache()
+
+    assert any(named in line for line in refused.value.running) and scratch.exists()
+    assert a_service == ["stop", "start"]
+    for record in paths.instances_dir().iterdir():
+        record.unlink()
+    a_service.clear()
+
+    home_migration.drop_cache()
+
+    assert a_service == ["stop", "start"] and not paths.cache_dir().exists()
+
+
+def test_a_service_that_will_not_stop_refuses_the_drop_saying_only_that(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's n2: the refusal read "the cache was not dropped: the rlx service would not
+    stop: the home was not moved", the move's words in a drop made after it."""
+    from aisquare.services import service_host
+
+    assert home_migration.move_home() is not None
+    scratch = paths.cache_dir() / "scratch.txt"
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    scratch.write_text("kept", encoding="utf-8")
+
+    def stuck(*, timeout: float = 0) -> bool:
+        raise service_host.ServiceError("the rlx service (pid 7) did not stop within 30 s")
+
+    monkeypatch.setattr(service_host, "stop_service", stuck)
+
+    result = CliRunner().invoke(app, ["move-home", "--drop-cache"])
+
+    said = result.output.replace("\n", " ")
+    assert result.exit_code == 1 and scratch.exists(), said
+    assert "the cache was not dropped: the rlx service (pid 7) did not stop within 30 s" in said
+    assert "not moved" not in said
+
+
+def test_a_drop_of_the_cache_holds_the_home_s_move_lock_and_removes_it_renamed_aside(
+    old_home: Path, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer's n4: the drop took no lock, so a move or a second drop could run beside
+    it; and an agent started between the quiet check and the removal had its scratch removed
+    with the rest. The drop holds the move's lock, and renames the cache aside before removing
+    it, so a cache made after the check is not reached."""
+    assert home_migration.move_home() is not None
+    cache = paths.cache_dir()
+    (cache / "old").mkdir(parents=True, exist_ok=True)
+    (cache.with_name("cache.dropping-1")).mkdir()  # one a crashed drop left aside
+
+    with (
+        home_migration._one_at_a_time(home_migration._move_lock_key()),
+        pytest.raises(home_migration.MigrationRefused, match="a drop of its cache"),
+    ):
+        home_migration.drop_cache()
+    assert (cache / "old").exists()
+
+    real = shutil.rmtree
+    made_after_the_check: list[Path] = []
+
+    def rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+        if not made_after_the_check and Path(path).name == f"cache.dropping-{os.getpid()}":
+            (cache / "new-session").mkdir(parents=True)  # an agent's, after the rename
+            made_after_the_check.append(cache / "new-session")
+        real(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    home_migration.drop_cache()
+
+    assert (cache / "new-session").is_dir() and not (cache / "old").exists()
+    assert [p.name for p in cache.parent.iterdir() if p.name.startswith("cache.")] == []
+
+
 def test_an_upgrade_starts_the_service_again_only_once_the_home_has_moved(
     old_home: Path, user_home: Path, installed: Installed, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1798,6 +1885,41 @@ def test_before_the_move_a_variable_naming_aisquare_reads_it_as_it_is(
     assert paths.db_path() == old_home / paths.OLD_STORE
 
 
+@pytest.mark.parametrize("variable", [paths.RLX_HOME_ENV, paths.HOME_ENV_VAR])
+@pytest.mark.parametrize("place", ["fresh", "a-link-to-nothing"])
+def test_a_variable_naming_aisquare_is_read_as_no_variable_on_a_fresh_or_purged_home(
+    user_home: Path,
+    keychain: FakeSecurity,
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    place: str,
+) -> None:
+    """The reviewer's MAJOR 1, round 4: such a variable was read by a rule of its own. On a
+    machine with no home yet rlx made ``~/.aisquare`` in the new layout, which a process
+    without the variable read as old (a split store). And once ``uninstall --purge`` removed
+    ``~/.rlx`` and left ``~/.aisquare`` linking to it, the fleet's ``RLX_HOME=~/.rlx`` named
+    ``~/.aisquare`` through the link, and every command refused it as in the way. It is read as
+    no variable: the home a plain process reads, before a command and after it."""
+    old, new = user_home / ".aisquare", user_home / ".rlx"
+    values = [str(old), f"{old}/"]
+    if place == "a-link-to-nothing":
+        old.symlink_to(new)  # what the purge leaves once the home has moved
+        values.append(str(new))  # every fleet window's RLX_HOME
+    plain = paths.home_of({})
+    assert plain == (new, paths.NEW)
+    runner = CliRunner()
+
+    for value in values:
+        monkeypatch.setenv(variable, value)
+        assert paths.home_of() == plain, value
+        for command in (["fleet", "ls"], ["accounts", "list"]):
+            result = runner.invoke(app, command)
+            assert result.exit_code == 0, (value, command, result.output)
+        assert paths.home_of({}) == plain == paths.home_of(), value
+        assert paths.db_path().is_relative_to(new), value
+    assert old.is_symlink() if place == "a-link-to-nothing" else not os.path.lexists(old)
+
+
 def test_the_cache_is_never_dropped_while_anything_runs_on_the_home(
     old_home: Path, user_home: Path
 ) -> None:
@@ -1889,29 +2011,130 @@ def test_upgrade_check_on_a_home_part_way_through_its_move_says_so(
 # --- round 4, the reviewer's #2295 -----------------------------------------------------------
 
 
-def test_every_exec_of_an_agent_in_the_cli_records_itself_first() -> None:
-    """MAJOR 1: `accounts run` and `team spawn --exec` exec'd agents on managed slots with no
-    record, and the move ran under them. Every os.execve/os.execvpe of cli/ is in a function
-    that calls launchers.execing, so the next path to exec an agent is held to it."""
+#: Every way ``os`` replaces a process.
+OS_EXECS = frozenset(
+    {"execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"}
+)
+
+#: Each ``os.exec*`` of the package that execs no agent, by module and function, and why it
+#: needs no record (the manager's m1 on #31: allowed by name, with the reason).
+EXECS_OF_NO_AGENT = {
+    "cli/fleet.py::_exec_attach": "`tmux attach`: a client of the fleet's tmux server, whose "
+    "panes the quiet check reads from the server itself",
+    "core/selfcli.py::exec_self": "rlx itself on this install (the app's Update and Uninstall, "
+    "`upgrade --reopen`), which the move's guard and lock hold to as any rlx command",
+    "services/install_route.py::exec_replace": "the package manager removing rlx, "
+    "uninstall's last step: no agent and no rlx left running",
+}
+
+
+def _execs_with_no_record_first(package: Path) -> list[str]:
+    """Each ``os.exec*`` under ``package`` with no ``launchers.execing`` before it in its own
+    function, but those :data:`EXECS_OF_NO_AGENT` names; and any ``from os import exec*``,
+    which would hide one from this reading."""
     import ast
 
     found: list[str] = []
-    for module in sorted(
-        (Path(__file__).resolve().parents[1] / "src" / "aisquare" / "cli").rglob("*.py")
-    ):
+    for module in sorted(package.rglob("*.py")):
+        name = module.relative_to(package).as_posix()
         tree = ast.parse(module.read_text(encoding="utf-8"))
-        for function in ast.walk(tree):
-            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "os"
+                and any(alias.name in OS_EXECS for alias in node.names)
+            ):
+                found.append(f"{name}: from os import {[a.name for a in node.names]}")
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
-            calls = [n for n in ast.walk(function) if isinstance(n, ast.Call)]
-            names = {
-                f"{c.func.value.id}.{c.func.attr}"
-                for c in calls
-                if isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name)
-            }
-            if names & {"os.execve", "os.execvpe"} and "launchers.execing" not in names:
-                found.append(f"{module.name}::{function.name}")
-    assert found == []
+            calls = sorted(
+                (call for call in ast.walk(node) if isinstance(call, ast.Call)),
+                key=lambda call: (call.lineno, call.col_offset),
+            )
+            recorded = False
+            for call in calls:
+                func = call.func
+                if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)):
+                    continue
+                if (func.value.id, func.attr) == ("launchers", "execing"):
+                    recorded = True
+                elif func.value.id == "os" and func.attr in OS_EXECS and not recorded:
+                    where = f"{name}::{node.name}"
+                    if where not in EXECS_OF_NO_AGENT:
+                        found.append(f"{where}: os.{func.attr} at line {call.lineno}")
+    return found
+
+
+def _execing_commands(package: Path) -> dict[str, str]:
+    """Each ``launchers.execing`` call under ``package``, by module and function: the command
+    it records (``launch`` when it names none)."""
+    import ast
+
+    found: dict[str, str] = {}
+    for module in sorted(package.rglob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for call in ast.walk(node):
+                func = call.func if isinstance(call, ast.Call) else None
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and (func.value.id, func.attr) == ("launchers", "execing")
+                ):
+                    continue
+                given = [k.value for k in call.keywords if k.arg == "command"]
+                command = given[0].value if given and isinstance(given[0], ast.Constant) else None
+                found[f"{module.relative_to(package).as_posix()}::{node.name}"] = str(
+                    command or "launch"
+                )
+    return found
+
+
+def test_every_exec_of_an_agent_records_itself_first() -> None:
+    """MAJOR 1: `accounts run` and `team spawn --exec` exec'd agents on managed slots with no
+    record, and the move ran under them. The reviewer's m1: the guard read only os.execve and
+    os.execvpe, so an execvp with no record passed, and took a record anywhere in the function.
+    Every os.exec* of the package now comes after launchers.execing in its own function, but
+    the three that exec no agent, each named with why."""
+    package = Path(__file__).resolve().parents[1] / "src" / "aisquare"
+    assert _execs_with_no_record_first(package) == []
+    for where in EXECS_OF_NO_AGENT:
+        module, function = where.split("::")
+        assert f"def {function}(" in (package / module).read_text(encoding="utf-8"), where
+    # The reviewer's n1: each names the command that started it ("rlx launch of sleep" was an
+    # `accounts run`). A new path that execs an agent is added here, with its own name.
+    assert _execing_commands(package) == {
+        "cli/launch.py::_exec": "launch",
+        "cli/accounts.py::_exec": "accounts run",
+        "cli/team.py::spawn": "team spawn",
+    }
+
+
+@pytest.mark.parametrize(
+    ("body", "caught"),
+    [
+        ("    os.execvp(argv[0], argv)\n", True),
+        ("    os.execl('/bin/agent', 'agent')\n", True),
+        ("    os.execvp(argv[0], argv)\n    launchers.execing('claude')\n", True),
+        ("    launchers.execing('claude')\n    os.execvp(argv[0], argv)\n", False),
+    ],
+    ids=["execvp-with-no-record", "execl-with-no-record", "a-record-after", "a-record-before"],
+)
+def test_the_exec_guard_catches_any_exec_with_no_record_before_it(
+    tmp_path: Path, body: str, caught: bool
+) -> None:
+    """The reviewer's surviving mutant: an execvp in `team spawn` with no record."""
+    (tmp_path / "cli").mkdir()
+    (tmp_path / "cli" / "team.py").write_text(f"def _spawn(argv):\n{body}", encoding="utf-8")
+    (tmp_path / "cli" / "other.py").write_text("from os import execv\n", encoding="utf-8")
+
+    found = _execs_with_no_record_first(tmp_path)
+
+    assert ("cli/team.py::_spawn" in " ".join(found)) is caught, found
+    assert any("from os import" in why for why in found), found
 
 
 def test_an_agent_accounts_run_execs_is_counted_by_the_quiet_check(
@@ -1938,7 +2161,8 @@ def test_an_agent_accounts_run_execs_is_counted_by_the_quiet_check(
             time.sleep(0.05)
         with pytest.raises(home_migration.MigrationRefused) as refused:
             home_migration.move_home()
-        assert any(f"(pid {process.pid})" in line for line in refused.value.running)
+        named = f"rlx accounts run of sleep (pid {process.pid})"
+        assert any(line.startswith(named) for line in refused.value.running), refused.value
     finally:
         process.kill()
         process.wait()
@@ -1947,25 +2171,84 @@ def test_an_agent_accounts_run_execs_is_counted_by_the_quiet_check(
 #: Nested past what ``json.loads`` takes: a ``RecursionError``, which is no ``ValueError``.
 TOO_DEEP = b"[" * 100_000 + b"]" * 100_000
 
+#: What an open move's journal holds, readable.
+OPEN_JOURNAL = json.dumps({"version": 1, "steps": ["backup"]})
+
+
+def _bytes(body: bytes) -> Callable[[Path, pytest.MonkeyPatch], None]:
+    def make(journal: Path, patch: pytest.MonkeyPatch) -> None:
+        journal.write_bytes(body)
+
+    return make
+
+
+def _a_folder(journal: Path, patch: pytest.MonkeyPatch) -> None:
+    journal.mkdir()
+
+
+def _a_link_to_nothing(journal: Path, patch: pytest.MonkeyPatch) -> None:
+    journal.symlink_to(journal.with_name("gone.json"))
+
+
+def _mode_000(journal: Path, patch: pytest.MonkeyPatch) -> None:
+    if getattr(os, "geteuid", lambda: 1)() == 0:
+        pytest.skip("root opens any file")
+    journal.write_text(OPEN_JOURNAL, encoding="utf-8")
+    journal.chmod(0)
+
+
+def _an_io_error(journal: Path, patch: pytest.MonkeyPatch) -> None:
+    """A disk that fails the read: each reader of the journal reads it through ``read_text``."""
+    journal.write_text(OPEN_JOURNAL, encoding="utf-8")
+    real = Path.read_text
+
+    def read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == journal:
+            raise OSError(errno.EIO, os.strerror(errno.EIO), str(self))
+        return real(self, *args, **kwargs)
+
+    patch.setattr(Path, "read_text", read_text)
+
 
 @pytest.mark.parametrize("moved", [False, True], ids=["before-the-move", "after-the-move"])
 @pytest.mark.parametrize(
-    ("body", "said"),
+    ("make", "said"),
     [
-        (b"{not json", "cannot read"),
-        (b"{}", "cannot read"),
-        (json.dumps({"version": 99, "steps": ["backup"]}).encode(), "a newer rlx's move"),
-        (b"\xff\xfe\xfa", "cannot read (UnicodeDecodeError)"),
+        (_bytes(b"{not json"), "cannot read"),
+        (_bytes(b"{}"), "cannot read"),
+        (_bytes(json.dumps({"version": 99, "steps": ["backup"]}).encode()), "a newer rlx's move"),
+        (_bytes(b"\xff\xfe\xfa"), "cannot read (UnicodeDecodeError)"),
         (
-            b'{"version": 1, "steps": ["backup"], "old_root": "\xff\xfe"}',
+            _bytes(b'{"version": 1, "steps": ["backup"], "old_root": "\xff\xfe"}'),
             "cannot read (UnicodeDecodeError)",
         ),
-        (TOO_DEEP, "cannot read (RecursionError)"),
+        (_bytes(TOO_DEEP), "cannot read (RecursionError)"),
+        (_a_folder, "cannot read (Is a directory)"),
+        (_a_link_to_nothing, "cannot read (a link to nothing)"),
+        (_mode_000, "cannot read (Permission denied)"),
+        (_an_io_error, f"cannot read ({os.strerror(errno.EIO)})"),
     ],
-    ids=["garbage", "no-journal-shape", "a-newer-rlx", "bad-utf8", "bad-utf8-in-json", "deep"],
+    ids=[
+        "garbage",
+        "no-journal-shape",
+        "a-newer-rlx",
+        "bad-utf8",
+        "bad-utf8-in-json",
+        "deep",
+        "a-folder",
+        "a-link-to-nothing",
+        "mode-000",
+        "an-io-error",
+    ],
 )
 def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywhere(
-    old_home: Path, user_home: Path, installed: Installed, body: bytes, said: str, moved: bool
+    old_home: Path,
+    user_home: Path,
+    installed: Installed,
+    monkeypatch: pytest.MonkeyPatch,
+    make: Callable[[Path, pytest.MonkeyPatch], None],
+    said: str,
+    moved: bool,
 ) -> None:
     """MAJOR 2: the guard read such a journal as open and the move read it as none, so every
     command refused and the move said there was nothing to do: locked out for good. One reading
@@ -1973,12 +2256,15 @@ def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywher
 
     Round 4's tester: bytes that are not UTF-8, or nesting too deep to parse, escaped that
     reading as a traceback from every command, the hook's exit 1 failing each of Claude Code's
-    hook events, in the old home and in the moved one alike."""
+    hook events, in the old home and in the moved one alike. And the manager's ruling on N2
+    (#2948): anything at the journal's path that cannot be read is unfinished, in both readers:
+    a folder, a link to nothing, a file that cannot be opened, a read that fails."""
     if moved:
         assert home_migration.move_home() is not None
     journal = (user_home / ".rlx" if moved else old_home).joinpath(*paths.MOVE_JOURNAL)
     journal.parent.mkdir(parents=True, exist_ok=True)
-    journal.write_bytes(body)
+    journal.unlink(missing_ok=True)
+    make(journal, monkeypatch)
     runner = CliRunner()
 
     for command in (
@@ -1992,7 +2278,7 @@ def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywher
         assert result.exit_code == 1, (command, result.output)
         assert isinstance(result.exception, SystemExit), (command, result.exception)
         out = result.output.replace("\n", " ")
-        assert said in out and "aside" in out, (command, out)
+        assert said in out and "aside" in out and "A journal rlx cannot read" in out, (command, out)
     as_json = runner.invoke(app, ["--json", "status"])
     assert as_json.exit_code == 1 and json.loads(as_json.stdout)["error"] == "home_mid_move"
     check = runner.invoke(app, ["upgrade", "--check"])
@@ -2004,40 +2290,53 @@ def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywher
     assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
 
 
-def test_a_journal_that_cannot_be_opened_is_unfinished_and_one_not_there_is_none(
+def test_nothing_at_the_journal_s_path_or_a_path_that_cannot_be_looked_at_is_no_move(
     old_home: Path, user_home: Path
 ) -> None:
-    """A journal there that cannot be opened is refused with the way out, as one that cannot be
-    parsed is, and a hook says nothing. One not there is none, and so is one behind a folder
-    that cannot be looked into: every command would otherwise blame a journal for it."""
+    """The manager's ruling on N2 (#2948): nothing there is no move, and so is a path behind a
+    folder this user cannot enter. Read as unfinished, it refused every command on such a home,
+    `uninstall` too, which keeps it and must never raise (round 19 of #257,
+    test_lifecycle_uninstall)."""
     if getattr(os, "geteuid", lambda: 1)() == 0:
-        pytest.skip("root opens any file")
+        pytest.skip("root looks into any folder")
     assert paths.unfinished_home_move() is None
     (user_home / "no-backups-folder").mkdir()
     (user_home / "no-backups-folder" / "backups").write_text("", encoding="utf-8")
     assert paths.unfinished_home_move_at(user_home / "no-backups-folder") is None
     journal = old_home.joinpath(*paths.MOVE_JOURNAL)
     journal.parent.mkdir(parents=True)
-    journal.write_text(json.dumps({"version": 1, "steps": ["backup"]}), encoding="utf-8")
-    journal.chmod(0)
-    runner = CliRunner()
-    try:
-        assert paths.unfinished_home_move() == journal
-        result = runner.invoke(app, ["fleet", "ls"])
-        hook = runner.invoke(
-            app, ["hook", "session-start"], input=json.dumps({"session_id": SESSION})
-        )
-    finally:
-        journal.chmod(0o600)
-
-    out = result.output.replace("\n", " ")
-    assert result.exit_code == 1 and "cannot read (Permission denied)" in out and "aside" in out
-    assert hook.exit_code == 0 and hook.output == ""
-    journal.parent.chmod(0)  # a folder that cannot be looked into: the home's problem, no move's
+    journal.write_text(OPEN_JOURNAL, encoding="utf-8")
+    journal.parent.chmod(0)
     try:
         assert paths.unfinished_home_move() is None
+        assert CliRunner().invoke(app, ["fleet", "ls"]).exit_code == 0
     finally:
         journal.parent.chmod(0o700)
+    assert paths.unfinished_home_move() == journal, "once it can be looked at, it is open"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["uninstall"],
+        ["fleet", "reap", "--finished", "--dry-run"],
+        ["project", "fresh", "--dry-run"],
+    ],
+    ids=["uninstall-not-dry", "another-dry-run", "a-third-dry-run"],
+)
+def test_mid_move_only_uninstall_s_dry_run_passes_as_only_asking(
+    old_home: Path, user_home: Path, command: list[str]
+) -> None:
+    """The reviewer's m4: a guard that let every --dry-run through, or every uninstall, was
+    not caught. Only uninstall's dry run (and a help page) asks without changing a file."""
+    with pytest.MonkeyPatch.context() as crash:
+        _crash_in(crash, "rewrite", "before")
+        with pytest.raises(Crash):
+            home_migration.move_home()
+
+    result = CliRunner().invoke(app, command, input="n\n")
+
+    assert result.exit_code == 1 and "part-way through its move" in result.output, result.output
 
 
 def test_mid_move_help_and_uninstall_s_dry_run_still_answer_and_a_dry_run_says_part_way(

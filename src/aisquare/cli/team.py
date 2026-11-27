@@ -761,7 +761,7 @@ def spawn(
             # It becomes its agent: recorded, so the home's move does not run under it (#31).
             from aisquare.core import launchers
 
-            launchers.execing(Path(argv[0]).stem)
+            launchers.execing(Path(argv[0]).stem, command="team spawn")
         os.execvpe(argv[0], argv, env)
     if not get_state().json_output:
         stdout_console().print(f"  run it in the role's terminal:\n  {command}", markup=False)

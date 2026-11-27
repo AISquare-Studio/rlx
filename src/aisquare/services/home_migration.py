@@ -294,8 +294,8 @@ def journal_refusal(path: Path) -> str | None:
         # Read before its shape: a newer release's journal may hold what this one lacks.
         return (
             f"a newer rlx's move of this home is unfinished (its journal is version "
-            f"{version}): finish it with that release, or move {paths.shown(path)} aside once "
-            "the home is whole"
+            f"{version}): finish it with that release, or, if the home shows the move finished "
+            f"or nothing moved ({JOURNAL_DOCS}), move {paths.shown(path)} aside"
         )
     try:
         Journal.model_validate_json(text)
@@ -304,12 +304,21 @@ def journal_refusal(path: Path) -> str | None:
     return None
 
 
+#: Where a person reads how to tell, from the home itself, whether a move finished.
+JOURNAL_DOCS = "docs/home-layout.md, “A journal rlx cannot read”"
+
+
 def _unreadable_journal(path: Path, exc: Exception) -> str:
-    why = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+    if os.path.islink(path) and not os.path.exists(path):  # neither raises
+        why = "a link to nothing"
+    elif isinstance(exc, OSError) and exc.strerror:
+        why = exc.strerror
+    else:
+        why = type(exc).__name__
     return (
         f"the home's move left a journal this rlx cannot read ({why}): {paths.shown(path)}. "
-        "Check that the home is whole (docs/home-layout.md), then move that file aside, and "
-        "rlx runs again"
+        f"If the home shows the move finished or nothing moved ({JOURNAL_DOCS} says how to "
+        "tell), move that file aside, and rlx runs again"
     )
 
 
@@ -615,7 +624,9 @@ def _one_at_a_time(old_root: str) -> Iterator[None]:
         with holding(lock, wait_s=0, mode=0o600):
             yield
     except TimeoutError:
-        raise MigrationRefused("another move of this home is running") from None
+        raise MigrationRefused(
+            "another move of this home, or a drop of its cache, is running"
+        ) from None
 
 
 def _names_the_default_home(environment: Mapping[str, str] | None = None) -> bool:
@@ -696,7 +707,7 @@ def _stop_the_service() -> bool:
     try:
         return service_host.stop_service()
     except service_host.ServiceError as exc:
-        raise MigrationRefused(f"{exc}: the home was not moved") from exc
+        raise MigrationRefused(str(exc)) from exc  # the caller says what it did not do
 
 
 def _start_the_service_again() -> str:
@@ -1533,8 +1544,21 @@ def shown_size(size: int) -> str:
 
 def drop_cache() -> None:
     """:func:`_drop_the_cache`, for the commands: ``rlx move-home --drop-cache`` and the offer
-    after a move (``rlx upgrade``)."""
-    _drop_the_cache()
+    after a move (``rlx upgrade``). It holds the home's move lock, as a move does, so neither a
+    move nor another drop runs beside it (the reviewer's n4, round 4); a move's own drop is
+    made under the lock the move holds."""
+    with _one_at_a_time(_move_lock_key()):
+        _drop_the_cache()
+
+
+def _move_lock_key() -> str:
+    """What a move of this process's home holds its lock by (:func:`_one_at_a_time`): the
+    home's root before any move, ``~/.aisquare`` for the default home and the folder a
+    variable names for any other, as :func:`planned_move` plans it."""
+    named = paths.named_home()
+    if named is not None and not _names_the_default_home():
+        return str(named)
+    return str(Path.home() / paths.OLD_HOME_NAME)
 
 
 def _drop_the_cache() -> None:
@@ -1555,10 +1579,27 @@ def _drop_the_cache() -> None:
             raise MigrationRefused(
                 f"the cache holds the scratch of what runs ({len(running)} thing(s))", running
             )
-        shutil.rmtree(paths.cache_dir(), ignore_errors=True)
+        _remove_the_cache(paths.cache_dir())
     finally:
         if stopped:
             _start_the_service_again()
+
+
+def _remove_the_cache(cache: Path) -> None:
+    """``cache`` renamed aside, then removed: an agent that starts once the home was found quiet
+    makes a cache of its own, which the removal never reaches, so what goes unseen is one
+    rename, not the walk of the whole cache. Where the rename is refused (Windows, a file open
+    in it) it is removed where it is. One a crash left aside goes too."""
+    for left in cache.parent.glob(f"{cache.name}.dropping-*"):
+        shutil.rmtree(left, ignore_errors=True)
+    aside = cache.with_name(f"{cache.name}.dropping-{os.getpid()}")
+    try:
+        os.rename(cache, aside)
+    except FileNotFoundError:
+        return
+    except OSError:
+        aside = cache
+    shutil.rmtree(aside, ignore_errors=True)
 
 
 def said_of_move(moved: Moved) -> list[str]:

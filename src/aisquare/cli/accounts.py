@@ -1688,7 +1688,7 @@ def _exec(binary: str, argv: list[str], env: dict[str, str]) -> None:
     if sys.platform != "win32":
         from aisquare.core import launchers
 
-        launchers.execing(Path(binary).stem)
+        launchers.execing(Path(binary).stem, command="accounts run")
     os.execve(binary, argv, env)
 
 

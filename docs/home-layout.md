@@ -110,7 +110,8 @@ opens has both) still means the default home: it moves to `~/.rlx` and is linked
 variable. After the move, a variable that still names `~/.aisquare` (a shell's startup file, a
 shell started from a fleet window) means `~/.rlx`, with every account's folder spelled from it,
 so each account reads signed in. It does so by any spelling of `~/.aisquare`: a link to it, a
-trailing slash, or resolved.
+trailing slash, or resolved. Such a variable is read in every way as no variable: on a machine
+with no home yet rlx makes `~/.rlx`, and a `~/.aisquare` left as a link to nothing is passed by.
 
 In the app, the ⬆ row under Settings offers **Move rlx's home** while the home is old, even when
 no newer release is out. Its *Restart & move* closes rlx, moves the home and reopens rlx. An
@@ -131,14 +132,17 @@ The move refuses, and names each thing it found, while any of these run on the h
 - a window on rlx's tmux server, or on a server a launch record names;
 - the watcher;
 - Remote, served from another process;
-- an agent started by rlx 0.10.2 or later with `rlx launch`, `rlx accounts run` or
-  `rlx team spawn --exec`, on any account. One started by 0.10.1 left no record of itself, so
-  the move cannot see it: stop such agents first.
+- an agent started by rlx 0.10.2 or later with `rlx launch`, on any account and any system,
+  or with `rlx accounts run` or `rlx team spawn --exec` on macOS or Linux.
 
 Stop them, then run `rlx upgrade` again. Nothing is touched until the home is quiet. The app's
 Move rlx's home says what runs before it closes rlx.
 
-The rlx service (`rlx service`, [service.md](service.md)) is not one of them: the move stops it
+Some agents leave no record, so the move cannot see them: stop them first. On Windows,
+`rlx accounts run` and `rlx team spawn --exec` start the agent and leave no record. An agent
+started by rlx 0.10.1, by any of the three commands, left none either.
+
+The rlx service (`rlx service`, [service.md](service.md)) is not in that list: the move stops it
 first and starts it again afterwards, on the home where it then is. A service that does not stop
 refuses the move.
 
@@ -202,6 +206,22 @@ move: finish that move with the release that began it, or check the home and mov
 aside. A journal this rlx cannot read includes one that cannot be opened, one whose bytes are
 not UTF-8, and one too deeply nested to parse. Otherwise a command would make a new, empty
 store where the old one was, and the move could not be finished.
+
+### A journal rlx cannot read
+
+When the move's journal (`backups/home-migration/journal.json`) cannot be read, rlx cannot tell
+how far that move got, so every command stops and names the file. The home itself tells:
+
+- **The default home.** The move finished if `~/.aisquare` is a link to `~/.rlx` and `~/.rlx`
+  holds `rlx.db`. Nothing moved if `~/.aisquare` is a folder that holds `context.db` and there is
+  no `~/.rlx`.
+- **A home `RLX_HOME` or `AISQUARE_HOME` names** (moved in place). The move finished if the home
+  holds `rlx.db` and none of `context.db`, `log/`, `launch-seals/`, `instances/` or
+  `claude-accounts/` at its top. Nothing moved if it holds `context.db` and no `rlx.db`.
+
+In either of those cases, move the journal aside and rlx runs again. Any other mix is a move that
+stopped part-way. Leave the journal's folder as it is: it holds the store as it was before the
+move (`context.db`). Then run the release that began the move, which reads its own journal.
 
 An install rlx does not upgrade itself (Homebrew, pipx) has its home moved by `rlx upgrade`
 too, which then says how that install upgrades.

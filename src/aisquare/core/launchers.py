@@ -59,11 +59,14 @@ class Launcher:
     started_at: datetime
     execed: bool = False
     """It became its agent (POSIX exec) rather than wait on it: :func:`exec_sessions`'."""
+    command: str = "launch"
+    """The command that started it, as typed after the program's name: ``launch``,
+    ``accounts run`` or ``team spawn``."""
 
     @property
     def label(self) -> str:
         """How a refusal names it: ``aisquare launch of claude (pid 4242)``."""
-        return f"{prog.word()} launch of {self.agent} (pid {self.pid})"
+        return f"{prog.word()} {self.command} of {self.agent} (pid {self.pid})"
 
 
 def registry_dir() -> Path:
@@ -104,6 +107,7 @@ def _read(record: Path) -> Launcher | None:
             agent=str(data["agent"]),
             started_at=datetime.fromisoformat(str(data["started_at"])),
             execed=data.get("exec") is True,
+            command=str(data.get("command") or "launch"),
         )
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
@@ -144,9 +148,10 @@ def exec_sessions() -> tuple[Launcher, ...]:
     )
 
 
-def execing(agent: str) -> None:
-    """Record this process as the ``agent`` it is about to become (POSIX exec): its lock taken,
-    and its descriptor made inheritable, so the agent holds it for as long as it runs. Dead
+def execing(agent: str, *, command: str = "launch") -> None:
+    """Record this process as the ``agent`` it is about to become (POSIX exec), started by
+    ``command`` (:attr:`Launcher.command`): its lock taken, and its descriptor made
+    inheritable, so the agent holds it for as long as it runs. Dead
     records of earlier ones (their lock free, a minute old) are cleared first. A home that
     cannot be written costs the record, never the launch."""
     import time
@@ -175,6 +180,7 @@ def execing(agent: str) -> None:
             "agent": agent,
             "started_at": datetime.now(UTC).isoformat(),
             "exec": True,
+            "command": command,
         }
         atomic.write_replacing(record, json.dumps(body) + "\n", durable=False, owner_only=True)
     except OSError:

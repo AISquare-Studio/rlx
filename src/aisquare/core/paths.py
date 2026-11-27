@@ -18,6 +18,7 @@ A home from before it (``~/.aisquare``) keeps the layout it was made in until H2
 
 WHERE the home is: ``$RLX_HOME``, else ``$AISQUARE_HOME`` (the name before it, still honoured),
 else ``~/.rlx`` if it exists, else ``~/.aisquare`` if it exists, else ``~/.rlx`` (a new user).
+A variable naming ``~/.aisquare`` itself, by any spelling, is read as no variable (#31).
 HOW it is laid out: a home a variable names is laid out by what is in it (``rlx.db``: the new
 layout; ``context.db``, ``launch-seals/``, ``instances/``, ``log/``, an agent's ``*-accounts/`` and
 the old layout's other top-level names: the old one;
@@ -433,19 +434,17 @@ def home_of(
     directory, when it is not this one's (``core.instance_scan``)."""
     named = named_home(environment)
     base = Path.home() if user_home is None else user_home
-    if named is not None:
-        if not _names_the_old_default(named, base):
-            return named, layout_of(named)
-        # A variable naming ~/.aisquare itself, by any spelling (a link to it, a trailing slash,
-        # resolved): the default home, read as without the variable (#31; the fleet hands its
-        # windows the home by both names, and a shell rc may keep the old one). Once the move
-        # made ~/.rlx it is that home, every path spelled from it, so each slot's Keychain item
-        # is named as the move copied it (the tester's blocker 1, round 4). Before, ~/.aisquare
-        # keeps the layout its contents say, as a named home is read.
-        if (base / HOME_NAME).exists():
-            return base / HOME_NAME, NEW
-        old = base / OLD_HOME_NAME
-        return old, layout_of(old)
+    if named is not None and not _names_the_old_default(named, base):
+        return named, layout_of(named)
+    # No variable, or one naming ~/.aisquare itself by any spelling (a link to it, a trailing
+    # slash, resolved): the default home, read exactly as a process without the variable reads
+    # it (#31; the fleet hands its windows the home by both names, and a shell rc may keep the
+    # old one). Once the move made ~/.rlx it is that home, every path spelled from it, so each
+    # slot's Keychain item is named as the move copied it (the tester's blocker 1, round 4).
+    # Read by its own rule instead, such a variable made a NEW-layout ~/.aisquare on a fresh
+    # machine, which a plain process then read as OLD (a split store), and once `uninstall
+    # --purge` left ~/.aisquare a link to nothing it refused the default home as in the way
+    # (the reviewer's MAJOR 1, round 4).
     new = base / HOME_NAME
     if new.exists():
         return new, NEW
@@ -1138,21 +1137,22 @@ def unfinished_home_move_at(root: Path) -> Path | None:
     the move is done. One that cannot be read is unfinished: a crash cannot be ruled out, and
     the move says the way out (``services.home_migration.journal_refusal``).
 
-    Unreadable takes in bytes that are not UTF-8 (``UnicodeDecodeError``, a ``ValueError``),
-    nesting too deep for the parser (``RecursionError``) and a file there that cannot be
-    opened. Any of them let out of here was a traceback from every command, the hook too,
-    with no way out said (round 4's tester). A file not there is no journal, and so is one
-    behind a folder that cannot be looked into: that is the home's own problem, not a move's.
+    Anything at the journal's path that cannot be read as a journal is unfinished (the
+    manager's ruling on N2, #2948): bytes that are not UTF-8 (``UnicodeDecodeError``, a
+    ``ValueError``), nesting too deep for the parser (``RecursionError``), a folder, a link to
+    nothing, a file that cannot be opened (mode 000, an I/O error). Let out of here, the first
+    two were a traceback from every command and the hook (round 4's tester). Nothing there is
+    no move, and so is a path that cannot even be looked at, behind a folder this user cannot
+    enter: read as unfinished, it refused every command on such a home, ``uninstall`` too,
+    which keeps it and must never raise (round 19 of #257).
     """
     journal = root.joinpath(*MOVE_JOURNAL)
     try:
         text = journal.read_text(encoding="utf-8")
-    except (FileNotFoundError, NotADirectoryError):
-        return None
     except ValueError:
         return journal  # a journal that cannot be read is one that has not finished
     except OSError:
-        return journal if os.path.lexists(journal) else None
+        return journal if os.path.lexists(journal) else None  # lstat finds a dangling link
     import json
 
     try:
