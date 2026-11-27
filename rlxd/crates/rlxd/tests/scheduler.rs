@@ -39,17 +39,27 @@ fn link(root: &Path, scenario: &str) -> PathBuf {
 
 /// A home whose rlxd runs fake-claude `scenario` on a test clock at `clock`, not started.
 fn unstarted(scenario: &str, clock: &str) -> TestHome {
+    unstarted_with(scenario, clock, &[])
+}
+
+/// [`unstarted`], with `envs` set too.
+fn unstarted_with(scenario: &str, clock: &str, envs: &[(&str, &str)]) -> TestHome {
     let home = TestHome::new();
     let claude = link(home.root(), scenario);
     let config = home.root().join("claude-config");
     std::fs::create_dir_all(&config).unwrap();
     let user = home.root().join("user-home");
     std::fs::create_dir_all(&user).unwrap();
-    home.with_claude(claude)
+    let mut home = home
+        .with_claude(claude)
         .with_env("CLAUDE_CONFIG_DIR", config.to_str().unwrap())
         .with_env("HOME", user.to_str().unwrap())
         .with_env("USERPROFILE", user.to_str().unwrap())
-        .with_env("RLXD_TEST_CLOCK", clock)
+        .with_env("RLXD_TEST_CLOCK", clock);
+    for (name, value) in envs {
+        home = home.with_env(name, value);
+    }
+    home
 }
 
 /// [`unstarted`], started in gate dev mode, the test client paired as the app.
@@ -725,4 +735,215 @@ fn the_database_is_private() {
     for name in ["rlxd.db", "rlxd.db-wal", "rlxd.db-shm"] {
         assert_eq!(mode(&dir.join(name)), 0o600, "{name}");
     }
+}
+
+// --- job.put is idempotent (review #2687) -------------------------------------------------
+
+#[test]
+fn the_same_put_again_changes_nothing_and_an_every_minutes_grid_stays() {
+    let home = home_at("hello", T0);
+    let five = job("t1", json!({"every_minutes": 5}), "skip");
+    put(&home, &five);
+    for _ in 0..4 {
+        advance(&home, 60);
+        // The app pushes its jobs again on each connect.
+        put(&home, &five);
+    }
+    assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:05:00Z");
+    // A field other than the schedule keeps it too.
+    let mut loud = five.clone();
+    loud["loud"] = json!(true);
+    put(&home, &loud);
+    assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:05:00Z");
+    // Disabled, it has none; enabled again, its schedule starts from now.
+    loud["enabled"] = json!(false);
+    put(&home, &loud);
+    assert_eq!(listed(&home, "t1")["next_fire_at"], Value::Null);
+    loud["enabled"] = json!(true);
+    put(&home, &loud);
+    assert_eq!(listed(&home, "t1")["next_fire_at"], "2027-01-01T00:09:00Z");
+}
+
+#[test]
+fn an_owed_fire_survives_the_same_put_before_the_app_connects() {
+    let home = home_at("hello", T0);
+    let once = every_minute("t1", "once");
+    put(&home, &once);
+    advance(&home, 60);
+    // The app's reconnect: it pushes its job again, then connects.
+    put(&home, &once);
+    let back = seq(&home);
+    let _app = app(&home);
+    let seen = wait_until(&home, back, 10, "the owed fire", |e| {
+        !typed(e, "job.fired", Some("t1")).is_empty()
+    });
+    let fired = typed(&seen, "job.fired", Some("t1"));
+    assert_eq!(fired[0]["data"]["cause"], "catch_up");
+    assert_eq!(fired[0]["data"]["scheduled_for"], "2027-01-01T00:01:00Z");
+}
+
+#[test]
+fn a_fire_missed_while_down_survives_the_same_put_inside_its_wait() {
+    let (home, since) = missed("once");
+    // The same put, inside the 10 s wait: the missed fire is still decided.
+    put(&home, &every_minute("t1", "once"));
+    advance(&home, 11);
+    assert_eq!(skips(&events(&home, since), "t1"), ["app_absent"]);
+}
+
+// --- a fire's run, started once (review #2687) --------------------------------------------
+
+#[test]
+fn a_crash_while_a_fire_starts_never_fires_that_time_again() {
+    let mut home = unstarted_with("hello", T0, &[("RLXD_TEST_CRASH_AFTER_FIRE", "1")]);
+    start(&home);
+    put(&home, &every_minute("t1", "once"));
+    // An app, as a bare process: rlxd is gone by the time it ends.
+    let since = seq(&home).to_string();
+    let mut bare = home.spawn(&[
+        "events", "--as-app", "--topics", "daemon", "--since", &since, "--follow",
+    ]);
+    common::eventually("the app is connected", || home.app_clients() == 1);
+    // rlxd exits once the 00:01 fire's run has started, before it is noted.
+    let crashed = home.rlxd(&["call", "debug.clock_advance", r#"{"seconds":60}"#]);
+    assert_ne!(crashed.code(), Some(0), "{crashed:?}");
+    common::eventually("rlxd is gone", || {
+        home.rlxd(&["call", "status"]).code() == Some(3)
+    });
+    let _ = bare.kill();
+    let _ = bare.wait();
+    home.set_env("RLXD_TEST_CRASH_AFTER_FIRE", "");
+    home.set_env("RLXD_TEST_CLOCK", "2027-01-01T00:01:30Z");
+    start(&home);
+    let since = 0;
+    let _app = app(&home);
+    advance(&home, 30);
+    let seen = events(&home, since);
+    let fired: Vec<String> = typed(&seen, "job.fired", Some("t1"))
+        .iter()
+        .map(|e| e["data"]["scheduled_for"].as_str().unwrap().to_owned())
+        .collect();
+    // The 00:01 fire is the run that started before the crash, settled, not fired again.
+    assert_eq!(
+        fired,
+        ["2027-01-01T00:01:00Z", "2027-01-01T00:02:00Z"],
+        "{seen:#?}"
+    );
+    let runs = call(&home, "run.list", &json!({"job_id": "t1"}));
+    assert_eq!(runs["runs"].as_array().unwrap().len(), 2, "{runs:#}");
+}
+
+#[test]
+fn a_fire_whose_run_cannot_start_is_skipped_start_failed_with_its_code() {
+    let home = home_at_with("hello", T0, &[("RLXD_TEST_REFUSE_FIRES", "hook_not_found")]);
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("t1", "skip"));
+    advance(&home, 60);
+    let seen = events(&home, since);
+    let skipped = typed(&seen, "job.skipped", Some("t1"));
+    assert_eq!(skipped.len(), 1, "{seen:#?}");
+    assert_eq!(skipped[0]["data"]["reason"], "start_failed");
+    assert_eq!(skipped[0]["data"]["code"], "hook_not_found");
+    assert_valid("job-event.json", skipped[0]);
+    assert!(typed(&seen, "job.fired", None).is_empty());
+    assert_eq!(
+        refused(&home, "job.run_now", &json!({"job_id": "t1"})),
+        "hook_not_found"
+    );
+}
+
+fn home_at_with(scenario: &str, clock: &str, envs: &[(&str, &str)]) -> TestHome {
+    let home = unstarted_with(scenario, clock, envs);
+    start(&home);
+    home
+}
+
+#[test]
+fn a_rate_limit_warning_holds_no_fires() {
+    let real_now = jiff_now();
+    let home = home_at_with(
+        "rate-limit",
+        &real_now,
+        &[("FAKE_CLAUDE_RATE_STATUS", "allowed_warning")],
+    );
+    let since = seq(&home);
+    let _app = app(&home);
+    put(&home, &every_minute("t1", "skip"));
+    advance(&home, 60);
+    let run_id = typed(&events(&home, since), "job.fired", Some("t1"))[0]["data"]["run_id"].clone();
+    let seen = wait_until(&home, since, 30, "the run ends", |e| run_ended(e, &run_id));
+    let limited = seen
+        .iter()
+        .find(|e| e["type"] == "run.rate_limited" && e["data"]["run_id"] == run_id)
+        .unwrap_or_else(|| panic!("{seen:#?}"));
+    assert_eq!(limited["data"]["status"], "allowed_warning");
+    std::thread::sleep(Duration::from_millis(300));
+    advance(&home, 60);
+    let seen = events(&home, since);
+    assert!(skips(&seen, "t1").is_empty(), "{seen:#?}");
+    assert_eq!(typed(&seen, "job.fired", Some("t1")).len(), 2);
+}
+
+#[test]
+fn a_jobs_last_state_is_its_runs_running_and_then_after_a_restart_failed() {
+    let home = home_at("slow", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    let mut slow = every_minute("t1", "skip");
+    slow["run"]["prompt"] = json!("take your time");
+    put(&home, &slow);
+    advance(&home, 60);
+    let run_id = typed(&events(&home, since), "job.fired", Some("t1"))[0]["data"]["run_id"].clone();
+    wait_until(&home, since, 20, "the run starts", |e| {
+        e.iter()
+            .any(|e| e["type"] == "run.started" && e["data"]["run_id"] == run_id)
+    });
+    assert_eq!(listed(&home, "t1")["last_state"], "running");
+    drop(_app);
+    home.stop();
+    start(&home);
+    let after = listed(&home, "t1");
+    assert_eq!(after["last_run_id"], run_id);
+    assert_eq!(
+        after["last_state"], "failed",
+        "ended engine_restarted: {after:#}"
+    );
+}
+
+#[test]
+fn an_hourly_job_put_again_every_fifty_minutes_still_fires_every_hour() {
+    // The tester's repro (#2689): it fired 0 times in 10 hours when each put moved it.
+    let home = home_at("hello", T0);
+    let since = seq(&home);
+    let _app = app(&home);
+    let hourly = job("t1", json!({"every_minutes": 60}), "skip");
+    put(&home, &hourly);
+    // Ten minutes at a time, so each fire is decided on time; put again every fifty.
+    for step in 1..=60 {
+        advance(&home, 10 * 60);
+        if step % 5 == 0 {
+            put(&home, &hourly);
+        }
+    }
+    // 600 minutes: one decision at each of hours 1 to 10, the grid never moved by a put.
+    // (A fire's run may still be going an hour later on this clock: then that hour is
+    // skipped overlap, which is a decision on the grid too.)
+    let seen = events(&home, since);
+    let decided: Vec<String> = seen
+        .iter()
+        .filter(|e| {
+            (e["type"] == "job.fired" || e["type"] == "job.skipped") && e["data"]["job_id"] == "t1"
+        })
+        .map(|e| e["data"]["scheduled_for"].as_str().unwrap().to_owned())
+        .collect();
+    let hours: Vec<String> = (1..=10)
+        .map(|h| format!("2027-01-01T{h:02}:00:00Z"))
+        .collect();
+    assert_eq!(decided, hours, "{seen:#?}");
+    assert!(
+        skips(&seen, "t1").iter().all(|reason| reason == "overlap"),
+        "{seen:#?}"
+    );
+    assert!(!typed(&seen, "job.fired", Some("t1")).is_empty());
 }

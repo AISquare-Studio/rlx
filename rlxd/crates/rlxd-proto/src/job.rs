@@ -460,6 +460,9 @@ pub enum SkipReason {
     /// It came due while rlxd was down (or the clock jumped past it), and its `catch_up`
     /// is `skip`.
     Missed,
+    /// Its run could not be started: `code` says why (`run.start`'s refusal code, or
+    /// `engine_restarted` for a start rlxd stopped in the middle of).
+    StartFailed,
 }
 
 impl SkipReason {
@@ -471,6 +474,7 @@ impl SkipReason {
             Self::RateLimited => "rate_limited",
             Self::AppAbsent => "app_absent",
             Self::Missed => "missed",
+            Self::StartFailed => "start_failed",
         }
     }
 }
@@ -485,6 +489,10 @@ pub struct JobSkippedData {
     pub scheduled_for: String,
     /// Why.
     pub reason: SkipReason,
+    /// For `start_failed`: the error code the run's start was refused with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub code: Option<String>,
 }
 
 impl JobSkippedData {
@@ -494,7 +502,15 @@ impl JobSkippedData {
             job_id,
             scheduled_for,
             reason,
+            code: None,
         }
+    }
+
+    /// This skip, its start refused with `code`.
+    #[must_use]
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
     }
 }
 

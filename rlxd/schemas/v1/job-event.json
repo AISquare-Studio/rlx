@@ -556,6 +556,10 @@
       "description": "`job.skipped`.",
       "type": "object",
       "properties": {
+        "code": {
+          "description": "For `start_failed`: the error code the run's start was refused with.",
+          "type": "string"
+        },
         "job_id": {
           "description": "The job's id.",
           "$ref": "#/$defs/JobId"
@@ -602,6 +606,11 @@
           "description": "It came due while rlxd was down (or the clock jumped past it), and its `catch_up`\nis `skip`.",
           "type": "string",
           "const": "missed"
+        },
+        {
+          "description": "Its run could not be started: `code` says why (`run.start`'s refusal code, or\n`engine_restarted` for a start rlxd stopped in the middle of).",
+          "type": "string",
+          "const": "start_failed"
         }
       ]
     }

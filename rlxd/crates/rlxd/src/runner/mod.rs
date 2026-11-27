@@ -88,7 +88,6 @@ const PARTIAL_TEXT: usize = 1 << 20;
 /// How long `run.cancel` waits for a running run to end before it answers.
 const CANCEL_WAIT: Duration = Duration::from_secs(10);
 
-/// The runner of one rlxd.
 /// The scheduler job a run was fired for (7.6): its id, and its `loud`, which rlxd only
 /// echoes on the run's `run.done` and `run.needs_you`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,11 +99,13 @@ pub struct JobTag {
 /// What a run a scheduler job fired did that the scheduler acts on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunNote {
-    /// The run was rate-limited until `resets_at` (RFC 3339), when Claude Code said.
+    /// A `rate_limit_event`: until `resets_at` (RFC 3339), in `status` (Claude Code's
+    /// word: `allowed_warning` lets the run go on, `rejected` means the limit is hit).
     RateLimited {
         job_id: String,
         run_id: RunId,
         resets_at: Option<String>,
+        status: Option<String>,
     },
     /// The run's attempt ended in `state`.
     Ended {
@@ -114,6 +115,7 @@ pub enum RunNote {
     },
 }
 
+/// The runner of one rlxd.
 pub struct Runner {
     home: Home,
     bus: Arc<Bus>,
@@ -535,10 +537,12 @@ impl Runner {
 
     /// Whether run `id` is queued or running, without its lock: for a job's overlap.
     pub fn live(&self, id: &RunId) -> bool {
-        self.runs()
-            .by_id
-            .get(id)
-            .is_some_and(|run| run.state.borrow().is_live())
+        self.state(id).is_some_and(RunState::is_live)
+    }
+
+    /// Run `id`'s state now, without its lock; `None` for a run rlxd doesn't know.
+    pub fn state(&self, id: &RunId) -> Option<RunState> {
+        self.runs().by_id.get(id).map(|run| *run.state.borrow())
     }
 
     fn runs(&self) -> MutexGuard<'_, Runs> {
@@ -1736,13 +1740,14 @@ impl Runner {
                     Line::RateLimit { resets_at, status } => {
                         let resets_at =
                             resets_at.map(|s| clock::format(UNIX_EPOCH + Duration::from_secs(s)));
-                        let data = RunRateLimitedData::new(resets_at.clone(), status);
+                        let data = RunRateLimitedData::new(resets_at.clone(), status.clone());
                         self.emit(run, &mut inner, run_types::RATE_LIMITED, &data);
                         if let Some(job_id) = &run.job_id {
                             self.note(RunNote::RateLimited {
                                 job_id: job_id.clone(),
                                 run_id: run.params.run_id.clone(),
                                 resets_at,
+                                status,
                             });
                         }
                     }

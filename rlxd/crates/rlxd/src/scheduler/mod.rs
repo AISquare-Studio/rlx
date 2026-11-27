@@ -57,6 +57,10 @@ const RATE_LIMIT_HOLD: SignedDuration = SignedDuration::from_mins(5);
 /// The longest the loop sleeps on the system's clock before it looks again.
 const LONGEST_SLEEP: Duration = Duration::from_secs(30);
 
+/// `job.skipped start_failed`'s code for a fire whose run rlxd stopped in the middle of
+/// starting.
+const ENGINE_RESTARTED: &str = "engine_restarted";
+
 /// The client name a job's runs carry, in `run.list`.
 const CLIENT: &str = "scheduler";
 
@@ -69,6 +73,8 @@ pub struct Scheduler {
     set_aside: Option<String>,
     clock: Clock,
     jobs: Mutex<BTreeMap<JobId, Job>>,
+    /// How many jobs it holds, for `status`, which takes no lock.
+    count: std::sync::atomic::AtomicU64,
     /// App gate clients connected, as the gate counts them.
     apps: watch::Receiver<u32>,
     /// Wakes the loop: a job changed.
@@ -120,6 +126,7 @@ impl Scheduler {
             set_aside: opened.set_aside,
             clock,
             jobs: Mutex::new(BTreeMap::new()),
+            count: std::sync::atomic::AtomicU64::new(0),
             apps,
             wake: Notify::new(),
             stopping: AtomicBool::new(false),
@@ -144,8 +151,86 @@ impl Scheduler {
                 Err(why) => warning!("scheduler: job {}: left out: {why}", row.job_id),
             }
         }
+        // Fires whose runs were being started when rlxd stopped: fired if the run was
+        // made (the runner has its record), else they didn't start. Never fired again.
+        for starting in self.db.starting()? {
+            let job = JobId::new(starting.job_id.clone())
+                .ok()
+                .and_then(|id| jobs.get_mut(&id));
+            let run = RunId::new(starting.run_id.clone())
+                .ok()
+                .and_then(|id| self.runner.state(&id).map(|state| (id, state)));
+            let scheduled: Timestamp = starting.scheduled_for.parse().unwrap_or(now);
+            match (job, run) {
+                (Some(job), Some((run_id, state))) => {
+                    self.settle(starting.id, "fired", None, None);
+                    job.last_fire_at = Some(starting.at.parse().unwrap_or(now));
+                    job.last_run_id = Some(run_id.clone());
+                    job.last_state = Some(state);
+                    job.owed = None;
+                    let cause = match starting.cause.as_deref() {
+                        Some("catch_up") => FireCause::CatchUp,
+                        Some("run_now") => FireCause::RunNow,
+                        _ => FireCause::Due,
+                    };
+                    self.publish(
+                        job_types::FIRED,
+                        &JobFiredData::new(
+                            job.def.job_id.clone(),
+                            run_id,
+                            scheduled.to_string(),
+                            starting.at.clone(),
+                            cause,
+                            job.def.loud,
+                        ),
+                    );
+                    self.store(job, now);
+                }
+                (Some(job), None) => {
+                    self.settle(
+                        starting.id,
+                        "skipped",
+                        Some(SkipReason::StartFailed.as_str()),
+                        Some(ENGINE_RESTARTED),
+                    );
+                    job.skipped_count += 1;
+                    self.publish(
+                        job_types::SKIPPED,
+                        &JobSkippedData::new(
+                            job.def.job_id.clone(),
+                            scheduled.to_string(),
+                            SkipReason::StartFailed,
+                        )
+                        .with_code(ENGINE_RESTARTED),
+                    );
+                    self.store(job, now);
+                }
+                (None, _) => self.settle(starting.id, "skipped", None, None),
+            }
+        }
+        // Each job's last run as it ended, the runs a previous rlxd left included.
+        for job in jobs.values_mut() {
+            if let Some(state) = job
+                .last_run_id
+                .as_ref()
+                .and_then(|id| self.runner.state(id))
+                && job.last_state != Some(state)
+            {
+                job.last_state = Some(state);
+                self.store(job, now);
+            }
+        }
+        self.count_of(&jobs);
         info!("scheduler: {} jobs", jobs.len());
         Ok(())
+    }
+
+    /// Notes how many jobs there are, for `status`.
+    fn count_of(&self, jobs: &BTreeMap<JobId, Job>) {
+        self.count.store(
+            u64::try_from(jobs.len()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
     }
 
     fn jobs(&self) -> MutexGuard<'_, BTreeMap<JobId, Job>> {
@@ -226,7 +311,7 @@ impl Scheduler {
     /// `status`'s `jobs`.
     pub fn status(&self) -> Jobs {
         let mut jobs = Jobs::default();
-        jobs.count = u64::try_from(self.jobs().len()).unwrap_or(u64::MAX);
+        jobs.count = self.count.load(Ordering::SeqCst);
         if let Some(aside) = &self.set_aside {
             jobs.db = Some("set_aside".to_owned());
             jobs.set_aside = Some(aside.clone());
@@ -234,8 +319,12 @@ impl Scheduler {
         jobs
     }
 
-    /// `job.put`: creates or replaces the job. A replace starts its schedule again from
-    /// now, and keeps what it has done (its last fire, its skips) and whether it is paused.
+    /// `job.put`: creates or replaces the job, idempotently: the app pushes its jobs again
+    /// on each connect. The same definition again changes nothing. A replace starts the
+    /// schedule again from now only when its `schedule` changes or it is enabled again;
+    /// else it keeps where its schedule is, a fire it owes, and a missed fire waiting for
+    /// an app. A replace keeps what the job has done (its last fire, its skips) and whether
+    /// it is paused.
     pub fn put(&self, params: JobPutParams) -> Result<JobRef, ErrorBody> {
         params
             .validate()
@@ -259,39 +348,57 @@ impl Scheduler {
         let now = self.clock.now();
         let id = params.job_id.clone();
         let mut jobs = self.jobs();
-        let kept = jobs.get(&id).cloned();
-        let mut job = Job {
-            next: params
-                .enabled
-                .then(|| plan.next_after(now, Some(now)))
-                .flatten(),
-            def: params,
-            plan,
-            anchor: now,
-            last_scheduled_for: None,
-            paused: false,
-            owed: None,
-            held_until: None,
-            last_fire_at: None,
-            last_run_id: None,
-            last_state: None,
-            skipped_count: 0,
-            put_at: now,
-            startup_wait: None,
+        let job = match jobs.get(&id) {
+            // The same definition again: nothing changes.
+            Some(kept) if kept.def == params => None,
+            Some(kept) => {
+                let again =
+                    kept.def.schedule != params.schedule || (!kept.def.enabled && params.enabled);
+                let mut job = kept.clone();
+                if again {
+                    job.anchor = now;
+                    job.next = params
+                        .enabled
+                        .then(|| plan.next_after(now, Some(now)))
+                        .flatten();
+                    job.owed = None;
+                    job.startup_wait = None;
+                    job.last_scheduled_for = None;
+                } else if !params.enabled {
+                    job.next = None;
+                }
+                job.plan = plan;
+                job.def = params;
+                job.put_at = now;
+                Some(job)
+            }
+            None => Some(Job {
+                next: params
+                    .enabled
+                    .then(|| plan.next_after(now, Some(now)))
+                    .flatten(),
+                def: params,
+                plan,
+                anchor: now,
+                last_scheduled_for: None,
+                paused: false,
+                owed: None,
+                held_until: None,
+                last_fire_at: None,
+                last_run_id: None,
+                last_state: None,
+                skipped_count: 0,
+                put_at: now,
+                startup_wait: None,
+            }),
         };
-        if let Some(kept) = kept {
-            job.paused = kept.paused;
-            job.held_until = kept.held_until;
-            job.last_scheduled_for = kept.last_scheduled_for;
-            job.last_fire_at = kept.last_fire_at;
-            job.last_run_id = kept.last_run_id;
-            job.last_state = kept.last_state;
-            job.skipped_count = kept.skipped_count;
+        if let Some(job) = job {
+            self.db.save(&job.row(now)).map_err(|e| {
+                refusal(codes::INTERNAL, format!("the job could not be stored: {e}"))
+            })?;
+            jobs.insert(id.clone(), job);
+            self.count_of(&jobs);
         }
-        self.db
-            .save(&job.row(now))
-            .map_err(|e| refusal(codes::INTERNAL, format!("the job could not be stored: {e}")))?;
-        jobs.insert(id.clone(), job);
         drop(jobs);
         self.publish(job_types::PUT, &JobRef::new(id.clone()));
         self.wake.notify_one();
@@ -300,7 +407,22 @@ impl Scheduler {
 
     /// `job.list`.
     pub fn list(&self) -> JobListData {
-        let jobs = self.jobs().values().map(Job::summary).collect();
+        let jobs = self
+            .jobs()
+            .values()
+            .map(|job| {
+                let mut summary = job.summary();
+                // The last run's state as the runner has it now: running, or how it ended.
+                if let Some(state) = job
+                    .last_run_id
+                    .as_ref()
+                    .and_then(|id| self.runner.state(id))
+                {
+                    summary.last_state = Some(state);
+                }
+                summary
+            })
+            .collect();
         JobListData { jobs }
     }
 
@@ -310,6 +432,7 @@ impl Scheduler {
         if jobs.remove(&job.job_id).is_none() {
             return Err(unknown_job(&job.job_id));
         }
+        self.count_of(&jobs);
         if let Err(e) = self.db.delete(job.job_id.as_str()) {
             warning!(
                 "scheduler: job {}: its row was not deleted: {e}",
@@ -413,6 +536,13 @@ impl Scheduler {
         let presence = self.presence();
         let mut jobs = self.jobs();
         for job in jobs.values_mut() {
+            // The clock went back past the job's last scheduled time (NTP, or set by hand):
+            // its next is counted from now again, so it doesn't go quiet for as long.
+            if job.def.enabled && job.last_scheduled_for.is_some_and(|last| last > now) {
+                job.next = job.plan.next_after(now, Some(job.anchor));
+                job.last_scheduled_for = None;
+                self.store(job, now);
+            }
             let Some(scheduled) = job.next else {
                 continue;
             };
@@ -431,14 +561,15 @@ impl Scheduler {
                 }
             };
             job.startup_wait = None;
-            let moment = self.moment(job, now, cause);
-            let decision = decide::decide(&job.view(), &moment);
-            self.apply(job, now, scheduled, decision);
             // On time, the next is the next after it; missed, the next after now, so
-            // however many were missed, they were one decision.
+            // however many were missed, they were one decision. Moved before the fire, and
+            // stored with it before its run starts ([`db::Db::begin_fire`]).
             let from = if cause == Cause::Due { scheduled } else { now };
             job.next = job.plan.next_after(from, Some(job.anchor));
             job.last_scheduled_for = Some(scheduled);
+            let moment = self.moment(job, now, cause);
+            let decision = decide::decide(&job.view(), &moment);
+            self.apply(job, now, scheduled, decision);
             self.store(job, now);
         }
     }
@@ -449,11 +580,16 @@ impl Scheduler {
         let now = self.clock.now();
         let mut jobs = self.jobs();
         for job in jobs.values_mut() {
-            let Some(owed) = job.owed.take() else {
+            let Some(owed) = job.owed else {
                 continue;
             };
             let moment = self.moment(job, now, Cause::Owed);
             let decision = decide::decide(&job.view(), &moment);
+            if decision == Decision::Nothing && moment.presence == Presence::Absent {
+                // The app left again before this: still owed, for when it is back.
+                continue;
+            }
+            job.owed = None;
             self.apply(job, now, owed, decision);
             self.store(job, now);
         }
@@ -468,8 +604,16 @@ impl Scheduler {
         let mut jobs = self.jobs();
         match note {
             RunNote::RateLimited {
-                job_id, resets_at, ..
+                job_id,
+                resets_at,
+                status,
+                ..
             } => {
+                // Only a limit that is hit holds the job's fires: a warning (Claude Code's
+                // `allowed_warning`) lets runs go on (manager #2687).
+                if !limit_hit(status.as_deref()) {
+                    return;
+                }
                 let Some(job) = JobId::new(job_id).ok().and_then(|id| jobs.get_mut(&id)) else {
                     return;
                 };
@@ -513,22 +657,8 @@ impl Scheduler {
     fn apply(&self, job: &mut Job, now: Timestamp, scheduled: Timestamp, decision: Decision) {
         match decision {
             Decision::Fire(cause) => {
-                if let Err(error) = self.fire(job, now, scheduled, cause) {
-                    warning!(
-                        "scheduler: job {}: its fire for {scheduled} did not start: {}",
-                        job.def.job_id,
-                        error.message
-                    );
-                    self.record(
-                        job,
-                        scheduled,
-                        now,
-                        "error",
-                        Some(error.code.as_str()),
-                        None,
-                        None,
-                    );
-                }
+                // A fire that doesn't start is job.skipped start_failed, from fire().
+                let _ = self.fire(job, now, scheduled, cause);
             }
             Decision::Skip(reason) => {
                 if reason == SkipReason::AppAbsent {
@@ -554,7 +684,10 @@ impl Scheduler {
     }
 
     /// Fires `job` for `scheduled`: a run of its template, with a fresh `run_id`, the
-    /// job's id and `loud`. `job.fired` names the run.
+    /// job's id and `loud`. The job (its schedule already moved past this fire) and a
+    /// `starting` record of the fire are stored together first, so a crash while the run
+    /// starts can't fire the same time again ([`Scheduler::load`] settles it). `job.fired`
+    /// names the run; a run that can't start is `job.skipped {reason: start_failed, code}`.
     fn fire(
         &self,
         job: &mut Job,
@@ -562,53 +695,134 @@ impl Scheduler {
         scheduled: Timestamp,
         cause: FireCause,
     ) -> Result<RunId, ErrorBody> {
-        let template =
-            job.def.run.as_ref().ok_or_else(|| {
-                refusal(codes::NOT_IMPLEMENTED, "only run jobs fire yet".to_owned())
-            })?;
-        let run_id = fresh_run_id();
-        let params = template
-            .start(&run_id)
-            .map_err(|invalid| refusal(codes::INVALID_PARAMS, invalid.to_string()))?;
-        let tag = JobTag {
-            job_id: job.def.job_id.to_string(),
-            loud: job.def.loud,
-        };
-        self.runner.start(params, CLIENT, Some(tag))?;
-        job.last_fire_at = Some(now);
-        job.last_run_id = Some(run_id.clone());
-        job.last_state = Some(RunState::Queued);
-        job.owed = None;
         let cause_name = match cause {
             FireCause::Due => "due",
             FireCause::CatchUp => "catch_up",
             FireCause::RunNow => "run_now",
         };
-        self.record(
-            job,
-            scheduled,
-            now,
-            "fired",
-            None,
-            Some(&run_id),
-            Some(cause_name),
-        );
-        self.publish(
-            job_types::FIRED,
-            &JobFiredData::new(
-                job.def.job_id.clone(),
-                run_id.clone(),
-                scheduled.to_string(),
-                now.to_string(),
-                cause,
-                job.def.loud,
-            ),
-        );
-        info!(
-            "scheduler: job {} fired run {run_id} ({cause_name})",
-            job.def.job_id
-        );
-        Ok(run_id)
+        let run_id = fresh_run_id();
+        let begun = job
+            .def
+            .run
+            .as_ref()
+            .ok_or_else(|| refusal(codes::NOT_IMPLEMENTED, "only run jobs fire yet".to_owned()))
+            .and_then(|template| {
+                template
+                    .start(&run_id)
+                    .map_err(|invalid| refusal(codes::INVALID_PARAMS, invalid.to_string()))
+            })
+            .and_then(|params| {
+                let fire = db::Fire {
+                    job_id: job.def.job_id.as_str(),
+                    scheduled_for: &scheduled.to_string(),
+                    at: &now.to_string(),
+                    outcome: "starting",
+                    reason: None,
+                    code: None,
+                    run_id: Some(run_id.as_str()),
+                    cause: Some(cause_name),
+                };
+                let id = self.db.begin_fire(&job.row(now), &fire).map_err(|e| {
+                    refusal(
+                        codes::INTERNAL,
+                        format!("the fire could not be stored: {e}"),
+                    )
+                })?;
+                Ok((id, params))
+            });
+        let (id, started) = match begun {
+            Ok((id, params)) => {
+                let tag = JobTag {
+                    job_id: job.def.job_id.to_string(),
+                    loud: job.def.loud,
+                };
+                let started = match test_refusal() {
+                    Some(code) => Err(refusal(
+                        &code,
+                        "refused by RLXD_TEST_REFUSE_FIRES".to_owned(),
+                    )),
+                    None => self.runner.start(params, CLIENT, Some(tag)),
+                };
+                test_crash_after_start(started.is_ok());
+                (Some(id), started)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        match started {
+            Ok(_) => {
+                if let Some(id) = id {
+                    self.settle(id, "fired", None, None);
+                }
+                job.last_fire_at = Some(now);
+                job.last_run_id = Some(run_id.clone());
+                job.last_state = Some(RunState::Queued);
+                job.owed = None;
+                self.publish(
+                    job_types::FIRED,
+                    &JobFiredData::new(
+                        job.def.job_id.clone(),
+                        run_id.clone(),
+                        scheduled.to_string(),
+                        now.to_string(),
+                        cause,
+                        job.def.loud,
+                    ),
+                );
+                info!(
+                    "scheduler: job {} fired run {run_id} ({cause_name})",
+                    job.def.job_id
+                );
+                Ok(run_id)
+            }
+            Err(error) => {
+                warning!(
+                    "scheduler: job {}: its fire for {scheduled} did not start ({}): {}",
+                    job.def.job_id,
+                    error.code,
+                    error.message
+                );
+                let reason = SkipReason::StartFailed.as_str();
+                match id {
+                    Some(id) => self.settle(id, "skipped", Some(reason), Some(&error.code)),
+                    None => {
+                        let fire = db::Fire {
+                            job_id: job.def.job_id.as_str(),
+                            scheduled_for: &scheduled.to_string(),
+                            at: &now.to_string(),
+                            outcome: "skipped",
+                            reason: Some(reason),
+                            code: Some(&error.code),
+                            run_id: None,
+                            cause: Some(cause_name),
+                        };
+                        if let Err(e) = self.db.record(&fire) {
+                            warning!(
+                                "scheduler: job {}: its fire was not recorded: {e}",
+                                job.def.job_id
+                            );
+                        }
+                    }
+                }
+                job.skipped_count += 1;
+                self.publish(
+                    job_types::SKIPPED,
+                    &JobSkippedData::new(
+                        job.def.job_id.clone(),
+                        scheduled.to_string(),
+                        SkipReason::StartFailed,
+                    )
+                    .with_code(error.code.clone()),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Settles fire record `id`, logging a failure.
+    fn settle(&self, id: i64, outcome: &str, reason: Option<&str>, code: Option<&str>) {
+        if let Err(e) = self.db.settle(id, outcome, reason, code) {
+            warning!("scheduler: fire record {id} was not settled: {e}");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -628,6 +842,7 @@ impl Scheduler {
             at: &now.to_string(),
             outcome,
             reason,
+            code: None,
             run_id: run_id.map(RunId::as_str),
             cause,
         };
@@ -743,6 +958,38 @@ impl Job {
             def,
         })
     }
+}
+
+/// Whether a `rate_limit_event`'s `status` says the limit is hit: anything but Claude
+/// Code's `allowed` and `allowed_warning`, which let runs go on. No status says nothing.
+fn limit_hit(status: Option<&str>) -> bool {
+    status.is_some_and(|status| !status.starts_with("allowed"))
+}
+
+/// Test builds only: `RLXD_TEST_REFUSE_FIRES=<code>` refuses each fire's start with
+/// `code`, as the runner would.
+#[cfg(feature = "debug-methods")]
+fn test_refusal() -> Option<String> {
+    std::env::var("RLXD_TEST_REFUSE_FIRES")
+        .ok()
+        .filter(|code| !code.is_empty())
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_refusal() -> Option<String> {
+    None
+}
+
+/// Test builds only: with `RLXD_TEST_CRASH_AFTER_FIRE` set, rlxd exits at once after a
+/// fire's run has started and before the scheduler has noted it: a crash in that window.
+fn test_crash_after_start(started: bool) {
+    #[cfg(feature = "debug-methods")]
+    if started && std::env::var("RLXD_TEST_CRASH_AFTER_FIRE").is_ok_and(|crash| !crash.is_empty()) {
+        crate::log::warning!("scheduler: RLXD_TEST_CRASH_AFTER_FIRE: exiting mid-fire");
+        std::process::exit(70);
+    }
+    #[cfg(not(feature = "debug-methods"))]
+    let _ = started;
 }
 
 /// A fresh run id: a random (version 4) UUID, lower case.

@@ -67,7 +67,7 @@ bound both validators agree on.
 | `job-list.json` | `job.list`'s params: `{}` |
 | `job-list-reply.json` | `job.list`'s reply: `{jobs: [{job_id, type, schedule, catch_up, enabled, paused, loud, next_fire_at, last_fire_at, last_run_id, last_state, skipped_count}]}` |
 | `job-run-now-reply.json` | `job.run_now`'s reply: `{job_id, run_id}`. Refused: `app_absent` with no app gate client, `job_running` while the job's last run is live, `rate_limited` (`detail.resets_at`) |
-| `job-event.json` | One event of the `job` topic: `event.json`, plus `job.put`, `job.deleted`, `job.paused` and `job.resumed` `{job_id}`, `job.fired {job_id, run_id, scheduled_for, fired_at, cause, loud}` and `job.skipped {job_id, scheduled_for, reason}` |
+| `job-event.json` | One event of the `job` topic: `event.json`, plus `job.put`, `job.deleted`, `job.paused` and `job.resumed` `{job_id}`, `job.fired {job_id, run_id, scheduled_for, fired_at, cause, loud}` and `job.skipped {job_id, scheduled_for, reason, code?}`, `code` for `reason: "start_failed"` |
 | `space.json` | `space.ensure`'s and `space.erase`'s params: `{name}`, 1 to 64 lower-case letters, digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, no `.` at the end, not a Windows device name |
 | `space-ensure-reply.json` | `space.ensure`'s reply: `{name, path}`, the space's folder, absolute and resolved |
 | `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path], links?: [path]}`, `links` being links inside the space removed as links. Every link is listed, under the space's resolved path. Refused whole: `runs_live` (`detail.run_ids`), `erase_in_progress`, `link_refused` (`detail.paths`), and `erase_incomplete` (`detail {removed, failed}`) when some paths stayed |

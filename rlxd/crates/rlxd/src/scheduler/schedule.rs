@@ -255,10 +255,15 @@ fn field(text: &str, low: u64, high: u64, names: &[&str], what: &str) -> Result<
         if from > to {
             return Err(format!("{what} range {range:?} runs backwards"));
         }
+        // A step past the field's span takes its first value only: the same as the span.
+        let step = step.min(high - low + 1);
         let mut n = from;
         while n <= to {
             bits |= 1 << n;
-            n += step;
+            match n.checked_add(step) {
+                Some(next) => n = next,
+                None => break,
+            }
         }
     }
     if bits == 0 {
@@ -342,6 +347,12 @@ mod tests {
         assert_eq!(
             fires(&cron("0 0 * * 7", "UTC"), "2027-01-01T00:00:00Z", 1),
             fires(&cron("0 0 * * 0", "UTC"), "2027-01-01T00:00:00Z", 1)
+        );
+        // A step of any size, never an overflow: past the span, the first value only.
+        let huge = cron("1/18446744073709551615 * * * *", "UTC");
+        assert_eq!(
+            fires(&huge, "2027-01-01T00:00:30Z", 2),
+            ["2027-01-01T00:01:00Z", "2027-01-01T01:01:00Z"]
         );
         for bad in [
             "* * * *",
