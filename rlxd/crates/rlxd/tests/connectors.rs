@@ -662,3 +662,39 @@ fn every_role_lists_and_remote_may_not_log_in() {
     assert_eq!(invalid.error_code(), "invalid_params", "{invalid:?}");
 }
 
+// --- 7.7: the CLI -------------------------------------------------------------------------
+
+/// Whether Python's side must run: rlxd.yml sets `RLXD_INTEROP_REQUIRED`, as for the
+/// registry's interop tests. A checkout with no uv passes without it.
+fn interop_required() -> bool {
+    ["RLXD_INTEROP_REQUIRED", "RLXD_BIN"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+}
+
+#[test]
+fn the_cli_prints_rlxds_data_bare() {
+    if !interop_required() {
+        eprintln!("skipped: set RLXD_INTEROP_REQUIRED=1 to run Python's side (rlxd.yml does)");
+        return;
+    }
+    let home = home_with("init-connectors", &[]);
+    let (_, events) = gated_start(&home, &mounting(), 60).wait();
+    assert!(
+        events.iter().any(|e| e["type"] == "run.done"),
+        "{events:#?}"
+    );
+    let data = home.rlxd(&["call", "connectors.list"]).data();
+    let repo = common::workspace().parent().unwrap().to_path_buf();
+    let output = std::process::Command::new("uv")
+        .args(["run", "--quiet", "rlx", "--json", "connectors", "list"])
+        .current_dir(&repo)
+        .env("AISQUARE_HOME", home.root())
+        .env_remove("RLX_HOME")
+        .env("RLX_RLXD_BIN", env!("CARGO_BIN_EXE_rlxd"))
+        .output()
+        .unwrap_or_else(|e| panic!("uv must run here (RLXD_INTEROP_REQUIRED is set): {e}"));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(printed, data);
+}
