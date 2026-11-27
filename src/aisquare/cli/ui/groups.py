@@ -16,6 +16,7 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.geometry import Region
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, Static
@@ -79,6 +80,33 @@ class DropGroup(Message):
 
 class UndoLayout(Message):
     pass
+
+
+class OpenGroupMenu(Message):
+    """⋯ on a group's header, ``.`` or a right-click on it (#39): its menu, under ``anchor``.
+
+    ``count`` is how many projects are the group's (its pinned members too: a delete moves
+    them all back to the top level); ``up`` and ``down`` say whether a step would move it
+    (``project_groups.step_group``): a pinned group, or one at an end, has no step there."""
+
+    def __init__(
+        self, group: ProjectGroup, anchor: Region, *, count: int, up: bool, down: bool
+    ) -> None:
+        super().__init__()
+        self.group = group
+        self.anchor = anchor
+        self.count = count
+        self.up = up
+        self.down = down
+
+
+class RenameGroup(Message):
+    """A group header's name field was saved with a name no other group has (#39)."""
+
+    def __init__(self, group_id: str, typed: str) -> None:
+        super().__init__()
+        self.group_id = group_id
+        self.typed = typed
 
 
 @dataclass
