@@ -1643,19 +1643,22 @@ def test_a_spawn_whose_read_outlives_the_users_move_leaves_them_where_they_went(
     spawns.answer = answer
     list_agents_as(monkeypatch, hung)  # the tick reads through list_agents_many (#83)
 
+    async def until(pilot: Pilot[None], holds: Callable[[], bool]) -> bool:
+        """Pause until ``holds()``, for 10 s at most, as the sibling above waits for its read.
+        Not ``settle_until``: it waits for the app's workers, and this read is held on purpose.
+        It was 200 pauses of 20 ms, which the spawn and the read after it outlasted on a
+        windows-py3.12 runner (#55): the premise below failed, not the product."""
+        deadline = time.monotonic() + 10
+        while not holds() and time.monotonic() < deadline:
+            await pilot.pause(0.02)
+        return holds()
+
     async def scenario(pilot: Pilot[None], app: RecordingFleetApp) -> list[Any]:
         try:
             await _submit_spawn(pilot, app)
-            for _ in range(200):
-                if held.is_set():
-                    break
-                await pilot.pause(0.02)
-            assert held.is_set(), "the premise: the read after the spawn is held"
+            assert await until(pilot, held.is_set), "the premise: the read after the spawn is held"
             app.post_message(AddProject())  # the user goes elsewhere meanwhile
-            for _ in range(200):
-                if app.content.current == "onboard":
-                    break
-                await pilot.pause(0.02)
+            await until(pilot, lambda: app.content.current == "onboard")
         finally:
             gate.set()
         await settle_workers(app)
