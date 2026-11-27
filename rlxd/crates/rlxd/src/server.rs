@@ -630,7 +630,7 @@ impl Daemon {
             Err(why) => {
                 let mut jobs = rlxd_proto::Jobs::default();
                 jobs.db = Some("unavailable".to_owned());
-                jobs.set_aside = Some(why.clone());
+                jobs.reason = Some(why.clone());
                 jobs
             }
         };

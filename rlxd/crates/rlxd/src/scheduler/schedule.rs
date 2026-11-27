@@ -62,13 +62,52 @@ impl Plan {
                 let anchor = anchor.unwrap_or(after);
                 let step = i64::from(*minutes) * 60;
                 let since = after.as_second() - anchor.as_second();
-                // The grid point after `after`: anchor + k·step, k ≥ 1.
-                let k = if since < 0 { 1 } else { since / step + 1 };
+                // The grid point after `after`: anchor + k·step. The grid runs back past
+                // the anchor too, so a clock set back before it doesn't leave the job
+                // quiet until the anchor.
+                let k = since.div_euclid(step) + 1;
                 Timestamp::from_second(anchor.as_second() + k * step).ok()
             }
             Self::Cron { cron, tz } => cron.next_after(after, tz),
         }
     }
+}
+
+impl Plan {
+    /// Whether `other` fires at the very times this does: the same `every_minutes`, or a
+    /// cron expression of the same parsed fields in a zone that keeps the same offsets
+    /// from `from` on (`UTC` and `Etc/UTC` are one zone; so are `* * * * *` and
+    /// `*/1 * * * *`).
+    pub fn same_as(&self, other: &Self, from: Timestamp) -> bool {
+        match (self, other) {
+            (Self::Every { minutes: a }, Self::Every { minutes: b }) => a == b,
+            (Self::Cron { cron: a, tz: x }, Self::Cron { cron: b, tz: y }) => {
+                a == b && same_zone(x, y, from)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether zones `a` and `b` keep the same offsets from `from` for twenty years: the same
+/// offset then, and the same transitions after.
+fn same_zone(a: &TimeZone, b: &TimeZone, from: Timestamp) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.to_offset(from) != b.to_offset(from) {
+        return false;
+    }
+    let until = from
+        .checked_add(SignedDuration::from_hours(24 * 366 * 20))
+        .unwrap_or(from);
+    let transitions = |zone: &TimeZone| -> Vec<(Timestamp, jiff::tz::Offset)> {
+        zone.following(from)
+            .take_while(|transition| transition.timestamp() < until)
+            .map(|transition| (transition.timestamp(), transition.offset()))
+            .collect()
+    };
+    transitions(a) == transitions(b)
 }
 
 fn schedule_text(schedule: &Schedule) -> String {
@@ -309,7 +348,9 @@ mod tests {
             ("2027-01-01T00:15:00Z", "2027-01-01T00:30:00Z"),
             ("2027-01-01T00:15:07Z", "2027-01-01T00:30:00Z"),
             ("2027-01-01T03:59:59Z", "2027-01-01T04:00:00Z"),
-            ("2026-12-31T23:00:00Z", "2027-01-01T00:15:00Z"),
+            // Before the anchor (the clock set back): the grid runs back too.
+            ("2026-12-31T23:00:00Z", "2026-12-31T23:15:00Z"),
+            ("2026-12-31T23:59:59Z", "2027-01-01T00:00:00Z"),
         ] {
             assert_eq!(
                 plan.next_after(at(after), anchor),
@@ -317,6 +358,22 @@ mod tests {
                 "{after}"
             );
         }
+    }
+
+    #[test]
+    fn a_schedule_respelled_or_in_an_alias_zone_is_the_same_schedule() {
+        let at = at("2027-01-01T00:00:00Z");
+        assert!(cron("* * * * *", "UTC").same_as(&cron("*/1 * * * *", "Etc/UTC"), at));
+        assert!(
+            cron("0 9 * * 1-5", "Europe/London")
+                .same_as(&cron("0 9 * * mon-fri", "Europe/London"), at)
+        );
+        assert!(cron("0 0 * * 0", "UTC").same_as(&cron("0 0 * * 7", "UTC"), at));
+        assert!(!cron("0 9 * * *", "UTC").same_as(&cron("0 9 * * *", "Europe/London"), at));
+        assert!(!cron("0 9 * * *", "UTC").same_as(&cron("0 10 * * *", "UTC"), at));
+        assert!(Plan::Every { minutes: 5 }.same_as(&Plan::Every { minutes: 5 }, at));
+        assert!(!Plan::Every { minutes: 5 }.same_as(&Plan::Every { minutes: 6 }, at));
+        assert!(!Plan::Every { minutes: 1 }.same_as(&cron("* * * * *", "UTC"), at));
     }
 
     #[test]

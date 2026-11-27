@@ -403,7 +403,10 @@ impl Db {
         };
         match begin() {
             Ok(id) => {
-                trim(&connection, fire.job_id)?;
+                // Committed: a failed trim leaves older records, nothing worse.
+                if let Err(e) = trim(&connection, fire.job_id) {
+                    crate::log::warning!("scheduler: old fire records were not trimmed: {e}");
+                }
                 Ok(id)
             }
             Err(e) => {

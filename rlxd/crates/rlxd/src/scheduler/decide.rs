@@ -12,6 +12,8 @@ use rlxd_proto::{CatchUp, FireCause, SkipReason};
 /// What [`decide`] reads of a job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Job {
+    /// `enabled: false` (the app's): it never fires, nor owes a fire.
+    pub enabled: bool,
     pub paused: bool,
     pub catch_up: CatchUp,
 }
@@ -81,6 +83,10 @@ pub fn app_policy(_job: &Job, presence: Presence) -> AppPolicy {
 /// with no app is `app_absent`, as 7.6 has it), overlap, the rate limit, then `catch_up`
 /// for a fire it couldn't make on time.
 pub fn decide(job: &Job, moment: &Moment) -> Decision {
+    // A disabled job fires nothing, skips nothing and owes nothing.
+    if !job.enabled {
+        return Decision::Nothing;
+    }
     if moment.cause == Cause::Owed {
         // An owed fire is made once, when it can be, and only for `once`; else it is let
         // go, and the next scheduled time comes as usual.
@@ -114,6 +120,8 @@ pub fn decide(job: &Job, moment: &Moment) -> Decision {
 /// Why `job.run_now` is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunNowRefused {
+    /// The job is disabled: `job_disabled`.
+    Disabled,
     /// No app gate client: `app_absent`.
     AppAbsent,
     /// The job's last run is live: `job_running`.
@@ -123,8 +131,11 @@ pub enum RunNowRefused {
 }
 
 /// Whether `job.run_now` fires `job` now. It is an explicit act, so `paused` doesn't stop
-/// it; the app's presence, overlap and the rate limit do.
+/// it; a disabled job, the app's presence, overlap and the rate limit do.
 pub fn run_now(job: &Job, moment: &Moment) -> Result<(), RunNowRefused> {
+    if !job.enabled {
+        return Err(RunNowRefused::Disabled);
+    }
     if app_policy(job, moment.presence) == AppPolicy::Skip {
         return Err(RunNowRefused::AppAbsent);
     }
@@ -142,7 +153,33 @@ mod tests {
     use super::*;
 
     fn job(paused: bool, catch_up: CatchUp) -> Job {
-        Job { paused, catch_up }
+        Job {
+            enabled: true,
+            paused,
+            catch_up,
+        }
+    }
+
+    #[test]
+    fn a_disabled_job_never_fires_nor_owes() {
+        let off = Job {
+            enabled: false,
+            paused: false,
+            catch_up: CatchUp::Once,
+        };
+        for cause in [Cause::Due, Cause::Missed, Cause::Owed] {
+            for presence in [Presence::App, Presence::Absent] {
+                assert_eq!(
+                    decide(&off, &moment(cause, presence)),
+                    Decision::Nothing,
+                    "{cause:?} {presence:?}"
+                );
+            }
+        }
+        assert_eq!(
+            run_now(&off, &moment(Cause::Due, Presence::App)),
+            Err(RunNowRefused::Disabled)
+        );
     }
 
     fn moment(cause: Cause, presence: Presence) -> Moment {

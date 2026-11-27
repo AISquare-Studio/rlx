@@ -947,3 +947,95 @@ fn an_hourly_job_put_again_every_fifty_minutes_still_fires_every_hour() {
     );
     assert!(!typed(&seen, "job.fired", Some("t1")).is_empty());
 }
+
+// --- round 2 (review #2704) ---------------------------------------------------------------
+
+/// The review's repro: an app_absent skip owed with catch_up once, then the job disabled.
+fn owed_then_disabled() -> (TestHome, Value) {
+    let home = home_at("hello", T0);
+    let once = every_minute("t1", "once");
+    put(&home, &once);
+    advance(&home, 60);
+    let mut off = once.clone();
+    off["enabled"] = json!(false);
+    put(&home, &off);
+    assert_eq!(listed(&home, "t1")["next_fire_at"], Value::Null);
+    (home, off)
+}
+
+#[test]
+fn a_disabled_job_never_fires_the_catch_up_it_owed() {
+    let (home, _) = owed_then_disabled();
+    let back = seq(&home);
+    let _app = app(&home);
+    std::thread::sleep(Duration::from_millis(500));
+    advance(&home, 120);
+    let seen = events(&home, back);
+    assert!(typed(&seen, "job.fired", None).is_empty(), "{seen:#?}");
+    assert!(typed(&seen, "job.skipped", None).is_empty(), "{seen:#?}");
+    assert_eq!(
+        refused(&home, "job.run_now", &json!({"job_id": "t1"})),
+        "job_disabled"
+    );
+}
+
+#[test]
+fn a_disabled_job_never_fires_the_catch_up_it_owed_across_a_restart() {
+    let (home, _) = owed_then_disabled();
+    home.stop();
+    // Not start(): its pairing call is an app connection.
+    home.start_dev();
+    let _app = app(&home);
+    std::thread::sleep(Duration::from_millis(500));
+    advance(&home, 120);
+    let seen = events(&home, 0);
+    assert!(typed(&seen, "job.fired", None).is_empty(), "{seen:#?}");
+}
+
+#[test]
+fn a_schedule_respelled_in_an_alias_zone_keeps_an_owed_fire() {
+    let home = home_at("hello", T0);
+    put(
+        &home,
+        &job("c", json!({"cron": "* * * * *", "tz": "UTC"}), "once"),
+    );
+    advance(&home, 60);
+    // The same schedule, written another way.
+    put(
+        &home,
+        &job("c", json!({"cron": "*/1 * * * *", "tz": "Etc/UTC"}), "once"),
+    );
+    let back = seq(&home);
+    let _app = app(&home);
+    let seen = wait_until(&home, back, 10, "the owed fire", |e| {
+        !typed(e, "job.fired", Some("c")).is_empty()
+    });
+    let fired = typed(&seen, "job.fired", Some("c"));
+    assert_eq!(fired[0]["data"]["cause"], "catch_up");
+    assert_eq!(fired[0]["data"]["scheduled_for"], "2027-01-01T00:01:00Z");
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(unsafe_code)]
+fn a_database_it_cannot_open_leaves_the_scheduler_unavailable_with_why() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = home_at("hello", T0);
+    put(&home, &every_minute("t1", "skip"));
+    home.stop();
+    let db = home.root().join("rlxd").join("rlxd.db");
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o000)).unwrap();
+    home.start_dev();
+    let jobs = home.status()["jobs"].clone();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if jobs["db"] == Value::Null {
+        return; // root opens anything
+    }
+    assert_eq!(jobs["db"], "unavailable", "{jobs:#}");
+    assert!(
+        jobs["reason"].as_str().unwrap().contains("left as it is"),
+        "{jobs:#}"
+    );
+    assert!(jobs.get("set_aside").is_none(), "{jobs:#}");
+    assert!(db.exists(), "the file stays where it is");
+}

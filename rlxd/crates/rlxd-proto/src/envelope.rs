@@ -367,6 +367,9 @@ pub mod codes {
     /// `job.run_now`: the job's last run is still queued or running; a job never
     /// overlaps itself.
     pub const JOB_RUNNING: &str = "job_running";
+    /// `job.run_now`: the job is disabled (`enabled: false`), and a disabled job never
+    /// fires.
+    pub const JOB_DISABLED: &str = "job_disabled";
     /// `job.run_now`: a run of the job was rate-limited, and the limit hasn't reset;
     /// `detail.resets_at` says when it does.
     pub const RATE_LIMITED: &str = "rate_limited";

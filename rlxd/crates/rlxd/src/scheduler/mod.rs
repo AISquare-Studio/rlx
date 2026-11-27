@@ -161,10 +161,21 @@ impl Scheduler {
                 .ok()
                 .and_then(|id| self.runner.state(&id).map(|state| (id, state)));
             let scheduled: Timestamp = starting.scheduled_for.parse().unwrap_or(now);
+            let at: Timestamp = starting.at.parse().unwrap_or(now);
+            // A row left unsettled behind a later fire (a settle that failed) is the past:
+            // settled quietly, the job's last fire left as it is.
+            let stale = |job: &Job| job.last_fire_at.is_some_and(|last| last >= at);
             match (job, run) {
+                (Some(job), Some(_)) if stale(job) => self.settle(starting.id, "fired", None, None),
+                (Some(job), None) if stale(job) => self.settle(
+                    starting.id,
+                    "skipped",
+                    Some(SkipReason::StartFailed.as_str()),
+                    Some(ENGINE_RESTARTED),
+                ),
                 (Some(job), Some((run_id, state))) => {
                     self.settle(starting.id, "fired", None, None);
-                    job.last_fire_at = Some(starting.at.parse().unwrap_or(now));
+                    job.last_fire_at = Some(at);
                     job.last_run_id = Some(run_id.clone());
                     job.last_state = Some(state);
                     job.owed = None;
@@ -352,8 +363,9 @@ impl Scheduler {
             // The same definition again: nothing changes.
             Some(kept) if kept.def == params => None,
             Some(kept) => {
-                let again =
-                    kept.def.schedule != params.schedule || (!kept.def.enabled && params.enabled);
+                // The schedule as it fires, not as it is written: a tz alias or a cron
+                // respelled is no change.
+                let again = !kept.plan.same_as(&plan, now) || (!kept.def.enabled && params.enabled);
                 let mut job = kept.clone();
                 if again {
                     job.anchor = now;
@@ -365,7 +377,10 @@ impl Scheduler {
                     job.startup_wait = None;
                     job.last_scheduled_for = None;
                 } else if !params.enabled {
+                    // Disabled: nothing due, owed or waiting.
                     job.next = None;
+                    job.owed = None;
+                    job.startup_wait = None;
                 }
                 job.plan = plan;
                 job.def = params;
@@ -475,6 +490,12 @@ impl Scheduler {
         let moment = self.moment(held, now, Cause::Due);
         match decide::run_now(&held.view(), &moment) {
             Ok(()) => {}
+            Err(RunNowRefused::Disabled) => {
+                return Err(refusal(
+                    codes::JOB_DISABLED,
+                    format!("job {} is disabled (enabled: false)", job.job_id),
+                ));
+            }
             Err(RunNowRefused::AppAbsent) => {
                 return Err(refusal(
                     codes::APP_ABSENT,
@@ -536,12 +557,19 @@ impl Scheduler {
         let presence = self.presence();
         let mut jobs = self.jobs();
         for job in jobs.values_mut() {
-            // The clock went back past the job's last scheduled time (NTP, or set by hand):
-            // its next is counted from now again, so it doesn't go quiet for as long.
-            if job.def.enabled && job.last_scheduled_for.is_some_and(|last| last > now) {
-                job.next = job.plan.next_after(now, Some(job.anchor));
-                job.last_scheduled_for = None;
-                self.store(job, now);
+            // The clock went back (NTP, or set by hand): counted from now, the job is due
+            // sooner than its next, so its next is counted from now again, and it doesn't
+            // go quiet for as long as the clock moved.
+            if job.def.enabled {
+                let fresh = job.plan.next_after(now, Some(job.anchor));
+                if let (Some(fresh), Some(next)) = (fresh, job.next)
+                    && fresh < next
+                    && next > now
+                {
+                    job.next = Some(fresh);
+                    job.last_scheduled_for = None;
+                    self.store(job, now);
+                }
             }
             let Some(scheduled) = job.next else {
                 continue;
@@ -877,6 +905,7 @@ impl Job {
     /// What [`decide`] reads of it.
     fn view(&self) -> decide::Job {
         decide::Job {
+            enabled: self.def.enabled,
             paused: self.paused,
             catch_up: self.def.catch_up,
         }
