@@ -29,10 +29,11 @@ or ``utime`` moves it, and nothing sets it back (review of #51).
 
 Limits:
 
-- On Windows, ``st_ctime_ns`` is the file's creation time, which an in-place write leaves. There, a
-  rewrite that keeps the size and inode and puts the old modification time back, done after the
-  file settled, is not seen until something else of its stat changes. Claude Code never writes so;
-  an editor's in-place save does not restore the time.
+- On Windows, ``st_ctime_ns`` is the file's creation time, which an in-place write leaves, and
+  ``os.fstat`` and ``os.stat`` disagree on it, so it is no key there (:data:`CTIME_IN_SIGNATURE`).
+  There, a rewrite that keeps the size and inode and puts the old modification time back, done
+  after the file settled, is not seen until something else of its stat changes. Claude Code
+  never writes so; an editor's in-place save does not restore the time.
 - A read that raises (no file there, any other ``OSError``) and a parse that raises (bytes that are
   no UTF-8, no JSON object, an empty file) drop the path's kept answer, and the exception goes on to
   the caller (:func:`parsed_or` turns ``OSError`` and ``ValueError`` into a fallback).
@@ -49,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -74,8 +76,16 @@ _clock: Callable[[], int] = time.time_ns
 """Now, in nanoseconds since the epoch, as ``st_mtime_ns`` counts them (a test's seam)."""
 
 
+CTIME_IN_SIGNATURE = sys.platform != "win32"
+"""Whether ``st_ctime_ns`` is a key of the signature. Not on Windows: there it is the creation
+time, which no write moves, and ``os.fstat`` of an open file and ``os.stat`` of its path do not
+agree on it (CPython 3.12; CI 46069839396), so a signature holding it never matched itself and
+nothing was ever kept."""
+
+
 def _stat_signature(stat: os.stat_result) -> Signature:
-    return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+    ctime = stat.st_ctime_ns if CTIME_IN_SIGNATURE else 0
+    return (stat.st_mtime_ns, ctime, stat.st_size, stat.st_ino)
 
 
 def _stat(path: Path) -> Signature:

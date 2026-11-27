@@ -226,7 +226,26 @@ KEYS = ("st_mtime_ns", "st_ctime_ns", "st_size", "st_ino")
 """The stat's fields the signature is made of (``parsed_files._stat_signature``)."""
 
 
-@pytest.mark.parametrize("key", KEYS)
+def _changed_ns(path: Path) -> int:
+    """When ``path`` last changed, as the racy guard reads it: the later of its signature's
+    modification and status-change times (the latter 0 where it is no key, on Windows)."""
+    signature = parsed_files._stat(path)
+    return max(signature[0], signature[1])
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param(
+            key,
+            marks=pytest.mark.skipif(
+                key == "st_ctime_ns" and not parsed_files.CTIME_IN_SIGNATURE,
+                reason="st_ctime_ns is no key of the signature on Windows (CTIME_IN_SIGNATURE)",
+            ),
+        )
+        for key in KEYS
+    ],
+)
 def test_a_change_in_any_one_key_of_the_signature_alone_is_read_again(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
@@ -261,6 +280,19 @@ def test_a_change_in_any_one_key_of_the_signature_alone_is_read_again(
     assert read == [path] and parsed == [path]
 
 
+def test_the_signature_of_the_bytes_read_is_the_signature_of_the_path(
+    slots: list[ClaudeAccount],
+) -> None:
+    """What the cache rests on: an unchanged file's signature from the handle its bytes were
+    read through (``os.fstat``) is the one ``os.stat`` gives its path. Where the two disagreed
+    (``st_ctime_ns`` on Windows, CI 46069839396), no answer was ever kept."""
+    path = core.claude_json_path(slots[1])
+    _write_email(path, "first@example.com")
+    _settled_at(path, 3600)
+    read, _body = parsed_files._read(path)
+    assert read == parsed_files._stat(path)
+
+
 def test_a_file_written_moments_ago_is_read_at_every_lookup_until_it_settles(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -280,8 +312,7 @@ def test_a_file_written_moments_ago_is_read_at_every_lookup_until_it_settles(
     _write_email(path, "again@example.com")
     os.utime(path, ns=(now, now))
     assert _email(path) == "again@example.com", "the same mtime and size, read again while fresh"
-    written = os.stat(path)
-    settles = max(written.st_mtime_ns, written.st_ctime_ns) + parsed_files.RACY_NS
+    settles = _changed_ns(path) + parsed_files.RACY_NS
     monkeypatch.setattr(parsed_files, "_clock", lambda: settles - 1)
     assert _email(path) == "again@example.com"
     assert _kept(path) == []
@@ -305,7 +336,9 @@ def _a_later_ctime(path: Path, than: int, mtime: int) -> os.stat_result:
     return now
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="st_ctime_ns is the creation time on Windows")
+@pytest.mark.skipif(
+    not parsed_files.CTIME_IN_SIGNATURE, reason="st_ctime_ns is no key of the signature here"
+)
 def test_a_settled_rewrite_that_puts_its_old_mtime_back_is_seen_by_its_ctime(
     slots: list[ClaudeAccount],
 ) -> None:
@@ -326,7 +359,9 @@ def test_a_settled_rewrite_that_puts_its_old_mtime_back_is_seen_by_its_ctime(
     assert _email(path) == "again@example.com"
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="elsewhere st_ctime_ns sees it (test above)")
+@pytest.mark.skipif(
+    parsed_files.CTIME_IN_SIGNATURE, reason="st_ctime_ns sees it here (the test above)"
+)
 def test_on_windows_a_settled_rewrite_holding_every_key_of_the_stat_is_not_seen(
     slots: list[ClaudeAccount],
 ) -> None:
@@ -356,8 +391,7 @@ def test_a_parse_that_outlasts_the_racy_window_keeps_nothing_of_a_file_fresh_whe
     after the read, so its answer is not kept however long the parse took."""
     path = core.claude_json_path(slots[1])
     _write_email(path, "first@example.com")
-    written = os.stat(path)
-    clock = [max(written.st_mtime_ns, written.st_ctime_ns)]
+    clock = [_changed_ns(path)]
     monkeypatch.setattr(parsed_files, "_clock", lambda: clock[0])
     json_object = parsed_files.json_object
 
