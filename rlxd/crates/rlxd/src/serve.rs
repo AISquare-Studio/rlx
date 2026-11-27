@@ -9,12 +9,14 @@
 //! 4. opens the event bus, which numbers on from `rlxd/seq` (`crate::bus`);
 //! 5. listens on the socket or pipe;
 //! 6. registers in `<home>/daemons/` (4.1), with a heartbeat every 5 s;
-//! 7. publishes `daemon.started`, and serves until `stop`, SIGTERM or Ctrl-C.
+//! 7. starts the resident Python brain (`crate::brain`);
+//! 8. publishes `daemon.started`, and serves until `stop`, SIGTERM or Ctrl-C.
 //!
-//! A stop publishes `daemon.stopping`, gives the connections a moment to send it, writes
-//! the bus's last seq, removes the socket, leaves the registry, then lets the lock go, so
+//! A stop publishes `daemon.stopping`, gives the connections a moment to send it, stops
+//! the brain and its tree, writes the bus's last seq, removes the socket, leaves the
+//! registry, then lets the lock go, so
 //! once the lock is free everything else is done. `--detach` starts the same in the background and returns once it takes
-//! a connection, printing its `status`.
+//! a connection and its brain runs (or has said why not), printing its `status`.
 
 use std::fs;
 use std::io;
@@ -29,6 +31,7 @@ use rlxd_client::{Home, Reply};
 use rlxd_proto::{VERSION, codes, methods};
 use tokio::task::JoinSet;
 
+use crate::brain::Brain;
 use crate::bus::Bus;
 use crate::config::Config;
 use crate::gate::Gate;
@@ -204,7 +207,8 @@ async fn serve_until_stopped(
     };
     let keeper = Keeper::start(home.clone(), registration, flags);
     let settings = Settings::open(&home);
-    let daemon = Daemon::new(home, token, listener.acl(), gate, bus, settings);
+    let brain = Brain::start(&home, Vec::new())?;
+    let daemon = Daemon::new(home, token, listener.acl(), gate, bus, settings, brain);
     daemon.started();
     tokio::spawn(watch_signals(Arc::clone(&daemon)));
     info!("listening on {endpoint}");
@@ -244,6 +248,7 @@ async fn serve_until_stopped(
             warning!("connections still not closed after their abort");
         }
     }
+    daemon.brain().stop().await;
     // No PTY outlives rlxd: each process and its group end before it does.
     let ending = Arc::clone(&daemon);
     if tokio::task::spawn_blocking(move || ending.end_ptys())
@@ -352,10 +357,33 @@ pub fn detach(gate_dev_mode: bool) -> ExitCode {
         command.args(dev_flags(gate_dev_mode));
     };
     match start(&home, adjust) {
-        Ok(reply) => out::print_reply(&reply),
+        Ok(reply) => out::print_reply(&brain_settled(&home, reply)),
         Err(StartError::AlreadyRunning) => already_running(&home),
         Err(StartError::Failed { message, hint }) => {
             out::fail(codes::START_FAILED, &message, hint.as_deref())
+        }
+    }
+}
+
+/// How long `--detach` waits for the brain to run, or to fail.
+const BRAIN_WAIT: Duration = Duration::from_secs(35);
+
+/// The `status` once the new rlxd's brain (`crate::brain`) runs, or says why not: `--detach`
+/// returns then, so the status it prints, and the next one asked, name the brain. `reply`
+/// as it was if rlxd stops answering meanwhile.
+fn brain_settled(home: &Home, mut reply: Reply) -> Reply {
+    let deadline = Instant::now() + BRAIN_WAIT;
+    loop {
+        let brain = reply.data().and_then(|data| data.get("brain"));
+        let settled =
+            brain.is_none_or(|brain| brain.get("pid").is_some() || brain.get("error").is_some());
+        if settled || Instant::now() >= deadline {
+            return reply;
+        }
+        thread::sleep(Duration::from_millis(25));
+        match cli::ask(home, methods::STATUS) {
+            Ok(next) if next.is_ok() => reply = next,
+            _ => return reply,
         }
     }
 }

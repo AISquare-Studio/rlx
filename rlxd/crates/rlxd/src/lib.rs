@@ -41,6 +41,7 @@ use clap::{Args, Parser, Subcommand};
 pub const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES");
 
 mod attach;
+mod brain;
 pub mod bus;
 mod claude;
 mod cli;
@@ -66,6 +67,7 @@ mod serve;
 mod server;
 mod settings;
 mod spaces;
+mod spawn;
 #[cfg(feature = "debug-methods")]
 mod test_hook;
 mod token;

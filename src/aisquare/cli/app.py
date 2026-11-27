@@ -17,6 +17,7 @@ from aisquare.cli import (
     accounts,
     agents,
     auth,
+    brain,
     brief,
     captain,
     capture,
@@ -252,6 +253,8 @@ app.add_typer(connectors.app, name="connectors")
 app.add_typer(context.app, name="context")
 app.add_typer(context.app, name="ctx", hidden=True, help="Alias of 'context'.")
 app.add_typer(daemon_cli.app, name="daemon")  # rlxd on this machine (0.10.3, 1.2)
+app.add_typer(brain.app, name="brain", hidden=True)  # rlxd's resident brain (0.10.3, 1.6)
+_NOT_FEATURES |= {"brain"}  # rlxd starts it, never a person: no count, no active ping
 app.add_typer(project.app, name="project")
 app.add_typer(project.app, name="workspace", hidden=True, help="Alias of 'project'.")
 app.add_typer(capture.app, name="capture", hidden=True)

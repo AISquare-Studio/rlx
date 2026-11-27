@@ -47,6 +47,7 @@ pub fn pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
 pub struct TestHome {
     root: PathBuf,
     claude: Option<PathBuf>,
+    rlx: Option<PathBuf>,
     envs: Vec<(String, String)>,
     binary: Option<PathBuf>,
 }
@@ -111,7 +112,7 @@ static NEXT: AtomicU32 = AtomicU32::new(0);
 
 impl TestHome {
     /// A new, empty home. Its rlxd finds no Claude Code unless [`TestHome::with_claude`]
-    /// names one.
+    /// names one, and no rlx to run as its brain unless [`TestHome::with_rlx`] does.
     pub fn new() -> Self {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("rlxd-{}-{n}", std::process::id()));
@@ -120,9 +121,16 @@ impl TestHome {
         Self {
             root,
             claude: None,
+            rlx: None,
             envs: Vec::new(),
             binary: None,
         }
+    }
+
+    /// This home, its rlxd running `program` as `rlx`: its brain is `program brain --stdio`.
+    pub fn with_rlx(mut self, program: PathBuf) -> Self {
+        self.rlx = Some(program);
+        self
     }
 
     /// This home, every `rlxd` in it run with `name` set to `value`.
@@ -225,6 +233,10 @@ impl TestHome {
                 self.claude
                     .clone()
                     .unwrap_or_else(|| self.root.join("no-claude")),
+            )
+            .env(
+                "RLXD_RLX_BIN",
+                self.rlx.clone().unwrap_or_else(|| self.root.join("no-rlx")),
             );
         command
     }
@@ -469,6 +481,76 @@ pub fn assert_valid(name: &str, instance: &Value) {
         .map(|e| e.to_string())
         .collect();
     assert!(errors.is_empty(), "{name}: {errors:?}\n{instance}");
+}
+
+/// `rlxd/tests/fixtures/fake-brain/<scenario>`, as this OS runs it: the batch file on
+/// Windows.
+pub fn fake_brain(scenario: &str) -> PathBuf {
+    let name = if cfg!(windows) {
+        format!("{scenario}.cmd")
+    } else {
+        scenario.to_owned()
+    };
+    workspace()
+        .join("tests")
+        .join("fixtures")
+        .join("fake-brain")
+        .join(name)
+}
+
+/// The checkout's own `rlx`, for a real brain: `RLXD_RLX_BIN` when the test runs with it
+/// set, else the `rlx` that `uv run` finds in the repository's environment. `None`, and
+/// the test skips, when neither is there and the run does not require it:
+/// `RLXD_INTEROP_REQUIRED`, which rlxd.yml sets, makes a missing one fail.
+pub fn real_rlx() -> Option<PathBuf> {
+    if let Some(named) = std::env::var_os("RLXD_RLX_BIN").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(named));
+    }
+    let required = std::env::var_os("RLXD_INTEROP_REQUIRED").is_some_and(|v| !v.is_empty());
+    let found = Command::new("uv")
+        .args([
+            "run",
+            "--quiet",
+            "python",
+            "-c",
+            "import shutil, sys; sys.stdout.write(shutil.which('rlx') or '')",
+        ])
+        .current_dir(workspace().parent().unwrap())
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    if found.is_none() {
+        assert!(
+            !required,
+            "no rlx: RLXD_INTEROP_REQUIRED is set, so `uv run` must find the checkout's rlx"
+        );
+        eprintln!("skipped: no rlx (set RLXD_RLX_BIN, or run where `uv run` works)");
+    }
+    found
+}
+
+/// Whether process `pid` is running.
+pub fn alive(pid: u64) -> bool {
+    if cfg!(windows) {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("tasklist runs");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    } else {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
 }
 
 /// `rlxd/tests/fixtures/fake-claude/<scenario>`.
