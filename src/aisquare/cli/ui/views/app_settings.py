@@ -122,10 +122,9 @@ from aisquare.cli.ui.confirm_button import ConfirmButton
 from aisquare.cli.ui.dont_ask import ASK_AGAIN, EVERY_ACTION_ASKS, said_not_asking
 from aisquare.cli.ui.save_model import UNDO_BINDING, UNDO_SAID, CommitInput, SavesAsYouGo
 from aisquare.cli.ui.sidebar import short_path
-from aisquare.cli.ui.views.settings_captain import CaptainToggle
-from aisquare.cli.ui.views.settings_remote import RemoteLink
+from aisquare.cli.ui.views.settings_captain import ExperimentalSection
 from aisquare.core import claude_accounts as accounts_core
-from aisquare.core import paths, personas
+from aisquare.core import experimental, paths, personas
 from aisquare.core.agent_adapters import adapters, get_adapter
 from aisquare.core.agent_adapters.codex import APPROVAL_POLICIES
 from aisquare.core.agent_adapters.types import (
@@ -327,9 +326,9 @@ PREFERENCES_TAB = "tab-user-preferences"
 """The *User preferences* tab's pane id: ``[ui]``, and ``[updates]`` below it."""
 REMOTE_TAB = "tab-remote"
 """The *Remote* tab's pane id: a way into the Remote page (``views.remote``), no Save."""
-CAPTAIN = "captain"
-"""Where the hub's *Captain* lands (:meth:`AppSettingsView.show_tab`): *Agent settings*,
-scrolled to its last section, the Captain box (Q18)."""
+EXPERIMENTAL = "experimental"
+"""Where the hub's *Experimental* lands (:meth:`AppSettingsView.show_tab`): *Agent settings*,
+scrolled to its last section, *Experimental* (Q18; the Captain box's place before #46)."""
 DISPLAY_TAB = "tab-display"
 """The *Display* tab's pane id: ``[ui]``'s switches, each saved as it is ticked (no Save)."""
 AGENT_ADVANCED = "agent-settings-advanced"
@@ -980,9 +979,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                     yield from self._compose_fleet()
                     yield from self._compose_more_accounts()
                     yield from self._compose_bindings()
-                # Last (Q18): an experimental switch, not what a new user opens App settings
-                # for. It topped the tab (#41).
-                yield CaptainToggle(id="settings-captain")
+                # Last (Q18): the experimental switches, not what a new user opens App
+                # settings for (the captain's topped the tab, #41; Remote joined it, #46).
+                yield ExperimentalSection(id="settings-experimental")
             with (
                 TabPane("User preferences", id=PREFERENCES_TAB),
                 VerticalScroll(id="user-preferences", classes="tab-body"),
@@ -993,11 +992,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 VerticalScroll(id="display-settings", classes="tab-body"),
             ):
                 yield from self._compose_display()
-            with (
-                TabPane("Remote", id=REMOTE_TAB),
-                VerticalScroll(id="remote-settings", classes="tab-body"),
-            ):
-                yield RemoteLink(id="settings-remote")
+            # Only while Remote is on (#46): off, nothing of it is loaded to show.
+            if bool(getattr(self.app, "remote_on", experimental.remote_enabled())):
+                yield self._remote_pane()
         # No Save and no Reload (M5): each control is kept as it changes, and the page re-reads
         # the file when it is opened. Reset all stays: it acts on every setting, armed twice.
         with Horizontal(id="settings-buttons"):
@@ -1397,14 +1394,39 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         if control == "default-agent" or control.startswith(f"{ROLE_ID_PREFIX}family-"):
             self._fill_account_selects()
 
+    @staticmethod
+    def _remote_pane() -> TabPane:
+        """The *Remote* tab: a way into the Remote page (``views.remote``), loaded with it."""
+        from aisquare.cli.ui.views.settings_remote import RemoteLink
+
+        return TabPane(
+            "Remote",
+            VerticalScroll(
+                RemoteLink(id="settings-remote"), id="remote-settings", classes="tab-body"
+            ),
+            id=REMOTE_TAB,
+        )
+
+    async def show_remote(self, on: bool) -> None:
+        """Remote turned on or off while the page is open (#46): its tab added after
+        *Display*, or taken away (the tab before it shown, if it was the one shown)."""
+        tabs = self.query_one("#app-settings-tabs", TabbedContent)
+        there = bool(tabs.query(f"#{REMOTE_TAB}"))
+        if on and not there:
+            await tabs.add_pane(self._remote_pane(), after=DISPLAY_TAB)
+        elif not on and there:
+            if tabs.active == REMOTE_TAB:
+                tabs.active = DISPLAY_TAB
+            await tabs.remove_pane(REMOTE_TAB)
+
     def show_tab(self, tab: str) -> None:
         """Bring ``tab`` (:data:`AGENT_TAB`, :data:`PREFERENCES_TAB`, :data:`REMOTE_TAB`) to
-        the front, or for :data:`CAPTAIN` *Agent settings* scrolled to the Captain box, its
+        the front, or for :data:`EXPERIMENTAL` *Agent settings* scrolled to that section, its
         last section: where the hub's *Captain* link lands."""
-        if tab == CAPTAIN:
+        if tab == EXPERIMENTAL:
             self.query_one("#app-settings-tabs", TabbedContent).active = AGENT_TAB
             # Once the tab is laid out: from another tab, its scroll had no region to reach.
-            box = self.query_one(CaptainToggle)
+            box = self.query_one(ExperimentalSection)
             self.call_after_refresh(box.scroll_visible, animate=False, top=True)
             return
         self.query_one("#app-settings-tabs", TabbedContent).active = tab
@@ -1510,7 +1532,7 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         for wid, key in _UI_SWITCHES.items():
             self.query_one(f"#{wid}", Switch).value = getattr(self.ui, key)
         self._show_ui(self.ui)
-        self.query_one(CaptainToggle).reread(config)
+        self.query_one(ExperimentalSection).reread(config)
         for role in self._roles:
             row = self._role_row(role)
             if row is None:

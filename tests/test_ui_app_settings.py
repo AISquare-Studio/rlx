@@ -1743,8 +1743,8 @@ def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> 
 
     seen = drive(scenario)
     agent_tab = cast(list[str], seen["agent tab"])
-    assert agent_tab[-1] == "settings-captain", agent_tab
-    assert agent_tab.index(AGENT_ADVANCED) < agent_tab.index("settings-captain"), "under it"
+    assert agent_tab[-1] == "settings-experimental", agent_tab
+    assert agent_tab.index(AGENT_ADVANCED) < agent_tab.index("settings-experimental"), "under it"
     for tab in TABS_IN_ORDER:
         assert seen[f"{tab} in view"] == [], f"{tab}: shown as it opens"
         assert seen[f"{tab} folded"] == [], f"{tab}: folded until Advanced is opened"

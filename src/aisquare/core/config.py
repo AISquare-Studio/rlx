@@ -192,9 +192,16 @@ class ExperimentalSettings(BaseModel):
     persona is absent and the voice page does not serve. ``AISQUARE_EXPERIMENTAL_CAPTAIN``
     wins over this field either way; ``core.experimental.captain_enabled`` is the one
     reader of both.
+
+    ``remote``: Remote, the fleet on a phone (#46). ``None`` until decided: read then as on
+    for a home where Remote was set up before it had a switch, else off
+    (``core.experimental.remote_enabled``, the one reader, with
+    ``AISQUARE_EXPERIMENTAL_REMOTE``). ``true`` and ``false`` are a choice made, kept by a
+    reset as ``[service]`` is, so an off is never turned back on behind the person's back.
     """
 
     captain: bool = False
+    remote: bool | None = None
 
 
 class RoleLaunchProfile(BaseModel):

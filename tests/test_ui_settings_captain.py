@@ -59,7 +59,7 @@ async def _settings(pilot: Pilot[None]) -> CaptainToggle:
     app = fleet_app(pilot)
     await pilot.click(app.query_one(SettingsRow))
     await settle_page(app)
-    await pilot.click("#hub-captain")
+    await pilot.click("#hub-experimental")
     await settle_page(app)
     return app.query_one(CaptainToggle)
 
