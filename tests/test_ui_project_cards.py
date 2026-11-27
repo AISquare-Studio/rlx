@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from rich.cells import cell_len
@@ -43,6 +44,7 @@ from aisquare.core.store import store_session
 from aisquare.models import FleetAgent, ProjectForgetReport, ProjectInfo
 from aisquare.services import project as project_service
 from tests.fleet_fakes import SessionsOnly, tmux_sessions_as
+from tests.pane_harness import bracketed_paste, post_terminal_input
 from tests.test_ui_shell import (
     PRIVATE_SOCKET,
     Script,
@@ -513,6 +515,40 @@ def test_an_empty_name_is_the_folders_and_the_field_holds_255_characters(
     assert held == limit == project_service.NICKNAME_MAX == 255
     stored = _stored("prj_a")
     assert stored is not None and stored.nickname == "y" * 255
+
+
+def test_a_paste_holding_a_raw_escape_neither_submits_nor_cancels_the_rename(
+    tmp_path: Path, script: Script
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends an Enter that follows an Escape in a paste to the field, which saves half of it, and
+    a trailing Escape closes the field; the guard keeps it one paste (``cli.ui.paste_guard``).
+    This test reads the messages the field posts, and its value: each paste's first line, as
+    the field takes any paste."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[list[str], str]:
+        app = fleet_app(pilot)
+        app.sidebar.open_rename("prj_a")
+        await settle(app)
+        field = _field(app, "prj_a")
+        posted: list[str] = []
+        post = field.post_message
+
+        def recorded(message: Any) -> bool:
+            posted.append(type(message).__name__)
+            return post(message)
+
+        field.post_message = recorded  # type: ignore[method-assign]
+        post_terminal_input(app, bracketed_paste("one\x1b\rtwo"))
+        await settle(app)
+        post_terminal_input(app, bracketed_paste("one\x1b"))
+        await settle(app)
+        return posted, field.value
+
+    posted, value = drive(go)
+    assert {"Submitted", "Cancelled"}.isdisjoint(posted), posted
+    assert value == "one\x1bone\x1b"  # the name was selected as the field opened
 
 
 def test_a_name_the_store_refuses_reopens_the_field_with_what_was_typed(
