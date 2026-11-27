@@ -222,6 +222,29 @@ fn a_request_the_brain_never_accepted_was_never_delivered() {
     });
 }
 
+/// The other side of the accept wait: an `accepted` the brain wrote, still unread in the
+/// pipe when the wait ends, is read once the brain is killed, so the request timed out and
+/// was never "not delivered" (review #2555 M1, tester #2645). The fake brain writes it
+/// without the line's end and stalls, which holds it there until the kill.
+#[test]
+fn an_accepted_left_in_the_pipe_at_the_accept_wait_is_read_after_the_kill() {
+    let home = TestHome::new().with_rlx(fake_brain("accepts-unterminated"));
+    home.start();
+    let first = brain_pid(&home);
+    let asked = Instant::now();
+    let ping = home.rlxd(&["call", "hook.ping"]);
+    assert!(asked.elapsed() >= Duration::from_secs(2), "{ping:?}");
+    assert_eq!(
+        ping.error_code(),
+        "timed_out",
+        "it may have run, so it was delivered: {ping:?}"
+    );
+    assert!(
+        !alive(first),
+        "the stalled brain was killed before the answer"
+    );
+}
+
 #[test]
 fn a_request_the_brain_accepted_then_died_on_failed_rather_than_never_ran() {
     let home = TestHome::new().with_rlx(fake_brain("accepts-then-dies"));
