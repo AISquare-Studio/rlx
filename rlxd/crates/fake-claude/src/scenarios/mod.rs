@@ -10,6 +10,7 @@ mod asks;
 mod big;
 mod connectors;
 mod crash;
+pub mod gate;
 mod hello;
 mod huge;
 pub mod login;
@@ -19,6 +20,7 @@ mod rate_limit;
 mod slow;
 mod structured;
 mod tool_result;
+pub mod watch_call;
 
 pub use connectors::{ROUTE_ENV, SLACK, TRY_TOOL_ENV, tools as slack_tools};
 pub use orphan::LINGER;
@@ -46,6 +48,7 @@ pub const ALL: &[(&str, Scenario)] = &[
         connectors::play(fake, Schedule::Never, ANSWER)
     }),
     ("crash", crash::run),
+    ("gate", gate::by_prompt),
     ("hello", hello::run),
     ("huge", huge::run),
     ("init-connectors", |fake| {
@@ -61,16 +64,18 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("stdin-eof-empty", connectors::stdin_eof_empty),
     ("structured", structured::run),
     ("tool-result", tool_result::run),
+    ("watch-call", watch_call::run),
 ];
 
 /// What the connector scenarios answer.
 const ANSWER: &str = "Nothing in Slack needs you.";
 
-/// The scenario called `name`.
+/// The scenario called `name`: one of [`ALL`], or one of the gate's ([`gate`]).
 pub fn find(name: &str) -> Option<Scenario> {
     ALL.iter()
         .find(|(each, _)| *each == name)
         .map(|(_, scenario)| *scenario)
+        .or_else(|| gate::named(name))
 }
 
 /// The code a scenario exits with when stdin closed before its first message: Claude

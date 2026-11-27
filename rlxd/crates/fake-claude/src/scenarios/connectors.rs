@@ -89,8 +89,8 @@ fn init(fake: &mut Fake, schedule: Schedule, status: &str) {
     } else {
         Vec::new()
     };
-    let servers = json!([{"name": SLACK, "status": status}]);
-    fake.emit_init(&tools, &servers);
+    let servers = json!([{"name": SLACK, "status": status, "source": "claudeai"}]);
+    fake.init(json!(tools), servers);
     let started_at = fake.started_at();
     if status == "connected"
         && let Some(log) = fake.log()
@@ -165,7 +165,7 @@ pub fn stdin_eof_empty(fake: &mut Fake) -> i32 {
     };
     fake.remember(&message);
     if fake.stdin_closed_within(300) {
-        fake.emit_init(&[], &json!([]));
+        fake.init(json!([]), json!([]));
     } else {
         init(fake, schedule, "connected");
     }

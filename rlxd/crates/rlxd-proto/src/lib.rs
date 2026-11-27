@@ -219,7 +219,7 @@ pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use job::{
     CatchUp, ClockAdvanceParams, ClockSetParams, FireCause, JobEvent, JobFiredData, JobId,
     JobListData, JobListParams, JobPutParams, JobRef, JobRunNowData, JobSkippedData, JobSummary,
-    JobType, RunTemplate, Schedule, SkipReason, job_types,
+    JobType, JobWatchResultData, RunTemplate, Schedule, SkipReason, job_types,
 };
 pub use marker::{False, True, V1};
 pub use pty::{
@@ -232,12 +232,13 @@ pub use pty::{
 };
 pub use request::{Params, Request, RequestId, methods};
 pub use run::{
-    CallState, ConnectorStatus, DEFAULT_DEADLINE_MS, FailReason, McpServer, Mount,
-    NeedsYouClearedData, NeedsYouRaisedData, NeedsYouReason, NeedsYouSource, NeedsYouWhen,
-    PinnedCall, RunCall, RunCancelData, RunDoneData, RunEvent, RunEventsData, RunEventsParams,
-    RunFailedData, RunGetData, RunId, RunKind, RunListData, RunListParams, RunNeedsYouData,
-    RunQueuedData, RunRateLimitedData, RunRef, RunResumeData, RunResumeParams, RunStartParams,
-    RunStartedData, RunState, RunSummary, RunTextData, RunToolResultData, Usage, run_types,
+    CallState, ConnectorStatus, DEFAULT_DEADLINE_MS, DecidedBy, Decision, FailReason, McpServer,
+    Mount, NeedsYouClearedData, NeedsYouRaisedData, NeedsYouReason, NeedsYouSource, NeedsYouWhen,
+    PinnedCall, RunCall, RunCancelData, RunDecideData, RunDecideParams, RunDoneData, RunEvent,
+    RunEventsData, RunEventsParams, RunFailedData, RunGetData, RunId, RunKind, RunListData,
+    RunListParams, RunNeedsYouData, RunQueuedData, RunRateLimitedData, RunRef, RunResumeData,
+    RunResumeParams, RunStartParams, RunStartedData, RunState, RunSummary, RunTextData,
+    RunToolCallData, RunToolDecidedData, RunToolResultData, Usage, run_types,
 };
 pub use settings::{
     MAX_DEPTH as MAX_SETTING_DEPTH, MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged,

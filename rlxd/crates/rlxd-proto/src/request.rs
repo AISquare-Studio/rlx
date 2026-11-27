@@ -228,6 +228,17 @@ pub mod methods {
     /// set: [`RunStartParams`](crate::RunStartParams) plus `job_id` in,
     /// [`RunRef`](crate::RunRef) out. A release build answers `unknown_method`.
     pub const DEBUG_RUN_START: &str = "debug.run_start";
+    /// The app's answer to a `run.tool_call`, from an app-role connection only (5.1):
+    /// [`RunDecideParams`](crate::RunDecideParams) in,
+    /// [`RunDecideData`](crate::RunDecideData) out.
+    pub const RUN_DECIDE: &str = "run.decide";
+    /// Test builds only: a run's PreToolUse hook request, as `rlxd-hook pre-tool-use` will
+    /// send it, decided by the gate: `{run_id, attempt, key, stdin}` in, `{output}` (the
+    /// hook's JSON for Claude Code) out. A release build answers `unknown_method`.
+    pub const DEBUG_PRE_TOOL_USE: &str = "debug.pre_tool_use";
+    /// Test builds only: drops every hook connection waiting on the gate, as a crash of
+    /// the connection would (5.1): `{}` in, `{dropped}` out.
+    pub const DEBUG_DROP_HOOK_CONNECTIONS: &str = "debug.drop_hook_connections";
     /// Creates or replaces a scheduler job by `job_id` (7.6):
     /// [`JobPutParams`](crate::JobPutParams) in, [`JobRef`](crate::JobRef) out.
     pub const JOB_PUT: &str = "job.put";

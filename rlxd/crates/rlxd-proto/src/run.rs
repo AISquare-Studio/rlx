@@ -27,6 +27,10 @@ pub mod run_types {
     pub const STARTED: &str = "run.started";
     /// Assistant text, or a partial chunk of it.
     pub const TEXT: &str = "run.text";
+    /// A tool call the app must decide with `run.decide` (5.1).
+    pub const TOOL_CALL: &str = "run.tool_call";
+    /// How a tool call was decided, and by whom (5.1).
+    pub const TOOL_DECIDED: &str = "run.tool_decided";
     /// A tool's result, as Claude Code gave it.
     pub const TOOL_RESULT: &str = "run.tool_result";
     /// Claude Code was rate limited, or warned it soon will be.
@@ -682,6 +686,208 @@ impl RunTextData {
     }
 }
 
+/// `run.tool_call` (5.1): a call of the run's that only the app can decide, with
+/// `run.decide` before `deadline_ms`. It replays through `run.events`, so an app that
+/// reconnects while it is pending sees it again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RunToolCallData {
+    /// Claude Code's `tool_use_id`, which the call's other events share.
+    pub call_id: String,
+    /// The tool, such as `mcp__claude_ai_Slack__slack_send_message`.
+    pub tool: String,
+    /// The tool's input, as Claude Code gave it.
+    pub input: Value,
+    /// The SHA-256, in hex, of the input's RFC 8785 canonical JSON.
+    #[schemars(regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub input_sha256: String,
+    /// How long the app has to decide, in milliseconds, from this event.
+    pub deadline_ms: u64,
+}
+
+impl RunToolCallData {
+    /// Call `call_id` of `tool` with `input`, whose hash is `input_sha256`.
+    pub fn new(
+        call_id: impl Into<String>,
+        tool: impl Into<String>,
+        input: Value,
+        input_sha256: impl Into<String>,
+        deadline_ms: u64,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            input,
+            input_sha256: input_sha256.into(),
+            deadline_ms,
+        }
+    }
+}
+
+/// What a tool call was decided (5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    /// It runs.
+    Allow,
+    /// It doesn't.
+    Deny,
+    /// It doesn't, and the app saved it as a draft (`draft_id`).
+    Draft,
+}
+
+impl Decision {
+    /// Its name on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Draft => "draft",
+        }
+    }
+}
+
+/// Who decided a tool call (5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecidedBy {
+    /// The app, with `run.decide`.
+    App,
+    /// rlxd's own rules: the mount, the kind, the pinned call.
+    Rlxd,
+    /// No answer came before the deadline.
+    Timeout,
+    /// No app-role connection was there to ask.
+    Unreachable,
+}
+
+impl DecidedBy {
+    /// Its name on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Rlxd => "rlxd",
+            Self::Timeout => "timeout",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// `run.tool_decided` (5.1): how a call was decided, and by whom.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct RunToolDecidedData {
+    /// Claude Code's `tool_use_id`.
+    pub call_id: String,
+    /// `allow`, `deny` or `draft`.
+    pub decision: Decision,
+    /// `app`, `rlxd`, `timeout` or `unreachable`.
+    pub by: DecidedBy,
+    /// Why: the app's reason, or rlxd's. Data only: it decides nothing.
+    pub reason: String,
+    /// For `draft`: the app's draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub draft_id: Option<String>,
+}
+
+impl RunToolDecidedData {
+    /// Call `call_id`, decided `decision` by `by`, for `reason`.
+    pub fn new(
+        call_id: impl Into<String>,
+        decision: Decision,
+        by: DecidedBy,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            decision,
+            by,
+            reason: reason.into(),
+            draft_id: None,
+        }
+    }
+
+    /// This decision, a draft saved as `draft_id`.
+    #[must_use]
+    pub fn with_draft(mut self, draft_id: Option<String>) -> Self {
+        self.draft_id = draft_id;
+        self
+    }
+}
+
+/// `run.decide`'s params (5.1), from an app-role connection only: the app's answer to a
+/// `run.tool_call`. The first answer wins.
+///
+/// rlxd refuses, by error code: `not_gate` from any other connection; `unknown_run`,
+/// `unknown_call`; `already_decided` once the call is decided; `too_late` once its
+/// deadline passed (it was denied `by: "timeout"`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(title = "RunDecideParams")]
+#[non_exhaustive]
+pub struct RunDecideParams {
+    /// The run.
+    pub run_id: RunId,
+    /// The call: its `run.tool_call`'s `call_id`.
+    #[schemars(length(min = 1))]
+    pub call_id: String,
+    /// `allow`, `deny` or `draft`.
+    pub decision: Decision,
+    /// Why, as Claude Code is told (`permissionDecisionReason`).
+    pub reason: String,
+    /// For `draft`: the app's draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub draft_id: Option<String>,
+    /// End the run, as `run.needs_you {reason: "denied"}`, once the call is denied.
+    #[serde(default)]
+    pub stop: bool,
+}
+
+impl RunDecideParams {
+    /// The app's `decision` on call `call_id` of run `run_id`, for `reason`.
+    pub fn new(
+        run_id: RunId,
+        call_id: impl Into<String>,
+        decision: Decision,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id,
+            call_id: call_id.into(),
+            decision,
+            reason: reason.into(),
+            draft_id: None,
+            stop: false,
+        }
+    }
+}
+
+/// `run.decide`'s reply: the decision taken.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "RunDecideData")]
+#[non_exhaustive]
+pub struct RunDecideData {
+    /// The run.
+    pub run_id: RunId,
+    /// The call.
+    pub call_id: String,
+    /// The decision.
+    pub decision: Decision,
+}
+
+impl RunDecideData {
+    /// `decision` taken on call `call_id` of run `run_id`.
+    pub fn new(run_id: RunId, call_id: impl Into<String>, decision: Decision) -> Self {
+        Self {
+            run_id,
+            call_id: call_id.into(),
+            decision,
+        }
+    }
+}
+
 /// `run.tool_result`: a `tool_result` block in a stream-json `user` message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
@@ -776,6 +982,16 @@ pub struct RunNeedsYouData {
 }
 
 impl RunNeedsYouData {
+    /// A run the app stopped (`run.decide` with `stop: true`) when it denied call `call_id`.
+    pub fn denied(call_id: impl Into<String>) -> Self {
+        Self {
+            reason: NeedsYouReason::Denied,
+            question: None,
+            call_id: Some(call_id.into()),
+            loud: None,
+        }
+    }
+
     /// A run whose output asked the user `question`.
     pub fn question(question: Option<String>) -> Self {
         Self {
@@ -1291,6 +1507,28 @@ pub struct RunCall {
     pub state: CallState,
 }
 
+impl RunCall {
+    /// Call `call_id` of `tool`, whose input hashes to `input_sha256`, as `decision` by
+    /// `by` decided it, now `state`.
+    pub fn new(
+        call_id: impl Into<String>,
+        tool: impl Into<String>,
+        input_sha256: impl Into<String>,
+        decision: Decision,
+        by: DecidedBy,
+        state: CallState,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            input_sha256: input_sha256.into(),
+            decision: Some(decision.as_str().to_owned()),
+            by: Some(by.as_str().to_owned()),
+            state,
+        }
+    }
+}
+
 /// `run.get`'s reply: one run, durably: its state, structured output and end survive an
 /// rlxd restart.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1479,6 +1717,14 @@ impl JsonSchema for RunEvent {
                 generator.subschema_for::<RunStartedData>(),
             ),
             (run_types::TEXT, generator.subschema_for::<RunTextData>()),
+            (
+                run_types::TOOL_CALL,
+                generator.subschema_for::<RunToolCallData>(),
+            ),
+            (
+                run_types::TOOL_DECIDED,
+                generator.subschema_for::<RunToolDecidedData>(),
+            ),
             (
                 run_types::TOOL_RESULT,
                 generator.subschema_for::<RunToolResultData>(),

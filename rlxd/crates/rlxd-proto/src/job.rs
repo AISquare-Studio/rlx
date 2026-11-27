@@ -8,7 +8,7 @@ use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::check::{self, drop_null};
 use crate::{Data, Invalid, RunId, RunStartParams, RunState};
@@ -27,6 +27,9 @@ pub mod job_types {
     pub const FIRED: &str = "job.fired";
     /// `job.skipped {job_id, scheduled_for, reason}`.
     pub const SKIPPED: &str = "job.skipped";
+    /// `job.watch_result {job_id, run_id, tool, input_sha256, content, is_error,
+    /// truncated}`: a watch job's call's raw result.
+    pub const WATCH_RESULT: &str = "job.watch_result";
 }
 
 /// A job's id, which the app picks: 1 to 128 ASCII letters, digits, `.`, `_`, `-` and
@@ -201,12 +204,15 @@ impl JsonSchema for RunTemplate {
 ///  "run": {"kind": "widget_refresh", "prompt": "…", "mount": {"kind": "no_tools"},
 ///          "space": "default"},
 ///  "catch_up": "once", "enabled": true, "loud": false}
+/// {"job_id": "ci-green", "type": "watch", "schedule": {"every_minutes": 5},
+///  "connector": "claude.ai GitHub", "tool": "mcp__claude_ai_GitHub__get_check_runs",
+///  "input": {"ref": "main"}, "catch_up": "skip", "enabled": true}
 /// ```
 ///
 /// rlxd refuses, by error code: `kind_mount_mismatch` and `pinned_call_required` for a
-/// template `run.start` would refuse; `not_implemented` for a `watch` job, until it is served; `invalid_params` for anything
-/// else, an unknown field, a cron expression it can't read or a time zone it doesn't
-/// know included.
+/// template `run.start` would refuse; `invalid_params` for anything else, an unknown
+/// field, a cron expression it can't read, a time zone it doesn't know, or a watch job's
+/// tool that isn't its connector's included.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "JobPutParams")]
@@ -223,18 +229,20 @@ pub struct JobPutParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub run: Option<RunTemplate>,
-    /// A `watch` job's connector, such as `claude.ai GitHub`.
+    /// A `watch` job's connector, such as `claude.ai GitHub`. Required for `watch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(transform = drop_null)]
+    #[schemars(transform = drop_null, length(min = 1))]
     pub connector: Option<String>,
-    /// A `watch` job's tool.
+    /// A `watch` job's tool, one of its connector's, such as
+    /// `mcp__claude_ai_GitHub__get_check_runs`. Required for `watch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(transform = drop_null)]
+    #[schemars(transform = drop_null, length(min = 1))]
     pub tool: Option<String>,
-    /// A `watch` job's tool input.
+    /// A `watch` job's tool input, a JSON object: the call is pinned to its RFC 8785
+    /// SHA-256. Required for `watch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
-    pub input: Option<Value>,
+    pub input: Option<Map<String, Value>>,
     /// What it does about fires it couldn't make.
     pub catch_up: CatchUp,
     /// Whether it fires at all. Absent: `true`.
@@ -267,6 +275,30 @@ impl JobPutParams {
         }
     }
 
+    /// A `watch` job `job_id`: one pinned call of `connector`'s `tool` with `input` per
+    /// tick, on `schedule`, enabled and quiet.
+    pub fn watch(
+        job_id: JobId,
+        schedule: Schedule,
+        connector: impl Into<String>,
+        tool: impl Into<String>,
+        input: Map<String, Value>,
+        catch_up: CatchUp,
+    ) -> Self {
+        Self {
+            job_id,
+            r#type: JobType::Watch,
+            schedule,
+            run: None,
+            connector: Some(connector.into()),
+            tool: Some(tool.into()),
+            input: Some(input),
+            catch_up,
+            enabled: true,
+            loud: false,
+        }
+    }
+
     /// Whether the params keep the rules the schema states: a `run` job has a `run`, and
     /// only a `watch` job names a connector, a tool or an input. (The template, the cron
     /// expression and the time zone are rlxd's to check.)
@@ -289,6 +321,15 @@ impl JobPutParams {
             JobType::Watch => {
                 if self.run.is_some() {
                     return Err(Invalid::new("run", "is a run job's, not a watch job's"));
+                }
+                for (field, value) in [("connector", &self.connector), ("tool", &self.tool)] {
+                    match value {
+                        Some(value) => check::non_empty(field, value)?,
+                        None => return Err(Invalid::new(field, "a watch job needs it")),
+                    }
+                }
+                if self.input.is_none() {
+                    return Err(Invalid::new("input", "a watch job needs it, an object"));
                 }
             }
         }
@@ -513,6 +554,49 @@ impl JobSkippedData {
     }
 }
 
+/// `job.watch_result`: a watch job's call's raw result, from the fire's run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct JobWatchResultData {
+    /// The job's id.
+    pub job_id: JobId,
+    /// The fire's run, as `job.fired` named it.
+    pub run_id: RunId,
+    /// The tool called.
+    pub tool: String,
+    /// The SHA-256 of the call's input as RFC 8785 JSON: the job's pinned call.
+    pub input_sha256: String,
+    /// The call's result, exactly as Claude Code gave it, up to 1 MiB of JSON; past that,
+    /// its first 1 MiB as a string (`truncated`).
+    pub content: Value,
+    /// Whether the call failed: then `content` is its error, not a result to match on.
+    pub is_error: bool,
+    /// Whether `content` was cut: then it is no result to match on either.
+    pub truncated: bool,
+}
+
+impl JobWatchResultData {
+    /// Job `job_id`'s call of `tool` (input `input_sha256`) in run `run_id`, which gave
+    /// `content`.
+    pub fn new(
+        job_id: JobId,
+        run_id: RunId,
+        tool: impl Into<String>,
+        input_sha256: impl Into<String>,
+        content: Value,
+    ) -> Self {
+        Self {
+            job_id,
+            run_id,
+            tool: tool.into(),
+            input_sha256: input_sha256.into(),
+            content,
+            is_error: false,
+            truncated: false,
+        }
+    }
+}
+
 /// One event of the `job` topic: an event (event.json) whose data, for each job event
 /// type 7.6 describes, carries that type's fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -534,6 +618,10 @@ impl JsonSchema for JobEvent {
             (
                 job_types::SKIPPED,
                 generator.subschema_for::<JobSkippedData>(),
+            ),
+            (
+                job_types::WATCH_RESULT,
+                generator.subschema_for::<JobWatchResultData>(),
             ),
         ];
         let mut rules = vec![Value::from(generator.subschema_for::<crate::Event>())];

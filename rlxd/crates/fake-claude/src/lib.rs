@@ -51,8 +51,9 @@
 //!   close after the scenario wrote its `result`, which is how a run ends, is not one.
 //! - `delivered` is whether the scenario got to write its `result`; a start that was
 //!   killed or crashed first stays `false`.
-//! - `connected_at` and `hook_replies` belong to the connector and gate scenarios (5.1,
-//!   5.5); `tool_runs` counts the tool calls a start ran, none in these scenarios.
+//! - `connected_at` belongs to the connector scenarios (5.5). `hook_replies` holds each
+//!   answer the run's PreToolUse hook gave a gate scenario (5.1, [`hook`]), and
+//!   `tool_runs` counts the tool calls a start ran: only on an allow.
 //! - `exit` is the code it exited with, `null` while it runs or once it was killed.
 //!
 //! Every write takes `fake-claude.log.lock` (an OS file lock), reads the log, changes
@@ -71,6 +72,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+pub mod hook;
 mod log;
 pub mod scenarios;
 
@@ -308,15 +310,26 @@ impl Fake {
     /// Waits until the run's first user message, then writes `system/init`: that
     /// message, or `None` when stdin closed with none.
     pub fn begin(&mut self) -> Option<Value> {
-        let message = self.next_user_message()?;
-        self.remember(&message);
-        self.emit_init(&[], &json!([]));
+        self.begin_with(json!([]), json!([]))
+    }
+
+    /// [`Fake::begin`], `system/init` listing `tools` and `mcp_servers`.
+    pub fn begin_with(&mut self, tools: Value, mcp_servers: Value) -> Option<Value> {
+        let message = self.first_message()?;
+        self.init(tools, mcp_servers);
         Some(message)
     }
 
-    /// Writes `system/init`, mounting `tools` and listing `mcp_servers`, then a line of a
-    /// type a later Claude Code may add, which rlxd ignores.
-    pub fn emit_init(&mut self, tools: &[String], mcp_servers: &Value) {
+    /// Waits for the run's first user message, and keeps it for the session file: `None`
+    /// when stdin closed with none. [`Fake::init`] follows it.
+    pub fn first_message(&mut self) -> Option<Value> {
+        let message = self.next_user_message()?;
+        self.remember(&message);
+        Some(message)
+    }
+
+    /// Writes `system/init`, listing `tools` and `mcp_servers`.
+    pub fn init(&mut self, tools: Value, mcp_servers: Value) {
         let strict = self.flag("--strict-mcp-config");
         let init = json!({
             "type": "system", "subtype": "init", "cwd": self.cwd,

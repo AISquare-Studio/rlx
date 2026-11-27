@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "JobPutParams",
-  "description": "`job.put`'s params (7.6). It creates or replaces the job by `job_id`, idempotently,\nand returns `{job_id}` (`job-ref.json`).\n\n```json\n{\"job_id\": \"slack-digest\", \"type\": \"run\", \"schedule\": {\"every_minutes\": 15},\n \"run\": {\"kind\": \"widget_refresh\", \"prompt\": \"…\", \"mount\": {\"kind\": \"no_tools\"},\n         \"space\": \"default\"},\n \"catch_up\": \"once\", \"enabled\": true, \"loud\": false}\n```\n\nrlxd refuses, by error code: `kind_mount_mismatch` and `pinned_call_required` for a\ntemplate `run.start` would refuse; `not_implemented` for a `watch` job, until it is served; `invalid_params` for anything\nelse, an unknown field, a cron expression it can't read or a time zone it doesn't\nknow included.",
+  "description": "`job.put`'s params (7.6). It creates or replaces the job by `job_id`, idempotently,\nand returns `{job_id}` (`job-ref.json`).\n\n```json\n{\"job_id\": \"slack-digest\", \"type\": \"run\", \"schedule\": {\"every_minutes\": 15},\n \"run\": {\"kind\": \"widget_refresh\", \"prompt\": \"…\", \"mount\": {\"kind\": \"no_tools\"},\n         \"space\": \"default\"},\n \"catch_up\": \"once\", \"enabled\": true, \"loud\": false}\n{\"job_id\": \"ci-green\", \"type\": \"watch\", \"schedule\": {\"every_minutes\": 5},\n \"connector\": \"claude.ai GitHub\", \"tool\": \"mcp__claude_ai_GitHub__get_check_runs\",\n \"input\": {\"ref\": \"main\"}, \"catch_up\": \"skip\", \"enabled\": true}\n```\n\nrlxd refuses, by error code: `kind_mount_mismatch` and `pinned_call_required` for a\ntemplate `run.start` would refuse; `invalid_params` for anything else, an unknown\nfield, a cron expression it can't read, a time zone it doesn't know, or a watch job's\ntool that isn't its connector's included.",
   "type": "object",
   "properties": {
     "catch_up": {
@@ -9,8 +9,9 @@
       "$ref": "#/$defs/CatchUp"
     },
     "connector": {
-      "description": "A `watch` job's connector, such as `claude.ai GitHub`.",
-      "type": "string"
+      "description": "A `watch` job's connector, such as `claude.ai GitHub`. Required for `watch`.",
+      "type": "string",
+      "minLength": 1
     },
     "enabled": {
       "description": "Whether it fires at all. Absent: `true`.",
@@ -18,7 +19,9 @@
       "default": true
     },
     "input": {
-      "description": "A `watch` job's tool input."
+      "description": "A `watch` job's tool input, a JSON object: the call is pinned to its RFC 8785\nSHA-256. Required for `watch`.",
+      "type": "object",
+      "additionalProperties": true
     },
     "job_id": {
       "description": "The job's id.",
@@ -45,8 +48,9 @@
       "$ref": "#/$defs/Schedule"
     },
     "tool": {
-      "description": "A `watch` job's tool.",
-      "type": "string"
+      "description": "A `watch` job's tool, one of its connector's, such as\n`mcp__claude_ai_GitHub__get_check_runs`. Required for `watch`.",
+      "type": "string",
+      "minLength": 1
     },
     "type": {
       "description": "`run` or `watch`.",

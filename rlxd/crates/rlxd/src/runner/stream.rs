@@ -57,6 +57,10 @@ pub struct Init {
     /// (`{"name", "annotations": {"readOnlyHint"}}`). Claude Code 2.1 lists names only,
     /// so this is empty and every hint `null` (5.3); the probe checks a later one.
     pub hints: HashMap<String, bool>,
+    /// Each MCP server's `source`, for those whose entry carries one: `claudeai` for a
+    /// claude.ai connector, else `sdk`, `plugin` or the config's scope (`local`, `user`,
+    /// `project`). Claude Code 2.1.332 writes it; the tool-call gate needs it (5.1).
+    pub sources: HashMap<String, String>,
 }
 
 /// A `result` line.
@@ -174,14 +178,19 @@ fn init(value: &Value) -> Init {
             _ => None,
         })
         .collect();
+    let mut sources = HashMap::new();
     let mcp_servers = value
         .get("mcp_servers")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|server| {
+            let name = server.get("name")?.as_str()?;
+            if let Some(source) = server.get("source").and_then(Value::as_str) {
+                sources.insert(name.to_owned(), source.to_owned());
+            }
             Some(McpServer::new(
-                server.get("name")?.as_str()?,
+                name,
                 server
                     .get("status")
                     .and_then(Value::as_str)
@@ -196,6 +205,7 @@ fn init(value: &Value) -> Init {
         mcp_servers,
         claude_version: text("claude_code_version"),
         hints,
+        sources,
     }
 }
 
@@ -339,6 +349,7 @@ mod tests {
                 mcp_servers: vec![McpServer::new("claude.ai Slack", "connected")],
                 claude_version: "2.1.314".into(),
                 hints: HashMap::new(),
+                sources: HashMap::new(),
             })
         );
     }
@@ -358,6 +369,25 @@ mod tests {
             HashMap::from([
                 ("mcp__a__r".to_owned(), true),
                 ("mcp__a__w".to_owned(), false)
+            ])
+        );
+    }
+
+    #[test]
+    fn an_mcp_servers_source_is_kept_where_its_entry_has_one() {
+        let line = one(json!({"type": "system", "subtype": "init", "mcp_servers": [
+            {"name": "claude.ai Slack", "status": "connected", "source": "claudeai"},
+            {"name": "mine", "status": "connected", "source": "local"},
+            {"name": "old", "status": "connected"}]}));
+        let Line::Init(init) = line else {
+            panic!("{line:?}");
+        };
+        assert_eq!(init.mcp_servers.len(), 3);
+        assert_eq!(
+            init.sources,
+            HashMap::from([
+                ("claude.ai Slack".to_owned(), "claudeai".to_owned()),
+                ("mine".to_owned(), "local".to_owned()),
             ])
         );
     }

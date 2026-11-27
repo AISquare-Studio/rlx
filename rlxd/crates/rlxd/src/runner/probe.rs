@@ -117,7 +117,7 @@ impl Runner {
         let mut line = Vec::new();
         let settled = tokio::time::Instant::now()
             + self.connectors.gate_times().settle
-            + super::gate::START_ALLOWANCE;
+            + super::connector_gate::START_ALLOWANCE;
         // As on route 2: what Claude Code writes before the prompt is not the probe's.
         loop {
             tokio::select! {

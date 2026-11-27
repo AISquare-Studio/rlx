@@ -78,8 +78,20 @@ pub fn args(params: &RunStartParams, attempt: u64, settings: &Path) -> Vec<OsStr
 /// `hook`, with a timeout of `deadline_ms / 1000 + 10` seconds (rounded up), so Claude
 /// Code never ends the hook before rlxd's own deadline.
 pub fn settings(params: &RunStartParams, attempt: u64, hook: &Path) -> Value {
+    settings_via(params, attempt, hook, None)
+}
+
+/// [`settings`], the hook run as `hook <via> pre-tool-use …`: test builds name rlxd itself
+/// with `__test-hook` until rlxd-hook's own pre-tool-use is wired.
+pub fn settings_via(
+    params: &RunStartParams,
+    attempt: u64,
+    hook: &Path,
+    via: Option<&str>,
+) -> Value {
+    let via = via.map(|via| format!(" {via}")).unwrap_or_default();
     let command = format!(
-        "{} pre-tool-use --run {} --attempt {attempt}",
+        "{}{via} pre-tool-use --run {} --attempt {attempt}",
         quoted(hook),
         params.run_id
     );
