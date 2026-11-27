@@ -144,8 +144,13 @@ def read_needs(projects: Sequence[ProjectInfo]) -> list[Need]:
 def _board_ready(view: ProjectView) -> bool:
     """Whether ``view`` can show its Board tab: the tab in its tab row, and the tab's pane in its
     switcher with the board in it composed. Before all of that, setting its active tab raises,
-    or hides one pane and shows none."""
-    if not view.is_mounted:
+    or hides one pane and shows none.
+
+    And the view has taken its first tab. Its tab row activates that tab as the view composes,
+    and the view handles it only after its own mount, so a view just mounted has no active tab
+    yet: the Board tab set then was put back to the first tab (Manager) a moment later, and the
+    card never opened (#40)."""
+    if not view.is_mounted or not view.active:
         return False
     if not view.query(f"ContentTabs #tabs-list > #{BOARD_TAB}"):
         return False

@@ -453,6 +453,57 @@ def test_landing_on_a_cold_projects_view_at_any_moment_of_its_mount(
     assert shown and focused
 
 
+def test_landing_the_moment_a_cold_projects_view_has_mounted_keeps_its_board(
+    tmp_path: Path, projects: dict[str, Any]
+) -> None:
+    """#40: the moment above that failed now and then in full-matrix runs (py3.11 and py3.12,
+    three times): the turn a cold view first reads mounted. Its tab row activated its first tab
+    (Manager) as the view composed, and the view handles that only after it mounts (Textual
+    yields once in between), so it has no active tab yet. The bar's Board tab, set then, was
+    put back to Manager a moment later, the bar read "another tab chosen" and dropped the card.
+    A landing retried every 50 ms hit that turn only by chance; this one lands on it."""
+    from aisquare.cli.ui.sidebar import ProjectSelected
+    from tests.test_ui_spawn import register
+
+    gamma = register(tmp_path / "gamma", project_id="prj_gamma", codename="calm-gecko")
+    projects["frames"][gamma.id] = _blocked_behind_five_reviews(gamma)
+
+    def gammas_view(app: Any) -> ProjectView | None:
+        views = app.query(f"#project-{gamma.id}")
+        return views.first(ProjectView) if views else None
+
+    async def go(pilot: Any, app: Any) -> tuple[str, str]:
+        await _on_betas_settings(pilot, app, projects["beta"])
+        bar = app.query_one(NeedsYouBar)
+        bar.read_now()
+        await settle_page(app)
+        named = bar.needs[0]
+        assert named.project.id == gamma.id, "the premise: the bar names gamma's card"
+        app.post_message(ProjectSelected(gamma.id))
+        for _ in range(5000):  # one event-loop turn at a time: the first turn it is mounted
+            if (view := gammas_view(app)) is not None and view.is_mounted:
+                break
+            await asyncio.sleep(0)
+        else:
+            pytest.fail("gamma's view never mounted")
+        first_tab = view.active  # "" until the view handles its tab row's first activation
+        bar._landing = (named, 0)  # what open_need leaves for the landing, at this moment
+        bar._land()
+        await _until(
+            pilot,
+            lambda: (
+                (board := gammas_view(app)) is not None
+                and _reader_focused(app, board.query_one(BoardPanel))
+            ),
+            what="gamma's card in the reader, the keys on it",
+        )
+        return first_tab, view.active
+
+    first_tab, active = drive((100, 30), go)
+    assert first_tab == "", "the premise: landed before the view took its first tab"
+    assert active == "tab-board"
+
+
 def _reader_focused(app: Any, board: BoardPanel | None) -> bool:
     focused = app.focused
     return bool(
