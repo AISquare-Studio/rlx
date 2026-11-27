@@ -435,9 +435,18 @@ def test_an_older_reader_publishing_last_gives_each_reader_its_own_identity(
     """Reader 1 reads A; before it parses, the file becomes B and reader 2 reads, parses and keeps
     B; then reader 1 parses A, finds the file's stat is no longer that of the bytes it read, and
     keeps nothing. This test reads both readers' emails, then the email and the parses of the
-    next read of B."""
+    next read of B.
+
+    A and B are given modification times half an hour apart, as a later write has once the
+    clock has ticked. Written moments apart at the same size, they can share every key of the
+    stat: Windows stamps a write from a clock of about 15.6 ms and keeps the creation time as
+    ``st_ctime_ns``, and ext4 stamps both from a tick of milliseconds (CI 46056955569,
+    windows-py3.12 shard 6/10, kept A under B's stat). That case is the racy guard's, which
+    :func:`settled` puts out of play here, and
+    :func:`test_a_file_written_moments_ago_is_read_at_every_lookup_until_it_settles` covers."""
     path = core.claude_json_path(slots[1])
     _write_email(path, "a@example.com")
+    _settled_at(path, 3600)
     read_file = parsed_files._read
     second: list[str | None] = []
 
@@ -446,6 +455,7 @@ def test_an_older_reader_publishing_last_gives_each_reader_its_own_identity(
         if target == path and not second:
             second.append(None)
             _write_email(path, "b@example.com")
+            _settled_at(path, 1800)
             second[0] = _email(path)
         return read
 
