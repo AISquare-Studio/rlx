@@ -3191,6 +3191,11 @@ def _pushed(root: Path, rev: str, default: str) -> bool:
     return remote.returncode == 0 and bool(remote.stdout.strip())
 
 
+def _status_failed(status: _GitResult) -> str:
+    """What ``_why_kept`` says of a tree git would not give the status of."""
+    return f"git status failed there ({status.stderr.strip() or status.returncode})"
+
+
 def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
     """``tree``'s status read once: why git could not say (else ``None``), the untracked
     entries whose every file lies inside a ``CACHEDIR.TAG`` directory (``core.cachedir``:
@@ -3202,7 +3207,7 @@ def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
     the file went with it."""
     status = _git(tree, "status", "--porcelain=v1", "-z", "--untracked-files=normal")
     if status.returncode != 0:
-        return f"git status failed there ({status.stderr.strip() or status.returncode})", [], True
+        return _status_failed(status), [], True
     caches: list[Path] = []
     other = False
     fields = iter(status.stdout.split("\0"))

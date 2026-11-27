@@ -15,6 +15,7 @@ import typer
 from rich.table import Table
 
 from aisquare.core import paths
+from aisquare.core import program as prog
 from aisquare.core.console import stdout_console
 from aisquare.core.state import get_state
 from aisquare.services import tidy as tidy_service
@@ -97,7 +98,7 @@ def tidy(
             return
         count = len(plan.items)
         console.print(
-            f"rlx tidy --dry-run: would free {size(plan.bytes)} in {count} "
+            f"{prog.word()} tidy --dry-run: would free {size(plan.bytes)} in {count} "
             f"{'path' if count == 1 else 'paths'}",
             markup=False,
         )
@@ -112,7 +113,8 @@ def tidy(
         return
     count = len(report.freed)
     console.print(
-        f"rlx tidy: freed {size(report.bytes)} in {count} {'path' if count == 1 else 'paths'}",
+        f"{prog.word()} tidy: freed {size(report.bytes)} in {count} "
+        f"{'path' if count == 1 else 'paths'}",
         markup=False,
     )
     if report.freed:

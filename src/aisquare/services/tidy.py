@@ -157,7 +157,7 @@ def _remove(path: Path, roots: Roots) -> None:
     unlinked, never followed (``cachedir.remove_dir``)."""
     info = os.lstat(path)
     if stat.S_ISLNK(info.st_mode):
-        raise Refused(f"{path} is a link: rlx tidy deletes no link's target, nor the link")
+        raise Refused(f"{path} is a link: tidy deletes no link's target, nor the link")
     if not roots.allows(path):
         raise Refused(f"{path} is outside rlx's own folders")
     if stat.S_ISDIR(info.st_mode):
@@ -322,7 +322,7 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
             continue
         if not result.roots.allows(tree):
             result.kept.append(
-                Kept(ENDED_WORKTREE, tree, f"not under {WORKTREES_DIR}: `fleet reap` judges it")
+                Kept(ENDED_WORKTREE, tree, f"not under {WORKTREES_DIR}: reap judges it")
             )
             continue
         try:
@@ -465,7 +465,7 @@ def _session_trees(
     for directory in sessions:
         session_id = directory.name
         moved = _session_moved(store, session_id, directory)
-        if not _ended(by_session.get(session_id, ()), session_id, commands, moved, at):
+        if not _session_ended(by_session.get(session_id, ()), session_id, commands, moved, at):
             continue
         assert moved is not None
         _one_session(directory, session_id, moved, at, result)
@@ -484,7 +484,7 @@ def _session_moved(store: ContextStore, session_id: str, directory: Path) -> dat
     return _last_moved(directory, *_session_signals(store, session_id))
 
 
-def _ended(
+def _session_ended(
     rows: Iterable[FleetAgent],
     identifier: str,
     commands: list[str] | None,
