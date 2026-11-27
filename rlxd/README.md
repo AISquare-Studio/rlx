@@ -275,7 +275,9 @@ ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the s
 - **Who may do what:** `cli` and `tui` every method; `remote` the reads and
   `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
 - **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;
-  128 KiB a write, so the longest one fits a frame however it is escaped.
+  128 KiB a write, so the longest one fits a frame however it is escaped. A longer write
+  gets `write_too_large`, and a frame over 1 MiB `frame_too_large`; the connection stays
+  open for both. A paste over 128 KiB would need a paste in parts: §1.8's to decide.
 - **The terminal** is `TERM=xterm-256color`, `COLORTERM=truecolor`, unless `env` says
   otherwise.
 - **The environment** is rlxd's, less what the fleet's tmux server takes out of a

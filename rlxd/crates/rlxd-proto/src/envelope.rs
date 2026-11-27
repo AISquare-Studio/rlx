@@ -280,9 +280,12 @@ pub mod codes {
     /// and the approver did not say `force`.
     pub const REVOKED_DEVICE: &str = "revoked_device";
     /// A frame after `hello` that is not a request: not JSON, not an object, no `method`,
-    /// params that are not an object, or a second `hello`. A frame longer than rlxd
-    /// reads also gets it, and then the connection closes.
+    /// params that are not an object, or a second `hello`.
     pub const INVALID_REQUEST: &str = "invalid_request";
+    /// A frame after `hello` longer than the 1 MiB rlxd reads. rlxd reads none of it past
+    /// that, skips it to its newline, and goes on: the connection stays open. The reply
+    /// has no `id`, which was not read; `detail.max` is the limit.
+    pub const FRAME_TOO_LARGE: &str = "frame_too_large";
     /// A method failed in a way its caller cannot fix, such as a file rlxd could not
     /// read. The message says what.
     pub const INTERNAL: &str = "internal";
@@ -341,6 +344,10 @@ pub mod codes {
     /// for the program as it may (16 MiB). Nothing of this write was taken: try again
     /// once the program reads.
     pub const PTY_BUSY: &str = "pty_busy";
+    /// `pty.write`: its `text`, `paste` or key names are more than the 128 KiB one write
+    /// may carry. Nothing of it was taken. `detail.max` is the limit and `detail.bytes`
+    /// the write's size.
+    pub const WRITE_TOO_LARGE: &str = "write_too_large";
     /// `pty.screen`, or `pty.subscribe`'s snapshot: the screen, with the history asked
     /// for, is longer than the longest line a client reads (16 MiB). Ask for less
     /// `scrollback`. A stream whose new snapshot is that long ends with it.

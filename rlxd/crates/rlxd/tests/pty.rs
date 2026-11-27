@@ -604,12 +604,13 @@ fn check_6_each_role_gets_what_it_may() {
     );
 }
 
-/// #2574 minor 5: the longest write there is, of control characters, which JSON writes
-/// in six bytes each, fits a frame, and one byte more is refused, with the connection
-/// left open for the next request.
+/// #2574 minor 5, and the manager's ruling on it: the longest write there is, of control
+/// characters, which JSON writes in six bytes each, fits a frame; one byte more, as text,
+/// a paste or key names, gets `write_too_large {max, bytes}`, with the connection left
+/// open for the next request.
 #[cfg(unix)]
 #[test]
-fn the_longest_write_fits_a_frame_and_a_longer_one_is_refused() {
+fn the_longest_write_fits_a_frame_and_a_longer_one_is_refused_by_name() {
     let home = TestHome::new();
     home.start();
     let id = spawn(
@@ -625,18 +626,83 @@ fn the_longest_write_fits_a_frame_and_a_longer_one_is_refused() {
     );
     assert!(reply.is_ok(), "{reply:?}");
     let over = "\u{1}".repeat(rlxd_proto::MAX_PTY_WRITE + 1);
+    let keys: Vec<String> = (0..=rlxd_proto::MAX_PTY_WRITE / 4)
+        .map(|_| "Home".to_owned())
+        .collect();
+    let bytes = keys.len() * 4;
+    for (input, size) in [
+        (json!({ "text": over }), over.len()),
+        (json!({ "paste": over }), over.len()),
+        (json!({ "keys": keys }), bytes),
+    ] {
+        let mut params = input.clone();
+        params["pty_id"] = json!(id);
+        let reply = request(&mut connection, "pty.write", params);
+        let error = reply.error().unwrap();
+        assert_eq!(error.code, "write_too_large", "{input:.40}: {reply:?}");
+        let line: Value = serde_json::from_str(&reply.line).unwrap();
+        assert_eq!(
+            line["error"]["detail"],
+            json!({"max": rlxd_proto::MAX_PTY_WRITE, "bytes": size})
+        );
+        let reply = request(&mut connection, "pty.list", json!({}));
+        assert!(reply.is_ok(), "the connection goes on: {reply:?}");
+    }
+}
+
+/// The manager's ruling on #2574 minor 5: a frame over the 1 MiB rlxd reads gets
+/// `frame_too_large`, and the connection goes on, a request's and a stream's alike.
+#[test]
+fn a_frame_over_the_limit_is_refused_by_name_and_the_connection_goes_on() {
+    let home = TestHome::new();
+    home.start();
+    let id = spawn(&home, json!({"argv": ready_argv(), "cols": 80, "rows": 24}));
+    let huge = "x".repeat(2 << 20);
+    let refused = |reply: &rlxd_client::Reply| {
+        assert_eq!(
+            reply.error().unwrap().code,
+            "frame_too_large",
+            "{}",
+            reply.line
+        );
+        let line: Value = serde_json::from_str(&reply.line).unwrap();
+        assert_eq!(line["error"]["detail"], json!({"max": 1 << 20}));
+    };
+    let mut connection = connect(&home, Role::Cli);
     let reply = request(
         &mut connection,
         "pty.write",
-        json!({"pty_id": id, "text": over}),
+        json!({"pty_id": id, "text": huge}),
     );
-    assert_eq!(reply.error().unwrap().code, "invalid_params", "{reply:?}");
-    let reply = request(&mut connection, "pty.list", json!({}));
-    assert!(reply.is_ok(), "the connection goes on: {reply:?}");
+    refused(&reply);
+    for _ in 0..2 {
+        let reply = request(&mut connection, "pty.list", json!({}));
+        assert!(reply.is_ok(), "the connection goes on: {}", reply.line);
+    }
+
+    let params = PtySubscribeParams::new(&id, false).unwrap();
+    let mut stream = connect(&home, Role::Cli).subscribe_pty(&params).unwrap();
+    assert!(matches!(stream.next_frame().unwrap(), Next::Event(_)));
+    let reply_to = |stream: &mut rlxd_client::Subscription, method: &str, params: Value| {
+        stream
+            .send(method, params.as_object().cloned().unwrap_or_default())
+            .unwrap();
+        loop {
+            if let Incoming::Reply(reply) = stream.next_incoming().unwrap() {
+                break reply;
+            }
+        }
+    };
+    let reply = reply_to(
+        &mut stream,
+        "pty.write",
+        json!({"pty_id": id, "text": huge}),
+    );
+    refused(&reply);
+    let reply = reply_to(&mut stream, "pty.write", json!({"pty_id": id, "text": "x"}));
+    assert!(reply.is_ok(), "the stream goes on: {}", reply.line);
 }
 
-/// #2574 minor 6: a program that never reads its input fills rlxd's queue for it, and
-/// then a write gets `pty_busy`, a code of its own, not `internal`.
 #[cfg(unix)]
 #[test]
 fn a_program_that_reads_nothing_makes_a_write_busy() {

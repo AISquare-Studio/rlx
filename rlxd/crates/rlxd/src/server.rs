@@ -65,8 +65,9 @@ use crate::{claude, spaces, token};
 /// `daemon.stopping`'s `reason` when a client asked rlxd to stop.
 pub const STOP_REQUESTED: &str = "stop";
 
-/// The longest frame rlxd reads: 1 MiB. A longer one gets `invalid_request`, and the
-/// connection closes.
+/// The longest frame rlxd reads: 1 MiB. After `hello`, a longer one gets
+/// `frame_too_large`, and rlxd skips the rest of it and reads on; as the first frame, it
+/// is no `hello`, and the connection closes, as for any other.
 pub const MAX_FRAME: usize = 1 << 20;
 
 // The longest `pty.write` fits a frame however it is escaped: six bytes of JSON for each
@@ -584,6 +585,7 @@ impl Daemon {
                 printed(&spawned.map_err(pty_refused)?)
             }
             methods::PTY_WRITE => {
+                write_fits(&params)?;
                 let params = params_of::<PtyWriteParams>(method, params)?;
                 if watching_read_only(session, &params.pty_id) {
                     return Err(error(
@@ -1157,6 +1159,7 @@ where
     let mut frames = Frames {
         reader: BufReader::new(reader),
         line: Vec::new(),
+        skipping: false,
     };
     let first = tokio::select! {
         first = tokio::time::timeout(HELLO_TIMEOUT, frames.next()) => first,
@@ -1213,9 +1216,10 @@ where
                 continue;
             }
             Ok(Some(Frame::TooLong)) => {
-                let message = format!("the frame is longer than {MAX_FRAME} bytes");
-                let reply = reply_err(None, codes::INVALID_REQUEST, message);
-                return refuse(&mut frames, &mut writer, &reply).await;
+                if send(&mut writer, &frame_too_large()).await.is_err() {
+                    return;
+                }
+                continue;
             }
             Ok(None) | Err(_) => return,
         };
@@ -1539,10 +1543,10 @@ where
             return send(writer, &reply).await.is_err().then_some(Flow::Close);
         }
         Ok(Some(Frame::TooLong)) => {
-            let message = format!("the frame is longer than {MAX_FRAME} bytes");
-            let reply = reply_err(None, codes::INVALID_REQUEST, message);
-            refuse(frames, writer, &reply).await;
-            return Some(Flow::Close);
+            return send(writer, &frame_too_large())
+                .await
+                .is_err()
+                .then_some(Flow::Close);
         }
         Ok(None) | Err(_) => return Some(Flow::Close),
     };
@@ -1663,6 +1667,8 @@ struct Frames<R> {
     reader: BufReader<R>,
     /// The frame read so far, until its newline comes.
     line: Vec<u8>,
+    /// The rest of a frame too long to read is being skipped, to its newline.
+    skipping: bool,
 }
 
 impl<R: AsyncRead + Unpin> Frames<R> {
@@ -1692,9 +1698,16 @@ impl<R: AsyncRead + Unpin> Frames<R> {
                 Some(at) => (&chunk[..at], at + 1, true),
                 None => (chunk, chunk.len(), false),
             };
+            if self.skipping {
+                // The rest of a frame too long to read: dropped as it comes.
+                self.skipping = !ended;
+                self.reader.consume(used);
+                continue;
+            }
             if self.line.len() + part.len() > MAX_FRAME {
                 self.reader.consume(used);
                 self.line.clear();
+                self.skipping = !ended;
                 return Ok(Some(Frame::TooLong));
             }
             self.line.extend_from_slice(part);
@@ -1875,6 +1888,48 @@ fn pty_refused(refused: pty::Refused) -> ErrorBody {
         )
         .with_hint("Its screen says error: screen_failed, and stays, blank, until pty.kill."),
     }
+}
+
+/// `frame_too_large`'s reply, to a frame rlxd skipped.
+fn frame_too_large() -> Envelope {
+    let mut detail = Data::new();
+    detail.insert("max".to_owned(), Value::from(MAX_FRAME));
+    let body = error(
+        codes::FRAME_TOO_LARGE,
+        &format!("the frame is longer than the {MAX_FRAME} bytes rlxd reads: it was skipped"),
+    )
+    .with_hint("Send less in one request: a pty.write carries at most 128 KiB.")
+    .with_detail(detail)
+    .expect("frame_too_large's detail is an object");
+    Envelope::err(body)
+}
+
+/// Refuses a `pty.write` whose input is more than [`MAX_PTY_WRITE`] bytes, by name,
+/// before its params are read: `write_too_large {max, bytes}`.
+fn write_fits(params: &Params) -> Result<(), ErrorBody> {
+    let bytes = match (params.get("text"), params.get("paste"), params.get("keys")) {
+        (Some(Value::String(text)), _, _) | (None, Some(Value::String(text)), _) => text.len(),
+        (None, None, Some(Value::Array(keys))) => {
+            keys.iter().filter_map(Value::as_str).map(str::len).sum()
+        }
+        _ => 0,
+    };
+    if bytes <= rlxd_proto::MAX_PTY_WRITE {
+        return Ok(());
+    }
+    let mut detail = Data::new();
+    detail.insert("max".to_owned(), Value::from(rlxd_proto::MAX_PTY_WRITE));
+    detail.insert("bytes".to_owned(), Value::from(bytes));
+    Err(error(
+        codes::WRITE_TOO_LARGE,
+        &format!(
+            "the write is {bytes} bytes, more than the {} one carries",
+            rlxd_proto::MAX_PTY_WRITE
+        ),
+    )
+    .with_hint("Nothing of it was taken: send it in parts.")
+    .with_detail(detail)
+    .expect("write_too_large's detail is an object"))
 }
 
 /// A screen of `long` bytes, longer than a client reads.

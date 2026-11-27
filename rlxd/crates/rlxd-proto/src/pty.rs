@@ -40,8 +40,8 @@ pub const MAX_SIZE: u16 = 1000;
 /// The most bytes one `pty.write` carries: its `text`, its `paste`, or its keys' names:
 /// 128 KiB, an eighth of the 1 MiB frame rlxd reads (#2574 minor 5). JSON takes at most
 /// six bytes for one (`\u001b`), so the longest write there is, its envelope with it,
-/// fits a frame, and one past it is refused with `invalid_params` rather than ending
-/// the connection as a frame too long would.
+/// fits a frame: one past it gets `write_too_large`, and a frame past 1 MiB
+/// `frame_too_large`, both on a connection that stays open.
 pub const MAX_WRITE: usize = 128 << 10;
 
 /// The most lines of history a PTY keeps above its screen, as the fleet's tmux keeps

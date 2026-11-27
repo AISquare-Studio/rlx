@@ -249,7 +249,9 @@ every connection's `pty.list`.
 - **Limits.** A home holds at most 64 PTYs, the exited ones included, else
   `too_many_ptys`. Each keeps at most 50,000 lines of history. A `pty.write` carries at
   most 128 KiB: an eighth of a frame, so even one of control characters, six bytes of
-  JSON each, fits one, and a longer one is refused rather than closing the connection.
+  JSON each, fits one. A longer write gets `write_too_large {max, bytes}`, and a frame over
+  1 MiB gets `frame_too_large {max}`, with no `id`, which rlxd didn't read; rlxd skips the
+  rest of that frame, and the connection stays open for the next request either way.
   A program that reads none of its input gets 16 MiB of it queued, then `pty_busy`:
   nothing of that write was taken, so write it again once the program reads. A
   `pty.screen` (or a stream's snapshot) longer than the 16 MiB line a client reads gets
