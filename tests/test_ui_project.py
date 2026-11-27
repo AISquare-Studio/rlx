@@ -59,6 +59,7 @@ from typer.testing import CliRunner
 from aisquare.cli.app import app
 from aisquare.cli.ui.board import COLUMN_WIDTH_KEY, DETAIL_HEIGHT_KEY, EMPTY_ROW, BoardPanel
 from aisquare.cli.ui.divider import Divider
+from aisquare.cli.ui.save_model import CommitInput
 from aisquare.cli.ui.terminal import TerminalPane
 from aisquare.cli.ui.views import personas_tab
 from aisquare.cli.ui.views import project as project_view_module
@@ -2501,6 +2502,108 @@ def test_the_nickname_is_kept_on_leaving_the_field_and_ctrl_z_puts_the_old_one_b
     assert seen["undone"] == (None, ""), "ctrl+z: the name it replaced (none), on disk and shown"
     assert any(m.endswith("· Undo: ctrl+z") for m in seen["notices"]), seen["notices"]
     assert "Undone: repo's nickname" in seen["notices"]
+
+
+def test_enter_then_leaving_the_nickname_before_its_save_lands_keeps_it_once(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#53 (found in #3272): on a slow machine, Enter and then leaving the field before the page
+    has heard the save committed the same nickname again. Two writes, and a second, no-op Undo
+    the person's first ctrl+z spent doing nothing. The save is held here AFTER its store write
+    (a gate, not a sleep) while the field is left, then let go. One write, one Undo, and one
+    ctrl+z puts the old name back, on disk and in the field."""
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)  # a rename renames the project's sessions: none, faked
+    real_rename = fleet_service.rename_project
+    written = threading.Event()  # the store holds the new name
+    let_go = threading.Event()  # the test lets the save's answer reach the page
+    writes: list[str | None] = []
+
+    def slowed(target: ProjectInfo, nickname: str | None, **kwargs: Any) -> ProjectInfo:
+        renamed = real_rename(target, nickname, **kwargs)
+        writes.append(nickname)
+        written.set()
+        let_go.wait(timeout=10)
+        return renamed
+
+    monkeypatch.setattr(fleet_service, "rename_project", slowed)
+
+    def stored() -> str | None:
+        with store_session() as store:
+            return store.get_project(project.id).nickname  # type: ignore[union-attr]
+
+    async def scenario(pilot: Pilot[None], host: Host) -> dict[str, Any]:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        page = host.query_one(SettingsView)
+        field = host.query_one("#nickname", CommitInput)
+        await pilot.click("#nickname")
+        field.value = "Auth"
+        await pilot.press("enter")
+        for _ in range(500):  # bounded: the worker's store write, on its own thread
+            if written.is_set():
+                break
+            await pilot.pause(0.01)
+        seen: dict[str, Any] = {"held": (written.is_set(), field.kept)}
+        field.blur()  # left before the page has heard the save
+        await pilot.pause()
+        let_go.set()
+        await settle(pilot)
+        seen["kept"] = (stored(), field.kept, len(page.changes), list(writes))
+        field.focus()  # ctrl+z reaches the page from its field
+        await pilot.pause()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen["undone"] = (stored(), field.value, len(page.changes), list(writes))
+        return seen
+
+    try:
+        seen = drive(project, scenario)
+    finally:
+        let_go.set()  # never a worker left waiting
+    assert seen["held"] == (True, ""), "the premise: the field was left before the save landed"
+    assert seen["kept"] == ("Auth", "Auth", 1, ["Auth"]), seen["kept"]
+    assert seen["undone"] == (None, "", 0, ["Auth", None]), seen["undone"]
+
+
+def test_a_nickname_whose_save_failed_is_saved_again_on_enter(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#53: a save that fails without refusing the name (the store said no: the project gone)
+    keeps the typed name to try again, and Enter with it unchanged tries again. The value in
+    flight is released, not held as if it were still being saved."""
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)
+    real_rename = fleet_service.rename_project
+    asked: list[str | None] = []
+
+    def once_gone(target: ProjectInfo, nickname: str | None, **kwargs: Any) -> ProjectInfo:
+        asked.append(nickname)
+        if len(asked) == 1:
+            raise KeyError(target.id)
+        return real_rename(target, nickname, **kwargs)
+
+    monkeypatch.setattr(fleet_service, "rename_project", once_gone)
+
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[list[str | None], str, bool]:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        field = host.query_one("#nickname", CommitInput)
+        await pilot.click("#nickname")
+        field.value = "Auth"
+        await pilot.press("enter")
+        await settle(pilot)
+        failed = any("the nickname was not saved" in m for m, _ in host.notices)
+        await pilot.press("enter")  # the same name, again
+        await settle(pilot)
+        return list(asked), field.kept, failed
+
+    asked_seen, kept, failed = drive(project, scenario)
+    assert failed, "the premise: the first save failed"
+    assert asked_seen == ["Auth", "Auth"] and kept == "Auth"
 
 
 def test_a_nickname_typed_and_not_left_is_kept_when_rlx_quits(

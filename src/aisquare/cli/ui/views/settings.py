@@ -288,6 +288,7 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
                 # Refused beside the field, which keeps what was typed to correct (M5).
                 self.refuse(self.query_one("#nickname"), f"not saved: {error}")
                 return
+            self.query_one("#nickname", CommitInput).release()  # to try again (#53)
             if isinstance(error, KeyError):
                 reason = "the project is no longer registered"
             elif isinstance(error, ValueError):
