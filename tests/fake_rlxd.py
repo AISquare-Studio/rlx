@@ -8,7 +8,9 @@ Run as ``python tests/fake_rlxd.py <command> …`` with ``FAKE_RLXD_DIR`` naming
   ``<dir>/stop-<kind>`` appears or it is signalled. As real rlxd does, it always finishes a
   stop it was asked for: while ``<dir>/stuck-<kind>`` is there it keeps running, and it
   stops once that is gone. ``<dir>/teardown`` ends every one of them, for good (a test's
-  end). ``watch`` is the same, as a ``watch`` daemon.
+  end). ``<dir>/argv-<kind>`` (a JSON list) is the argv it records instead of its own, and
+  ``<dir>/mute-<kind>`` (seconds) how long it is registered before it answers.
+  ``watch`` is the same, as a ``watch`` daemon.
 - ``status --json``, ``call <method> [params]`` and ``stop`` answer as rlxd's command line:
   one JSON envelope (``ok``, ``data`` or ``error``). The runs and PTYs are
   ``<dir>/state.json``'s, which a test writes; ``pty.kill`` marks one exited.
@@ -52,6 +54,14 @@ def _live() -> daemons.Daemon | None:
     return found[0] if found else None
 
 
+def _answering() -> daemons.Daemon | None:
+    """The live rlxd, once it answers (``mute-rlxd``)."""
+    live = _live()
+    if live is None or time.time() < float(_state().get("rlxd", {}).get("answers_at", 0.0)):
+        return None
+    return live
+
+
 def _daemon(kind: str) -> None:
     asked = False
 
@@ -62,9 +72,14 @@ def _daemon(kind: str) -> None:
     signal.signal(signal.SIGTERM, stop)
     version = (DIR / "version").read_text(encoding="utf-8").strip()
     argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    planted = DIR / f"argv-{kind}"  # a record that names another program (a review's H1a)
+    if planted.exists():
+        argv = json.loads(planted.read_text(encoding="utf-8"))
     registration = daemons.register(kind, argv=argv, restartable=True)  # type: ignore[arg-type]
+    mute = DIR / f"mute-{kind}"
+    answers_at = time.time() + float(mute.read_text(encoding="utf-8")) if mute.exists() else 0.0
     state = _state()
-    state[kind] = {"pid": os.getpid(), "version": version}
+    state[kind] = {"pid": os.getpid(), "version": version, "answers_at": answers_at}
     _save(state)
     try:
         while not (DIR / "teardown").exists():
@@ -88,13 +103,13 @@ def main() -> None:
         _daemon("watch")
         return
     if command == ["status", "--json"]:
-        live = _live()
+        live = _answering()
         if live is None:
             _say({"ok": False, "error": {"code": "not_running", "message": "not running"}}, 3)
         version = _state().get("rlxd", {}).get("version")
         _say({"ok": True, "data": {"pid": live.pid, "version": version}})
     if command[:1] == ["call"]:
-        if _live() is None:
+        if _answering() is None:
             _say({"ok": False, "error": {"code": "not_running", "message": "not running"}}, 3)
         method = command[1]
         params = json.loads(command[2]) if len(command) > 2 else {}

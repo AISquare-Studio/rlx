@@ -26,7 +26,7 @@ before the swap and starts them again after it.
   install); then, once the hooks are refreshed, each stopped daemon started again from its
   recorded argv (``start_daemons``), rlxd waited for until it reports the expected version
   from a new pid. Whatever ends the upgrade (a failure, an exception, Ctrl-C, SIGTERM:
-  :func:`guarded`), what it stopped is started again from what is in place, the old
+  :func:`guard_daemons`), what it stopped is started again from what is in place, the old
   binaries included. A daemon asked to stop that still runs when the upgrade gives up on it
   keeps running, and a detached helper starts it again once it has stopped
   (:func:`restart_when_gone`): an upgrade never leaves no rlxd.
@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 from aisquare.core import daemons as daemons_core
 from aisquare.core import procs, registry
+from aisquare.core import program as prog
 from aisquare.core.spawn import untraced_env
 from aisquare.core.version import DISTRIBUTION
 from aisquare.services import install_route, rlxd_install
@@ -113,6 +114,9 @@ the upgrade, with no console of its own."""
 
 _RESTART_WHEN_GONE = "restart-when-gone"
 """The helper's command (``python -m aisquare.services.upgrade_daemons restart-when-gone``)."""
+
+RESTART_LOG = "restart.log"
+"""The helpers' log, in :func:`restarts_dir`."""
 
 
 class Refused(Exception):
@@ -338,6 +342,8 @@ class Census:
     rlxd_error: str | None = None
     """Why rlxd's runs and PTYs are not known though an rlxd is registered: unknown, which
     refuses as some would."""
+    pending: tuple[dict[str, Any], ...] = ()
+    """Helpers waiting to start a daemon again once it has ended (:func:`pending_restarts`)."""
 
     @property
     def here(self) -> tuple[daemons_core.Daemon, ...]:
@@ -399,6 +405,7 @@ class Census:
                 for pty in self.ptys
             ],
             "rlxd_error": self.rlxd_error,
+            "restarts_pending": list(self.pending),
         }
 
 
@@ -415,6 +422,7 @@ def census(rlxd: Rlxd | None = None, *, ask_rlxd: bool = True) -> Census:
     found = Census(
         daemons=tuple(found_roll.live),
         unreadable=tuple(record for record in found_roll.unreadable if record.held),
+        pending=pending_restarts(),
     )
     if not ask_rlxd or not found.rlxd_runs:
         return found
@@ -629,8 +637,8 @@ def with_package(
     ):
         raise Refused(
             "upgrade_unsupported_route",
-            f"{PACKAGE_ENV} is set, but this install is no uv tool, the only install it can "
-            f"reinstall ({route.describe()})",
+            f"{PACKAGE_ENV} is set, but this install was not made by uv as a tool, the only "
+            f"install it can reinstall ({route.describe()})",
             route.describe(),
         )
     receipt = route.receipt
@@ -799,12 +807,41 @@ def spawn_detached(argv: Sequence[str], cwd: str | None) -> None:
     )
 
 
-def restart_when_gone(daemon: daemons_core.Daemon) -> None:
+def restarts_dir() -> Path:
+    """Where a pending :func:`restart_when_gone` helper says what it waits for
+    (``<id>.json``, its claim) and logs what it does (:data:`RESTART_LOG`): beside the
+    daemon registry."""
+    return daemons_core.registry_dir().parent / "upgrade-restarts"
+
+
+def pending_restarts() -> tuple[dict[str, Any], ...]:
+    """The helpers still waiting to start a daemon again (``upgrade --check``'s
+    ``restarts_pending``): each claim whose helper runs."""
+    try:
+        claims = sorted(restarts_dir().glob("*.json"))
+    except OSError:
+        return ()
+    found = []
+    for claim in claims:
+        with contextlib.suppress(OSError):
+            said = _json_object(claim.read_text(encoding="utf-8"))
+            helper = said.get("helper_pid")
+            if isinstance(helper, int) and procs.alive(helper):
+                found.append({key: said.get(key) for key in _CLAIM_KEYS})
+    return tuple(found)
+
+
+_CLAIM_KEYS = ("id", "kind", "pid", "helper_pid", "since", "log")
+
+
+def restart_when_gone(daemon: daemons_core.Daemon) -> Path:
     """Starts a detached helper that waits (up to :data:`RESTART_WHEN_GONE_SECONDS`) for
     ``daemon``, asked to stop and still stopping, to end, then runs its argv: a daemon the
-    upgrade gave up on is started again whenever it does end."""
+    upgrade gave up on is started again whenever it does end. Waits a moment for the helper
+    to claim it, so the upgrade's end already shows it pending; the helper's log."""
     payload = {
         "id": daemon.id,
+        "kind": daemon.kind,
         "pid": daemon.pid,
         "argv": list(daemon.argv),
         "cwd": daemon.cwd,
@@ -813,24 +850,95 @@ def restart_when_gone(daemon: daemons_core.Daemon) -> None:
     }
     helper = [sys.executable, "-P", "-m", __name__, _RESTART_WHEN_GONE, json.dumps(payload)]
     spawn_detached(helper, None)
+    claim = restarts_dir() / f"{daemon.id}.json"
+    deadline = time.monotonic() + 5.0
+    while not claim.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return restarts_dir() / RESTART_LOG
+
+
+def _say_in_log(log: Path, line: str) -> None:
+    """One line of the helper's log: when, which helper, what."""
+    moment = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    with contextlib.suppress(OSError):
+        handle = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(handle, "a", encoding="utf-8") as out:
+            out.write(f"{moment} helper {os.getpid()}: {line}\n")
+
+
+def _claim(claim: Path, said: dict[str, Any]) -> bool:
+    """Whether this helper is the one for ``claim``'s daemon: the claim made new, or taken
+    over from a helper that no longer runs. ``False`` while another helper holds it."""
+    for _ in range(2):
+        try:
+            handle = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                other = _json_object(claim.read_text(encoding="utf-8")).get("helper_pid")
+                if isinstance(other, int) and other != os.getpid() and procs.alive(other):
+                    return False
+            claim.unlink(missing_ok=True)
+            continue
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(said, out)
+        return True
+    return False
+
+
+def _running_already(kind: str, argv: Sequence[str]) -> daemons_core.Daemon | None:
+    """A live daemon of this host that stands for the one to start again: any rlxd (one runs
+    per home), or one of ``kind`` with the same argv."""
+    host = registry.host_name()
+    for record in daemons_core.list_live(kind=kind, prune=False):
+        if record.host == host and (kind == "rlxd" or list(record.argv) == list(argv)):
+            return record
+    return None
 
 
 def _helper(argv: Sequence[str]) -> int:
-    """The helper :func:`restart_when_gone` starts: ``restart-when-gone <payload>``."""
+    """The helper :func:`restart_when_gone` starts: ``restart-when-gone <payload>``. It holds
+    a claim on the daemon's record id (a second helper for it does nothing), logs each step
+    to :data:`RESTART_LOG`, and starts the daemon only if nothing stands for it by then (a
+    restart by hand, another helper's)."""
     if len(argv) != 2 or argv[0] != _RESTART_WHEN_GONE:
         return 2
     payload = json.loads(argv[1])
-    deadline = time.monotonic() + float(payload.get("wait", RESTART_WHEN_GONE_SECONDS))
-    record_id, pid = str(payload["id"]), int(payload["pid"])
-    while record_id in _live_ids():
-        if time.monotonic() >= deadline:
-            return 1
-        time.sleep(0.5)
-    ended = time.monotonic() + float(payload.get("grace", RESTART_GRACE_SECONDS))
-    while procs.alive(pid) and time.monotonic() < ended:
-        time.sleep(0.2)
-    spawn_detached([str(part) for part in payload["argv"]], payload.get("cwd"))
-    return 0
+    record_id, pid, kind = str(payload["id"]), int(payload["pid"]), str(payload["kind"])
+    command = [str(part) for part in payload["argv"]]
+    folder = restarts_dir()
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log, claim = folder / RESTART_LOG, folder / f"{record_id}.json"
+    said = {
+        "id": record_id,
+        "kind": kind,
+        "pid": pid,
+        "helper_pid": os.getpid(),
+        "since": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "log": str(log),
+    }
+    if not _claim(claim, said):
+        _say_in_log(log, f"another helper waits for {kind} (record {record_id}): nothing to do")
+        return 0
+    try:
+        _say_in_log(log, f"waiting for {kind} (record {record_id}, pid {pid}) to end")
+        deadline = time.monotonic() + float(payload.get("wait", RESTART_WHEN_GONE_SECONDS))
+        while record_id in _live_ids():
+            if time.monotonic() >= deadline:
+                _say_in_log(log, f"gave up: {kind} (pid {pid}) still runs")
+                return 1
+            time.sleep(0.5)
+        ended = time.monotonic() + float(payload.get("grace", RESTART_GRACE_SECONDS))
+        while procs.alive(pid) and time.monotonic() < ended:
+            time.sleep(0.2)
+        running = _running_already(kind, command)
+        if running is not None:
+            _say_in_log(log, f"{kind} ended; another runs already (pid {running.pid}): kept")
+            return 0
+        spawn_detached(command, payload.get("cwd"))
+        _say_in_log(log, f"{kind} ended; started again: {' '.join(command)}")
+        return 0
+    finally:
+        claim.unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
@@ -879,7 +987,7 @@ def ended_by(exc: BaseException) -> str:
 
 
 @contextlib.contextmanager
-def guarded(around: Around | None, *, sigterm: bool) -> Iterator[None]:
+def guard_daemons(around: Around | None, *, sigterm: bool) -> Iterator[None]:
     """Whatever ends the block, an exception, Ctrl-C or (with ``sigterm``) SIGTERM, what
     ``around`` stopped is started again before it goes on, with both signals held off while
     that runs; the step that was open is said to have failed first. Every caller of
@@ -901,7 +1009,7 @@ class Around:
     """The daemons' part of one upgrade, which ``services.lifecycle.upgrade`` calls around
     its installer (:meth:`before_install`, :meth:`installed`), and the command after it
     (:meth:`finish`). It carries the steps' events, and what it asked to stop, so that
-    whatever ends the upgrade, that is started again (:func:`guarded`)."""
+    whatever ends the upgrade, that is started again (:func:`guard_daemons`)."""
 
     found: Census
     options: Options
@@ -1038,7 +1146,8 @@ class Around:
             "place is kept"
         )
         if not self.options.restart_daemons:
-            self.events.say_line(f"! {message}. Install it with: rlx daemon install")
+            advice = prog.shell_advice(f" Install it with: {prog.words('daemon', 'install')}")
+            self.events.say_line(f"! {message}.{advice}")
             return
         self.failure = Refused("rlxd_install_failed", f"{message}, and runs again", code)
 
@@ -1083,11 +1192,11 @@ class Around:
             if daemon not in self.stopped and not _gone(daemon):
                 self._handled.add(daemon.id)
                 try:
-                    restart_when_gone(daemon)
+                    log = restart_when_gone(daemon)
                 except OSError as exc:
                     self._start_failed.append(f"{daemon.kind}: {exc}")
                     continue
-                self.later.append(daemon.kind)
+                self.later.append(f"{daemon.kind} (log: {log})")
                 continue
             before = _live_ids()
             try:

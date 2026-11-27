@@ -213,6 +213,11 @@ def _daemon_lines(found: upgrade_daemons.Census) -> None:
         _say(f"rlxd PTYs live: {len(found.ptys)} (restarting rlxd ends them)")
     if found.rlxd_error is not None:
         _say(f"rlxd's runs and PTYs are not known: {found.rlxd_error}")
+    for pending in found.pending:
+        _say(
+            f"{pending['kind']} is started again once it has stopped: helper pid "
+            f"{pending['helper_pid']}, waiting since {pending['since']} (log: {pending['log']})"
+        )
 
 
 def _emit_plan(plan: lifecycle_service.UpgradePlan) -> None:
@@ -784,7 +789,7 @@ def _upgrade(
     try:
         # Whatever ends it from here, Ctrl-C and SIGTERM included, what was stopped starts
         # again (review M2): the guard holds the stop, the install and the restart.
-        with upgrade_daemons.guarded(around, sigterm=options.restart_daemons):
+        with upgrade_daemons.guard_daemons(around, sigterm=options.restart_daemons):
             report = lifecycle_service.upgrade(plan, to_stderr=json_output, around=around)
             if not report.installed:
                 # A run uv could not resolve (a cutoff in its settings that excludes even the
@@ -960,7 +965,7 @@ def _json_lines_run(
         raise offline
     source = f"installing from {wheel} ({upgrade_daemons.PACKAGE_ENV})" if wheel else None
     around = upgrade_daemons.prepare(plan, options, events, windows=windows, said=(source,))
-    with upgrade_daemons.guarded(around, sigterm=False):  # SIGTERM: _upgrade_json_lines'
+    with upgrade_daemons.guard_daemons(around, sigterm=False):  # SIGTERM: _upgrade_json_lines'
         try:
             report = lifecycle_service.upgrade(plan, to_stderr=True, around=around)
         except lifecycle_service.UpgradeRefused as exc:

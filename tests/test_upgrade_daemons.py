@@ -189,7 +189,7 @@ def test_the_census_counts_daemons_runs_in_flight_and_live_ptys(fake: Daemons) -
     assert [run["run_id"] for run in found.runs] == ["r1"], "queued and running only"
     assert [pty["pty_id"] for pty in found.ptys] == ["p1"], "live ones only"
     shown = found.as_json()
-    assert set(shown) == {"daemons", "runs_in_flight", "ptys", "rlxd_error"}
+    assert set(shown) == {"daemons", "runs_in_flight", "ptys", "rlxd_error", "restarts_pending"}
     assert shown["daemons"][0]["kind"] == "rlxd" and shown["daemons"][0]["restartable"]
     assert shown["runs_in_flight"] == [
         {"run_id": "r1", "kind": "task", "state": "running", "job_id": None}
@@ -386,7 +386,7 @@ def test_a_stop_that_fails_installs_nothing_and_starts_again_what_it_stopped(
     assert refused.value.code == "daemon_stop_failed"
     assert [d.pid for d in fake.live("rlxd")] == [old.pid], "it still runs"
     assert fake.wait_live("watch", not_pid=watch.pid).pid != watch.pid
-    assert around.later == ["rlxd"]
+    assert [later.split(" ")[0] for later in around.later] == ["rlxd"]
     steps = _steps(_events(out))
     assert ("stop_daemons", "failed") in steps
     assert not any(step == "install" for step, _ in steps), "the install never started"
@@ -763,6 +763,7 @@ def test_an_up_to_date_upgrade_is_nothing_to_do_whatever_runs(
     plain = CliRunner().invoke(app, ["upgrade", "--yes"])
     assert plain.exit_code == 0, plain.output
     assert "nothing to do" in plain.output
+    assert "keeps running the release" not in plain.stderr, "no warning on a no-op"
     lines = _lines(_upgrade("--restart-daemons"))
     assert lines[-1] == {**lines[-1], "type": "upgrade.done"}
     assert lines[-1]["data"] == {"from": "1.0.0", "to": "1.0.0", "restarted": []}
@@ -1057,3 +1058,148 @@ def test_after_a_failed_stop_or_install_no_step_is_said_twice(
     failed = _lines(_upgrade("--restart-daemons"))
     assert failed[-1]["data"]["code"] == "upgrade_failed"
     assert _steps(failed).count(("install", "failed")) == 1
+
+
+# --- the restart-when-gone helper (#2829: one at a time, logged, shown) ----------------------
+
+
+def _given_up_on(fake: Daemons) -> tuple[daemons_core.Daemon, Around]:
+    """rlxd asked to stop and still stopping when the upgrade gives up on it (the real-stop
+    model: it finishes once ``stuck-rlxd`` is gone): the helper pending."""
+    old = fake.start()
+    (fake.dir / "stuck-rlxd").write_text("", encoding="utf-8")
+    around, _ = _around(fake, Options(restart_daemons=True))
+    with pytest.raises(Refused):
+        around.before_install()
+    return old, around
+
+
+def _settled(fake: Daemons, seconds: float = 3.0) -> list[daemons_core.Daemon]:
+    time.sleep(seconds)  # the helper's poll, its grace and a start, had there been one
+    return fake.live("rlxd")
+
+
+def test_the_helper_is_shown_logs_each_step_and_starts_rlxd_once(fake: Daemons, tool: Path) -> None:
+    old, around = _given_up_on(fake)
+    assert around.later and around.later[0].startswith("rlxd (log: ")
+    check = CliRunner().invoke(app, ["--json", "upgrade", "--check"])
+    pending = json.loads(check.stdout)["restarts_pending"]
+    assert [(p["id"], p["kind"], p["pid"]) for p in pending] == [(old.id, "rlxd", old.pid)]
+    log = Path(pending[0]["log"])
+    upgrade_daemons.restart_when_gone(old)  # a second helper, for the same record
+    (fake.dir / "stuck-rlxd").unlink()  # rlxd finishes the stop it took
+    new = fake.wait_live("rlxd", not_pid=old.pid)
+    assert [d.pid for d in _settled(fake)] == [new.pid], "started once"
+    said = log.read_text(encoding="utf-8")
+    assert f"waiting for rlxd (record {old.id}, pid {old.pid}) to end" in said
+    assert f"another helper waits for rlxd (record {old.id}): nothing to do" in said
+    assert said.count("rlxd ended; started again: ") == 1
+    assert upgrade_daemons.pending_restarts() == ()
+
+
+def test_an_rlxd_started_by_hand_while_the_helper_waits_is_the_one_kept(fake: Daemons) -> None:
+    old, _ = _given_up_on(fake)
+    before = upgrade_daemons._live_ids()
+    upgrade_daemons.spawn_daemon(old)  # a restart by hand, while the old one still stops
+    deadline = time.monotonic() + 20
+    while not (upgrade_daemons._live_ids() - before):
+        assert time.monotonic() < deadline, "the rlxd started by hand never registered"
+        time.sleep(0.05)
+    by_hand = next(d for d in fake.live("rlxd") if d.pid != old.pid)
+    fake.pids.append(by_hand.pid)
+    (fake.dir / "stuck-rlxd").unlink()
+    assert [d.pid for d in _settled(fake)] == [by_hand.pid], "no second rlxd"
+    said = (upgrade_daemons.restarts_dir() / upgrade_daemons.RESTART_LOG).read_text("utf-8")
+    assert f"rlxd ended; another runs already (pid {by_hand.pid}): kept" in said
+
+
+# --- tester-upgrade's findings on 3fdf7768 (#2831) --------------------------------------------
+
+
+@posix_only
+def test_a_real_sigint_during_the_install_starts_rlxd_again(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F4: Ctrl-C (SIGINT) while uv runs, under --restart-daemons --json-lines."""
+    old = fake.start()
+
+    def interrupted(argv: Any, **kwargs: Any) -> int:
+        signal.raise_signal(signal.SIGINT)
+        return 0
+
+    monkeypatch.setattr(install_route, "run_installer", interrupted)
+    result = _upgrade("--restart-daemons")
+    assert result.exit_code == 1, result.output
+    assert _lines(result)[-1]["data"]["code"] == "interrupted"
+    new = fake.wait_live("rlxd", not_pid=old.pid)
+    assert fake.rlxd.daemon_status() == {"pid": new.pid, "version": "1.0.0"}
+
+
+@posix_only
+def test_a_live_record_naming_another_program_is_neither_signalled_nor_run(
+    fake: Daemons, tool: Path, tmp_path: Path
+) -> None:
+    """H1a: a live record whose argv is `/usr/bin/touch <marker>`."""
+    marker = tmp_path / "marker"
+    (fake.dir / "argv-watch").write_text(json.dumps(["/usr/bin/touch", str(marker)]), "utf-8")
+    planted = fake.start("watch")
+    result = _upgrade("--restart-daemons")
+    assert result.exit_code == 0, result.output
+    lines = _lines(result)
+    stopped = [e["data"] for e in lines if e["data"].get("step") == "stop_daemons"]
+    assert "left running: watch (it runs /usr/bin/touch, not " in stopped[-1]["detail"]
+    assert lines[-1]["data"]["restarted"] == []
+    assert [d.pid for d in fake.live("watch")] == [planted.pid], "never signalled"
+    assert not marker.exists(), "never run"
+
+
+@posix_only
+def test_an_up_to_date_pinned_upgrade_is_nothing_to_do_whatever_runs(
+    fake: Daemons, tool: Path
+) -> None:
+    """M6, live: `rlx upgrade --yes --version <current>` with a run in flight."""
+    fake.start()
+    fake.state(runs=[{"run_id": "r1", "state": "running"}])
+    result = CliRunner().invoke(app, ["upgrade", "--yes", "--version", "1.0.0"])
+    assert result.exit_code == 0, result.output
+    assert "already the version asked for" in result.output
+    lines = _lines(_upgrade("--version", "1.0.0"))
+    assert lines[-1]["type"] == "upgrade.done"
+
+
+def test_queued_runs_are_in_flight_too(fake: Daemons) -> None:
+    """M13."""
+    fake.start()
+    fake.state(runs=[{"run_id": "r1", "kind": "task", "state": "queued", "job_id": "j1"}])
+    found = upgrade_daemons.census(fake.rlxd)
+    assert [run["run_id"] for run in found.runs] == ["r1"]
+    refused = upgrade_daemons.refusal(found, Options(), windows=False)
+    assert refused is not None and refused.code == "runs_in_flight"
+
+
+@posix_only
+def test_a_person_running_restart_daemons_gets_rlxd_back_on_the_new_release(
+    fake: Daemons, tool: Path
+) -> None:
+    """M18: the human path, not only --json-lines."""
+    old = fake.start()
+    result = CliRunner().invoke(app, ["upgrade", "--yes", "--restart-daemons"])
+    assert result.exit_code == 0, result.output
+    new = fake.wait_live("rlxd", not_pid=old.pid)
+    assert fake.rlxd.daemon_status() == {"pid": new.pid, "version": "2.0.0"}
+    assert "· start_daemons: started: rlxd" in result.stderr
+    assert "· stop_daemons: stopped: rlxd" in result.stderr
+
+
+def test_the_restart_waits_until_rlxd_answers(fake: Daemons) -> None:
+    """M12 (a mutant tester-upgrade's tests let live): rlxd registers before it answers, and
+    the restart waits for the answer, not only the record."""
+    fake.start()
+    around, _ = _around(fake, Options(restart_daemons=True))
+    around.before_install()
+    (fake.dir / "mute-rlxd").write_text("2", encoding="utf-8")
+    around.installed("2.0.0", None)
+    around.finish(())
+    assert around.restarted == ["rlxd"] and around.failure is None
+    status = fake.rlxd.daemon_status()
+    assert status is not None and status["version"] == "2.0.0", "answering when restarted"
