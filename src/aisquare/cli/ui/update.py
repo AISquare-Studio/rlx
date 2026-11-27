@@ -44,7 +44,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
-from aisquare.services.lifecycle import UpgradePlan, taken_refusal
+from aisquare.services.lifecycle import UpgradePlan, newer_release, taken_refusal
 
 PLAN_WORKER = "update-plan"
 """The read the row starts before the dialog opens: how this install upgrades, and whether
@@ -94,6 +94,33 @@ def taken_line(plan: UpgradePlan) -> str | None:
     program's ``rlx`` or ``relax`` in uv's directory (``lifecycle.taken_refusal``), naming
     each file, its remedy ending in the ⬆ row; ``None`` when nothing is in the way."""
     return taken_refusal("upgrade", plan.commands_taken, again=TAKEN_AGAIN)
+
+
+def home_busy_line(busy: tuple[str, ...], live: int) -> str:
+    """What the home's move waits for: each thing that runs on the home, as the plan read it
+    (``UpgradePlan.home_busy``: an rlx, a fleet agent, a window on rlx's tmux server, the
+    watcher, Remote served elsewhere, an ``rlx launch``), or the agents the frame shows when
+    the plan read none (the reviewer's m7 on #31)."""
+    if not busy:
+        return home_agents_line(live)
+    shown = "; ".join(busy[:3]) + (f"; and {len(busy) - 3} more" if len(busy) > 3 else "")
+    return (
+        f"⚠ {len(busy)} thing{'s run' if len(busy) != 1 else ' runs'} on this home ({shown}): "
+        "the home moves only once nothing does, so stop them first. Otherwise rlx reopens on "
+        "the old home and says what still runs."
+    )
+
+
+def home_agents_line(live: int) -> str:
+    """What the home's move asks of the ``live`` agents: it runs only once nothing runs on the
+    home (``services.home_migration``), so they are stopped first; asq names no command."""
+    if live == 0:
+        return "No agent is running."
+    agents = "1 agent is" if live == 1 else f"{live} agents are"
+    return (
+        f"⚠ {agents} running: the home moves only once nothing runs on it, so stop them "
+        "first. Otherwise rlx reopens on the old home and says what still runs."
+    )
 
 
 def remote_line(plan: UpgradePlan) -> str | None:
@@ -152,16 +179,43 @@ class UpdateScreen(ModalScreen[bool]):
         self.query_one("#update-text", Static).update(self.body())
         for button in self.query("#update-confirm").results(Button):
             button.disabled = False
+            button.label = self.confirm_label
+
+    @property
+    def moves_home_only(self) -> bool:
+        """Whether the press moves a home from before 0.10.2 and installs nothing: the plan has
+        a move (``UpgradePlan.home_move``) and :attr:`version` is no newer than the one that
+        runs (#31). A newer release PyPI names makes it an update that also moves the home."""
+        return (
+            self.plan.home_move is not None
+            and newer_release(self.version, self.plan.current) is not True
+        )
+
+    @property
+    def confirm_label(self) -> str:
+        """The press's words: the home moved alone, or an update."""
+        return "Restart & move" if self.moves_home_only else "Restart & update"
 
     @property
     def offers_update(self) -> bool:
         """Whether *Restart & update* is offered: an install asq updates, with nothing of
-        another program's in the way (:func:`taken_line`)."""
+        another program's in the way (:func:`taken_line`); or the home's move alone, which is
+        rlx's own on any install (#31)."""
+        if self.moves_home_only:
+            return True
         return self.plan.runnable and taken_line(self.plan) is None
 
     def body(self) -> Text:
         """What the dialog says, above its buttons."""
         text = Text()
+        move = self.plan.home_move
+        if self.moves_home_only and move is not None:
+            text.append(f"rlx closes, moves its home ({move}) and reopens here.\n")
+            text.append(home_busy_line(self.plan.home_busy, self.live))
+            if self.status is not None:
+                text.append("\n")
+                text.append(self.status, style="dim")
+            return text
         taken = taken_line(self.plan) if self.plan.runnable else None
         if taken is not None:
             text.append("rlx cannot update this install now: ", style="bold")
@@ -184,12 +238,15 @@ class UpdateScreen(ModalScreen[bool]):
             return text
         if self.confirmed:
             text.append(f"rlx closes, installs {self.version} and reopens here.\n")
+            text.append(agents_line(self.live))
         else:
             text.append(
                 f"rlx closes, installs the newest release ({self.version} when last checked) "
                 "and reopens here.\n"
             )
-        text.append(agents_line(self.live))
+            text.append(agents_line(self.live))
+        if move is not None and not self.moves_home_only:
+            text.append(f"\nIt also moves rlx's home ({move}), once nothing runs on it.")
         remote = remote_line(self.plan)
         if remote is not None:
             text.append("\n")
@@ -202,6 +259,8 @@ class UpdateScreen(ModalScreen[bool]):
     def heading(self) -> Text:
         """``Update aisquare 0.8.2 → 0.8.3`` once PyPI has answered, ``Update aisquare 0.8.2``
         until then: the versions are data, never markup."""
+        if self.moves_home_only:
+            return Text("Move rlx's home")
         text = Text("Update rlx ")
         text.append(self.plan.current)
         if self.confirmed:
@@ -217,7 +276,7 @@ class UpdateScreen(ModalScreen[bool]):
             with Horizontal(id="update-buttons"):
                 if self.offers_update:
                     yield Button(
-                        "Restart & update",
+                        self.confirm_label,
                         id="update-confirm",
                         variant="primary",
                         disabled=self.status == CHECKING,

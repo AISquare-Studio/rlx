@@ -165,6 +165,8 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             _check_provenance(),
             _check_home(),
             _check_home_filesystem(),
+            # Only for a home from before 0.10.2 that no upgrade has moved yet (#31).
+            *_optional(_check_home_layout()),
             _check_config(),
             _check_database(),
             _check_claude_code(cwd),
@@ -698,6 +700,40 @@ def _config_file_kind() -> str:
         return "not created yet"
     except OSError:
         return "unreadable"
+
+
+HOME_LAYOUT_UI_FIX = "Move it with ⬆ Move rlx's home in the sidebar, once nothing runs on it"
+"""The home-layout row's fix in asq, which names no command (R13): the update row's own action
+(``cli.ui.sidebar.HOME_MOVE_ROW``), which hands off to the one-click upgrade."""
+
+
+def _check_home_layout() -> DoctorCheck | None:
+    """A home laid out before 0.10.2 that the move has not moved yet (#31): ``rlx upgrade`` moves
+    it, on the release that runs too (an upgrade from 0.10.1 is 0.10.1's code, which cannot). A
+    warning, never a failure: the old home works as it is. ``None`` for a home in the new
+    layout. Reads only (``lifecycle.planned_home_move``)."""
+    from aisquare.services import lifecycle
+
+    try:
+        move, refusal = lifecycle.planned_home_move()
+    except Exception:
+        return None
+    if refusal is not None:
+        return _warn(
+            "home-layout",
+            f"laid out before 0.10.2, and it cannot be moved as it stands: {refusal}",
+            f"Move what is in the way aside, then run `{prog.word()} upgrade`",
+            ui_fix="Move what is in the way aside, then use ⬆ Move rlx's home in the sidebar",
+        )
+    if move is None:
+        return None
+    return _warn(
+        "home-layout",
+        f"laid out before 0.10.2 ({move})"
+        + prog.detail_advice(f": `{prog.word()} upgrade` moves it, once nothing runs on it"),
+        f"Move it: `{prog.word()} upgrade` (run it again if it installed a release)",
+        ui_fix=HOME_LAYOUT_UI_FIX,
+    )
 
 
 def _check_home_filesystem() -> DoctorCheck:
