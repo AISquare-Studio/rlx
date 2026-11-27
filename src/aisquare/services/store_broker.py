@@ -94,7 +94,6 @@ this list to it, and every board call a role's cycle teaches to it:
 - `aisquare team focus`
 - `aisquare team standby` (a manager waiting on its person, R12)
 - `aisquare team log`
-- `aisquare team complete-pass`
 - `aisquare team verify`
 - `aisquare team show` (the event on its own board an update line points at)
 - `aisquare team signal` (not the fleet's own)
@@ -307,8 +306,7 @@ WHITELIST: dict[tuple[str, ...], str] = {
     ("team", "status"): "read the board",
     ("team", "focus"): "announce your focus",
     ("team", "standby"): "wait on your person (a manager's standby)",
-    ("team", "log"): "read the team pipe or the bound manager's pass range",
-    ("team", "complete-pass"): "complete the bound manager's acknowledged pass",
+    ("team", "log"): "read the team pipe",
     ("team", "verify"): "re-check a receipt",
     ("team", "show"): "read one board event in full (what an update line points at)",
     ("team", "signal"): "set or read a board signal (not the fleet's own)",

@@ -336,26 +336,6 @@ def test_a_key_pattern_holds_its_glob_characters_as_themselves(store: ContextSto
     assert list(store.list_meta("signal/")) == ["signal/prj_ab/1"]
 
 
-@pytest.mark.parametrize("scope", ["as_fleet", "as_board"])
-def test_resetting_a_project_removes_its_manager_seat_progress(
-    store: ContextStore, scope: str
-) -> None:
-    """Progress belongs to both the fleet that reads and the board it reads from."""
-    from aisquare.services import manager_seat
-
-    store.ensure_project(PROJECT)
-    peer = "prj_manager_seat_peer"
-    fleet, board = (PROJECT.id, peer) if scope == "as_fleet" else (peer, PROJECT.id)
-    urgent = manager_seat.progress_key(fleet, board, "urgent")
-    passed = manager_seat.progress_key(fleet, board, "pass")
-    unrelated = manager_seat.progress_key(peer, peer, "pass")
-    for key in (urgent, passed, unrelated):
-        store.set_meta(key, "value")
-    store.reset_project(PROJECT.id, apply=True)
-    assert store.get_meta(urgent) is None and store.get_meta(passed) is None
-    assert store.get_meta(unrelated) == "value"
-
-
 @pytest.mark.parametrize("ref", ["*", "?", "[", "*?[", ""])
 def test_a_ref_with_nothing_left_once_its_glob_characters_go_names_nothing(
     store: ContextStore, ref: str
@@ -510,8 +490,8 @@ def test_migrations_reach_the_current_schema_version() -> None:
     # arrangement of another agent's account slots (Codex accounts), v48 every window of a
     # usage reading (an agent's daily per-model quotas), v49 one priority order over every
     # agent's accounts (account_rank), v50 the agent of a usage session (usage_session.agent:
-    # the opt-in share keeps Claude Code's alone), v51 the session's manager wake policy.
-    assert version == SCHEMA_VERSION == 51
+    # the opt-in share keeps Claude Code's alone)
+    assert version == SCHEMA_VERSION == 50
 
 
 def test_a_v14_store_gains_nullable_persona_columns_through_the_persona_step() -> None:
@@ -1646,11 +1626,9 @@ _USAGE_STEP = {
 
 
 def _pr_113_steps() -> set[tuple[str, str]]:
-    """The coding-agent products added in v44 through v50."""
-    return _built(50) - _built(43)
-
-
-_MANAGER_WAKE_STEP = {("column", "team_session.manager_wake")}
+    """#113's v44 to v50 by name (the coding-agent steps, appended on main's v43): what a
+    fresh store holds past main's ladder."""
+    return _built(SCHEMA_VERSION) - _built(43)
 
 
 _FIRST_PROMPT_COLUMNS = {
@@ -1912,7 +1890,6 @@ def test_mains_v24_store_gains_the_persona_columns_and_keeps_every_row() -> None
         | _FIRST_PROMPT_COLUMNS
         | _EVENT_ACTOR_COLUMNS
         | _pr_113_steps()
-        | _MANAGER_WAKE_STEP
         | _PARENT_COLUMNS
         | _BRIEF_STEP
         | _USAGE_STATS_STEP
@@ -2204,13 +2181,13 @@ def test_one_schema_is_mains_v32_with_the_persona_columns_and_the_rcs_v21_with_m
     details (P1 WS-2), v38 a group's parent manager and a task's origin (P2-W6), v39 the
     work-brief table, v40 0.9.1's Usage & stats, v41 the codenames a renamed project gave up,
     v42 ``fleet_agent.paused_at`` (fleet pause), v43 ``metric.origin`` (who started a turn),
-    #113's v44 to v50 the coding-agent steps, and v51 the session's manager wake policy."""
+    #113's v44 to v50 the coding-agent steps, and nothing else."""
     fresh = _built(SCHEMA_VERSION)
     persona = _built(33)
 
-    assert SCHEMA_VERSION == 51
+    assert SCHEMA_VERSION == 50
     ours = _pr_113_steps()
-    assert fresh == _built(43) | ours | _MANAGER_WAKE_STEP
+    assert fresh == _built(43) | ours
     assert _built(43) == _built(42) | _ORIGIN_STEP
     assert _built(42) == _built(41) | _PAUSE_STEP
     assert _built(41) == _built(40) | _CODENAME_ALIAS_STEP
@@ -2325,7 +2302,7 @@ def test_every_store_in_the_wild_reaches_the_persona_step_with_its_rows(
     _schema_again, rows_again = _contents(db)
     version, shape, notnull = _persona_shape(db)
 
-    assert version == SCHEMA_VERSION == 51, label
+    assert version == SCHEMA_VERSION == 50, label
     assert shape == _built(SCHEMA_VERSION), label
     assert notnull == {"team_session": 0, "fleet_agent": 0}, label
     assert old_session is not None and old_session.persona == persona, label
@@ -2368,7 +2345,7 @@ def test_a_v47_stores_usage_reading_reaches_v48_and_reads_as_its_session_and_wee
         store.close()
     version, shape, _notnull = _persona_shape(db)
 
-    assert version == SCHEMA_VERSION == 51
+    assert version == SCHEMA_VERSION == 50
     assert shape == _built(SCHEMA_VERSION)
     assert _built(48) - _built(47) == {("column", "claude_usage.windows")}
     assert (old.session_percent, old.week_percent, old.token_fingerprint) == (12.0, 40.0, "fp")
@@ -2378,9 +2355,8 @@ def test_a_v47_stores_usage_reading_reaches_v48_and_reads_as_its_session_and_wee
 
 def test_a_store_from_main_0_9_0_reaches_head_with_the_coding_agent_steps() -> None:
     """Main's v39 (0.9.0: the parent-manager columns and the ``brief`` table, both there)
-    opens here at v51 through 0.9.1's v40 (Usage & stats), 0.9.2's v41-v43 and #113's seven
-    steps (v44-v50), plus v51's manager wake column. The coding-agent steps add the identity
-    columns, whose
+    opens here at v50 through 0.9.1's v40 (Usage & stats), 0.9.2's v41-v43 and #113's seven
+    steps (v44-v50), which only add: the identity columns, whose
     backfill marks the rows Claude Code made (every row on a store that never had another
     agent), ``team_meta``'s dates, the Codex accounts' table, ``claude_usage.windows`` and
     ``account_rank``, and a usage session's agent. Its rows read back unchanged, 0.9.0's tables
@@ -2408,7 +2384,7 @@ def test_a_store_from_main_0_9_0_reaches_head_with_the_coding_agent_steps() -> N
 
     version, shape, _notnull = _persona_shape(db)
     assert (version, missing) == (SCHEMA_VERSION, [])
-    assert SCHEMA_VERSION == 51
+    assert SCHEMA_VERSION == 50
     assert shape == _built(SCHEMA_VERSION), "not the schema a fresh store has"
     assert shape >= _PARENT_COLUMNS | _BRIEF_STEP | _USAGE_STATS_STEP | _MAINS_092 | _pr_113_steps()
     assert after == before, "a row the store held changed on a column it had"
@@ -2425,9 +2401,9 @@ def test_a_store_from_main_0_9_0_reaches_head_with_the_coding_agent_steps() -> N
 
 def test_a_store_from_main_0_9_1_reaches_head_with_the_coding_agent_steps() -> None:
     """Main's v40 (0.9.1: Usage & stats on top of 0.9.0's parent-manager columns and ``brief``
-    table, all there) opens here at v51 through 0.9.2's v41-v43 and #113's seven steps
-    (v44-v50), plus v51's manager wake column. The coding-agent steps add the identity
-    columns, whose
+    table, all there) opens here at v50 through 0.9.2's v41-v43 and #113's seven steps
+    (v44-v50), which only add:
+    the identity columns, whose
     backfill marks the rows Claude Code made (every row on a store that never had another
     agent), ``team_meta``'s dates, the Codex accounts' table, ``claude_usage.windows`` and
     ``account_rank``, and a usage session's agent. Its rows read back unchanged, 0.9.0's tables
@@ -2457,7 +2433,7 @@ def test_a_store_from_main_0_9_1_reaches_head_with_the_coding_agent_steps() -> N
 
     version, shape, _notnull = _persona_shape(db)
     assert (version, missing) == (SCHEMA_VERSION, [])
-    assert SCHEMA_VERSION == 51
+    assert SCHEMA_VERSION == 50
     assert shape == _built(SCHEMA_VERSION), "not the schema a fresh store has"
     assert shape >= _PARENT_COLUMNS | _BRIEF_STEP | _USAGE_STATS_STEP | _MAINS_092 | _pr_113_steps()
     assert after == before, "a row the store held changed on a column it had"
@@ -2475,8 +2451,8 @@ def test_a_store_from_main_0_9_1_reaches_head_with_the_coding_agent_steps() -> N
 def test_a_store_from_main_0_9_2_reaches_head_with_the_coding_agent_steps() -> None:
     """Main's v43 (0.9.2: the codename aliases, ``fleet_agent.paused_at`` and ``metric.origin``
     on top of 0.9.1's Usage & stats and 0.9.0's columns and ``brief`` table, all there) opens
-    here at v51 through #113's seven steps (v44-v50) and v51's manager wake column. The
-    coding-agent steps add the identity columns, whose
+    here at v50 through #113's seven steps (v44-v50), which only add:
+    the identity columns, whose
     backfill marks the rows Claude Code made (every row on a store that never had another
     agent), ``team_meta``'s dates, the Codex accounts' table, ``claude_usage.windows`` and
     ``account_rank``, and a usage session's agent. Its rows read back unchanged, 0.9.0's tables
@@ -2506,7 +2482,7 @@ def test_a_store_from_main_0_9_2_reaches_head_with_the_coding_agent_steps() -> N
 
     version, shape, _notnull = _persona_shape(db)
     assert (version, missing) == (SCHEMA_VERSION, [])
-    assert SCHEMA_VERSION == 51
+    assert SCHEMA_VERSION == 50
     assert shape == _built(SCHEMA_VERSION), "not the schema a fresh store has"
     assert shape >= _PARENT_COLUMNS | _BRIEF_STEP | _USAGE_STATS_STEP | _MAINS_092 | _pr_113_steps()
     assert after == before, "a row the store held changed on a column it had"
@@ -2633,12 +2609,12 @@ def test_a_row_none_names_is_not_shared_where_any_table_records_an_unshared_agen
 
 
 def test_a_fresh_store_is_built_with_the_persona_step() -> None:
-    """No file at all: v1 to v51 (``SCHEMA_VERSION``), the same shape as every cohort above
+    """No file at all: v1 to v50 (``SCHEMA_VERSION``), the same shape as every cohort above
     reaches."""
     open_store().close()
     version, shape, notnull = _persona_shape(_db_path())
 
-    assert version == SCHEMA_VERSION == 51
+    assert version == SCHEMA_VERSION == 50
     assert shape == _built(SCHEMA_VERSION)
     assert {("column", "team_session.persona"), ("column", "fleet_agent.persona")} <= shape
     assert notnull == {"team_session": 0, "fleet_agent": 0}
@@ -2724,7 +2700,7 @@ def test_the_two_v34_steps_are_v34_and_v35_each_idempotent() -> None:
     Run twice on one store, each leaves what it left once."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50
     assert _MIGRATIONS[33] == ""
     assert _PRODUCTS[33] == _Products(columns=(("fleet_agent", "ended_by", "TEXT"),))
     assert _PRODUCTS[34] == _Products(
@@ -2911,7 +2887,7 @@ def test_the_first_prompt_step_is_v36_past_mains_two_and_idempotent() -> None:
     it left once."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50  # #113's v44 to v50 follow main's v43
     assert _MIGRATIONS[35] == ""
     assert _PRODUCTS[33] == _Products(columns=(("fleet_agent", "ended_by", "TEXT"),))
     assert _PRODUCTS[35] == _Products(
@@ -2949,7 +2925,7 @@ def test_the_event_actor_step_is_v37_past_the_first_prompt_and_idempotent() -> N
     left once."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50  # #113's v44 to v50 follow main's v43
     assert _MIGRATIONS[36] == ""
     assert _PRODUCTS[36] == _Products(
         columns=(("team_event", "actor", "TEXT"), ("team_event", "meta", "TEXT"))
@@ -2981,7 +2957,7 @@ def test_the_parent_step_is_v38_past_the_event_actor_and_idempotent() -> None:
     leaves what it left once."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50  # #113's v44 to v50 follow main's v43
     assert _MIGRATIONS[37] == ""
     assert _PRODUCTS[37] == _Products(
         columns=(
@@ -3192,7 +3168,7 @@ def test_the_brief_step_is_v39_and_idempotent() -> None:
     leaves what it left once."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50  # 0.9.2's v41-v43 and #113's v44-v50 follow it
     assert _PRODUCTS[38] == _Products(("brief", "brief_number"))
     conn = sqlite3.connect(":memory:")
     try:
@@ -3338,7 +3314,7 @@ def test_the_usage_stats_step_is_v40_and_idempotent() -> None:
     twice on one store, it leaves what it left once; a fresh store has all of it."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50  # 0.9.2's v41-v43 and #113's v44-v50 follow it
     assert _PRODUCTS[39] == _Products(
         ("repo_profile", "feature_use", "usage_turn_recorded"),
         (
@@ -3366,7 +3342,6 @@ def test_the_usage_stats_step_is_v40_and_idempotent() -> None:
         | _PAUSE_STEP
         | _ORIGIN_STEP
         | _pr_113_steps()
-        | _MANAGER_WAKE_STEP
     )
     open_store().close()
     raw = sqlite3.connect(str(_db_path()))
@@ -3446,7 +3421,7 @@ def test_the_pause_step_is_v42_and_idempotent() -> None:
     left once; a fresh store has it."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50  # #113's v44 to v50 follow main's v43
     assert _MIGRATIONS[41] == ""
     assert _PRODUCTS[41] == _Products(columns=(("fleet_agent", "paused_at", "TEXT"),))
     conn = sqlite3.connect(":memory:")
@@ -3462,7 +3437,7 @@ def test_the_pause_step_is_v42_and_idempotent() -> None:
     open_store().close()
     raw = sqlite3.connect(str(_db_path()))
     try:
-        assert _shape(raw) == once | _pr_113_steps() | _MANAGER_WAKE_STEP
+        assert _shape(raw) == once | _pr_113_steps(), "a fresh store is not the ladder's schema"
     finally:
         raw.close()
 
@@ -3503,7 +3478,7 @@ def test_the_origin_step_is_v43_and_idempotent() -> None:
     a fresh store has it."""
     from aisquare.core.store import _MIGRATIONS, _PRODUCTS, _Products, _run_step
 
-    assert SCHEMA_VERSION == len(_MIGRATIONS) == 51
+    assert SCHEMA_VERSION == len(_MIGRATIONS) == 50  # #113's v44 to v50 follow main's v43
     assert _MIGRATIONS[42] == ""
     assert _PRODUCTS[42] == _Products(columns=(("metric", "origin", "TEXT"),))
     conn = sqlite3.connect(":memory:")
@@ -3519,7 +3494,7 @@ def test_the_origin_step_is_v43_and_idempotent() -> None:
     open_store().close()
     raw = sqlite3.connect(str(_db_path()))
     try:
-        assert _shape(raw) == once | _pr_113_steps() | _MANAGER_WAKE_STEP
+        assert _shape(raw) == once | _pr_113_steps(), "a fresh store is not the ladder's schema"
     finally:
         raw.close()
 
@@ -3576,7 +3551,7 @@ def test_a_store_at_the_v40_schema_reaches_the_schema_a_fresh_store_has() -> Non
     open_store().close()
     schema, rows = _contents(db)
 
-    assert rows["PRAGMA user_version"] == [(SCHEMA_VERSION,)] == [(51,)]
+    assert rows["PRAGMA user_version"] == [(SCHEMA_VERSION,)] == [(50,)]
     assert schema == _fresh_schema(), "a migrated v40 store is not a fresh store's schema"
 
 
@@ -5516,3 +5491,21 @@ def test_fleet_manager_board_is_the_newest_manager_rows_a_live_one_first() -> No
         assert store.fleet_manager_board(PROJECT.id) == "prj_hub", "the newest, stopped"
         store.upsert_fleet_agent(row(0, "manager", "prj_m"))
         assert store.fleet_manager_board(PROJECT.id) == "prj_m", "a live one first"
+
+
+def test_a_cursor_page_keeps_only_the_kinds_asked_for_before_its_limit(
+    store: ContextStore,
+) -> None:
+    """``events_since(include_kinds=…)`` (#41): asked IN the query, so a page of other kinds
+    hides nothing behind it; a scheduled manager's question behind its results is found."""
+    now = datetime.now(tz=UTC)
+    _board(
+        store,
+        PROJECT.id,
+        *(("result", "ses_1", now) for _ in range(5)),
+        ("question", "ses_1", now),
+        ("limited", "ses_2", now),
+    )
+    page = store.events_since(PROJECT.id, 0, include_kinds=("question", "limited"), limit=2)
+    assert [event.kind for event in page] == ["question", "limited"]
+    assert [e.kind for e in store.events_since(PROJECT.id, 0, limit=2)] == ["result", "result"]

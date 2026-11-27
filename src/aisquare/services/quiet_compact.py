@@ -51,7 +51,6 @@ from aisquare.core.agent_adapters.types import AgentTranscript, CompactCommand
 from aisquare.core.config import FleetSettings, load_config
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import FleetAgent, TeamSession
-from aisquare.services import manager_pass, manager_seat
 from aisquare.services import team as team_service
 
 COMPACT_INSTRUCTIONS = (
@@ -175,9 +174,6 @@ def _state_age(project_id: str) -> datetime | str:
 def _last_wake(store: ContextStore, session: TeamSession, cursor: int) -> datetime | None:
     """When the newest wake-class event the manager has been handed (at or before its
     cursor) was written: its state file must be newer than the last decision it acted on."""
-    mode, project = manager_seat.mode(store, session)
-    if mode == "schedule" and project is not None:
-        return manager_pass.read(store, project, session.project_id)[1].decision_at
     for event in store.recent_events(session.project_id, limit=100):
         if event.seq <= cursor and team_service.wake_class(event, session) == "wake":
             return event.created_at
@@ -194,7 +190,8 @@ def refusal(
     """Why the manager may not be compacted now, or ``None``: every condition but the pane's.
 
     Still ``waiting`` (not working, limited, mid-hand-over or needing the human); its
-    cursor where it was when its turn ended; no wake-class event past it; a context of at
+    cursor where it was when its turn ended; no wake-class event past it (for a scheduled
+    manager, none that wakes it now: ``team.pending_wake``); a context of at
     least ``quiet_compact_at`` tokens (its transcript's last request, as its agent's reader
     reads it: ``AgentTranscript.context_tokens``); no quiet compaction
     within the cooldown; and a state file written within ``quiet_compact_state_max_age``
@@ -206,16 +203,23 @@ def refusal(
         return f"it reads {session.state}, not waiting"
     if session.cursor != cursor:
         return "it has read the board since its turn ended"
-    policy = manager_seat.policy(store, agent.project_id)
-    if policy.configured and manager_seat.bound(store, agent) is None:
-        return "manager seat and board binding disagree"
-    if policy.pass_minutes:
-        pending = manager_pass.read(store, agent.project_id, session.project_id)[1].pending
+    if team_service.schedule_of(store, session) is not None:
+        # A scheduled manager (#41): only what wakes it now, as its nudge and its Stop
+        # decide. Its held routine news is no wake to come, or one in a busy fleet would
+        # never be compacted (#551).
+        pending = team_service.pending_wake(store, session).now
         if pending is not None:
-            return f"manager pass {pending.id} is outstanding"
-    wakes = team_service.pending_wakes(store, session, limit=500)
-    if wakes:
-        return f"a {wakes[0].kind} is pending (#{wakes[0].seq})"
+            return f"a {pending.kind} is pending (#{pending.seq})"
+    else:
+        for event in store.events_since(
+            session.project_id,
+            cursor,
+            exclude_session=session.id,
+            exclude_actor=session.id,
+            limit=500,
+        ):
+            if team_service.wake_class(event, session) == "wake":
+                return f"a {event.kind} is pending (#{event.seq})"
     reader = _reader(session)
     size = (
         reader.context_tokens(Path(session.transcript_path))
@@ -252,27 +256,13 @@ def check(session_id: str, cursor: int, token: str) -> str:
     """
     # Here, not at the top: the Stop hook imports this module on every turn of every agent,
     # and the fleet module is only this worker's.
+    from aisquare.services import fleet as fleet_service
+    from aisquare.services.delivery import TellResult
+
     settings = _settings()
     if settings.quiet_compact_at <= 0:
         return "quiet compaction is off"
     _sleep(settings.quiet_compact_delay)
-    with store_session() as store:
-        row = store.fleet_agent_for_session(session_id)
-        configured = row is not None and manager_seat.policy(store, row.project_id).configured
-    if row is not None and configured:
-        try:
-            with manager_seat.reserve(row.project_id):
-                return _check_reserved(session_id, cursor, token, settings)
-        except TimeoutError:
-            return "manager pane delivery is busy"
-    return _check_reserved(session_id, cursor, token, settings)
-
-
-def _check_reserved(session_id: str, cursor: int, token: str, settings: FleetSettings) -> str:
-    """Recheck eligibility with the pane delivery reserved."""
-    from aisquare.services import fleet as fleet_service
-    from aisquare.services.delivery import TellResult
-
     with store_session() as store:
         session = store.get_session(session_id)
         agent = store.fleet_agent_for_session(session_id) if session is not None else None
@@ -293,11 +283,6 @@ def _check_reserved(session_id: str, cursor: int, token: str, settings: FleetSet
         why = fleet_service.quiet_prompt_refusal(agent)
         if why is not None:
             return _refuse(store, session_id, why)
-        if manager_seat.policy(store, agent.project_id).configured:
-            current = store.get_session(session.id)
-            why = refusal(store, current, agent, cursor, settings)
-            if why is not None:
-                return _refuse(store, session_id, why)
         typed_at = _now()
         team_service.write_quiet_mark(store, session_id, team_service.QuietMark(typed_at, None))
 
@@ -342,11 +327,6 @@ def _check_reserved(session_id: str, cursor: int, token: str, settings: FleetSet
         _sleep(ACK_POLL)
         waited += ACK_POLL
     if settings.quiet_compact_resume and fleet_service.quiet_prompt_refusal(agent) is None:
-        with store_session() as store:
-            if manager_seat.policy(store, agent.project_id).configured:
-                current = store.get_session(session.id)
-                if current is None or team_service.wake_pending(store, current):
-                    return "compacted"
         since = _now()
 
         def prompted() -> bool:  # its UserPromptSubmit stamps prompted_at (P0-W1a)

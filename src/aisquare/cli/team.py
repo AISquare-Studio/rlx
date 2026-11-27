@@ -1375,12 +1375,6 @@ def log(
     since_seq: Annotated[
         int | None, typer.Option("--since-seq", help="Only events past this seq (cursor).")
     ] = None,
-    through_seq: Annotated[
-        int | None, typer.Option("--through-seq", help="Inclusive upper sequence for this page.")
-    ] = None,
-    pass_id: Annotated[
-        str | None, typer.Option("--pass-id", help="Read this pending manager pass range.")
-    ] = None,
     kind: Annotated[
         str | None, typer.Option("--kind", help="Only this kind (note, decision, task_done, …).")
     ] = None,
@@ -1404,14 +1398,10 @@ def log(
             by=by,
             since=moment,
             since_seq=since_seq,
-            through_seq=through_seq,
-            pass_id=pass_id,
             kind=kind,
             task_ref=task,
             session_ref=as_session,
         )
-    except ValueError as exc:
-        fail(str(exc), error="invalid_pass")
     except STORE_ERRORS as exc:
         _fail_team(exc, task or by or as_session)
     warn_board_scope(as_session)
@@ -1428,23 +1418,6 @@ def log(
             f"{local_time(event.created_at):%H:%M} {who} {event.kind}: {event.text}",
             markup=False,
         )
-
-
-@app.command("complete-pass")
-def complete_pass(pass_id: str, as_session: SessionRef = None) -> None:
-    """Record that the bound manager has processed a scheduled board range."""
-    if as_session is None:
-        fail("--as <session> is required", error="missing_session")
-    try:
-        team_service.complete_manager_pass(pass_id, as_session)
-    except ValueError as exc:
-        fail(str(exc), error="invalid_pass")
-    except STORE_ERRORS as exc:
-        _fail_team(exc, as_session)
-    if get_state().json_output:
-        typer.echo(json.dumps({"pass_id": pass_id}))
-    else:
-        typer.echo(f"Completed manager pass {pass_id}.")
 
 
 @app.command("verify")

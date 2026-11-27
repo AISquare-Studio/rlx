@@ -119,7 +119,6 @@ class TickReport:
     files: dict[str, Path] = field(default_factory=dict)
     """Project id → the detail file its new items were written to."""
     nudged: list[str] = field(default_factory=list)
-    passed: dict[str, str] = field(default_factory=dict)
     stopped: list[str] = field(default_factory=list)
     """Labels of the finished workers auto-stop stopped this tick."""
     notes: list[str] = field(default_factory=list)
@@ -133,7 +132,6 @@ class TickReport:
             "files": {pid: str(path) for pid, path in self.files.items()},
             "nudged": self.nudged,
             "stopped": self.stopped,
-            "passed": self.passed,
             "notes": self.notes,
         }
 
@@ -406,7 +404,6 @@ class Watcher:
                 except Exception as exc:  # the news waits for the next tick
                     undelivered |= {item.id for item in found}
                     notes.append(f"delivery to {project_id} failed: {type(exc).__name__}: {exc}")
-            self._manager_passes(report)
             kept = {i for i in seen if _look_of(i) in failed}
             _save_watch_state(
                 {
@@ -416,6 +413,12 @@ class Watcher:
                 }
             )
         _release_woken_holds(item for item in items if item.id not in undelivered)
+        # A scheduled manager's routine news, held until due (#41): sent from here too, so a
+        # fleet run with neither the rlx service nor asq still hears it. Theirs alone: every
+        # other held nudge is the rlx service's and asq's to send, as before.
+        from aisquare.services import fleet as fleet_service
+
+        fleet_service.retry_deferred_nudges(scheduled_only=True)
         if self.settings.auto_stop:
             with contextlib.suppress(Exception):  # a stop never costs the tick its news
                 from aisquare.services import autostop
@@ -426,35 +429,6 @@ class Watcher:
                     if done.stopped
                 ]
         return report
-
-    def _manager_passes(self, report: TickReport) -> None:
-        """Send due passes while the watcher state lock is held."""
-        from aisquare.services import fleet, manager_seat
-
-        with store_session() as store:
-            passes = store.project_settings(manager_seat.PASS_MINUTES)
-            schedules = store.project_settings(manager_seat.WAKE)
-        for project in dict.fromkeys([*passes, *schedules]):
-            try:
-                if (
-                    schedules.get(project) == "schedule"
-                    and project not in report.nudged
-                    and fleet.nudge_manager(project, reason="scheduled urgency")
-                ):
-                    report.nudged.append(project)
-                    continue
-                if passes.get(project) in (None, "0"):
-                    continue
-                pass_id, note = fleet.deliver_manager_pass(project, report.at)
-            except TimeoutError:
-                continue
-            except Exception as exc:
-                report.notes.append(f"{project}: manager pass error ({type(exc).__name__}: {exc})")
-                continue
-            if pass_id is not None:
-                report.passed[project] = pass_id
-            if note is not None:
-                report.notes.append(note)
 
 
 IDLE_BY_DESIGN_KINDS: frozenset[str] = frozenset({"result", "question", "task_review", "task_done"})
@@ -673,17 +647,12 @@ def _deliver(project_id: str, items: Sequence[WatchItem], path: Path) -> bool:
     """One ``watch`` event addressed to the project's manager, on the board its row reads,
     then its guarded nudge. Whether the nudge went."""
     from aisquare.services import fleet as fleet_service
-    from aisquare.services import manager_seat
     from aisquare.services import team as team_service
 
     with store_session() as store:
         manager = store.fleet_agent_by_label(
             project_id, fleet_service.MANAGER_LABEL, live_only=True
         )
-        if manager_seat.policy(store, project_id).configured and (
-            manager is None or manager_seat.bound(store, manager) is None
-        ):
-            raise ValueError("manager seat and board binding disagree")
     board = fleet_service.board_of_row(manager) if manager is not None else project_id
     team_service.watch_event(
         board, event_text(items, path), urgent=any(map(_urgent, items)), project_id=project_id

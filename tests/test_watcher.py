@@ -292,33 +292,6 @@ def test_a_shutdown_that_leaves_agents_keeps_the_watcher(
     assert stopped == [], "another project's agents still need it"
 
 
-@pytest.mark.parametrize("holder", [None, -1])
-def test_doctor_requires_a_watcher_for_scheduled_managers(
-    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch, holder: int | None
-) -> None:
-    """Doctor distinguishes a missing watcher from a locked watcher with no known PID."""
-    with store_session() as store:
-        store.set_project_setting(project.id, "manager_wake", "schedule")
-    monkeypatch.setattr(watch_service, "running_pid", lambda: holder)
-    row = diagnostics._check_watcher()
-    if holder is None:
-        assert row.status.value == "fail" and "scheduled managers need the watcher" in row.detail
-    else:
-        assert row.status.value == "warn" and "watch lock holder unknown" in row.detail
-
-
-def test_doctor_reports_invalid_policy_and_a_missing_reserved_seat(project: ProjectInfo) -> None:
-    """Doctor exposes both the invalid value and the binding needed for a pass."""
-    with store_session() as store:
-        store.set_project_setting(project.id, "manager_wake", "unsupported")
-    rows = diagnostics._check_manager_policies()
-    assert len(rows) == 2 and all(row.name == f"manager policy {project.id}" for row in rows)
-    invalid, binding = rows
-    assert "using defaults for manager_wake" in invalid.detail
-    assert invalid.fix and "fleet manager-policy --project" in invalid.fix
-    assert "reserved manager expects no row" in binding.detail
-
-
 def test_the_doctor_row_shows_the_last_looks_age(monkeypatch: pytest.MonkeyPatch) -> None:
     watch_service.watch_dir().mkdir(parents=True, exist_ok=True)
     watch_service._save_watch_state(
@@ -473,3 +446,20 @@ def test_the_persons_items_are_seen_and_never_on_the_managers_line(
     assert (
         watcher.tick(NOW + timedelta(minutes=1)).new == [] and len(_watch_events(project.id)) == 1
     )
+
+
+def test_each_tick_sends_the_scheduled_managers_held_wakes_alone(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#41: a scheduled manager's routine news held until due is sent by watch's tick too,
+    with nothing new to deliver, so a fleet run with neither the rlx service nor asq hears
+    it; watch sends no other held nudge (``scheduled_only``)."""
+    asked: list[bool] = []
+
+    def retry(*, scheduled_only: bool = False) -> int:
+        asked.append(scheduled_only)
+        return 0
+
+    monkeypatch.setattr(fleet_service, "retry_deferred_nudges", retry)
+    _watcher(project, Fleet(agents=[])).tick(NOW)
+    assert asked == [True]

@@ -1526,9 +1526,6 @@ alone. Only ``doing`` carries a LEASE — the ``claim_expires_at`` that
 two hold their claim indefinitely (review of #203)."""
 
 
-ManagerWake = Literal["every_write", "schedule"]
-
-
 class TeamSession(BaseModel):
     """One live agent session on the orchestrator (id = the agent's session id)."""
 

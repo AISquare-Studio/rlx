@@ -71,33 +71,22 @@ back where it was.
 
 ### Manager wake schedule
 
-Enable the watcher and set the policy for the fleet project:
+By default a fleet's manager is woken by every board write that concerns it. A busy
+fleet can wake it for urgent news only, and for routine news at most every N minutes:
 
 ```sh
-rlx watch --detach
 rlx fleet manager-policy manager_wake schedule --project <project>
 rlx fleet manager-policy manager_pass_minutes 15 --project <project>
 ```
 
-First activation replays retained urgency from the start of the board, including already handled items, so unanswered questions and direct notes are delivered.
-
-The reserved manager receives urgent questions, direct human notes, usage
-limits, failed handovers, blocking dialogs, and exits that need attention.
-Scheduled urgency still works if the manager was started with
-`AISQUARE_TEAM_DELTA=0` to mute legacy wake traffic. Routine updates wait for
-the watcher's bounded pass. Its prompt includes the
-board range and the completion command. A replacement manager resumes the
-same unread range. A project can customize the prompt with
-`projects/<project-id>/manager/pass.md` under the rlx home. The file survives
-manager replacement and is removed by a fleet fresh.
-
-Use `rlx fleet manager-policy --project <project>` to read settings. Use
-`--clear` with a key to restore its default: `every_write` for wakes and
-`0` for watcher passes. Keep the manual timer until the watcher is healthy
-and its first acknowledged pass is complete. To initialize the completed
-read position from an operator-verified manual pass, run
-`rlx fleet manager-policy --read-through <seq> --project <project>` before
-the first watcher pass.
+Urgent news wakes it at once: a question to it, a note to it from you, an agent's usage
+limit, a hand-over that failed, a first prompt not taken, an exit that needs it, and
+watch's urgent lines (a dialog, a crash). Routine news (results, task moves, agents'
+notes) waits until N minutes after its last prompt; it then reads it all in one turn.
+N is 15 unless set; 0 means routine news waits for an urgent wake or your next prompt.
+`team standby` holds until you speak again, with tasks in flight or not. Run
+`rlx fleet manager-policy --project <project>` to read the policy, and `--clear` with a
+key to restore its default.
 
 ## Accounts
 

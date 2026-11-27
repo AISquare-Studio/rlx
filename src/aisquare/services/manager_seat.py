@@ -1,117 +1,79 @@
-"""Project policy and durable read positions for the reserved manager seat."""
+"""The wake policy of a fleet's manager, per fleet project (#551, #41).
+
+- ``every_write`` (the default): every board write the manager wakes for wakes it, as
+  always (``services.team.manager_wakes``).
+- ``schedule``: urgent news wakes it at once, and routine news at most every
+  ``manager_pass_minutes`` minutes (``services.team.wake_now``).
+
+Stored in the store's ``project_setting`` table, under the fleet project whose ``manager``
+row the manager runs in: a writer's process, the manager's own hooks and the tickers that
+send a held wake (the rlx service, ``asq``, ``rlx watch``) all read the same two keys.
+``rlx fleet manager-policy`` reads, sets and clears them.
+
+The policy says only WHEN news reaches the manager, never how it is delivered, so 0.10.3's
+rlxd (an event bus and a scheduler, no typing into panes) can honour the same keys.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
 
-from aisquare.core import locking, paths
 from aisquare.core.store import ContextStore
-from aisquare.models import FleetAgent, ManagerWake, TeamSession
 
-LABEL = "manager"
+ManagerWake = Literal["every_write", "schedule"]
 WAKE = "manager_wake"
 PASS_MINUTES = "manager_pass_minutes"
+KEYS = (WAKE, PASS_MINUTES)
+DEFAULT_MINUTES = 15
+"""Routine news's interval under ``schedule`` when ``manager_pass_minutes`` is not set. 0
+(routine news never wakes the manager) only when set explicitly: a waiting manager would
+otherwise never hear a result, and a fleet could stall with nobody noticing (#41)."""
 EVENT_PROJECT = "manager_project"
-WakeMode = ManagerWake | Literal["blocked"]
+"""The ``meta`` key, on a board event, of the fleet project whose manager it is for: stamped
+where a question, a sessionless note or a fleet's system event is written, so the managers of
+several fleets on one hub board each wake for their own alone."""
 
 
 @dataclass(frozen=True)
 class Policy:
-    """The project's runtime policy and any invalid stored keys."""
+    """One fleet project's policy, the defaults filled in, and the stored keys that were not
+    valid (and so read as their default)."""
 
     wake: ManagerWake = "every_write"
-    pass_minutes: int = 0
-    configured: bool = False
+    minutes: int = DEFAULT_MINUTES
     invalid: tuple[str, ...] = ()
+
+    @property
+    def scheduled(self) -> bool:
+        return self.wake == "schedule"
 
 
 def validate(key: str, raw: str) -> str:
-    """Validate a project setting before it reaches the store."""
-    if key == WAKE and raw in {"every_write", "schedule"}:
-        return raw
-    if key == PASS_MINUTES and raw.isascii() and raw.isdecimal():
-        try:
-            return str(int(raw))
-        except ValueError:
-            pass
+    """``raw`` as ``key`` stores it, or ``ValueError``: a wake mode, or a whole number of
+    minutes."""
+    value = raw.strip()
+    if key == WAKE and value in ("every_write", "schedule"):
+        return value
+    if key == PASS_MINUTES and value.isascii() and value.isdecimal():
+        return str(int(value))
     raise ValueError(f"invalid {key}: {raw!r}")
 
 
-def policy(store: ContextStore, project: str) -> Policy:
-    """Read policy for one fleet project, with explicit defaults."""
-    wake = store.project_setting(project, WAKE)
-    raw = store.project_setting(project, PASS_MINUTES)
+def policy(store: ContextStore, project_id: str) -> Policy:
+    """``project_id``'s policy: a key not set, or not valid, reads as its default."""
     invalid: list[str] = []
-    minutes = 0
+    wake: ManagerWake = "every_write"
+    stored = store.project_setting(project_id, WAKE)
+    if stored == "schedule":
+        wake = "schedule"
+    elif stored not in (None, "every_write"):
+        invalid.append(WAKE)
+    minutes = DEFAULT_MINUTES
+    raw = store.project_setting(project_id, PASS_MINUTES)
     if raw is not None:
         try:
             minutes = int(validate(PASS_MINUTES, raw))
         except ValueError:
             invalid.append(PASS_MINUTES)
-    if wake not in (None, "every_write", "schedule"):
-        invalid.append(WAKE)
-    return Policy(
-        "schedule" if wake == "schedule" else "every_write",
-        minutes,
-        wake is not None or raw is not None,
-        tuple(invalid),
-    )
-
-
-def bound(store: ContextStore, row: FleetAgent) -> TeamSession | None:
-    """Return the live board session that occupies this project's reserved row."""
-    if row.label != LABEL or row.ended_at is not None or row.session_id is None:
-        return None
-    session = store.get_session(row.session_id)
-    if (
-        session is None
-        or session.ended_at is not None
-        or session.role != LABEL
-        or session.project_id != (row.board or row.project_id)
-    ):
-        return None
-    return session if store.fleet_agent_for_session(session.id) == row else None
-
-
-def mode(store: ContextStore, session: TeamSession) -> tuple[WakeMode, str | None]:
-    """Resolve the reader's own fleet and refuse mismatched configured seats."""
-    row = store.fleet_agent_for_session(session.id)
-    project = row.project_id if row is not None else session.project_id
-    settings = policy(store, project)
-    if row is None or bound(store, row) is None:
-        return ("blocked", project) if settings.configured else ("every_write", None)
-    return settings.wake, project
-
-
-def progress_key(project: str, board: str, kind: str) -> str:
-    """Build a progress key owned by both its fleet and source board."""
-    return f"manager-seat/{project}/{board}/{kind}"
-
-
-def urgent_position(store: ContextStore, project: str, board: str) -> int:
-    """Read the urgent position, starting at retained history on first activation."""
-    return int(store.get_meta(progress_key(project, board, "urgent")) or 0)
-
-
-def advance_urgent(store: ContextStore, project: str, board: str, seq: int) -> None:
-    """Record the highest urgent sequence the seat has seen."""
-    key = progress_key(project, board, "urgent")
-    while True:
-        prior = store.get_meta(key)
-        if prior is None:
-            if store.set_meta_once(key, str(seq)):
-                return
-        elif int(prior) >= seq or store.compare_meta(key, prior, str(seq)):
-            return
-
-
-@contextmanager
-def reserve(project: str) -> Iterator[None]:
-    """Serialize pane delivery without holding a store transaction."""
-    locks = paths.aisquare_home() / "manager-delivery"
-    locks.mkdir(parents=True, exist_ok=True)
-    with locking.holding(locks / project, wait_s=0):
-        yield
+    return Policy(wake, minutes, tuple(invalid))

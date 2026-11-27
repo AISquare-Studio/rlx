@@ -161,7 +161,6 @@ from aisquare.services import (
     explainability_ops,
     handoff,
     install_route,
-    manager_pass,
     manager_seat,
     model_memory,
     pane_idle,
@@ -222,8 +221,10 @@ sandbox, :func:`nudge_manager`). Its value is when; :func:`deliver_owed_nudge` t
 
 NUDGE_DEFERRED = "nudge_deferred:"
 """The ``team_meta`` prefix of a nudge a draft held back (P0-W2), or a dialog on the manager's
-screen (R25): ``nudge_deferred:<session>`` → when it was held back. :func:`retry_deferred_nudges`
-sends it once the box is clear and no dialog is open."""
+screen (R25), or a scheduled manager's routine news not due yet (#41,
+``team.pending_wake``): ``nudge_deferred:<session>`` → when it was held back.
+:func:`retry_deferred_nudges` sends it once the box is clear, no dialog is open and the news is
+due."""
 
 _NUDGE_RE_PRESS: tuple[float, ...] = (2.0,)
 _NUDGE_LAST_WAIT = 2.0
@@ -19446,42 +19447,6 @@ def deliver_owed_nudge(project_id: str) -> bool:
     return _nudge(project_id, owe=False)
 
 
-def _manager_placement(
-    store: ContextStore, project: str, board: str | None
-) -> tuple[Placed, TeamSession] | None:
-    """Resolve a live manager binding and its verified placement."""
-    found = _by_label(store, project, MANAGER_LABEL, live_only=True)
-    if found is None:
-        return None
-    row, record = found
-    if row.session_id is None:
-        return None
-    session = store.get_session(row.session_id)
-    if session is None or session.ended_at is not None:
-        return None
-    if manager_seat.policy(store, project).configured and manager_seat.bound(store, row) is None:
-        return None
-    placement = resolve_place(row, record)
-    why = placement.why if isinstance(placement, Unplaced) else placement.rewritten
-    if not isinstance(placement, Placed) or why is not None:
-        _say_refused(project, row, "it is not woken", why or "", "it reads the board when prompted")
-        return None
-    if board is not None and _board_of_row(placement.agent) != board:
-        return None
-    return placement, session
-
-
-def _waiting_manager_pane(placement: Placed, session: TeamSession, now: datetime) -> bool:
-    """Check the placed manager's live pane and waiting prompt."""
-    pane, manager = placement.pane, placement.agent
-    facts = pane.facts_or_raise()
-    if facts is None or not _its_agent(manager, facts):
-        return False
-    view = _PaneView(facts.dead, facts.dead_status, facts.current_command, facts.last_output)
-    state, _ = _derive(manager, session, view, observed=True, now=now)
-    return _at_its_prompt(pane, manager, session, state, now)
-
-
 def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
     """:func:`nudge_manager`, leaving the nudge owed where tmux refused it when ``owe``;
     otherwise :func:`deliver_owed_nudge`'s. Either is due only for news the manager wakes for,
@@ -19492,35 +19457,59 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
     sandbox, and the row was the sandbox's to write before its broker (review r5 of
     #113, finding 1; r6, finding 1). ``board`` as for :func:`nudge_manager`."""
     try:
-        with store_session() as store, contextlib.ExitStack() as locks:
-            if manager_seat.policy(store, project_id).configured:
-                locks.enter_context(manager_seat.reserve(project_id))
-            target = _manager_placement(store, project_id, board)
-            if target is None:
+        with store_session() as store:
+            found = _by_label(store, project_id, MANAGER_LABEL, live_only=True)
+            if found is None:
                 return False
-            placement, session = target
-            manager, pane = placement.agent, placement.pane
-            # Due only for news it wakes for, unread (``team.wake_pending``, R12): its own
+            row, record = found
+            if row.session_id is None:
+                return False
+            placement = resolve_place(row, record)
+            why = placement.why if isinstance(placement, Unplaced) else placement.rewritten
+            if not isinstance(placement, Placed) or why is not None:
+                _say_refused(
+                    project_id,
+                    row,
+                    "it is not woken",
+                    why or "",
+                    "it reads the board when prompted",
+                )
+                return False
+            manager, pane = placement.agent, placement.pane  # its place and agent: the record's
+            if board is not None and _board_of_row(manager) != board:
+                return False
+            session = store.get_session(row.session_id)
+            if session is None or session.ended_at is not None:
+                return False
+            # Due only for news it wakes for, unread (``team.pending_wake``, R12): its own
             # result, an echo of news it has read, or a line its standby holds wakes nobody,
             # whichever write asked. An owed one was always asked this; now every one is.
-            if not _team().wake_pending(store, session):
+            # A scheduled manager's routine news not due yet is held for the tickers (#41).
+            pending = _team().pending_wake(store, session)
+            now = _now()
+            if pending.now is None:
+                if pending.held:
+                    _hold(store, session, now)
                 return False
             key = f"nudge:{session.id}"
-            now = _now()
             last = store.get_meta(key)
-            if last is not None:
-                last_at = datetime.fromisoformat(last)
-                if last_at > now:
-                    store.compare_meta(key, last, now.isoformat())
-                    return False
-                if now - last_at < NUDGE_DEBOUNCE:
-                    return False
+            if last is not None and now - datetime.fromisoformat(last) < NUDGE_DEBOUNCE:
+                return False
+            if pending.scheduled and not _claim(store, key, last, now):
+                return False  # another process took this wake: the rlx service, asq or watch
             try:
-                if not _waiting_manager_pane(placement, session, now):
-                    return False
+                facts = pane.facts_or_raise()
             except TmuxError:
                 if owe:
                     store.set_meta(NUDGE_OWED + project_id, now.isoformat())
+                return False
+            if facts is None or not _its_agent(manager, facts):
+                return False  # not the agent, or the id is another agent's on another server
+            view = _PaneView(
+                facts.dead, facts.dead_status, facts.current_command, facts.last_output
+            )
+            state, _ = _derive(manager, session, view, observed=True, now=now)
+            if not _at_its_prompt(pane, manager, session, state, now):
                 return False
             deferred = f"{NUDGE_DEFERRED}{session.id}"
             if _dialog_on_its_screen(pane, recorded_adapter(manager.agent)) is not None:
@@ -19557,123 +19546,28 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
         return False
 
 
-def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str | None]:
-    """Send one due bounded pass through the reserved manager's waiting pane."""
-    with manager_seat.reserve(project), store_session() as store:
-        policy = manager_seat.policy(store, project)
-        if not policy.pass_minutes:
-            return None, None
-        row = store.fleet_agent_by_label(project, MANAGER_LABEL, live_only=True)
-        session = manager_seat.bound(store, row) if row is not None else None
-        if session is None:
-            return None, f"{project}: manager pass requires a live bound manager seat"
-        board = session.project_id
-        raw, progress = manager_pass.read(store, project, board)
-        pending = progress.pending
-        if pending is not None and manager_pass.observe_transcript(session, pending):
-            return pending.id, None
-        if progress.delivered_at is not None and progress.delivered_at > now:
-            rebased = progress.model_copy(update={"delivered_at": now})
-            manager_pass.save(store, project, board, raw, rebased)
-            return None, None
-        if pending is None and not manager_pass.due(progress, policy.pass_minutes, now):
-            return None, None
-        if pending is not None and not manager_pass.retryable(pending, session):
-            delivery_state = "acknowledged" if pending.acknowledged_at else "submission uncertain"
-            owner = store.get_project(project)
-            detail = f"{project}: pass {pending.id} {delivery_state}."
-            if owner is not None:
-                detail += prog.shell_advice(
-                    " If idle and recovery is needed, use "
-                    + project_service.fleet_command("requeue-manager-pass", owner, pending.id)
-                )
-            return None, detail
-        if _team().standby_of(store, session) is not None or _team().wake_pending(store, session):
-            return None, None
-        target = _manager_placement(store, project, board)
-        if target is None:
-            return None, None
-        placement, verified = target
-        if verified.id != session.id or not _waiting_manager_pane(placement, verified, now):
-            return None, None
-        pane = placement.pane
-        adapter = recorded_adapter(placement.agent.agent)
-        if _dialog_on_its_screen(pane, adapter) is not None:
-            return None, None
-        if _team().wake_pending(store, session):
-            return None, None
-        pending = pending or manager_pass.new_range(store, session, progress)
-        attempt = pending.start_attempt(verified)
-        sending = progress.model_copy(update={"pending": attempt})
-        if not manager_pass.save(store, project, board, raw, sending):
-            return None, None
-        text, why = manager_pass.prompt(project, board, attempt)
-
-        def acknowledged() -> bool:
-            _, current = manager_pass.read(store, project, board)
-            return current.completed == attempt.id or (
-                current.pending is not None
-                and current.pending.attempt_id == attempt.attempt_id
-                and current.pending.acknowledged_at is not None
-            )
-
-        result = pane.deliver_typed(
-            text,
-            MANAGER_LABEL,
-            press="press Enter in its pane",
-            acked=acknowledged,
-            reads_box=_input_box_of(adapter) is not None,
-            what="the manager pass",
-            guard=settings().draft_quiet_seconds,
-            re_press=(),
-            origin=prompt_origin.WAKE,
-            gap=_enter_gap(adapter),
-        )
-        if (
-            result.told.typed == "no"
-            and not result.presses
-            and not result.in_box
-            and not acknowledged()
-        ):
-            retry = attempt.clear_attempt()
-            manager_pass.save(
-                store,
-                project,
-                board,
-                sending.model_dump_json(),
-                sending.model_copy(update={"pending": retry}),
-            )
-            return None, why
-        if not acknowledged():
-            return None, f"{project}: pass {attempt.id} submission uncertain. {why or ''}".rstrip()
-        return attempt.id, why
+def _hold(store: ContextStore, session: TeamSession, now: datetime) -> None:
+    """Hold back a scheduled manager's nudge for routine news that is not due yet
+    (:data:`NUDGE_DEFERRED`), for :func:`retry_deferred_nudges` to send once it is. Written
+    when no mark is there, or the one there predates its last prompt, which read the news it
+    was for: a tick that finds it held still writes nothing."""
+    key = f"{NUDGE_DEFERRED}{session.id}"
+    since = store.get_meta(key)
+    prompted = session.prompted_at
+    if not since or (prompted is not None and datetime.fromisoformat(since) <= prompted):
+        store.set_meta(key, now.isoformat())
 
 
-def requeue_manager_pass(project: str, pass_id: str) -> None:
-    """Requeue the exact unfinished range after verifying its pane is idle."""
-    with manager_seat.reserve(project), store_session() as store:
-        target = _manager_placement(store, project, None)
-        if target is None:
-            raise ValueError("the manager seat has no verified pane")
-        placement, session = target
-        board = session.project_id
-        raw, progress = manager_pass.read(store, project, board)
-        pending = progress.pending
-        if pending is None or pending.id != pass_id:
-            raise ValueError("no matching unfinished pass")
-        if not _waiting_manager_pane(placement, session, _now()):
-            raise ValueError("the manager is not at its waiting prompt")
-        refusal = quiet_prompt_refusal(placement.agent)
-        if refusal is not None:
-            raise ValueError(refusal)
-        retry = pending.clear_attempt()
-        if not manager_pass.save(
-            store, project, board, raw, progress.model_copy(update={"pending": retry})
-        ):
-            raise ValueError("pass changed during recovery")
+def _claim(store: ContextStore, key: str, last: str | None, now: datetime) -> bool:
+    """Take a scheduled manager's nudge (its debounce ``key``) before typing it, by compare and
+    set: of the tickers that send a held one (the rlx service, ``asq``, ``rlx watch``), the
+    one that takes it types it, and the others see it taken (#41)."""
+    if last is None:
+        return store.set_meta_once(key, now.isoformat())
+    return store.compare_meta(key, last, now.isoformat())
 
 
-def retry_deferred_nudges() -> int:
+def retry_deferred_nudges(*, scheduled_only: bool = False) -> int:
     """Send each manager nudge a draft or a dialog held back (:data:`NUDGE_DEFERRED`), now that
     its input box may be clear and the dialog closed: ``asq``'s refresh asks every frame. How
     many were sent.
@@ -19688,16 +19582,19 @@ def retry_deferred_nudges() -> int:
     per read (P2-W3, #83)."""
     try:
         with store_session() as store:
-            targets = deferred_nudge_targets(store)
+            targets = deferred_nudge_targets(store, scheduled_only=scheduled_only)
     except Exception:
         return 0
     return send_deferred_nudges(targets)
 
 
-def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
+def deferred_nudge_targets(
+    store: ContextStore, *, scheduled_only: bool = False
+) -> list[FleetAgent]:
     """The managers whose held-back nudge is still owed, read in ``store``; one owed no
     more (its manager prompted since, or its row ended) is dropped there. One indexed read
-    when nothing is held back."""
+    when nothing is held back. ``scheduled_only``: those of fleets whose policy is
+    ``schedule`` alone (``rlx watch``'s, #41), the others left as they were."""
     held = {
         key.removeprefix(NUDGE_DEFERRED): since
         for key, since in store.list_meta(NUDGE_DEFERRED).items()
@@ -19706,6 +19603,10 @@ def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
     targets: list[FleetAgent] = []
     for session_id, since in held.items():
         row = store.fleet_agent_for_session(session_id)
+        if scheduled_only and (
+            row is None or not manager_seat.policy(store, row.project_id).scheduled
+        ):
+            continue
         session = store.get_session(session_id)
         prompted = session.prompted_at if session is not None else None
         gone = row is None or row.ended_at is not None or row.label != MANAGER_LABEL

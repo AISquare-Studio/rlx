@@ -195,8 +195,6 @@ PROJECT_OF: dict[tuple[str, str], str] = {
     ("services/diagnostics.py", "_left_from_before_capture"): "each captured row itself",
     ("services/diagnostics.py", "_check_dead_managers"): _WALKED,
     ("services/diagnostics.py", "_account_limit_checks"): _ROW_OF_SESSION,
-    ("services/diagnostics.py", "_manager_policy_rows"): "the project that owns the policy",
-    ("services/fleet.py", "deliver_manager_pass"): "the project that owns the pending pass",
     ("services/fleet.py", "_replaced"): _FLEET_OP,
     ("services/fleet.py", "_in_hand_over"): _FLEET_OP,
     ("services/fleet.py", "_refuse_an_agents_setting_command"): _FLEET_OP,

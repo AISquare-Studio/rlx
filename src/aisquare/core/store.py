@@ -1522,9 +1522,6 @@ CREATE TABLE IF NOT EXISTS account_rank (
 # recorded Codex rows before the column (review r28 of #113, m1). One neither names keeps
 # NULL, which reads as the default agent's, only where the store never recorded another.
 _SCHEMA_V50 = ""
-
-# v51 adds team_session.manager_wake through _PRODUCTS.
-_SCHEMA_V51 = ""
 # Ordered migrations; index i upgrades the db from user_version i to i+1.
 _MIGRATIONS = (
     _SCHEMA_V1,
@@ -1577,7 +1574,6 @@ _MIGRATIONS = (
     _SCHEMA_V48,
     _SCHEMA_V49,
     _SCHEMA_V50,
-    _SCHEMA_V51,
 )
 SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -1682,7 +1678,6 @@ _PRODUCTS: dict[int, _Products] = {
     47: _Products(columns=(("claude_usage", "windows", "TEXT"),)),
     48: _Products(("account_rank",)),
     49: _Products(columns=(("usage_session", "agent", "TEXT"),)),
-    50: _Products(columns=(("team_session", "manager_wake", "TEXT"),)),
 }
 
 _PROJECT_COLUMNS = (
@@ -2017,7 +2012,6 @@ class ContextStore(Protocol):
         project_id: str,
         seq: int,
         *,
-        through_seq: int | None = None,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
         include_kinds: Collection[str] = (),
@@ -2040,7 +2034,6 @@ class ContextStore(Protocol):
         session_id: str | None = None,
         since_iso: str | None = None,
         since_seq: int | None = None,
-        through_seq: int | None = None,
         kind: str | None = None,
         task_id: str | None = None,
         to_role: str | None = None,
@@ -5284,7 +5277,6 @@ class SqliteStore:
         session_id: str | None = None,
         since_iso: str | None = None,
         since_seq: int | None = None,
-        through_seq: int | None = None,
         kind: str | None = None,
         task_id: str | None = None,
         to_role: str | None = None,
@@ -5315,9 +5307,6 @@ class SqliteStore:
         if since_seq is not None:
             clauses.append("seq > ?")
             params.append(since_seq)
-        if through_seq is not None:
-            clauses.append("seq <= ?")
-            params.append(through_seq)
         if kind is not None:
             clauses.append("kind = ?")
             params.append(kind)
@@ -5345,7 +5334,6 @@ class SqliteStore:
         project_id: str,
         seq: int,
         *,
-        through_seq: int | None = None,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
         include_kinds: Collection[str] = (),
@@ -5360,26 +5348,25 @@ class SqliteStore:
         agent's session, with the manager as its actor. ``relevant`` keeps only what a
         ``relevant`` board context reads (:class:`Relevance`).
 
-        ``include_kinds`` and ``exclude_kinds`` filter kinds inside the query, as
+        ``exclude_kinds`` leaves those kinds out INSIDE the query, as
         :meth:`filtered_events` does, so ``limit`` counts rows the caller can use.
         Dropped after the LIMIT, a run of the captain's audit lines filled the whole
         page, and the event behind it was not read at all (review of #240, finding 11).
+        ``include_kinds`` keeps only those kinds, inside the query for the same reason: a
+        scheduled manager's urgent news behind a page of results (``team.wake_now``, #41).
         """
         keep, kept = _relevant_clause(relevant)
-        bounds = "AND seq <= ? " if through_seq is not None else ""
-        included = _and_kinds(include_kinds)
         rows = self._conn.execute(
             f"SELECT {_EVENT_COLUMNS} FROM team_event "
             "WHERE project_id = ? AND seq > ? "
             "AND (session_id IS NULL OR session_id != ?) "
             "AND (actor IS NULL OR actor != ?) "
-            f"{bounds}{_and_not_kinds(exclude_kinds)}{included}{keep}ORDER BY seq LIMIT ?",
+            f"{_and_not_kinds(exclude_kinds)}{_and_kinds(include_kinds)}{keep}ORDER BY seq LIMIT ?",
             (
                 project_id,
                 seq,
                 exclude_session or "",
                 exclude_actor or "",
-                *((through_seq,) if through_seq is not None else ()),
                 *exclude_kinds,
                 *include_kinds,
                 *kept,
@@ -7481,13 +7468,7 @@ the launch record's refusal its board was last told (``services.fleet._say_refus
 go with the row (:func:`_fleet_meta_terms`): nothing else expires a ``first-prompt:``,
 ``fleet-stopped:`` or ``launch-refused:`` key."""
 
-_PROJECT_META: tuple[str, ...] = (
-    "signal/{}/*",
-    "nudge-owed:{}",
-    "broker-refused:{}:*",
-    "manager-seat/{}/*",
-    "manager-seat/*/{}/*",
-)
+_PROJECT_META: tuple[str, ...] = ("signal/{}/*", "nudge-owed:{}", "broker-refused:{}:*")
 """The ``team_meta`` keys kept per project, as GLOBs of its id: its signals, the nudge a board
 write owed its manager (``services.fleet.NUDGE_OWED``) and the once-per-launch-and-kind marks
 of the broker refusals its board was told (``services.store_broker.record_refusal``). A reset
@@ -7586,7 +7567,8 @@ def _relevant_clause(relevant: Relevance | None) -> tuple[str, list[str]]:
 
 
 def _and_kinds(kinds: Collection[str]) -> str:
-    """Include kinds inside an event page."""
+    """``AND kind IN (?, …) `` for a query that keeps ``kinds`` alone, or nothing; the caller
+    hands ``*kinds`` to the query at that place."""
     return f"AND kind IN ({', '.join('?' * len(kinds))}) " if kinds else ""
 
 

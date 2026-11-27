@@ -434,47 +434,33 @@ def spawn(
 @app.command("manager-policy")
 def manager_policy(
     key: Annotated[str | None, typer.Argument(help="manager_wake or manager_pass_minutes.")] = None,
-    value: Annotated[str | None, typer.Argument(help="Value to set.")] = None,
+    value: Annotated[str | None, typer.Argument(help="The value to set.")] = None,
     project: Annotated[str | None, typer.Option("--project", help="Fleet project or ID.")] = None,
-    clear: Annotated[
-        bool, typer.Option("--clear", help="Restore the selected key's default.")
-    ] = False,
-    read_through: Annotated[
-        int | None,
-        typer.Option("--read-through", min=0, help="Verified last manual pass sequence."),
-    ] = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Restore the key's default.")] = False,
 ) -> None:
-    """Read, set, or clear the project's manager scheduling policy."""
+    """Read, set or clear how the fleet's manager is woken (#551): on every board write that
+    concerns it (manager_wake every_write, the default), or urgent news at once and routine
+    news at most every manager_pass_minutes minutes (schedule; 15 unless set)."""
     from aisquare.core.store import store_session
-    from aisquare.services import manager_pass, manager_seat
+    from aisquare.services import manager_seat
 
     target = _project(project)
-    if key not in (None, manager_seat.WAKE, manager_seat.PASS_MINUTES):
-        raise typer.BadParameter("unknown manager policy key")
-    if (clear or value is not None) and key is None:
-        raise typer.BadParameter("select a manager policy key")
+    if key is not None and key not in manager_seat.KEYS:
+        raise typer.BadParameter(f"unknown key {key!r}: manager_wake or manager_pass_minutes")
+    if key is None and (clear or value is not None):
+        raise typer.BadParameter("name the key to set or clear")
     if clear and value is not None:
-        raise typer.BadParameter("--clear cannot be combined with a value")
-    if read_through is not None and (key is not None or value is not None or clear):
-        raise typer.BadParameter("--read-through must be set separately from policy changes")
+        raise typer.BadParameter("--clear takes no value")
+    validated: str | None = None
+    if key is not None and value is not None:
+        try:
+            validated = manager_seat.validate(key, value)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     with store_session() as store:
-        if read_through is not None:
-            row = store.fleet_agent_by_label(target.id, manager_seat.LABEL, live_only=True)
-            session = manager_seat.bound(store, row) if row is not None else None
-            if session is None:
-                message = "the project needs a live bound manager"
-                fail(message, error="no_bound_manager", detail=message)
-            try:
-                manager_pass.baseline(store, target.id, session.project_id, read_through)
-            except ValueError as exc:
-                fail(str(exc), error="baseline_refused", detail=str(exc))
         if key is not None and clear:
             store.clear_project_setting(target.id, key)
-        if key is not None and value is not None:
-            try:
-                validated = manager_seat.validate(key, value)
-            except ValueError as exc:
-                raise typer.BadParameter(str(exc)) from exc
+        elif key is not None and validated is not None:
             store.set_project_setting(target.id, key, validated)
         policy = manager_seat.policy(store, target.id)
     if get_state().json_output:
@@ -482,32 +468,25 @@ def manager_policy(
             json.dumps(
                 {
                     "project_id": target.id,
-                    "manager_wake": policy.wake,
-                    "manager_pass_minutes": policy.pass_minutes,
-                    "invalid": policy.invalid,
+                    manager_seat.WAKE: policy.wake,
+                    manager_seat.PASS_MINUTES: policy.minutes,
+                    "invalid": list(policy.invalid),
                 }
             )
         )
         return
-    typer.echo(f"{target.id} manager_wake={policy.wake} manager_pass_minutes={policy.pass_minutes}")
+    typer.echo(
+        f"{_display_name(target)}: {manager_seat.WAKE}={policy.wake} "
+        f"{manager_seat.PASS_MINUTES}={policy.minutes}"
+    )
     if policy.invalid:
-        typer.echo(f"Using defaults for invalid settings: {', '.join(policy.invalid)}", err=True)
-
-
-@app.command("requeue-manager-pass")
-def requeue_manager_pass(
-    pass_id: str,
-    project: Annotated[str | None, typer.Option("--project", help="Fleet project or ID.")] = None,
-) -> None:
-    """Requeue an unfinished pass after confirming its pane is idle."""
-    try:
-        fleet_service.requeue_manager_pass(_project(project).id, pass_id)
-    except (ValueError, TimeoutError) as exc:
-        fail(str(exc), error="requeue_refused", detail=str(exc))
-    if get_state().json_output:
-        typer.echo(json.dumps({"pass_id": pass_id}))
-    else:
-        typer.echo(f"Requeued manager pass {pass_id}.")
+        typer.echo(f"Using the defaults of invalid settings: {', '.join(policy.invalid)}", err=True)
+    if policy.scheduled and policy.minutes == 0:
+        typer.echo(
+            f"{manager_seat.PASS_MINUTES} is 0: routine news waits for an urgent wake or the "
+            "person's next prompt.",
+            err=True,
+        )
 
 
 @app.command("ls")
