@@ -43,8 +43,8 @@ use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, JobListParams,
     JobPutParams, JobRef, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams,
     PtyResizeParams, PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request,
-    RequestId, Role, RunEventsParams, RunListParams, RunRef, RunResumeParams, RunStartParams,
-    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
+    RequestId, Role, RunDecideParams, RunEventsParams, RunListParams, RunRef, RunResumeParams,
+    RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
     SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
     methods, setting_keys, topics,
 };
@@ -143,6 +143,10 @@ enum Answer {
     Stream(Subscription),
     /// A run's events from its log (`run.events`), whose last frame is the reply.
     RunStream(RequestId, Box<Replay>),
+    /// No reply: the connection closes (a hook request the gate dropped, 5.1). Only test
+    /// builds make hook requests until rlxd-hook's pre-tool-use is wired (#617).
+    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+    Hangup,
 }
 
 /// A gate credential `gate.pair` minted for `device`, whose SHA-256 is `sha256`. If its
@@ -206,6 +210,7 @@ impl Daemon {
         let bus = Arc::new(bus);
         let runner = Runner::new(home.clone(), Arc::clone(&bus));
         let gate = Arc::new(gate);
+        runner.follow_apps(gate.apps());
         let scheduler = Scheduler::new(&home, Arc::clone(&bus), Arc::clone(&runner), gate.apps());
         match &scheduler {
             Ok(scheduler) => {
@@ -474,6 +479,19 @@ impl Daemon {
             }
             #[cfg(feature = "debug-methods")]
             methods::DEBUG_RUN_START => self.debug_run_start(session, request.params),
+            methods::RUN_DECIDE => self.run_decide(session, request.params).await,
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_PRE_TOOL_USE => {
+                match self.debug_pre_tool_use(session, request.params).await {
+                    Ok(Some(data)) => Ok(data),
+                    Ok(None) => return Answer::Hangup,
+                    Err(error) => Err(error),
+                }
+            }
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_DROP_HOOK_CONNECTIONS => {
+                Ok(object(&json!({"dropped": self.runner.drop_hooks()})))
+            }
             methods::JOB_PUT
             | methods::JOB_LIST
             | methods::JOB_DELETE
@@ -856,6 +874,58 @@ impl Daemon {
                 }),
             )
         })?)
+    }
+
+    /// `run.decide`: the app's answer to a pending tool call (5.1), from an app-role
+    /// connection that holds the gate only. Any other gets `not_gate`.
+    async fn run_decide(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        if session.app.as_ref().is_none_or(Hold::is_kicked) {
+            info!(
+                "run.decide refused ({} {}, {}): not_gate",
+                role_name(session.role),
+                session.client,
+                session.peer
+            );
+            return Err(error(
+                codes::NOT_GATE,
+                "only rlx's app, holding the gate, decides a run's tool calls",
+            )
+            .with_hint(NOT_GATE_HINT));
+        }
+        let params = params_of::<RunDecideParams>(methods::RUN_DECIDE, params)?;
+        printed(&self.runner.decide(params).await?)
+    }
+
+    /// `debug.pre_tool_use {run_id, attempt, key, stdin}`: a hook request, as rlxd-hook's
+    /// pre-tool-use will send it, from this connection's process. `None` when the gate
+    /// dropped it. Test builds only.
+    #[cfg(feature = "debug-methods")]
+    async fn debug_pre_tool_use(
+        &self,
+        session: &Session,
+        params: Params,
+    ) -> Result<Option<Data>, ErrorBody> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct HookParams {
+            run_id: String,
+            attempt: u64,
+            key: String,
+            stdin: Value,
+        }
+        let params = params_of::<HookParams>(methods::DEBUG_PRE_TOOL_USE, params)?;
+        let ask = crate::runner::Ask {
+            run_id: params.run_id,
+            attempt: params.attempt,
+            key: params.key,
+            peer: Arc::clone(&session.peer),
+            stdin: params.stdin,
+        };
+        Ok(self
+            .runner
+            .pre_tool_use(ask)
+            .await
+            .map(|output| object(&json!({"output": output}))))
     }
 
     /// The scheduler's methods (handoff 0.10.3, 7.6): `job.put`, `job.list`, `job.delete`,
@@ -1413,6 +1483,7 @@ where
                     return dropped(&session, &mut frames, &mut writer).await;
                 }
             }
+            Answer::Hangup => return,
             Answer::RunStream(id, replay) => {
                 let flow = send_run_stream(
                     &daemon,
@@ -1807,6 +1878,7 @@ where
             }
             minted.close.then_some(Flow::Dropped)
         }
+        Answer::Hangup => Some(Flow::Close),
         Answer::Stream(_) | Answer::RunStream(..) => {
             unreachable!("a streaming connection takes no second stream")
         }
@@ -2213,6 +2285,7 @@ fn served() -> Vec<&'static str> {
         methods::RUN_GET,
         methods::RUN_LIST,
         methods::RUN_EVENTS,
+        methods::RUN_DECIDE,
         methods::SPACE_ENSURE,
         methods::SPACE_ERASE,
         methods::JOB_PUT,
@@ -2228,6 +2301,8 @@ fn served() -> Vec<&'static str> {
         served.push(methods::DEBUG_RUN_START);
         served.push(methods::DEBUG_CLOCK_ADVANCE);
         served.push(methods::DEBUG_CLOCK_SET);
+        served.push(methods::DEBUG_PRE_TOOL_USE);
+        served.push(methods::DEBUG_DROP_HOOK_CONNECTIONS);
     }
     served
 }
