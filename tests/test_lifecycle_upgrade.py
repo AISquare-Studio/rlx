@@ -4778,6 +4778,46 @@ def test_a_failed_move_back_turns_on_no_item_the_os_had_off(
     assert enables == [], enables
 
 
+@pytest.mark.parametrize("ran", [False, True], ids=["stopped", "running"])
+def test_a_failed_move_back_starts_the_service_only_if_the_upgrade_stopped_it(
+    runner: CliRunner,
+    tool: Tool,
+    machine: Machine,
+    no_real_login_item: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    ran: bool,
+) -> None:
+    """The manager's decision #2927: the put back loaded the agent again, which starts it
+    (``RunAtLoad``), whether or not the service ran before the upgrade. It starts nothing now;
+    the upgrade starts again only the service it stopped, through the OS: the agent put back is
+    loaded, once."""
+    from aisquare.services import service_host, service_login
+
+    service_login.register_at_login()
+    item = service_login.item_path("launchd")
+    target = f"gui/501/{service_login.label()}"
+    no_real_login_item.reply("launchctl", "print", target, code=113, said="Could not find")
+    monkeypatch.setattr(service_host, "stop_service", lambda **_: ran)
+    answers: list[Any] = [None, None]
+
+    def running(**_: Any) -> Any:
+        return answers.pop(0) if answers else _a_service(4242, "0.10.2")
+
+    monkeypatch.setattr(service_host, "running_service", running)
+    _a_failed_move_back(machine)
+    no_real_login_item.calls.clear()
+
+    result = runner.invoke(app, ["--json", "upgrade", "--yes"])
+
+    assert result.exit_code != 0 and item.is_file(), result.output
+    starts = [
+        call
+        for call in no_real_login_item.calls
+        if call[:2] in (("launchctl", "bootstrap"), ("launchctl", "kickstart"))
+    ]
+    assert starts == ([("launchctl", "bootstrap", "gui/501", str(item))] if ran else [])
+
+
 @pytest.mark.parametrize("pin", [(), ("--version", "0.9.1")], ids=["latest", "pinned"])
 def test_a_move_back_the_installer_did_not_make_puts_the_login_item_back(
     runner: CliRunner, tool: Tool, machine: Machine, pin: tuple[str, ...]

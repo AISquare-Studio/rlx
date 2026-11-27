@@ -111,7 +111,8 @@ names the home when one does; nothing else. From a checkout or a development vir
 environment, `rlx service install` refuses: a login item should not run that code.
 
 `rlx service start`, and `rlx upgrade`'s restart, start the service through launchd or systemd
-when its login item is set up, so the service that runs is the one they keep alive. `rlx service
+when its login item is set up, so the service that runs is the one they keep alive (on macOS, a
+login item launchd has not loaded yet is loaded, which starts it). `rlx service
 stop` stops it as before: a stop is not a crash, so it stays stopped. If a service already runs
 when you log in, the one at login exits quietly, and is not started again either.
 
@@ -153,7 +154,8 @@ whose item was in place and on is forgotten with it, so a later release sets it 
 of off, or of on whose item you removed or turned off in the OS, is kept. If that upgrade's
 installer fails, or installs a release that has the service after all, the items are put back
 as they were (but one whose file you could not read, which is taken away all the same: `rlx
-service status` then says how it stands). A reset (App settings' *Reset all*, `rlx config reset`) or `--reinit` of a
+service status` then says how it stands). Putting them back starts nothing: each starts at your
+next login, and the upgrade starts the service again only if it was running before. A reset (App settings' *Reset all*, `rlx config reset`) or `--reinit` of a
 `config.toml` that does not parse carries the choice over from its text, or, when the text holds
 none or cannot be read (`chmod 000`), records the default home's as the OS has it (an item in
 place is on, none is off). `--reinit --yes` writes its defaults readable, never at a mode that

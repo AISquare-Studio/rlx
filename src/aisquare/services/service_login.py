@@ -666,23 +666,26 @@ def forget_at_login() -> Taken:
 
 def put_back(taken: Taken) -> str | None:
     """Exactly what :func:`forget_at_login` took away, put back, after a move that did not
-    happen: each item's file as it was, loaded or enabled again only where it was, and the
-    choice as it was; never an explicit install, which would turn back on an item the person
-    had turned off, or add this home's for another's (review of #33, round 3). What to say of
-    it; ``None`` when nothing was taken away."""
+    happen: whether each item starts at login, as it did, and the choice as it was. Each file
+    as it was, and a unit enabled again only where it was; never an explicit install, which
+    would turn back on an item the person had turned off, or add this home's for another's
+    (review of #33, round 3).
+
+    And nothing started: a LaunchAgent loaded again (``bootstrap``) starts at once, as its
+    ``RunAtLoad`` says, and so does a unit enabled ``--now``, so a service the upgrade had
+    stopped, and would not start again, ran again (manager's decision #2927). The agent loads
+    at the next login; whether the service runs now is the upgrade's to say, and a start goes
+    through the OS (:func:`start_through_the_os`). What to say of it; ``None`` when nothing was
+    taken away."""
     if not taken.items and not taken.forgot:
         return None
     back = [item for item in taken.items if _written_back(item)]
     missed = [item for item in taken.items if item not in back]
     if taken.how == "systemd" and back:
         _service_manager(["systemctl", "--user", "daemon-reload"])
-    for item in back:
-        if not item.live:
-            continue
-        if taken.how == "launchd":
-            _service_manager(["launchctl", "bootstrap", _domain(), str(item.path)])
-        else:
-            _service_manager(["systemctl", "--user", "enable", "--now", item.name])
+        for item in back:
+            if item.live:
+                _service_manager(["systemctl", "--user", "enable", item.name])
     mine = None if taken.how is None else item_path(taken.how)
     if taken.forgot and all(item.path != mine for item in missed):
         # This home's ON, its item back. One that could not come back stays forgotten, so the
@@ -929,7 +932,12 @@ def state_line(state: AtLogin) -> str:
 def start_through_the_os() -> bool:
     """Ask the OS to start the service from this home's item, when the item is there, ours and
     not turned off, so the service that holds S1's lock is the one the OS supervises, not a copy
-    it does not know. Whether the OS took the request; the caller waits for the service."""
+    it does not know. Whether the OS took the request; the caller waits for the service.
+
+    A LaunchAgent launchd has not loaded (one put back after an upgrade that did not move,
+    :func:`put_back`, or written away from the Mac) is loaded, which starts it (``RunAtLoad``);
+    one loaded is kickstarted. Away from a login session at the Mac the load fails, and the
+    caller starts the service itself."""
     try:
         how = login_how()
         item = item_path(how)
@@ -940,6 +948,8 @@ def start_through_the_os() -> bool:
     if _turned_off_by_the_os(how) is not None:
         return False
     if how == "launchd":
+        if not _service_manager(["launchctl", "print", _target()]).ok:
+            return _service_manager(["launchctl", "bootstrap", _domain(), str(item)]).ok
         return _service_manager(["launchctl", "kickstart", _target()]).ok
     return _service_manager(["systemctl", "--user", "start", unit_name()]).ok
 

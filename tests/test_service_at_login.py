@@ -1433,8 +1433,8 @@ def test_an_item_that_stays_keeps_what_was_taken_so_it_can_be_put_back(
 ) -> None:
     """The NIT: a named home's file that would not go raised after this home's item was gone,
     so nothing was kept to put back after a failed move. What was taken is kept, every other
-    item still goes, and a put back restores this home's item, its ON choice and the one it
-    booted out."""
+    item still goes, and a put back restores this home's item and its ON choice, loading
+    neither (the manager's decision #2927)."""
     named, named_label = _a_named_homes_item(monkeypatch)
     service_login.register_at_login()
     mine = _plist().read_bytes()
@@ -1470,8 +1470,8 @@ def test_an_item_that_stays_keeps_what_was_taken_so_it_can_be_put_back(
         back == "the rlx service's login items, taken away for the move, were put back as they were"
     )
     assert _plist().read_bytes() == mine and _choice() is True
-    assert ("launchctl", "bootstrap", DOMAIN, str(_plist())) in login_os.calls
-    assert ("launchctl", "bootstrap", DOMAIN, str(named)) in login_os.calls
+    assert named.exists(), "the one that stayed is left as it was"
+    assert login_os.changes() == [], "neither loaded again: each loads at the next login"
 
 
 def test_a_named_homes_unit_that_cannot_be_read_is_taken_for_rlxs(
@@ -1491,3 +1491,57 @@ def test_a_named_homes_unit_that_cannot_be_read_is_taken_for_rlxs(
     monkeypatch.setattr(Path, "read_bytes", unreadable)
 
     assert service_login._every_item("systemd") == [(unit, unit.name)]
+
+
+# --- the manager's decision #2927 (round 6): a put back starts nothing --------------------------
+
+
+def test_put_back_loads_no_agent_and_starts_nothing(login_os: LoginOs) -> None:
+    """A LaunchAgent loaded again (``bootstrap``) starts at once, as ``RunAtLoad`` says: the put
+    back after a move that did not happen started a service the upgrade had stopped and would
+    not start again. The file goes back as it was, and loads at the next login."""
+    _rlx("service", "install")
+    body = _plist().read_bytes()
+    taken = service_login.forget_at_login()
+    assert [item.live for item in taken.items] == [True], "launchd had it loaded"
+    login_os.calls.clear()
+
+    said = service_login.put_back(taken)
+
+    assert said is not None and _plist().read_bytes() == body and _choice() is True
+    assert login_os.changes() == [], login_os.changes()
+    assert service_login.at_login_state().on
+
+
+@pytest.mark.usefixtures("linux")
+def test_put_back_enables_a_unit_that_was_enabled_and_starts_nothing(login_os: LoginOs) -> None:
+    _rlx("service", "install")
+    login_os.reply("systemctl", "--user", "is-enabled", "rlx.service", said="enabled")
+    taken = service_login.forget_at_login()
+    assert [item.live for item in taken.items] == [True], "systemd had it enabled"
+    login_os.calls.clear()
+
+    service_login.put_back(taken)
+
+    assert _unit().is_file() and _choice() is True
+    assert login_os.changes() == [
+        ("systemctl", "--user", "daemon-reload"),
+        ("systemctl", "--user", "enable", "rlx.service"),
+    ]
+
+
+def test_start_loads_an_agent_launchd_has_not_loaded(login_os: LoginOs) -> None:
+    """A start after a put back, or of an agent written away from the Mac: a kickstart of a job
+    launchd has not loaded fails, and the service ran as a copy launchd does not know. It is
+    loaded, which starts it; away from a login session at the Mac that fails, and the caller
+    starts it itself."""
+    _rlx("service", "install")
+    login_os.reply("launchctl", "print", TARGET, code=113, said=NOT_LOADED)
+    login_os.calls.clear()
+
+    assert service_login.start_through_the_os() is True
+    assert ("launchctl", "bootstrap", DOMAIN, str(_plist())) in login_os.calls
+    assert not any(call[:2] == ("launchctl", "kickstart") for call in login_os.calls)
+
+    login_os.reply("launchctl", "bootstrap", code=125, said="Bootstrap failed: 125")
+    assert service_login.start_through_the_os() is False
