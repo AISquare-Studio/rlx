@@ -390,6 +390,12 @@ pub mod codes {
     pub const ERASE_INCOMPLETE: &str = "erase_incomplete";
     /// `space.erase`: the space is being erased already, by another call; wait for it.
     pub const ERASE_IN_PROGRESS: &str = "erase_in_progress";
+    /// `run.decide`: the call was decided already; the first answer won.
+    pub const ALREADY_DECIDED: &str = "already_decided";
+    /// `run.decide`: the call's deadline passed, and it was denied `by: "timeout"`.
+    pub const TOO_LATE: &str = "too_late";
+    /// `run.decide`: the run has no call of that `call_id`.
+    pub const UNKNOWN_CALL: &str = "unknown_call";
     /// `job.*`: rlxd holds no job of that `job_id`.
     pub const UNKNOWN_JOB: &str = "unknown_job";
     /// `job.run_now`: no app gate client is connected, and jobs fire only while one is

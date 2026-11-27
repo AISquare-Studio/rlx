@@ -41,12 +41,35 @@ the same files.
 | `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
 
+**The gate's scenarios** (5.1) make a tool call as Claude Code does: the `tool_use`, then
+the PreToolUse hook the run's `--settings` names, run with the call as JSON on its stdin
+(split into words, no shell), then the tool only on an explicit `allow`, else the hook's
+reason as the call's error result. Each answer is added to `hook_replies` (never the
+key), and each tool run to `tool_runs`. `system/init` lists the send tool
+(`readOnlyHint: false`), the read tool (`true`) and one with no annotations (`null`).
+Each is a scenario of its own name, and `gate` plays the one its prompt names, so one
+home runs them all. With `FAKE_CLAUDE_KEY_OUT` set to a file outside the home, each start
+adds its `RLXD_HOOK_KEY` there, for the check that rlxd writes it nowhere.
+
+| Scenario | What it does |
+|---|---|
+| `slack-send` | Says text claiming approval (which decides nothing), then calls the send tool with `gate/input.json`; resumed, it calls again under another id |
+| `slack-read` | Calls the read tool |
+| `write-call` | Calls the tool with no hint: a write |
+| `send-twice` | Calls the send tool twice, the same input, two ids |
+| `send-parallel` | Calls the send tool twice in one message, the same input, two ids, asking the hook about both at once |
+| `send-fails` | Calls the send tool; allowed, the tool fails |
+| `crash-in-call` | Calls the send tool; allowed, exits 1 mid-call |
+| `tool-hang` | Calls the send tool; allowed, the tool hangs two minutes |
+| `forge` | First asks the hook itself about a call of its own with the real call's id, then makes the real call |
+| `bad-hooks` | Asks the hook with a wrong key, no key, a wrong attempt, and the run named in `./other-run`, then makes a real call |
+
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for
 `-p --output-format stream-json` without `--verbose`, waits for its first stream-json user
 message before `system/init`, and also writes a message type and fields rlxd must ignore.
 
-To add a scenario (the gate's, 5.1, the connectors', 5.5): a module in
+To add a scenario (the connectors', 5.5): a module in
 `crates/fake-claude/src/scenarios/` and a line in its table.
 
 Windows has no exec bit and `which`-style lookups need PATHEXT: give each scenario a

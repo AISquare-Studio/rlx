@@ -807,6 +807,44 @@ fn kill_tree(tree: &Tree) {
     unsafe { TerminateJobObject(tree.job.as_raw_handle(), 1) };
 }
 
+/// Whether process `pid` is one of `tree`'s: in the run's process group, which the guard
+/// leads, on macOS and Linux; in the run's job on Windows. The gate's third binding
+/// (5.1): a hook connection from outside the run is never the run's hook.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn holds(tree: &Tree, pid: u32) -> bool {
+    let (Ok(pid), Ok(group)) = (libc::pid_t::try_from(pid), libc::pid_t::try_from(tree.pid)) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: getpgid(2) of a pid; a gone one fails with ESRCH.
+    let of = unsafe { libc::getpgid(pid) };
+    of != -1 && of == group
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn holds(tree: &Tree, pid: u32) -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: opening a process by pid for a query; a gone one gives a null handle.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return false;
+    }
+    let mut inside = 0;
+    // SAFETY: both handles are open; `inside` is written.
+    let asked = unsafe { IsProcessInJob(process, tree.job.as_raw_handle(), &raw mut inside) };
+    // SAFETY: closing the handle opened above.
+    unsafe { CloseHandle(process) };
+    asked != 0 && inside != 0
+}
+
 /// Windows needs no sweep: a job whose last handle closes kills its processes.
 #[cfg(windows)]
 pub fn sweep(_pid: u32, _started: &str, _run_id: &str) -> bool {

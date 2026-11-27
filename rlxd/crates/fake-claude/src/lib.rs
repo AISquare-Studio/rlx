@@ -51,8 +51,9 @@
 //!   close after the scenario wrote its `result`, which is how a run ends, is not one.
 //! - `delivered` is whether the scenario got to write its `result`; a start that was
 //!   killed or crashed first stays `false`.
-//! - `connected_at` and `hook_replies` belong to the connector and gate scenarios (5.1,
-//!   5.5); `tool_runs` counts the tool calls a start ran, none in these scenarios.
+//! - `connected_at` belongs to the connector scenarios (5.5). `hook_replies` holds each
+//!   answer the run's PreToolUse hook gave a gate scenario (5.1, [`hook`]), and
+//!   `tool_runs` counts the tool calls a start ran: only on an allow.
 //! - `exit` is the code it exited with, `null` while it runs or once it was killed.
 //!
 //! Every write takes `fake-claude.log.lock` (an OS file lock), reads the log, changes
@@ -70,6 +71,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+pub mod hook;
 mod log;
 pub mod scenarios;
 
@@ -252,12 +254,17 @@ impl Fake {
     /// Waits until the run's first user message, then writes `system/init`: that
     /// message, or `None` when stdin closed with none.
     pub fn begin(&mut self) -> Option<Value> {
+        self.begin_with(json!([]), json!([]))
+    }
+
+    /// [`Fake::begin`], `system/init` listing `tools` and `mcp_servers`.
+    pub fn begin_with(&mut self, tools: Value, mcp_servers: Value) -> Option<Value> {
         let message = self.next_user_message()?;
         self.remember(&message);
         let strict = self.flag("--strict-mcp-config");
         let init = json!({
             "type": "system", "subtype": "init", "cwd": self.cwd,
-            "session_id": self.session_id, "tools": [], "mcp_servers": [],
+            "session_id": self.session_id, "tools": tools, "mcp_servers": mcp_servers,
             "model": MODEL, "permissionMode": self.value("--permission-mode").unwrap_or("default"),
             "slash_commands": [], "apiKeySource": "none", "claude_code_version": VERSION,
             "output_style": "default", "agents": [], "skills": [], "plugins": [],
