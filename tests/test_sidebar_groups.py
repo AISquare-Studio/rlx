@@ -66,6 +66,7 @@ from tests.test_ui_shell import (
     seed,
     settle,
     shown,
+    status,
 )
 from tests.test_ui_shell import no_real_tmux as _no_real_tmux
 from tests.test_ui_shell import script as _script
@@ -704,6 +705,51 @@ def test_ctrl_z_in_the_sidebar_never_reaches_a_settings_pages_undo(
     assert seen["folded"] is True
     assert seen["sidebar ctrl+z"] == (False, "Auth"), "the layout's undo, and only it"
     assert seen["page ctrl+z"] is None, "the page's own undo still takes its change back"
+
+
+@pytest.mark.parametrize("field", ["card nickname", "agent label", "group name"])
+def test_ctrl_z_typed_in_an_open_name_field_undoes_no_arrangement(
+    tmp_path: Path, script: Script, field: str
+) -> None:
+    """Reviewer of #39 (#2993): an ``Input`` lets ctrl+z through to the sidebar's binding, and
+    a group just deleted came back while a name was being typed. In a card's, an agent's or a
+    group's name field, ctrl+z undoes no arrangement: the field stays open with what was
+    typed, and the arrangement waits for ctrl+z from the sidebar itself."""
+    seed(tmp_path, *THREE)
+    script["prj_a"] = [status("prj_a", "coder-1", "coder", "working")]
+    with store_session() as store:
+        groups_service.create_group(store, "tools", ["prj_b"])
+        groups_service.create_group(store, "old")
+
+    async def go(pilot: Pilot[None]) -> tuple[set[str], object, set[str]]:
+        app = fleet_app(pilot)
+        menu = await menu_by_dot(pilot, app, "old")
+        await delete_from_menu(pilot, app, menu)  # the arrangement ctrl+z would take back
+        if field == "card nickname":
+            app.sidebar.open_rename("prj_c")
+        elif field == "agent label":
+            assert app.sidebar.open_agent_rename("agt_a_coder-1") is None
+        else:
+            await highlight(pilot, app, "tools")
+            await pilot.press("f2")
+        await settle(app)
+        focused = app.focused
+        assert isinstance(focused, Input), type(focused).__name__
+        await pilot.press(*"xy", "ctrl+z")
+        await settle(app)
+        typed = (app.focused is focused, focused.value.endswith("xy"))
+        during = stored_names()
+        await pilot.press("escape")
+        await settle(app)
+        app.sidebar.focus()
+        await pilot.press("ctrl+z")
+        await settle(app)
+        return during, typed, stored_names()
+
+    during, typed, after = drive(go)
+    assert during == {"tools"}, "ctrl+z in the field brought no group back"
+    assert typed == (True, True), "the field is still open, with what was typed"
+    assert after == {"tools", "old"}, "ctrl+z from the sidebar still takes the delete back"
 
 
 # --- parity with the CLI ---------------------------------------------------------------------

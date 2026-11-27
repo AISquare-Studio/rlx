@@ -2965,6 +2965,12 @@ class Sidebar(Vertical):
             self.post_message(GroupProjects(list(self._marked)))
 
     def action_undo_layout(self) -> None:
+        """``u`` or ctrl+z: take the last arrangement back — never from a name field open in the
+        sidebar (a card's, an agent's, a group's). An ``Input`` lets ctrl+z through to here,
+        and a group just deleted came back mid-typing (reviewer of #39, #2993); ``u`` it takes
+        as text."""
+        if isinstance(self.screen.focused, Input):
+            return
         self.post_message(UndoLayout())
 
     # a card's name and its menu
