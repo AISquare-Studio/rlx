@@ -2,8 +2,9 @@
 //! reads the connector, the tool and the input from the JSON rlxd quotes in its message,
 //! lists that tool (read-only) of that connector (from claude.ai) in `system/init`, and
 //! makes the call through the run's PreToolUse hook. Allowed, the tool gives
-//! `watch-call/content.json`. Then it tries the identical call again, which rlxd denies
-//! (`pinned_call_used`), and ends.
+//! `watch-call/content.json`; or, as a tool would for its input, an error for `{"ref":
+//! "missing"}` ([`MISSING`]) and [`HUGE_BYTES`] of text for `{"ref": "huge"}`. Then it
+//! tries the identical call again, which rlxd denies (`pinned_call_used`), and ends.
 
 use serde_json::{Value, json};
 
@@ -18,6 +19,28 @@ pub const AGAIN_ID: &str = "toolu_01FakeWatchCall0000000002";
 /// The tool's result, exactly as Claude Code gives it.
 pub const CONTENT: &str =
     include_str!("../../../../tests/fixtures/fake-claude/watch-call/content.json");
+
+/// The tool's error for the input `{"ref": "missing"}`.
+pub const MISSING: &str = "No commit found for the ref missing";
+
+/// How much text the tool gives for the input `{"ref": "huge"}`: more than a tool
+/// result's 1 MiB.
+pub const HUGE_BYTES: usize = 2 << 20;
+
+/// What the tool gives for `input`, and whether it failed.
+fn result_of(input: &Value) -> (Value, bool) {
+    match input["ref"].as_str() {
+        Some("missing") => (Value::String(MISSING.to_owned()), true),
+        Some("huge") => (
+            json!([{"type": "text", "text": "x".repeat(HUGE_BYTES)}]),
+            false,
+        ),
+        _ => (
+            serde_json::from_str(CONTENT).expect("content.json is JSON"),
+            false,
+        ),
+    }
+}
 
 /// `watch-call`.
 pub fn run(fake: &mut Fake) -> i32 {
@@ -37,14 +60,14 @@ pub fn run(fake: &mut Fake) -> i32 {
         json!([{"name": tool, "annotations": {"readOnlyHint": true}}]),
         json!([{"name": connector, "status": "connected", "source": "claudeai"}]),
     );
-    let content: Value = serde_json::from_str(CONTENT).expect("content.json is JSON");
+    let (content, failed) = result_of(&input);
     let mut said = Vec::new();
     for id in [CALL_ID, AGAIN_ID] {
         tool_use(fake, id, &tool, &input);
         let answer = fake.ask_hook("call", id, &tool, &input);
         if answer.allowed() {
             fake.ran_tool();
-            tool_result(fake, id, content.clone(), false);
+            tool_result(fake, id, content.clone(), failed);
             said.push("ran");
         } else {
             let denied = format!("Hook PreToolUse denied this tool: {}", answer.reason);

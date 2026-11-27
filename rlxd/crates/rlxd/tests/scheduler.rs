@@ -1294,3 +1294,82 @@ fn run_now_fires_a_watch_job_whose_result_names_its_run() {
         r
     );
 }
+
+/// Watch job `id` with `input`.
+fn watch_with(id: &str, input: Value) -> Value {
+    let mut job = watch_job(id);
+    job["input"] = input;
+    job
+}
+
+/// Job `id`'s fire, its one call allowed: its run and the events until the run ended.
+fn allowed_fire(home: &TestHome, id: &str) -> (Value, Vec<Value>) {
+    let since = seq(home);
+    advance(home, 60);
+    let r = fired_run(home, since, id);
+    wait_until(home, since, 30, "the call reaches the app", |e| {
+        !of_run(e, &r, "run.tool_call").is_empty()
+    });
+    assert_eq!(decide(home, &r, WATCH_CALL, "allow").code(), Some(0));
+    let seen = wait_until(home, since, 30, "the run ends", |e| run_ended(e, &r));
+    (r, seen)
+}
+
+#[test]
+fn an_allowed_watch_call_that_fails_gives_its_error_as_is_error() {
+    let home = watch_home();
+    let _app = app(&home);
+    put(&home, &watch_with("ci-green", json!({"ref": "missing"})));
+    let (r, seen) = allowed_fire(&home, "ci-green");
+    let results = typed(&seen, "job.watch_result", Some("ci-green"));
+    assert_eq!(results.len(), 1, "{seen:#?}");
+    let data = &results[0]["data"];
+    assert_eq!(data["run_id"], r);
+    assert_eq!(data["is_error"], true, "{data:#}");
+    assert_eq!(data["truncated"], false);
+    assert_eq!(data["content"], "No commit found for the ref missing");
+}
+
+#[test]
+fn a_watch_result_over_1_mib_is_cut_and_says_so() {
+    let home = watch_home();
+    let _app = app(&home);
+    put(&home, &watch_with("ci-green", json!({"ref": "huge"})));
+    let (r, seen) = allowed_fire(&home, "ci-green");
+    let results = typed(&seen, "job.watch_result", Some("ci-green"));
+    assert_eq!(results.len(), 1);
+    let data = &results[0]["data"];
+    assert_eq!(data["is_error"], false);
+    assert_eq!(data["truncated"], true, "the result was cut");
+    // Its first 1 MiB, as a string: as run.tool_result carries it.
+    let content = data["content"].as_str().unwrap();
+    assert!(content.len() <= 1 << 20, "{}", content.len());
+    assert!(content.len() > 1 << 19, "{}", content.len());
+    let tool_result = of_run(&seen, &r, "run.tool_result")[0];
+    assert_eq!(tool_result["data"]["content"], data["content"]);
+    assert_eq!(tool_result["data"]["truncated"], true);
+}
+
+#[test]
+fn a_pinned_run_job_gives_no_watch_result() {
+    let home = watch_home();
+    let _app = app(&home);
+    // A run job whose template is a pinned send, its call the one watch-call makes.
+    let message = format!(
+        "{FIXED_PROMPT}.\n\n```json\n{}\n```",
+        json!({"connector": "claude.ai GitHub", "input": {"ref": "main"}, "tool": WATCH_TOOL})
+    );
+    let job = json!({"job_id": "send", "type": "run", "schedule": {"every_minutes": 1},
+        "run": {"kind": "send_executor", "prompt": message, "space": "default",
+            "mount": {"kind": "connectors", "connectors": ["claude.ai GitHub"]},
+            "pinned_call": {"tool": WATCH_TOOL, "input_sha256": WATCH_SHA256}},
+        "catch_up": "skip", "enabled": true});
+    put(&home, &job);
+    let (r, seen) = allowed_fire(&home, "send");
+    // The call ran and gave its result, as any run's: no job.watch_result.
+    assert_eq!(of_run(&seen, &r, "run.tool_result").len(), 2, "{seen:#?}");
+    assert!(
+        typed(&seen, "job.watch_result", None).is_empty(),
+        "{seen:#?}"
+    );
+}
