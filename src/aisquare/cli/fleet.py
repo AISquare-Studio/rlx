@@ -501,7 +501,7 @@ def requeue_manager_pass(
     try:
         fleet_service.requeue_manager_pass(_project(project).id, pass_id)
     except (ValueError, TimeoutError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        fail(str(exc), error="requeue_refused", detail=str(exc))
     if get_state().json_output:
         typer.echo(json.dumps({"pass_id": pass_id}))
     else:
