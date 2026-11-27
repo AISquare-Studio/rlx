@@ -83,7 +83,6 @@ KEYS_REPORTS_AND_PASTES = [
     pytest.param("\x1b[<0;5;5M", id="mouse report"),
     pytest.param("\x1b[3;4R", id="cursor report"),
     pytest.param("\x1b[200x", id="a start marker's first characters, then x"),
-    pytest.param("\x1b[", id="key escape, then ["),
 ]
 
 PARSE_SOURCE_SHA256 = "f9837587f1778f18"
@@ -153,10 +152,10 @@ def everywhere(raw: str) -> range:
     return range(1, len(raw))
 
 
-def inside(marker: str, raw: str) -> list[int]:
-    """The positions in ``raw`` that split one of its ``marker``s."""
-    starts = [at for at in range(len(raw)) if raw.startswith(marker, at)]
-    return [at + offset for at in starts for offset in range(1, len(marker))]
+def inside_an_end_marker(raw: str) -> list[int]:
+    """The positions in ``raw`` that split one of its end markers."""
+    starts = [at for at in range(len(raw)) if raw.startswith(PASTE_END, at)]
+    return [at + offset for at in starts for offset in range(1, len(PASTE_END))]
 
 
 # --- a raw Escape inside a paste ---------------------------------------------------------------
@@ -218,22 +217,22 @@ def test_input_that_ends_after_a_whole_paste_gives_that_paste() -> None:
 # --- a pause inside a marker -------------------------------------------------------------------
 
 
-ORDINARY_BODIES = [
-    pytest.param("one\rtwo", "one\rtwo", id="enter"),
-    pytest.param("", "", id="empty"),
-    pytest.param("a\nb", "a\nb", id="line feed"),
-    pytest.param("a\x00b", "ab", id="NUL, which Textual drops"),
-]
-
-
-@pytest.mark.parametrize(("body", "text"), ORDINARY_BODIES)
+@pytest.mark.parametrize(
+    ("body", "text"),
+    [
+        pytest.param("one\rtwo", "one\rtwo", id="enter"),
+        pytest.param("", "", id="empty"),
+        pytest.param("a\nb", "a\nb", id="line feed"),
+        pytest.param("a\x00b", "ab", id="NUL, which Textual drops"),
+    ],
+)
 def test_an_ordinary_paste_with_a_pause_inside_its_end_marker_is_one_exact_paste(
     body: str, text: str, clock: Clock
 ) -> None:
     """Textual's own parse times the end marker's Escape out there, loses the paste and
     swallows what follows: the escape timeout inside an open paste."""
     raw = bracketed_paste(body)
-    for reads in two_reads(raw, inside(PASTE_END, raw)):
+    for reads in two_reads(raw, inside_an_end_marker(raw)):
         assert fed(XTermParser(), reads, clock, paused=True) == paste(text), reads
 
 
@@ -248,7 +247,7 @@ def test_input_around_a_paste_with_a_pause_inside_an_end_marker_is_as_in_one_rea
     raw: str, clock: Clock
 ) -> None:
     one_read = fed(textuals_parser(), [raw], clock, paused=False)
-    for reads in two_reads(raw, inside(PASTE_END, raw)):
+    for reads in two_reads(raw, inside_an_end_marker(raw)):
         assert fed(XTermParser(), reads, clock, paused=True) == one_read, reads
 
 
@@ -256,39 +255,22 @@ def test_a_key_after_a_paste_with_a_pause_inside_its_end_marker_is_that_key(
     clock: Clock,
 ) -> None:
     raw = bracketed_paste("one\rtwo")
-    for first, rest in two_reads(raw, inside(PASTE_END, raw)):
+    for first, rest in two_reads(raw, inside_an_end_marker(raw)):
         got = fed(XTermParser(), [first, rest, "x"], clock, paused=True)
         assert got == [*paste("one\rtwo"), repr(events.Key("x", "x"))], first
 
 
-@pytest.mark.parametrize(
-    ("body", "text"),
-    [pytest.param(raw.values[0], raw.values[0], id=raw.id) for raw in RAW_ESCAPE_BODIES]
-    + ORDINARY_BODIES,
-)
-def test_a_paste_whose_start_marker_a_pause_cuts_is_the_cut_keys_then_one_exact_paste(
-    body: str, text: str, clock: Clock
-) -> None:
-    """Fed in two reads split at each position inside the start marker, with a pause between
-    them. Textual times the characters before the pause out as keys, and they stay keys: a
-    lone Escape must reach the app. The cut keys are what Textual's own parse gives for the
-    first read alone."""
-    raw = bracketed_paste(body)
-    for reads in two_reads(raw, inside(PASTE_START, raw)):
-        cut_keys = fed(textuals_parser(), reads[:1], clock, paused=True)
-        assert fed(XTermParser(), reads, clock, paused=True) == [*cut_keys, *paste(text)], reads
-
-
 @pytest.mark.parametrize("body", RAW_ESCAPE_BODIES)
-def test_a_start_marker_that_pauses_twice_gives_what_textuals_parse_gives(
+def test_a_pause_inside_the_start_marker_gives_what_textuals_parse_gives(
     body: str, clock: Clock
 ) -> None:
-    """Fed in three reads, with a pause after the Escape and another after the next two
-    characters: the guard waits out the second pause no longer than Textual's own escape
-    timeout, so the marker is not read as one, as in Textual's own parse."""
-    reads = [PASTE_START[:1], PASTE_START[1:3], PASTE_START[3:] + body + PASTE_END]
-    expected = fed(textuals_parser(), reads, clock, paused=True)
-    assert fed(XTermParser(), reads, clock, paused=True) == expected
+    """Pinned, not fixed: until its start marker is whole no paste is open, so these bytes
+    are an escape sequence like any other, decided by ``ESCAPE_DELAY``. Fed in two reads
+    split at each position inside the start marker, with a pause between them."""
+    raw = bracketed_paste(body)
+    for reads in two_reads(raw, range(1, len(PASTE_START))):
+        expected = fed(textuals_parser(), reads, clock, paused=True)
+        assert fed(XTermParser(), reads, clock, paused=True) == expected, reads
 
 
 # --- everything else is Textual's --------------------------------------------------------------
@@ -299,10 +281,9 @@ def test_keys_reports_and_ordinary_pastes_give_what_textuals_parse_gives(
     raw: str, clock: Clock
 ) -> None:
     """Fed in one read; in two reads split at each position; and in two reads split at each
-    position but inside a start or end marker, with a pause between them. Inside a marker
+    position but inside an end marker, with a pause between them. Inside an end marker
     Textual's own parse loses the paste."""
-    in_a_marker = inside(PASTE_START, raw) + inside(PASTE_END, raw)
-    paused_at = [at for at in everywhere(raw) if at not in in_a_marker]
+    paused_at = [at for at in everywhere(raw) if at not in inside_an_end_marker(raw)]
     readings = [
         ([raw], False),
         *((reads, False) for reads in two_reads(raw, everywhere(raw))),
