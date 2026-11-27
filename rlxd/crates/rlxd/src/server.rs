@@ -2037,13 +2037,18 @@ fn frame_too_large() -> Envelope {
 /// Refuses a `pty.write` whose input is more than [`MAX_PTY_WRITE`] bytes, by name,
 /// before its params are read: `write_too_large {max, bytes}`.
 fn write_fits(params: &Params) -> Result<(), ErrorBody> {
-    let bytes = match (params.get("text"), params.get("paste"), params.get("keys")) {
-        (Some(Value::String(text)), _, _) | (None, Some(Value::String(text)), _) => text.len(),
-        (None, None, Some(Value::Array(keys))) => {
-            keys.iter().filter_map(Value::as_str).map(str::len).sum()
-        }
+    // Each input there is, whatever else is there (a `null` beside it, or a second
+    // input, which the params refuse after): the largest is the write's size (#2649).
+    let size = |value: Option<&Value>| match value {
+        Some(Value::String(text)) => text.len(),
+        Some(Value::Array(keys)) => keys.iter().filter_map(Value::as_str).map(str::len).sum(),
         _ => 0,
     };
+    let bytes = ["text", "paste", "keys"]
+        .into_iter()
+        .map(|field| size(params.get(field)))
+        .max()
+        .unwrap_or(0);
     if bytes <= rlxd_proto::MAX_PTY_WRITE {
         return Ok(());
     }

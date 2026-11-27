@@ -630,10 +630,14 @@ fn the_longest_write_fits_a_frame_and_a_longer_one_is_refused_by_name() {
         .map(|_| "Home".to_owned())
         .collect();
     let bytes = keys.len() * 4;
+    // Each on its own, and each beside a `null` of another (#2649).
     for (input, size) in [
         (json!({ "text": over }), over.len()),
         (json!({ "paste": over }), over.len()),
         (json!({ "keys": keys }), bytes),
+        (json!({"text": null, "paste": over}), over.len()),
+        (json!({"paste": null, "keys": keys}), bytes),
+        (json!({"keys": null, "text": over}), over.len()),
     ] {
         let mut params = input.clone();
         params["pty_id"] = json!(id);
@@ -648,6 +652,44 @@ fn the_longest_write_fits_a_frame_and_a_longer_one_is_refused_by_name() {
         let reply = request(&mut connection, "pty.list", json!({}));
         assert!(reply.is_ok(), "the connection goes on: {reply:?}");
     }
+}
+
+/// #2641 major 2 and the #28 tester's round 2 (#2649): one PTY's flood of distinct long
+/// characters, more than its quota, leaves a PTY spawned after it, the first one killed,
+/// showing characters no PTY printed before as they are.
+#[cfg(unix)]
+#[test]
+fn one_ptys_flood_of_characters_leaves_a_new_ptys_alone() {
+    let home = TestHome::new();
+    home.start();
+    let flood = "import sys\n\
+                 sys.stdout.write(''.join(chr(c) for c in range(0x20000, 0x20000 + 326000)))\n\
+                 sys.stdout.write('\\nflooded\\n'); sys.stdout.flush()\n\
+                 import time; time.sleep(60)";
+    let a = spawn(
+        &home,
+        json!({"argv": ["python3", "-c", flood], "cols": 80, "rows": 24}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while !screen(&home, &a)["text"]
+        .as_str()
+        .unwrap()
+        .contains("flooded")
+    {
+        assert!(Instant::now() < deadline, "the flood never ended");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        call(&home, "pty.kill", &json!({ "pty_id": a })).code(),
+        Some(0)
+    );
+    // Characters of more than three bytes that nothing in these tests prints elsewhere.
+    let line = "a🦩b xज्ञy ঙ্ক 🫠";
+    let argv = json!(["sh", "-c", format!("printf '%s\\n' '{line}'; sleep 30")]);
+    let b = spawn(&home, json!({"argv": argv, "cols": 80, "rows": 24}));
+    eventually("the new pty shows its line as it is", || {
+        screen(&home, &b)["text"].as_str().unwrap().contains(line)
+    });
 }
 
 /// The manager's ruling on #2574 minor 5: a frame over the 1 MiB rlxd reads gets
