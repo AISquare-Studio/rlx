@@ -37,11 +37,13 @@ stays on ``get_state()``) so a leading ``--json`` still wins.
 from __future__ import annotations
 
 import contextlib
+import copy
+import functools
 import json
 import re
 import sqlite3
 from difflib import get_close_matches
-from typing import Any
+from typing import Annotated, Any
 
 import typer
 from typer.core import TyperGroup, TyperOption
@@ -112,6 +114,74 @@ def _merge_profile(ctx: Any, param: Any, value: Any) -> Any:
     return value
 
 
+_SHARED = typer.Typer(add_completion=False)
+"""The five shared flags, declared as any command declares its options, for typer to build.
+
+Built by hand as ``TyperOption(...)`` they broke on typer 0.29.0, whose constructor added a
+required ``type_descriptor`` that only typer's own builder makes (every command of a fresh
+0.9.2 install failed, ``--version`` included). ``typer.main.get_command`` builds them the
+same way on 0.28 and 0.29."""
+
+
+@_SHARED.command()
+def _shared_flags(
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            expose_value=False,
+            callback=_merge_flag("verbose"),
+            show_default=False,
+            help="Enable verbose output.",
+        ),
+    ] = False,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            "-q",
+            expose_value=False,
+            callback=_merge_flag("quiet"),
+            show_default=False,
+            help="Suppress non-essential output.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            expose_value=False,
+            callback=_merge_flag("json_output"),
+            show_default=False,
+            help=_JSON_HELP,
+        ),
+    ] = False,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            metavar="NAME",
+            expose_value=False,
+            callback=_merge_profile,
+            show_default=False,
+            help="Configuration profile to use.",
+        ),
+    ] = None,
+    no_color: Annotated[
+        bool,
+        typer.Option(
+            "--no-color",
+            expose_value=False,
+            callback=_merge_flag("no_color"),
+            show_default=False,
+            help="Disable coloured output.",
+        ),
+    ] = False,
+) -> None:
+    """Never runs: only its options are taken (:func:`_shared_options`)."""
+
+
 def _shared_options() -> list[TyperOption]:
     """Fresh per-command instances of the five shared flags.
 
@@ -119,56 +189,18 @@ def _shared_options() -> list[TyperOption]:
     between nodes; help texts mirror the root callback's so ``-h`` reads the
     same everywhere.
     """
-    options = [
-        TyperOption(
-            param_decls=["--verbose", "-v"],
-            is_flag=True,
-            default=False,
-            expose_value=False,
-            callback=_merge_flag("verbose"),
-            show_default=False,
-            help="Enable verbose output.",
-        ),
-        TyperOption(
-            param_decls=["--quiet", "-q"],
-            is_flag=True,
-            default=False,
-            expose_value=False,
-            callback=_merge_flag("quiet"),
-            show_default=False,
-            help="Suppress non-essential output.",
-        ),
-        TyperOption(
-            param_decls=["--json"],
-            is_flag=True,
-            default=False,
-            expose_value=False,
-            callback=_merge_flag("json_output"),
-            show_default=False,
-            help=_JSON_HELP,
-        ),
-        TyperOption(
-            param_decls=["--profile"],
-            metavar="NAME",
-            default=None,
-            expose_value=False,
-            callback=_merge_profile,
-            show_default=False,
-            help="Configuration profile to use.",
-        ),
-        TyperOption(
-            param_decls=["--no-color"],
-            is_flag=True,
-            default=False,
-            expose_value=False,
-            callback=_merge_flag("no_color"),
-            show_default=False,
-            help="Disable coloured output.",
-        ),
-    ]
+    options = [copy.copy(option) for option in _shared_templates()]
     for option in options:
         setattr(option, INJECTED_MARK, True)
     return options
+
+
+@functools.cache
+def _shared_templates() -> tuple[TyperOption, ...]:
+    """The five as typer built them, once: building them is most of the tree's build time
+    (0.7 ms, against ~300 commands), and a shallow copy of each is a fresh instance."""
+    params = typer.main.get_command(_SHARED).params
+    return tuple(param for param in params if isinstance(param, TyperOption))
 
 
 def _declared(command: Any) -> set[str]:

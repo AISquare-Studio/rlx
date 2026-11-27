@@ -15,8 +15,9 @@ the one it goes back to:
    agents', when neither is here), and the page looks again on every refresh tick
    while it is shown, and on *Check again*. With more than one agent installed and
    nothing more specific than the user default choosing, *Use …* saves the pick as
-   the user default (``agents use``). *Sign in* opens the Accounts page (for Codex,
-   with ``codex login --device-auth`` already open on the account the manager will use), and the
+   the user default (``agents use``). *Sign in* opens the Accounts page with the agent's own
+   sign-in already open on the account the manager will use (Claude Code's login in its
+   pane, Codex's ``codex login --device-auth``: Q7), and the
    shell comes back here once a sign-in started there lands (#286): the page looks
    again and the keyboard goes to the next step, which is step 3's button when the
    sign-in was all it waited on (:meth:`WelcomeView.back_from_sign_in`).
@@ -26,15 +27,30 @@ the one it goes back to:
    coders do. Codex runs its hooks only once they are trusted: Connect records that
    trust where Codex keeps a review's yes, and where it cannot, the user trusts them in
    ``/hooks``, which no button can do: the card says so, and step 3 says where.
-3. **Fleet** — *Start manager*, then *Start the coders* (coder-1 and coder-2),
-   through ``services.first_run.start_on_agent`` (``start_fleet`` on step 2's
-   agent), which never types into an agent it starts: Claude Code and Codex first
-   ask whether to trust the folder, and the user answers that in the manager's
-   pane. The card waits for step 2's hooks, because
+3. **Fleet** — *Start fleet* starts the manager through
+   ``services.first_run.start_on_agent`` (``start_fleet`` on step 2's agent), which never
+   types into an agent it starts, and opens its pane in place as soon as the shell lists it
+   (M4/L3): Claude Code and Codex first ask whether to trust the folder, and the user
+   answers that there. The coders (coder-1 and coder-2) start on their own once it is
+   answered (``first_run.wait_for_trust``: the manager's first hook), never before, as
+   each would ask the same question in a pane nobody watches; when no answer comes,
+   *Start the coders* starts them. The card waits for step 2's hooks, because
    they are how the manager receives its instructions. Each agent reads as the
    shell's frame sees it: one whose window is gone, or that tmux cannot answer for
    (as after a reboot), is never called running, and a coder whose window is gone
    is restarted under its own label, as its own page's Restart does it.
+
+**A finished step folds to one line** (Q16), which never wraps (cut short with an ellipsis
+on a narrow screen): step 1's number, a ✓, the project and its folder, and *Change*; step
+2's number and agent, a ✓, its version and whether it is signed in. Step 2 stays open while
+it still offers a sign-in; step 3, once the fleet is up, is the page's point, and keeps its
+*Open the manager*.
+
+**The sharing question waits for the fleet** (Q6): the shell asks it only once a listed
+project's fleet is up (``first_run.fleet_is_up``), whichever page rlx opens on, and not
+while this page sets another fleet up or waits on its manager's trust answer
+(:meth:`WelcomeView.holds_the_sharing_ask`), nor while the sign-in it started is open; it
+asks at the next page change after that.
 
 **The page never takes the keyboard on its own.** The sidebar has it at mount,
 and the app's keys depend on that; the one exception is the return from a sign-in
@@ -64,7 +80,7 @@ from textual.content import Content
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Input, Static
-from textual.worker import Worker, WorkerState
+from textual.worker import Worker, WorkerState, get_current_worker
 
 from aisquare.cli.ui.attach import ReturnTo
 from aisquare.cli.ui.sidebar import AccountsSelected, AgentSelected, short_path
@@ -88,6 +104,13 @@ from aisquare.services.onboarding import FixResult, OnboardOutcome, PathVerdict
 
 WORKER_GROUP = "welcome"
 """Every worker the page starts; one of each name runs at a time."""
+TRUST_GROUP = "welcome-trust"
+"""The wait on the manager's trust answer (``trust``): a group of its own, as it may run for
+as long as the human takes, and a wait for the page's work is never a wait for that."""
+TRUST_WORKER = "welcome-trust"
+"""Its worker's name (``worker_name("trust")``): the shell's hand-over cuts it off rather than
+waiting for it (``app._cut_off_workers``), as it may wait for as long as the human takes and
+writes nothing."""
 
 
 def worker_name(step: str) -> str:
@@ -186,6 +209,10 @@ def _start(project: ProjectInfo, manager: bool, coders: int) -> FleetStart:
     return first_run.start_on_agent(project, manager=manager, coders=coders)
 
 
+def _trust(manager: FleetAgent, cancelled: Callable[[], bool]) -> bool:
+    return first_run.wait_for_trust(manager, cancelled=cancelled)
+
+
 @dataclass(frozen=True)
 class Seams:
     """What the page asks of the machine and does to it — the services, unless a test says not."""
@@ -209,6 +236,11 @@ class Seams:
     choose: Callable[[str], None] = _choose
     """Save an agent as the user default (``agents use``)."""
     start: Callable[[ProjectInfo, bool, int], FleetStart] = _start
+    trust: Callable[[FleetAgent, Callable[[], bool]], bool] = _trust
+    """Whether the manager answered its folder-trust question before the wait ended
+    (``first_run.wait_for_trust``). Called off the UI thread with the started manager and
+    whether the page's worker was cancelled; it writes nothing, and the coders then start
+    through *Start the coders*' own work."""
     platform: str = sys.platform
 
 
@@ -291,14 +323,9 @@ def _install_text(text: Text, claude: ClaudeState, platform: str) -> None:
 
 
 def _sign_in_opens(agent: str) -> str:
-    """What step 2's *Sign in* opens for ``agent``: its own sign-in on the Accounts page
-    (``AgentAccounts.sign_in_args``: Codex's ``codex login --device-auth``), else the page
-    alone, where an agent that signs in from its TUI does so, as Claude Code's line says."""
-    adapter = get_adapter(agent)
-    args = adapter.accounts.sign_in_args() if adapter.accounts is not None else ()
-    if not args:
-        return "Sign in opens Accounts"
-    return f"Sign in opens {adapter.label}'s sign-in on the Accounts page"
+    """What step 2's *Sign in* opens for ``agent``: its own sign-in, open on the Accounts page
+    (Codex's ``codex login --device-auth``; Claude Code's login, in its pane: Q7)."""
+    return f"Sign in opens {get_adapter(agent).label}'s sign-in on the Accounts page"
 
 
 def _other_agent_text(text: Text, claude: ClaudeState) -> Text:
@@ -402,7 +429,8 @@ def claude_text(claude: ClaudeState | None, *, platform: str) -> Text:
         text.append("\n· ", style="yellow")
         text.append("not signed in — ")
         text.append(
-            "Sign in opens Accounts; Claude Code also asks when it first starts", style="dim"
+            f"{_sign_in_opens(claude.agent)}; {name} also asks when it first starts",
+            style="dim",
         )
     if claude.connected:
         text.append("\n✓ ", style="green")
@@ -437,6 +465,15 @@ def claude_text(claude: ClaudeState | None, *, platform: str) -> Text:
     if claude.problem:
         text.append(f"\n{claude.problem}", style="dim")
     return text
+
+
+def step_two_summary(claude: ClaudeState) -> str:
+    """Step 2 folded to its title line (Q16): what is settled about the agent, short enough
+    for one line at 80 columns. Connected is what its ✓ says (``ClaudeState.ready``)."""
+    parts = [claude.version or "installed"]
+    if claude.signed_in is True:
+        parts.append("signed in")
+    return " · ".join(parts)
 
 
 def step_line(step: FleetStep) -> Text:
@@ -502,6 +539,10 @@ class WelcomeView(VerticalScroll):
     WelcomeView .card.-done { border: round $success; }
     WelcomeView .card.-waiting { border: round $panel-lighten-2; }
     WelcomeView .card-title { text-style: bold; }
+    WelcomeView .card-head { height: auto; }
+    WelcomeView .card-head .card-title { width: 1fr; text-wrap: nowrap; text-overflow: ellipsis; }
+    WelcomeView .card-title.-folded { text-wrap: nowrap; text-overflow: ellipsis; }
+    WelcomeView .card-head Button { margin: 0 0 0 1; width: auto; min-width: 0; }
     WelcomeView #project-candidates { height: auto; }
     WelcomeView .row { height: auto; }
     WelcomeView .candidate { height: auto; }
@@ -598,6 +639,17 @@ class WelcomeView(VerticalScroll):
         self.opened: str | None = None
         """The manager whose pane *Open the manager* last opened: the trust question's turn
         is over, and the coders are next."""
+        self._open_owed: FleetAgent | None = None
+        """The manager *Start fleet* just started, whose pane opens in place once the shell's
+        frame lists it (M4/L3): asked before then, the shell says it is no longer listed."""
+        self._trust_for: str | None = None
+        """The project whose manager the coders wait on (``trust`` in :attr:`busy`)."""
+        self._trust_worker: Worker[Any] | None = None
+        """That wait's worker: the one whose end counts. One it superseded is cancelled, and
+        its end ignored (:meth:`_wait_for_trust`)."""
+        self.trust_given_up = False
+        """The wait for the manager's trust answer ended without one: *Start the coders* is
+        the user's."""
         self._shown = False
         self._full_owed = False
         """A full look was asked for while another look ran: it starts when that one lands."""
@@ -615,14 +667,15 @@ class WelcomeView(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield MarkStatic(self._intro, id="welcome-intro")
         with Vertical(id="step-project", classes="card"):
-            yield Static(id="project-title", classes="card-title")
+            with Horizontal(id="project-head", classes="card-head"):
+                yield Static(id="project-title", classes="card-title")
+                yield Button("Change", id="welcome-change", compact=True)
             yield Static(id="project-status")
             yield Vertical(id="project-candidates")
             with Horizontal(id="project-other", classes="row"):
                 yield Input(placeholder="or type a folder: ~/Code/your-repo", id="welcome-path")
                 yield Button("Use this folder", id="welcome-path-use", disabled=True)
             yield Static(id="welcome-path-verdict")
-            yield Button("Choose another", id="welcome-change")
         with Vertical(id="step-claude", classes="card"):
             yield Static(id="claude-title", classes="card-title")
             yield Static(id="claude-status")
@@ -643,7 +696,7 @@ class WelcomeView(VerticalScroll):
             yield Static(id="fleet-title", classes="card-title")
             yield Static(id="fleet-status")
             with Horizontal(id="fleet-actions", classes="row"):
-                yield Button("Start manager", id="fleet-manager", variant="primary")
+                yield Button("Start fleet", id="fleet-manager", variant="primary")
                 yield Button("Open the manager", id="fleet-open", variant="primary")
                 yield Button("Start the coders", id="fleet-coders", variant="primary")
         yield Static(self._keys(), id="welcome-keys")
@@ -700,9 +753,10 @@ class WelcomeView(VerticalScroll):
 
     # ------------------------------------------------------------------ workers
 
-    def _run(self, name: str, work: Callable[[], object]) -> None:
-        self.run_worker(
-            work, name=worker_name(name), group=WORKER_GROUP, thread=True, exit_on_error=False
+    def _run(self, name: str, work: Callable[[], object]) -> Worker[Any]:
+        group = TRUST_GROUP if name == "trust" else WORKER_GROUP
+        return self.run_worker(
+            work, name=worker_name(name), group=group, thread=True, exit_on_error=False
         )
 
     def _in_flight(self, name: str) -> bool:
@@ -768,12 +822,14 @@ class WelcomeView(VerticalScroll):
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         worker = event.worker
-        if worker.group != WORKER_GROUP:
+        if worker.group not in (WORKER_GROUP, TRUST_GROUP):
             return
         event.stop()
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
             return
         name = (worker.name or "").removeprefix(worker_name(""))
+        if name == "trust" and worker is not self._trust_worker:
+            return  # a wait superseded by a later one (``_wait_for_trust``): that one is busy
         self.busy.discard(name)
         if event.state is WorkerState.CANCELLED:
             return
@@ -794,7 +850,9 @@ class WelcomeView(VerticalScroll):
         elif name == "sign-in":
             self._sign_in_ready(result, error)
         elif name in ("manager", "coders"):
-            self._started(result, error)
+            self._started(result, error, opens=name == "manager")
+        elif name == "trust":
+            self._trusted(result, error)
         self.paint()
 
     def _looked(self, result: Any) -> None:
@@ -1086,16 +1144,13 @@ class WelcomeView(VerticalScroll):
             self.look(full=True)
         elif button.id == "claude-sign-in":
             claude = self.claude
-            slots = get_adapter(claude.agent).accounts if claude is not None else None
-            if claude is None or (slots is not None and not slots.sign_in_args()):
-                # An agent that signs in from its TUI (Claude Code's) does so on its first
-                # start too; Accounts has its row, and the shell comes back here once a
-                # sign-in started there lands (#286).
-                project_id = self.project.id if self.project is not None else None
-                self.post_message(AccountsSelected(return_to=ReturnTo("welcome", project_id)))
+            if claude is None:
+                # Nothing looked at yet: the page, and back here once a sign-in lands (#286).
+                self.post_message(AccountsSelected(return_to=self._return_here()))
             else:
-                # The account the manager will use, with its sign-in open: a plain home
-                # the agent never ran in has no row there until it exists.
+                # The account the manager will use, with its sign-in open, for Claude Code as
+                # for Codex (Q7): a plain home the agent never ran in has no row there until it
+                # exists.
                 sign_in = self.seams.sign_in
                 self.agent_error = None
                 self._start_work("sign-in", lambda: sign_in(claude))
@@ -1141,7 +1196,11 @@ class WelcomeView(VerticalScroll):
         if not isinstance(result, int):
             self.agent_error = f"could not open the sign-in: {_reason(error)}"
             return
-        self.post_message(AccountsSelected(sign_in=result))
+        self.post_message(AccountsSelected(self._return_here(), sign_in=result))
+
+    def _return_here(self) -> ReturnTo:
+        """Where the shell comes back to once a sign-in started here lands (#286)."""
+        return ReturnTo("welcome", self.project.id if self.project is not None else None)
 
     def _start_fleet(self, which: str) -> None:
         project = self.project
@@ -1156,7 +1215,7 @@ class WelcomeView(VerticalScroll):
         else:
             self._start_work("coders", lambda: start(project, False, first_run.CODERS))
 
-    def _started(self, result: Any, error: BaseException | None) -> None:
+    def _started(self, result: Any, error: BaseException | None, *, opens: bool = False) -> None:
         if not isinstance(result, FleetStart):
             self.fleet_error = f"could not start the fleet: {_reason(error)}"
             return
@@ -1166,6 +1225,81 @@ class WelcomeView(VerticalScroll):
         self._frame_at_start = getattr(self.app, "snapshot", None)
         if self.project is not None:
             self.post_message(self.Progress(self.project.id))
+        manager = next(
+            (
+                step.agent
+                for step in result.steps
+                if step.role == first_run.FLEET_ROLE
+                and step.agent is not None
+                and step.outcome != "refused"
+            ),
+            None,
+        )
+        if opens and manager is not None:
+            # Start fleet: the manager's pane, where its trust question is answered, and the
+            # coders once it is (M4/L3).
+            self._open_owed = manager
+            self._wait_for_trust(manager)
+            self._open_if_listed()
+
+    def _wait_for_trust(self, manager: FleetAgent) -> None:
+        """Wait, off the UI thread, for ``manager``'s trust answer; the coders start on it.
+
+        One wait at a time, on the manager started last: a *Start fleet* on another project
+        after *Change* cancels the wait on the first one's manager, whose card is gone, and
+        waits on its own, as its card says the coders follow it (the reviewer of #570: only
+        the first manager was waited on, and its answer started nothing)."""
+        project, trust = self.project, self.seams.trust
+        if project is None:
+            return
+        waiting = self._trust_worker
+        if waiting is not None and not waiting.is_finished:
+            if self._trust_for == project.id:
+                return  # this project's manager is waited on already
+            waiting.cancel()
+        self._trust_for = project.id
+        self.trust_given_up = False
+
+        def work() -> bool:
+            worker = get_current_worker()
+            return trust(manager, lambda: worker.is_cancelled)
+
+        self.busy.add("trust")
+        self._trust_worker = self._run("trust", work)
+        self.paint()
+
+    def _waiting_here(self) -> bool:
+        """Whether the coders wait on THIS card's manager: the page's one wait on a trust
+        answer (``trust`` in :attr:`busy`) is for the chosen project. *Start fleet* on alpha,
+        *Change*, *Start fleet* on beta, then *Change* back: the wait is beta's, and alpha's
+        card promised a start that nothing would make (the round-3 tester of #570). It then
+        says that *Start the coders* is the user's, as after a wait that ended."""
+        project = self.project
+        return "trust" in self.busy and project is not None and self._trust_for == project.id
+
+    def _trusted(self, result: Any, error: BaseException | None) -> None:
+        """The wait for the manager's trust answer ended: the coders start on an answer, as
+        *Start the coders* starts them; with none, that button is the user's."""
+        waited_for, self._trust_for = self._trust_for, None
+        if self.project is None or self.project.id != waited_for:
+            return  # the page has moved on to another project: its own start is its own
+        if result is True:
+            self._start_fleet("coders")
+        elif error is not None:
+            self.fleet_error = f"could not wait for the manager: {_reason(error)}"
+        else:
+            self.trust_given_up = True
+
+    def _open_if_listed(self) -> None:
+        """Open the manager *Start fleet* started, once the shell's frame lists it."""
+        owed = self._open_owed
+        snapshot = getattr(self.app, "snapshot", None)
+        listed = getattr(snapshot, "agent", None)
+        if owed is None or not callable(listed) or listed(owed.project_id, owed.id) is None:
+            return
+        self._open_owed = None
+        self.opened = owed.id
+        self.post_message(AgentSelected(owed.project_id, owed.id))
 
     # ------------------------------------------------------------------ the frame
 
@@ -1211,6 +1345,31 @@ class WelcomeView(VerticalScroll):
             if seen is None or (seen.agent.id != agent.id and snapshot is self._frame_at_start):
                 live[agent.label] = _Live(agent)
         return live
+
+    @property
+    def fleet_up(self) -> bool:
+        """Whether the chosen project's fleet is up, as step 3 says "Your fleet is up": its
+        manager and :data:`first_run.CODERS` coders running in the shell's frame, or just
+        started by this page (``first_run.is_a_fleet``)."""
+        live = self._live().values()
+        return first_run.is_a_fleet(row.agent.role for row in live if row.counts_as_running)
+
+    @property
+    def setting_up(self) -> bool:
+        """Whether this page is setting a first fleet up: a start of its own made or in flight
+        (the manager, the coders, the wait on the trust answer), and the fleet not up yet."""
+        started = any(step.outcome != "refused" for step in self.steps.values())
+        working = bool(self.busy & (FLEET_WORK | {"trust"}))
+        return (started or working) and not self.fleet_up
+
+    def holds_the_sharing_ask(self) -> bool:
+        """Whether this page holds the shell's usage-sharing question back (Q6: never
+        mid-setup): while it sets a fleet up (:attr:`setting_up`), and while its fleet's work or
+        the wait on the manager's trust answer is in flight, the fleet up or not (the coders
+        started by hand before that answer, it is still the manager's pane's question). The
+        shell asks nothing anyway until a listed project's fleet is up
+        (``first_run.fleet_is_up``)."""
+        return self.setting_up or bool(self.busy & (FLEET_WORK | {"trust"}))
 
     def _read_after_start(self) -> bool:
         """Whether the shell's frame was read after the last start landed, for the chosen
@@ -1320,10 +1479,12 @@ class WelcomeView(VerticalScroll):
         title = Text("1  Project", style="bold")
         status = Text()
         if project is not None:
-            title.append("  ✓", style="green")
-            status.append("✓ ", style="green")
-            status.append(project.root.name or str(project.root), style="bold")
-            status.append(f" — {short_path(project.root)}", style="dim")
+            # Folded (Q16): the title line says what step 1 settled on, the project first, so
+            # a narrow screen cuts its folder, not its name.
+            title = Text("1  ", style="bold")
+            title.append("✓ ", style="green")
+            title.append(project.root.name or str(project.root), style="bold")
+            title.append(f" — {short_path(project.root)}", style="dim")
         else:
             status.append("Pick the folder your agents will work in.")
             if self.candidates is not None and not self.candidates.items:
@@ -1337,7 +1498,10 @@ class WelcomeView(VerticalScroll):
             status.append("\n")
             status.append_text(self.project_note)
         self.query_one("#project-title", Static).update(title)
-        self.query_one("#project-status", Static).update(status)
+        project_status = self.query_one("#project-status", Static)
+        project_status.update(status)
+        # Folded once done: a note left from setting the folder up is over with it.
+        project_status.display = bool(status.plain) and not done
         choosing = project is None
         self.query_one("#project-candidates", Vertical).display = choosing
         self.query_one("#project-other", Horizontal).display = choosing
@@ -1362,6 +1526,13 @@ class WelcomeView(VerticalScroll):
         title = Text(f"2  {name[:1].upper()}{name[1:]}", style="bold")
         if done:
             title.append("  ✓", style="green")
+        sign_in = claude is not None and claude.found and claude.signed_in is False
+        # Folded (Q16) once done, unless it still offers something: a sign-in, or the pick of
+        # an agent between those installed. The title line then says how it stands.
+        folded = done and not sign_in and claude is not None and not claude.others
+        if folded and claude is not None:
+            title.append(f" {step_two_summary(claude)}", style="dim not bold")
+        self.query_one("#claude-title", Static).set_class(folded, "-folded")
         body = claude_text(claude, platform=self.seams.platform)
         if "connect" in self.busy:
             body.append("\nConnecting…", style="dim")
@@ -1372,8 +1543,10 @@ class WelcomeView(VerticalScroll):
         elif self.agent_error:
             body.append(f"\n✗ {self.agent_error}", style="red")
         self.query_one("#claude-title", Static).update(title)
-        self.query_one("#claude-status", Static).update(body)
-        others = claude.others if claude is not None else ()
+        claude_status = self.query_one("#claude-status", Static)
+        claude_status.update(body)
+        claude_status.display = not folded
+        others = claude.others if claude is not None and not folded else ()
         note = self.query_one("#agent-choice-note", Static)
         note.display = bool(others)
         note.update(choice_text(claude))
@@ -1391,8 +1564,8 @@ class WelcomeView(VerticalScroll):
             and not claude.switched_off
             and claude.refused is None
         )
-        sign_in = found and claude is not None and claude.signed_in is False
         self.query_one("#claude-sign-in", Button).display = sign_in
+        self.query_one("#claude-actions", Horizontal).display = not folded
         self.query_one("#claude-check", Button).display = claude is not None and not claude.found
         # Step 3 does not wait on a sign-in, so a done card can still offer one: Tab keeps it.
         self._card("step-claude", done=done, waiting=waiting, keep_keys=sign_in)
@@ -1417,9 +1590,10 @@ class WelcomeView(VerticalScroll):
             status.append("Starting the manager…", style="dim")
         elif manager is None:
             name = self.project.root.name if self.project is not None else "the project"
-            status.append(f"Starts the manager in {name}. ")
+            status.append(f"Starts the manager in {name} and opens its pane. ")
             status.append(
-                f"{self._trust_question()}: answer it in the manager's pane.", style="dim"
+                f"{self._trust_question()}: answer it there, and the coders start on their own.",
+                style="dim",
             )
         for line in self._fleet_lines(live):
             if status.plain:
@@ -1451,6 +1625,12 @@ class WelcomeView(VerticalScroll):
                 status.append(
                     f"\n{stuck} could not be restarted: its window is gone. Ask the manager to "
                     "reap its row; Start the coders then starts a new one in its place.",
+                    style="dim",
+                )
+            elif self._waiting_here():
+                status.append(
+                    f"\nOpen the manager and {self._folder_question()}{self._hooks_review()}: "
+                    "the coders start on their own once it is answered.",
                     style="dim",
                 )
             else:
@@ -1487,6 +1667,8 @@ class WelcomeView(VerticalScroll):
         open_button.variant = "default" if coders_next else "primary"
         open_button.can_focus = not coders_next
         coders_button = self.query_one("#fleet-coders", Button)
+        # Offered while the coders wait on the manager's trust answer too: a start tops them
+        # up, so the wait's own start meets them running.
         coders_button.display = manager_running and not up
         coders_button.disabled = not ready
         coders_button.variant = "primary" if opened else "default"
@@ -1555,6 +1737,7 @@ class WelcomeView(VerticalScroll):
         counted as standing, and its refusal stayed as if the restart had ended the row
         itself (third delta review).
         """
+        self._open_if_listed()
         if not self._read_after_start():
             return
         for row in self._live().values():
@@ -1625,17 +1808,15 @@ class WelcomeView(VerticalScroll):
 
     def _waiting_for(self) -> str:
         missing: list[str] = []
-        if self.project is None:
-            missing.append("a project (step 1)")
         claude = self.claude
         name = step_two_name(claude)
         if claude is None or not claude.found:
-            missing.append(f"{name} installed (step 2)")
+            missing.append(f"install {name} (step 2)")
         elif not claude.connected:
-            missing.append(f"{name} connected (step 2)")
-        line = (
-            ("The manager starts once there is " + " and ".join(missing) + ".") if missing else ""
-        )
+            missing.append(f"connect {name} (step 2)")
+        if self.project is None:
+            missing.insert(0, "pick a project (step 1)")
+        line = ("The fleet can start once you " + " and ".join(missing) + ".") if missing else ""
         tmux = self.tmux
         if tmux is not None and not tmux.ok:
             fix = f" — install it as {TMUX_INSTALL_PAGE} says"

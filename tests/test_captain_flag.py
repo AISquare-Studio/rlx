@@ -332,6 +332,11 @@ def test_a_ui_receiver_refuses_every_captain_action_when_off(
     """The second guard: a receiver started anyway (asq starts none while off) refuses
     each action in the one line, and nothing it was asked for runs."""
     receiver_suite.fleet(tmp_path, script)
+    from aisquare.core.store import store_session
+
+    with store_session() as store:
+        # Home is beta (start opens home since L1), so alpha selected is the refused action's.
+        store.set_ui_state("fleet.last_project", "prj_bbb")
 
     async def body(pilot: Pilot[None]) -> tuple[list[dict[str, Any]], str | None]:
         app = fleet_app(pilot)

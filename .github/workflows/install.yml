@@ -214,15 +214,23 @@ jobs:
         # arguments and nothing else; main's install.sh hands off to the
         # release's own inside WSL. The runner has no WSL distribution, so
         # `wsl.exe` here is a FUNCTION (a function wins over an application of
-        # the same name) that names one distribution and keeps the command.
+        # the same name) that names one distribution and keeps every command:
+        # the install, and after it the two questions that pick the word to
+        # type (`command -v rlx`, `uv tool dir --bin`), which it answers as WSL
+        # would with this install's rlx first on PATH. Each is held to the
+        # same rule.
         run: |
           function global:wsl.exe {
             if ($args -contains '--list') {
               if ($args -contains '--verbose') { return '* Ubuntu    Running    2' }
               return 'Ubuntu'
             }
-            $global:Inner = $args[-1]
+            $command = $args[-1]
+            $global:Calls += , $command
+            if ($command -like '*curl -fsSL*') { $global:Inner = $command }
             $global:LASTEXITCODE = 0
+            if ($command -eq 'command -v rlx 2>/dev/null') { return '/home/u/.local/bin/rlx' }
+            if ($command -eq 'uv tool dir --bin 2>/dev/null') { return '/home/u/.local/bin' }
           }
           $main = 'https://raw.githubusercontent.com/AISquare-Studio/rlx/main/install.sh'
           $cases = @(
@@ -232,12 +240,18 @@ jobs:
           )
           foreach ($case in $cases) {
             $global:Inner = $null
+            $global:Calls = @()
             $forward = $case.Args
             ./install.ps1 @forward
             $want = "set -e; curl -fsSL '$main' | sh -s -- $($case.Tail)"
             Write-Host "$forward -> $global:Inner"
             if ($global:Inner -ne $want) { Write-Host "expected: $want"; exit 1 }
-            if ($global:Inner -match '[$`"\\]') { Write-Host 'WSL default shell would expand it'; exit 1 }
+            if ($global:Calls.Count -ne 3) {
+              Write-Host "expected 3 WSL commands: $($global:Calls -join ' / ')"; exit 1
+            }
+            foreach ($call in $global:Calls) {
+              if ($call -match '[$`"\\]') { Write-Host "WSL default shell would expand: $call"; exit 1 }
+            }
           }
           Write-Host 'install.ps1 hands WSL main''s install.sh, untouched by its default shell'
 

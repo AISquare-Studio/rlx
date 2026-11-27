@@ -192,7 +192,8 @@ def test_a_failed_read_or_an_answer_with_neither_window_is_still_no_reading(
     fake_home: Path, fetch: _Fetch
 ) -> None:
     """A reading that failed has no windows, so it is never taken for a plan with a week
-    alone: unread, ranked nowhere, its session cell the reason (``!`` on the page)."""
+    alone: unread, ranked nowhere, its session cell the reason (``! …`` on the page, never
+    ``no 5h limit``)."""
     account = core.create_account()
     _sign_in(account, "max@example.com")
 
@@ -204,7 +205,8 @@ def test_a_failed_read_or_an_answer_with_neither_window_is_still_no_reading(
     session, week = accounts_cli._usage_cells(usage, now=NOW)
     assert session != NO_5H and NO_5H not in session and week == ""
     cells = account_cells(_status(account, usage), usage, now=NOW)
-    assert cells["session"].plain == PROBLEM_MARK
+    assert cells["session"].plain.startswith(f"{PROBLEM_MARK} ")
+    assert NO_5H not in cells["session"].plain
     summary = service.fleet_headroom([account], {account.slot: usage})
     assert (summary.usable, summary.limit_by_slot, summary.percent_left) == (0, {}, None)
     assert summary.week_left_by_slot == {}

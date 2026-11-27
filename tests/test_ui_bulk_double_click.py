@@ -45,7 +45,7 @@ no_tmux = _no_tmux
 script = _script
 
 T = TypeVar("T")
-SIZE = (120, 47)
+SIZE = (120, 53)
 """Where Confirm covers cells of *Stop all…* and of *Pause all…* with one agent."""
 DOUBLE = FleetApp.CLICK_CHAIN_TIME_THRESHOLD / 2
 """The second press of a double-click, this long after the first."""

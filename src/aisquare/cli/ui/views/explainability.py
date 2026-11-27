@@ -767,7 +767,7 @@ class ExplainabilityView(VerticalScroll):
                 "so this is also how one setting is changed later. The deployment field names "
                 "the entry these settings belong to; this machine keeps using its current one "
                 "unless 'make active' is ticked. The key is written to "
-                "~/.aisquare/explainability-key at mode 600 and never shown back; with "
+                "~/.rlx/explainability-key at mode 600 and never shown back; with "
                 "'this project only' ticked it is this page's project's own key instead (the "
                 "hub's under a hub), for that deployment alone.",
             ),

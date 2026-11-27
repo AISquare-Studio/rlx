@@ -181,6 +181,7 @@ def test_the_manager_tab_says_each_managers_agent_at_every_width(
     async def go(pilot: Pilot[None]) -> tuple[str, str, str]:
         app = fleet_app(pilot)
         await settle(app)
+        await ui_suite.to_the_sidebar(app)  # below 70 columns, the side the card is on (L2)
         await pilot.click(card_for(app, "prj_a").query_one(ProjectTitle))
         await settle(app)
         hint = app.query_one("#project-prj_a #manager-hint", Static)

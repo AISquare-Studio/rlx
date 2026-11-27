@@ -1,4 +1,4 @@
-"""``~/.aisquare/state.json`` — the small runtime-state file, read and written in one place.
+"""``~/.rlx/state.json`` — the small runtime-state file, read and written in one place.
 
 Three preferences share it: the project ``project switch`` pinned
 (``active_project_id``, :mod:`aisquare.core.workspace`), the board's theme
@@ -216,7 +216,7 @@ def _sweep_stale_temps(target: Path) -> None:
 def _locked(path: Path) -> Iterator[None]:
     """Hold ``<path>.lock`` exclusively for the block, waiting at most :data:`LOCK_WAIT_S`.
 
-    Beside the path every process opens (``~/.aisquare/state.json.lock``), not
+    Beside the path every process opens (``~/.rlx/state.json.lock``), not
     beside a symlink's target: a dotfiles repo should not gain a lock file.
     Opened and polled by ``core.locking`` (:func:`~aisquare.core.locking.open_lock_file`,
     :func:`~aisquare.core.locking.held`), the one copy of both: for writing first,

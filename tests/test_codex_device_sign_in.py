@@ -103,7 +103,7 @@ def test_claude_codes_sign_in_argv_and_window_are_byte_identical_to_before(
     nothing after the slot, and carries the home and Claude Code's two variables."""
     account = ClaudeAccount(
         slot=2,
-        config_dir=tmp_path / "claude-accounts" / "2",
+        config_dir=tmp_path / "slots" / "2",
         tmp_dir=tmp_path / "cache" / "2",
         managed=True,
     )
@@ -124,8 +124,12 @@ def test_claude_codes_sign_in_argv_and_window_are_byte_identical_to_before(
         "2",
     ]
     env_binary = shutil.which("env") or "/usr/bin/env"
+    # Byte-identical to before but for the home's new name (#30), unset as this process has
+    # none: a tmux server's stale RLX_HOME, which wins, cannot name another home.
     assert command == [
         env_binary,
+        "-u",
+        "RLX_HOME",
         "-u",
         core.TMPDIR_VAR,
         sys.executable,

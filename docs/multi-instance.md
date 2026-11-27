@@ -1,7 +1,7 @@
 # Running more than one rlx on one home
 
 You can run rlx at the Mac and, at the same time, over SSH into that same Mac. Both use the same
-home (`~/.aisquare`) and the same fleet. This page explains what the two share, what only one of
+home (`~/.rlx`) and the same fleet. This page explains what the two share, what only one of
 them holds at a time, and what rlx does to keep two releases from running against one home.
 Below, each running rlx on a home is an instance, and each one's messages call it rlx.
 
@@ -15,7 +15,8 @@ Below, each running rlx on a home is an instance, and each one's messages call i
   ```
 
   `Mac` (`local` on Linux) is an rlx at this machine, `ssh` is one reached from another machine,
-  and a host name is an rlx on another machine that shares the home. Hover the chip to see each
+  `service` is the [rlx service](service.md), and a host name is an rlx on another machine that
+  shares the home. Hover the chip to see each
   rlx's version, host, pid, terminal and start time. With one rlx open, the chip is hidden.
 - **The command.** `rlx instances` lists the live rlx instances: their kind, host, pid,
   version, when each started and how long ago it last checked in. `--json` gives the same list
@@ -30,7 +31,7 @@ Below, each running rlx on a home is an instance, and each one's messages call i
 - **The doctor.** `rlx doctor` (and rlx's Doctor page) has an `asq instances` row. It is ok
   when every live rlx runs this release and store schema, and warns when one doesn't.
 
-Every rlx writes a small record to `~/.aisquare/instances/` when it starts, refreshes it every
+Every rlx writes a small record to `~/.rlx/run/instances/` when it starts, refreshes it every
 5 seconds, and removes it when it quits. A crashed rlx's record is ignored at once, and deleted
 by the next rlx that starts or by the next heartbeat of any rlx still running. Looking (the chip,
 the command, the doctor) never changes the folder.
@@ -48,7 +49,9 @@ Every rlx on a home works on the same things:
 Some things can only have one holder. Whichever rlx takes it first keeps it until it quits:
 
 - **Remote.** Only one process serves Remote for a home. While another rlx serves it, this rlx's
-  Remote panel says so instead of starting a second server.
+  Remote panel says so instead of starting a second server. While the
+  [rlx service](service.md) runs, it serves Remote, and every rlx window's switch turns it on and
+  off.
 - **The captain's ui socket.** The captain's `ui` actions (open a dialog, select a row) go to the
   first rlx that listens on the socket. Another rlx that starts later leaves it alone.
 - **A shared pane's size.** When two rlx instances show the same agent's pane, the rlx you last

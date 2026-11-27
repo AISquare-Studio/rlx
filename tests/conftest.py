@@ -173,6 +173,9 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 #: was nothing to compare against. The per-role families, which no list of names
 #: can cover, are :data:`AMBIENT_ENV_PREFIXES` below.
 AMBIENT_ENV_VARS = (
+    # rlx's home by its own name (#30), which wins over the AISQUARE_HOME each test names:
+    # a developer's RLX_HOME left set would put every test's files in their own home.
+    "RLX_HOME",
     # Textual's start theme, which asq's restore ranks between a saved pick and rlx
     # (`cli.ui.theme.restore_theme`): left set, the tests of the default would start in
     # the developer's theme.
@@ -277,6 +280,12 @@ AMBIENT_ENV_VARS = (
     # left set, every session start would resolve THEIR row and THEIR pid.
     "AISQUARE_FLEET_AGENT",
     "CLAUDE_PID",
+    # The marks an agent leaves on the processes it starts (Claude Code's on every one,
+    # Codex's on its tools' shells): with either set, `core.prompt_origin` reads this
+    # process as an agent's, and `aisquare board` prints the agents' block, not a
+    # person's board (B1 #14). CI has neither; a suite run inside an agent had both.
+    "CLAUDECODE",
+    "CODEX_THREAD_ID",
     "AISQUARE_MODEL_PLANNER",
     "AISQUARE_MODEL_CODER",
     "AISQUARE_MODEL_RUNNER",
@@ -425,7 +434,7 @@ AMBIENT_ENV_PREFIXES = ("AISQUARE_BIN_", "AISQUARE_MODEL_", "AISQUARE_EFFORT_")
 
 #: The home the shell named, if it named one; ``None`` leaves the run to name its own
 #: for wherever no test's own home is in force (:func:`home_outside_a_test`).
-SHELL_HOME: str | None = os.environ.get(HOME_ENV_VAR) or None
+SHELL_HOME: str | None = os.environ.get("RLX_HOME") or os.environ.get(HOME_ENV_VAR) or None
 
 #: The developer's home directory as the run found it, and which project markers
 #: (``core.workspace.ROOT_MARKERS``) it held already: one that appears in it during the
@@ -926,10 +935,60 @@ def no_background_shipper(monkeypatch: pytest.MonkeyPatch) -> None:
     (``core.sharing.start_background_ship`` from the root callback); a real one is a process that
     outlives the test, minds the test's home and, under load, mints an identity mid-test (a test
     of "no identity yet" failed once in the full run, never alone). A test of the spawn itself
-    replaces ``_spawn`` with its own recorder."""
+    replaces ``_spawn`` with its own recorder. The same for the daily active ping's detached
+    ``aisquare metrics ping`` (``services.active_ping``), which is on unless turned off."""
     from aisquare.core import sharing
+    from aisquare.services import active_ping
 
     monkeypatch.setattr(sharing, "_spawn", lambda: None)
+    monkeypatch.setattr(active_ping, "_spawn", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def no_real_service(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test starts a REAL detached ``rlx service run`` unless it asks for :func:`real_service`.
+
+    One outlives the test that started it (ppid 1), minds that test's home and holds its Remote
+    port: ``tests/test_stubs.py`` running ``service start`` with no arguments left real services
+    running after pytest (#32's tester, #1743). The one place a service is started,
+    ``service_host._spawn_service``, refuses here, as :class:`ServiceError` says it."""
+    if "real_service" in request.fixturenames:
+        return
+    from aisquare.services import service_host
+
+    def refuse(command: Any, out: Any) -> Any:
+        raise service_host.ServiceError(
+            "a test may not start a real rlx service (tests/conftest.py::no_real_service); "
+            "one that must asks for the real_service fixture"
+        )
+
+    monkeypatch.setattr(service_host, "_spawn_service", refuse)
+
+
+@pytest.fixture
+def real_service(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Any]]:
+    """Real ``rlx service run`` processes for this test: each one it starts is listed, and one
+    still running at its end is killed and FAILS the test, so none outlives it."""
+    from aisquare.services import service_host
+
+    started: list[Any] = []
+    spawn = service_host._spawn_service
+
+    def recorded(command: Any, out: Any) -> Any:
+        child = spawn(command, out)
+        started.append(child)
+        return child
+
+    monkeypatch.setattr(service_host, "_spawn_service", recorded)
+    yield started
+    left = [child for child in started if child.poll() is None]
+    for child in left:
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except Exception:
+            child.kill()
+    assert not left, f"the test left rlx services running: pids {[c.pid for c in left]}"
 
 
 @pytest.fixture

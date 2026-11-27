@@ -646,11 +646,13 @@ def test_a_limit_mark_for_the_launchs_family_sends_it_past_the_account_the_rung_
     machine: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The rung ran before the model was known: an Opus mark on the account it picked shuts
-    that account to an Opus launch, which then takes the headroom rung's answer."""
+    that account to an Opus launch, which then takes the headroom rung's answer. The second
+    is well behind the first, so the balanced pick (#35) takes the first whatever the 20% the
+    machine default keeps for its person."""
     first = _claude("c@example.com")
     second = _claude("d@example.com")
     codex = _codex("x@example.com")
-    _usage(monkeypatch, {first.slot: 10.0, second.slot: 20.0, codex.slot: 30.0})
+    _usage(monkeypatch, {first.slot: 10.0, second.slot: 40.0, codex.slot: 50.0})
     selected = agent_launch.resolve("coder")
     assert selected.pick is not None and selected.pick.account is not None
     assert selected.pick.account.slot == first.slot

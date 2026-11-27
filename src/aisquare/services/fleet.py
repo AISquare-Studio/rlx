@@ -6002,6 +6002,7 @@ def spawn(
                 agent=selected.adapter.id,
                 pick=selected.pick,
                 family=family,
+                task_id=resolved_task_id,  # its tier: a task another one --needs is high (#35)
             )
         except claude_accounts_service.NoSuchAccount as exc:
             message = str(exc)
@@ -6210,7 +6211,7 @@ def spawn(
         # `$HOME`, under `~/.aisquare`) as a project; the window's hub, the home's
         # root (`_spawn_board_and_hub`), lands the launcher on the home board, which
         # the store keeps captured (T2).
-        env["AISQUARE_HOME"] = str(paths.aisquare_home().resolve())
+        env["AISQUARE_HOME"] = env["RLX_HOME"] = str(paths.aisquare_home().resolve())
         # Nobody may be watching its pane, which is answered from a phone: a prompt of the
         # agent's own there holds it (`unattended_env`). Claude Code's session-rating survey
         # drew in the captain's pane mid-conversation, and send (rightly) never types into a
@@ -8267,7 +8268,7 @@ def _admit(config: FleetSettings) -> list[str]:
     memory refusal the floor is ``min_free_mb + 512`` for five minutes, so admission
     does not flap on a box hovering at the line. Unknown headroom admits, with a note.
     Each refusal, and each admission that fills the budget, is one line in
-    ``~/.aisquare/fleet/admission.jsonl``.
+    ``~/.rlx/fleet/admission.jsonl``.
     """
     notes: list[str] = []
     counts = _live_per_project() if config.max_agents_total > 0 else {}
@@ -8958,7 +8959,7 @@ def _memory_refused(record: Mapping[str, object], why: str) -> NoReturn:
 def _log_admission(outcome: str, record: Mapping[str, object]) -> None:
     """One JSON line per refusal and per admission at the budget; never fails a spawn."""
     with contextlib.suppress(OSError):
-        log = paths.aisquare_home() / "fleet" / "admission.jsonl"
+        log = paths.fleet_dir() / "admission.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
         if log.is_file() and log.stat().st_size > _ADMISSION_LOG_MAX:
             log.replace(log.with_name(log.name + ".1"))
@@ -10097,6 +10098,11 @@ def _statuses(
     if live_only:
         placements = _with_lingering_windows(placements, views, running, keep=paused)
     reached = {placement.row.id for placement in placements if _view(placement, views) is not None}
+    # A live row's session on another board, read by its id (`_listing`): a hub's, or the
+    # principal checkout's for a project rooted in a sub-folder or at a linked worktree,
+    # where its hooks register it. Its state, its limit and the task it claimed are that
+    # session's; without it such a row read as having none (#14, tester #1306).
+    sessions = {**{sid: s for sid, s in by_id.items() if s is not None}, **sessions}
     sessions = _record_failed_turns(
         [placement.agent for placement in placements], sessions, reached, records
     )
@@ -14496,10 +14502,15 @@ def switch(
                 raise _replaced(project, label, head, agent_id) from None
             if not _the_owners(spawned_by, store):
                 raise _paused_by_the_owner(project, label) from None
-            resume = project_service.fleet_command("resume", project)
+            # asq's Move reaches here (views.agent): it gets the sentence without the command.
             raise FleetError(
-                f"{label} is paused, with no process to move: `{resume}` brings it back, and "
-                "a switch then moves it; nothing was changed"
+                f"{label} is paused, with no process to move: "
+                + prog.shell_advice(
+                    f"`{project_service.fleet_command('resume', project)}` brings it back, and "
+                    "a switch then moves it",
+                    app="resume it, then move it",
+                )
+                + "; nothing was changed"
             ) from None
         # First: every refusal after this one reads the role, the agent and the account,
         # and they are the launch record's (`core.launch_seal`), never the row's.
@@ -14587,14 +14598,21 @@ def switch(
             )
             raise FleetError(
                 f"no account under the line for {label!r}{where} — every other account is "
-                f"over switch_at or unreadable; {stays}, or "
-                f"`{project_service.fleet_command('switch', project, label)}` moves it by "
-                f"hand{said}"
+                f"over switch_at or unreadable; {stays}"
+                + prog.shell_advice(
+                    f", or `{project_service.fleet_command('switch', project, label)}` moves it "
+                    "by hand"
+                )
+                + said
             )
         raise FleetError(
-            f"no other account with headroom for {label!r}{where}"
-            f" — add or enable one (`{prog.word()} accounts`), name one with --to, or wait for "
-            f"the reset{said}"
+            f"no other account with headroom for {label!r}{where} — "
+            + prog.shell_advice(
+                f"add or enable one (`{prog.word()} accounts`), name one with --to, or wait for "
+                "the reset",
+                app="add or enable one on the Accounts page, or wait for the reset",
+            )
+            + said
         )
     target = choice.account
     if crossing:
@@ -15164,8 +15182,7 @@ def _respawn(
         ]
         said = f"{', '.join(kept)} and arguments" if kept else "arguments"
         notes.append(
-            f"launched as recorded — {said} come from its launch record, not from today's "
-            "config (#144)"
+            f"launched as recorded — {said} come from its launch record, not from today's config"
         )
     notes.extend(receipt.notes)
     return receipt, resume is not None, notes
@@ -16469,7 +16486,7 @@ def hand_off(
     agent_id: str | None = None,
     to_agent: str | None = None,
 ) -> HandoffReceipt:
-    """Start an agent from teammate ``source``: the Spawn dialog's *Hand off from*.
+    """Start an agent from teammate ``source``: the Spawn dialog's *Continue from*.
 
     **Fork**, the default, touches nothing of the source: no mark, no stop, no claim, and
     neither its row, its window, its tree nor its branch. The new agent takes a label that
@@ -16732,7 +16749,7 @@ def _handoff_row(
 
     The label alone names the newest row that carries it, and two rows of a project can
     carry one label over time: an exited coder-1 and the coder-1 started since. The Spawn
-    dialog's *Hand off from* can show the older one, so by label its fork forked, and its
+    dialog's *Continue from* can show the older one, so by label its fork forked, and its
     take-over stopped and restarted, the NEWER agent (review of #240, "also confirmed":
     hand-off by label). A caller that means one teammate names its row, as the agent view
     does for :func:`stop` and :func:`restart`: by its whole id, as theirs is. A row of
@@ -17313,7 +17330,7 @@ its replacement is a deliberate add, and would bring the project back to every l
 NOT_PAUSED = "not paused"
 """Why a resume by :func:`bulk` leaves a row: running, or exited (💤) without a pause — only
 the agents a ``fleet pause`` stopped come back."""
-NOT_CHOSEN = "not chosen"
+NOT_CHOSEN = "unticked in the pick-list"
 """Why :func:`bulk` leaves a row the plan it was shown would have acted on: the person
 unticked it in asq's dialog (R17, its pick-list). A pause that leaves one of a project's
 agents so does not fleet-pause the project (:func:`_fully_picked`)."""

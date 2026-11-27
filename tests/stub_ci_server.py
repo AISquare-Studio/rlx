@@ -145,6 +145,10 @@ class StubCI:
     """A ``Location`` header on the descriptor route — a redirecting server."""
     seen: list[Recorded] = field(default_factory=list)
     echo: bool = False
+    recorded: threading.Condition = field(
+        default_factory=threading.Condition, repr=False, compare=False
+    )
+    """Notified as each request lands in :attr:`seen`, from the handler's thread."""
 
     @property
     def requests(self) -> list[dict[str, Any]]:
@@ -176,6 +180,17 @@ class StubCI:
     def call_count(self) -> int:
         """How many hook calls arrived. Descriptor and readiness GETs are not calls."""
         return len(self.hooks)
+
+    def wait_for_calls(self, count: int, timeout_s: float = 10.0) -> int:
+        """:attr:`call_count` once it reaches ``count``, or after ``timeout_s``.
+
+        A call that ends at its ceiling can end before the handler's thread has read the
+        request and recorded it: the client does not wait on the server's threads, and a
+        loaded runner schedules them late (CI run 44371518750). A test that counts such a
+        call waits here, on the record itself."""
+        with self.recorded:
+            self.recorded.wait_for(lambda: self.call_count >= count, timeout_s)
+        return self.call_count
 
     @property
     def descriptor_fetches(self) -> int:
@@ -234,7 +249,9 @@ def _handler(stub: StubCI) -> type[BaseHTTPRequestHandler]:
                 body=parsed,
                 raw=raw,
             )
-            stub.seen.append(record)
+            with stub.recorded:
+                stub.seen.append(record)
+                stub.recorded.notify_all()
             if stub.echo:
                 sys.stderr.write(f"{record.method} {record.path}\n{raw}\n\n")
                 sys.stderr.flush()
