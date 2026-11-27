@@ -705,9 +705,12 @@ mod tests {
             "{:?}",
             other.capture(0)
         );
-        // The flooded one keeps its quota and no more.
+        // The flooded one keeps its quota and no more, and memory() counts it: a few
+        // hundred KB are the screen, the rest its table (#2685 (b)).
         let held = flooded.memory();
         assert!(held < 16 << 20, "{held} bytes");
+        assert!(held > 4 << 20, "{held} bytes: the table is counted");
+        assert!(other.memory() < 1 << 20, "{} bytes", other.memory());
         // Past its quota a new long character is spaces there, and there only.
         flooded.feed(b"\x1b[2J\x1b[H");
         flooded.feed(line.as_bytes());

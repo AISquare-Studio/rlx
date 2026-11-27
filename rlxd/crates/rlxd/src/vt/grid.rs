@@ -173,6 +173,12 @@ impl Utf8 {
     fn pack(&self, chars: &Chars) -> u32 {
         let size = u32::from(self.size);
         let width = u32::from(self.width.min(2));
+        if usize::from(self.size) == UTF8_SIZE {
+            // As tmux's packing reads back a character of exactly 32 bytes (#2685 m2):
+            // UTF8_SET_SIZE(32) is 1 << 29, past its 5 bits of size and into the width,
+            // so the cell comes back empty, and a cell wider.
+            return (width + 1).min(3) << 30;
+        }
         let index = if self.size <= 3 {
             u32::from(self.data[0]) | u32::from(self.data[1]) << 8 | u32::from(self.data[2]) << 16
         } else if let Some(index) = chars.put(self.bytes()) {
@@ -1741,13 +1747,17 @@ pub fn string_cells(grid: &Grid, py: u32, last: &mut Cell, links: &Hyperlinks) -
         return out;
     };
     let mut has_link = false;
+    // tmux's `code`: the last cell's codes, which the line's end appends to (below).
+    let mut code = Vec::new();
     let end = line.cellsize().min(grid.sx);
     for xx in 0..end {
         let cell = line.get(xx as usize, &grid.chars);
         if cell.flags & FLAG_PADDING != 0 {
             continue;
         }
-        cells_code(last, &cell, &mut out, links, &mut has_link);
+        code.clear();
+        cells_code(last, &cell, &mut code, links, &mut has_link);
+        out.extend_from_slice(&code);
         if cell.flags & FLAG_TAB != 0 {
             out.push(b'\t');
         } else {
@@ -1756,7 +1766,10 @@ pub fn string_cells(grid: &Grid, py: u32, last: &mut Cell, links: &Hyperlinks) -
         *last = cell;
     }
     if has_link {
-        add_hyperlink(&mut out, "", "");
+        // As tmux closes a link: strlcat onto `code`, which still holds the last cell's
+        // codes, so they are printed again before the close (#2678 minor 2).
+        add_hyperlink(&mut code, "", "");
+        out.extend_from_slice(&code);
     }
     while out.last() == Some(&b' ') {
         out.pop();
@@ -1806,12 +1819,15 @@ mod tests {
             ("中".as_bytes(), 2),
             ("👍🏽".as_bytes(), 2),
             ("e\u{301}\u{302}\u{303}".as_bytes(), 1),
-            (&[b'x'; UTF8_SIZE][..], 1),
+            (&[b'x'; UTF8_SIZE - 1][..], 1),
             (b"", 0),
         ] {
             let utf8 = Utf8::new(bytes, width);
             assert_eq!(Utf8::unpack(utf8.pack(&chars), &chars), utf8, "{bytes:?}");
         }
+        // One of exactly 32 bytes comes back as tmux's does: empty, and a cell wider.
+        let full = Utf8::new(&[b'x'; UTF8_SIZE], 1);
+        assert_eq!(Utf8::unpack(full.pack(&chars), &chars), Utf8::new(b"", 2));
         // A long character's number is the same each time.
         let long = Utf8::new("👍🏽".as_bytes(), 2);
         assert_eq!(long.pack(&chars), long.pack(&chars));

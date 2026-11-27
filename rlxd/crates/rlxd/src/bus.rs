@@ -579,7 +579,14 @@ impl Bus {
         // The main ring's loss first: what it dropped, of every topic, as a gap.
         if cursor.after < state.floor {
             let to = state.floor.min(end);
-            let gap = gap(cursor.after + 1, to, false);
+            // From the earlier of the two places: an output loss still waiting to be told
+            // is in this gap too, which the cursor reads past (#2678 minor 1).
+            let from = if output {
+                cursor.after.min(cursor.output_after)
+            } else {
+                cursor.after
+            };
+            let gap = gap(from + 1, to, false);
             taken += gap.len();
             batch.push(gap);
             cursor.after = to;
@@ -2023,6 +2030,46 @@ mod tests {
                 .collect();
             assert_eq!(output, [flood - 2, flood - 1, flood]);
         }
+    }
+
+    /// #2678 minor 1, the review's repro: an output loss still waiting when the main ring
+    /// drops past the cursor is in the main ring's gap, which starts below it.
+    #[test]
+    fn an_output_loss_waiting_is_in_the_main_rings_gap() {
+        let dir = Dir::new();
+        let bus = Bus::open_with(
+            dir.mark(),
+            Limits {
+                events: 2,
+                ..Limits::DEFAULT
+            },
+            Limits {
+                events: 1,
+                ..Limits::OUTPUT
+            },
+        )
+        .unwrap();
+        // o1 d2 o3 o4
+        output(&bus, 1);
+        emit(&bus, 1);
+        output(&bus, 2);
+        let mut cursor = bus.cursor(Topics::ALL, Some(0), true).unwrap();
+        let first = events(&bus.read(&mut cursor, 1, BATCH_BYTES));
+        assert_eq!(
+            (first[0]["seq"].as_u64(), &first[0]["type"]),
+            (Some(2), &json!("daemon.debug"))
+        );
+        // d5 d6 d7: the main ring keeps two, so it drops past the cursor.
+        emit(&bus, 3);
+        let read = events(&bus.read(&mut cursor, 256, BATCH_BYTES));
+        assert_eq!(read[0]["type"], "daemon.gap", "{read:?}");
+        assert_eq!(
+            read[0]["data"],
+            json!({"from": 1, "to": 5}),
+            "o1 is in a gap"
+        );
+        let seqs: Vec<u64> = read.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, [5, 6, 7]);
     }
 
     #[test]

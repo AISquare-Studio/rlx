@@ -745,6 +745,8 @@ fn a_frame_over_the_limit_is_refused_by_name_and_the_connection_goes_on() {
     assert!(reply.is_ok(), "the stream goes on: {}", reply.line);
 }
 
+/// #2574 minor 6: a program that never reads its input fills rlxd's queue for it, and
+/// then a write gets `pty_busy`, a code of its own, not `internal`.
 #[cfg(unix)]
 #[test]
 fn a_program_that_reads_nothing_makes_a_write_busy() {
@@ -1470,6 +1472,180 @@ fn check_5_a_stalled_subscriber_holds_up_neither_the_pty_nor_memory() {
             "never told of the end: {:?}",
             end.last()
         );
+    }
+}
+
+/// A process stopped (SIGSTOP) and continued has not ended: macOS reports a stop to
+/// `waitid(WEXITED)` too, which made rlxd take it for an exit with status 17 (found by
+/// the attach test below). Its real end comes after.
+#[cfg(unix)]
+#[test]
+fn a_stopped_process_has_not_ended() {
+    let home = TestHome::new();
+    home.start();
+    let id = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "echo ready; read x; exit 4"], "cols": 80, "rows": 24}),
+    );
+    eventually("it starts", || {
+        screen(&home, &id)["text"]
+            .as_str()
+            .unwrap()
+            .contains("ready")
+    });
+    let pid = list(&home)["ptys"][0]["pid"].as_u64().unwrap().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-STOP", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(screen(&home, &id)["exited"], false, "a stop is no end");
+    assert!(
+        Command::new("kill")
+            .args(["-CONT", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(screen(&home, &id)["exited"], false, "nor is a continue");
+    assert_eq!(
+        call(&home, "pty.write", &json!({"pty_id": id, "text": "\r"})).code(),
+        Some(0)
+    );
+    eventually("it ends", || screen(&home, &id)["exited"] == true);
+    assert_eq!(screen(&home, &id)["status"], 4);
+}
+
+/// #2685 (c): a stream that lags behind its PTY's flood and exit, while another PTY's
+/// flood pushes the output partition's floor past that exit, still gets the PTY's own
+/// `pty.exited`: it comes before the gap, and the resync keeps it.
+#[cfg(unix)]
+#[test]
+fn a_resync_keeps_the_ptys_own_end_read_before_the_gap() {
+    let home = TestHome::new();
+    home.start();
+    let a = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "read x; yes 0123456789abcdef | head -c 2000000; exit 5"],
+               "cols": 80, "rows": 24}),
+    );
+    let params = PtySubscribeParams::new(&a, true).unwrap();
+    let mut stalled = connect(&home, Role::Tui).subscribe_pty(&params).unwrap();
+    assert_eq!(
+        call(&home, "pty.write", &json!({"pty_id": a, "text": "\r"})).code(),
+        Some(0)
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while screen(&home, &a)["exited"] != true {
+        assert!(Instant::now() < deadline, "the first pty never ended");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let b = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "yes 'the quick brown fox jumps over the lazy dog 0123456789' | head -c 40000000; echo DONE; sleep 60"],
+               "cols": 80, "rows": 24}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while !screen(&home, &b)["text"].as_str().unwrap().contains("DONE") {
+        assert!(
+            Instant::now() < deadline,
+            "the second pty never got through its output"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // To its own end, or to a snapshot that says it ended: without the PTY's
+    // pty.exited, the resync's snapshot is what tells of the end.
+    let read = stream_until(&mut stalled, |e| {
+        e["type"] == "pty.exited"
+            || e["type"] == "daemon.gap"
+            || e["type"] == "pty.snapshot" && e["data"]["exited"] == true
+    });
+    let ended: Vec<&Value> = read.iter().filter(|e| e["type"] == "pty.exited").collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "the pty's own end, before the resync: {:?}",
+        read.last()
+    );
+    assert_eq!(ended[0]["data"]["status"], 5);
+}
+
+/// #2685 (d): `rlxd attach` ends when a resync's snapshot says the process ended, its
+/// `pty.exited` having gone with what it missed: attach is stopped while its PTY floods
+/// and exits, then goes on.
+#[cfg(unix)]
+#[test]
+fn attach_ends_on_a_snapshot_that_says_the_process_ended() {
+    let home = TestHome::new();
+    home.start();
+    let inner = spawn(
+        &home,
+        json!({"argv": ["sh", "-c", "echo ready; read x; yes 'the quick brown fox jumps over the lazy dog 0123456789' | head -c 40000000; exit 5"],
+               "cols": 80, "rows": 24}),
+    );
+    let rlxd = env!("CARGO_BIN_EXE_rlxd");
+    let root = home.root().to_string_lossy().to_string();
+    let outer = spawn(
+        &home,
+        json!({"argv": [rlxd, "attach", "--read-only", inner], "cols": 80, "rows": 24,
+               "env": {"RLX_HOME": root}}),
+    );
+    eventually("attach is drawing", || {
+        screen(&home, &outer)["text"]
+            .as_str()
+            .unwrap()
+            .contains("ready")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = list(&home)["ptys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pty| pty["pty_id"] == outer.as_str())
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    let signal = |name: &str| {
+        let ok = Command::new("kill")
+            .args([name, &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(ok.success(), "kill {name}");
+    };
+    signal("-STOP");
+    assert_eq!(
+        call(&home, "pty.write", &json!({"pty_id": inner, "text": "\r"})).code(),
+        Some(0)
+    );
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while screen(&home, &inner)["exited"] != true {
+        assert!(Instant::now() < deadline, "the pty never ended");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    signal("-CONT");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let shown = screen(&home, &outer);
+        if shown["exited"] == true {
+            assert!(
+                shown["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("[the process exited, status 5]"),
+                "{shown}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attach never ended: {}",
+            shown["text"]
+        );
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 

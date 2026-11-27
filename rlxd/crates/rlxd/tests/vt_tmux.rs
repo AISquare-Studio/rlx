@@ -234,6 +234,42 @@ fn fixtures() -> Vec<Fixture> {
         since: Some((3, 6)),
         ..fixture("a private DSR ends a repeat", "a\x1b[?996n\x1b[3b|")
     });
+    // #2685 m2: combining marks up to tmux's 32 bytes a cell, and either side of it: tmux
+    // keeps a cell of exactly 32, which its packing reads back as empty.
+    for (name, first, marks) in [
+        ("a cell of 31 bytes", "e", 15),
+        ("a cell of 32 bytes", "é", 15),
+        ("a cell of 33 bytes", "e", 16),
+    ] {
+        // tmux 3.6 raised a cell's limit from 21 bytes to 32.
+        all.push(Fixture {
+            cols: 20,
+            rows: 3,
+            since: Some((3, 6)),
+            ..fixture(name, format!("a{first}{}b|", "\u{301}".repeat(marks)))
+        });
+    }
+    // #2678 minor 2: a link that starts in the last column and wraps. tmux prints the
+    // last cell's codes again as it closes the link at the line's end.
+    all.push(Fixture {
+        cols: 80,
+        rows: 5,
+        ..fixture(
+            "a link from the last column, wrapping",
+            format!(
+                "{}\x1b]8;;https://example.com/a/long/path\x1b\\https://example.com/a/long/path\x1b]8;;\x1b\\ done",
+                "x".repeat(79)
+            ),
+        )
+    });
+    all.push(Fixture {
+        cols: 20,
+        rows: 4,
+        ..fixture(
+            "a coloured link that ends each line",
+            "\x1b[31m\x1b]8;id=a;http://x\x1b\\0123456789abcdefghijKLMNOPQRSTUVWXYZ\x1b]8;;\x1b\\\x1b[m",
+        )
+    });
     // #2585: a hyperlink that isn't UTF-8 is kept, its bytes escaped.
     all.push(fixture(
         "a hyperlink that isn't UTF-8",

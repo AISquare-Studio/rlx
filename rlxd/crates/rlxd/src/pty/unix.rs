@@ -47,13 +47,33 @@ pub fn wait(pid: u32) -> io::Result<Ended> {
                 libc::WEXITED | libc::WNOWAIT,
             )
         };
-        if got == 0 {
+        if got != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+            continue;
+        }
+        if matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
             break;
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
+        // macOS reports a stop to WEXITED too, and again until it is taken (#2685's
+        // attach test found it): take it, which reaps nothing, and wait on. Linux never
+        // gets here.
+        // SAFETY: as above; WSTOPPED and WCONTINUED without WEXITED reap nothing.
+        let mut taken: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &raw mut taken,
+                libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
+            )
+        };
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let status = child_status(&info);
     if info.si_code == libc::CLD_KILLED || info.si_code == libc::CLD_DUMPED {
