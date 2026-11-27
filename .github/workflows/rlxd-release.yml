@@ -26,6 +26,9 @@ name: rlxd release
 #   install  on ubuntu, macOS and Windows: `rlx daemon install` of the tree, from a
 #            stub releases server (tests/stub_releases.py) serving `rlxd-archives`,
 #            then the installed rlxd's version; and tests/test_rlxd_install.py.
+#   upgrade  on ubuntu, macOS and Windows: handoff 4.2's and 7.8's upgrade checks,
+#            rlx $V upgraded to a second build of the tree stamped $V+upgrade, with
+#            rlxd restarted, PTYs and a run in flight; not for a release's run.
 #   attach   only for a release: the archives and the sums onto GitHub Release
 #            vX.Y.Z, by `gh release upload` as installers.yml attaches the
 #            installers. It refuses a tag that is not `v` + pyproject.toml's version.
@@ -479,6 +482,167 @@ jobs:
 
       - name: tests/test_rlxd_install.py
         run: uv run --locked --extra dev pytest tests/test_rlxd_install.py -q -p no:cacheprovider
+
+  # Handoff 4.2's and 7.8's upgrade checks (pre-release form), on the three OSes: rlx $V
+  # installed as a uv tool from the tree's wheel, its rlxd from the stub releases server
+  # serving `rlxd-archives`, running; on macOS and Linux a second build, dist2, stamped
+  # $V+upgrade (a wheel, this host's rlxd archive and its sums, served as v$V+upgrade), and
+  # fake-claude for a run in flight. Windows runs the daemon_running line: rlx can't
+  # replace itself there while it runs. Not for a release's run: `attach` needs none of it.
+  upgrade:
+    name: upgrade (${{ matrix.os }})
+    needs: package
+    if: github.event_name != 'release' && inputs.tag == ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rlxd-archives
+          path: ${{ runner.temp }}/a
+
+      - name: The Rust toolchain rlxd/rust-toolchain.toml names
+        if: runner.os != 'Windows'
+        working-directory: rlxd
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: runner.os != 'Windows'
+        with:
+          workspaces: rlxd -> target
+          key: upgrade-${{ matrix.target }}
+
+      - name: Sync the tree
+        run: uv sync --locked --extra dev
+
+      - name: rlx upgrade with rlx's daemons (handoff 4.2, 7.8)
+        run: |
+          set -euo pipefail
+          exe=""; [ "$RUNNER_OS" = Windows ] && exe=.exe
+          export AISQUARE_HOME="$RUNNER_TEMP/home" CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude"
+          export UV_TOOL_DIR="$RUNNER_TEMP/uv-tools" UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv-bin"
+          mkdir -p "$AISQUARE_HOME" "$CLAUDE_CONFIG_DIR"
+
+          # rlx $V, a uv tool from the tree's wheel, and the stub releases server.
+          uv build --wheel -o "$RUNNER_TEMP/dist"
+          uv tool install "$(ls "$RUNNER_TEMP"/dist/*.whl)"
+          bin=$(uv tool dir --bin); [ "$RUNNER_OS" = Windows ] && bin=$(cygpath -u "$bin")
+          export PATH="$bin:$PATH"
+          V=$(rlx --version | awk '{print $2}')
+          root="$RUNNER_TEMP/stub"; mkdir -p "$root/v$V" && cp "$RUNNER_TEMP"/a/* "$root/v$V/"
+          uv run --locked --extra dev python tests/stub_releases.py "$root" \
+            --log "$RUNNER_TEMP/stub.log" --url-file "$RUNNER_TEMP/url" > "$RUNNER_TEMP/stub.out" 2>&1 &
+          stub=$!
+          trap 'rlxd stop >/dev/null 2>&1 || true; kill $stub 2>/dev/null || true' EXIT
+          for _ in $(seq 100); do test -s "$RUNNER_TEMP/url" && break; sleep 0.2; done
+          export AISQUARE_RELEASES_URL="$(cat "$RUNNER_TEMP/url")"
+          rlx daemon install
+          rlxd serve --detach
+          echo "rlx $V; rlxd $(rlxd status --json | jq -r .data.version)"
+
+          # 4.1 and 7.8: the check counts rlxd, and keeps every key the app reads.
+          rlx --json upgrade --check > check.json
+          jq -e '.daemons | map(.kind) | index("rlxd") != null' check.json
+          jq -e '(["current","latest","update_available","live_agents","remote","asqs","launchers","commands_taken","daemons","runs_in_flight","ptys"] - keys) == []' check.json
+
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Without --restart-daemons, a running daemon refuses the upgrade.
+            set +e; rlx upgrade --yes --json-lines > up.jsonl; code=$?; set -e
+            cat up.jsonl; test "$code" = 1
+            jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "daemon_running"' up.jsonl
+            jq -c . up.jsonl > /dev/null
+            exit 0
+          fi
+
+          # dist2: the tree stamped $V+upgrade, a wheel and this host's rlxd archive.
+          W="$V+upgrade"
+          uv run --locked --extra dev python - "$W" <<'EOF'
+          import re, sys
+          from pathlib import Path
+          version = sys.argv[1]
+          for path, pattern in (("pyproject.toml", r'(?m)^version = "[^"]+"'),
+                                ("rlxd/Cargo.toml", r'(?m)^version = "[^"]+"')):
+              text = Path(path).read_text(encoding="utf-8")
+              text, n = re.subn(pattern, f'version = "{version}"', text, count=1)
+              assert n == 1, path
+              Path(path).write_text(text, encoding="utf-8")
+          EOF
+          uv build --wheel -o "$RUNNER_TEMP/dist2"
+          (cd rlxd && cargo build --release -p rlxd -p rlxd-hook)
+          mkdir -p "$root/v$W"
+          uv run --locked --extra dev python scripts/rlxd_archive.py pack --target "$TARGET" \
+            --bin-dir rlxd/target/release --out "$root/v$W"
+          uv run --locked --extra dev python scripts/rlxd_archive.py sums --dir "$root/v$W"
+          (cd rlxd && cargo build --release -p rlxd --features fake-claude --bin fake-claude)
+          fc="$RUNNER_TEMP/fake-claude"; mkdir -p "$fc"; cp rlxd/target/release/fake-claude "$fc/slow"
+          git checkout -- pyproject.toml rlxd/Cargo.toml rlxd/Cargo.lock
+          export AISQUARE_INSTALL_PACKAGE="$(ls "$RUNNER_TEMP"/dist2/*.whl)"
+
+          # 4.2: the upgrade with --restart-daemons ends upgrade.done, rlxd restarted at
+          # the new version with a new pid.
+          OLD_PID=$(rlxd status --json | jq .data.pid)
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; echo "$code"; test "$code" = 0
+          jq -s -e 'length > 0 and .[-1].type == "upgrade.done" and (.[-1].data.restarted | index("rlxd") != null)' up.jsonl
+          rlxd status --json | jq -e --arg v "$(rlx --version | awk '{print $2}')" --argjson p "$OLD_PID" '.data.version == $v and .data.pid != $p and .data.pid > 0'
+          test "$(rlx --version | awk '{print $2}')" = "$W"
+          [ "$(jq -c . up.jsonl | wc -l)" -eq "$(wc -l < up.jsonl)" ]
+
+          # PTYs: a live one refuses a restart (ptys_live), and --end-ptys lets it go.
+          rlxd call pty.spawn '{"argv":["sh","-c","sleep 300"],"cols":80,"rows":24}'
+          rlx --json upgrade --check | jq -e '.ptys | length == 1'
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "ptys_live"' up.jsonl
+          rlx upgrade --yes --restart-daemons --end-ptys --json-lines > up.jsonl
+          cat up.jsonl
+
+          # Runs in flight: a fake-claude/slow run (30 s) refuses (runs_in_flight), and
+          # --wait-runs 1 waits for it to end.
+          rlxd stop
+          RLXD_CLAUDE_BIN="$fc/slow" FAKE_CLAUDE_SLOW_MS=30000 rlxd serve --detach
+          run=$(uv run --locked --extra dev python -c 'import uuid; print(uuid.uuid4())')
+          rlxd call run.start "{\"run_id\":\"$run\",\"kind\":\"task\",\"prompt\":\"go\",\"mount\":{\"kind\":\"no_tools\"},\"space\":\"default\"}"
+          for _ in $(seq 50); do
+            rlxd call run.get "{\"run_id\":\"$run\"}" | jq -e '.data.state == "running"' > /dev/null && break
+            sleep 0.2
+          done
+          rlx --json upgrade --check | jq -e '.runs_in_flight | length == 1'
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].data.code == "runs_in_flight"' up.jsonl
+          rlx upgrade --yes --restart-daemons --wait-runs 1 --json-lines > up.jsonl
+          cat up.jsonl
+          rlxd call run.get "{\"run_id\":\"$run\"}" | jq -e '.data.state == "done"'
 
   attach:
     name: attach to the release

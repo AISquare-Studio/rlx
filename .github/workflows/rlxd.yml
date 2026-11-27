@@ -25,6 +25,9 @@ on:
       - "src/aisquare/core/locking.py"
       - "src/aisquare/core/registry.py"
       - "tests/test_daemon_registry.py"
+      - "src/aisquare/services/upgrade_daemons.py"
+      - "tests/test_upgrade_daemons.py"
+      - "tests/fake_rlxd.py"
   push:
     branches: [main, "rc/**"]
   workflow_dispatch:
