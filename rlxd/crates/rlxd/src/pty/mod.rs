@@ -16,7 +16,7 @@
 //! - **`pty.kill`** sends SIGHUP and SIGTERM to the process's whole group, SIGKILL to
 //!   what is left after two seconds, and returns once the group is gone. A process that
 //!   left the group itself is not ended, as under tmux.
-//! - **Limits:** [`MAX_PTYS`] PTYs a home, the exited ones included, and
+//! - **Limits:** [`MAX_PTYS`] PTYs a home, the exited ones included ([`max_ptys`]), and
 //!   [`SCROLLBACK`] lines of history each.
 
 pub mod env;
@@ -52,6 +52,35 @@ use crate::vt::Terminal;
 /// The most PTYs a home holds, live and exited.
 pub const MAX_PTYS: usize = 64;
 
+/// The most PTYs this rlxd's home holds: [`MAX_PTYS`]. A test build takes a smaller
+/// `RLXD_TEST_MAX_PTYS` (1 to [`MAX_PTYS`]), so the check of the cap needs no 64
+/// pseudo-terminals at once on a shared machine.
+pub fn max_ptys() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| limit(test_max_ptys().as_deref()))
+}
+
+/// The limit `named` asks for, when it is a number from 1 to [`MAX_PTYS`]; else
+/// [`MAX_PTYS`].
+fn limit(named: Option<&str>) -> usize {
+    named
+        .and_then(|n| n.parse().ok())
+        .filter(|n| (1..=MAX_PTYS).contains(n))
+        .unwrap_or(MAX_PTYS)
+}
+
+/// Test builds only: `RLXD_TEST_MAX_PTYS`.
+#[cfg(feature = "debug-methods")]
+fn test_max_ptys() -> Option<String> {
+    std::env::var("RLXD_TEST_MAX_PTYS").ok()
+}
+
+/// A release build holds [`MAX_PTYS`].
+#[cfg(not(feature = "debug-methods"))]
+fn test_max_ptys() -> Option<String> {
+    None
+}
+
 /// The lines of history each PTY keeps, as the fleet's tmux does (`history-limit`).
 pub const SCROLLBACK: u32 = MAX_PTY_SCROLLBACK;
 
@@ -70,7 +99,7 @@ const READ_CHUNK: usize = 32 << 10;
 /// Why a PTY call was refused.
 #[derive(Debug)]
 pub enum Refused {
-    /// The home holds [`MAX_PTYS`] already.
+    /// The home holds [`max_ptys`] already.
     TooMany,
     /// No PTY has that id.
     Unknown(String),
@@ -252,7 +281,7 @@ impl Host {
     /// Starts `params.argv` on a new PTY, for `who`, as logged.
     pub fn spawn(&self, params: &PtySpawnParams, who: &str) -> Result<PtyRef, Refused> {
         let mut ptys = self.ptys();
-        if ptys.len() >= MAX_PTYS {
+        if ptys.len() >= max_ptys() {
             return Err(Refused::TooMany);
         }
         let cwd = match &params.cwd {
@@ -895,6 +924,16 @@ fn home_dir() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_limit_is_64_unless_a_test_build_asks_for_fewer() {
+        assert_eq!(MAX_PTYS, 64);
+        assert_eq!(limit(None), MAX_PTYS);
+        assert_eq!(limit(Some("4")), 4);
+        for named in ["0", "65", "-1", "x", ""] {
+            assert_eq!(limit(Some(named)), MAX_PTYS, "{named:?}");
+        }
+    }
 
     #[test]
     fn base64_goes_there_and_back() {

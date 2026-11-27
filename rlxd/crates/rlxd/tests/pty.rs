@@ -217,8 +217,37 @@ fn counter_argv() -> Value {
 }
 
 /// The highest count on `id`'s screen, 0 before the first.
+/// Waits up to a minute for PTY `id` to count past `after`: a shared Windows runner may
+/// take more than `eventually`'s 10 s to start PowerShell (#2794). Fails showing what the
+/// PTY printed, and whether it ended.
+fn counts_past(home: &TestHome, id: &str, after: u64, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let shown = screen(home, id);
+        let counted = count_in(&shown);
+        if counted > after {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never: {what} (past {after} within 60 s): its screen {:?}, exited {}, \
+             status {}, signal {}, error {}",
+            shown["text"],
+            shown["exited"],
+            shown["status"],
+            shown["signal"],
+            shown["error"]
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn count(home: &TestHome, id: &str) -> u64 {
-    let shown = screen(home, id);
+    count_in(&screen(home, id))
+}
+
+/// The highest `tick <n>` on `shown`, a `pty.screen` reply.
+fn count_in(shown: &Value) -> u64 {
     shown["text"]
         .as_str()
         .unwrap()
@@ -248,7 +277,7 @@ fn a_panic_in_one_ptys_screen_model_ends_that_pty_alone() {
             &home,
             json!({"argv": counter_argv(), "cols": 80, "rows": 24}),
         );
-        eventually("it counts", || count(&home, &id) > 0);
+        counts_past(&home, &id, 0, &format!("{at}: it counts"));
         let run = call(&home, "debug.pty_panic", &json!({"pty_id": id, "at": at}));
         assert_eq!(run.code(), Some(0), "{at}: {run:?}");
         match at {
@@ -286,9 +315,12 @@ fn a_panic_in_one_ptys_screen_model_ends_that_pty_alone() {
         // The same rlxd goes on, and so does the other PTY: its output, screen and size.
         assert_eq!(home.status()["pid"], pid, "{at}");
         let before = count(&home, &bystander);
-        eventually("the other pty counts on", || {
-            count(&home, &bystander) > before
-        });
+        counts_past(
+            &home,
+            &bystander,
+            before,
+            &format!("{at}: the other pty counts on"),
+        );
         let resize = json!({"pty_id": bystander, "cols": 81, "rows": 24});
         assert_eq!(call(&home, "pty.resize", &resize).code(), Some(0), "{at}");
         assert!(screen(&home, &bystander)["error"].is_null(), "{at}");
@@ -845,24 +877,31 @@ fn rlxd_call_prints_a_pty_stream() {
 }
 
 #[test]
-fn a_home_holds_at_most_64_ptys_exited_ones_included() {
-    let home = TestHome::new();
+fn a_home_holds_at_most_its_limit_of_ptys_exited_ones_included() {
+    // The limit is 64 (a unit test pins it). Here a test build's smaller one, so the
+    // check never needs 64 pseudo-terminals at once on a shared runner (#2853).
+    const LIMIT: usize = 4;
+    let home = TestHome::new().with_env("RLXD_TEST_MAX_PTYS", &LIMIT.to_string());
     home.start();
     let argv = if cfg!(windows) {
         json!(["cmd", "/c", "exit 0"])
     } else {
         json!(["true"])
     };
-    let ids: Vec<String> = (0..64)
+    let ids: Vec<String> = (0..LIMIT)
         .map(|_| spawn(&home, json!({"argv": argv, "cols": 20, "rows": 5})))
         .collect();
+    // Exited ones count.
+    for id in &ids {
+        eventually("it exits", || screen(&home, id)["exited"] == true);
+    }
     let refused = call(
         &home,
         "pty.spawn",
         &json!({"argv": argv, "cols": 20, "rows": 5}),
     );
     assert_eq!(refused.error_code(), "too_many_ptys", "{refused:?}");
-    assert_eq!(refused.json()["error"]["detail"], json!({"max": 64}));
+    assert_eq!(refused.json()["error"]["detail"], json!({"max": LIMIT}));
     assert_eq!(
         call(&home, "pty.kill", &json!({"pty_id": ids[0]})).code(),
         Some(0)

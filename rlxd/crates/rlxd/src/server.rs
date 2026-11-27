@@ -2201,10 +2201,10 @@ fn pty_refused(refused: pty::Refused) -> ErrorBody {
     match refused {
         pty::Refused::TooMany => {
             let mut detail = Data::new();
-            detail.insert("max".to_owned(), Value::from(pty::MAX_PTYS));
+            detail.insert("max".to_owned(), Value::from(pty::max_ptys()));
             error(
                 codes::TOO_MANY_PTYS,
-                &format!("the home holds {} ptys, the most it may", pty::MAX_PTYS),
+                &format!("the home holds {} ptys, the most it may", pty::max_ptys()),
             )
             .with_hint("pty.kill one first: an exited pty counts until it is killed.")
             .with_detail(detail)
