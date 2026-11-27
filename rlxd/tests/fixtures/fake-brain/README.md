@@ -18,6 +18,7 @@ variables, is longer.
 | `accepts-then-dies` | Accepts its first request, then dies before it answers: the request failed, and was not "never delivered" |
 | `accepts-unterminated` | Writes its first request's `accepted` without the line's end, then stalls: rlxd's accept wait ends with it unread, and after the kill it is read, so the request timed out and was not "never delivered" |
 | `spawns-child` | Starts a child that would run five minutes (its pid in `$AISQUARE_HOME/fake-brain-child.pid`), then says a good hello: rlxd's stop must end the child with it |
+| `print-env` | Says a good hello, then answers each request with its pid and the `CLAUDE_CONFIG_DIR` it was started with (4.3). Once it has accepted a request it touches `$AISQUARE_HOME/fake-brain-busy`, and holds the reply while `$AISQUARE_HOME/fake-brain-hold` exists: a check changes the app's environment while a request runs |
 
 The checks that need a brain that works run the real `rlx brain --stdio` of the checkout
 (`uv run`), as `tests/brain.rs` says.

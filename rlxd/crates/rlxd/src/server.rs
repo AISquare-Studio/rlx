@@ -202,8 +202,10 @@ enum Frame {
 
 impl Daemon {
     /// An rlxd serving `home` with `token`, whose gate is `gate`, publishing on `bus`,
-    /// serving `settings`, and asking `brain`.
+    /// serving `settings` and the app's environment `env`, and asking `brain`, which runs
+    /// with `env`.
     /// `pipe_acl` is what `status` says of the pipe's DACL, on Windows.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         home: Home,
         token: String,
@@ -211,9 +213,9 @@ impl Daemon {
         gate: Gate,
         bus: Bus,
         settings: Settings,
+        env: Arc<Env>,
         brain: Arc<Brain>,
     ) -> Arc<Self> {
-        let env = Arc::new(Env::open(&home));
         let bus = Arc::new(bus);
         let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
         let gate = Arc::new(gate);

@@ -10,6 +10,8 @@
 //! - **`claude`.** It is resolved on the app's `PATH` ([`claude::resolve_on`]) when a
 //!   change is taken in and when rlxd starts, and kept: a run starts that absolute path,
 //!   never one looked up at its start.
+//! - **The brain** hears of each change that alters the values ([`Env::subscribe`]), and
+//!   is started again with them once no request runs (`crate::brain`).
 //! - **An unreadable file** (not JSON, a key this rlxd doesn't know, a value too long) is
 //!   moved aside to `env.json.unreadable-<time>`, logged, and rlxd starts with no values,
 //!   as the settings do. One that can't be moved aside either freezes the values: every
@@ -22,6 +24,7 @@ use std::sync::Mutex;
 
 use rlxd_client::Home;
 use rlxd_proto::{EnvChange, EnvValues};
+use tokio::sync::watch;
 
 use crate::claude::{self, Resolved, Source};
 use crate::log::{error, info};
@@ -36,6 +39,8 @@ pub struct Env {
     state: Mutex<State>,
     /// Why every change is refused: the file could not be read at start, nor moved aside.
     frozen: Option<String>,
+    /// The values, for what must hear of a change: the brain, which runs with them.
+    changes: watch::Sender<EnvValues>,
 }
 
 struct State {
@@ -80,9 +85,16 @@ impl Env {
         info!("env: {}; claude: {}", describe(&values), shown(&claude.0));
         Self {
             path,
+            changes: watch::Sender::new(values.clone()),
             state: Mutex::new(State { values, claude }),
             frozen,
         }
+    }
+
+    /// The values now, and each change to them from here on: what the brain runs with
+    /// (`crate::brain`).
+    pub fn subscribe(&self) -> watch::Receiver<EnvValues> {
+        self.changes.subscribe()
     }
 
     /// The values now.
@@ -97,7 +109,8 @@ impl Env {
     }
 
     /// Applies `change`, already checked, for `who`: the file first, then the values, and
-    /// `claude` resolved again. The values now.
+    /// `claude` resolved again, and [`Env::subscribe`]'s receivers told when the values
+    /// differ. The values now.
     pub fn set(&self, change: &EnvChange, who: &str) -> Result<EnvValues, Unchanged> {
         if let Some(why) = &self.frozen {
             return Err(Unchanged::Frozen(why.clone()));
@@ -110,6 +123,13 @@ impl Env {
         })?;
         state.claude = resolve(&values);
         state.values = values.clone();
+        self.changes.send_if_modified(|now| {
+            let differ = *now != values;
+            if differ {
+                now.clone_from(&values);
+            }
+            differ
+        });
         let named: Vec<&str> = change.keys().map(String::as_str).collect();
         info!(
             "env: {who} set {}; now {}; claude: {}",
@@ -236,6 +256,25 @@ mod tests {
             let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_subscriber_hears_each_change_that_alters_the_values_and_only_those() {
+        let dir = dir("subscribed");
+        let env = Env::open_at(dir.join(FILE));
+        let mut heard = env.subscribe();
+        assert_eq!(*heard.borrow_and_update(), EnvValues::default());
+        env.set(&change(json!({"CLAUDE_CONFIG_DIR": "cc-brain"})), "test")
+            .unwrap();
+        assert!(heard.has_changed().unwrap());
+        let now = heard.borrow_and_update().clone();
+        assert_eq!(now.claude_config_dir.as_deref(), Some("cc-brain"));
+        assert_eq!(now, env.values());
+        // The same value again changes nothing, and is not heard.
+        env.set(&change(json!({"CLAUDE_CONFIG_DIR": "cc-brain"})), "test")
+            .unwrap();
+        assert!(!heard.has_changed().unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
 

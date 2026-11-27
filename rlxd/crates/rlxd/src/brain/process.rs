@@ -19,6 +19,7 @@
 //!   group is killed, then reaps it; nothing signals the group after that, as its id may
 //!   be another's by then. [`Process::exit`] says when it has ended, and how.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -78,7 +79,7 @@ impl Process {
         program: &Path,
         args: &[&str],
         cwd: &Path,
-        env: &[(String, String)],
+        env: &[(OsString, OsString)],
         log: Arc<Mutex<LogFile>>,
     ) -> io::Result<Self> {
         let mut command = Command::new(program);
