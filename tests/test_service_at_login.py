@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import stat
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -30,8 +31,10 @@ from aisquare.cli.ui.views import start_at_login
 from aisquare.cli.ui.views.app_settings import PREFERENCES_TAB
 from aisquare.core import paths
 from aisquare.core.config import load_config
+from aisquare.core.version import PRODUCT_NAME
 from aisquare.services import install_route, lifecycle, service_host, service_login
 from tests.conftest import LoginOs
+from tests.fsperms import can_deny_reads
 from tests.test_ui_app_settings import AppHost, drive
 
 REAL_ENTRY_POINT = service_login.entry_point
@@ -1284,3 +1287,207 @@ def test_a_reinit_with_no_service_of_a_broken_file_says_it_changed_nothing(
 
     assert again.exit_code == 0, again.output
     assert "--no-service changed nothing there" in again.output, again.output
+
+
+# --- tester of #33, round 4 (#2877): KEPT-1, NEW-1, and the NIT ----------------------------------
+
+DENIES_READS = pytest.mark.skipif(
+    not can_deny_reads(), reason="chmod(0) denies nothing here (root, or NTFS where it is advice)"
+)
+
+
+@DENIES_READS
+@pytest.mark.parametrize("how", ["removed-in-the-os", "no-service"])
+def test_a_reinit_of_a_config_its_owner_cannot_read_keeps_the_item_away(
+    tmp_path: Path, login_os: LoginOs, how: str
+) -> None:
+    """KEPT-1, #2877's repro: --reinit --yes over a ``chmod 000`` config.toml wrote its defaults
+    at 000, so nothing was recorded, and once the person fixed the mode the next init added back
+    the item they had taken away. The defaults are written readable, with the choice as the OS
+    has it."""
+    project = tmp_path / "project"
+    project.mkdir()
+    if how == "removed-in-the-os":
+        _rlx("service", "install")
+        _plist().unlink()
+    else:
+        _init(project, "--no-service")
+    config = paths.config_path()
+    config.chmod(0)
+    login_os.calls.clear()
+
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(project))
+    still = _init(project)
+    config.chmod(0o600)  # the person repairs the mode
+    later = _init(project)
+
+    assert again.exit_code == 0, again.output
+    said = "login item was left as it is: config.toml cannot be read (PermissionError"
+    assert said in again.output, again.output
+    assert still.exit_code == 0 and later.exit_code == 0, still.output + later.output
+    assert _choice() is False
+    assert not _plist().exists() and login_os.changes() == []
+
+
+@DENIES_READS
+def test_reinit_writes_its_defaults_readable_over_a_file_its_owner_cannot_read(
+    tmp_path: Path,
+) -> None:
+    _init(tmp_path / "project", "--no-service")
+    config = paths.config_path()
+    config.chmod(0)
+
+    again = _rlx("init", "--reinit", "--yes", "--local", "--no-onboard", str(tmp_path / "project"))
+
+    assert again.exit_code == 0, again.output
+    assert stat.S_IMODE(config.stat().st_mode) & stat.S_IRUSR
+    assert service_login.config_unreadable() is None
+
+
+def _a_named_homes_item(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
+    """A named home's agent beside the default home's, made as its own install makes it."""
+    monkeypatch.setattr(service_login, "_named_home", lambda: Path("/srv/scratch-home"))
+    service_login.register_at_login()
+    found = service_login.item_path("launchd"), service_login.label()
+    monkeypatch.setattr(service_login, "_named_home", lambda: None)
+    return found
+
+
+@DENIES_READS
+@pytest.mark.parametrize("whose", ["this-homes", "a-named-homes"])
+def test_a_move_back_takes_away_an_item_whose_file_cannot_be_read(
+    login_os: LoginOs, monkeypatch: pytest.MonkeyPatch, whose: str
+) -> None:
+    """NEW-1: reading each item to put it back raised a bare PermissionError on a ``chmod 000``
+    plist, out of the move back. It is taken away all the same, with nothing to put back."""
+    named, named_label = _a_named_homes_item(monkeypatch)
+    service_login.register_at_login()
+    locked = _plist() if whose == "this-homes" else named
+    locked.chmod(0)
+    login_os.calls.clear()
+
+    said, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
+
+    assert said == "the rlx service no longer starts at login: 0.10.1 has no rlx service"
+    assert not _plist().exists() and not named.exists()
+    assert ("launchctl", "bootout", TARGET) in login_os.calls
+    assert ("launchctl", "bootout", f"{DOMAIN}/{named_label}") in login_os.calls
+    assert taken is not None
+    assert [item.body is None for item in taken.items if item.path == locked] == [True]
+
+
+@DENIES_READS
+def test_a_failed_move_back_says_which_unreadable_item_it_could_not_put_back(
+    login_os: LoginOs,
+) -> None:
+    """NEW-1, put back: one it never read cannot be; this home's ON choice stays forgotten, so
+    its next init adds the item again rather than read it as removed in the OS."""
+    service_login.register_at_login()
+    _plist().chmod(0)
+    _, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
+    login_os.calls.clear()
+
+    said = lifecycle._put_the_login_items_back(service_login, taken)
+
+    assert said is not None and ", which could not be" in said, said
+    assert paths.shown(_plist()) in said
+    assert not _plist().exists() and _choice() is None
+    assert login_os.changes() == []
+
+
+@DENIES_READS
+def test_rlx_uninstall_takes_away_an_item_whose_file_cannot_be_read(
+    login_os: LoginOs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NEW-1, ``rlx uninstall``'s step: a PermissionError out of it was no refusal the CLI
+    catches, after the service was stopped."""
+    monkeypatch.setattr(service_host, "stop_service", lambda **_: True)
+    service_login.register_at_login()
+    _plist().chmod(0)
+
+    lifecycle._stop_the_service_for_good()
+
+    assert not _plist().exists()
+    assert ("launchctl", "bootout", TARGET) in login_os.changes()
+
+
+def test_rlx_uninstall_refuses_on_an_os_error_taking_the_item_away(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whatever ``OSError`` gets out of taking the item away is the refusal the CLI says."""
+
+    def forget() -> service_login.Taken:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(service_host, "stop_service", lambda **_: True)
+    monkeypatch.setattr(service_login, "forget_at_login", forget)
+
+    with pytest.raises(lifecycle.UninstallRefused) as refused:
+        lifecycle._stop_the_service_for_good()
+
+    assert refused.value.error == "service_at_login"
+
+
+def test_an_item_that_stays_keeps_what_was_taken_so_it_can_be_put_back(
+    login_os: LoginOs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The NIT: a named home's file that would not go raised after this home's item was gone,
+    so nothing was kept to put back after a failed move. What was taken is kept, every other
+    item still goes, and a put back restores this home's item, its ON choice and the one it
+    booted out."""
+    named, named_label = _a_named_homes_item(monkeypatch)
+    service_login.register_at_login()
+    mine = _plist().read_bytes()
+    unlink = Path.unlink
+
+    def stays(path: Path, missing_ok: bool = False) -> None:
+        if path == named:
+            raise PermissionError(13, "Permission denied", str(path))
+        unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", stays)
+    login_os.calls.clear()
+
+    said, taken = lifecycle._no_login_item_for(service_login, "0.10.1")
+
+    assert said is not None and "could not be taken away (could not remove" in said, said
+    assert (
+        taken is not None
+        and taken.forgot
+        and {item.path for item in taken.items}
+        == {
+            _plist(),
+            named,
+        }
+    )
+    assert not _plist().exists() and named.exists() and _choice() is None
+    assert ("launchctl", "bootout", f"{DOMAIN}/{named_label}") in login_os.calls
+    login_os.calls.clear()
+
+    back = lifecycle._put_the_login_items_back(service_login, taken)
+
+    assert (
+        back == "the rlx service's login items, taken away for the move, were put back as they were"
+    )
+    assert _plist().read_bytes() == mine and _choice() is True
+    assert ("launchctl", "bootstrap", DOMAIN, str(_plist())) in login_os.calls
+    assert ("launchctl", "bootstrap", DOMAIN, str(named)) in login_os.calls
+
+
+def test_a_named_homes_unit_that_cannot_be_read_is_taken_for_rlxs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NEW-1 on Linux: telling a unit is rlx's read it, so a ``chmod 000`` one raised. A name
+    this exact is rlx's."""
+    monkeypatch.setattr(service_login, "_platform", lambda: "linux")
+    monkeypatch.setattr(service_login, "_systemd_runs", lambda: True)
+    unit = service_login.systemd_user_dir() / f"{PRODUCT_NAME}-0123abcd.service"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text("[Service]\nExecStart=/opt/rlx service run --at-login\n", encoding="utf-8")
+
+    def unreadable(path: Path) -> bytes:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable)
+
+    assert service_login._every_item("systemd") == [(unit, unit.name)]

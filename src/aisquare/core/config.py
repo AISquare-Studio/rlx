@@ -1822,8 +1822,9 @@ def save_config(
     # recipe gets the retry, not only this one.
     try:
         # keep_mode: a config the operator tightened to 0600 stays 0600 — the
-        # rewrite used to reset it to the umask default.
-        write_replacing(written, payload, keep_mode=True)
+        # rewrite used to reset it to the umask default. But not a mode its owner
+        # cannot read (_a_mode_to_keep).
+        write_replacing(written, payload, keep_mode=_a_mode_to_keep(written))
     except OSError as exc:
         if written == target:
             raise
@@ -1842,6 +1843,19 @@ def save_config(
         except TypeError:  # an OSError subclass with an unusual signature
             raise OSError(exc.errno, detail, str(written)) from exc
     return target
+
+
+def _a_mode_to_keep(written: Path) -> bool:
+    """Whether a rewrite of ``written`` keeps its mode: not one its owner cannot read, which
+    only ``init --reinit --yes`` writes over (``discard_unreadable``). Kept, the defaults it
+    wrote over a ``chmod 000`` file were as unreadable as that file, so whatever reads them
+    next, the login item's choice among them, still could not; and once the mode was fixed, a
+    login item the person had taken away was added back (tester of #33, round 4, KEPT-1).
+    Written as a new file is, at the umask's mode, they can be read."""
+    try:
+        return bool(os.stat(written).st_mode & stat.S_IRUSR)
+    except OSError:
+        return True  # gone since: nothing to keep, and write_replacing knows
 
 
 #: The UTC stamp a reset's backup is named with: ``config.toml.bak-20261014T031700Z``, the

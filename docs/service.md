@@ -151,10 +151,13 @@ home's login item away too, and so does `rlx upgrade` to a release before the se
 and earlier), which has no command for them to run and none to take them away: a choice of on
 whose item was in place and on is forgotten with it, so a later release sets it up again; a choice
 of off, or of on whose item you removed or turned off in the OS, is kept. If that upgrade's
-installer fails, the items are put back as they were. A reset (App settings' *Reset all*, `rlx
-config reset`) or `--reinit` of a `config.toml` that does not parse carries the choice over from
-its text, or, when the text holds none, records the default home's as the OS has it (an item in
-place is on, none is off).
+installer fails, or installs a release that has the service after all, the items are put back
+as they were (but one whose file you could not read, which is taken away all the same: `rlx
+service status` then says how it stands). A reset (App settings' *Reset all*, `rlx config reset`) or `--reinit` of a
+`config.toml` that does not parse carries the choice over from its text, or, when the text holds
+none or cannot be read (`chmod 000`), records the default home's as the OS has it (an item in
+place is on, none is off). `--reinit --yes` writes its defaults readable, never at a mode that
+keeps you out.
 
 `rlx service status` says whether it starts at login, and if not, why.
 

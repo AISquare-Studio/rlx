@@ -1303,6 +1303,11 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     if version is not None and lacks_the_service(version):
         item_said = item_said or _no_login_item_for(service_login, version)[0]
     elif version is not None:
+        if taken is not None:
+            # The installer said yes, but what is in place has the service (a release other
+            # than the one asked for): what was taken away for the move comes back as it was
+            # (reviewer of #33, round 4).
+            item_said = _put_the_login_items_back(service_login, taken) or item_said
         # Only ever refreshed, never made (design #1875), by the install now in place, as its
         # hooks are: a new path to rlx, a new PATH.
         _refresh_the_login_item(plan)
@@ -1350,10 +1355,11 @@ def _no_login_item_for(
     service = service_login.SERVICE
     try:
         taken = service_login.forget_at_login()
-    except service_login.LoginError as exc:
+    except (service_login.LoginError, OSError) as exc:
+        # What was taken away before an item that stayed, kept to put back (NotAllTaken).
         return (
             f"the {service}'s login item could not be taken away ({exc}): {release} has none",
-            None,
+            getattr(exc, "taken", None),
         )
     if not taken.gone:
         return None, taken
@@ -2716,7 +2722,7 @@ def _stop_the_service_for_good() -> None:
         raise UninstallRefused(f"{exc}: nothing was removed", "service_running") from exc
     try:
         service_login.forget_at_login()
-    except service_login.LoginError as exc:
+    except (service_login.LoginError, OSError) as exc:
         raise UninstallRefused(f"{exc}: nothing else was removed", "service_at_login") from exc
 
 
