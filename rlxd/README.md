@@ -8,9 +8,9 @@ brain and the TUI. The plan is `docs/plans/0.10.3-handoff.md`, section 1.
 This is the daemon's core (1.3, 7.2, 7.4), its event bus (1.7, 7.3) and the app gate's
 authentication (5.1): one rlxd per home, on a local socket or a named pipe, a token
 `hello`, the envelope on every reply, `status`, `events.subscribe`, and per-device gate
-credentials with the peer identity check. The PTY host, the runner and the rest arrive
-with later items, each a method on this socket that publishes on the bus. `rlxd-hook`
-answers `--version` only for now.
+credentials with the peer identity check, and the headless runner with its spaces (2.1,
+2.5, 7.5). The PTY host and the rest arrive with later items, each a method on this
+socket that publishes on the bus. `rlxd-hook` answers `--version` only for now.
 
 ```
 rlxd/
@@ -19,6 +19,7 @@ rlxd/
                        call, subscribe
   crates/rlxd/         the daemon: serve, status, stop, call, events, and the bus
   crates/rlxd-hook/    the tiny hook client (`--version` only for now)
+  crates/fake-claude/  the tests' stand-in for Claude Code (a test-only binary)
   schemas/v1/          generated from rlxd-proto and checked in; CI fails on drift
   tests/fixtures/      fake-claude scenarios
 ```
@@ -153,7 +154,9 @@ One numbered stream of events per home (1.7, 7.3), the `crate::bus` module:
   so slowly that the buffer drops events it hasn't read gets one mid-stream. Gaps come
   whatever the topics.
 - **Runs.** Run events also carry `run_seq`, per run. The bus indexes them by run, and
-  a run's replay from the buffer says the home seq to follow on from.
+  a run's replay from the buffer says the home seq to follow on from. The runner writes
+  each run event to the run's log on disk before the bus publishes it: the seq is held
+  meanwhile, and later publishers wait for it, never subscribers.
 - **The buffer** holds the last 10,000 events, at most 64 MiB of them, none older than
   24 hours. One event may be at most 16 MiB, the longest line a client reads.
 - **`events.subscribe {topics?, since?, follow?}`** replays what the buffer holds after
@@ -224,6 +227,59 @@ token reads every one.
   paired, whose credential its `hello` carries. One whose device is unpaired, or whose
   credential is replaced, can no longer change a protected key.
   `crates/rlxd/tests/settings.rs` pairs a device for real, in gate dev mode.
+
+## The runner and spaces
+
+rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.5 and
+7.5), the `crate::runner` and `crate::spaces` modules.
+
+- **`run.start`** (`schemas/v1/run-start.json`) takes the app's `run_id`, a lower-case
+  UUID that is also Claude Code's `--session-id`, and refuses `run_exists`,
+  `kind_mount_mismatch`, `pinned_call_required` and, until 5.5, `not_implemented` for a
+  non-empty `needs_connectors`. Each kind has its own pool (tasks 2, refreshes and
+  watches 1, the rest 2); over it, a run waits as `run.queued {position}`.
+- **The command line** is 2.1's exactly: `-p --output-format stream-json --verbose
+  --input-format stream-json --session-id <run_id> [--no-session-persistence] --tools ""
+  [--strict-mcp-config] [--json-schema …] [--append-system-prompt …]
+  [--include-partial-messages] --settings <home>/rlxd/runs/<run_id>/<attempt>/settings.json
+  --setting-sources project --permission-mode dontAsk`, never `--allowedTools` or `--bare`.
+  Claude Code is resolved to an absolute path when each attempt starts
+  (`RLXD_CLAUDE_BIN`, from rlxd's own environment only, else `claude` on rlxd's `PATH`).
+  Its environment is rlxd's own until 4.3 passes the app's.
+- **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
+  pre-tool-use --run <run_id> --attempt <n>` by the absolute path of the `rlxd-hook`
+  beside rlxd (quoted when it must be; on Windows in forward slashes, always quoted),
+  with a timeout of `deadline_ms / 1000 + 10` s. When rlxd can't name that path,
+  `run.start` refuses `hook_not_found`; it never falls back to a name on `PATH`. The
+  gate's decisions are 5.1's; until then `rlxd-hook` denies every call.
+- **Stdin stays open**: the prompt is a stream-json user message, and stdin closes only
+  after the `result`. Each stream-json line becomes `run.started`, `run.text` (and
+  partial chunks under `partial`), `run.tool_result` (content up to 1 MiB, then
+  `truncated`), `run.rate_limited`, `run.done` or `run.failed {reason}`. Types and fields
+  rlxd doesn't know are ignored. A line over 16 MiB fails the run (`line_too_long`)
+  without rlxd holding it, and a result or structured output over 1 MiB fails it
+  (`output_too_large`), so a run always gets its end.
+- **The process tree.** On macOS and Linux Claude Code runs under a guard, the hidden
+  `rlxd __run-guard`: Claude Code leads a process group of its own, and the guard kills
+  that group when Claude Code exits (what it left running goes with it), when rlxd tells
+  it to (cancel, timeout), and when rlxd dies (it checks its parent every 100 ms; on Linux
+  its parent-death signal too). It kills the group only while Claude Code is unreaped,
+  so the group's id can't be another's, and it exits as Claude Code did, a signal
+  included. On Windows Claude Code is started suspended inside a Job Object with
+  `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
+  "engine_restarted"}`.
+- **The log** of each run is `<home>/rlxd/runs/<run_id>/`: `run.json`, rewritten whole and
+  durably, and `events.jsonl`, each event as published. The runner numbers each run's
+  events itself, under that run's own lock: an event that changes the run's state
+  (`run.started`, `run.needs_you`, each end) is written into `run.json`, after the log so
+  far is fsynced, before it is published; any other event is published, then appended,
+  and fsynced with the run's next state event or every 64. No fsync happens under the
+  bus's lock or the runner's, so a slow disk under one run holds up no other run and no
+  other topic.
+- **Spaces.** `space.ensure {name}` makes `<home>/spaces/<name>/` with an empty project
+  `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
+  not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
+  separator, no `..` and no leading dot.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 
@@ -427,7 +483,18 @@ brief, §3). Nothing listens on a TCP port, on the host or on the device.
   local`: no remote forwards of either kind, and no listening.
 - **An rlxd that does not run** shows through the channel as a connection that closes
   before `hello`'s reply: sshd could not connect to the socket, and ssh says `connect
-  failed`. Run `rlxd here --start` first, and again when a connection closes.
+  failed`. Run `rlxd here --start` first, and again when a connection closes. An sshd
+  that refuses socket forwarding closes the channel the same way. So when a connection
+  through `--socket` closes without a whole reply to `hello`, `rlxd call` and `rlxd
+  events` say `disconnected` (exit 1), with a hint naming both likely causes: the host's
+  rlxd isn't running, or its sshd doesn't allow socket forwarding. A close after
+  `hello`'s reply is rlxd's own, and a plain `disconnected` with no such hint. When
+  nothing listens at `--socket` at all, as when the forward is down, it is
+  `not_running` (exit 3), with a hint to check the forward.
+- **A missing token.** With `--socket` or `--token-file`, a token file that can't be
+  read is `unauthorized` (exit 1), from `rlxd call` and `rlxd events` alike, whatever
+  runs in this home: each reads the token before it connects. Only the home's own token
+  file, missing where no rlxd runs, reads as `not_running`.
 - **The gate** checks a forwarded connection as it checks any other, on the short socket
   too: the token, then for the app role the credential and the peer. A forwarded
   connection's peer is sshd, not rlx's app, so outside gate dev mode it can neither pair

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpaceEnsureData",
+  "description": "`space.ensure`'s reply: the space's folder, made if it was not there.\n\n```json\n{\"name\": \"default\", \"path\": \"/Users/u/.aisquare/spaces/default\"}\n```\n\nThe folder is the runs' working directory. It holds an empty project\n`.claude/settings.json`, so that `--setting-sources project` has a project, and\nnothing else of rlxd's: it is not a git repository and not an onboarded project.\n`path` is absolute and resolved, as the runs' Claude Code reports its `cwd`.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "description": "The space.",
+      "type": "string"
+    },
+    "path": {
+      "description": "Its folder.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "path"
+  ]
+}

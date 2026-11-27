@@ -20,6 +20,10 @@
 //!   installed, whether its rlxd runs, and the protocol versions it serves;
 //! - [`DaemonRecord`] (4.1): one non-UI rlx process in `<home>/daemons/`, a file that
 //!   Python's registry and rlxd both write and read;
+//! - the runner (2.1, 5.4, 7.5): [`RunStartParams`], [`RunRef`], [`RunCancelData`], and
+//!   each run event's `data` ([`RunStartedData`], [`RunTextData`], [`RunDoneData`], …),
+//!   which `run-event-list.json` ([`RunEvent`]) holds a run's stream to;
+//! - spaces (2.5): [`SpaceParams`], [`SpaceEnsureData`] and [`SpaceEraseData`];
 //! - [`BrainInput`] and [`BrainOutput`] (1.6): the frames rlxd and its resident Python
 //!   brain, `rlx brain --stdio`, write to each other. That protocol is internal to one rlx
 //!   release, and versioned on its own ([`BRAIN_PROTOCOL`]);
@@ -190,8 +194,10 @@ mod here;
 mod hook;
 mod marker;
 mod request;
+mod run;
 pub mod schemas;
 mod settings;
+mod space;
 mod status;
 mod subscribe;
 
@@ -209,12 +215,22 @@ pub use hook::{
 };
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
+pub use run::{
+    ConnectorStatus, DEFAULT_DEADLINE_MS, FailReason, McpServer, Mount, NeedsYouReason,
+    NeedsYouWhen, PinnedCall, RunCancelData, RunDoneData, RunEvent, RunFailedData, RunId, RunKind,
+    RunNeedsYouData, RunQueuedData, RunRateLimitedData, RunRef, RunStartParams, RunStartedData,
+    RunState, RunTextData, RunToolResultData, Usage, run_types,
+};
 pub use settings::{
     MAX_DEPTH as MAX_SETTING_DEPTH, MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged,
     SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams,
     check_key as check_setting_key, check_value as check_setting_value,
     check_value_to_write as check_setting_value_to_write, is_protected as setting_is_protected,
     keys as setting_keys, send_safety_lowers, send_safety_modes,
+};
+pub use space::{
+    DEFAULT_SPACE, MAX_SPACE_NAME, SPACE_NAME_PATTERN, SpaceEnsureData, SpaceEraseData,
+    SpaceParams, check_name as check_space_name,
 };
 pub use status::{Brain, Claude, Clients, Jobs, Paths, Runs, StatusData};
 pub use subscribe::SubscribeParams;
