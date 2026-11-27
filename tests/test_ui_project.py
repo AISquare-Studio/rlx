@@ -2576,20 +2576,23 @@ def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_
     report (``show_project``, the store's project) already held the new name, so the one Undo
     wrote the new name again and the first ctrl+z did nothing. It is taken as the save is asked
     now. The save is held after its write by a gate, the frame lands, then the save is let go:
-    one ctrl+z puts the OLD name back, on disk and shown."""
+    one ctrl+z puts the OLD name back, on disk and shown. Undo's own save is held the same way,
+    with a frame in its window too: its line names the codename it replaced, from the project
+    as it was asked, not the frame's (tester #3362, m1)."""
     from aisquare.core.store import store_session
     from tests.fleet_fakes import tmux_sessions_as
 
     tmux_sessions_as(monkeypatch)
     real_rename = fleet_service.rename_project
-    written = threading.Event()
-    let_go = threading.Event()
+    gates = {name: (threading.Event(), threading.Event()) for name in ("Auth", None)}
+    written, let_go = gates["Auth"]  # the save; gates[None] is its Undo's, back to no nickname
 
     def slowed(target: ProjectInfo, nickname: str | None, **kwargs: Any) -> ProjectInfo:
         renamed = real_rename(target, nickname, **kwargs)
-        if nickname == "Auth":  # the save under test; its Undo's goes straight through
-            written.set()
-            let_go.wait(timeout=10)
+        if nickname in gates:
+            its_written, its_let_go = gates[nickname]
+            its_written.set()
+            its_let_go.wait(timeout=10)
         return renamed
 
     monkeypatch.setattr(fleet_service, "rename_project", slowed)
@@ -2621,17 +2624,28 @@ def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_
         field.focus()  # ctrl+z reaches the page from its field
         await pilot.pause()
         await pilot.press("ctrl+z")
+        undo_written, undo_let_go = gates[None]
+        for _ in range(500):
+            if undo_written.is_set():
+                break
+            await pilot.pause(0.01)
+        page.show_project(from_store())  # a frame in the Undo's window too: codename back
+        await pilot.pause()
+        undo_let_go.set()
         await settle(pilot)
         seen["undone"] = (from_store().nickname, field.value, len(page.changes))
+        seen["said"] = [m for m, _ in host.notices if "shows its folder name again" in m]
         return seen
 
     try:
         seen = drive(project, scenario)
     finally:
-        let_go.set()  # never a worker left waiting
+        for _written, its_let_go in gates.values():
+            its_let_go.set()  # never a worker left waiting
     assert seen["framed"] == (True, "Auth"), "the premise: the frame held the new name"
     assert seen["kept"] == ("Auth", 1), seen["kept"]
     assert seen["undone"] == (None, "", 0), "one ctrl+z: the old name, on disk and shown"
+    assert [m for m in seen["said"] if m.endswith("(was auth)")], seen["said"]
 
 
 def test_a_save_superseded_before_its_report_is_heard_records_no_undo_and_keeps_nothing(
