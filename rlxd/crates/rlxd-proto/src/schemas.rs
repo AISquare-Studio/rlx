@@ -9,11 +9,13 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, PtyExited, PtyKillParams,
-    PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
-    PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunEvent, RunEventsData,
-    RunEventsParams, RunGetData, RunListData, RunListParams, RunRef, RunResumeData,
-    RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
+    ConnectorChanged, ConnectorId, ConnectorLoginDone, ConnectorLoginError, ConnectorLoginOpenUrl,
+    ConnectorLoginWaiting, ConnectorsList, ConnectorsListParams, ConnectorsLoginData,
+    ConnectorsLoginParams, DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData,
+    PtyExited, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen,
+    PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RunCancelData,
+    RunEvent, RunEventsData, RunEventsParams, RunGetData, RunListData, RunListParams, RunRef,
+    RunResumeData, RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
     SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, SpaceEnsureData,
     SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
 };
@@ -30,6 +32,16 @@ pub struct SchemaFile {
 /// Every schema file of this schema version, in name order.
 pub fn all() -> Vec<SchemaFile> {
     let mut files = vec![
+        file::<ConnectorChanged>("connector-changed.json"),
+        file::<ConnectorId>("connector-id.json"),
+        file::<ConnectorLoginDone>("connector-login-done.json"),
+        file::<ConnectorLoginError>("connector-login-error.json"),
+        file::<ConnectorLoginOpenUrl>("connector-login-open-url.json"),
+        file::<ConnectorLoginWaiting>("connector-login-waiting.json"),
+        file::<ConnectorsList>("connectors.json"),
+        file::<ConnectorsListParams>("connectors-list.json"),
+        file::<ConnectorsLoginParams>("connectors-login.json"),
+        file::<ConnectorsLoginData>("connectors-login-reply.json"),
         file::<DaemonRecord>("daemon-record.json"),
         file::<Envelope>("envelope.json"),
         file::<Event>("event.json"),

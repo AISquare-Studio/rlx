@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorsListParams",
+  "description": "`connectors.list`'s params: `{refresh?, allow_turn?}`, both `false` when absent.",
+  "type": "object",
+  "properties": {
+    "allow_turn": {
+      "description": "With `refresh`, and no route without a turn: run a one-turn probe for it.",
+      "type": "boolean"
+    },
+    "refresh": {
+      "description": "Read the connectors from Claude Code now, rather than the latest `system/init`.",
+      "type": "boolean"
+    }
+  }
+}

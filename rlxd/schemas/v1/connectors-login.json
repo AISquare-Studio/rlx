@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorsLoginParams",
+  "description": "`connectors.login`'s params: `{id}`, the connector to sign in again.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "The connector, such as `claude.ai Slack`.",
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
+    }
+  },
+  "required": [
+    "id"
+  ]
+}

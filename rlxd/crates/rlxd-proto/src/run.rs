@@ -295,7 +295,6 @@ pub struct NeedsYouWhen {
 /// - `kind_mount_mismatch`: a `check`, `parse_instruction` or `widget_author` run whose
 ///   mount is not `no_tools`;
 /// - `pinned_call_required`: a `send_executor` or `watch` run without `pinned_call`;
-/// - `not_implemented`: a non-empty `needs_connectors`, until the connector gate (5.5);
 /// - `invalid_params`: anything else these rules or the schema refuse.
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[schemars(title = "RunStartParams")]
@@ -311,8 +310,9 @@ pub struct RunStartParams {
     pub prompt: String,
     /// Which tools the run may reach.
     pub mount: Mount,
-    /// The connectors that must be `connected` before the first turn (5.5). Not yet
-    /// served: a non-empty list is refused with `not_implemented`.
+    /// The connectors that must be `connected` before the first turn (5.5): rlxd makes
+    /// up to 3 tries, and ends the run `run.failed {reason: "connectors"}` when they run
+    /// out, or at once when one is `needs-auth` or `failed`.
     #[serde(default)]
     pub needs_connectors: Vec<String>,
     /// A JSON Schema the final output must match (`--json-schema`); `run.done` then
@@ -894,6 +894,16 @@ pub struct ConnectorStatus {
     pub status: String,
 }
 
+impl ConnectorStatus {
+    /// The connector `id`, in `status`.
+    pub fn new(id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: status.into(),
+        }
+    }
+}
+
 /// `run.failed`: the run ended without a result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
@@ -923,6 +933,13 @@ impl RunFailedData {
             partial_text: partial_text.into(),
             connectors: None,
         }
+    }
+
+    /// This failure, naming `connectors`, each not connected, with its status.
+    #[must_use]
+    pub fn with_connectors(mut self, connectors: Vec<ConnectorStatus>) -> Self {
+        self.connectors = Some(connectors);
+        self
     }
 }
 

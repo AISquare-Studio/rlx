@@ -78,6 +78,16 @@ bound both validators agree on.
 | `space.json` | `space.ensure`'s and `space.erase`'s params: `{name}`, 1 to 64 lower-case letters, digits, `-`, `_` and `.`, starting with a letter or digit, no `..`, no `.` at the end, not a Windows device name |
 | `space-ensure-reply.json` | `space.ensure`'s reply: `{name, path}`, the space's folder, absolute and resolved |
 | `space-erase-reply.json` | `space.erase`'s reply: `{removed: [path], links?: [path]}`, `links` being links inside the space removed as links. Every link is listed, under the space's resolved path. Refused whole: `runs_live` (`detail.run_ids`), `erase_in_progress`, `link_refused` (`detail.paths`), and `erase_incomplete` (`detail {removed, failed}`) when some paths stayed |
+| `connectors.json` | `connectors.list`'s reply (5.3, 7.7): `{connectors: [{id, source, status, tools: [{name, read_only_hint}]}], as_of, from, model_turns}`. `status` is `connected`, `needs-auth`, `pending` or `failed`; `read_only_hint` is always there, `true`, `false` or `null`; `as_of` is `null` before any `system/init`; `from` is `init` (or `listing`, with `connectors.no_turn`); `model_turns` is 0, or 1 for a one-turn refresh |
+| `connectors-list.json` | `connectors.list`'s params: `{refresh?, allow_turn?}`. `refresh` without a route that makes no turn is `no_route`, unless `allow_turn` |
+| `connectors-login.json` | `connectors.login`'s params: `{id}`, 1 to 256 bytes with no control character. Refused for `remote` (`role_not_allowed`) |
+| `connectors-login-reply.json` | `connectors.login`'s reply: `{login_id}`, which its `connector.login.*` events carry |
+| `connector-id.json` | `connector.added`'s and `connector.removed`'s data, on the `connector` topic: `{id}` |
+| `connector-changed.json` | `connector.changed`'s data: `{id, status, previous_status}`, once a real change |
+| `connector-login-open-url.json` | `connector.login.open_url`'s data: `{login_id, id, url}`, `url` always `https://` |
+| `connector-login-waiting.json` | `connector.login.waiting`'s data: `{login_id}` |
+| `connector-login-done.json` | `connector.login.done`'s data: `{login_id, id, status}` |
+| `connector-login-error.json` | `connector.login.error`'s data: `{login_id, code, message}`, `code` one of `claude_not_found`, `no_url`, `not_https`, `failed` and `timed_out` |
 
 Validate a document with `uvx check-jsonschema --schemafile rlxd/schemas/v1/<schema> <file>`.
 
