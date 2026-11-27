@@ -372,37 +372,44 @@ impl Daemon {
             let error = error(codes::UNAUTHORIZED, "the token is wrong").with_hint(hint);
             return Err(Envelope::err(error).with_optional_id(id));
         }
-        // env (4.3) is the app's alone: any other hello carrying it is refused, and one
-        // the app sends is checked whole before the gate admits it.
-        let env_change = match &hello.env {
-            None => None,
-            Some(_) if hello.role != Role::App => {
-                info!(
-                    "hello refused: env from {} as {} (not_gate)",
-                    hello.client,
-                    role_name(hello.role)
-                );
-                return Err(Envelope::err(env_not_gate("hello's env")).with_optional_id(id));
-            }
-            Some(env) => match EnvValues::from_map(env) {
-                Ok(change) => Some(change),
-                Err(refusal) => {
-                    info!("hello refused: {refusal}");
-                    return Err(Envelope::err(env_refused(refusal)).with_optional_id(id));
-                }
-            },
-        };
+        // env (4.3) is the app's alone: any other hello carrying it is refused not_gate,
+        // as is an app hello the gate refuses, whatever its env (7.2). The app's is checked
+        // whole once the gate would admit it, and before it takes the gate, so a hello
+        // refused for its env takes no hold.
+        if hello.env.is_some() && hello.role != Role::App {
+            info!(
+                "hello refused: env from {} as {} (not_gate)",
+                hello.client,
+                role_name(hello.role)
+            );
+            return Err(Envelope::err(env_not_gate("hello's env")).with_optional_id(id));
+        }
+        let mut env_change = None;
         let (app, counted) = if hello.role == Role::App {
-            match self.admit_app(&hello, &peer).await {
-                Ok(hold) => (Some(hold), None),
-                Err(message) => {
-                    info!(
-                        "hello refused: role app, from {} ({peer}): {message} (not_gate)",
-                        hello.client
-                    );
-                    let error = error(codes::NOT_GATE, &message).with_hint(NOT_GATE_HINT);
-                    return Err(Envelope::err(error).with_optional_id(id));
+            let not_gate = |message: &str| {
+                info!(
+                    "hello refused: role app, from {} ({peer}): {message} (not_gate)",
+                    hello.client
+                );
+                let error = error(codes::NOT_GATE, message).with_hint(NOT_GATE_HINT);
+                Err(Envelope::err(error).with_optional_id(id))
+            };
+            let credential = match self.vet_app(&hello, &peer).await {
+                Ok(credential) => credential,
+                Err(message) => return not_gate(&message),
+            };
+            if let Some(env) = &hello.env {
+                match EnvValues::from_map(env) {
+                    Ok(change) => env_change = Some(change),
+                    Err(refusal) => {
+                        info!("hello refused: {refusal}");
+                        return Err(Envelope::err(env_refused(refusal)).with_optional_id(id));
+                    }
                 }
+            }
+            match self.gate.attach(credential) {
+                Some(hold) => (Some(hold), None),
+                None => return not_gate("the gate_credential was replaced or unpaired meanwhile"),
             }
         } else {
             let Some(counted) = Counted::new(self, hello.role) else {
@@ -444,8 +451,13 @@ impl Daemon {
 
     /// Whether a `hello {role: "app"}` may hold the gate: a paired device's credential,
     /// a peer of rlxd's user, and for a device paired locally, a peer that passes the
-    /// identity check (outside dev mode). Its hold, or why not.
-    async fn admit_app(&self, hello: &HelloParams, peer: &Arc<Peer>) -> Result<Hold, String> {
+    /// identity check (outside dev mode). Its credential, to take the gate with
+    /// (`Gate::attach`), or why not.
+    async fn vet_app<'a>(
+        &self,
+        hello: &'a HelloParams,
+        peer: &Arc<Peer>,
+    ) -> Result<&'a str, String> {
         let Some(credential) = hello.gate_credential.as_deref() else {
             return Err("role app needs a gate_credential, which gate.pair mints".to_owned());
         };
@@ -471,9 +483,7 @@ impl Daemon {
                 info!("gate: device {device:?}: {how}");
             }
         }
-        self.gate
-            .attach(credential)
-            .ok_or_else(|| "the gate_credential was replaced or unpaired meanwhile".to_owned())
+        Ok(credential)
     }
 
     /// What one request frame after `hello` gets. On a connection that carries a stream

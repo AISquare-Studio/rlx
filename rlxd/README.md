@@ -273,10 +273,11 @@ rlxd call env.get
 - **`env.set {<key>: <value>, …}`**, and `env` in a `hello`, are taken only from an
   app-role connection that holds the gate (5.1). Anything else gets `not_gate`, and
   nothing changes: an `env.set` from a `cli` or `tui` client, a `hello` with `env` that
-  doesn't take the app role, or an app `hello` the gate refuses. **`env.get`** is open
-  to every client. Each replies with every value now: `schemas/v1/env.json`.
+  doesn't take the app role, or an app `hello` the gate refuses, whatever keys its `env`
+  holds. **`env.get`** is open to every client. Each replies with every value now: `schemas/v1/env.json`.
 - **Keys.** Exactly the three. Any other key gets `bad_env_key`, and so does the whole
-  request, valid keys included: nothing changes. A key the request doesn't name keeps
+  request, valid keys included: nothing changes, and an app `hello` refused so takes no
+  hold of the gate. A key the request doesn't name keeps
   its value, and an empty value removes its key.
 - **Values** are strings of at most 64 KiB with no NUL (`invalid_params` otherwise),
   kept as sent: a relative `CLAUDE_CONFIG_DIR` stays relative.
@@ -285,7 +286,10 @@ rlxd call env.get
   can't be read (not JSON, a key this rlxd doesn't know, a value too long) is moved
   aside whole to `env.json.unreadable-<time>`, logged as an error, and rlxd starts with
   no app environment, as the settings do. If it can't be moved either, every change is
-  refused until it is fixed and rlxd restarted.
+  refused until it is fixed and rlxd restarted. A change that can't be written (that, or
+  a full disk) refuses its request with why (`internal`), an app `hello` carrying `env`
+  included: the app then holds no gate until the file is fixed, or it says hello
+  without `env`.
 - **`claude`** is resolved when the values are taken in (`env.set`, an app `hello`'s
   `env`) and when rlxd starts, never when a run starts: the first `claude` on the app's
   `PATH`, in order, else on rlxd's own `PATH` when the app set none. Empty and relative

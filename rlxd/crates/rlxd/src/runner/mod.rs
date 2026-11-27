@@ -639,30 +639,7 @@ impl Runner {
     /// The `claude` a run starts: the absolute path the app's environment resolved to
     /// (4.3), or the refusal `run.start` gives when it resolved to none rlxd runs.
     fn claude_to_run(&self) -> Result<PathBuf, ErrorBody> {
-        let (resolved, source) = self.env.claude();
-        let looked = match source {
-            claude::Source::App => "on the app's PATH".to_owned(),
-            claude::Source::Rlxd => "on rlxd's PATH, as the app set none".to_owned(),
-            claude::Source::RlxdClaudeBin => format!("where {} names", claude::BIN_ENV),
-        };
-        match resolved {
-            Resolved::Found(program) => Ok(program),
-            Resolved::NotFound => Err(refusal(
-                codes::CLAUDE_NOT_FOUND,
-                format!(
-                    "Claude Code was not found: there is no claude {looked}. rlxd looks when \
-                     the app sets PATH and when it starts"
-                ),
-            )),
-            Resolved::NotRunnable(program) => Err(refusal(
-                codes::CLAUDE_NOT_RUNNABLE,
-                format!(
-                    "the claude found first {looked}, {}, is a batch file, which rlxd does not \
-                     run through cmd: install Claude Code's native build",
-                    program.display()
-                ),
-            )),
-        }
+        claude_from(self.env.claude())
     }
 
     /// Every run rlxd knows now, to read with the runner's lock let go.
@@ -954,8 +931,8 @@ impl Runner {
                 "rlxd is stopping: resume the run once it is back".to_owned(),
             ));
         }
-        self.claude_to_run()?;
         let run = self.find(&params.run_id)?;
+        self.claude_to_run()?;
         let id = params.run_id;
         {
             // The run is held for this resume under the runner's lock, and no run's lock
@@ -1647,9 +1624,10 @@ impl Runner {
             ))
         };
         // The absolute path resolved when the app set its environment or rlxd started,
-        // never a lookup now (4.3). Refused at run.start when there was none; this is for
-        // an environment changed since.
-        let program = match self.claude_to_run() {
+        // never a lookup now (4.3), read with the values it goes with. Refused at run.start
+        // when there was none; this is for an environment changed since.
+        let (values, resolved) = self.env.snapshot();
+        let program = match claude_from(resolved) {
             Ok(program) => program,
             Err(refused) => return failed(refused.message),
         };
@@ -1674,7 +1652,7 @@ impl Runner {
         if let Some(reason) = ending {
             return ended_early(run, reason);
         }
-        let mut env = run_env(&self.env.values());
+        let mut env = run_env(&values);
         // Every process of the run inherits it: the start sweep's way to know them.
         env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
         // The attempt's hook key: its hooks inherit it, and the gate wants it back (5.1).
@@ -2387,6 +2365,35 @@ fn needs_you(params: &RunStartParams, done: &RunDoneData) -> Option<RunNeedsYouD
             other => other.to_string(),
         });
     Some(RunNeedsYouData::question(question))
+}
+
+/// The `claude` a run starts, from what the app's environment resolved to and where it
+/// looked (`Env::claude`, `Env::snapshot`): its absolute path (4.3), or the refusal
+/// `run.start` gives when it resolved to none rlxd runs.
+fn claude_from((resolved, source): (Resolved, claude::Source)) -> Result<PathBuf, ErrorBody> {
+    let looked = match source {
+        claude::Source::App => "on the app's PATH".to_owned(),
+        claude::Source::Rlxd => "on rlxd's PATH, as the app set none".to_owned(),
+        claude::Source::RlxdClaudeBin => format!("where {} names", claude::BIN_ENV),
+    };
+    match resolved {
+        Resolved::Found(program) => Ok(program),
+        Resolved::NotFound => Err(refusal(
+            codes::CLAUDE_NOT_FOUND,
+            format!(
+                "Claude Code was not found: there is no claude {looked}. rlxd looks when \
+                 the app sets PATH and when it starts"
+            ),
+        )),
+        Resolved::NotRunnable(program) => Err(refusal(
+            codes::CLAUDE_NOT_RUNNABLE,
+            format!(
+                "the claude found first {looked}, {}, is a batch file, which rlxd does not \
+                 run through cmd: install Claude Code's native build",
+                program.display()
+            ),
+        )),
+    }
 }
 
 /// The environment a run's Claude Code gets beyond rlxd's own, which it inherits: the

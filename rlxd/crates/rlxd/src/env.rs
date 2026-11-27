@@ -108,6 +108,13 @@ impl Env {
         self.state().claude.clone()
     }
 
+    /// The values and the `claude` they resolve to, read together, so a change between
+    /// two reads can't pair one's `claude` with the other's values: what a run starts with.
+    pub fn snapshot(&self) -> (EnvValues, (Resolved, Source)) {
+        let state = self.state();
+        (state.values.clone(), state.claude.clone())
+    }
+
     /// Applies `change`, already checked, for `who`: the file first, then the values, and
     /// `claude` resolved again, and [`Env::subscribe`]'s receivers told when the values
     /// differ. The values now.

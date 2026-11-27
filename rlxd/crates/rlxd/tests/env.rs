@@ -145,6 +145,25 @@ fn only_the_app_sets_them() {
             r#"{"PATH":"/tmp"}"#,
             "status",
         ],
+        // Refused by the gate, or not the app: not_gate before any look at the keys (7.2).
+        &[
+            "call",
+            "--role",
+            "app",
+            "--gate-credential",
+            "made-up",
+            "--env",
+            r#"{"HOME":"x"}"#,
+            "status",
+        ],
+        &[
+            "call",
+            "--role",
+            "tui",
+            "--env",
+            r#"{"HOME":"x"}"#,
+            "status",
+        ],
     ] {
         let run = home.rlxd(args);
         assert_eq!(run.code(), Some(1), "{args:?}: {run:?}");
@@ -199,8 +218,9 @@ fn claude(home: &TestHome) -> Value {
 #[test]
 fn claude_is_resolved_on_the_apps_path_when_it_is_set_and_kept_as_found() {
     // The Accept's "Absolute paths", up to the run: `status.claude.path` is the program a
-    // run would start. With RLXD_CLAUDE_BIN unset.
-    let home = TestHome::new();
+    // run would start. With RLXD_CLAUDE_BIN unset, so rlxd finds the stub on its own PATH
+    // until the app sets one, and a user of its own.
+    let home = TestHome::new().with_own_user();
     let root = home.root().to_path_buf();
     let (program, name) = if cfg!(windows) {
         // A program that runs: this rlxd, which prints no version a probe reads.
@@ -272,4 +292,73 @@ fn claude_is_resolved_on_the_apps_path_when_it_is_set_and_kept_as_found() {
         let seen = claude(&home);
         assert_eq!(seen["installed"], false, "a batch file is not run: {seen}");
     }
+}
+
+#[test]
+fn no_test_can_start_a_real_claude() {
+    // A real claude would read the developer's sign-in. To the tests' guard, a real one is
+    // a `claude` in a folder outside the test's home: here, another home's.
+    let home = TestHome::new().with_own_user();
+    let elsewhere = TestHome::new();
+    let real_bin = elsewhere.root().join("bin");
+    std::fs::create_dir_all(&real_bin).unwrap();
+    let real = real_bin.join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    std::fs::write(&real, "").unwrap();
+
+    // rlxd's own PATH: the stub's folder first, the real one's left off.
+    let base = std::env::join_paths([real_bin.clone(), home.root().join("bin")]).unwrap();
+    let path: Vec<PathBuf> = std::env::split_paths(&home.rlxd_path(&base)).collect();
+    assert_eq!(
+        path,
+        [
+            common::stub_claude_dir().to_path_buf(),
+            home.root().join("bin")
+        ]
+    );
+
+    // RLXD_CLAUDE_BIN unset and no PATH from the app: rlxd finds the stub on its own.
+    let mut serve = home.command(&["serve", "--detach", "--gate-dev-mode"]);
+    serve.env_remove("RLXD_CLAUDE_BIN").stdin(Stdio::null());
+    let run = common::run(serve, None);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let stub = common::stub_claude_dir().join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    let seen = claude(&home);
+    assert_eq!(seen["path_source"], "rlxd", "{seen}");
+    assert_eq!(seen["path"], stub.display().to_string(), "{seen}");
+
+    // What would let rlxd start the real one fails the test before anything starts.
+    let fails =
+        |what: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(what)).is_err();
+    let set = serde_json::json!({"PATH": real_bin.to_str().unwrap()}).to_string();
+    assert!(fails(&|| drop(
+        home.command(&["call", "--as-app", "env.set", &set])
+    )));
+    assert!(fails(&|| drop(
+        home.command(&["call", "--as-app", "--env", &set, "status"])
+    )));
+    let raw = format!(r#"{{"id":1,"method":"env.set","params":{set}}}"#);
+    assert!(fails(&|| drop(
+        home.rlxd_with_stdin(&["call", "--raw"], Some(&raw))
+    )));
+    let stored = home.root().join("rlxd").join("env.json");
+    let before = std::fs::read(&stored).ok();
+    std::fs::write(&stored, &set).unwrap();
+    assert!(fails(&|| drop(home.command(&["serve", "--detach"]))));
+    match before {
+        Some(text) => std::fs::write(&stored, text).unwrap(),
+        None => std::fs::remove_file(&stored).unwrap(),
+    }
+    let named = TestHome::new().with_claude(real.clone());
+    assert!(fails(&|| drop(named.command(&["status"]))));
+    // The home's own folders, and the stub's, are the tests'.
+    let own = serde_json::json!({"PATH": home.root().join("bin").to_str().unwrap()}).to_string();
+    drop(home.command(&["call", "--as-app", "env.set", &own]));
 }
