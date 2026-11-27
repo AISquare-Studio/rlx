@@ -1365,7 +1365,13 @@ def test_a_managers_own_stop_does_not_wake_it(
 
     exited = [e for e in team_service.log_events(work_dir) if e.kind == "agent_exited"][-1]
     assert exited.actor == MANAGER
-    assert exited.meta == {"status": None, "force": True, "released": 0, "why": None}
+    assert exited.meta == {
+        "status": None,
+        "force": True,
+        "released": 0,
+        "why": None,
+        "manager_project": exited.project_id,
+    }
     assert exited.text == "coder-x exited (?) — stopped by manager (--force)"
     assert team_service.wake_class(exited, before) == "own"
     result = _stop(runner, MANAGER, work_dir, stop_hook_active=False)

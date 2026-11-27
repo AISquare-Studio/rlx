@@ -2014,6 +2014,7 @@ class ContextStore(Protocol):
         *,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
+        include_kinds: Collection[str] = (),
         exclude_actor: str | None = None,
         relevant: Relevance | None = None,
         limit: int = 50,
@@ -5335,6 +5336,7 @@ class SqliteStore:
         *,
         exclude_session: str | None = None,
         exclude_kinds: Collection[str] = (),
+        include_kinds: Collection[str] = (),
         exclude_actor: str | None = None,
         relevant: Relevance | None = None,
         limit: int = 50,
@@ -5350,6 +5352,8 @@ class SqliteStore:
         :meth:`filtered_events` does, so ``limit`` counts rows the caller can use.
         Dropped after the LIMIT, a run of the captain's audit lines filled the whole
         page, and the event behind it was not read at all (review of #240, finding 11).
+        ``include_kinds`` keeps only those kinds, inside the query for the same reason: a
+        scheduled manager's urgent news behind a page of results (``team.wake_now``, #41).
         """
         keep, kept = _relevant_clause(relevant)
         rows = self._conn.execute(
@@ -5357,13 +5361,14 @@ class SqliteStore:
             "WHERE project_id = ? AND seq > ? "
             "AND (session_id IS NULL OR session_id != ?) "
             "AND (actor IS NULL OR actor != ?) "
-            f"{_and_not_kinds(exclude_kinds)}{keep}ORDER BY seq LIMIT ?",
+            f"{_and_not_kinds(exclude_kinds)}{_and_kinds(include_kinds)}{keep}ORDER BY seq LIMIT ?",
             (
                 project_id,
                 seq,
                 exclude_session or "",
                 exclude_actor or "",
                 *exclude_kinds,
+                *include_kinds,
                 *kept,
                 limit,
             ),
@@ -7559,6 +7564,12 @@ def _relevant_clause(relevant: Relevance | None) -> tuple[str, list[str]]:
     if not terms:
         return "AND 0 ", []  # keeps nothing: no task, no name, no decisions
     return f"AND ({' OR '.join(terms)}) ", params
+
+
+def _and_kinds(kinds: Collection[str]) -> str:
+    """``AND kind IN (?, …) `` for a query that keeps ``kinds`` alone, or nothing; the caller
+    hands ``*kinds`` to the query at that place."""
+    return f"AND kind IN ({', '.join('?' * len(kinds))}) " if kinds else ""
 
 
 def _and_not_kinds(kinds: Collection[str]) -> str:

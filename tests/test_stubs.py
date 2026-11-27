@@ -88,6 +88,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
             "top",
             "gate",
             "adopt",
+            "manager-policy",
         )
     ),
     ("code", "find"),

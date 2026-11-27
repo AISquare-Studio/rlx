@@ -446,3 +446,20 @@ def test_the_persons_items_are_seen_and_never_on_the_managers_line(
     assert (
         watcher.tick(NOW + timedelta(minutes=1)).new == [] and len(_watch_events(project.id)) == 1
     )
+
+
+def test_each_tick_sends_the_scheduled_managers_held_wakes_alone(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#41: a scheduled manager's routine news held until due is sent by watch's tick too,
+    with nothing new to deliver, so a fleet run with neither the rlx service nor asq hears
+    it; watch sends no other held nudge (``scheduled_only``)."""
+    asked: list[bool] = []
+
+    def retry(*, scheduled_only: bool = False) -> int:
+        asked.append(scheduled_only)
+        return 0
+
+    monkeypatch.setattr(fleet_service, "retry_deferred_nudges", retry)
+    _watcher(project, Fleet(agents=[])).tick(NOW)
+    assert asked == [True]

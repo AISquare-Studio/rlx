@@ -87,6 +87,7 @@ from aisquare.services import (
     diagnostics,
     install_route,
     lifecycle,
+    manager_seat,
     model_memory,
 )
 from aisquare.services import claude_accounts as accounts_service
@@ -6311,7 +6312,13 @@ def test_a_managers_own_stop_says_so_and_nudges_nobody_and_a_kill_by_anyone_else
 
     exits = {e.text.split(" ")[0]: e for e in _board_events(project, "agent_exited")}
     assert exits["coder-a"].actor == manager.session_id
-    assert exits["coder-a"].meta == {"status": None, "force": True, "released": 0, "why": None}
+    assert exits["coder-a"].meta == {
+        "status": None,
+        "force": True,
+        "released": 0,
+        "why": None,
+        "manager_project": project.id,
+    }
     assert exits["coder-a"].text == "coder-a exited (?) — stopped by manager (--force)"
     assert exits["coder-c"].text == "coder-c exited (0) — stopped by user"
 
@@ -15671,6 +15678,515 @@ def _waiting_manager(tmux: FakeTmux, project: ProjectInfo) -> FleetAgent:
     # The board write these nudges follow, unread: a nudge is due only for news (R12).
     team_service.watch_event(project.id, "watch: 1 new (1 permission)")
     return manager
+
+
+# --- a scheduled manager (#551, #41) ---------------------------------------------------------
+
+
+def _scheduled_manager(
+    tmux: FakeTmux, project: ProjectInfo, *, minutes: str | None = None, wake: str = "schedule"
+) -> str:
+    """A waiting manager of ``project``, whose policy is ``wake``; its session id."""
+    with store_session() as store:
+        store.set_project_setting(project.id, manager_seat.WAKE, wake)
+        if minutes is not None:
+            store.set_project_setting(project.id, manager_seat.PASS_MINUTES, minutes)
+    manager = fleet_service.spawn(project, "manager").agent
+    _board_session(manager, "waiting")
+    tmux.set_command(manager.pane_id, "claude")
+    tmux.typed.clear()
+    assert manager.session_id is not None
+    return manager.session_id
+
+
+def _working_coder(project: ProjectInfo, **kwargs: object) -> FleetAgent:
+    coder = _coder(project, **kwargs) if kwargs else fleet_service.spawn(project, "coder").agent
+    _board_session(coder, "working")
+    assert coder.session_id is not None
+    return coder
+
+
+def _pastes(tmux: FakeTmux) -> list[str]:
+    return [line for _, action, line in tmux.typed if action == "paste"]
+
+
+def _held(session_id: str) -> bool:
+    with store_session() as store:
+        return bool(store.get_meta(f"{fleet_service.NUDGE_DEFERRED}{session_id}"))
+
+
+def _last_prompt(session_id: str, ago: timedelta) -> None:
+    with store_session() as store:
+        store.mark_prompted(session_id, datetime.now(tz=UTC) - ago)
+
+
+def _working(session_id: str) -> None:
+    with store_session() as store:
+        store.touch_session(session_id, state="working")
+
+
+@pytest.mark.parametrize("path", ["pane", "stop"])
+@pytest.mark.parametrize("kind", ["result", "note", "decision", "elsewhere", "routine_watch"])
+def test_a_scheduled_managers_routine_news_types_nothing_and_keeps_no_stop(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, kind: str, path: str
+) -> None:
+    """#551's first ask: a result, or an agent's note to the manager, types nothing into its
+    pane and keeps no Stop going; it is held for its due time instead."""
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    if path == "stop":
+        _working(manager)
+    if kind == "elsewhere":
+        team_service.add_note(
+            "which test?", session_ref=coder.session_id, kind="question", to_role="reviewer"
+        )
+    elif kind == "routine_watch":
+        team_service.watch_event(project.id, "watch: 1 new (1 idle)", urgent=False)
+        fleet_service.nudge_manager(project.id, reason="watch", board=project.id)
+    else:
+        team_service.add_note(
+            "routine update", session_ref=coder.session_id, kind=kind, to_role="manager"
+        )
+    assert _pastes(tmux) == []
+    assert team_service.hook_stop(manager, project.root) is None
+    assert _held(manager), "held for the tickers, not dropped"
+
+
+@pytest.mark.parametrize("path", ["pane", "stop"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "question",
+        "question_by_id",
+        "unaddressed",
+        "persons_note",
+        "persons_note_by_id",
+        "limited",
+        "handover_failed",
+        "watch",
+        "agent_exited",
+        "prompt_unsent",
+    ],
+)
+def test_each_urgent_kind_wakes_a_scheduled_manager_at_once(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, kind: str, path: str
+) -> None:
+    """The urgent set (the PR's): a typed wake for a waiting manager, a Stop that goes on for
+    a working one, with the news in what it reads."""
+    manager = _scheduled_manager(tmux, project)
+    coder = (
+        _working_coder(project, prompt="/effort max", spawned_by="user")
+        if kind == "prompt_unsent"
+        else _working_coder(project)
+    )
+    assert coder.session_id is not None
+    if path == "stop":
+        _working(manager)
+    said = {
+        "question": "please decide",
+        "question_by_id": "please decide",
+        "unaddressed": "please decide",
+        "persons_note": "please decide",
+        "persons_note_by_id": "please decide",
+        "limited": "usage limit",
+        "handover_failed": "could not switch",
+        "watch": "blocking permission dialog",
+        "agent_exited": "exited",
+        "prompt_unsent": "test delivery stalled",
+    }[kind]
+    if kind in ("question", "question_by_id", "unaddressed"):
+        to = {"question": "manager", "question_by_id": manager[:8], "unaddressed": None}[kind]
+        team_service.add_note(said, session_ref=coder.session_id, kind="question", to_role=to)
+    elif kind in ("persons_note", "persons_note_by_id"):
+        to = "manager" if kind == "persons_note" else manager
+        team_service.add_note(said, kind="note", to_role=to, board_id=project.id)
+    elif kind == "limited":
+        team_service.hook_stop_failure(
+            coder.session_id, error="rate_limit", message=said, details=None
+        )
+    elif kind == "handover_failed":
+        team_service.hook_handover_failed(project.id, said, session_id=coder.session_id)
+    elif kind == "watch":
+        team_service.watch_event(project.id, f"watch: {said}")
+        fleet_service.nudge_manager(project.id, reason="watch", board=project.id)
+    elif kind == "prompt_unsent":
+        assert fleet_service._first_prompt_unsent(coder, said)
+    else:
+        fleet_service.stop(project, coder.label, force=True)
+    if path == "pane":
+        assert _pastes(tmux) == [NUDGE_TEXT]
+        delivered = team_service.hook_prompt_heartbeat(manager, project.root)
+    else:
+        assert _pastes(tmux) == []
+        decision = team_service.hook_stop(manager, project.root)
+        assert decision is not None
+        delivered = decision.reason
+    assert said in delivered
+
+
+def test_a_question_behind_pages_of_results_wakes_a_scheduled_manager_at_once(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """Urgency is looked for past the delta's window (``include_kinds``): a question behind
+    160 results wakes the manager at once, and its delta and Stops reach it, 50 a page."""
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    with store_session() as store:
+        for n in range(160):
+            team_service._emit(
+                store, project.id, "result", f"routine {n}", session_id=coder.session_id
+            )
+    team_service.add_note("please decide", session_ref=coder.session_id, kind="question")
+    assert _pastes(tmux) == [NUDGE_TEXT]
+    read = [team_service.hook_prompt_heartbeat(manager, project.root)]
+    while "please decide" not in read[-1] and len(read) < 6:
+        decision = team_service.hook_stop(manager, project.root)
+        assert decision is not None, "the question is still past its cursor"
+        read.append(decision.reason)
+    assert "please decide" in read[-1] and len(read) == 4  # 50 + 50 + 50 + the last 11
+    assert team_service.hook_stop(manager, project.root) is None
+
+
+def test_held_routine_news_is_typed_once_when_due(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """After N minutes the held wake is typed once, by whichever ticker runs (the rlx service
+    and asq retry every held nudge, watch a scheduled manager's), and the manager reads the
+    news in its normal delta; then nothing is left to type."""
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    team_service.add_note("ready for review", session_ref=coder.session_id, kind="result")
+    assert _pastes(tmux) == [] and _held(manager)
+    assert fleet_service.retry_deferred_nudges() == 0, "not due: 15 minutes by default"
+    _last_prompt(manager, timedelta(minutes=16))  # before the hold: it read nothing since
+    assert fleet_service.retry_deferred_nudges(scheduled_only=True) == 1
+    assert fleet_service.retry_deferred_nudges() == 0
+    assert _pastes(tmux) == [NUDGE_TEXT]
+    assert "ready for review" in team_service.hook_prompt_heartbeat(manager, project.root)
+    assert fleet_service.retry_deferred_nudges() == 0
+    assert team_service.hook_stop(manager, project.root) is None
+    assert _pastes(tmux) == [NUDGE_TEXT]
+
+
+def test_two_tickers_sending_one_held_wake_type_it_once(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The debounce key is taken by compare and set before typing: a ticker that read it
+    before another took it types nothing."""
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    team_service.add_note("ready for review", session_ref=coder.session_id, kind="result")
+    _last_prompt(manager, timedelta(minutes=16))
+    claim = fleet_service._claim
+
+    def raced(store: Any, key: str, last: str | None, now: datetime) -> bool:
+        assert claim(store, key, last, now - timedelta(seconds=1)), "the other ticker's"
+        return claim(store, key, last, now)
+
+    monkeypatch.setattr(fleet_service, "_claim", raced)
+    assert fleet_service.retry_deferred_nudges() == 0
+    assert _pastes(tmux) == []
+
+
+@pytest.mark.parametrize("minutes", [None, "0", "30"])
+def test_routine_news_falls_due_after_its_minutes_15_unless_set(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, minutes: str | None
+) -> None:
+    """15 minutes unless set; 0, set explicitly, holds routine news until an urgent wake,
+    which then carries it in the same delta."""
+    manager = _scheduled_manager(tmux, project, minutes=minutes)
+    coder = _working_coder(project)
+    _last_prompt(manager, timedelta(minutes=20))
+    team_service.add_note("ready for review", session_ref=coder.session_id, kind="result")
+    due = minutes is None
+    assert _pastes(tmux) == ([NUDGE_TEXT] if due else [])
+    if minutes == "30":
+        _last_prompt(manager, timedelta(minutes=31))
+        assert fleet_service.retry_deferred_nudges() == 1
+        assert _pastes(tmux) == [NUDGE_TEXT]
+    if minutes == "0":
+        _last_prompt(manager, timedelta(days=1))
+        assert fleet_service.retry_deferred_nudges() == 0, "0: never due"
+        team_service.add_note("which way?", session_ref=coder.session_id, kind="question")
+        assert _pastes(tmux) == [NUDGE_TEXT]
+    delta = team_service.hook_prompt_heartbeat(manager, project.root)
+    assert "ready for review" in delta
+
+
+def test_manager_policy_command_sets_reads_and_warns_about_zero(project: ProjectInfo) -> None:
+    runner = CliRunner()
+    read = runner.invoke(app, ["--json", "fleet", "manager-policy", "--project", project.id])
+    assert read.exit_code == 0, read.output
+    assert json.loads(read.stdout) == {
+        "project_id": project.id,
+        "manager_wake": "every_write",
+        "manager_pass_minutes": 15,
+        "invalid": [],
+    }
+    for key, value in (("manager_wake", "schedule"), ("manager_pass_minutes", "0")):
+        done = runner.invoke(app, ["fleet", "manager-policy", key, value, "--project", project.id])
+        assert done.exit_code == 0, done.output
+    assert "manager_wake=schedule manager_pass_minutes=0" in done.stdout
+    assert "routine news waits for an urgent wake or the person's next prompt" in done.stderr
+    bad = runner.invoke(
+        app, ["fleet", "manager-policy", "manager_wake", "hourly", "-P", project.id]
+    )
+    assert bad.exit_code != 0
+    cleared = runner.invoke(
+        app, ["fleet", "manager-policy", "manager_pass_minutes", "--clear", "--project", project.id]
+    )
+    assert "manager_pass_minutes=15" in cleared.stdout and "waits" not in cleared.stderr
+    with store_session() as store:
+        assert manager_seat.policy(store, project.id) == manager_seat.Policy("schedule", 15)
+
+
+@pytest.mark.parametrize("wake", [None, "every_write"])
+def test_every_write_still_wakes_for_a_result_debounced(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, wake: str | None
+) -> None:
+    """The default, unset or set: a result types the nudge, a second write inside the 5 s
+    debounce does not, and a Stop goes on for news (the original's own tests run as they
+    were: owed, deferred for a draft and a dialog)."""
+    manager = fleet_service.spawn(project, "manager").agent
+    assert manager.session_id is not None
+    if wake is not None:
+        with store_session() as store:
+            store.set_project_setting(project.id, manager_seat.WAKE, wake)
+    _board_session(manager, "waiting")
+    tmux.set_command(manager.pane_id, "claude")
+    tmux.typed.clear()
+    coder = _working_coder(project)
+    team_service.add_note("ready for review", session_ref=coder.session_id, kind="result")
+    team_service.add_note("and this", session_ref=coder.session_id, kind="result")
+    assert _pastes(tmux) == [NUDGE_TEXT]
+    assert not _held(manager.session_id)
+    decision = team_service.hook_stop(manager.session_id, project.root)
+    assert decision is not None and "ready for review" in decision.reason
+
+
+@pytest.mark.parametrize("wake", ["every_write", "schedule"])
+def test_a_scheduled_managers_delta_shows_50_lines_and_every_other_10(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, wake: str
+) -> None:
+    """Q1 (b) of #41: a scheduled manager's page is 50 lines, the same render; everyone
+    else's stays 10, byte for byte as before."""
+    manager = _scheduled_manager(tmux, project, wake=wake)
+    coder = _working_coder(project)
+    with store_session() as store:
+        events = [
+            team_service._emit(
+                store, project.id, "result", f"routine {n}", session_id=coder.session_id
+            )
+            for n in range(60)
+        ]
+        authors = team_service.authors_of(store.team_sessions(project.id))
+        board = team_service._board_of(store, project.id)
+    page = 50 if wake == "schedule" else 10
+    delta = team_service.hook_prompt_heartbeat(manager, project.root)
+    assert delta.endswith(
+        team_service._render_delta(
+            events[:page], authors, truncated=True, board=board.name, numbers={}
+        )
+    )
+    with store_session() as store:
+        session = store.get_session(manager)
+    assert session is not None and session.cursor == events[page - 1].seq
+
+
+def test_a_scheduled_managers_delta_stays_under_the_hook_output_cap(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """50 long lines would pass the 10,000 characters Claude Code keeps of a hook's output:
+    the page is cut to its budget, and the rest stays past the cursor."""
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    with store_session() as store:
+        for n in range(50):
+            team_service._emit(
+                store, project.id, "result", f"{n} " + "x" * 400, session_id=coder.session_id
+            )
+    delta = team_service.hook_prompt_heartbeat(manager, project.root)
+    shown = delta.count("\n- ")
+    assert len(delta) <= team_service._SCHEDULED_DELTA_BUDGET and 10 < shown < 50
+    assert "more waiting" in delta
+    decision = team_service.hook_stop(manager, project.root)
+    assert decision is None, "the rest is routine, not due: held for its next page"
+
+
+def test_team_standby_holds_with_tasks_in_flight_and_urgent_news_still_wakes(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """#551: `team standby` held only while no task was in flight. It holds now, through work
+    going back into flight, until --off or its person's next prompt; what it holds is as it
+    was (watch's routine lines) and a question still wakes it."""
+    manager = fleet_service.spawn(project, "manager").agent
+    sid = manager.session_id
+    assert sid is not None
+    _board_session(manager, "waiting")
+    tmux.set_command(manager.pane_id, "claude")
+    coder = _working_coder(project)
+    task = _task(project, "in flight")
+    team_service.claim_task(task.id, session_ref=coder.session_id)
+    team_service.set_standby(sid, on=True)
+    team_service.review_task(task.id, note="ready", session_ref=coder.session_id)  # work returns
+    with store_session() as store:
+        session = store.get_session(sid)
+        assert session is not None
+        assert team_service.standby_of(store, session) is not None, "held, work in flight"
+    tmux.typed.clear()
+    with store_session() as store:
+        store.touch_session(sid, cursor=store.latest_seq(project.id))
+        store.delete_meta(f"nudge:{sid}")  # the review's nudge: past its debounce
+    team_service.watch_event(project.id, "watch: 1 new (1 idle)", urgent=False)
+    assert fleet_service.nudge_manager(project.id, reason="watch") is False
+    team_service.add_note("which way?", session_ref=coder.session_id, kind="question")
+    assert _pastes(tmux) == [NUDGE_TEXT]
+    team_service.set_standby(sid, on=False)
+    with store_session() as store:
+        session = store.get_session(sid)
+        assert session is not None and team_service.standby_of(store, session) is None
+
+
+def test_the_standby_watch_infers_still_ends_when_work_is_in_flight(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """The ``asked`` standby (its turn ended on a question to its person) keeps its rule: a
+    fleet at work reaches a manager that did not ask for quiet."""
+    manager = fleet_service.spawn(project, "manager").agent
+    _board_session(manager, "waiting")
+    coder = _working_coder(project)
+    task = _task(project, "in flight")
+    with store_session() as store:
+        session = store.get_session(manager.session_id or "")
+        assert session is not None
+        team_service.begin_standby(store, session, why="asked")
+        assert team_service.standby_of(store, session) is not None
+    team_service.claim_task(task.id, session_ref=coder.session_id)
+    with store_session() as store:
+        assert team_service.standby_of(store, session) is None
+
+
+def test_a_scheduled_manager_in_standby_gets_no_routine_wake_when_due(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    team_service.set_standby(manager, on=True)
+    _last_prompt(manager, timedelta(minutes=20))
+    team_service.add_note("ready for review", session_ref=coder.session_id, kind="result")
+    assert fleet_service.retry_deferred_nudges() == 0
+    assert _pastes(tmux) == []
+    team_service.add_note("which way?", session_ref=coder.session_id, kind="question")
+    assert _pastes(tmux) == [NUDGE_TEXT]
+
+
+def test_watch_sends_only_a_scheduled_managers_held_wake(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """``rlx watch`` retries a scheduled manager's held wake alone: another's draft-held nudge
+    is the rlx service's and asq's, as before."""
+    manager = fleet_service.spawn(project, "manager").agent
+    assert manager.session_id is not None
+    _board_session(manager, "waiting")
+    since = datetime.now(tz=UTC).isoformat()
+    with store_session() as store:
+        store.set_meta(f"{fleet_service.NUDGE_DEFERRED}{manager.session_id}", since)
+        assert fleet_service.deferred_nudge_targets(store, scheduled_only=True) == []
+        assert [row.id for row in fleet_service.deferred_nudge_targets(store)] == [manager.id]
+        store.set_project_setting(project.id, manager_seat.WAKE, "schedule")
+        assert [
+            row.id for row in fleet_service.deferred_nudge_targets(store, scheduled_only=True)
+        ] == [manager.id]
+
+
+@pytest.mark.parametrize("producer", ["id", "alias", "person", "watch"])
+@pytest.mark.parametrize("path", ["pane", "stop"])
+def test_scheduled_managers_on_one_hub_wake_only_for_their_own(
+    hubbed: _Hubbed, tmp_path: Path, producer: str, path: str
+) -> None:
+    """Two fleets' scheduled managers on one hub board: a question by session id, one to
+    ``manager`` from a fleet's coder, and a fleet's urgent watch line each wake their own."""
+    from aisquare.services import watch
+
+    first = hubbed
+    root = tmp_path / "another-fleet"
+    root.mkdir()
+    with store_session() as store:
+        second = store.onboard_project(team_project(root))
+        for fleet in (first.fleet, second):
+            store.set_project_setting(fleet.id, manager_seat.WAKE, "schedule")
+    other, sid = _spawned(second, "manager", None, first.tmux, first.monkeypatch)
+    team_service.hook_session_start(sid, second.root, "startup")
+    first.tmux.set_command(first.manager.pane_id, "claude")
+    first.tmux.set_command(other.pane_id, "claude")
+    first.monkeypatch.setattr(fleet_service, "nudge_manager", first.nudge)
+    ours = producer in ("alias", "person")  # the first fleet's: its coder's, or from its folder
+    intended, wrong = (first.manager_sid, sid) if ours else (sid, first.manager_sid)
+    intended_pane = first.manager.pane_id if ours else other.pane_id
+    with store_session() as store:
+        head = store.latest_seq(first.hub.id)
+        for session in (intended, wrong):
+            store.touch_session(
+                session, state="waiting" if path == "pane" else "working", cursor=head
+            )
+    first.tmux.typed.clear()
+    if producer == "watch":
+        watch._deliver(
+            second.id,
+            [watch.WatchItem("needs:urgent", second.id, "second", "dialog", "permission")],
+            tmp_path / "watch.json",
+        )
+        expected = "watch:"
+    elif producer == "person":
+        # No session: the fleet it is for is stamped as the nudge picked it (its folder).
+        team_service.add_note(
+            "scoped question",
+            kind="question",
+            to_role="manager",
+            board_id=first.hub.id,
+            cwd=first.fleet.root,
+        )
+        expected = "scoped question"
+    else:
+        team_service.add_note(
+            "scoped question",
+            kind="question",
+            to_role=sid if producer == "id" else " MANAGER ",
+            session_ref=first.coder_sid,
+        )
+        expected = "scoped question"
+    pastes = [(pane, line) for pane, action, line in first.tmux.typed if action == "paste"]
+    if path == "pane":
+        assert pastes == [(intended_pane, NUDGE_TEXT)]
+        assert expected in team_service.hook_prompt_heartbeat(intended, root)
+    else:
+        assert pastes == []
+        decision = team_service.hook_stop(intended, root)
+        assert decision is not None and expected in decision.reason
+    assert team_service.hook_stop(wrong, root) is None
+
+
+def test_a_turn_end_holds_the_routine_news_its_prompt_left_for_the_next_page(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """The person's prompt reads a page of 50 held results; the 10 left are not due (that
+    prompt was the last read) and the hold the prompt made moot is dropped. The turn's end
+    holds them again, after that prompt, for the tickers to send when they fall due."""
+    manager = _scheduled_manager(tmux, project)
+    coder = _working_coder(project)
+    with store_session() as store:
+        for n in range(60):
+            team_service._emit(
+                store, project.id, "result", f"routine {n}", session_id=coder.session_id
+            )
+    fleet_service.nudge_manager(project.id, reason="result")
+    assert _pastes(tmux) == [] and _held(manager)
+    team_service.hook_prompt_heartbeat(manager, project.root)  # the person's, 50 lines
+    with store_session() as store:
+        assert fleet_service.deferred_nudge_targets(store) == [], "moot: it read the board"
+    assert team_service.hook_stop(manager, project.root) is None
+    with store_session() as store:
+        assert [row.session_id for row in fleet_service.deferred_nudge_targets(store)] == [manager]
 
 
 def test_nudge_types_one_fixed_line_into_a_waiting_manager(
