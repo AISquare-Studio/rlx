@@ -594,6 +594,24 @@ def test_the_dry_run_prints_each_path_with_its_size_and_rule_and_json_holds_the_
     assert real["freed"] == data["paths"] and not cache.exists()
 
 
+@pytest.mark.parametrize("columns", ["80", "120"])
+def test_a_kept_paths_why_is_printed_whole_at_any_width(
+    tmp_path: Path, repo: Path, columns: str
+) -> None:
+    """Tester #3507, F3: the ``kept:`` table dropped its WHY at 80 and 120 columns, the line that
+    says what to push. Each kept path is two lines now, and the why is never cut."""
+    session = session_dir()
+    clone = _clone(repo, session / "scratchpad" / "clone")
+    _commit(clone, "only-here.txt")
+    aged(session, 3 * HOUR)
+    why = _kept_why(planned(tmp_path), clone)
+
+    shown = CliRunner().invoke(app, ["tidy", "--dry-run"], env={"COLUMNS": columns})
+
+    assert shown.exit_code == 0, shown.output
+    assert f"      {why}" in shown.output.splitlines(), shown.output
+
+
 # --- 11. links and roots ----------------------------------------------------------------------
 
 

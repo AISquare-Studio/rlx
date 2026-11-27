@@ -73,13 +73,21 @@ def _paths_table(rows: list[tuple[str, str, str]], header: tuple[str, str, str])
     return table
 
 
-def _print_kept(kept: list[tidy_service.Kept]) -> None:
-    if not kept:
+def _print_reasons(title: str, rows: list[tuple[str, str, str]]) -> None:
+    """``rows`` of (rule, path, why) under ``title``, each as two lines: the rule and the path,
+    then why, whole. A table at 80 columns dropped the why (tester #3507, F3), the line that says
+    what to push; printed soft-wrapped, it is never cut, the terminal wraps it."""
+    if not rows:
         return
     console = stdout_console()
-    console.print("\nkept:", style="bold")
-    rows = [(k.rule, paths.shown(k.path), k.why) for k in kept]
-    console.print(_paths_table(rows, ("RULE", "PATH", "WHY")), markup=False)
+    console.print(f"\n{title}", style="bold")
+    for rule, where, why in rows:
+        console.print(f"  {rule}  {where}", markup=False)
+        console.print(f"      {why}", markup=False)
+
+
+def _print_kept(kept: list[tidy_service.Kept]) -> None:
+    _print_reasons("kept:", [(k.rule, paths.shown(k.path), k.why) for k in kept])
 
 
 def tidy(
@@ -120,10 +128,9 @@ def tidy(
     if report.freed:
         rows = [(i.rule, size(i.bytes), paths.shown(i.path)) for i in report.freed]
         console.print(_paths_table(rows, ("RULE", "SIZE", "PATH")), markup=False)
-    if report.not_freed:
-        console.print("\nnot freed:", style="bold")
-        rows = [(i.rule, paths.shown(i.path), why) for i, why in report.not_freed]
-        console.print(_paths_table(rows, ("RULE", "PATH", "WHY")), markup=False)
+    _print_reasons(
+        "not freed:", [(i.rule, paths.shown(i.path), why) for i, why in report.not_freed]
+    )
     for repo, branch in report.branches_deleted:
         console.print(f"deleted branch {branch} in {paths.shown(repo)}", markup=False)
     _print_kept(report.kept)
