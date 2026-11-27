@@ -68,14 +68,14 @@ _clock: Callable[[], int] = time.time_ns
 """Now, in nanoseconds since the epoch, as ``st_mtime_ns`` counts them (a test's seam)."""
 
 
-def _signature(stat: os.stat_result) -> Signature:
+def _stat_signature(stat: os.stat_result) -> Signature:
     return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
 
 
 def _read(path: Path) -> tuple[Signature, bytes]:
     """The bytes of the file at ``path``, and the signature of the file they were read from."""
     with path.open("rb") as handle:
-        return _signature(os.fstat(handle.fileno())), handle.read()
+        return _stat_signature(os.fstat(handle.fileno())), handle.read()
 
 
 def _forget(key: _Key) -> None:
@@ -94,7 +94,7 @@ def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
     answer."""
     key = (path, parse)
     try:
-        now = _signature(os.stat(path))
+        now = _stat_signature(os.stat(path))
         with _LOCK:
             kept = _KEPT.get(key)
             if kept is not None and kept[0] == now:
@@ -102,7 +102,7 @@ def parsed(path: Path, parse: Callable[[Path, str], T]) -> T:
                 return cast(T, kept[1])
         read, body = _read(path)
         value = parse(path, body.decode("utf-8"))
-        after = _signature(os.stat(path))
+        after = _stat_signature(os.stat(path))
     except Exception:
         _forget(key)
         raise
