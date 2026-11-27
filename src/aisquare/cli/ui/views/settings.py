@@ -101,6 +101,8 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         self.project = project
         self._undoing = False
         """The rename running is Undo's: it takes a change back rather than keeping a new one."""
+        self._nickname_worker: Worker[object] | None = None
+        """The latest rename asked: only its report is heard (:meth:`_nickname_saved`)."""
         self.agents: list[FleetAgentStatus] | None = None
         """The project's agent rows as the shell's last frame listed them; ``None`` before
         the first."""
@@ -241,8 +243,9 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
                 self.project, field.value.strip() or None, notes=[], follow_unchanged=False
             )
 
-    def _save_nickname(self, wanted: str) -> None:
-        """Write ``wanted`` as the nickname, off the UI thread; blank clears it.
+    def _save_nickname(self, wanted: str, *, undoing: bool = False) -> None:
+        """Write ``wanted`` as the nickname, off the UI thread; blank clears it; ``undoing``:
+        Undo's, which keeps no new change.
 
         Always written, never compared with the tab's copy of the project first: a
         rename made elsewhere may not have reached it, and writing the same name
@@ -254,6 +257,7 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         held the new name, and the one Undo wrote that again (reviewer of #53, #3320).
         """
         project = self.project
+        self._undoing = undoing  # this save's, the latest: an earlier one is not heard
 
         def rename() -> tuple[ProjectInfo, list[str], bool, ProjectInfo]:
             notes: list[str] = []
@@ -264,7 +268,7 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
             works = bool(before) and fleet_service.old_codename_works(renamed.id, before or "")
             return renamed, notes, works, project
 
-        self.run_worker(
+        self._nickname_worker = self.run_worker(
             rename,
             name=NICKNAME_WORKER,
             group=NICKNAME_WORKER,
@@ -277,14 +281,19 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         """How ctrl+z takes this rename back: the name it replaced, written again."""
 
         def undo() -> None:
-            self._undoing = True
-            self._save_nickname(previous)
+            self._save_nickname(previous, undoing=True)
 
         return Change(f"{folder}'s nickname", undo)
 
     @on(Worker.StateChanged)
     def _nickname_saved(self, event: Worker.StateChanged) -> None:
         if event.worker.name != NICKNAME_WORKER:
+            return
+        if event.worker is not self._nickname_worker:
+            # A save another one asked after it: heard, it recorded a second Undo back to the
+            # same name and kept its value over the one typed since (reviewer of #53, #3354).
+            # Its newer one answers the field and records the one change. As exclusive=True
+            # cancels one still running, this is one that finished first, its report queued.
             return
         if event.state is WorkerState.ERROR:
             error = event.worker.error

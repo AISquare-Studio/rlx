@@ -2634,6 +2634,159 @@ def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_
     assert seen["undone"] == (None, "", 0), "one ctrl+z: the old name, on disk and shown"
 
 
+def test_a_save_superseded_before_its_report_is_heard_records_no_undo_and_keeps_nothing(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #53 round 2 (#3354), case 2: V1's save FINISHED, its report still queued,
+    when V2 was asked (exclusive=True cancels only a save still running). Heard, V1's report
+    kept V1 over the typed V2 and recorded an Undo back to the old name, and V2's recorded a
+    second one to the same name: the first ctrl+z skipped V1, the second did nothing. A report
+    of a save that is not the latest is not heard now.
+
+    Deterministic: each save is held after its store write by its own gate; V1's SUCCESS
+    report is held back on the page (its worker posts it through the page's post_message)
+    while V2 is committed for real, then delivered, then V2 is let go. One change, the
+    field and the store V2 throughout, and one ctrl+z puts the OLD name back."""
+    from textual.message import Message
+    from textual.worker import Worker, WorkerState
+
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)
+    real_rename = fleet_service.rename_project
+    gates = {name: (threading.Event(), threading.Event()) for name in ("V1", "V2")}
+
+    def held(target: ProjectInfo, nickname: str | None, **kwargs: Any) -> ProjectInfo:
+        renamed = real_rename(target, nickname, **kwargs)
+        if nickname in gates:  # Undo's own save goes straight through
+            written, let_go = gates[nickname]
+            written.set()
+            let_go.wait(timeout=10)
+        return renamed
+
+    monkeypatch.setattr(fleet_service, "rename_project", held)
+
+    def stored() -> str | None:
+        with store_session() as store:
+            return store.get_project(project.id).nickname  # type: ignore[union-attr]
+
+    async def until(pilot: Pilot[None], done: Callable[[], bool]) -> None:
+        for _ in range(500):  # bounded: a worker's step, on its own thread
+            if done():
+                return
+            await pilot.pause(0.01)
+        raise AssertionError("never happened")
+
+    async def scenario(pilot: Pilot[None], host: Host) -> dict[str, Any]:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        page = host.query_one(SettingsView)
+        field = host.query_one("#nickname", CommitInput)
+        await pilot.click("#nickname")
+        field.value = "V1"
+        await pilot.press("enter")
+        await until(pilot, gates["V1"][0].is_set)
+        first = page._nickname_worker
+        assert first is not None
+        queued: list[Message] = []
+        post = page.post_message
+
+        def hold_firsts_report(message: Message) -> bool:
+            if (
+                isinstance(message, Worker.StateChanged)
+                and message.worker is first
+                and message.state is WorkerState.SUCCESS
+            ):
+                queued.append(message)  # finished, its report not heard yet
+                return True
+            return post(message)
+
+        monkeypatch.setattr(page, "post_message", hold_firsts_report)
+        gates["V1"][1].set()
+        await until(pilot, lambda: first.state is WorkerState.SUCCESS and bool(queued))
+        field.value = "V2"
+        await pilot.press("enter")  # V2 asked while V1's report waits
+        await until(pilot, gates["V2"][0].is_set)
+        monkeypatch.setattr(page, "post_message", post)
+        post(queued[0])  # V1's report reaches the page, after V2 was asked
+        await pilot.pause()
+        seen: dict[str, Any] = {"heard_v1": (field.value, field.kept, len(page.changes))}
+        gates["V2"][1].set()
+        await settle(pilot)
+        seen["kept"] = (stored(), field.value, field.kept, len(page.changes))
+        field.focus()
+        await pilot.pause()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen["undone"] = (stored(), field.value, len(page.changes))
+        return seen
+
+    try:
+        seen = drive(project, scenario)
+    finally:
+        for _written, let_go in gates.values():
+            let_go.set()  # never a worker left waiting
+    assert seen["heard_v1"] == ("V2", "", 0), "V1's late report keeps nothing, records nothing"
+    assert seen["kept"] == ("V2", "V2", "V2", 1), seen["kept"]
+    assert seen["undone"] == (None, "", 0), "one ctrl+z: the old name, on disk and shown"
+
+
+def test_a_name_kept_after_an_undo_it_superseded_records_its_own_undo(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undo's save, superseded by a new name before its report is heard, is not heard (#3354);
+    so whether a save is Undo's goes with the save asked last, not a flag Undo's report would
+    have reset. Else the new name was taken for Undo's and kept no Undo of its own."""
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)
+    real_rename = fleet_service.rename_project
+    written, let_go = threading.Event(), threading.Event()
+
+    def held(target: ProjectInfo, nickname: str | None, **kwargs: Any) -> ProjectInfo:
+        renamed = real_rename(target, nickname, **kwargs)
+        if nickname is None:  # Undo's save back to no nickname: held after its write
+            written.set()
+            let_go.wait(timeout=10)
+        return renamed
+
+    monkeypatch.setattr(fleet_service, "rename_project", held)
+
+    def stored() -> str | None:
+        with store_session() as store:
+            return store.get_project(project.id).nickname  # type: ignore[union-attr]
+
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[int, tuple[str | None, int]]:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        page = host.query_one(SettingsView)
+        field = host.query_one("#nickname", CommitInput)
+        await pilot.click("#nickname")
+        field.value = "V1"
+        await pilot.press("enter")
+        await settle(pilot)
+        await pilot.press("ctrl+z")  # Undo's save, held after its write
+        for _ in range(500):  # bounded: the worker's store write, on its own thread
+            if written.is_set():
+                break
+            await pilot.pause(0.01)
+        after_undo = len(page.changes)
+        field.value = "V3"
+        await pilot.press("enter")  # a new name before Undo's report is heard
+        let_go.set()
+        await settle(pilot)
+        return after_undo, (stored(), len(page.changes))
+
+    try:
+        after_undo, after_v3 = drive(project, scenario)
+    finally:
+        let_go.set()
+    assert after_undo == 0, "the premise: ctrl+z took V1's change"
+    assert after_v3 == ("V3", 1), "V3 kept, with an Undo of its own"
+
+
 def test_a_nickname_whose_save_failed_is_saved_again_on_enter(
     project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
