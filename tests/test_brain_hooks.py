@@ -61,9 +61,12 @@ SLOT_TRANSCRIPT = "claude-accounts/2/projects/-proj/t1.jsonl"
 #: Columns whose values are times, durations or fresh ids, the same nowhere twice.
 _MASKED = {"id", "trace_id", "wall_ms", "round_trip_ms", "server_ms"}
 _TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
-#: A span from now, such as "resets in 2h 53m" or "0m ago": two runs a minute apart say two.
-#: The clock time beside it, "(Fri 00:30)", stays, and with it the zone's parity.
-_SPAN = re.compile(r"\b(?:\d+h )?\d+m\b")
+#: A span from now, in every shape ``claude_accounts.format_reset`` and ``format_age`` write
+#: one: "12m", "3h", "2h 53m", "2d", "2d 4h", "0m ago". Two runs a minute apart say two: on a
+#: whole hour the fresh run said "resets in 3h" and the brain's, a minute later, "2h 59m"
+#: (ci.yml run 46066195807). The clock time beside it, "(Fri 00:30)", stays, and with it
+#: the zone's parity.
+_SPAN = re.compile(r"\b(?:\d+d(?: \d+h)?|\d+h(?: \d+m)?|\d+m)\b")
 
 
 #: Now, as a time inside a value (a JSON record's ``"at"``): fractional seconds, as a clock
@@ -174,6 +177,11 @@ def template(tmp_path: Path) -> tuple[Path, Path]:
     home = tmp_path / "template-home"
     project = tmp_path / "proj"
     project.mkdir()
+    # No symbol index: the onboard builds one in a detached ``code index``, which would
+    # still be writing this home as each run copies it (Windows refuses to copy its locked
+    # ``index.db-shm``: ci.yml run 46066195807). No hook prints or stores anything of it.
+    home.mkdir()
+    (home / "config.toml").write_text("[code]\nenabled = false\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(project)], check=True)
     env = {**os.environ, "AISQUARE_HOME": str(home)}
     rlx = _program("aisquare")
@@ -503,10 +511,11 @@ def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
             assert brain_printed[event] == fresh_printed[event], (name, event)
         assert brain_rows == fresh_rows, name
     # The checks can fail: what each environment says is its own.
-    a_start = parity["fresh"]["a"][0]["session-start"][1]
-    assert b"seed fact for the hook check" in a_start
-    assert b"role: coder" in a_start
-    assert b"role: manager" in parity["fresh"]["b"][0]["session-start"][1]
+    a_start, a_said = parity["fresh"]["a"][0]["session-start"][1:]
+    assert b"seed fact for the hook check" in a_start, a_said
+    assert b"role: coder" in a_start, a_said
+    b_start, b_said = parity["fresh"]["b"][0]["session-start"][1:]
+    assert b"role: manager" in b_start, b_said
     rows = {name: parity["fresh"][name][1]["team_session"] for name in ("a", "b", "c")}
     assert rows["a"][0]["role"] == "coder" and rows["b"][0]["role"] == "manager"
     assert rows["a"][0]["account"] != rows["b"][0]["account"]

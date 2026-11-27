@@ -357,11 +357,14 @@ def forwarded(name: str) -> bool:
 
 #: Variables the hook path reads that describe the brain's own process or machine, not the
 #: hook's, and so are not sent: the shell-completion switches of click and typer (a hook
-#: never completes), macOS's per-user text encoding, and Windows' system folders and
-#: program lookup, the same for every process of the user's.
+#: never completes; named after the program's file, ``rlx.exe``'s on Windows), macOS's
+#: per-user text encoding, and Windows' system folders and program lookup, the same for
+#: every process of the user's.
 ENV_OF_THE_BRAIN: frozenset[str] = frozenset(
     {
+        "_AISQUARE.EXE_COMPLETE",
         "_AISQUARE_COMPLETE",
+        "_RLX.EXE_COMPLETE",
         "_RLX_COMPLETE",
         "_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION",
         "__CF_USER_TEXT_ENCODING",
