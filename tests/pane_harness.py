@@ -1,4 +1,5 @@
-"""Shared plumbing for the pane tests: a fake tmux, and mouse gestures that take the app's own road.
+"""Shared plumbing for the pane tests: a fake tmux, and mouse gestures and terminal input that take
+the app's own road.
 
 Not a test module. ``tests/test_terminal_pane.py`` drives ``TerminalPane`` under a
 small host app and ``tests/test_ui_shell.py`` drives the real ``FleetApp``; both
@@ -30,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from textual import events
+from textual._xterm_parser import XTermParser
+from textual.app import App
 from textual.geometry import Offset
 from textual.pilot import Pilot
 from textual.widget import Widget
@@ -370,6 +373,32 @@ def asks_a_server(argv: Sequence[str]) -> bool:
     (the shell tests and the accounts tests each carried one).
     """
     return list(argv)[1:] != ["-V"]
+
+
+# --- terminal input, the driver's way ----------------------------------------------------
+
+PASTE_START = "\x1b[200~"
+"""What a terminal sends before a paste in bracketed-paste mode."""
+
+PASTE_END = "\x1b[201~"
+"""What it sends after one."""
+
+
+def bracketed_paste(text: str) -> str:
+    """``text`` as a terminal sends it pasted, in bracketed-paste mode."""
+    return PASTE_START + text + PASTE_END
+
+
+def post_terminal_input(app: App[Any], raw: str) -> None:
+    """Post to ``app`` each message Textual's ``XTermParser`` makes of ``raw`` fed in one read,
+    as the driver's input thread posts them. The parser is not ticked: a sequence still pending
+    at the end of ``raw`` (a lone Escape) posts nothing.
+
+    ``Pilot.press`` and a posted ``Paste`` never run the parser, so a test of what it
+    makes of the terminal's bytes (a raw Escape inside a paste) cannot use them. Build
+    ``app`` first: an asq app guards the parser it builds (``cli.ui.paste_guard``)."""
+    for message in XTermParser().feed(raw):
+        app.post_message(message)
 
 
 # --- mouse gestures, the driver's way ---------------------------------------------------
