@@ -301,12 +301,12 @@ A read that HANGS rather than fails (a store on a hung mount, a wedged tmux at 3
 call) raises nothing for the store-unreadable notice to say, and each tick only owes one
 more read: the sidebar went silently stale (review of #272)."""
 ACCOUNTS_WORKER = "shell-accounts"
+"""The thread worker that reads the accounts' frame (``FleetApp.refresh_accounts``)."""
 FOLDED_SWEEP_SECONDS = 30.0
 """How often, at most, a fleet read lists the projects a collapsed group folds away, so the rows of
 panes that died there are ended (:func:`_read_fleet`'s ``sweep_folded``): a frame reads only
 what it shows (#83), and the view left behind another no longer keeps its folded project read
-(rlx#557)."""
-"""The thread worker that reads the accounts' frame (``FleetApp.refresh_accounts``)."""
+(rlx#557). A read that fails does not count (:meth:`FleetApp._fleet_read`): the next one sweeps."""
 HEADROOM_WORKER = "sidebar-headroom"
 """The thread worker that reads the status line's headroom (``FleetApp.refresh_headroom``)."""
 HOUSEKEEPING_SECONDS = 30.0
@@ -1654,10 +1654,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self._fleet_owed = False
         """A frame was asked for while a read was in flight: read once more after it."""
         self._fleet_viewed: frozenset[str] = frozenset()
-        self._folded_swept_at = time.monotonic()
-        """When a fleet read last listed the folded projects too (:data:`FOLDED_SWEEP_SECONDS`);
-        the first frame folds nothing."""
         """The project the next fleet read reads though folded (:meth:`_viewed_projects`)."""
+        self._folded_swept_at = time.monotonic()
+        """When the last fleet read that listed the folded projects too and painted its frame
+        began (:data:`FOLDED_SWEEP_SECONDS`); the first frame folds nothing."""
+        self._fleet_sweeps: dict[Worker[_FleetRead], float] = {}
+        """When each read that lists the folded projects too began, by read, until it ends."""
         self._fleet_calls = 0
         """How many calls have asked for a fleet frame (:meth:`refresh_data`): the newest
         one's number. It orders a call against an accounts read where a clock cannot:
@@ -2156,8 +2158,6 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self._fleet_since = time.monotonic()
         self._fleet_viewed = self._viewed_projects()  # asked here, on the UI thread
         sweep = self._fleet_since - self._folded_swept_at >= FOLDED_SWEEP_SECONDS
-        if sweep:
-            self._folded_swept_at = self._fleet_since
         self._fleet_worker = self.run_worker(
             lambda: _read_frame(
                 self.show_captured,
@@ -2172,6 +2172,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             exit_on_error=False,
         )
         self._fleet_asked[self._fleet_worker] = asked
+        if sweep:
+            self._fleet_sweeps[self._fleet_worker] = self._fleet_since
         if after:
             self._fleet_after[self._fleet_worker] = after
 
@@ -2187,6 +2189,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if event.state is WorkerState.CANCELLED:
             self._fleet_after.pop(worker, None)  # with the app: nothing to paint or owe
             self._fleet_asked.pop(worker, None)
+            self._fleet_sweeps.pop(worker, None)
             return
         result = worker.result if event.state is WorkerState.SUCCESS else None
         if isinstance(result, _FleetRead):
@@ -2199,6 +2202,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             if event.state is WorkerState.RUNNING:
                 self._fleet_since = time.monotonic()  # a read held for a hand-over begins now
             return  # still running
+        swept = self._fleet_sweeps.pop(worker, None)
+        if swept is not None and read.error is None:
+            # Swept only by a read that painted its frame: one that failed listed nothing, so the
+            # next read sweeps, and a folded project's dead pane is still ended within the bound.
+            self._folded_swept_at = max(self._folded_swept_at, swept)
         self._paint_fleet(read, asked=self._fleet_asked.pop(worker, None))
         newer = self._fleet_worker
         if self._fleet_owed and (newer is None or newer.is_finished):
