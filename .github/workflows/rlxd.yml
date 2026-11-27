@@ -140,6 +140,24 @@ jobs:
           echo "RLXD_GATE_TEST_KEYCHAIN=$kc" >> "$GITHUB_ENV"
           echo "RLXD_GATE_TEST_KEYCHAIN_PASSWORD=rlxd-gate-test" >> "$GITHUB_ENV"
 
+      # 1.4: the PTY host's frame must equal tmux's capture-pane byte for byte, so the
+      # tests compare against tmux itself, installed here for them only. With
+      # RLXD_TMUX_REQUIRED, a missing tmux fails them rather than skipping.
+      - name: tmux, for the frame tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux
+          tmux -V
+          echo "RLXD_TMUX_REQUIRED=1" >> "$GITHUB_ENV"
+
+      - name: tmux, for the frame tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install tmux
+          tmux -V
+          echo "RLXD_TMUX_REQUIRED=1" >> "$GITHUB_ENV"
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -177,6 +195,35 @@ jobs:
         env:
           RLXD_BIN: ${{ github.workspace }}/rlxd/target/release/rlxd${{ runner.os == 'Windows' && '.exe' || '' }}
         run: uv run --extra dev pytest tests/test_daemon_registry.py -q -p no:cacheprovider
+
+  # 7.6's scheduler Accept lines, on real one-minute schedules (tests/scheduler_accept.rs):
+  # each takes one to three minutes, so they are #[ignore]d in the test job and run here,
+  # all at once. tests/scheduler.rs has every rule fast, on a test clock, in the test job.
+  scheduler:
+    name: scheduler accept (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rlxd -> target
+          key: scheduler-accept
+
+      - name: cargo test, the scheduler's Accept lines
+        run: >-
+          cargo test -p rlxd --locked --test scheduler_accept --
+          --ignored --test-threads 16
 
   # Licences and RustSec advisories, once: the dependency graph is the same on every
   # OS, since cargo-deny reads every target's dependencies wherever it runs.

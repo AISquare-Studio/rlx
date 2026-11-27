@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunEventsData",
+  "description": "`run.events`'s reply, which ends its stream: the last `run_seq` it sent, or would\nhave.",
+  "type": "object",
+  "properties": {
+    "last_run_seq": {
+      "description": "The run's last `run_seq` when the stream ended.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "run_id": {
+      "description": "The run.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "required": [
+    "run_id",
+    "last_run_seq"
+  ]
+}

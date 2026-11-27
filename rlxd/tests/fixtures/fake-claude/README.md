@@ -32,21 +32,63 @@ the same files.
 | `hello` | One answer, then a successful result |
 | `slow` | Says it is working, then takes `FAKE_CLAUDE_SLOW_MS` (default 60,000) before it answers; the prompt `quick` makes it answer at once. It ignores stdin closing, so only rlxd ending its tree ends it |
 | `structured` | With `--json-schema`, its result's `structured_output` is `structured/output.json` |
-| `rate-limit` | A `rate_limit_event` an hour before the limit resets, then an answer |
+| `rate-limit` | A `rate_limit_event` saying the limit is hit (`rejected`; `FAKE_CLAUDE_RATE_STATUS` gives another, such as `allowed_warning`), five minutes before it resets, then an answer |
 | `asks` | Ends with the output `{"status":"needs_you","question":"Which channel?"}`; resumed, it reads the reply and ends `{"status":"done","channel":<reply>}` |
 | `crash` | Says part of an answer, then exits 1 with no result |
 | `persist` | `hello`, named for the erase check: every scenario writes its session file where Claude Code does unless `--no-session-persistence` |
 | `orphan` | Starts a process of its own that would linger a minute, answers, and exits: the run's end must take that process too |
-| `abort` | Says part of an answer, then dies of `SIGABRT` (an abort), so rlxd reports the signal |
+| `abort` | Says part of an answer, waits `FAKE_CLAUDE_ABORT_AFTER_MS` (default 0), then dies of `SIGABRT` (an abort), so rlxd reports the signal |
 | `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
+
+**The gate's scenarios** (5.1) make a tool call as Claude Code does: the `tool_use`, then
+the PreToolUse hook the run's `--settings` names, run with the call as JSON on its stdin
+(split into words, no shell) and started detached as Claude Code starts it (a session and
+process group of its own; on Windows, detached from the console in a group of its own),
+then the tool only on an explicit `allow`, else the hook's reason as the call's error
+result. Each answer is added to `hook_replies` (never the
+key), and each tool run to `tool_runs`. `system/init` lists the send tool
+(`readOnlyHint: false`), the read tool (`true`) and one with no annotations (`null`).
+Each is a scenario of its own name, and `gate` plays the one its prompt names, so one
+home runs them all. With `FAKE_CLAUDE_KEY_OUT` set to a file outside the home, each start
+adds its `RLXD_HOOK_KEY` there, for the check that rlxd writes it nowhere.
+
+| Scenario | What it does |
+|---|---|
+| `slack-send` | Says text claiming approval (which decides nothing), then calls the send tool with `gate/input.json`; resumed, it calls again under another id |
+| `slack-read` | Calls the read tool |
+| `write-call` | Calls the tool with no hint: a write |
+| `send-twice` | Calls the send tool twice, the same input, two ids |
+| `send-parallel` | Calls the send tool twice in one message, the same input, two ids, asking the hook about both at once |
+| `send-fails` | Calls the send tool; allowed, the tool fails |
+| `crash-in-call` | Calls the send tool; allowed, exits 1 mid-call |
+| `tool-hang` | Calls the send tool; allowed, the tool hangs two minutes |
+| `forge` | First asks the hook itself about a call of its own with the real call's id, then makes the real call |
+| `bad-hooks` | Asks the hook with a wrong key, no key, a wrong attempt, and the run named in `./other-run`, then makes a real call |
+| `lookalike-nested`, `lookalike-evil` | Init lists the Slack connector and a local server `claude_ai_Slack__x` (or `__evil`); the call is to a tool of the local one |
+| `lookalike-same`, `lookalike-local` | Init lists a local server `claude_ai_Slack` beside the connector, or alone; the call is to `mcp__claude_ai_Slack__post` |
+| `beta-send` | Init lists `claude.ai Slack (Beta)`; the call is to its tool, `mcp__claude_ai_Slack_Beta__send` |
+| `impostor` | `slack-send`, but init's one server named `claude.ai Slack` is a local one (`source: "local"`), not the claude.ai connector |
+| `evil-unlisted` | Init lists only the Slack connector and its tools; the call is to `mcp__claude_ai_Slack__evil__delete_everything`, which the init doesn't list |
+
+Each look-alike scenario's init lists its own tool, as Claude Code would, and every
+server carries its `source` as Claude Code 2.1.332 writes it (`claudeai` for a connector).
+
+Resumed, a scenario that makes one call makes it under another id.
+
+**`watch-call`** plays a watch job's run (7.6) as a model would. It reads the connector,
+the tool and the input from the JSON rlxd quotes in its message, lists that tool
+(read-only, of that connector, from claude.ai) in `system/init`, and makes the call through
+the hook. Allowed, the tool gives `watch-call/content.json`, which `job.watch_result`
+carries; for the input `{"ref": "missing"}` an error, and for `{"ref": "huge"}` 2 MiB of
+text, as a tool would. Then it tries the identical call again, which rlxd denies `pinned_call_used`.
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for
 `-p --output-format stream-json` without `--verbose`, waits for its first stream-json user
 message before `system/init`, and also writes a message type and fields rlxd must ignore.
 
-To add a scenario (the gate's, 5.1, the connectors', 5.5): a module in
+To add a scenario (the connectors', 5.5): a module in
 `crates/fake-claude/src/scenarios/` and a line in its table.
 
 Windows has no exec bit and `which`-style lookups need PATHEXT: give each scenario a

@@ -60,6 +60,18 @@ impl Peer {
             .and_then(|pid| u32::try_from(pid).ok())
     }
 
+    /// [`super::Peer::while_pinned`]: through the pidfd, never a bare pid.
+    pub fn while_pinned(&self, check: impl FnOnce(u32) -> bool) -> bool {
+        let pidfd = match &self.pin {
+            Pin::PeerPidfd(pidfd) | Pin::PidfdOpen(pidfd) => pidfd.as_raw_fd(),
+            Pin::None(_) => return false,
+        };
+        let Some(pid) = pid_of(pidfd).and_then(|pid| u32::try_from(pid).ok()) else {
+            return false;
+        };
+        alive(pidfd).is_ok() && check(pid) && alive(pidfd).is_ok()
+    }
+
     pub fn image(&self) -> Option<String> {
         let exe = fs::read_link(format!("/proc/{}/exe", self.pid()?)).ok()?;
         Some(exe.display().to_string())
