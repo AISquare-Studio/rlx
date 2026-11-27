@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import tempfile
 import time
 from collections import Counter
@@ -391,8 +392,8 @@ def _ephemeral_roots() -> tuple[Path, ...]:
         Path(tempfile.gettempdir()),
         Path("/tmp"),
         Path("/var/tmp"),
-        paths.aisquare_home() / "cache",
-        paths.aisquare_home() / "bench",
+        paths.cache_dir(),
+        paths.bench_dir(),
     }
     roots: set[Path] = set()
     for candidate in candidates:
@@ -459,6 +460,14 @@ def account_types(store: ContextStore, *, refresh: bool = True) -> dict[int, str
         return cached
     types: dict[int, str] = {}
     for account in accounts_core.list_accounts():
+        if not os.path.isdir(account.config_dir):
+            # A home its agent never ran in (Claude Code's plain ~/.claude before its first
+            # run) keeps no login: none is asked for, of the Keychain or a file (#1891), as
+            # the usage read asks none for an account with no login recorded. os.path, never
+            # Path.exists: that raises for a folder it cannot stat (EACCES), and one such
+            # account cost the whole sweep, nothing recorded (review of #32, #1918).
+            types[account.slot] = cached.get(account.slot, UNKNOWN_TYPE)
+            continue
         try:
             types[account.slot] = _subscription_of(account)
         except Exception:  # an account whose login cannot be read is one of unknown type
@@ -591,7 +600,9 @@ def _sweep(
     purged = purged_repos(store)
     repos: dict[Path, tuple[str, Path] | None] = {}
     seen_repos: dict[str, Path] = {}
-    types = account_types(store)
+    # Nothing to attribute: no account's login is read. An empty home's sweep (the rlx
+    # service's, every ten minutes) ran `security` for Claude Code's item (#32, #1891).
+    types = account_types(store) if found else {}
     for index, transcript in enumerate(found):
         if progress is not None:
             progress(index, len(found))

@@ -34,7 +34,7 @@ from typer.testing import CliRunner
 
 from aisquare.cli import launch as launch_cli
 from aisquare.cli.app import app
-from aisquare.core import insights, outbox
+from aisquare.core import insights, outbox, paths
 from aisquare.core.config import AppConfig, save_config
 from aisquare.services import explainability as service
 from aisquare.services import explainability_ops as ops
@@ -1370,7 +1370,7 @@ def test_the_printed_spawn_command_still_launches_when_the_gateway_refuses(
     server, gateway_url, posted = _gateway(
         {"/v1/traces/ingest": (409, {"detail": "not registered"})}
     )
-    log = isolated_home / "log" / "explainability-root.log"
+    log = paths.log_dir() / "explainability-root.log"
     try:
         with healthy_proxy() as proxy_url:
             _owning_machine(proxy_url=proxy_url, gateway_url=gateway_url)

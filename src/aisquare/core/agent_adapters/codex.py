@@ -1562,7 +1562,7 @@ class CodexAdapter:
         whatever a recorded launch spec said (one from before it had the store writable).
         ``None`` when ``args`` set no such table: the session runs unsandboxed or in a
         sandbox the operator chose. One ``-c`` cannot add a path to the table: Codex
-        splits a ``-c`` key on every dot, and a home's path has them (``~/.aisquare``).
+        splits a ``-c`` key on every dot, and a home's path has them (``~/.rlx``).
 
         Measured on 0.162.1: a ``read`` path inside the writable workspace (or ``/tmp``)
         refuses every write under it, a path that does not exist yet included, which

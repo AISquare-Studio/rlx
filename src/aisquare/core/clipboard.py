@@ -18,7 +18,7 @@ never raised.
 A tool that fails is not the end of the copy: the next one the platform has is tried
 (:func:`fallback_writers`, at most :data:`MAX_TRIES` a copy), and a tool that failed is
 passed over for :data:`RECHECK`. Inside the user's own tmux, tmux itself is one more
-route (:func:`relay_writer`, ``tmux load-buffer -w``): the one that can reach a terminal
+route (:func:`relay_writer`, ``tmux load-buffer -b rlx-copy -w``): the one that can reach a terminal
 over SSH, where tmux keeps an app's own OSC 52 to itself by default. What became of a
 copy is told as a :class:`CopyResult` — copied, only sent, or failed, and why
 (:func:`verdict`) — so every surface says what is true (R13, #146).
@@ -120,8 +120,9 @@ class Writer:
     env: tuple[tuple[str, str], ...] = ()
     """Set in the tool's environment over this process's own."""
     relay: bool = False
-    """It hands the text to a multiplexer (``tmux load-buffer -w``), which passes it on to
-    the terminal by its own settings: taken, the copy was SENT, not known to be copied."""
+    """It hands the text to a multiplexer (``tmux load-buffer -b rlx-copy -w``), which passes
+    it on to the terminal by its own settings: taken, the copy was SENT, not known to be
+    copied."""
 
     @property
     def name(self) -> str:
@@ -333,16 +334,27 @@ def fallback_writers(first: Writer, *, remote: bool = False) -> tuple[Writer, ..
     return tuple(writer for writer in found if writer.argv[0] != first.argv[0])
 
 
+RELAY_BUFFER = "rlx-copy"
+"""The one tmux buffer a relayed copy is put in, each copy over the last (:func:`relay_writer`)."""
+
+
 def relay_writer() -> Writer | None:
-    """Inside the user's own tmux, tmux itself: ``tmux load-buffer -w -`` puts the text in
-    a tmux buffer and sends it to the terminal of the client attached (tmux 3.2 and later),
-    which an app's own OSC 52 does not reach under tmux's default ``set-clipboard
-    external``. ``None`` outside tmux, or with no ``tmux`` on PATH. It scans PATH, so it
-    runs on the clipboard thread only."""
+    """Inside the user's own tmux, tmux itself: ``tmux load-buffer -b rlx-copy -w -`` puts
+    the text in a tmux buffer and sends it to the terminal of the client attached (tmux 3.2
+    and later), which an app's own OSC 52 does not reach under tmux's default
+    ``set-clipboard external``. ``None`` outside tmux, or with no ``tmux`` on PATH. It scans
+    PATH, so it runs on the clipboard thread only.
+
+    The buffer is a named one, :data:`RELAY_BUFFER`, which each copy replaces. Unnamed, every
+    copy was a new automatic buffer on the user's paste-buffer stack, Remote's link and its
+    token among them, kept there until tmux's ``buffer-limit`` pushed them off (the 0.10.2
+    handoff: privacy)."""
     if not os.environ.get("TMUX"):
         return None
     found = shutil.which("tmux")
-    return Writer((found, "load-buffer", "-w", "-"), relay=True) if found else None
+    if not found:
+        return None
+    return Writer((found, "load-buffer", "-b", RELAY_BUFFER, "-w", "-"), relay=True)
 
 
 def local_writer() -> Writer | None:

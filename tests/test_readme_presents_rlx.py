@@ -242,6 +242,16 @@ def test_the_readme_is_titled_rlx_and_does_not_explain_the_name() -> None:
     assert not _title(_readme())
 
 
+_LOGO_ATTRIBUTES: dict[str, frozenset[str]] = {
+    "svg": frozenset({"viewBox", "width", "height", "role"}),
+    "title": frozenset(),
+    "path": frozenset({"fill", "d"}),
+}
+"""The logo's elements, paths only, and the attributes each may set: nothing else draws (a
+``<rect>`` background), strokes (a ``stroke`` outlines the glyphs a second time), styles (a
+``style`` fill paints over ``fill``) or runs (an ``onload``)."""
+
+
 def _logo_problems(svg: str) -> list[str]:
     """What keeps an SVG from being the r\\x logo as an <img> shows it on GitHub and PyPI."""
     root = ElementTree.fromstring(svg)
@@ -253,6 +263,19 @@ def _logo_problems(svg: str) -> list[str]:
     problems += [
         f"runs or loads {tag}" for tag in sorted(tags & {"script", "image", "use", "foreignObject"})
     ]
+    problems += [f"draws {tag}: paths only" for tag in sorted(tags - set(_LOGO_ATTRIBUTES))]
+    for element in root.iter():
+        tag = element.tag.rpartition("}")[2]
+        if tag not in _LOGO_ATTRIBUTES:
+            continue  # refused whole above
+        for name in sorted(set(element.attrib) - _LOGO_ATTRIBUTES[tag]):
+            name = name.rpartition("}")[2]
+            if name.startswith("stroke"):
+                problems.append(f"{tag} sets {name}: no stroke, the outlines are filled")
+            elif name.startswith("on"):
+                problems.append(f"{tag} sets {name}: runs something")
+            else:
+                problems.append(f"{tag} sets {name}, which the mark does not")
     if "path" not in tags:
         problems.append("draws no path")
     if fills != {"#2F74F0"}:
@@ -276,6 +299,46 @@ def test_the_logo_is_the_outlined_mark() -> None:
     assert _logo_problems(good.replace("#2F74F0", "#2f74f1"))
     assert _logo_problems(good.replace("<title>rlx</title>", ""))
     assert _logo_problems(good.replace("</svg>", '<image href="https://example.com/x.png"/></svg>'))
+
+
+def test_the_logo_guard_holds_it_to_filled_paths_alone() -> None:
+    """The 0.10.2 handoff: "paths only" and "no stroke" were not enforced. A stroke, an
+    ``onload``, a ``style`` fill and a ``<rect>`` background each left the guard green; the
+    committed file has none of them. Each is caught now, by what it is, and the brand blue
+    used for each does not hide it."""
+    good = LOGO.read_text(encoding="utf-8")
+    assert good.count("<path ") == 1 and good.count('role="img">') == 1  # what the cases edit
+    cases = {
+        "stroke": good.replace("<path ", '<path stroke="#2F74F0" stroke-width="40" '),
+        "onload": good.replace('role="img">', 'role="img" onload="alert(1)">'),
+        "style fill": good.replace("<path ", '<path style="fill:#2F74F0" '),
+        "rect background": good.replace(
+            "<path ", '<rect width="1606" height="940" fill="#2F74F0"/><path '
+        ),
+    }
+    said = {case: _logo_problems(svg) for case, svg in cases.items()}
+    assert said == {
+        "stroke": [
+            "path sets stroke: no stroke, the outlines are filled",
+            "path sets stroke-width: no stroke, the outlines are filled",
+        ],
+        "onload": ["svg sets onload: runs something"],
+        "style fill": ["path sets style, which the mark does not"],
+        "rect background": ["draws rect: paths only"],
+    }, said
+
+
+def test_the_readmes_codex_link_is_the_page_the_app_sends_people_to() -> None:
+    """The README linked learn.chatgpt.com/docs/codex/cli while the adapter's install page,
+    which the Accounts page and Doctor show, is developers.openai.com/codex/cli (the 0.10.2
+    handoff). One page for one thing."""
+    from aisquare.core.agent_adapters import get_adapter
+
+    page = get_adapter("codex").install_page
+    text = README.read_text(encoding="utf-8")
+    assert page == "https://developers.openai.com/codex/cli"
+    assert f"[Codex]({page})" in text
+    assert "learn.chatgpt.com" not in text
 
 
 def test_no_page_explains_the_name() -> None:
@@ -381,7 +444,7 @@ def test_cli_is_caught_in_any_case_and_urls_and_the_package_are_not() -> None:
         "uv tool install --python 3.13 aisquare-cli",
         "codex plugin add aisquare@aisquare-cli",
         "`uvx --from aisquare-cli==<version>`",
-        "[Codex](https://learn.chatgpt.com/docs/codex/cli)",
+        "[Codex](https://developers.openai.com/codex/cli)",
         "a remote client, a climb, a clinic",
     )
     for line in innocent:

@@ -34,13 +34,12 @@ from pathlib import Path
 
 import pytest
 
-from aisquare.core import spawn
+from aisquare.core import paths, spawn
 from aisquare.core import tmux as tmux_module
 from aisquare.core.tmux import (
     _SEP,
     BUNDLED_CONF,
     CHECK_SOCKET_SUFFIX,
-    CONF_NAME,
     DEFAULT_WINDOW_HEIGHT,
     DEFAULT_WINDOW_WIDTH,
     MIN_VERSION,
@@ -293,7 +292,8 @@ def test_run_maps_a_failure_to_tmux_error_carrying_stderr(fake_bin: Path, conf: 
 def test_conf_path_repairs_drift_and_leaves_a_correct_file_alone(
     fake_bin: Path, isolated_home: Path
 ) -> None:
-    path = isolated_home / CONF_NAME
+    path = paths.tmux_conf_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     isolated_home.mkdir(parents=True, exist_ok=True)
     path.write_text("set -g status on  # someone edited it\n", encoding="utf-8")
 
@@ -336,7 +336,8 @@ def test_a_conf_that_cannot_be_rewritten_fails_open_instead_of_raising(
     is on ``conf_fallback`` so a caller can say it out loud.
     """
     isolated_home.mkdir(parents=True, exist_ok=True)
-    path = isolated_home / CONF_NAME
+    path = paths.tmux_conf_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("set -g status on  # what the last version wrote\n", encoding="utf-8")
     path.chmod(0o444)
 
@@ -346,7 +347,7 @@ def test_a_conf_that_cannot_be_rewritten_fails_open_instead_of_raising(
     assert server.argv("has-session")[4] == str(path)
     assert path.read_text(encoding="utf-8").startswith("set -g status on")
     assert server.conf_fallback is not None
-    assert CONF_NAME in server.conf_fallback
+    assert paths.tmux_conf_path().name in server.conf_fallback
     assert "whatever the last version wrote" in server.conf_fallback
 
     fresh = TmuxServer("s", binary=str(fake_bin), runner=FakeTmux())
@@ -372,7 +373,8 @@ def test_a_conf_that_cannot_be_READ_is_replaced_by_devnull(
     nothing in `-ra` said so.
     """
     isolated_home.mkdir(parents=True, exist_ok=True)
-    path = isolated_home / CONF_NAME
+    path = paths.tmux_conf_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("set -g status on  # what the last version wrote\n", encoding="utf-8")
 
     path.chmod(0o000)

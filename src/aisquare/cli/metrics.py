@@ -223,7 +223,7 @@ def _json(payload: object) -> None:
 
 
 def _state_file() -> str:
-    """Where the sharing's state lives, as a person would type it (``~/.aisquare/state.json``)."""
+    """Where the sharing's state lives, as a person would type it (``~/.rlx/state.json``)."""
     path = paths.state_path()
     try:
         return "~/" + path.relative_to(Path.home()).as_posix()
@@ -275,7 +275,8 @@ def share_on() -> None:
 @share_app.command("off")
 def share_off() -> None:
     """Stop sharing. What was kept of the shipments is purged, and one opt-out notice is sent
-    (best effort, only if anything was ever sent); nothing is sent after it."""
+    (best effort, only if anything was ever sent); no usage is sent after it. The daily active
+    ping is separate and has its own switch (`config set sharing.active_ping false`)."""
     report = usage_share.disable()
     if get_state().json_output:
         _json({"enabled": False, **report.model_dump(mode="json")})
@@ -294,6 +295,28 @@ def share_status() -> None:
         _json(status.model_dump(mode="json"))
         return
     emit_sharing_status(status)
+    typer.echo(_ping_line())
+
+
+def _ping_line() -> str:
+    """The daily active ping, which ``share status`` names beside sharing: it is separate."""
+    from aisquare.core import program as prog
+    from aisquare.services import active_ping
+
+    ping = active_ping.status()
+    if ping.forced_off:
+        state = f"off, forced: {ping.forced_off}"
+    elif ping.enabled:
+        state = "on"
+    else:
+        state = "off"
+    turn = "false" if ping.switch else "true"
+    return (
+        f"Daily active ping: {state}. Separate from sharing: one anonymous ping on each day you "
+        "use rlx (date, version, OS, CPU type, install method; no id). "
+        f"Turn it {'off' if ping.switch else 'on'}: "
+        f"{prog.word()} config set sharing.active_ping {turn}"
+    )
 
 
 @share_app.command("preview")
@@ -353,3 +376,16 @@ def ship(
         _json(report.model_dump(mode="json"))
         return
     emit_ship_report(report)
+
+
+@app.command("ping", hidden=True)
+def ping() -> None:
+    """Send today's anonymous active ping if it is on and due: the detached process a command
+    starts (never the command itself). Prints nothing; ``--json`` prints what it did."""
+    from dataclasses import asdict
+
+    from aisquare.services import active_ping
+
+    result = active_ping.send()
+    if get_state().json_output:
+        _json(asdict(result))

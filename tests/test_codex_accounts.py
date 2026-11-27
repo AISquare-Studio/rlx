@@ -29,7 +29,7 @@ from aisquare.cli import accounts as accounts_cli
 from aisquare.cli.app import app
 from aisquare.core import claude_accounts as core
 from aisquare.core import codex_accounts as codex
-from aisquare.core import launch_seal
+from aisquare.core import launch_seal, paths
 from aisquare.core.agent_adapters import adapters, get_adapter
 from aisquare.core.agent_adapters import get_adapter as _get_adapter
 from aisquare.core.config import AccountsSettings, load_config, save_config
@@ -191,10 +191,11 @@ def test_codex_slots_share_one_ladder_with_claude_and_keep_its_numbers(home: Pat
     claude_four = core.create_account()
 
     assert (claude_two.slot, first_codex.slot, claude_four.slot) == (2, 3, 4)
-    assert first_codex.config_dir == Path(os.environ["AISQUARE_HOME"]) / "codex-accounts" / "3"
+    assert first_codex.config_dir == paths.agent_accounts_dir("codex-accounts") / "3"
     assert first_codex.tmp_dir is None and first_codex.agent == "codex"
     # The Claude slots are exactly what they were: directory, scratch dir, marker.
-    assert claude_two.config_dir.parent.name == "claude-accounts" and claude_two.tmp_dir
+    assert claude_two.config_dir.parent == paths.agent_accounts_dir("claude-accounts")
+    assert claude_two.tmp_dir
     claude_marker = json.loads((claude_two.config_dir / core.MARKER).read_text())
     codex_marker = json.loads((first_codex.config_dir / core.MARKER).read_text())
     assert "agent" not in claude_marker and codex_marker["agent"] == "codex"
@@ -742,9 +743,9 @@ def test_alias_disable_order_move_and_remove_work_on_codex_slots(home: Path) -> 
 
     service.set_default(str(second.slot))
     moved = service.remove(core.find_account(second.slot) or second)
-    assert (
-        moved.name.startswith(f"{second.slot}.removed-") and moved.parent.name == "codex-accounts"
-    )
+    assert moved.name.startswith(
+        f"{second.slot}.removed-"
+    ) and moved.parent == paths.agent_accounts_dir("codex-accounts")
     assert service.machine_default("codex") is None  # the one enabled slot went with it
     with pytest.raises(service.AccountsError, match="codex logout"):
         (home / ".codex").mkdir()

@@ -780,7 +780,7 @@ def test_the_team_strip_counts_each_role_by_state_and_hides_with_only_the_manage
         return (*team, strip.display)
 
     text, displayed, alone = drive(project, scenario)
-    assert text == "🔨 2▶  🧪 1⏸  👀 1🔔  · board for detail"
+    assert text == "🔨 2▶  🧪 1◦  👀 1🔔  · board for detail"
     assert displayed is True
     assert alone is False
 
@@ -796,7 +796,7 @@ def test_the_team_strip_shows_each_state_of_a_role_and_a_role_it_has_no_icon_for
     ]
     text = project_view_module.team_strip_text(frame)
     assert text is not None
-    assert text.plain == "🔨 1▶ 1⏸ 1⏳  🤖 docs-writer 1⏸  · board for detail"
+    assert text.plain == "🔨 1▶ 1◦ 1⏳  🤖 docs-writer 1◦  · board for detail"
     assert project_view_module.team_strip_text(frame[:0]) is None
 
 
@@ -1023,7 +1023,11 @@ def test_board_tab_shows_this_projects_tasks_and_not_anothers(
 
     async def rows(pilot: Pilot[None], host: Host) -> int:
         """The task rows: with none open, the table's one row is the empty state (#286)."""
-        return sum(key.value != EMPTY_ROW for key in host.query_one("#tasks", DataTable).rows)
+        table = host.query_one("#tasks", DataTable)
+        # Not the empty state, nor a group's heading (B2): the tasks.
+        return sum(
+            key.value != EMPTY_ROW and not str(key.value).startswith("group:") for key in table.rows
+        )
 
     assert drive(project, rows) == 2
     assert drive(other, rows) == 0  # the panel reads the project it was given, not the cwd
@@ -1093,6 +1097,74 @@ def test_b_on_the_board_tab_hides_and_brings_back_the_column_every_time(
         return states
 
     assert drive(project, scenario) == [(False, "feed"), (True, "tasks"), (False, "feed")]
+
+
+def test_the_board_keys_answer_as_soon_as_its_tab_is_clicked(project: ProjectInfo) -> None:
+    """B1 #1: a click on the Board tab left the focus on the tab row, outside the panel, and
+    ``d``, ``b`` or ``a`` did nothing until a second click inside the board."""
+
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[bool, bool, bool]:
+        await pilot.click("#--content-tab-tab-board")
+        panel = host.query_one("#board-panel", BoardPanel)
+
+        def inside() -> bool:
+            focused = host.focused
+            return focused is not None and panel in focused.ancestors_with_self
+
+        # The click's chain (the tab activated, its pane shown, the panel's on_show taking the
+        # keys) is several messages long; one pause() guesses "idle" from CPU time and, on a
+        # loaded Windows runner, returned before its end (#29). Wait for the focus itself.
+        for _ in range(500):  # bounded: 10 s at most
+            if inside():
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"the tab's click left the focus outside the board: {host.focused!r}")
+        took = inside()
+        folded = "done" in panel.folds
+        await pilot.press("d")  # no click inside the board first: Done unfolds (B2)
+        for _ in range(500):
+            if "done" not in panel.folds:
+                break
+            await pilot.pause(0.02)
+        else:
+            pytest.fail(f"d did not reach the board: its folds read {sorted(panel.folds)}")
+        return took, folded, "done" in panel.folds
+
+    inside, folded, still = drive(project, scenario)
+    assert inside, "the tab's click left the focus outside the board"
+    assert folded and not still, "d answered with no click first"
+
+
+class BesideAField(Host):
+    """The Project view beside a field: a focus outside its tabs, as the sidebar is in asq."""
+
+    def compose(self) -> ComposeResult:
+        yield Input(id="outside")
+        yield from super().compose()
+
+
+def test_a_board_shown_from_outside_its_tabs_leaves_the_focus_where_it_was(
+    project: ProjectInfo,
+) -> None:
+    """B1 #1's other half: the board takes the keys from its own tabs only. Shown because the
+    sidebar moved to its project, it left the focus in the sidebar, which the arrows walk."""
+
+    async def scenario(pilot: Pilot[None], host: Host) -> str | None:
+        host.query_one("#outside", Input).focus()
+        await pilot.pause()
+        host.query_one(ProjectView).active = "tab-board"
+        await pilot.pause()
+        await pilot.pause()
+        return host.focused.id if host.focused is not None else None
+
+    async def run() -> str | None:
+        host = BesideAField(project)
+        async with host.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            return await scenario(pilot, host)
+
+    assert asyncio.run(run()) == "outside"
 
 
 class TwoProjects(App[None]):
@@ -1384,7 +1456,7 @@ def test_settings_saves_a_nickname_and_a_blank_one_clears_it(
         seen.append(shown(host.query_one("#fleet-id", Static)))
         sessions.sessions.add("asq-auth-wip")  # an agent started under the new codename
         field.value = ""
-        host.query_one("#save-nickname", Button).press()
+        field.blur()  # leaving the field keeps it: there is no Save (M5)
         await settle(pilot)
         with store_session() as store:
             seen.append(store.get_project(project.id).nickname)  # type: ignore[union-attr]
@@ -1401,10 +1473,13 @@ def test_settings_saves_a_nickname_and_a_blank_one_clears_it(
     assert renamed == [project.id, project.id], "the app hears of both, to repaint the name"
     assert isinstance(notices, list)
     assert any(
-        m.endswith("is now called Auth [wip] 🚀 · fleet codename auth-wip") for m, _ in notices
+        m.endswith("is now called Auth [wip] 🚀 · fleet codename auth-wip · Undo: ctrl+z")
+        for m, _ in notices
     ), notices
     assert any(
-        m.endswith("shows its folder name again · fleet codename repo (was auth-wip)")
+        m.endswith(
+            "shows its folder name again · fleet codename repo (was auth-wip) · Undo: ctrl+z"
+        )
         for m, _ in notices
     ), notices
     # The session made by hand above is one no launch record names: #113 renames the
@@ -1416,21 +1491,28 @@ def test_settings_saves_a_nickname_and_a_blank_one_clears_it(
 def test_a_nickname_the_store_refuses_is_said_and_nothing_is_written(
     project: ProjectInfo,
 ) -> None:
+    """M5 acceptance 3: an invalid value is refused beside its field, and not saved; the field
+    keeps what was typed, to correct."""
     from aisquare.core.store import store_session
 
-    async def scenario(pilot: Pilot[None], host: Host) -> list[tuple[str, str]]:
+    async def scenario(pilot: Pilot[None], host: Host) -> tuple[str, str, str]:
         host.query_one(ProjectView).active = "tab-settings"
         await settle(pilot)
-        host.query_one("#nickname", Input).value = "two\tparts"
-        host.query_one("#save-nickname", Button).press()
+        field = host.query_one("#nickname", Input)
+        field.value = "two\tparts"
+        await pilot.click("#nickname")
+        await pilot.press("enter")
         await settle(pilot)
-        return host.notices
+        said, typed = host.query_one(SettingsView).problem(field), field.value
+        field.value = ""  # what the store holds (no nickname), typed back
+        await pilot.press("enter")
+        await settle(pilot)
+        return said, typed, host.query_one(SettingsView).problem(field)
 
-    notices = drive(project, scenario)
-    assert any(
-        m.startswith("the nickname was not saved: a nickname is one line") and s == "error"
-        for m, s in notices
-    ), notices
+    said, typed, after = drive(project, scenario)
+    assert said.startswith("not saved: a nickname is one line"), said
+    assert typed == "two\tparts", "the field keeps what was typed"
+    assert after == "", "the stored name typed back: the line goes (tester of #24, F1)"
     with store_session() as store:
         assert store.get_project(project.id).nickname is None  # type: ignore[union-attr]
 
@@ -2378,3 +2460,96 @@ def test_the_key_row_names_a_missing_file_instead_of_contradicting_itself(
 
     assert "file MISSING" in row and str(path) in row
     assert "not used for target stg" not in row
+
+
+def test_the_nickname_is_kept_on_leaving_the_field_and_ctrl_z_puts_the_old_one_back(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M5: no Save: leaving the field keeps the nickname, on disk; ctrl+z puts the one it
+    replaced back, on disk and in the field."""
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)  # a rename renames the project's sessions: none, faked
+
+    def stored() -> str | None:
+        with store_session() as store:
+            return store.get_project(project.id).nickname  # type: ignore[union-attr]
+
+    async def scenario(pilot: Pilot[None], host: Host) -> dict[str, Any]:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        field = host.query_one("#nickname", Input)
+        seen: dict[str, Any] = {
+            "buttons": [str(b.label) for b in host.query_one(SettingsView).query(Button)]
+        }
+        await pilot.click("#nickname")
+        field.value = "Auth"
+        field.blur()
+        await settle(pilot)
+        seen["kept"] = stored()
+        host.query_one(SettingsView).focus()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen["undone"] = (stored(), field.value)
+        seen["notices"] = [m for m, _ in host.notices]
+        return seen
+
+    seen = drive(project, scenario)
+    assert "Save" not in seen["buttons"], seen["buttons"]
+    assert seen["kept"] == "Auth", "kept on leaving the field, no Save pressed"
+    assert seen["undone"] == (None, ""), "ctrl+z: the name it replaced (none), on disk and shown"
+    assert any(m.endswith("· Undo: ctrl+z") for m in seen["notices"]), seen["notices"]
+    assert "Undone: repo's nickname" in seen["notices"]
+
+
+def test_a_nickname_typed_and_not_left_is_kept_when_rlx_quits(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #24: quitting before the field was left lost the name typed in it."""
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)  # a rename renames the project's sessions: none, faked
+
+    async def scenario(pilot: Pilot[None], host: Host) -> None:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        await pilot.click("#nickname")
+        await settle(pilot)
+        await pilot.press(*"Auth")
+        await pilot.pause()
+        host.exit()  # no Enter, the field never left
+
+    drive(project, scenario)
+    with store_session() as store:
+        assert store.get_project(project.id).nickname == "Auth"  # type: ignore[union-attr]
+
+
+def test_a_nickname_the_service_cannot_write_on_quit_raises_nothing_as_rlx_exits(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #24: the quit-time write let ``rename_project``'s KeyError (a project gone)
+    out, a traceback as rlx exited. The name typed is still tried as rlx goes, and whatever
+    the service raises, rlx exits quietly."""
+    from aisquare.services import fleet as fleet_service
+
+    tried: list[str | None] = []
+
+    def gone(_project: object, wanted: str | None, **_k: object) -> None:
+        tried.append(wanted)
+        raise KeyError(project.id)
+
+    monkeypatch.setattr(fleet_service, "rename_project", gone)
+
+    async def scenario(pilot: Pilot[None], host: Host) -> None:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        await pilot.click("#nickname")
+        await settle(pilot)
+        await pilot.press(*"Auth")
+        await pilot.pause()
+        host.exit()
+
+    drive(project, scenario)  # exits quietly: a KeyError out of here fails the test
+    assert tried == ["Auth"], "the typed name was written as rlx went, and the error kept in"

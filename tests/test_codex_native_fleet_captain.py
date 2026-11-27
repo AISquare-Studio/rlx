@@ -47,7 +47,7 @@ import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
-from aisquare.core import agents, selfcli
+from aisquare.core import agents, paths, selfcli
 from aisquare.core.agent_adapters.types import store_dir, store_read_only
 from aisquare.core.config import (
     FleetRoleSettings,
@@ -131,7 +131,7 @@ def _codex_fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> 
         project = team.activate(workspace)
         for kept in store_read_only(store_dir()):
             kept.parent.mkdir(parents=True, exist_ok=True)
-        (store / "codex-accounts").mkdir(exist_ok=True)
+        paths.agent_accounts_dir("codex-accounts").mkdir(parents=True, exist_ok=True)
         try:
             yield Fleet(project, fleet.server(config.fleet), provider.requests, outside)  # type: ignore[attr-defined]
         finally:

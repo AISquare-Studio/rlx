@@ -37,11 +37,15 @@ def registered(monkeypatch: pytest.MonkeyPatch) -> Iterator[instances.Registrati
 
 
 def _beaten(registration: instances.Registration, pids: set[int]) -> None:
-    """Wait for a beat whose read of the others names exactly ``pids``."""
+    """Wait for a beat whose read of the others began after this call and names exactly
+    ``pids``: newer than any claim stamped before (``size_owner_runs``). Not a sleep of one
+    beat more: a starved beat thread outlasted it, and a claim stamped before the wait read as
+    newer than the registry's last read (py3.12 shard 2/4, run 44226472438)."""
+    asked = time.time_ns()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if {other.pid for other in registration.others} == pids:
-            time.sleep(0.05)  # and one beat more, so the read is newer than any claim before
+        fresh = registration.others_read_ns > asked  # first: the beat sets `others` before it
+        if fresh and {other.pid for other in registration.others} == pids:
             return
         time.sleep(0.01)
     pytest.fail(f"the beat read {registration.others}")
@@ -126,9 +130,19 @@ def test_a_claim_newer_than_the_last_read_of_the_registry_counts(
 ) -> None:
     """An asq that started and claimed since the beat last read: the read could not know it."""
     _beaten(registered, set())
-    monkeypatch.setattr(instances, "HEARTBEAT_SECONDS", 60.0)  # no read after this one
-    time.sleep(0.05)
-    fresh = SizeOwner(os.getppid(), "mini", "ssh", time.time_ns())
+
+    # No read lands after this one. The beat goes on and this process stays registered, but a
+    # read that looks the registry up from now on fails before it lands; one already under way
+    # took its time before `since`. A longer beat and a sleep left one beat due at the old 20 ms,
+    # which a starved thread took after the claim's stamp.
+    def no_read_lands(*, prune: bool = True) -> list[instances.Instance]:
+        raise OSError("no read lands after the test's (test_multi_instance_combined)")
+
+    monkeypatch.setattr(instances, "live_instances", no_read_lands)
+    since = time.time_ns()
+    # Stamped past `since`, not at `time.time_ns()`: Windows' clock moves in 15.6 ms steps, and a
+    # claim stamped just after the read tied it (windows-py3.12; review #1782 of #20).
+    fresh = SizeOwner(os.getppid(), "mini", "ssh", since + 1)
 
     assert fresh.stamp > registered.others_read_ns and size_owner_runs(fresh)
 

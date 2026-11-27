@@ -53,7 +53,7 @@ def test_a_server_only_the_spawners_home_names_is_switched_off_where_the_window_
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spawners = tmp_path / "codex-accounts" / "5"
+    spawners = tmp_path / "slots" / "5"
     spawners.mkdir(parents=True)
     (spawners / "config.toml").write_text(
         '[mcp_servers.linear]\ncommand = "/opt/linear"\n', encoding="utf-8"

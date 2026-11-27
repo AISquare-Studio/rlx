@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import re
+import stat
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -17,7 +18,6 @@ import typer
 from rich import box
 from rich.table import Table
 from rich.text import Text
-from typer.models import TyperPath
 
 from aisquare.core import paths
 from aisquare.core import program as prog
@@ -1278,7 +1278,7 @@ def fail(
     raise typer.Exit(exit_code)
 
 
-class AgentPath(TyperPath):
+class AgentPath:
     """The type of a path option a sandboxed agent's broker runs a command with (``task add
     --detail-file``, ``brief evidence|finding --artifact``, ``brief check --source-root``,
     ``watch show <path>``): there the path is taken as given, and the command judges it, the
@@ -1286,11 +1286,32 @@ class AgentPath(TyperPath):
     the path as the user, outside the sandbox, before that: their "is a directory" and "is not
     readable" told the sandbox what lies at a path outside its tree, which the command's own
     refusal says nothing of (review r38 of #113, finding 1). Any other command's path is
-    checked as it always was (a usage error)."""
+    checked as it always was (a usage error).
 
-    def convert(self, value: str | os.PathLike[str], param: Any, ctx: Any) -> Any:
+    A ``parser=`` callable, not a click type: typer 0.29 dropped ``click_type=`` and the
+    ``TyperPath`` this subclassed, and both 0.28 and 0.29 take a parser. A parser also takes
+    the path out of typer's own path checks, so the unbrokered ones are here: typer's for a
+    path that need not exist and must be readable (``dir_okay=False``: not a directory), in
+    its words. ``__name__`` is the type's name in help (``<file>``, ``<path>``) on 0.28."""
+
+    def __init__(self, *, dir_okay: bool = True) -> None:
+        self.dir_okay = dir_okay
+        self.__name__ = "path" if dir_okay else "file"
+
+    def __call__(self, value: str | os.PathLike[str]) -> Path:
         from aisquare.services.store_broker import brokered_call
 
-        if brokered_call():
-            return self.coerce_path_result(value)
-        return super().convert(value, param, ctx)
+        if not brokered_call():
+            self._check(value)
+        return Path(value)
+
+    def _check(self, value: str | os.PathLike[str]) -> None:
+        try:
+            found = os.stat(value)
+        except OSError:
+            return
+        said = f"{self.__name__.title()} {os.fsdecode(value)!r}"
+        if not self.dir_okay and stat.S_ISDIR(found.st_mode):
+            raise typer.BadParameter(f"{said} is a directory.")
+        if not os.access(value, os.R_OK):
+            raise typer.BadParameter(f"{said} is not readable.")

@@ -50,7 +50,7 @@ _CLAIM_STALE_SECONDS = 900.0
 
 def root() -> Path:
     """Directory holding the spool (not created)."""
-    return paths.aisquare_home() / "explainability"
+    return paths.explainability_dir()
 
 
 def queue_dir() -> Path:

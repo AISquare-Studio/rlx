@@ -716,7 +716,7 @@ def observe(sources: Sources, *, cursors: Mapping[str, int], now: datetime) -> O
 
 def queue_path() -> Path:
     """Where the home's queue lives: ``<AISQUARE_HOME>/captain/queue.json``."""
-    return paths.aisquare_home() / "captain" / "queue.json"
+    return paths.captain_dir() / "queue.json"
 
 
 def rank(items: Iterable[QueueItem]) -> list[QueueItem]:

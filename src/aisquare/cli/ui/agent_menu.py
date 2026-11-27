@@ -11,7 +11,11 @@ already offers in place:
 - *Restart* on every row but a paused one (restarting a paused row IS its resume);
 - *Rename*, always listed, and greyed with why under it when the row offers none (the manager,
   the captain, a paused or an ended agent): ``sidebar.rename_refusal_words``, the service's
-  rule in words that name no command.
+  rule in words that name no command;
+- on a limited agent, first, *Move to me@example.com (80% left)* and *Wait*, as the agent's
+  header offers them (the 0.10.2 UX audit's M1): the account is found as the menu opens, off
+  the UI thread (``views.agent.move_offer``), and *Move* stays greyed until it is, or says
+  that no account has room. *Wait* calls nothing.
 
 The menu answers what was chosen and does nothing itself, as a project card's menu does: the
 shell (``FleetApp.on_open_agent_menu``) runs the header's own press when the agent's view is
@@ -31,9 +35,11 @@ from textual.geometry import Region
 from textual.screen import ModalScreen
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
+from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.dont_ask import PAUSE, RESTART, STOP
 from aisquare.cli.ui.sidebar import STOP_STATES
+from aisquare.cli.ui.views.agent import MOVE, OFFER_WORKER, WAIT, MoveOffer, move_offer
 from aisquare.models import FleetAgentStatus
 
 RESUME = "resume"
@@ -44,12 +50,36 @@ MENU_WIDTH = 26
 sidebar beside it."""
 
 
+FINDING = "⇄ Move: finding room…"
+"""*Move* while the menu looks for the account with the most room."""
+NO_ROOM = "⇄ Move: no account has room"
+"""*Move* when no other account of the agent's has room: greyed."""
+
+
+def move_prompt(offer: MoveOffer | None, *, asked: bool) -> str:
+    """*Move*'s words: the offer's (``⇄ Move to me@example.com (80% left)``), else
+    :data:`FINDING` while it is looked for, else :data:`NO_ROOM`."""
+    if offer is not None:
+        return f"⇄ {offer.words()}"
+    return FINDING if not asked else NO_ROOM
+
+
 def agent_menu_options(
-    status: FleetAgentStatus, *, pausable: bool, rename_refusal: str | None
+    status: FleetAgentStatus,
+    *,
+    pausable: bool,
+    rename_refusal: str | None,
+    offer: MoveOffer | None = None,
+    asked: bool = False,
 ) -> list[Option]:
-    """The entries for ``status``'s row, in the header's order, Rename last."""
+    """The entries for ``status``'s row, in the header's order, Rename last; a limited
+    agent's *Move* and *Wait* first (``offer``: where *Move* takes it; ``asked``: whether
+    that was looked for already)."""
     paused = status.state == "paused"
     options: list[Option] = []
+    if status.state == "limited":
+        options.append(Option(move_prompt(offer, asked=asked), id=MOVE, disabled=offer is None))
+        options.append(Option("⏳ Wait", id=WAIT))
     if paused:
         options.append(Option("▶ Resume", id=RESUME))
     elif pausable:
@@ -93,6 +123,8 @@ class AgentMenu(ModalScreen[str | None]):
         """Where the row is on screen: the menu opens under it."""
         self.pausable = pausable
         self.rename_refusal = rename_refusal
+        self.offer: MoveOffer | None = None
+        """Where *Move* takes a limited agent, once found (:func:`views.agent.move_offer`)."""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="agent-menu"):
@@ -125,6 +157,27 @@ class AgentMenu(ModalScreen[str | None]):
         box.styles.offset = (x, y)
         options.highlighted = 0
         options.focus()
+        if self.status.state == "limited":
+            status = self.status
+            self.run_worker(
+                lambda: move_offer(status),
+                name=OFFER_WORKER,
+                group=OFFER_WORKER,
+                exclusive=True,
+                thread=True,
+                exit_on_error=False,
+            )
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """The account *Move* takes the agent to was found, or none: say it on the entry."""
+        if event.worker.group != OFFER_WORKER or not event.worker.is_finished:
+            return
+        result = event.worker.result if event.state is WorkerState.SUCCESS else None
+        self.offer = result if isinstance(result, MoveOffer) else None
+        options = self.query_one(OptionList)
+        options.replace_option_prompt(MOVE, move_prompt(self.offer, asked=True))
+        if self.offer is not None:
+            options.enable_option(MOVE)
 
     @on(OptionList.OptionSelected, "#agent-menu-options")
     def _chosen(self, event: OptionList.OptionSelected) -> None:
