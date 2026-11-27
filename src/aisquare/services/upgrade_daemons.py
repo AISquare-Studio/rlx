@@ -791,16 +791,33 @@ def _rlx_verb(kind: str, verb: Sequence[str]) -> bool:
     )
 
 
-def _same_program(given: str, expected: str) -> str | None:
-    """Why ``given``, a record's ``argv[0]``, is not the program ``expected``, or ``None``."""
+def _same_program(given: str, expected: str, *, kind: str) -> str | None:
+    """Why ``given``, a record's ``argv[0]``, is not the program ``expected``, or ``None``.
+    Not "the same file" (``samefile``), which a symlink passes (review #3471):
+
+    - **watch, serve:** the very path rlx writes, ``sys.executable`` (``selfcli.argv_for``).
+      A venv's ``bin/python`` is a link to its base interpreter, and Python takes its
+      environment from the path it was started by: another venv on the same base (a
+      planted one, a checkout's ``.venv``) would run its own ``aisquare``.
+    - **rlxd:** the same file, by the same name, in the same folder, resolved, as the rlxd
+      beside rlx: rlxd runs the ``rlx`` and ``rlxd-hook`` beside the path it was started
+      by. A resolved folder keeps Linux's ``current_exe`` (``/proc/self/exe``, resolved)."""
     program = Path(given)
     if not program.is_absolute() or not program.is_file():
         return f"its program {given} is not a file"
+    wrong = f"it runs {given}, not {expected}"
+    if kind != "rlxd":
+        return None if given == expected else wrong
+    target = Path(expected)
     try:
-        same = os.path.samefile(program, expected)
+        same = (
+            program.name == target.name
+            and program.parent.resolve() == target.parent.resolve()
+            and os.path.samefile(program, target)
+        )
     except OSError:
         same = False
-    return None if same else f"it runs {given}, not {expected}"
+    return None if same else wrong
 
 
 def _registry_untrusted() -> str | None:
@@ -848,7 +865,7 @@ def restart_refusal(daemon: daemons_core.Daemon) -> str | None:
         return f"rlx doesn't restart a {daemon.kind}"
     if argv[1 : len(command)] != list(command[1:]):
         return "its command is not rlx's"
-    wrong = _same_program(argv[0], command[0])
+    wrong = _same_program(argv[0], command[0], kind=daemon.kind)
     if wrong is not None:
         return wrong
     untrusted = _registry_untrusted()
@@ -963,8 +980,8 @@ def pending_restarts() -> tuple[dict[str, Any], ...]:
 def _helper_holds(lock: Path) -> bool:
     """Whether a helper holds ``lock``, its claim on a record id."""
     try:
-        handle = locking.open_lock_file(lock, create=False)
-    except FileNotFoundError:
+        handle = os.open(lock, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:  # none there, or a link planted at its name: no helper's
         return False
     try:
         locking.acquire(handle, wait_s=0)
@@ -1014,7 +1031,8 @@ def _say_in_log(log: Path, line: str) -> None:
 def _claim(lock: Path) -> int | None:
     """This helper's claim on a record id: ``lock`` held for as long as it runs (the OS lets
     it go when the helper ends, however it ends). ``None`` while another helper holds it."""
-    handle = locking.open_lock_file(lock, mode=0o600)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)  # a link planted at its name is not followed
+    handle = os.open(lock, os.O_RDWR | os.O_CREAT | no_follow, 0o600)
     try:
         locking.acquire(handle, wait_s=0)
     except TimeoutError:

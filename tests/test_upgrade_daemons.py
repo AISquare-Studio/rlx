@@ -35,6 +35,9 @@ from aisquare.services.upgrade_daemons import Around, Events, Options, Refused
 from tests.installer_seams import no_real_installer  # noqa: F401 — autouse, applied by import
 
 FAKE = Path(__file__).with_name("fake_rlxd.py")
+REAL_PYTHON_COMMAND = upgrade_daemons.python_command
+REAL_RLXD_COMMAND = upgrade_daemons.rlxd_command
+"""The real commands records must start with, which the `fake` fixture replaces."""
 
 
 @dataclass
@@ -1459,3 +1462,81 @@ def test_an_upgrade_with_nothing_to_install_says_rlxd_lags(
     assert lines[-1]["type"] == "upgrade.done"
     checked = [e["data"] for e in lines if e["data"].get("step") == "check"]
     assert "rlxd runs 0.9.0" in checked[-1]["detail"], checked
+
+
+# --- round 3 of #626's review (#3471): the same program, not the same file ---------------------
+
+
+@posix_only
+def test_a_planted_venv_on_the_same_interpreter_is_not_rlxs_watch(
+    fake: Daemons, tool: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1: a watch record of rlx's shape whose argv[0] is another venv's `bin/python`, a link
+    to the interpreter rlx runs on. Python takes its venv from the path it was started by,
+    so the planted `aisquare` would run: refused, and never run."""
+    monkeypatch.setattr(upgrade_daemons, "python_command", REAL_PYTHON_COMMAND)
+    base = Path(os.path.realpath(sys.executable))
+    venv = tmp_path / "planted-venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(base)
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {base.parent}\ninclude-system-site-packages = false\n", encoding="utf-8"
+    )
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    package = venv / "lib" / version / "site-packages" / "aisquare"
+    package.mkdir(parents=True)
+    marker = tmp_path / "planted-aisquare-ran"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        f"open({str(marker)!r}, 'w').write('ran')\n", encoding="utf-8"
+    )
+    argv = [str(venv / "bin" / "python"), "-P", "-m", "aisquare", "watch", "--detach"]
+    (fake.dir / "argv-watch").write_text(json.dumps(argv), "utf-8")
+    fake.start()
+    watch = fake.start("watch")
+    said = upgrade_daemons.restart_refusal(watch)
+    assert said == f"it runs {argv[0]}, not {sys.executable}", said
+    last = _lines(_upgrade("--restart-daemons"))[-1]
+    assert last["data"]["code"] == "daemon_unrecognized", last
+    time.sleep(1)
+    assert not marker.exists(), "the planted aisquare ran"
+    assert [d.pid for d in fake.live("watch")] == [watch.pid], "never signalled"
+
+
+@posix_only
+def test_an_rlxd_linked_from_another_folder_is_not_rlxds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2: rlxd runs the `rlx` and `rlxd-hook` beside the path it was started by (macOS's
+    current_exe is the link's path), so a link to the rlxd beside rlx from another folder
+    is not rlxd's own. The folder beside rlx by another name for it (a linked folder) is."""
+    monkeypatch.setattr(upgrade_daemons, "rlxd_command", REAL_RLXD_COMMAND)
+    real = tmp_path / "uv-bin" / "rlxd"
+    real.parent.mkdir()
+    real.write_text("#!/bin/sh\n", encoding="utf-8")
+    real.chmod(0o755)
+    monkeypatch.setattr(upgrade_daemons, "installed_rlxd", lambda: real)
+    daemons_core.registry_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    planted = tmp_path / "planted" / "rlxd"
+    planted.parent.mkdir()
+    planted.symlink_to(real)
+    said = upgrade_daemons.restart_refusal(_record(argv=(str(planted), "serve", "--detach")))
+    assert said == f"it runs {planted}, not {real}", said
+    alias = tmp_path / "bin-alias"
+    alias.symlink_to(real.parent, target_is_directory=True)
+    beside = _record(argv=(str(alias / "rlxd"), "serve", "--detach"))
+    assert upgrade_daemons.restart_refusal(beside) is None, "the same folder, another name"
+
+
+@posix_only
+def test_a_checkouts_venv_is_not_this_installs_interpreter(tmp_path: Path) -> None:
+    """S1 without an attacker: a dev checkout's `.venv/bin/python` shares uv's base
+    interpreter with the tool's, and is still not the interpreter rlx writes."""
+    daemons_core.registry_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    checkout = tmp_path / "checkout" / ".venv" / "bin"
+    checkout.mkdir(parents=True)
+    python = checkout / "python"
+    python.symlink_to(os.path.realpath(sys.executable))  # as uv makes a venv's
+    argv = (str(python), "-P", "-m", "aisquare", "watch", "--detach")
+    said = upgrade_daemons.restart_refusal(_record(kind="watch", argv=argv))
+    assert said == f"it runs {python}, not {sys.executable}", said
