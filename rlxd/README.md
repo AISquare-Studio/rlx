@@ -756,3 +756,8 @@ the crate's licence is `MIT AND ISC`:
 
 Each of those files starts with the copyright lines and the permission notice of the
 tmux files it comes from.
+
+Every rlxd binary carries those notices too: `THIRD_PARTY_NOTICES` here holds tmux's
+copyright and permission notice for each file ported from it, rlxd embeds it when it is
+built, and `rlxd licenses` prints it. The release archives hold just `rlxd` and
+`rlxd-hook`, so the notice travels inside the binary.

@@ -583,14 +583,31 @@ impl Bus {
             taken += gap.len();
             batch.push(gap);
             cursor.after = to;
+            cursor.output_after = cursor.output_after.max(to);
         }
-        cursor.output_after = cursor.output_after.max(cursor.after);
+        if !output {
+            cursor.output_after = cursor.after;
+        }
         // The output partition's loss, for a cursor that asked for `pty`: a gap that
         // says it is `pty`'s only, in its place in seq order, so the main ring's events
-        // below its end still come, before it.
-        let mut output_lost = (output && cursor.output_after < state.output_floor)
-            .then(|| state.output_floor.min(end))
-            .filter(|&to| to > cursor.output_after);
+        // below its end still come, before it. It runs from where the loss began, and
+        // ends at the highest seq up to the partition's floor (and the cursor's end) that
+        // no held event of the main ring has: only a dropped output event can have had
+        // it, so the gap's own seq is no other line's.
+        let lost_from = cursor.output_after + 1;
+        let mut output_lost = None;
+        if output && cursor.output_after < state.output_floor {
+            let mut to = state.output_floor.min(end);
+            while to > cursor.output_after
+                && state
+                    .held
+                    .binary_search_by_key(&to, |held| held.seq)
+                    .is_ok()
+            {
+                to -= 1;
+            }
+            output_lost = (to > cursor.output_after).then_some(to);
+        }
         let mut main = state.held.partition_point(|held| held.seq <= cursor.after);
         let mut out = if output {
             state
@@ -617,12 +634,14 @@ impl Bus {
                 break;
             }
             if output_lost == Some(seq) {
-                let gap = gap(cursor.output_after + 1, seq, true);
+                let gap = gap(lost_from, seq, true);
                 taken += gap.len();
                 batch.push(gap);
                 output_lost = None;
+                cursor.output_after = seq;
             } else {
-                let held = if a.is_some_and(|a| a.seq == seq) {
+                let from_main = a.is_some_and(|a| a.seq == seq);
+                let held = if from_main {
                     main += 1;
                     a
                 } else {
@@ -634,11 +653,15 @@ impl Bus {
                     taken += held.line.len();
                     batch.push(Arc::clone(&held.line));
                 }
+                // The output partition's place moves with its own events, and with the
+                // main ring's only once no loss of its is waiting to be told.
+                if !from_main || output_lost.is_none() {
+                    cursor.output_after = cursor.output_after.max(seq);
+                }
             }
             // Read in seq order: every held event before `seq`, in either partition, is
             // read or passed over.
             cursor.after = seq;
-            cursor.output_after = cursor.output_after.max(seq);
         }
         batch
     }
@@ -1808,10 +1831,11 @@ mod tests {
             .unwrap();
         let read = events(&bus.read(&mut pty, BATCH, BATCH_BYTES));
         assert_eq!(read[0]["type"], "daemon.gap");
-        // From 4: the run's events, 1 to 3, are still here, only not this cursor's.
+        // From 1, where the cursor's output began: the run's events, 1 to 3, are still
+        // here, only not this cursor's, and the gap says only pty's are gone.
         assert_eq!(
             read[0]["data"],
-            json!({"from": 4, "to": flood - 3, "topics": ["pty"]})
+            json!({"from": 1, "to": flood - 3, "topics": ["pty"]})
         );
         let after: Vec<u64> = read[1..]
             .iter()
@@ -1880,7 +1904,7 @@ mod tests {
             assert_eq!(gaps.len(), 1, "{topics:?}: {read:?}");
             assert_eq!(
                 gaps[0]["data"],
-                json!({"from": main[3] + 1, "to": flood - 3, "topics": ["pty"]}),
+                json!({"from": 1, "to": flood - 3, "topics": ["pty"]}),
                 "{topics:?}"
             );
             let held: Vec<u64> = read
@@ -1903,6 +1927,102 @@ mod tests {
         let read = events(&bus.read(&mut runs, BATCH, BATCH_BYTES));
         assert!(read.iter().all(|e| e["type"] == "run.text"), "{read:?}");
         assert_eq!(read.len(), 3);
+    }
+
+    /// Every line a cursor reads, at most `lines` at a time.
+    fn read_by(bus: &Bus, cursor: &mut Cursor, lines: usize) -> Vec<Value> {
+        let mut read = Vec::new();
+        loop {
+            let batch = bus.read(cursor, lines, BATCH_BYTES);
+            if batch.is_empty() {
+                return read;
+            }
+            read.extend(events(&batch));
+        }
+    }
+
+    /// #2641 major 1: a replay that ends (`follow: false`) at a held event of the main
+    /// ring, with output dropped past that end before it reads: the output's gap takes a
+    /// seq of its own, below the event's, and the event still comes, however few lines a
+    /// read takes.
+    #[test]
+    fn a_replays_output_gap_never_shares_a_seq_or_costs_its_last_event() {
+        let few = Limits {
+            events: 3,
+            ..Limits::OUTPUT
+        };
+        let exited = rlxd_proto::PtyExited::new(PTY_ID, 3, None)
+            .unwrap()
+            .to_data()
+            .unwrap();
+        for (topics, last) in [
+            (Topics::ALL, "daemon.debug"),
+            (Topics::of([topics::PTY]).unwrap(), "pty.exited"),
+        ] {
+            for lines in [256, 1] {
+                let dir = Dir::new();
+                let bus = Bus::open_with(dir.mark(), Limits::DEFAULT, few).unwrap();
+                output(&bus, 2);
+                let head = if last == "pty.exited" {
+                    bus.publish(topics::PTY, event_types::PTY_EXITED, exited.clone())
+                        .unwrap()
+                } else {
+                    emit(&bus, 1)
+                };
+                let mut cursor = bus.cursor(topics, Some(0), false).unwrap();
+                output(&bus, 10);
+                let read = read_by(&bus, &mut cursor, lines);
+                let seqs: Vec<u64> = read.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+                assert!(
+                    seqs.windows(2).all(|w| w[0] < w[1]),
+                    "{last}, {lines} a read: {seqs:?}"
+                );
+                assert_eq!(read.len(), 2, "{last}, {lines} a read: {read:?}");
+                assert_eq!(
+                    read[0]["data"],
+                    json!({"from": 1, "to": head - 1, "topics": ["pty"]})
+                );
+                assert_eq!(
+                    (read[1]["seq"].as_u64(), &read[1]["type"]),
+                    (Some(head), &json!(last))
+                );
+                assert_eq!(cursor.after(), head);
+            }
+        }
+    }
+
+    /// #2641 minor 4: the output's gap starts where its loss did, before the main ring's
+    /// events that came between, which still come first.
+    #[test]
+    fn an_output_gap_starts_where_the_loss_did() {
+        let dir = Dir::new();
+        let bus = Bus::open_with(
+            dir.mark(),
+            Limits::DEFAULT,
+            Limits {
+                events: 3,
+                ..Limits::OUTPUT
+            },
+        )
+        .unwrap();
+        output(&bus, 1);
+        let held = emit(&bus, 1);
+        let flood = output(&bus, 10);
+        for lines in [256, 1] {
+            let mut cursor = bus.cursor(Topics::ALL, Some(0), false).unwrap();
+            let read = read_by(&bus, &mut cursor, lines);
+            assert_eq!(read[0]["seq"], held, "{lines}: {read:?}");
+            assert_eq!(
+                read[1]["data"],
+                json!({"from": 1, "to": flood - 3, "topics": ["pty"]}),
+                "{lines}: {read:?}"
+            );
+            let output: Vec<u64> = read[2..]
+                .iter()
+                .map(|e| e["seq"].as_u64().unwrap())
+                .collect();
+            assert_eq!(output, [flood - 2, flood - 1, flood]);
+        }
     }
 
     #[test]

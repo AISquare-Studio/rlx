@@ -185,7 +185,13 @@ fn follow(subscription: &mut rlxd_client::Subscription) -> Ended {
             continue;
         };
         match event["type"].as_str() {
-            Some(event_types::PTY_SNAPSHOT) => draw(&mut stdout, &event["data"]),
+            Some(event_types::PTY_SNAPSHOT) => {
+                draw(&mut stdout, &event["data"]);
+                // A resync's snapshot can be the first to say the process ended.
+                if event["data"]["exited"] == true {
+                    return Ended::Exited(event["data"]["status"].as_u64().unwrap_or(0));
+                }
+            }
             Some(event_types::PTY_OUTPUT) => {
                 let bytes = event["data"]["bytes_b64"]
                     .as_str()

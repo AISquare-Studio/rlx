@@ -125,6 +125,7 @@ impl Screen {
         self.grid.bytes()
             + self.saved_grid.as_ref().map_or(0, Grid::bytes)
             + self.hyperlinks.bytes()
+            + self.grid.chars.bytes()
     }
 
     /// A screen `sx` by `sy`, keeping `hlimit` lines of history.
@@ -811,7 +812,8 @@ impl Screen {
             return;
         }
         let (sx, sy) = (self.sx(), self.sy());
-        let mut saved = Grid::new(sx, sy, 0);
+        // The terminal's own long characters: the saved screen's lines come back here.
+        let mut saved = Grid::sharing(sx, sy, 0, self.grid.chars.clone());
         saved.duplicate_lines(0, &self.grid, self.grid.hsize, sy);
         self.saved_grid = Some(saved);
         if cursor {

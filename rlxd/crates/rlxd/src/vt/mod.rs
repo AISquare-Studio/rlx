@@ -381,7 +381,7 @@ mod tests {
             "99999999999999999999",
         ];
         let finals = b"@ABCDEFGHJKLMPSTXZ`bcdfghlmnpqrstu";
-        match rng.below(14) {
+        match rng.below(15) {
             0 => (0..rng.below(4096)).map(|_| rng.next() as u8).collect(),
             1 => {
                 let n = rng.pick(&huge);
@@ -475,6 +475,17 @@ mod tests {
             )
             .into_bytes(),
             11 => format!("x\x1b[{}b\x1b#8\x1bc\x1b[3J\x1b[2J", rng.pick(&huge)).into_bytes(),
+            // Small inserts and deletes under an RGB background, many of them: each
+            // clears cells it moves (#2641 major 3).
+            14 => format!(
+                "\x1b[48;2;{};{};{}m{}",
+                rng.below(256),
+                rng.below(256),
+                rng.below(256),
+                rng.pick(&["\x1b[3@", "\x1b[2P", "\x1b[40@", "\x1b[40P", "\x1b[X"])
+                    .repeat(rng.below(3000) as usize)
+            )
+            .into_bytes(),
             _ => unreachable!(),
         }
     }
@@ -541,12 +552,12 @@ mod tests {
                 );
                 assert_eq!(terminal.size(), (cols, rows));
                 // Every line as wide as the screen has been (a line keeps its cells), on
-                // both screens, each cell 5 bytes and 24 more when extended, which a screen
+                // both screens, each cell 5 bytes and 16 more when extended, which a screen
                 // line's can take twice of until it goes into the history; then the
                 // parser's string, up to 1 MiB and its doubling, and the hyperlinks, at
                 // most 5000 of a 1 KiB URI and id each, held twice.
                 let lines = 500 + 2 * usize::from(tallest);
-                let cell = 5 + 2 * 24;
+                let cell = 5 + 2 * 16;
                 let bound = lines * (usize::from(widest) * cell + 256) + (2 << 20) + (21 << 20);
                 assert!(
                     terminal.memory() < bound,
@@ -578,12 +589,19 @@ mod tests {
         }
     }
 
-    /// #2585: a full history of coloured or wide text, at most 1.5 times what tmux 3.8
+    /// #2585: a full history of coloured or wide text, within 1.5 times what tmux 3.8
     /// took for the same, by the review's figures: 52,000 lines written at 80 columns,
     /// with tmux's 50,000-line history, one process's RSS, in MiB.
+    ///
+    /// `memory()` counts what the model holds, and the allocator adds about a fifth to
+    /// it (#2641's nit), so it is held to 1.25 times tmux's RSS: the model's own peak
+    /// RSS, measured in release by a program that runs it alone, is then within 1.5 times
+    /// (at #2641's round: ASCII 26.6 MiB, RGB 92.1, wide 58.1, against tmux's 26, 169
+    /// and 45). rlxd's RSS has the bus's copy of the output on top, its own budget
+    /// (decision 4).
     #[test]
     fn a_full_history_of_colour_or_wide_text_stays_near_tmuxs_memory() {
-        // And within 5% of what the layout itself takes: 5 bytes a cell, 24 more for one
+        // And within 5% of what the layout itself takes: 5 bytes a cell, 16 more for one
         // that is extended, and up to 128 a line for the line and its place in the grid.
         for (what, line, tmux, extended) in [
             ("ASCII", "x".repeat(80), 26, 0),
@@ -609,12 +627,12 @@ mod tests {
             );
             let held = terminal.memory();
             assert!(
-                held < (tmux << 20) * 3 / 2,
+                held < (tmux << 20) * 5 / 4,
                 "{what}: {} MiB, where tmux takes {tmux}",
                 held >> 20
             );
             let lines = terminal.history() as usize + 24;
-            let layout = lines * (80 * 5 + extended * 24 + 128);
+            let layout = lines * (80 * 5 + extended * 16 + 128);
             assert!(
                 held < layout * 21 / 20,
                 "{what}: {held} bytes, where its cells take {layout}"
@@ -658,6 +676,53 @@ mod tests {
         terminal.feed_at(b"\x1bPq\x1b\\a", start);
         terminal.feed_at(b"b", later(9));
         assert_eq!(terminal.capture(0), "ab\n\n\n");
+    }
+
+    /// #2641 major 2: each terminal numbers its own long characters, so one that is sent
+    /// more distinct ones than its quota (the review's 262,154 code points from U+20000)
+    /// leaves another's emoji and conjuncts as they are, and holds a bounded table.
+    #[test]
+    fn one_terminals_flood_of_characters_leaves_anothers_alone() {
+        let line = "a🚀b xक्षy";
+        let mut flooded = Terminal::new(80, 24, 100, "test");
+        let flood: String = (0x2_0000u32..0x2_0000 + 262_154)
+            .filter_map(char::from_u32)
+            .collect();
+        flooded.feed(flood.as_bytes());
+        let mut other = Terminal::new(80, 24, 100, "test");
+        other.feed(line.as_bytes());
+        assert!(
+            other.capture(0).starts_with(&format!("{line}\n")),
+            "{:?}",
+            other.capture(0)
+        );
+        // The flooded one keeps its quota and no more.
+        let held = flooded.memory();
+        assert!(held < 16 << 20, "{held} bytes");
+        // Past its quota a new long character is spaces there, and there only.
+        flooded.feed(b"\x1b[2J\x1b[H");
+        flooded.feed(line.as_bytes());
+        assert!(!flooded.capture(0).contains('🚀'));
+        assert!(other.capture(0).contains('🚀'));
+    }
+
+    /// #2641 major 3: inserts and deletes under an RGB background clear the cells they
+    /// move, each with an extended cell of its own: the screen's lines stay bounded.
+    #[test]
+    fn inserts_and_deletes_under_an_rgb_background_stay_bounded() {
+        for each in [&b"\x1b[40@"[..], b"\x1b[40P", b"\x1b[@", b"\x1b[3@\x1b[2P"] {
+            let mut terminal = Terminal::new(80, 24, 100, "test");
+            terminal.feed(b"\x1b[48;2;1;2;3m");
+            for _ in 0..4 {
+                terminal.feed(&each.repeat(50_000));
+            }
+            // A screen of 80 by 24, each cell 5 bytes and at most two extended ones.
+            let held = terminal.memory();
+            assert!(
+                held < 24 * 80 * (5 + 2 * 16) + (64 << 10),
+                "{each:?}: {held} bytes"
+            );
+        }
     }
 
     #[test]

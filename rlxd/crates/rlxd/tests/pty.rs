@@ -1335,8 +1335,9 @@ fn check_5_a_stalled_subscriber_holds_up_neither_the_pty_nor_memory() {
     let since = home.status()["seq"].as_u64().unwrap();
     let (first, last) = home.emit(50);
     assert_eq!(last - first + 1, 50);
+    // It ends after its flood, so the stalled subscriber must learn of the end too.
     let script = "read x; yes 'the quick brown fox jumps over the lazy dog 0123456789 abcdefghij' \
-                  | head -c 50000000; echo DONE; sleep 60";
+                  | head -c 50000000; echo DONE; sleep 1; exit 7";
     let id = spawn(
         &home,
         json!({"argv": ["sh", "-c", script], "cols": 80, "rows": 24}),
@@ -1403,6 +1404,20 @@ fn check_5_a_stalled_subscriber_holds_up_neither_the_pty_nor_memory() {
         snapshots >= 2,
         "the first, and one after the output it missed"
     );
+    // #2641 minor 5: and it is told the process ended, by its pty.exited or a snapshot
+    // that says so, whichever the resync left it.
+    let told = |e: &Value| {
+        (e["type"] == "pty.exited" || e["type"] == "pty.snapshot" && e["data"]["exited"] == true)
+            && e["data"]["status"] == 7
+    };
+    if !resumed.iter().any(told) {
+        let end = stream_until(&mut stalled, |e| told(e) || e["type"] == "daemon.gap");
+        assert!(
+            end.last().is_some_and(told),
+            "never told of the end: {:?}",
+            end.last()
+        );
+    }
 }
 
 /// The end of a process comes after its last output: a burst right before it exits
@@ -1520,6 +1535,39 @@ fn rlxd_attach_puts_a_pty_in_a_terminal_and_types_into_it() {
             .contains("a\u{a0}b\u{3000}c")
     });
     assert_eq!(screen(&home, &outer)["exited"], false, "attach goes on");
+    // #2641's check for bd4fad75: a paste longer than a frame, which attach sends on as
+    // one, is refused by name; attach rings the bell and goes on, and types after it.
+    let part = "p".repeat(120 << 10);
+    let mut writes = vec![json!({"pty_id": outer, "text": "\u{1b}[200~"})];
+    writes.extend((0..10).map(|_| json!({"pty_id": outer, "text": part})));
+    writes.push(json!({"pty_id": outer, "text": "\u{1b}[201~"}));
+    for params in writes {
+        assert_eq!(call(&home, "pty.write", &params).code(), Some(0));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        screen(&home, &outer)["exited"],
+        false,
+        "attach lives through it"
+    );
+    for params in [
+        json!({"pty_id": outer, "text": "after"}),
+        json!({"pty_id": outer, "keys": ["Enter"]}),
+    ] {
+        assert_eq!(call(&home, "pty.write", &params).code(), Some(0));
+    }
+    eventually("typing goes on after the refused paste", || {
+        screen(&home, &inner)["text"]
+            .as_str()
+            .unwrap()
+            .contains("after")
+    });
+    assert!(
+        !screen(&home, &inner)["text"]
+            .as_str()
+            .unwrap()
+            .contains("ppppp")
+    );
     assert_eq!(
         call(
             &home,

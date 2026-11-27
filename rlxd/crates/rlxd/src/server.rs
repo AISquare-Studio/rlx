@@ -1507,7 +1507,11 @@ fn pty_lines(
             let (snapshot, seq) = off_worker(|| daemon.pty_snapshot(&pty.id)).map_err(|_| ())?;
             let topics = Topics::of([topics::PTY]).expect("the bus carries pty events");
             *cursor = daemon.bus.cursor(topics, Some(seq), true).map_err(|_| ())?;
-            return Ok(vec![snapshot]);
+            // The snapshot stands for the output before it, not for the PTY's end: a
+            // pty.exited of this PTY's already read goes before it (#2641 minor 5).
+            kept.retain(|kept: &Line| contains(kept, b"\"type\":\"pty.exited\""));
+            kept.push(snapshot);
+            return Ok(kept);
         }
         if contains(&line, id.as_bytes()) {
             kept.push(line);

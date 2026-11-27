@@ -35,6 +35,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+/// rlxd/THIRD_PARTY_NOTICES: tmux's copyright and ISC permission notice for each file
+/// ported from it, which every rlxd binary carries and `rlxd licenses` prints.
+pub const THIRD_PARTY_NOTICES: &str = include_str!("../../../THIRD_PARTY_NOTICES");
+
 mod attach;
 pub mod bus;
 mod claude;
@@ -162,6 +166,9 @@ enum Action {
         )]
         argv: Vec<std::ffi::OsString>,
     },
+    /// Print the notices of what rlxd carries from others: tmux's ISC licence, for the
+    /// parts of rlxd ported from tmux.
+    Licenses,
     /// Say what rlx is installed here and whether its rlxd runs: rlx.app's probe over SSH.
     /// Exits 0 running, 3 installed but not running, 4 unsupported.
     Here {
@@ -308,6 +315,10 @@ pub fn main() -> ExitCode {
         } => serve::serve(background, gate_dev_mode),
         Action::Status { json } => cli::status(json),
         Action::Stop => cli::stop(),
+        Action::Licenses => {
+            print!("{THIRD_PARTY_NOTICES}");
+            ExitCode::SUCCESS
+        }
         Action::Here {
             json,
             start,

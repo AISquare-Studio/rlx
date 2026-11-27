@@ -47,6 +47,70 @@ fn check_7_a_release_build_has_no_debug_methods() {
     );
 }
 
+/// The manager's decision on #2641's licence note: every rlxd binary carries tmux's ISC
+/// notice for each file ported from it, and `rlxd licenses` prints it, a release
+/// build's as a test build's. Each file that says it is ported from tmux is named in it.
+#[test]
+fn a_release_build_carries_tmuxs_notice_for_every_ported_file() {
+    let notices = std::fs::read_to_string(common::workspace().join("THIRD_PARTY_NOTICES")).unwrap();
+    for binary in [
+        release_rlxd(),
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_rlxd")),
+    ] {
+        let run = TestHome::new()
+            .with_binary(binary.clone())
+            .rlxd(&["licenses"]);
+        assert_eq!(run.code(), Some(0), "{binary:?}: {run:?}");
+        assert_eq!(
+            run.stdout, notices,
+            "{binary:?} prints THIRD_PARTY_NOTICES as it is"
+        );
+    }
+    let src = common::workspace().join("crates/rlxd/src");
+    let mut ported = Vec::new();
+    let mut dirs = vec![src.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if std::fs::read_to_string(&path).is_ok_and(|text| {
+                text.lines().take(3).any(|line| {
+                    line.contains("from tmux 3.8")
+                        || line.contains("ported from the capture loop of tmux")
+                })
+            }) {
+                ported.push(path);
+            }
+        }
+    }
+    assert!(ported.len() >= 6, "{ported:?}");
+    for path in ported {
+        let name = path
+            .strip_prefix(common::workspace())
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            notices.contains(&format!("- rlxd/{name}:")),
+            "{name} is not in THIRD_PARTY_NOTICES"
+        );
+    }
+    for holder in [
+        "Copyright (c) 2007 Nicholas Marriott",
+        "Copyright (c) 2021 Will",
+        "Copyright (c) 2022 Jeff Chiang",
+        "Copyright (c) 2009 Jonathan Alvarado",
+        "Copyright (c) 2023 Nicholas Marriott",
+    ] {
+        assert!(notices.contains(holder), "{holder}");
+    }
+    assert_eq!(
+        notices.matches("Permission to use, copy, modify").count(),
+        13
+    );
+}
+
 #[test]
 fn a_release_build_has_no_gate_dev_mode() {
     let version = env!("CARGO_PKG_VERSION");

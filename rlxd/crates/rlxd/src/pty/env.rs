@@ -87,6 +87,18 @@ fn same(a: &OsStr, b: &str) -> bool {
     }
 }
 
+/// Whether `name` starts with [`BROKERED`]: whatever its case on Windows, where names
+/// are one whatever their case, as Python's `os.environ` upper-cases them there.
+fn brokered(name: &OsStr) -> bool {
+    let (name, prefix) = (name.as_encoded_bytes(), BROKERED.as_bytes());
+    name.len() >= prefix.len()
+        && if cfg!(windows) {
+            name[..prefix.len()].eq_ignore_ascii_case(prefix)
+        } else {
+            name.starts_with(prefix)
+        }
+}
+
 /// `env`, rlxd's own, as a PTY's process inherits it: less every name above, and an
 /// agent's home when `env` is that agent's tool shell.
 pub fn inherited(env: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
@@ -103,7 +115,7 @@ pub fn inherited(env: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(Os
     env.iter()
         .filter(|(name, _)| {
             let named = |names: &[&str]| names.iter().any(|dropped| same(name, dropped));
-            let brokered = name.to_str().is_some_and(|name| name.starts_with(BROKERED));
+            let brokered = brokered(name);
             !(named(IDENTITY)
                 || named(TEAM)
                 || named(AGENT)
@@ -113,4 +125,41 @@ pub fn inherited(env: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(Os
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kept(names: &[&str]) -> Vec<String> {
+        let env = names.iter().map(|name| ((*name).into(), "v".into()));
+        inherited(env)
+            .into_iter()
+            .map(|(name, _)| name.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_brokered_scope_is_taken_out_whatever_follows_the_prefix() {
+        assert_eq!(
+            kept(&[
+                "AISQUARE_BROKERED_SCOPE",
+                "AISQUARE_BROKERED",
+                "PATH",
+                "AISQUARE_BROKE"
+            ]),
+            ["PATH", "AISQUARE_BROKE"]
+        );
+    }
+
+    /// #2641's nit: on Windows a name is one whatever its case, the prefix's included.
+    #[test]
+    fn on_windows_names_and_the_prefix_match_whatever_their_case() {
+        let names = ["aisquare_brokered_scope", "Tmux", "claudecode", "PATH"];
+        if cfg!(windows) {
+            assert_eq!(kept(&names), ["PATH"]);
+        } else {
+            assert_eq!(kept(&names), names);
+        }
+    }
 }
