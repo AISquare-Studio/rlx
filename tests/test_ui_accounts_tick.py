@@ -25,7 +25,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -221,40 +222,40 @@ def test_a_change_in_each_key_of_the_stat_is_read_again(
     assert read == [path] and parsed == [path]
 
 
-KEYS = ("mtime", "ctime", "size", "inode")
-"""The signature's keys, in its order (``parsed_files.Signature``)."""
-
-
-def _signature(values: list[int]) -> parsed_files.Signature:
-    mtime, ctime, size, inode = values
-    return (mtime, ctime, size, inode)
+KEYS = ("st_mtime_ns", "st_ctime_ns", "st_size", "st_ino")
+"""The stat's fields the signature is made of (``parsed_files._stat_signature``)."""
 
 
 @pytest.mark.parametrize("key", KEYS)
 def test_a_change_in_any_one_key_of_the_signature_alone_is_read_again(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    """Each of the signature's four keys moved alone, the bytes as they were, has the next lookup
-    read and parse the file again. The path is stat'ed through a stand-in
-    (``parsed_files._stat``, and ``_read``'s signature): no file system moves ``st_ctime_ns``
-    alone, or the other three without it."""
+    """Each of the four fields of the stat the signature is made of moved alone, the bytes as
+    they were, has the next lookup read and parse the file again. The path is stat'ed through a
+    stand-in, a stat whose fields the test sets, made a signature by ``_stat_signature`` itself
+    (``parsed_files._stat``, and ``_read``'s): no file system moves ``st_ctime_ns`` alone, or the
+    other three without it."""
     path = core.claude_json_path(slots[1])
     _write_email(path, "first@example.com")
-    moved = list(parsed_files._stat(path))
+    real = os.stat(path)
+    fields = {name: getattr(real, name) for name in KEYS}
     stat, read_file = parsed_files._stat, parsed_files._read
 
+    def signature() -> parsed_files.Signature:
+        return parsed_files._stat_signature(cast(os.stat_result, SimpleNamespace(**fields)))
+
     def statting(target: Path) -> parsed_files.Signature:
-        return _signature(moved) if target == path else stat(target)
+        return signature() if target == path else stat(target)
 
     def reading(target: Path) -> tuple[parsed_files.Signature, bytes]:
-        signature, body = read_file(target)
-        return (_signature(moved) if target == path else signature), body
+        read, body = read_file(target)
+        return (signature() if target == path else read), body
 
     monkeypatch.setattr(parsed_files, "_stat", statting)
     monkeypatch.setattr(parsed_files, "_read", reading)
     assert _email(path) == "first@example.com"
     assert _kept(path) != []
-    moved[KEYS.index(key)] += 1
+    fields[key] += 1
     with identity_io(monkeypatch) as (read, parsed):
         assert _email(path) == "first@example.com"
     assert read == [path] and parsed == [path]
