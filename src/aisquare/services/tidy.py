@@ -675,6 +675,8 @@ def _agent_temps(
         owners.setdefault(paths.agent_tmp_dir(row.id), []).append(row)
     for directory in _subdirs(root):
         rows = owners.get(directory, [])
+        if not rows:
+            continue  # no row names it: not ours to judge (#57 keeps its own owner records)
         if not _agent_temp_ended(rows, commands, directory, at):
             continue
         item = Item(AGENT_TMPDIR, directory, cachedir.allocated_bytes(directory))

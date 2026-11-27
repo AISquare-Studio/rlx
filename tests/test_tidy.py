@@ -357,7 +357,7 @@ def test_an_ended_sessions_small_files_stay_a_week_then_its_directory_goes(
 # --- 7. the per-agent TMPDIR ------------------------------------------------------------------
 
 
-def test_an_ended_agents_tmpdir_goes_and_a_live_or_paused_ones_stays(
+def test_an_ended_agents_tmpdir_goes_and_a_live_paused_or_unnamed_one_stays(
     tmp_path: Path, project: ProjectInfo
 ) -> None:
     gone = row(project, str(uuid.uuid4()), ended_at=datetime.now(UTC) - 3 * HOUR)
@@ -365,8 +365,8 @@ def test_an_ended_agents_tmpdir_goes_and_a_live_or_paused_ones_stays(
     paused = row(
         project, str(uuid.uuid4()), ended_at=datetime.now(UTC), paused_at=datetime.now(UTC)
     )
-    for agent in (gone, live, paused):
-        directory = paths.agent_tmp_dir(agent.id)
+    unnamed = paths.agent_tmp_root() / "abc234"  # a dir no row names: never judged
+    for directory in (*(paths.agent_tmp_dir(a.id) for a in (gone, live, paused)), unnamed):
         tag(directory / "pytest-of-someone")
         aged(directory, 3 * HOUR)
 
@@ -376,6 +376,7 @@ def test_an_ended_agents_tmpdir_goes_and_a_live_or_paused_ones_stays(
     tidy.apply(made)
     assert not paths.agent_tmp_dir(gone.id).exists()
     assert paths.agent_tmp_dir(live.id).is_dir() and paths.agent_tmp_dir(paused.id).is_dir()
+    assert unnamed.is_dir()
 
 
 # --- 8. stale home-migration locks in the system temp directory --------------------------------
