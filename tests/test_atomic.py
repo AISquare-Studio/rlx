@@ -196,14 +196,14 @@ def test_bytes_land_exactly_and_text_lands_as_it_always_has(tmp_path: Path) -> N
     reads the file back, so bytes must reach the disk unchanged: in text mode Windows adds a
     CR per line. Every other caller passes text, and text is still written as it always was,
     UTF-8 with the platform's line ends."""
-    secret = tmp_path / "remote.json"
+    secret = tmp_path / "secret.json"
     raw = '{\n  "password": "café-ünïcode"\n}'.encode()
     write_replacing(secret, raw, owner_only=True)
     assert secret.read_bytes() == raw
     text = tmp_path / "config.toml"
     write_replacing(text, 'model = "café"\nkeep = true\n')
     assert text.read_bytes() == f'model = "café"{os.linesep}keep = true{os.linesep}'.encode()
-    assert _leftovers(tmp_path) == ["config.toml", "remote.json"]
+    assert _leftovers(tmp_path) == ["config.toml", "secret.json"]
 
 
 def test_durable_syncs_the_file_then_the_directory_and_not_durable_syncs_nothing(

@@ -109,6 +109,9 @@ REPO = Path(__file__).resolve().parents[1]
 DOCUMENTED = (
     "README.md",
     "docs/multi-instance.md",
+    # The rlx service's page (#32): `rlx service start`, `status`, `stop`, `restart` and `run`
+    # are what a reader types.
+    "docs/service.md",
     # Found by widening the staleness sweep past root-plus-`docs/`. The template
     # asks a reporter to run `aisquare doctor` and paste the output, so by this
     # guard's own rule — commands meant to be RUN get the document listed — it
@@ -791,6 +794,9 @@ _NOT_AN_INVOCATION = (
 #: failure message, which is the only way this file reports them.
 CENSUS = {
     ".github/ISSUE_TEMPLATE/bug_report.md": (1, 0),
+    # The rlx service's page (#32), measured 2026-11-26: the five `rlx service` verbs of its one
+    # fenced block, and no other mention.
+    "docs/service.md": (5, 0),
     # Re-measured 2026-10-07 when the README became a front page (roadmap 9.5):
     # the two quickstarts and the plain-command block, with the `uv tool install`
     # line and the installer URL as the two classified mentions. 2026-10-28: the

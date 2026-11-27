@@ -126,7 +126,7 @@ class ExplainabilitySettings(BaseModel):
 
     The key itself is NOT here. ``config.toml`` is a readable settings file
     people paste into issues; a workspace credential lives in
-    ``~/.aisquare/explainability-key`` at mode 600, or in
+    ``~/.rlx/explainability-key`` at mode 600, or in
     ``EXPLAINABILITY_API_KEY``.
     """
 
@@ -711,7 +711,7 @@ def _written_whole(data: dict[str, Any]) -> bool:
 
     Such a release keeps a higher ``config_version`` it finds (it does not know the
     version's steps, and must not undo them), so a version-2 file one of them saved again
-    — an older install sharing ``~/.aisquare``, or a move back and forth — says 2 while
+    — an older install sharing ``~/.rlx``, or a move back and forth — says 2 while
     holding every value that release's defaults gave it. A version cannot record that, nor
     can a marker this build writes: those releases keep a key they do not know. The
     file's values can. Those releases always wrote ``profile``, ``api_url`` and
@@ -1102,7 +1102,7 @@ class AccountsSettings(BaseModel):
 
     ``share`` (P2-W7, #198), empty by default, names what every account has in common, by
     the parts each agent declares (``AgentAccounts.share_parts``): for Claude Code ``memory``
-    (one auto-memory directory per project under ``~/.aisquare/claude-shared/memory``,
+    (one auto-memory directory per project under ``~/.rlx/claude-shared/memory``,
     passed to each launch), ``skills``, ``agents``, ``commands`` and ``claude_md``, and
     ``plugins`` (experimental); for Codex ``agents_md`` and ``skills``. A linked part makes
     each managed slot's entry a link to the plain home's, its own kept beside it. A name an
@@ -1205,21 +1205,28 @@ DONT_ASK_STOP = "stop"
 class SharingSettings(BaseModel):
     """``[sharing]`` — opt-in anonymous usage sharing (docs/usage-telemetry.md).
 
-    ``enabled`` is the switch, **off by default**: nothing leaves this machine until it is
+    ``enabled`` is the switch, **off by default**: no usage leaves this machine until it is
     turned on (Settings ▸ Usage & stats, or ``aisquare metrics share on``). Turned on, daily
     counts of usage (tokens, sessions, which commands) are sent to AISquare, never names, paths,
     remotes, prompts or arguments. ``DO_NOT_TRACK=1``, ``AISQUARE_NO_TELEMETRY=1`` and ``CI``
     force it off whatever this says (``core.sharing.forced_off_reason``).
+
+    ``active_ping`` is the switch of the daily active ping (``services.active_ping``), which is
+    separate from sharing and sent whether sharing is on or off: on each local day rlx is used,
+    one anonymous POST of the date, the version, the OS, the architecture and the install
+    method, with no identifier. On unless turned off (Settings ▸ Usage & stats, or
+    ``aisquare config set sharing.active_ping false``); the same three variables stop it.
 
     The installation's random id, its salt for the repository hashes and what has been sent
     are kept beside the other runtime state (``state.json``), not here.
     """
 
     enabled: bool = False
+    active_ping: bool = True
 
 
 class AppConfig(BaseModel):
-    """Root configuration object persisted at ``~/.aisquare/config.toml``."""
+    """Root configuration object persisted at ``~/.rlx/config.toml``."""
 
     profile: str = "default"
     agents: AgentSettings = Field(default_factory=AgentSettings)
@@ -1710,7 +1717,7 @@ def save_config(
     the state is visible before a write meets it.
 
     This restriction applies ONLY when a link was followed. An ordinary first
-    write still creates ``~/.aisquare`` — that path never involved a pointer to
+    write still creates ``~/.rlx`` — that path never involved a pointer to
     somewhere else.
 
     Returns the path the CALLER asked for, not the resolved one: commands echo it
@@ -1787,7 +1794,7 @@ def save_config(
     # and the QUIETEST caller is the one a torn write hurt: ``cli/launch.py``
     # treats an unreadable config as "launching untraced" by design. The temp
     # is removed on any failure rather than left next to the file an operator
-    # reads. POSIX rename semantics hold because ~/.aisquare is a native disk;
+    # reads. POSIX rename semantics hold because ~/.rlx is a native disk;
     # on a DrvFs /mnt/c or \\wsl.localhost path the guarantee softens, and
     # nothing in this code can tell which kind of path it is on. On NTFS the
     # rename is refused while another process has the config open, even only

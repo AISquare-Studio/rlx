@@ -335,7 +335,7 @@ def _persona_system_prompt(
         return []
     block = "\n".join(personas.briefing(persona)) + "\n"
     digest = hashlib.sha256(block.encode("utf-8")).hexdigest()[:12]
-    path = paths.aisquare_home() / "cache" / "persona-prompts" / f"{name}-{digest}.md"
+    path = paths.persona_prompts_dir() / f"{name}-{digest}.md"
     adapter = selected.adapter
     home = agent_launch._launch_home(selected, env)
     seam = adapter.system_prompt_args(path, block, args, home, cwd=Path.cwd())

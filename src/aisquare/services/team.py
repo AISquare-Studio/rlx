@@ -33,6 +33,7 @@ from typing import Any, Final, Literal, NamedTuple, NoReturn
 
 from aisquare.core import (
     agent_sessions,
+    event_time,
     experimental,
     harness,
     insights,
@@ -56,6 +57,7 @@ from aisquare.core.store import (
     unmet_needs,
 )
 from aisquare.core.tmux import TmuxError
+from aisquare.core.version import PRODUCT_NAME
 from aisquare.models import (
     CLOSED_STATUSES,
     FleetAgent,
@@ -2603,6 +2605,17 @@ def stopped_because(task: TeamTask) -> str | None:
     return text[len(prefix) :] if text.startswith(prefix) else None
 
 
+def task_history(task: TeamTask, *, limit: int = 200) -> list[TeamEvent]:
+    """Every event that names ``task``, oldest first, the newest ``limit`` of them: what the
+    board's reader shows under a task (B2). A read, as :func:`stopped_because` is, and it fails
+    open the same way: a store that cannot be read costs the history, never the board."""
+    try:
+        with store_session() as store:
+            return store.filtered_events(task.project_id, task_id=task.id, limit=limit)
+    except Exception:
+        return []
+
+
 def last_feedback(task: TeamTask) -> str | None:
     """The reason given at the task's newest ``task reopen``, whatever its status now (#74).
 
@@ -4635,12 +4648,25 @@ def render_board(
     *,
     names: Mapping[str, str] | None = None,
 ) -> str:
-    """The human/board view (``asq board``), without the protocol contract. With ``names``
-    (``cli.board_names.read_board_names``), what ``aisquare board`` prints for a person, each
-    session is named as asq's left pane names its agent (#140); without, as an agent reads it
-    (the MCP board): by its short id and role, which ``--as`` takes."""
+    """The board without the protocol contract. With ``names``
+    (``cli.board_names.read_board_names``), what ``aisquare board`` prints: each session named
+    as asq's left pane names its agent (#140) — for a person, a text board of its own
+    (:func:`_human_board`, B1 #14); for an agent (:func:`read_by_an_agent`), the
+    ``<aisquare-team>`` block it always read there, byte for byte. Without ``names``, as an
+    agent reads it through MCP: the same block, each session by its short id and role, which
+    ``--as`` takes."""
     from aisquare.services import claude_accounts as accounts_service  # lazy: no import cycle
 
+    if names is not None and not read_by_an_agent():
+        return _human_board(
+            project,
+            sessions,
+            tasks,
+            events,
+            names=names,
+            labels=accounts_service.slot_labels,
+            links=_link_marks(project.id),
+        )
     return _render_board(
         project,
         sessions,
@@ -4651,6 +4677,165 @@ def render_board(
         links=_link_marks(project.id),
         names=names,
     )
+
+
+def read_by_an_agent() -> bool:
+    """Whether what this process prints is read by an agent: a command a sandboxed agent's
+    broker runs for it (:func:`brokered`), or one run inside an agent — a fleet window, a
+    process Claude Code started, a Codex tool shell (``core.prompt_origin.origin_sender``, the
+    rule a ``fleet tell``'s origin is told by). The protocol sends agents to ``aisquare
+    board``, and what they read there stays the ``<aisquare-team>`` block (B1 #14)."""
+    from aisquare.core import prompt_origin  # lazy: read once per board command
+
+    return brokered() or prompt_origin.origin_sender() != prompt_origin.HUMAN
+
+
+#: A session's state in words, as the boards a person reads write it: the text board here,
+#: and beside the sidebar's mark in the TUI's team block (``cli.watch.state_chip``).
+STATE_WORDS: Final = {
+    "working": "working",
+    "waiting": "waiting for input",
+    "attention": "NEEDS YOU",
+    "limited": "limited",
+    "switching": "switching accounts",
+}
+#: A task's status as the human board words it.
+_HUMAN_STATUS: Final = {
+    "todo": "to do",
+    "doing": "doing",
+    "review": "in review",
+    "blocked": "blocked",
+    "done": "done",
+}
+#: The widest a name column grows on the human board: a longer name pushes its row only.
+_HUMAN_NAME_CELLS: Final = 24
+
+
+def _padded(text: str, cells: int) -> str:
+    """``text`` padded to ``cells`` terminal cells: a name with an emoji or a wide character
+    in it takes two cells a character, where ``str.ljust`` counts one."""
+    from rich.cells import cell_len  # lazy: a person's board alone measures, never a hook
+
+    return text + " " * max(0, cells - cell_len(text))
+
+
+def _off_ladder(session: TeamSession) -> bool:
+    """Whether ``session``'s model is off its role's ladder and none the owner chose (#16)."""
+    if not session.model:
+        return False
+    role = base_role(session.role)
+    if not harness.model_mismatch(role, session.model, agent=session.agent):
+        return False
+    return bool(
+        harness.model_mismatch(
+            role,
+            session.model,
+            agent=session.agent,
+            chosen=model_memory.chosen_models(session),
+        )
+    )
+
+
+def _human_board(
+    project: ProjectInfo,
+    sessions: list[TeamSession],
+    tasks: list[TeamTask],
+    events: list[TeamEvent],
+    *,
+    names: Mapping[str, str],
+    labels: Mapping[int, str] | Callable[[], Mapping[int, str]] | None,
+    links: Mapping[str, str] | None,
+) -> str:
+    """``aisquare board`` for a person (B1 #14): a title, then the team, the open tasks and the
+    recent updates, each a section under a plain heading, in columns — no ``<aisquare-team>``
+    block, which is how an agent's board is fenced in its prompt.
+
+    One row per agent: its name (``names``), its state in words, its account once several are
+    in play, its model, its persona, how long ago it was seen and its focus. A task by its
+    number, its status in words, its title, who has it, what it waits on and its link mark.
+    An update by its time, dated when it is not today's (``core.event_time``), then the line the
+    agents' text writes for it, named (:func:`event_line`); a text of several lines keeps them,
+    under the first.
+    """
+    from rich.cells import cell_len  # lazy: a person's board alone measures, never a hook
+
+    now = _now()
+    numbers = {t.id: t.number for t in tasks if t.number is not None}
+    lines = [f"{PRODUCT_NAME} board — {project.root.name or project.id}", ""]
+    live = [s for s in sessions if s.ended_at is None]
+    accounts = len({s.account for s in live if s.account})
+    if callable(labels):
+        labels = labels() if accounts > 1 else None
+    if live:
+        lines.append(f"team — {len(live)} live")
+        shown = {s.id: names.get(s.id) or board_name(s) for s in live}
+        name_cells = min(_HUMAN_NAME_CELLS, max(cell_len(name) for name in shown.values()))
+        state_cells = max(cell_len(STATE_WORDS.get(s.state, s.state)) for s in live)
+        for session in live:
+            facts: list[str] = []
+            label = account_label(session.account, labels)
+            if label and accounts > 1:
+                facts.append(label)
+            if session.model:
+                facts.append(
+                    f"{session.model} ⚠ off-ladder" if _off_ladder(session) else session.model
+                )
+            if session.persona:
+                facts.append(f"persona {session.persona}")
+            seen = f"{age_text(session.last_seen_at, now)} ago"
+            if now - session.last_seen_at > _STALE_AFTER:
+                seen += " (stale)"
+            facts.append(seen)
+            if session.focus:
+                facts.append(f"focus: {' '.join(session.focus.split())}")
+            state = STATE_WORDS.get(session.state, session.state)
+            lines.append(
+                f"  {_padded(shown[session.id], name_cells)}  {_padded(state, state_cells)}  "
+                + " · ".join(facts)
+            )
+    else:
+        lines.append("team — nobody live right now")
+    open_tasks = [t for t in tasks if t.status in ("todo", "doing", "review", "blocked")]
+    if tasks:
+        counts = " · ".join(
+            f"{sum(1 for t in tasks if t.status == status)} {_HUMAN_STATUS[status]}"
+            for status in ("todo", "doing", "review", "blocked", "done")
+            if any(t.status == status for t in tasks)
+        )
+        lines += ["", f"tasks — {counts}"]
+        statuses = {t.id: t.status for t in tasks}
+        listed = open_tasks[:_BOARD_TASKS]
+        marks = [f"#{t.number}" if t.number is not None else t.id for t in listed]
+        mark_cells = max((len(mark) for mark in marks), default=0)
+        status_cells = max((len(_HUMAN_STATUS[t.status]) for t in listed), default=0)
+        for task, mark in zip(listed, marks, strict=True):
+            row = f"  {mark:<{mark_cells}}  {_HUMAN_STATUS[task.status]:<{status_cells}}  "
+            row += task.title
+            if task.claimed_by:
+                row += f" — {names.get(task.claimed_by) or short_id(task.claimed_by)}"
+            waiting = unmet_needs(task, statuses)
+            if waiting:
+                row += " ⧗ waits on " + ", ".join(
+                    f"#{numbers[need]}" if need in numbers else need[-8:] for need in waiting
+                )
+            if links and task.id in links:
+                row += f" {links[task.id]}"
+            lines.append(row)
+        if len(open_tasks) > _BOARD_TASKS:
+            # A person's: the command at a shell, as every hint a person reads (R13a).
+            more = prog.shell_advice(f" — `{prog.word()} task list`")
+            lines.append(f"  … {len(open_tasks) - _BOARD_TASKS} more{more}")
+    if events:
+        lines += ["", "recent updates"]
+        roles = {s.id: s.role for s in sessions}
+        stamps = [event_time.stamp(event.created_at, now=now) for event in events]
+        stamp_cells = max(len(stamp) for stamp in stamps)
+        under = " " * (2 + stamp_cells + 2)
+        for event, stamp in zip(events, stamps, strict=True):
+            first, *rest = event_line(event, roles, numbers, names).split("\n")
+            lines.append(f"  {stamp:>{stamp_cells}}  {first}")
+            lines.extend(f"{under}{line}" for line in rest)
+    return "\n".join(lines)
 
 
 def _render_board(
@@ -4669,10 +4854,10 @@ def _render_board(
     links: Mapping[str, str] | None = None,
     names: Mapping[str, str] | None = None,
 ) -> str:
-    """The board, and for ``me`` the protocol and its role's cycle, whose fleet commands
-    name ``fleet`` (:func:`_cycle_project`). ``briefing`` is a session's first injection's
-    alone — SessionStart's, or the prompt's that joins a session the board did not know
-    (review of #201, R1-F3): it adds ``me``'s persona after the role cycle. Never on the
+    """The board as an agent reads it, and for ``me`` the protocol and its role's cycle, whose
+    fleet commands name ``fleet`` (:func:`_cycle_project`). ``briefing`` is a session's first
+    injection's alone — SessionStart's, or the prompt's that joins a session the board did not
+    know (review of #201, R1-F3): it adds ``me``'s persona after the role cycle. Never on the
     board command, never on a later prompt, so no factual surface carries persona text
     (§3.1).
     ``persona_note`` is the one line saying why no attached persona was read. ``cwd`` is the

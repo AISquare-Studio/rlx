@@ -13,6 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
+from aisquare.core import paths
 
 pytest.importorskip("mcp", reason="the [serve] extra is not installed")
 
@@ -74,7 +75,7 @@ def test_serve_token_is_created_once_with_tight_permissions(isolated_home: Path)
     first = mcp_server.serve_token()
     second = mcp_server.serve_token()
     assert first == second and len(first) > 30
-    creds = isolated_home / "credentials"
+    creds = paths.credentials_path()
     if sys.platform == "win32":
         # Mode bits are advisory on NTFS -- S_IMODE reports 0o666 however the
         # file is really protected -- so assert the ACL that was actually

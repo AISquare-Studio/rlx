@@ -41,6 +41,7 @@ from aisquare.models import (
 )
 from aisquare.services import agent_launch, diagnostics, onboarding
 from aisquare.services import agents as agents_service
+from tests.settings_fields import leave_fields
 from tests.test_ui_app_settings import AppHost
 from tests.test_ui_app_settings import drive as drive_app_settings
 from tests.test_ui_codex_accounts import _sign_in_codex
@@ -97,7 +98,7 @@ def test_settings_save_approve_for_me_and_follow_the_roles_agent(tmp_path: Path)
         view.query_one("#role-family-coder", Select).value = "claude-code"
         await settle_page(host)
         lines.append(str(view.query_one("#role-launch-coder", Static).render()))
-        view.query_one("#save-settings", Button).press()
+        leave_fields(view)
         await settle_page(host)
         return lines
 

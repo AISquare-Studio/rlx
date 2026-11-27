@@ -7,7 +7,9 @@ only ``time.sleep`` is patched, so the poll loop runs in milliseconds.
 
 from __future__ import annotations
 
+import io
 import json
+import re
 import stat
 import sys
 import threading
@@ -17,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from aisquare.cli import auth as auth_cli
@@ -533,6 +536,108 @@ def test_the_local_deadline_ends_an_endless_pending(
         assert "expired before it was approved" in result.output
     finally:
         stub.close()
+
+
+class _Terminal(io.StringIO):
+    """A terminal the sign-in writes to, stdout and stderr both: ``isatty`` says yes, so the
+    countdown draws (Rich's live display) as it does in a pane."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+_CSI = re.compile(r"\x1b\[(\??)([0-9;]*)([A-Za-z])")
+
+
+def _screen(written: str) -> list[str]:
+    """What a terminal shows after ``written``, line by line: the text, carriage returns and
+    newlines, and the two moves Rich's live display makes, cursor up (``CSI n A``) and erase
+    in line (``CSI K``, ``CSI 2K``). Colours and the cursor's visibility draw nothing."""
+    rows: list[list[str]] = [[]]
+    row = col = 0
+    at = 0
+    while at < len(written):
+        char = written[at]
+        if char == "\x1b":
+            control = _CSI.match(written, at)
+            assert control is not None, f"a control this screen does not know: {written[at:]!r}"
+            private, argument, final = control.groups()
+            if not private and final == "A":
+                row = max(0, row - int(argument or 1))
+            elif not private and final == "K":
+                rows[row] = [] if argument == "2" else rows[row][:col]
+            at = control.end()
+            continue
+        if char == "\r":
+            col = 0
+        elif char == "\n":
+            row, col = row + 1, 0
+            rows.extend([] for _ in range(row + 1 - len(rows)))
+        else:
+            line = rows[row]
+            line.extend(" " * (col - len(line)))
+            line[col : col + 1] = [char]
+            col += 1
+        at += 1
+    return ["".join(line).rstrip() for line in rows]
+
+
+def test_screen_replays_what_the_live_display_draws_and_erases() -> None:
+    """The replay the expiry test reads the pane through: a redraw goes up and erases."""
+    drawn = "one\ntwo\r\x1b[2K\x1b[1A\x1b[2Kthree\nfour\x1b[0m\n\x1b[?25h\r\x1b[1A\x1b[2K"
+    assert _screen(drawn) == ["three", "", ""]
+    assert _screen("abcdef\rX\x1b[K") == ["X"]
+    assert _screen("abc\rX") == ["Xbc"]
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "said"),
+    [
+        (
+            ["pending", "pending", "expired"],
+            "The code expired before it was approved. Run aisquare login again.",
+        ),
+        (["pending", "denied"], "The request was denied in the browser. Nothing was stored."),
+        (["pending", "paused"], "Sign-in from rlx is temporarily paused. Try again later."),
+    ],
+    ids=["expired", "denied", "paused"],
+)
+def test_how_a_wait_ended_is_still_on_screen_after_the_countdown_goes(
+    monkeypatch: pytest.MonkeyPatch, outcomes: list[str], said: str
+) -> None:
+    """The 0.10.1 release's exploratory test (2026-11-18): in a tmux pane, a code that expired
+    before it was approved left "code expires in 0:00" as the pane's last line, and no word of
+    why the sign-in ended. ``fail`` printed while the countdown ran, through a console that
+    writes past the live display's redirect, so the line landed on the countdown's last row,
+    and the countdown's last redraw and its transient clean-up erased it. Replayed as a
+    terminal shows it: the countdown drew, then went, and the line is still there."""
+    terminal = _Terminal()
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(sys, "stdout", terminal)
+    monkeypatch.setattr(sys, "stderr", terminal)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())  # no Esc watcher on a developer's own tty
+    monkeypatch.setattr(auth_cli, "_interactive", lambda: True)
+    answers = iter(outcomes)
+    monkeypatch.setattr(iam, "poll_token", lambda _e, _g: iam.PollOutcome(next(answers)))
+    update = auth_cli._LiveStatus.update
+
+    def update_and_draw(status: auth_cli._LiveStatus, *, next_check_in: float) -> None:
+        update(status, next_check_in=next_check_in)
+        status._live.refresh()  # what the display's own thread does 8 times a second
+
+    monkeypatch.setattr(auth_cli._LiveStatus, "update", update_and_draw)
+    grant = iam.DeviceAuthorization(
+        DEVICE_CODE, USER_CODE, "https://a.test/rlx", "https://a.test/rlx?c=1", 600, 5, RLX
+    )
+    endpoints = iam.Endpoints(*(f"https://a.test/{path}" for path in "iduvr"))
+    with pytest.raises(typer.Exit) as ended:
+        auth_cli._wait_for_approval(endpoints, grant)
+    written = terminal.getvalue()
+    screen = _screen(written)
+    assert ended.value.exit_code == 1
+    assert "Waiting for approval in the browser" in written  # the countdown did draw…
+    assert not any("Waiting for approval" in line for line in screen)  # …and went
+    assert [line for line in screen if line] == [f"✗ {said}"]  # said, and nothing else left
 
 
 # --------------------------------------------------------------------------- refusals

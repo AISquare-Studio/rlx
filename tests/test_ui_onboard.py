@@ -865,7 +865,10 @@ def test_clicking_a_fix_runs_it_in_the_cwd_then_refreshes_the_doctor(tmp_path: P
             return (
                 host.received,
                 _text(view.query_one("#doctor-status", Static)),
-                _text(view.query_one("#doctor-report", Static)),
+                # The problems, then the passing rows behind their fold (Q5): the whole page.
+                _text(view.query_one("#doctor-report", Static))
+                + "\n"
+                + _text(view.query_one("#doctor-passed-list", Static)),
                 buttons,
             )
 

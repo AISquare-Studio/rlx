@@ -135,7 +135,6 @@ from aisquare.core.locking import holding
 from aisquare.models import LaunchSpec
 
 _log = logging.getLogger(__name__)
-DIR_NAME = "launch-seals"
 VERSION = 1
 """The version of :class:`LaunchRecord` this aisquare writes; a newer one is refused."""
 
@@ -302,7 +301,7 @@ _SEEN: dict[str, SessionFacts] = {}
 
 def seals_dir() -> Path:
     """Where the records of the launches ``fleet spawn`` made are kept."""
-    return paths.aisquare_home() / DIR_NAME
+    return paths.launch_seals_dir()
 
 
 def digest(agent_id: str) -> str:

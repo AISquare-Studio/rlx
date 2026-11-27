@@ -7,11 +7,11 @@ Textual, so every branch — on/off, ngrok missing, auto-off, restore after a
 restart — is a plain unit test.
 
 Persistence (PLAN §1): the two switch values ``remote_enabled`` and
-``auto_off_minutes`` sit next to the theme key in ``~/.aisquare/state.json``
+``auto_off_minutes`` sit next to the theme key in ``~/.rlx/state.json``
 through the file's one locked writer (``core.state_file.update_state``), each
 key on its own, and in the fleet UI through the autosave the theme uses, off
 Textual's thread. Token, password, devices and the write switch are the
-SERVER's (``~/.aisquare/remote.json``) and are only read and written through its
+SERVER's (``~/.rlx/remote/remote.json``) and are only read and written through its
 API, so ``aisquare remote allow-write`` and ``regenerate-password`` from a shell
 and this modal always agree.
 
@@ -60,6 +60,7 @@ from aisquare.services.ngrok_tunnel import (
 
 # The one sentence every read-only refusal says, re-exported for the modal.
 from aisquare.services.remote_server import read_only_reason as read_only_reason
+from aisquare.services.service_host import SERVICE, ServiceRemote
 
 AUTO_OFF_CHOICES: tuple[int | None, ...] = (30, 60, 120, None)
 """Minutes until Remote switches itself off — ``None`` is "Never".
@@ -209,6 +210,17 @@ def load_remote_state() -> RemoteState:
     )
 
 
+SERVICE_TURNS_ON = f"the {SERVICE} turns Remote on…"
+"""The status line of a TUI that is the service's client, as its switch is turned on."""
+SERVICE_TURNS_OFF = f"the {SERVICE} turns Remote off…"
+SERVED_BY_SERVICE = f"served by the {SERVICE}, which keeps it on with no rlx window open"
+
+
+def service_gave_up(problem: str) -> str:
+    """A client's status line once the service stopped trying to start Remote (#1717)."""
+    return f"{problem} — the {SERVICE} stopped trying and turned Remote's switch off"
+
+
 SwitchSaver = Callable[[str, object], None]
 """Hands one switch's new value to ``state.json``, by key: :func:`update_state`'s shape, which
 raises :class:`StateUnwritableError` when the file refuses it."""
@@ -245,6 +257,17 @@ class RemoteController:
         self._url_timeout = url_timeout
         self.state = state if state is not None else load_remote_state()
         self.info: remote_server.RemoteInfo | None = None
+        """This process's own Remote server, while it serves one (:attr:`remote_serving`)."""
+        self._service_asked_at: datetime | None = None
+        """When this controller, as the service's client, last turned Remote's switch on: a
+        give-up the service says from before then is not that press's answer."""
+        self.service: ServiceRemote | None = None
+        """The rlx service's Remote, while a service of this release runs on this home and
+        this process serves none (#32): this controller is then its client
+        (:attr:`client`). Its switch is saved, and the service follows it; nothing is
+        started or stopped here. Set by the fleet UI from each frame (``cli.ui.service_client``), as
+        an attribute: what it says is read where it is shown (:meth:`adopt_server_deadline`,
+        :meth:`status_line`)."""
         self.tunnel: Tunnel | None = None
         self._last_tunnel_error: str | None = None
         """What the last Remote's tunnel said as it was turned off (:meth:`tunnel_error`)."""
@@ -340,7 +363,22 @@ class RemoteController:
 
     @property
     def running(self) -> bool:
+        """Whether Remote is on for this home's panel: this process's own server, or the rlx
+        service's, whose client this is."""
+        if self.info is not None:
+            return True
+        service = self.service
+        return service is not None and service.on
+
+    @property
+    def remote_serving(self) -> bool:
+        """Whether THIS process serves Remote (a server and maybe ngrok of its own)."""
         return self.info is not None
+
+    @property
+    def client(self) -> bool:
+        """Whether this controller is the rlx service's client: one runs, this serves none."""
+        return self.service is not None and self.info is None
 
     def turn_on(self, *, wait: bool = True) -> None:
         """Start the server, then the tunnel; the public URL arrives on a background thread.
@@ -363,12 +401,18 @@ class RemoteController:
         its last steps clear the deadline and the public origin in the running process,
         and would clear this Remote's.
         """
+        if self.client:
+            # The service serves this home's Remote: the switch is what it follows.
+            self._set_state(remote_enabled=True)
+            self.message = SERVICE_TURNS_ON
+            self._service_asked_at = _aware(self._now())
+            return
         self._turn_on(wait=wait, restoring=False)
 
     def _turn_on(self, *, wait: bool, restoring: bool) -> bool:
         """:meth:`turn_on`; whether the server is up (or was already). ``restoring``: a start of
         the TUI's, whose trouble is news (:meth:`restore`)."""
-        if self.running:
+        if self.remote_serving:
             return True
         if not self.wait_until_off(OFF_WAIT_SECONDS):
             self.message = STILL_TURNING_OFF
@@ -640,7 +684,10 @@ class RemoteController:
             # Not on a start's own failure, from the writer's thread: that start saved none.
             self._set_state(remote_auto_off_at=None)
         if not served and tunnel is None:
-            self.message = status
+            client = self.service
+            self.message = (
+                SERVICE_TURNS_OFF if persist and client is not None and client.on else status
+            )
             return False
         self.message = status or TURNING_OFF
         stopper = threading.Thread(
@@ -763,8 +810,8 @@ class RemoteController:
         (:attr:`call_back`) once it has been, read or not: a file that could not be read is
         the start's to say.
         """
-        if not self.state.remote_enabled or self.running:
-            return
+        if not self.state.remote_enabled or self.remote_serving or self.client:
+            return  # a client's Remote is the service's to bring back
         reading = self._first_read()
         if reading is not None and not wait:
             reading.add_done_callback(lambda _read: self.call_back(self._restore_read))
@@ -776,7 +823,7 @@ class RemoteController:
     def _restore_read(self, *, wait: bool = False) -> None:
         """:meth:`restore`'s start, ``remote.json`` read; nothing for a Remote turned on, or its
         switch turned off, meanwhile."""
-        if not self.state.remote_enabled or self.running:
+        if not self.state.remote_enabled or self.remote_serving or self.client:
             return
         if self._auto_off_missed():
             return
@@ -903,8 +950,8 @@ class RemoteController:
         if minutes not in AUTO_OFF_CHOICES:
             raise ValueError(f"auto-off must be one of {AUTO_OFF_CHOICES}, not {minutes}")
         self._set_state(auto_off_minutes=minutes)
-        if not self.running:
-            return
+        if not self.remote_serving:
+            return  # a client's: the service follows the saved minutes (services.service_host)
         deadline = self._hold_deadline()
         self._set_state(remote_auto_off_at=deadline)
 
@@ -931,8 +978,8 @@ class RemoteController:
 
         ``wait=False`` returns ``None`` before the write, and :attr:`on_done` is told once
         the new passphrase is in."""
-        if self.info is None:
-            return None
+        if self.info is None and not (self.client and self.running):
+            return None  # off; a client's goes to remote.json, which the service's server reads
         made: list[str] = []
 
         def remote_json_job() -> None:
@@ -1124,12 +1171,24 @@ class RemoteController:
         :data:`SAVING` while a write of ``remote.json`` a control asked for waits, one that did
         not land (:attr:`save_problem`), why the file could not be read (:attr:`read_problem`)
         and a switch ``state.json`` refused, each on a line of its own."""
+        service = self.service
+        gave_up = None
+        if self.info is None and service is not None:
+            if self.message in (SERVICE_TURNS_ON, SERVICE_TURNS_OFF) and service.on == (
+                self.message == SERVICE_TURNS_ON
+            ):
+                self.message = None  # the service did what the switch asked
+            gave_up = self._service_gave_up(service)
+            if gave_up is not None and self.message == SERVICE_TURNS_ON:
+                self.message = None  # it stopped trying: why is the line instead
         tunnel = self.tunnel
         api = tunnel.api_warning if tunnel is not None else None
         since = self._writing_since
         saving = SAVING if since is not None and time.monotonic() - since >= SAVING_AFTER else None
         lines = (
+            SERVED_BY_SERVICE if self.client and self.running and self.message is None else None,
             self.message,
+            None if gave_up is None else service_gave_up(gave_up),
             api,
             saving,
             self.save_problem,
@@ -1162,7 +1221,7 @@ class RemoteController:
         """
         self._last_tunnel_error = None
         tunnel = self.tunnel
-        if self.running and tunnel is not None and tunnel.running:
+        if self.remote_serving and tunnel is not None and tunnel.running:
             if tunnel.public_url is None:
                 return self.revive_tunnel_if_dead(retry=True, replace=True)
             with self._lock:
@@ -1193,6 +1252,16 @@ class RemoteController:
             self._elsewhere_looking, self._elsewhere_at = True, now
         threading.Thread(target=self._look_elsewhere, name="remote-elsewhere", daemon=True).start()
         return self.elsewhere
+
+    def served_elsewhere_now(self) -> bool:
+        """:meth:`served_elsewhere`, looked for now on the caller's thread: for a caller that may
+        wait on the home's lock, never Textual's (the rlx service, ``services.service_host``)."""
+        if self.running:
+            return False
+        try:
+            return bool(self._server.remote_served_elsewhere())
+        except Exception:  # a home that cannot tell says nothing of another Remote
+            return False
 
     def _look_elsewhere(self) -> None:
         try:
@@ -1231,11 +1300,25 @@ class RemoteController:
         with self._lock:
             info, origin = self.info, self.public_origin
         if info is None:
-            return None, False
+            return self._service_link()
         token = self._link_token(info)
         if origin is None:
             return remote_server.build_local_url(token, self._port), False
         return build_public_url(origin, token), True
+
+    def _service_link(self) -> tuple[str | None, bool]:
+        """:meth:`remote_link` of the service's Remote, for its client: the token ``remote.json``
+        holds, on the service's public origin once ngrok is up there."""
+        service = self.service
+        if service is None or not service.on or self._first_read() is not None:
+            return None, False
+        try:
+            token = str(self._server.remote_link_token())
+        except Exception:  # unreadable for a moment: no link rather than a wrong one
+            return None, False
+        if service.public_origin is None:
+            return remote_server.build_local_url(token, self._port), False
+        return build_public_url(service.public_origin, token), True
 
     def link_url(self) -> str | None:
         """:meth:`remote_link`'s link alone: the one the Copy button copies."""
@@ -1262,7 +1345,7 @@ class RemoteController:
         shows at the next paint, not the one this Remote started with. ``None`` while off,
         unless another process serves this home (:attr:`elsewhere`): it is that Remote's."""
         info = self.info
-        if info is None and not self.elsewhere:
+        if info is None and not self.elsewhere and not (self.client and self.running):
             return None
         if self._first_read() is not None:
             return None if info is None else info.password
@@ -1316,7 +1399,10 @@ class RemoteController:
         whether a phone extended the unsaved timer or the file held a longer one: the gate
         waits for it.
         """
-        if not self.running or (self.auto_off_at is None and not self._deadline_unsaved):
+        service = self.service
+        if service is not None and self.info is None:
+            return service.auto_off_at  # a client's: the service's timer, which it enforces
+        if not self.remote_serving or (self.auto_off_at is None and not self._deadline_unsaved):
             return self.auto_off_at
         if self._deadline_writes:  # the server has not been handed the deadline in hand yet
             return self.auto_off_at
@@ -1340,7 +1426,7 @@ class RemoteController:
         fleet UI never waits for the stopping.
         """
         deadline = self.adopt_server_deadline()
-        if self.running and deadline is not None and _aware(self._now()) >= deadline:
+        if self.remote_serving and deadline is not None and _aware(self._now()) >= deadline:
             ran_out = "Remote turned off — the auto-off timer ran out"
             self._remote_news(ran_out)  # before what the stopping could not do, if anything
             self.turn_off(reason="auto-off", wait=wait, status=ran_out)
@@ -1348,6 +1434,31 @@ class RemoteController:
         return False
 
     # --- persistence -----------------------------------------------------------------------------
+
+    def _service_gave_up(self, service: ServiceRemote) -> str | None:
+        """Why the service stopped trying to start Remote, while that is the news: Remote off,
+        and no press of this client's since (it is trying again for that one)."""
+        problem, at, asked = service.problem, service.problem_at, self._service_asked_at
+        if service.on or problem is None:
+            return None
+        if asked is not None and (at is None or _aware(at) < asked):
+            return None
+        return problem
+
+    def switch_off_unstarted(self) -> None:
+        """Save Remote's switch off after the starts it asked for kept failing, as a press's
+        failed start saves it (:meth:`_start_failed`): for the rlx service, which tries a few
+        times and then stops (#1717). Nothing while this process serves, or while another
+        Remote is on for this home."""
+        self._start_failed()
+
+    def reload_switches(self) -> None:
+        """The saved switches again, as ``state.json`` holds them now: what any rlx on this
+        home saved last, the rlx service's auto-off or another window's switch included. For
+        a step that acts on them after this controller was built (the take-back of a service
+        that died, ``cli.ui.service_client``); :attr:`state` is otherwise read once, at its
+        build, and what it says since is what this controller itself saved (#32, #1717)."""
+        self.state = load_remote_state()
 
     def _set_state(self, **changes: Any) -> None:
         """Take ``changes`` in hand, and save each switch that changed, on its own.
@@ -1416,7 +1527,7 @@ class RemoteController:
         for an off and on that nothing asked for (sweep 5 of #243).
         """
         dead = self.tunnel
-        if not self.running or dead is None or (dead.running and not replace):
+        if not self.remote_serving or dead is None or (dead.running and not replace):
             return False
         if (
             not retry

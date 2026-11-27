@@ -26,7 +26,9 @@ HERE = "here"
 def place(instance: Instance, *, host: str) -> str:
     """Where ``instance`` runs, in a word: ``ssh`` for one reached from another machine,
     ``Mac`` (``local`` off macOS) for one at this machine, and the host's name for one at
-    another machine sharing the home."""
+    another machine sharing the home; ``service`` for the headless rlx service (#32)."""
+    if instance.kind == "service":
+        return "service"
     if instance.kind == "ssh":
         return "ssh"
     if instance.host != host:

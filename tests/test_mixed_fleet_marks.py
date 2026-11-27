@@ -44,6 +44,7 @@ from aisquare.models import (
     FleetAgentStatus,
     UsageCause,
 )
+from tests.test_ui_shell import to_the_sidebar
 from tests.ui_workers import settle_page, settle_until_held
 
 NOW = datetime(2026, 11, 13, 12, 0, tzinfo=UTC)
@@ -230,7 +231,10 @@ def test_a_real_problem_keeps_its_mark(
     status = _status(agent, **status_kwargs)
     assert not accounts_view.awaits_first_reading(status, usage)
     cells = accounts_view.account_cells(status, usage, now=NOW)
-    assert cells["session"].plain == accounts_view.PROBLEM_MARK
+    # The mark, and why in words after it (Q19 of the 0.10.2 UX audit), never the quiet line.
+    said = cells["session"].plain
+    assert said.startswith(f"{accounts_view.PROBLEM_MARK} ") and said != "! ", said
+    assert said == accounts_view.problem_words(status, usage, now=NOW).plain
 
 
 # --- R16-E verify (seq 11952): the mark gives way; old rows; the captain's row ---------------
@@ -271,6 +275,7 @@ def test_in_a_narrow_sidebar_the_mark_gives_way_and_no_chip_is_cut(
         app = FleetApp(refresh_seconds=3600, doctor=lambda: [], accounts=_overview)
         async with app.run_test(size=(width, 40)):
             await settle_page(app)
+            await to_the_sidebar(app)  # under 70 columns, start on Welcome shows the other side
             app.sidebar.session_usage = {5: 100.0, 2: 64.0}
             app.sidebar.show_projects([project], {project.id: rows})
             await settle_page(app)

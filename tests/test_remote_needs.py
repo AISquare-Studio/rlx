@@ -3112,9 +3112,9 @@ def test_a_needs_file_a_write_cannot_read_whole_is_kept_aside_not_overwritten(
     path.write_bytes(body)
     with caplog.at_level(logging.WARNING, logger=remote_needs.log.name):
         record_needs_dismissal("ny_newest")
-    assert path.with_name("remote-needs.json.bad").read_bytes() == body
+    assert path.with_name(f"{path.name}.bad").read_bytes() == body
     assert set(load_needs_dismissals()) == {"ny_newest"}
-    assert "remote-needs.json.bad" in caplog.text
+    assert f"{path.name}.bad" in caplog.text
 
 
 def test_each_needs_file_kept_aside_is_kept_under_a_name_of_its_own(
@@ -3133,10 +3133,10 @@ def test_each_needs_file_kept_aside_is_kept_under_a_name_of_its_own(
             record_needs_dismissal("ny_newest")
     kept = [
         path.with_name(name)
-        for name in ("remote-needs.json.bad", *(f"remote-needs.json.bad.{n}" for n in (1, 2)))
+        for name in (f"{path.name}.bad", *(f"{path.name}.bad.{n}" for n in (1, 2)))
     ]
     assert [aside.read_bytes() for aside in kept] == bodies
-    assert "remote-needs.json.bad.2" in caplog.text
+    assert f"{path.name}.bad.2" in caplog.text
     assert set(load_needs_dismissals()) == {"ny_newest"}
 
 
@@ -3155,7 +3155,7 @@ def test_a_later_versions_needs_file_is_never_written_over() -> None:
         record_needs_dismissal("ny_newest")
     assert isinstance(remote_needs.LaterNeedsFile("x"), OSError), "said as a failed write"
     assert path.read_bytes() == body
-    assert not path.with_name("remote-needs.json.bad").exists()
+    assert not path.with_name(f"{path.name}.bad").exists()
     assert set(load_needs_dismissals()) == set(_KEPT_DISMISSED)
 
 
@@ -3190,7 +3190,7 @@ def test_a_needs_file_that_could_not_be_read_is_never_written(
         patched.setattr(Path, "read_text", failing)
         record_needs_dismissal("ny_newest")
     assert json.loads(path.read_text(encoding="utf-8")) == _KEPT_BEFORE
-    assert not path.with_name("remote-needs.json.bad").exists()
+    assert not path.with_name(f"{path.name}.bad").exists()
     record_needs_dismissal("ny_newest")  # the control: read whole, it is built on
     assert set(load_needs_dismissals()) == {*_KEPT_DISMISSED, "ny_newest"}
 
@@ -6262,7 +6262,8 @@ def test_under_a_team_hub_a_projects_rows_are_derived_again_in_one_look_at_tmux(
     """Every row's session is the hub's, so every row was derived again by
     ``fleet.status_of``: a store session and a look at its tmux server for each agent, on
     top of the listing's one look, every 3 s (verifier of sweep 4's item 8 on #243). The
-    rows are derived again together, each with its own session."""
+    listing derives each row with its session itself now, the hub's read by its id (#14,
+    #1306): the listing's one look is the scan's only one."""
     now = datetime.now(UTC)
     hour_ago = now - timedelta(hours=1)
     hub = _rooted(tmp_path / "hub")
@@ -6297,7 +6298,7 @@ def test_under_a_team_hub_a_projects_rows_are_derived_again_in_one_look_at_tmux(
     monkeypatch.setattr(fleet_service, "server_for", lambda socket, config=None: tmux)
     monkeypatch.setattr(fleet_service, "_observe", looked)
     items = scan_needs_you(remote_needs.live_needs_sources(), now=now, dismissed=())
-    assert looks == [list(labels), list(labels)], "the listing's look, and one more"
+    assert looks == [list(labels)], "the listing's look, and no other"
     assert [(item.kind, item.agent) for item in items] == [("permission", "coder-2")]
     assert items[0].reason == "coder-2 shows a dialog that needs you"
 

@@ -2,7 +2,7 @@
 
 Detection is read-only: an agent is "detected" when its config directory (or a
 known context file) exists. The set of connected agents is persisted in
-``~/.aisquare/agents.json``. Reading an agent's context (e.g. Claude Code's
+``~/.rlx/agents.json``. Reading an agent's context (e.g. Claude Code's
 ``CLAUDE.md``) is what ``agents connect`` ingests into the context pools.
 """
 

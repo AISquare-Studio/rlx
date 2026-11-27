@@ -22,6 +22,12 @@ An install asq does not update itself (Homebrew, pip, pipx) gets the command tha
 from the same plan ``aisquare upgrade`` builds (:attr:`UpgradePlan.command`,
 :attr:`UpgradePlan.reason`), and a Close button: there is nothing to restart into.
 
+Nor is *Restart & update* offered while another program's ``rlx`` or ``relax`` sits where
+uv puts this install's commands (:attr:`UpgradePlan.commands_taken`): the update's
+reinstall would replace it without a word, so ``aisquare upgrade`` refuses it, and offered
+here, asq closed, the command refused, and asq came back after Enter (0.10.1's final
+review). The dialog refuses instead, naming the file (:func:`taken_line`), with Close.
+
 Every string reaches the screen as a :class:`rich.text.Text` built with ``append``: a
 command or a Remote's name is data, never markup.
 """
@@ -38,7 +44,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
-from aisquare.services.lifecycle import UpgradePlan
+from aisquare.services.lifecycle import UpgradePlan, taken_refusal
 
 PLAN_WORKER = "update-plan"
 """The read the row starts before the dialog opens: how this install upgrades, and whether
@@ -77,6 +83,17 @@ def agents_line(live: int) -> str:
         f"{live} agents keep running; any whose pane is gone afterwards is restarted on its "
         "session."
     )
+
+
+TAKEN_AGAIN = "open the ⬆ row again"
+"""The refusal's last step in asq's words (R13: asq names no command to type)."""
+
+
+def taken_line(plan: UpgradePlan) -> str | None:
+    """Why the dialog will not update: the refusal ``aisquare upgrade`` makes over another
+    program's ``rlx`` or ``relax`` in uv's directory (``lifecycle.taken_refusal``), naming
+    each file, its remedy ending in the ⬆ row; ``None`` when nothing is in the way."""
+    return taken_refusal("upgrade", plan.commands_taken, again=TAKEN_AGAIN)
 
 
 def remote_line(plan: UpgradePlan) -> str | None:
@@ -136,9 +153,24 @@ class UpdateScreen(ModalScreen[bool]):
         for button in self.query("#update-confirm").results(Button):
             button.disabled = False
 
+    @property
+    def offers_update(self) -> bool:
+        """Whether *Restart & update* is offered: an install asq updates, with nothing of
+        another program's in the way (:func:`taken_line`)."""
+        return self.plan.runnable and taken_line(self.plan) is None
+
     def body(self) -> Text:
         """What the dialog says, above its buttons."""
         text = Text()
+        taken = taken_line(self.plan) if self.plan.runnable else None
+        if taken is not None:
+            text.append("rlx cannot update this install now: ", style="bold")
+            text.append(taken)
+            text.append(" The agents keep running.")
+            if self.status is not None:
+                text.append("\n")
+                text.append(self.status, style="dim")
+            return text
         if not self.plan.runnable:
             # The way it was installed updates it; asq names no command to type (R13).
             text.append(f"rlx does not update this install itself ({self.plan.reason}).")
@@ -183,7 +215,7 @@ class UpdateScreen(ModalScreen[bool]):
         with box:
             yield Static(self.body(), id="update-text", classes="update-text")
             with Horizontal(id="update-buttons"):
-                if self.plan.runnable:
+                if self.offers_update:
                     yield Button(
                         "Restart & update",
                         id="update-confirm",

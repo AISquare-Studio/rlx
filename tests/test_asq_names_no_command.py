@@ -133,7 +133,7 @@ def test_a_fix_button_says_what_it_does_and_which_home_never_its_command() -> No
     connect = FixCommand("claude-code", ("agents", "connect", "claude-code"), "machine", "")
     # As a fix spells it on this platform, and with "/" after the home, as one written by
     # hand on Windows has it: both shown from "~", in this platform's separators (#517).
-    native = str(Path.home() / ".aisquare" / "codex-accounts" / "4")
+    native = str(Path.home() / ".rlx" / "accounts" / "codex" / "4")
     slot = FixCommand(
         "claude-code",
         ("agents", "connect", "codex", "--config-dir", f"{home}/.aisquare/codex-accounts/3"),
@@ -152,7 +152,7 @@ def test_a_fix_button_says_what_it_does_and_which_home_never_its_command() -> No
 
     assert connect.title == "Connect Claude Code"
     assert slot.title == f"Connect Codex ({Path('~', '.aisquare', 'codex-accounts', '3')})"
-    assert slot_4.title == f"Connect Codex ({Path('~', '.aisquare', 'codex-accounts', '4')})"
+    assert slot_4.title == f"Connect Codex ({Path('~', '.rlx', 'accounts', 'codex', '4')})"
     assert elsewhere.title == "Connect Claude Code (/srv/x)"
     assert refresh.title == "Refresh this project"
     assert fix_all.title == "Fix what the checks can"
