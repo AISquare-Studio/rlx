@@ -104,10 +104,19 @@ def _now() -> datetime:
 
 
 def _settings() -> TidySettings:
+    """``[tidy]``; with a config that cannot be read, the coder rule OFF (review of #58): a rule
+    that deletes fails closed."""
     try:
         return load_config().tidy
     except Exception:
-        return TidySettings()
+        return TidySettings(idle_build_hours=0)
+
+
+ROOT_TAG = (
+    "a CACHEDIR.TAG at the root of what tidy judges authorises nothing (CARGO_TARGET_DIR or "
+    "UV_CACHE_DIR there, pytest -o cache_dir=.): ignored, git alone judges it"
+)
+"""What a plan says of a tag it ignores (review of #58, C2)."""
 
 
 # --- what may be deleted -------------------------------------------------------------------
@@ -210,8 +219,10 @@ class Plan:
     kept: list[Kept] = field(default_factory=list)
     roots: Roots = field(default_factory=Roots)
     actions: list[_Action] = field(default_factory=list)
-    branches: list[Callable[[fleet_service.ReapReport], None]] = field(default_factory=list)
-    """Reap's branch sweep, per project whose trees it judged, run after their trees."""
+    branches: list[tuple[Path, str]] = field(default_factory=list)
+    """``(repo, branch)``: the ``fleet/…`` branches reap's sweep deletes once the planned trees
+    are gone (``fleet.sweep_plan``), shown in the dry run and deleted, those alone, by apply."""
+    sweeps: list[Callable[[fleet_service.ReapReport], None]] = field(default_factory=list)
 
     @property
     def bytes(self) -> int:
@@ -251,28 +262,38 @@ def plan(*, now: datetime | None = None) -> Plan:
     config = _settings()
     with store_session() as store:
         projects = store.list_projects(all=True)
-        rows = {project.id: store.fleet_agents(project.id) for project in projects}
-        every = [row for project_rows in rows.values() for row in project_rows]
+        # Liveness from every row there is, a forgotten project's too (review of #58, M2):
+        # forgetting refuses only live rows, so a paused agent can sit in one.
+        every = _every_row(store)
         result = Plan(roots=_roots(projects))
         commands = _command_lines()
         for project in projects:
             _ended_worktrees(store, project, result)
             if config.idle_build_hours > 0:
-                _idle_build_output(store, project, rows[project.id], config, at, result)
+                rows = [row for row in every if row.project_id == project.id]
+                _idle_build_output(store, project, rows, config, at, result)
         _session_trees(store, every, commands, at, result)
     _stale_locks(at, result)
     return result
 
 
+def _every_row(store: ContextStore) -> list[FleetAgent]:
+    return [
+        row
+        for project in store.list_projects(all=True, include_forgotten=True)
+        for row in store.fleet_agents(project.id)
+    ]
+
+
 def apply(made: Plan) -> Report:
-    """Carry out ``made``, exactly: each action re-checks its items first, and an item still
-    there afterwards is reported with why. Then reap's branch sweep for each project whose
-    trees were judged."""
+    """Carry out ``made``, exactly, and decide nothing again: each action re-checks its items
+    first and never frees more than planned (a tree planned kept loses its caches alone), and an
+    item still there afterwards is reported with why. Then the planned branches, those alone."""
     report = Report(kept=list(made.kept))
     for action in made.actions:
         try:
             why = action.run()
-        except (OSError, Refused, fleet_service.FleetError) as exc:
+        except (OSError, Refused, ValueError, fleet_service.FleetError) as exc:
             why = str(exc)
         for item in action.items:
             if _there(item.path):
@@ -280,7 +301,7 @@ def apply(made: Plan) -> Report:
             else:
                 report.freed.append(item)
     reaped = fleet_service.ReapReport()
-    for sweep in made.branches:
+    for sweep in made.sweeps:
         try:
             sweep(reaped)
         except fleet_service.FleetError:
@@ -304,6 +325,17 @@ def _roots(projects: Iterable[ProjectInfo]) -> Roots:
 # --- 1. ended agents' worktrees: reap's worktree half ---------------------------------------
 
 
+def _untracked_caches(tree: Path) -> list[Path]:
+    """The caches among ``tree``'s untracked entries, as reap deletes them: each entry that is
+    one, or the caches inside one that holds nothing else."""
+    _failed, untracked, _other = fleet_service._untracked_caches(tree)
+    return [
+        found
+        for entry in untracked
+        for found in ([entry] if cachedir.is_cache(entry) else cachedir.cache_dirs(entry))
+    ]
+
+
 def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) -> None:
     trees = fleet_service.ended_trees(store, project)
     if trees is None:
@@ -311,6 +343,7 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
     if isinstance(trees, fleet_service.RootUnseen):
         result.kept.append(Kept(ENDED_WORKTREE, trees.root, trees.why))
         return
+    going: list[Path] = []
     for agent in trees.candidates:
         tree = agent.cwd
         try:
@@ -324,41 +357,49 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
                 Kept(ENDED_WORKTREE, tree, f"not under {WORKTREES_DIR}: reap judges it")
             )
             continue
+        if cachedir.is_cache_dir(tree):
+            result.kept.append(Kept(ENDED_WORKTREE, tree, ROOT_TAG))
         try:
             why = fleet_service._why_kept(trees.root, tree, trees.default)
         except fleet_service.FleetError as exc:
             result.kept.append(Kept(ENDED_WORKTREE, tree, f"git could not be asked ({exc})"))
             continue
-        _failed, untracked, _other = fleet_service._untracked_caches(tree)
-        caches = [found for entry in untracked for found in cachedir.cache_dirs(entry)]
         if why is None:
+            going.append(tree)
             items = [Item(ENDED_WORKTREE, tree, cachedir.allocated_bytes(tree))]
         else:
             result.kept.append(Kept(ENDED_WORKTREE, tree, why))
+            caches = _untracked_caches(tree)
             items = [Item(ENDED_WORKTREE_CACHE, c, cachedir.allocated_bytes(c)) for c in caches]
-        result.add(items, _reap_one(project, agent, trees))
+        result.add(items, _reap_one(project, agent, trees, remove=why is None))
     unplaced = fleet_service._unplaced_trees_kept(trees.placed, trees.owners, trees.in_use)
     result.kept.extend(Kept(ENDED_WORKTREE, tree, why) for tree, why in unplaced)
     root, common, default = trees.root, trees.common, trees.default
+    rows = store.fleet_agents(project.id)
+    try:
+        done, _kept = fleet_service.sweep_plan(root, common, default, rows, gone=going)
+    except fleet_service.FleetError:
+        return
+    if not done:
+        return
+    result.branches.extend((root, branch) for branch in done)
 
     def sweep(report: fleet_service.ReapReport) -> None:
-        with store_session() as again:
-            rows = again.fleet_agents(project.id)
-        fleet_service._sweep_fleet_branches(root, common, default, rows, report)
+        fleet_service._delete_swept(root, common, done, report)
 
-    result.branches.append(sweep)
+    result.sweeps.append(sweep)
 
 
 def _reap_one(
-    project: ProjectInfo, agent: FleetAgent, trees: fleet_service.EndedTrees
+    project: ProjectInfo, agent: FleetAgent, trees: fleet_service.EndedTrees, *, remove: bool
 ) -> Callable[[], str | None]:
     def run() -> str | None:
         with store_session() as store:
             removed, kept = fleet_service._reap_tree(
-                store, project, agent, trees.default, trees.common, trees.read_at
+                store, project, agent, trees.default, trees.common, trees.read_at, remove=remove
             )
-        if removed:
-            return None
+        if removed or not remove:
+            return None if removed else kept
         return kept or "another agent is at the tree now"
 
     return run
@@ -368,11 +409,12 @@ def _reap_one(
 
 
 def _command_lines() -> list[str] | None:
-    """Every running process's command line, read once; ``None`` where they cannot be read
-    (no ``ps``, as on Windows, or it did not answer): then no session is taken for ended."""
+    """Every running process's command line, every user's and every terminal's or none (``ps
+    -A``, POSIX), read once; ``None`` where they cannot be read (no ``ps``, as on Windows, or it
+    did not answer): then no session is taken for ended."""
     if sys.platform == "win32":
         return None
-    listed = process_table._run(["ps", "-axww", "-o", "args="])
+    listed = process_table._run(["ps", "-A", "-ww", "-o", "args="])
     if listed is None or listed.returncode != 0:
         return None
     return [line for line in listed.stdout.splitlines() if line.strip()]
@@ -443,6 +485,39 @@ def _subdirs(path: Path) -> list[Path]:
         return []
 
 
+@dataclass(frozen=True)
+class _Liveness:
+    """What says whether a session is over, read once for the plan and again before each act."""
+
+    held: bool
+    """A live or paused row in any project names it."""
+    ended: bool
+    """POSITIVE evidence it ended (review of #58, M1): its board row's ``ended_at``, or rows
+    naming it that have all ended. Idleness alone is never evidence."""
+    running: bool | None
+    """A running process names it; ``None`` when the processes could not be read."""
+    wrote: datetime | None
+    """When the session itself last wrote: its board row's last hook, its transcript."""
+
+
+def _liveness(
+    store: ContextStore, session_id: str, rows: list[FleetAgent], commands: list[str] | None
+) -> _Liveness:
+    session = store.get_session(session_id)
+    wrote: list[datetime | None] = []
+    if session is not None:
+        transcript = _mtime(Path(session.transcript_path)) if session.transcript_path else None
+        wrote = [session.last_seen_at, transcript]
+    known = [moment for moment in wrote if moment is not None]
+    ended_row = bool(rows) and all(row.ended_at is not None for row in rows)
+    return _Liveness(
+        held=_held_by(rows),
+        ended=ended_row or (session is not None and session.ended_at is not None),
+        running=_named_running(session_id, commands),
+        wrote=max(known) if known else None,
+    )
+
+
 def _session_trees(
     store: ContextStore,
     every: list[FleetAgent],
@@ -463,54 +538,31 @@ def _session_trees(
             by_session.setdefault(row.session_id, []).append(row)
     for directory in sessions:
         session_id = directory.name
-        moved = _session_moved(store, session_id, directory)
-        if not _session_ended(by_session.get(session_id, ()), session_id, commands, moved, at):
+        alive = _liveness(store, session_id, by_session.get(session_id, []), commands)
+        if alive.held or alive.running is not False:
             continue
-        assert moved is not None
-        _one_session(directory, session_id, moved, at, result)
-
-
-def _session_signals(store: ContextStore, session_id: str) -> list[datetime | None]:
-    """What the session itself last wrote: its board row's last hook, its transcript's time."""
-    session = store.get_session(session_id)
-    if session is None:
-        return []
-    transcript = _mtime(Path(session.transcript_path)) if session.transcript_path else None
-    return [session.last_seen_at, transcript]
-
-
-def _session_moved(store: ContextStore, session_id: str, directory: Path) -> datetime | None:
-    return _last_moved(directory, *_session_signals(store, session_id))
-
-
-def _session_ended(
-    rows: Iterable[FleetAgent],
-    identifier: str,
-    commands: list[str] | None,
-    moved: datetime | None,
-    at: datetime,
-) -> bool:
-    """All three: no live or paused row names it, no running process names it, and nothing of
-    it moved for :data:`ENDED_IDLE`."""
-    if _held_by(rows):
-        return False
-    if _named_running(identifier, commands) is not False:
-        return False
-    return moved is not None and at - moved >= ENDED_IDLE
+        moved = _last_moved(directory, alive.wrote)
+        if moved is None:
+            continue
+        idle = at - moved
+        if alive.ended and idle >= ENDED_IDLE:
+            _one_session(directory, session_id, moved, at, result, ended=True)
+        elif idle >= EVIDENCE_TTL:
+            # No word that it ended (a hand launch without tracing, `claude --continue`): never
+            # ended by tidy, only aged out whole, once git would keep none of its checkouts.
+            _one_session(directory, session_id, moved, at, result, ended=False)
 
 
 def _checkouts(directory: Path) -> list[Path]:
-    """The git checkouts in ``directory``: each directory holding a ``.git`` (a linked worktree's
-    file or a clone's directory), the outermost only, never through a link or a tagged
-    directory."""
+    """The git checkouts in ``directory``, ``directory`` itself among them when it is one: each
+    directory holding a ``.git`` (a linked worktree's file or a clone's directory), the outermost
+    only, never through a link. A tag hides none (review of #58, C2)."""
     found: list[Path] = []
     pending = [directory]
     while pending:
         here = pending.pop()
-        if here != directory and _there(here / ".git"):
+        if _there(here / ".git"):
             found.append(here)
-            continue
-        if cachedir.is_cache_dir(here):
             continue
         pending.extend(_subdirs(here))
     return sorted(found)
@@ -540,9 +592,9 @@ def _commits(shas: list[str], where: str, then: str) -> str:
 
 
 def _checkout_kept(checkout: Path, scope: Path) -> str | None:
-    """Why ``checkout`` stays, or ``None``: changed or untracked work outside tagged directories,
-    or a commit found nowhere that outlives the deletion (#58: kept and named on any doubt, git's
-    word being the only one taken).
+    """Why ``checkout`` stays, or ``None``: changed or untracked work outside caches, or a commit
+    found nowhere that outlives the deletion (#58: kept and named on any doubt, git's word being
+    the only one taken).
 
     Where the checkout's repository is deleted with ``scope`` (:func:`_repository_goes`), its own
     branches and tags go too: only its REMOTES count as elsewhere, so every commit any of its refs
@@ -591,15 +643,29 @@ def _common_dir(checkout: Path) -> Path | None:
     return Path(found.stdout.strip())
 
 
+def _tracked_inside(checkout: Path, tagged: Path) -> bool:
+    """Whether git tracks anything at or under ``tagged`` in ``checkout`` (true where it cannot
+    say): tracked content is git's to judge, never a tag's (review of #58)."""
+    try:
+        listed = _git(checkout, "ls-files", "--", os.path.relpath(tagged, checkout))
+    except fleet_service.FleetError:
+        return True
+    return listed.returncode != 0 or bool(listed.stdout.strip())
+
+
+def _checkout_caches(checkout: Path) -> list[Path]:
+    """The caches STRICTLY inside a judged ``checkout`` that git tracks nothing of and that hold
+    no ``.git``: untracked or ignored build output alone."""
+    return [t for t in cachedir.cache_dirs(checkout) if not _tracked_inside(checkout, t)]
+
+
 def _remove_checkout(checkout: Path, roots: Roots) -> str | None:
-    """``checkout`` gone: its tagged output first, then through its repository's ``git worktree
-    remove`` (no ``--force``: one git will not remove stays, and says why) for a linked
-    worktree, or deleted for a clone. A linked one whose repository is gone is deleted, and the
-    repository's list pruned where there is one."""
+    """``checkout`` gone: its untracked caches first, as reap deletes them (inside it alone, no
+    link followed), then through its repository's ``git worktree remove`` (no ``--force``: one
+    git will not remove stays, and says why) for a linked worktree, or deleted for a clone."""
     if not roots.allows(checkout):
         raise Refused(f"{checkout} is outside rlx's own folders")
-    for tagged in cachedir.cache_dirs(checkout):
-        _remove(tagged, roots)
+    fleet_service._remove_untracked_caches(checkout)
     common = _common_dir(checkout)
     if common is None:
         if (checkout / ".git").is_file():
@@ -613,8 +679,14 @@ def _remove_checkout(checkout: Path, roots: Roots) -> str | None:
 
 
 def _one_session(
-    directory: Path, session_id: str, moved: datetime, at: datetime, result: Plan
+    directory: Path, session_id: str, moved: datetime, at: datetime, result: Plan, *, ended: bool
 ) -> None:
+    """``ended``: with positive evidence, its checkouts and caches go, and after
+    :data:`EVIDENCE_TTL` the whole directory. Without (aged out): the whole directory alone,
+    and only when git would keep none of its checkouts."""
+    for top in (directory, *_subdirs(directory)):
+        if cachedir.is_cache_dir(top):
+            result.kept.append(Kept(SESSION_CACHE, top, ROOT_TAG))
     kept: list[Path] = []
     gone: list[Path] = []
     # A linked worktree before any clone: its repository may be one of them.
@@ -628,7 +700,7 @@ def _one_session(
             kept.append(checkout)
             result.kept.append(Kept(SESSION_CHECKOUT, checkout, why))
     roots = result.roots
-    if at - moved >= EVIDENCE_TTL and not kept:
+    if at - moved >= EVIDENCE_TTL and not kept and directory not in gone:
         whole = Item(SESSION_DIR, directory, cachedir.allocated_bytes(directory))
 
         def drop() -> str | None:
@@ -639,21 +711,29 @@ def _one_session(
             _remove(directory, roots)
             return None
 
-        result.add([whole], _guarded(session_id, directory, drop))
+        result.add([whole], _guarded(session_id, directory, drop, ended=ended))
+        return
+    if not ended:
         return
     for checkout in gone:
         item = Item(SESSION_CHECKOUT, checkout, cachedir.allocated_bytes(checkout))
         result.add(
-            [item], _guarded(session_id, directory, partial(_remove_checkout, checkout, roots))
+            [item],
+            _guarded(session_id, directory, partial(_remove_checkout, checkout, roots), ended=True),
         )
-    outside = [
+    caches = [
         tagged
-        for tagged in cachedir.cache_dirs(directory)
-        if not any(tagged.is_relative_to(checkout) for checkout in gone)
+        for top in _subdirs(directory)
+        if not _there(top / ".git")
+        for tagged in cachedir.cache_dirs(top)
     ]
-    for tagged in outside:
+    for checkout in kept:
+        caches.extend(_checkout_caches(checkout))
+    for tagged in sorted(caches):
         item = Item(SESSION_CACHE, tagged, cachedir.allocated_bytes(tagged))
-        result.add([item], _guarded(session_id, directory, partial(_removed, tagged, roots)))
+        result.add(
+            [item], _guarded(session_id, directory, partial(_removed, tagged, roots), ended=True)
+        )
 
 
 def _removed(path: Path, roots: Roots) -> str | None:
@@ -662,25 +742,20 @@ def _removed(path: Path, roots: Roots) -> str | None:
 
 
 def _guarded(
-    session_id: str, directory: Path, run: Callable[[], str | None]
+    session_id: str, directory: Path, run: Callable[[], str | None], *, ended: bool
 ) -> Callable[[], str | None]:
-    """``run``, once the session is still ended: no row took it up, no process names it now,
-    and it wrote nothing since (its board row, its transcript). Its directory's own times are
-    not asked again: this run's deletes move them."""
+    """``run``, once the session is still as planned: no row took it up, no process names it now,
+    it wrote nothing since (its board row, its transcript), and, for one planned ``ended``, the
+    evidence it ended stands. Its directory's own times are not asked again: this run's deletes
+    move them."""
 
     def checked() -> str | None:
         with store_session() as store:
-            rows = [
-                row
-                for project in store.list_projects(all=True)
-                for row in store.fleet_agents(project.id)
-                if row.session_id == session_id
-            ]
-            wrote = [moment for moment in _session_signals(store, session_id) if moment]
-        now = _now()
-        if _held_by(rows) or _named_running(session_id, _command_lines()) is not False:
+            rows = [row for row in _every_row(store) if row.session_id == session_id]
+            alive = _liveness(store, session_id, rows, _command_lines())
+        if alive.held or alive.running is not False or (ended and not alive.ended):
             return "skipped: the session is no longer ended"
-        if wrote and now - max(wrote) < ENDED_IDLE:
+        if alive.wrote is not None and _now() - alive.wrote < ENDED_IDLE:
             return "skipped: the session is no longer ended"
         return run()
 
@@ -694,7 +769,7 @@ def _idle_coder(
     store: ContextStore, project: ProjectInfo, row: FleetAgent, hours: float, at: datetime
 ) -> bool:
     """A live, unpaused coder whose board session has waited ``hours`` and holds no task in
-    doing: nothing it works on now needs its build output."""
+    doing on its board (``row.board``): nothing it works on now needs its build output."""
     if row.ended_at is not None or row.paused_at is not None or row.role != "coder":
         return False
     if not row.session_id:
@@ -704,7 +779,7 @@ def _idle_coder(
         return False
     if at - session.last_seen_at < timedelta(hours=hours):
         return False
-    doing = store.team_tasks(project.id, status="doing")
+    doing = store.team_tasks(row.board or project.id, status="doing")
     return not any(task.claimed_by == row.session_id for task in doing)
 
 
@@ -726,25 +801,22 @@ def _idle_build_output(
         tree = fleet_service._in_its_recorded_tree(placed).cwd
         if not roots.allows(tree):
             continue  # the project's own checkout, or a tree outside the fleet's folder
+        if cachedir.is_cache_dir(tree):
+            result.kept.append(Kept(IDLE_BUILD_CACHE, tree, ROOT_TAG))
         for tagged in _build_output(tree):
             item = Item(IDLE_BUILD_CACHE, tagged, cachedir.allocated_bytes(tagged))
             result.add([item], _while_idle(project, row, config.idle_build_hours, tagged, roots))
 
 
 def _build_output(tree: Path) -> list[Path]:
-    """The tagged directories in ``tree``, outermost, never one that is an environment nor any
-    inside one (a live agent runs its commands from it)."""
-    found: list[Path] = []
-    pending = [tree]
-    while pending:
-        here = pending.pop()
-        if cachedir.is_environment(here):
-            continue
-        if cachedir.is_cache_dir(here):
-            found.append(here)
-            continue
-        pending.extend(_subdirs(here))
-    return sorted(found)
+    """The caches STRICTLY inside ``tree`` (never its root, nor one holding a ``.git``), never an
+    environment nor any inside one (a live agent runs its commands from it), and none that git
+    tracks anything of."""
+    return [
+        tagged
+        for tagged in cachedir.cache_dirs(tree, skip=cachedir.is_environment)
+        if not _tracked_inside(tree, tagged)
+    ]
 
 
 def _while_idle(

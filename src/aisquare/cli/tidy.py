@@ -47,6 +47,7 @@ def plan_json(plan: tidy_service.Plan) -> dict[str, Any]:
         "paths": [_item(item) for item in plan.items],
         "kept": [_kept(kept) for kept in plan.kept],
         "counts": plan.counts(),
+        "branches": [{"repo": str(repo), "branch": branch} for repo, branch in plan.branches],
     }
 
 
@@ -113,6 +114,8 @@ def tidy(
         if plan.items:
             rows = [(i.rule, size(i.bytes), paths.shown(i.path)) for i in plan.items]
             console.print(_paths_table(rows, ("RULE", "SIZE", "PATH")), markup=False)
+        for repo, branch in plan.branches:
+            console.print(f"branch {branch} in {paths.shown(repo)} would go", markup=False)
         _print_kept(plan.kept)
         return
     report = tidy_service.apply(plan)

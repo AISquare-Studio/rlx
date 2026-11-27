@@ -3228,13 +3228,15 @@ def _remove_untracked_caches(tree: Path) -> list[Path]:
     """Delete the ``CACHEDIR.TAG`` directories in ``tree``'s untracked entries that hold
     nothing else (:func:`_untracked_caches`); the ones deleted. One that will not go is left
     for ``git worktree remove`` to refuse, which says so."""
+    if os.path.islink(tree):
+        return []  # a tree reached through a link: nothing is deleted through it
     _failed, caches, _other = _untracked_caches(tree)
     removed: list[Path] = []
     for entry in caches:
-        for tagged in cachedir.cache_dirs(entry):
+        for tagged in [entry] if cachedir.is_cache(entry) else cachedir.cache_dirs(entry):
             try:
-                cachedir.remove_dir(tagged)
-            except OSError:
+                cachedir.remove_within(tagged, tree)
+            except (OSError, ValueError):
                 continue  # left in the tree: git's own refusal names it
             removed.append(tagged)
     return removed
@@ -3486,6 +3488,8 @@ def _reap_tree(
     default: str,
     common: Path,
     read_at: datetime,
+    *,
+    remove: bool = True,
 ) -> tuple[bool, str | None]:
     """Reap ``agent``'s tree: ``agent`` ended, and was the newest row at the tree's path when
     :func:`reap` read the rows at ``read_at``. Record on its row the branch the tree is on
@@ -3537,6 +3541,8 @@ def _reap_tree(
             _remove_untracked_caches(tree)
             if kept is not None:
                 return False, kept
+            if not remove:  # ``rlx tidy`` planned it kept: it never decides again (#58)
+                return False, "kept, as planned"
             removal = _git(project.root, "worktree", "remove", str(tree))
     except FleetError as exc:
         held = f"; when asked just before, it held: {kept}" if kept is not None else ""
@@ -3593,6 +3599,22 @@ def _sweep_fleet_branches(
     hand, or one its agent left for another — is left as it is, and so is a recorded one
     that is not ``fleet/…`` (``fix/auth``): only branches :func:`branch_name` makes go.
     """
+    done, kept = sweep_plan(root, common, default, rows)
+    report.branches_kept.extend((root, branch) for branch in kept)
+    _delete_swept(root, common, done, report)
+
+
+def sweep_plan(
+    root: Path,
+    common: Path,
+    default: str,
+    rows: Sequence[FleetAgent],
+    *,
+    gone: Collection[Path] = (),
+) -> tuple[dict[str, str], list[str]]:
+    """What :func:`_sweep_fleet_branches` decides, without deleting: the branches it deletes,
+    each with the tip judged, and the ones it names kept. ``gone``: trees about to be removed
+    (``rlx tidy``'s dry run, #58), whose branches count as out of every tree."""
     paused = _paused_heads(rows)  # a paused agent's branch is where its resume carries on
     live = {row.branch for row in rows if row.ended_at is None or row.id in paused}
     recorded = {
@@ -3604,26 +3626,30 @@ def _sweep_fleet_branches(
         and row.branch not in live
     }
     if not recorded:
-        return
+        return {}, []
     # Of the recorded ones, those still there: ended rows are kept for good, so `recorded`
     # is never empty again once a project ran a coder, and with them all swept, the trees
     # were asked (`git worktree list` and their state files) on every reap for nothing
     # (review of #259, round 35, 5/8).
     every = {b: tip for b, tip in (_fleet_branches(root) or {}).items() if b in recorded}
     if not every:
-        return
+        return {}, []
     merged = _fleet_branches(root, f"--merged={default}")
     out = None if merged is None else _branches_in_use(root, common)
     if merged is None or out is None:
-        return
+        return {}, []
+    if gone:  # trees about to go (tidy's dry run): their branches are out of no tree then
+        held = _worktree_branches(root)
+        out = out - {held[tree] for tree in (_tree_at(t) for t in gone) if tree in held}
     asked = {b: tip for b, tip in every.items() if b not in out}
     squashed = _squashed(root, {b: tip for b, tip in asked.items() if b not in merged}, default)
-    done: list[str] = []
-    for branch in asked:
-        if branch in merged or branch in squashed:
-            done.append(branch)
-        else:
-            report.branches_kept.append((root, branch))
+    done = {b: tip for b, tip in asked.items() if b in merged or b in squashed}
+    return done, [b for b in asked if b not in done]
+
+
+def _delete_swept(root: Path, common: Path, done: Mapping[str, str], report: ReapReport) -> None:
+    """Delete each of ``done`` (branch → the tip judged), as :func:`_sweep_fleet_branches` says:
+    under the branch lock, asking the trees again, each at its judged tip alone."""
     if not done:
         return
     try:
@@ -3631,11 +3657,11 @@ def _sweep_fleet_branches(
         # next reap deletes what this one could not.
         with _branches_locked(common, wait=0):
             out = _branches_in_use(root, common)  # asked again, under the lock
-            for branch in done:
+            for branch, tip in done.items():
                 if out is None or branch in out:
                     continue
                 ref = f"refs/heads/{branch}"
-                if _git(root, "update-ref", "-d", ref, every[branch]).returncode == 0:
+                if _git(root, "update-ref", "-d", ref, tip).returncode == 0:
                     _git(root, "config", "--remove-section", f"branch.{branch}")  # none: fine
                     report.branches_deleted.append((root, branch))
     except FleetError:

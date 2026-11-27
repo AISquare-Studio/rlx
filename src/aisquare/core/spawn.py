@@ -650,9 +650,23 @@ def untraced_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     }
 
 
+GIT_REPOSITORY_VARS: tuple[str, ...] = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+"""What points git at another repository than the one it is asked about: a git hook sets
+``GIT_DIR``, and an aisquare it runs judged the hook's repository, not the tree named with
+``-C`` (review of #58). None of them reaches a git aisquare runs."""
+
+
 def git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment of every git command aisquare runs: ``base`` (default the current
-    environment) without the tracing identity (:func:`untraced_env`), with
+    environment) without the tracing identity (:func:`untraced_env`) nor any variable that
+    points git at another repository (:data:`GIT_REPOSITORY_VARS`), with
     ``GIT_OPTIONAL_LOCKS=0`` and ``GIT_TERMINAL_PROMPT=0``.
 
     No git aisquare runs is a model process, and one started from a traced session's hook is
@@ -665,6 +679,8 @@ def git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     so a fix to one did not reach the other (round 28, 10/10).
     """
     env = untraced_env(base)
+    for name in GIT_REPOSITORY_VARS:
+        env.pop(name, None)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env

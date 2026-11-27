@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -22,7 +25,7 @@ import pytest
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
-from aisquare.core import cachedir, claude_accounts, paths
+from aisquare.core import cachedir, claude_accounts, paths, process_table
 from aisquare.core.config import TidySettings
 from aisquare.core.locking import holding
 from aisquare.core.store import store_session
@@ -41,7 +44,21 @@ project = fleet_suite.project
 TAG = cachedir.SIGNATURE + b"\n# a cache, by its own word\n"
 SYSTEM_TEMP_DIRS = tidy._system_temp_dirs
 """The real lookup, kept before :func:`sandboxed` replaces it: asked only for a path."""
+COMMAND_LINES = tidy._command_lines
+"""The real reader, kept before the suite's fixture replaces it: run here only with a fake
+runner, never the real ``ps``."""
+BOARD = "prj_tidyboard0001"
+"""The sandbox board a session's own row is on (:func:`session_dir`)."""
 HOUR = timedelta(hours=1)
+
+
+@pytest.fixture(autouse=True)
+def board(tmp_path: Path) -> ProjectInfo:
+    """The board the sessions' own rows are on: a sandbox project, no checkout."""
+    root = tmp_path / "board"
+    root.mkdir()
+    with store_session() as store:
+        return store.onboard_project(ProjectInfo(id=BOARD, root=root))
 
 
 @pytest.fixture(autouse=True)
@@ -85,19 +102,37 @@ def aged(path: Path, ago: timedelta) -> None:
     os.utime(path, (when, when))
 
 
-def session_dir(slot: int = 2, session: str | None = None) -> Path:
-    """An ended Claude session's temp under the accounts' temp root, as Claude Code lays it
-    out under the ``CLAUDE_CODE_TMPDIR`` rlx gives a managed slot."""
-    found = (
-        claude_accounts.tmp_root()
-        / str(slot)
-        / "claude-501"
-        / "-Users-someone-code-repo"
-        / (session or str(uuid.uuid4()))
-    )
+def session_dir(slot: int = 2, session: str | None = None, *, ended: bool = True) -> Path:
+    """A Claude session's temp under the accounts' temp root, as Claude Code lays it out under
+    the ``CLAUDE_CODE_TMPDIR`` rlx gives a managed slot. ``ended``: its board row says it ended
+    (the positive evidence tidy needs, review of #58 M1), its last hook a month ago; without,
+    no row and no word that it ended."""
+    name = session or str(uuid.uuid4())
+    found = claude_accounts.tmp_root() / str(slot) / "claude-501" / "-Users-someone-code-repo"
+    found = found / name
     (found / "scratchpad").mkdir(parents=True)
     (found / "scratchpad" / "notes.md").write_text("what the reviewer wrote\n", encoding="utf-8")
+    if ended:
+        month_ago = datetime.now(UTC) - 30 * timedelta(days=1)
+        with store_session() as store:
+            store.upsert_session(
+                TeamSession(
+                    id=name,
+                    project_id=BOARD,
+                    role="reviewer",
+                    started_at=month_ago,
+                    last_seen_at=month_ago,
+                    ended_at=month_ago,
+                )
+            )
+        assert stored_ended(name), "inserted ended: end_session would stamp now"
     return found
+
+
+def stored_ended(session: str) -> bool:
+    with store_session() as store:
+        found = store.get_session(session)
+    return found is not None and found.ended_at is not None
 
 
 def row(project: ProjectInfo, session: str, **fields: object) -> FleetAgent:
@@ -320,6 +355,283 @@ def test_a_clone_with_everything_on_its_remote_goes(tmp_path: Path, repo: Path) 
     assert rules(made) == {clone: tidy.SESSION_CHECKOUT}
     tidy.apply(made)
     assert not clone.exists()
+
+
+# --- C2 of review #3522: a tag never authorises a root, nor anything holding a .git ----------
+
+
+@pytest.mark.parametrize("by", ["CARGO_TARGET_DIR=scratchpad", "UV_CACHE_DIR=scratchpad"])
+def test_a_tagged_scratchpad_authorises_nothing_and_hides_no_checkout(
+    tmp_path: Path, repo: Path, by: str
+) -> None:
+    """A build pointed at the scratchpad tags its root: the tag is ignored and said so, and the
+    checkouts in it are judged by git alone, one kept for its unpushed commit, one gone through
+    git."""
+    session = session_dir()
+    scratchpad = tag(session / "scratchpad", files=1)
+    unpushed = _clone(repo, scratchpad / "unpushed")
+    sha = _commit(unpushed, "only-here.txt")
+    clean = _clone(repo, scratchpad / "clean")
+    aged(session, 3 * HOUR)
+
+    made = planned(tmp_path)
+
+    assert rules(made) == {clean: tidy.SESSION_CHECKOUT}, by
+    assert sha[:12] in _kept_why(made, unpushed)
+    assert tidy.Kept(tidy.SESSION_CACHE, scratchpad, tidy.ROOT_TAG) in made.kept
+    tidy.apply(made)
+    assert (scratchpad / "notes.md").is_file() and (unpushed / "only-here.txt").is_file()
+
+
+def test_a_tag_at_a_live_coders_tree_root_never_takes_the_tree(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """``pytest -o cache_dir=.`` tags a tree's root: only the build output strictly inside goes,
+    and the tree, its files and its .venv stay."""
+    _agent, tree = _idle_coder_tree(project, waited=25 * HOUR)
+    (tree / cachedir.TAG).write_bytes(TAG)
+
+    made = planned(tmp_path)
+
+    assert rules(made) == {tree / "target": tidy.IDLE_BUILD_CACHE}
+    assert tidy.Kept(tidy.IDLE_BUILD_CACHE, tree, tidy.ROOT_TAG) in made.kept
+    tidy.apply(made)
+    assert (tree / "notes.txt").is_file() and (tree / ".venv").is_dir()
+
+
+def test_a_tracked_tag_is_judged_by_git_never_by_the_tag(tmp_path: Path, repo: Path) -> None:
+    """A repository that tracks a CACHEDIR.TAG at its root, and a tagged folder of tracked files:
+    in a kept checkout of it, neither is build output."""
+    (repo / cachedir.TAG).write_bytes(TAG)
+    vendored = tag(repo / "vendor" / "cache", files=1)
+    _git("add", "-f", cachedir.TAG, str(vendored.relative_to(repo)), cwd=repo)
+    _git("commit", "-q", "-m", "tracked tags", cwd=repo)
+    session = session_dir()
+    checkout = _scratch_worktree(repo, session / "scratchpad" / "wt")
+    (checkout / "wip.txt").write_text("uncommitted\n", encoding="utf-8")
+    aged(session, 3 * HOUR)
+
+    made = planned(tmp_path)
+
+    assert made.items == []
+    assert _kept_why(made, checkout) == "uncommitted changes"
+
+
+def test_a_tagged_folder_holding_a_repository_is_no_build_output(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """Reap's rule too: a tagged untracked folder with a nested repository in it keeps the tree."""
+    agent = _ended_coder(project, "coder-nested")
+    nested = tag(agent.cwd / "target")
+    _git("init", "-q", str(nested / "repo"), cwd=agent.cwd)
+
+    report = fleet_service.reap(project)
+
+    assert (agent.cwd, "uncommitted changes") in report.worktrees_kept
+    assert (nested / "repo" / ".git").is_dir()
+
+
+def test_cachedir_never_counts_a_root_or_a_tagged_folder_holding_a_git(tmp_path: Path) -> None:
+    root = tag(tmp_path / "root", files=1)
+    inner = tag(root / "inner", files=1)
+    holding_git = tag(root / "has-git", files=1)
+    (holding_git / "deep" / ".git").mkdir(parents=True)
+    assert cachedir.cache_dirs(root) == [inner]
+    assert not cachedir.is_cache(holding_git) and not cachedir.only_caches(holding_git)
+
+
+# --- M1 and M2 of review #3522: positive evidence; every project's rows --------------------
+
+
+def test_a_session_with_no_word_that_it_ended_is_never_ended_by_idleness(
+    tmp_path: Path,
+) -> None:
+    quiet = session_dir(ended=False)
+    tag(quiet / "scratchpad" / "target")
+    aged(quiet, 3 * HOUR)
+
+    assert planned(tmp_path).items == []
+
+
+def test_a_session_with_no_word_that_it_ended_ages_out_whole_after_a_week_alone(
+    tmp_path: Path, repo: Path
+) -> None:
+    """Without evidence, only the evidence TTL ages it out, and only with nothing git keeps."""
+    empty = session_dir(ended=False)
+    aged(empty, 8 * timedelta(days=1))
+    holding = session_dir(ended=False)
+    clone = _clone(repo, holding / "scratchpad" / "clone")
+    _commit(clone, "only-here.txt")
+    tag(holding / "scratchpad" / "target")
+    aged(holding, 8 * timedelta(days=1))
+
+    made = planned(tmp_path)
+
+    assert rules(made) == {empty: tidy.SESSION_DIR}
+    assert clone in {k.path for k in made.kept}
+
+
+def test_rows_that_have_all_ended_are_evidence_enough(tmp_path: Path, project: ProjectInfo) -> None:
+    session = session_dir(ended=False)
+    row(project, session.name, ended_at=datetime.now(UTC) - 3 * HOUR)
+    cache = tag(session / "scratchpad" / "target")
+    aged(session, 3 * HOUR)
+
+    assert rules(planned(tmp_path)) == {cache: tidy.SESSION_CACHE}
+
+
+def test_a_paused_row_in_a_forgotten_project_still_holds_its_session(
+    tmp_path: Path, project: ProjectInfo
+) -> None:
+    session = session_dir()
+    row(project, session.name, ended_at=datetime.now(UTC), paused_at=datetime.now(UTC))
+    with store_session() as store:
+        store.forget_project(project.id)
+    tag(session / "scratchpad" / "target")
+    aged(session, 3 * HOUR)
+
+    assert planned(tmp_path).items == []
+
+
+# --- the minors of review #3522 ----------------------------------------------------------------
+
+
+def test_a_tree_planned_kept_is_never_removed_by_the_real_run(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """``apply`` decides nothing again: the change that kept the tree is gone by the real run,
+    and still only its build output goes."""
+    changed = _ended_coder(project, "coder-changed")
+    (changed.cwd / "wip.txt").write_text("unfinished\n", encoding="utf-8")
+    cache = tag(changed.cwd / "target")
+    made = planned(tmp_path)
+    assert rules(made) == {cache: tidy.ENDED_WORKTREE_CACHE}
+    (changed.cwd / "wip.txt").unlink()
+
+    tidy.apply(made)
+
+    assert changed.cwd.is_dir() and not cache.exists()
+
+
+def test_the_branch_sweep_is_in_the_dry_run_and_the_real_run_deletes_those_alone(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    agent = _ended_coder(project, "coder-merged")
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=agent.cwd)
+
+    made = planned(tmp_path)
+
+    assert made.branches == [(project.root, branch)]
+    shown = json.loads(CliRunner().invoke(app, ["--json", "tidy", "--dry-run"]).stdout)
+    assert shown["branches"] == [{"repo": str(project.root), "branch": branch}]
+    report = tidy.apply(made)
+    assert report.branches_deleted == [(project.root, branch)]
+    assert _git("branch", "--list", branch, cwd=project.root) == ""
+
+
+def test_an_idle_coders_task_in_doing_is_read_on_its_own_board(
+    tmp_path: Path,
+    tmux: object,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    board: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coder spawned under a hub reads the hub's board (``row.board``), not its project's: its
+    task in doing is there."""
+    monkeypatch.setenv("AISQUARE_TEAM_HUB", str(board.root))
+    agent, _tree = _idle_coder_tree(project, waited=25 * HOUR)
+    assert agent.board is not None and agent.board != project.id, (agent.board, project.id)
+    with store_session() as store:
+        hub = store.get_project(agent.board) or store.onboard_project(
+            ProjectInfo(id=agent.board, root=board.root)
+        )
+    _claim(agent, _add_task(hub, "keep building, on the hub"))
+
+    assert planned(tmp_path).items == []
+
+
+def test_a_config_that_cannot_be_read_turns_the_coder_rule_off(
+    tmp_path: Path,
+    tmux: object,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _idle_coder_tree(project, waited=25 * HOUR)
+
+    def broken() -> object:
+        raise ValueError("config.toml: not TOML")
+
+    monkeypatch.setattr(tidy, "load_config", broken)
+
+    assert tidy._settings().idle_build_hours == 0
+    assert planned(tmp_path).items == []
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid") or os.getuid() == 0, reason="needs a mode to bite")
+def test_a_delete_never_changes_the_mode_of_what_a_link_points_at(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not ours\n", encoding="utf-8")
+    outside.chmod(0o400)
+    stuck = tmp_path / "stuck"
+    stuck.mkdir()
+    (stuck / "link").symlink_to(outside)
+    stuck.chmod(0o500)  # the link cannot be unlinked: the delete fails, as it should
+    try:
+        with pytest.raises(OSError):
+            cachedir.remove_dir(stuck)
+    finally:
+        stuck.chmod(0o700)
+    assert oct(outside.stat().st_mode & 0o777) == oct(0o400)
+
+
+def test_reap_deletes_nothing_through_a_tree_that_is_a_link(tmp_path: Path) -> None:
+    real = tmp_path / "real-tree"
+    _git("init", "-q", str(real), cwd=tmp_path)
+    target = tag(real / "target")
+    link = tmp_path / "linked-tree"
+    link.symlink_to(real, target_is_directory=True)
+
+    assert fleet_service._remove_untracked_caches(link) == []
+    assert target.is_dir()
+
+
+def test_the_process_list_is_every_process_not_only_a_terminals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[list[str]] = []
+
+    def fake(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        asked.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "claude --session-id abc\n", "")
+
+    monkeypatch.setattr(process_table, "_run", fake)
+    if sys.platform == "win32":
+        assert COMMAND_LINES() is None
+        return
+    assert COMMAND_LINES() == ["claude --session-id abc"]
+    assert asked == [["ps", "-A", "-ww", "-o", "args="]]
+
+
+def test_a_session_whose_root_is_a_checkout_is_judged(tmp_path: Path, repo: Path) -> None:
+    session = session_dir()
+    shutil.rmtree(session / "scratchpad")
+    _clone(repo, session)
+    sha = _commit(session, "only-here.txt")
+    aged(session, 8 * timedelta(days=1))
+
+    made = planned(tmp_path)
+
+    assert made.items == [] and sha[:12] in _kept_why(made, session)
+
+
+def test_git_runs_with_no_variable_pointing_it_at_another_repository() -> None:
+    from aisquare.core import spawn
+
+    env = spawn.git_env({"GIT_DIR": "/elsewhere/.git", "GIT_WORK_TREE": "/elsewhere", "A": "1"})
+
+    assert "GIT_DIR" not in env and "GIT_WORK_TREE" not in env and env["A"] == "1"
 
 
 # --- 4. ended agents' worktrees: reap's worktree half, with the tag rule -----------------------
