@@ -103,12 +103,10 @@ fn run_to_its_end(home: &TestHome) -> (String, Value) {
 }
 
 /// A home whose rlxd runs with `RLXD_CLAUDE_BIN` unset, so `claude` is resolved on the
-/// app's `PATH`, in gate dev mode, with `CLAUDE_CONFIG_DIR` in the home.
+/// app's `PATH` (on rlxd's own, the stub, until the app sets one), in gate dev mode, with
+/// `HOME`, `USERPROFILE` and `CLAUDE_CONFIG_DIR` in the home.
 fn home_without_claude_bin() -> TestHome {
-    let home = TestHome::new();
-    let config = home.root().join("claude-config");
-    std::fs::create_dir_all(&config).unwrap();
-    let mut home = home.with_env("CLAUDE_CONFIG_DIR", config.to_str().unwrap());
+    let mut home = TestHome::new().with_own_user();
     if cfg!(windows) {
         home = home.with_env("FAKE_CLAUDE_SCENARIO", "print-env");
     }
@@ -166,9 +164,7 @@ fn a_run_starts_the_claude_resolved_when_the_app_set_path() {
     let resolved = claude_in(&bin, &f);
     std::fs::create_dir_all(&bin1).unwrap();
     let mut dirs = vec![bin1.clone(), bin.clone()];
-    dirs.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
+    dirs.extend(home.path_without_real_claude());
     let path = std::env::join_paths(dirs).unwrap();
     let set = json!({"PATH": path.to_str().unwrap()}).to_string();
     let run = home.rlxd(&["call", "--as-app", "env.set", &set]);
