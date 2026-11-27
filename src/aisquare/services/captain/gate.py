@@ -20,7 +20,7 @@ call: they spend quota, but each only types into one agent or asks the manager).
   in a row" shows.
 
 **Where things live.**
-- The secret is ``~/.aisquare/captain/gate.secret``, mode 0600, written once by ``aisquare
+- The secret is ``~/.rlx/captain/gate.secret``, mode 0600, written once by ``aisquare
   captain gate enroll``.
 - The window, the last accepted step and the failure count live in ``state.json``, under
   its lock (``core.state_file``). The captain's Actions server and the owner's CLI are two
@@ -113,7 +113,7 @@ class TotpVerifier:
         except ImportError:
             return (
                 f"the owner gate needs pyotp: {EXTRA} (or add `gate = false` under [captain] in "
-                "~/.aisquare/config.toml by hand: `config set` does not take it)"
+                "~/.rlx/config.toml by hand: `config set` does not take it)"
             )
         if not secret_path().is_file():
             return f"the owner gate is not enrolled yet: {enroll_command()}"

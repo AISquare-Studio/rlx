@@ -79,6 +79,7 @@ from aisquare.core.agent_adapters.types import staged_label
 from aisquare.core.config import RoleLaunchProfile, load_config
 from aisquare.core.names import name_key
 from aisquare.models import AccountsOverview, ClaudeAccountStatus, FleetAgentStatus, ProjectInfo
+from aisquare.services import claude_accounts as accounts_service
 from aisquare.services import fleet as fleet_service
 from aisquare.services import settings as settings_service
 
@@ -93,7 +94,7 @@ SECTION_ORDER: dict[Intent, tuple[Section, ...]] = {
 }
 SECTION_TITLES: dict[Section, str] = {
     "agents": "Agents — attach to a running agent",
-    "binds": "Binds — spawn as a bound teammate",
+    "binds": "Presets — spawn as a saved teammate",
     "accounts": "Accounts — spawn on an account",
 }
 
@@ -200,7 +201,7 @@ def read_targets(project: ProjectInfo, accounts: Callable[[], AccountsOverview] 
         binds = dict(load_config().team.profiles)
     except Exception as exc:  # a broken config costs the binds, never the picker
         binds = {}
-        problems.append(f"binds unavailable — {type(exc).__name__}: {exc}")
+        problems.append(f"presets unavailable — {type(exc).__name__}: {exc}")
     statuses: list[ClaudeAccountStatus] | None = None
     if accounts is not None:
         try:
@@ -243,6 +244,8 @@ def account_prompt(status: ClaudeAccountStatus, *, agent: bool = False, dark: bo
     part is appended as data: an email is the user's."""
     who = status.identity.email if status.identity is not None else "not signed in"
     parts = [Text(str(status.account.slot)), Text(who), Text(status.subscription or "plan unknown")]
+    if status.account.alias:  # the name the Accounts page gives it, before its email (Q1)
+        parts.insert(1, Text(status.account.alias))
     if agent:
         named = Text(accounts_core.agent_label(status.account.agent))
         mark = mark_of(status.account.agent)
@@ -276,7 +279,7 @@ def bind_account(profile: RoleLaunchProfile, statuses: Iterable[ClaudeAccountSta
 
 
 def _account_named(ref: str, agent: str | None, statuses: list[ClaudeAccountStatus]) -> str:
-    """``account 3 · me@example.com`` for a bind's ``account``: a slot, an alias or an
+    """``me@example.com`` (:func:`_account_text`) for a preset's ``account``: a slot, an alias or an
     email, matched in the accounts already read as ``services.claude_accounts.resolve``
     matches them (the bind's agent's first); ``account <ref>`` when none is."""
     ordered = sorted(statuses, key=lambda status: status.account.agent != agent)
@@ -294,13 +297,16 @@ def _account_named(ref: str, agent: str | None, statuses: list[ClaudeAccountStat
 
 
 def _account_text(agent: str, slot: int, statuses: list[ClaudeAccountStatus]) -> str:
-    """``account 3 · me@example.com``: ``agent``'s account in ``slot``, whose number another
-    agent's account may hold too after a rollback (#100)."""
+    """``me@example.com``, or ``work · me@example.com`` for an aliased one: ``agent``'s
+    account in ``slot`` as the Accounts page names it (the 0.10.2 UX audit's Q1), whose
+    number another agent's account may hold too after a rollback (#100); ``account 3`` for
+    one signed in as no one, or not read."""
     for status in statuses:
         if (status.account.agent, status.account.slot) == (agent, slot):
-            if status.identity is not None:
-                return f"account {slot} · {status.identity.email}"
-            break
+            account, identity = status.account, status.identity
+            if identity is not None and account.alias:
+                return f"{account.alias} · {identity.email}"
+            return accounts_service.display_name(account, identity)
     return f"account {slot}"
 
 
@@ -312,7 +318,7 @@ def bind_binary(profile: RoleLaunchProfile) -> str:
 def bind_text(
     seat: str, profile: RoleLaunchProfile, statuses: Iterable[ClaudeAccountStatus] | None
 ) -> str:
-    """``coder2 · claude2 · account 2 · me@example.com`` — seat, binary, account."""
+    """``coder2 · claude2 · me@example.com`` — seat, binary, account (:func:`_account_text`)."""
     return f"{seat} · {bind_binary(profile)} · {bind_account(profile, statuses)}"
 
 
@@ -393,7 +399,7 @@ class AttachTargetScreen(ModalScreen[Target | None]):
             yield Static(self._header(), classes="picker-header")
             yield Input(
                 value=self._filter_text,
-                placeholder="filter agents, binds and accounts",
+                placeholder="filter agents, presets and accounts",
                 id="picker-filter",
             )
             if self.attaching:
@@ -402,12 +408,12 @@ class AttachTargetScreen(ModalScreen[Target | None]):
             yield OptionList(id="picker-list")
             yield Static(id="picker-status", classes="picker-note")
             with Horizontal(classes="picker-buttons"):
-                yield Button("+ New bind", id="picker-new-bind")
+                yield Button("+ New preset", id="picker-new-bind")
                 yield Button("+ New account", id="picker-new-account")
                 yield Button("Cancel", id="picker-cancel")
 
     def on_mount(self) -> None:
-        self._say("reading agents, binds and accounts …", "dim")
+        self._say("reading agents, presets and accounts …", "dim")
         self.read(select=self._wanted)
         self.query_one("#picker-list", OptionList).focus()
         self.app.theme_changed_signal.subscribe(self, lambda _theme: self._recolour())
@@ -726,7 +732,7 @@ class NewBindScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Vertical():
             seat, bound = self._editing or ("", RoleLaunchProfile())
-            header = Text("Edit bind" if self._editing else "New bind", style="bold")
+            header = Text("Edit preset" if self._editing else "New preset", style="bold")
             header.append(" — pin a seat's binary, environment and args", style="dim")
             yield Static(header, classes="picker-header")
             with Horizontal(classes="picker-row"):

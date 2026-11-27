@@ -295,12 +295,12 @@ def test_each_dialog_lists_its_agents_by_project_with_cancel_focused(
     if action == "stop":
         assert listed == [
             "alpha",
-            "  manager · manager · ⏸ waiting",
+            "  manager · manager · ◦ waiting",
             "  coder-1 · coder · ▶ working",
             "",
             "beta",
             "  manager · manager · ▶ working",
-            "  coder-1 · coder · ⏸ waiting",
+            "  coder-1 · coder · ◦ waiting",
             "  tester-1 · tester · 💤 exited — left: exited",
         ]
     else:
@@ -309,10 +309,10 @@ def test_each_dialog_lists_its_agents_by_project_with_cancel_focused(
         assert listed == [
             "alpha",
             "  coder-1 · coder · ▶ working",
-            "  manager · manager · ⏸ waiting",
+            "  manager · manager · ◦ waiting",
             "",
             "beta",
-            "  coder-1 · coder · ⏸ waiting",
+            "  coder-1 · coder · ◦ waiting",
             f"  tester-1 · tester · 💤 exited — left: {fleet_service.ENDED_CLEANLY}",
             "  manager · manager · ▶ working",
         ]
@@ -769,11 +769,9 @@ def test_a_restart_of_all_is_told_per_agent_and_never_moves_the_view(acted: Acte
     assert "✓ restarted manager (beta) — resumed its session" in toasts
     [summary] = [t for t in toasts if t.startswith("restarted ")]
     assert summary.splitlines() == [
-        "restarted 2 · skipped 3 · failed 0",
-        f"skipped: coder-1 (alpha) — {fleet_service.NOT_CHOSEN}; "
-        f"coder-1 (beta) — {fleet_service.NOT_CHOSEN}; "
-        f"tester-1 (beta) — {fleet_service.ENDED_CLEANLY}",
-    ], "the unticked coders are named, never restarted"
+        "restarted 2 · skipped 1 · failed 0",
+        f"skipped: tester-1 (beta) — {fleet_service.ENDED_CLEANLY}",
+    ], "the unticked coders are never restarted, and not listed: leaving them was a choice"
 
 
 def test_confirm_acts_on_the_agents_shown_and_skips_one_that_ended_since(

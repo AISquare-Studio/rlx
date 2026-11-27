@@ -64,7 +64,7 @@ from tests.ui_workers import settle_page
 
 # The Spawn dialog suite's fixtures, bound here so pytest finds them for this module's tests
 # (``no_real_tmux``, ``spawns`` and ``teammates`` are autouse there: no test reaches tmux,
-# ``fleet_service.spawn`` is a recorder, and *Hand off from* lists only what a test adds).
+# ``fleet_service.spawn`` is a recorder, and *Continue from* lists only what a test adds).
 no_real_tmux = spawn_suite.no_real_tmux
 spawns = spawn_suite.spawns
 teammates = spawn_suite.teammates
@@ -312,7 +312,7 @@ def test_the_captains_start_locks_import_while_it_runs_and_pick_stays_locked_for
 def test_unpicking_a_teammate_during_a_spawn_does_not_bring_pick_back_before_the_answer(
     git_project: ProjectInfo, spawns: SpawnRecorder, teammates: list[FleetAgentStatus]
 ) -> None:
-    """The form's fields stay live while a spawn runs, and *Hand off from* locks and frees
+    """The form's fields stay live while a spawn runs, and *Continue from* locks and frees
     *Pick…* on its own account. Freed by it mid-spawn, *Pick…* was live again."""
     teammates.append(teammate(git_project))
     held = Held(refuses=True)

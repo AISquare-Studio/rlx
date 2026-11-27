@@ -1055,7 +1055,7 @@ def test_ngroks_api_is_turned_off_in_a_config_merged_over_the_humans_own(
     assert configs is not None
     first, ours = configs
     assert first == own
-    assert ours == paths.aisquare_home() / f"remote-ngrok-v{version}.yml"
+    assert ours == paths.ngrok_config_path(f"remote-ngrok-v{version}.yml")
     assert ours.read_text().endswith(f'version: "{version}"\n{api}\n')
     assert api_off_configs(own=own) == configs, "written once, the same each start"
     command = ngrok_command(8750, configs=configs)
@@ -1071,7 +1071,7 @@ def test_without_a_config_of_the_humans_ngrok_starts_as_it_always_did(tmp_path: 
     missing = tmp_path / "nowhere" / "ngrok.yml"
     assert api_off_configs(own=missing, environ={}) is None
     signed_in = api_off_configs(own=missing, environ={"NGROK_AUTHTOKEN": "tok_123"})
-    assert signed_in == [paths.aisquare_home() / "remote-ngrok-v2.yml"]
+    assert signed_in == [paths.ngrok_config_path("remote-ngrok-v2.yml")]
     own = write_ngrok_config(tmp_path, "authtoken: tok_123\n")
     assert api_off_configs(own=own, environ={}) is None, "a config with no version"
     own = write_ngrok_config(tmp_path / "v1", 'version: "1"\n')
@@ -1115,7 +1115,7 @@ def test_a_config_of_ours_that_is_no_utf8_is_written_again_not_raised_into_the_u
     fleet UI (sweep of #243, as ngrok's log was)."""
     own = write_ngrok_config(tmp_path, 'version: "2"\nauthtoken: tok_123\n')
     paths.ensure_home()
-    ours = paths.aisquare_home() / "remote-ngrok-v2.yml"
+    ours = paths.ngrok_config_path("remote-ngrok-v2.yml")
     ours.write_bytes(b"web_addr: \xff\n")
     assert api_off_configs(own=own) == [own, ours]
     assert ours.read_text(encoding="utf-8").endswith('version: "2"\nweb_addr: false\n')
@@ -1142,7 +1142,7 @@ def test_a_config_of_the_humans_saved_with_a_byte_order_mark_still_turns_the_api
     own.write_bytes(raw)
     assert api_off_configs(own=own, environ={}) == [
         own,
-        paths.aisquare_home() / "remote-ngrok-v3.yml",
+        paths.ngrok_config_path("remote-ngrok-v3.yml"),
     ]
 
 
@@ -1283,7 +1283,7 @@ def test_the_panels_ngrok_runs_with_its_agent_api_off(tmp_path: Path) -> None:
     try:
         assert tunnel.wait_for_url(10) == OURS["url"]
         (run,) = runs
-        assert run[-1] == f"--config={own},{paths.aisquare_home() / OUR_CONFIG}"
+        assert run[-1] == f"--config={own},{paths.ngrok_config_path(OUR_CONFIG)}"
         assert "--inspect=false" in run
         assert tunnel.api_warning is None and tunnel.api_refused is None
     finally:
@@ -3512,6 +3512,15 @@ def test_a_port_the_panel_cannot_use_is_a_sentence_and_unset_is_the_default() ->
             given.turn_off()
 
 
+def _out_of_range(message: str, low: int, high: int) -> bool:
+    """Whether ``message`` is typer's refusal of a number outside ``low``..``high``: click's
+    words up to typer 0.28, pydantic's (the bound it broke) from 0.29."""
+    return f"not in the range {low}<=x<={high}" in message or any(
+        f"Input should be {side} than or equal to {bound}" in message
+        for side, bound in (("greater", low), ("less", high))
+    )
+
+
 @pytest.mark.parametrize("raw", ["0", "-1", "65536", "70000"])
 def test_a_port_no_command_can_use_is_a_usage_error_never_a_dead_link_or_a_traceback(
     raw: str, monkeypatch: pytest.MonkeyPatch
@@ -3539,7 +3548,7 @@ def test_a_port_no_command_can_use_is_a_usage_error_never_a_dead_link_or_a_trace
         assert result.exit_code == 2, (command, exports, result.output)
         answer = json.loads(result.stdout)
         assert answer["error"] == "usage", (command, exports)
-        assert "not in the range 1<=x<=65535" in answer["message"], (command, exports)
+        assert _out_of_range(answer["message"], 1, 65535), (command, exports, answer)
     assert not paths.remote_state_path().exists(), "refused before anything was read or made"
     with pytest.MonkeyPatch.context() as env:
         env.setenv(PORT_ENV, raw)
@@ -3567,7 +3576,7 @@ def test_an_auto_off_past_a_week_is_a_usage_error_never_a_traceback(
         exported = runner.invoke(cli, ["--json", "remote", "serve"], env={AUTO_OFF_ENV: raw})
         for result in (flagged, exported):
             assert result.exit_code == 2, result.output
-            assert "not in the range 0<=x<=10080" in json.loads(result.stdout)["message"]
+            assert _out_of_range(json.loads(result.stdout)["message"], 0, 10080), result.stdout
     for raw in ("10080", "0"):
         assert runner.invoke(cli, ["remote", "serve", "--auto-off", raw]).exit_code == 0
     assert timers == [10080, 0]

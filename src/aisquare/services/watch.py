@@ -21,9 +21,9 @@ What it looks at, composed and never classified a third time:
   (``capacity_busy``) whose capacity has freed up, as ``capacity_freed``, so its manager
   retries the spawn without polling. Delivered, the hold is forgotten: one wake per hold.
 
-Delivery, per tick: the ids seen are kept in ``~/.aisquare/watch/state.json`` (written whole
+Delivery, per tick: the ids seen are kept in ``~/.rlx/watch/state.json`` (written whole
 under its lock). Per project with new items, the full items go to
-``~/.aisquare/watch/<project>/<UTC stamp>.json`` (mode 600); one board event of kind
+``~/.rlx/watch/<project>/<UTC stamp>.json`` (mode 600); one board event of kind
 ``watch`` addressed to the manager carries the counts and that path, never an excerpt
 (``watch: 3 new (2 permission, 1 pr_approved): aisquare watch show <path>``); then the
 manager's guarded nudge (``fleet.nudge_manager``, P0-W2). A working manager gets the

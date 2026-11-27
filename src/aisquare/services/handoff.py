@@ -6,7 +6,7 @@ that no Claude Code session resumes, and a Claude Code transcript is nothing Cod
 So a hand-off onto another agent starts the target FRESH, and what carries the work is a
 **brief**: the source's task, contract and claims, its last board entries, the state of its
 tree, and the newest of its conversation. ``fleet switch --agent`` (or ``--to`` an account
-of another agent), the Spawn dialog's *Hand off from* with another Agent, and the automatic
+of another agent), the Spawn dialog's *Continue from* with another Agent, and the automatic
 hand-over once the agent's own accounts are all limited (:func:`pick_across`) all start
 one.
 
@@ -122,7 +122,7 @@ _SLUG = re.compile(r"[^A-Za-z0-9-]+")
 def brief_dir() -> Path:
     """Where the briefs are kept: under the aisquare home, which a sandboxed agent's
     profile makes read-only (``types.store_read_only``), so no agent's tools wrote one."""
-    return paths.aisquare_home() / DIR_NAME
+    return paths.handoffs_dir()
 
 
 @dataclass(frozen=True)

@@ -872,7 +872,7 @@ def _probe_env() -> dict[str, str]:
     who never asked a question. Stripped here rather than left to the proxy's
     junk-run suppression: the traffic is ours not to send in the first place.
     """
-    keep = {"AISQUARE_HOME"}  # a relocated tree must stay relocated in the child
+    keep = {"AISQUARE_HOME", "RLX_HOME"}  # a relocated tree must stay relocated in the child
     context = _PROBE_CONTEXT.get()
     ambient = spawn.untraced_env(context.env if context else None)
     env = {k: v for k, v in ambient.items() if k in keep or not k.startswith("AISQUARE_")}

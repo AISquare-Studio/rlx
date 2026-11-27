@@ -230,7 +230,7 @@ def test_beside_another_release_with_no_terminal_asq_builds_nothing_and_says_how
     assert refused.value.exit_code == 1
     assert built == [], "no FleetApp"
     assert not tmux_calls.exists(), tmux_calls.read_text() if tmux_calls.exists() else ""
-    assert not (paths.aisquare_home() / "context.db").exists(), "no store"
+    assert not paths.db_path().exists(), "no store"
     assert f"rlx {__version__} (store schema {SCHEMA_VERSION}) cannot run beside" in said
     where = f"ssh on {other.host}, pid {other.pid}, /dev/ttys009, since"
     assert f"rlx 0.0.1 (store schema {SCHEMA_VERSION}) — {where}" in said

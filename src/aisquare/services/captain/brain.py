@@ -159,13 +159,13 @@ def server() -> Server:
     return Server(
         command=sys.executable,
         args=["-m", "aisquare.services.captain", "--stdio", "--close-after", "0"],
-        env={"AISQUARE_HOME": str(_home())},
+        env={"AISQUARE_HOME": str(_home()), "RLX_HOME": str(_home())},
         inherit=SERVER_INHERITS,
     )
 
 
 #: The variables :func:`launch_args` sets.
-LAUNCH_ENV = ("AISQUARE_HOME", "AISQUARE_TEAM_HUB")
+LAUNCH_ENV = ("AISQUARE_HOME", "RLX_HOME", "AISQUARE_TEAM_HUB")
 
 
 def launch_args(home_root: Path) -> list[str]:
@@ -173,8 +173,12 @@ def launch_args(home_root: Path) -> list[str]:
     never its agent's arguments: the fleet gives them at every launch, before the ``--``
     (``fleet.spawn``). Its tools are the fleet's to confine at every launch too
     (:func:`server`)."""
-    home, hub = LAUNCH_ENV
-    return ["-e", f"{home}={_home()}", "-e", f"{hub}={home_root}"]
+    home, rlx_home, hub = LAUNCH_ENV
+    return [
+        "-e", f"{home}={_home()}",
+        "-e", f"{rlx_home}={_home()}",
+        "-e", f"{hub}={home_root}",
+    ]  # fmt: skip
 
 
 def find() -> FleetAgent | None:

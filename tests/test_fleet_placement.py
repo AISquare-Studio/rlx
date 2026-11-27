@@ -7,7 +7,8 @@ may say where the fleet types, reads, probes or kills: not a row's ``pane_id``,
 (``core.launch_seal``). Rounds r5 to r8 of #113 each found one more path that handed one
 of them to tmux. So the rule is structural, and this test enumerates it over the fleet's
 service and the board's (``services/fleet.py``, ``services/team.py``), the doctor
-(``services/diagnostics.py``) and asq's views (``cli/ui``), keyed on the ``TmuxServer``
+(``services/diagnostics.py``), Settings ▸ tmux's (``services/tmux_panes.py``) and asq's views
+(``cli/ui``), keyed on the ``TmuxServer``
 handle itself (review r8 of #113, finding 11):
 
 1. Every place a ``TmuxServer`` is MADE — ``TmuxServer(…)``, ``.at(path)``, ``server_for``,
@@ -38,7 +39,8 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "aisquare"
 TMUX = SRC / "core" / "tmux.py"
 FLEET = "services/fleet.py"
 SERVICES = (FLEET, "services/team.py")
-MODULES = (*SERVICES, "services/diagnostics.py")
+TMUX_PAGE = "services/tmux_panes.py"
+MODULES = (*SERVICES, "services/diagnostics.py", TMUX_PAGE)
 UI = "cli/ui"
 
 #: The resolver's handles: the only classes whose methods put a target to tmux unlisted.
@@ -84,6 +86,12 @@ MADE: dict[str, dict[str, str]] = {
         "_fleet_server": "the doctor's factory: a socket's name from config or a record",
         "_check_fleet": "today's socket, and each address a launch record places",
     },
+    TMUX_PAGE: {
+        "rlx_server": (
+            "today's socket (the config's): Settings ▸ tmux lists every window on rlx's own "
+            "server, and acts only there (handoff E)"
+        ),
+    },
     f"{UI}/terminal.py": {"TerminalPane.attach": "today's socket, when a view gave none"},
     f"{UI}/persona_dialogs.py": {
         "EditorPaneScreen._open_editor": (
@@ -92,6 +100,13 @@ MADE: dict[str, dict[str, str]] = {
         )
     },
     f"{UI}/views/accounts.py": {"AccountsView.server": "today's socket: its own sign-in windows"},
+    f"{UI}/views/doctor.py": {
+        "launch_fix_pane": (
+            "today's socket (the config's), where a Doctor pane fix opens its own window: a "
+            "window of no row, which nothing records a place for, as the persona editor's "
+            "(#15)"
+        )
+    },
     f"{UI}/views/agent.py": {
         "AgentView.__init__": "a listed status's socket and path: placed by the resolver"
     },
@@ -179,18 +194,45 @@ ACTS: dict[str, dict[str, str]] = {
             "pinned-team-variable rows, 0.8.2's `fleet server env`)"
         ),
     },
+    TMUX_PAGE: {
+        # Each acts on a pane tmux itself listed on today's server, asked again as it acts
+        # (`_again`: the same pane id, on a server with the same start), and never on a row's
+        # word: a row's pane is told by its launch record (`resolve_place`) only to be LEFT
+        # alone. Handoff E, the owner's Q2.
+        "stop": (
+            "kills the window of a pane tmux listed on today's server that no launch record "
+            "places there, or that is dead: never a placed row's live pane"
+        ),
+        "adopt": (
+            "types the agent's exit command into a pane tmux listed on today's server that no "
+            "launch record places, which runs Claude Code or Codex, after the human's confirm"
+        ),
+        "_refuse_unless_at_its_prompt": "reads the screen of the pane `adopt` is about to type in",
+        "_close_if_dead": (
+            "kills the pane `adopt` quit the agent in, that pane alone (`kill-pane`, never its "
+            "window's others), once tmux says it is dead on the server it was listed on"
+        ),
+    },
     f"{UI}/terminal.py": {
         "TerminalPane": (
             "the pane a view attached (`shown_pane`): a listed status's, placed by the "
-            "resolver, or a sign-in window the Accounts view made itself; its keys and frames "
-            "go down that pane's server's control client (`core.tmux_control`, 0.8.2's #272) "
-            "or are polled, for that pane alone"
+            "resolver, a sign-in window the Accounts view made itself, or a window no record "
+            "places that tmux listed on today's server, opened from Settings ▸ tmux "
+            "(`views.tmux_page.PaneScreen`); its keys and frames go down that pane's server's "
+            "control client (`core.tmux_control`, 0.8.2's #272) or are polled, for that pane "
+            "alone"
         )
     },
     f"{UI}/persona_dialogs.py": {
         "EditorPaneScreen": (
             "the editor window this screen opened (`_open_editor`), by the pane tmux answered "
             "for it: watched while the editor runs and closed with the screen (#212)"
+        )
+    },
+    f"{UI}/views/doctor.py": {
+        "FixPaneScreen": (
+            "the fix's window this screen opened (`launch_fix_pane`), by the pane tmux "
+            "answered for it: watched while its command runs and closed with the screen (#15)"
         )
     },
     f"{UI}/views/accounts.py": {

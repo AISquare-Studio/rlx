@@ -148,6 +148,12 @@ _SAMPLES: dict[str, tuple[str, tuple[str, ...]]] = {
     "project onboard": ("project onboard --refresh", ("project", "onboard", "--refresh")),
     "doctor --fix": ("doctor --fix --yes", ("doctor", "--fix", "--yes")),
     "accounts run": ("accounts run 3 login --device-auth", ("accounts", "run", "3")),
+    "fleet switch": (
+        "fleet switch --project amber-otter coder-1",
+        ("fleet", "switch", "--project", "amber-otter", "coder-1"),
+    ),
+    "watch --stop": ("watch --stop", ("watch", "--stop")),
+    "watch --detach": ("watch --detach", ("watch", "--detach")),
 }
 
 

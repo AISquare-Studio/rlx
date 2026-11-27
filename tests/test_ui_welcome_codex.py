@@ -93,7 +93,7 @@ def test_the_hooks_home_is_named_in_full_as_this_platform_spells_it() -> None:
     """On the Windows runner the account home sat under the user's folder and step 2 named
     it ``~/AppData/.../codex-accounts/2``, a spelling neither cmd nor Explorer takes; it is
     named in full, as the binary and a hooks-off config.toml are, wherever it lives."""
-    home = Path.home() / ".aisquare" / "codex-accounts" / "2"
+    home = Path.home() / ".rlx" / "accounts" / "codex" / "2"
     for state in (CODEX_UNHOOKED, CODEX_TRUSTED):
         text = claude_text(dataclasses.replace(state, home=home), platform=sys.platform).plain
         assert f" in {home}" in text and "~" not in text, text
@@ -168,12 +168,14 @@ def test_sign_in_asks_for_the_managers_account_and_opens_accounts_on_it() -> Non
     assert [state.agent for state in machine.sign_ins] == ["codex"]
     opened = [m for m in received if isinstance(m, AccountsSelected)]
     assert len(opened) == 1 and opened[0].sign_in == 0
-    # Control: Claude Code's Sign in only opens the page, as it always did.
+    # Claude Code's Sign in opens its own login on the manager's account too (Q7), where it
+    # opened the page alone.
     claude = dataclasses.replace(READY, signed_in=False)
-    plain = Machine(claude=[claude])
-    _text, claude_received = hosted(plain, go)
-    assert not plain.sign_ins
-    assert [m.sign_in for m in claude_received if isinstance(m, AccountsSelected)] == [None]
+    plain = Machine(claude=[claude], sign_in_slot=1)
+    claude_text, claude_received = hosted(plain, go)
+    assert [state.agent for state in plain.sign_ins] == [claude.agent]
+    assert [m.sign_in for m in claude_received if isinstance(m, AccountsSelected)] == [1]
+    assert "Sign in opens Claude Code's sign-in on the Accounts page" in claude_text
 
 
 # --------------------------------------------------------------------------- the choice

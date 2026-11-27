@@ -553,6 +553,9 @@ def usage_(
     others (a daily quota per model) shows each by its name under "windows used",
     and which one limits it. The last row, `all`, and the line under the table are
     the fleet's: what is LEFT now and of the week, and the soonest weekly reset.
+    While fleet agents run, "agents" is how many run on each account and "share" its
+    fair share of them, the figure a launch weighs when it picks an account: its plan
+    times what is left of its week, over every account a launch could take.
     """
     # The arranged list, like every other account surface: priority order, the
     # alias as the label, disabled marked — and one concurrent read for all of
@@ -600,6 +603,17 @@ def usage_(
     windowed = any(_windows_cell(status.usage) is not None for status in statuses)
     if windowed:
         table.add_column("windows used")
+    # The fleet's agents on each account and its fair share of them (#35): display only, and
+    # only while agents run (with none, every share is nought).
+    shares = accounts_service.usage_shares(
+        [status.account for status in statuses],
+        readings,
+        {status.account.slot: status.subscription for status in statuses},
+    )
+    fleet_runs = any(agents for agents, _ in shares.values())
+    if fleet_runs:
+        table.add_column("agents", justify="right")
+        table.add_column("share", justify="right")
     for status, label in zip(statuses, labels, strict=True):
         who = Text(status.identity.email) if status.identity else Text("not signed in", style="dim")
         session, week = _usage_cells(status.usage)
@@ -619,7 +633,13 @@ def usage_(
             session,
             week,
         ]
-        table.add_row(*row, *([windows or ""] if windowed else []))
+        agents, share = shares.get(status.account.slot, (0, None))
+        fleet_cells: list[Text | str] = (
+            [str(agents), Text(_DASH, style="dim") if share is None else f"{share:.1f}"]
+            if fleet_runs
+            else []
+        )
+        table.add_row(*row, *([windows or ""] if windowed else []), *fleet_cells)
     if fleet.limit_by_slot:
         # The fleet's row (#287): the mean of the usable accounts, percent USED like the
         # rows above it, so the columns keep one meaning.
@@ -648,6 +668,8 @@ def usage_(
             Text(""),
             f"{round(used_now)}%",
             used_week,
+            *([""] if windowed else []),
+            *([str(sum(agents for agents, _ in shares.values())), ""] if fleet_runs else []),
             style="bold",
         )
     console.print(table)
@@ -1573,7 +1595,7 @@ def _share_help() -> str:
     for name, root in merged:
         paragraphs.append(
             f"`{name}` gives every launch one auto-memory directory per project, under "
-            f"~/.aisquare/{root}/memory (merged from every account the first time)."
+            f"~/.rlx/{root}/memory (merged from every account the first time)."
         )
     paragraphs.append(
         "The others make each managed account's entry a link to the plain home's, its own "

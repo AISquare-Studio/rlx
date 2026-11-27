@@ -625,8 +625,8 @@ def test_the_question_names_the_exit_command_of_the_rows_own_agent(agent: str) -
 
     question = StopAgentScreen(ProjectInfo(id="prj_a", root=Path("/w")), row).question().plain
 
-    assert f"{typed}, then the window is killed after" in question, question
-    assert f"Force skips the {typed}." in question, question
+    assert f"asked to quit (rlx types {typed}) and closed" in question, question
+    assert "Force closes it at once." in question, question
     assert "Its exit command" not in question and "the exit command." not in question, question
 
 
@@ -646,6 +646,6 @@ def test_the_question_asks_the_service_what_the_stop_types(
 
     question = StopAgentScreen(ProjectInfo(id="prj_a", root=Path("/w")), row).question().plain
 
-    assert "/leave-now, then the window is killed after" in question, question
-    assert "Force skips the /leave-now." in question, question
+    assert "asked to quit (rlx types /leave-now) and closed" in question, question
+    assert "Force closes it at once." in question, question
     assert asked and set(asked) == {row.agent.id}, "asked of THIS row"

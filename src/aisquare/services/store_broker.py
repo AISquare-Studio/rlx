@@ -188,8 +188,6 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from aisquare.core.agent_adapters.types import AgentAdapter, SandboxWrites
 
-DIR_NAME = "broker"
-"""The launches' broker directories, under the aisquare home (:func:`launch_dir`)."""
 DIR_ENV = "AISQUARE_BROKER"
 """The launch's broker directory, in the agent's environment and so its tools' shells."""
 NONCE_ENV = "AISQUARE_BROKER_NONCE"
@@ -899,7 +897,7 @@ def _who(agent: str) -> str:
 
 def launch_dir(store: Path, launch_id: str) -> Path:
     """The broker directory of the launch ``launch_id`` under the aisquare home ``store``."""
-    return store / DIR_NAME / launch_id
+    return paths.broker_dir(store) / launch_id
 
 
 # --- what runs: the whitelist -----------------------------------------------------------
@@ -2417,7 +2415,7 @@ def start_for_launch(
         return access, "\n".join(said)
     import secrets
 
-    prune(store / DIR_NAME)
+    prune(paths.broker_dir(store))
     nonce = secrets.token_urlsafe(32)
     try:
         directory.mkdir(parents=True, mode=0o700)

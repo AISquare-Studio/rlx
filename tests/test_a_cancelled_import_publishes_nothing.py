@@ -34,7 +34,7 @@ from typing import Any, Literal, TypeVar
 
 import pytest
 from textual.pilot import Pilot
-from textual.widgets import Input, RadioButton, Static, Switch
+from textual.widgets import Input, Static, Switch
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app
@@ -198,9 +198,8 @@ async def start_import(
     force: bool = False,
 ) -> None:
     """Fill the form and press Import; the import is at its hold when this returns."""
+    assert layer == "user", "every import is yours since 0.10.2: no dialog writes a project's"
     dialog.query_one("#import-source", Input).value = str(source)
-    if layer == "project":
-        dialog.query_one("#import-project", RadioButton).value = True
     dialog.query_one("#import-force", Switch).value = force
     await pilot.pause()
     await press(pilot, "#import-submit")
@@ -257,7 +256,7 @@ def test_backing_out_of_a_running_import_closes_the_dialog_and_publishes_nothing
     assert isinstance(outcome, PersonaError) and outcome.code == "cancelled"
 
 
-@pytest.mark.parametrize("layer", ["user", "project"])
+@pytest.mark.parametrize("layer", ["user"])  # the project's layer is written by nothing now
 def test_backing_out_of_a_forced_import_leaves_the_persona_that_was_there_byte_identical(
     layer: Layer, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

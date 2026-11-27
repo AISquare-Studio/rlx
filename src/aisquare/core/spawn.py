@@ -367,6 +367,26 @@ SEAMS: dict[str, Seam] = {
         "command that started it",
         strips_identity=True,
     ),
+    "aisquare/services/service_host.py::_spawn_service": Seam(
+        EXCLUDED,
+        "`rlx service run` of ours in the background: the headless rlx that keeps Remote, the "
+        "usage reads and the held-back nudges going for the home; a worker, not an agent "
+        "session, and it outlives the command (or the upgrade) that started it (#32)",
+        strips_identity=True,
+    ),
+    "aisquare/services/service_host.py::_detached": Seam(
+        EXCLUDED,
+        "the rlx service's own workers, one at a time: the usage sweep and the anonymous usage "
+        "shipment (when sharing is on); aisquare's work for the home, not an agent session (#32)",
+        strips_identity=True,
+    ),
+    "aisquare/services/active_ping.py::_spawn": Seam(
+        EXCLUDED,
+        "a detached `aisquare metrics ping` of ours — the anonymous daily active ping, started "
+        "once a day by a command or the app opening; a worker, not an agent session, and it "
+        "outlives the command that started it",
+        strips_identity=True,
+    ),
     "aisquare/services/outcomes.py::_commit_lines": Seam(
         EXCLUDED,
         "`git diff-tree --numstat` over a week's commits, for `aisquare outcomes`' lines added "

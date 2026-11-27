@@ -33,9 +33,9 @@ from aisquare.cli.ui.sidebar import (
     ORANGE_RED,
     RED,
     SETTINGS_KEY,
-    TIMES,
     YELLOW,
     AgentHeadroom,
+    AppSettingsSelected,
     OthersSection,
     SettingsRow,
     StatusLine,
@@ -43,17 +43,17 @@ from aisquare.cli.ui.sidebar import (
     headroom_dot,
     status_line_text,
 )
-from aisquare.cli.ui.views import personas_tab
+from aisquare.cli.ui.views import personas_tab, tmux_page
 from aisquare.cli.ui.views.app_settings import (
     AGENT_TAB,
     PREFERENCES_TAB,
-    REMOTE_TAB,
     AppSettingsView,
 )
 from aisquare.cli.ui.views.personas_tab import PersonasTab
+from aisquare.cli.ui.views.remote import RemotePanel
 from aisquare.cli.ui.views.settings_captain import CaptainToggle
 from aisquare.cli.ui.views.settings_hub import SettingsHubView
-from aisquare.cli.ui.views.settings_remote import RemoteSection
+from aisquare.cli.ui.views.tmux_page import TmuxView
 from aisquare.core import claude_accounts as core
 from aisquare.core.store import store_session
 from aisquare.models import (
@@ -68,10 +68,12 @@ from aisquare.models import (
     ProjectInfo,
 )
 from aisquare.services import claude_accounts as accounts_service
+from aisquare.services import tmux_panes
+from aisquare.services.tmux_panes import TmuxReport
 from tests.fleet_fakes import list_agents_as
 from tests.test_claude_accounts import _sign_in
 from tests.test_ui_accounts import _overview, _status
-from tests.test_ui_shell import composited
+from tests.test_ui_shell import composited, to_the_sidebar
 from tests.ui_workers import settle_page, settle_until
 
 T = TypeVar("T")
@@ -206,14 +208,14 @@ def test_settings_personas_opens_your_personas_with_no_project_and_reads_them_ea
             await settle_page(app)
         page = app.query_one("#personas", PersonasTab)
         seen["page"] = (app.content.current, app.sidebar.selected_key, page.project, page.root)
-        seen["chips"] = [str(box.id) for box in page.query("#personas-layers Checkbox")]
+        seen["chips"] = [str(box.id) for box in page.query("Checkbox")]
         seen["attach"] = len(page.query("#persona-attach-existing, #persona-attach-new"))
         seen["pages"] = len(app.query(PersonasTab))
         return seen
 
     seen = _drive(go)
     assert seen["page"] == ("personas", SETTINGS_KEY, None, None)
-    assert seen["chips"] == ["layer-user", "layer-bundled"]
+    assert seen["chips"] == [], "no layer checkboxes (0.10.2): yours and the bundled ones"
     assert seen["attach"] == 0
     assert seen["pages"] == 1, "one page, kept"
     assert reads == [None, None], "read at the first opening and again at the second"
@@ -297,18 +299,20 @@ def test_the_keyboard_reaches_settings_and_walks_the_hubs_links_but_never_the_st
         second = app.focused.id if app.focused is not None else None
         await pilot.press("enter")
         await settle_page(app)
-        return keys, first, second, app.content.current
+        return keys, first, second, type(app.screen).__name__
 
     keys, first, second, current = _drive(go)
     assert keys[-1] == SETTINGS_KEY and "" not in keys  # the status line is no row
     assert first == "hub-app-settings"  # opened from the keyboard: the first link has it
-    assert second == "hub-remote"  # Remote control, then Captain, under App settings (#41)
-    assert current == "app-settings"
+    assert second == "hub-remote"  # Remote control, then Captain (#41)
+    assert current == "RemotePanel", "Enter on Remote control: the Remote page (Q17)"
 
 
-def test_remote_control_and_captain_open_app_settings_on_their_own_tab_and_leave_the_hub() -> None:
-    """The owner's placement (#41): Remote in its own tab, the Captain box atop Agent
-    settings — and the hub still has one obvious way in to each, a link that lands there."""
+def test_remote_control_opens_the_remote_page_and_captain_app_settings_last_tab() -> None:
+    """The hub has one obvious way in to each (#41). Remote is one page (Q17), which the
+    hub's *Remote control* opens over the hub, as ``R`` does; the Captain box is the last
+    section of App settings' *Agent settings* (Q18), where the hub's *Captain* lands, scrolled
+    to it."""
 
     async def go(pilot: Pilot[None]) -> dict[str, object]:
         app = _app(pilot)
@@ -316,28 +320,41 @@ def test_remote_control_and_captain_open_app_settings_on_their_own_tab_and_leave
         await pilot.click(app.query_one(SettingsRow))
         await settle_page(app)
         hub = app.query_one(SettingsHubView)
-        seen["hub holds"] = (len(hub.query(RemoteSection)), len(hub.query(CaptainToggle)))
-        for stem in ("remote", "captain"):
-            # From the other tab each time, so the link is what brings its tab forward.
-            if app.query("#app-settings"):
-                app.query_one("#app-settings-tabs", TabbedContent).active = PREFERENCES_TAB
-            await pilot.click(app.query_one(SettingsRow))
-            await settle_page(app)
-            await pilot.click(f"#hub-{stem}")
-            await settle_page(app)
-            tabs = app.query_one("#app-settings-tabs", TabbedContent)
-            seen[stem] = (app.content.current, app.sidebar.selected_key, tabs.active)
+        seen["hub holds"] = (len(hub.query(RemotePanel)), len(hub.query(CaptainToggle)))
+        await pilot.click("#hub-remote")
+        await settle_page(app)
+        screen = app.screen
+        seen["remote"] = (
+            type(screen).__name__,
+            isinstance(screen, RemotePanel) and screen.controller is app.remote,
+            app.content.current,
+        )
+        await pilot.press("escape")
+        await settle_page(app)
+        seen["back"] = (app.screen is app.screen_stack[0], app.content.current)
+        app.post_message(AppSettingsSelected())  # from another tab, so the link brings its own
+        await settle_page(app)
+        app.query_one("#app-settings-tabs", TabbedContent).active = PREFERENCES_TAB
+        await pilot.click(app.query_one(SettingsRow))
+        await settle_page(app)
+        await pilot.click("#hub-captain")
+        await settle_page(app)
+        tabs = app.query_one("#app-settings-tabs", TabbedContent)
+        seen["captain"] = (app.content.current, app.sidebar.selected_key, tabs.active)
         view = app.query_one(AppSettingsView)
-        seen["remote in"] = [node.id for node in view.query_one(RemoteSection).ancestors]
-        seen["captain first"] = view.query_one("#agent-settings").children[0].id
+        box = view.query_one(CaptainToggle)
+        agent = view.query_one("#agent-settings")
+        seen["captain last"] = agent.children[-1] is box
+        seen["captain shown"] = box.region.area > 0 and agent.region.contains_region(box.region)
         return seen
 
     seen = _drive(go)
     assert seen["hub holds"] == (0, 0)
-    assert seen["remote"] == ("app-settings", SETTINGS_KEY, REMOTE_TAB)
+    assert seen["remote"] == ("RemotePanel", True, "settings-hub"), "over the hub, as R opens it"
+    assert seen["back"] == (True, "settings-hub"), "Esc: back on the hub"
     assert seen["captain"] == ("app-settings", SETTINGS_KEY, AGENT_TAB)
-    assert isinstance(seen["remote in"], list) and REMOTE_TAB in seen["remote in"]
-    assert seen["captain first"] == "settings-captain"
+    assert seen["captain last"] is True, "Q18: the tab's last section"
+    assert seen["captain shown"] is True, "scrolled to it, whole in the tab"
 
 
 def test_the_hub_is_titled_settings_and_says_what_each_link_opens() -> None:
@@ -362,13 +379,46 @@ def test_the_hub_is_titled_settings_and_says_what_each_link_opens() -> None:
         "Personas",
         "Usage & stats",
         "Agent resources",
+        "tmux",
         "Doctor",
         "Restart all…",
         "Stop all…",
         "Pause all…",
         "Resume all…",
     ]
-    assert len(about) == 9 and all(about)  # the Fleet section's four share one line
+    assert len(about) == 10 and all(about)  # the Fleet section's four share one line
+
+
+def test_the_tmux_link_sits_after_agent_resources_and_opens_its_page_under_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handoff E (the owner's Q2): a page of the hub's, next to Agent resources. With no tmux
+    (Windows) the page says so in one plain line and shows nothing else."""
+    report = TmuxReport(read_at=datetime.now(UTC), unavailable=tmux_panes.NO_TMUX_ON_WINDOWS)
+    monkeypatch.setattr(tmux_page, "default_reader", lambda: lambda: report)
+
+    async def go(pilot: Pilot[None]) -> dict[str, object]:
+        app = _app(pilot)
+        await pilot.click(app.query_one(SettingsRow))
+        await settle_page(app)
+        hub = app.query_one(SettingsHubView)
+        ids = [button.id for button in hub.query(".hub-link").results(Button)]
+        await pilot.click("#hub-tmux")
+        page = app.query_one("#tmux", TmuxView)
+        await settle_until(app, lambda: page.report is not None)
+        await settle_page(app)
+        return {
+            "after": ids[ids.index("hub-resources") + 1],
+            "open": (app.content.current, app.sidebar.selected_key),
+            "said": _shown(page.query_one("#tmux-unavailable", Static)),
+            "table": page.query_one("#tmux-panes").display,
+        }
+
+    seen = _drive(go)
+    assert seen["after"] == "hub-tmux"
+    assert seen["open"] == ("tmux", SETTINGS_KEY)
+    assert seen["said"] == tmux_panes.NO_TMUX_ON_WINDOWS
+    assert seen["table"] is False
 
 
 def test_the_usage_link_names_no_agent() -> None:
@@ -417,7 +467,10 @@ def _doctor_page(app: FleetApp) -> tuple[str, str, str]:
     """The Doctor page's header, report and status line, as they read."""
     return (
         _shown(app.query_one("#doctor-scope", Static)),
-        _shown(app.query_one("#doctor-report", Static)),
+        # The problems, then the passing rows behind their fold (Q5): the whole report.
+        _shown(app.query_one("#doctor-report", Static))
+        + "\n"
+        + _shown(app.query_one("#doctor-passed-list", Static)),
         _shown(app.query_one("#doctor-status", Static)),
     )
 
@@ -499,9 +552,13 @@ def test_the_doctor_page_names_the_project_its_checks_are_about(
     highlighted nothing on screen said which: the header names it, by its nickname."""
     root = tmp_path / "alpha"
     root.mkdir()
+    (tmp_path / "beta").mkdir()
     with store_session() as store:
         store.onboard_project(ProjectInfo(id="prj_a", root=root))
         store.set_project_nickname("prj_a", "Payments [v2]")
+        # Home is beta (start opens home since L1): the one run at start is about it.
+        store.onboard_project(ProjectInfo(id="prj_b", root=tmp_path / "beta"))
+        store.set_ui_state("fleet.last_project", "prj_b")
 
     def no_agents(project: ProjectInfo, *, live_only: bool = True) -> list[FleetAgentStatus]:
         return []
@@ -519,9 +576,7 @@ def test_the_doctor_page_names_the_project_its_checks_are_about(
         return during, _doctor_page(app)
 
     during, after = _drive(go, doctor=doctor)
-    assert during[0] == "checks for this machine", (
-        "the report on screen is still the one from start"
-    )
+    assert during[0] == "checks for beta", "the report on screen is still the one from start"
     assert during[2] == "… running the checks for Payments [v2]"
     assert after[0] == "checks for Payments [v2]" and after[2] == ""
 
@@ -564,7 +619,8 @@ def test_the_claude_dot_follows_the_headroom_level(
     text = status_line_text(summary)
     assert text.plain.startswith(dot)
     if summary is not None:
-        assert f"{summary.usable}{TIMES} claude" in text.plain
+        accounts = "account" if summary.usable == 1 else "accounts"
+        assert f"Claude: {summary.usable} {accounts}" in text.plain  # in words (Q8)
 
 
 @pytest.mark.parametrize("width", [38, 45, 60, 90, 200])
@@ -616,10 +672,11 @@ def test_the_sidebar_names_no_aisquare_and_the_accounts_page_has_the_sign_in(
         )
         async with app.run_test(size=(width, 40)) as pilot:
             await settle_page(app)
+            await to_the_sidebar(app)  # below 70 columns, start on Welcome shows the other side
             return await go(pilot)
 
     sidebar, line, page = asyncio.run(run())
-    assert line and line[0].startswith(f"● 3{TIMES} claude"), line  # its first cell, no gap
+    assert line and line[0].startswith("● Claude: 3 accounts"), line  # its first cell, no gap
     assert not [row for row in sidebar if "aisquare" in row.lower()], sidebar
     said = {
         "signed in": "✓ Signed in as me@aisquare.studio",
@@ -637,16 +694,16 @@ def test_the_help_legend_of_the_line_names_no_aisquare_and_starts_codex_unindent
     text = HelpScreen("f12").keys_text().plain
     legend = text[text.index("The line under ⚙ Settings") : text.index("Esc closes this")]
     assert "aisquare" not in legend.lower(), legend
-    agents = [row for row in legend.splitlines() if row.lstrip().startswith("● ") and TIMES in row]
-    assert agents == [
-        f"  ● 3{TIMES} claude  usable Claude accounts; the dot is the room LEFT across them:",
-        f"  ● 1{TIMES} codex  another agent's accounts (Codex's), read the same way, on a line",
-    ], legend
+    agents = [row for row in legend.splitlines() if row.lstrip().startswith("● ") and ": " in row]
+    # In the line's own words (Q8), each starting in the same column.
+    assert agents == ["  ● Claude: 3 accounts · 58% left", "  ● Codex: 1 account · 70% left"], (
+        legend
+    )
 
 
 def test_a_login_due_puts_a_warning_on_the_line() -> None:
     due = HeadroomSummary(level="fair", percent_left=30.0, usable=1, needs_login=1)
-    assert status_line_text(due).plain == f"● 1{TIMES} claude 30% ⚠"
+    assert status_line_text(due).plain == "● Claude: 1 account · 30% left ⚠"
     assert "⚠" not in status_line_text(GOOD).plain
 
 
@@ -674,15 +731,18 @@ def test_a_login_due_keeps_its_warning_in_the_cells_the_line_has() -> None:
             painted.append(composited(line).rstrip())
         return painted
 
+    # The sidebar's 28 cells: " left" gives way, the figure and the ⚠ stay (Q8's words).
     assert _drive(go) == [
-        f"● 2{TIMES} claude 58% ⚠",
-        f"● 2{TIMES} claude 3% ⚠",
-        f"● 9{TIMES} claude 100%",
+        "● Claude: 2 accounts · 58% ⚠",
+        "● Claude: 2 accounts · 3% ⚠",
+        "● Claude: 9 accounts · 100%",
     ]
-    narrow = {left: status_line_text(due[left], width=16).plain for left in due}
-    assert narrow == {58.0: f"● 2{TIMES} claude ⚠", 3.0: f"● 2{TIMES} claude 3% ⚠"}
-    wide = status_line_text(due[58.0], width=17)
-    assert wide.plain == f"● 2{TIMES} claude 58% ⚠", "with room, both"
+    narrow = {left: status_line_text(due[left], width=27).plain for left in due}
+    assert narrow == {58.0: "● Claude: 2 accounts ⚠", 3.0: "● Claude: 2 accounts · 3% ⚠"}
+    wide = status_line_text(due[58.0], width=28)
+    assert wide.plain == "● Claude: 2 accounts · 58% ⚠", "with room, both"
+    widest = status_line_text(due[58.0], width=33)
+    assert widest.plain == "● Claude: 2 accounts · 58% left ⚠", "with more, the word too"
 
 
 def test_the_line_paints_the_injected_headroom() -> None:
@@ -691,7 +751,7 @@ def test_the_line_paints_the_injected_headroom() -> None:
     async def go(pilot: Pilot[None]) -> str:
         return _shown(_app(pilot).query_one(StatusLine))
 
-    assert _drive(go, headroom=lambda accounts: critical) == f"● 2{TIMES} claude 3% ⚠"
+    assert _drive(go, headroom=lambda accounts: critical) == "● Claude: 2 accounts · 3% ⚠"
 
 
 def _delta_e(one: Color, other: Color) -> float:
@@ -822,7 +882,7 @@ def test_a_signed_out_account_puts_a_warning_on_the_line(
     )
     # Slot 1 signed out, slot 2 good: the 60% and the ⚠, in the sidebar's 28 cells now no
     # AISquare dot takes 12 of them (R21; the figure gives way where both do not fit, #357).
-    assert line == f"● 1{TIMES} claude 60% ⚠", line
+    assert line == "● Claude: 1 account · 60% ⚠", line
     assert headroom is not None and headroom.needs_login == 1 and headroom.usable == 1
     assert headroom.percent_left == 60.0
     assert calls == [good.slot], "only the signed-in slot was asked"
@@ -839,7 +899,7 @@ def test_every_account_signed_out_is_a_red_dot_and_a_warning_not_grey(fake_home:
     line, dot = _drive(
         go, headroom=accounts_service.read_fleet_headroom, accounts=accounts_service.overview
     )
-    assert line.endswith(f"● 0{TIMES} claude ⚠"), line
+    assert line.endswith("● Claude: 0 accounts ⚠"), line
     assert dot == ("●", RED)  # every enabled account needs a login
 
 
@@ -891,7 +951,7 @@ def test_an_unreachable_main_account_beside_a_signed_out_spare_is_grey_with_a_wa
     line, dot = _drive(
         go, headroom=accounts_service.read_fleet_headroom, accounts=accounts_service.overview
     )
-    assert line.endswith(f"● 0{TIMES} claude ⚠"), line
+    assert line.endswith("● Claude: 0 accounts ⚠"), line
     assert dot == ("●", "grey50")
 
 
@@ -957,8 +1017,8 @@ def test_another_agents_accounts_have_a_dot_of_their_own_under_the_first() -> No
     text = status_line_text(GOOD, more=[AgentHeadroom("codex", codex)])
     # Each agent's line carries its share left beside the count (#287): 80 % of Claude Code's,
     # 10 % of Codex's, whose signed-out slot is the ⚠.
-    assert text.plain == (f"● 3{TIMES} claude 80%\n● 1{TIMES} codex 10% ⚠")
-    assert status_line_text(GOOD).plain == f"● 3{TIMES} claude 80%", "alone"
+    assert text.plain == ("● Claude: 3 accounts · 80% left\n● Codex: 1 account · 10% left ⚠")
+    assert status_line_text(GOOD).plain == "● Claude: 3 accounts · 80% left", "alone"
 
 
 def test_the_status_line_reads_and_names_the_codex_accounts_apart_from_claudes() -> None:
@@ -988,7 +1048,7 @@ def test_the_status_line_reads_and_names_the_codex_accounts_apart_from_claudes()
 
     line, more = _drive(go, headroom=reader, accounts=overview)
 
-    assert line == f"● 1{TIMES} claude 40%\n● 1{TIMES} codex 70% ⚠"
+    assert line == "● Claude: 1 account · 40%\n● Codex: 1 account · 70% ⚠"
     assert asked[-2:] == [[("claude-code", 1)], [("codex", 0), ("codex", 3)]]
     assert more == (AgentHeadroom("codex", codex.model_copy(update={"needs_login": 1})),)
 
@@ -996,8 +1056,8 @@ def test_the_status_line_reads_and_names_the_codex_accounts_apart_from_claudes()
 def test_the_line_paints_the_fleets_share_left_beside_the_count() -> None:
     """#287 slice 2a: the dot had no number. Percent LEFT, as the band means, in its colour."""
     text = status_line_text(HeadroomSummary(level="fair", percent_left=41.6, usable=3))
-    assert text.plain == f"● 3{TIMES} claude 42%"
-    figure = next(span for span in text.spans if text.plain[span.start : span.end] == " 42%")
+    assert text.plain == "● Claude: 3 accounts · 42% left"
+    figure = next(span for span in text.spans if text.plain[span.start : span.end] == "42%")
     assert str(figure.style) == headroom_dot(HeadroomSummary(level="fair", percent_left=41.6))[1]
     unread = status_line_text(HeadroomSummary(level="unknown"))
-    assert unread.plain == f"● 0{TIMES} claude", "no reading, no number"
+    assert unread.plain == "● Claude: 0 accounts", "no reading, no number"
