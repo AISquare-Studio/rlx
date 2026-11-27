@@ -684,11 +684,35 @@ fn a_template_run_start_would_refuse_is_refused_at_put() {
             }),
             "invalid_params",
         ),
+        // A watch job: its connector, its tool (one of the connector's) and an object
+        // input, and no run template.
         (
             json!({"job_id": "bad", "type": "watch", "schedule": {"every_minutes": 5},
                 "connector": "claude.ai GitHub", "tool": "x", "input": {},
                 "catch_up": "skip"}),
-            "not_implemented",
+            "invalid_params",
+        ),
+        (
+            json!({"job_id": "bad", "type": "watch", "schedule": {"every_minutes": 5},
+                "connector": "claude.ai GitHub", "tool": "mcp__claude_ai_Slack__send",
+                "input": {}, "catch_up": "skip"}),
+            "invalid_params",
+        ),
+        (
+            json!({"job_id": "bad", "type": "watch", "schedule": {"every_minutes": 5},
+                "connector": "claude.ai GitHub", "input": {}, "catch_up": "skip"}),
+            "invalid_params",
+        ),
+        (
+            json!({"job_id": "bad", "type": "watch", "schedule": {"every_minutes": 5},
+                "connector": "claude.ai GitHub", "tool": "mcp__claude_ai_GitHub__x",
+                "input": "ref=main", "catch_up": "skip"}),
+            "invalid_params",
+        ),
+        (
+            json!({"job_id": "bad", "type": "watch", "schedule": {"every_minutes": 5},
+                "tool": "mcp__claude_ai_GitHub__x", "input": {}, "catch_up": "skip"}),
+            "invalid_params",
         ),
     ] {
         assert_eq!(refused(&home, "job.put", &bad), code, "{bad:#}");
@@ -1085,4 +1109,188 @@ fn a_clock_set_back_counts_the_next_fire_from_now() {
     common::eventually("before the anchor, on its grid", || {
         listed(&home, "fired")["next_fire_at"] == "2026-12-31T23:35:00Z"
     });
+}
+
+// --- Watch jobs (7.6): the fallback route, a pinned watch run ------------------------------
+
+/// The watch jobs' tool, and its input's RFC 8785 SHA-256 (`{"ref":"main"}`).
+const WATCH_TOOL: &str = "mcp__claude_ai_GitHub__get_check_runs";
+const WATCH_SHA256: &str = "a934b65d9e929e7a924f901e05035152e791f1d2575f4b2adcb3721ec55d5e93";
+
+/// rlxd's prompt for a watch run.
+const FIXED_PROMPT: &str = "Call this tool once with exactly this input; do nothing else";
+
+/// `watch-call`'s two calls: the one the app decides, and the identical second.
+const WATCH_CALL: &str = "toolu_01FakeWatchCall0000000001";
+const WATCH_AGAIN: &str = "toolu_01FakeWatchCall0000000002";
+
+/// A home whose runs are fake-claude's `watch-call`, with rlxd as each run's hook.
+fn watch_home() -> TestHome {
+    let home = unstarted_with("watch-call", T0, &[("RLXD_TEST_HOOK", "1")]);
+    start(&home);
+    home
+}
+
+/// A watch job `id` of GitHub's check runs on `main`, every minute.
+fn watch_job(id: &str) -> Value {
+    json!({"job_id": id, "type": "watch", "schedule": {"every_minutes": 1},
+        "connector": "claude.ai GitHub", "tool": WATCH_TOOL, "input": {"ref": "main"},
+        "catch_up": "skip", "enabled": true})
+}
+
+/// The app's `run.decide` on run `run_id`'s call `call_id`.
+fn decide(home: &TestHome, run_id: &Value, call_id: &str, decision: &str) -> common::Run {
+    let params = json!({"run_id": run_id, "call_id": call_id, "decision": decision,
+        "reason": "the test"});
+    home.rlxd(&["call", "--as-app", "run.decide", &params.to_string()])
+}
+
+/// The fire's run, once job `id` fired: its `run_id`.
+fn fired_run(home: &TestHome, since: u64, id: &str) -> Value {
+    let seen = wait_until(home, since, 30, "the job fires", |e| {
+        !typed(e, "job.fired", Some(id)).is_empty()
+    });
+    typed(&seen, "job.fired", Some(id))[0]["data"]["run_id"].clone()
+}
+
+/// Run `run_id`'s events of `type`.
+fn of_run<'a>(events: &'a [Value], run_id: &Value, r#type: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|e| e["type"] == r#type && e["data"]["run_id"] == *run_id)
+        .collect()
+}
+
+#[test]
+fn a_watch_job_makes_its_pinned_call_and_its_raw_result_is_job_watch_result() {
+    let home = watch_home();
+    let _app = app(&home);
+    let since = seq(&home);
+    put(&home, &watch_job("ci-green"));
+    advance(&home, 60);
+    let r = fired_run(&home, since, "ci-green");
+    // Its one call reaches the app, as a watch run's, pinned to the input.
+    let seen = wait_until(&home, since, 30, "the call reaches the app", |e| {
+        !of_run(e, &r, "run.tool_call").is_empty()
+    });
+    let calls = of_run(&seen, &r, "run.tool_call");
+    assert_eq!(calls[0]["data"]["kind"], "watch");
+    assert_eq!(calls[0]["data"]["tool"], WATCH_TOOL);
+    assert_eq!(calls[0]["data"]["input"], json!({"ref": "main"}));
+    assert_eq!(calls[0]["data"]["input_sha256"], WATCH_SHA256);
+    assert_eq!(calls[0]["data"]["job_id"], "ci-green");
+    let allowed = decide(&home, &r, WATCH_CALL, "allow");
+    assert_eq!(allowed.code(), Some(0), "{allowed:?}");
+    let seen = wait_until(&home, since, 30, "the run ends", |e| run_ended(e, &r));
+    // The raw result, once.
+    let results = typed(&seen, "job.watch_result", Some("ci-green"));
+    assert_eq!(results.len(), 1, "{seen:#?}");
+    assert_valid("job-event.json", results[0]);
+    let content: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            common::workspace().join("tests/fixtures/fake-claude/watch-call/content.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let data = &results[0]["data"];
+    assert_eq!(data["run_id"], r);
+    assert_eq!(data["tool"], WATCH_TOOL);
+    assert_eq!(data["input_sha256"], WATCH_SHA256);
+    assert_eq!(data["content"], content);
+    assert_eq!(data["is_error"], false);
+    assert_eq!(data["truncated"], false);
+    // The identical second call never reached the app: rlxd denied it.
+    assert_eq!(of_run(&seen, &r, "run.tool_call").len(), 1, "{seen:#?}");
+    let decided = of_run(&seen, &r, "run.tool_decided");
+    let again = decided
+        .iter()
+        .find(|d| d["data"]["call_id"] == WATCH_AGAIN)
+        .unwrap_or_else(|| panic!("{seen:#?}"));
+    assert_eq!(again["data"]["by"], "rlxd");
+    assert_eq!(again["data"]["reason"], "pinned_call_used");
+    assert_eq!(of_run(&seen, &r, "run.done").len(), 1, "{seen:#?}");
+    // The run's command line carries rlxd's fixed prompt.
+    let log: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.root().join("fake-claude.log.json")).unwrap(),
+    )
+    .unwrap();
+    let argv: Vec<&str> = log["starts"][0]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    let at = argv
+        .iter()
+        .position(|a| *a == "--append-system-prompt")
+        .unwrap_or_else(|| panic!("{argv:?}"));
+    assert_eq!(argv[at + 1], FIXED_PROMPT);
+    assert_eq!(log["starts"][0]["tool_runs"], 1);
+    // The job's record of the fire.
+    assert_eq!(listed(&home, "ci-green")["last_run_id"], r);
+}
+
+#[test]
+fn a_watch_call_the_app_denies_gives_no_watch_result() {
+    let home = watch_home();
+    let _app = app(&home);
+    let since = seq(&home);
+    put(&home, &watch_job("ci-green"));
+    advance(&home, 60);
+    let r = fired_run(&home, since, "ci-green");
+    wait_until(&home, since, 30, "the call reaches the app", |e| {
+        !of_run(e, &r, "run.tool_call").is_empty()
+    });
+    assert_eq!(decide(&home, &r, WATCH_CALL, "deny").code(), Some(0));
+    // A denied call doesn't use the pinned call: the identical second one is the app's
+    // too, and denied again.
+    wait_until(&home, since, 30, "the second call reaches the app", |e| {
+        of_run(e, &r, "run.tool_call").len() == 2
+    });
+    assert_eq!(decide(&home, &r, WATCH_AGAIN, "deny").code(), Some(0));
+    let seen = wait_until(&home, since, 30, "the run ends", |e| run_ended(e, &r));
+    assert!(
+        typed(&seen, "job.watch_result", None).is_empty(),
+        "{seen:#?}"
+    );
+}
+
+#[test]
+fn a_watch_job_with_no_app_is_skipped_app_absent_and_runs_nothing() {
+    let home = watch_home();
+    let since = seq(&home);
+    put(&home, &watch_job("ci-green"));
+    advance(&home, 60);
+    let seen = wait_until(&home, since, 30, "the skip", |e| {
+        !skips(e, "ci-green").is_empty()
+    });
+    assert_eq!(skips(&seen, "ci-green"), ["app_absent"]);
+    assert!(typed(&seen, "job.fired", Some("ci-green")).is_empty());
+    assert!(typed(&seen, "run.started", None).is_empty(), "{seen:#?}");
+}
+
+#[test]
+fn run_now_fires_a_watch_job_whose_result_names_its_run() {
+    let home = watch_home();
+    put(&home, &watch_job("ci-green"));
+    assert_eq!(
+        refused(&home, "job.run_now", &json!({"job_id": "ci-green"})),
+        "app_absent"
+    );
+    let _app = app(&home);
+    let since = seq(&home);
+    let now = call(&home, "job.run_now", &json!({"job_id": "ci-green"}));
+    let r = now["run_id"].clone();
+    wait_until(&home, since, 30, "the call reaches the app", |e| {
+        !of_run(e, &r, "run.tool_call").is_empty()
+    });
+    assert_eq!(decide(&home, &r, WATCH_CALL, "allow").code(), Some(0));
+    let seen = wait_until(&home, since, 30, "the result", |e| {
+        !typed(e, "job.watch_result", Some("ci-green")).is_empty()
+    });
+    assert_eq!(
+        typed(&seen, "job.watch_result", Some("ci-green"))[0]["data"]["run_id"],
+        r
+    );
 }

@@ -502,8 +502,7 @@ them by `job_id`; rlxd keeps a definition only to fire it, and records what each
   fire waiting for an app. A replace keeps the job's record and whether it is paused. `job.list`, `job.delete`, `job.pause`, `job.resume`, and `job.run_now`, which
   fires the job now. `job.run_now` needs an app gate client (`app_absent` otherwise);
   `paused` doesn't stop it, a live run of the job (`job_running`) or its rate limit
-  (`rate_limited`, `detail.resets_at`) do. `watch` jobs come with the tool gate (5.1).
-  `job.list`'s `last_state` is the job's last run's state as the runner has it now.
+  (`rate_limited`, `detail.resets_at`) do. `job.list`'s `last_state` is the job's last run's state as the runner has it now.
 - **When.** `every_minutes` fires on a grid from `job.put`, so a late fire never drifts
   it. Cron matches civil minutes in its IANA zone (jiff's bundled tz database, the same
   on every OS), each once: a time a DST gap skips fires once at the gap's end, and a time
@@ -522,10 +521,29 @@ them by `job_id`; rlxd keeps a definition only to fire it, and records what each
   its events, and the job's `loud`, which rlxd only echoes, on `job.fired` and on the
   run's `run.done` and `run.needs_you`. Events on topic `job`: `job.put`, `job.deleted`,
   `job.paused`, `job.resumed`, `job.fired {job_id, run_id, scheduled_for, fired_at,
-  cause, loud}` and `job.skipped {job_id, scheduled_for, reason, code?}`. `job.fired`
+  cause, loud}`, `job.skipped {job_id, scheduled_for, reason, code?}` and
+  `job.watch_result`. `job.fired`
   goes out once the run has started, so its first run events may come before it. A run
   that can't start is `job.skipped {reason: "start_failed", code}`, `code` being
   `run.start`'s refusal.
+- **Watch jobs** (`"type": "watch"`, with `connector`, `tool` and an object `input`) make
+  one pinned call per tick, with no prompt of the job's; the tool must read as one of the
+  connector's (`mcp__<connector as Claude Code writes it>__…`), else `invalid_params` at
+  `job.put`. Every fire is a `watch` run with an rlxd-picked `run_id`, gated like any run
+  (5.1): an app must be connected (else `app_absent`, as for any job) and must allow the
+  call. Until `connectors.call` (5.3) exists, the run is the fallback,
+  `scheduler::watch_job`'s one route: Claude Code with rlxd's fixed prompt, "Call this
+  tool once with exactly this input; do nothing else", as its appended system prompt (so
+  its command line carries it) and as its message, which quotes the connector, the tool
+  and the input as canonical JSON in a fence, as data, and nothing of the job's as text.
+  Its mount is the connector, and its `pinned_call` is the tool and the input's RFC 8785
+  SHA-256, so a connector's text can't steer the call, and a second call, even the
+  identical one, is denied `pinned_call_used`. The allowed call's raw result is
+  `job.watch_result {job_id, run_id, tool, input_sha256, content, is_error, truncated}`
+  (`content` as `run.tool_result` carries it, up to 1 MiB): the app evaluates `match`
+  itself, never on an error or a cut result. A denied call gives none. When 5.3 lands,
+  `connectors.call` becomes a second route there, with the same `run_id`, gate and
+  result.
 - **Once.** Before a fire's run starts, the job (its schedule moved past the fire) and a
   `starting` record of the fire, with its `run_id`, are written in one transaction. So
   a crash while the run starts never fires that time again: the next rlxd settles the

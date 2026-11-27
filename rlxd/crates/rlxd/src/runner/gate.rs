@@ -631,26 +631,32 @@ impl Runner {
     }
 
     /// The call `call_id`'s `tool_result`: `ok`, or `error` when `is_error`, for a call the
-    /// ledger has executing. Written durably.
-    pub(super) fn tool_ran(&self, run: &Run, inner: &mut RunInner, call_id: &str, is_error: bool) {
-        let Some(call) = inner
+    /// ledger has executing. Written durably. The call's entry, when it was one the gate
+    /// allowed.
+    pub(super) fn tool_ran(
+        &self,
+        run: &Run,
+        inner: &mut RunInner,
+        call_id: &str,
+        is_error: bool,
+    ) -> Option<RunCall> {
+        let call = inner
             .calls
             .iter_mut()
-            .find(|call| call.call_id == call_id && call.state == CallState::Executing)
-        else {
-            return;
-        };
+            .find(|call| call.call_id == call_id && call.state == CallState::Executing)?;
         call.state = if is_error {
             CallState::Error
         } else {
             CallState::Ok
         };
+        let ran = call.clone();
         if let Err(e) = self.write_ledger(run, inner) {
             warning!(
                 "gate: run {}: the ledger was not written: {e}",
                 run.params.run_id
             );
         }
+        Some(ran)
     }
 }
 

@@ -416,3 +416,99 @@ fn missed() {
         }
     }
 }
+
+/// rlxd's prompt for a watch run.
+const FIXED_PROMPT: &str = "Call this tool once with exactly this input; do nothing else";
+
+/// While `stop` is clear, the app's allow for each `run.tool_call` since `s`: "with the app
+/// connected and its calls allowed".
+fn allow_calls(home: &TestHome, s: &str, stop: &std::sync::atomic::AtomicBool) {
+    let mut decided = std::collections::HashSet::new();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let replay = home.rlxd(&["events", "--topics", "run", "--since", s]);
+        for e in replay.lines() {
+            if e["type"] != "run.tool_call" {
+                continue;
+            }
+            let key = (e["data"]["run_id"].clone(), e["data"]["call_id"].clone());
+            if decided.insert(key) {
+                let params = json!({"run_id": e["data"]["run_id"], "call_id":
+                    e["data"]["call_id"], "decision": "allow", "reason": "watching"});
+                home.rlxd(&["call", "--as-app", "run.decide", &params.to_string()]);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[test]
+#[ignore = "real one-minute schedules: rlxd.yml's scheduler job runs it"]
+fn watch() {
+    let home = home_with("watch-call", &[("RLXD_TEST_HOOK", "1")]);
+    let j = "ci-green";
+    let s = seq(&home);
+    let cap = capture(&home, true, "job,run", &s, "job.watch_result", 400);
+    let job = json!({"job_id": j, "type": "watch", "schedule": {"every_minutes": 1},
+        "connector": "claude.ai GitHub", "tool": "mcp__claude_ai_GitHub__get_check_runs",
+        "input": {"ref": "main"}, "catch_up": "skip", "enabled": true});
+    put(&home, &job.to_string());
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let run = std::thread::scope(|scope| {
+        scope.spawn(|| allow_calls(&home, &s, &stop));
+        let run = finish_within(cap, Duration::from_secs(450));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        run
+    });
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let events = run.lines();
+    let expected: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            common::workspace().join("tests/fixtures/fake-claude/watch-call/content.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The handoff's jq, as Rust.
+    let r = of(&events, "job.fired", j)
+        .first()
+        .map(|e| e["data"]["run_id"].clone())
+        .unwrap_or_else(|| panic!("never fired: {events:#?}"));
+    let calls: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            e["type"] == "run.tool_call" && e["data"]["run_id"] == r && e["data"]["kind"] == "watch"
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "{events:#?}");
+    let results: Vec<&Value> = of(&events, "job.watch_result", j)
+        .into_iter()
+        .filter(|e| e["data"]["run_id"] == r)
+        .collect();
+    assert_eq!(results.len(), 1, "{events:#?}");
+    assert_eq!(results[0]["data"]["content"], expected);
+    // Without connectors.call: the fallback run's argv carries rlxd's fixed prompt, and its
+    // second, identical call is denied by rlxd, pinned_call_used.
+    let log: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.root().join("fake-claude.log.json")).unwrap(),
+    )
+    .unwrap();
+    let argv = log["starts"][0]["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|a| a == FIXED_PROMPT), "{argv:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let replay = home
+            .rlxd(&["events", "--topics", "run", "--since", &s])
+            .lines();
+        let used = replay.iter().any(|e| {
+            e["type"] == "run.tool_decided"
+                && e["data"]["run_id"] == r
+                && e["data"]["by"] == "rlxd"
+                && e["data"]["reason"] == "pinned_call_used"
+        });
+        if used {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{replay:#?}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}

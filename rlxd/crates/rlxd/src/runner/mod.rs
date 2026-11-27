@@ -66,7 +66,7 @@ mod argv;
 mod gate;
 #[cfg(unix)]
 pub(crate) mod guard;
-mod jcs;
+pub(crate) mod jcs;
 mod process;
 mod remove;
 mod store;
@@ -115,8 +115,20 @@ pub enum RunNote {
         run_id: RunId,
         state: RunState,
     },
+    /// A watch run's pinned call, allowed, gave its result (7.6): `content` as
+    /// `run.tool_result` carries it, bounded.
+    WatchResult {
+        job_id: String,
+        run_id: RunId,
+        tool: String,
+        input_sha256: String,
+        content: Value,
+        is_error: bool,
+        truncated: bool,
+    },
 }
 
+pub(crate) use gate::claude_server_name;
 #[cfg(feature = "debug-methods")]
 pub use gate::{Ask, HOOK_KEY_ENV, output as hook_output};
 
@@ -1852,8 +1864,26 @@ impl Runner {
                         content,
                     } => {
                         // The ledger's outcome for an allowed call (5.1), before its event.
-                        self.tool_ran(run, &mut inner, &call_id, is_error);
+                        let ran = self.tool_ran(run, &mut inner, &call_id, is_error);
                         let (content, truncated) = stream::bounded(content);
+                        // A watch job's pinned call: its raw result goes to the scheduler,
+                        // as job.watch_result (7.6).
+                        if let (Some(ran), Some(job_id), Some(pinned)) =
+                            (ran, &run.job_id, &run.params.pinned_call)
+                            && run.params.kind == RunKind::Watch
+                            && ran.tool == pinned.tool
+                            && ran.input_sha256 == pinned.input_sha256
+                        {
+                            self.note(RunNote::WatchResult {
+                                job_id: job_id.clone(),
+                                run_id: run.params.run_id.clone(),
+                                tool: ran.tool,
+                                input_sha256: ran.input_sha256,
+                                content: content.clone(),
+                                is_error,
+                                truncated,
+                            });
+                        }
                         let tool = tools.get(&call_id).cloned().unwrap_or_default();
                         let data = RunToolResultData::new(call_id, tool, is_error, content)
                             .truncated(truncated);

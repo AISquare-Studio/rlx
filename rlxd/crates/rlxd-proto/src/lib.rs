@@ -212,7 +212,7 @@ pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use job::{
     CatchUp, ClockAdvanceParams, ClockSetParams, FireCause, JobEvent, JobFiredData, JobId,
     JobListData, JobListParams, JobPutParams, JobRef, JobRunNowData, JobSkippedData, JobSummary,
-    JobType, RunTemplate, Schedule, SkipReason, job_types,
+    JobType, JobWatchResultData, RunTemplate, Schedule, SkipReason, job_types,
 };
 pub use marker::{False, True, V1};
 pub use pty::{

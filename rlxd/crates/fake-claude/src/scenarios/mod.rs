@@ -18,6 +18,7 @@ mod rate_limit;
 mod slow;
 mod structured;
 mod tool_result;
+pub mod watch_call;
 
 pub use orphan::LINGER;
 
@@ -39,6 +40,7 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("slow", slow::run),
     ("structured", structured::run),
     ("tool-result", tool_result::run),
+    ("watch-call", watch_call::run),
 ];
 
 /// The scenario called `name`: one of [`ALL`], or one of the gate's ([`gate`]).
