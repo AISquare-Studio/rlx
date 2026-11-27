@@ -1030,6 +1030,27 @@ mod tests {
         // hides.
         let (group, both) = leaderless_group(true, Some("r1"));
         started.0.extend(both);
+        // Recorded as started after them, it is not the run's: nothing is killed.
+        // (A cat that waits on its stdin, so its start time can be read before it exits.)
+        let mut later = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let after = start_time(later.id()).unwrap();
+        drop(later.stdin.take());
+        later.wait().unwrap();
+        assert!(
+            start_key(&after) > start_key(&before),
+            "{after} after {before}"
+        );
+        assert!(
+            !sweep(group, &after, "r1"),
+            "processes started before the run are not the run's"
+        );
+        for pid in both {
+            assert!(runs(pid), "started before the run: runs on");
+        }
         assert!(
             sweep(group, &before, "r1"),
             "the guard's group and session, with the run's id, are swept"

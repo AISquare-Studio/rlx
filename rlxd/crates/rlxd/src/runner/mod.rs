@@ -112,6 +112,12 @@ pub struct Runner {
     /// Test builds only: a space whose runs' state events wait this long, once published,
     /// before their lines are appended to the log (`RLXD_TEST_SLOW_APPEND=<space>:<ms>`).
     slow_append: Option<(String, Duration)>,
+    /// Test builds only: how long `run.cancel` waits before it answers, once the attempt
+    /// it cancelled has ended (`RLXD_TEST_CANCEL_REPLY_DELAY_MS`): room for a resume.
+    cancel_reply_delay: Option<Duration>,
+    /// Test builds only: how long `run.resume` waits with the run held for it, before it
+    /// decides (`RLXD_TEST_RESUME_DELAY_MS`): room for an erase or another resume.
+    resume_delay: Option<Duration>,
     runs: Mutex<Runs>,
     /// Set once rlxd stops: no run starts from then on.
     stopping: AtomicBool,
@@ -155,7 +161,14 @@ struct Run {
     /// What `run.list` shows of the run, as last published: its own lock, held for a copy
     /// and never over the disk, so a listing never waits on a run's lock.
     view: Mutex<View>,
+    /// How each of its attempts ended, the latest last (at most [`ENDS_KEPT`]): what a
+    /// `run.cancel` answers from, the attempt it cancelled's own end, whatever a resume did
+    /// since.
+    ends: watch::Sender<Vec<(u64, RunState)>>,
 }
+
+/// How many attempts' ends a run keeps for `run.cancel`.
+const ENDS_KEPT: usize = 16;
 
 /// A run as `run.list` shows it.
 #[derive(Clone)]
@@ -232,6 +245,14 @@ enum Durability {
 /// (5.4).
 pub(crate) const UNSYNCED_MAX: u32 = 64;
 
+/// What `run.cancel` did, under the run's lock.
+enum Cancel {
+    /// Ended the run, queued or waiting for the user, as it now is.
+    Ended(RunState),
+    /// Killed attempt `n`'s tree, whose end comes.
+    Ends(u64),
+}
+
 /// How an attempt ended.
 enum End {
     Done(RunDoneData),
@@ -279,6 +300,8 @@ impl Runner {
             slow_start: test_slow_in("RLXD_TEST_SLOW_START"),
             slow_erase: test_slow_in("RLXD_TEST_SLOW_ERASE"),
             slow_append: test_slow_in("RLXD_TEST_SLOW_APPEND"),
+            cancel_reply_delay: test_delay("RLXD_TEST_CANCEL_REPLY_DELAY_MS"),
+            resume_delay: test_delay("RLXD_TEST_RESUME_DELAY_MS"),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
         });
@@ -424,6 +447,11 @@ impl Runner {
                     started_at: record.started_at.clone(),
                     ended_at: record.ended_at.clone(),
                     last_run_seq,
+                }),
+                ends: watch::Sender::new(if record.state.is_live() {
+                    Vec::new()
+                } else {
+                    vec![(record.attempt, record.state)]
                 }),
                 params: record.params,
             });
@@ -602,6 +630,7 @@ impl Runner {
                 ended_at: None,
                 last_run_seq: 0,
             }),
+            ends: watch::Sender::new(Vec::new()),
             params,
         });
         let created = blocking(|| {
@@ -665,7 +694,7 @@ impl Runner {
     /// does one that waits for the user. A run that has ended is left as it was.
     pub async fn cancel(self: &Arc<Self>, id: &RunId) -> Result<RunCancelData, ErrorBody> {
         let run = self.find(id)?;
-        let mut changes = run.state.subscribe();
+        let mut ends = run.ends.subscribe();
         {
             // Out of its queue first, under the runner's lock, so no place goes to it. No
             // run's lock is taken under it: a run's may be held over a slow disk. (A run
@@ -689,9 +718,10 @@ impl Runner {
                     let failed =
                         RunFailedData::new(FailReason::Cancelled, message, inner.text.clone());
                     let placed = self.end(&run, &mut inner, End::Failed(failed));
+                    let ended = inner.state;
                     drop(inner);
                     self.release_if(placed, run.params.kind);
-                    Ok(false)
+                    Ok(Cancel::Ended(ended))
                 }
                 RunState::Running => {
                     inner.ending.get_or_insert(FailReason::Cancelled);
@@ -699,20 +729,40 @@ impl Runner {
                     if let Some(tree) = &inner.tree {
                         tree.kill();
                     }
-                    Ok(true)
+                    Ok(Cancel::Ends(inner.attempt))
                 }
                 state @ (RunState::Done | RunState::Failed) => Err(state),
             }
         });
-        match decided {
+        let attempt = match decided {
             Err(state) => return Ok(RunCancelData::new(id.clone(), false, state)),
-            Ok(true) => {
-                let _ = tokio::time::timeout(CANCEL_WAIT, changes.wait_for(|s| !s.is_live())).await;
+            Ok(Cancel::Ended(state)) => {
+                return Ok(RunCancelData::new(
+                    id.clone(),
+                    state == RunState::Failed,
+                    state,
+                ));
             }
-            Ok(false) => {}
+            Ok(Cancel::Ends(attempt)) => attempt,
+        };
+        // The answer is how the attempt it cancelled ended, whatever a resume did since.
+        let of_it = |ends: &Vec<(u64, RunState)>| {
+            ends.iter()
+                .rev()
+                .find(|(ended, _)| *ended == attempt)
+                .map(|(_, state)| *state)
+        };
+        let _ =
+            tokio::time::timeout(CANCEL_WAIT, ends.wait_for(|ends| of_it(ends).is_some())).await;
+        if let Some(delay) = self.cancel_reply_delay {
+            tokio::time::sleep(delay).await;
         }
-        let now = *run.state.borrow();
-        Ok(RunCancelData::new(id.clone(), now == RunState::Failed, now))
+        let ended = of_it(&ends.borrow());
+        Ok(match ended {
+            Some(state) => RunCancelData::new(id.clone(), state == RunState::Failed, state),
+            // Not ended within the wait: as it is now.
+            None => RunCancelData::new(id.clone(), false, *run.state.borrow()),
+        })
     }
 
     /// `run.resume`: a run with no live process goes on as a new attempt, with the same
@@ -758,6 +808,9 @@ impl Runner {
                 ));
             }
             runs.reserved.insert(id.clone(), run.params.space.clone());
+        }
+        if let Some(delay) = self.resume_delay {
+            std::thread::sleep(delay);
         }
         let resumed = self.resume_under_its_lock(&run, params.reply);
         let kind = run.params.kind;
@@ -1325,6 +1378,7 @@ impl Runner {
         inner.seeded = false;
         run.state.send_replace(state);
         run.show(inner);
+        run.ended_as(inner.attempt, state);
         info!("run {}: {state}", run.params.run_id);
         std::mem::take(&mut inner.placed)
     }
@@ -1699,6 +1753,9 @@ impl Runner {
             let mut view = View::of(inner);
             view.last_run_seq = run_seq;
             run.set_view(view);
+            if !inner.state.is_live() {
+                run.ended_as(inner.attempt, inner.state);
+            }
         }
         let scope = bus::Run {
             id,
@@ -1800,6 +1857,21 @@ impl Run {
     /// Shows `view` in `run.list`.
     fn set_view(&self, view: View) {
         *self.view.lock().unwrap_or_else(|p| p.into_inner()) = view;
+    }
+
+    /// Notes that `attempt` ended `state` (once: an end published again, as a failure, is
+    /// noted again).
+    fn ended_as(&self, attempt: u64, state: RunState) {
+        self.ends.send_if_modified(|ends| {
+            if ends.last() == Some(&(attempt, state)) {
+                return false;
+            }
+            ends.push((attempt, state));
+            if ends.len() > ENDS_KEPT {
+                ends.remove(0);
+            }
+            true
+        });
     }
 
     /// The run as `run.list` shows it.

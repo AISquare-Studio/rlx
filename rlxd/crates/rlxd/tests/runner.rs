@@ -1415,9 +1415,11 @@ fn a_result_too_large_for_run_done_still_ends_the_run_with_its_reason() {
 fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
     // Test builds only: the state events of runs in the space "slowdisk" wait 4 s before
     // they are made durable, as under a slow fsync.
-    let home = home_with("hello", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:4000")]);
+    // A takes its time, so it is still running when the resume below decides; every
+    // other run answers at once ("quick").
+    let home = home_with("slow", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:4000")]);
     let since = seq(&home);
-    let mut slow = task("hi");
+    let mut slow = task("take your time");
     slow["space"] = json!("slowdisk");
     let a = run_id();
     start(&home, &slow, &a);
@@ -1466,11 +1468,11 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
         quick("run.list during a resume", &["call", "run.list", "{}"]);
         quick(
             "run.start during a resume",
-            &["call", "run.start", &with_id(&task("hi"), &run_id())],
+            &["call", "run.start", &with_id(&task("quick"), &run_id())],
         );
         // Another run, in another space, starts and ends meanwhile.
         let b = run_id();
-        start(&home, &task("hi"), &b);
+        start(&home, &task("quick"), &b);
         let events = wait_until(&home, since, 20, "B ends", |e| ended(e, &b));
         assert!(
             of(&events, &a, Some("run.started")).is_empty(),
@@ -1488,7 +1490,7 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
         quick("run.list during a cancel", &["call", "run.list", "{}"]);
         quick(
             "run.start during a cancel",
-            &["call", "run.start", &with_id(&task("hi"), &run_id())],
+            &["call", "run.start", &with_id(&task("quick"), &run_id())],
         );
         assert_eq!(cancel.join().unwrap().code(), Some(0));
     });
@@ -1634,6 +1636,98 @@ fn a_run_is_not_live_once_its_end_is_published_though_its_log_line_comes_later()
     assert_eq!(listed["runs"][0]["state"], "done", "{listed:#}");
     // Not runs_live: it may wait for the run's lock, while its line is logged.
     call(&home, "space.erase", &json!({"name": "slowlog"}));
+}
+
+#[test]
+fn a_cancel_answers_for_the_attempt_it_cancelled_though_a_resume_follows() {
+    // Test builds only: state events in "slowdisk" take 2 s to be made durable, and a
+    // cancel waits 1.5 s more before it answers, so the resume lands in between.
+    let home = home_with(
+        "slow",
+        &[
+            ("RLXD_TEST_SLOW_PERSIST", "slowdisk:2000"),
+            ("RLXD_TEST_CANCEL_REPLY_DELAY_MS", "1500"),
+        ],
+    );
+    let since = seq(&home);
+    let mut slow = task("take your time");
+    slow["space"] = json!("slowdisk");
+    let r = run_id();
+    start(&home, &slow, &r);
+    wait_until(&home, since, 20, "the run starts", |e| {
+        !of(e, &r, Some("run.started")).is_empty()
+    });
+    thread::scope(|scope| {
+        let cancel = scope.spawn(|| call(&home, "run.cancel", &json!({"run_id": r})));
+        thread::sleep(Duration::from_millis(300));
+        let resumed = call(&home, "run.resume", &json!({"run_id": r}));
+        assert_eq!(resumed["attempt"], 2, "{resumed:#}");
+        let cancelled = cancel.join().unwrap();
+        assert_eq!(cancelled["cancelled"], true, "{cancelled:#}");
+        assert_eq!(cancelled["state"], "failed", "{cancelled:#}");
+    });
+    // Attempt 2 runs; it goes too.
+    let again = call(&home, "run.cancel", &json!({"run_id": r}));
+    assert_eq!(again["cancelled"], true, "{again:#}");
+}
+
+#[test]
+fn a_run_held_for_a_resume_is_live_for_an_erase_and_taken_for_another_resume() {
+    // Test builds only: a resume holds the run 1.5 s before it decides.
+    let home = home_with("hello", &[("RLXD_TEST_RESUME_DELAY_MS", "1500")]);
+    let mut busy = task("hi");
+    busy["space"] = json!("busy");
+    let (r, since, _) = gated_start(&home, &busy).wait();
+    thread::scope(|scope| {
+        let resume = scope.spawn(|| call(&home, "run.resume", &json!({"run_id": r})));
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            refused(&home, "space.erase", &json!({"name": "busy"})),
+            "runs_live"
+        );
+        assert_eq!(
+            refused(&home, "run.resume", &json!({"run_id": r})),
+            "run_alive"
+        );
+        assert_eq!(resume.join().unwrap()["attempt"], 2);
+    });
+    wait_until(&home, since, 20, "attempt 2 ends", |e| {
+        of(e, &r, None)
+            .iter()
+            .any(|e| e["type"] == "run.done" && e["data"]["attempt"] == 2)
+    });
+    call(&home, "space.erase", &json!({"name": "busy"}));
+}
+
+#[cfg(unix)]
+#[test]
+fn files_planted_at_old_temporary_names_wedge_no_attempt_and_take_no_write() {
+    // A FIFO at <run>/2/settings.json.tmp, and a link at <run>/run.json.tmp to a file
+    // outside: rlxd's writes go to new files of random names, so the resumed attempt
+    // runs, and the file outside is untouched.
+    let home = home("hello");
+    let (r, since, _) = gated_start(&home, &task("hi")).wait();
+    let dir = record_path(&home, &r).parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(dir.join("2")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(dir.join("2").join("settings.json.tmp"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let outside = home.root().join("outside");
+    std::fs::write(&outside, "keep\n").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("run.json.tmp")).unwrap();
+    call(&home, "run.resume", &json!({"run_id": r}));
+    wait_until(&home, since, 20, "attempt 2 ends", |e| {
+        of(e, &r, None)
+            .iter()
+            .any(|e| e["type"] == "run.done" && e["data"]["attempt"] == 2)
+    });
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep\n");
+    for file in [dir.join("run.json"), dir.join("2").join("settings.json")] {
+        let kind = std::fs::symlink_metadata(&file).unwrap().file_type();
+        assert!(kind.is_file(), "{file:?} is {kind:?}");
+    }
 }
 
 #[test]
