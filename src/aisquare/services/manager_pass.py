@@ -15,7 +15,7 @@ from aisquare.models import TeamSession
 from aisquare.services import manager_seat, transcript
 
 _PREFIX = "Scheduled manager pass "
-_DEFAULT = "Read the board range and act on what needs you. If nothing needs you, stop."
+_DEFAULT = "Read the board range and act on what needs you."
 
 
 class Pass(BaseModel):
@@ -252,11 +252,12 @@ def complete(store: ContextStore, session: TeamSession, pass_id: str) -> None:
 
 
 def retryable(pending: Pass, session: TeamSession) -> bool:
-    """Retry only after replacement or a later, finished turn."""
+    """Hold acknowledged passes until completion, replacement or explicit recovery."""
     if pending.session != session.id or pending.attempted_at is None:
         return True
     return (
-        session.state == "waiting"
+        pending.acknowledged_at is None
+        and session.state == "waiting"
         and session.prompted_at is not None
         and session.prompted_at >= pending.attempted_at
     )

@@ -16061,6 +16061,14 @@ def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
     watcher.tick(now + timedelta(seconds=1))
     assert sum(action == "paste" for _, action, _ in tmux.typed) == 1
     assert manager_pass.acknowledge(sid, prompt, now)
+    team_service.hook_prompt_heartbeat(sid, project.root)
+    assert team_service.hook_stop(sid, project.root) is None
+    for seconds in (2, 60, 120):
+        watcher.tick(now + timedelta(seconds=seconds))
+    assert [line for _, action, line in tmux.typed if action == "paste"] == [prompt]
+    with store_session() as store:
+        current = manager_pass.read(store, project.id, project.id)[1].pending
+        assert current is not None and current.acknowledged_at == now
     page = team_service.log_events(
         session_ref=sid, pass_id=pending.id, since_seq=pending.lower, through_seq=pending.upper
     )
