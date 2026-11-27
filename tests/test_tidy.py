@@ -220,6 +220,108 @@ def test_a_scratch_checkout_with_a_tracked_change_is_kept(
     assert [(k.path, k.why) for k in made.kept] == [(checkout, "uncommitted changes")]
 
 
+# --- F1 of #3507: a checkout whose repository goes with it keeps what no REMOTE has ------------
+
+
+def _clone(repo: Path, where: Path) -> Path:
+    """A clone of ``repo``'s bare remote at ``where``: its ``main`` is on the remote."""
+    remote = repo.parent / "remote.git"
+    if not remote.exists():
+        _git("clone", "-q", "--bare", str(repo), str(remote), cwd=repo.parent)
+    _git("clone", "-q", str(remote), str(where), cwd=repo.parent)
+    return where
+
+
+def _commit(checkout: Path, name: str) -> str:
+    (checkout / name).write_text(f"{name}\n", encoding="utf-8")
+    _git("add", name, cwd=checkout)
+    _git("commit", "-q", "-m", name, cwd=checkout)
+    return _git("rev-parse", "HEAD", cwd=checkout)
+
+
+def _kept_why(made: tidy.Plan, path: Path) -> str:
+    (why,) = [k.why for k in made.kept if k.path == path]
+    return why
+
+
+@pytest.mark.parametrize("age", [3 * HOUR, 8 * timedelta(days=1)], ids=["3 h", "8 d"])
+def test_a_clone_with_a_commit_on_no_remote_is_kept_however_old_its_session(
+    tmp_path: Path, repo: Path, age: timedelta
+) -> None:
+    """Tester #3507's data loss: the commit sat on the clone's own ``main``, which goes with it."""
+    session = session_dir()
+    clone = _clone(repo, session / "scratchpad" / "clone")
+    sha = _commit(clone, "only-here.txt")
+    aged(session, age)
+
+    made = planned(tmp_path)
+
+    assert clone not in rules(made) and session not in rules(made)
+    why = _kept_why(made, clone)
+    assert sha[:12] in why and "on no remote" in why and "push" in why, why
+    tidy.apply(made)
+    assert _git("cat-file", "-t", sha, cwd=clone) == "commit"
+
+
+def test_a_clone_whose_other_branch_has_a_commit_on_no_remote_is_kept(
+    tmp_path: Path, repo: Path
+) -> None:
+    session = session_dir()
+    clone = _clone(repo, session / "scratchpad" / "clone")
+    _git("switch", "-q", "-c", "side", cwd=clone)
+    sha = _commit(clone, "side.txt")
+    _git("switch", "-q", "main", cwd=clone)  # HEAD itself is on the remote
+    aged(session, 3 * HOUR)
+
+    why = _kept_why(planned(tmp_path), clone)
+
+    assert sha[:12] in why and "push" in why, why
+
+
+def test_a_clone_with_a_stash_is_kept(tmp_path: Path, repo: Path) -> None:
+    (repo / "tracked.txt").write_text("v1\n", encoding="utf-8")
+    _git("add", "tracked.txt", cwd=repo)
+    _git("commit", "-q", "-m", "tracked", cwd=repo)
+    session = session_dir()
+    clone = _clone(repo, session / "scratchpad" / "clone")
+    (clone / "tracked.txt").write_text("work in progress\n", encoding="utf-8")
+    _git("stash", "-q", cwd=clone)
+    aged(session, 3 * HOUR)
+
+    assert _kept_why(planned(tmp_path), clone).startswith("a stash"), "kept for its stash"
+
+
+def test_a_worktree_whose_repository_is_inside_the_session_counts_only_remotes(
+    tmp_path: Path, repo: Path
+) -> None:
+    """Its commit is on a branch of a repository that goes with the session: no remote has it."""
+    session = session_dir()
+    inner = _clone(repo, session / "scratchpad" / "repo")
+    tree = session / "scratchpad" / "wt"
+    _git("worktree", "add", "-q", "-b", "feature", str(tree), cwd=inner)
+    sha = _commit(tree, "feature.txt")
+    aged(session, 8 * timedelta(days=1))
+
+    made = planned(tmp_path)
+
+    assert session not in rules(made) and tree not in rules(made)
+    why = _kept_why(made, tree)
+    assert sha[:12] in why and "on no remote" in why, why
+
+
+def test_a_clone_with_everything_on_its_remote_goes(tmp_path: Path, repo: Path) -> None:
+    """The control: nothing of it lives only there."""
+    session = session_dir()
+    clone = _clone(repo, session / "scratchpad" / "clone")
+    aged(session, 3 * HOUR)
+
+    made = planned(tmp_path)
+
+    assert rules(made) == {clone: tidy.SESSION_CHECKOUT}
+    tidy.apply(made)
+    assert not clone.exists()
+
+
 # --- 4. ended agents' worktrees: reap's worktree half, with the tag rule -----------------------
 
 

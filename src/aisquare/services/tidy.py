@@ -521,33 +521,58 @@ def _git(cwd: Path, *args: str) -> fleet_service._GitResult:
     return fleet_service._git(cwd, *args)
 
 
-def _checkout_kept(checkout: Path) -> str | None:
+def _repository_goes(checkout: Path, scope: Path) -> bool:
+    """Whether ``checkout``'s repository is deleted with ``scope``: a clone's is its own ``.git``;
+    a linked worktree's is its common directory, gone with ``scope`` when it lies inside it. One
+    whose repository cannot be found is taken to go with it, the side that keeps more."""
+    if (checkout / ".git").is_dir():
+        return True
+    common = _common_dir(checkout)
+    if common is None:
+        return True
+    found = _real(common)
+    within = _real(scope)
+    return found is None or within is None or found.is_relative_to(within)
+
+
+def _commits(shas: list[str], where: str, then: str) -> str:
+    many = "commit" if len(shas) == 1 else "commits"
+    return f"{len(shas)} {many} {where} (newest {shas[0][:12]}): {then}, then tidy again"
+
+
+def _checkout_kept(checkout: Path, scope: Path) -> str | None:
     """Why ``checkout`` stays, or ``None``: changed or untracked work outside tagged directories,
-    or commits reachable from its HEAD that no branch, tag or remote has (#58: kept and named on
-    any doubt, git's word being the only one taken)."""
+    or a commit found nowhere that outlives the deletion (#58: kept and named on any doubt, git's
+    word being the only one taken).
+
+    Where the checkout's repository is deleted with ``scope`` (:func:`_repository_goes`), its own
+    branches and tags go too: only its REMOTES count as elsewhere, so every commit any of its refs
+    or worktrees reach must be on one, and its stash must be empty (tester #3507: a clone's
+    unpushed commit was deleted, counted as safe on the clone's own branch). A linked worktree of
+    a repository that stays counts that repository's branches and tags as well."""
     try:
         failed, _caches, other = fleet_service._untracked_caches(checkout)
         if failed is not None:
             return failed
         if other:
             return "uncommitted changes"
-        head = _git(checkout, "rev-parse", "--verify", "--quiet", "HEAD")
-        if head.returncode != 0 or not head.stdout.strip():
-            return None  # no commit at all: nothing of it lives only here
-        alone = _git(checkout, "rev-list", "HEAD", "--not", "--branches", "--tags", "--remotes")
+        if _repository_goes(checkout, scope):
+            stash = _git(checkout, "rev-parse", "--verify", "--quiet", "refs/stash")
+            if stash.returncode == 0 and stash.stdout.strip():
+                return "a stash, which goes with its repository: apply and push it, then tidy again"
+            alone = _git(checkout, "rev-list", "--all", "--not", "--remotes")
+            where, then = "on no remote", "push them"
+        else:
+            head = _git(checkout, "rev-parse", "--verify", "--quiet", "HEAD")
+            if head.returncode != 0 or not head.stdout.strip():
+                return None  # no commit at all: nothing of it lives only here
+            alone = _git(checkout, "rev-list", "HEAD", "--not", "--branches", "--tags", "--remotes")
+            where, then = "no branch, tag or remote has", "branch or push them"
         if alone.returncode != 0:
             return f"git could not say what only it has ({alone.stderr.strip()})"
         shas = alone.stdout.split()
         if shas:
-            many = "commit" if len(shas) == 1 else "commits"
-            return (
-                f"{len(shas)} {many} no branch, tag or remote has (newest {shas[0][:12]}): "
-                "branch or push them, then tidy again"
-            )
-        if (checkout / ".git").is_dir():
-            stash = _git(checkout, "rev-parse", "--verify", "--quiet", "refs/stash")
-            if stash.returncode == 0 and stash.stdout.strip():
-                return "a stash"
+            return _commits(shas, where, then)
     except fleet_service.FleetError as exc:
         return f"git could not be asked ({exc})"
     return None
@@ -593,8 +618,9 @@ def _one_session(
 ) -> None:
     kept: list[Path] = []
     gone: list[Path] = []
-    for checkout in _checkouts(directory):
-        why = _checkout_kept(checkout)
+    # A linked worktree before any clone: its repository may be one of them.
+    for checkout in sorted(_checkouts(directory), key=lambda c: (c / ".git").is_dir()):
+        why = _checkout_kept(checkout, directory)
         if why is None and _common_dir(checkout) is None and (checkout / ".git").is_file():
             why = "a worktree whose repository could not be found: git can't say what it holds"
         if why is None:
