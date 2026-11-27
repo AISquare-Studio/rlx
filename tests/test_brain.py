@@ -103,6 +103,22 @@ def test_accepted_is_written_before_the_method_runs() -> None:
     assert seen and seen[0].endswith('{"type":"accepted","id":5}\n'), seen
 
 
+def test_the_baseline_is_the_serving_brains_and_goes_with_it() -> None:
+    """While it serves, the brain holds the baseline its hooks start from; once it returns,
+    nothing of it is left in the process, so an in-process ``serve`` (a test's) puts nothing
+    back in a later hook of another (#617's CI)."""
+    held: list[int] = []
+
+    def probe(params: Mapping[str, Any]) -> dict[str, Any]:
+        held.append(len(brain._BASELINE))
+        return {}
+
+    raw = b"".join(json.dumps(f).encode() + b"\n" for f in [HELLO, _request(1, "probe")])
+    brain.serve(brain.Channel(io.BytesIO(raw), io.BytesIO()), {"probe": probe})
+    assert held and held[0] > 0, "a baseline while it serves"
+    assert not brain._BASELINE and not brain._BASELINE_MODULES
+
+
 def test_a_failed_request_is_answered_and_the_brain_goes_on() -> None:
     def boom(params: Mapping[str, Any]) -> dict[str, Any]:
         raise RuntimeError("no store")

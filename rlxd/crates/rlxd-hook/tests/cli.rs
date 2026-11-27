@@ -34,11 +34,13 @@ fn help_prints_the_usage() {
     );
 }
 
+/// A usage error says why and exits 0, as every hook does: Claude Code reads exit 2 as a
+/// blocking error (review #2562).
 #[test]
 fn anything_else_is_a_usage_error() {
     for args in [&[][..], &["serve"], &["--version", "--help"]] {
         let output = run(args);
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
         assert!(
             String::from_utf8(output.stderr)
@@ -78,9 +80,15 @@ impl NoRlxd {
     }
 
     fn run(&self, args: &[&str], stdin: &[u8]) -> Output {
+        self.run_with(args, stdin, &[])
+    }
+
+    /// [`NoRlxd::run`], with `envs` set too.
+    fn run_with(&self, args: &[&str], stdin: &[u8], envs: &[(&str, &str)]) -> Output {
         use std::io::Write;
         let mut child = Command::new(env!("CARGO_BIN_EXE_rlxd-hook"))
             .args(args)
+            .envs(envs.iter().copied())
             .env("AISQUARE_HOME", self.root.join("home"))
             .env_remove("RLX_HOME")
             .env("RLXD_RLX_BIN", &self.rlx)
@@ -89,8 +97,16 @@ impl NoRlxd {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("rlxd-hook runs");
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
-        child.wait_with_output().unwrap()
+        let mut pipe = child.stdin.take().unwrap();
+        let writing = std::thread::spawn({
+            let stdin = stdin.to_vec();
+            move || {
+                let _ = pipe.write_all(&stdin);
+            }
+        });
+        let output = child.wait_with_output().unwrap();
+        writing.join().unwrap();
+        output
     }
 }
 
@@ -154,35 +170,53 @@ fn ping_with_no_rlxd_exits_3_and_says_why() {
 
 #[test]
 fn an_event_it_does_not_take_is_a_usage_error() {
+    for args in [&["codex"][..], &["hook", "stop"], &["stop", "extra"]] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).starts_with("usage: rlxd-hook"));
+    }
+    // The gate's hook run wrongly still denies: an exit 0 with nothing printed would let
+    // Claude Code ask no one.
     for args in [
-        &["codex"][..],
-        &["hook", "stop"],
-        &["stop", "extra"],
-        &["pre-tool-use", "--run", "x"],
+        &["pre-tool-use", "--run", "x"][..],
         &["pre-tool-use", "--attempt", "0", "--run", "x"],
     ] {
         let output = run(args);
-        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 }
 
 /// A stand-in for rlxd in `here`'s home: it says ok to the hello and answers every `hook`
-/// with an ok reply whose stdout is `stdout`, as a wrong rlxd or brain could. It stops
-/// listening when dropped.
+/// as it is told, as a wrong rlxd or brain could, counting them. It stops listening when
+/// dropped.
 #[cfg(unix)]
 struct FakeRlxd {
     socket: std::path::PathBuf,
+    hooks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(unix)]
 impl FakeRlxd {
+    /// Answers each `hook` ok, with `stdout`.
     fn answering(here: &NoRlxd, stdout: &[u8]) -> Self {
+        use rlxd_client::proto::b64;
+        let data = serde_json::json!({"stdout_b64": b64::encode(stdout), "stderr_b64": "",
+            "exit_code": 0});
+        Self::replying(here, serde_json::json!({"ok": true, "data": data}))
+    }
+
+    /// Answers each `hook` with `reply`'s `ok` and `data` or `error`.
+    fn replying(here: &NoRlxd, reply: serde_json::Value) -> Self {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
+        use std::sync::atomic::Ordering;
+
         use rlxd_client::Home;
-        use rlxd_client::proto::b64;
         use serde_json::{Value, json};
 
         let layout = Home::at(here.root.join("home"));
@@ -195,24 +229,29 @@ impl FakeRlxd {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
-        let data = json!({"stdout_b64": b64::encode(stdout), "stderr_b64": "", "exit_code": 0});
+        let hooks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&hooks);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let data = data.clone();
+                let told = reply.clone();
+                let counted = std::sync::Arc::clone(&counted);
                 std::thread::spawn(move || {
                     let mut writer = &stream;
                     for line in BufReader::new(&stream).lines() {
                         let Ok(line) = line else { return };
                         let request: Value = serde_json::from_str(&line).unwrap_or_default();
-                        let said = match request["method"].as_str() {
-                            Some("hello") => json!({"protocol_version": 1,
+                        let mut reply = match request["method"].as_str() {
+                            Some("hello") => json!({"ok": true, "data": {"protocol_version": 1,
                                 "protocol_versions": [1], "rlxd_version": "0.10.3",
-                                "capabilities": []}),
-                            _ => data.clone(),
+                                "capabilities": []}}),
+                            _ => {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                told.clone()
+                            }
                         };
-                        let reply = json!({"schema_version": 1, "id": request["id"],
-                            "ok": true, "data": said});
+                        reply["schema_version"] = json!(1);
+                        reply["id"] = request["id"].clone();
                         if writeln!(writer, "{reply}").is_err() {
                             return;
                         }
@@ -220,7 +259,12 @@ impl FakeRlxd {
                 });
             }
         });
-        Self { socket }
+        Self { socket, hooks }
+    }
+
+    /// How many `hook` requests reached it.
+    fn hooks(&self) -> usize {
+        self.hooks.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -272,4 +316,115 @@ fn pre_tool_use_prints_only_a_deny_whatever_rlxd_answers() {
             "{case}"
         );
     }
+}
+
+/// A hook rlxd-hook cannot send as it is runs as `rlx hook`, with the same stdin, before
+/// anything reaches rlxd: a request longer than rlxd reads in one frame (its stdin, or its
+/// stdin with its variables), or a variable longer than rlxd-proto allows (review #2562).
+#[cfg(unix)]
+#[test]
+fn a_hook_too_long_for_one_frame_runs_as_rlx_hook_and_never_reaches_rlxd() {
+    use rlxd_client::proto::{HOOK_ENV_VALUE_MOST, HOOK_FRAME_MOST};
+
+    let stdin_alone = vec![b'a'; HOOK_FRAME_MOST / 4 * 3 + 64];
+    // In base64 it fits a frame alone (768 KiB), and not with ten long variables.
+    let with_vars = vec![b'b'; HOOK_FRAME_MOST / 16 * 9];
+    let near = "v".repeat(HOOK_ENV_VALUE_MOST - 1);
+    let over = "w".repeat(HOOK_ENV_VALUE_MOST + 1);
+    let many: Vec<(&str, &str)> = [
+        "AISQUARE_BOARD_CONTEXT",
+        "AISQUARE_BROKER",
+        "AISQUARE_PERSONA",
+        "AISQUARE_TEAM",
+        "AISQUARE_TEAM_DELTA",
+        "AISQUARE_PIPELINE_ID",
+        "AISQUARE_LAUNCH_ID",
+        "AISQUARE_FLEET_AGENT",
+        "CLAUDE_EFFORT",
+        "TMUX_PANE",
+    ]
+    .into_iter()
+    .map(|name| (name, near.as_str()))
+    .collect();
+    type Case<'a> = (&'a str, &'a [u8], Vec<(&'a str, &'a str)>);
+    let cases: [Case; 3] = [
+        ("stdin", &stdin_alone, vec![]),
+        ("stdin-and-vars", &with_vars, many),
+        (
+            "a-long-var",
+            b"{}",
+            vec![("AISQUARE_PERSONA", over.as_str())],
+        ),
+    ];
+    for (case, stdin, envs) in cases {
+        let here = NoRlxd::new(&format!("frame-{case}"));
+        let rlxd = FakeRlxd::answering(&here, b"from rlxd\n");
+        let output = here.run_with(&["user-prompt-submit"], stdin, &envs);
+        assert_eq!(output.status.code(), Some(0), "{case}");
+        let mut expected = b"fake rlx: hook user-prompt-submit\n".to_vec();
+        expected.extend_from_slice(stdin);
+        assert!(
+            output.stdout == expected,
+            "{case}: rlx hook, with the same stdin"
+        );
+        assert_eq!(rlxd.hooks(), 0, "{case}: nothing reached rlxd");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("running `rlx hook"),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// rlxd's refusal of the request itself (it handed nothing to the brain) runs the hook as
+/// `rlx hook`; an error once the brain may have it never does (review #2562).
+#[cfg(unix)]
+#[test]
+fn a_request_rlxd_refused_runs_as_rlx_hook_and_a_failed_hook_never_does() {
+    for (code, falls_back) in [
+        ("invalid_request", true),
+        ("invalid_params", true),
+        ("unknown_method", true),
+        ("role_not_allowed", true),
+        ("hook_not_delivered", true),
+        ("hook_failed", false),
+        ("hook_timeout", false),
+        ("internal", false),
+    ] {
+        let here = NoRlxd::new(&format!("refused-{code}"));
+        let rlxd = FakeRlxd::replying(
+            &here,
+            serde_json::json!({"ok": false, "error": {"code": code, "message": "m"}}),
+        );
+        let output = here.run(&["stop"], b"{\"session_id\":\"t1\"}\n");
+        assert_eq!(output.status.code(), Some(0), "{code}");
+        assert_eq!(rlxd.hooks(), 1, "{code}");
+        let ran = String::from_utf8_lossy(&output.stdout).contains("fake rlx: hook stop");
+        assert_eq!(ran, falls_back, "{code}: {output:?}");
+    }
+}
+
+/// A directory or variable JSON cannot carry unchanged is not sent lossily: the hook runs
+/// as `rlx hook`, which reads them as they are (review #2562's nit).
+#[cfg(unix)]
+#[test]
+fn a_hook_whose_variable_is_not_utf8_runs_as_rlx_hook() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+
+    let here = NoRlxd::new("not-utf8");
+    let rlxd = FakeRlxd::answering(&here, b"from rlxd\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_rlxd-hook"))
+        .arg("stop")
+        .env("AISQUARE_HOME", here.root.join("home"))
+        .env_remove("RLX_HOME")
+        .env("RLXD_RLX_BIN", &here.rlx)
+        .env("AISQUARE_PERSONA", OsStr::from_bytes(b"caf\xe9"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(rlxd.hooks(), 0);
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("fake rlx: hook stop"));
 }

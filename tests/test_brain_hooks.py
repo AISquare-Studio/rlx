@@ -78,6 +78,17 @@ def _payload(event: str, cwd: Path) -> bytes:
     return json.dumps({"session_id": "t1", "cwd": str(cwd), **PAYLOADS[event]}).encode()
 
 
+@pytest.fixture(autouse=True)
+def _no_baseline_of_another_test() -> Iterator[None]:
+    """Each test starts with no baseline, as a brain does before its hello. One kept in this
+    process (by an in-process ``serve`` of another test, in the same xdist worker) would put
+    back, before the next hook, what this test patched: #617's CI lost the three hooks'
+    threads and exit handler that way."""
+    brain.drop_baseline()
+    yield
+    brain.drop_baseline()
+
+
 @pytest.fixture
 def template(tmp_path: Path) -> tuple[Path, Path]:
     """A home with a project onboarded and a fact remembered, and the project: what each
@@ -216,12 +227,22 @@ class Brain:
             os.environ.__class__ = Recording
             sys.argv = [sys.argv[2]]
             from aisquare.services import brain
+
+            # The modules the baseline holds, which serve drops as it returns.
+            held = set()
+            take = brain.take_baseline
+
+            def taking():
+                take()
+                held.update(brain._BASELINE_MODULES)
+
+            brain.take_baseline = taking
             try:
                 code = brain.serve_stdio()
             finally:
                 late = sorted(
                     name for name in sys.modules
-                    if name.startswith("aisquare") and name not in brain._BASELINE_MODULES
+                    if name.startswith("aisquare") and name not in held
                     and name != "aisquare.services.brain"
                 )
                 with open(here, "w", encoding="utf-8") as out:
@@ -432,8 +453,7 @@ def baseline() -> Iterator[None]:
     try:
         yield
     finally:
-        brain._BASELINE.clear()
-        brain._BASELINE_MODULES.clear()
+        brain.drop_baseline()
 
 
 @pytest.mark.usefixtures("baseline")

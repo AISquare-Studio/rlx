@@ -13,7 +13,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use common::{TestHome, fake_brain, real_rlx, rlxd_hook};
+use common::{TestHome, fake_brain, real_rlx, rlxd_hook, workspace};
 use serde_json::{Value, json};
 
 /// A home with rlx's brain, and a project onboarded with a fact to print at session start.
@@ -86,6 +86,24 @@ impl Seeded {
         stdout
     }
 
+    /// `rlxd-hook <event>` with `stdin` and `envs`, whose fallback is the real rlx: its
+    /// stdout and stderr.
+    fn rlxd_hook_with(
+        &self,
+        event: &str,
+        stdin: &[u8],
+        envs: &[(&str, &str)],
+    ) -> (Vec<u8>, String) {
+        let rlx = self.rlx.display().to_string();
+        let mut all = vec![("RLXD_RLX_BIN", rlx.as_str())];
+        all.extend_from_slice(envs);
+        let (code, stdout, stderr) =
+            self.home
+                .run_bytes(&rlxd_hook(), &[event], &self.project, stdin, &all);
+        assert_eq!(code, Some(0), "rlxd-hook {event} exits 0: {stderr}");
+        (stdout, stderr)
+    }
+
     /// `rlx hook <event>` with `stdin`: its stdout.
     fn rlx_hook(&self, event: &str, stdin: &[u8]) -> Vec<u8> {
         let (code, stdout, stderr) =
@@ -120,16 +138,18 @@ fn fleet_events() -> Vec<(&'static str, &'static str, Value)> {
             "SessionStart",
             json!({"source": "startup"}),
         ),
+        // Not ASCII, so the bytes each side reads and writes are its stdio's encoding's,
+        // on Windows too (review #2562).
         (
             "user-prompt-submit",
             "UserPromptSubmit",
-            json!({"prompt": "x"}),
+            json!({"prompt": "x — naïve 日本語 ✓"}),
         ),
         ("stop", "Stop", json!({"stop_hook_active": false})),
         (
             "notification",
             "Notification",
-            json!({"message": "m", "notification_type": "idle_prompt"}),
+            json!({"message": "m — café ✓", "notification_type": "idle_prompt"}),
         ),
         (
             "stop-failure",
@@ -263,6 +283,78 @@ fn a_hook_the_brain_accepted_never_runs_again() {
         0,
         "the brain accepted it: no fallback ran it"
     );
+}
+
+/// Python, from the checkout's environment, as `real_rlx` finds rlx: `script` with `args`.
+fn python(script: &str, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new("uv");
+    command
+        .args(["run", "--quiet", "python", "-c", script])
+        .args(args)
+        .current_dir(workspace().parent().unwrap());
+    command
+}
+
+/// A session's end through the brain outlasts the store's wait for a busy database (5 s),
+/// as `rlx hook` does: under a 4 s `BEGIN EXCLUSIVE` it waits, ends the session's row, and
+/// never times out (review #2562: a 3 s deadline lost it).
+#[test]
+fn a_session_end_waits_out_a_busy_store_as_rlx_hook_does() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let Some(seeded) = Seeded::new() else { return };
+    seeded.home.start();
+    let role = [("AISQUARE_ROLE", "coder")];
+    let start = seeded.payload("SessionStart", json!({"source": "startup"}));
+    seeded.rlxd_hook_with("session-start", &start, &role);
+    let store = seeded.home.root().join("context.db").display().to_string();
+    let ended_at = || {
+        let output = python(
+            "import sqlite3, sys\n\
+             row = sqlite3.connect(sys.argv[1]).execute(\n\
+                 'SELECT ended_at FROM team_session WHERE id = ?', (sys.argv[2],)).fetchone()\n\
+             print('none' if row is None else (row[0] or ''))",
+            &[&store, "t1"],
+        )
+        .output()
+        .expect("python runs");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_eq!(ended_at(), "", "session-start made t1's row, not ended");
+    let mut holder = python(
+        "import sqlite3, sys, time\n\
+         db = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=30)\n\
+         db.execute('BEGIN EXCLUSIVE')\n\
+         print('held', flush=True)\n\
+         time.sleep(4)\n\
+         db.execute('COMMIT')",
+        &[&store],
+    )
+    .stdout(Stdio::piped())
+    .spawn()
+    .expect("python runs");
+    let mut said = String::new();
+    BufReader::new(holder.stdout.take().unwrap())
+        .read_line(&mut said)
+        .unwrap();
+    assert_eq!(said.trim(), "held");
+    let started = Instant::now();
+    let end = seeded.payload("SessionEnd", json!({"reason": "exit"}));
+    let (_, stderr) = seeded.rlxd_hook_with("session-end", &end, &role);
+    let took = started.elapsed();
+    assert!(holder.wait().unwrap().success());
+    assert!(!stderr.contains("not run again"), "{stderr}");
+    assert!(
+        took >= Duration::from_secs(3),
+        "it waited for the store: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(8),
+        "inside rlxd-hook's budget: {took:?}"
+    );
+    assert_ne!(ended_at(), "", "the session's row is ended");
 }
 
 #[test]

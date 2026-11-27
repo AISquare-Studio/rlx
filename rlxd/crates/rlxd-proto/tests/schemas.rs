@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
     Auth, BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, DaemonRecord, Data, Detail,
-    Envelope, ErrorBody, Event, HOOK_ENV_NAMES, HOOK_EVENTS, HelloData, HelloParams, HereData,
-    HookEventData, HookParams, HookReply, InstalledRlx, InstalledRlxd, Invalid, PRE_TOOL_USE,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request, RequestId, Role, RunScope, SCHEMA_VERSION,
-    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
-    SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, b64, brain_codes, codes,
-    daemon_kinds, deny_output, event_types, hook_codes, hook_env_forwarded, hook_event_type,
-    methods, protocol_version_of, schema_version_of, schemas, send_safety_lowers,
+    Envelope, ErrorBody, Event, HOOK_ENV_NAMES, HOOK_ENV_VALUE_MOST, HOOK_EVENTS, HelloData,
+    HelloParams, HereData, HookEventData, HookParams, HookReply, InstalledRlx, InstalledRlxd,
+    Invalid, PRE_TOOL_USE, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, Request, RequestId, Role,
+    RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams,
+    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, b64,
+    brain_codes, codes, daemon_kinds, deny_output, event_types, hook_codes, hook_env_forwarded,
+    hook_event_type, methods, protocol_version_of, schema_version_of, schemas, send_safety_lowers,
     send_safety_modes, setting_is_protected, setting_keys, topics,
 };
 use serde::Serialize;
@@ -2390,9 +2390,14 @@ fn hook_documents_refuse_their_wrong_shapes() {
         json!({"event": "stop", "stdin_b64": "", "env": {"A": 1}}),
         json!({"event": "stop", "stdin_b64": "", "run_id": ""}),
         json!({"event": "stop", "stdin_b64": "", "attempt": 0}),
+        json!({"event": "stop", "stdin_b64": "",
+               "env": {"PATH": "a".repeat(HOOK_ENV_VALUE_MOST + 1)}}),
     ] {
         both_refuse::<HookParams>("hook.json", params);
     }
+    let longest = json!({"event": "stop", "stdin_b64": "",
+                         "env": {"PATH": "a".repeat(HOOK_ENV_VALUE_MOST)}});
+    assert_eq!(agrees::<HookParams>("hook.json", &longest), longest);
     // What the schema cannot say: the event is one rlxd-hook takes, and the bytes base64.
     for params in [
         json!({"event": "codex", "stdin_b64": ""}),

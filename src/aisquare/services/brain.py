@@ -103,6 +103,10 @@ The allowlist (:data:`ENV_NAMES`), exact names, which rlxd-hook sends and the br
 - **The agents' own,** which only their adapters name: ``AgentAdapter.hook_env`` (Claude
   Code's config dir, pid, temporary folder and effort). No credential is among them.
 - **tmux's:** ``TMUX`` and ``TMUX_PANE``, the agent's pane.
+- **Python's start:** ``PYTHONIOENCODING`` and ``PYTHONUTF8``, which Python reads only as a
+  process starts. The brain's are rlxd's; rlxd hands a hook whose values differ to ``rlx
+  hook`` (``hook_not_delivered``), so the brain's streams are always the ones ``rlx hook``
+  would make.
 - **The process's:** ``PATH`` (which ``tmux``, ``git`` and ``claude`` a hook's children
   run), the user's home (``HOME``, and Windows' ``USERPROFILE``), ``TZ`` (times a hook
   prints), the locale's ``LC_CTYPE``, the temporary folder (``TMPDIR``, Windows' ``TEMP``
@@ -237,6 +241,11 @@ _RLX_NAMES = (
 #: tmux's: the pane the agent runs in.
 _TMUX_NAMES = ("TMUX", "TMUX_PANE")
 
+#: Python's, read only as a process starts: its stdio's encoding and UTF-8 mode. rlxd hands
+#: a hook whose values are not the brain's own to ``rlx hook`` (it would not start as the
+#: brain did); the brain sets the rest's, for the hook's children.
+_PYTHON_NAMES = ("PYTHONIOENCODING", "PYTHONUTF8")
+
 #: The process's own that the hook path reads: its programs, its user's home, its zone and
 #: locale; and Windows' for the same (its user's home and folders, its temporary folder).
 _PROCESS_NAMES = (
@@ -267,7 +276,7 @@ def _agent_names() -> set[str]:
 #: The parity test holds it to what the hooks read: every variable they read is here, and
 #: every one here they read, or is in :data:`ENV_READ_ELSEWHERE`.
 ENV_NAMES: tuple[str, ...] = tuple(
-    sorted({*_RLX_NAMES, *_TMUX_NAMES, *_PROCESS_NAMES, *_agent_names()})
+    sorted({*_RLX_NAMES, *_TMUX_NAMES, *_PYTHON_NAMES, *_PROCESS_NAMES, *_agent_names()})
 )
 _ENV_SET = frozenset(ENV_NAMES)
 
@@ -294,6 +303,12 @@ ENV_READ_ELSEWHERE: dict[str, str] = {
     "on paths these runs do not take",
     "TMUX_PANE": "the pane every tmux a hook starts, or a worker it detaches, takes as its "
     "own when a command names none",
+    "PYTHONIOENCODING": "Python reads it as a process starts, for its stdio's encoding: rlxd "
+    "does not deliver a hook whose value is not the brain's (it runs as a process of its "
+    "own); a child of the hook reads it",
+    "PYTHONUTF8": "Python reads it as a process starts (UTF-8 mode: stdio and text files): "
+    "rlxd does not deliver a hook whose value is not the brain's (it runs as a process of "
+    "its own); a child of the hook reads it",
     "HOME": "POSIX: the user's home, where Path.home() looks",
 }
 
@@ -406,6 +421,14 @@ def take_baseline() -> None:
             container = isinstance(value, _CONTAINERS) and not attribute.startswith("__")
             kept = _copy(value) if container else _PLAIN
             _BASELINE[(name, attribute)] = (value, kept)
+
+
+def drop_baseline() -> None:
+    """Forgets the baseline. :func:`serve` drops its own as it returns, so a process that
+    goes on after it (a test's) keeps nothing of it: a later in-process hook would otherwise
+    put back what that process changed since (a test's ``monkeypatch``)."""
+    _BASELINE.clear()
+    _BASELINE_MODULES.clear()
 
 
 def _put_back(value: object, kept: object) -> None:
@@ -867,6 +890,8 @@ def serve(channel: Channel, methods: Mapping[str, Method] | None = None) -> int:
         return 2
     except (BrokenPipeError, ConnectionResetError):
         return 0  # rlxd is gone
+    finally:
+        drop_baseline()
 
 
 def private_channel() -> Channel:

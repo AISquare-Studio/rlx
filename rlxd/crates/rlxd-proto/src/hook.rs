@@ -71,6 +71,8 @@ pub const HOOK_ENV_NAMES: &[&str] = &[
     "LC_CTYPE",
     "LOCALAPPDATA",
     "PATH",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
     "RLX_HOME",
     "TEMP",
     "TMP",
@@ -81,6 +83,15 @@ pub const HOOK_ENV_NAMES: &[&str] = &[
     "USERNAME",
     "USERPROFILE",
 ];
+
+/// The longest value of a variable rlxd-hook sends with a hook, in bytes. No path, zone or
+/// id is longer; a hook with a longer one is `rlx hook`'s, which reads it itself.
+pub const HOOK_ENV_VALUE_MOST: usize = 32 << 10;
+
+/// The longest `hook` request rlxd-hook sends, its line's bytes: the longest frame rlxd
+/// reads (its `server::MAX_FRAME`). A hook whose request would be longer (its stdin, in
+/// base64, with its variables) is `rlx hook`'s, run before anything is sent.
+pub const HOOK_FRAME_MOST: usize = 1 << 20;
 
 /// Whether rlxd-hook sends the variable `name` with a hook, and the brain sets it: one of
 /// [`HOOK_ENV_NAMES`], by its exact name, which Windows compares upper-case. Nothing else
@@ -151,8 +162,9 @@ pub struct HookParams {
     #[schemars(transform = drop_null, length(min = 1))]
     pub cwd: Option<String>,
     /// The variables of the allowlist rlxd-hook has, by name. A name off the list is
-    /// ignored.
+    /// ignored. No value is longer than [`HOOK_ENV_VALUE_MOST`] (32 KiB).
     #[serde(default)]
+    #[schemars(extend("additionalProperties" = {"type": "string", "maxLength": 32768}))]
     pub env: BTreeMap<String, String>,
     /// How long the brain may take to accept the hook, in milliseconds, before it is
     /// withdrawn unrun (`hook_not_delivered`). Absent is 5000.
@@ -331,6 +343,19 @@ impl HookParams {
         }
         if let Some(cwd) = &self.cwd {
             check::non_empty("cwd", cwd)?;
+        }
+        if let Some((name, value)) = self
+            .env
+            .iter()
+            .find(|(_, value)| value.len() > HOOK_ENV_VALUE_MOST)
+        {
+            return Err(Invalid::new(
+                "env",
+                format!(
+                    "{name} is {} bytes, more than {HOOK_ENV_VALUE_MOST}",
+                    value.len()
+                ),
+            ));
         }
         for (field, value) in [
             ("accept_ms", self.accept_ms),

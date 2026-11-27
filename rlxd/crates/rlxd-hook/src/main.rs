@@ -18,8 +18,13 @@
 //! **The fallback line.** rlxd-hook runs `rlx hook <event>` itself, with the same stdin
 //! bytes, only when the hook certainly never ran:
 //! - before it starts writing the `hook` request: no home, no token, rlxd not running, a
-//!   refused hello, a hook too big for one frame, or its own timer ending first;
-//! - after, only when rlxd answers `hook_not_delivered`: the brain never accepted it.
+//!   refused hello, its own timer ending first, or a hook it cannot send as it is: a
+//!   request longer than rlxd reads in one frame (`HOOK_FRAME_MOST`: the stdin in base64
+//!   with the variables), a variable longer than `HOOK_ENV_VALUE_MOST`, or a directory or
+//!   variable that is not UTF-8, which JSON cannot carry unchanged;
+//! - after, only when rlxd answers that it never handed the hook to the brain:
+//!   `hook_not_delivered` (the brain never accepted it), or a refusal of the request
+//!   itself (`invalid_request`, `invalid_params`, `unknown_method`, `role_not_allowed`).
 //!
 //! Anything else after the request starts out (rlxd's `hook_failed` or `hook_timeout`, a
 //! dropped connection, a reply it cannot read, or its own timer) may come after the brain
@@ -31,13 +36,17 @@
 //! **Its timer** ends below Claude Code's own timeout for the hook as rlx installs it:
 //! 120 s for `session-start` and `user-prompt-submit`, 10 s for `session-end`, 60 s for the
 //! rest. rlxd is asked to have the brain accept the hook within a quarter of that (5 s at
-//! most) and to answer 5 s before it ends.
+//! most) and to let it run until 1 s before the timer ends: a `session-end` gets 7 s, past
+//! the store's 5 s wait for a busy database, as `rlx hook` does. A hook still running then
+//! may have run, so rlxd-hook runs nothing more, whether rlxd's `hook_timeout` or its own
+//! timer comes first.
 //!
 //! **`pre-tool-use`** never falls back (`rlx hook` has no such handler): it prints a deny
 //! and exits 0 on any failure, and rlxd itself denies every call until the gate decides
 //! them (5.1). Until then it prints rlxd's reply only when it is a deny
 //! (`is_deny_output`); any other reply, an empty one included, is a failure too, so none
-//! lets a call through. Every hook exits 0.
+//! lets a call through. Every hook exits 0, a usage error too (Claude Code reads 2 as a
+//! blocking error): it says why on stderr, and `pre-tool-use` still prints its deny.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -50,8 +59,8 @@ use std::thread;
 use std::time::Duration;
 
 use rlxd_client::proto::{
-    Data, HOOK_ENV_NAMES, HOOK_EVENTS, HelloParams, HookParams, HookReply, PRE_TOOL_USE, Role,
-    VERSION, b64, deny_output, hook_codes, is_deny_output, methods,
+    Data, HOOK_ENV_NAMES, HOOK_EVENTS, HOOK_FRAME_MOST, HelloParams, HookParams, HookReply,
+    PRE_TOOL_USE, Role, VERSION, b64, codes, deny_output, hook_codes, is_deny_output, methods,
 };
 use rlxd_client::{CallError, ConnectError, Connection, Home, install};
 use serde::Deserialize;
@@ -63,8 +72,12 @@ Hands a Claude Code hook to rlxd, or runs `rlx hook <event>` when rlxd cannot ta
 stop-failure, notification. `ping` checks that rlxd and its brain answer.
 ";
 
-/// The largest hook rlxd-hook sends: its base64 and the rest stay under rlxd's 1 MiB frame.
-const MOST_STDIN: usize = 640 << 10;
+/// Room in a `hook` request's line for what is not its params: the envelope's id, method
+/// and schema version.
+const ENVELOPE_ROOM: usize = 256;
+
+/// Why a `pre-tool-use` hook run with a command line rlxd-hook does not take is denied.
+const MISRUN: &str = "rlxd-hook was run with arguments it does not take, so the call is denied";
 
 /// Why a `pre-tool-use` hook rlxd-hook could not ask rlxd about is denied.
 const UNREACHED: &str = "rlxd could not be asked about this tool call, so it is denied";
@@ -92,16 +105,21 @@ fn main() -> ExitCode {
         ["ping"] => ping(),
         [PRE_TOOL_USE, rest @ ..] => match run_of(rest) {
             Some(run) => pre_tool_use(run),
-            None => usage(),
+            None => {
+                write_out(deny_output(MISRUN).as_bytes());
+                usage()
+            }
         },
         [event] if HOOK_EVENTS.contains(event) => fleet_hook(event),
         _ => usage(),
     }
 }
 
+/// A command line rlxd-hook does not take: why on stderr, and exit 0, as every hook does
+/// (Claude Code reads exit 2 as a blocking error).
 fn usage() -> ExitCode {
     eprint!("{USAGE}");
-    ExitCode::from(2)
+    ExitCode::SUCCESS
 }
 
 /// Prints `text` on stdout, and fails rather than panics when stdout is closed.
@@ -157,9 +175,18 @@ fn budget(event: &str) -> Duration {
 fn times(event: &str) -> (u64, u64) {
     let budget = budget(event).as_millis() as u64;
     let accept = (budget / 4).min(5_000);
-    let deadline = budget.saturating_sub(5_000).max(accept);
+    let deadline = budget.saturating_sub(1_000).max(accept);
     (accept, deadline)
 }
+
+/// rlxd's refusals of a request itself, before it hands anything to the brain: the hook
+/// never ran.
+const NEVER_HANDED_ON: &[&str] = &[
+    codes::INVALID_REQUEST,
+    codes::INVALID_PARAMS,
+    codes::UNKNOWN_METHOD,
+    codes::ROLE_NOT_ALLOWED,
+];
 
 /// How asking rlxd ended.
 enum Asked {
@@ -229,16 +256,17 @@ fn emit(reply: &HookReply) {
 /// Asks rlxd about the hook, within `budget`, on a thread of its own: past the budget, the
 /// hook never ran if the request had not started out, and may have otherwise.
 fn ask_in_time(event: &str, stdin: &[u8], run: Option<(String, u64)>, budget: Duration) -> Asked {
-    if stdin.len() > MOST_STDIN {
-        return Asked::NeverRan(format!(
-            "the hook's {} bytes are more than rlxd takes in one frame",
-            stdin.len()
-        ));
+    if stdin.len().div_ceil(3) * 4 > HOOK_FRAME_MOST {
+        return Asked::NeverRan(too_long(stdin.len().div_ceil(3) * 4));
     }
     let params = match params_of(event, stdin, run) {
         Ok(params) => params,
         Err(why) => return Asked::NeverRan(why),
     };
+    let line = serde_json::to_vec(&params).map_or(usize::MAX, |params| params.len());
+    if line.saturating_add(ENVELOPE_ROOM) > HOOK_FRAME_MOST {
+        return Asked::NeverRan(too_long(line));
+    }
     let stage = Arc::new(AtomicU8::new(READY));
     let (said, answer) = mpsc::channel();
     let asking = Arc::clone(&stage);
@@ -261,17 +289,35 @@ fn ask_in_time(event: &str, stdin: &[u8], run: Option<(String, u64)>, budget: Du
     }
 }
 
-/// `hook`'s params for this hook.
+fn too_long(bytes: usize) -> String {
+    format!(
+        "the hook's request would be {bytes} bytes or more, longer than rlxd reads in one frame"
+    )
+}
+
+/// `hook`'s params for this hook, or why it cannot be sent as it is: a directory or a
+/// variable that is not UTF-8 (JSON carries text, and a lossy one would not be the hook's),
+/// or a variable longer than rlxd-proto allows.
 fn params_of(event: &str, stdin: &[u8], run: Option<(String, u64)>) -> Result<Data, String> {
     // By exact name, as Windows looks one up whatever its case; nothing else.
-    let env: BTreeMap<String, String> = HOOK_ENV_NAMES
-        .iter()
-        .filter_map(|&name| Some((name.to_owned(), std::env::var(name).ok()?)))
-        .collect();
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|dir| dir.display().to_string())
-        .filter(|dir| !dir.is_empty());
+    let mut env = BTreeMap::new();
+    for &name in HOOK_ENV_NAMES {
+        if let Some(value) = std::env::var_os(name) {
+            let value = value
+                .into_string()
+                .map_err(|_| format!("the hook's {name} is not UTF-8"))?;
+            env.insert(name.to_owned(), value);
+        }
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => Some(
+            dir.into_os_string()
+                .into_string()
+                .map_err(|_| "the hook's directory is not UTF-8".to_owned())?,
+        ),
+        Err(_) => None,
+    }
+    .filter(|dir| !dir.is_empty());
     let (accept, deadline) = times(event);
     let mut params = HookParams::new(event, b64::encode(stdin), cwd, env)
         .and_then(|params| params.with_times(accept, deadline))
@@ -314,6 +360,11 @@ fn ask(params: Data, stage: &AtomicU8) -> Asked {
         Some(error) if error.code == hook_codes::HOOK_NOT_DELIVERED => {
             Asked::NeverRan(format!("rlxd's brain did not take it: {}", error.message))
         }
+        // rlxd refused the request itself, so nothing of it reached the brain.
+        Some(error) if NEVER_HANDED_ON.contains(&error.code.as_str()) => Asked::NeverRan(format!(
+            "rlxd refused it, {}: {}",
+            error.code, error.message
+        )),
         Some(error) => Asked::MayHaveRun(format!("rlxd said {}: {}", error.code, error.message)),
         None => Asked::MayHaveRun("rlxd's reply says nothing".to_owned()),
     }
@@ -406,17 +457,19 @@ mod tests {
         assert_eq!(budget("session-start"), Duration::from_secs(118));
         assert_eq!(budget("session-end"), Duration::from_secs(8));
         assert_eq!(budget("stop"), Duration::from_secs(58));
-        assert_eq!(times("session-start"), (5_000, 113_000));
-        assert_eq!(times("session-end"), (2_000, 3_000));
+        assert_eq!(times("session-start"), (5_000, 117_000));
+        // Past the store's 5 s wait for a busy database (review #2562).
+        assert_eq!(times("session-end"), (2_000, 7_000));
+        assert_eq!(times("stop"), (5_000, 57_000));
         for event in HOOK_EVENTS {
             let (accept, deadline) = times(event);
-            // rlxd answers by the deadline plus 4 s (an ack wait and a kill): inside the
-            // timer, which leaves the fallback the rest.
-            assert!(
-                deadline + 4_000 < budget(event).as_millis() as u64,
+            assert_eq!(
+                deadline + 1_000,
+                budget(event).as_millis() as u64,
                 "{event}"
             );
             assert!(accept <= deadline, "{event}");
+            assert!(accept <= 5_000, "{event}");
         }
     }
 

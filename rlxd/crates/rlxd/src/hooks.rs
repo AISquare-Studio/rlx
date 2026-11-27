@@ -12,6 +12,10 @@
 //!   (`hook_env_forwarded`; any other name is dropped here), and answers the bytes for
 //!   rlxd-hook's stdout and stderr. The brain must accept it within `accept_ms` (5 s
 //!   unless rlxd-hook says less) and finish it within `deadline_ms`.
+//! - **Python's start.** What Python reads only as a process starts, and which shapes a
+//!   hook's stdio and text files (`PYTHONIOENCODING`, `PYTHONUTF8`), is the brain's own:
+//!   rlxd's, which started it. A fleet hook whose values differ cannot run in the brain as
+//!   `rlx hook` would, so it is `hook_not_delivered` too, and runs as `rlx hook`.
 //! - **The fallback line** is the brain's `accepted`. A hook the brain never accepted
 //!   fails with `hook_not_delivered`: nothing of it ran, and rlxd-hook runs `rlx hook
 //!   <event>` itself. Once accepted, a failure is `hook_failed` and an overrun
@@ -62,6 +66,9 @@ pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
     publish(daemon, &params, &stdin);
     if params.event == PRE_TOOL_USE {
         return Ok(reply(deny_output(NO_GATE_YET).as_bytes()));
+    }
+    if let Err(why) = same_start(&params.env, |name| std::env::var(name).ok()) {
+        return Err(error(hook_codes::HOOK_NOT_DELIVERED, &why));
     }
     let env: serde_json::Map<String, Value> = params
         .env
@@ -159,6 +166,29 @@ fn same_home(own: &Home, params: &HookParams) -> Result<(), String> {
     }
 }
 
+/// The variables Python reads only as a process starts that shape what a hook writes and
+/// reads: its stdio's encoding (`PYTHONIOENCODING`) and UTF-8 mode (`PYTHONUTF8`).
+const READ_AT_START: &[&str] = &["PYTHONIOENCODING", "PYTHONUTF8"];
+
+/// Whether the hook's [`READ_AT_START`] variables are the brain's (`own`: rlxd's, which the
+/// brain started with). Else why not: the brain's streams and files would not be the ones
+/// `rlx hook` makes.
+fn same_start(
+    hook: &std::collections::BTreeMap<String, String>,
+    own: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    for &name in READ_AT_START {
+        let theirs = hook.get(name).map(String::as_str);
+        if theirs != own(name).as_deref() {
+            return Err(format!(
+                "the hook's {name} is not the brain's, which Python reads only as it starts: \
+                 run as `rlx hook`, which starts with it"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `path`, joined to `cwd` when relative, as the OS resolves it (links and `..` gone)
 /// when it exists.
 fn real(path: &Path, cwd: Option<&Path>) -> PathBuf {
@@ -226,5 +256,40 @@ fn with_brain(code: &str, message: &str, why: &ErrorBody) -> ErrorBody {
     match detail {
         Value::Object(fields) => base.clone().with_detail(fields).unwrap_or(base),
         _ => base,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn rlxd_hook_sends_no_frame_longer_than_rlxd_reads() {
+        assert_eq!(rlxd_proto::HOOK_FRAME_MOST, crate::server::MAX_FRAME);
+    }
+
+    #[test]
+    fn a_hook_python_starts_otherwise_is_not_the_brains() {
+        let hook = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+                .collect()
+        };
+        let none: fn(&str) -> Option<String> = |_| None;
+        let utf8: fn(&str) -> Option<String> =
+            |name| (name == "PYTHONUTF8").then(|| "1".to_owned());
+        assert!(same_start(&hook(&[("PATH", "/bin")]), none).is_ok());
+        assert!(same_start(&hook(&[("PYTHONUTF8", "1")]), utf8).is_ok());
+        for (theirs, own) in [
+            (hook(&[("PYTHONUTF8", "1")]), none),
+            (hook(&[]), utf8),
+            (hook(&[("PYTHONUTF8", "0")]), utf8),
+            (hook(&[("PYTHONIOENCODING", "latin-1")]), none),
+        ] {
+            assert!(same_start(&theirs, own).is_err(), "{theirs:?}");
+        }
     }
 }
