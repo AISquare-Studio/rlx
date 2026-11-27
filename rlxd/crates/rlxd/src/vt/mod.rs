@@ -575,11 +575,20 @@ mod tests {
         // #2585's sequence: the cursor ?1049h saves at row 22 of 24 outlives the
         // alternate screen; ?47h after a shorter resize, then a wider one, then ?1049l
         // restores it. tmux reads past its lines there; rlxd clamps it to the screen.
-        for (cols, rows) in [(100, 10), (80, 10)] {
+        // And the #28 tester's (#2589): row 20, ?1047h, at each of its sizes.
+        let cases = [
+            (22, &b"\x1b[?47h"[..], 100, 10),
+            (22, b"\x1b[?47h", 80, 10),
+            (20, b"\x1b[?1047h", 40, 12),
+            (20, b"\x1b[?1047h", 40, 5),
+            (20, b"\x1b[?1047h", 100, 5),
+            (20, b"\x1b[?1047h", 80, 5),
+        ];
+        for (row, enter, cols, rows) in cases {
             let mut terminal = Terminal::new(80, 24, 100, "test");
-            terminal.feed(b"\x1b[22;1H\x1b[?1049h\x1b[?1049l");
+            terminal.feed(format!("\x1b[{row};1H\x1b[?1049h\x1b[?1049l").as_bytes());
             terminal.resize(80, 10);
-            terminal.feed(b"\x1b[?47h");
+            terminal.feed(enter);
             terminal.resize(cols, rows);
             terminal.feed(b"\x1b[?1049l");
             let (_, y, _) = terminal.cursor();

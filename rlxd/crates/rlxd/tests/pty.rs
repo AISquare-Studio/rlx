@@ -749,11 +749,22 @@ import time; time.sleep(60)
         &home,
         json!({"argv": ["python3", "-c", program], "cols": 80, "rows": 24}),
     );
-    eventually("the history fills", || {
+    // 17 MB of colour for a debug build's screen to take: slow on a CI runner.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
         let shown = screen(&home, &id);
-        shown["history"].as_u64().unwrap() >= 6900
+        if shown["history"].as_u64().unwrap() >= 6900
             && shown["text"].as_str().unwrap().contains("done")
-    });
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the history never filled: {}",
+            shown["history"]
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let all = call(
         &home,
         "pty.screen",
