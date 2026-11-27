@@ -6,9 +6,10 @@
 //! events`. One rlxd runs per home, on a local socket or named pipe, and a client gets in
 //! with the shared token through `hello`. Every reply is the 7.2 envelope, and
 //! `events.subscribe` streams the home's events. `settings.get`, `settings.set` and
-//! `settings.list` serve the app settings every device shares. `run.start` and
-//! `run.cancel` drive the headless runner (2.1, 7.5), and `space.ensure` the spaces its
-//! runs work in (2.5). The PTY host and the rest are later items, each a method on this
+//! `settings.list` serve the app settings every device shares. `run.start`,
+//! `run.cancel`, `run.resume`, `run.get`, `run.list` and `run.events` drive the headless
+//! runner and its durable log (2.1, 5.4, 7.5), and `space.ensure` and `space.erase` the
+//! spaces its runs work in (2.5). The PTY host and the rest are later items, each a method on this
 //! socket, publishing on the bus.
 //! `rlxd here [--start]` is the probe rlx.app runs over SSH: what is installed, whether
 //! rlxd runs, and the protocol versions it serves.

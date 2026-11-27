@@ -68,17 +68,48 @@ fn linked(path: &Path) -> io::Error {
     )
 }
 
+/// Every link inside `space`, found without following any: a symlink, or on Windows a
+/// junction. (Windows' erase lists them before std removes them; elsewhere the erase
+/// finds them as it removes.)
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn links_in(space: &Path) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    let mut pending: Vec<PathBuf> = fs::read_dir(space)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    while let Some(path) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            links.push(path);
+            continue;
+        }
+        if meta.is_dir()
+            && let Ok(entries) = fs::read_dir(&path)
+        {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    links
+}
+
 /// `path` resolved, without Windows' verbatim prefix (`\\?\C:\x` is `C:\x`).
 pub fn resolved(path: &Path) -> io::Result<PathBuf> {
-    let resolved = fs::canonicalize(path)?;
-    let text = resolved.to_string_lossy();
+    Ok(plain(&fs::canonicalize(path)?))
+}
+
+/// `path` without Windows' verbatim prefix (`\\?\C:\x` is `C:\x`, `\\?\UNC\s\x` is
+/// `\\s\x`), as it is shown.
+pub fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
     if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-        return Ok(PathBuf::from(format!(r"\\{unc}")));
+        return PathBuf::from(format!(r"\\{unc}"));
     }
     if let Some(plain) = text.strip_prefix(r"\\?\") {
-        return Ok(PathBuf::from(plain));
+        return PathBuf::from(plain);
     }
-    Ok(resolved)
+    path.to_path_buf()
 }
 
 #[cfg(test)]

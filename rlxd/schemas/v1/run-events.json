@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunEventsParams",
+  "description": "`run.events`'s params: replay a run's durable log from `from_run_seq`, then, for a\nlive run, follow it until it ends. The stream is event frames, then the reply\n`{run_id, last_run_seq}`, which ends it.\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\", \"from_run_seq\": 2}\n```",
+  "type": "object",
+  "properties": {
+    "from_run_seq": {
+      "description": "The first `run_seq` to send. Absent: 1, the run's first event.",
+      "type": "integer",
+      "format": "uint64",
+      "default": 1,
+      "maximum": 18446744073709551615,
+      "minimum": 1
+    },
+    "run_id": {
+      "description": "The run.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "required": [
+    "run_id"
+  ]
+}

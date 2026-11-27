@@ -260,13 +260,16 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   without rlxd holding it, and a result or structured output over 1 MiB fails it
   (`output_too_large`), so a run always gets its end.
 - **The process tree.** On macOS and Linux Claude Code runs under a guard, the hidden
-  `rlxd __run-guard`: Claude Code leads a process group of its own, and the guard kills
-  that group when Claude Code exits (what it left running goes with it), when rlxd tells
-  it to (cancel, timeout), and when rlxd dies (it checks its parent every 100 ms; on Linux
-  its parent-death signal too). It kills the group only while Claude Code is unreaped,
-  so the group's id can't be another's, and it exits as Claude Code did, a signal
-  included. On Windows Claude Code is started suspended inside a Job Object with
-  `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
+  `rlxd __run-guard`, which leads a new session and process group (ids: its pid, which
+  stays held while it is unreaped); Claude Code and what it starts run in that group,
+  with no terminal. The guard kills the group when Claude Code exits (what it left
+  running goes with it), and when rlxd dies (it checks its parent every 100 ms; on Linux
+  its parent-death signal too, and Claude Code's from the guard). rlxd kills the group
+  on a cancel or a timeout, and as soon as it sees the guard exit, before it reaps it,
+  so a guard killed alone leaves nothing. The guard tells rlxd how Claude Code ended
+  (`exit 1`, `signal 6`) over an inherited pipe, for `run.failed`'s message, and never
+  re-raises the signal. On Windows Claude Code is started suspended inside a Job Object
+  with `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
   "engine_restarted"}`.
 - **The log** of each run is `<home>/rlxd/runs/<run_id>/`: `run.json`, rewritten whole and
   durably, and `events.jsonl`, each event as published. The runner numbers each run's
@@ -276,10 +279,60 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   and fsynced with the run's next state event or every 64. No fsync happens under the
   bus's lock or the runner's, so a slow disk under one run holds up no other run and no
   other topic.
+- **The lifecycle** (5.4). `run.get {run_id}` and `run.list {states?, job_id?, limit?}`
+  read the runs rlxd knows, those from before a restart too: rlxd reads every run's record
+  when it starts. `run.events {run_id, from_run_seq}` replays a run's log from disk,
+  never from the bus's buffer, then follows a live run until it ends; `rlxd call` prints
+  each event as a line and exits 0 when the stream closes.
+- **Needs-you and resume.** A finished run whose output matches `needs_you_when` ends
+  `run.needs_you {reason: "question", question}`, after `needs_you.raised` on the
+  `needs_you` topic. `run.resume {run_id, reply?}` goes on with a run that has no live
+  process as a new attempt (`--resume <run_id>`, its own settings file, the reply as its
+  first message), and `needs_you.cleared` follows, after a restart too. It refuses
+  `run_alive`, `not_resumable` (a `send_executor`) and `no_session`, also for a run that
+  never reached `run.started` (cancelled while queued, failed before it started), which
+  has no session to resume.
+- **After a crash or a `kill -9`,** the guard has already ended the run's process group.
+  Should the guard have died with rlxd (`killall -9 rlxd`), the next rlxd, in the same
+  boot only, kills the guard's group if the guard still runs with the recorded pid and
+  start time. Otherwise the group is the run's only when one of its processes, in the
+  guard's session and started at or after the run, carries `RLXD_RUN_ID=<run_id>`, which
+  every process of a run inherits (a group's id can't be taken while one of its
+  processes lives); then each such process is killed. On macOS an Apple binary's
+  environment is hidden, even from its own user, so a run whose leftovers are all
+  Apple's (a Bash tool's `zsh`, `sleep` or `tail -f`, with Claude Code gone) can't be
+  told from another group, and is left: the sweep never kills what it can't tell is the
+  run's. On Linux Claude Code dies with the guard (its parent-death signal), and
+  `/proc` shows the environment of each of the user's own processes. It cuts a torn last line from the run's log,
+  puts back a state event its record holds that the log lost, and ends the run `failed
+  {reason: "engine_restarted"}`, numbered on from its log.
+- **`job_id`** is set by rlxd alone, for the scheduler (7.6). Test builds have
+  `debug.run_start`, `run.start`'s params plus a `job_id`.
 - **Spaces.** `space.ensure {name}` makes `<home>/spaces/<name>/` with an empty project
   `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
   not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
-  separator, no `..` and no leading dot.
+  separator, no `..` and no leading dot. `space.erase {name}` deletes the folder, the
+  Claude Code session files of its runs, and rlxd's records of them. Session files are
+  `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
+  (every account's config directory once the brain serves rlx's list), the space dir
+  encoded as Claude Code does: no other project folder is touched.
+  It refuses `runs_live` while a run in the space is queued, running, being started or
+  being resumed, and `link_refused` (`detail.paths`) when a link, a junction or a mount
+  point is below a root on the way: `spaces/`, the space itself, a config directory's
+  `projects/`, or the space's folder there; nothing is removed then. `<home>` and each
+  config directory are roots, taken as they resolve once (a `~/.claude` kept in dotfiles
+  is fine), and the config directories are only gone into when the space has runs. Every folder on the way is
+  opened once without following a link, and checked and removed through what was opened
+  (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
+  from being renamed meanwhile), so a link put there after the check is never followed.
+  A link inside the space goes as a link and is named in `links`, every one, under the
+  space's resolved path. A mount point inside the space (another filesystem, or on Linux
+  a bind mount of the same one) is never gone into, and a tree more than 256 folders
+  deep is not removed past that: either fails the erase `erase_incomplete`, naming it.
+  A second erase of a space being erased gets `erase_in_progress`. Paths it can't remove
+  fail it `erase_incomplete` (`detail {removed, failed}`, each failure named under the
+  space's resolved path), the runs concerned keep their records, and erasing again
+  finishes.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 

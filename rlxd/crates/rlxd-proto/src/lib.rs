@@ -201,10 +201,12 @@ pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use marker::{False, True, V1};
 pub use request::{Params, Request, RequestId, methods};
 pub use run::{
-    ConnectorStatus, DEFAULT_DEADLINE_MS, FailReason, McpServer, Mount, NeedsYouReason,
-    NeedsYouWhen, PinnedCall, RunCancelData, RunDoneData, RunEvent, RunFailedData, RunId, RunKind,
-    RunNeedsYouData, RunQueuedData, RunRateLimitedData, RunRef, RunStartParams, RunStartedData,
-    RunState, RunTextData, RunToolResultData, Usage, run_types,
+    CallState, ConnectorStatus, DEFAULT_DEADLINE_MS, FailReason, McpServer, Mount,
+    NeedsYouClearedData, NeedsYouRaisedData, NeedsYouReason, NeedsYouSource, NeedsYouWhen,
+    PinnedCall, RunCall, RunCancelData, RunDoneData, RunEvent, RunEventsData, RunEventsParams,
+    RunFailedData, RunGetData, RunId, RunKind, RunListData, RunListParams, RunNeedsYouData,
+    RunQueuedData, RunRateLimitedData, RunRef, RunResumeData, RunResumeParams, RunStartParams,
+    RunStartedData, RunState, RunSummary, RunTextData, RunToolResultData, Usage, run_types,
 };
 pub use settings::{
     MAX_DEPTH as MAX_SETTING_DEPTH, MAX_KEY as MAX_SETTING_KEY, Setting, SettingsChanged,
