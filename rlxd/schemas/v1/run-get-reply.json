@@ -42,14 +42,7 @@
     },
     "last_event": {
       "description": "Its last event, as the stream carried it.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/Event"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/Event"
     },
     "last_run_seq": {
       "description": "Its last event's `run_seq`, 0 before its first.",

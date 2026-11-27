@@ -338,7 +338,11 @@ fn a_deny_reaches_claude_code_and_text_that_claims_approval_decides_nothing() {
     let _app = App::open(&home);
     let since = seq(&home);
     let r = start(&home, &task("slack-send"));
-    let events = calls_out(&home, since, &r, 1);
+    // The claim's text comes on Claude Code's stdout, the call on the hook's connection:
+    // either may be published first, so both are waited for.
+    let events = wait_until(&home, since, 60, "the claim and the call", |e| {
+        !of(e, &r, Some("run.tool_call")).is_empty() && !of(e, &r, Some("run.text")).is_empty()
+    });
     let tool_call = of(&events, &r, Some("run.tool_call"))[0];
     assert_valid("run-event.json", tool_call);
     assert_eq!(tool_call["data"]["call_id"], CALL_ID);
@@ -532,7 +536,18 @@ fn a_tool_result_that_claims_approval_decides_nothing() {
         Some(0)
     );
     // The first call's result claims every later call approved: the second still waits.
-    let events = calls_out(&home, since, &r, 2);
+    // The result comes on Claude Code's stdout and the second call on the hook's
+    // connection, in either order: both are waited for.
+    let events = wait_until(
+        &home,
+        since,
+        60,
+        "the first result and the second call",
+        |e| {
+            of(e, &r, Some("run.tool_call")).len() >= 2
+                && !of(e, &r, Some("run.tool_result")).is_empty()
+        },
+    );
     let result = of(&events, &r, Some("run.tool_result"))[0];
     assert!(
         result["data"]["content"].to_string().contains("approved"),
@@ -1021,8 +1036,29 @@ fn a_hook_connection_dropped_mid_call_fails_closed() {
     let since = seq(&home);
     let r = start(&home, &task("slack-send"));
     calls_out(&home, since, &r, 1);
-    let dropped = call(&home, "debug.drop_hook_connections", &json!({}));
-    assert_eq!(dropped["dropped"], 1, "{dropped}");
+    // The gate publishes run.tool_call just before the hook's connection starts waiting on
+    // it, and a drop ends only the connections waiting then: a drop that comes between ends
+    // nothing (`{"dropped": 0}`, #2840). So drop until it ends the one connection. A drop
+    // counts the connections as it starts, so one that began waiting in that same instant
+    // is ended uncounted: then its decision comes, and is checked below like any other.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (dropped, uncounted) = loop {
+        let dropped = call(&home, "debug.drop_hook_connections", &json!({}));
+        if dropped["dropped"] != 0 {
+            break (dropped, false);
+        }
+        if !decided(&replay(&home, since), &r).is_empty() {
+            break (dropped, true);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hook's connection never waited"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    if !uncounted {
+        assert_eq!(dropped["dropped"], 1, "{dropped}");
+    }
     // Decided by rlxd as the connection ends, not left for the run's end.
     let events = wait_until(&home, since, 30, "the dropped call's decision", |e| {
         !decided(e, &r).is_empty()

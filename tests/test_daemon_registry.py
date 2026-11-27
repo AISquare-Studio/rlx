@@ -1,8 +1,9 @@
 """The real rlxd binary, read by Python's daemon registry (handoff 0.10.3, 4.1).
 
 While rlxd runs, :func:`aisquare.core.daemons.list_live` lists it, by the lock rlxd holds
-(``flock``, or ``LockFileEx`` on byte 0 on Windows, against ``core.locking``'s). After a
-stop it is gone; after a kill the OS frees its lock, so it reads as dead.
+(``flock``, or ``LockFileEx`` on byte 0 on Windows, against ``core.locking``'s), and the
+resident brain it runs (1.6), whose record's lock rlxd holds too. After a stop both are
+gone; after a kill the OS frees rlxd's locks, so both read as dead.
 
 ``RLXD_BIN`` names the binary; ``.github/workflows/rlxd.yml`` sets it to the one its job
 built. The tests skip when ``RLXD_BIN`` is unset, so the Python suite, which builds no
@@ -53,6 +54,7 @@ class Rlxd:
     def run(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = {**os.environ, "AISQUARE_HOME": str(self.home)}
         env["RLXD_CLAUDE_BIN"] = str(self.home / "no-claude")
+        env["RLXD_RLX_BIN"] = _rlx()
         env.pop("RLX_HOME", None)
         return subprocess.run(
             [str(self.binary), *args],
@@ -64,12 +66,22 @@ class Rlxd:
             check=False,
         )
 
-    def start(self) -> int:
+    def start(self) -> tuple[int, int]:
+        """Starts rlxd, which returns once its brain runs: rlxd's pid and the brain's."""
         started = self.run("serve", "--detach")
         assert started.returncode == 0, started
-        pid = json.loads(started.stdout)["data"]["pid"]
+        data = json.loads(started.stdout)["data"]
+        pid, brain = data["pid"], data["brain"].get("pid")
         assert isinstance(pid, int)
-        return pid
+        assert isinstance(brain, int), data["brain"]
+        return pid, brain
+
+
+def _rlx() -> str:
+    """This checkout's ``rlx``, which rlxd runs as its brain."""
+    found = shutil.which("rlx", path=str(Path(sys.executable).parent))
+    assert found, f"no rlx beside {sys.executable}"
+    return found
 
 
 @pytest.fixture
@@ -99,12 +111,15 @@ def _eventually(what: str, done: Callable[[], bool]) -> None:
 
 
 def test_a_running_rlxd_reads_as_live_and_after_a_stop_is_gone(rlxd: Rlxd) -> None:
-    pid = rlxd.start()
-    assert _live() == [("rlxd", pid)]
-    (record,) = daemons.list_live()
-    assert record.restartable is True
-    assert Path(record.argv[0]).is_absolute()
-    assert record.argv[1:] == ("serve", "--detach")
+    pid, brain = rlxd.start()
+    assert sorted(_live()) == [("brain", brain), ("rlxd", pid)]
+    records = {record.kind: record for record in daemons.list_live()}
+    assert records["rlxd"].restartable is True
+    assert Path(records["rlxd"].argv[0]).is_absolute()
+    assert records["rlxd"].argv[1:] == ("serve", "--detach")
+    # rlxd starts its brain again itself: an upgrade does not.
+    assert records["brain"].restartable is False
+    assert records["brain"].argv == (_rlx(), "brain", "--stdio")
 
     stopped = rlxd.run("stop")
     assert stopped.returncode == 0, stopped
@@ -113,8 +128,8 @@ def test_a_running_rlxd_reads_as_live_and_after_a_stop_is_gone(rlxd: Rlxd) -> No
 
 
 def test_after_a_kill_rlxd_reads_as_dead(rlxd: Rlxd) -> None:
-    pid = rlxd.start()
-    assert _live() == [("rlxd", pid)]
+    pid, brain = rlxd.start()
+    assert sorted(_live()) == [("brain", brain), ("rlxd", pid)]
     if sys.platform == "win32":
         # os.kill is TerminateProcess there, as Stop-Process -Force is.
         os.kill(pid, signal.SIGTERM)

@@ -27,7 +27,10 @@
 //! - the runner (2.1, 5.4, 7.5): [`RunStartParams`], [`RunRef`], [`RunCancelData`], and
 //!   each run event's `data` ([`RunStartedData`], [`RunTextData`], [`RunDoneData`], …),
 //!   which `run-event-list.json` ([`RunEvent`]) holds a run's stream to;
-//! - spaces (2.5): [`SpaceParams`], [`SpaceEnsureData`] and [`SpaceEraseData`].
+//! - spaces (2.5): [`SpaceParams`], [`SpaceEnsureData`] and [`SpaceEraseData`];
+//! - [`BrainInput`] and [`BrainOutput`] (1.6): the frames rlxd and its resident Python
+//!   brain, `rlx brain --stdio`, write to each other. That protocol is internal to one rlx
+//!   release, and versioned on its own ([`BRAIN_PROTOCOL`]).
 //!
 //! # One set of rules
 //!
@@ -186,6 +189,7 @@
 //!   of `argv`. `cwd` isn't required to be absolute. Python's registry (#576) and this
 //!   schema tighten them together, or not at all.
 
+mod brain;
 mod check;
 mod daemon;
 mod envelope;
@@ -203,6 +207,7 @@ mod space;
 mod status;
 mod subscribe;
 
+pub use brain::{BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, codes as brain_codes};
 pub use check::Invalid;
 pub use daemon::{DaemonRecord, kinds as daemon_kinds};
 pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};

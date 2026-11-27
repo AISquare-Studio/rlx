@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BrainOutput",
+  "description": "A frame the brain writes on its stdout.\n\n```json\n{\"type\": \"hello\", \"protocol\": 1, \"pid\": 4243, \"rlx_version\": \"0.10.3\"}\n{\"type\": \"accepted\", \"id\": 7}\n{\"type\": \"reply\", \"id\": 7, \"ok\": true, \"result\": {\"pid\": 4243}}\n{\"type\": \"reply\", \"id\": 8, \"ok\": false, \"error\": {\"code\": \"unknown_method\", \"message\": \"…\"}}\n```",
+  "oneOf": [
+    {
+      "description": "The brain's answer to rlxd's hello: the protocol they agree on, and who it is.",
+      "type": "object",
+      "properties": {
+        "pid": {
+          "description": "The brain's process id, from 1 to 2147483647.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2147483647,
+          "minimum": 1
+        },
+        "protocol": {
+          "description": "The brain protocol the brain agrees on: one rlxd's hello named.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "rlx_version": {
+          "description": "The version of the rlx running the brain.",
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "hello"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "pid",
+        "rlx_version"
+      ]
+    },
+    {
+      "description": "The brain will not serve this rlxd, and exits: `incompatible_protocol` when they\nshare no protocol.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Why, as a code, such as `incompatible_protocol`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "description": "Why, for a person.",
+          "type": "string",
+          "minLength": 1
+        },
+        "supported": {
+          "description": "The brain protocols the brain speaks.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint32",
+            "maximum": 4294967295,
+            "minimum": 0
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "refused"
+        }
+      },
+      "required": [
+        "type",
+        "code",
+        "message"
+      ]
+    },
+    {
+      "description": "The brain has read request `id` and is about to run it. Nothing of it ran before\nthis frame.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The request's `id`.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "accepted"
+        }
+      },
+      "required": [
+        "type",
+        "id"
+      ]
+    },
+    {
+      "description": "The answer to request `id`: `result` when `ok`, else `error`.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "description": "Why it failed, when not `ok`.",
+          "$ref": "#/$defs/Error"
+        },
+        "id": {
+          "description": "The request's `id`.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 1
+        },
+        "ok": {
+          "description": "Whether the request succeeded.",
+          "type": "boolean"
+        },
+        "result": {
+          "description": "What the method returned, when `ok`.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "type": {
+          "type": "string",
+          "const": "reply"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "ok"
+      ]
+    }
+  ],
+  "$defs": {
+    "Error": {
+      "title": "Error",
+      "description": "Why a request was refused or failed.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "A stable, machine-readable code, such as `unauthorized`, `unknown_method`,\n`incompatible_protocol`, `not_gate` or `not_a_tty`. A client also accepts codes it\ndoes not know.",
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "description": "More about what went wrong: a string, such as an underlying error's text, or an\nobject whose fields the code defines, such as `incompatible_protocol`'s\n`{\"supported\": [1]}` or `denied`'s `{\"by\": …}`. Never `null`: absent instead.",
+          "type": [
+            "string",
+            "object"
+          ]
+        },
+        "hint": {
+          "description": "What to do about it, for a person.",
+          "type": "string"
+        },
+        "message": {
+          "description": "What went wrong, for a person.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "incompatible_protocol"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "object",
+                "properties": {
+                  "supported": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "maximum": 4294967295,
+                      "minimum": 1
+                    },
+                    "minItems": 1
+                  }
+                },
+                "required": [
+                  "supported"
+                ]
+              }
+            },
+            "required": [
+              "detail"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "since_ahead"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "object",
+                "properties": {
+                  "head": {
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 0
+                  },
+                  "since": {
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "head"
+                ]
+              }
+            },
+            "required": [
+              "detail"
+            ]
+          }
+        }
+      ],
+      "required": [
+        "code",
+        "message"
+      ]
+    }
+  }
+}
