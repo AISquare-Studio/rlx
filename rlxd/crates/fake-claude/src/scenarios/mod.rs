@@ -8,9 +8,11 @@ use crate::Fake;
 mod abort;
 mod asks;
 mod big;
+mod connectors;
 mod crash;
 mod hello;
 mod huge;
+pub mod login;
 mod orphan;
 mod persist;
 mod rate_limit;
@@ -18,7 +20,10 @@ mod slow;
 mod structured;
 mod tool_result;
 
+pub use connectors::{ROUTE_ENV, SLACK, TRY_TOOL_ENV, tools as slack_tools};
 pub use orphan::LINGER;
+
+use connectors::Schedule;
 
 /// One scenario: plays a start, and returns its exit code.
 pub type Scenario = fn(&mut Fake) -> i32;
@@ -28,16 +33,38 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("abort", abort::run),
     ("asks", asks::run),
     ("big", big::run),
+    ("connectors-late", |fake| {
+        connectors::play(fake, Schedule::ConnectsAt(3000), ANSWER)
+    }),
+    ("connectors-later", |fake| {
+        connectors::play(fake, Schedule::ConnectsAt(8000), ANSWER)
+    }),
+    ("connectors-needs-auth", |fake| {
+        connectors::play(fake, Schedule::NeedsAuth, ANSWER)
+    }),
+    ("connectors-never", |fake| {
+        connectors::play(fake, Schedule::Never, ANSWER)
+    }),
     ("crash", crash::run),
     ("hello", hello::run),
     ("huge", huge::run),
+    ("init-connectors", |fake| {
+        connectors::play(fake, Schedule::ConnectsAt(0), ANSWER)
+    }),
+    ("init-needs-auth", |fake| {
+        connectors::play(fake, Schedule::NeedsAuth, ANSWER)
+    }),
     ("orphan", orphan::run),
     ("persist", persist::run),
     ("rate-limit", rate_limit::run),
     ("slow", slow::run),
+    ("stdin-eof-empty", connectors::stdin_eof_empty),
     ("structured", structured::run),
     ("tool-result", tool_result::run),
 ];
+
+/// What the connector scenarios answer.
+const ANSWER: &str = "Nothing in Slack needs you.";
 
 /// The scenario called `name`.
 pub fn find(name: &str) -> Option<Scenario> {

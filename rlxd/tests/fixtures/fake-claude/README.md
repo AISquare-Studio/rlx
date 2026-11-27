@@ -41,6 +41,26 @@ the same files.
 | `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
 
+### The connectors' scenarios (5.5 and 7.7)
+
+One connector, `claude.ai Slack`, with made-up tools (`init-connectors/expected-tools.json`). Its status follows the fixture clock from the run's first start, and doesn't start again with each try. As Claude Code does, a start writes `system/init` after its first message, listing Slack's status then and mounting its tools only when connected. With `RLXD_TEST_CONNECTOR_ROUTE=1` (rlxd's route-1 switch, which rlxd passes on), it plays a Claude Code that also reports the states before the first message: an init as it starts and another at each change. `connected_at` is when the start saw Slack connected. With `FAKE_CLAUDE_TRY_TOOL=<tool>`, a start that sees Slack connected asks its `--settings`' PreToolUse hooks about one call of that tool, and logs the answer in `hook_replies`.
+
+| Scenario | What it does |
+|---|---|
+| `init-connectors` | Slack connected from the start |
+| `init-needs-auth` | Slack `needs-auth`, its tools not mounted |
+| `connectors-late` | Slack `pending`, then connected from 3 s |
+| `connectors-later` | Slack `pending`, then connected from 8 s |
+| `connectors-never` | Slack `pending` throughout |
+| `connectors-needs-auth` | Slack `needs-auth` throughout |
+| `stdin-eof-empty` | No servers in `system/init` when stdin is at EOF by then, as E9 found; Slack connected while it is open |
+| `mcp-login` | `claude mcp login <name>`: prints an `https://` URL whose query holds made-up secrets, waits, says it signed in, and exits 0 |
+| `mcp-login-fails` | The same URL, then says the sign-in failed, and exits 1 |
+| `mcp-login-http` | Prints an `http://` URL, then waits a minute |
+| `mcp-login-silent` | Prints no URL, and exits 0 |
+
+`FAKE_CLAUDE_SCENARIO_FILE=<file>` names a file holding the scenario's name, read at each start, over the binary's name: so one rlxd plays one scenario, then another.
+
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for
 `-p --output-format stream-json` without `--verbose`, waits for its first stream-json user

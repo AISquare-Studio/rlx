@@ -63,7 +63,8 @@ use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,6 +75,11 @@ mod log;
 pub mod scenarios;
 
 pub use log::Log;
+
+/// A variable naming a file that holds the scenario's name, read at each start: so one
+/// rlxd plays one scenario, then another (the connector checks, 7.7). It wins over the
+/// binary's name.
+pub const SCENARIO_FILE_ENV: &str = "FAKE_CLAUDE_SCENARIO_FILE";
 
 /// The Claude Code version every scenario claims.
 pub const VERSION: &str = "2.1.314";
@@ -111,6 +117,14 @@ pub fn main() -> ExitCode {
             );
             return ExitCode::SUCCESS;
         }
+        ["mcp", "login", connector] => {
+            let Some(login) = scenarios::login::find(&name) else {
+                eprintln!("fake-claude/{name}: plays no `mcp login`");
+                return ExitCode::from(2);
+            };
+            let code = login(&argv, connector);
+            return ExitCode::from(u8::try_from(code).unwrap_or(1));
+        }
         _ => {}
     }
     let Some(scenario) = scenarios::find(&name) else {
@@ -147,6 +161,13 @@ fn scenario_of(argv: &[String]) -> (String, Vec<String>) {
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
     let args = argv.get(1..).unwrap_or_default().to_vec();
+    if let Some(name) = std::env::var_os(SCENARIO_FILE_ENV)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| text.trim().to_owned())
+        .filter(|name| !name.is_empty())
+    {
+        return (name, args);
+    }
     if stem == "fake-claude"
         && let Some(name) = args.first().and_then(|a| a.strip_prefix("--scenario="))
     {
@@ -161,6 +182,10 @@ pub struct Fake {
     log: Option<Log>,
     input: Receiver<Option<Value>>,
     finished: Arc<Mutex<bool>>,
+    /// Whether stdin has closed.
+    closed: Arc<AtomicBool>,
+    /// When this start began, on the fixture clock: 0 with no log.
+    started_at: u64,
     session_id: String,
     cwd: String,
     /// The session file's lines so far, when the session persists.
@@ -171,12 +196,15 @@ impl Fake {
     /// Starts reading stdin, and logs this start.
     fn start(argv: Vec<String>, args: Vec<String>) -> Self {
         let log = Log::open(&argv);
+        let started_at = log.as_ref().map_or(0, Log::now);
         let finished = Arc::new(Mutex::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
         let (sender, input) = mpsc::channel();
         {
             let log = log.clone();
             let finished = Arc::clone(&finished);
-            thread::spawn(move || read_stdin(&sender, log.as_ref(), &finished));
+            let closed = Arc::clone(&closed);
+            thread::spawn(move || read_stdin(&sender, log.as_ref(), &finished, &closed));
         }
         let cwd = std::env::current_dir()
             .map(|dir| dir.display().to_string())
@@ -186,6 +214,8 @@ impl Fake {
             log,
             input,
             finished,
+            closed,
+            started_at,
             session_id: String::new(),
             cwd,
             session: Vec::new(),
@@ -229,6 +259,32 @@ impl Fake {
         self.input.recv().ok().flatten()
     }
 
+    /// The next user message on stdin, waiting at most `wait`: `Ok(None)` once stdin has
+    /// closed, `Err(Timeout)` when none came in time.
+    pub fn next_user_message_within(
+        &mut self,
+        wait: Duration,
+    ) -> Result<Option<Value>, RecvTimeoutError> {
+        self.input.recv_timeout(wait)
+    }
+
+    /// When this start began, on the fixture clock: 0 with no log.
+    pub fn started_at(&self) -> u64 {
+        self.started_at
+    }
+
+    /// Whether stdin closes within `ms` milliseconds, or has closed.
+    pub fn stdin_closed_within(&self, ms: u64) -> bool {
+        let until = std::time::Instant::now() + Duration::from_millis(ms);
+        while !self.closed.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
     /// The text of a stream-json user message: its content string, or its text blocks.
     pub fn text_of(message: &Value) -> String {
         match &message["message"]["content"] {
@@ -254,22 +310,27 @@ impl Fake {
     pub fn begin(&mut self) -> Option<Value> {
         let message = self.next_user_message()?;
         self.remember(&message);
+        self.emit_init(&[], &json!([]));
+        Some(message)
+    }
+
+    /// Writes `system/init`, mounting `tools` and listing `mcp_servers`, then a line of a
+    /// type a later Claude Code may add, which rlxd ignores.
+    pub fn emit_init(&mut self, tools: &[String], mcp_servers: &Value) {
         let strict = self.flag("--strict-mcp-config");
         let init = json!({
             "type": "system", "subtype": "init", "cwd": self.cwd,
-            "session_id": self.session_id, "tools": [], "mcp_servers": [],
+            "session_id": self.session_id, "tools": tools, "mcp_servers": mcp_servers,
             "model": MODEL, "permissionMode": self.value("--permission-mode").unwrap_or("default"),
             "slash_commands": [], "apiKeySource": "none", "claude_code_version": VERSION,
             "output_style": "default", "agents": [], "skills": [], "plugins": [],
             "uuid": uuid(), "fake_strict_mcp_config": strict,
         });
         self.emit(&init);
-        // Something a later Claude Code may add, which rlxd ignores.
         self.emit(
             &json!({"type": "fake_future_event", "subtype": "probe", "uuid": uuid(),
             "session_id": self.session_id}),
         );
-        Some(message)
     }
 
     /// Writes an assistant text message, with its text deltas first under
@@ -338,6 +399,58 @@ impl Fake {
         thread::sleep(Duration::from_millis(ms));
     }
 
+    /// Asks the PreToolUse hooks of `--settings` about a call of `tool` with `input`, as
+    /// Claude Code does: each matching hook's command through the shell, with the call's
+    /// JSON on its stdin. Logs the answer in `hook_replies` as `{tool, decision, reason}`,
+    /// and counts the call in `tool_runs` when no hook denied it. The decision: `deny`
+    /// when a hook printed a deny or exited 2, else `allow`.
+    pub fn pre_tool_use(&mut self, tool: &str, input: &Value) -> String {
+        let hooks = self
+            .value("--settings")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .map(|settings| settings["hooks"]["PreToolUse"].clone())
+            .unwrap_or(Value::Null);
+        let call = json!({"session_id": self.session_id, "cwd": self.cwd,
+            "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input});
+        let mut decision = "allow".to_owned();
+        let mut reason = String::new();
+        for group in hooks.as_array().into_iter().flatten() {
+            let matcher = group["matcher"].as_str().unwrap_or("*");
+            if matcher != "*" && matcher != tool {
+                continue;
+            }
+            for hook in group["hooks"].as_array().into_iter().flatten() {
+                let Some(command) = hook["command"].as_str() else {
+                    continue;
+                };
+                let (said, code) = run_hook(command, &call.to_string());
+                let answer: Value = serde_json::from_str(said.trim()).unwrap_or(Value::Null);
+                let output = &answer["hookSpecificOutput"];
+                if code == Some(2) || output["permissionDecision"] == "deny" {
+                    decision = "deny".to_owned();
+                    reason = output["permissionDecisionReason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                }
+            }
+        }
+        if let Some(log) = &self.log {
+            let reply = json!({"tool": tool, "decision": decision, "reason": reason});
+            let allowed = decision != "deny";
+            log.update(|start| {
+                if let Some(replies) = start["hook_replies"].as_array_mut() {
+                    replies.push(reply);
+                }
+                if allowed {
+                    start["tool_runs"] = Value::from(start["tool_runs"].as_u64().unwrap_or(0) + 1);
+                }
+            });
+        }
+        decision
+    }
+
     /// Keeps `line` for the session file.
     pub fn remember(&mut self, line: &Value) {
         self.session.push(line.clone());
@@ -380,6 +493,47 @@ impl Fake {
     }
 }
 
+/// Runs a hook's `command` with `stdin`: its stdout and exit code. Through `sh -c` on
+/// macOS and Linux, as Claude Code does. On Windows, the command rlxd writes, a program
+/// in double quotes and plain words after it, is run as it is.
+fn run_hook(command: &str, stdin: &str) -> (String, Option<i32>) {
+    use std::process::{Command, Stdio};
+    let mut process = if cfg!(windows) {
+        let (program, rest) = match command.strip_prefix('"').and_then(|c| c.split_once('"')) {
+            Some((program, rest)) => (program.to_owned(), rest),
+            None => match command.split_once(' ') {
+                Some((program, rest)) => (program.to_owned(), rest),
+                None => (command.to_owned(), ""),
+            },
+        };
+        let mut process = Command::new(program);
+        process.args(rest.split_whitespace());
+        process
+    } else {
+        let mut process = Command::new("sh");
+        process.args(["-c", command]);
+        process
+    };
+    let child = process
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return (String::new(), None);
+    };
+    if let Some(mut input) = child.stdin.take() {
+        let _ = input.write_all(stdin.as_bytes());
+    }
+    match child.wait_with_output() {
+        Ok(output) => (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            output.status.code(),
+        ),
+        Err(_) => (String::new(), None),
+    }
+}
+
 /// Claude Code's config directory: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
 fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
@@ -397,7 +551,12 @@ pub fn encode_project(cwd: &str) -> String {
 }
 
 /// Reads stdin's stream-json lines, logging each, and hands the user messages over.
-fn read_stdin(sender: &mpsc::Sender<Option<Value>>, log: Option<&Log>, finished: &Mutex<bool>) {
+fn read_stdin(
+    sender: &mpsc::Sender<Option<Value>>,
+    log: Option<&Log>,
+    finished: &Mutex<bool>,
+    closed: &AtomicBool,
+) {
     let stdin = io::stdin();
     let mut lines = stdin.lock();
     let mut line = String::new();
@@ -430,6 +589,7 @@ fn read_stdin(sender: &mpsc::Sender<Option<Value>>, log: Option<&Log>, finished:
         let at = log.now();
         log.update(|start| start["stdin_eof_at"] = Value::from(at));
     }
+    closed.store(true, Ordering::SeqCst);
     let _ = sender.send(None);
 }
 
