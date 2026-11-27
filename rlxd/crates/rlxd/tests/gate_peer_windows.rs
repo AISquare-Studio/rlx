@@ -50,7 +50,7 @@ struct TestSigner {
 impl TestSigner {
     /// The signer, or `None` (with a note) where no root can be trusted.
     fn new() -> Option<Self> {
-        let made = powershell(&format!(
+        let made = powershell_said(&format!(
             "$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN={SIGNER}' \
              -CertStoreLocation Cert:\\CurrentUser\\My -NotAfter (Get-Date).AddDays(2); \
              $f = Join-Path ([IO.Path]::GetTempPath()) ('rlxd-gate-' + $c.Thumbprint + '.cer'); \
@@ -60,18 +60,20 @@ impl TestSigner {
              Remove-Item $f; throw }}; Remove-Item $f; $c.Thumbprint"
         ));
         // PowerShell may print more before it; the thumbprint is the last line.
-        let thumbprint = made.map(|out| {
-            out.lines()
+        let thumbprint = made.map(|(out, said)| {
+            let thumbprint = out
+                .lines()
                 .map(str::trim)
                 .rfind(|line| !line.is_empty())
                 .unwrap_or_default()
-                .to_owned()
+                .to_owned();
+            (thumbprint, out, said)
         });
         match thumbprint {
-            Ok(thumbprint) => {
+            Ok((thumbprint, out, said)) => {
                 assert!(
                     thumbprint.len() == 40 && thumbprint.bytes().all(|b| b.is_ascii_hexdigit()),
-                    "not a thumbprint: {thumbprint:?}"
+                    "not a thumbprint: {thumbprint:?} (stdout {out:?}, stderr {said:?})"
                 );
                 Some(Self { thumbprint })
             }
@@ -113,13 +115,21 @@ impl Drop for TestSigner {
 
 /// Runs `script` in Windows PowerShell: its stdout, or why it failed.
 fn powershell(script: &str) -> Result<String, String> {
+    powershell_said(script).map(|(out, _)| out)
+}
+
+/// Runs `script` in Windows PowerShell: its stdout and stderr, or why it failed.
+fn powershell_said(script: &str) -> Result<(String, String), String> {
     let out = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
     } else {
         Err(format!(
             "{}{}",
