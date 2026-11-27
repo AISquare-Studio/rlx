@@ -12,6 +12,7 @@ takes it away so the config and the home decide.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import textwrap
@@ -22,15 +23,20 @@ from textual.widgets import Checkbox, TabbedContent
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app as cli
+from aisquare.cli.ui import remote_control
+from aisquare.cli.ui.remote_control import RemoteController
 from aisquare.cli.ui.sidebar import SettingsRow
 from aisquare.cli.ui.views.app_settings import REMOTE_TAB
 from aisquare.cli.ui.views.settings_captain import CaptainToggle, ExperimentalSection, RemoteToggle
 from aisquare.core import experimental, paths
 from aisquare.core import program as prog
 from aisquare.core.config import load_config, save_config
-from aisquare.services import diagnostics
+from aisquare.core.state_file import update_state
+from aisquare.services import diagnostics, service_host
+from aisquare.services.service_host import RemotePart
 from tests import test_ui_shell as ui_suite
 from tests.test_captain_view import drive
+from tests.test_remote_control import fake_server, fake_tunnel_factory
 from tests.test_ui_shell import Script, fleet_app
 from tests.ui_workers import settle_page
 
@@ -358,3 +364,103 @@ def test_the_remote_box_brings_remote_up_and_down_at_once_and_ctrl_z_takes_it_ba
     assert on == (True, True, 1, True, True, 1, True)
     assert off == (False, False, 0, False, False, 0, False), "ctrl+z: off again, and kept"
     assert stopping == (True,), "stopped on its own thread; run_ui waits for it at the quit"
+
+
+# --- the rlx service ---------------------------------------------------------------------------
+
+_SERVICE_PART = textwrap.dedent(
+    """
+    import sys
+    from aisquare.core.state_file import update_state
+    from aisquare.services.service_host import RemotePart
+    # Remote's own switch on while it is off in Experimental (nothing of it may load even so),
+    # and off for the control, so that no real server or ngrok ever starts here.
+    update_state("remote_enabled", sys.argv[1] == "0")
+    part = RemotePart()
+    part.start_part()
+    health = part.tick_part()
+    print("PART", health.state, "|", health.detail)
+    print("LOADED", " ".join(sorted(m for m in sys.modules if m in {modules!r})))
+    """
+)
+
+
+def _service_part(variable: str) -> dict[str, str]:
+    """What the rlx service's Remote part reports, started and ticked once in a fresh
+    interpreter with Remote set ``variable``, and which of Remote's modules it loaded."""
+    code = _SERVICE_PART.replace("{modules!r}", repr(set(REMOTE_MODULES)))
+    env = {**__import__("os").environ, experimental.REMOTE_ENV: variable}
+    result = subprocess.run(
+        [sys.executable, "-c", code, variable], capture_output=True, text=True, env=env, timeout=120
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    lines = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+    return {key: lines.get(key, "") for key in ("PART", "LOADED")}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason=service_host.NOT_HERE)
+def test_with_remote_off_the_service_loads_nothing_of_it() -> None:
+    """Off, the service's Remote part imports nothing of Remote and says why, its own switch
+    on or not. On, the same start loads its controller (the control: the check can fail)."""
+    off = _service_part("0")
+    on = _service_part("1")
+
+    assert off["PART"] == f"off | {service_host.EXPERIMENTAL_OFF}", off
+    assert off["LOADED"] == "", off
+    assert on["PART"] == "off | switched off", on
+    assert {"aisquare.cli.ui.remote_control", "aisquare.services.remote_server"} <= set(
+        on["LOADED"].split()
+    ), on
+
+
+def _choose_remote(on: bool) -> None:
+    """Remote's box in Settings' *Experimental*, as it saves."""
+    config = load_config()
+    config.experimental.remote = on
+    save_config(config)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason=service_host.NOT_HERE)
+def test_the_service_starts_and_stops_remote_as_experimental_turns_it_on_and_off(
+    decides: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Off in Experimental, the service makes no controller and serves nothing, though
+    Remote's own switch is on. Turned on, it serves at the next follow; off, it stops the
+    Remote it serves and says why, the switch kept; on again, it serves again."""
+    update_state("remote_enabled", True)  # Remote's own switch, as a TUI saved it
+    _choose_remote(False)
+    server = fake_server()
+    made: list[RemoteController] = []
+
+    def controller() -> RemoteController:
+        tunnel = fake_tunnel_factory(url="https://quiet-otter.ngrok-free.app")
+        made.append(RemoteController(server=server, tunnel_factory=tunnel))
+        return made[-1]
+
+    part = RemotePart(controller)
+    part.start_part()
+    first = part.tick_part()
+
+    assert (first.state, first.detail, first.extra["on"]) == (
+        "off",
+        service_host.EXPERIMENTAL_OFF,
+        False,
+    )
+    assert (made, part.controller, server.running) == ([], None, False)
+
+    _choose_remote(True)
+    assert part.tick_part().state == "ok" and server.running and len(made) == 1
+
+    _choose_remote(False)
+    with caplog.at_level(logging.INFO, logger=service_host.__name__):
+        stopped = part.tick_part()
+    assert (stopped.state, stopped.detail) == ("off", service_host.EXPERIMENTAL_OFF)
+    assert not server.running
+    assert made[0].message == service_host.EXPERIMENTAL_OFF_REASON
+    assert f"remote: {service_host.EXPERIMENTAL_OFF_REASON}" in caplog.messages
+    assert remote_control.load_remote_state().remote_enabled, "its own switch kept"
+
+    _choose_remote(True)
+    assert part.tick_part().state == "ok" and server.running and len(made) == 1
+    part.stop_part()
+    assert not server.running

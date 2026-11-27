@@ -52,6 +52,12 @@ so once.
 If Remote can't start in the service (its port is taken, say), the service tries again a few
 times over about a minute, then turns Remote's switch off. The window's Remote panel says why.
 
+Remote is experimental. While it is off in Settings' *Experimental*, the service doesn't load
+it, and `rlx service status` says `Remote is experimental and off`. Turned on there, the
+service starts it within two seconds if its switch is on. Turned off, the service stops a
+Remote it serves within two seconds and keeps its switch, so Remote comes back when it's on
+again.
+
 With no service, rlx windows work as they always have.
 
 ## One release per home
