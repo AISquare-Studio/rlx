@@ -461,11 +461,12 @@ def manager_policy(
             row = store.fleet_agent_by_label(target.id, manager_seat.LABEL, live_only=True)
             session = manager_seat.bound(store, row) if row is not None else None
             if session is None:
-                raise typer.BadParameter("the project needs a live bound manager")
+                message = "the project needs a live bound manager"
+                fail(message, error="no_bound_manager", detail=message)
             try:
                 manager_pass.baseline(store, target.id, session.project_id, read_through)
             except ValueError as exc:
-                raise typer.BadParameter(str(exc)) from exc
+                fail(str(exc), error="baseline_refused", detail=str(exc))
         if key is not None and clear:
             store.clear_project_setting(target.id, key)
         if key is not None and value is not None:

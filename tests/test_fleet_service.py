@@ -16320,18 +16320,33 @@ def test_manager_policy_cli_persists_only_a_verified_read_through_on_its_board(
     """A verified manual baseline sets the next pass's exclusive lower bound once."""
     from aisquare.services import manager_pass, watch
 
+    argv = ["--json", "fleet", "manager-policy", "--project", project.id, "--read-through"]
+    runner = CliRunner()
+    no_seat = runner.invoke(app, [*argv, "0"])
+    assert no_seat.exit_code == 1
+    assert json.loads(no_seat.stdout) == {
+        "error": "no_bound_manager",
+        "detail": "the project needs a live bound manager",
+    }
+
     _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
     floor = team_service.add_note("handled manually", kind="decision", board_id=project.id)
     next_event = team_service.add_note("next pass", kind="decision", board_id=project.id)
-    argv = ["--json", "fleet", "manager-policy", "--project", project.id, "--read-through"]
-    runner = CliRunner()
     invalid = runner.invoke(app, [*argv, str(next_event.seq + 1)])
-    assert invalid.exit_code != 0 and "verified boundary" in invalid.output
+    assert invalid.exit_code == 1
+    assert json.loads(invalid.stdout) == {
+        "error": "baseline_refused",
+        "detail": "the verified boundary must be on this board",
+    }
     receipt = runner.invoke(app, [*argv, str(floor.seq)])
     assert receipt.exit_code == 0, receipt.output
     assert json.loads(receipt.stdout)["manager_wake"] == "schedule"
     refused = runner.invoke(app, [*argv, str(next_event.seq)])
-    assert refused.exit_code != 0 and "already has a pass read position" in refused.output
+    assert refused.exit_code == 1
+    assert json.loads(refused.stdout) == {
+        "error": "baseline_refused",
+        "detail": "this seat already has a pass read position",
+    }
     with store_session() as store:
         store.set_project_setting(project.id, "manager_pass_minutes", "15")
     watcher = watch.Watcher()
