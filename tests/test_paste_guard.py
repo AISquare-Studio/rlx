@@ -8,6 +8,11 @@ reads moves it past ``ESCAPE_DELAY`` and ticks the parser, as the driver ticks i
 guard must change nothing, its output is compared with Textual's own parse
 (:func:`paste_guard.textual_parse`) fed the same reads.
 
+The canary tests (``test_canary_*``) fail naming ``cli/ui/paste_guard.py`` and textual#6802
+when a Textual internal the guard wraps changes: the installed version, the parse's signature,
+the names it reads, the parse's source, or its behaviour. The last one passing again means
+Textual fixed the bug: drop the guard and the textual==8.2.8 pin.
+
 Each consumer's own regression sits beside its paste or key tests: the pane
 (``tests/test_terminal_pane.py``), the router, a dialog's field and a text area
 (``tests/test_ui_shell.py``), the rename field (``tests/test_ui_project_cards.py``) and the
@@ -17,15 +22,18 @@ board (``tests/test_watch.py``).
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
+import importlib.metadata
 import inspect
 import sys
 from collections.abc import Callable, Generator, Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from textual import _parser, _xterm_parser, constants, events
 from textual._xterm_parser import XTermParser
+from textual.binding import Binding
 
 from aisquare.cli.ui import paste_guard
 from aisquare.cli.ui.clipboard import ClipboardApp
@@ -83,12 +91,26 @@ KEYS_REPORTS_AND_PASTES = [
     pytest.param("\x1b[<0;5;5M", id="mouse report"),
     pytest.param("\x1b[3;4R", id="cursor report"),
     pytest.param("\x1b[200x", id="a start marker's first characters, then x"),
+    pytest.param("\x1b[", id="key escape, then ["),
+    pytest.param("hello there", id="typing"),
+    pytest.param("\x1b\x1b", id="key escape escape"),
+    pytest.param("\x1b[1;3A", id="key alt+up"),
+    pytest.param("\x1bq", id="key alt+q"),
 ]
 
 PARSE_SOURCE_SHA256 = "f9837587f1778f18"
 """The start of the SHA-256 hex digest of ``XTermParser.parse``'s source as Textual 8.2.0 to
 8.2.8 ship it, taken at 8.2.0, 8.2.4 and 8.2.8. The guard leans on how that parse reads a
 paste: a release that changes it is read again before this moves."""
+
+TEXTUAL_VERSION = "8.2.8"
+"""The Textual release the guard was read against, and pinned to in ``pyproject.toml``."""
+
+CANARY = (
+    "cli/ui/paste_guard.py wraps Textual's XTermParser.parse to keep a raw Escape inside a"
+    " bracketed paste (textual#6802, https://github.com/Textualize/textual/issues/6802)"
+)
+"""How every canary failure starts: which guard, and why it exists."""
 
 Clock = list[float]
 
@@ -214,6 +236,17 @@ def test_input_that_ends_after_a_whole_paste_gives_that_paste() -> None:
     assert [repr(message) for message in messages] == paste("one\x1btwo")
 
 
+@pytest.mark.parametrize("body", [*RAW_ESCAPE_BODIES, "one\rtwo", ""])
+def test_a_paste_that_ends_exactly_at_its_end_marker_is_delivered_there_with_no_tick(
+    body: str,
+) -> None:
+    """No timer: the paste goes out as the end marker's last character is read, and nothing
+    is left pending for a tick to flush."""
+    parser = XTermParser()
+    assert [repr(message) for message in parser.feed(bracketed_paste(body))] == paste(body)
+    assert list(parser.tick()) == []
+
+
 # --- a pause inside a marker -------------------------------------------------------------------
 
 
@@ -273,6 +306,21 @@ def test_a_pause_inside_the_start_marker_gives_what_textuals_parse_gives(
         assert fed(XTermParser(), reads, clock, paused=True) == expected, reads
 
 
+def test_a_start_marker_a_pause_splits_is_not_guarded_and_its_enter_still_leaks(
+    clock: Clock,
+) -> None:
+    """The guard's known limit, pinned so a change to it is seen (``paste_guard``'s comment
+    and the PR say it too): until ``ESC[200~`` is whole no paste is open, so a pause longer
+    than ``ESCAPE_DELAY`` inside it lets Textual time its head out as keys, and the paste
+    after it is Textual's as before, its Enter a key. Terminals write the marker in one go."""
+    raw = bracketed_paste("one\rtwo")
+    for reads in two_reads(raw, range(1, len(PASTE_START))):
+        got = fed(XTermParser(), reads, clock, paused=True)
+        assert got == fed(textuals_parser(), reads, clock, paused=True), reads
+        assert repr(events.Key("enter", "\r")) in got, reads
+        assert not any(shown.startswith("Paste(") for shown in got), reads
+
+
 # --- everything else is Textual's --------------------------------------------------------------
 
 
@@ -294,7 +342,62 @@ def test_keys_reports_and_ordinary_pastes_give_what_textuals_parse_gives(
         assert fed(XTermParser(), reads, clock, paused=paused) == expected, (reads, paused)
 
 
-# --- the seam ----------------------------------------------------------------------------------
+# --- the canary: the Textual seam the guard wraps ----------------------------------------------
+
+
+def test_canary_the_installed_textual_is_the_release_the_guard_was_read_against() -> None:
+    """(a) A bump past the pin, by hand or by Dependabot, is read against the guard first."""
+    installed = importlib.metadata.version("textual")
+    assert installed == TEXTUAL_VERSION, (
+        f"{CANARY}: it was read against Textual {TEXTUAL_VERSION}, and Textual {installed} is"
+        " installed. If that release fixes textual#6802, drop the guard and the pin; if not,"
+        " read its XTermParser.parse against paste_guard, then move the pin and this test."
+    )
+
+
+def test_canary_textuals_parse_keeps_the_signature_the_guard_wraps() -> None:
+    """(b) The guard is called as ``parse(self, token_callback)`` and drives a generator."""
+    parse = textuals_parse()
+    parameters = list(inspect.signature(parse).parameters)
+    assert parameters == ["self", "token_callback"], (
+        f"{CANARY}: XTermParser.parse now takes {parameters}, not (self, token_callback)."
+    )
+    assert inspect.isgeneratorfunction(parse), (
+        f"{CANARY}: XTermParser.parse is no longer a generator function, so install() leaves"
+        " it unguarded."
+    )
+
+
+def test_canary_the_textual_names_the_guard_reads_are_where_it_reads_them() -> None:
+    """(c) The private names: the markers, the read request, the two interruptions, the
+    escape delay, and the parser's ``read1``, ``feed`` and ``tick`` that drive them."""
+    names = {
+        "textual._xterm_parser.BRACKETED_PASTE_START": (
+            getattr(_xterm_parser, "BRACKETED_PASTE_START", None) == PASTE_START
+        ),
+        "textual._xterm_parser.BRACKETED_PASTE_END": (
+            getattr(_xterm_parser, "BRACKETED_PASTE_END", None) == PASTE_END
+        ),
+        "textual._parser.Read1(timeout=None)": (
+            getattr(getattr(_parser, "Read1", None), "_fields", None) == ("timeout",)
+            and _parser.Read1().timeout is None
+        ),
+        "XTermParser.read1 is textual._parser.Read1": (
+            getattr(XTermParser, "read1", None) is getattr(_parser, "Read1", object())
+        ),
+        "textual._parser.ParseTimeout": isinstance(getattr(_parser, "ParseTimeout", None), type)
+        and issubclass(_parser.ParseTimeout, Exception),
+        "textual._parser.ParseEOF": isinstance(getattr(_parser, "ParseEOF", None), type)
+        and issubclass(_parser.ParseEOF, Exception),
+        "textual.constants.ESCAPE_DELAY": isinstance(
+            getattr(constants, "ESCAPE_DELAY", None), float
+        ),
+        "Parser.feed and Parser.tick": all(
+            callable(getattr(_parser.Parser, name, None)) for name in ("feed", "tick")
+        ),
+    }
+    moved = [name for name, present in names.items() if not present]
+    assert moved == [], f"{CANARY}: these Textual names moved or changed: {moved}."
 
 
 def textuals_parse_source(module_source: str) -> str:
@@ -305,29 +408,31 @@ def textuals_parse_source(module_source: str) -> str:
             for member in node.body:
                 if isinstance(member, ast.FunctionDef) and member.name == "parse":
                     return ast.get_source_segment(module_source, member) or ""
-    raise AssertionError("no XTermParser.parse in textual._xterm_parser")
+    raise AssertionError(f"{CANARY}: there is no XTermParser.parse in textual._xterm_parser.")
 
 
-def test_the_textual_seam_is_where_the_guard_expects_it(clock: Clock) -> None:
-    """The private names the guard reads; the parse it wraps, by its source; the empty paste
-    that parse flushes for an end marker read alone, which closes its own paste; and the
-    defect itself, still in that parse."""
-    assert (_xterm_parser.BRACKETED_PASTE_START, _xterm_parser.BRACKETED_PASTE_END) == (
-        PASTE_START,
-        PASTE_END,
-    )
-    assert all(hasattr(_parser, name) for name in ("Read1", "ParseTimeout", "ParseEOF"))
+def test_canary_textuals_parse_is_the_source_the_guard_was_read_against() -> None:
+    """(d) The parse the guard wraps, by its source."""
     source = textuals_parse_source(inspect.getsource(_xterm_parser))
     digest = hashlib.sha256(source.encode()).hexdigest()
     assert digest[: len(PARSE_SOURCE_SHA256)] == PARSE_SOURCE_SHA256, (
-        "Textual's XTermParser.parse has changed: read it against paste_guard before the pin moves"
+        f"{CANARY}: Textual's XTermParser.parse has changed (sha256 {digest[:16]}). Read it"
+        " against paste_guard before the pin moves; if it fixes textual#6802, drop the guard."
     )
+
+
+def test_canary_textuals_parse_still_behaves_as_the_guard_expects(clock: Clock) -> None:
+    """(e) The empty paste Textual's parse flushes for an end marker read alone, which is how
+    the guard closes that parse's paste; and the defect itself, still in it."""
     handshake = fed(textuals_parser(), [PASTE_START, PASTE_END], clock, paused=False)
-    assert handshake == paste("")
-    canary = fed(textuals_parser(), [bracketed_paste("one\x1btwo")], clock, paused=False)
-    assert any(shown.startswith("Key(") for shown in canary), (
-        "Textual's parse now keeps an Escape inside a paste as text: raise the floor to that"
-        " release and delete paste_guard"
+    assert handshake == paste(""), (
+        f"{CANARY}: Textual's parse no longer flushes one empty Paste for a start and end"
+        f" marker alone ({handshake}), which the guard relies on to close that parse's paste."
+    )
+    leaked = fed(textuals_parser(), [bracketed_paste("one\x1b\rtwo")], clock, paused=False)
+    assert any(shown.startswith("Key(") for shown in leaked), (
+        f"{CANARY}: Textual's own parse now keeps a raw Escape inside a paste as text"
+        f" ({leaked}): textual#6802 looks fixed. Drop the guard and the textual==8.2.8 pin."
     )
 
 
@@ -356,6 +461,30 @@ def test_a_second_install_says_installed_and_keeps_the_guard_and_textuals_parse(
     parse, textual = XTermParser.parse, paste_guard.textual_parse()
     assert paste_guard.install() is True
     assert (XTermParser.parse, paste_guard.textual_parse()) == (parse, textual)
+
+
+@pytest.mark.usefixtures("uninstalled")
+def test_installing_twice_wraps_textuals_parse_once() -> None:
+    textual = XTermParser.parse
+    assert paste_guard.install() is True
+    guarded = XTermParser.parse
+    assert paste_guard.install() is True
+    assert XTermParser.parse is guarded is not textual
+    assert getattr(guarded, paste_guard.GUARD_MARK) is textual  # one layer: Textual's own
+    assert not hasattr(textual, paste_guard.GUARD_MARK)
+
+
+@pytest.mark.usefixtures("uninstalled")
+def test_an_install_that_lost_its_record_still_wraps_once() -> None:
+    """As after a reload of the module: the record is gone, the guarded parse is still in
+    place, and installing again keeps it rather than wrapping it a second time."""
+    textual = XTermParser.parse
+    assert paste_guard.install() is True
+    guarded = XTermParser.parse
+    paste_guard._installed = None
+    assert paste_guard.install() is True
+    assert XTermParser.parse is guarded
+    assert paste_guard.textual_parse() is textual
 
 
 def _no_generator(self: Any, token_callback: Callable[[Any], None]) -> None:
@@ -403,3 +532,54 @@ def test_a_parse_that_flushes_nothing_for_the_end_marker_keeps_its_later_empty_p
     assert paste_guard.install()
     got = fed(XTermParser(), [bracketed_paste("a") + "!"], clock, paused=False)
     assert got == [*paste("a"), *paste("")]
+
+
+# --- the app -----------------------------------------------------------------------------------
+
+
+class InputRecorder(ClipboardApp[None]):
+    """An rlx app (so the guard is installed) that records each paste, each key and each
+    escape its binding takes."""
+
+    BINDINGS: ClassVar = [Binding("escape", "escaped", priority=True)]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pastes: list[str] = []
+        self.keys: list[str] = []
+        self.escapes = 0
+
+    def action_escaped(self) -> None:
+        self.escapes += 1
+
+    def on_paste(self, event: events.Paste) -> None:
+        self.pastes.append(event.text)
+
+    def on_key(self, event: events.Key) -> None:
+        self.keys.append(event.key)
+
+
+@pytest.mark.usefixtures("uninstalled")
+def test_a_raw_escape_paste_then_a_lone_escape_reach_the_app_as_one_paste_then_escape(
+    clock: Clock,
+) -> None:
+    """From the terminal's bytes, through a parser built after the app, as the driver builds
+    it: the paste arrives whole with no key (no Enter), and a lone Escape pressed after it
+    still reaches the app as the escape key once Textual's ``ESCAPE_DELAY`` has passed."""
+
+    async def drive() -> InputRecorder:
+        app = InputRecorder()
+        async with app.run_test() as pilot:
+            parser = XTermParser()
+            messages = [*parser.feed(bracketed_paste("one\x1b\rtwo")), *parser.feed("\x1b")]
+            clock[0] += 2 * constants.ESCAPE_DELAY
+            messages += parser.tick()
+            for message in messages:
+                app.post_message(message)
+            await pilot.pause()
+        return app
+
+    app = asyncio.run(drive())
+    assert app.pastes == ["one\x1b\rtwo"]
+    assert app.escapes == 1
+    assert "enter" not in app.keys, app.keys

@@ -3,20 +3,35 @@
 Textual's ``XTermParser.parse`` keeps decoding escape sequences while a bracketed paste is
 open, so a raw Escape in the pasted text sends the rest of it to the app as keys, an Enter
 among them, ahead of a cut-short paste. In an agent's pane that Enter submits a half-pasted
-prompt.
+prompt (textual#6802, https://github.com/Textualize/textual/issues/6802).
 
-:func:`install` wraps that parse, once per process. Once Textual's own parse has read a
-paste's start marker, the text up to the end marker is read here and delivered as one
-``Paste`` holding it, NULs dropped as Textual drops them; every character outside a paste
-still goes through Textual's parse. It leans on private Textual names: ``XTermParser.parse``,
-``textual._parser.Read1``, ``ParseTimeout`` and ``ParseEOF``, ``BRACKETED_PASTE_START`` and
-``BRACKETED_PASTE_END``, and the empty ``Paste`` that Textual's parse flushes for an end marker
-read with no text before it, which is how the wrapper closes Textual's own paste.
-``tests/test_paste_guard.py`` pins them; should a name it reads be missing when asq starts,
-Textual's parse stays as it is.
+:func:`install` wraps that parse, once per process. Textual's own parse reads every character
+until it has read a paste's start marker (``ESC[200~``). From there the guard reads the body
+itself, with no timeout, up to the first exact end marker (``ESC[201~``), which it looks for
+in a fixed trailing window of the last six characters read. It hands the end marker to
+Textual's parse, so that parse closes its own paste, and delivers exactly one ``Paste`` with
+the body's text, an empty one included, NULs dropped once as Textual drops them. Every
+character outside a paste still goes through Textual's parse: typing, alt+key, reports, and a
+lone Escape, which becomes the escape key after Textual's own ``ESCAPE_DELAY``.
 
-Delete this module, its install in ``ClipboardApp`` and the seam test once a Textual release
-keeps an Escape inside a paste as text.
+Its known limits, each Textual's own behaviour or the price of no timer:
+
+- A start marker split by a pause longer than ``ESCAPE_DELAY`` is not guarded: Textual times
+  its head out as keys, and the paste after it is Textual's as before.
+- A paste whose end marker never arrives holds later input until one does or the input ends;
+  input that ends inside a paste gives no paste and no key.
+- An exact end marker inside the pasted text ends the paste there.
+- Focus and resize reports inside a paste are text.
+
+It leans on private Textual names: ``XTermParser.parse``, ``textual._parser.Read1``,
+``ParseTimeout`` and ``ParseEOF``, ``BRACKETED_PASTE_START`` and ``BRACKETED_PASTE_END``, and
+the empty ``Paste`` that Textual's parse flushes for an end marker read with no text before
+it. ``tests/test_paste_guard.py``'s canary tests pin each one, the parse's source and the
+defect itself, and fail naming this module; should a name it reads be missing when rlx
+starts, Textual's parse stays as it is.
+
+Drop this guard and the textual==8.2.8 pin once Textual ships the fix for textual#6802: this
+module, its install in ``ClipboardApp``, its tests, and the pin in ``pyproject.toml``.
 """
 
 from __future__ import annotations
@@ -48,6 +63,11 @@ class _Installed:
 
 _installed: _Installed | None = None
 
+GUARD_MARK = "_rlx_paste_guard_wraps"
+"""The attribute :func:`install` sets on the guarded parse: the parse it wraps. Installing
+reads it on whatever ``XTermParser.parse`` is now, so a parse already guarded is never wrapped
+again, even when this module's record of it is gone (a reload)."""
+
 
 def textual_parse() -> Parse | None:
     """Textual's own ``XTermParser.parse``, which :func:`install` wrapped; None before it has."""
@@ -57,15 +77,19 @@ def textual_parse() -> Parse | None:
 def install() -> bool:
     """Wrap ``XTermParser.parse`` (:func:`_guard`), once per process: whether it is wrapped.
 
-    A Textual whose private names have moved, or whose parse is no longer a generator,
-    keeps its own parse: a Textual release must never stop asq from starting."""
+    Idempotent: a parse that already carries :data:`GUARD_MARK` is kept as it is, so
+    installing twice wraps once. A Textual whose private names have moved, or whose parse is
+    no longer a generator, keeps its own parse: a Textual release must never stop rlx from
+    starting (the canary tests are what make such a release loud)."""
     global _installed
     try:
         import textual._parser as textual_parser
         import textual._xterm_parser as xterm_parser
 
         current = xterm_parser.XTermParser.parse
-        if _installed is not None and current is _installed.guarded_parse:
+        wrapped = getattr(current, GUARD_MARK, None)
+        if wrapped is not None:
+            _installed = _Installed(wrapped, current)
             return True
         guarded = _guard(
             current,
@@ -79,11 +103,16 @@ def install() -> bool:
         return False
     if not inspect.isgeneratorfunction(current):
         return False
+    setattr(guarded, GUARD_MARK, current)
     xterm_parser.XTermParser.parse = guarded  # type: ignore[method-assign, assignment]
     _installed = _Installed(current, guarded)
     return True
 
 
+# Drop this guard and the textual==8.2.8 pin once Textual ships the fix for textual#6802
+# (https://github.com/Textualize/textual/issues/6802). Known limit, by choice: a start marker
+# that a pause longer than ESCAPE_DELAY splits is not guarded, as stock Textual times its head
+# out as keys (tests/test_paste_guard.py pins that behaviour).
 def _guard(
     textual: Parse,
     *,
@@ -94,7 +123,8 @@ def _guard(
     end: str,
 ) -> Parse:
     """``textual``'s parse with each paste's body read here: everything after ``start``,
-    which ``textual`` reads and so opens its paste, up to the first ``end``."""
+    which ``textual`` reads and so opens its paste, up to the first exact ``end``, read with
+    no timeout and delivered as exactly one ``Paste``."""
 
     def parse(
         self: XTermParser, token_callback: Callable[[Message], None]
@@ -128,22 +158,27 @@ def _guard(
                 continue
             last_read = ""
             try:
-                body = yield from _paste_body(read1, end)
+                text = yield from _paste_body(read1, end)
             except eof:
                 return  # as ``textual`` does: input that ends inside a paste is no paste
             replaying_end = True
             for marker_character in end:
                 awaiting = inner.send(marker_character)
             replaying_end = False
-            # Textual drops NULs from a paste (its issue 1661), and so does this.
-            token_callback(events.Paste("".join(body[: -len(end)]).replace("\x00", "")))
+            # Textual drops NULs from a paste (its issue 1661), and so does this, once.
+            token_callback(events.Paste(text.replace("\x00", "")))
 
     return parse
 
 
-def _paste_body(read1: Callable[[], Read1], end: str) -> Generator[Read1, str, list[str]]:
-    """The characters read up to and including the first ``end``, joined by the caller once."""
+def _paste_body(read1: Callable[[], Read1], end: str) -> Generator[Read1, str, str]:
+    """The text read up to the first exact ``end``, which is read and left out. Read with no
+    timeout, however long a read pauses; ``end`` is looked for in a fixed trailing window,
+    the last ``len(end)`` characters, so each character costs the same in a long paste."""
     body: list[str] = []
-    while "".join(body[-len(end) :]) != end:
-        body.append((yield read1()))
-    return body
+    window = ""
+    while window != end:
+        character = yield read1()
+        body.append(character)
+        window = (window + character)[-len(end) :]
+    return "".join(body[: -len(end)])
