@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunDecideData",
+  "description": "`run.decide`'s reply: the decision taken.",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "description": "The call.",
+      "type": "string"
+    },
+    "decision": {
+      "description": "The decision.",
+      "$ref": "#/$defs/Decision"
+    },
+    "run_id": {
+      "description": "The run.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "required": [
+    "run_id",
+    "call_id",
+    "decision"
+  ],
+  "$defs": {
+    "Decision": {
+      "description": "What a tool call was decided (5.1).",
+      "oneOf": [
+        {
+          "description": "It runs.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "It doesn't.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "It doesn't, and the app saved it as a draft (`draft_id`).",
+          "type": "string",
+          "const": "draft"
+        }
+      ]
+    }
+  }
+}

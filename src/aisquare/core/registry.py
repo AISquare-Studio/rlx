@@ -32,7 +32,8 @@ process):
 - ``<id>.json`` — the record, UTF-8 JSON, replaced whole: written to a temp file in the
   folder whose name is not ``<id>.json`` and renamed over it, so a reader sees the old record
   or the new one, never a part. This module writes ``.<id>.json.<pid>.<hex>.tmp``; rlxd
-  writes ``<id>.json.tmp`` and fsyncs it first. A reader takes either for a file of ``<id>``.
+  writes ``<id>.json.<hex>.tmp``, made new (never a file, FIFO or link already there), and
+  fsyncs it first. A reader takes either for a file of ``<id>``.
 - ``<id>.lock`` — empty, locked by the process for as long as it runs. A pid is recycled; a
   lock is not: the OS drops it with the process, however the process ended, so a record
   whose lock is free is a crashed process's, whatever has its pid now.

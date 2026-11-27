@@ -67,6 +67,44 @@
       "if": {
         "properties": {
           "type": {
+            "const": "run.tool_call"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunToolCallData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.tool_decided"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunToolDecidedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
             "const": "run.tool_result"
           }
         },
@@ -214,6 +252,51 @@
       "required": [
         "id",
         "status"
+      ]
+    },
+    "DecidedBy": {
+      "description": "Who decided a tool call (5.1).",
+      "oneOf": [
+        {
+          "description": "The app, with `run.decide`.",
+          "type": "string",
+          "const": "app"
+        },
+        {
+          "description": "rlxd's own rules: the mount, the kind, the pinned call.",
+          "type": "string",
+          "const": "rlxd"
+        },
+        {
+          "description": "No answer came before the deadline.",
+          "type": "string",
+          "const": "timeout"
+        },
+        {
+          "description": "No app-role connection was there to ask.",
+          "type": "string",
+          "const": "unreachable"
+        }
+      ]
+    },
+    "Decision": {
+      "description": "What a tool call was decided (5.1).",
+      "oneOf": [
+        {
+          "description": "It runs.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "It doesn't.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "It doesn't, and the app saved it as a draft (`draft_id`).",
+          "type": "string",
+          "const": "draft"
+        }
       ]
     },
     "Event": {
@@ -903,6 +986,74 @@
       "required": [
         "text",
         "partial"
+      ]
+    },
+    "RunToolCallData": {
+      "description": "`run.tool_call` (5.1): a call of the run's that only the app can decide, with\n`run.decide` before `deadline_ms`. It replays through `run.events`, so an app that\nreconnects while it is pending sees it again.",
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "description": "Claude Code's `tool_use_id`, which the call's other events share.",
+          "type": "string"
+        },
+        "deadline_ms": {
+          "description": "How long the app has to decide, in milliseconds, from this event.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "input": {
+          "description": "The tool's input, as Claude Code gave it."
+        },
+        "input_sha256": {
+          "description": "The SHA-256, in hex, of the input's RFC 8785 canonical JSON.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "tool": {
+          "description": "The tool, such as `mcp__claude_ai_Slack__slack_send_message`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool",
+        "input",
+        "input_sha256",
+        "deadline_ms"
+      ]
+    },
+    "RunToolDecidedData": {
+      "description": "`run.tool_decided` (5.1): how a call was decided, and by whom.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "`app`, `rlxd`, `timeout` or `unreachable`.",
+          "$ref": "#/$defs/DecidedBy"
+        },
+        "call_id": {
+          "description": "Claude Code's `tool_use_id`.",
+          "type": "string"
+        },
+        "decision": {
+          "description": "`allow`, `deny` or `draft`.",
+          "$ref": "#/$defs/Decision"
+        },
+        "draft_id": {
+          "description": "For `draft`: the app's draft.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why: the app's reason, or rlxd's. Data only: it decides nothing.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "decision",
+        "by",
+        "reason"
       ]
     },
     "RunToolResultData": {

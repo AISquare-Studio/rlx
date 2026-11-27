@@ -9,6 +9,7 @@ mod abort;
 mod asks;
 mod big;
 mod crash;
+pub mod gate;
 mod hello;
 mod huge;
 mod orphan;
@@ -19,6 +20,7 @@ mod rate_limit;
 mod slow;
 mod structured;
 mod tool_result;
+pub mod watch_call;
 
 pub use orphan::LINGER;
 
@@ -31,6 +33,7 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("asks", asks::run),
     ("big", big::run),
     ("crash", crash::run),
+    ("gate", gate::by_prompt),
     ("hello", hello::run),
     ("huge", huge::run),
     ("orphan", orphan::run),
@@ -44,13 +47,15 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("slow", slow::run),
     ("structured", structured::run),
     ("tool-result", tool_result::run),
+    ("watch-call", watch_call::run),
 ];
 
-/// The scenario called `name`.
+/// The scenario called `name`: one of [`ALL`], or one of the gate's ([`gate`]).
 pub fn find(name: &str) -> Option<Scenario> {
     ALL.iter()
         .find(|(each, _)| *each == name)
         .map(|(_, scenario)| *scenario)
+        .or_else(|| gate::named(name))
 }
 
 /// The code a scenario exits with when stdin closed before its first message: Claude

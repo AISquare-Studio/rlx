@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunDecideParams",
+  "description": "`run.decide`'s params (5.1), from an app-role connection only: the app's answer to a\n`run.tool_call`. The first answer wins.\n\nrlxd refuses, by error code: `not_gate` from any other connection; `unknown_run`,\n`unknown_call`; `already_decided` once the call is decided; `too_late` once its\ndeadline passed (it was denied `by: \"timeout\"`).",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "description": "The call: its `run.tool_call`'s `call_id`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "description": "`allow`, `deny` or `draft`.",
+      "$ref": "#/$defs/Decision"
+    },
+    "draft_id": {
+      "description": "For `draft`: the app's draft.",
+      "type": "string"
+    },
+    "reason": {
+      "description": "Why, as Claude Code is told (`permissionDecisionReason`).",
+      "type": "string"
+    },
+    "run_id": {
+      "description": "The run.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "stop": {
+      "description": "End the run, as `run.needs_you {reason: \"denied\"}`, once the call is denied.",
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "call_id",
+    "decision",
+    "reason"
+  ],
+  "$defs": {
+    "Decision": {
+      "description": "What a tool call was decided (5.1).",
+      "oneOf": [
+        {
+          "description": "It runs.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "It doesn't.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "It doesn't, and the app saved it as a draft (`draft_id`).",
+          "type": "string",
+          "const": "draft"
+        }
+      ]
+    }
+  }
+}

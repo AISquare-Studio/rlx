@@ -65,8 +65,10 @@ use crate::log::{info, warning};
 use crate::{clock, spaces};
 
 mod argv;
+mod gate;
 #[cfg(unix)]
 pub(crate) mod guard;
+pub(crate) mod jcs;
 mod process;
 mod remove;
 mod store;
@@ -90,12 +92,14 @@ const PARTIAL_TEXT: usize = 1 << 20;
 /// How long `run.cancel` waits for a running run to end before it answers.
 const CANCEL_WAIT: Duration = Duration::from_secs(10);
 
-/// The scheduler job a run was fired for (7.6): its id, and its `loud`, which rlxd only
-/// echoes on the run's `run.done` and `run.needs_you`.
+/// The scheduler job a run was fired for (7.6): its id, its `loud`, which rlxd only
+/// echoes on the run's `run.done` and `run.needs_you`, and whether it is a watch job,
+/// whose pinned call's result is `job.watch_result`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobTag {
     pub job_id: String,
     pub loud: bool,
+    pub watch: bool,
 }
 
 /// What a run a scheduler job fired did that the scheduler acts on.
@@ -115,7 +119,22 @@ pub enum RunNote {
         run_id: RunId,
         state: RunState,
     },
+    /// A watch run's pinned call, allowed, gave its result (7.6): `content` as
+    /// `run.tool_result` carries it, bounded.
+    WatchResult {
+        job_id: String,
+        run_id: RunId,
+        tool: String,
+        input_sha256: String,
+        content: Value,
+        is_error: bool,
+        truncated: bool,
+    },
 }
+
+pub(crate) use gate::claude_server_name;
+#[cfg(feature = "debug-methods")]
+pub use gate::{Ask, HOOK_KEY_ENV, output as hook_output};
 
 /// The runner of one rlxd.
 pub struct Runner {
@@ -153,6 +172,22 @@ pub struct Runner {
     runs: Mutex<Runs>,
     /// Set once rlxd stops: no run starts from then on.
     stopping: AtomicBool,
+    /// The app gate's connections, as the gate counts them ([`Runner::follow_apps`]).
+    apps: std::sync::OnceLock<watch::Receiver<u32>>,
+    /// Test builds only: bumped to end every hook connection waiting on the gate
+    /// (`debug.drop_hook_connections`).
+    #[cfg(feature = "debug-methods")]
+    hooks_dropped: watch::Sender<u64>,
+    /// Test builds only: how many hook connections wait on the gate now.
+    #[cfg(feature = "debug-methods")]
+    hooks_waiting: watch::Sender<u64>,
+    /// Test builds only: rlxd itself as each run's hook, and the subcommand it runs as
+    /// (`rlxd __test-hook pre-tool-use`, which asks `debug.pre_tool_use`), until
+    /// rlxd-hook's own pre-tool-use is wired (`RLXD_TEST_HOOK`).
+    test_hook: Option<(PathBuf, &'static str)>,
+    /// Test builds only: the space whose runs' ledger writes fail
+    /// (`RLXD_TEST_FAIL_LEDGER`).
+    fail_ledger: Option<String>,
     /// Where notes on runs scheduler jobs fired go ([`Runner::notes`]).
     notes: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<RunNote>>,
 }
@@ -183,6 +218,9 @@ struct Run {
     job_id: Option<String>,
     /// The job's `loud`, for a run a scheduler job fired.
     loud: Option<bool>,
+    /// Whether a watch job fired the run: then its pinned call's result goes to the
+    /// scheduler as `job.watch_result`. Not kept across a restart, which ends the run.
+    watch_job: bool,
     client: String,
     dir: RunDir,
     inner: Mutex<RunInner>,
@@ -263,6 +301,23 @@ struct RunInner {
     /// Whether some attempt reached `run.started` with its session kept: only then is
     /// there a session for `run.resume`.
     session_started: bool,
+    /// The gate's ledger of the run's calls (5.1), as `run.json` keeps it.
+    calls: Vec<rlxd_proto::RunCall>,
+    /// Whether the run's pinned call was allowed once: every later call is denied, in any
+    /// attempt, after a restart too.
+    pinned_call_used: bool,
+    /// The running attempt's hook key ([`gate`]): in memory only, never logged or written.
+    hook_key: Option<String>,
+    /// What the attempt's `system/init` listed: its tools, its MCP servers and each
+    /// tool's `readOnlyHint`, which rlxd's rules decide by. Empty until the init comes.
+    listed: gate::Listed,
+    /// The run's last state event, as its record keeps it until its log line is fsynced
+    /// (`last_event`): every record written keeps it, the gate's too.
+    last_state_event: Option<Value>,
+    /// The calls the gate is deciding or decided in this rlxd, by `call_id`.
+    gate: HashMap<String, gate::Status>,
+    /// The call whose denial the app ended the run on (`run.decide` with `stop: true`).
+    stopped: Option<String>,
 }
 
 /// How durable an event is before it is published.
@@ -341,6 +396,13 @@ impl Runner {
             resume_delay: test_delay("RLXD_TEST_RESUME_DELAY_MS"),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
+            apps: std::sync::OnceLock::new(),
+            #[cfg(feature = "debug-methods")]
+            hooks_dropped: watch::Sender::new(0),
+            #[cfg(feature = "debug-methods")]
+            hooks_waiting: watch::Sender::new(0),
+            test_hook: test_hook(rlxd.as_deref()),
+            fail_ledger: test_space("RLXD_TEST_FAIL_LEDGER"),
             notes: std::sync::OnceLock::new(),
         });
         runner.load();
@@ -453,6 +515,7 @@ impl Runner {
             let run = Arc::new(Run {
                 job_id: record.job_id.clone(),
                 loud: record.loud,
+                watch_job: false,
                 client: record.client.clone(),
                 dir,
                 inner: Mutex::new(RunInner {
@@ -476,6 +539,24 @@ impl Runner {
                     needs_you,
                     unsynced: 0,
                     logged: tail.last_run_seq,
+                    // A call still executing when its rlxd stopped may have run: unknown.
+                    calls: record
+                        .calls
+                        .iter()
+                        .cloned()
+                        .map(|mut call| {
+                            if call.state == rlxd_proto::CallState::Executing {
+                                call.state = rlxd_proto::CallState::Unknown;
+                            }
+                            call
+                        })
+                        .collect(),
+                    pinned_call_used: record.pinned_call_used,
+                    hook_key: None,
+                    listed: gate::Listed::default(),
+                    last_state_event: record.last_event.clone(),
+                    gate: HashMap::new(),
+                    stopped: None,
                 }),
                 state: watch::Sender::new(record.state),
                 logged: watch::Sender::new(tail.last_run_seq),
@@ -616,11 +697,11 @@ impl Runner {
         job: Option<JobTag>,
     ) -> Result<RunRef, ErrorBody> {
         check_start(&params)?;
-        let (job_id, loud) = match job {
-            Some(job) => (Some(job.job_id), Some(job.loud)),
-            None => (None, None),
+        let (job_id, loud, watch_job) = match job {
+            Some(job) => (Some(job.job_id), Some(job.loud), job.watch),
+            None => (None, None, false),
         };
-        self.start_checked(params, client, job_id, loud)
+        self.start_checked(params, client, job_id, loud, watch_job)
     }
 
     /// [`Runner::start`], its params checked.
@@ -630,6 +711,7 @@ impl Runner {
         client: &str,
         job_id: Option<String>,
         loud: Option<bool>,
+        watch_job: bool,
     ) -> Result<RunRef, ErrorBody> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(refusal(
@@ -682,6 +764,7 @@ impl Runner {
         let run = Arc::new(Run {
             job_id,
             loud,
+            watch_job,
             client: client.to_owned(),
             dir,
             inner: Mutex::new(RunInner {
@@ -705,6 +788,13 @@ impl Runner {
                 unsynced: 0,
                 logged: 0,
                 session_started: false,
+                calls: Vec::new(),
+                pinned_call_used: false,
+                hook_key: None,
+                listed: gate::Listed::default(),
+                last_state_event: None,
+                gate: HashMap::new(),
+                stopped: None,
             }),
             state: watch::Sender::new(RunState::Queued),
             logged: watch::Sender::new(0),
@@ -1017,6 +1107,8 @@ impl Runner {
             .and_then(|line| serde_json::from_slice::<Event>(line).ok());
         data.session.clone_from(&inner.session);
         data.structured_output.clone_from(&inner.structured_output);
+        // The gate's ledger: what the app reads of a send after any end (5.1).
+        data.calls.clone_from(&inner.calls);
         Ok(data)
     }
 
@@ -1411,6 +1503,15 @@ impl Runner {
         };
         // A needs-you that was out is settled by any end, a new needs-you included.
         self.clear_needs_you(inner);
+        // A call still open as the run ends is denied; one still executing may have run
+        // (5.1). The attempt's hook key goes, so no hook of it is answered from now on.
+        self.settle_open(run, inner);
+        for call in &mut inner.calls {
+            if call.state == rlxd_proto::CallState::Executing {
+                call.state = rlxd_proto::CallState::Unknown;
+            }
+        }
+        inner.hook_key = None;
         inner.state = state;
         inner.ended_at = Some(clock::now());
         inner.tree = None;
@@ -1558,7 +1659,10 @@ impl Runner {
                 .hook
                 .as_ref()
                 .map_err(|why| std::io::Error::other(why.clone()))?;
-            let settings = argv::settings(params, attempt, hook);
+            let settings = match &self.test_hook {
+                Some((rlxd, via)) => argv::settings_via(params, attempt, rlxd, Some(via)),
+                None => argv::settings(params, attempt, hook),
+            };
             let settings = run.dir.write_settings(attempt, &settings)?;
             Ok((space, settings))
         });
@@ -1573,6 +1677,17 @@ impl Runner {
         let mut env = run_env(&self.env.values());
         // Every process of the run inherits it: the start sweep's way to know them.
         env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
+        // The attempt's hook key: its hooks inherit it, and the gate wants it back (5.1).
+        let Some(key) = gate::new_key() else {
+            return failed("the attempt's hook key could not be made: no randomness".to_owned());
+        };
+        env.push((gate::HOOK_KEY_ENV.into(), key.as_str().into()));
+        {
+            let mut inner = run.inner();
+            inner.hook_key = Some(key);
+            inner.listed = gate::Listed::default();
+            inner.stopped = None;
+        }
         let launch = Launch {
             program: program.clone(),
             args: argv::args(params, attempt, &settings),
@@ -1657,11 +1772,24 @@ impl Runner {
                 failed(message)
             }
         };
-        let ending = run.inner().ending;
+        let (ending, stopped) = {
+            let mut inner = run.inner();
+            (inner.ending, inner.stopped.take())
+        };
         match ending {
             // rlxd ended the run as its result came: rlxd's reason stands.
             Some(reason) if !matches!(&end, End::Failed(f) if f.reason == reason) => {
                 ended_early(run, reason)
+            }
+            // The app ended the run as it denied a call: the user is wanted (5.1).
+            None if stopped.is_some() => {
+                let call_id = stopped.unwrap_or_default();
+                let session = params.persists().then(|| params.run_id.to_string());
+                let mut done = RunDoneData::new(session, "", rlxd_proto::Usage::default());
+                done.loud = run.loud;
+                let mut needs = RunNeedsYouData::denied(call_id);
+                needs.loud = run.loud;
+                End::NeedsYou(needs, done)
             }
             _ => end,
         }
@@ -1742,6 +1870,18 @@ impl Runner {
                 match parsed {
                     Line::Init(init) if !started => {
                         started = true;
+                        inner.listed = gate::Listed {
+                            tools: init.tools.iter().cloned().collect(),
+                            servers: init
+                                .mcp_servers
+                                .iter()
+                                .map(|server| gate::Server {
+                                    name: server.name.clone(),
+                                    source: init.sources.get(&server.name).cloned(),
+                                })
+                                .collect(),
+                            hints: init.hints.clone(),
+                        };
                         let data = RunStartedData::new(init.cwd, init.model, init.claude_version)
                             .with_tools(init.tools, init.mcp_servers)
                             .resumed(attempt > 1);
@@ -1770,7 +1910,29 @@ impl Runner {
                         is_error,
                         content,
                     } => {
+                        // The ledger's outcome for an allowed call (5.1), before its event.
+                        let ran = self.tool_ran(run, &mut inner, &call_id, is_error);
                         let (content, truncated) = stream::bounded(content);
+                        // A watch job's pinned call: its raw result goes to the scheduler,
+                        // as job.watch_result (7.6). A run job's never does, whatever
+                        // its template's kind.
+                        if let (Some(ran), Some(job_id), Some(pinned)) =
+                            (ran, &run.job_id, &run.params.pinned_call)
+                            && run.watch_job
+                            && run.params.kind == RunKind::Watch
+                            && ran.tool == pinned.tool
+                            && ran.input_sha256 == pinned.input_sha256
+                        {
+                            self.note(RunNote::WatchResult {
+                                job_id: job_id.clone(),
+                                run_id: run.params.run_id.clone(),
+                                tool: ran.tool,
+                                input_sha256: ran.input_sha256,
+                                content: content.clone(),
+                                is_error,
+                                truncated,
+                            });
+                        }
                         let tool = tools.get(&call_id).cloned().unwrap_or_default();
                         let data = RunToolResultData::new(call_id, tool, is_error, content)
                             .truncated(truncated);
@@ -1908,9 +2070,9 @@ impl Runner {
             warning!("run {id}: its log could not be fsynced: {e}");
         }
         inner.unsynced = 0;
+        inner.last_state_event = Some(json!({"run_seq": run_seq, "type": r#type, "data": data}));
         let mut record = run.record(inner);
         record.last_run_seq = run_seq;
-        record.last_event = Some(json!({"run_seq": run_seq, "type": r#type, "data": data}));
         if let Err(e) = run.dir.write_record(&record) {
             warning!("run {id}: its record was not written: {e}");
         }
@@ -2011,10 +2173,11 @@ impl Run {
             process: inner.process.clone(),
             job_id: self.job_id.clone(),
             loud: self.loud,
-            last_event: None,
+            last_event: inner.last_state_event.clone(),
             boot: process::boot_id(),
             session_started: inner.session_started,
-            calls: Vec::new(),
+            calls: inner.calls.clone(),
+            pinned_call_used: inner.pinned_call_used,
         }
     }
 }
@@ -2275,6 +2438,31 @@ fn test_delay(name: &str) -> Option<Duration> {
 
 #[cfg(not(feature = "debug-methods"))]
 fn test_delay(_name: &str) -> Option<Duration> {
+    None
+}
+
+/// Test builds only: with `RLXD_TEST_HOOK` set, rlxd itself (`rlxd`) as each run's hook,
+/// run as `rlxd __test-hook`.
+#[cfg(feature = "debug-methods")]
+fn test_hook(rlxd: Option<&std::path::Path>) -> Option<(PathBuf, &'static str)> {
+    std::env::var_os("RLXD_TEST_HOOK")
+        .filter(|on| !on.is_empty())
+        .and(rlxd.map(|rlxd| (rlxd.to_path_buf(), "__test-hook")))
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_hook(_rlxd: Option<&std::path::Path>) -> Option<(PathBuf, &'static str)> {
+    None
+}
+
+/// Test builds only: the space the variable `name` names.
+#[cfg(feature = "debug-methods")]
+fn test_space(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|space| !space.is_empty())
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_space(_name: &str) -> Option<String> {
     None
 }
 

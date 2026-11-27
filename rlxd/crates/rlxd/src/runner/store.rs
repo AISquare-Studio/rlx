@@ -72,7 +72,10 @@ pub struct Record {
     pub session_started: bool,
     /// The call ledger: one entry per gated call (5.1).
     #[serde(default)]
-    pub calls: Vec<Value>,
+    pub calls: Vec<rlxd_proto::RunCall>,
+    /// Whether the run's pinned call was allowed once (5.1): every later call is denied.
+    #[serde(default)]
+    pub pinned_call_used: bool,
 }
 
 /// A run's process, as the sweep finds it again.

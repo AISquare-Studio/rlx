@@ -12,9 +12,9 @@ use crate::{
     DaemonRecord, EnvValues, Envelope, Event, HelloData, HelloParams, HereData, JobEvent,
     JobListData, JobListParams, JobPutParams, JobRef, JobRunNowData, PtyExited, PtyKillParams,
     PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
-    PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunEvent, RunEventsData,
-    RunEventsParams, RunGetData, RunListData, RunListParams, RunRef, RunResumeData,
-    RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
+    PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunDecideData, RunDecideParams,
+    RunEvent, RunEventsData, RunEventsParams, RunGetData, RunListData, RunListParams, RunRef,
+    RunResumeData, RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
     SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, SpaceEnsureData,
     SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
 };
@@ -63,6 +63,8 @@ pub fn all() -> Vec<SchemaFile> {
         file::<PtyWriteParams>("pty-write.json"),
         file::<Request>("request.json"),
         file::<RunCancelData>("run-cancel-reply.json"),
+        file::<RunDecideParams>("run-decide.json"),
+        file::<RunDecideData>("run-decide-reply.json"),
         file::<RunEvent>("run-event.json"),
         list_of::<RunEvent>(
             "run-event-list.json",

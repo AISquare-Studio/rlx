@@ -66,6 +66,8 @@ mod serve;
 mod server;
 mod settings;
 mod spaces;
+#[cfg(feature = "debug-methods")]
+mod test_hook;
 mod token;
 pub mod vt;
 #[cfg(windows)]
@@ -168,6 +170,20 @@ enum Action {
             value_parser = clap::value_parser!(std::ffi::OsString)
         )]
         argv: Vec<std::ffi::OsString>,
+    },
+    /// Test builds only: a run's hook, as rlxd-hook's will be: asks rlxd's gate about the
+    /// call on stdin (`debug.pre_tool_use`), and prints its answer, or a deny.
+    #[cfg(feature = "debug-methods")]
+    #[command(name = "__test-hook", hide = true)]
+    TestHook {
+        /// The hook's event: `pre-tool-use`.
+        event: String,
+        /// The run.
+        #[arg(long)]
+        run: String,
+        /// The run's attempt.
+        #[arg(long)]
+        attempt: u64,
     },
     /// Print the notices of what rlxd carries from others: tmux's ISC licence, for the
     /// parts of rlxd ported from tmux.
@@ -362,6 +378,12 @@ pub fn main() -> ExitCode {
         Action::Attach { pty_id, read_only } => {
             attach::attach(attach::AttachArgs { pty_id, read_only })
         }
+        #[cfg(feature = "debug-methods")]
+        Action::TestHook {
+            event,
+            run,
+            attempt,
+        } => test_hook::main(&event, &run, attempt),
         #[cfg(unix)]
         Action::RunGuard { argv } => runner::guard::main(&argv),
         #[cfg(not(unix))]
