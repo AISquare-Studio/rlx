@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunListParams",
+  "description": "`run.list`'s params: which runs, of every run rlxd knows, live or ended, from before\nan app or rlxd restart too.\n\n```json\n{\"states\": [\"running\", \"queued\"], \"job_id\": \"j1\", \"limit\": 50}\n```",
+  "type": "object",
+  "properties": {
+    "job_id": {
+      "description": "Only the runs this scheduler job fired.",
+      "type": "string",
+      "minLength": 1
+    },
+    "limit": {
+      "description": "At most this many, the latest first.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "states": {
+      "description": "Only runs in these states. Absent: every state.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RunState"
+      }
+    }
+  },
+  "$defs": {
+    "RunState": {
+      "description": "Where a run stands (7.5).",
+      "oneOf": [
+        {
+          "description": "Waiting for a place in its kind's pool.",
+          "type": "string",
+          "const": "queued"
+        },
+        {
+          "description": "Its Claude Code is running.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "It ended needing the user; `run.resume` goes on with it.",
+          "type": "string",
+          "const": "needs_you"
+        },
+        {
+          "description": "It ended with a result.",
+          "type": "string",
+          "const": "done"
+        },
+        {
+          "description": "It ended without one: `run.failed`'s `reason` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    }
+  }
+}

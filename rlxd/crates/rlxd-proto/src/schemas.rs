@@ -11,10 +11,11 @@ use serde_json::Value;
 use crate::{
     DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, PtyExited, PtyKillParams,
     PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
-    PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunEvent, RunRef, RunStartParams,
-    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
-    SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceEraseData, SpaceParams,
-    StatusData, SubscribeParams,
+    PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunEvent, RunEventsData,
+    RunEventsParams, RunGetData, RunListData, RunListParams, RunRef, RunResumeData,
+    RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
+    SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, SpaceEnsureData,
+    SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
 };
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
@@ -61,7 +62,14 @@ pub fn all() -> Vec<SchemaFile> {
             "A run's events as a JSON array, such as `jq -s .` makes of a capture of the \
              run and needs_you topics, or of `run.events`.",
         ),
+        file::<RunEventsParams>("run-events.json"),
+        file::<RunEventsData>("run-events-reply.json"),
+        file::<RunGetData>("run-get-reply.json"),
+        file::<RunListParams>("run-list.json"),
+        file::<RunListData>("run-list-reply.json"),
         file::<RunRef>("run-ref.json"),
+        file::<RunResumeParams>("run-resume.json"),
+        file::<RunResumeData>("run-resume-reply.json"),
         file::<RunStartParams>("run-start.json"),
         file::<StatusData>("status-reply.json"),
         file::<Setting>("setting.json"),

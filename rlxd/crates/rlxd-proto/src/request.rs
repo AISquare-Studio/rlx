@@ -197,6 +197,28 @@ pub mod methods {
     /// [`SpaceParams`](crate::SpaceParams) in, [`SpaceEnsureData`](crate::SpaceEnsureData)
     /// out.
     pub const SPACE_ENSURE: &str = "space.ensure";
+    /// Goes on with a run that has no live process, as a new attempt:
+    /// [`RunResumeParams`](crate::RunResumeParams) in,
+    /// [`RunResumeData`](crate::RunResumeData) out.
+    pub const RUN_RESUME: &str = "run.resume";
+    /// One run, from its durable record: [`RunRef`](crate::RunRef) in,
+    /// [`RunGetData`](crate::RunGetData) out.
+    pub const RUN_GET: &str = "run.get";
+    /// Every run rlxd knows: [`RunListParams`](crate::RunListParams) in,
+    /// [`RunListData`](crate::RunListData) out.
+    pub const RUN_LIST: &str = "run.list";
+    /// A run's events from its durable log, then live until it ends:
+    /// [`RunEventsParams`](crate::RunEventsParams) in, event frames, then
+    /// [`RunEventsData`](crate::RunEventsData), which ends the stream.
+    pub const RUN_EVENTS: &str = "run.events";
+    /// Deletes a space, its runs' Claude Code sessions and rlxd's records of its runs:
+    /// [`SpaceParams`](crate::SpaceParams) in, [`SpaceEraseData`](crate::SpaceEraseData)
+    /// out.
+    pub const SPACE_ERASE: &str = "space.erase";
+    /// Test builds only: `run.start` with a scheduler `job_id`, which no other client can
+    /// set: [`RunStartParams`](crate::RunStartParams) plus `job_id` in,
+    /// [`RunRef`](crate::RunRef) out. A release build answers `unknown_method`.
+    pub const DEBUG_RUN_START: &str = "debug.run_start";
 }
 
 impl Request {

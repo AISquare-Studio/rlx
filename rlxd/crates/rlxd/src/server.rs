@@ -42,10 +42,10 @@ use rlxd_client::Home;
 use rlxd_proto::{
     Claude, Clients, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, PROTOCOL_VERSION,
     PROTOCOL_VERSIONS, Params, Paths, PtyKillParams, PtyResizeParams, PtyScreenParams,
-    PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role, RunRef,
-    RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
-    SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
-    methods, setting_keys, topics,
+    PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role, RunEventsParams,
+    RunListParams, RunRef, RunResumeParams, RunStartParams, SettingsDeleteParams,
+    SettingsGetParams, SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceParams,
+    StatusData, SubscribeParams, VERSION, codes, event_types, methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -58,7 +58,7 @@ use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
 use crate::pty::{self, Host};
-use crate::runner::Runner;
+use crate::runner::{Replay, Runner};
 use crate::settings::{self, Settings};
 use crate::{claude, spaces, token};
 
@@ -137,6 +137,8 @@ enum Answer {
     Paired(Envelope, Minted),
     /// The event stream, whose last frame is the reply.
     Stream(Subscription),
+    /// A run's events from its log (`run.events`), whose last frame is the reply.
+    RunStream(RequestId, Box<Replay>),
 }
 
 /// A gate credential `gate.pair` minted for `device`, whose SHA-256 is `sha256`. If its
@@ -432,18 +434,34 @@ impl Daemon {
         let id = request.id;
         let outcome = match request.method.as_str() {
             methods::STATUS => self.status(session).await,
-            methods::RUN_START | methods::RUN_CANCEL | methods::SPACE_ENSURE => {
+            methods::RUN_EVENTS | methods::EVENTS_SUBSCRIBE if streaming => Err(error(
+                codes::INVALID_REQUEST,
+                "this connection carries an event stream already: open another for a second",
+            )),
+            methods::RUN_EVENTS => {
+                match params_of::<RunEventsParams>(methods::RUN_EVENTS, request.params)
+                    .and_then(|params| self.runner.replay(&params))
+                {
+                    Ok(replay) => return Answer::RunStream(id, Box::new(replay)),
+                    Err(error) => Err(error),
+                }
+            }
+            methods::RUN_START
+            | methods::RUN_CANCEL
+            | methods::RUN_RESUME
+            | methods::RUN_GET
+            | methods::RUN_LIST
+            | methods::SPACE_ENSURE
+            | methods::SPACE_ERASE => {
                 self.runs_and_spaces(session, &request.method, request.params)
                     .await
             }
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_RUN_START => self.debug_run_start(session, request.params),
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
             }
-            methods::EVENTS_SUBSCRIBE if streaming => Err(error(
-                codes::INVALID_REQUEST,
-                "this connection carries an event stream already: open another for a second",
-            )),
             methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
                 Ok(subscription) => return Answer::Stream(subscription),
                 Err(error) => Err(error),
@@ -779,9 +797,28 @@ impl Daemon {
         claude
     }
 
-    /// The runner's methods (handoff 0.10.3, 7.5) and spaces' (2.5): `run.start`,
-    /// `run.cancel` and `space.ensure`. A run's client, in `run.list`, is the `client` the
-    /// connection's hello named.
+    /// `debug.run_start`: `run.start`'s params plus a scheduler `job_id`, which only rlxd
+    /// sets otherwise (7.6), so tests can check `run.list {job_id}`. Test builds only.
+    #[cfg(feature = "debug-methods")]
+    fn debug_run_start(&self, session: &Session, mut params: Params) -> Result<Data, ErrorBody> {
+        let job_id = match params.remove("job_id") {
+            Some(Value::String(job_id)) if !job_id.is_empty() => job_id,
+            _ => {
+                return Err(error(
+                    codes::INVALID_PARAMS,
+                    "debug.run_start takes run.start's params and a job_id, a string",
+                ));
+            }
+        };
+        let params = params_of::<RunStartParams>(methods::DEBUG_RUN_START, params)?;
+        printed(&off_worker(|| {
+            self.runner.start(params, &session.client, Some(job_id))
+        })?)
+    }
+
+    /// The runner's methods (handoff 0.10.3, 5.4 and 7.5) and spaces' (2.5): `run.start`,
+    /// `run.cancel`, `run.resume`, `run.get`, `run.list`, `space.ensure` and `space.erase`.
+    /// A run's client, in `run.list`, is the `client` the connection's hello named.
     async fn runs_and_spaces(
         &self,
         session: &Session,
@@ -799,6 +836,22 @@ impl Daemon {
             methods::RUN_CANCEL => {
                 let params = params_of::<RunRef>(method, params)?;
                 printed(&self.runner.cancel(&params.run_id).await?)
+            }
+            methods::RUN_RESUME => {
+                let params = params_of::<RunResumeParams>(method, params)?;
+                printed(&off_worker(|| self.runner.resume(params))?)
+            }
+            methods::RUN_GET => {
+                let params = params_of::<RunRef>(method, params)?;
+                printed(&off_worker(|| self.runner.get(&params.run_id))?)
+            }
+            methods::RUN_LIST => {
+                let params = params_of::<RunListParams>(method, params)?;
+                printed(&off_worker(|| self.runner.list(&params)))
+            }
+            methods::SPACE_ERASE => {
+                let params = params_of::<SpaceParams>(method, params)?;
+                printed(&off_worker(|| self.runner.erase(&params.name))?)
             }
             _ => {
                 let params = params_of::<SpaceParams>(method, params)?;
@@ -1254,6 +1307,24 @@ where
                     return dropped(&session, &mut frames, &mut writer).await;
                 }
             }
+            Answer::RunStream(id, replay) => {
+                let flow = send_run_stream(
+                    &daemon,
+                    &session,
+                    &mut frames,
+                    &mut writer,
+                    &mut watch,
+                    id,
+                    *replay,
+                )
+                .await;
+                match flow {
+                    Flow::GoOn => {}
+                    Flow::Linger => return linger(&mut frames).await,
+                    Flow::Dropped => return dropped(&session, &mut frames, &mut writer).await,
+                    Flow::Close => return,
+                }
+            }
             Answer::Stream(subscription) => {
                 let flow = send_stream(
                     &daemon,
@@ -1524,6 +1595,59 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Sends a `run.events` stream: the run's events from its log on disk, read as they are
+/// logged, then its reply `{run_id, last_run_seq}` once the run has no live process and
+/// every event it logged is sent. Answers the client's requests meanwhile, as
+/// [`send_stream`] does. When rlxd stops, the reply comes at once.
+async fn send_run_stream<R, W>(
+    daemon: &Arc<Daemon>,
+    session: &Session,
+    frames: &mut Frames<R>,
+    writer: &mut W,
+    watch: &mut Watch,
+    id: RequestId,
+    mut replay: Replay,
+) -> Flow
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut stopping = false;
+    loop {
+        loop {
+            let lines = off_worker(|| replay.read());
+            if lines.is_empty() {
+                break;
+            }
+            if send_lines(writer, &lines).await.is_err() {
+                return Flow::Close;
+            }
+        }
+        if stopping || off_worker(|| replay.done()) {
+            let reply = match printed(&replay.reply()) {
+                Ok(data) => Envelope::ok(data).with_id(id),
+                Err(error) => Envelope::err(error).with_id(id),
+            };
+            if send(writer, &reply).await.is_err() {
+                return Flow::Close;
+            }
+            return if stopping { Flow::Linger } else { Flow::GoOn };
+        }
+        tokio::select! {
+            () = replay.changed() => {}
+            () = daemon.stopped() => stopping = true,
+            () = kicked(session) => return Flow::Dropped,
+            frame = watch.next_line(frames) => {
+                if let Some(flow) =
+                    answer_in_stream(daemon, session, frames, writer, watch, frame).await
+                {
+                    return flow;
+                }
+            }
+        }
+    }
+}
+
 /// Answers `frame`, read while the connection carries a stream. `None` when the stream
 /// goes on.
 async fn answer_in_stream<R, W>(
@@ -1577,7 +1701,9 @@ where
             }
             minted.close.then_some(Flow::Dropped)
         }
-        Answer::Stream(_) => unreachable!("a streaming connection takes no second stream"),
+        Answer::Stream(_) | Answer::RunStream(..) => {
+            unreachable!("a streaming connection takes no second stream")
+        }
     }
 }
 
@@ -1972,11 +2098,17 @@ fn served() -> Vec<&'static str> {
         methods::PTY_LIST,
         methods::RUN_START,
         methods::RUN_CANCEL,
+        methods::RUN_RESUME,
+        methods::RUN_GET,
+        methods::RUN_LIST,
+        methods::RUN_EVENTS,
         methods::SPACE_ENSURE,
+        methods::SPACE_ERASE,
     ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);
         served.push(methods::DEBUG_PTY_PANIC);
+        served.push(methods::DEBUG_RUN_START);
     }
     served
 }

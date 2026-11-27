@@ -35,6 +35,10 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "it published daemon.started only"
     );
 
+    // Nor the runner's test-only start with a scheduler job_id.
+    let run = release.rlxd(&["call", "debug.run_start", r#"{"job_id":"j"}"#]);
+    assert_eq!(run.error_code(), "unknown_method", "{run:?}");
+
     let test_build = TestHome::new();
     test_build.start();
     let run = test_build.rlxd(&["call", "debug.emit", r#"{"count":1}"#]);

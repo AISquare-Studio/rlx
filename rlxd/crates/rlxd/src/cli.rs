@@ -1,7 +1,7 @@
 //! The client commands, `rlxd call`, `rlxd status`, `rlxd stop` and `rlxd gate …`
 //! (handoff 0.10.3, "How to read the checks", 1.3, 5.1 and 7.2). Each opens a new
 //! connection to this home's rlxd, says `hello`, sends one request and prints the reply
-//! envelope. For a streaming method, `events.subscribe`, `rlxd call` prints each event as
+//! envelope. For a streaming method, `events.subscribe` or `run.events`, `rlxd call` prints each event as
 //! a JSON line instead, and exits 0 when the stream ends (`crate::events` is `rlxd
 //! events`).
 //!
@@ -39,7 +39,11 @@ const CLIENT: &str = "rlxd-cli";
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// The methods whose reply ends a stream of events, which `rlxd call` prints instead.
-const STREAMING: &[&str] = &[methods::EVENTS_SUBSCRIBE, methods::PTY_SUBSCRIBE];
+const STREAMING: &[&str] = &[
+    methods::EVENTS_SUBSCRIBE,
+    methods::PTY_SUBSCRIBE,
+    methods::RUN_EVENTS,
+];
 
 /// `rlxd call`'s options, as the command line gave them.
 #[derive(Debug, Default)]
