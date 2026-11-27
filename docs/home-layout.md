@@ -199,8 +199,9 @@ finish it (`rlx move-home`) or put the home back (`rlx move-home --rollback`). A
 `rlx uninstall --dry-run` still answer, and an agent's hook does nothing meanwhile. A journal
 this rlx cannot read, or a newer release's, is refused the same way by every command and by the
 move: finish that move with the release that began it, or check the home and move the journal
-aside. Otherwise a command would make a new, empty store where the old one
-was, and the move could not be finished.
+aside. A journal this rlx cannot read includes one that cannot be opened, one whose bytes are
+not UTF-8, and one too deeply nested to parse. Otherwise a command would make a new, empty
+store where the old one was, and the move could not be finished.
 
 An install rlx does not upgrade itself (Homebrew, pipx) has its home moved by `rlx upgrade`
 too, which then says how that install upgrades.

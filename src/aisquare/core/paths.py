@@ -1136,18 +1136,29 @@ def unfinished_home_move() -> Path | None:
 def unfinished_home_move_at(root: Path) -> Path | None:
     """:func:`unfinished_home_move` of the home at ``root``: the journal there unless it says
     the move is done. One that cannot be read is unfinished: a crash cannot be ruled out, and
-    the move says the way out (``services.home_migration.journal_refusal``)."""
+    the move says the way out (``services.home_migration.journal_refusal``).
+
+    Unreadable takes in bytes that are not UTF-8 (``UnicodeDecodeError``, a ``ValueError``),
+    nesting too deep for the parser (``RecursionError``) and a file there that cannot be
+    opened. Any of them let out of here was a traceback from every command, the hook too,
+    with no way out said (round 4's tester). A file not there is no journal, and so is one
+    behind a folder that cannot be looked into: that is the home's own problem, not a move's.
+    """
     journal = root.joinpath(*MOVE_JOURNAL)
     try:
         text = journal.read_text(encoding="utf-8")
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
+    except ValueError:
+        return journal  # a journal that cannot be read is one that has not finished
+    except OSError:
+        return journal if os.path.lexists(journal) else None
     import json
 
     try:
         data = json.loads(text)
-    except ValueError:
-        return journal  # a journal that cannot be read is one that has not finished
+    except (ValueError, RecursionError):
+        return journal
     steps = data.get("steps") if isinstance(data, dict) else None
     return None if isinstance(steps, list) and "done" in steps else journal
 

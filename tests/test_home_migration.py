@@ -1944,34 +1944,100 @@ def test_an_agent_accounts_run_execs_is_counted_by_the_quiet_check(
         process.wait()
 
 
+#: Nested past what ``json.loads`` takes: a ``RecursionError``, which is no ``ValueError``.
+TOO_DEEP = b"[" * 100_000 + b"]" * 100_000
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["before-the-move", "after-the-move"])
 @pytest.mark.parametrize(
     ("body", "said"),
     [
-        ("{not json", "cannot read"),
-        ("{}", "cannot read"),
-        (json.dumps({"version": 99, "steps": ["backup"]}), "a newer rlx's move"),
+        (b"{not json", "cannot read"),
+        (b"{}", "cannot read"),
+        (json.dumps({"version": 99, "steps": ["backup"]}).encode(), "a newer rlx's move"),
+        (b"\xff\xfe\xfa", "cannot read (UnicodeDecodeError)"),
+        (
+            b'{"version": 1, "steps": ["backup"], "old_root": "\xff\xfe"}',
+            "cannot read (UnicodeDecodeError)",
+        ),
+        (TOO_DEEP, "cannot read (RecursionError)"),
     ],
-    ids=["garbage", "no-journal-shape", "a-newer-rlx"],
+    ids=["garbage", "no-journal-shape", "a-newer-rlx", "bad-utf8", "bad-utf8-in-json", "deep"],
 )
 def test_a_journal_this_rlx_cannot_take_up_is_refused_with_its_way_out_everywhere(
-    old_home: Path, user_home: Path, body: str, said: str
+    old_home: Path, user_home: Path, installed: Installed, body: bytes, said: str, moved: bool
 ) -> None:
     """MAJOR 2: the guard read such a journal as open and the move read it as none, so every
     command refused and the move said there was nothing to do: locked out for good. One reading
-    for both, and the way out said; once the file is moved aside rlx runs again."""
-    journal = old_home.joinpath(*paths.MOVE_JOURNAL)
-    journal.parent.mkdir(parents=True)
-    journal.write_text(body, encoding="utf-8")
+    for both, and the way out said; once the file is moved aside rlx runs again.
+
+    Round 4's tester: bytes that are not UTF-8, or nesting too deep to parse, escaped that
+    reading as a traceback from every command, the hook's exit 1 failing each of Claude Code's
+    hook events, in the old home and in the moved one alike."""
+    if moved:
+        assert home_migration.move_home() is not None
+    journal = (user_home / ".rlx" if moved else old_home).joinpath(*paths.MOVE_JOURNAL)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_bytes(body)
     runner = CliRunner()
 
-    for command in (["fleet", "ls"], ["move-home"], ["move-home", "--rollback"]):
+    for command in (
+        ["fleet", "ls"],
+        ["doctor"],
+        ["move-home"],
+        ["move-home", "--rollback"],
+        ["move-home", "--dry-run"],
+    ):
         result = runner.invoke(app, command)
         assert result.exit_code == 1, (command, result.output)
+        assert isinstance(result.exception, SystemExit), (command, result.exception)
         out = result.output.replace("\n", " ")
         assert said in out and "aside" in out, (command, out)
+    as_json = runner.invoke(app, ["--json", "status"])
+    assert as_json.exit_code == 1 and json.loads(as_json.stdout)["error"] == "home_mid_move"
+    check = runner.invoke(app, ["upgrade", "--check"])
+    assert check.exit_code == 0 and said in check.output.replace("\n", " "), check.output
+    hook = runner.invoke(app, ["hook", "session-start"], input=json.dumps({"session_id": SESSION}))
+    assert hook.exit_code == 0 and hook.output == "", (hook.output, hook.exception)
 
     journal.rename(journal.with_name("journal.json.aside"))
     assert runner.invoke(app, ["fleet", "ls"]).exit_code == 0
+
+
+def test_a_journal_that_cannot_be_opened_is_unfinished_and_one_not_there_is_none(
+    old_home: Path, user_home: Path
+) -> None:
+    """A journal there that cannot be opened is refused with the way out, as one that cannot be
+    parsed is, and a hook says nothing. One not there is none, and so is one behind a folder
+    that cannot be looked into: every command would otherwise blame a journal for it."""
+    if getattr(os, "geteuid", lambda: 1)() == 0:
+        pytest.skip("root opens any file")
+    assert paths.unfinished_home_move() is None
+    (user_home / "no-backups-folder").mkdir()
+    (user_home / "no-backups-folder" / "backups").write_text("", encoding="utf-8")
+    assert paths.unfinished_home_move_at(user_home / "no-backups-folder") is None
+    journal = old_home.joinpath(*paths.MOVE_JOURNAL)
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"version": 1, "steps": ["backup"]}), encoding="utf-8")
+    journal.chmod(0)
+    runner = CliRunner()
+    try:
+        assert paths.unfinished_home_move() == journal
+        result = runner.invoke(app, ["fleet", "ls"])
+        hook = runner.invoke(
+            app, ["hook", "session-start"], input=json.dumps({"session_id": SESSION})
+        )
+    finally:
+        journal.chmod(0o600)
+
+    out = result.output.replace("\n", " ")
+    assert result.exit_code == 1 and "cannot read (Permission denied)" in out and "aside" in out
+    assert hook.exit_code == 0 and hook.output == ""
+    journal.parent.chmod(0)  # a folder that cannot be looked into: the home's problem, no move's
+    try:
+        assert paths.unfinished_home_move() is None
+    finally:
+        journal.parent.chmod(0o700)
 
 
 def test_mid_move_help_and_uninstall_s_dry_run_still_answer_and_a_dry_run_says_part_way(

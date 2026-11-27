@@ -287,7 +287,7 @@ def journal_refusal(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="utf-8")
         loaded: Any = json.loads(text)
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:  # bytes not UTF-8 are a ValueError
         return _unreadable_journal(path, exc)
     version = loaded.get("version") if isinstance(loaded, dict) else None
     if isinstance(version, int) and version > JOURNAL_VERSION:
