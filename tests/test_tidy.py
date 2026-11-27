@@ -456,31 +456,6 @@ def test_an_ended_sessions_small_files_stay_a_week_then_its_directory_goes(
     assert (checkout / "only.txt").is_file() and checkout in {k.path for k in made.kept}
 
 
-# --- 7. the per-agent TMPDIR ------------------------------------------------------------------
-
-
-def test_an_ended_agents_tmpdir_goes_and_a_live_paused_or_unnamed_one_stays(
-    tmp_path: Path, project: ProjectInfo
-) -> None:
-    gone = row(project, str(uuid.uuid4()), ended_at=datetime.now(UTC) - 3 * HOUR)
-    live = row(project, str(uuid.uuid4()), label="coder-1", role="coder")
-    paused = row(
-        project, str(uuid.uuid4()), ended_at=datetime.now(UTC), paused_at=datetime.now(UTC)
-    )
-    unnamed = paths.agent_tmp_root() / "abc234"  # a dir no row names: never judged
-    for directory in (*(paths.agent_tmp_dir(a.id) for a in (gone, live, paused)), unnamed):
-        tag(directory / "pytest-of-someone")
-        aged(directory, 3 * HOUR)
-
-    made = planned(tmp_path)
-
-    assert rules(made) == {paths.agent_tmp_dir(gone.id): tidy.AGENT_TMPDIR}
-    tidy.apply(made)
-    assert not paths.agent_tmp_dir(gone.id).exists()
-    assert paths.agent_tmp_dir(live.id).is_dir() and paths.agent_tmp_dir(paused.id).is_dir()
-    assert unnamed.is_dir()
-
-
 # --- 8. stale home-migration locks in the system temp directory --------------------------------
 
 
@@ -518,7 +493,7 @@ def test_a_real_run_frees_exactly_the_dry_runs_list_and_nothing_else(
     lock = tmp_path / "system-temp" / f"rlx-home-migration-{'f' * 16}.lock"
     lock.write_bytes(b"")
     aged(lock, 25 * HOUR)
-    watched = (claude_accounts.tmp_root(), paths.agent_tmp_root(), tmp_path / "system-temp")
+    watched = (claude_accounts.tmp_root(), tmp_path / "system-temp")
     before = set().union(*(every_path(root) for root in watched))
 
     dry = planned(tmp_path)
@@ -671,10 +646,7 @@ def test_slot_ones_claude_home_and_files_beside_the_session_layout_are_never_loo
     made = planned(tmp_path)
 
     assert made.items == [] and (beside / "target").is_dir()
-    assert made.roots.temp == {
-        claude_accounts.tmp_root().resolve(),
-        paths.agent_tmp_root().resolve(),
-    }
+    assert made.roots.temp == {claude_accounts.tmp_root().resolve()}
 
 
 def test_a_process_list_that_cannot_be_read_ends_no_session(
@@ -713,4 +685,3 @@ def test_every_root_these_tests_plan_under_is_the_sandboxs(tmp_path: Path) -> No
     """A guard on the guards: the home every test here plans in is the sandbox's."""
     assert paths.aisquare_home().resolve().is_relative_to(tmp_path.resolve())
     assert claude_accounts.tmp_root().resolve().is_relative_to(tmp_path.resolve())
-    assert paths.agent_tmp_root().resolve().is_relative_to(tmp_path.resolve())

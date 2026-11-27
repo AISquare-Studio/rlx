@@ -538,18 +538,6 @@ def cache_dir() -> Path:
     return aisquare_home() / "cache"
 
 
-def agent_tmp_root() -> Path:
-    """Where each fleet agent's own ``TMPDIR`` lives (the owner's disk tidy): one directory per
-    agent, kept short (macOS caps a unix socket's path at 104 bytes), removed when the agent
-    ends, and by ``rlx tidy`` when it was not."""
-    return aisquare_home() / "tmp"
-
-
-def agent_tmp_dir(agent_id: str) -> Path:
-    """The ``TMPDIR`` of the fleet agent ``agent_id``: its id's time-sortable tail, short."""
-    return agent_tmp_root() / agent_id.removeprefix("agt_")[-12:].lower()
-
-
 def ci_cache_dir() -> Path:
     """Directory for the CI test bed's cached delivery descriptors.
 

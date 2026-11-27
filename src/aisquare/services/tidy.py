@@ -19,13 +19,15 @@ The rules (:data:`RULES`):
    kept tree or not.
 2. **Ended sessions' temp trees**, under the ``CLAUDE_CODE_TMPDIR`` rlx gives each managed
    Claude slot (``claude-<uid>/<project>/<session id>/``; slot 1 and Codex have none of
-   rlx's), and the per-agent ``TMPDIR`` (``paths.agent_tmp_dir``). A session is ENDED when all
+   rlx's). A session is ENDED when all
    three hold: no live or paused fleet row in any project names it, no running process names
    it on its command line, and nothing of it moved for :data:`ENDED_IDLE`. Then its git
    checkouts go (through ``git worktree remove`` for a registered worktree, without
-   ``--force``) unless one holds something found nowhere else, which is kept and named; its
-   tagged directories go; and once nothing of it moved for :data:`EVIDENCE_TTL` the whole
-   session directory goes, unless it holds a kept checkout.
+   ``--force``) unless one holds something found nowhere else, which is kept and named (one
+   whose repository goes with the session, a clone or a worktree of a repository inside it,
+   counts only its remotes: :func:`_checkout_kept`); its tagged directories go; and once nothing
+   of it moved for :data:`EVIDENCE_TTL` the whole session directory goes, unless it holds a kept
+   checkout. The per-agent ``TMPDIR`` is #57's, which adds its rule here (manager #3494).
 3. **Idle live coders' build output**: a live coder whose board session has waited
    ``[tidy] idle_build_hours`` with no task in doing loses the tagged directories in its
    worktree, never one that is a PEP 405 environment (``core.cachedir.is_environment``: the one
@@ -59,7 +61,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 
-from aisquare.core import cachedir, claude_accounts, paths, process_table
+from aisquare.core import cachedir, claude_accounts, process_table
 from aisquare.core.config import TidySettings, load_config
 from aisquare.core.locking import holding
 from aisquare.core.store import ContextStore, store_session
@@ -71,7 +73,6 @@ ENDED_WORKTREE_CACHE = "ended worktree cache"
 SESSION_CHECKOUT = "session checkout"
 SESSION_CACHE = "session cache"
 SESSION_DIR = "session dir"
-AGENT_TMPDIR = "agent tmpdir"
 IDLE_BUILD_CACHE = "idle build cache"
 MIGRATION_LOCK = "migration lock"
 RULES = (
@@ -80,7 +81,6 @@ RULES = (
     SESSION_CHECKOUT,
     SESSION_CACHE,
     SESSION_DIR,
-    AGENT_TMPDIR,
     IDLE_BUILD_CACHE,
     MIGRATION_LOCK,
 )
@@ -260,7 +260,6 @@ def plan(*, now: datetime | None = None) -> Plan:
             if config.idle_build_hours > 0:
                 _idle_build_output(store, project, rows[project.id], config, at, result)
         _session_trees(store, every, commands, at, result)
-        _agent_temps(every, commands, at, result)
     _stale_locks(at, result)
     return result
 
@@ -296,7 +295,7 @@ def _roots(projects: Iterable[ProjectInfo]) -> Roots:
 
     return Roots(
         trees=real(project.root / WORKTREES_DIR for project in projects),
-        temp=real((claude_accounts.tmp_root(), paths.agent_tmp_root())),
+        temp=real((claude_accounts.tmp_root(),)),
         locks=real(_system_temp_dirs()),
         checkouts=real(project.root for project in projects),
     )
@@ -686,48 +685,6 @@ def _guarded(
         return run()
 
     return checked
-
-
-# --- the per-agent TMPDIR ---------------------------------------------------------------------
-
-
-def _agent_temps(
-    every: list[FleetAgent], commands: list[str] | None, at: datetime, result: Plan
-) -> None:
-    root = paths.agent_tmp_root()
-    roots = result.roots
-    owners: dict[Path, list[FleetAgent]] = {}
-    for row in every:
-        owners.setdefault(paths.agent_tmp_dir(row.id), []).append(row)
-    for directory in _subdirs(root):
-        rows = owners.get(directory, [])
-        if not rows:
-            continue  # no row names it: not ours to judge (#57 keeps its own owner records)
-        if not _agent_temp_ended(rows, commands, directory, at):
-            continue
-        item = Item(AGENT_TMPDIR, directory, cachedir.allocated_bytes(directory))
-
-        def drop(d: Path = directory, r: list[FleetAgent] = rows) -> str | None:
-            with store_session() as store:
-                now_rows = [store.get_fleet_agent(row.id) or row for row in r]
-            if not _agent_temp_ended(now_rows, _command_lines(), d, _now()):
-                return "skipped: its agent is no longer ended"
-            _remove(d, roots)
-            return None
-
-        result.add([item], drop)
-
-
-def _agent_temp_ended(
-    rows: list[FleetAgent], commands: list[str] | None, directory: Path, at: datetime
-) -> bool:
-    if _held_by(rows):
-        return False
-    for row in rows:
-        if row.session_id and _named_running(row.session_id, commands) is not False:
-            return False
-    moved = _last_moved(directory)
-    return moved is not None and at - moved >= ENDED_IDLE
 
 
 # --- 3. idle live coders' build output -------------------------------------------------------
