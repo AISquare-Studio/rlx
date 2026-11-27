@@ -347,10 +347,11 @@ pub mod codes {
     /// `space.erase`: a run in the space is queued or running. `detail.run_ids` names
     /// them.
     pub const RUNS_LIVE: &str = "runs_live";
-    /// `space.erase`: a link (a junction on Windows) is on the way to what it removes:
-    /// `<home>/spaces`, the space, a Claude Code config directory, its `projects`, or the
-    /// space's folder there. rlxd does not follow one; `detail.paths` names them, and
-    /// nothing was removed.
+    /// `space.erase`: a link (a junction on Windows) or a mount point is on the way to what
+    /// it removes: `<home>/spaces`, the space, a Claude Code config directory's `projects`,
+    /// or the space's folder there. rlxd does not go through one; `detail.paths` names
+    /// them, and nothing was removed. (`<home>` and a config directory are roots, taken as
+    /// they resolve, a link included.)
     pub const LINK_REFUSED: &str = "link_refused";
     /// `space.erase`: some paths could not be removed. `detail.removed` and
     /// `detail.failed[{path, error}]` say which; the runs whose files remain keep their

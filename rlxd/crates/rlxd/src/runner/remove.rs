@@ -8,7 +8,8 @@
 //! - **macOS and Linux:** every folder is a descriptor opened with `O_NOFOLLOW |
 //!   O_DIRECTORY` relative to its parent's (`openat`), and files and folders are removed
 //!   relative to it (`unlinkat`). A link put at a path that was checked is never reached.
-//!   A folder on another filesystem than its parent's (a mount point) is not gone into.
+//!   A folder on another filesystem than its parent's, or (Linux) on another mount of the
+//!   same one, a bind mount, is a mount point, and is not gone into.
 //!   The removal walks the tree with a stack of its own, at most [`MAX_DEPTH`] folders
 //!   deep, so no tree is deep enough to overflow a thread's stack.
 //! - **Windows:** every folder on the way is a handle opened with
@@ -96,6 +97,9 @@ mod unix {
         shown: PathBuf,
         /// The filesystem it is on.
         dev: libc::dev_t,
+        /// The mount it is on (Linux, `statx`'s `STATX_MNT_ID`): a bind mount of a folder of
+        /// the same filesystem has its `dev`, and another mount.
+        mount: Option<u64>,
     }
 
     fn c_name(name: &OsStr) -> io::Result<CString> {
@@ -112,11 +116,38 @@ mod unix {
         if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let mount = mount_of(&fd);
         Ok(Dir {
             fd,
             shown,
             dev: stat.st_dev,
+            mount,
         })
+    }
+
+    /// The id of the mount `fd` is on: `statx`'s `STATX_MNT_ID` (Linux 5.8 and on), or
+    /// `None` where there is none to read.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn mount_of(fd: &OwnedFd) -> Option<u64> {
+        // SAFETY: statx is plain data, for which zero is a valid value.
+        let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: statx(2) of a held descriptor itself (AT_EMPTY_PATH, an empty path) into
+        // a writable statx.
+        let done = unsafe {
+            libc::statx(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                libc::STATX_MNT_ID,
+                &raw mut stx,
+            )
+        };
+        (done == 0 && stx.stx_mask & libc::STATX_MNT_ID != 0).then_some(stx.stx_mnt_id)
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    fn mount_of(_fd: &OwnedFd) -> Option<u64> {
+        None
     }
 
     /// One level of a removal: a folder being emptied, its name in its parent, and the
@@ -169,7 +200,9 @@ mod unix {
             };
             if fd >= 0 {
                 let dir = held(fd, self.shown.join(name))?;
-                if dir.dev != self.dev {
+                let other_mount =
+                    matches!((dir.mount, self.mount), (Some(it), Some(parent)) if it != parent);
+                if dir.dev != self.dev || other_mount {
                     return Ok(Opened::Mount);
                 }
                 return Ok(Opened::Dir(dir));
@@ -698,6 +731,51 @@ mod tests {
             root.child(OsStr::new("etc")).unwrap(),
             Opened::Dir(_) | Opened::Link
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bind_mount_of_the_same_filesystem_is_not_gone_into() {
+        let sudo = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new("sudo")
+                .arg("-n")
+                .args(args)
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        if !sudo(&[OsStr::new("true")]) {
+            eprintln!("skipped: binding a folder needs `sudo -n`, which isn't here");
+            return;
+        }
+        /// Unmounts its folder when the test ends, passed or failed.
+        struct Bound(PathBuf);
+        impl Drop for Bound {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("sudo")
+                    .args([OsStr::new("-n"), OsStr::new("umount"), self.0.as_os_str()])
+                    .status();
+            }
+        }
+        // A folder of the same filesystem, bound inside the space: its files are the
+        // source's, which an erase must not touch.
+        let source = temp("bind-source");
+        std::fs::write(source.join("keep"), "x").unwrap();
+        let root = temp("bind");
+        let at = root.join("space").join("repo");
+        std::fs::create_dir_all(&at).unwrap();
+        assert!(sudo(&[
+            OsStr::new("mount"),
+            OsStr::new("--bind"),
+            source.as_os_str(),
+            at.as_os_str(),
+        ]));
+        let _bound = Bound(at.clone());
+        let dir = Dir::open_root(&root).unwrap().unwrap();
+        let failed = dir
+            .remove_tree(OsStr::new("space"), &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(failed.path, at, "{failed:?}");
+        assert_eq!(std::fs::read_to_string(source.join("keep")).unwrap(), "x");
     }
 
     #[test]

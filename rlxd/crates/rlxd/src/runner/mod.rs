@@ -109,6 +109,9 @@ pub struct Runner {
     /// Test builds only: a space whose erases take this long before they remove anything
     /// (`RLXD_TEST_SLOW_ERASE=<space>:<ms>`).
     slow_erase: Option<(String, Duration)>,
+    /// Test builds only: a space whose runs' state events wait this long, once published,
+    /// before their lines are appended to the log (`RLXD_TEST_SLOW_APPEND=<space>:<ms>`).
+    slow_append: Option<(String, Duration)>,
     runs: Mutex<Runs>,
     /// Set once rlxd stops: no run starts from then on.
     stopping: AtomicBool,
@@ -145,6 +148,10 @@ struct Run {
     state: watch::Sender<RunState>,
     /// The last `run_seq` in the run's log on disk: what `run.events` follows.
     logged: watch::Sender<u64>,
+    /// Where the run's log ends after its last append that succeeded: how far a follower
+    /// reads, so it never reads what an append that failed wrote before it was cut back.
+    /// Set before `logged`.
+    logged_len: std::sync::atomic::AtomicU64,
     /// What `run.list` shows of the run, as last published: its own lock, held for a copy
     /// and never over the disk, so a listing never waits on a run's lock.
     view: Mutex<View>,
@@ -271,6 +278,7 @@ impl Runner {
             slow_persist: test_slow_in("RLXD_TEST_SLOW_PERSIST"),
             slow_start: test_slow_in("RLXD_TEST_SLOW_START"),
             slow_erase: test_slow_in("RLXD_TEST_SLOW_ERASE"),
+            slow_append: test_slow_in("RLXD_TEST_SLOW_APPEND"),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
         });
@@ -346,6 +354,7 @@ impl Runner {
                     warning!("run {id}: its record was not written: {e}");
                 }
             }
+            let log_len = std::fs::metadata(dir.events()).map_or(0, |log| log.len());
             let live = record.state.is_live();
             let text = if live {
                 store::attempt_text(&dir.events(), record.attempt)
@@ -408,6 +417,7 @@ impl Runner {
                 }),
                 state: watch::Sender::new(record.state),
                 logged: watch::Sender::new(tail.last_run_seq),
+                logged_len: std::sync::atomic::AtomicU64::new(log_len),
                 view: Mutex::new(View {
                     state: record.state,
                     attempt: record.attempt,
@@ -584,6 +594,7 @@ impl Runner {
             }),
             state: watch::Sender::new(RunState::Queued),
             logged: watch::Sender::new(0),
+            logged_len: std::sync::atomic::AtomicU64::new(0),
             view: Mutex::new(View {
                 state: RunState::Queued,
                 attempt: 1,
@@ -723,6 +734,17 @@ impl Runner {
             // is taken under it: an erase of its space counts it live meanwhile, and a
             // second resume is refused.
             let mut runs = self.runs();
+            // An erase may have taken the run between find() and here: then it is gone.
+            if !runs
+                .by_id
+                .get(&id)
+                .is_some_and(|known| Arc::ptr_eq(known, &run))
+            {
+                return Err(refusal(
+                    codes::UNKNOWN_RUN,
+                    format!("rlxd knows no run {id}"),
+                ));
+            }
             if runs.erasing.contains(&run.params.space) {
                 return Err(refusal(
                     codes::RUN_START_FAILED,
@@ -1670,6 +1692,13 @@ impl Runner {
         let run_seq = inner.last_run_seq + 1;
         if durability == Durability::State {
             blocking(|| self.persist_state(run, inner, run_seq, r#type, &data));
+            // Durable: the run's new state is what everything that reads it sees from now
+            // on, before anyone hears of the event. A client acting on run.done never
+            // finds the run live (space.erase, status, run.list).
+            run.state.send_replace(inner.state);
+            let mut view = View::of(inner);
+            view.last_run_seq = run_seq;
+            run.set_view(view);
         }
         let scope = bus::Run {
             id,
@@ -1687,8 +1716,15 @@ impl Runner {
         inner.last_run_seq = run_seq;
         inner.last_line = Some(bus::Line::clone(&line));
         run.show(inner);
-        if blocking(|| log_line(run, inner, run_seq, r#type, &line)) {
+        let logged = blocking(|| {
+            if durability == Durability::State {
+                wait_if(self.slow_append.as_ref(), &run.params.space);
+            }
+            log_line(run, inner, run_seq, r#type, &line)
+        });
+        if let Some(end) = logged {
             inner.logged = run_seq;
+            run.logged_len.store(end, Ordering::SeqCst);
             run.logged.send_replace(run_seq);
         }
         Ok(())
@@ -1722,8 +1758,15 @@ impl Runner {
 }
 
 /// Appends the published event `run_seq`'s line to the run's log, fsyncing it after
-/// [`UNSYNCED_MAX`] unsynced appends. Whether it was appended.
-fn log_line(run: &Run, inner: &mut RunInner, run_seq: u64, r#type: &str, line: &[u8]) -> bool {
+/// [`UNSYNCED_MAX`] unsynced appends: where the log ends then, or `None` when it wasn't
+/// appended.
+fn log_line(
+    run: &Run,
+    inner: &mut RunInner,
+    run_seq: u64,
+    r#type: &str,
+    line: &[u8],
+) -> Option<u64> {
     let id = run.params.run_id.as_str();
     if inner.events.is_none() {
         match run.dir.open_events() {
@@ -1731,21 +1774,19 @@ fn log_line(run: &Run, inner: &mut RunInner, run_seq: u64, r#type: &str, line: &
             Err(e) => warning!("run {id}: its log could not be opened: {e}"),
         }
     }
-    let Some(events) = inner.events.as_mut() else {
-        return false;
-    };
+    let events = inner.events.as_mut()?;
     inner.unsynced += 1;
     let sync = inner.unsynced >= UNSYNCED_MAX;
     match store::append(events, line, sync) {
-        Ok(()) => {
+        Ok(end) => {
             if sync {
                 inner.unsynced = 0;
             }
-            true
+            Some(end)
         }
         Err(e) => {
             warning!("run {id}: {type} (run_seq {run_seq}) was not logged: {e}");
-            false
+            None
         }
     }
 }
@@ -1753,7 +1794,12 @@ fn log_line(run: &Run, inner: &mut RunInner, run_seq: u64, r#type: &str, line: &
 impl Run {
     /// Shows `inner`, the run as it is now, in `run.list`.
     fn show(&self, inner: &RunInner) {
-        *self.view.lock().unwrap_or_else(|p| p.into_inner()) = View::of(inner);
+        self.set_view(View::of(inner));
+    }
+
+    /// Shows `view` in `run.list`.
+    fn set_view(&self, view: View) {
+        *self.view.lock().unwrap_or_else(|p| p.into_inner()) = view;
     }
 
     /// The run as `run.list` shows it.
@@ -1817,7 +1863,8 @@ impl Replay {
     /// answer always means the log has been read to its end.
     pub fn read(&mut self) -> Vec<bus::Line> {
         loop {
-            let lines = match self.reader.read() {
+            let limit = self.run.logged_len.load(Ordering::SeqCst);
+            let lines = match self.reader.read(limit) {
                 Ok(lines) => lines,
                 Err(e) => {
                     warning!(

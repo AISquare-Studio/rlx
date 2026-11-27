@@ -1616,6 +1616,27 @@ fn a_run_recorded_in_another_boot_is_never_swept() {
 }
 
 #[test]
+fn a_run_is_not_live_once_its_end_is_published_though_its_log_line_comes_later() {
+    // Test builds only: in "slowlog" a state event's line reaches the log 2 s after it is
+    // published. The run is ended for every reader the moment its end is published, so a
+    // client acting on run.done finds it ended.
+    let home = home_with("hello", &[("RLXD_TEST_SLOW_APPEND", "slowlog:2000")]);
+    let since = seq(&home);
+    let mut slow = task("hi");
+    slow["space"] = json!("slowlog");
+    let r = run_id();
+    start(&home, &slow, &r);
+    wait_until(&home, since, 30, "run.done", |e| {
+        !of(e, &r, Some("run.done")).is_empty()
+    });
+    assert_eq!(home.status()["runs"], json!({"live": 0, "queued": 0}));
+    let listed = call(&home, "run.list", &json!({}));
+    assert_eq!(listed["runs"][0]["state"], "done", "{listed:#}");
+    // Not runs_live: it may wait for the run's lock, while its line is logged.
+    call(&home, "space.erase", &json!({"name": "slowlog"}));
+}
+
+#[test]
 fn an_erase_in_progress_refuses_a_second_erase_and_runs_in_its_space() {
     // Test builds only: an erase of "busy" waits 2 s before it removes anything.
     let home = home_with("hello", &[("RLXD_TEST_SLOW_ERASE", "busy:2000")]);

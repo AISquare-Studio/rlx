@@ -328,10 +328,11 @@ impl Reader {
         self.gone
     }
 
-    /// The whole lines written since the last read, each with its newline: a few MiB of
-    /// them at a time, so a long log is sent in turns. None once it has read every whole
-    /// line written so far.
-    pub fn read(&mut self) -> io::Result<Vec<Vec<u8>>> {
+    /// The whole lines written since the last read, up to byte `limit` of the log (the end
+    /// of its last append that succeeded, so nothing of an append that failed and was cut
+    /// back is ever read), each with its newline: a few MiB of them at a time, so a long
+    /// log is sent in turns. None once it has read every whole line up to `limit`.
+    pub fn read(&mut self, limit: u64) -> io::Result<Vec<Vec<u8>>> {
         /// How much is read at a time.
         const CHUNK: u64 = 4 << 20;
         let mut file = match File::open(&self.path) {
@@ -357,8 +358,9 @@ impl Reader {
         }
         file.seek(SeekFrom::Start(self.offset))?;
         let end = loop {
+            let room = limit.saturating_sub(self.offset).min(CHUNK);
             let mut fresh = Vec::new();
-            let read = (&mut file).take(CHUNK).read_to_end(&mut fresh)?;
+            let read = (&mut file).take(room).read_to_end(&mut fresh)?;
             self.offset += read as u64;
             self.partial.extend_from_slice(&fresh);
             match self.partial.iter().rposition(|&b| b == b'\n') {
@@ -377,9 +379,10 @@ impl Reader {
     }
 }
 
-/// Appends `line`, one event and its newline, in one write, then fsyncs it when `sync`.
-/// A write that fails part way is cut back off, so no torn line is left in the log.
-pub fn append(file: &mut File, line: &[u8], sync: bool) -> io::Result<()> {
+/// Appends `line`, one event and its newline, in one write, then fsyncs it when `sync`:
+/// where the log ends then. A write that fails part way is cut back off, so no torn line
+/// is left in the log.
+pub fn append(file: &mut File, line: &[u8], sync: bool) -> io::Result<u64> {
     let before = file.metadata()?.len();
     if let Err(e) = file.write_all(line) {
         // Whatever of the line was written goes: the next append starts a line of its own.
@@ -389,7 +392,7 @@ pub fn append(file: &mut File, line: &[u8], sync: bool) -> io::Result<()> {
     if sync {
         file.sync_data()?;
     }
-    Ok(())
+    Ok(before + line.len() as u64)
 }
 
 /// Makes `dir` and its parents; on POSIX, `dir` itself 0700.
@@ -489,15 +492,21 @@ mod tests {
     fn the_reader_gives_each_whole_line_once_and_says_when_the_log_is_gone() {
         let (_temp, path) = temp("reader");
         let mut reader = Reader::new(path.clone());
-        assert!(reader.read().unwrap().is_empty());
+        assert!(reader.read(u64::MAX).unwrap().is_empty());
         assert!(reader.gone());
         fs::write(&path, line(1, 3) + "{\"partial").unwrap();
-        assert_eq!(reader.read().unwrap().len(), 1);
+        assert_eq!(reader.read(u64::MAX).unwrap().len(), 1);
         assert!(!reader.gone());
-        assert!(reader.read().unwrap().is_empty(), "the partial line waits");
+        assert!(
+            reader.read(u64::MAX).unwrap().is_empty(),
+            "the partial line waits"
+        );
         let mut rest = fs::OpenOptions::new().append(true).open(&path).unwrap();
         rest.write_all(b"\":1}\n").unwrap();
-        assert_eq!(reader.read().unwrap(), vec![b"{\"partial\":1}\n".to_vec()]);
+        assert_eq!(
+            reader.read(u64::MAX).unwrap(),
+            vec![b"{\"partial\":1}\n".to_vec()]
+        );
     }
 
     #[test]
@@ -505,13 +514,43 @@ mod tests {
         let (_temp, path) = temp("cut");
         let mut reader = Reader::new(path.clone());
         fs::write(&path, line(1, 3) + "{\"type\":\"run.te").unwrap();
-        assert_eq!(reader.read().unwrap(), vec![line(1, 3).into_bytes()]);
+        assert_eq!(
+            reader.read(u64::MAX).unwrap(),
+            vec![line(1, 3).into_bytes()]
+        );
         // The append failed part way and was cut back off; then the next one came.
         let log = fs::OpenOptions::new().write(true).open(&path).unwrap();
         log.set_len(line(1, 3).len() as u64).unwrap();
-        assert!(reader.read().unwrap().is_empty());
+        assert!(reader.read(u64::MAX).unwrap().is_empty());
         let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
         log.write_all(line(2, 3).as_bytes()).unwrap();
-        assert_eq!(reader.read().unwrap(), vec![line(2, 3).into_bytes()]);
+        assert_eq!(
+            reader.read(u64::MAX).unwrap(),
+            vec![line(2, 3).into_bytes()]
+        );
+    }
+
+    #[test]
+    fn a_follower_reads_only_what_appends_that_succeeded_wrote() {
+        let (_temp, path) = temp("follow");
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let mut reader = Reader::new(path.clone());
+        let first = append(&mut log, line(1, 3).as_bytes(), false).unwrap();
+        // An append fails part way: what it wrote is there until it is cut back, past the
+        // end of the last append that succeeded, which is where the follower stops.
+        log.write_all(b"{\"type\":\"run.te").unwrap();
+        assert_eq!(reader.read(first).unwrap(), vec![line(1, 3).into_bytes()]);
+        let cut = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        cut.set_len(first).unwrap();
+        // The next append is longer than what failed, and comes before the next read.
+        let next = line(2, 40);
+        let second = append(&mut log, next.as_bytes(), false).unwrap();
+        assert_eq!(second, first + next.len() as u64);
+        assert_eq!(reader.read(second).unwrap(), vec![next.into_bytes()]);
+        assert!(reader.read(second).unwrap().is_empty());
     }
 }

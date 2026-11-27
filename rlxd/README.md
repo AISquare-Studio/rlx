@@ -295,8 +295,15 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
 - **After a crash or a `kill -9`,** the guard has already ended the run's process group.
   Should the guard have died with rlxd (`killall -9 rlxd`), the next rlxd, in the same
   boot only, kills the guard's group if the guard still runs with the recorded pid and
-  start time, and otherwise each process left in the guard's group and session that
-  started at or after the run. It cuts a torn last line from the run's log,
+  start time. Otherwise the group is the run's only when one of its processes, in the
+  guard's session and started at or after the run, carries `RLXD_RUN_ID=<run_id>`, which
+  every process of a run inherits (a group's id can't be taken while one of its
+  processes lives); then each such process is killed. On macOS an Apple binary's
+  environment is hidden, even from its own user, so a run whose leftovers are all
+  Apple's (a Bash tool's `zsh`, `sleep` or `tail -f`, with Claude Code gone) can't be
+  told from another group, and is left: the sweep never kills what it can't tell is the
+  run's. On Linux Claude Code dies with the guard (its parent-death signal), and
+  `/proc` shows the environment of each of the user's own processes. It cuts a torn last line from the run's log,
   puts back a state event its record holds that the log lost, and ends the run `failed
   {reason: "engine_restarted"}`, numbered on from its log.
 - **`job_id`** is set by rlxd alone, for the scheduler (7.6). Test builds have
@@ -309,19 +316,23 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
   (every account's config directory once the brain serves rlx's list), the space dir
   encoded as Claude Code does: no other project folder is touched.
-  It refuses `runs_live` while a run in the space is queued or running (or being
-  started), and `link_refused` (`detail.paths`) when a link or a junction is below a root
-  on the way: `spaces/`, the space itself, a config directory's `projects/`, or the
-  space's folder there; nothing is removed then. `<home>` and each config directory are
-  roots, taken as they resolve (a `~/.claude` kept in dotfiles is fine), and the config
-  directories are only gone into when the space has runs. Every folder on the way is
+  It refuses `runs_live` while a run in the space is queued, running, being started or
+  being resumed, and `link_refused` (`detail.paths`) when a link, a junction or a mount
+  point is below a root on the way: `spaces/`, the space itself, a config directory's
+  `projects/`, or the space's folder there; nothing is removed then. `<home>` and each
+  config directory are roots, taken as they resolve once (a `~/.claude` kept in dotfiles
+  is fine), and the config directories are only gone into when the space has runs. Every folder on the way is
   opened once without following a link, and checked and removed through what was opened
   (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
   from being renamed meanwhile), so a link put there after the check is never followed.
   A link inside the space goes as a link and is named in `links`, every one, under the
-  space's resolved path. A second erase of a space being erased gets `erase_in_progress`. Paths it can't remove
-  fail it `erase_incomplete` (`detail {removed, failed}`), the runs concerned keep their
-  records, and erasing again finishes.
+  space's resolved path. A mount point inside the space (another filesystem, or on Linux
+  a bind mount of the same one) is never gone into, and a tree more than 256 folders
+  deep is not removed past that: either fails the erase `erase_incomplete`, naming it.
+  A second erase of a space being erased gets `erase_in_progress`. Paths it can't remove
+  fail it `erase_incomplete` (`detail {removed, failed}`, each failure named under the
+  space's resolved path), the runs concerned keep their records, and erasing again
+  finishes.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 

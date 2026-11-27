@@ -25,8 +25,10 @@
 //!     guard is an rlxd), rlxd's next start in the same boot sweeps the run's group
 //!     ([`sweep`]) by the recorded guard pid and start time: the whole group if the guard
 //!     still runs with that start time, nothing if another process has that pid, and
-//!     otherwise each process of the guard's group and session that started at or after
-//!     the run and carries the run's id ([`RUN_ID_ENV`]).
+//!     otherwise, once one of them carries the run's id ([`RUN_ID_ENV`]), each process of
+//!     the guard's group and session that started at or after the run. macOS hides an
+//!     Apple binary's environment, so a run whose leftovers are all Apple's is not
+//!     swept: nothing is killed that can't be told for the run's.
 //!   - Everywhere, the run's stdin closes with rlxd, and Claude Code ends its turn and
 //!     exits on it; that is a courtesy, not what the guarantee rests on.
 
