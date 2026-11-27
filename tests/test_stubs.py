@@ -63,6 +63,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("logout",),
     ("whoami",),
     ("instances",),
+    ("tidy",),
     ("auth", "status"),
     ("auth", "token"),
     ("ui",),

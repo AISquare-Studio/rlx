@@ -50,7 +50,7 @@ def sandboxed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[list[
     lines are the test's (empty unless it adds one), and the system temp is ``tmp_path``'s."""
     running: list[str] = []
     system = tmp_path / "system-temp"
-    system.mkdir()
+    system.mkdir(exist_ok=True)  # the suite's own fixture made it (no_tidy_of_the_machine)
     monkeypatch.setattr(tidy, "_command_lines", lambda: list(running))
     monkeypatch.setattr(tidy, "_system_temp_dirs", lambda: [system])
     yield running
