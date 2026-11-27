@@ -48,6 +48,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -61,9 +62,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
 from aisquare.core import daemons as daemons_core
-from aisquare.core import procs, registry
+from aisquare.core import locking, procs, registry
 from aisquare.core import program as prog
 from aisquare.core.spawn import untraced_env
+from aisquare.core.state import FLAGS, RuntimeState
 from aisquare.core.version import DISTRIBUTION
 from aisquare.services import install_route, rlxd_install
 
@@ -91,6 +93,10 @@ parent never waits for it stays a zombie)."""
 
 RLXD_CALL_TIMEOUT_SECONDS = 30.0
 """How long one ``rlxd`` command may take."""
+
+CHECK_CALL_TIMEOUT_SECONDS = 5.0
+"""How long one ``rlxd`` command may take for ``upgrade --check``, which the app reads: a
+frozen rlxd makes it say its runs and PTYs are unknown, not wait."""
 
 INSTALL_TIMEOUT_SECONDS = 300.0
 """How long the new install's ``daemon install`` may take: a download and a check."""
@@ -242,6 +248,7 @@ class Rlxd:
     subcommand (the binary beside rlx, or what a test stands in for it)."""
 
     command: tuple[str, ...]
+    timeout: float = RLXD_CALL_TIMEOUT_SECONDS
 
     def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
         """A registered spawn seam (``core.spawn.SEAMS``): rlxd's own command line, which
@@ -254,7 +261,7 @@ class Rlxd:
             errors="replace",
             stdin=subprocess.DEVNULL,
             env=untraced_env(),
-            timeout=RLXD_CALL_TIMEOUT_SECONDS,
+            timeout=self.timeout,
             check=False,
         )
 
@@ -313,12 +320,12 @@ def installed_rlxd() -> Path | None:
     return path if path.is_file() else None
 
 
-def find_rlxd() -> Rlxd | None:
+def find_rlxd(timeout: float = RLXD_CALL_TIMEOUT_SECONDS) -> Rlxd | None:
     """The rlxd command line to ask: the one installed beside rlx, which talks to this home's
     running rlxd whatever program that runs; ``None`` when there is none. Never a program a
     record names: ``upgrade --check`` reads, and runs nothing a JSON file says to."""
     installed = installed_rlxd()
-    return None if installed is None else Rlxd((str(installed),))
+    return None if installed is None else Rlxd((str(installed),), timeout)
 
 
 # --- the census ----------------------------------------------------------------------------
@@ -409,6 +416,22 @@ class Census:
         }
 
 
+NOT_BESIDE = "rlxd runs, but no rlxd is installed beside rlx to ask"
+"""Why rlxd's runs and PTYs are unknown when the rlxd that runs is not the one beside rlx (a
+build of its own): waiting can't help, only stopping it."""
+
+
+def _unknown_advice(error: str, waiting: str) -> str:
+    """What to do about runs or PTYs rlxd could not say: ``waiting``, unless no rlxd beside rlx
+    can ask, when only stopping the rlxd that runs helps."""
+    if error == NOT_BESIDE:
+        install = prog.shell_advice(
+            f", or install it beside rlx with {prog.words('daemon', 'install')}"
+        )
+        return f"stop the rlxd that runs (rlxd stop) and upgrade{install}"
+    return waiting
+
+
 def _runs_now(rlxd: Rlxd) -> tuple[dict[str, Any], ...]:
     runs = rlxd.call("run.list", {"states": list(RUN_STATES)}).get("runs") or []
     return tuple(run for run in runs if isinstance(run, dict))
@@ -428,7 +451,7 @@ def census(rlxd: Rlxd | None = None, *, ask_rlxd: bool = True) -> Census:
         return found
     rlxd = rlxd if rlxd is not None else find_rlxd()
     if rlxd is None:
-        return replace(found, rlxd_error="rlxd runs, but no rlxd is installed beside rlx to ask")
+        return replace(found, rlxd_error=NOT_BESIDE)
     try:
         runs = _runs_now(rlxd)
         ptys = rlxd.call("pty.list").get("ptys") or []
@@ -457,6 +480,20 @@ def refusal(found: Census, options: Options, *, windows: bool) -> Refused | None
             "upgrade and start them again after it.",
             ", ".join(held),
         )
+    if options.restart_daemons:
+        unrecognized = [
+            f"{daemon.label}: {why}"
+            for daemon in found.here
+            if daemon.restartable and (why := restart_refusal(daemon)) is not None
+        ] + [f"{_unreadable_kind(u)} (record {u.id}): not readable" for u in found.unreadable]
+        if unrecognized:
+            return Refused(
+                "daemon_unrecognized",
+                "--restart-daemons stops and starts again only the daemons whose record is the "
+                f"one rlx itself writes, and these are not: {'; '.join(unrecognized)}. Stop "
+                "them yourself, then upgrade.",
+                "; ".join(unrecognized),
+            )
     if options.restart_daemons and not options.end_ptys:
         if found.ptys:
             many = len(found.ptys) != 1
@@ -469,10 +506,13 @@ def refusal(found: Census, options: Options, *, windows: bool) -> Refused | None
                 ", ".join(str(pty.get("pty_id")) for pty in found.ptys),
             )
         if found.rlxd_error is not None:
+            advice = _unknown_advice(
+                found.rlxd_error, "upgrade once rlxd answers, or add --end-ptys"
+            )
             return Refused(
                 "ptys_live",
                 f"rlxd's PTYs can't be read ({found.rlxd_error}), and restarting rlxd ends any "
-                "that are live: upgrade once rlxd answers, or add --end-ptys.",
+                f"that are live: {advice}.",
                 found.rlxd_error,
             )
     if options.wait_runs is None:
@@ -496,10 +536,11 @@ def _runs_refused(runs: Sequence[dict[str, Any]]) -> Refused:
 
 
 def _runs_unknown(error: str) -> Refused:
+    advice = _unknown_advice(error, "upgrade once rlxd answers, or add --wait-runs <minutes>")
     return Refused(
         "runs_in_flight",
         f"rlxd's runs can't be read ({error}), and the upgrade replaces rlxd-hook under any "
-        "in flight: upgrade once rlxd answers, or add --wait-runs <minutes>.",
+        f"in flight: {advice}.",
         error,
     )
 
@@ -672,17 +713,68 @@ def with_package(
 # --- what may be stopped and started --------------------------------------------------------
 
 
-def restart_prefix(kind: str) -> tuple[str, ...] | None:
-    """What a record of ``kind`` must start with for an upgrade to stop it and run it again:
-    rlxd, the rlxd installed beside rlx, then ``serve --detach``; rlx's own Python daemons,
-    this install's interpreter (Python writes ``sys.executable``). ``None`` for a kind this
-    release doesn't know (or the brain, rlxd's child), or rlxd not installed beside rlx."""
-    if kind == "rlxd":
-        installed = installed_rlxd()
-        return None if installed is None else (str(installed), "serve", "--detach")
-    if kind in daemons_core.KINDS and kind != "brain":
-        return (sys.executable,)
-    return None
+RLXD_FLAGS: tuple[tuple[str, ...], ...] = ((), ("--gate-dev-mode",))
+"""What rlxd writes after ``serve --detach`` in its record (rlxd's ``serve::dev_flags``):
+nothing, or gate dev mode's flag."""
+
+
+def rlxd_command() -> tuple[str, ...] | None:
+    """The command an rlxd record starts with, as rlxd writes it: the rlxd installed beside
+    rlx, ``serve --detach``. ``None`` when no rlxd is installed beside rlx."""
+    installed = installed_rlxd()
+    return None if installed is None else (str(installed), "serve", "--detach")
+
+
+def python_command() -> tuple[str, ...]:
+    """The command a record of rlx's own Python daemons starts with, as
+    ``core.selfcli.argv_for`` writes it: this install's interpreter, ``-P -m aisquare``."""
+    return (sys.executable, "-P", "-m", "aisquare")
+
+
+def _global_flags(rest: Sequence[str]) -> int:
+    """How many of ``rest``'s first items are global flags as ``core.selfcli.global_flags``
+    writes them (``core.state.FLAGS``): a boolean one bare, a valued one as
+    ``--flag=VALUE``, ``--json`` never."""
+    unset = RuntimeState()
+    named = [(flag, getattr(unset, field)) for field, flag in FLAGS.items()]
+    bare = {flag for flag, default in named if isinstance(default, bool) and flag != "--json"}
+    valued = [f"{flag}=" for flag, default in named if not isinstance(default, bool)]
+    count = 0
+    for arg in rest:
+        if arg in bare or any(arg.startswith(at) and len(arg) > len(at) for at in valued):
+            count += 1
+            continue
+        break
+    return count
+
+
+def _rlx_verb(kind: str, verb: Sequence[str]) -> bool:
+    """Whether ``verb``, what follows the global flags, is what rlx writes for a restartable
+    daemon of ``kind``: ``watch --detach`` (``services.watch``, the one restartable watch)
+    and ``serve --port N --bind HOST`` (``cli.serve``, the one restartable serve)."""
+    if kind == "watch":
+        return list(verb) == ["watch", "--detach"]
+    return (
+        kind == "serve"
+        and len(verb) == 5
+        and (verb[0], verb[1], verb[3]) == ("serve", "--port", "--bind")
+        and re.fullmatch(r"[0-9]{1,5}", verb[2]) is not None
+        and 0 < int(verb[2]) < 65536
+        and bool(verb[4])
+        and not verb[4].startswith("-")
+    )
+
+
+def _same_program(given: str, expected: str) -> str | None:
+    """Why ``given``, a record's ``argv[0]``, is not the program ``expected``, or ``None``."""
+    program = Path(given)
+    if not program.is_absolute() or not program.is_file():
+        return f"its program {given} is not a file"
+    try:
+        same = os.path.samefile(program, expected)
+    except OSError:
+        same = False
+    return None if same else f"it runs {given}, not {expected}"
 
 
 def _registry_untrusted() -> str | None:
@@ -703,25 +795,36 @@ def _registry_untrusted() -> str | None:
 
 def restart_refusal(daemon: daemons_core.Daemon) -> str | None:
     """Why the upgrade won't stop ``daemon`` and run its recorded argv again; ``None`` when it
-    will: restartable, of a kind rlx restarts, its argv starting with
-    :func:`restart_prefix` (its program the same file, absolute), the registry private.
+    will: restartable, its argv exactly what rlx itself writes for its kind, its program the
+    same file, the registry private.
+
+    - **rlxd:** :func:`rlxd_command`, then nothing or ``--gate-dev-mode`` (:data:`RLXD_FLAGS`).
+    - **watch, serve:** :func:`python_command`, rlx's global flags, then the verb rlx writes
+      (:func:`_rlx_verb`). Nothing else: not ``python -c``, not another module.
+    - **Any other kind** (the brain, rlxd's child; a later release's): not restarted.
+
     The argv is run as a list, never through a shell."""
     if not daemon.restartable:
         return "not restartable"
-    prefix = restart_prefix(daemon.kind)
-    if prefix is None:
+    argv = list(daemon.argv)
+    if daemon.kind == "rlxd":
+        command = rlxd_command()
+        if command is None:
+            return "no rlxd is installed beside rlx to start it again"
+        if tuple(argv[len(command) :]) not in RLXD_FLAGS:
+            return "its command is not the one rlxd writes"
+    elif daemon.kind in ("watch", "serve"):
+        command = python_command()
+        rest = argv[len(command) :]
+        if not _rlx_verb(daemon.kind, rest[_global_flags(rest) :]):
+            return f"its command is not the one rlx writes for a {daemon.kind} (it runs {argv[0]})"
+    else:
         return f"rlx doesn't restart a {daemon.kind}"
-    program = Path(daemon.argv[0])
-    if not program.is_absolute() or not program.is_file():
-        return f"its program {daemon.argv[0]} is not a file"
-    if tuple(daemon.argv[1 : len(prefix)]) != prefix[1:]:
+    if argv[1 : len(command)] != list(command[1:]):
         return "its command is not rlx's"
-    try:
-        same = os.path.samefile(program, prefix[0])
-    except OSError:
-        same = False
-    if not same:
-        return f"it runs {daemon.argv[0]}, not {prefix[0]}"
+    wrong = _same_program(argv[0], command[0])
+    if wrong is not None:
+        return wrong
     untrusted = _registry_untrusted()
     if untrusted is not None:
         return f"the daemon registry can't be trusted: {untrusted}"
@@ -816,7 +919,8 @@ def restarts_dir() -> Path:
 
 def pending_restarts() -> tuple[dict[str, Any], ...]:
     """The helpers still waiting to start a daemon again (``upgrade --check``'s
-    ``restarts_pending``): each claim whose helper runs."""
+    ``restarts_pending``): each claim whose lock its helper holds (a lock, not a pid, which
+    the OS can hand to another process once the helper ends)."""
     try:
         claims = sorted(restarts_dir().glob("*.json"))
     except OSError:
@@ -824,11 +928,25 @@ def pending_restarts() -> tuple[dict[str, Any], ...]:
     found = []
     for claim in claims:
         with contextlib.suppress(OSError):
-            said = _json_object(claim.read_text(encoding="utf-8"))
-            helper = said.get("helper_pid")
-            if isinstance(helper, int) and procs.alive(helper):
+            if _helper_holds(claim.with_suffix(".lock")):
+                said = _json_object(claim.read_text(encoding="utf-8"))
                 found.append({key: said.get(key) for key in _CLAIM_KEYS})
     return tuple(found)
+
+
+def _helper_holds(lock: Path) -> bool:
+    """Whether a helper holds ``lock``, its claim on a record id."""
+    try:
+        handle = locking.open_lock_file(lock, create=False)
+    except FileNotFoundError:
+        return False
+    try:
+        locking.acquire(handle, wait_s=0)
+    except TimeoutError:
+        return True
+    finally:
+        os.close(handle)
+    return False
 
 
 _CLAIM_KEYS = ("id", "kind", "pid", "helper_pid", "since", "log")
@@ -860,29 +978,23 @@ def restart_when_gone(daemon: daemons_core.Daemon) -> Path:
 def _say_in_log(log: Path, line: str) -> None:
     """One line of the helper's log: when, which helper, what."""
     moment = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    no_follow = getattr(os, "O_NOFOLLOW", 0)  # a link planted at its name is not written
     with contextlib.suppress(OSError):
-        handle = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        handle = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | no_follow, 0o600)
         with os.fdopen(handle, "a", encoding="utf-8") as out:
             out.write(f"{moment} helper {os.getpid()}: {line}\n")
 
 
-def _claim(claim: Path, said: dict[str, Any]) -> bool:
-    """Whether this helper is the one for ``claim``'s daemon: the claim made new, or taken
-    over from a helper that no longer runs. ``False`` while another helper holds it."""
-    for _ in range(2):
-        try:
-            handle = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            with contextlib.suppress(OSError):
-                other = _json_object(claim.read_text(encoding="utf-8")).get("helper_pid")
-                if isinstance(other, int) and other != os.getpid() and procs.alive(other):
-                    return False
-            claim.unlink(missing_ok=True)
-            continue
-        with os.fdopen(handle, "w", encoding="utf-8") as out:
-            json.dump(said, out)
-        return True
-    return False
+def _claim(lock: Path) -> int | None:
+    """This helper's claim on a record id: ``lock`` held for as long as it runs (the OS lets
+    it go when the helper ends, however it ends). ``None`` while another helper holds it."""
+    handle = locking.open_lock_file(lock, mode=0o600)
+    try:
+        locking.acquire(handle, wait_s=0)
+    except TimeoutError:
+        os.close(handle)
+        return None
+    return handle
 
 
 def _running_already(kind: str, argv: Sequence[str]) -> daemons_core.Daemon | None:
@@ -907,6 +1019,9 @@ def _helper(argv: Sequence[str]) -> int:
     command = [str(part) for part in payload["argv"]]
     folder = restarts_dir()
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if sys.platform != "win32":
+        if folder.stat().st_uid == os.getuid():
+            folder.chmod(0o700)  # each time, not only when made
     log, claim = folder / RESTART_LOG, folder / f"{record_id}.json"
     said = {
         "id": record_id,
@@ -916,9 +1031,17 @@ def _helper(argv: Sequence[str]) -> int:
         "since": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "log": str(log),
     }
-    if not _claim(claim, said):
+    held = _claim(claim.with_suffix(".lock"))
+    if held is None:
         _say_in_log(log, f"another helper waits for {kind} (record {record_id}): nothing to do")
         return 0
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(
+        os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | no_follow, 0o600),
+        "w",
+        encoding="utf-8",
+    ) as out:
+        json.dump(said, out)
     try:
         _say_in_log(log, f"waiting for {kind} (record {record_id}, pid {pid}) to end")
         deadline = time.monotonic() + float(payload.get("wait", RESTART_WHEN_GONE_SECONDS))
@@ -939,17 +1062,24 @@ def _helper(argv: Sequence[str]) -> int:
         return 0
     finally:
         claim.unlink(missing_ok=True)
+        os.close(held)
 
 
 @contextlib.contextmanager
 def _signals_held_off() -> Iterator[None]:
-    """Ctrl-C and SIGTERM ignored inside (main thread only): what starts the daemons again
-    is not cut short by the same signal twice."""
+    """Ctrl-C and SIGTERM held off inside (main thread only): what starts the daemons again
+    is not cut short by the same signal twice. Caught by a handler that does nothing, not
+    ignored: an ignored signal stays ignored across exec, so every daemon and helper started
+    in here would begin deaf to SIGTERM, while a caught one is reset to its default."""
     if threading.current_thread() is not threading.main_thread():
         yield
         return
+
+    def held_off(signum: int, frame: object) -> None:
+        return None
+
     names = [signal.SIGINT] + ([signal.SIGTERM] if hasattr(signal, "SIGTERM") else [])
-    before = {signum: signal.signal(signum, signal.SIG_IGN) for signum in names}
+    before = {signum: signal.signal(signum, held_off) for signum in names}
     try:
         yield
     finally:
@@ -1036,6 +1166,7 @@ class Around:
     new_install: Callable[[], Sequence[str]] | None = None
     """The new install's ``python -P -m aisquare`` (its interpreter), for ``daemon install``."""
     _checked: bool = False
+    _ended_ptys: set[Any] = field(default_factory=set)
     _handled: set[str] = field(default_factory=set)
     _start_failed: list[str] = field(default_factory=list)
     _start_said: bool = False
@@ -1047,7 +1178,7 @@ class Around:
         ``stop_daemons``: with ``--restart-daemons``, the live PTYs ended (``--end-ptys``)
         and each daemon of this host the upgrade may restart stopped, rlxd last. A stop that
         fails starts again what was asked to stop, and raises: nothing is installed."""
-        fresh = census(self.rlxd)
+        fresh = self.counted_again()
         refused = refusal(fresh, replace(self.options, wait_runs=None), windows=self.windows)
         if refused is not None:
             self.events.step("check", "failed", refused.code)
@@ -1060,24 +1191,25 @@ class Around:
             self.events.step("install", "started")
             return
         self.events.step("stop_daemons", "started")
-        ended = 0
-        if self.options.end_ptys and self.rlxd is not None:
-            for pty in fresh.ptys:
-                with contextlib.suppress(RlxdError):  # ending rlxd ends it anyway
-                    self.rlxd.call("pty.kill", {"pty_id": pty.get("pty_id")})
-                    ended += 1
-        targets = []
-        for daemon in fresh.here:
-            why = restart_refusal(daemon)
-            if why is None:
-                targets.append(daemon)
-            else:
-                self.left.append(f"{daemon.kind} ({why})")
-        self.left.extend(
-            f"{_unreadable_kind(u)} (record {u.id}, not readable)" for u in fresh.unreadable
-        )
+        ended = self._end_ptys(fresh)
+        # What refusal() let through: rlx's own records, or ones the upgrade does not stop.
+        targets = [daemon for daemon in fresh.here if restart_refusal(daemon) is None]
+        self.left = [f"{d.kind} (not restartable)" for d in fresh.here if not d.restartable]
         targets.sort(key=lambda daemon: daemon.kind == "rlxd")
         for daemon in targets:
+            if daemon.kind == "rlxd":
+                # The others took their time to stop: a PTY or run that opened meanwhile
+                # refuses now, before rlxd's stop would end it without a word (round 2, m2).
+                late = refusal(
+                    self.counted_again(),
+                    replace(self.options, wait_runs=None),
+                    windows=self.windows,
+                )
+                if late is not None:
+                    self.events.step("stop_daemons", "failed", late.code)
+                    self.start_again()
+                    raise late
+                ended += self._end_ptys(self.found)
             if daemon.kind == "rlxd" and self.rlxd is not None:
                 status = self.rlxd.daemon_status() or {}
                 version = status.get("version")
@@ -1097,6 +1229,26 @@ class Around:
             said.append(f"left running: {', '.join(self.left)}")
         self.events.step("stop_daemons", "done", "; ".join(said) or None)
         self.events.step("install", "started")
+
+    def counted_again(self) -> Census:
+        """The census now, kept as :attr:`found`."""
+        self.found = census(self.rlxd)
+        return self.found
+
+    def _end_ptys(self, found: Census) -> int:
+        """With ``--end-ptys``, ends each live PTY of ``found`` not ended already: how many."""
+        if not self.options.end_ptys or self.rlxd is None:
+            return 0
+        ended = 0
+        for pty in found.ptys:
+            pty_id = pty.get("pty_id")
+            if pty_id in self._ended_ptys:
+                continue
+            with contextlib.suppress(RlxdError):  # ending rlxd ends it anyway
+                self.rlxd.call("pty.kill", {"pty_id": pty_id})
+                self._ended_ptys.add(pty_id)
+                ended += 1
+        return ended
 
     def installed(self, version: str | None, problem: str | None) -> None:
         """The install's end: on a problem, what was stopped starts again from what is in

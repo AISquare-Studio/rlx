@@ -619,30 +619,50 @@ jobs:
           v2_wheel="$(ls "$RUNNER_TEMP"/dist2/*.whl)"
           export AISQUARE_INSTALL_PACKAGE="$v2_wheel"
 
-          # Live findings of #626's test (#2831), against this real rlxd.
-          # H1a and H1c: two live records that name other programs, an rlxd whose argv[0]
-          # is a script and a watch whose argv is /usr/bin/touch. `upgrade --check` runs
-          # neither (rlxd is asked through the rlxd beside rlx), and the upgrade below
-          # neither signals nor runs them.
+          # Live findings of #626's test (#2831) and review (#3038), against this real rlxd.
+          # H1a, H1c and R1: three live, restartable records that name what rlx doesn't
+          # write: an rlxd whose argv[0] is a script, a watch running /usr/bin/touch, and a
+          # watch running rlx's own interpreter with `-c`. `upgrade --check` runs none of
+          # them (rlxd is asked through the rlxd beside rlx), and the upgrade refuses
+          # (daemon_unrecognized) before it signals or runs any.
           plant="$RUNNER_TEMP/plant"; mkdir -p "$plant"
+          tool_python="$UV_TOOL_DIR/aisquare-cli/bin/python"; test -x "$tool_python"
           printf '#!/bin/sh\ntouch "%s/ran-script"\n' "$plant" > "$plant/rlxd"
           chmod +x "$plant/rlxd"
-          uv run --locked --extra dev python - "$plant" <<'EOF' &
+          uv run --locked --extra dev python - "$plant" "$tool_python" <<'EOF' &
           import os, sys, time
           from pathlib import Path
           from aisquare.core import daemons
-          plant = Path(sys.argv[1])
+          plant, tool_python = Path(sys.argv[1]), sys.argv[2]
+          code = f"open({str(plant / 'ran-dash-c')!r}, 'w')"
           held = [
               daemons.register("rlxd", argv=[str(plant / "rlxd"), "serve", "--detach"], restartable=True),
               daemons.register("watch", argv=["/usr/bin/touch", str(plant / "ran-touch")], restartable=True),
+              daemons.register("watch", argv=[tool_python, "-c", code], restartable=True),
           ]
           (plant / "pid").write_text(str(os.getpid()), encoding="utf-8")
           time.sleep(3600)
           EOF
           for _ in $(seq 150); do test -s "$plant/pid" && break; sleep 0.2; done
+          # Whatever ends the step, the holder goes too: left, it keeps its records alive.
+          trap 'rlxd stop >/dev/null 2>&1 || true; kill $stub "$(cat "$plant/pid")" 2>/dev/null || true' EXIT
           rlx --json upgrade --check > check.json
-          jq -e '[.daemons[].kind] | (index("watch") != null) and (map(select(. == "rlxd")) | length == 2)' check.json
+          jq -e '[.daemons[].kind] | (map(select(. == "watch")) | length == 2) and (map(select(. == "rlxd")) | length == 2)' check.json
           test ! -e "$plant/ran-script"
+          REAL=$(rlxd status --json | jq .data.pid)
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "daemon_unrecognized" and (.[-1].data.detail | contains("/usr/bin/touch") and contains("rlxd ("))' up.jsonl
+          sleep 1
+          test ! -e "$plant/ran-touch"; test ! -e "$plant/ran-script"; test ! -e "$plant/ran-dash-c"
+          kill -0 "$(cat "$plant/pid")"
+          rlxd status --json | jq -e --argjson p "$REAL" '.data.pid == $p'
+          kill "$(cat "$plant/pid")" && rm "$plant/pid"  # the trap kills no pid reused since
+          for _ in $(seq 100); do
+            rlx --json upgrade --check | jq -e '.daemons | length == 1' > /dev/null && break
+            sleep 0.2
+          done
+          rlx --json upgrade --check | jq -e '.daemons | length == 1'
 
           # M4: a frozen rlxd (SIGSTOP) can't say its runs and PTYs, so the upgrade refuses
           # (ptys_live, the error its detail) and stops nothing.
@@ -663,11 +683,6 @@ jobs:
           rlxd status --json | jq -e --arg v "$(rlx --version | awk '{print $2}')" --argjson p "$OLD_PID" '.data.version == $v and .data.pid != $p and .data.pid > 0'
           test "$(rlx --version | awk '{print $2}')" = "$W"
           [ "$(jq -c . up.jsonl | wc -l)" -eq "$(wc -l < up.jsonl)" ]
-          # H1a: the planted records were left running and named, never signalled nor run.
-          jq -s -e --arg p "$plant/rlxd" 'any(.[]; .data.step == "stop_daemons" and .data.status == "done" and ((.data.detail // "") | contains("watch (it runs /usr/bin/touch") and contains("rlxd (it runs " + $p)))' up.jsonl
-          test ! -e "$plant/ran-touch"; test ! -e "$plant/ran-script"
-          kill -0 "$(cat "$plant/pid")"
-          kill "$(cat "$plant/pid")"
 
           # PTYs: a live one refuses a restart (ptys_live), and --end-ptys ends it. rlx is
           # $W now, so this leg swaps back to $V (the first wheel; the stub serves v$V's

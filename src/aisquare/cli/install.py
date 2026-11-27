@@ -146,7 +146,10 @@ def _latest_line(plan: lifecycle_service.UpgradePlan) -> str:
 
 
 def _emit_check(plan: lifecycle_service.UpgradePlan) -> None:
-    found = upgrade_daemons.census()  # 4.2: daemons, runs_in_flight, ptys
+    # 4.2: daemons, runs_in_flight, ptys; a frozen rlxd makes them unknown in seconds.
+    found = upgrade_daemons.census(
+        upgrade_daemons.find_rlxd(timeout=upgrade_daemons.CHECK_CALL_TIMEOUT_SECONDS)
+    )
     if get_state().json_output:
         _echo_json({**_plan_json(plan), **found.as_json()})
         return
@@ -585,6 +588,10 @@ def upgrade(
     asking for the version that already runs is nothing to do on every install.
     Asks first at a terminal; off a terminal it is a dry run unless --yes.
     """
+    if end_ptys and not restart_daemons:
+        raise typer.BadParameter(
+            "--end-ptys ends rlxd's PTYs for --restart-daemons, and does nothing without it"
+        )
     daemons = upgrade_daemons.Options(
         restart_daemons=restart_daemons, end_ptys=end_ptys, wait_runs=wait_runs
     )

@@ -14,6 +14,7 @@ import io
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ from typer.testing import CliRunner
 
 from aisquare.cli.app import app
 from aisquare.core import daemons as daemons_core
-from aisquare.core import registry
+from aisquare.core import locking, registry
 from aisquare.services import install_route, lifecycle, upgrade_daemons
 from aisquare.services.install_route import Captured, Facts, LatestRelease
 from aisquare.services.upgrade_daemons import Around, Events, Options, Refused
@@ -63,7 +64,7 @@ class Daemons:
         return state
 
     def start(self, kind: str = "rlxd") -> daemons_core.Daemon:
-        argv = [sys.executable, str(FAKE), "serve" if kind == "rlxd" else "watch"]
+        argv = [sys.executable, str(FAKE), "serve" if kind == "rlxd" else "watch", "--detach"]
         upgrade_daemons.spawn_daemon(
             daemons_core.Daemon(
                 id="000000000000",
@@ -104,16 +105,17 @@ def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Daemons]:
     world.state()
     monkeypatch.setenv("FAKE_RLXD_DIR", str(folder))
     monkeypatch.setenv("FAKE_RLXD_STOP_WAIT", "1")  # `rlxd stop` gives up after 1 s
-    monkeypatch.setattr(upgrade_daemons, "find_rlxd", lambda: world.rlxd)
+    monkeypatch.setattr(upgrade_daemons, "find_rlxd", lambda **_: world.rlxd)
     monkeypatch.setattr(upgrade_daemons, "installed_rlxd", lambda: folder / "rlxd")
-    real_prefix = upgrade_daemons.restart_prefix
+    # The fake's records, as rlx's and rlxd's own are: `<fake> serve --detach`, and
+    # `<fake> watch --detach` where rlx writes `python -P -m aisquare watch --detach`.
+    fake_program = str(FAKE.resolve())
     monkeypatch.setattr(
         upgrade_daemons,
-        "restart_prefix",
-        lambda kind: (
-            (sys.executable, str(FAKE.resolve()), "serve") if kind == "rlxd" else real_prefix(kind)
-        ),
+        "rlxd_command",
+        lambda: (sys.executable, fake_program, "serve", "--detach"),
     )
+    monkeypatch.setattr(upgrade_daemons, "python_command", lambda: (sys.executable, fake_program))
     monkeypatch.setattr(upgrade_daemons, "STOP_TIMEOUT_SECONDS", 8.0)
     monkeypatch.setattr(upgrade_daemons, "RESTART_WHEN_GONE_SECONDS", 60.0)
     monkeypatch.setattr(upgrade_daemons, "RESTART_GRACE_SECONDS", 1.0)
@@ -216,7 +218,7 @@ def _census(**values: Any) -> upgrade_daemons.Census:
         started_at=registry.moment("2027-01-01T00:00:00+00:00"),
         heartbeat_at=registry.moment("2027-01-01T00:00:00+00:00"),
         argv=("rlxd", "serve", "--background"),
-        restartable=True,
+        restartable=False,
     )
     return upgrade_daemons.Census(daemons=(daemon,), **values)
 
@@ -797,34 +799,61 @@ def test_wait_runs_takes_a_bounded_number_of_minutes(minutes: str) -> None:
 
 
 def _record(**values: Any) -> daemons_core.Daemon:
-    return replace(_census().daemons[0], **values)
+    return replace(_census().daemons[0], **{"restartable": True, **values})
 
 
 def test_only_rlxs_own_commands_are_stopped_and_run_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """m1: the record's argv is checked before it is ever run."""
+    """Round 1 m1 and round 2 M1: a record's argv must be exactly what rlx (or rlxd) writes
+    for its kind before it is ever run: no `python -c`, no other module, nothing more."""
     rlxd = tmp_path / "bin" / "rlxd"
     rlxd.parent.mkdir()
     rlxd.write_text("", encoding="utf-8")
     monkeypatch.setattr(upgrade_daemons, "installed_rlxd", lambda: rlxd)
     daemons_core.registry_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
-    good = _record(argv=(str(rlxd), "serve", "--detach", "--log", "x"))
-    assert upgrade_daemons.restart_refusal(good) is None
+    python = (sys.executable, "-P", "-m", "aisquare")
+    good = [
+        _record(argv=(str(rlxd), "serve", "--detach")),
+        _record(argv=(str(rlxd), "serve", "--detach", "--gate-dev-mode")),
+        _record(kind="watch", argv=(*python, "watch", "--detach")),
+        _record(kind="watch", argv=(*python, "--no-color", "--profile=work", "watch", "--detach")),
+        _record(kind="serve", argv=(*python, "serve", "--port", "8765", "--bind", "127.0.0.1")),
+    ]
+    for record in good:
+        assert upgrade_daemons.restart_refusal(record) is None, record.argv
     other = tmp_path / "rlxd-dev"
     other.write_text("", encoding="utf-8")
+    not_rlxs = "its command is not the one rlx writes for a"
     cases = [
-        (_record(argv=good.argv, restartable=False), "not restartable"),
-        (_record(kind="later_kind", argv=good.argv), "rlx doesn't restart a later_kind"),
-        (_record(kind="brain", argv=good.argv), "rlx doesn't restart a brain"),
+        (_record(argv=good[0].argv, restartable=False), "not restartable"),
+        (_record(kind="later_kind", argv=good[0].argv), "rlx doesn't restart a later_kind"),
+        (_record(kind="brain", argv=good[0].argv), "rlx doesn't restart a brain"),
         (_record(argv=("rlxd", "serve", "--detach")), "its program rlxd is not a file"),
         (_record(argv=(str(rlxd), "call", "stop")), "its command is not rlx's"),
+        (
+            _record(argv=(str(rlxd), "serve", "--detach", "--log", "x")),
+            "its command is not the one rlxd writes",
+        ),
         (_record(argv=(str(other), "serve", "--detach")), f"it runs {other}, not {rlxd}"),
+        (_record(kind="watch", argv=(sys.executable, "-c", "print(1)")), f"{not_rlxs} watch"),
+        (_record(kind="watch", argv=(sys.executable, "-m", "aisquare", "watch")), "its command"),
+        (_record(kind="watch", argv=(*python, "watch")), f"{not_rlxs} watch"),
+        (_record(kind="watch", argv=(*python, "--json", "watch", "--detach")), f"{not_rlxs} watch"),
+        (_record(kind="watch", argv=(*python, "watch", "--detach", "x")), f"{not_rlxs} watch"),
+        (_record(kind="serve", argv=(*python, "serve", "--stdio")), f"{not_rlxs} serve"),
+        (
+            _record(kind="serve", argv=(*python, "serve", "--port", "0", "--bind", "h")),
+            f"{not_rlxs} serve",
+        ),
+        (
+            _record(kind="serve", argv=(*python, "serve", "--port", "80", "--bind", "-x")),
+            f"{not_rlxs} serve",
+        ),
     ]
     for record, why in cases:
-        assert upgrade_daemons.restart_refusal(record) == why
-    python = _record(kind="watch", argv=(sys.executable, "-m", "aisquare", "watch"))
-    assert upgrade_daemons.restart_refusal(python) is None
+        said = upgrade_daemons.restart_refusal(record)
+        assert said is not None and said.startswith(why), (record.argv, said)
 
 
 @posix_only
@@ -832,25 +861,32 @@ def test_a_registry_open_to_others_names_nothing_to_run(tmp_path: Path) -> None:
     folder = daemons_core.registry_dir()
     folder.mkdir(parents=True, exist_ok=True)
     folder.chmod(0o755)
-    python = _record(kind="watch", argv=(sys.executable, "-m", "aisquare", "watch"))
+    python = _record(
+        kind="watch", argv=(sys.executable, "-P", "-m", "aisquare", "watch", "--detach")
+    )
     said = upgrade_daemons.restart_refusal(python)
     assert said is not None and "open to others" in said
     folder.chmod(0o700)
     assert upgrade_daemons.restart_refusal(python) is None
 
 
-def test_a_record_naming_another_program_is_left_running_and_said(
+def test_a_record_naming_another_program_refuses_and_nothing_stops(
     fake: Daemons, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Round 2 M1: a restartable record rlx did not write refuses (daemon_unrecognized)
+    before anything stops."""
     old = fake.start()
-    elsewhere = ("/nowhere/rlxd", "serve", "--detach")
-    monkeypatch.setattr(upgrade_daemons, "restart_prefix", lambda kind: elsewhere)
+    monkeypatch.setattr(
+        upgrade_daemons, "rlxd_command", lambda: ("/nowhere/rlxd", "serve", "--detach")
+    )
     around, out = _around(fake, Options(restart_daemons=True))
-    around.before_install()
+    with pytest.raises(Refused) as refused:
+        around.before_install()
+    assert refused.value.code == "daemon_unrecognized"
+    assert refused.value.detail is not None and refused.value.detail.startswith("rlxd (")
     assert [d.pid for d in fake.live("rlxd")] == [old.pid]
-    assert around.stopped == []
-    done = [e["data"] for e in _events(out) if e["data"].get("step") == "stop_daemons"]
-    assert "left running: rlxd (" in done[-1]["detail"]
+    assert around.asked == []
+    assert _steps(_events(out)) == [("check", "failed")]
 
 
 @posix_only
@@ -1136,20 +1172,26 @@ def test_a_real_sigint_during_the_install_starts_rlxd_again(
 
 
 @posix_only
+@pytest.mark.parametrize("how", ["touch", "python -c"])
 def test_a_live_record_naming_another_program_is_neither_signalled_nor_run(
-    fake: Daemons, tool: Path, tmp_path: Path
+    fake: Daemons, tool: Path, tmp_path: Path, how: str
 ) -> None:
-    """H1a: a live record whose argv is `/usr/bin/touch <marker>`."""
+    """H1a (tester, round 1) and R1 (review, round 2): a live, restartable record whose argv
+    is `/usr/bin/touch <marker>`, or this very interpreter with `-c <code>`."""
     marker = tmp_path / "marker"
-    (fake.dir / "argv-watch").write_text(json.dumps(["/usr/bin/touch", str(marker)]), "utf-8")
+    code = f"open({str(marker)!r}, 'w').write('ran')"
+    argv = ["/usr/bin/touch", str(marker)] if how == "touch" else [sys.executable, "-c", code]
+    (fake.dir / "argv-watch").write_text(json.dumps(argv), "utf-8")
+    old = fake.start()
     planted = fake.start("watch")
     result = _upgrade("--restart-daemons")
-    assert result.exit_code == 0, result.output
-    lines = _lines(result)
-    stopped = [e["data"] for e in lines if e["data"].get("step") == "stop_daemons"]
-    assert "left running: watch (it runs /usr/bin/touch, not " in stopped[-1]["detail"]
-    assert lines[-1]["data"]["restarted"] == []
+    assert result.exit_code == 1, result.output
+    last = _lines(result)[-1]
+    assert last["type"] == "upgrade.error" and last["data"]["code"] == "daemon_unrecognized"
+    assert "watch" in last["data"]["detail"], last
+    time.sleep(1)
     assert [d.pid for d in fake.live("watch")] == [planted.pid], "never signalled"
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid], "nothing stopped"
     assert not marker.exists(), "never run"
 
 
@@ -1203,3 +1245,149 @@ def test_the_restart_waits_until_rlxd_answers(fake: Daemons) -> None:
     assert around.restarted == ["rlxd"] and around.failure is None
     status = fake.rlxd.daemon_status()
     assert status is not None and status["version"] == "2.0.0", "answering when restarted"
+
+
+# --- round 2 of #626's review (#3038) ----------------------------------------------------------
+
+
+@posix_only
+def test_what_starts_while_signals_are_held_off_takes_sigterm_as_by_default() -> None:
+    """m1: held off by a handler, not SIG_IGN, which a daemon or helper would inherit."""
+    probe = (
+        "import signal, sys; "
+        "sys.stdout.write(str(signal.getsignal(signal.SIGTERM) == signal.SIG_DFL))"
+    )
+    with upgrade_daemons._signals_held_off():
+        held = signal.getsignal(signal.SIGTERM)
+        child = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+        )
+    assert held not in (signal.SIG_IGN, signal.SIG_DFL)
+    assert child.stdout == "True", "SIGTERM's default, not ignored"
+
+
+@posix_only
+def test_a_helper_the_guard_starts_ends_on_sigterm(
+    fake: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2: Ctrl-C while the upgrade waits for a stuck rlxd; the helper the guard starts is
+    an ordinary process, which SIGTERM ends."""
+    fake.start()
+    (fake.dir / "stuck-rlxd").write_text("", encoding="utf-8")
+    around, _ = _around(fake, Options(restart_daemons=True))
+    real, calls = upgrade_daemons._wait_gone, {"n": 0}
+
+    def ctrl_c_once(daemon: Any, timeout: float) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt
+        return real(daemon, timeout)
+
+    monkeypatch.setattr(upgrade_daemons, "_wait_gone", ctrl_c_once)
+    with pytest.raises(KeyboardInterrupt), upgrade_daemons.guard_daemons(around, sigterm=False):
+        around.before_install()
+    helper = int(upgrade_daemons.pending_restarts()[0]["helper_pid"])
+    os.kill(helper, signal.SIGTERM)
+    ended = False
+    if sys.platform != "win32":  # waitpid's WNOHANG and SIGKILL are POSIX's, as the test is
+        deadline = time.monotonic() + 10
+        while not ended and time.monotonic() < deadline:
+            with contextlib.suppress(ChildProcessError):
+                ended = os.waitpid(helper, os.WNOHANG) != (0, 0)
+            time.sleep(0.1)
+        if not ended:
+            os.kill(helper, signal.SIGKILL)
+    assert ended, "the helper ignored SIGTERM"
+    assert upgrade_daemons.pending_restarts() == (), "its claim went with it"
+
+
+@posix_only
+def test_a_pty_opened_while_another_daemon_stops_refuses_before_rlxd_stops(
+    fake: Daemons, tool: Path
+) -> None:
+    """m2 (R3): counted again right before rlxd's own stop."""
+    old = fake.start()
+    watch = fake.start("watch")
+    (fake.dir / "stuck-watch").write_text("", encoding="utf-8")
+
+    def later() -> None:
+        time.sleep(1.0)
+        fake.state(ptys=[{"pty_id": "p-late", "exited": False}])
+        time.sleep(0.5)
+        (fake.dir / "stuck-watch").unlink()
+
+    threading.Thread(target=later, daemon=True).start()
+    lines = _lines(_upgrade("--restart-daemons"))
+    assert lines[-1]["type"] == "upgrade.error" and lines[-1]["data"]["code"] == "ptys_live"
+    assert ("stop_daemons", "failed") in _steps(lines)
+    assert [d.pid for d in fake.live("rlxd")] == [old.pid], "rlxd never stopped"
+    assert fake.wait_live("watch", not_pid=watch.pid).pid != watch.pid, "the watch is back"
+
+
+def test_end_ptys_without_restart_daemons_is_a_usage_error() -> None:
+    """n2."""
+    result = CliRunner().invoke(app, ["upgrade", "--check", "--end-ptys"])
+    assert result.exit_code == 2, result.output
+
+
+@posix_only
+def test_an_rlxd_not_beside_rlx_is_told_to_stop_not_to_wait(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """n1 (R5): waiting can't help when no rlxd beside rlx can say what runs."""
+    fake.start()
+    monkeypatch.setattr(upgrade_daemons, "find_rlxd", lambda **_: None)
+    began = time.monotonic()
+    for flags in ([], ["--wait-runs", "1"]):
+        last = _lines(_upgrade(*flags))[-1]["data"]
+        assert last["code"] == "runs_in_flight", last
+        assert "stop the rlxd that runs" in last["message"], last
+        assert "--wait-runs" not in last["message"], last
+    assert time.monotonic() - began < 30, "refused at once, not after the wait"
+
+
+def test_a_claim_no_helper_holds_is_not_pending(tmp_path: Path) -> None:
+    """n4: a helper is pending while it holds its claim's lock, not while some process has
+    its old pid."""
+    folder = upgrade_daemons.restarts_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    said = {"id": "0123456789ab", "kind": "rlxd", "pid": 1, "helper_pid": os.getpid()}
+    (folder / "0123456789ab.json").write_text(json.dumps(said), encoding="utf-8")
+    lock = folder / "0123456789ab.lock"
+    assert upgrade_daemons.pending_restarts() == (), "no lock: no helper"
+    handle = locking.open_lock_file(lock)
+    try:
+        assert upgrade_daemons.pending_restarts() == (), "a lock nobody holds"
+        held = _hold_elsewhere(lock)
+        try:
+            assert [p["id"] for p in upgrade_daemons.pending_restarts()] == ["0123456789ab"]
+        finally:
+            held.kill()
+            held.wait()
+    finally:
+        os.close(handle)
+
+
+def _hold_elsewhere(lock: Path) -> subprocess.Popen[str]:
+    """Another process holding ``lock`` until it is killed, once it says it does."""
+    code = (
+        "import sys, time; from aisquare.core import locking; "
+        f"fd = locking.open_lock_file(__import__('pathlib').Path({str(lock)!r})); "
+        "locking.acquire(fd, wait_s=5); print('held', flush=True); time.sleep(60)"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    assert holder.stdout is not None and holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def test_check_asks_rlxd_with_a_short_timeout(tool: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """n5: a frozen rlxd makes the check's runs and PTYs unknown in seconds."""
+    asked: dict[str, Any] = {}
+
+    def find(**given: Any) -> None:
+        asked.update(given)
+
+    monkeypatch.setattr(upgrade_daemons, "find_rlxd", find)
+    result = CliRunner().invoke(app, ["--json", "upgrade", "--check"])
+    assert result.exit_code == 0, result.output
+    assert asked == {"timeout": upgrade_daemons.CHECK_CALL_TIMEOUT_SECONDS}
