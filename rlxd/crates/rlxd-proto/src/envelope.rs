@@ -325,7 +325,8 @@ pub mod codes {
     /// `<namespace>.<name>`, are always free to use.
     pub const UNKNOWN_SETTING: &str = "unknown_setting";
     /// The connection's role may not call that method, such as an `app` connection's
-    /// `pty.write`. `detail` names the `role` and the `method`.
+    /// `pty.write`, or `hook` and `hook.ping` from anything but a `cli` client. `detail`
+    /// names the `role` and the `method`.
     pub const ROLE_NOT_ALLOWED: &str = "role_not_allowed";
     /// `pty.spawn`: the home holds as many PTYs as it may, the live and the exited ones.
     /// `pty.kill` one first. `detail.max` is the cap.

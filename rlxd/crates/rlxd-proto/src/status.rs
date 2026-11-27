@@ -4,23 +4,23 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::PROTOCOL_VERSION;
 use crate::check::{self, Invalid, drop_null, present};
+use crate::{ErrorBody, PROTOCOL_VERSION};
 
 /// `status`'s reply data.
 ///
 /// ```json
 /// {"version": "0.10.3", "pid": 4242, "platform": "macos", "protocol_version": 1,
 ///  "capabilities": [], "seq": 0, "clients": {"app": 0, "tui": 0, "remote": 0, "cli": 1},
-///  "gate": "signed app only", "brain": {"restarts": 0, "handled": 0},
+///  "gate": "signed app only", "brain": {"pid": 4243, "restarts": 0, "handled": 12, "queued": 0},
 ///  "claude": {"installed": true, "version": "2.1.314", "signed_in": true,
 ///             "auth_method": "claude.ai", "account": "…", "plan": "pro"},
 ///  "runs": {"live": 0, "queued": 0}, "jobs": {"count": 0},
 ///  "paths": {"home": "…", "socket": "…", "lock": "…", "token": "…", "logs": "…"}}
 /// ```
 ///
-/// `brain`, `runs` and `jobs` hold zeros until the brain, the runner and the scheduler
-/// fill them, and `seq` is 0 until the event bus does.
+/// `runs` and `jobs` hold zeros until the runner and the scheduler fill them, and `seq` is
+/// 0 until the event bus does.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "StatusData")]
 #[non_exhaustive]
@@ -118,11 +118,13 @@ pub struct Clients {
     pub cli: u32,
 }
 
-/// The resident Python brain.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The resident Python brain, `rlx brain --stdio`, which rlxd starts and keeps running
+/// (1.6).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[non_exhaustive]
 pub struct Brain {
-    /// Its process id, while one runs: from 1 to 2147483647 (2^31 - 1), as rlxd's.
+    /// Its process id, while one runs and speaks rlxd's protocol: from 1 to 2147483647
+    /// (2^31 - 1), as rlxd's. Absent while it starts, waits to start again, or is missing.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -130,10 +132,35 @@ pub struct Brain {
     )]
     #[schemars(transform = drop_null, range(min = 1, max = 2147483647))]
     pub pid: Option<u32>,
-    /// How many times rlxd started it again.
+    /// How many times rlxd started it again after it ended: 0 for the first brain.
     pub restarts: u64,
-    /// How many requests it handled.
+    /// How many requests it answered.
     pub handled: u64,
+    /// How many requests wait for it now, in its queue: at most 64, after which a request
+    /// is refused at once. Absent from a status before the queue had a bound reads as 0.
+    #[serde(default)]
+    pub queued: u64,
+    /// Why no brain runs now, or why the last one ended: `brain_not_found`,
+    /// `brain_start_failed`, `brain_incompatible` (rlx and rlxd are of releases that share
+    /// no brain protocol), `brain_exited` or `brain_unresponsive`. Absent once a brain
+    /// runs. A client ignores codes it does not know.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null)]
+    pub error: Option<ErrorBody>,
+    /// While rlxd waits to start it again: how long that wait is, in milliseconds. It
+    /// doubles with each start that fails, up to 30 s, so a brain that keeps dying does
+    /// not spin.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(transform = drop_null)]
+    pub backoff_ms: Option<u64>,
 }
 
 /// The Claude Code rlxd runs, and its sign-in, as `claude --version` and

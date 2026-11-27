@@ -1,6 +1,7 @@
 //! Where rlx and rlxd are installed: the folders to look in for them, in order. This is
-//! the one list: `rlxd here` looks for rlx in it, and gives the rlxd it starts these
-//! folders on its `PATH`. rlxapp looks in it for a local rlxd, and the README spells it
+//! the one list: `rlxd here` looks for rlx in it ([`find_rlx`]), as rlxd does for the rlx
+//! it runs as its brain and rlxd-hook for the one it falls back to ([`rlx_to_run`]), and
+//! `rlxd here` gives the rlxd it starts these folders on its `PATH`. rlxapp looks in it for a local rlxd, and the README spells it
 //! out for a remote one, where a non-login SSH session has not read the user's profile.
 //!
 //! 1. **uv's tool bin folder**, where `uv tool install` puts `rlx`, found as uv finds it:
@@ -24,6 +25,41 @@ use std::path::{Path, PathBuf};
 /// that do not exist are listed too.
 pub fn dirs() -> Vec<PathBuf> {
     dirs_from(|name| env::var_os(name), env::home_dir(), cfg!(windows))
+}
+
+/// The variable naming the program rlxd and rlxd-hook run as `rlx`, in place of looking
+/// for it: for tests and development, such as a checkout's `.venv/bin/rlx`. It must be an
+/// absolute path.
+pub const RLX_BIN_ENV: &str = "RLXD_RLX_BIN";
+
+/// rlx's command, as an absolute path: in `beside` first, the folder of the rlxd or
+/// rlxd-hook asking, since they are installed beside rlx; then in [`dirs`]; then in the
+/// absolute folders on `PATH`. This is `rlxd here`'s lookup.
+pub fn find_rlx(beside: Option<&Path>) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = beside.into_iter().map(Path::to_path_buf).collect();
+    dirs.extend(self::dirs());
+    dirs.extend(
+        env::var_os("PATH")
+            .map(|path| env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|dir| dir.is_absolute()),
+    );
+    find_in("rlx", &dirs)
+}
+
+/// The `rlx` to run, rlxd's brain (`rlx brain --stdio`) or rlxd-hook's fallback (`rlx
+/// hook <event>`): what [`RLX_BIN_ENV`] names when it is set and not empty, and nothing
+/// else when that is not an absolute path to a file; otherwise [`find_rlx`]. Never a bare
+/// name for the OS to look up when it starts the program.
+pub fn rlx_to_run(beside: Option<&Path>) -> Option<PathBuf> {
+    match env::var_os(RLX_BIN_ENV).filter(|value| !value.is_empty()) {
+        Some(named) => {
+            let path = PathBuf::from(named);
+            (path.is_absolute() && path.is_file()).then_some(path)
+        }
+        None => find_rlx(beside),
+    }
 }
 
 /// `program` in the first of `dirs` that holds it as an executable file: `program.exe`

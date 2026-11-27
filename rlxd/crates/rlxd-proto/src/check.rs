@@ -209,4 +209,16 @@ pub(crate) fn drop_null(schema: &mut Schema) {
             schema.insert("type".to_owned(), only);
         }
     }
+    // An optional field of a type with a schema of its own, such as `Option<ErrorBody>`,
+    // is `anyOf: [{"$ref": …}, {"type": "null"}]`: the `$ref` alone stays.
+    if let Some(Value::Array(choices)) = schema.get_mut("anyOf") {
+        choices.retain(|choice| choice != &serde_json::json!({"type": "null"}));
+        if let [Value::Object(only)] = choices.as_slice() {
+            let only = only.clone();
+            schema.remove("anyOf");
+            for (key, value) in only {
+                schema.insert(key, value);
+            }
+        }
+    }
 }
