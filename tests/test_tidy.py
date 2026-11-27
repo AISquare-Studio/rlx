@@ -521,6 +521,19 @@ def test_the_one_delete_refuses_a_path_outside_the_roots_a_root_itself_and_a_lin
     assert outside.is_dir() and link.is_symlink()
 
 
+def test_a_cachedir_tag_without_the_specs_signature_tags_nothing(tmp_path: Path) -> None:
+    """The spec's word is its signature: a file that only bears the name marks no cache."""
+    ended = session_dir()
+    signed = tag(ended / "scratchpad" / "target")
+    unsigned = ended / "scratchpad" / "results"
+    unsigned.mkdir()
+    (unsigned / cachedir.TAG).write_text("not the signature\n", encoding="utf-8")
+    (unsigned / "evidence.log").write_text("a test run's log\n", encoding="utf-8")
+    aged(ended, 3 * HOUR)
+
+    assert rules(planned(tmp_path)) == {signed: tidy.SESSION_CACHE}
+
+
 # --- 12. never touched ------------------------------------------------------------------------
 
 
