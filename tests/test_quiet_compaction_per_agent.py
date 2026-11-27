@@ -338,9 +338,7 @@ def test_compaction_resume_honors_policy_when_a_wake_arrives_during_compaction(
             store.set_project_setting(live.agent.project_id, "manager_wake", "schedule")
     type_line = fleet_service.type_line
 
-    def with_news(
-        agent: FleetAgent, text: str, *, acked: Callable[[], bool]
-    ) -> delivery.Delivered:
+    def with_news(agent: FleetAgent, text: str, *, acked: Callable[[], bool]) -> delivery.Delivered:
         result = type_line(agent, text, acked=acked)
         if text == "/compact":
             team_service.add_note(

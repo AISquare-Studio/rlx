@@ -3623,9 +3623,7 @@ def _prompt_delta(
     newest = store.latest_seq(session.project_id) if briefed_through is None else briefed_through
     reads, relevant = _board_reading(store, session)
     mode, project = (
-        manager_seat.mode(store, session)
-        if session.role == MANAGER_ROLE
-        else ("every_write", None)
+        manager_seat.mode(store, session) if session.role == MANAGER_ROLE else ("every_write", None)
     )
     scheduled_project = project if mode == "schedule" else None
     if scheduled_project is not None:

@@ -526,9 +526,12 @@ def test_schedule_compacts_past_held_results_but_refuses_urgent_work(manager: Ma
     team_service.add_note("held result", kind="result", board_id=manager.project.id)
     with store_session() as store:
         session = manager.session()
-        assert quiet_compact.refusal(
-            store, session, manager.agent, session.cursor, load_config().fleet
-        ) is None
+        assert (
+            quiet_compact.refusal(
+                store, session, manager.agent, session.cursor, load_config().fleet
+            )
+            is None
+        )
     team_service.add_note(
         "urgent question", kind="question", to_role=manager.sid, board_id=manager.project.id
     )
