@@ -16372,10 +16372,13 @@ def test_manager_pass_timer_stays_manual_until_a_completed_pass_and_healthy_watc
     )
 
 
-def test_manager_pass_prompt_uses_the_project_template_or_builtin(project: ProjectInfo) -> None:
+def test_manager_pass_prompt_uses_the_project_template_or_builtin(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A missing or empty project prompt still produces a bounded pass command."""
     from aisquare.services import manager_pass
 
+    monkeypatch.setattr(manager_pass.program, "word", lambda: "rlx")
     pending = manager_pass.Pass(id="test-pass", lower=4, upper=9, session="bound-seat")
     path = paths.aisquare_home() / "projects" / project.id / "manager" / "pass.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -16389,8 +16392,8 @@ def test_manager_pass_prompt_uses_the_project_template_or_builtin(project: Proje
     assert empty == missing and why == "pass.md empty or too long"
     read_range = "team log --pass-id test-pass --since-seq 4 --through-seq 9 --as bound-seat"
     for prompt in (missing, customized):
-        assert read_range in prompt
-        assert "team complete-pass test-pass --as bound-seat" in prompt
+        assert f"aisquare --json {read_range}" in prompt.splitlines()
+        assert "aisquare team complete-pass test-pass --as bound-seat" in prompt.splitlines()
 
 
 def test_manager_still_wakes_for_a_result_by_default(

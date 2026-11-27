@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from aisquare.core import harness, paths, program
 from aisquare.core.agent_adapters import transcripts
+from aisquare.core.shell_line import command_line
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import TeamSession
 from aisquare.services import manager_seat, transcript
@@ -96,20 +97,25 @@ def template(project: str) -> tuple[str, str | None]:
 def prompt(project: str, board: str, pending: Pass) -> tuple[str, str | None]:
     """Attach commands for the exact range to the project template."""
     body, why = template(project)
-    read = program.words(
-        "--json",
-        "team",
-        "log",
-        "--pass-id",
-        pending.id,
-        "--since-seq",
-        str(pending.lower),
-        "--through-seq",
-        str(pending.upper),
-        "--as",
-        pending.session,
+    read = command_line(
+        [
+            program.PROTOCOL,
+            "--json",
+            "team",
+            "log",
+            "--pass-id",
+            pending.id,
+            "--since-seq",
+            str(pending.lower),
+            "--through-seq",
+            str(pending.upper),
+            "--as",
+            pending.session,
+        ]
     )
-    complete = program.words("team", "complete-pass", pending.id, "--as", pending.session)
+    complete = command_line(
+        [program.PROTOCOL, "team", "complete-pass", pending.id, "--as", pending.session]
+    )
     return (
         f"{_PREFIX}{pending.id}\n{body}\n\n"
         f"Board {board}. Read after #{pending.lower} through #{pending.upper}:\n"
