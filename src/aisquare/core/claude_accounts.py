@@ -781,7 +781,7 @@ def identity(
 
 def read_identity(path: Path) -> ClaudeIdentity | None:
     """Read stable account identity without using or fingerprinting rotating tokens. The file
-    is read each call; a parse of the same bytes is reused while one is kept
+    is read only once its stat changes; until then the parse kept for it is reused
     (``core.parsed_files``), and each caller gets its own copy."""
     identity = parsed_or(path, _identity_in_file, None)
     return identity.model_copy() if identity is not None else None

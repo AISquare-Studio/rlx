@@ -1,11 +1,14 @@
-"""``asq``'s accounts read reuses a slot's identity parse while its ``.claude.json`` holds the
-same bytes.
+"""``asq``'s accounts read reuses a slot's identity parse while its ``.claude.json`` is unchanged.
 
 The status line and the Accounts page follow ``claude_accounts.overview``, which ``asq`` reads
-after every fleet frame. ``read_identity`` keeps its parse of each ``.claude.json`` under the
-SHA-256 digest of the bytes it parsed (``core.parsed_files``): each lookup reads the file and parses
-it only when the digest differs. These tests count the identity reads and parses, read what the read
-after each kind of change shows, and read what the cache keeps.
+after every fleet frame. ``read_identity`` keeps its parse of each ``.claude.json`` under the file's
+stat signature (``core.parsed_files``: ``st_mtime_ns``, ``st_size``, ``st_ino``): a lookup whose
+stat is unchanged opens nothing, and any other reads and parses (rlx#557, by Vaibhav; the stat rule
+is the owner's decision on its takeover, #51). These tests count the identity reads and parses,
+read what the read after each kind of change shows, and read what the cache keeps.
+
+Every file here is old enough to be kept (:func:`settled`) unless a test says otherwise: a file
+written less than ``parsed_files.RACY_NS`` before it was read is read again at every lookup.
 """
 
 from __future__ import annotations
@@ -80,25 +83,31 @@ def no_kept_parses() -> None:
         parsed_files._KEPT.clear()
 
 
+@pytest.fixture(autouse=True)
+def settled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The clock an hour on: every file the fixtures just wrote reads as settled, and is kept."""
+    monkeypatch.setattr(parsed_files, "_clock", lambda: time.time_ns() + 3600 * 10**9)
+
+
 @contextmanager
 def identity_io(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[list[Path], list[Path]]]:
-    """The ``.claude.json`` files read through ``Path.read_bytes`` and the ones the identity
-    parser parsed (its JSON step, ``json_object``) in the block, once each time."""
+    """The ``.claude.json`` files opened and read (``parsed_files._read``) and the ones the
+    identity parser parsed (its JSON step, ``json_object``) in the block, once each time."""
     read: list[Path] = []
     parsed: list[Path] = []
-    read_bytes, json_object = Path.read_bytes, parsed_files.json_object
+    read_file, json_object = parsed_files._read, parsed_files.json_object
 
-    def reading(path: Path) -> bytes:
+    def reading(path: Path) -> tuple[parsed_files.Signature, bytes]:
         if path.name == ".claude.json":
             read.append(path)
-        return read_bytes(path)
+        return read_file(path)
 
     def parsing(path: Path, text: str) -> Any:
         parsed.append(path)
         return json_object(path, text)
 
     with monkeypatch.context() as patched:
-        patched.setattr(Path, "read_bytes", reading)
+        patched.setattr(parsed_files, "_read", reading)
         patched.setattr(core, "json_object", parsing)
         yield read, parsed
 
@@ -141,18 +150,18 @@ def _kept(path: Path) -> list[object]:
     return [kept for (key_path, _parse), kept in parsed_files._KEPT.items() if key_path == path]
 
 
-def test_ten_warm_overviews_read_each_claude_json_three_times_an_overview_and_parse_none(
+def test_ten_warm_overviews_read_no_claude_json_and_parse_none(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ``slots`` fixture: three Claude ``.claude.json`` files, each asked for its identity
-    three times an overview."""
-    claude_jsons = {core.claude_json_path(account) for account in slots[:3]}
+    three times an overview. Unchanged, none is opened: each lookup is an ``os.stat`` (#51; the
+    digest rule read all three files at every lookup, 30 reads)."""
     assert rows(service.overview()) == FIRST
     with identity_io(monkeypatch) as (read, parsed):
         for _ in range(10):
             assert rows(service.overview()) == FIRST
     assert parsed == []
-    assert sorted(read) == sorted(path for path in claude_jsons for _ in range(30))
+    assert read == []
 
 
 def test_a_changed_claude_json_is_the_one_the_next_overview_parses_and_shows(
@@ -167,38 +176,91 @@ def test_a_changed_claude_json_is_the_one_the_next_overview_parses_and_shows(
     assert parsed == [changed]
 
 
-def test_a_rewrite_holding_the_stat_of_the_file_it_replaced_shows_on_the_next_read(
-    slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
+def _settled_at(path: Path, seconds_ago: float) -> int:
+    """``path``'s modification time set ``seconds_ago`` back; the new ``st_mtime_ns``."""
+    when = time.time_ns() - int(seconds_ago * 10**9)
+    os.utime(path, ns=(when, when))
+    return when
+
+
+@pytest.mark.parametrize("key", ["mtime", "size", "inode"])
+def test_a_change_in_each_key_of_the_stat_is_read_again(
+    slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    """Slot 2's ``.claude.json`` holds A, written an hour ago, and is read once; then B, of the same
-    size, is written in place and given A's modification time back, while ``os.stat`` of the
-    file, with or without keywords (``Path.stat`` passes one), answers A's stat. This test reads
-    the stat ``Path.stat`` and ``os.stat`` give after B, B's own size, inode and modification
-    time, and the email of the read after B."""
+    """Each of ``st_mtime_ns``, ``st_size`` and ``st_ino`` changed alone (the other two as they
+    were) has the next lookup read and parse the file again, and show what it holds."""
     path = core.claude_json_path(slots[1])
     _write_email(path, "first@example.com")
-    old = time.time() - 3600
-    os.utime(path, (old, old))
+    mtime = _settled_at(path, 3600)
     assert _email(path) == "first@example.com"
-    pinned = os.stat(path)
-    real_stat = os.stat
+    before = os.stat(path)
+    if key == "mtime":
+        _write_email(path, "again@example.com")  # the same size, in place: the same inode
+        _settled_at(path, 1800)
+    elif key == "size":
+        _write_email(path, "a.longer.one@example.com")  # in place: the same inode
+        os.utime(path, ns=(mtime, mtime))
+    else:
+        beside = path.with_name("replacement.json")
+        _write_email(beside, "again@example.com")  # the same size, a new inode
+        os.utime(beside, ns=(mtime, mtime))
+        os.replace(beside, path)
+    after = os.stat(path)
+    changed = {
+        "mtime": after.st_mtime_ns != before.st_mtime_ns,
+        "size": after.st_size != before.st_size,
+        "inode": after.st_ino != before.st_ino,
+    }
+    assert changed == {name: name == key for name in changed}, changed
+    with identity_io(monkeypatch) as (read, parsed):
+        shown = _email(path)
+    assert shown in ("again@example.com", "a.longer.one@example.com")
+    assert read == [path] and parsed == [path]
 
-    def as_before(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
-        if isinstance(target, (str, os.PathLike)) and Path(target) == path:
-            return pinned
-        return real_stat(target, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", as_before)
+def test_a_file_written_moments_ago_is_read_at_every_lookup_until_it_settles(
+    slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git's "racily clean" rule: a file read inside its timestamp's granularity of its last write
+    could be written again with the same stat, so nothing is kept for it, and each lookup reads.
+    Here, a rewrite of the same size given the first one's modification time back, made while
+    the file is fresh, shows at once. Once :data:`~aisquare.core.parsed_files.RACY_NS` has
+    passed, its answer is kept."""
+    now = time.time_ns()
+    monkeypatch.setattr(parsed_files, "_clock", lambda: now)
+    path = core.claude_json_path(slots[1])
+    _write_email(path, "first@example.com")
+    os.utime(path, ns=(now, now))
+    assert _email(path) == "first@example.com"
+    assert _kept(path) == []
     _write_email(path, "again@example.com")
-    os.utime(path, ns=(pinned.st_atime_ns, pinned.st_mtime_ns))
-    assert path.stat() == pinned and os.stat(path) == pinned
-    real = real_stat(path)
-    assert (real.st_size, real.st_ino, real.st_mtime_ns) == (
-        pinned.st_size,
-        pinned.st_ino,
-        pinned.st_mtime_ns,
-    )
+    os.utime(path, ns=(now, now))
+    assert _email(path) == "again@example.com", "the same stat, read again while fresh"
+    monkeypatch.setattr(parsed_files, "_clock", lambda: now + parsed_files.RACY_NS)
     assert _email(path) == "again@example.com"
+    assert _kept(path) != []
+    with identity_io(monkeypatch) as (read, _parsed):
+        assert _email(path) == "again@example.com"
+    assert read == []
+
+
+def test_a_settled_rewrite_holding_the_stat_of_the_file_it_replaced_is_not_seen(
+    slots: list[ClaudeAccount],
+) -> None:
+    """The stat rule's one blind spot, pinned so a change to it is deliberate: once the file has
+    settled, a rewrite in place at the same size that puts the old modification time back keeps
+    every key of the stat, and the kept answer stands until something else of it changes. (The
+    digest rule this replaced saw it, by reading the file at every lookup; Claude Code never
+    writes so.)"""
+    path = core.claude_json_path(slots[1])
+    _write_email(path, "first@example.com")
+    mtime = _settled_at(path, 3600)
+    assert _email(path) == "first@example.com"
+    _write_email(path, "again@example.com")
+    os.utime(path, ns=(mtime, mtime))
+    assert _email(path) == "first@example.com"
+    _settled_at(path, 1800)
+    assert _email(path) == "again@example.com", "any key changed: read again"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a symlink needs a privilege on Windows")
@@ -207,47 +269,52 @@ def test_a_link_moved_to_b_while_read_and_back_to_a_gives_b_then_a(
 ) -> None:
     """Slot 2's ``.claude.json`` is a link to file A. Its first read moves the link to B, reads B,
     and moves the link back to A before the lookup returns. This test reads that lookup's email,
-    then the next lookup's."""
+    then the next lookup's: B's answer is kept under neither stat (the bytes' ``fstat`` is B's,
+    the path's A's)."""
     path = core.claude_json_path(slots[1])
     a, b = tmp_path / "a.json", tmp_path / "b.json"
     _write_email(a, "a@example.com")
     _write_email(b, "b@example.com")
     path.unlink()
     path.symlink_to(a)
-    read_bytes = Path.read_bytes
+    read_file = parsed_files._read
     moved: list[bool] = []
 
-    def moving(self: Path) -> bytes:
-        if self != path or moved:
-            return read_bytes(self)
+    def moving(target: Path) -> tuple[parsed_files.Signature, bytes]:
+        if target != path or moved:
+            return read_file(target)
         moved.append(True)
-        self.unlink()
-        self.symlink_to(b)
-        body = read_bytes(self)
-        self.unlink()
-        self.symlink_to(a)
-        return body
+        target.unlink()
+        target.symlink_to(b)
+        read = read_file(target)
+        target.unlink()
+        target.symlink_to(a)
+        return read
 
     with monkeypatch.context() as patched:
-        patched.setattr(Path, "read_bytes", moving)
+        patched.setattr(parsed_files, "_read", moving)
         assert _email(path) == "b@example.com"
+    assert _kept(path) == []
     assert _email(path) == "a@example.com"
 
 
-def test_a_failed_read_of_an_unchanged_warm_file_gives_none_then_the_next_read_parses_it(
+def test_a_failed_read_of_a_changed_warm_file_gives_none_then_the_next_read_parses_it(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A warm file whose stat is unchanged is not opened, so cannot fail to read: once its stat
+    changes, a read that fails gives none and drops the kept answer."""
     path = core.claude_json_path(slots[1])
     assert _email(path) == "slot1@example.com"
-    read_bytes = Path.read_bytes
+    _settled_at(path, 1800)
+    read_file = parsed_files._read
 
-    def refused(self: Path) -> bytes:
-        if self == path:
-            raise PermissionError(13, "Permission denied", str(self))
-        return read_bytes(self)
+    def refused(target: Path) -> tuple[parsed_files.Signature, bytes]:
+        if target == path:
+            raise PermissionError(13, "Permission denied", str(target))
+        return read_file(target)
 
     with monkeypatch.context() as patched:
-        patched.setattr(Path, "read_bytes", refused)
+        patched.setattr(parsed_files, "_read", refused)
         assert _email(path) is None
     assert _kept(path) == []
     with identity_io(monkeypatch) as (_read, parsed):
@@ -259,23 +326,24 @@ def test_an_older_reader_publishing_last_gives_each_reader_its_own_identity(
     slots: list[ClaudeAccount], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Reader 1 reads A; before it parses, the file becomes B and reader 2 reads, parses and keeps
-    B; then reader 1 parses and keeps A. This test reads both readers' emails, then the email and
-    the parses of the next read of B."""
+    B; then reader 1 parses A, finds the file's stat is no longer that of the bytes it read, and
+    keeps nothing. This test reads both readers' emails, then the email and the parses of the
+    next read of B."""
     path = core.claude_json_path(slots[1])
     _write_email(path, "a@example.com")
-    read_bytes = Path.read_bytes
+    read_file = parsed_files._read
     second: list[str | None] = []
 
-    def overtaken(self: Path) -> bytes:
-        body = read_bytes(self)
-        if self == path and not second:
+    def overtaken(target: Path) -> tuple[parsed_files.Signature, bytes]:
+        read = read_file(target)
+        if target == path and not second:
             second.append(None)
             _write_email(path, "b@example.com")
             second[0] = _email(path)
-        return body
+        return read
 
     with monkeypatch.context() as patched:
-        patched.setattr(Path, "read_bytes", overtaken)
+        patched.setattr(parsed_files, "_read", overtaken)
         first = _email(path)
     assert (first, second) == ("a@example.com", ["b@example.com"])
     with identity_io(monkeypatch) as (_read, parsed):
