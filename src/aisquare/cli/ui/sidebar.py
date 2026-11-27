@@ -26,9 +26,10 @@ Two rules shape the code more than the layout does:
 - **Rows post messages; the app decides.** ``AddProject``, ``ProjectSelected``,
   ``AgentSelected``, ``SpawnAgent``, ``SettingsSelected``, ``AccountsSelected``,
   ``UpdateSelected``, ``RenameProject``, ``RenameAgent`` and ``OpenProjectMenu`` are the whole
-  contract between this pane and the shell (the Settings hub posts ``AppSettingsSelected``,
-  ``AccountsSelected`` and ``DoctorSelected``). Nothing here opens a view or
-  writes the store.
+  contract between this pane and the shell, with the groups' gestures (``ui.groups``, a group
+  header's ``OpenGroupMenu`` and ``RenameGroup`` among them; the Settings hub posts
+  ``AppSettingsSelected``, ``AccountsSelected`` and ``DoctorSelected``). Nothing here opens
+  a view or writes the store.
 
 Every visible string is a ``rich.text.Text`` built with ``append`` — a project
 called ``[archive]`` must reach the screen as ``[archive]`` (CONTRIBUTING: no
@@ -65,6 +66,8 @@ from aisquare.cli.ui.groups import (
     DropProject,
     GroupProjects,
     MoveRow,
+    OpenGroupMenu,
+    RenameGroup,
     ToggleCollapse,
     TogglePin,
     UndoLayout,
@@ -1667,8 +1670,41 @@ def has_live_agent(
     return (live or {}).get(project_id, 0) > 0
 
 
+class GroupNameInput(NicknameInput):
+    """A group header's name as a field (#39): the card's name field, Enter, Esc, a paste and
+    a press away alike. The header handles what it posts (``NicknameInput.Cancelled`` and
+    ``Left``): no card is above it to take them."""
+
+
+GROUP_EMPTY = "Empty. Drag a project here, or ⋯ → Delete"
+"""What an expanded group with no project says under its header (#39): quiet, and the two
+ways on from it."""
+
+GROUP_TIP = f"click folds · F2 renames · {MENU_TIP} · drag to reorder"
+"""A group header's gestures, on hover."""
+
+
+def group_name_refusal(typed: str, group_id: str, taken: Iterable[ProjectGroup]) -> str | None:
+    """Why a group header's field does not save ``typed``, in the sidebar's words: no name, or
+    another group's (the store's rule: exactly, or with another case). ``None`` saves it."""
+    clean = typed.strip()
+    if not clean:
+        return "a group needs a name"
+    for other in taken:
+        if other.id != group_id and (other.name == clean or other.name.lower() == clean.lower()):
+            return f"another group is called {other.name}"
+    return None
+
+
 class GroupHeader(DragHandle):
-    """A group's line: Enter or a click folds and unfolds it; drag it to reorder groups (#140)."""
+    """A group's line: Enter or a click folds and unfolds it; drag it to reorder groups (#140).
+
+    Its menu (#39) is the card's: ⋯ in its last two cells while it is hovered or highlighted,
+    a click there, a right-click anywhere on it, or ``.`` on it. Its name is renamed in place,
+    from that menu or F2: a field opens over the line, prefilled and all selected; Enter or
+    leaving it saves a name no other group has (:func:`group_name_refusal`, said in a toast,
+    the field staying open with what was typed), and Esc always closes it with nothing changed.
+    """
 
     # Two rows while it is the drop target: the accent line takes one, and on a
     # one-row header it took the only row — the name went blank under the pointer.
@@ -1676,6 +1712,7 @@ class GroupHeader(DragHandle):
     GroupHeader { padding: 0 1; color: $text; background: $boost; }
     GroupHeader.-dragging { opacity: 60%; }
     GroupHeader.-drop-before { height: 2; border-top: solid $accent; }
+    GroupHeader GroupNameInput { width: 1fr; height: 1; }
     """
 
     def __init__(
@@ -1684,9 +1721,16 @@ class GroupHeader(DragHandle):
         agents: Mapping[str, list[FleetAgentStatus]],
         live: Mapping[str, int] | None = None,
     ) -> None:
-        super().__init__(group_header_text(entry, agents, live), id=f"group-{entry.group.id}")
+        text = group_header_text(entry, agents, live)
+        super().__init__(text, id=f"group-{entry.group.id}")
         self.group: ProjectGroup = entry.group
+        self.count = len(entry.members) + len(entry.pinned_members)
+        """How many projects are the group's, its pinned ones too."""
         self.selection_key = f"group:{entry.group.id}"
+        self._text = text
+        self._painted: tuple[Text, int, bool] | None = None
+        self._field: GroupNameInput | None = None
+        self.tooltip = GROUP_TIP
 
     def show(
         self,
@@ -1695,7 +1739,9 @@ class GroupHeader(DragHandle):
         live: Mapping[str, int] | None = None,
     ) -> None:
         self.group = entry.group
-        self.update(group_header_text(entry, agents, live))
+        self.count = len(entry.members) + len(entry.pinned_members)
+        self._text = group_header_text(entry, agents, live)
+        self.paint()
 
     def message(self) -> Message:
         return ToggleCollapse(self.group.id)
@@ -1705,7 +1751,166 @@ class GroupHeader(DragHandle):
         # has nothing to move either): dropped, it renumbered the unpinned groups.
         if self.group.pinned_at is not None:
             return None
+        if self.renaming:
+            # A press in its name field bubbles up here: it is the field's (its cursor, its
+            # selection), never a drag of the group. A card's field is beside its title; this
+            # one is in the handle.
+            return None
         return DragState("group", self.group.id)
+
+    # --- its line, and the ⋯ on it --------------------------------------------------------
+
+    def paint(self) -> None:
+        """Draw the line for its width: ⋯ in the last two cells while it is hovered or
+        highlighted (:attr:`menu_shown`), the name giving way for it, as an agent's row does."""
+        width = self.content_size.width
+        menu = self.menu_shown
+        wanted = (self._text, width, menu)
+        if wanted == self._painted:
+            return
+        self._painted = wanted
+        text = self._text.copy()
+        if menu and width > len(MENU_GLYPH):
+            text.truncate(width - len(MENU_GLYPH), overflow="ellipsis", pad=True)
+            text.append(MENU_GLYPH, style="bold")
+        self.update(text, layout=False)
+
+    @property
+    def menu_shown(self) -> bool:
+        return self._hovered or self.has_class("selected")
+
+    _hovered = False
+
+    def on_enter(self, event: events.Enter) -> None:
+        if not self._hovered:
+            self._hovered = True
+            self.paint()
+
+    def on_leave(self, event: events.Leave) -> None:
+        if self._hovered:
+            self._hovered = False
+            self.paint()
+
+    def on_resize(self) -> None:
+        self.paint()
+
+    def render(self) -> RenderResult:
+        """Painted here too, as an agent's row is: a frame is never drawn at no width, and the
+        highlight (a class) repaints the line with its ⋯."""
+        self.paint()
+        return super().render()
+
+    def _on_menu(self, event: events.Click) -> bool:
+        """Whether ``event`` is a plain click on the line's ⋯, its last two cells."""
+        if event.button != 1 or not self.menu_shown:
+            return False
+        offset = event.get_content_offset(self)
+        return offset is not None and offset.x >= self.content_size.width - len(MENU_GLYPH)
+
+    def on_click(self, event: events.Click) -> None:
+        if self.renaming:
+            # A click in its field is the field's: no fold.
+            event.stop()
+            event.prevent_default()
+            return
+        sidebar = self._sidebar()
+        if sidebar is not None and (event.button == 3 or self._on_menu(event)):
+            # Its menu: a right-click anywhere on the line, or a click on its ⋯.
+            event.stop()
+            event.prevent_default()
+            sidebar.open_group_menu(self.group.id)
+
+    # --- the name, renamed in place ---------------------------------------------------
+
+    @property
+    def renaming(self) -> bool:
+        return self._field is not None
+
+    @property
+    def field(self) -> GroupNameInput | None:
+        return self._field
+
+    def open_rename(self, typed: str | None = None) -> None:
+        """Open the field over the line, prefilled with the name (or ``typed``), all selected.
+
+        Already open, it only takes the focus back: what was typed is kept."""
+        if self._field is None:
+            field = GroupNameInput(
+                value=self.group.name if typed is None else typed,
+                compact=True,
+                id=f"group-name-{self.group.id}",
+            )
+            field.tooltip = "Enter saves, Esc cancels"
+            self._field = field
+            self.add_class("-renaming")
+            self.mount(field)
+        self.call_after_refresh(self._focus_field)
+
+    def _focus_field(self) -> None:
+        if self._field is not None and self._field.is_mounted:
+            self._field.focus()
+            self._field.select_all()
+
+    def close_rename(self, *, refocus: bool) -> None:
+        """Close the field and show the line; ``refocus`` hands the keys back to the sidebar."""
+        field = self._field
+        if field is None:
+            return
+        self._field = None
+        self.remove_class("-renaming")
+        field.remove()
+        sidebar = self._sidebar()
+        if refocus and sidebar is not None:
+            sidebar.focus()
+
+    def _save_typed(self, typed: str, *, refocus: bool) -> None:
+        """Save what the field says: unchanged, it just closes; a name the sidebar refuses is
+        said, and the field stays open with it; any other the shell writes (``RenameGroup``)."""
+        if typed.strip() == self.group.name:
+            self.close_rename(refocus=refocus)
+            return
+        sidebar = self._sidebar()
+        refusal = group_name_refusal(typed, self.group.id, sidebar.groups if sidebar else ())
+        if refusal is not None:
+            self.app.notify(f"not renamed: {refusal}", severity="warning", timeout=6, markup=False)
+            if refocus:
+                self._focus_field()
+            return
+        self.close_rename(refocus=refocus)
+        self.post_message(RenameGroup(self.group.id, typed.strip()))
+
+    @on(Input.Submitted, "GroupNameInput")
+    def _submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._save_typed(event.value, refocus=True)
+
+    @on(NicknameInput.Left)
+    def _left(self, event: NicknameInput.Left) -> None:
+        """Focus-out saves, as Enter does — while the field is still open, and not when the
+        terminal itself lost the focus (Textual blurs the focused widget then)."""
+        event.stop()
+        if self._field is not None and self.app.app_focus:
+            self._save_typed(self._field.value, refocus=False)
+
+    @on(NicknameInput.Cancelled)
+    def _cancelled(self, event: NicknameInput.Cancelled) -> None:
+        event.stop()
+        self.close_rename(refocus=True)
+
+
+class GroupEmptyLine(Static):
+    """Under an expanded group with no project (#39): :data:`GROUP_EMPTY`, dim. Not a row the
+    arrows stop on; a card dropped on it goes into its group, as one dropped on the header."""
+
+    # Wrapped, not cut: the narrowest sidebar keeps both ways on (two lines at 30 columns).
+    DEFAULT_CSS = """
+    GroupEmptyLine { height: auto; padding: 0 1 0 4; color: $text-muted; }
+    GroupEmptyLine.-drop-before { border-top: solid $accent; }
+    """
+
+    def __init__(self, group_id: str) -> None:
+        super().__init__(Text(GROUP_EMPTY), id=f"group-empty-{group_id}")
+        self.group_id = group_id
 
 
 class SectionLabel(Static):
@@ -2306,9 +2511,11 @@ class Sidebar(Vertical):
         Binding("G,shift+g", "group_marked", "group selection", show=False),
         Binding("m", "toggle_mark", "mark", show=False),
         Binding("space", "toggle_collapse", "fold", show=False),
-        Binding("u", "undo_layout", "undo", show=False),
+        # ctrl+z too (#39), the settings pages' undo key: bound here, it is the sidebar's
+        # alone, and a settings page's binds its own.
+        Binding("u,ctrl+z", "undo_layout", "undo", show=False),
         Binding("escape", "escape", "clear marks · home", show=False),
-        # The highlighted card: its name in place, and its menu (⋯).
+        # The highlighted card's or group header's name in place, and its menu (⋯).
         Binding("f2", "rename", "rename", show=False),
         Binding("full_stop", "project_menu", "menu", show=False, key_display="."),
         # The header's ○/●: only the projects with a live agent, or all of them again.
@@ -2499,6 +2706,7 @@ class Sidebar(Vertical):
         existing_cards = {c.project.id: c for c in shown if isinstance(c, ProjectCard)}
         existing_headers = {h.group.id: h for h in shown if isinstance(h, GroupHeader)}
         existing_labels = {label.id: label for label in shown if isinstance(label, SectionLabel)}
+        existing_empty = {line.group_id: line for line in shown if isinstance(line, GroupEmptyLine)}
         names = Counter(project_name(p) for p in projects)
         ordered: list[Widget] = []
         stripe = 0
@@ -2542,6 +2750,11 @@ class Sidebar(Vertical):
             if not header.display:
                 hidden_groups.add(entry.group.id)
             ordered.append(header)
+            if not entry.members and not entry.pinned_members:
+                # Quiet, not broken (#39): an expanded group with no project says so.
+                line = existing_empty.pop(entry.group.id, None) or GroupEmptyLine(entry.group.id)
+                line.display = header.display and not entry.group.collapsed
+                ordered.append(line)
             for member in entry.members:
                 card_for(member, scope=entry.group.id, hidden=entry.group.collapsed)
             return header.display
@@ -2569,6 +2782,7 @@ class Sidebar(Vertical):
             *existing_cards.values(),
             *existing_headers.values(),
             *existing_labels.values(),
+            *existing_empty.values(),
         ]
         for widget in stale:
             widget.remove()
@@ -2677,8 +2891,15 @@ class Sidebar(Vertical):
         """Esc in the sidebar: clear the cards' marks, or with none to clear, go home (L1: the
         last-used project's Manager tab, as the logo and the Home key go; the shell decides).
         Esc's own: the shell clears the marks after a drop or a group pick (``clear_marks``),
-        and going home there replaced whatever view was open (review of #580, #981)."""
-        if self._marked:
+        and going home there replaced whatever view was open (review of #580, #981).
+
+        A group's name field left open, unsaved, by a refused name (#39) closes first: Esc
+        always leaves it with nothing changed."""
+        open_fields = [header for header in self.query(GroupHeader) if header.renaming]
+        if open_fields:
+            for header in open_fields:
+                header.close_rename(refocus=True)
+        elif self._marked:
             self.action_clear_marks()
         else:
             self.post_message(HomeRequested())
@@ -2759,6 +2980,7 @@ class Sidebar(Vertical):
             if other.project.id != project_id and other.renaming:
                 other.close_rename(refocus=False)
         self._close_agent_fields()
+        self._close_group_fields()
         card = self._card(project_id)
         if card is not None and card.display:
             card.open_rename(typed)
@@ -2787,6 +3009,7 @@ class Sidebar(Vertical):
             if card.renaming:
                 card.close_rename(refocus=False)
         self._close_agent_fields(but=row)
+        self._close_group_fields()
         row.open_rename(typed)
         return None
 
@@ -2810,6 +3033,8 @@ class Sidebar(Vertical):
         target = self._cursor_target()
         if target is not None and target[0] == "project":
             self.open_rename(target[1])
+        elif target is not None and target[0] == "group":
+            self.open_group_rename(target[1])
 
     def action_project_menu(self) -> None:
         """``.``: the menu of what is highlighted — an agent's row, its agent's (Q-F1); a card,
@@ -2822,6 +3047,8 @@ class Sidebar(Vertical):
         target = self._cursor_target()
         if target is not None and target[0] == "project":
             self.open_menu(target[1])
+        elif target is not None and target[0] == "group":
+            self.open_group_menu(target[1])
 
     def open_agent_menu(self, agent_id: str) -> None:
         """Ask the shell for ``agent_id``'s menu, under its row."""
@@ -2829,6 +3056,62 @@ class Sidebar(Vertical):
         if row is not None:
             agent = row.status.agent
             self.post_message(OpenAgentMenu(agent.project_id, agent.id, row.region))
+
+    # a group header's name and its menu (#39)
+
+    @property
+    def groups(self) -> list[ProjectGroup]:
+        """Every group the last frame listed, pinned or not."""
+        if self.arrangement is None:
+            return []
+        pinned = [e.group for e in self.arrangement.pinned if isinstance(e, GroupEntry)]
+        return [*pinned, *(e.group for e in self.arrangement.groups)]
+
+    def _group_header(self, group_id: str) -> GroupHeader | None:
+        return next((h for h in self.query(GroupHeader) if h.group.id == group_id), None)
+
+    def open_group_menu(self, group_id: str) -> None:
+        """Ask the shell for ``group_id``'s menu, under its header: how many projects are the
+        group's, and whether a step up or down would move it (``project_groups.step_group``'s
+        rule: past the next header on screen, never a pinned group)."""
+        header = self._group_header(group_id)
+        if header is None or not self._on_screen(header):
+            return
+        steps = [
+            e.group.id
+            for e in (self.arrangement.groups if self.arrangement is not None else [])
+            if e.group.id not in self.hidden_groups
+        ]
+        movable = header.group.pinned_at is None and group_id in steps
+        index = steps.index(group_id) if movable else -1
+        self.post_message(
+            OpenGroupMenu(
+                header.group,
+                header.region,
+                count=header.count,
+                up=movable and index > 0,
+                down=movable and index < len(steps) - 1,
+            )
+        )
+
+    def open_group_rename(self, group_id: str, typed: str | None = None) -> None:
+        """Open ``group_id``'s name field on its header (``typed`` in it); every other name
+        field closes unsaved: one at a time."""
+        header = self._group_header(group_id)
+        if header is None or not self._on_screen(header):
+            return
+        for card in self.query(ProjectCard):
+            if card.renaming:
+                card.close_rename(refocus=False)
+        self._close_agent_fields()
+        self._close_group_fields(but=header)
+        header.open_rename(typed)
+
+    def _close_group_fields(self, but: GroupHeader | None = None) -> None:
+        """Close every group header's open name field, unsaved, but ``but``'s."""
+        for header in self.query(GroupHeader):
+            if header is not but and header.renaming:
+                header.close_rename(refocus=False)
 
     # drag and drop: press on a title or a group header, move past its row, release on a target
 
@@ -2896,8 +3179,9 @@ class Sidebar(Vertical):
             if before != drag.ident:  # dropped on itself: snap back
                 self.post_message(DropGroup(drag.ident, before=before))
             return True
-        if isinstance(target, GroupHeader):
-            self.post_message(DropProject(drag.project_ids, scope=target.group.id, before=None))
+        if isinstance(target, GroupHeader | GroupEmptyLine):
+            scope = target.group.id if isinstance(target, GroupHeader) else target.group_id
+            self.post_message(DropProject(drag.project_ids, scope=scope, before=None))
         elif isinstance(target, ProjectCard):
             if target.project.id not in drag.project_ids:  # dropped on itself: snap back
                 self.post_message(
@@ -2933,6 +3217,9 @@ class Sidebar(Vertical):
         if widget is holder:
             return holder
         for node in (widget, *widget.ancestors):
+            if isinstance(node, GroupEmptyLine):
+                # Into its group, as onto the header; never a place for a group (#39).
+                return None if drag.kind == "group" else node
             if isinstance(node, GroupHeader):
                 if drag.kind == "group" and (
                     node.group.pinned_at is not None or node.group.id == drag.ident
@@ -2955,7 +3242,7 @@ class Sidebar(Vertical):
         if self._drop_target is not None:
             self._drop_target.remove_class("-drop-before")
         self._drop_target = target
-        if isinstance(target, ProjectCard | GroupHeader):
+        if isinstance(target, ProjectCard | GroupHeader | GroupEmptyLine):
             target.add_class("-drop-before")
 
     def show_notice(self, text: str | None) -> None:
