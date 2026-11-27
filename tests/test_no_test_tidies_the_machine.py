@@ -34,6 +34,7 @@ def test_a_real_rlx_tidy_under_the_suite_frees_a_stale_lock_in_the_sandbox_alone
     assert tidy._system_temp_dirs() == [tmp_path / "system-temp"]
     assert tidy._command_lines() == []
     lock = tmp_path / "system-temp" / f"rlx-home-migration-{'a' * 16}.lock"
+    lock.parent.mkdir()
     lock.write_bytes(b"")
     day_ago = time.time() - 25 * 3600
     os.utime(lock, (day_ago, day_ago))
