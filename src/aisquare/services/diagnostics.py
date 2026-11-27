@@ -2951,8 +2951,7 @@ def _check_fleet_terminal(
     """What an agent pane's keys have to cross (#147): the outer terminal, tmux, the server.
 
     Three facts an operator otherwise learns one broken chord at a time: whether
-    the terminal this shell runs in speaks the kitty keyboard protocol (without
-    it shift+enter arrives as enter and the UI never fakes it), whether the tmux
+    the terminal this shell runs in speaks the kitty keyboard protocol, whether the tmux
     the keys cross carries extended keys (3.5+; below it shift+enter travels as
     ``C-j``, the same newline to Claude Code; the running server's version, which
     an in-place upgrade leaves older than the binary here, else the binary's),
@@ -2961,6 +2960,9 @@ def _check_fleet_terminal(
     pre-#147 conf keeps ``C-b``, Claude Code's background-tasks chord, in
     ``fleet attach``) and which of the desktop variables it holds stale (each new
     spawn carries this shell's, agents already running keep the server's).
+
+    The outer terminal's keyboard protocol determines whether Shift+Enter reaches the pane
+    as a distinct key. Ctrl+J adds a line in Claude Code and Codex.
 
     ``ok`` for everything but the stale prefix, which only a server restart
     fixes and which eats a documented Claude Code key.
@@ -2975,11 +2977,11 @@ def _check_fleet_terminal(
             )
         elif kitty is False:
             outer = (
-                f"outer terminal {terminal} (no kitty keyboard protocol: shift+enter arrives as "
-                "enter — `\\` then Enter, or ctrl+j, is the newline)"
+                f"outer terminal {terminal} (no kitty keyboard protocol, shift+enter arrives as "
+                "enter. Use ctrl+j for a newline)"
             )
         else:
-            outer = f"outer terminal {terminal} (protocol unknown: try shift+enter in a pane)"
+            outer = f"outer terminal {terminal} (protocol unknown, use ctrl+j for a newline)"
         if env.get("TMUX"):
             outer += "; this shell is itself inside tmux, which adds its own translation"
         if server is None and _uncreated_home(name) is not None:
