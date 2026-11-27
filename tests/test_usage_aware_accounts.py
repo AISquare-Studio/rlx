@@ -1431,7 +1431,10 @@ def test_choose_uses_headroom_only_when_configured_and_falls_back_to_rank_1(
     spread = service.choose(role="coder", project=work, fetch=fetch)
     assert spread.source == "headroom" and spread.account is not None
     assert spread.account.slot == 3
-    assert spread.describe() == "account 3 · headroom"
+    # The balanced pick (#35) says why: the launch line names the account and its reason.
+    assert spread.describe() == f"account 3 ({spread.why})"
+    assert spread.why.startswith("fair share 1/1 · resets in ")
+    assert spread.why.endswith(" · normal tier")
 
     # A binding still outranks headroom: explicit beats automatic.
     from aisquare.services import settings as settings_service
@@ -2062,6 +2065,97 @@ def test_a_board_on_one_account_reads_no_labels(
         "sess-work", work.root, "startup", transcript_path=transcript(two.config_dir, "w")
     )
     assert reads == [1] and "[plain claude]" in both and "[account 2]" in both
+
+
+def test_the_board_injected_into_agents_names_accounts_as_before_never_by_email(
+    fake_home: Path, work: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.10.2's Q1 names accounts by their email where a person reads them (the Accounts page,
+    and the agent header after it): ``display_name``. The board the SessionStart hook injects
+    into every agent is not one of those: its account tags stay ``slot_labels``' built-in
+    names and aliases, which an agent names an account by in its commands (``--to "account
+    3"``), and no person's address goes into an agent's prompt. Driven through the hook, as
+    an agent on each slot starts."""
+    two = _slot("work@example.com", "tok-work")
+    three = _slot("personal@example.com", "tok-personal")
+    service.set_alias("3", "personal")
+
+    def transcript(config_dir: Path, session_id: str) -> str:
+        return str(config_dir / "projects" / "-repo" / f"{session_id}.jsonl")
+
+    monkeypatch.setenv("AISQUARE_ROLE", "coder")
+    monkeypatch.setenv(core.CONFIG_DIR_VAR, str(two.config_dir))
+    team_service.hook_session_start(
+        "sess-two", work.root, "startup", transcript_path=transcript(two.config_dir, "two")
+    )
+    monkeypatch.setenv(core.CONFIG_DIR_VAR, str(three.config_dir))
+    board = team_service.hook_session_start(
+        "sess-three", work.root, "startup", transcript_path=transcript(three.config_dir, "three")
+    )
+
+    assert "[account 2]" in board and "[personal]" in board
+    assert "@example.com" not in board  # no email reaches an agent's prompt
+    assert service.slot_labels() == {1: "plain claude", 2: "account 2", 3: "personal"}
+    # What a person reads instead: the email, the alias where one was given.
+    assert service.display_labels() == {1: "plain claude", 2: "work@example.com", 3: "personal"}
+    statuses = service.describe_all(service.list_accounts())  # the page's frame holds these
+    assert service.display_labels(statuses) == service.display_labels()
+
+
+def test_a_limited_agents_move_offer_is_the_account_with_the_most_room(
+    fake_home: Path, work: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#14 (the 0.10.2 UX audit's M1): a limited agent's header and menu offer "Move to
+    <account> (N% left)". The account is the switch's own pick (``choose_for_handover``:
+    headroom first, the one the agent is on left out), named as the Accounts page names it,
+    by its email, or its alias once it has one; the room is that account's, left. *Move*
+    passes it to the switch as ``to``, so the account offered is the one moved to. A row that
+    is not limited is offered nothing."""
+    from aisquare.cli.ui.views.agent import MoveOffer, move_offer
+
+    _slot("work@example.com", "tok-work")  # slot 2: the agent's, at its limit
+    personal = _slot("personal@example.com", "tok-personal")  # slot 3: 20% used
+    _slot("third@example.com", "tok-third")  # slot 4: 60% used
+    fetch = _Usage(
+        {"tok-work": _payload(100), "tok-personal": _payload(20), "tok-third": _payload(60)}
+    )
+    monkeypatch.setattr(service, "_http_get", fetch)
+    agent = FleetAgent(
+        id="agt_1",
+        project_id=work.id,
+        label="coder-1",
+        role="coder",
+        pane_id="%1",
+        cwd=work.root,
+        created_at=datetime.now(tz=UTC),
+        account_slot=2,
+    )
+    limited = FleetAgentStatus(agent=agent, state="limited")
+
+    offer = move_offer(limited)
+
+    assert offer == MoveOffer(ref="claude-code:3", name="personal@example.com", left=80.0)
+    assert offer.words() == "Move to personal@example.com (80% left)"
+    assert move_offer(limited.model_copy(update={"state": "working"})) is None
+    service.set_alias("3", "personal")
+    named = move_offer(limited)
+    assert named is not None and (named.ref, named.name) == ("claude-code:3", "personal")
+    # A row its spawn put on no account leaves the one its session runs under, read as the
+    # switch reads it (``leaving_slot``): never offered that one (#579's tester, note 4).
+    on_three = TeamSession(
+        id="s",
+        project_id=work.id,
+        role="coder",
+        started_at=datetime.now(tz=UTC),
+        last_seen_at=datetime.now(tz=UTC),
+        account=str(personal.config_dir),
+    )
+    no_slot = FleetAgentStatus(
+        agent=agent.model_copy(update={"account_slot": None}), state="limited", session=on_three
+    )
+    assert move_offer(no_slot) == MoveOffer(
+        ref="claude-code:4", name="third@example.com", left=40.0
+    )
 
 
 def test_a_removed_slots_readings_do_not_rate_the_next_occupant(fake_home: Path) -> None:

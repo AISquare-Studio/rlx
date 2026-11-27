@@ -353,7 +353,7 @@ def test_a_dripping_body_cannot_hold_the_hook_past_the_ceiling(wired: StubCI) ->
     elapsed_s = time.monotonic() - started
     assert result.reason is ClientReason.deadline_exceeded
     assert elapsed_s < _CUT_OFF_BY_S, f"returned after {elapsed_s * 1000:.0f} ms"
-    assert wired.call_count == 1
+    assert wired.wait_for_calls(1) == 1  # it may land after the ceiling ended the call
 
 
 def test_a_response_that_arrives_after_the_ceiling_is_still_a_breach(

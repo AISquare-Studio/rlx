@@ -23,7 +23,7 @@ from starlette.testclient import TestClient, WebSocketDenialResponse
 from typer.testing import CliRunner
 
 from aisquare.cli.app import app as cli
-from aisquare.core.paths import remote_audit_path, remote_state_path
+from aisquare.core.paths import aisquare_home, remote_audit_path, remote_state_path
 from aisquare.services import remote_server
 from aisquare.services.remote_server import (
     COOKIE,
@@ -405,11 +405,14 @@ def test_read_endpoints_return_the_sources_verbatim(
 
 
 def test_remote_endpoint_carries_the_switches_only(client: TestClient, runtime: Runtime) -> None:
+    """The switches, the version, and the sentence every 403 ``read_only`` says, which the
+    page shows in place of a command of its own (0.10.1's final review): nothing secret."""
     unlock(client, runtime)
     payload = client.get(f"{base(runtime)}/api/remote").json()
-    assert set(payload) == {"allow_write", "auto_off_at", "version"}
+    assert set(payload) == {"allow_write", "auto_off_at", "version", "read_only_reason"}
     assert payload["allow_write"] is False and payload["auto_off_at"] is None
     assert isinstance(payload["version"], str)
+    assert payload["read_only_reason"] == read_only_reason(), "the 403's own sentence"
 
 
 # --- rate limit -------------------------------------------------------------------------
@@ -967,14 +970,22 @@ def test_start_reports_a_busy_port(
     remote_server.stop_remote_server()
 
 
+def _serve_lock(home: Path) -> Path:
+    """The home's ``remote-serve.lock``, beside ``remote.json`` as the server keeps it, in the
+    layout of the home ``home`` is (``core.paths``)."""
+    assert home == aisquare_home(), "the home the server serves"
+    return remote_state_path().with_name(remote_server.SERVE_LOCK_NAME)
+
+
 @contextlib.contextmanager
 def _another_process_serves(home: Path) -> Iterator[None]:
     """``remote-serve.lock`` held as another Remote's process holds it: through a
     descriptor of its own, which conflicts with this process's as another process's does."""
     from aisquare.core.locking import lock_exclusive, unlock
 
-    home.mkdir(parents=True, exist_ok=True)
-    fd = os.open(home / remote_server.SERVE_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    lock = _serve_lock(home)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         lock_exclusive(fd)
         try:
@@ -989,7 +1000,9 @@ def _held_elsewhere(home: Path) -> bool:
     """Whether a process other than this caller holds the home's serving lock."""
     from aisquare.core.locking import lock_exclusive, unlock
 
-    fd = os.open(home / remote_server.SERVE_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    lock = _serve_lock(home)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         lock_exclusive(fd)
     except OSError:

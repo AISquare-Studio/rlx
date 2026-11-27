@@ -27,7 +27,7 @@ curl -fsSL https://aisquare.studio/rlx/install.sh | sh
   conventions reach every new session, so it starts oriented, not cold.
 - **Everything is also a command**, for your scripts and for the agents.
 - **Local-first.** Your memory, boards and fleet live in a SQLite store under
-  `~/.aisquare` on your machine. rlx runs no daemon (the agents run in a tmux
+  `~/.rlx` on your machine. rlx runs no daemon (the agents run in a tmux
   server) and needs no cloud service of its own.
 
 ## Install
@@ -57,10 +57,10 @@ The package is `aisquare-cli`. Its command is `rlx`; `relax`, `asq` and
 1. **Project:** use the folder you are in, or choose another.
 2. **Coding agent:** Claude Code or Codex. Connect it: Welcome links its
    install page if it is missing, and offers the sign-in if it is signed out.
-3. **Fleet:** press *Start manager*, then *Open the manager* and answer the
-   agent's one-time question about trusting the folder, then *Start the
-   coders*: a manager and two coders, each a real session. **Type your goal to
-   the manager in plain words.**
+3. **Fleet:** press *Start fleet*: the manager's pane opens. Answer the
+   agent's one-time question about trusting the folder there, and the two
+   coders start on their own: a manager and two coders, each a real session.
+   **Type your goal to the manager in plain words.**
 
 Click an agent to drive its session. **Press `F12`** to hand focus back to the
 sidebar, where `w` returns to Welcome and `q` quits. **The agents keep
@@ -170,7 +170,7 @@ rlx doctor                           # is everything wired? (and how to fix anyt
 - macOS, Linux, or Windows through WSL2.
 - Python 3.11+ if you install by hand (the one-liner brings its own 3.13).
 - [Claude Code](https://claude.com/claude-code) or
-  [Codex](https://learn.chatgpt.com/docs/codex/cli) (0.164.0 or newer, tested
+  [Codex](https://developers.openai.com/codex/cli) (0.164.0 or newer, tested
   on 0.164.0, 0.166.0 and 0.167.0) for the agents, either or both, and
   tmux 3.2+ for the fleet.
 - Node 22.12+, optional, for browser tools like the Chrome DevTools MCP; the one-liner

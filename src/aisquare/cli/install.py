@@ -684,7 +684,12 @@ def _upgrade(
             else f"upgrading rlx {plan.current} → {plan.destination}"
         )
         _say(f"{move}: {plan.command}")
-    report = lifecycle_service.upgrade(plan, to_stderr=json_output)
+    try:
+        report = lifecycle_service.upgrade(plan, to_stderr=json_output)
+    except lifecycle_service.UpgradeRefused as refused:
+        # Refused at the last moment, before uv ran: the rlx service would not stop (#32).
+        _reopen(reopen)
+        fail(refused.reason, error="service_running", detail=refused.reason)
     if not report.installed:
         # A run uv could not resolve (a cutoff in its settings that excludes even the release
         # that runs) leaves that release in place. The one-liner's own upgrade asks uv for
@@ -1042,7 +1047,7 @@ def uninstall(
         bool,
         typer.Option(
             "--purge",
-            help="Also delete the rlx home (~/.aisquare): memory, boards, settings, "
+            help="Also delete the rlx home (~/.rlx): memory, boards, settings, "
             "its Claude Code account slots (on macOS their sign-in tokens stay in the Keychain) "
             "and Codex account homes, and the Claude Code plugin's answers about uv "
             "(~/.cache/aisquare).",
@@ -1063,7 +1068,7 @@ def uninstall(
         ),
     ] = False,
 ) -> None:
-    """Remove rlx: its Claude Code and Codex hooks, then the package. Keeps ~/.aisquare.
+    """Remove rlx: its Claude Code and Codex hooks, then the package. Keeps ~/.rlx.
 
     Takes rlx's hooks out of every Claude Code directory it finds (the ones
     this machine connected, $CLAUDE_CONFIG_DIR, ~/.claude* and the account
@@ -1071,7 +1076,7 @@ def uninstall(
     the Codex account homes), leaving every other hook as it was. MCP servers
     and plugins that run rlx are named with the `claude` or `codex` command
     that removes each; their files are never rewritten. Refuses while fleet
-    agents are running. ~/.aisquare is kept unless --purge, which waits until an
+    agents are running. ~/.rlx is kept unless --purge, which waits until an
     enabled aisquare plugin is removed (the plan names the command). The package goes
     last: a uv tool install, whatever it was installed from, is removed with
     `uv tool uninstall`; any other install, and any install on native Windows,
@@ -1119,7 +1124,10 @@ def uninstall(
             return
     if refusal is not None:
         fail(str(refusal), error=refusal.error, detail=str(refusal))
-    report = lifecycle_service.uninstall(plan)
+    try:
+        report = lifecycle_service.uninstall(plan)
+    except lifecycle_service.UninstallRefused as refused:  # the rlx service would not stop (#32)
+        fail(str(refused), error=refused.error, detail=str(refused))
     _emit_uninstall_report(report)
     if report.failed:
         raise typer.Exit(1)

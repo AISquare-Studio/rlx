@@ -1,7 +1,7 @@
 """The phone page that ships inside aisquare-cli, served when no other page is installed.
 
 ``asq remote serve --dist DIR`` serves DIR, and a build ``asq remote install-page``
-copied to ``~/.aisquare/remote-dist`` overrides this one; otherwise the server
+copied to ``~/.rlx/remote/dist`` overrides this one; otherwise the server
 answers from the files of the ``aisquare.web.remote`` package: one hand-written
 HTML page, one script, one stylesheet, the service worker, the manifest and two
 icons, with no build step and nothing fetched from anywhere else (SPEC §6).

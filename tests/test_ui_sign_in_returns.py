@@ -15,6 +15,7 @@ import dataclasses
 import os
 import sys
 from collections.abc import Awaitable, Callable, Iterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -23,6 +24,7 @@ from textual.notifications import SeverityLevel
 from textual.pilot import Pilot
 from textual.widgets import Button, Input, Select
 
+from aisquare.cli.ui import app as app_mod
 from aisquare.cli.ui.app import FleetApp
 from aisquare.cli.ui.attach import AttachTargetScreen
 from aisquare.cli.ui.sidebar import AccountsSelected, SpawnAgent, action_text
@@ -46,7 +48,7 @@ from aisquare.services import iam
 from tests.test_ui_accounts import _script_claude_sign_in
 from tests.test_ui_spawn import register
 from tests.test_ui_welcome import READY, _ready_machine
-from tests.ui_workers import settle_page
+from tests.ui_workers import settle_page, settle_until
 
 T = TypeVar("T")
 SIZE = (140, 60)
@@ -97,8 +99,8 @@ def offline(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
 class Shell(FleetApp):
     """The real shell, its notices recorded."""
 
-    def __init__(self) -> None:
-        super().__init__(refresh_seconds=3600, doctor=lambda: [], accounts=None)
+    def __init__(self, *, sharing: Any = None) -> None:
+        super().__init__(refresh_seconds=3600, doctor=lambda: [], accounts=None, sharing=sharing)
         self.notices: list[str] = []
 
     def notify(
@@ -114,9 +116,9 @@ class Shell(FleetApp):
         super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
 
 
-def drive(fn: Callable[[Pilot[None], Shell], Awaitable[T]]) -> T:
+def drive(fn: Callable[[Pilot[None], Shell], Awaitable[T]], *, sharing: Any = None) -> T:
     async def run() -> T:
-        app = Shell()
+        app = Shell(sharing=sharing)
         async with app.run_test(size=SIZE) as pilot:
             await pilot.pause()
             await settle_page(app)
@@ -141,19 +143,23 @@ def test_welcomes_sign_in_comes_back_to_step_three(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline: dict[str, Any]
 ) -> None:
     """On b26dd140 the content stayed on Accounts. Now Welcome is shown again, looks again,
-    and the keyboard is on step 3; from there the manager's pane is two keys away."""
+    and the keyboard is on step 3; from there the manager's pane is two keys away.
+
+    Step 2's *Sign in* starts Claude Code's login itself, on the account the manager will use,
+    as Codex's does (Q7): the Accounts page opens with its pane already up, no *Add* to press."""
     signed_out = dataclasses.replace(READY, signed_in=False)
     machine, _project = _ready_machine(tmp_path, claude=[signed_out])
+    machine.sign_in_slot = 2
     monkeypatch.setattr(welcome, "DEFAULT_SEAMS", machine.seams())
-    _script_claude_sign_in(monkeypatch, tmp_path, lands=True)
+    launched = _script_claude_sign_in(monkeypatch, tmp_path, lands=True)
 
     async def go(pilot: Pilot[None], app: Shell) -> dict[str, Any]:
         page = app.query_one(WelcomeView)
         page.query_one("#claude-sign-in", Button).press()
-        await settle_page(app)
+        await settle_until(app, lambda: launched["opened"])
         seen: dict[str, Any] = {"left_for": app.content.current}
-        await pilot.click("#claude-add")
-        await settle_page(app)
+        seen["asked"] = [state.agent for state in machine.sign_ins]
+        seen["begun"], seen["windows"] = launched.get("begin"), list(launched["opened"])
         machine.claude = [READY]  # signed in now: the next look reads it
         await sign_in_lands(pilot, app, offline)
         seen["back_on"] = app.content.current
@@ -168,9 +174,79 @@ def test_welcomes_sign_in_comes_back_to_step_three(
 
     seen = drive(go)
     assert seen["left_for"] == "accounts"
+    assert seen["asked"] == [signed_out.agent], "the manager's account, as Codex's is asked"
+    assert seen["begun"] == 2 and len(seen["windows"]) == 1, "its login started, once, by itself"
     assert seen["back_on"] == "welcome"
     assert seen["focused"] == "fleet-manager", "step 3's next button"
     assert seen["opened"] is not None and seen["presses"] <= 3, seen
+
+
+def test_welcomes_sign_in_holds_the_sharing_question_until_it_is_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    offline: dict[str, Any],
+    sharing_allowed: None,
+) -> None:
+    """Q6 (the round-2 tester of #570): Welcome's own *Sign in* is part of setting up, and the
+    sharing question came up over the Claude login pane it had just opened. Here a listed
+    project's fleet is up, so nothing else holds it: the sign-in Welcome started does, while
+    it is open, and the question comes at the page change that brings Welcome back."""
+    from aisquare.cli.ui.views.usage_sharing import ConsentDialog
+    from aisquare.models import FleetAgent, FleetAgentStatus
+    from aisquare.services import first_run
+    from tests.fleet_fakes import list_agents_as
+    from tests.projects import add_project
+    from tests.test_ui_usage_share import FakeSharing
+
+    signed_out = dataclasses.replace(READY, signed_in=False)
+    machine, _project = _ready_machine(tmp_path, claude=[signed_out])
+    machine.sign_in_slot = 2
+    monkeypatch.setattr(welcome, "DEFAULT_SEAMS", machine.seams())
+    launched = _script_claude_sign_in(monkeypatch, tmp_path, lands=True)
+    listed = add_project(tmp_path / "work")
+    listed.root.mkdir(exist_ok=True)
+    rows: dict[str, list[FleetAgentStatus]] = {}
+    list_agents_as(monkeypatch, lambda project, live_only=True: list(rows.get(project.id, [])))
+    fake = FakeSharing()
+
+    def running(label: str, role: str) -> FleetAgentStatus:
+        agent = FleetAgent(
+            id=f"agt_{label}",
+            project_id=listed.id,
+            label=label,
+            role=role,
+            pane_id="%1",
+            tmux_socket=PRIVATE_SOCKET,
+            cwd=listed.root,
+            created_at=datetime(2026, 11, 25, 9, 0, tzinfo=UTC),
+        )
+        return FleetAgentStatus(agent=agent, state="working")
+
+    async def go(pilot: Pilot[None], app: Shell) -> dict[str, Any]:
+        await app.action_welcome()  # `w`: Welcome, no fleet up yet, nothing asked
+        await settle_page(app)
+        coders = [running(f"coder-{n}", "coder") for n in range(1, first_run.CODERS + 1)]
+        rows[listed.id] = [running("manager", "manager"), *coders]
+        app.refresh_data()
+        await settle_page(app, group=app_mod.FLEET_WORKER)
+        seen: dict[str, Any] = {"before": type(app.screen).__name__}
+        app.query_one(WelcomeView).query_one("#claude-sign-in", Button).press()
+        await settle_until(app, lambda: launched["opened"])
+        await settle_page(app)
+        seen["sign_in"] = (app.content.current, type(app.screen).__name__)
+        seen["asked_then"] = fake.calls.count("consent_due")
+        machine.claude = [READY]
+        await sign_in_lands(pilot, app, offline)
+        await settle_until(app, lambda: isinstance(app.screen, ConsentDialog))
+        seen["back"] = (app.content.current, type(app.screen).__name__)
+        return seen
+
+    seen = drive(go, sharing=fake.seam())
+    assert seen["before"] != "ConsentDialog", seen
+    assert seen["sign_in"] == ("accounts", "PaneScreen"), "its login pane, and nothing over it"
+    assert seen["asked_then"] == 0, "not asked while the sign-in Welcome started is open"
+    assert seen["back"] == ("welcome", "ConsentDialog"), seen
+    assert fake.calls.count("consent_due") == 1
 
 
 def test_the_spawn_dialogs_new_account_comes_back_as_it_was_typed(

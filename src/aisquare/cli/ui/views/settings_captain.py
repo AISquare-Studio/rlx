@@ -12,10 +12,10 @@ could not find.
 set, the box shows the state it forces, greyed, and one line says why: a tick would save
 a setting the variable overrides.
 
-It tops App settings' *Agent settings* tab (the owner's placement, #41), in that form's
-format: a section heading, the box as a row, a dim help line, styled by the form's own
-``.section``/``.row``/``.about`` rules. It saves at once, as it did, not with the form's
-*Save*; the form's Reload and Reset all re-read the file under it
+It ends App settings' *Agent settings* tab, under its *Advanced* (Q18: it topped the tab,
+#41), in that form's format: a section heading, the box as a row, a dim help line, styled by
+the form's own ``.section``/``.row``/``.about`` rules. It saves at once, as it did, not with
+the form's *Save*; the form's Reload and Reset all re-read the file under it
 (:meth:`CaptainToggle.reread`), so the box and the shell follow what the file holds.
 
 Under the box, *captain's agent*: the coding agent the captain runs on, ``[team.profiles.
@@ -32,6 +32,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Checkbox, Label, Select, Static
 
+from aisquare.cli.ui.save_model import page_of
 from aisquare.core import experimental
 from aisquare.core.config import AppConfig, RoleLaunchProfile, load_config, save_config
 
@@ -70,7 +71,11 @@ class CaptainSwitched(Message):
 
 class CaptainToggle(Vertical):
     """*Captain (experimental)*: a box that saves the setting and posts :class:`CaptainSwitched`,
-    and the select of the agent it runs on."""
+    and the select of the agent it runs on. Each is kept as it changes, and its page's ctrl+z
+    takes it back (M5, ``cli.ui.save_model``)."""
+
+    _agent = ""
+    """The captain's agent as the file holds it: what ctrl+z puts back after a pick."""
 
     DEFAULT_CSS = """
     CaptainToggle { height: auto; }
@@ -104,6 +109,7 @@ class CaptainToggle(Vertical):
             current = captain_agent(load_config())
         except Exception:  # a broken config.toml: the form says so; the select offers default
             current = ""
+        self._agent = current
         # One line, a compact select under the box: App settings opens on the box and the first
         # of how launches pick, whole, at 80x24 (#41).
         with Horizontal(classes="row preference"):
@@ -124,9 +130,10 @@ class CaptainToggle(Vertical):
         from aisquare.cli.ui.views.app_settings import agent_options
 
         agent = self.query_one("#captain-agent", Select)
+        self._agent = captain_agent(config)
         with self.prevent(Select.Changed):
-            agent.set_options(agent_options(captain_agent(config)))
-            agent.value = captain_agent(config)
+            agent.set_options(agent_options(self._agent))
+            agent.value = self._agent
         if experimental.captain_forced() is not None:
             return
         box = self.query_one("#captain-toggle", Checkbox)
@@ -141,23 +148,58 @@ class CaptainToggle(Vertical):
         if event.checkbox.id != "captain-toggle":
             return
         event.stop()
-        problem = self._save(event.value)
+        if not self._switch(event.value):
+            return
+        page = page_of(self)
+        if page is not None:
+            back = not event.value
+            page.kept(f"the captain: {'on' if event.value else 'off'}", lambda: self._switch(back))
+
+    def _switch(self, on: bool) -> bool:
+        """Save the captain ``on`` (or off), shown on the box, and tell the shell; said, and the
+        box put back, when the config would not take it."""
+        box = self.query_one("#captain-toggle", Checkbox)
+        problem = self._save(on)
         if problem is not None:
             self.notify(problem, severity="error", timeout=8, markup=False)
             with self.prevent(Checkbox.Changed):
-                event.checkbox.value = not event.value
-            return
+                box.value = not on
+            return False
+        if box.value != on:
+            with self.prevent(Checkbox.Changed):
+                box.value = on
         self.post_message(CaptainSwitched(experimental.captain_enabled()))
+        return True
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "captain-agent":
             return
         event.stop()
         value = event.value if isinstance(event.value, str) else ""
+        before = self._agent
         problem = self._save_agent(value)
         # "" is nothing written: the file holds it already, as at the select's first Changed.
         if problem:
             self.notify(problem, severity="error", timeout=8, markup=False)
+            return
+        if problem is None:
+            self._agent = value
+            page = page_of(self)
+            if page is not None:
+                page.kept("the captain's agent", lambda: self._put_agent(before))
+
+    def _put_agent(self, agent: str) -> bool:
+        """Undo of a pick: the captain's agent the file held before, shown and saved; whether
+        it was."""
+        select = self.query_one("#captain-agent", Select)
+        problem = self._save_agent(agent)
+        if problem:
+            self.notify(problem, severity="error", timeout=8, markup=False)
+            return False
+        with self.prevent(Select.Changed):
+            select.value = agent
+        self._agent = agent
+        return True
 
     @staticmethod
     def _save_agent(agent: str) -> str | None:

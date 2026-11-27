@@ -52,7 +52,7 @@ HTTP_TIMEOUT_SECONDS = 10.0
 DISCOVERY_TTL_SECONDS = 24 * 3600
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
-# The credential keys, all strings, merged into ~/.aisquare/credentials by
+# The credential keys, all strings, merged into ~/.rlx/accounts/aisquare/credentials by
 # core.credentials.store. Read here and nowhere else.
 KEY_API_URL = "iam_api_url"
 KEY_TOKEN = "iam_token"

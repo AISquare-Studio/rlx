@@ -544,7 +544,7 @@ def test_a_launch_whose_broker_cannot_start_holds_the_store_read_only_and_says_w
 
 
 def test_a_launch_prunes_the_directories_of_brokers_that_are_gone() -> None:
-    root = store_dir() / store_broker.DIR_NAME
+    root = paths.broker_dir(store_dir())
     gone, live, fresh, stale = (root / name for name in ("gone", "live", "fresh", "stale"))
     for directory in (gone, live, fresh, stale):
         (directory / store_broker.INBOX).mkdir(parents=True)

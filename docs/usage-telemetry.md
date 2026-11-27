@@ -1,8 +1,13 @@
 # Usage sharing: what is sent, what never is, and the wire contract
 
 rlx can send AISquare **anonymous daily counts of how it is used**, so that the people who
-build it know what to improve. It is **off by default**. Nothing leaves your machine until you
+build it know what to improve. It is **off by default**. No usage leaves your machine until you
 turn it on, you can see what would be sent first, and you can turn it off with one click.
+
+Separate from usage sharing, and sent whether it is on or off, rlx sends one **daily active
+ping**: on each day you use it, the date, its version, your OS, the CPU type and how it was
+installed, with no id of any kind, so that AISquare can count how many installs are active.
+It has its own switch. See [The daily active ping](#the-daily-active-ping) below.
 
 Turn it on or off, either way:
 
@@ -115,16 +120,65 @@ the attempt is retried after the backoff.
 was sent, and sends **one** notice that you opted out (only if anything was ever sent). A shipment
 already under way is stopped: it looks at the switch again before every request, so at most the
 request that is already out finishes (5 seconds at most), and nothing it would have recorded is
-written after the deletion. Nothing is sent after the notice until you turn sharing on again. Saying
+written after the deletion. No usage is sent after the notice until you turn sharing on again (the
+daily active ping is separate, with its own switch: below). Saying
 *off* is also the answer to the one-time question, which is not asked afterwards. These force it off whatever the switch says, and
 suppress the question: `DO_NOT_TRACK=1`, `AISQUARE_NO_TELEMETRY=1`, and any `CI` run.
 `rlx metrics share reset-id` gives the installation a new id and salt.
+
+## The daily active ping
+
+Usage sharing tells AISquare how rlx is used by the people who turn it on. The daily active
+ping only counts how many installs are used each day, those not sharing included. It is
+**separate from usage sharing**: it is sent whether sharing is on or off, and it has its own
+switch.
+
+**What it sends**, once on each local day you use rlx, and nothing else:
+
+```json
+{"date": "2026-11-25", "version": "0.10.2", "os": "darwin", "arch": "arm64", "install_method": "brew"}
+```
+
+- `date`: your local calendar day;
+- `version`: rlx's version (`unknown` if it is not a plain version number);
+- `os`: `darwin`, `linux`, `windows` or `other`;
+- `arch`: `x86_64`, `arm64` or `other`;
+- `install_method`: `brew`, `pipx`, `uv`, `script`, `pip` or `unknown`, as above.
+
+**What it never sends:** an install id or any other identifier, your AISquare account or sign-in
+token, anything about your repositories, prompts, commands or usage, your machine's name, or the
+time of day. The server keeps only a count per date, version, OS, CPU type and install method,
+with no IP address stored with the counts. So it can count active installs per day, but it
+cannot tell one install from another, or recognise the same install on two days.
+
+**When it is sent:** a day counts as a day you used rlx when you run an rlx command or open the
+app (an agent's `aisquare task …` command counts too; its hooks do not). The ping goes from a
+background process after the command is done, so it never slows a command or the app. A command
+never prints anything about it. It is sent at most once a day:
+
+- once the server has answered, nothing more goes that day;
+- if the server is not there yet (a 404, which is what happens until AISquare deploys the
+  endpoint), nothing more goes that day, and it is tried again on the next day you use rlx;
+- if the server refuses it (another 4xx), it is not sent again that day;
+- if the server is busy (408, 425, 429 or 503, waiting at least its `Retry-After`), or rlx is offline,
+  it is tried again later the same day, after 5 minutes and then twice as long each time;
+- a day it did not reach the server is never sent later.
+
+**Turning it off:**
+
+- *Settings ▸ Usage & stats ▸ Turn the daily ping off*;
+- or `rlx config set sharing.active_ping false` (and `true` to turn it on again).
+
+`rlx metrics share status` says whether it is on. `DO_NOT_TRACK=1`, `AISQUARE_NO_TELEMETRY=1`
+and any `CI` run stop it, as they stop sharing. The command that turns it off sends no ping.
 
 ## Where it lives in the code
 
 `src/aisquare/services/usage_share.py` builds and sends the batch, `src/aisquare/core/sharing.py`
 holds the rules (forced off, the state, the backoff), and the local figures it is made of are
-`src/aisquare/services/usage_stats.py`.
+`src/aisquare/services/usage_stats.py`. The daily active ping is
+`src/aisquare/services/active_ping.py`, and its switch is `[sharing] active_ping` in
+`config.toml`.
 
 ---
 
@@ -135,9 +189,11 @@ is agreed by both first. **v1.1** is v1 with the amendments of the team board (s
 *(v1.1)* below; the `schema_version` of the body stays `1`.
 
 ## Principles
-- Local stats are always recorded and shown; NOTHING leaves the machine unless
+- Local stats are always recorded and shown; NO usage leaves the machine unless
   the user opted in. Default OFF. `DO_NOT_TRACK=1` or `AISQUARE_NO_TELEMETRY=1`
   forces off and suppresses the consent prompt; so does CI (`CI` env set).
+  (The daily active ping is not part of this contract: it has its own, at the end of this
+  file.)
 - Repos are shared ONLY as a salted hash + coarse traits. Never names, paths,
   remote URLs, emails, prompts, file names, command arguments or any text.
 - Consent: one-time TUI dialog after onboarding (Share / No thanks / See what
@@ -271,3 +327,37 @@ Field rules:
   capped at 24 hours (the ingest answers 503 with `Retry-After: 3600` while its kill switch is
   off, and a 500 or 502's `Retry-After` is not read); the days are
   rebuilt from the local record, so none is lost.
+
+---
+
+# rlx daily active ping — wire contract (rlx ⇄ AISquare-Studio-BE)
+
+The source of truth is AISquare-Studio-BE's `docs/handoffs/rlx-active-installs.md` (its draft
+handoff PR, #4004). A change to it is agreed by both sides first. This is the client's half,
+`src/aisquare/services/active_ping.py`.
+
+- **Endpoint:** `POST {api_url}/api/v1/rlx/active/`. It uses the same `api_url` as the sign-in
+  and usage sharing, with the trailing slash, and never follows a redirect.
+- **Request:**
+  - headers: `Content-Type: application/json`, `Accept: application/json`, and rlx's usual
+    `User-Agent`;
+  - no `Authorization` and no cookie: the transport has no place for a token;
+  - body: the JSON object of the five keys above, all strings, nothing else.
+- **Answers:**
+
+  | Answer | What the client does |
+  |---|---|
+  | 2xx (the BE answers 204) | Delivered: nothing more that local day |
+  | 404 (not deployed yet) | Nothing more that day, silently. Tried again on a later day |
+  | 400, and any other 4xx except 408, 425 and 429 | Refused: nothing more that day |
+  | 408, 425, 429, 503 | Waits the longer of `Retry-After` (capped at 24 h) and the backoff, then tries again the same day |
+  | other 5xx, a 3xx, a timeout (5 s), no network | Tries again after the backoff (5 min, doubling), the same day |
+
+- **Once a day:** the state (`state.json`, key `active_ping`) keeps only:
+  - the local day that is settled, and how;
+  - when the next try may go;
+  - the failure count.
+
+  It keeps nothing that is sent. The body always carries the day it is sent on.
+- **Forced off:** `DO_NOT_TRACK`, `AISQUARE_NO_TELEMETRY`, `CI`, or `[sharing] active_ping =
+  false`. Both the starting command and the detached pinger check them.

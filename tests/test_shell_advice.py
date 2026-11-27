@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from collections.abc import Callable, Iterator, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,7 @@ import pytest
 from aisquare.cli.ui.views.doctor import COMMAND
 from aisquare.core import program
 from aisquare.core.selfcli import CliResult
-from aisquare.models import TeamEvent
+from aisquare.models import FleetAgent, TeamEvent
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "aisquare"
 
@@ -61,7 +62,7 @@ DOCTOR_ROWS = frozenset({"_warn", "_fail", "degrade", "DoctorCheck"})
 ALLOWED: dict[str, str] = {
     "services/manager_pass.py::prompt": "agent: the bounded pass commands typed to the manager",
     "core/sandbox_roots.py::forget_argv": "data: returns the argv; its callers wrap it",
-    "services/adopt.py::adopt": (
+    "services/adopt.py::_held_note": (
         "data: the argv that runs an agent in its account, which server_note wraps"
     ),
     "services/diagnostics.py::_check_role_bindings": "doctor-fix: the connect its fix names",
@@ -165,6 +166,9 @@ ALLOWED: dict[str, str] = {
         "doctor-fix: the switches its row's fix names"
     ),
     "services/diagnostics.py::_check_claude_code": "doctor-fix: the connects its row's fix names",
+    "services/diagnostics.py::_check_statusline": (
+        "doctor-fix: the install its OK row offers, a quiet pane button in asq (#15)"
+    ),
     "services/diagnostics.py::_check_database": (
         "doctor-fix: the copy (cp) its fix says to keep; the search its detail names is "
         "detail_advice"
@@ -242,7 +246,6 @@ ALLOWED: dict[str, str] = {
     "services/fleet.py::pause_agent": (
         "agent: a stored board event (agent_paused); asq's board drops its tail (watch.shown_text)"
     ),
-    "services/fleet.py::switch": "cli: `fleet switch`'s refusals, printed at a shell",
     "services/handoff.py::HandoffBrief._tail": "agent: the brief the agent taking over reads",
     "services/hooks.py::_warn": (
         "agent: a stored board event agents act on; asq's board drops its tail "
@@ -250,9 +253,6 @@ ALLOWED: dict[str, str] = {
     ),
     "services/hooks.py::capture_prompt": "agent: a hook's stderr, in the agent's own pane",
     "services/hooks.py::check_before_limit": "agent: a hook's stderr, in the agent's own pane",
-    "services/hooks.py::fresh_replacement_refusal": (
-        "cli: `fleet switch`'s refusal, printed at a shell"
-    ),
     "services/hooks.py::hand_over": (
         "agent: a stored board event agents act on; asq's board drops its tail "
         "(watch.drop_switch_tail)"
@@ -536,9 +536,30 @@ def test_at_a_shell_keeps_the_shell_s_advice_and_still_drops_a_detail_s_in_asq()
 # --- the shared messages, both ways ---------------------------------------------------------
 
 
+_MOVED = datetime(2026, 11, 12, 12, 0, tzinfo=UTC)
+_THREE_MIN = timedelta(minutes=3)
+
+
+def _fresh_replacement() -> FleetAgent:
+    """A replacement the usage-limit hand-over started at :data:`_MOVED`: ``fleet switch``
+    refuses it for ``HANDOVER_COOLDOWN``, and asq's Move reaches that refusal (#14)."""
+    from aisquare.services import hooks
+
+    return FleetAgent(
+        id="agt_1",
+        project_id="prj_1",
+        label="coder-1",
+        role="coder",
+        pane_id="%1",
+        cwd=Path("/w"),
+        created_at=_MOVED,
+        spawned_by=hooks.HANDOVER_SPAWNER,
+    )
+
+
 def _builders() -> dict[str, Callable[[], str]]:
     from aisquare.models import UsageCause
-    from aisquare.services import agents, destinations, fleet, lifecycle, remote_server
+    from aisquare.services import agents, destinations, fleet, hooks, lifecycle, remote_server
     from aisquare.services import claude_accounts as accounts
     from aisquare.services.captain import gate
 
@@ -555,6 +576,9 @@ def _builders() -> dict[str, Callable[[], str]]:
         "the captain's row in a pause": fleet.the_captain_reason,
         "the folder-trust question": lambda: fleet.trust_prompt_detail(Path("/srv/app")),
         "this shell's hook directory": agents._repoint,
+        "a fresh replacement's move": lambda: (
+            hooks.fresh_replacement_refusal(_fresh_replacement(), now=_MOVED + _THREE_MIN) or ""
+        ),
     }
 
 
@@ -562,7 +586,7 @@ SHELL = {
     "a vanished account": "no Claude account in slot ? any more — it was removed meanwhile; "
     "see: rlx accounts",
     "a sign-in's usage fix": "press Log in (in a terminal: rlx accounts run 2, then /login)",
-    "another Remote on": "another Remote is on for this ~/.aisquare (the rlx UI's R panel, or "
+    "another Remote on": "another Remote is on for this ~/.rlx (the rlx UI's R panel, or "
     "`rlx remote serve` in another shell) — turn it off first: two would share one link, one "
     "passphrase, one auto-off and one list of phones",
     "Remote on elsewhere": "press Ctrl-C where `rlx remote serve` runs, or turn Remote off in "
@@ -570,6 +594,8 @@ SHELL = {
     "the captain's gate": "say your authenticator's code to the captain, or run: rlx captain "
     "gate unlock <code>",
     "the captain's row in a pause": "the captain — `rlx captain` runs it",
+    "a fresh replacement's move": "'coder-1' was moved 3 min ago by the usage-limit "
+    "hand-over; `--force` moves it again",
 }
 """The shell's text, byte for byte as before R13b, for those whose words are fixed."""
 

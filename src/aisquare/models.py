@@ -224,6 +224,10 @@ class DoctorCheck(BaseModel):
     button, the page, the row to press (R13, #146). ``fix`` stays the shell's: the CLI prints
     it, its commands make the page's buttons, and a manager asked to fix the row is handed
     it. ``None``: the page says the button or the manager that fixes it, never a command."""
+    offer: str | None = None
+    """An ok row's optional improvement, as the shell would run it (``rlx accounts statusline
+    --install``, ``gh auth login``): asq's Doctor makes it a quiet button in the folded passing
+    section, which opens it in a pane. Never a problem, never counted (0.10.2, #15)."""
 
 
 class PromptRecord(BaseModel):
@@ -2325,9 +2329,9 @@ class FreshCounts(BaseModel):
     briefs: int = 0
     """Work briefs, with their numbered requirements: the board's, as its tasks are."""
     evidence: int = 0
-    """Files of the briefs' kept evidence, under ``~/.aisquare/briefs/<id>/``."""
+    """Files of the briefs' kept evidence, under ``~/.rlx/briefs/<id>/``."""
     manager_state: int = 0
-    """Files of the manager's own state (``~/.aisquare/projects/<id>/manager/``: its
+    """Files of the manager's own state (``~/.rlx/projects/<id>/manager/``: its
     ``state.md``, goal, decisions, open items, next step), which a blank manager must not
     read back."""
     entries: int | None = None

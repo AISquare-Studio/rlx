@@ -790,9 +790,11 @@ def fresh_replacement_refusal(agent: FleetAgent, *, now: datetime | None = None)
     if agent.spawned_by != HANDOVER_SPAWNER or since >= HANDOVER_COOLDOWN:
         return None
     minutes = max(1, int(since.total_seconds() // 60))
-    return (
-        f"{agent.label!r} was moved {minutes} min ago by the usage-limit hand-over; "
-        "`--force` moves it again"
+    # asq's Move reaches here (views.agent), with no --force to offer: it says when instead.
+    left = int((HANDOVER_COOLDOWN - since).total_seconds())
+    again = max(1, -(-left // 60))  # whole minutes, rounded up
+    return f"{agent.label!r} was moved {minutes} min ago by the usage-limit hand-over; " + (
+        prog.shell_advice("`--force` moves it again", app=f"it can move again in {again} min")
     )
 
 

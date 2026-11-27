@@ -310,7 +310,7 @@ def test_the_help_names_the_parts_each_agent_declares_and_the_experimental_ones(
     for name in ("skills", "memory", "agents_md", "claude_md"):
         assert f"`{name}` is experimental" not in help_text
     memory = core.kind("claude-code").memory
-    assert memory is not None and f"~/.aisquare/{memory.root_name}/memory" in help_text
+    assert memory is not None and f"~/.rlx/{memory.root_name}/memory" in help_text
 
 
 def test_json_form_is_unchanged_by_the_wording(
