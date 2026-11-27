@@ -3,7 +3,7 @@
 The owner's words: "spawn agent, select role (should allow no role, normal general purpose
 claude), handoff, account". The dialog showed a dozen rows at once, and *Pick…* beside Role
 opened the target picker, which picks an account too, beside the Account select. Now Role,
-*Hand off from* and Account are on show; everything else is in one *Advanced* section,
+*Continue from* and Account are on show; everything else is in one *Advanced* section,
 folded until it is opened, or until it holds the reason *Spawn* is disabled. Role's first
 option is *(none) — general-purpose agent*: ``fleet.PLAIN_ROLE``, a plain session of its
 agent on the board with no standing cycle and no mission.

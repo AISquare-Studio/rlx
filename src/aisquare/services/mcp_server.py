@@ -22,7 +22,7 @@ Transports:
 - ``stdio`` — for Claude Desktop launching the server itself (on Windows:
   ``wsl -e … aisquare serve --stdio``). No network, no token.
 - ``streamable HTTP`` — bound to 127.0.0.1 by default and always guarded by
-  the static bearer token stored in ``~/.aisquare/credentials``, restricted to
+  the static bearer token stored in ``~/.rlx/accounts/aisquare/credentials``, restricted to
   the current user (0600 on POSIX, an equivalent ACL on Windows). A bind
   outside ``LOOPBACK_BINDS`` also drops the SDK's Host/Origin validation,
   leaving that token — long-lived, and sent in clear over plain HTTP — as the

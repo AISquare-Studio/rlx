@@ -587,24 +587,26 @@ def _card_project(
 
 
 @pytest.mark.parametrize(
-    ("nickname", "codename", "aside"),
+    ("nickname", "codename"),
     [
-        (None, "earnest-hawk", "earnest-hawk"),  # generated, never renamed
-        (None, "aisquare-cli", None),  # the folder's own slug
-        ("AISquare CLI", "aisquare-cli", None),  # renamed: the name says it
-        ("AISquare CLI", "aisquare-cli-2", "aisquare-cli-2"),  # suffixed: another held it
-        ("AISquare CLI", "billing", "billing"),  # set with `fleet rename`
-        ("!!!", "earnest-hawk", "earnest-hawk"),  # a name that gives no codename
-        ("Anything", None, None),  # no agent yet: nothing to say
+        (None, "earnest-hawk"),  # generated, never renamed
+        (None, "aisquare-cli"),  # the folder's own slug
+        ("AISquare CLI", "aisquare-cli"),  # renamed: the name says it
+        ("AISquare CLI", "aisquare-cli-2"),  # suffixed: another held it
+        ("AISquare CLI", "billing"),  # set with `fleet rename`
+        ("!!!", "earnest-hawk"),  # a name that gives no codename
+        ("Anything", None),  # no agent yet: nothing to say
     ],
 )
-def test_the_card_says_the_codename_when_its_name_does_not_give_it(
-    nickname: str | None, codename: str | None, aside: str | None
+def test_the_card_never_says_the_codename_and_its_tooltip_does(
+    nickname: str | None, codename: str | None
 ) -> None:
+    """Q3 (the UX audit): the codename is off the sidebar. It was said under a name that does not
+    give it (``· earnest-hawk``); the card's line is its directory alone, where it has one, and
+    the title's tooltip keeps the codename for whoever looks."""
     from collections import Counter
 
     from aisquare.cli.ui.sidebar import (
-        codename_aside,
         project_name,
         project_subtitle,
         project_title_tooltip,
@@ -612,12 +614,10 @@ def test_the_card_says_the_codename_when_its_name_does_not_give_it(
     )
 
     shown = _card_project(nickname, codename)
-    assert codename_aside(shown) == aside
     alone = Counter([project_name(shown)])
     twins = Counter([project_name(shown)] * 2)
-    path = short_path(shown.root)
-    assert project_subtitle(shown, alone, always=False) == (f"· {aside}" if aside else None)
-    assert project_subtitle(shown, twins, always=False) == (f"{path} · {aside}" if aside else path)
+    assert project_subtitle(shown, alone, always=False) is None
+    assert project_subtitle(shown, twins, always=False) == short_path(shown.root)
     tooltip = project_title_tooltip(shown)
     assert "double-click or F2 to rename" in tooltip
     if codename:

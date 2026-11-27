@@ -90,7 +90,7 @@ _PASTE_CHIP = re.compile(r"^\[Pasted text #\d+(?: \+\d+ lines?)?\]")
 
 def prompts_dir() -> Path:
     """Where first messages wait for their launcher: ``$AISQUARE_HOME/run/prompts``."""
-    return paths.aisquare_home() / "run" / "prompts"
+    return paths.run_dir() / "prompts"
 
 
 def write_prompt_file(agent_id: str, text: str) -> Path:
@@ -436,7 +436,7 @@ def typing_lease(server: TmuxServer, pane_id: str) -> Path:
         where = server.socket  # no POSIX uid: no tmux server either
     digest = hashlib.sha256(where.encode()).hexdigest()[:12]
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{server.socket}-{digest}-{pane_id.lstrip('%')}")
-    return paths.aisquare_home() / "run" / "typing" / name
+    return paths.run_dir() / "typing" / name
 
 
 def touch_typing_lease(server: TmuxServer, pane_id: str) -> None:

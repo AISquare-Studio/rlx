@@ -137,6 +137,11 @@ def test_the_spawn_dialogs_first_prompt_is_never_typed_into_the_trust_dialog(
         pytest.param(shots.REAL_CHOOSER, "a numbered choice", id="the real chooser"),
         pytest.param(shots.MODEL_PICKER, "a dialog waiting for Enter or Esc", id="a picker"),
         pytest.param(shots.RATING_ABOVE_BOX, "the session-rating prompt", id="the survey"),
+        pytest.param(
+            shots.REAL_SURVEY_2_1_332,
+            "the session-rating prompt",
+            id="the survey above the effort row (2.1.332, live)",
+        ),
     ],
 )
 @pytest.mark.needs_captain

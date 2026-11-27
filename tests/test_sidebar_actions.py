@@ -85,6 +85,15 @@ def actions_lines(app: FleetApp) -> list[str]:
 # --- no spawn row under any project ---------------------------------------------------------
 
 
+async def _to_the_top(pilot: Pilot[None]) -> None:
+    """The highlight on the sidebar's first row, the +: up from wherever it is, and up at the
+    top stays there. A walk that began from nothing highlighted begins here since L1, start
+    having opened home and highlighted its project's row."""
+    for _ in range(10):
+        await pilot.press("up")
+    await pilot.pause()
+
+
 def test_no_project_card_has_a_spawn_row_and_no_key_for_one_is_left(
     tmp_path: Path, script: Script
 ) -> None:
@@ -312,7 +321,8 @@ def test_both_actions_work_from_the_keyboard_and_the_mouse(tmp_path: Path, scrip
         opened: list[str] = []
         app.sidebar.focus()
         await pilot.pause()
-        for key in ("down", "down", "enter"):  # add → start-captain → Enter
+        await _to_the_top(pilot)  # the + (start opens home since L1, a project's row)
+        for key in ("down", "enter"):  # add → start-captain → Enter
             await pilot.press(key)
             await settle(app)
         assert isinstance(app.screen, SpawnDialog)
@@ -355,7 +365,8 @@ def test_the_live_captains_row_opens_the_captain_view_from_the_keyboard(
         await pilot.pause()
         app.sidebar.focus()
         await pilot.pause()
-        for key in ("down", "down", "enter"):  # add → the captain's row → Enter
+        await _to_the_top(pilot)  # the + (start opens home since L1, a project's row)
+        for key in ("down", "enter"):  # add → the captain's row → Enter
             await pilot.press(key)
             await settle(app)
         await until(pilot, agent_opened(pilot, captain.agent.id), what="the captain view open")
@@ -518,7 +529,9 @@ def test_the_cursor_target_of_an_action_row_is_no_project(tmp_path: Path, script
         await refreshed(app)
         app.sidebar.focus()
         seen: list[tuple[str | None, object]] = []
-        for key in ("down", "down", "down"):  # add → start-captain → spawn-agent
+        await _to_the_top(pilot)  # the + (start opens home since L1, a project's row)
+        seen.append((app.sidebar.selected_key, app.sidebar._cursor_target()))
+        for key in ("down", "down"):  # add → start-captain → spawn-agent
             await pilot.press(key)
             await settle(app)
             seen.append((app.sidebar.selected_key, app.sidebar._cursor_target()))

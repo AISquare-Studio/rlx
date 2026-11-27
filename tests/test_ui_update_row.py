@@ -58,6 +58,7 @@ from aisquare.services.install_route import Facts, InstallRoute, LatestRelease
 from aisquare.services.lifecycle import UpgradePlan
 from tests.installer_seams import no_real_installer  # noqa: F401 — autouse, applied by import
 from tests.rendered import plain
+from tests.settings_fields import leave_fields
 from tests.test_lifecycle_upgrade import Machine, Tool, _hooked, _record, machine, tool  # noqa: F401
 from tests.test_release_check import _state
 from tests.test_ui_doctor_handoff import Terminal, terminal  # noqa: F401
@@ -76,7 +77,9 @@ _FACTS = Facts(
 )
 
 
-def _plan(*, runnable: bool = True, remote: str | None = None) -> UpgradePlan:
+def _plan(
+    *, runnable: bool = True, remote: str | None = None, taken: tuple[Path, ...] = ()
+) -> UpgradePlan:
     if runnable:
         route = InstallRoute(install_route.UV_TOOL, _FACTS)
         argv: tuple[str, ...] = ("uv", "tool", "install", "--force", "aisquare-cli>=0.9.0")
@@ -94,6 +97,7 @@ def _plan(*, runnable: bool = True, remote: str | None = None) -> UpgradePlan:
         env={},
         reason=reason,
         remote=remote,
+        commands_taken=taken,
     )
 
 
@@ -271,7 +275,7 @@ def test_the_release_check_switch_takes_the_row_away_and_brings_it_back_at_once(
             hold.clear()  # asked before this save, answered after it
             app.check_release()
         app.query_one("#updates-check", Switch).value = on
-        app.query_one("#save-settings", Button).press()
+        leave_fields(app)
         # Messages only: the check this test holds open is a worker settle_page waits for.
         await settle_page(app, group="no-worker-of-this-name")
         hold.set()
@@ -316,7 +320,7 @@ def test_an_asq_started_with_the_check_off_asks_at_once_when_it_is_switched_on(
 
     async def save(app: FleetApp, on: bool) -> None:
         app.query_one("#updates-check", Switch).value = on
-        app.query_one("#save-settings", Button).press()
+        leave_fields(app)
         await settle_page(app)
 
     async def body(pilot: Pilot[None], app: FleetApp) -> list[object]:
@@ -484,6 +488,44 @@ def test_an_install_asq_does_not_update_shows_no_command_and_no_restart(
     assert said.startswith("rlx does not update this install itself (Homebrew installs are")
     assert "Update it the way you installed it, then start rlx again." in said
     assert buttons == ["Close"]
+    assert hand_off is None and updates.take_press() is None
+
+
+@pytest.mark.parametrize("names", [("rlx",), ("rlx", "relax")], ids=["rlx", "rlx-and-relax"])
+def test_another_programs_command_in_the_way_is_refused_in_the_dialog_by_name(
+    tmp_path: Path,
+    script: Script,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    names: tuple[str, ...],
+) -> None:
+    """0.10.1's final review: with another program's ``rlx`` or ``relax`` in the install's
+    bin folder, the dialog offered *Restart & update*; asq closed, ``aisquare upgrade``
+    refused (command_taken), and asq came back after Enter. The dialog refuses now, with the
+    upgrade's own refusal naming each file (``lifecycle.taken_refusal``), its last step in
+    asq's words rather than a command (R13), and Close alone: no hand-off is set up."""
+    _two_alive(tmp_path, script)
+    taken = tuple(Path("/tools/bin") / name for name in names)
+    monkeypatch.setattr(lifecycle, "upgrade_plan", lambda *a, **k: _plan(taken=taken))
+
+    async def body(pilot: Pilot[None], app: FleetApp) -> tuple[str, list[str], Any]:
+        screen = await _open_by_keyboard(pilot, app)
+        await settle_page(app)
+        said = shown(screen.query_one("#update-text", Static))
+        buttons = [str(b.label) for b in screen.query(Button)]
+        await pilot.click("#update-cancel")
+        await settle_page(app)
+        return said, buttons, app.hand_off
+
+    said, buttons, hand_off = _drive(body)
+
+    assert said.startswith("rlx cannot update this install now: "), said
+    for path in taken:
+        assert str(path) in said, (path, said)  # named, as the shell refusal names it
+    refusal = lifecycle.taken_refusal("upgrade", taken, again="open the ⬆ row again")
+    assert refusal is not None and refusal in said
+    assert "first, then open the ⬆ row again." in said and "then then" not in said
+    assert "aisquare upgrade" not in said and "`" not in said, "asq names no command (R13)"
+    assert buttons == ["Close"]  # no Restart & update
     assert hand_off is None and updates.take_press() is None
 
 

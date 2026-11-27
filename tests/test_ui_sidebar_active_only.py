@@ -127,7 +127,7 @@ def test_an_exited_or_lost_row_is_no_live_agent(state: str) -> None:
 
 
 def test_a_paused_row_is_no_live_agent() -> None:
-    """A ⏯ paused agent (rc/0.9.2's `fleet pause`) has no process: not in ``ALIVE_STATES``,
+    """A ⏸ paused agent (rc/0.9.2's `fleet pause`) has no process: not in ``ALIVE_STATES``,
     nor the card's alive chip, so a project whose agents are all paused is hidden too."""
     assert "paused" not in ALIVE_STATES
     assert not has_live_agent("prj_a", {"prj_a": [status("prj_a", "x", "coder", "paused")]})

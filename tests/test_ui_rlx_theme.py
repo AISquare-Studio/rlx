@@ -52,7 +52,16 @@ from aisquare.services import team as team_service
 from tests import test_ui_shell as ui_suite
 from tests.projects import add_project
 from tests.test_ui_agent_mark_contrast import contrast
-from tests.test_ui_shell import Script, _state, _write_state, drive, fleet_app, seed, settle
+from tests.test_ui_shell import (
+    Script,
+    _state,
+    _write_state,
+    drive,
+    fleet_app,
+    from_welcome,
+    seed,
+    settle,
+)
 from tests.ui_workers import settle_page
 
 no_real_tmux = ui_suite.no_real_tmux
@@ -531,7 +540,7 @@ async def _focus(app: FleetApp, side: Widget) -> None:
 
 
 async def _marks(pilot: Pilot[None], themes: list[str]) -> Marks:
-    app = fleet_app(pilot)
+    app = await from_welcome(pilot)  # its heading is drawn where it shows (start opens home)
     app.sidebar.show_live_total(3)
     await settle(app)
     seen: Marks = {}
@@ -616,8 +625,8 @@ def test_the_top_left_is_r_backslash_x_bold_in_the_marks_colour_and_cut_where_rl
     """R23, the owner (2026-11-17): "rlx's logo is now r\\x: r, a backslash, x ... in place of
     'rlx'". As the screen paints it, under each look: the header's first three cells are r, a
     backslash and x, bold in the mark's colour. The rest of the row is what rlx's was. A
-    nine-digit count is cut in the 24-cell sidebar (38 to 60 columns), and it is cut in the
-    same cell."""
+    nine-digit count was cut in the 24-cell sidebar of a 38 to 60 column terminal; below 70
+    columns the sidebar is the whole row now (L2), so it is whole at every width here."""
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def body(pilot: Pilot[None]) -> LogoRows:
@@ -650,8 +659,7 @@ def test_the_top_left_is_r_backslash_x_bold_in_the_marks_colour_and_cut_where_rl
         assert cells == [("r", mark, True), ("\\", mark, True), ("x", mark, True)], (theme, cells)
         assert row.lstrip().startswith(f"{LOGO} · 123456789"), (theme, row)
         assert row == before[theme][0].replace("rlx", LOGO, 1), (theme, row, before[theme][0])
-    cut = width < 90
-    assert (" live" not in shown["rlx"][0]) is cut, shown["rlx"][0]
+    assert " live" in shown["rlx"][0], shown["rlx"][0]
 
 
 def test_a_theme_that_sets_the_mark_colours_it_apart_from_its_primary(
@@ -696,7 +704,7 @@ async def _drawn_both_ways(pilot: Pilot[None], themes: list[str]) -> Drawn:
     """Each theme, the keyboard on the content (the sidebar faded), then on the sidebar (the
     content faded), then on the content again: the top-left mark and its count, Welcome's
     heading and the line under it, as drawn on each side."""
-    app = fleet_app(pilot)
+    app = await from_welcome(pilot)  # its heading is drawn where it shows (start opens home)
     app.sidebar.show_live_total(3)
     seen: Drawn = {}
     page = app.query_one(WelcomeView)
@@ -740,7 +748,7 @@ def test_the_rest_of_a_marks_widget_still_fades(tmp_path: Path, script: Script) 
     seed(tmp_path, ("prj_a", "alpha", None))
 
     async def body(pilot: Pilot[None]) -> tuple[Drawn, dict[str, Color]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)  # Welcome on screen (start opens home since L1)
         app.sidebar.show_live_total(3)
         page = app.query_one(WelcomeView)
         intro = page.query_one("#welcome-intro", MarkStatic)

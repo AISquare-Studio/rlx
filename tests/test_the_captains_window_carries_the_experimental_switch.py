@@ -141,7 +141,7 @@ def test_tmux_is_asked_for_the_captains_window_with_the_switch_among_its_e_pairs
         return Completed(0, "", "")
 
     server = TmuxServer(
-        "asq-test", binary=sys.executable, conf=tmp_path / "fleet-tmux.conf", runner=recording
+        "asq-test", binary=sys.executable, conf=tmp_path / "tmux.conf", runner=recording
     )
     monkeypatch.setattr(fleet_service, "server", lambda config=None: server)
     monkeypatch.setattr(tmux_core, "desktop_environment", lambda environ=None: {})

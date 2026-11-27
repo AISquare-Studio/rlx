@@ -55,6 +55,7 @@ from tests.test_ui_shell import (
     composited,
     drive,
     fleet_app,
+    from_welcome,
     refreshed,
     row_for,
     seed,
@@ -202,7 +203,7 @@ def test_an_emoji_nickname_shows_whole_and_keeps_the_cards_columns(
         script[project_id] = [status(project_id, "manager", "manager", "working")]
 
     async def go(pilot: Pilot[None]) -> tuple[str, int, tuple[int, int], tuple[int, int]]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         a, b = card_for(app, "prj_a"), card_for(app, "prj_b")
         title = a.query_one(ProjectTitle)
         return (
@@ -274,13 +275,13 @@ def test_a_double_click_renames_in_place_and_enter_saves_at_once(
     assert seen["view"] == "project-prj_a", "the first click of the two opened it"
 
 
-def test_a_card_says_a_codename_its_name_does_not_give_and_its_tooltip_always_does(
+def test_no_card_says_its_codename_and_its_tooltip_always_does(
     tmp_path: Path, script: Script
 ) -> None:
-    """Task #6, acceptance 5: what a manager calls the project is on its card. A generated
-    codename (``earnest-hawk``), never renamed, is said dim under the name; one the name
-    gives (``beta``) is not; the name's tooltip says the codename either way. A ``fleet
-    rename`` reaches the card at the next frame."""
+    """Q3 (the UX audit): the codename is off the sidebar. A generated codename
+    (``earnest-hawk``), never renamed, was said dim under the name; no card has that line now,
+    and the name's tooltip says the codename either way. A ``fleet rename`` reaches the
+    tooltip at the next frame, and still not the card."""
     seed(tmp_path, ("prj_a", "alpha", "earnest-hawk"), ("prj_b", "beta", "beta"))
 
     async def go(pilot: Pilot[None]) -> dict[str, object]:
@@ -288,7 +289,7 @@ def test_a_card_says_a_codename_its_name_does_not_give_and_its_tooltip_always_do
         a, b = card_for(app, "prj_a"), card_for(app, "prj_b")
         line = a.query_one(".card-subtitle", Static)
         seen: dict[str, object] = {
-            "a": shown(line) if line.display else None,
+            "a": line.display,
             "b": b.query_one(".card-subtitle", Static).display,
             "a tip": str(a.query_one(ProjectTitle).tooltip),
             "b tip": str(b.query_one(ProjectTitle).tooltip),
@@ -296,18 +297,43 @@ def test_a_card_says_a_codename_its_name_does_not_give_and_its_tooltip_always_do
         with store_session() as store:
             store.set_codename("prj_a", "quiet-lynx")
         await refreshed(app)
-        seen["a after"] = shown(line)
+        seen["a after"] = line.display
         seen["a tip after"] = str(a.query_one(ProjectTitle).tooltip)
+        seen["sidebar"] = " ".join(shown(static) for static in app.sidebar.query(Static))
         return seen
 
     seen = drive(go)
-    assert seen["a"] == "· earnest-hawk"
-    assert seen["b"] is False, "beta's codename is its name's: no line"
+    assert seen["a"] is False and seen["b"] is False, "no codename line on either card"
     assert str(seen["a tip"]).startswith(
         "fleet codename earnest-hawk · double-click or F2 to rename"
     )
     assert str(seen["b tip"]).startswith("fleet codename beta · ")
-    assert seen["a after"] == "· quiet-lynx" and "quiet-lynx" in str(seen["a tip after"])
+    assert seen["a after"] is False and "quiet-lynx" in str(seen["a tip after"])
+    sidebar = str(seen["sidebar"])
+    assert "earnest-hawk" not in sidebar and "quiet-lynx" not in sidebar, sidebar
+
+
+def test_a_card_counts_its_agents_at_a_usage_limit(tmp_path: Path, script: Script) -> None:
+    """M1 (the UX audit): a usage-limited agent is alive and parked, and its card said so only
+    as one more in the alive count. The card counts them: ``⏳2``, after the 🔔 count."""
+    seed(tmp_path, ("prj_a", "alpha", None), ("prj_b", "beta", None))
+    script["prj_a"] = [
+        status("prj_a", "manager", "manager", "working"),
+        status("prj_a", "coder-1", "coder", "limited", minute=1),
+        status("prj_a", "coder-2", "coder", "limited", minute=2),
+        status("prj_a", "coder-3", "coder", "attention", minute=3),
+    ]
+    script["prj_b"] = [status("prj_b", "manager", "manager", "working")]
+
+    async def go(pilot: Pilot[None]) -> tuple[str, str]:
+        app = fleet_app(pilot)
+        return tuple(  # type: ignore[return-value]
+            shown(card_for(app, project).query_one(CardChips)) for project in ("prj_a", "prj_b")
+        )
+
+    alpha, beta = drive(go)
+    assert alpha.split() == ["4", "·", "🔔1", "·", "⏳2"], alpha
+    assert "⏳" not in beta and beta.split() == ["1"], beta
 
 
 @pytest.mark.usefixtures("wide_click_chain")
@@ -559,7 +585,7 @@ def test_the_menu_opens_from_its_button_the_dot_key_and_a_right_click(
     seed(tmp_path, ("prj_a", "alpha", None), ("prj_b", "beta", None))
 
     async def go(pilot: Pilot[None]) -> dict[str, object]:
-        app = fleet_app(pilot)
+        app = await from_welcome(pilot)
         a, b = card_for(app, "prj_a"), card_for(app, "prj_b")
         hidden_before = not a.query_one(CardMenuButton).visible
         await _click(pilot, a.query_one(ProjectTitle))
@@ -605,12 +631,13 @@ def test_the_menu_opens_from_its_button_the_dot_key_and_a_right_click(
     seen = drive(go)
     assert seen["hidden_before"] and seen["shown_on_selected"] and seen["still_hidden"]
     assert seen["opened"] == ["button:prj_a", "dot:prj_b", "right:prj_a"]
+    # Q11: three groups, the project, its agents (only what would act: nothing runs here, so a
+    # greyed Pause holds the row, and no greyed Resume beside it), then starting over.
     assert seen["labels"] == [
         "✎ Rename",
         "📌 Pin",
         f"{SETTINGS_ICON} Open settings",  # the sidebar's monotone gear, not the emoji
         "⏸ Pause agents…",
-        "▶ Resume agents…",
         "↺ Start fresh…",
         "✗ Remove from fleet",  # a row of its own that asks in place, not a dialog: no …
     ]
@@ -779,7 +806,9 @@ def test_the_menu_s_arrows_reach_remove_as_one_more_option(tmp_path: Path, scrip
             )
         return seen
 
-    assert drive(go) == ["project-menu-remove", "option 5", "project-menu-remove", "option 0"]
+    # Alpha runs nothing: its agents' group is the one greyed Pause agents… (Q11), so the last
+    # option is the fifth, Start fresh…, below the groups' two separators.
+    assert drive(go) == ["project-menu-remove", "option 4", "project-menu-remove", "option 0"]
 
 
 def test_removing_a_project_moves_to_a_neighbour_the_next_frame_still_lists(

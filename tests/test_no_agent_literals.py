@@ -183,7 +183,7 @@ BASELINE: dict[str, dict[Shape, int]] = {
     "services/explainability_ops.py": {"env": 1, "dir": 4},
     "services/first_run.py": {"dir": 1},
     "services/store_broker.py": {"flag": 1},
-    "statusline.py": {"binary": 1, "env": 1, "dir": 1},  # asq-statusline wraps Claude Code's (#287)
+    "statusline.py": {"binary": 1, "env": 1},  # asq-statusline wraps Claude Code's (#287)
 }
 
 

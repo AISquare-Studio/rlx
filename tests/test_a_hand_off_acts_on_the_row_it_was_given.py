@@ -2,7 +2,7 @@
 
 Review of #240, "also confirmed": hand-off by label. Two rows of a project can carry one
 label over time, an exited coder-1 and the coder-1 started since, and the Spawn dialog's
-*Hand off from* can show the older one (both, or the one it listed before the other
+*Continue from* can show the older one (both, or the one it listed before the other
 started). ``hand_off`` resolved its source by label, which names the NEWEST row, so
 choosing the older teammate forked, or stopped and restarted, the newer one.
 

@@ -31,6 +31,7 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.message import Message
 from textual.pilot import Pilot
+from textual.widget import Widget
 from textual.widgets import Button, Input, Static
 
 from aisquare.cli.ui import app as app_mod
@@ -141,6 +142,16 @@ class Machine:
     """Every agent a *Use …* pick saved as the user default."""
     sign_ins: list[ClaudeState] = field(default_factory=list)
     sign_in_slot: int = 0
+    trust: threading.Event | None = None
+    """The manager's folder-trust answer, which the coders wait on (``after_trust``): set, it
+    has come. ``None``: none comes, and step 3's *Start the coders* is the user's."""
+    waited: list[str] = field(default_factory=list)
+    """The manager each wait on its trust answer was for, by label."""
+    waited_for: list[str] = field(default_factory=list)
+    """…and the project whose manager it was, by id."""
+    trust_by: dict[str, threading.Event] = field(default_factory=dict)
+    """Each project's own manager's answer, by project id, where one is scripted: it releases
+    that manager's wait alone (else :attr:`trust` answers for all)."""
     after_choice: list[ClaudeState] = field(default_factory=list)
     """What the looks answer once a pick is saved; the current answers when empty."""
     starts: list[tuple[str, bool, int]] = field(default_factory=list)
@@ -212,6 +223,17 @@ class Machine:
             self.sign_ins.append(state)
             return self.sign_in_slot
 
+        def trust(manager: FleetAgent, cancelled: Callable[[], bool]) -> bool:
+            self.waited.append(manager.label)
+            self.waited_for.append(manager.project_id)
+            answer = self.trust_by.get(manager.project_id, self.trust)
+            if answer is None:
+                return False
+            while not answer.wait(0.05):  # a bounded poll on the answer itself
+                if cancelled():
+                    return False
+            return True
+
         def choose(agent: str) -> None:
             self.chosen.append(agent)
             # Saved: the next look is about that agent, now the user's default.
@@ -232,6 +254,7 @@ class Machine:
             sign_in=sign_in,
             choose=choose,
             start=start,
+            trust=trust,
             platform=platform,
         )
 
@@ -617,7 +640,7 @@ def test_a_listed_folder_asq_started_in_is_chosen_without_a_click(tmp_path: Path
 
     async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> tuple[str | None, str]:
         chosen = page.project.id if page.project is not None else None
-        return chosen, card(page, "project-status")
+        return chosen, card(page, "project-title")
 
     chosen, text = hosted(machine, go)
     assert chosen == "prj_demo" and "✓ demo-app" in text
@@ -681,7 +704,7 @@ def test_choosing_an_unlisted_folder_onboards_it_first(tmp_path: Path) -> None:
         buttons = candidate_buttons(page)
         first_candidate(page).press()
         await settle_page(host)
-        return buttons, card(page, "project-status")
+        return buttons, card(page, "project-title")
 
     buttons, text = hosted(machine, go)
     assert buttons == ["Use new-app"]
@@ -732,7 +755,7 @@ def test_a_typed_folder_is_judged_then_used(tmp_path: Path) -> None:
         await settle_page(host)
         enabled = visible(page, "welcome-path-use")
         await press(pilot, page, "welcome-path-use")
-        return before, enabled, card(page, "project-status")
+        return before, enabled, card(page, "project-title")
 
     before, enabled, text = hosted(machine, go)
     assert not before and enabled  # the verdict decides the button
@@ -781,6 +804,143 @@ def test_step_one_judges_a_git_dir_as_steps_two_and_three_do(
     again = welcome._find_candidates([])
     assert [(c.root, c.is_git) for c in again.items] == [(root, True)]
     assert hosted(RealPathBox(), go)[0], "control: the folder can be used"
+
+
+def test_a_start_fleet_after_change_waits_on_its_own_managers_trust_answer(
+    tmp_path: Path,
+) -> None:
+    """The reviewer of #570, finding 3: *Change* while the coders waited on alpha's manager,
+    then *Start fleet* on beta. Beta's card said its coders start on their own, but only
+    alpha's manager was waited on (``waited == ['manager']``) and its answer started nothing.
+    The wait now follows the manager started last: alpha's is cancelled, beta's is waited on,
+    and beta's answer starts beta's coders, alone."""
+    alpha = ProjectInfo(id="prj_alpha", root=tmp_path / "alpha", onboarded_at=T0)
+    beta = ProjectInfo(id="prj_beta", root=tmp_path / "beta", onboarded_at=T0)
+    for root in (alpha.root, beta.root):
+        root.mkdir()  # the start's folder: start_fleet refuses one that is gone
+    other = Candidate(root=beta.root, is_git=True, project=beta)
+    machine = Machine(
+        claude=[READY],
+        found=Candidates(items=(here(alpha.root, alpha), other)),
+        trust=threading.Event(),
+    )
+    group = welcome.WORKER_GROUP  # the wait on the answer is held on purpose: not settled
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> dict[str, Any]:
+        page.query_one("#fleet-manager", Button).press()
+        await settle_until(host, lambda: machine.waited_for == [alpha.id], group=group)
+        page.query_one("#welcome-change", Button).press()
+        await settle_page(host, group=group)
+        page.choose(beta.root, beta)
+        await settle_until(host, lambda: visible(page, "fleet-manager"), group=group)
+        page.query_one("#fleet-manager", Button).press()
+        await settle_until(host, lambda: len(machine.waited_for) == 2, group=group)
+        seen: dict[str, Any] = {"waited": list(machine.waited_for)}
+        seen["card"] = card(page, "fleet-status")
+        seen["before"] = list(machine.starts)
+        machine.trust.set()  # type: ignore[union-attr]  # answered in beta's manager's pane
+        await settle_until(host, lambda: len(machine.starts) > 2)
+        await settle_page(host)
+        seen["after"] = list(machine.starts)
+        return seen
+
+    seen = hosted(machine, go)
+    assert seen["waited"] == [alpha.id, beta.id], "beta's manager is waited on too"
+    assert "the coders start on their own" in seen["card"], seen["card"]
+    assert seen["before"] == [(alpha.id, True, 0), (beta.id, True, 0)], "no coder before"
+    assert seen["after"] == [*seen["before"], (beta.id, False, first_run.CODERS)], seen
+
+
+@dataclass
+class OwnIds(Machine):
+    """A machine whose agents have ids of their own per project, as the store mints them (the
+    plain one names each by its label, so two projects' managers would be one row)."""
+
+    def spawn(self, project: ProjectInfo, role: str, **kwargs: Any) -> fleet_service.SpawnReceipt:
+        receipt = super().spawn(project, role, **kwargs)
+        own = receipt.agent.model_copy(update={"id": f"agt_{project.id}_{receipt.agent.label}"})
+        self.live[self.live.index(receipt.agent)] = own
+        return dataclasses.replace(receipt, agent=own)
+
+
+def test_a_card_promises_its_coders_only_while_its_own_manager_is_waited_on(
+    captain: str | None,
+    scripted: Callable[[Machine], None],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The round-3 tester of #570, in the real shell: *Start fleet* on alpha, *Change*, *Start
+    fleet* on beta (alpha's wait is cancelled, beta's manager waited on), then *Change* back.
+    Alpha's card said "the coders start on their own once it is answered" while the one wait
+    was beta's, and alpha's answer started nothing. Now a card promises that only while its
+    own manager is the one waited on; alpha's says *Start the coders* is the user's. Each
+    project's answer releases its own manager's wait alone."""
+    alpha = ProjectInfo(id="prj_alpha", root=tmp_path / "alpha", onboarded_at=T0)
+    beta = ProjectInfo(id="prj_beta", root=tmp_path / "beta", onboarded_at=T0)
+    for each in (alpha, beta):
+        each.root.mkdir()
+    machine = OwnIds(
+        claude=[READY],
+        found=Candidates(
+            items=(here(alpha.root, alpha), Candidate(root=beta.root, is_git=True, project=beta))
+        ),
+        trust_by={alpha.id: threading.Event(), beta.id: threading.Event()},
+    )
+    listed_by(machine, alpha, monkeypatch)
+    listed_by(machine, beta, monkeypatch)
+    scripted(machine)
+    group = welcome.WORKER_GROUP  # the waits on the answers are held on purpose: not settled
+
+    async def go(pilot: Pilot[None], app: FleetApp, page: WelcomeView) -> dict[str, Any]:
+        async def start_fleet(project: ProjectInfo) -> None:
+            await settle_until(app, lambda: visible(page, "fleet-manager"), group=group)
+            page.query_one("#fleet-manager", Button).press()
+            await settle_until(
+                app,
+                lambda: project.id in machine.waited_for and app.content.current != "welcome",
+                group=group,
+            )
+            await app.action_welcome()  # `w`, from the manager's pane it opened
+            await frame_read(app)
+            await settle_page(app, group=group)
+
+        async def change_to(project: ProjectInfo) -> None:
+            page.query_one("#welcome-change", Button).press()
+            await settle_page(app, group=group)
+            page.choose(project.root, project)
+            await settle_until(app, lambda: page.project == project, group=group)
+            await settle_page(app, group=group)
+
+        await start_fleet(alpha)
+        await change_to(beta)
+        await start_fleet(beta)
+        await change_to(alpha)
+        seen: dict[str, Any] = {"waited": list(machine.waited_for)}
+        seen["alpha"] = card(page, "fleet-status")
+        seen["alpha coders"] = visible(page, "fleet-coders")
+        machine.trust_by[alpha.id].set()  # answered in alpha's pane: its wait was cancelled
+        for _ in range(3):
+            await pilot.pause()
+            await settle_page(app, group=group)
+        seen["after alpha's answer"] = list(machine.starts)
+        await change_to(beta)
+        seen["beta"] = card(page, "fleet-status")
+        machine.trust_by[beta.id].set()  # beta's own answer: its wait is the one running
+        await settle_until(app, lambda: len(machine.starts) > 2)
+        await settle_page(app)
+        seen["after beta's answer"] = list(machine.starts)
+        return seen
+
+    seen = in_shell(machine, go)
+    started = [(alpha.id, True, 0), (beta.id, True, 0)]
+    promise = "the coders start on their own once it is answered"
+    assert seen["waited"] == [alpha.id, beta.id], seen
+    assert promise not in seen["alpha"], seen["alpha"]
+    assert "back here to start the coders" in seen["alpha"], seen["alpha"]
+    assert seen["alpha coders"], "Start the coders is alpha's way, and it is offered"
+    assert seen["after alpha's answer"] == started, "its wait was cancelled: nothing started"
+    assert promise in seen["beta"], seen["beta"]
+    assert seen["after beta's answer"] == [*started, (beta.id, False, first_run.CODERS)], seen
 
 
 def test_choose_another_is_not_undone_by_a_return_to_the_page(tmp_path: Path) -> None:
@@ -1320,14 +1480,22 @@ def in_shell(
     fn: Callable[[Pilot[None], FleetApp, WelcomeView], Awaitable[T]],
     *,
     doctor: Callable[[], list[DoctorCheck]] = lambda: [],
+    size: tuple[int, int] = SIZE,
 ) -> T:
-    """Run ``fn`` against the real shell, its Welcome page scripted by ``machine``."""
+    """Run ``fn`` against the real shell, its Welcome page scripted by ``machine`` and on screen.
+
+    With a project listed, start opens home since L1, the last-used project's Manager tab
+    (tests/test_manager_tab_is_home.py), and ``w`` brings Welcome back, as it does here; with
+    none, Welcome is what start shows."""
 
     async def run() -> T:
         app = FleetApp(refresh_seconds=3600, doctor=doctor, accounts=None)
-        async with app.run_test(size=SIZE) as pilot:
+        async with app.run_test(size=size) as pilot:
             await pilot.pause()
             await settle_page(app)
+            if app.content.current != "welcome":
+                await app.action_welcome()  # `w`
+                await settle_page(app)
             return await fn(pilot, app, app.query_one("#welcome", WelcomeView))
 
     return asyncio.run(run())
@@ -1676,7 +1844,8 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
     tmp_path: Path,
 ) -> None:
     """Step 2 answers for the project step 1 chose, and the Doctor answered for the folder
-    asq started in. With a project-scope plugin in one and not the other, the Doctor warned
+    asq started in (since L1, the one run at start is about home's project). With a
+    project-scope plugin in one and not the other, the Doctor warned
     "hooks are missing" under a step 2 that said connected, and its Connect would have
     installed them for every repository (review of #257). While Welcome is shown the
     Doctor's scope is its project; once Choose another clears it, the folder asq started
@@ -1688,6 +1857,8 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
         for project in (alpha, beta):
             project.root.mkdir()
             store.onboard_project(ProjectInfo(id=project.id, root=project.root))
+        # Home is beta (start opens home since L1), so its start run and step 1 differ.
+        store.set_ui_state(app_mod.LAST_PROJECT_KEY, beta.id)
     listed = tuple(Candidate(root=p.root, is_git=True, project=p) for p in (alpha, beta))
     machine = Machine(claude=[READY], found=Candidates(items=listed))
     scripted(machine)
@@ -1722,12 +1893,14 @@ def test_the_doctor_answers_for_the_project_step_one_chose(
     start, chosen, elsewhere, back, cleared, opened = in_shell(
         machine, go, doctor=diagnostics.doctor
     )
-    assert start == (None, [None]), "control: nothing chosen, the folder asq started in"
-    assert chosen == (alpha.id, [None]), "the scope follows step 1; the checks do not run"
-    assert elsewhere == (beta.id, [None]), "another page's project, as before"
-    assert back == (alpha.id, [None]), "back on Welcome, the project step 2 is about"
-    assert cleared == (None, [None])
-    assert opened == (alpha.id, [None, alpha.root]), "the page runs them, for that project"
+    # The one run at start-up was about home's project, beta (start opens home since L1);
+    # back on Welcome with nothing chosen, the scope is the folder asq started in.
+    assert start == (None, [beta.root]), "control: nothing chosen on Welcome"
+    assert chosen == (alpha.id, [beta.root]), "the scope follows step 1; the checks do not run"
+    assert elsewhere == (beta.id, [beta.root]), "another page's project, as before"
+    assert back == (alpha.id, [beta.root]), "back on Welcome, the project step 2 is about"
+    assert cleared == (None, [beta.root])
+    assert opened == (alpha.id, [beta.root, alpha.root]), "the page runs them, for that project"
 
 
 def test_back_on_welcome_in_the_same_frame_the_doctor_still_takes_its_project(
@@ -1781,9 +1954,10 @@ def test_step_one_reads_the_shells_frame_not_a_second_store_open(
         return None
 
     in_shell(machine, go)
-    assert [[p.id for p in frame] if frame is not None else None for frame in machine.frames] == [
-        ["prj_seeded"]
-    ]
+    # Welcome reads its machine each time it is shown, and it is shown once start has gone home
+    # (L1) and `w` brought it back: every read is the shell's frame, never a store of its own.
+    frames = [[p.id for p in frame] if frame is not None else None for frame in machine.frames]
+    assert frames and all(frame == ["prj_seeded"] for frame in frames), frames
 
 
 def test_a_shell_whose_store_will_not_open_still_shows_the_page(
@@ -2246,7 +2420,10 @@ def test_update_waits_for_welcomes_real_start_by_its_workers_name(
 
     refused, said, after = in_shell(machine, go)
     assert refused is None, "the manager start is still running"
-    assert said == ["a manager start is still running — try again when it ends"]
+    # Once it lands, the manager's pane opens in place (M4/L3): what it says of its pane is
+    # its own, not the hand-off's.
+    held = [line for line in said if "still running" in line]
+    assert held == ["a manager start is still running — try again when it ends"]
     assert after == ("upgrade", "--reopen"), "control: once it has landed, Update quits"
 
 
@@ -2388,3 +2565,141 @@ def test_the_page_hosted_alone_asks_the_store_itself() -> None:
 
     hosted(machine, go)
     assert machine.frames == [None]  # no shell, no frame: the service reads the store
+
+
+# ----------------------------------------------------- the first run's polish (0.10.2: Q7, Q16, M4)
+
+
+def test_claudes_sign_in_asks_for_the_managers_account_and_opens_its_login(tmp_path: Path) -> None:
+    """Q7: *Sign in* starts Claude Code's login itself, as Codex's does: the slot the manager
+    will use (``first_run.sign_in_slot``, the spy here), opened on the Accounts page, and the
+    way back to this page with it. It opened the Accounts page alone."""
+    signed_out = dataclasses.replace(READY, signed_in=False)
+    machine, _project = _ready_machine(tmp_path, claude=[signed_out], sign_in_slot=3)
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> tuple[str, list[Any]]:
+        await settle_until(
+            page.app, lambda: page.project is not None and visible(page, "claude-sign-in")
+        )
+        text = card(page, "claude-status")
+        await press(pilot, page, "claude-sign-in")
+        return text, list(host.received)
+
+    text, received = hosted(machine, go)
+    assert "Sign in opens Claude Code's sign-in on the Accounts page" in text
+    assert [state.agent for state in machine.sign_ins] == [signed_out.agent]
+    [opened] = [m for m in received if isinstance(m, AccountsSelected)]
+    assert opened.sign_in == 3
+    assert opened.return_to is not None and opened.return_to.kind == "welcome"
+
+
+def _rows(app: App[Any], widget: Widget) -> list[str]:
+    """The screen's rows ``widget`` covers, as drawn, within its own columns."""
+    strips = app.screen._compositor.render_full_update(simplify=True).strips
+    region = widget.region
+    lines = ["".join(segment.text for segment in strip) for (strip,) in strips]
+    return [line[region.x : region.right] for line in lines[region.y : region.bottom]]
+
+
+@pytest.mark.parametrize("size", [(80, 24), (60, 24)], ids=["80x24", "60x24"])
+def test_finished_steps_fold_to_one_line_each(
+    captain: str | None,
+    fleet_rows: dict[str, list[FleetAgentStatus]],
+    scripted: Callable[[Machine], None],
+    tmp_path: Path,
+    size: tuple[int, int],
+) -> None:
+    """Q16, in the real shell at the contract's 80x24 and at 60x24: once step 1 has its project
+    and step 2 its agent, each card is ONE line, never wrapped. Step 1's says ✓ and the project
+    first (a narrow screen cuts its folder, not its name), with *Change* beside it; step 2's,
+    its agent and ✓. At 80x24 step 2's version and sign-in fit whole (the round-2 tester of
+    #570: it wrapped to a second line there, and at 60x24 step 1 read "1  Proj…")."""
+    machine, _project = _ready_machine(tmp_path)
+    scripted(machine)
+
+    async def go(pilot: Pilot[None], app: FleetApp, page: WelcomeView) -> dict[str, Any]:
+        await settle_until(app, lambda: page.project is not None and page.claude is not None)
+        await settle_page(app)
+        seen: dict[str, Any] = {}
+        for card_id in ("step-project", "step-claude"):
+            box = page.query_one(f"#{card_id}")
+            shown_lines = [child for child in box.children if child.display and child.region.height]
+            seen[card_id] = (box.content_region.height, len(shown_lines))
+            seen[f"{card_id} row"] = _rows(app, box)[1]  # under its top border
+        seen["change"] = visible(page, "welcome-change")
+        seen["fleet"] = page.query_one("#step-fleet").content_region.height
+        return seen
+
+    seen = in_shell(machine, go, size=size)
+    assert seen["step-project"] == (1, 1) and seen["step-claude"] == (1, 1), seen
+    project_row, claude_row = seen["step-project row"], seen["step-claude row"]
+    assert "1  ✓ demo-app" in project_row and "Change" in project_row, seen
+    assert "2  Claude Code  ✓" in claude_row, seen
+    if size == (80, 24):
+        assert f"✓ {READY.version} · signed in" in claude_row, "whole at the contract's size"
+    assert seen["change"], "step 1's Change stays, on its line"
+    assert seen["fleet"] > 1, "step 3, not done, is not folded"
+
+
+def test_step_two_does_not_fold_while_it_still_offers_a_sign_in(tmp_path: Path) -> None:
+    signed_out = dataclasses.replace(READY, signed_in=False)
+    machine, _project = _ready_machine(tmp_path, claude=[signed_out])
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> tuple[int, bool]:
+        await settle_until(page.app, lambda: page.claude is not None and page.project is not None)
+        await settle_page(page.app)
+        return page.query_one("#step-claude").content_region.height, visible(page, "claude-sign-in")
+
+    height, sign_in = hosted(machine, go)
+    assert height > 1 and sign_in
+
+
+def test_step_three_says_in_plain_words_what_it_waits_for(tmp_path: Path) -> None:
+    """The fleet's card, before steps 1 and 2: what the user does, not "once there is"."""
+
+    async def go(pilot: Pilot[None], page: WelcomeView, host: Host) -> str:
+        await settle_until(page.app, lambda: page.claude is not None)
+        await settle_page(page.app)
+        return card(page, "fleet-status")
+
+    said = hosted(Machine(claude=[MISSING]), go)
+    assert said.startswith("The fleet can start once you pick a project (step 1) and install ")
+    assert "once there is" not in said
+
+
+def test_start_fleet_opens_the_manager_in_place_and_the_coders_follow_its_trust_answer(
+    captain: str | None,
+    scripted: Callable[[Machine], None],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """M4/L3: one *Start fleet*. The manager starts, and its pane opens in place once the
+    shell lists it, where its folder-trust question is answered; the coders wait for that
+    answer and then start on their own: none before."""
+    machine, project = _ready_machine(tmp_path, trust=threading.Event())
+    listed_by(machine, project, monkeypatch)
+    scripted(machine)
+
+    async def go(pilot: Pilot[None], app: FleetApp, page: WelcomeView) -> dict[str, Any]:
+        seen: dict[str, Any] = {"label": str(page.query_one("#fleet-manager", Button).label)}
+        await settle_until(app, lambda: visible(page, "fleet-manager"))
+        page.query_one("#fleet-manager", Button).press()
+        # The wait on the trust answer is held on purpose: settle the page's other work only.
+        await settle_until(
+            app,
+            lambda: machine.waited and app.content.current != "welcome",
+            group=welcome.WORKER_GROUP,
+        )
+        manager = next(agent for agent in machine.live if agent.label == "manager")
+        seen["shown"] = app.content.current == f"agent-{manager.id}"
+        seen["before"] = list(machine.starts)
+        machine.trust.set()  # type: ignore[union-attr]  # answered in the manager's pane
+        await settle_until(app, lambda: len(machine.starts) > 1)
+        seen["after"] = list(machine.starts)
+        return seen
+
+    seen = in_shell(machine, go)
+    assert seen["label"] == "Start fleet"
+    assert seen["shown"], "the manager's own view, its pane taking the keyboard"
+    assert seen["before"] == [(project.id, True, 0)], "no coder before the trust answer"
+    assert seen["after"] == [(project.id, True, 0), (project.id, False, first_run.CODERS)]

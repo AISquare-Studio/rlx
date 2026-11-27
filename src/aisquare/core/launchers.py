@@ -58,7 +58,7 @@ class Launcher:
 
 def registry_dir() -> Path:
     """``<home>/launchers``; made by the first launcher to wait, never by a reader."""
-    return paths.aisquare_home() / FOLDER
+    return paths.launchers_dir()
 
 
 def valid_id(text: str) -> bool:

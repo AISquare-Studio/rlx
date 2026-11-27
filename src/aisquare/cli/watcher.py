@@ -137,7 +137,7 @@ def _print_watch_status() -> None:
 def show(
     path: Annotated[
         Path | None,
-        typer.Argument(help="A detail file a watch line named.", click_type=AgentPath()),
+        typer.Argument(help="A detail file a watch line named.", parser=AgentPath()),
     ] = None,
     last: Annotated[bool, typer.Option("--last", help="The newest detail file.")] = False,
 ) -> None:

@@ -60,9 +60,14 @@ from uuid import uuid4
 
 from aisquare.core import atomic, locking, paths, procs
 
-Kind = Literal["native", "ssh"]
+Kind = Literal["native", "ssh", "service"]
 """How the person at an asq reaches it: at the machine, or from another one (SSH, a tmux
-whose client attached over SSH, a Codespace)."""
+whose client attached over SSH, a Codespace); or ``service``, the headless rlx that hosts
+what a TUI would (``services.service_host``, #32), which nobody reaches."""
+
+KINDS: tuple[Kind, ...] = ("native", "ssh", "service")
+"""Every kind a record of this release may say; a release that knows fewer reads the rest as
+``native``, so its version gate still counts the service."""
 
 HEARTBEAT_SECONDS = 5.0
 """How often a live asq rewrites its record: well under :data:`STALE_SECONDS`, so an asq on
@@ -75,6 +80,12 @@ cannot be asked whether the pid runs, so the heartbeat is the only word on it.""
 POLL_SECONDS = 0.5
 """How often the beat thread looks for a quit request: a newcomer waiting for this asq to
 quit waits at most this long for it to start."""
+
+SERVICE_POLL_SECONDS = 2.0
+""":data:`POLL_SECONDS` for the rlx service (kind ``service``), which runs for weeks with
+nobody at it: the 0.5 s look was 120 of its wakeups a minute, most of its idle cost (#32,
+#1717). A quit request to it (``rlx service stop``, a TUI's version gate) waits at most this
+long to begin, and ``stop_service`` waits 15 s for the whole."""
 
 QUIT_CHANNEL = 1
 """The quit-request channel this release reads (``<id>.quit``). A record without one is an
@@ -90,7 +101,6 @@ KIND_SECONDS = 60.0
 
 _ID = re.compile(r"[0-9a-f]{12}")
 
-FOLDER = "instances"
 GATE_LOCK = ".gate.lock"
 
 _log = logging.getLogger(__name__)
@@ -146,7 +156,7 @@ class Instance:
                 host=str(data["host"]),
                 version=str(data["version"]),
                 schema=int(data["schema"]),
-                kind=kind if kind in ("native", "ssh") else "native",
+                kind=kind if kind in KINDS else "native",
                 tty=tty if isinstance(tty, str) else None,
                 started_at=_zoned(datetime.fromisoformat(data["started_at"])),
                 heartbeat=_zoned(datetime.fromisoformat(data["heartbeat"])),
@@ -204,7 +214,7 @@ def _zoned(moment: datetime) -> datetime:
 
 def registry_dir() -> Path:
     """``<home>/instances``; made by the first asq to register, never by a reader."""
-    return paths.aisquare_home() / FOLDER
+    return paths.instances_dir()
 
 
 def valid_id(text: str) -> bool:
@@ -341,10 +351,35 @@ def _live(instance: Instance, held: bool | None, *, host: str | None, now: datet
     return age < timedelta(seconds=STALE_SECONDS)
 
 
+_DELETE_RETRY_SECONDS = 1.0
+"""How long a registry file's delete is tried again while it is refused with
+``PermissionError``: on Windows, a file another process has open cannot be deleted (WinError
+32, a sharing violation), and every reader of the registry opens each record for a moment,
+the quit gate's wait on it ten times a second. Refused once and given up, the record stayed,
+and a record naming another host name counted as live by its heartbeat for
+:data:`STALE_SECONDS`: the gate waited out its 15 s and refused the person's yes (#28)."""
+
+
+def _unlink(path: Path) -> bool:
+    """Delete ``path`` (gone already is fine), trying again for :data:`_DELETE_RETRY_SECONDS`
+    while it is refused with ``PermissionError``; whether it is gone. Never raises."""
+    deadline = time.monotonic() + _DELETE_RETRY_SECONDS
+    while True:
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_RETRY_SECONDS)
+        except OSError:
+            return False
+        else:
+            return True
+
+
 def _forget(instance_id: str) -> None:
     for path in (_record(instance_id), _quit(instance_id), _lock(instance_id)):
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
+        _unlink(path)
 
 
 Unloaded = Literal["gone", "failed", "unparsable"]
@@ -530,8 +565,9 @@ def wait_gone(
     held: bool = False,
     clock: Callable[[], float] = time.monotonic,
 ) -> bool:
-    """Wait at most ``timeout`` seconds for ``instance`` to quit (its record gone, or no
-    longer live, and on this machine its process ended); whether it did.
+    """Wait at most ``timeout`` seconds for ``instance`` to quit; whether it did. On this
+    machine, its process ended and its lock let go (:func:`_ended_here`), whatever a record it
+    left says; on another, its record gone or no longer live.
 
     The process too: an asq leaves the registry once its quit's waits are over, and runs a
     moment longer to its exit, in which the gate's look in ``ps`` (``core.instance_scan``)
@@ -545,13 +581,28 @@ def wait_gone(
     deadline = clock() + timeout
     here = instance.host == host_name() or held or _lock_held(instance.id) is True
     while True:
-        instance_now = _read(_record(instance.id))
-        left = instance_now is None or not is_live(instance_now)
-        if left and (not here or not procs.alive(instance.pid)):
-            return True
+        if here:
+            if _ended_here(instance):
+                return True
+        else:
+            instance_now = _read(_record(instance.id))
+            if instance_now is None or not is_live(instance_now):
+                return True
         if clock() >= deadline:
             return False
         time.sleep(0.1)
+
+
+def _ended_here(instance: Instance) -> bool:
+    """Whether ``instance``, an asq of this machine, has ended: its process gone and its lock
+    let go. Its record is not asked: one its asq could not delete as it quit (Windows refuses a
+    delete while a reader has the file open) named another host name and read as live by its
+    heartbeat for :data:`STALE_SECONDS` (#28). Once ended, such a leftover is removed, as the
+    gate's next read would take it for an asq still running and ask it to quit again."""
+    if procs.alive(instance.pid) or _lock_held(instance.id) is True:
+        return False
+    _forget(instance.id)
+    return True
 
 
 def _read_request(path: Path) -> QuitRequest | None:
@@ -560,7 +611,7 @@ def _read_request(path: Path) -> QuitRequest | None:
         kind = data.get("kind")
         return QuitRequest(
             version=str(data["version"]),
-            kind=kind if kind in ("native", "ssh") else "native",
+            kind=kind if kind in KINDS else "native",
             host=str(data["host"]),
             pid=int(data["pid"]),
         )
@@ -644,9 +695,9 @@ class Registration:
         if thread is not None and thread is not threading.current_thread():
             thread.join(2.0)
         # The record first, so no reader finds it once the lock is let go; the lock file
-        # after its descriptor is closed, which Windows asks before a delete.
-        with contextlib.suppress(OSError):
-            _record(self._instance.id).unlink(missing_ok=True)
+        # after its descriptor is closed, which Windows asks before a delete. A delete a
+        # reader's open file refuses is tried again (``_unlink``, #28).
+        _unlink(_record(self._instance.id))
         fd, self._lock_fd = self._lock_fd, None
         if fd is not None:
             with contextlib.suppress(OSError):
@@ -665,6 +716,8 @@ class Registration:
                     kind: Kind | None = None
                     # Outside tmux the answer cannot change: asked once. Inside, a reattach
                     # changes it: asked again every KIND_SECONDS, not at every beat.
+                    if self._instance.kind == "service":
+                        next_kind = None  # nobody attaches to the service: it stays one
                     if next_kind is not None and time.monotonic() >= next_kind:
                         kind = attached_kind()
                         inside = bool(os.environ.get("TMUX"))
@@ -684,7 +737,9 @@ class Registration:
                 self._look_for_quit()
             except Exception:
                 _log.debug("a quit request could not be read", exc_info=True)
-            if self._stop.wait(POLL_SECONDS):
+            if self._stop.wait(
+                SERVICE_POLL_SECONDS if self._instance.kind == "service" else POLL_SECONDS
+            ):
                 return
 
     def _look_for_quit(self) -> None:
