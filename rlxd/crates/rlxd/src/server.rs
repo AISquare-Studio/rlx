@@ -871,6 +871,7 @@ impl Daemon {
                 Some(crate::runner::JobTag {
                     job_id,
                     loud: false,
+                    watch: false,
                 }),
             )
         })?)

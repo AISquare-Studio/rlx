@@ -541,7 +541,8 @@ them by `job_id`; rlxd keeps a definition only to fire it, and records what each
   identical one, is denied `pinned_call_used`. The allowed call's raw result is
   `job.watch_result {job_id, run_id, tool, input_sha256, content, is_error, truncated}`
   (`content` as `run.tool_result` carries it, up to 1 MiB): the app evaluates `match`
-  itself, never on an error or a cut result. A denied call gives none. When 5.3 lands,
+  itself, never on an error or a cut result. A denied call gives none, and so does a run
+  job, even one whose template is a pinned `watch` run. When 5.3 lands,
   `connectors.call` becomes a second route there, with the same `run_id`, gate and
   result.
 - **Once.** Before a fire's run starts, the job (its schedule moved past the fire) and a

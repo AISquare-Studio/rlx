@@ -768,6 +768,7 @@ impl Scheduler {
                 let tag = JobTag {
                     job_id: job.def.job_id.to_string(),
                     loud: job.def.loud,
+                    watch: job.def.r#type == JobType::Watch,
                 };
                 let started = match test_refusal() {
                     Some(code) => Err(refusal(

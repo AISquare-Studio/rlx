@@ -90,12 +90,14 @@ const PARTIAL_TEXT: usize = 1 << 20;
 /// How long `run.cancel` waits for a running run to end before it answers.
 const CANCEL_WAIT: Duration = Duration::from_secs(10);
 
-/// The scheduler job a run was fired for (7.6): its id, and its `loud`, which rlxd only
-/// echoes on the run's `run.done` and `run.needs_you`.
+/// The scheduler job a run was fired for (7.6): its id, its `loud`, which rlxd only
+/// echoes on the run's `run.done` and `run.needs_you`, and whether it is a watch job,
+/// whose pinned call's result is `job.watch_result`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobTag {
     pub job_id: String,
     pub loud: bool,
+    pub watch: bool,
 }
 
 /// What a run a scheduler job fired did that the scheduler acts on.
@@ -211,6 +213,9 @@ struct Run {
     job_id: Option<String>,
     /// The job's `loud`, for a run a scheduler job fired.
     loud: Option<bool>,
+    /// Whether a watch job fired the run: then its pinned call's result goes to the
+    /// scheduler as `job.watch_result`. Not kept across a restart, which ends the run.
+    watch_job: bool,
     client: String,
     dir: RunDir,
     inner: Mutex<RunInner>,
@@ -504,6 +509,7 @@ impl Runner {
             let run = Arc::new(Run {
                 job_id: record.job_id.clone(),
                 loud: record.loud,
+                watch_job: false,
                 client: record.client.clone(),
                 dir,
                 inner: Mutex::new(RunInner {
@@ -655,11 +661,11 @@ impl Runner {
         job: Option<JobTag>,
     ) -> Result<RunRef, ErrorBody> {
         check_start(&params)?;
-        let (job_id, loud) = match job {
-            Some(job) => (Some(job.job_id), Some(job.loud)),
-            None => (None, None),
+        let (job_id, loud, watch_job) = match job {
+            Some(job) => (Some(job.job_id), Some(job.loud), job.watch),
+            None => (None, None, false),
         };
-        self.start_checked(params, client, job_id, loud)
+        self.start_checked(params, client, job_id, loud, watch_job)
     }
 
     /// [`Runner::start`], its params checked.
@@ -669,6 +675,7 @@ impl Runner {
         client: &str,
         job_id: Option<String>,
         loud: Option<bool>,
+        watch_job: bool,
     ) -> Result<RunRef, ErrorBody> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(refusal(
@@ -720,6 +727,7 @@ impl Runner {
         let run = Arc::new(Run {
             job_id,
             loud,
+            watch_job,
             client: client.to_owned(),
             dir,
             inner: Mutex::new(RunInner {
@@ -1867,9 +1875,11 @@ impl Runner {
                         let ran = self.tool_ran(run, &mut inner, &call_id, is_error);
                         let (content, truncated) = stream::bounded(content);
                         // A watch job's pinned call: its raw result goes to the scheduler,
-                        // as job.watch_result (7.6).
+                        // as job.watch_result (7.6). A run job's never does, whatever
+                        // its template's kind.
                         if let (Some(ran), Some(job_id), Some(pinned)) =
                             (ran, &run.job_id, &run.params.pinned_call)
+                            && run.watch_job
                             && run.params.kind == RunKind::Watch
                             && ran.tool == pinned.tool
                             && ran.input_sha256 == pinned.input_sha256

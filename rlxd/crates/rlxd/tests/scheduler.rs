@@ -1373,3 +1373,28 @@ fn a_pinned_run_job_gives_no_watch_result() {
         "{seen:#?}"
     );
 }
+
+#[test]
+fn a_run_job_whose_template_is_a_pinned_watch_run_gives_no_watch_result() {
+    let home = watch_home();
+    let _app = app(&home);
+    // A run job, not a watch job, though its template is the very run a watch job's fire
+    // would be: job.watch_result is a watch job's alone.
+    let message = format!(
+        "{FIXED_PROMPT}.\n\n```json\n{}\n```",
+        json!({"connector": "claude.ai GitHub", "input": {"ref": "main"}, "tool": WATCH_TOOL})
+    );
+    let job = json!({"job_id": "looks-like-a-watch", "type": "run",
+        "schedule": {"every_minutes": 1},
+        "run": {"kind": "watch", "prompt": message, "space": "default",
+            "mount": {"kind": "connectors", "connectors": ["claude.ai GitHub"]},
+            "pinned_call": {"tool": WATCH_TOOL, "input_sha256": WATCH_SHA256}},
+        "catch_up": "skip", "enabled": true});
+    put(&home, &job);
+    let (r, seen) = allowed_fire(&home, "looks-like-a-watch");
+    assert_eq!(of_run(&seen, &r, "run.tool_result").len(), 2, "{seen:#?}");
+    assert!(
+        typed(&seen, "job.watch_result", None).is_empty(),
+        "{seen:#?}"
+    );
+}
