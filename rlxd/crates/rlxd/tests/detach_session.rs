@@ -143,7 +143,7 @@ fn serve_detach_outlives_the_job_object_it_was_started_in() {
             )
         };
         if read == 0 || (limits.BasicLimitInformation.LimitFlags & breakaway) == 0 {
-            eprintln!("skipped: this test's own job lets no process break away from it");
+            said("skipped: this test's own job lets no process break away from it");
             return;
         }
     }
@@ -176,13 +176,13 @@ fn serve_detach_outlives_the_job_object_it_was_started_in() {
     // SAFETY: the starter's process handle, which `starter` holds open.
     let assigned = unsafe { AssignProcessToJobObject(job, starter.as_raw_handle() as HANDLE) };
     if assigned == 0 {
+        let why = std::io::Error::last_os_error();
         let _ = starter.kill();
         // SAFETY: closing the job made above.
         unsafe { CloseHandle(job) };
-        eprintln!(
-            "skipped: the starter could not be put in a job here: {}",
-            std::io::Error::last_os_error()
-        );
+        said(&format!(
+            "skipped: the starter could not be put in a job here: {why}"
+        ));
         return;
     }
     assert!(resume(starter.id()), "the starter's thread resumes");
@@ -194,6 +194,18 @@ fn serve_detach_outlives_the_job_object_it_was_started_in() {
     // SAFETY: closing the job made above, its last handle.
     unsafe { CloseHandle(job) };
     still_answering(&home, pid);
+    said("ran: rlxd still answers after its starter's job was closed");
+}
+
+/// A line in the test's log whether it passes or not: written to stderr itself, which the
+/// harness does not capture as it does `eprintln!`, so a skip shows in CI.
+#[cfg(windows)]
+fn said(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "serve_detach_outlives_the_job_object: {line}"
+    );
 }
 
 /// Resumes the one thread of the suspended process `pid`, as rlxd's runner does
