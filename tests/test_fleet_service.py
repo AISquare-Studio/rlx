@@ -16091,6 +16091,98 @@ def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
     assert saved.pending is None
 
 
+def test_watcher_rebases_pass_deadlines_across_a_clock_rollback(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    plain_project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restarted watcher keeps each seat's interval after the clock changes."""
+    from aisquare.services import manager_pass, watch
+
+    first = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    second = _manager_with_wake_setting(tmux, plain_project, monkeypatch, "schedule")
+    monkeypatch.setattr(watch.Watcher, "look_all", lambda *args: [])
+    now = datetime.now(UTC) - timedelta(hours=3)
+    future = now + timedelta(hours=2)
+    with store_session() as store:
+        for seat, minutes in ((project, "1"), (plain_project, "2")):
+            store.set_project_setting(seat.id, "manager_pass_minutes", minutes)
+            assert manager_pass.save(
+                store, seat.id, seat.id, None, manager_pass.Progress(delivered_at=future)
+            )
+    assert watch.Watcher().tick(now).passed == {}
+    with store_session() as store:
+        for seat in (project, plain_project):
+            progress = manager_pass.read(store, seat.id, seat.id)[1]
+            assert progress.delivered_at == now and progress.pending is None
+    watcher = watch.Watcher()
+    watcher.tick(now + timedelta(seconds=59))
+    assert tmux.typed == []
+    watcher.tick(now + timedelta(minutes=1))
+    first_prompt = next(line for _, action, line in tmux.typed if action == "paste")
+    assert manager_pass.acknowledge(first, first_prompt, now + timedelta(minutes=1))
+    with store_session() as store:
+        first_pass = manager_pass.read(store, project.id, project.id)[1].pending
+        assert first_pass is not None
+        manager = store.fleet_agent_by_label(project.id, "manager", live_only=True)
+        assert manager is not None
+        assert manager_pass.read(store, plain_project.id, plain_project.id)[1].pending is None
+    with monkeypatch.context() as manager_env:
+        _become(manager, tmux, manager_env, pid=PANE_PID, role="manager")
+        replacement = "acb5aeb8-1234-4123-8123-abcdef123456"
+        _clear(first, replacement, project)
+        assert team_service.hook_stop(replacement, project.root) is None
+
+    watcher = watch.Watcher()
+    watcher.tick(now + timedelta(hours=1))
+    with store_session() as store:
+        retried = manager_pass.read(store, project.id, project.id)[1].pending
+        second_pass = manager_pass.read(store, plain_project.id, plain_project.id)[1].pending
+    assert retried is not None and second_pass is not None
+    assert (retried.id, retried.lower, retried.upper) == (
+        first_pass.id,
+        first_pass.lower,
+        first_pass.upper,
+    )
+    assert retried.session == replacement and second_pass.session == second
+    assert sum(action == "paste" for _, action, _ in tmux.typed) == 3
+
+
+def test_watcher_rebases_nudge_debounce_across_a_clock_rollback(
+    tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An urgent event survives a rollback, and a restart keeps its new debounce."""
+    from aisquare.services import manager_seat, watch
+
+    sid = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    monkeypatch.setattr(watch.Watcher, "look_all", lambda *args: [])
+    now = datetime.now(UTC) - timedelta(hours=1)
+    clock = now
+    monkeypatch.setattr(fleet_service, "_now", lambda: clock)
+    key = f"nudge:{sid}"
+    with store_session() as store:
+        store.set_meta(key, (now + timedelta(hours=1)).isoformat())
+        store.touch_session(sid, state="working")
+    ask = team_service.add_note(
+        "pending urgent question", kind="question", to_role=sid, board_id=project.id
+    )
+    with store_session() as store:
+        store.touch_session(sid, state="waiting")
+    assert watch.Watcher().tick(clock).nudged == []
+    with store_session() as store:
+        assert store.get_meta(key) == now.isoformat()
+        assert manager_seat.urgent_position(store, project.id, project.id) < ask.seq
+    watcher = watch.Watcher()
+    clock = now + fleet_service.NUDGE_DEBOUNCE - timedelta(seconds=1)
+    assert watcher.tick(clock).nudged == []
+    clock = now + fleet_service.NUDGE_DEBOUNCE
+    assert watcher.tick(clock).nudged == [project.id]
+    assert watcher.tick(clock).nudged == []
+    assert sum(action == "paste" for _, action, _ in tmux.typed) == 1
+
+
 def test_watcher_recovers_manager_pass_from_claude_transcript(
     tmux: FakeTmux,
     claude_on_path: Path,

@@ -19491,8 +19491,13 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
             key = f"nudge:{session.id}"
             now = _now()
             last = store.get_meta(key)
-            if last is not None and now - datetime.fromisoformat(last) < NUDGE_DEBOUNCE:
-                return False
+            if last is not None:
+                last_at = datetime.fromisoformat(last)
+                if last_at > now:
+                    store.compare_meta(key, last, now.isoformat())
+                    return False
+                if now - last_at < NUDGE_DEBOUNCE:
+                    return False
             try:
                 if not _waiting_manager_pane(placement, session, now):
                     return False
@@ -19550,6 +19555,10 @@ def deliver_manager_pass(project: str, now: datetime) -> tuple[str | None, str |
         pending = progress.pending
         if pending is not None and manager_pass.observe_transcript(session, pending):
             return pending.id, None
+        if progress.delivered_at is not None and progress.delivered_at > now:
+            rebased = progress.model_copy(update={"delivered_at": now})
+            manager_pass.save(store, project, board, raw, rebased)
+            return None, None
         if pending is None and not manager_pass.due(progress, policy.pass_minutes, now):
             return None, None
         if pending is not None and not manager_pass.retryable(pending, session):
