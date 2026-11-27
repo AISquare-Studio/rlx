@@ -16035,6 +16035,44 @@ def test_solo_session_receives_only_scoped_urgency_when_briefed_as_scheduled_man
     assert team_service.hook_prompt_heartbeat(sid, project.root) == ""
 
 
+@pytest.mark.parametrize("via_stop", [False, True])
+def test_schedule_delivers_urgent_work_with_the_legacy_delta_flag_off(
+    tmux: FakeTmux,
+    claude_on_path: Path,
+    project: ProjectInfo,
+    monkeypatch: pytest.MonkeyPatch,
+    via_stop: bool,
+) -> None:
+    """The project schedule keeps urgent delivery and passes available at cutover."""
+    from aisquare.services import manager_seat, watch
+
+    monkeypatch.setenv("AISQUARE_TEAM_DELTA", "0")
+    sid = _manager_with_wake_setting(tmux, project, monkeypatch, "schedule")
+    with store_session() as store:
+        store.set_project_setting(project.id, "manager_pass_minutes", "15")
+        if via_stop:
+            store.touch_session(sid, state="working")
+    question = team_service.add_note(
+        "urgent during schedule cutover", kind="question", to_role=sid, board_id=project.id
+    )
+    if via_stop:
+        assert tmux.typed == []
+        delivered = team_service.hook_stop(sid, project.root)
+        assert delivered is not None and question.text in delivered.reason
+    else:
+        assert [line for _, action, line in tmux.typed if action == "paste"] == [NUDGE_TEXT]
+        assert question.text in team_service.hook_prompt_heartbeat(sid, project.root)
+    assert team_service.hook_stop(sid, project.root) is None
+    with store_session() as store:
+        assert manager_seat.urgent_position(store, project.id, project.id) == question.seq
+    watcher = watch.Watcher()
+    monkeypatch.setattr(watcher, "look_all", lambda *args: [])
+    assert watcher.tick(datetime.now(UTC)).nudged == []
+    pastes = [line for _, action, line in tmux.typed if action == "paste"]
+    assert pastes[-1].startswith("Scheduled manager pass ")
+    assert pastes.count(NUDGE_TEXT) == int(not via_stop)
+
+
 def test_watcher_pass_uses_a_bounded_range_until_the_bound_manager_completes(
     tmux: FakeTmux, claude_on_path: Path, project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:

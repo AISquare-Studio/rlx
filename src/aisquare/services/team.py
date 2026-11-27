@@ -3634,7 +3634,7 @@ def _prompt_delta(
         events = []
     else:
         events = _wake_candidates(store, session, relevant)
-    if not events or not orchestrator.delta_enabled() or not reads:
+    if not events or not reads or not _wake_delta_enabled(scheduled_project):
         if scheduled_project is not None and not events:
             manager_seat.advance_urgent(store, scheduled_project, session.project_id, newest)
         read_to = events[-1].seq if events else newest
@@ -3986,7 +3986,8 @@ def _deferred_wake_reason(store: ContextStore, me: TeamSession) -> str | None:
     prompt's delta advances the cursor, and the nudge is debounced and refused
     for any state but ``waiting``.
     """
-    if not orchestrator.delta_enabled():
+    mode, project = manager_seat.mode(store, me)
+    if not _wake_delta_enabled(project if mode == "schedule" else None):
         return None
     pending = pending_wakes(store, me)
     return f"deferred:{pending[0].kind}" if pending else None
@@ -4017,6 +4018,11 @@ def _manager_wakeup(
     )
 
 
+def _wake_delta_enabled(scheduled_project: str | None) -> bool:
+    """Use the shared fleet policy for scheduled urgency and the flag for legacy deltas."""
+    return scheduled_project is not None or orchestrator.delta_enabled()
+
+
 def _wakeup(
     store: ContextStore,
     me: TeamSession,
@@ -4038,15 +4044,15 @@ def _wakeup(
     exclusions, same limit, the same board context (``relevant``) — because the reason IS
     that delta, delivered a turn early. One exception, ``keep``: an agent whose board
     context is ``none`` reads no delta at all, and its turn end hands it only the notes
-    addressed to it (sync #365). Muted deltas (``AISQUARE_TEAM_DELTA=0``) mute this too:
-    it is the same injection through a different door.
+    addressed to it (sync #365). Muted legacy deltas mute this too unless the fleet
+    has enabled scheduled urgency.
 
     Order of the writes matters. The hourly counter is bumped BEFORE the cursor
     moves and the row flips to ``working``: a lost increment costs one of thirty
     continuations, while a moved cursor with no continuation printed would cost
     the events themselves.
     """
-    if stop_hook_active or not orchestrator.delta_enabled():
+    if stop_hook_active or not _wake_delta_enabled(scheduled_project):
         return None
     events = (
         _scheduled_wake_candidates(store, me, scheduled_project)

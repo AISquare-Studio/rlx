@@ -83,7 +83,9 @@ First activation replays retained urgency from the start of the board, including
 
 The reserved manager receives urgent questions, direct human notes, usage
 limits, failed handovers, blocking dialogs, and exits that need attention.
-Routine updates wait for the watcher's bounded pass. Its prompt includes the
+Scheduled urgency still works if the manager was started with
+`AISQUARE_TEAM_DELTA=0` to mute legacy wake traffic. Routine updates wait for
+the watcher's bounded pass. Its prompt includes the
 board range and the completion command. A replacement manager resumes the
 same unread range. A project can customize the prompt with
 `projects/<project-id>/manager/pass.md` under the rlx home. The file survives
