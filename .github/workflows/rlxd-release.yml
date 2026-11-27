@@ -583,32 +583,41 @@ jobs:
             exit 0
           fi
 
-          # dist2: the tree stamped $V+upgrade, a wheel and this host's rlxd archive.
+          # dist2: the tree stamped $V+upgrade, a wheel and this host's rlxd archive. It is
+          # built in a worktree of this commit, so the checkout's pyproject.toml and uv.lock
+          # are never touched and every `uv run --locked` here checks the real lock. Cargo
+          # builds into the checkout's target dir, whose cached dependencies build once.
           W="$V+upgrade"
-          uv run --locked --extra dev python - "$W" <<'EOF'
+          tree2="$RUNNER_TEMP/tree2"
+          target="$PWD/rlxd/target"
+          git worktree add --detach "$tree2" HEAD
+          uv run --locked --extra dev python - "$tree2" "$W" <<'EOF'
           import re, sys
           from pathlib import Path
-          version = sys.argv[1]
-          for path, pattern in (("pyproject.toml", r'(?m)^version = "[^"]+"'),
-                                ("rlxd/Cargo.toml", r'(?m)^version = "[^"]+"')):
-              text = Path(path).read_text(encoding="utf-8")
-              text, n = re.subn(pattern, f'version = "{version}"', text, count=1)
-              assert n == 1, path
-              Path(path).write_text(text, encoding="utf-8")
+          root, version = Path(sys.argv[1]), sys.argv[2]
+          for name in ("pyproject.toml", "rlxd/Cargo.toml"):
+              path = root / name
+              text = path.read_text(encoding="utf-8")
+              text, n = re.subn(r'(?m)^version = "[^"]+"', f'version = "{version}"', text, count=1)
+              assert n == 1, name
+              path.write_text(text, encoding="utf-8")
           EOF
-          uv build --wheel -o "$RUNNER_TEMP/dist2"
-          (cd rlxd && cargo build --release -p rlxd -p rlxd-hook)
+          (cd "$tree2" && uv build --wheel -o "$RUNNER_TEMP/dist2")
+          (cd "$tree2/rlxd" && CARGO_TARGET_DIR="$target" cargo build --release -p rlxd -p rlxd-hook)
           mkdir -p "$root/v$W"
           uv run --locked --extra dev python scripts/rlxd_archive.py pack --target "$TARGET" \
-            --bin-dir rlxd/target/release --out "$root/v$W"
+            --bin-dir "$target/release" --out "$root/v$W"
           uv run --locked --extra dev python scripts/rlxd_archive.py sums --dir "$root/v$W"
-          (cd rlxd && cargo build --release -p rlxd --features fake-claude --bin fake-claude)
-          fc="$RUNNER_TEMP/fake-claude"; mkdir -p "$fc"; cp rlxd/target/release/fake-claude "$fc/slow"
-          git checkout -- pyproject.toml rlxd/Cargo.toml rlxd/Cargo.lock
-          export AISQUARE_INSTALL_PACKAGE="$(ls "$RUNNER_TEMP"/dist2/*.whl)"
+          (cd "$tree2/rlxd" && CARGO_TARGET_DIR="$target" cargo build --release -p rlxd --features fake-claude --bin fake-claude)
+          fc="$RUNNER_TEMP/fake-claude"; mkdir -p "$fc"; cp "$target/release/fake-claude" "$fc/slow"
+          git worktree remove --force "$tree2"
+          git diff --exit-code -- pyproject.toml uv.lock rlxd/Cargo.toml rlxd/Cargo.lock
+          v1_wheel="$(ls "$RUNNER_TEMP"/dist/*.whl)"
+          v2_wheel="$(ls "$RUNNER_TEMP"/dist2/*.whl)"
 
           # 4.2: the upgrade with --restart-daemons ends upgrade.done, rlxd restarted at
           # the new version with a new pid.
+          export AISQUARE_INSTALL_PACKAGE="$v2_wheel"
           OLD_PID=$(rlxd status --json | jq .data.pid)
           set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
           cat up.jsonl; echo "$code"; test "$code" = 0
@@ -617,7 +626,10 @@ jobs:
           test "$(rlx --version | awk '{print $2}')" = "$W"
           [ "$(jq -c . up.jsonl | wc -l)" -eq "$(wc -l < up.jsonl)" ]
 
-          # PTYs: a live one refuses a restart (ptys_live), and --end-ptys lets it go.
+          # PTYs: a live one refuses a restart (ptys_live), and --end-ptys ends it. rlx is
+          # $W now, so this leg swaps back to $V (the first wheel; the stub serves v$V's
+          # archive): a real swap, not "nothing newer to install".
+          export AISQUARE_INSTALL_PACKAGE="$v1_wheel"
           rlxd call pty.spawn '{"argv":["sh","-c","sleep 300"],"cols":80,"rows":24}'
           rlx --json upgrade --check | jq -e '.ptys | length == 1'
           set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
@@ -625,9 +637,13 @@ jobs:
           jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "ptys_live"' up.jsonl
           rlx upgrade --yes --restart-daemons --end-ptys --json-lines > up.jsonl
           cat up.jsonl
+          jq -s -e 'any(.[]; .data.step == "stop_daemons" and .data.status == "done" and ((.data.detail // "") | startswith("ended 1 PTY;")))' up.jsonl
+          jq -s -e --arg v "$V" '.[-1].type == "upgrade.done" and .[-1].data.to == $v and (.[-1].data.restarted | index("rlxd") != null)' up.jsonl
+          rlxd status --json | jq -e --arg v "$V" '.data.version == $v'
 
           # Runs in flight: a fake-claude/slow run (30 s) refuses (runs_in_flight), and
-          # --wait-runs 1 waits for it to end.
+          # --wait-runs 1 waits for it to end, then swaps to $W again.
+          export AISQUARE_INSTALL_PACKAGE="$v2_wheel"
           rlxd stop
           RLXD_CLAUDE_BIN="$fc/slow" FAKE_CLAUDE_SLOW_MS=30000 rlxd serve --detach
           run=$(uv run --locked --extra dev python -c 'import uuid; print(uuid.uuid4())')
@@ -642,7 +658,9 @@ jobs:
           jq -s -e '.[-1].data.code == "runs_in_flight"' up.jsonl
           rlx upgrade --yes --restart-daemons --wait-runs 1 --json-lines > up.jsonl
           cat up.jsonl
+          jq -s -e --arg w "$W" '.[-1].type == "upgrade.done" and .[-1].data.to == $w and (.[-1].data.restarted | index("rlxd") != null)' up.jsonl
           rlxd call run.get "{\"run_id\":\"$run\"}" | jq -e '.data.state == "done"'
+          rlxd status --json | jq -e --arg w "$W" '.data.version == $w'
 
   attach:
     name: attach to the release

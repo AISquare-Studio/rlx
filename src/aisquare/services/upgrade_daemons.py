@@ -585,10 +585,12 @@ class Around:
             self.events.step("install", "started")
             return
         self.events.step("stop_daemons", "started")
+        ended = 0
         if self.options.end_ptys and self.rlxd is not None:
             for pty in self.found.ptys:
                 with contextlib.suppress(RlxdError):  # ending rlxd ends it anyway
                     self.rlxd.call("pty.kill", {"pty_id": pty.get("pty_id")})
+                    ended += 1
         targets = [daemon for daemon in self.found.here if daemon.restartable]
         targets.sort(key=lambda daemon: daemon.kind == "rlxd")
         for daemon in targets:
@@ -599,8 +601,10 @@ class Around:
                 self.start_again()
                 raise
             self.stopped.append(daemon)
-        kinds = ", ".join(daemon.kind for daemon in self.stopped)
-        self.events.step("stop_daemons", "done", f"stopped: {kinds}" if kinds else None)
+        said = [f"ended {ended} PTY{'' if ended == 1 else 's'}"] if ended else []
+        if self.stopped:
+            said.append(f"stopped: {', '.join(daemon.kind for daemon in self.stopped)}")
+        self.events.step("stop_daemons", "done", "; ".join(said) or None)
         self.events.step("install", "started")
 
     def installed(self, version: str | None, problem: str | None) -> None:

@@ -294,9 +294,27 @@ def test_restart_daemons_stops_them_swaps_rlxd_and_starts_them_on_the_new_releas
 def test_end_ptys_ends_each_live_pty_before_rlxd_stops(fake: Daemons) -> None:
     fake.start()
     fake.state(ptys=[{"pty_id": "p1", "exited": False}, {"pty_id": "p2", "exited": False}])
-    around, _ = _around(fake, Options(restart_daemons=True, end_ptys=True))
+    around, out = _around(fake, Options(restart_daemons=True, end_ptys=True))
     around.before_install()
     assert fake.read_state()["killed"] == ["p1", "p2"]
+    stopped = [e["data"] for e in _events(out) if e["data"].get("step") == "stop_daemons"]
+    assert stopped[-1] == {
+        "step": "stop_daemons",
+        "status": "done",
+        "detail": "ended 2 PTYs; stopped: rlxd",
+    }
+    around.installed("2.0.0", None)
+    around.finish(())
+
+
+def test_without_end_ptys_no_pty_is_ended_or_said_to_be(fake: Daemons) -> None:
+    fake.start()
+    fake.state(ptys=[{"pty_id": "p1", "exited": False}])
+    around, out = _around(fake, Options(restart_daemons=True))
+    around.before_install()
+    assert "killed" not in fake.read_state()
+    stopped = [e["data"] for e in _events(out) if e["data"].get("step") == "stop_daemons"]
+    assert stopped[-1]["detail"] == "stopped: rlxd"
     around.installed("2.0.0", None)
     around.finish(())
 
