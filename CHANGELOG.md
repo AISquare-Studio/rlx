@@ -11,12 +11,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `rlx service` keeps Remote, the accounts' usage reads and the fleet's held-back nudges
   going with no rlx window open (`rlx service start | stop | status`); an rlx window that
   finds it running leaves them to it, and takes them back if it stops.
+- rlx's background service now starts when you log in, on by default: a LaunchAgent on
+  macOS, a systemd user unit on Linux and in WSL. Turn it off in App settings ▸ User
+  preferences, with `rlx service uninstall`, or in your OS's startup settings, and rlx won't
+  turn it back on.
+- The rlx service shows rlx's `\` in the macOS menu bar or the Linux tray (Open rlx, Restart
+  rlx, Quit rlx, the agents and accounts at a glance), with the `tray` extra the installer
+  adds; App settings ▸ User preferences ▸ Tray switches it.
 - Settings has a tmux page: every window on rlx's tmux server and whose it is, with Open,
   Stop for windows no agent owns, and Adopt for a Claude Code or Codex left running outside
   the fleet; other tmux servers are listed read-only.
 - A one-line "needs you" bar sits at the top of every screen while any project has something
   that needs you: how many, then the first with its project. F6 or a click opens that
   project's board on it; with nothing to show, it takes no space.
+- A fleet's manager can be woken on a schedule (`rlx fleet manager-policy manager_wake
+  schedule`): urgent news at once, routine news at most every 15 minutes (or N), read in one
+  turn; `team standby` now holds while tasks are in flight. Thanks to Arbind (arbind-ais).
+- Sidebar groups can now be renamed, deleted, pinned, collapsed and moved from their own
+  menu (⋯, right-click or `.`), and an empty group says so.
 - Below 70 columns (SSH, phones) rlx shows the sidebar or the open view, one at a time; F12
   or the bar on top switches between them.
 - A usage-limited agent's view and ⋯ menu offer "Move to `<account>` (N% left)" or "Wait",
@@ -26,12 +38,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - rlx sends one anonymous "active today" ping a day (date, version, OS, CPU type, install
   method; no id), whether usage sharing is on or off, with its own switch in Settings ▸
   Usage & stats; the sharing question now shows your own last 30 days first.
+- The README shows how agents on different accounts reach each other: `rlx --json fleet top`
+  to find one, and `rlx fleet tell -P <project_id> <label>` to message it. Claude Code's own
+  `/peers` and `SendMessage` reach only one account. Thanks to Vaibhav (VBajaj113).
 
 ### Changed
 
 - rlx's home is now `~/.rlx` (set `RLX_HOME` to put it elsewhere; `AISQUARE_HOME` still
   works), laid out as docs/home-layout.md describes; an existing `~/.aisquare` keeps working
   as it is until it is migrated.
+- `rlx upgrade`, and the app's ⬆ Move rlx's home, now move a home from before 0.10.2
+  (`~/.aisquare`) to `~/.rlx` in the new layout, only while nothing runs on it, and leave
+  `~/.aisquare` as a link for one release (from 0.10.1, run `rlx upgrade` twice; do not move
+  back to a release before 0.10.2 afterwards).
 - rlx opens on your last-used project's Manager tab instead of Welcome, and the logo and the
   Home key take you back there; `w` still opens Welcome.
 - The board is laid out as what needs you, the work and the stream: a "needs you" lane you
@@ -41,8 +60,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   project.
 - The board answers its keys as soon as its tab opens, dates every time that is not today's,
   keeps your place when you scroll up (with a "↓ N new" count), names every event kind,
-  shows why a task is blocked or done, fits a 90-column footer, and `aisquare board` prints
-  a readable text board.
+  shows why a task is blocked or done, fits a 90-column footer, and `rlx board` prints a
+  readable text board.
 - Settings save as you change them. A switch or a pick is kept at once, and a text field
   when you press Enter or leave it; a "Saved … · Undo: ctrl+z" notification says so, and
   `ctrl+z` on the page takes the last change back. A value rlx refuses is said beside its
@@ -84,6 +103,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The installer and the WSL installer name the command you will actually type, rlx's Update
   says up front when another program's rlx is in the way, and copies made inside tmux no
   longer stay on its paste-buffer list.
+- `rlx doctor` tells a terminal whose Shift+Enter it cannot prove to use Ctrl+J for a
+  newline in an agent pane, rather than to try Shift+Enter. kitty, WezTerm, foot, alacritty,
+  iTerm2, Windows Terminal and the VS Code terminal are now read as unknown. Thanks to
+  Vaibhav (VBajaj113).
+- An agent's pane keeps far fewer rendered rows in memory: four screens' worth at most, and
+  none while it is hidden. Long-running rlx windows stay much smaller, and scrolling looks
+  and feels the same.
+- The board reads only what it shows at each tick (its open tasks, and the sessions its
+  lines and cards name), so rlx stays lighter and quicker with a long board history.
+- rlx reads each account's identity file only when it has changed, and of a collapsed
+  group's projects refreshes only the one whose view is on screen (each folded project is
+  still checked for exited agents every 30 s), so rlx does less work at every refresh.
+  Thanks to Vaibhav (VBajaj113).
 - rlx now runs on typer 0.29 (the cap moves from below 0.29 to below 0.30). On typer 0.29,
   which a fresh install gets, help pages show each option's type (`<bool>` on every flag,
   `<list[str]>` and `...` on repeatable options and arguments, `<Path>` in place of
@@ -91,6 +123,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   included, use typer's new pydantic wording ("Input should be less than or equal to 65535",
   "Input should be a valid integer…" without the value given, "Value error, 'x' is not one
   of …").
+<!-- PLACEHOLDER: the Experimental section in Settings (Captain and Remote, both off on a fresh home; Remote stays on where it was set up), from its PR's Changelog line. -->
+<!-- PLACEHOLDER (lands on or after 2026-12-01): gpt-5.6-sol's price once its promo ends. -->
 
 ### Fixed
 
@@ -99,6 +133,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On Windows, answering yes to quit another rlx no longer fails with "has not quit within 15
   s" when that rlx's registry record could not be deleted as it quit.
 - Fixed a rare crash when a notification was redrawn just as it was being dismissed.
+- The needs-you bar's F6 or click, on a project not opened yet, no longer shows that
+  project's Manager tab now and then instead of opening the card it named.
+- A Codex agent spawned with Claude Code flags now starts. `--effort` reaches Codex as its
+  reasoning effort, `--model` and `--add-dir` pass as they are, and any flag Codex has no
+  equivalent for is refused before its window opens, with the setting it came from and why.
+  Thanks to Vaibhav (VBajaj113).
+- A paste holding a raw Escape (from coloured log output, say) now arrives as one paste,
+  Escape included; none of it reaches rlx as keystrokes, so an Enter in it no longer sends
+  half a prompt. rlx pins Textual to 8.2.8 until
+  [textual#6802](https://github.com/Textualize/textual/issues/6802) is fixed upstream.
+  Thanks to Vaibhav (VBajaj113).
+
+### For contributors
+
+- The test suite can no longer read your real macOS Keychain: a guard in the test process
+  and in every process a test starts refuses `/usr/bin/security`, so running the tests never
+  reads your Claude Code sign-in.
 
 ## [0.10.1] - 2026-11-18
 
