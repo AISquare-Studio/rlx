@@ -116,6 +116,23 @@ impl Drop for App {
     }
 }
 
+/// A file outside the home where fake-claude keeps each start's hook key
+/// (`FAKE_CLAUDE_KEY_OUT`), removed when dropped, a failed test's too.
+struct KeyFile(PathBuf);
+
+impl KeyFile {
+    fn new() -> Self {
+        let name = format!("rlxd-keys-{}-{}", std::process::id(), run_id());
+        Self(std::env::temp_dir().join(name))
+    }
+}
+
+impl Drop for KeyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A new run id.
 fn run_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -980,7 +997,8 @@ fn two_runs_in_one_space_are_gated_apart() {
 #[test]
 fn a_hook_request_not_bound_to_the_run_is_refused_before_the_app() {
     // Each start's key, kept outside the home: an outsider that somehow has one.
-    let keys = std::env::temp_dir().join(format!("rlxd-keys-{}-{}", std::process::id(), run_id()));
+    let kept = KeyFile::new();
+    let keys = &kept.0;
     let home = home_with(&[("FAKE_CLAUDE_KEY_OUT", keys.to_str().unwrap())]);
     let _app = App::open(&home);
     let since = seq(&home);
@@ -1021,13 +1039,12 @@ fn a_hook_request_not_bound_to_the_run_is_refused_before_the_app() {
     assert!(decided(&events, &a).is_empty() && decided(&events, &b).is_empty());
     // A process outside every run reaches nothing either: with a key it guessed, or with
     // B's own key (B started first, so its key is the first kept).
-    let b_key = std::fs::read_to_string(&keys)
+    let b_key = std::fs::read_to_string(keys)
         .unwrap()
         .lines()
         .next()
         .unwrap()
         .to_owned();
-    let _ = std::fs::remove_file(&keys);
     for (key, why) in [("1".repeat(64), "key"), (b_key, "not inside the run")] {
         let stdin = json!({"hook_event_name": "PreToolUse", "tool_name": SEND,
             "tool_input": {}, "tool_use_id": "toolu_outsider"});
@@ -1096,7 +1113,8 @@ fn a_request_forged_inside_the_run_never_allows_claude_codes_call() {
 
 #[test]
 fn the_hook_key_is_never_logged_published_or_written() {
-    let out = std::env::temp_dir().join(format!("rlxd-keys-{}-{}", std::process::id(), run_id()));
+    let kept = KeyFile::new();
+    let out = &kept.0;
     let home = home_with(&[("FAKE_CLAUDE_KEY_OUT", out.to_str().unwrap())]);
     let _app = App::open(&home);
     let since = seq(&home);
@@ -1109,12 +1127,11 @@ fn the_hook_key_is_never_logged_published_or_written() {
     calls_out(&home, since, &b, 1);
     assert_eq!(decide(&home, &b, CALL_ID, "deny", "no").code(), Some(0));
     let events = end_of(&home, since, &b);
-    let keys: Vec<String> = std::fs::read_to_string(&out)
+    let keys: Vec<String> = std::fs::read_to_string(out)
         .unwrap()
         .lines()
         .map(str::to_owned)
         .collect();
-    let _ = std::fs::remove_file(&out);
     assert_eq!(keys.len(), 2, "{keys:?}");
     for key in &keys {
         assert_eq!(key.len(), 64, "{key}");
