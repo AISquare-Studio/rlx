@@ -174,10 +174,11 @@ impl Utf8 {
         let size = u32::from(self.size);
         let width = u32::from(self.width.min(2));
         if usize::from(self.size) == UTF8_SIZE {
-            // As tmux's packing reads back a character of exactly 32 bytes (#2685 m2):
-            // UTF8_SET_SIZE(32) is 1 << 29, past its 5 bits of size and into the width,
-            // so the cell comes back empty, and a cell wider.
-            return (width + 1).min(3) << 30;
+            // As tmux's packing reads back a character of exactly 32 bytes (#2685 m2,
+            // #2699): UTF8_SET_SIZE(32) is 1 << 29, past its 5 bits of size and OR'd into
+            // the width's (w + 1) << 29, so the cell comes back empty and
+            // ((w + 1) | 1) - 1 wide: 2 for a base of width 1 or 2.
+            return (((width + 1) | 1) - 1) << 30;
         }
         let index = if self.size <= 3 {
             u32::from(self.data[0]) | u32::from(self.data[1]) << 8 | u32::from(self.data[2]) << 16
@@ -1825,9 +1826,16 @@ mod tests {
             let utf8 = Utf8::new(bytes, width);
             assert_eq!(Utf8::unpack(utf8.pack(&chars), &chars), utf8, "{bytes:?}");
         }
-        // One of exactly 32 bytes comes back as tmux's does: empty, and a cell wider.
-        let full = Utf8::new(&[b'x'; UTF8_SIZE], 1);
-        assert_eq!(Utf8::unpack(full.pack(&chars), &chars), Utf8::new(b"", 2));
+        // One of exactly 32 bytes comes back as tmux's does: empty, and ((w + 1) | 1) - 1
+        // wide, so 2 from a base of width 1 or 2, and 0 from 0.
+        for (width, back) in [(1, 2), (2, 2), (0, 0)] {
+            let full = Utf8::new(&[b'x'; UTF8_SIZE], width);
+            assert_eq!(
+                Utf8::unpack(full.pack(&chars), &chars),
+                Utf8::new(b"", back),
+                "{width}"
+            );
+        }
         // A long character's number is the same each time.
         let long = Utf8::new("👍🏽".as_bytes(), 2);
         assert_eq!(long.pack(&chars), long.pack(&chars));

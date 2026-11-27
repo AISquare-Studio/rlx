@@ -249,6 +249,22 @@ fn fixtures() -> Vec<Fixture> {
             ..fixture(name, format!("a{first}{}b|", "\u{301}".repeat(marks)))
         });
     }
+    // #2699: a 32-byte cell on a wide base, which tmux reads back 2 wide, and the same
+    // rewrapped one column narrower.
+    let wide = format!("a中\u{20d0}{}\u{301}z|", "\u{301}".repeat(13));
+    all.push(Fixture {
+        cols: 20,
+        rows: 3,
+        since: Some((3, 6)),
+        ..fixture("a 32-byte cell on a wide base", wide.clone())
+    });
+    all.push(Fixture {
+        cols: 20,
+        rows: 3,
+        resize: Some((19, 3)),
+        since: Some((3, 6)),
+        ..fixture("a 32-byte cell on a wide base, narrower", wide)
+    });
     // #2678 minor 2: a link that starts in the last column and wraps. tmux prints the
     // last cell's codes again as it closes the link at the line's end.
     all.push(Fixture {
