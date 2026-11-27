@@ -10,10 +10,13 @@ boundary on #31). POSIX only where the fake runs: it is a script, as the real on
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
+import runpy
 import shutil
 import sqlite3
+import subprocess
 import sys
 import uuid
 from collections.abc import Iterator
@@ -56,47 +59,49 @@ SECURITY = """#!{python} -I
 import json, pathlib, shlex, sys
 here = pathlib.Path(__file__).parent
 table = here / 'items.json'
-args = sys.argv[1:]
-with open(here / 'calls.jsonl', 'a') as log:
-    log.write(json.dumps(args) + '\\n')
-items = json.loads(table.read_text())
 def key(a):
     return a[a.index('-s') + 1] + '\\t' + a[a.index('-a') + 1]
 def printed(data):
     if all(0x20 <= b < 0x7f for b in data):
         return data.decode('ascii') + '\\n'
     return data.hex() + '\\n'
-def run(a, through):
-    verb = a[0]
-    if verb == 'find-generic-password':
-        item = items.get(key(a))
-        if item is None:
-            sys.stderr.write({not_found!r})
-            return 44
-        if item.get('exit'):
-            sys.stderr.write(item.get('stderr', ''))
-            return item['exit']
-        sys.stdout.write(item['stdout'])
-        return 0
-    if verb == 'add-generic-password':
-        data = bytes.fromhex(a[a.index('-X') + 1])
-        if (here / 'corrupt').exists():
-            data = data[:-1] + b'!'
-        items[key(a)] = {{'stdout': printed(data), 'through': through}}
-        table.write_text(json.dumps(items))
-        return 0
-    if verb == 'delete-generic-password':
-        if items.pop(key(a), None) is None:
-            sys.stderr.write({not_found!r})
-            return 44
-        table.write_text(json.dumps(items))
-        return 0
-    return 2
-if args == ['-i']:
-    for line in sys.stdin.read().splitlines():
-        run(shlex.split(line), 'stdin')
-    sys.exit(0)  # as `security -i` does, whatever a command it ran answered
-sys.exit(run(args, 'argv'))
+def main(args, stdin, out, err):
+    with open(here / 'calls.jsonl', 'a') as log:
+        log.write(json.dumps(args) + '\\n')
+    items = json.loads(table.read_text())
+    def run(a, through):
+        verb = a[0]
+        if verb == 'find-generic-password':
+            item = items.get(key(a))
+            if item is None:
+                err.write({not_found!r})
+                return 44
+            if item.get('exit'):
+                err.write(item.get('stderr', ''))
+                return item['exit']
+            out.write(item['stdout'])
+            return 0
+        if verb == 'add-generic-password':
+            data = bytes.fromhex(a[a.index('-X') + 1])
+            if (here / 'corrupt').exists():
+                data = data[:-1] + b'!'
+            items[key(a)] = {{'stdout': printed(data), 'through': through}}
+            table.write_text(json.dumps(items))
+            return 0
+        if verb == 'delete-generic-password':
+            if items.pop(key(a), None) is None:
+                err.write({not_found!r})
+                return 44
+            table.write_text(json.dumps(items))
+            return 0
+        return 2
+    if args == ['-i']:
+        for line in stdin.read().splitlines():
+            run(shlex.split(line), 'stdin')
+        return 0  # as `security -i` does, whatever a command it ran answered
+    return run(args, 'argv')
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))
 """
 
 
@@ -131,6 +136,30 @@ class FakeSecurity:
         if not self.log.exists():
             return []
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def in_process(self, patch: pytest.MonkeyPatch) -> None:
+        """The script's own ``main`` answers a run of it in this process, given the same
+        arguments and stdin and logging them alike. Everything else still runs.
+
+        A test that runs the move a hundred times otherwise starts a Python per item read,
+        written or deleted: a thousand starts, which put a whole CI shard past its time
+        limit (run 45857783948)."""
+        script = runpy.run_path(str(self.tool), run_name="fake_security")
+        fake = str(self.tool)
+        real_run = subprocess.run
+
+        def run(args: Any, *rest: Any, **kwargs: Any) -> Any:
+            if not isinstance(args, list | tuple) or not args or str(args[0]) != fake:
+                return real_run(args, *rest, **kwargs)
+            given: bytes | None = kwargs.get("input")
+            stdin = io.StringIO("" if given is None else given.decode("utf-8"))
+            out, err = io.StringIO(), io.StringIO()
+            code = script["main"]([str(arg) for arg in args[1:]], stdin, out, err)
+            return subprocess.CompletedProcess(
+                args, code, out.getvalue().encode("utf-8"), err.getvalue().encode("utf-8")
+            )
+
+        patch.setattr(subprocess, "run", run)
 
 
 @pytest.fixture
@@ -1260,13 +1289,16 @@ def test_a_crash_at_each_write_of_a_roll_back_is_finished_by_the_next_run(
     keychain: FakeSecurity,
     tmp_path: Path,
     failing: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Blocker 2: the roll-back is journaled phase by phase, each file put back and each rename
     reversed written down, so a crash at any of its journal writes (before the write lands, or
     after) is finished by the next run, and the home is as it was: no stray copy of the seals,
-    no slot left at its new place, every login where it was."""
+    no slot left at its new place, every login where it was. The move runs some seventy times
+    here, so the fake ``security`` answers in this process."""
     from aisquare.core import agents as agent_core
 
+    keychain.in_process(monkeypatch)
     assert agent_core.install_hooks("codex", _slot(3, "codex"))
     saved = tmp_path / "saved"
     saved.mkdir()
