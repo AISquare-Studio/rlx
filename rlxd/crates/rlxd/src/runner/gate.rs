@@ -58,10 +58,33 @@ pub const TOOL_NOT_IN_INIT: &str = "tool_not_in_init";
 pub struct Listed {
     /// Its tools, by their exact names.
     pub tools: std::collections::HashSet<String>,
-    /// Its MCP servers, by name.
-    pub servers: Vec<String>,
+    /// Its MCP servers.
+    pub servers: Vec<Server>,
     /// Each tool's `readOnlyHint`, where its entry carried one.
     pub hints: HashMap<String, bool>,
+}
+
+/// An MCP server an attempt's `system/init` listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Server {
+    /// Its name, such as `claude.ai Slack`.
+    pub name: String,
+    /// Where it comes from, where init said: `claudeai` for a claude.ai connector.
+    pub source: Option<String>,
+}
+
+/// A claude.ai connector's name begins so, as Claude Code names them.
+const CLAUDE_AI: &str = "claude.ai ";
+
+/// A claude.ai connector's `source` in `system/init`.
+const CLAUDE_AI_SOURCE: &str = "claudeai";
+
+/// Whether the mount's connector `connector` is `server`: the same name, and for a
+/// claude.ai connector, a server whose source is claude.ai. A local, user, project or
+/// plugin server named exactly like a claude.ai connector is never it.
+fn is_mounted(connector: &str, server: &Server) -> bool {
+    connector == server.name
+        && (!connector.starts_with(CLAUDE_AI) || server.source.as_deref() == Some(CLAUDE_AI_SOURCE))
 }
 
 /// The name of the variable that holds an attempt's hook key.
@@ -166,12 +189,41 @@ impl Runner {
     /// Ends every hook connection waiting on the gate, as a dropped connection would:
     /// each one's call is denied, and its hook gets no answer (test builds' `debug.
     /// drop_hook_connections`). How many there were.
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+    #[cfg(feature = "debug-methods")]
     pub fn drop_hooks(&self) -> u64 {
         let waiting = *self.hooks_waiting.borrow();
         self.hooks_dropped.send_modify(|n| *n += 1);
         waiting
     }
+
+    /// Test builds only: resolves once `debug.drop_hook_connections` ends the hook
+    /// connections waiting now. A release build's never does.
+    #[cfg(feature = "debug-methods")]
+    fn hooks_dropped(&self) -> impl std::future::Future<Output = ()> + use<> {
+        let mut dropped = self.hooks_dropped.subscribe();
+        async move {
+            let _ = dropped.changed().await;
+        }
+    }
+
+    #[cfg(not(feature = "debug-methods"))]
+    #[allow(dead_code)]
+    fn hooks_dropped(&self) -> impl std::future::Future<Output = ()> + use<> {
+        std::future::pending()
+    }
+
+    /// Test builds only: counts a hook connection as it starts waiting on the gate (`up`)
+    /// or stops.
+    #[cfg(feature = "debug-methods")]
+    fn count_waiting(&self, up: bool) {
+        self.hooks_waiting.send_modify(|n| {
+            *n = if up { *n + 1 } else { n.saturating_sub(1) };
+        });
+    }
+
+    #[cfg(not(feature = "debug-methods"))]
+    #[allow(dead_code)]
+    fn count_waiting(&self, _up: bool) {}
 
     /// The gate's answer to one hook request: Claude Code's hook JSON, allow or deny.
     /// `None` when its connection was dropped (`debug.drop_hook_connections`): the hook
@@ -240,12 +292,12 @@ impl Runner {
             waiting
         };
         let mut guard = Unanswered::new(self, &run, call);
-        let mut dropped = self.hooks_dropped.subscribe();
+        let dropped = self.hooks_dropped();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
         let mut came = tokio::select! {
             answer = &mut waiting => answer.map_or(Came::Gone, Came::Answer),
             () = tokio::time::sleep_until(deadline) => Came::Deadline,
-            _ = dropped.changed() => {
+            () = dropped => {
                 // Denied by its end: the guard writes it.
                 drop(guard);
                 return None;
@@ -615,7 +667,7 @@ struct Unanswered {
 impl Unanswered {
     /// Holds `call` of `run`, counted among the hook connections waiting on the gate.
     fn new(runner: &Arc<Runner>, run: &Arc<Run>, call: Call) -> Self {
-        runner.hooks_waiting.send_modify(|n| *n += 1);
+        runner.count_waiting(true);
         Self {
             runner: Arc::clone(runner),
             run: Arc::clone(run),
@@ -637,9 +689,7 @@ impl Unanswered {
 
 impl Drop for Unanswered {
     fn drop(&mut self) {
-        self.runner
-            .hooks_waiting
-            .send_modify(|n| *n = n.saturating_sub(1));
+        self.runner.count_waiting(false);
         let Some(call) = self.call.take() else {
             return;
         };
@@ -686,17 +736,22 @@ pub fn rlxd_rule(
                 return Some(TOOL_NOT_IN_INIT.to_owned());
             }
             // Every listed server whose name, as Claude Code writes it, begins the tool's.
-            let of: Vec<&String> = listed
+            let of: Vec<&Server> = listed
                 .servers
                 .iter()
                 .filter(|server| {
                     tool.strip_prefix("mcp__")
-                        .and_then(|rest| rest.strip_prefix(claude_server_name(server).as_str()))
+                        .and_then(|rest| {
+                            rest.strip_prefix(claude_server_name(&server.name).as_str())
+                        })
                         .is_some_and(|rest| rest.starts_with("__"))
                 })
                 .collect();
             match of.as_slice() {
-                [server] if connectors.iter().any(|connector| connector == *server) => {}
+                [server]
+                    if connectors
+                        .iter()
+                        .any(|connector| is_mounted(connector, server)) => {}
                 [_, _, ..] => {
                     return Some(format!(
                         "{tool} could be a tool of more than one of the run's MCP servers"
@@ -755,7 +810,7 @@ pub fn claude_server_name(name: &str) -> String {
             written.extend(std::iter::repeat_n('_', c.len_utf16()));
         }
     }
-    if !name.starts_with("claude.ai ") {
+    if !name.starts_with(CLAUDE_AI) {
         return written;
     }
     let mut collapsed = String::with_capacity(written.len());
@@ -844,11 +899,24 @@ mod tests {
     const READ: &str = "mcp__claude_ai_Slack__slack_search_public";
 
     /// What an init listed: `tools`, `servers`, and `hints` for its tools.
+    /// A claude.ai connector's names come from claude.ai, any other from a local config.
     fn listed(tools: &[&str], servers: &[&str], hints: &[(&str, bool)]) -> Listed {
         Listed {
             tools: tools.iter().map(|t| (*t).to_owned()).collect(),
-            servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+            servers: servers.iter().map(|name| server(name)).collect(),
             hints: hints.iter().map(|(t, h)| ((*t).to_owned(), *h)).collect(),
+        }
+    }
+
+    fn server(name: &str) -> Server {
+        let source = if name.starts_with(CLAUDE_AI) {
+            CLAUDE_AI_SOURCE
+        } else {
+            "local"
+        };
+        Server {
+            name: name.to_owned(),
+            source: Some(source.to_owned()),
         }
     }
 
@@ -864,7 +932,7 @@ mod tests {
     #[test]
     fn the_mount_comes_first() {
         let mut both = slack_listed();
-        both.servers.push("claude.ai Gmail".to_owned());
+        both.servers.push(server("claude.ai Gmail"));
         both.tools.insert("mcp__claude_ai_Gmail__send".to_owned());
         let no_tools = params(RunKind::Task, Mount::NoTools);
         assert!(rlxd_rule(&no_tools, false, &both, READ, "h").is_some());
@@ -901,6 +969,39 @@ mod tests {
         let mut with = slack_listed();
         with.tools.insert(evil.to_owned());
         assert_eq!(rlxd_rule(&task, false, &with, evil, "h"), None);
+    }
+
+    #[test]
+    fn a_server_named_as_a_claude_ai_connector_is_it_only_from_claude_ai() {
+        let task = params(RunKind::Task, slack());
+        let with = |source: Option<&str>| Listed {
+            servers: vec![Server {
+                name: "claude.ai Slack".to_owned(),
+                source: source.map(str::to_owned),
+            }],
+            ..slack_listed()
+        };
+        assert_eq!(
+            rlxd_rule(&task, false, &with(Some("claudeai")), SEND, "h"),
+            None
+        );
+        for impostor in [
+            Some("local"),
+            Some("user"),
+            Some("project"),
+            Some("plugin"),
+            None,
+        ] {
+            assert!(
+                rlxd_rule(&task, false, &with(impostor), SEND, "h").is_some(),
+                "{impostor:?}"
+            );
+        }
+        // A mount naming a server that isn't a claude.ai connector matches it by name.
+        let local = params(RunKind::Task, mount(&["mine"]));
+        let tool = "mcp__mine__do";
+        let seen = listed(&[tool], &["mine"], &[]);
+        assert_eq!(rlxd_rule(&local, false, &seen, tool, "h"), None);
     }
 
     #[test]

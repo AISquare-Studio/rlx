@@ -412,9 +412,14 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
   to be the real parent (a parent never started after its child, so a pid given to
   another process since fails), and the asking process itself is the one pinned when
   the connection was accepted: Linux holds its pidfd across the check, macOS requires
-  the process at its pid to have started before the connection was accepted. On Windows
-  it must be in the run's Job Object, checked through the process handle pinned when the
-  pipe connected. fake-claude starts its hooks detached the same way.
+  the process at its pid to have started before the connection was accepted. macOS has
+  no public handle on a process, so its pin is a pid and a start time, with two windows
+  left open: a peer that exits between its `connect` and rlxd's `accept`, its pid reused
+  in that instant, and a process started after the wall clock was stepped back past the
+  accept. Neither is in reach: macOS hands out pids in order, and a pid that passes must
+  also be inside the run, whose processes hold the key already. On Windows it must be in
+  the run's Job Object, checked through the process handle pinned when the pipe
+  connected. fake-claude starts its hooks detached the same way.
 - **What the key does not stop.** Every process Claude Code starts inherits the key, not
   only its hooks, so a process inside a run (a tool's shell, say) can send a request for
   its own run. It only ever gets the app's answer to its own request: each call is its
@@ -435,13 +440,14 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
   `needs_connectors` is for, since a run that names a connector there starts its first
   turn only once it is connected, so its tools are in the init. A tool's server is the
   one MCP server of the attempt's `system/init` whose name, as Claude Code writes it in
-  tool names
-  (each UTF-16 unit but a letter, a digit, `_` or `-` as `_`; for a `claude.ai `
-  connector, runs of `_` as one and none at the ends), begins the tool's name before a
-  `__`. When none does, or more than one does (a local server named `claude_ai_Slack` or
-  `claude_ai_Slack__x` beside the `claude.ai Slack` connector), the call is denied. A
-  tool is read-only only when its
-  `system/init` entry says `annotations.readOnlyHint: true`; a hint that isn't there
+  tool names (each UTF-16 unit but a letter, a digit, `_` or `-` as `_`; for a
+  `claude.ai ` connector, runs of `_` as one and none at the ends), begins the tool's
+  name before a `__`. When none does, or more than one does (a local server named
+  `claude_ai_Slack` or `claude_ai_Slack__x` beside the `claude.ai Slack` connector), the
+  call is denied. A mount's `claude.ai ` connector is only a server whose init `source`
+  is `claudeai`: a local, user, project or plugin server named exactly `claude.ai Slack`
+  never passes as it.
+- **Read-only.** A tool is read-only only when its `system/init` entry says `annotations.readOnlyHint: true`; a hint that isn't there
   (`null`) counts as a write, in one function, `read_only`, until the hub decides
   otherwise (#2718).
 - **Every other call goes to the app** as `run.tool_call {call_id, tool, input,

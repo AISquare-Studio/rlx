@@ -199,9 +199,10 @@ impl Peer {
     /// Runs `check` on the pid of the process that connected, only while that very
     /// process runs: the pin is checked before `check` and again after it, so a pid that
     /// names another process meanwhile fails. `false` when the OS gave no pin or the
-    /// process has gone. For the tool-call gate's binding (5.1), which never trusts a
-    /// bare pid: Linux holds a pidfd; macOS requires the process at the pid to have
-    /// started before the connection was accepted.
+    /// process has gone. For the tool-call gate's binding (5.1): Linux holds a pidfd;
+    /// macOS, which has no public handle on a process, requires the process at the pid to
+    /// have started before the connection was accepted, a weaker pin with a
+    /// connect-to-accept window and the wall clock's steps open (`peer::macos`).
     #[cfg(unix)]
     pub fn while_pinned(&self, check: impl FnOnce(u32) -> bool) -> bool {
         self.inner.while_pinned(check)

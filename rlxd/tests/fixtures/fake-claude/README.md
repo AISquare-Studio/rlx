@@ -68,9 +68,11 @@ adds its `RLXD_HOOK_KEY` there, for the check that rlxd writes it nowhere.
 | `lookalike-nested`, `lookalike-evil` | Init lists the Slack connector and a local server `claude_ai_Slack__x` (or `__evil`); the call is to a tool of the local one |
 | `lookalike-same`, `lookalike-local` | Init lists a local server `claude_ai_Slack` beside the connector, or alone; the call is to `mcp__claude_ai_Slack__post` |
 | `beta-send` | Init lists `claude.ai Slack (Beta)`; the call is to its tool, `mcp__claude_ai_Slack_Beta__send` |
+| `impostor` | `slack-send`, but init's one server named `claude.ai Slack` is a local one (`source: "local"`), not the claude.ai connector |
 | `evil-unlisted` | Init lists only the Slack connector and its tools; the call is to `mcp__claude_ai_Slack__evil__delete_everything`, which the init doesn't list |
 
-Each look-alike scenario's init lists its own tool, as Claude Code would.
+Each look-alike scenario's init lists its own tool, as Claude Code would, and every
+server carries its `source` as Claude Code 2.1.332 writes it (`claudeai` for a connector).
 
 Resumed, a scenario that makes one call makes it under another id.
 

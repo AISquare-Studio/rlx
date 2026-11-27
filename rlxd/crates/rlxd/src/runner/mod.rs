@@ -155,11 +155,12 @@ pub struct Runner {
     stopping: AtomicBool,
     /// The app gate's connections, as the gate counts them ([`Runner::follow_apps`]).
     apps: std::sync::OnceLock<watch::Receiver<u32>>,
-    /// Bumped to end every hook connection waiting on the gate (`debug.drop_hook_connections`).
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+    /// Test builds only: bumped to end every hook connection waiting on the gate
+    /// (`debug.drop_hook_connections`).
+    #[cfg(feature = "debug-methods")]
     hooks_dropped: watch::Sender<u64>,
-    /// How many hook connections wait on the gate now.
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+    /// Test builds only: how many hook connections wait on the gate now.
+    #[cfg(feature = "debug-methods")]
     hooks_waiting: watch::Sender<u64>,
     /// Test builds only: rlxd itself as each run's hook, and the subcommand it runs as
     /// (`rlxd __test-hook pre-tool-use`, which asks `debug.pre_tool_use`), until
@@ -373,7 +374,9 @@ impl Runner {
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
             apps: std::sync::OnceLock::new(),
+            #[cfg(feature = "debug-methods")]
             hooks_dropped: watch::Sender::new(0),
+            #[cfg(feature = "debug-methods")]
             hooks_waiting: watch::Sender::new(0),
             test_hook: test_hook(rlxd.as_deref()),
             fail_ledger: test_space("RLXD_TEST_FAIL_LEDGER"),
@@ -1810,7 +1813,14 @@ impl Runner {
                         started = true;
                         inner.listed = gate::Listed {
                             tools: init.tools.iter().cloned().collect(),
-                            servers: init.mcp_servers.iter().map(|s| s.name.clone()).collect(),
+                            servers: init
+                                .mcp_servers
+                                .iter()
+                                .map(|server| gate::Server {
+                                    name: server.name.clone(),
+                                    source: init.sources.get(&server.name).cloned(),
+                                })
+                                .collect(),
                             hints: init.hints.clone(),
                         };
                         let data = RunStartedData::new(init.cwd, init.model, init.claude_version)

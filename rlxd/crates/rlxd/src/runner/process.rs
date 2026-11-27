@@ -815,26 +815,25 @@ fn kill_tree(tree: &Tree) {
 ///   Code starts each hook detached, in a session and process group of its own, so the
 ///   group can't tell; the chain can. Each step up must be the real parent, not a process
 ///   given a gone parent's pid since: a parent never starts after its child. The guard is
-///   rlxd's unreaped child, so its pid is the run's while the run lives. The peer itself
-///   is held through its pin ([`crate::peer::Peer::while_pinned`]), never a bare pid.
+///   rlxd's unreaped child, so its pid is the run's while the run lives: its `reaped`
+///   lock is held across the walk, so it can't be reaped meanwhile. The peer itself is
+///   held through its pin ([`crate::peer::Peer::while_pinned`]): Linux's pidfd; on
+///   macOS a pid and a start time, open to a connect-to-accept window and to the wall
+///   clock's steps (`peer::macos` says why neither is in reach).
 /// - **Windows:** in the run's Job Object, through the process handle the peer was
 ///   pinned with when it connected (Claude Code's detached children stay in the job).
 #[cfg(unix)]
 pub fn holds(tree: &Tree, peer: &crate::peer::Peer) -> bool {
-    if *tree.reaped.lock().unwrap_or_else(|p| p.into_inner()) {
-        return false;
-    }
-    peer.while_pinned(|pid| descends(pid, tree.pid))
+    let reaped = tree.reaped.lock().unwrap_or_else(|p| p.into_inner());
+    !*reaped && peer.while_pinned(|pid| descends(pid, tree.pid))
 }
 
 #[cfg(windows)]
 pub fn holds(tree: &Tree, peer: &crate::peer::Peer) -> bool {
     use std::os::windows::io::AsHandle;
 
-    if *tree.reaped.lock().unwrap_or_else(|p| p.into_inner()) {
-        return false;
-    }
-    peer.in_job(tree.job.as_handle())
+    let reaped = tree.reaped.lock().unwrap_or_else(|p| p.into_inner());
+    !*reaped && peer.in_job(tree.job.as_handle())
 }
 
 /// How many steps up a parent chain [`descends`] looks.
@@ -868,6 +867,12 @@ fn descends_by(
         let Some((grandparent, parent_started)) = parent_of(parent) else {
             return false;
         };
+        // Still its parent once the parent was read: a parent that went would have left
+        // `at` another parent before its pid could be given out again, so what was read
+        // is the real parent's, even where start times tie (Linux counts in ticks).
+        if parent_of(at).map(|(again, _)| again) != Some(parent) {
+            return false;
+        }
         // A process that started after its "child" was given a gone parent's pid.
         if parent_started > started {
             return false;

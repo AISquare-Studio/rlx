@@ -29,6 +29,8 @@
 //!   and the call is to its tool.
 //! - `evil-unlisted`: init lists only the Slack connector and its tools, and the call is
 //!   to [`EVIL_TOOL`], which the init doesn't list.
+//! - `impostor`: `slack-send`, but init's one server named `claude.ai Slack` is a local
+//!   one (`source: "local"`), not the claude.ai connector.
 //!
 //! Each look-alike scenario's init lists its own tool, as Claude Code would.
 //!
@@ -89,21 +91,24 @@ fn input() -> Value {
     serde_json::from_str(INPUT).expect("gate/input.json is JSON")
 }
 
-/// The MCP servers a gate scenario's `system/init` lists: the Slack connector, and for
-/// the look-alike scenarios, servers whose names Claude Code writes as the connector's,
-/// or as its with more after `__`.
+/// The MCP servers a gate scenario's `system/init` lists, each with its `source` as
+/// Claude Code 2.1.332 writes it: the Slack connector (`claudeai`), and for the look-alike
+/// scenarios, local servers whose names Claude Code writes as the connector's, or as its
+/// with more after `__`. `impostor`'s one server is local, named exactly `claude.ai Slack`.
 fn servers_of(name: &str) -> Value {
-    let names: &[&str] = match name {
-        "lookalike-nested" => &["claude.ai Slack", "claude_ai_Slack__x"],
-        "lookalike-evil" => &["claude.ai Slack", "claude_ai_Slack__evil"],
-        "lookalike-same" => &["claude.ai Slack", "claude_ai_Slack"],
-        "lookalike-local" => &["claude_ai_Slack"],
-        "beta-send" => &["claude.ai Slack (Beta)"],
-        _ => &["claude.ai Slack"],
+    const SLACK: (&str, &str) = ("claude.ai Slack", "claudeai");
+    let servers: &[(&str, &str)] = match name {
+        "lookalike-nested" => &[SLACK, ("claude_ai_Slack__x", "local")],
+        "lookalike-evil" => &[SLACK, ("claude_ai_Slack__evil", "local")],
+        "lookalike-same" => &[SLACK, ("claude_ai_Slack", "user")],
+        "lookalike-local" => &[("claude_ai_Slack", "project")],
+        "beta-send" => &[("claude.ai Slack (Beta)", "claudeai")],
+        "impostor" => &[("claude.ai Slack", "local")],
+        _ => &[SLACK],
     };
-    names
+    servers
         .iter()
-        .map(|name| json!({"name": name, "status": "connected"}))
+        .map(|(name, source)| json!({"name": name, "status": "connected", "source": source}))
         .collect()
 }
 
@@ -237,6 +242,7 @@ const BODIES: &[(&str, super::Scenario)] = &[
     ("crash-in-call", crash_in_call),
     ("evil-unlisted", lookalike_evil),
     ("forge", forge),
+    ("impostor", slack_send),
     ("lookalike-evil", lookalike_evil),
     ("lookalike-local", lookalike_post),
     ("lookalike-nested", lookalike_nested),
@@ -259,6 +265,7 @@ pub fn named(name: &str) -> Option<super::Scenario> {
         "crash-in-call" => |fake| play(fake, "crash-in-call"),
         "evil-unlisted" => |fake| play(fake, "evil-unlisted"),
         "forge" => |fake| play(fake, "forge"),
+        "impostor" => |fake| play(fake, "impostor"),
         "lookalike-evil" => |fake| play(fake, "lookalike-evil"),
         "lookalike-local" => |fake| play(fake, "lookalike-local"),
         "lookalike-nested" => |fake| play(fake, "lookalike-nested"),

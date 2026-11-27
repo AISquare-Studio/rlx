@@ -233,6 +233,15 @@ impl Peer {
 
     /// [`super::Peer::while_pinned`]: the process at the token's pid must have started
     /// before rlxd accepted the connection, before `check` and after it.
+    ///
+    /// A pid and a start time, not a held handle: macOS's live pid version is in no public
+    /// API. Two windows stay open. A peer that exits between its `connect` and rlxd's
+    /// `accept`, its pid reused within that instant, passes as the new process; and both
+    /// times are the wall clock, so a process started after the clock was stepped back
+    /// past the accept passes too. Neither is in reach: macOS hands out pids in order up to
+    /// 99,999, so no one can aim a reused pid at a backlog window of under a millisecond,
+    /// and a pid that passes the gate must also lie inside the run, whose processes hold
+    /// the key already.
     pub fn while_pinned(&self, check: impl FnOnce(u32) -> bool) -> bool {
         let Some(pid) = self.pid() else {
             return false;

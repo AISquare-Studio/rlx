@@ -810,11 +810,14 @@ fn a_tool_of_a_look_alike_server_is_not_the_mounted_connectors() {
     let _app = App::open(&home);
     // A local server listed beside the connector (or alone) whose name Claude Code writes
     // as the connector's, or as its with more after `__`: denied by rlxd, never the app's.
+    // So is a local server named exactly `claude.ai Slack`: a claude.ai connector is one
+    // whose init source is claude.ai's.
     for scenario in [
         "lookalike-nested",
         "lookalike-evil",
         "lookalike-same",
         "lookalike-local",
+        "impostor",
     ] {
         let reason = denied_by_rlxd(&home, &task(scenario));
         assert!(
@@ -891,6 +894,17 @@ fn an_allow_whose_ledger_entry_cant_be_written_is_a_deny() {
     assert_eq!(replies(&home, &r)[0]["decision"], "deny");
     assert_eq!(tool_runs(&home, &r), 0);
     assert!(home.log().contains("the ledger was not written"));
+    // The deny replaced the allow's entry: one entry, deny by rlxd, decided, in run.get and
+    // in run.json (the run's end wrote it), and still so after a restart. Never "allow by
+    // the app" for a call that never ran.
+    let denied = |entry: &Value| {
+        entry["decision"] == "deny" && entry["by"] == "rlxd" && entry["state"] == "decided"
+    };
+    let calls = ledger(&home, &r);
+    assert!(denied(entry(&calls, CALL_ID)), "{calls:#?}");
+    let written = record(&home, &r)["calls"].as_array().cloned().unwrap();
+    assert!(denied(entry(&written, CALL_ID)), "{written:#?}");
+    let first = r.clone();
 
     // A pinned run: its pinned call stays used, so the next call is denied too.
     let since = seq(&home);
@@ -915,6 +929,19 @@ fn an_allow_whose_ledger_entry_cant_be_written_is_a_deny() {
         "{events:#?}"
     );
     assert_eq!(tool_runs(&home, &p), 0);
+
+    home.stop();
+    home.start_dev();
+    let calls = ledger(&home, &first);
+    assert!(
+        denied(entry(&calls, CALL_ID)),
+        "after a restart: {calls:#?}"
+    );
+    let calls = ledger(&home, &p);
+    assert!(
+        denied(entry(&calls, CALL_ID)),
+        "after a restart: {calls:#?}"
+    );
 }
 
 #[test]
