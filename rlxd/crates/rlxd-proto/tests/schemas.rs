@@ -2259,3 +2259,106 @@ fn env_documents_and_the_env_type_agree() {
         ]
     );
 }
+
+/// `schema`, with its `$ref` to `#/$defs/<name>` followed, in `root`.
+fn followed<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
+    match schema.get("$ref").and_then(Value::as_str) {
+        Some(reference) => {
+            let name = reference
+                .strip_prefix("#/$defs/")
+                .unwrap_or_else(|| panic!("{reference}"));
+            followed(root, &root["$defs"][name])
+        }
+        None => schema,
+    }
+}
+
+/// The JSON types `schema` allows: its `type`, a word or a list.
+fn types_of(schema: &Value) -> Vec<String> {
+    match &schema["type"] {
+        Value::String(one) => vec![one.clone()],
+        Value::Array(many) => many
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every field of `doc` is a property `schema` declares, with `doc`'s JSON type there,
+/// all the way down.
+fn declares(root: &Value, schema: &Value, doc: &Value, at: &str) {
+    let schema = followed(root, schema);
+    let types = types_of(schema);
+    let wanted = match doc {
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
+        Value::String(_) => "string",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_f64() => "number",
+        Value::Number(_) => "integer",
+        Value::Null => "null",
+    };
+    assert!(
+        types
+            .iter()
+            .any(|t| t == wanted || (t == "number" && wanted == "integer")),
+        "§7.4's {at} is {wanted}, status-reply.json says {types:?}"
+    );
+    match doc {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                let property = schema["properties"].get(key).unwrap_or_else(|| {
+                    panic!("status-reply.json has no {at}.{key}, which §7.4 shows")
+                });
+                declares(root, property, value, &format!("{at}.{key}"));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                declares(root, &schema["items"], item, &format!("{at}[]"));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn status_declares_every_field_of_7_4_with_its_type() {
+    // Handoff 0.10.3 §7.4's status, as written there ("…" for what varies).
+    let doc = json!({"version": "…", "pid": 0, "platform": "…", "protocol_version": 1,
+        "capabilities": ["…"], "seq": 0, "clients": {"app": 0, "tui": 0, "remote": 0, "cli": 1},
+        "gate": "signed app only", "brain": {"pid": 0, "restarts": 0, "handled": 0},
+        "claude": {"installed": true, "version": "…", "signed_in": true,
+                   "auth_method": "claude.ai", "account": "…", "plan": "…"},
+        "runs": {"live": 0, "queued": 0}, "jobs": {"count": 0}});
+    let schema = read_json(&schemas_dir().join("status-reply.json"));
+    declares(&schema, &schema, &doc, "status");
+    // And every field §7.4 always shows is one status always sends.
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for always in [
+        "version",
+        "pid",
+        "platform",
+        "protocol_version",
+        "capabilities",
+        "seq",
+        "clients",
+        "gate",
+        "brain",
+        "claude",
+        "runs",
+        "jobs",
+    ] {
+        assert!(
+            required.contains(&always),
+            "{always} is not required: {required:?}"
+        );
+    }
+}

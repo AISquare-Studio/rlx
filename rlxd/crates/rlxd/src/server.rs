@@ -76,7 +76,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const LINGER: Duration = Duration::from_secs(1);
 
 /// What this rlxd can do, by name, for `hello`'s reply and `status`. The later items add
-/// theirs.
+/// theirs: 5.3's `connectors.call`, `connectors.no_turn` and `connectors.gate_before_turn`
+/// once their routes exist, and nothing before.
 const CAPABILITIES: &[&str] = &[];
 
 /// One running rlxd: what every connection shares.
@@ -628,6 +629,8 @@ impl Daemon {
         status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
         (status.runs.live, status.runs.queued) = self.runner.counts();
+        // Scheduler jobs (7.6): none until the scheduler (#34) counts its own here.
+        status.jobs.count = 0;
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {
             Ok(Value::Object(data)) => Ok(data),

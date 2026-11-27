@@ -101,19 +101,8 @@ pub fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["--version"] => {
-            println!("{VERSION} (Claude Code)");
-            return ExitCode::SUCCESS;
-        }
-        ["auth", "status", "--json"] => {
-            println!(
-                "{}",
-                json!({"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty",
-                    "email": "probe@example.com", "orgId": "00000000-0000-4000-8000-000000000000",
-                    "orgName": "Probe Org", "subscriptionType": "pro"})
-            );
-            return ExitCode::SUCCESS;
-        }
+        ["--version"] => return scenarios::probe::version(&name),
+        ["auth", "status", "--json"] => return scenarios::probe::auth_status(&name),
         _ => {}
     }
     let Some(scenario) = scenarios::find(&name) else {

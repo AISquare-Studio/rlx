@@ -40,6 +40,7 @@ the same files.
 | `abort` | Says part of an answer, then dies of `SIGABRT` (an abort), so rlxd reports the signal |
 | `huge` | A successful result of 1.5 MiB of text, more than `run.done` carries |
 | `tool-result` | A recorded connector call and its `tool_result` block, whose content is `tool-result/content.json`. It runs no tool and asks no hook |
+| `auth-status`, `signed-out`, `probe-hangs`, `auth-env` | What `claude --version` and `claude auth status --json` answer, for `status` (7.4): signed in as `probe@example.com` on pro (every other scenario answers so too); signed out (exit 1); neither answers for a minute; signed in as `probe+<CLAUDE_CONFIG_DIR>@example.com`. A run started as one plays `hello` |
 | `print-env` | Answers with the app's environment it got (4.3): `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` and `PATH`, those set, as JSON. Started by a name that is no scenario, such as `bin/claude`, fake-claude follows the name's links to its scenario, else takes `FAKE_CLAUDE_SCENARIO` (Windows, where the tests copy it) |
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
