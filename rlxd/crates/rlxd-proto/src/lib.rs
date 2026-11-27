@@ -14,6 +14,10 @@
 //!   [`SettingsSetParams`], [`SettingsDeleteParams`], [`SettingsListParams`],
 //!   [`Setting`], [`SettingsList`] and [`SettingsChanged`], app settings every device
 //!   shares;
+//! - the PTY host (1.4): [`PtySpawnParams`], [`PtyWriteParams`], [`PtyResizeParams`],
+//!   [`PtyScreenParams`], [`PtySubscribeParams`], [`PtyKillParams`], and the replies
+//!   [`PtyRef`], [`PtyScreen`] and [`PtyList`]; the `pty` topic's [`PtyOutput`] and
+//!   [`PtyExited`];
 //! - [`StatusData`] (7.4): `status`'s reply, what rlxd is and whether Claude Code is
 //!   installed and signed in;
 //! - [`HereData`]: `rlxd here`'s reply, the probe rlx.app runs over SSH: what rlx is
@@ -41,12 +45,14 @@
 //! - **Each type's `validate()`** is that one set of rules, for code that builds a value
 //!   field by field.
 //!
-//! JSON Schema cannot express three of the rules, so the types are stricter there:
+//! JSON Schema cannot express four of the rules, so the types are stricter there:
 //!
 //! - It reads `1.0` as the integer `1`, which the types refuse. No producer of these
 //!   documents writes integers that way.
 //! - It cannot count how deep a value nests: a setting's value is at most 32 arrays or
 //!   objects deep ([`MAX_SETTING_DEPTH`]).
+//! - It counts a string's length in characters, so a `pty.write`'s 128 KiB, which the
+//!   types count in bytes, isn't in the schema.
 //! - It cannot compare one field with another. So the schema checks that an event's
 //!   `type` starts with its `topic` only for the topics v1 lists (7.3's and 7.8's), while
 //!   the types check it for every topic.
@@ -135,6 +141,9 @@
 //! `from` to `to` are gone. It starts the stream when `since` is older than the oldest
 //! event rlxd holds, and can also come anywhere later, for a client so slow that rlxd
 //! drops events it has not read. It comes whatever the topics, and its own `seq` is `to`.
+//! One with `topics: ["pty"]` is narrower: rlxd keeps `pty.output` apart, and dropped
+//! only those, so every other event in that span still comes, before the gap (a
+//! subscriber that didn't ask for `pty` never gets one).
 //! A `since` past the last event gets [`codes::SINCE_AHEAD`], with `detail.head`.
 //!
 //! # Versioning
@@ -184,6 +193,7 @@ mod event;
 mod hello;
 mod here;
 mod marker;
+mod pty;
 mod request;
 mod run;
 pub mod schemas;
@@ -199,6 +209,14 @@ pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};
 pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use marker::{False, True, V1};
+pub use pty::{
+    ID_LENGTH as PTY_ID_LENGTH, MAX_KEY_NAME as MAX_PTY_KEY_NAME, MAX_LABEL as MAX_PTY_LABEL,
+    MAX_SCROLLBACK as MAX_PTY_SCROLLBACK, MAX_SIGNAL as MAX_PTY_SIGNAL, MAX_SIZE as MAX_PTY_SIZE,
+    MAX_WRITE as MAX_PTY_WRITE, PtyCursor, PtyExited, PtyInfo, PtyInput, PtyKillParams, PtyList,
+    PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
+    PtySubscribeParams, PtyWriteParams, check_id as check_pty_id,
+    check_key_name as check_pty_key_name, errors as pty_errors,
+};
 pub use request::{Params, Request, RequestId, methods};
 pub use run::{
     CallState, ConnectorStatus, DEFAULT_DEADLINE_MS, FailReason, McpServer, Mount,

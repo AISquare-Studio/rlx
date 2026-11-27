@@ -46,6 +46,13 @@
 //! `events.subscribe {since}` replays. One event's line may be at most [`MAX_EVENT`]
 //! bytes, the longest line a client reads.
 //!
+//! **PTY output is kept apart** (handoff 1.4): `pty.output` events, which a busy terminal
+//! publishes by the thousand, go to a partition of their own, with its own caps
+//! ([`Limits::OUTPUT`]), so they never push a run, job or other topic's event out. Seqs
+//! stay the home's, one numbering across both. A subscriber reads both in seq order, and
+//! gets a `daemon.gap` for the output partition only when it asked for the `pty` topic.
+//! `pty.exited` stays with the other events.
+//!
 //! # Subscribers
 //!
 //! A subscriber is a place in the buffer ([`Cursor`]), not a queue of its own. Publishing
@@ -101,6 +108,14 @@ impl Limits {
     pub const DEFAULT: Self = Self {
         events: 10_000,
         bytes: 64 << 20,
+        age: Duration::from_secs(24 * 60 * 60),
+    };
+
+    /// The `pty.output` partition's: the last 20,000 events, at most 32 MiB of them, none
+    /// older than 24 hours.
+    pub const OUTPUT: Self = Self {
+        events: 20_000,
+        bytes: 32 << 20,
         age: Duration::from_secs(24 * 60 * 60),
     };
 }
@@ -238,6 +253,10 @@ pub struct RunReplay {
 #[derive(Clone, Debug)]
 pub struct Cursor {
     after: u64,
+    /// The same in the `pty.output` partition, which can be ahead of `after`: up to a
+    /// gap of that partition's, which says what it dropped, before the main ring's events
+    /// below the gap's end are read. Never behind `after`.
+    output_after: u64,
     topics: Topics,
     until: Option<u64>,
 }
@@ -262,17 +281,25 @@ pub struct Bus {
     head: watch::Sender<u64>,
     mark: Mark,
     limits: Limits,
+    output_limits: Limits,
     #[cfg(test)]
     hooks: tests::Hooks,
 }
 
 struct State {
-    /// The events held, oldest first: seqs `floor + 1` to `head`, one each.
+    /// The events held but `pty.output`, oldest first, in seq order.
     held: VecDeque<Held>,
     /// The bytes of their lines.
     bytes: usize,
-    /// Every seq at or below it is gone: dropped from the buffer, or an earlier rlxd's.
+    /// Every one of them at or below it is gone: dropped from the buffer, or an earlier
+    /// rlxd's.
     floor: u64,
+    /// The `pty.output` events held, oldest first, in seq order.
+    output: VecDeque<Held>,
+    /// The bytes of their lines.
+    output_bytes: usize,
+    /// Every `pty.output` event at or below it is gone.
+    output_floor: u64,
     /// The last seq given out.
     head: u64,
     /// The mark on disk: seqs up to it may be given out.
@@ -309,8 +336,15 @@ impl Bus {
         Self::open_at(home.rlxd_dir().join(MARK_FILE), Limits::DEFAULT)
     }
 
-    /// A bus whose mark is `path`, holding what `limits` allow.
+    /// A bus whose mark is `path`, holding what `limits` allow, and `pty.output` what
+    /// [`Limits::OUTPUT`] does.
     pub fn open_at(path: PathBuf, limits: Limits) -> Result<Self, String> {
+        Self::open_with(path, limits, Limits::OUTPUT)
+    }
+
+    /// A bus whose mark is `path`, holding what `limits` allow, and `pty.output` what
+    /// `output` does.
+    pub fn open_with(path: PathBuf, limits: Limits, output: Limits) -> Result<Self, String> {
         let mark = Mark::new(path);
         let last = mark.read()?;
         if last > u64::MAX - RESERVE {
@@ -329,6 +363,9 @@ impl Bus {
                 held: VecDeque::new(),
                 bytes: 0,
                 floor: last,
+                output: VecDeque::new(),
+                output_bytes: 0,
+                output_floor: last,
                 head: last,
                 reserved,
                 writing: false,
@@ -341,6 +378,10 @@ impl Bus {
             limits: Limits {
                 events: limits.events.max(1),
                 ..limits
+            },
+            output_limits: Limits {
+                events: output.events.max(1),
+                ..output
             },
             #[cfg(test)]
             hooks: tests::Hooks::default(),
@@ -376,7 +417,8 @@ impl Bus {
         let seq = state.head + 1;
         let event = Event::new(seq, clock::now(), topic, r#type, data).map_err(Refused::Event)?;
         let line = line(&event)?;
-        let write = self.append(&mut state, seq, bit, None, line);
+        let output = topic == topics::PTY && r#type == event_types::PTY_OUTPUT;
+        let write = self.append_to(&mut state, seq, bit, None, line, output);
         drop(state);
         self.after_unlock(seq, write);
         Ok(seq)
@@ -433,7 +475,7 @@ impl Bus {
         let log = state.runs.entry(Arc::clone(&id)).or_default();
         log.last = run_seq;
         log.held.push_back((run_seq, seq));
-        let write = self.append(&mut state, seq, bit, Some(id), Arc::clone(&line));
+        let write = self.append_to(&mut state, seq, bit, Some(id), Arc::clone(&line), false);
         drop(state);
         self.after_unlock(seq, write);
         Ok((Numbered { seq, run_seq }, line))
@@ -514,6 +556,7 @@ impl Bus {
             Some(since) if since > head => Err(head),
             since => Ok(Cursor {
                 after: since.unwrap_or(head),
+                output_after: since.unwrap_or(head),
                 topics,
                 until: (!follow).then_some(head),
             }),
@@ -525,31 +568,107 @@ impl Bus {
     /// events after it. None when it is up to date, or done.
     pub fn read(&self, cursor: &mut Cursor, lines: usize, bytes: usize) -> Vec<Line> {
         let mut state = self.state();
-        state.drop_old(&self.limits);
+        state.drop_old(&self.limits, &self.output_limits);
         let end = cursor.until.unwrap_or(state.head).min(state.head);
         let mut batch = Vec::new();
         if cursor.after >= end {
             return batch;
         }
+        let output = bit(topics::PTY).is_some_and(|pty| cursor.topics.has(pty));
         let mut taken = 0;
+        // The main ring's loss first: what it dropped, of every topic, as a gap.
         if cursor.after < state.floor {
             let to = state.floor.min(end);
-            let gap = gap(cursor.after + 1, to);
+            // From the earlier of the two places: an output loss still waiting to be told
+            // is in this gap too, which the cursor reads past (#2678 minor 1).
+            let from = if output {
+                cursor.after.min(cursor.output_after)
+            } else {
+                cursor.after
+            };
+            let gap = gap(from + 1, to, false);
             taken += gap.len();
             batch.push(gap);
             cursor.after = to;
+            cursor.output_after = cursor.output_after.max(to);
         }
-        let start = usize::try_from(cursor.after.saturating_sub(state.floor)).unwrap_or(usize::MAX);
-        for held in state.held.range(start.min(state.held.len())..) {
+        if !output {
+            cursor.output_after = cursor.after;
+        }
+        // The output partition's loss, for a cursor that asked for `pty`: a gap that
+        // says it is `pty`'s only, in its place in seq order, so the main ring's events
+        // below its end still come, before it. It runs from where the loss began, and
+        // ends at the highest seq up to the partition's floor (and the cursor's end) that
+        // no held event of the main ring has: only a dropped output event can have had
+        // it, so the gap's own seq is no other line's.
+        let lost_from = cursor.output_after + 1;
+        let mut output_lost = None;
+        if output && cursor.output_after < state.output_floor {
+            let mut to = state.output_floor.min(end);
+            while to > cursor.output_after
+                && state
+                    .held
+                    .binary_search_by_key(&to, |held| held.seq)
+                    .is_ok()
+            {
+                to -= 1;
+            }
+            output_lost = (to > cursor.output_after).then_some(to);
+        }
+        let mut main = state.held.partition_point(|held| held.seq <= cursor.after);
+        let mut out = if output {
+            state
+                .output
+                .partition_point(|held| held.seq <= cursor.output_after)
+        } else {
+            state.output.len()
+        };
+        loop {
+            let a = state.held.get(main).filter(|held| held.seq <= end);
+            let b = state.output.get(out).filter(|held| held.seq <= end);
+            let next = [a.map(|a| a.seq), b.map(|b| b.seq), output_lost]
+                .into_iter()
+                .flatten()
+                .min();
+            let Some(seq) = next else {
+                // Every event up to the end is read or not this cursor's.
+                cursor.after = end;
+                cursor.output_after = end;
+                break;
+            };
             let full = batch.len() >= lines.max(1) || (!batch.is_empty() && taken >= bytes);
-            if held.seq > end || full {
+            if full {
                 break;
             }
-            cursor.after = held.seq;
-            if cursor.topics.has(held.topic) {
-                taken += held.line.len();
-                batch.push(Arc::clone(&held.line));
+            if output_lost == Some(seq) {
+                let gap = gap(lost_from, seq, true);
+                taken += gap.len();
+                batch.push(gap);
+                output_lost = None;
+                cursor.output_after = seq;
+            } else {
+                let from_main = a.is_some_and(|a| a.seq == seq);
+                let held = if from_main {
+                    main += 1;
+                    a
+                } else {
+                    out += 1;
+                    b
+                };
+                let held = held.expect("the next seq is one of the held events'");
+                if cursor.topics.has(held.topic) {
+                    taken += held.line.len();
+                    batch.push(Arc::clone(&held.line));
+                }
+                // The output partition's place moves with its own events, and with the
+                // main ring's only once no loss of its is waiting to be told.
+                if !from_main || output_lost.is_none() {
+                    cursor.output_after = cursor.output_after.max(seq);
+                }
             }
+            // Read in seq order: every held event before `seq`, in either partition, is
+            // read or passed over.
+            cursor.after = seq;
         }
         batch
     }
@@ -595,26 +714,34 @@ impl Bus {
         }
     }
 
-    /// Appends event `seq`, the next, and moves the head watch on while the lock is still
-    /// held, so it never goes back. The mark to write ahead, when this publisher is to.
-    fn append(
+    /// Appends event `seq`, the next, to the `output` partition or the other, and moves
+    /// the head watch on while the lock is still held, so it never goes back. The mark to
+    /// write ahead, when this publisher is to.
+    fn append_to(
         &self,
         state: &mut State,
         seq: u64,
         topic: u32,
         run: Option<Arc<str>>,
         line: Line,
+        output: bool,
     ) -> Option<u64> {
-        state.bytes += line.len();
-        state.held.push_back(Held {
+        let held = Held {
             seq,
             topic,
             at: SystemTime::now(),
             run,
             line,
-        });
+        };
+        if output {
+            state.output_bytes += held.line.len();
+            state.output.push_back(held);
+        } else {
+            state.bytes += held.line.len();
+            state.held.push_back(held);
+        }
         state.head = seq;
-        state.drop_old(&self.limits);
+        state.drop_old(&self.limits, &self.output_limits);
         self.head.send_replace(seq);
         let retry = state
             .failed
@@ -664,10 +791,23 @@ impl Bus {
 }
 
 impl State {
-    /// Drops the oldest events while there are more than `limits` allow, or they are too
-    /// old. The newest event stays.
-    fn drop_old(&mut self, limits: &Limits) {
+    /// Drops the oldest events of each partition while it holds more than its limits
+    /// allow, or they are too old. Each partition's newest event stays.
+    fn drop_old(&mut self, limits: &Limits, output: &Limits) {
         let now = SystemTime::now();
+        while let Some(oldest) = self.output.front() {
+            let old = now.duration_since(oldest.at).unwrap_or_default() > output.age;
+            let over = self.output.len() > output.events
+                || (self.output_bytes > output.bytes && self.output.len() > 1);
+            if !over && !old {
+                break;
+            }
+            let Some(gone) = self.output.pop_front() else {
+                break;
+            };
+            self.output_floor = gone.seq;
+            self.output_bytes -= gone.line.len();
+        }
         while let Some(oldest) = self.held.front() {
             let old = now.duration_since(oldest.at).unwrap_or_default() > limits.age;
             let over = self.held.len() > limits.events
@@ -692,9 +832,12 @@ impl State {
         }
     }
 
-    /// The line of held event `seq`.
+    /// The line of held event `seq`, which is not `pty.output`.
     fn line(&self, seq: u64) -> Line {
-        let at = usize::try_from(seq - self.floor - 1).expect("a held seq");
+        let at = self
+            .held
+            .binary_search_by_key(&seq, |held| held.seq)
+            .expect("a held seq");
         Arc::clone(&self.held[at].line)
     }
 }
@@ -710,10 +853,15 @@ fn line(event: &Event) -> Result<Line, Refused> {
 }
 
 /// `daemon.gap {from, to}`, numbered `to`.
-fn gap(from: u64, to: u64) -> Line {
+/// `daemon.gap {from, to}`, or for the `pty.output` partition `{from, to, topics: ["pty"]}`:
+/// only `pty` events went there, and the other topics' events in that span still come.
+fn gap(from: u64, to: u64, output: bool) -> Line {
     let mut data = Data::new();
     data.insert("from".to_owned(), Value::from(from));
     data.insert("to".to_owned(), Value::from(to));
+    if output {
+        data.insert("topics".to_owned(), Value::from(vec![topics::PTY]));
+    }
     let event = Event::new(
         to,
         clock::now(),
@@ -1629,5 +1777,337 @@ mod tests {
             !bus.state().runs.contains_key("idle"),
             "nothing held: gone at once"
         );
+    }
+
+    const PTY_ID: &str = "6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b";
+
+    fn output(bus: &Bus, n: u64) -> u64 {
+        let mut last = 0;
+        for _ in 0..n {
+            let data = rlxd_proto::PtyOutput::new(PTY_ID, "cmVhZHkNCg==")
+                .unwrap()
+                .to_data()
+                .unwrap();
+            last = bus
+                .publish(topics::PTY, event_types::PTY_OUTPUT, data)
+                .unwrap();
+        }
+        last
+    }
+
+    #[test]
+    fn pty_output_never_pushes_another_topics_event_out() {
+        let dir = Dir::new();
+        let few = Limits {
+            events: 4,
+            ..Limits::DEFAULT
+        };
+        let bus = Bus::open_with(
+            dir.mark(),
+            few,
+            Limits {
+                events: 3,
+                ..Limits::OUTPUT
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            bus.publish_run(run("r1"), "run.text", Data::new()).unwrap();
+        }
+        let flood = output(&bus, 500);
+        // The run's events are all still here, for a replay and for a since.
+        let replay = bus.run_events("r1", 1).unwrap();
+        assert_eq!(seqs(&replay.lines), [1, 2, 3]);
+        let mut runs = bus
+            .cursor(Topics::of([topics::RUN]).unwrap(), Some(0), false)
+            .unwrap();
+        let read = bus.read(&mut runs, BATCH, BATCH_BYTES);
+        assert_eq!(
+            seqs(&read),
+            [1, 2, 3],
+            "no gap for a topic that lost nothing"
+        );
+        assert!(
+            runs.is_done(),
+            "a replay ends at the head, an output event's"
+        );
+        assert_eq!(runs.after(), flood);
+        // The output partition kept its last three.
+        let mut pty = bus
+            .cursor(Topics::of([topics::PTY]).unwrap(), Some(0), false)
+            .unwrap();
+        let read = events(&bus.read(&mut pty, BATCH, BATCH_BYTES));
+        assert_eq!(read[0]["type"], "daemon.gap");
+        // From 1, where the cursor's output began: the run's events, 1 to 3, are still
+        // here, only not this cursor's, and the gap says only pty's are gone.
+        assert_eq!(
+            read[0]["data"],
+            json!({"from": 1, "to": flood - 3, "topics": ["pty"]})
+        );
+        let after: Vec<u64> = read[1..]
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(after, [flood - 2, flood - 1, flood]);
+    }
+
+    /// #2574 major 1: an output flood costs no cursor the main ring's events it still
+    /// holds: a cursor of every topic, one of run and pty, and one of pty alone, whose
+    /// held pty.exited comes before the output's gap.
+    #[test]
+    fn an_output_flood_costs_no_cursor_the_main_rings_events() {
+        let dir = Dir::new();
+        let bus = Bus::open_with(
+            dir.mark(),
+            Limits::DEFAULT,
+            Limits {
+                events: 3,
+                ..Limits::OUTPUT
+            },
+        )
+        .unwrap();
+        let exited = rlxd_proto::PtyExited::new(PTY_ID, 3, None)
+            .unwrap()
+            .to_data()
+            .unwrap();
+        let mut main = Vec::new();
+        main.push(
+            bus.publish(topics::PTY, event_types::PTY_EXITED, exited)
+                .unwrap(),
+        );
+        for _ in 0..2 {
+            main.push(
+                bus.publish_run(run("r1"), "run.text", Data::new())
+                    .unwrap()
+                    .seq,
+            );
+        }
+        main.push(emit(&bus, 3));
+        let flood = output(&bus, 500);
+        let after = bus
+            .publish_run(run("r1"), "run.text", Data::new())
+            .unwrap()
+            .seq;
+        for (topics, wanted) in [
+            (Topics::ALL, vec![1, 2, 3, 4, 5, 6, after]),
+            (
+                Topics::of([topics::RUN, topics::PTY]).unwrap(),
+                vec![1, 2, 3, after],
+            ),
+            (Topics::of([topics::PTY]).unwrap(), vec![1]),
+        ] {
+            let mut cursor = bus.cursor(topics, Some(0), false).unwrap();
+            let mut read = Vec::new();
+            loop {
+                let batch = bus.read(&mut cursor, 7, BATCH_BYTES);
+                if batch.is_empty() {
+                    break;
+                }
+                read.extend(events(&batch));
+            }
+            let seqs: Vec<u64> = read.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{topics:?}: {seqs:?}");
+            let gaps: Vec<&Value> = read.iter().filter(|e| e["type"] == "daemon.gap").collect();
+            assert_eq!(gaps.len(), 1, "{topics:?}: {read:?}");
+            assert_eq!(
+                gaps[0]["data"],
+                json!({"from": 1, "to": flood - 3, "topics": ["pty"]}),
+                "{topics:?}"
+            );
+            let held: Vec<u64> = read
+                .iter()
+                .filter(|e| e["type"] != "daemon.gap" && e["type"] != "pty.output")
+                .map(|e| e["seq"].as_u64().unwrap())
+                .collect();
+            assert_eq!(held, wanted, "{topics:?}");
+            let output: Vec<u64> = read
+                .iter()
+                .filter(|e| e["type"] == "pty.output")
+                .map(|e| e["seq"].as_u64().unwrap())
+                .collect();
+            assert_eq!(output, [flood - 2, flood - 1, flood], "{topics:?}");
+        }
+        // A cursor without pty never hears of the output's loss.
+        let mut runs = bus
+            .cursor(Topics::of([topics::RUN]).unwrap(), Some(0), false)
+            .unwrap();
+        let read = events(&bus.read(&mut runs, BATCH, BATCH_BYTES));
+        assert!(read.iter().all(|e| e["type"] == "run.text"), "{read:?}");
+        assert_eq!(read.len(), 3);
+    }
+
+    /// Every line a cursor reads, at most `lines` at a time.
+    fn read_by(bus: &Bus, cursor: &mut Cursor, lines: usize) -> Vec<Value> {
+        let mut read = Vec::new();
+        loop {
+            let batch = bus.read(cursor, lines, BATCH_BYTES);
+            if batch.is_empty() {
+                return read;
+            }
+            read.extend(events(&batch));
+        }
+    }
+
+    /// #2641 major 1: a replay that ends (`follow: false`) at a held event of the main
+    /// ring, with output dropped past that end before it reads: the output's gap takes a
+    /// seq of its own, below the event's, and the event still comes, however few lines a
+    /// read takes.
+    #[test]
+    fn a_replays_output_gap_never_shares_a_seq_or_costs_its_last_event() {
+        let few = Limits {
+            events: 3,
+            ..Limits::OUTPUT
+        };
+        let exited = rlxd_proto::PtyExited::new(PTY_ID, 3, None)
+            .unwrap()
+            .to_data()
+            .unwrap();
+        for (topics, last) in [
+            (Topics::ALL, "daemon.debug"),
+            (Topics::of([topics::PTY]).unwrap(), "pty.exited"),
+        ] {
+            for lines in [256, 1] {
+                let dir = Dir::new();
+                let bus = Bus::open_with(dir.mark(), Limits::DEFAULT, few).unwrap();
+                output(&bus, 2);
+                let head = if last == "pty.exited" {
+                    bus.publish(topics::PTY, event_types::PTY_EXITED, exited.clone())
+                        .unwrap()
+                } else {
+                    emit(&bus, 1)
+                };
+                let mut cursor = bus.cursor(topics, Some(0), false).unwrap();
+                output(&bus, 10);
+                let read = read_by(&bus, &mut cursor, lines);
+                let seqs: Vec<u64> = read.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+                assert!(
+                    seqs.windows(2).all(|w| w[0] < w[1]),
+                    "{last}, {lines} a read: {seqs:?}"
+                );
+                assert_eq!(read.len(), 2, "{last}, {lines} a read: {read:?}");
+                assert_eq!(
+                    read[0]["data"],
+                    json!({"from": 1, "to": head - 1, "topics": ["pty"]})
+                );
+                assert_eq!(
+                    (read[1]["seq"].as_u64(), &read[1]["type"]),
+                    (Some(head), &json!(last))
+                );
+                assert_eq!(cursor.after(), head);
+            }
+        }
+    }
+
+    /// #2641 minor 4: the output's gap starts where its loss did, before the main ring's
+    /// events that came between, which still come first.
+    #[test]
+    fn an_output_gap_starts_where_the_loss_did() {
+        let dir = Dir::new();
+        let bus = Bus::open_with(
+            dir.mark(),
+            Limits::DEFAULT,
+            Limits {
+                events: 3,
+                ..Limits::OUTPUT
+            },
+        )
+        .unwrap();
+        output(&bus, 1);
+        let held = emit(&bus, 1);
+        let flood = output(&bus, 10);
+        for lines in [256, 1] {
+            let mut cursor = bus.cursor(Topics::ALL, Some(0), false).unwrap();
+            let read = read_by(&bus, &mut cursor, lines);
+            assert_eq!(read[0]["seq"], held, "{lines}: {read:?}");
+            assert_eq!(
+                read[1]["data"],
+                json!({"from": 1, "to": flood - 3, "topics": ["pty"]}),
+                "{lines}: {read:?}"
+            );
+            let output: Vec<u64> = read[2..]
+                .iter()
+                .map(|e| e["seq"].as_u64().unwrap())
+                .collect();
+            assert_eq!(output, [flood - 2, flood - 1, flood]);
+        }
+    }
+
+    /// #2678 minor 1, the review's repro: an output loss still waiting when the main ring
+    /// drops past the cursor is in the main ring's gap, which starts below it.
+    #[test]
+    fn an_output_loss_waiting_is_in_the_main_rings_gap() {
+        let dir = Dir::new();
+        let bus = Bus::open_with(
+            dir.mark(),
+            Limits {
+                events: 2,
+                ..Limits::DEFAULT
+            },
+            Limits {
+                events: 1,
+                ..Limits::OUTPUT
+            },
+        )
+        .unwrap();
+        // o1 d2 o3 o4
+        output(&bus, 1);
+        emit(&bus, 1);
+        output(&bus, 2);
+        let mut cursor = bus.cursor(Topics::ALL, Some(0), true).unwrap();
+        let first = events(&bus.read(&mut cursor, 1, BATCH_BYTES));
+        assert_eq!(
+            (first[0]["seq"].as_u64(), &first[0]["type"]),
+            (Some(2), &json!("daemon.debug"))
+        );
+        // d5 d6 d7: the main ring keeps two, so it drops past the cursor.
+        emit(&bus, 3);
+        let read = events(&bus.read(&mut cursor, 256, BATCH_BYTES));
+        assert_eq!(read[0]["type"], "daemon.gap", "{read:?}");
+        assert_eq!(
+            read[0]["data"],
+            json!({"from": 1, "to": 5}),
+            "o1 is in a gap"
+        );
+        let seqs: Vec<u64> = read.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, [5, 6, 7]);
+    }
+
+    #[test]
+    fn both_partitions_read_in_seq_order() {
+        let dir = Dir::new();
+        let bus = dir.bus(CAPACITY);
+        let mut expected = Vec::new();
+        for i in 0..20 {
+            expected.push(if i % 3 == 0 {
+                emit(&bus, 1)
+            } else {
+                output(&bus, 1)
+            });
+        }
+        let pty_exited = rlxd_proto::PtyExited::new(PTY_ID, 3, None)
+            .unwrap()
+            .to_data()
+            .unwrap();
+        expected.push(
+            bus.publish(topics::PTY, event_types::PTY_EXITED, pty_exited)
+                .unwrap(),
+        );
+        let mut all = bus.cursor(Topics::ALL, Some(0), false).unwrap();
+        let mut read = Vec::new();
+        loop {
+            let batch = bus.read(&mut all, 4, BATCH_BYTES);
+            if batch.is_empty() {
+                break;
+            }
+            read.extend(seqs(&batch));
+        }
+        assert_eq!(read, expected);
+        // A cursor that didn't ask for pty passes the output over, and still ends.
+        let mut daemon = bus
+            .cursor(Topics::of([topics::DAEMON]).unwrap(), Some(0), false)
+            .unwrap();
+        let read = seqs(&bus.read(&mut daemon, BATCH, BATCH_BYTES));
+        assert_eq!(read, [1, 4, 7, 10, 13, 16, 19]);
+        assert!(daemon.is_done());
     }
 }

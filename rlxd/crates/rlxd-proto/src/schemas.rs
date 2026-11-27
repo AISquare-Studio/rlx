@@ -9,9 +9,11 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, Request, RunCancelData,
-    RunEvent, RunEventsData, RunEventsParams, RunGetData, RunListData, RunListParams, RunRef,
-    RunResumeData, RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
+    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, PtyExited, PtyKillParams,
+    PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
+    PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunEvent, RunEventsData,
+    RunEventsParams, RunGetData, RunListData, RunListParams, RunRef, RunResumeData,
+    RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
     SettingsGetParams, SettingsList, SettingsListParams, SettingsSetParams, SpaceEnsureData,
     SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
 };
@@ -40,6 +42,17 @@ pub fn all() -> Vec<SchemaFile> {
         file::<HelloParams>("hello.json"),
         file::<HelloData>("hello-reply.json"),
         file::<HereData>("here-reply.json"),
+        file::<PtyExited>("pty-exited.json"),
+        file::<PtyKillParams>("pty-kill.json"),
+        file::<PtyList>("pty-list-reply.json"),
+        file::<PtyOutput>("pty-output.json"),
+        file::<PtyRef>("pty-ref.json"),
+        file::<PtyResizeParams>("pty-resize.json"),
+        file::<PtyScreenParams>("pty-screen.json"),
+        file::<PtyScreen>("pty-screen-reply.json"),
+        file::<PtySpawnParams>("pty-spawn.json"),
+        file::<PtySubscribeParams>("pty-subscribe.json"),
+        file::<PtyWriteParams>("pty-write.json"),
         file::<Request>("request.json"),
         file::<RunCancelData>("run-cancel-reply.json"),
         file::<RunEvent>("run-event.json"),

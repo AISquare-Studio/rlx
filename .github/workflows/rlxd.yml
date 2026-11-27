@@ -136,6 +136,24 @@ jobs:
           echo "RLXD_GATE_TEST_KEYCHAIN=$kc" >> "$GITHUB_ENV"
           echo "RLXD_GATE_TEST_KEYCHAIN_PASSWORD=rlxd-gate-test" >> "$GITHUB_ENV"
 
+      # 1.4: the PTY host's frame must equal tmux's capture-pane byte for byte, so the
+      # tests compare against tmux itself, installed here for them only. With
+      # RLXD_TMUX_REQUIRED, a missing tmux fails them rather than skipping.
+      - name: tmux, for the frame tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux
+          tmux -V
+          echo "RLXD_TMUX_REQUIRED=1" >> "$GITHUB_ENV"
+
+      - name: tmux, for the frame tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install tmux
+          tmux -V
+          echo "RLXD_TMUX_REQUIRED=1" >> "$GITHUB_ENV"
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

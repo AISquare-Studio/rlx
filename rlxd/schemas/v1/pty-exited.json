@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtyExited",
+  "description": "`pty.exited`'s data, on the `pty` topic: the process ended. The PTY keeps its last\nscreen until `pty.kill`.\n\n```json\n{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\", \"status\": 3}\n```",
+  "type": "object",
+  "properties": {
+    "error": {
+      "description": "Why rlxd ended the process itself, when it did, as [`PtyScreen`]'s says.",
+      "type": "string",
+      "pattern": "^[a-z_]{1,64}$"
+    },
+    "pty_id": {
+      "description": "The PTY.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "signal": {
+      "description": "The signal that ended it, when one did.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 127,
+      "minimum": 1
+    },
+    "status": {
+      "description": "Its exit status, as [`PtyScreen`]'s.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "pty_id",
+    "status"
+  ]
+}

@@ -228,6 +228,65 @@ token reads every one.
   credential is replaced, can no longer change a protected key.
   `crates/rlxd/tests/settings.rs` pairs a device for real, in gate dev mode.
 
+## PTYs
+
+rlxd holds processes on pseudo-terminals (handoff 1.4), as tmux held the fleet's panes:
+ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the screen.
+
+- **The methods:** `pty.spawn {argv, cols, rows, cwd?, env?, label?}`, `pty.write
+  {pty_id, text | keys | paste}`, `pty.resize`, `pty.screen {pty_id, scrollback?}`,
+  `pty.subscribe {pty_id, read_only}`, `pty.kill` and `pty.list`, each through `rlxd
+  call` but the stream. Their shapes are in `schemas/v1/README.md`.
+- **The stream:** `pty.subscribe` sends the screen (`pty.snapshot`), then the PTY's
+  `pty.output` and `pty.exited`. A client too slow to keep up gets a fresh snapshot
+  instead of what it missed; the PTY never waits for it. `pty.output` has a partition of
+  the bus to itself (20,000 events, 32 MiB), so it never pushes another topic's events
+  out.
+- **The screen is tmux's.** `pty.screen`'s `text` is what `tmux capture-pane -e -p`
+  prints for the same screen, byte for byte. `crate::vt` is tmux 3.8's own grid, screen
+  writes and input parser, ported. Each ported file keeps tmux's ISC notice.
+  `tests/vt_tmux.rs` checks it against tmux itself on 41 screens, and `tests/pty.rs`
+  runs the handoff's own `cmp`.
+- **A program's output can't take rlxd down.** The model parses what a program writes,
+  so it takes hostile bytes too; a seeded random test feeds it such bytes, with resizes
+  in the middle of sequences, and checks it never panics and its memory stays bounded.
+  Should it panic anyway, that PTY alone ends: rlxd catches the panic, ends the
+  process's group, and the PTY's screen (blank from then on), list entry and
+  `pty.exited` say `error: "screen_failed"`. rlxd, its other PTYs and every connection
+  go on. Unlike tmux, a hyperlink whose id is over 1 KiB is dropped, as one whose URI is:
+  tmux keeps up to 5,000 ids of any length.
+- **A PTY outlives every client,** and one any connection spawned is in every
+  connection's `pty.list`. A process that ends keeps its screen and exit status until
+  `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `rlxd stop` ends them all.
+- **`rlxd attach <pty_id> [--read-only]`** puts a PTY in this terminal, as `tmux -L asq
+  attach` did: its screen, then its output; this terminal's keys sent by name and its
+  pastes as pastes, so rlxd sends them as the program's modes need; the PTY sized to
+  this terminal. Ctrl-] detaches. `--read-only` sends nothing and leaves the size alone.
+- **`pty.kill`** ends the process's whole group: SIGHUP and SIGTERM, then SIGKILL after
+  two seconds. It replies once the group is gone.
+- **On Windows** each PTY's processes are in a Job Object that rlxd makes, named with
+  128 random bits, with `KILL_ON_JOB_CLOSE`; `pty.kill` ends the job. The ConPTY's
+  process is rlxd itself in a hidden mode, `rlxd __pty-shim`, which joins the job before
+  it starts the program, so nothing the program starts escapes it, and exits with the
+  program's exit code, all 32 bits. The shim lives through Ctrl-C and Ctrl-Break, which
+  the console sends the program too, and turns Ctrl-C back on for the program first: a
+  detached rlxd's process group ignores it, and every process would inherit that.
+  `pty.list`'s `pid` there is the shim's.
+- **Who may do what:** `cli` and `tui` every method; `remote` the reads and
+  `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
+- **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;
+  128 KiB a write, so the longest one fits a frame however it is escaped. A longer write
+  gets `write_too_large`, and a frame over 1 MiB `frame_too_large`; the connection stays
+  open for both. A paste over 128 KiB would need a paste in parts: §1.8's to decide.
+- **The terminal** is `TERM=xterm-256color`, `COLORTERM=truecolor`, unless `env` says
+  otherwise.
+- **The environment** is rlxd's, less what the fleet's tmux server takes out of a
+  window's (`core/spawn.py`'s `tmux_client_env`) and tmux's own `TMUX`, `TMUX_PANE`,
+  `TERM_PROGRAM` and `TERM_PROGRAM_VERSION` (`src/pty/env.rs`). `tests/pty.rs` checks
+  the lists against Python's through `uv run`, so they can't drift.
+- **A process that ends** stays a zombie until `pty.kill` or `rlxd stop` reaps it, after
+  signalling its group, so the group's id is never another's by then.
+
 ## The runner and spaces
 
 rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.5 and
@@ -738,3 +797,20 @@ is renamed aside, and the next install removes it.
 ## Licence
 
 MIT, as rlx is (`../LICENSE`).
+
+Parts of `crates/rlxd` are ported from tmux 3.8 and stay under tmux's ISC licence, so
+the crate's licence is `MIT AND ISC`:
+
+- `src/vt/` (its grid, screen writes, input parser, UTF-8 handling, hyperlinks and
+  `capture-pane`'s loop: grid.c, grid-view.c, screen.c, screen-write.c, input.c,
+  utf8.c, utf8-combined.c, hyperlinks.c and cmd-capture-pane.c);
+- `src/pty/keys.rs` (key names, the bytes for keys, and `paste-buffer -p`:
+  key-string.c, input-keys.c, cmd-send-keys.c and cmd-paste-buffer.c).
+
+Each of those files starts with the copyright lines and the permission notice of the
+tmux files it comes from.
+
+Every rlxd binary carries those notices too: `THIRD_PARTY_NOTICES` here holds tmux's
+copyright and permission notice for each file ported from it, rlxd embeds it when it is
+built, and `rlxd licenses` prints it. The release archives hold just `rlxd` and
+`rlxd-hook`, so the notice travels inside the binary.
