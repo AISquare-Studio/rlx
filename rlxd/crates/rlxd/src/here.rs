@@ -452,10 +452,7 @@ fn parse_versions(text: &str) -> Result<Vec<u32>, String> {
 /// rlx's command: beside this rlxd first, since rlxd is installed in rlx's folder
 /// ([`install::dirs`]), then in the install folders, then on `PATH`.
 fn find_rlx(beside: Option<&Path>) -> InstalledRlx {
-    let mut dirs: Vec<PathBuf> = beside.into_iter().map(Path::to_path_buf).collect();
-    dirs.extend(install::dirs());
-    dirs.extend(path_dirs());
-    match install::find_in("rlx", &dirs) {
+    match install::find_rlx(beside) {
         Some(path) => InstalledRlx::found(shown(&path), rlx_version(&path)),
         None => InstalledRlx::missing(),
     }

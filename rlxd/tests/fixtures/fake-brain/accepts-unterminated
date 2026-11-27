@@ -1,0 +1,13 @@
+#!/bin/sh
+# fake-brain/accepts-unterminated: says a good hello, then writes its first request's
+# accepted frame WITHOUT the line's end, and stalls. rlxd's accept wait ends with the
+# bytes unread in the pipe; once it kills the brain it must read them (the last line,
+# unended, at the pipe's end) and say the request timed out, never that it was not
+# delivered: the brain may have begun running it (review #2555 M1, tester #2645).
+# accepts-unterminated.cmd is the same for Windows.
+read -r hello
+printf '%s\n' "{\"type\":\"hello\",\"protocol\":1,\"pid\":$$,\"rlx_version\":\"0.0.0\"}"
+read -r request
+id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"type":"accepted","id":%s}' "$id"
+exec sleep 60

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BrainInput",
+  "description": "A frame rlxd writes on the brain's stdin.\n\n```json\n{\"type\": \"hello\", \"protocol\": 1, \"rlxd_version\": \"0.10.3\"}\n{\"type\": \"request\", \"id\": 7, \"method\": \"ping\", \"params\": {}}\n```",
+  "oneOf": [
+    {
+      "description": "The first frame: the brain protocol rlxd speaks.",
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "description": "The brain protocol rlxd speaks.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "rlxd_version": {
+          "description": "rlxd's version, which is rlx's.",
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "hello"
+        }
+      },
+      "required": [
+        "type",
+        "protocol",
+        "rlxd_version"
+      ]
+    },
+    {
+      "description": "One request. rlxd sends the next only once this one has its reply.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The request's number, from 1, which its `accepted` and `reply` repeat.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 1
+        },
+        "method": {
+          "description": "What to do, such as `ping`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "params": {
+          "description": "The method's arguments.",
+          "type": "object",
+          "additionalProperties": true,
+          "default": {}
+        },
+        "type": {
+          "type": "string",
+          "const": "request"
+        }
+      },
+      "required": [
+        "type",
+        "id",
+        "method"
+      ]
+    }
+  ]
+}
