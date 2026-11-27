@@ -17760,6 +17760,7 @@ _WINDOW_PROBE = (
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+@pytest.mark.usefixtures("keychain_fake_for_children")
 def test_spawn_and_stop_on_a_real_tmux_server(
     claude_on_path: Path,
     project: ProjectInfo,
