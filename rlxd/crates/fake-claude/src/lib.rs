@@ -119,7 +119,8 @@ pub fn main() -> ExitCode {
             );
             return ExitCode::SUCCESS;
         }
-        ["mcp", "login", connector] => {
+        // `--` ends the options, as rlxd passes it.
+        ["mcp", "login", "--", connector] | ["mcp", "login", connector] => {
             let Some(login) = scenarios::login::find(&name) else {
                 eprintln!("fake-claude/{name}: plays no `mcp login`");
                 return ExitCode::from(2);
@@ -469,8 +470,10 @@ impl Fake {
         self.session.push(line.clone());
     }
 
-    /// Writes the session file, unless `--no-session-persistence`.
-    fn persist(&mut self) {
+    /// Writes what the session holds so far to its file, unless
+    /// `--no-session-persistence`. A scenario may write it early, as Claude Code writes
+    /// a message as it comes; the rest follows at the end.
+    pub(crate) fn persist(&mut self) {
         if self.flag("--no-session-persistence") {
             return;
         }

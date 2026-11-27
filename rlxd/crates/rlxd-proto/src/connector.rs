@@ -212,7 +212,8 @@ pub struct ConnectorsListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub refresh: Option<bool>,
-    /// With `refresh`, and no route without a turn: run a one-turn probe for it.
+    /// With `refresh`, and no route without a turn: run a one-turn probe for it. For
+    /// `app`, `cli` and `tui`; `remote` gets `role_not_allowed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub allow_turn: Option<bool>,
@@ -257,8 +258,9 @@ struct UncheckedList {
 #[schemars(title = "ConnectorsLoginParams")]
 #[non_exhaustive]
 pub struct ConnectorsLoginParams {
-    /// The connector, such as `claude.ai Slack`.
-    #[schemars(length(min = 1, max = 256))]
+    /// The connector, such as `claude.ai Slack`. Never one that begins with `-`, which
+    /// `claude mcp login` would read as an option.
+    #[schemars(length(min = 1, max = 256), regex(pattern = r"^[^-]"))]
     pub id: String,
 }
 
@@ -272,7 +274,14 @@ impl ConnectorsLoginParams {
 
     /// Whether these params keep every rule of `connectors-login.json`.
     pub fn validate(&self) -> Result<(), Invalid> {
-        check_id("id", &self.id)
+        check_id("id", &self.id)?;
+        if self.id.starts_with('-') {
+            return Err(Invalid::new(
+                "id",
+                "begins with '-', which `claude mcp login` would read as an option",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -507,5 +516,21 @@ impl ConnectorLoginError {
             code,
             message: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_login_id_is_a_connector_id_that_is_no_option() {
+        assert!(ConnectorsLoginParams::new("claude.ai Slack").is_ok());
+        for id in ["", "-x", "--help", "a\nb", &"a".repeat(MAX_ID + 1)] {
+            assert!(ConnectorsLoginParams::new(id).is_err(), "{id:?}");
+        }
+        let read: Result<ConnectorsLoginParams, _> =
+            serde_json::from_value(serde_json::json!({"id": "--help"}));
+        assert!(read.is_err());
     }
 }

@@ -250,11 +250,13 @@
           "$ref": "#/$defs/Mount"
         },
         "needs_connectors": {
-          "description": "The connectors that must be `connected` before the first turn (5.5): rlxd makes\nup to 3 tries, and ends the run `run.failed {reason: \"connectors\"}` when they run\nout, or at once when one is `needs-auth` or `failed`.",
+          "description": "The connectors that must be `connected` before the first turn (5.5): rlxd makes\nup to 3 tries, and ends the run `run.failed {reason: \"connectors\"}` when they run\nout, or at once when one is `needs-auth` or `failed`. Each is a connector's id, as\n`connectors.list` gives it. A `no_tools` run loads none, so it names none.",
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
           }
         },
         "needs_you_when": {

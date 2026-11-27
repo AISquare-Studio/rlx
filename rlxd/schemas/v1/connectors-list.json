@@ -5,7 +5,7 @@
   "type": "object",
   "properties": {
     "allow_turn": {
-      "description": "With `refresh`, and no route without a turn: run a one-turn probe for it.",
+      "description": "With `refresh`, and no route without a turn: run a one-turn probe for it. For\n`app`, `cli` and `tui`; `remote` gets `role_not_allowed`.",
       "type": "boolean"
     },
     "refresh": {

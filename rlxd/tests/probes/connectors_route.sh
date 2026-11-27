@@ -8,7 +8,14 @@
 # prints is statuses, counts and yes/no.
 #
 #   rlxd/tests/probes/connectors_route.sh            P1-P3, P5, P6 and P7
-#   rlxd/tests/probes/connectors_route.sh --login    P4 as well: a real `claude mcp login`
+#   rlxd/tests/probes/connectors_route.sh --login    P4 as well: a real `claude mcp login`,
+#                                                    which signs the connector in again
+#
+# Every Claude Code it starts itself (P1, P5) runs in an empty folder with no user or
+# local settings (`--setting-sources project`), asks for no permission
+# (`--permission-mode dontAsk`), and has each tool call it attempts denied by rlxd's own
+# probe hook (`rlxd __probe-deny`), as rlxd's one-turn refresh does. P6 and P7 go through
+# rlxd, which starts Claude Code its own way.
 #
 # CLAUDE      Claude Code (default: `command -v claude`)
 # RLXD        a built rlxd (default: rlxd/target/debug/rlxd; `cargo build -p rlxd` first)
@@ -30,6 +37,10 @@ for need in jq mkfifo uuidgen; do
 done
 [ -x "$CLAUDE" ] || { echo "no Claude Code: set CLAUDE" >&2; exit 2; }
 [ -x "$RLXD" ] || { echo "no rlxd at $RLXD: cargo build -p rlxd, or set RLXD" >&2; exit 2; }
+RLXD=$(cd "$(dirname "$RLXD")" && pwd)/$(basename "$RLXD")
+case "$RLXD" in
+  *[\"\$\`\\]*) echo "rlxd's path holds a character a hook's shell would read" >&2; exit 2;;
+esac
 
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/rlxd-connectors-probe.XXXXXX")
 echo "probe: results in $OUT"
@@ -37,8 +48,17 @@ PROMPT='Reply with the single word OK.'
 user_line() {
   jq -cn --arg t "$1" '{type:"user",message:{role:"user",content:[{type:"text",text:$t}]},parent_tool_use_id:null}'
 }
-# The prefix Claude Code mounts a server's tools under, as rlxd expects it.
-prefix=$(printf 'mcp__%s__' "$(printf '%s' "$CONNECTOR" | sed 's/[^A-Za-z0-9_-]/_/g')")
+# The prefix Claude Code mounts a server's tools under, as rlxd expects it: each
+# character but a letter, a digit, _ or - as _, and for a claude.ai connector runs of _
+# as one and none at the ends.
+written=$(printf '%s' "$CONNECTOR" | sed 's/[^A-Za-z0-9_-]/_/g')
+case "$CONNECTOR" in "claude.ai "*) written=$(printf '%s' "$written" | sed -E 's/_+/_/g; s/^_//; s/_$//');; esac
+prefix="mcp__${written}__"
+# The settings of every Claude Code this script starts itself: each tool call denied.
+deny="$OUT/deny-all.json"
+jq -n --arg c "\"$RLXD\" __probe-deny" \
+  '{hooks: {PreToolUse: [{matcher: "*", hooks: [{type: "command", command: $c, timeout: 10}]}]}}' > "$deny"
+safe=(--setting-sources project --permission-mode dontAsk --settings "$deny")
 mask() { sed -E 's#(https?://[^ ?#]*)[?#][^ ]*#\1?<query masked>#g'; }
 verdict() { printf '%-4s %s\n' "$1" "$2"; printf '%s\t%s\n' "$1" "$2" >> "$OUT/summary.tsv"; }
 
@@ -49,7 +69,7 @@ verdict() { printf '%-4s %s\n' "$1" "$2"; printf '%s\t%s\n' "$1" "$2" >> "$OUT/s
 space=$(mktemp -d "$OUT/space.XXXXXX")
 mkfifo "$OUT/p1.in"
 (cd "$space" && exec "$CLAUDE" -p --verbose --output-format stream-json --input-format stream-json \
-  --no-session-persistence --tools "" --max-turns 1 --setting-sources project \
+  --no-session-persistence --tools "" --max-turns 1 "${safe[@]}" \
   < "$OUT/p1.in" > "$OUT/p1.jsonl" 2> "$OUT/p1.err") &
 p1=$!
 exec 3> "$OUT/p1.in"
@@ -72,8 +92,9 @@ verdict P2 "tools under $prefix: $(jq -r --arg p "$prefix" '[.tools[]? | (if typ
 verdict P3 "--max-turns 1 taken: $(grep -qi 'unknown option\|error: ' "$OUT/p1.err" && echo "NO (see p1.err)" || echo yes)"
 
 # --- P4: claude mcp login, in a terminal (--login only) ----------------------------------
+# It signs the connector in again: finishing it in the browser replaces its sign-in.
 if [ "$LOGIN" = 1 ]; then
-  echo "P4: a real 'claude mcp login $CONNECTOR': finish or close the browser when it opens"
+  echo "P4: a real 'claude mcp login $CONNECTOR', which signs it in again: finish or close the browser when it opens"
   if [ "$(uname)" = Darwin ]; then
     script -q "$OUT/p4.raw" "$CLAUDE" mcp login "$CONNECTOR" </dev/tty || true
   else
@@ -86,13 +107,15 @@ if [ "$LOGIN" = 1 ]; then
   verdict P4 "its URL is https: $(case "$url" in https://*) echo yes;; '') echo -;; *) echo NO;; esac)"
 fi
 
-# --- P5: a gated try ended, then the same --session-id again (two turns at most) ---------
-# rlxd removes an ended try's session file before the next try of a run that persists.
+# --- P5: a gated try ended, then the same --session-id again (three turns at most) -------
+# After a first attempt's missed try, rlxd removes the session file it left, so the next
+# try's --session-id starts anew. (A resumed attempt's tries are --resume, and rlxd only
+# cuts its session file back to its length before the attempt.)
 sid=$(uuidgen | tr 'A-Z' 'a-z')
 try() {
   (cd "$space" && printf '%s\n' "$(user_line "$PROMPT")" | "$CLAUDE" -p --verbose \
     --output-format stream-json --input-format stream-json --session-id "$sid" --tools "" \
-    --max-turns 1 > "$OUT/p5-$1.jsonl" 2> "$OUT/p5-$1.err") || true
+    --max-turns 1 "${safe[@]}" > "$OUT/p5-$1.jsonl" 2> "$OUT/p5-$1.err") || true
 }
 try 1
 try 2

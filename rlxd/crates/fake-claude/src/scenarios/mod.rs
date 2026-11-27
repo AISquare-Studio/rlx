@@ -41,6 +41,9 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("connectors-later", |fake| {
         connectors::play(fake, Schedule::ConnectsAt(8000), ANSWER)
     }),
+    ("connectors-later-noisy", |fake| {
+        connectors::play_noisy(fake, Schedule::ConnectsAt(8000), ANSWER)
+    }),
     ("connectors-needs-auth", |fake| {
         connectors::play(fake, Schedule::NeedsAuth, ANSWER)
     }),
@@ -57,6 +60,7 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("init-needs-auth", |fake| {
         connectors::play(fake, Schedule::NeedsAuth, ANSWER)
     }),
+    ("init-other", connectors::other),
     ("orphan", orphan::run),
     ("persist", persist::run),
     ("rate-limit", rate_limit::run),

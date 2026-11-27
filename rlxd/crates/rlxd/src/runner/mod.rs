@@ -303,6 +303,9 @@ struct RunInner {
     reply: Option<String>,
     /// The `needs_you.raised` the run has out, to clear when it goes on or ends.
     needs_you: Option<String>,
+    /// The connectors its `needs_you {reason: "auth"}` waits on (5.5): it is cleared,
+    /// too, once each is `connected` again. Empty when it has none out.
+    auth: Vec<String>,
     /// Events appended to the log since its last fsync.
     unsynced: u32,
     /// The last `run_seq` in the run's log: an event whose append failed is not counted,
@@ -455,6 +458,12 @@ impl Runner {
             notes: std::sync::OnceLock::new(),
         });
         runner.load();
+        let told = Arc::downgrade(&runner);
+        runner.connectors.on_connected(Box::new(move |connected| {
+            if let Some(runner) = told.upgrade() {
+                runner.signed_in(connected);
+            }
+        }));
         runner
     }
 
@@ -559,7 +568,13 @@ impl Runner {
             if lost.is_none() {
                 last_run_seq += skip;
             }
-            let needs_you = (record.state == RunState::NeedsYou)
+            // A failed run's sign-in needs-you stays out until its connectors are back.
+            let auth = if record.state == RunState::Failed {
+                record.auth.clone()
+            } else {
+                Vec::new()
+            };
+            let needs_you = (record.state == RunState::NeedsYou || !auth.is_empty())
                 .then(|| format!("run:{id}:{}", record.attempt));
             let run = Arc::new(Run {
                 job_id: record.job_id.clone(),
@@ -586,6 +601,7 @@ impl Runner {
                     last_line: tail.last_line.map(bus::Line::from),
                     reply: None,
                     needs_you,
+                    auth,
                     unsynced: 0,
                     logged: tail.last_run_seq,
                     // A call still executing when its rlxd stopped may have run: unknown.
@@ -802,6 +818,7 @@ impl Runner {
                 last_line: None,
                 reply: None,
                 needs_you: None,
+                auth: Vec::new(),
                 unsynced: 0,
                 logged: 0,
                 session_started: false,
@@ -1502,7 +1519,7 @@ impl Runner {
             return false;
         }
         let mut question = None;
-        let mut auth = None;
+        let mut auth = Vec::new();
         let (state, r#type, data) = match end {
             End::Done(done) => {
                 inner.session.clone_from(&done.session);
@@ -1526,7 +1543,7 @@ impl Runner {
                     .flatten()
                     .filter(|c| c.status == rlxd_proto::ConnectorState::NeedsAuth.as_str())
                     .map(|c| c.id.clone())
-                    .reduce(|a, b| format!("{a}, {b}"));
+                    .collect::<Vec<_>>();
                 (
                     RunState::Failed,
                     run_types::FAILED,
@@ -1565,15 +1582,23 @@ impl Runner {
             self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
             inner.needs_you = Some(id);
         }
-        if let Some(named) = auth {
-            // A connector's sign-in lapsed (5.5): the user signs it in again
-            // (`connectors.login`), and resumes the run. Raised before run.failed, as a
-            // question is.
+        if !auth.is_empty() {
+            // A connector's sign-in lapsed (5.5). Raised before run.failed, as a question
+            // is, and kept in the run's record. The user signs it in again
+            // (`connectors.login`, or Claude Code itself), and once rlxd sees each
+            // connector `connected` again (the login's end, or a later system/init) it is
+            // cleared ([`Runner::signed_in`]); a resume or the space's erase clears it
+            // too. A run that never reached run.started has no session to resume
+            // (`no_session`): a new run is the way on.
             let id = format!("run:{}:{}", run.params.run_id, inner.attempt);
-            let text = format!("Sign in again to {named}: its sign-in has lapsed.");
+            let text = format!(
+                "Sign in again to {}: its sign-in has lapsed.",
+                auth.join(", ")
+            );
             let raised = NeedsYouRaisedData::run(&id, run.params.run_id.as_str(), "auth", text);
             self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
             inner.needs_you = Some(id);
+            inner.auth = auth;
         }
         let published = match data {
             Ok(Value::Object(data)) => self.publish(run, inner, r#type, data, Durability::State),
@@ -1624,8 +1649,29 @@ impl Runner {
 
     /// Clears the `needs_you.raised` the run has out, if it has one.
     fn clear_needs_you(&self, inner: &mut RunInner) {
+        inner.auth.clear();
         if let Some(id) = inner.needs_you.take() {
             self.publish_needs_you(run_types::NEEDS_YOU_CLEARED, &NeedsYouClearedData::new(id));
+        }
+    }
+
+    /// Clears each failed run's `needs_you {reason: "auth"}` whose connectors are all
+    /// among `connected` (5.5): their sign-in is back. Called with no run's lock held.
+    fn signed_in(&self, connected: &[String]) {
+        for run in self.snapshot() {
+            let mut inner = run.inner();
+            if inner.auth.is_empty() || !inner.auth.iter().all(|id| connected.contains(id)) {
+                continue;
+            }
+            info!(
+                "run {}: its connectors are signed in again; its needs-you is cleared",
+                run.params.run_id
+            );
+            self.clear_needs_you(&mut inner);
+            let record = run.record(&inner);
+            if let Err(e) = blocking(|| run.dir.write_record(&record)) {
+                warning!("run {}: its record was not written: {e}", run.params.run_id);
+            }
         }
     }
 
@@ -1721,12 +1767,14 @@ impl Runner {
         let deadline = params
             .timeout_s
             .map(|s| Instant::now() + Duration::from_secs(s));
+        // What a missed try may add to the session, to take back: a resumed attempt's
+        // session as it was before its first try.
+        let kept = gate
+            .as_ref()
+            .map(|_| self.session_kept(run, &space, attempt));
         let mut tries = 0;
         loop {
             tries += 1;
-            if tries > 1 {
-                self.forget_try(run, &space);
-            }
             let end = match self
                 .try_once(
                     run,
@@ -1751,6 +1799,9 @@ impl Runner {
                         connector_gate::TRIES,
                         connector_gate::failure_message(&connectors, tries)
                     );
+                    if let Some(kept) = &kept {
+                        blocking(|| self.forget_try(run, kept));
+                    }
                     if !stop && tries < connector_gate::TRIES {
                         if let Some(reason) = self
                             .back_off(run, connector_gate::backoff(tries), deadline)
@@ -1760,11 +1811,8 @@ impl Runner {
                         }
                         continue;
                     }
-                    if let Some(init) = init {
-                        blocking(|| {
-                            self.connectors
-                                .observe(&init.mcp_servers, &init.tools, &init.hints);
-                        });
+                    if let Some(init) = init.filter(|_| reads_connectors(params)) {
+                        blocking(|| self.connectors.observe(init.observed()));
                     }
                     End::Failed(
                         RunFailedData::new(
@@ -1802,21 +1850,63 @@ impl Runner {
         })
     }
 
-    /// Before a gated run's next try: the session file a try that was ended may have
-    /// left, so the next starts its session anew and keeps nothing the run didn't
-    /// deliver. Only a run whose session persists has one.
-    fn forget_try(&self, run: &Run, space: &std::path::Path) {
+    /// The session files a gated attempt's tries write to, each with its length before
+    /// the first try when the attempt resumes one ([`Kept`]). None for a run whose
+    /// session isn't kept.
+    fn session_kept(&self, run: &Run, space: &std::path::Path, attempt: u64) -> Kept {
         if !run.params.persists() {
-            return;
+            return Kept::default();
         }
         let file = format!("{}.jsonl", run.params.run_id);
-        for dir in config_dirs() {
-            let path = dir.join("projects").join(project_folder(space)).join(&file);
-            let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
-            if regular && let Err(e) = std::fs::remove_file(&path) {
+        let files = config_dirs()
+            .into_iter()
+            .map(|dir| {
+                let path = dir.join("projects").join(project_folder(space)).join(&file);
+                let length = std::fs::symlink_metadata(&path)
+                    .ok()
+                    .filter(|m| m.file_type().is_file())
+                    .map(|m| m.len());
+                (path, length)
+            })
+            .collect();
+        Kept {
+            resumed: attempt > 1,
+            files,
+        }
+    }
+
+    /// After a gated try that was ended unconfirmed: what it wrote to its session is
+    /// taken back, so the next try (or a later resume) has nothing the run didn't
+    /// deliver. A first attempt's session started with the try, so its file goes. A
+    /// resumed attempt's file is the run's whole session: it is never removed, only cut
+    /// back to its length before the attempt's first try, and left as it is (with a
+    /// warning) when it is shorter than that or is no file.
+    fn forget_try(&self, run: &Run, kept: &Kept) {
+        for (path, before) in &kept.files {
+            let now = std::fs::symlink_metadata(path)
+                .ok()
+                .filter(|m| m.file_type().is_file())
+                .map(|m| m.len());
+            let forgotten = match (kept.resumed, before, now) {
+                (_, _, None) => Ok(()),
+                (false, _, Some(_)) => std::fs::remove_file(path),
+                (true, Some(before), Some(now)) if now > *before => std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .and_then(|file| file.set_len(*before)),
+                (true, Some(before), Some(now)) if now < *before => Err(std::io::Error::other(
+                    "it is shorter than before the attempt, so it is left as it is",
+                )),
+                (true, Some(_), Some(_)) => Ok(()),
+                (true, None, Some(_)) => Err(std::io::Error::other(
+                    "it was not there before the attempt, so it is left as it is",
+                )),
+            };
+            if let Err(e) = forgotten {
                 warning!(
-                    "run {}: the last try's session file was not removed: {e}",
-                    run.params.run_id
+                    "run {}: the last try's session was not taken back from {}: {e}",
+                    run.params.run_id,
+                    path.display()
                 );
             }
         }
@@ -2183,22 +2273,16 @@ impl Runner {
                     // Nothing of a try is the run's before its connectors are confirmed.
                     (_, false, Some(_)) => continue,
                 };
-                // The run's truth of its connectors, into their cache, its file written
-                // with no run's lock held. A no_tools run loads none, and says nothing
-                // of them.
-                if let Line::Init(init) = &parsed
-                    && !started
-                    && params.mount != Mount::NoTools
-                {
-                    blocking(|| {
-                        self.connectors
-                            .observe(&init.mcp_servers, &init.tools, &init.hints);
-                    });
-                }
+                // The init to take as the truth of the connectors, once the run has it.
+                let mut seen = None;
                 let mut inner = run.inner();
                 match parsed {
                     Line::Init(init) if !started => {
                         started = true;
+                        // A no_tools run loads none, and says nothing of them.
+                        if reads_connectors(params) {
+                            seen = Some(init.clone());
+                        }
                         inner.listed = gate::Listed {
                             tools: init.tools.iter().cloned().collect(),
                             servers: init
@@ -2283,6 +2367,13 @@ impl Runner {
                     }
                     Line::Result(outcome) => return Streamed::Result(outcome, stdin),
                     Line::Init(_) | Line::Partial(_) | Line::Other => {}
+                }
+                drop(inner);
+                // Into the connectors' cache, its file written with no run's lock held, and
+                // only after the gate has what the init listed: a hook that asks about the
+                // turn's first call never waits on the cache (5.1).
+                if let Some(init) = seen {
+                    blocking(|| self.connectors.observe(init.observed()));
                 }
             }
         }
@@ -2507,6 +2598,7 @@ impl Run {
             session_started: inner.session_started,
             calls: inner.calls.clone(),
             pinned_call_used: inner.pinned_call_used,
+            auth: inner.auth.clone(),
         }
     }
 }
@@ -2583,6 +2675,22 @@ impl Replay {
     pub fn reply(&self) -> RunEventsData {
         RunEventsData::new(self.run.params.run_id.clone(), self.through)
     }
+}
+
+/// Whether a run's `system/init` is the truth of the connectors: a `no_tools` run loads
+/// none (`--strict-mcp-config`), so it says nothing of them.
+fn reads_connectors(params: &RunStartParams) -> bool {
+    params.mount != Mount::NoTools
+}
+
+/// A gated attempt's session files ([`Runner::session_kept`]).
+#[derive(Debug, Default)]
+struct Kept {
+    /// Whether the attempt resumes the run's session (`--resume`).
+    resumed: bool,
+    /// Each file a try may write, with its length before the attempt's first try where
+    /// it was a file then.
+    files: Vec<(PathBuf, Option<u64>)>,
 }
 
 /// The Claude Code config directories whose sessions `space.erase` deletes:
@@ -2850,6 +2958,14 @@ pub fn check_start(params: &RunStartParams) -> Result<(), ErrorBody> {
                 "a {} run takes only mount {{\"kind\": \"no_tools\"}}",
                 params.kind
             ),
+        ));
+    }
+    if !params.needs_connectors.is_empty() && params.mount == Mount::NoTools {
+        return Err(refusal(
+            codes::KIND_MOUNT_MISMATCH,
+            "a run with needs_connectors takes a mount that loads them: mount \
+             {\"kind\": \"no_tools\"} loads none"
+                .to_owned(),
         ));
     }
     if params.kind.needs_pinned_call() && params.pinned_call.is_none() {

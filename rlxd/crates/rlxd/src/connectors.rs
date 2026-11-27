@@ -7,10 +7,15 @@
 //!   gated run that failed, and a one-turn refresh's. A gated try's `system/init` that is
 //!   not confirmed and is followed by another try changes nothing, so a connector warming
 //!   up is no change. A run with mount `no_tools` lists none (`--strict-mcp-config`) and
-//!   is not read. The cache is kept in `<home>/rlxd/connectors.json` (0600), so a
-//!   restarted rlxd lists what it listed.
+//!   is not read, and no `system/init` that lists no server at all empties the cache: a
+//!   Claude Code that loaded none says so too (E9's stdin at EOF). The cache is kept in
+//!   `<home>/rlxd/connectors.json` (0600), written whole ([`crate::durable::write`])
+//!   before any change is published, so a restarted rlxd lists what it listed.
 //! - **Events** (topic `connector`): `connector.added` and `connector.removed`, and
-//!   `connector.changed {id, status, previous_status}` once for each real change.
+//!   `connector.changed {id, status, previous_status}` once for each real change. A
+//!   change that leaves a connector `connected` is also told to the runner
+//!   ([`Connectors::on_connected`]), which clears a run's `needs_you {reason: "auth"}`
+//!   once each connector it named is back.
 //! - **`connectors.list`** gives the cache: `from: "init"`, `model_turns: 0`.
 //! - **`connectors.login {id}`** runs `claude mcp login <id>` in an rlxd PTY and reports
 //!   its steps as `connector.login.*` events. Only an `https://` URL is passed on, and no
@@ -18,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
@@ -34,7 +39,7 @@ use serde_json::Value;
 use crate::bus::Bus;
 use crate::log::{info, warning};
 use crate::pty::Host;
-use crate::{claude, clock, files};
+use crate::{claude, clock, durable};
 
 /// The cache's file, under `<home>/rlxd/`.
 const FILE: &str = "connectors.json";
@@ -71,6 +76,9 @@ impl Default for GateTimes {
     }
 }
 
+/// Told every connector the cache holds `connected`, after a change left one so.
+pub type OnConnected = Box<dyn Fn(&[String]) + Send + Sync>;
+
 /// What the file holds.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Saved {
@@ -91,6 +99,8 @@ pub struct Connectors {
     gate: GateTimes,
     /// The logins running, by connector: their `login_id`s.
     logins: Mutex<HashMap<String, String>>,
+    /// Who is told when a change leaves a connector `connected`: the runner.
+    on_connected: OnceLock<OnConnected>,
 }
 
 impl Connectors {
@@ -115,7 +125,24 @@ impl Connectors {
             route_1: test_route_1(),
             gate: GateTimes::default(),
             logins: Mutex::new(HashMap::new()),
+            on_connected: OnceLock::new(),
         })
+    }
+
+    /// Has `told` called, with no lock of the cache's held, with every connector the
+    /// cache holds `connected` each time a change leaves one so. The first caller's
+    /// stands.
+    pub fn on_connected(&self, told: OnConnected) {
+        if self.on_connected.set(told).is_err() {
+            warning!("connectors: a second on_connected is not taken");
+        }
+    }
+
+    /// Tells [`Connectors::on_connected`]'s callee who is connected now.
+    fn tell_connected(&self, connected: &[String]) {
+        if let Some(told) = self.on_connected.get() {
+            told(connected);
+        }
     }
 
     fn cache(&self) -> MutexGuard<'_, Saved> {
@@ -152,10 +179,18 @@ impl Connectors {
         )
     }
 
-    /// Takes a `system/init`'s `servers` and the `tools` it mounted, with each tool's
-    /// `readOnlyHint` where it carried one (`hints`), as the connectors now: the cache
-    /// and its file are replaced, and each change is published.
-    pub fn observe(&self, servers: &[McpServer], tools: &[String], hints: &HashMap<String, bool>) {
+    /// Takes a `system/init` as the connectors now: its `servers`, with each one's
+    /// `source` where it carried one (`sources`), and the `tools` it mounted, with each
+    /// tool's `readOnlyHint` where it carried one (`hints`). The cache and its file are
+    /// replaced, then each change is published. An init that lists no server changes
+    /// nothing a cache that holds some.
+    pub fn observe(&self, init: Observed<'_>) {
+        let Observed {
+            servers,
+            sources,
+            tools,
+            hints,
+        } = init;
         let mut now: BTreeMap<String, Connector> = BTreeMap::new();
         for server in servers {
             if now.contains_key(&server.name)
@@ -171,13 +206,18 @@ impl Connectors {
                 .collect();
             let connector = Connector::new(
                 server.name.clone(),
-                source_of(&server.name),
+                source_of(&server.name, sources.get(&server.name).map(String::as_str)),
                 ConnectorState::of(&server.status),
                 mounted,
             );
             now.insert(server.name.clone(), connector);
         }
         let mut cache = self.cache();
+        if now.is_empty() && !cache.connectors.is_empty() {
+            // It can't be told from a Claude Code that loaded no server (E9's stdin at
+            // EOF, a `no_tools` start), so it empties nothing.
+            return;
+        }
         let before: BTreeMap<&str, ConnectorState> = cache
             .connectors
             .iter()
@@ -199,15 +239,24 @@ impl Connectors {
                 events.push((connector_types::REMOVED, json_of(&ConnectorId::new(*id))));
             }
         }
+        let connected_now = now.iter().any(|(id, connector)| {
+            connector.status == ConnectorState::Connected
+                && before.get(id.as_str()) != Some(&ConnectorState::Connected)
+        });
         cache.connectors = now.into_values().collect();
         cache.as_of = Some(clock::now());
-        let saved = cache.clone();
-        // Published under the cache's lock, so two inits' changes are in their order.
+        // Kept, then published, both under the cache's lock: two inits' changes are
+        // written and published in their order, and none is published before it is
+        // kept.
+        self.save(&cache);
         for (r#type, data) in events {
             self.publish(r#type, data);
         }
+        let connected = connected_now.then(|| connected_in(&cache));
         drop(cache);
-        self.save(&saved);
+        if let Some(connected) = connected {
+            self.tell_connected(&connected);
+        }
     }
 
     /// Sets `id`'s status, when the cache has it: a login's end.
@@ -221,13 +270,16 @@ impl Connectors {
             return;
         }
         connector.status = status;
-        let saved = cache.clone();
+        self.save(&cache);
         self.publish(
             connector_types::CHANGED,
             json_of(&ConnectorChanged::new(id, status, previous)),
         );
+        let connected = (status == ConnectorState::Connected).then(|| connected_in(&cache));
         drop(cache);
-        self.save(&saved);
+        if let Some(connected) = connected {
+            self.tell_connected(&connected);
+        }
     }
 
     fn path(&self) -> PathBuf {
@@ -240,7 +292,7 @@ impl Connectors {
             .map_err(std::io::Error::other)
             .and_then(|text| {
                 std::fs::create_dir_all(self.home.rlxd_dir())?;
-                files::write_private(&path, &text)
+                durable::write(&path, text.as_bytes())
             });
         if let Err(e) = written {
             warning!("connectors: {} was not written: {e}", path.display());
@@ -326,10 +378,13 @@ impl Connectors {
             );
             return;
         };
+        // `--` first, so no id is read as an option (`connectors.login` refuses one that
+        // begins with `-` anyway).
         let argv = vec![
             program.to_string_lossy().into_owned(),
             "mcp".to_owned(),
             "login".to_owned(),
+            "--".to_owned(),
             id.to_owned(),
         ];
         let spawned = PtySpawnParams::new(argv, LOGIN_COLS, 50)
@@ -478,28 +533,43 @@ impl Connectors {
     }
 }
 
-/// The prefix of the tools Claude Code mounts for the server `name`: `mcp__`, the name
-/// with each character but an ASCII letter, digit, `_` or `-` as `_`, then `__`.
-pub fn tool_prefix(name: &str) -> String {
-    let normal: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("mcp__{normal}__")
+/// A `system/init`'s facts of the connectors ([`Connectors::observe`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Observed<'a> {
+    pub servers: &'a [McpServer],
+    /// Each server's `source`, where its entry carried one.
+    pub sources: &'a HashMap<String, String>,
+    pub tools: &'a [String],
+    /// Each tool's `readOnlyHint`, where its entry carried one.
+    pub hints: &'a HashMap<String, bool>,
 }
 
-/// Where a server comes from: `claude.ai` for a claude.ai connector, else `mcp`.
-fn source_of(name: &str) -> &'static str {
-    if name.starts_with("claude.ai ") {
-        "claude.ai"
-    } else {
-        "mcp"
+/// The connectors `saved` holds `connected`.
+fn connected_in(saved: &Saved) -> Vec<String> {
+    saved
+        .connectors
+        .iter()
+        .filter(|c| c.status == ConnectorState::Connected)
+        .map(|c| c.id.clone())
+        .collect()
+}
+
+/// The prefix of the tools Claude Code mounts for the server `name`: `mcp__`, its name
+/// as Claude Code writes it in tool names (the tool-call gate's
+/// [`crate::runner::claude_server_name`]), then `__`.
+pub fn tool_prefix(name: &str) -> String {
+    format!("mcp__{}__", crate::runner::claude_server_name(name))
+}
+
+/// Where a server comes from: `claude.ai` for a claude.ai connector, else `mcp`. A
+/// `source` from `system/init` decides (`claudeai` is a claude.ai connector, so a local
+/// server named like one is not); with none, a name that begins `claude.ai ` is one.
+fn source_of(name: &str, source: Option<&str>) -> &'static str {
+    match source {
+        Some("claudeai") => "claude.ai",
+        Some(_) => "mcp",
+        None if name.starts_with("claude.ai ") => "claude.ai",
+        None => "mcp",
     }
 }
 
@@ -616,9 +686,99 @@ mod tests {
     #[test]
     fn a_servers_tools_are_those_with_its_prefix() {
         assert_eq!(tool_prefix("claude.ai Slack"), "mcp__claude_ai_Slack__");
+        assert_eq!(
+            tool_prefix("claude.ai Slack (Beta)"),
+            "mcp__claude_ai_Slack_Beta__"
+        );
         assert_eq!(tool_prefix("my-server_2"), "mcp__my-server_2__");
-        assert_eq!(source_of("claude.ai Slack"), "claude.ai");
-        assert_eq!(source_of("claude.aiSlack"), "mcp");
+    }
+
+    #[test]
+    fn init_s_source_decides_where_a_server_comes_from() {
+        assert_eq!(source_of("claude.ai Slack", Some("claudeai")), "claude.ai");
+        // A local server named like a connector is not one.
+        assert_eq!(source_of("claude.ai Slack", Some("local")), "mcp");
+        assert_eq!(source_of("claude.ai Slack", None), "claude.ai");
+        assert_eq!(source_of("claude.aiSlack", None), "mcp");
+    }
+
+    /// A home of its own, removed after.
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("rlxd-conn-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn connectors(&self) -> Arc<Connectors> {
+            let bus = crate::bus::Bus::open_at(self.0.join("seq"), crate::bus::Limits::DEFAULT);
+            Connectors::new(Home::at(&self.0), Arc::new(bus.unwrap()))
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seen<'a>(
+        servers: &'a [McpServer],
+        tools: &'a [String],
+        none: &'a (HashMap<String, String>, HashMap<String, bool>),
+    ) -> Observed<'a> {
+        Observed {
+            servers,
+            sources: &none.0,
+            tools,
+            hints: &none.1,
+        }
+    }
+
+    #[test]
+    fn an_init_with_no_server_empties_no_cache() {
+        let dir = Dir::new();
+        let connectors = dir.connectors();
+        let none = (HashMap::new(), HashMap::new());
+        let slack = [McpServer::new("claude.ai Slack", "connected")];
+        let tools = ["mcp__claude_ai_Slack__read".to_owned()];
+        connectors.observe(seen(&slack, &tools, &none));
+        connectors.observe(seen(&[], &[], &none));
+        let list = connectors.list(0);
+        assert_eq!(list.connectors.len(), 1);
+        assert_eq!(list.connectors[0].tools.len(), 1);
+    }
+
+    #[test]
+    fn a_change_that_connects_one_is_told_with_every_connected_one() {
+        let dir = Dir::new();
+        let connectors = dir.connectors();
+        let told = Arc::new(Mutex::new(Vec::new()));
+        connectors.on_connected(Box::new({
+            let told = Arc::clone(&told);
+            move |ids| told.lock().unwrap().push(ids.to_vec())
+        }));
+        let none = (HashMap::new(), HashMap::new());
+        let slack = |status| McpServer::new("claude.ai Slack", status);
+        let local = McpServer::new("local", "connected");
+        for status in ["needs-auth", "needs-auth", "connected", "connected"] {
+            connectors.observe(seen(&[slack(status), local.clone()], &[], &none));
+        }
+        let both = vec!["claude.ai Slack".to_owned(), "local".to_owned()];
+        // local's coming, then Slack's sign-in back; nothing for no change.
+        assert_eq!(
+            *told.lock().unwrap(),
+            [vec!["local".to_owned()], both.clone()]
+        );
+        connectors.set_status("claude.ai Slack", ConnectorState::NeedsAuth);
+        connectors.set_status("claude.ai Slack", ConnectorState::Connected);
+        assert_eq!(told.lock().unwrap().len(), 3);
+        assert_eq!(told.lock().unwrap()[2], both);
     }
 
     #[test]

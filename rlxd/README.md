@@ -294,7 +294,8 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
 
 - **`run.start`** (`schemas/v1/run-start.json`) takes the app's `run_id`, a lower-case
   UUID that is also Claude Code's `--session-id`, and refuses `run_exists`,
-  `kind_mount_mismatch` and `pinned_call_required`. Each kind has its own pool (tasks 2, refreshes and
+  `kind_mount_mismatch` (also `needs_connectors` with mount `no_tools`, which loads no
+  connector) and `pinned_call_required`. Each kind has its own pool (tasks 2, refreshes and
   watches 1, the rest 2); over it, a run waits as `run.queued {position}`.
 - **The command line** is 2.1's exactly: `-p --output-format stream-json --verbose
   --input-format stream-json --session-id <run_id> [--no-session-persistence] --tools ""
@@ -409,26 +410,40 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   states before it sends the prompt. A `needs-auth` or `failed` connector stops the gate
   at once. When it gives up, the run ends `run.failed {reason: "connectors", connectors:
   [{id, status}]}`, after `needs_you.raised {reason: "auth"}` when a connector's sign-in
-  lapsed. Before the next try of a run whose session persists, the ended try's session
-  file is removed, so the next starts it anew.
+  lapsed. That needs-you is kept in the run's record, and cleared once rlxd sees each
+  connector it names `connected` again (a login's end, or any later `system/init`), or
+  by a resume or the space's erase. A run that never reached `run.started` has no
+  session to resume (`no_session`): a new run is the way on.
+- **What a missed try leaves.** Nothing of a try ended unconfirmed stays in the run's
+  session. On a first attempt (`--session-id`), the session file the try left is
+  removed, so the next try starts it anew. On a resumed attempt (`--resume`), the file is
+  the run's whole session: it is never removed, only cut back to its length before the
+  attempt's first try, so a later resume goes on from what was delivered.
 - **The cache.** Each `system/init` rlxd takes as a run's truth updates the list: an
   ungated run's (not `no_tools`, which lists none), a gated run's once confirmed, the
-  last try's of one that failed, and a refresh's. It is kept in
-  `<home>/rlxd/connectors.json` (0600). Each change is an event on the `connector`
-  topic: `connector.added`, `connector.removed`, and `connector.changed {id, status,
-  previous_status}` once for each real change.
+  last try's of one that failed, and a refresh's. An init that lists no server at all
+  empties nothing, since a Claude Code that loaded none (E9's stdin at EOF) says the
+  same. A server's `source` is init's where it gives one (`claudeai` is a claude.ai
+  connector), and its tools are those under `mcp__<name>__`, the name as Claude Code
+  writes it (the tool-call gate's `claude_server_name`). The cache is kept in
+  `<home>/rlxd/connectors.json` (0600), written whole (`durable::write`) under the
+  cache's lock before any change is published. Each change is an event on the
+  `connector` topic: `connector.added`, `connector.removed`, and `connector.changed
+  {id, status, previous_status}` once for each real change.
 - **`connectors.list {refresh?, allow_turn?}`** gives the cache (`from: "init"`,
   `model_turns: 0`), to every role. `refresh` is `no_route` until there is a route with
-  no turn (`connectors.no_turn`), unless `allow_turn`: then rlxd runs its own one-turn
-  probe, not a run, with the user's MCP servers loaded and every tool call it attempts
-  denied by rlxd itself (its settings' hook is `rlxd __probe-deny`, which opens no
-  connection), and reports `model_turns: 1`. rlxd's log says when each probe ran, and
-  holds neither its prompt nor what it listed.
+  no turn (`connectors.no_turn`), unless `allow_turn`, which `app`, `cli` and `tui` may
+  pass (`remote` gets `role_not_allowed`): then rlxd runs its own one-turn probe, not a
+  run, with the user's MCP servers loaded and every tool call it attempts denied by rlxd
+  itself (its settings' hook is `rlxd __probe-deny`, which opens no connection), and
+  reports `model_turns: 1`. rlxd's log says when each probe ran, and holds neither its
+  prompt nor what it listed.
 - **`read_only_hint`** is each tool's MCP `readOnlyHint` when `system/init` lists the
   tool with annotations, else `null`: Claude Code 2.1 lists names only.
 - **`connectors.login {id}`**, for `app`, `cli` and `tui` (`remote` gets
-  `role_not_allowed`), runs `claude mcp login <id>` in an rlxd PTY, by Claude Code's
-  absolute path, and returns `{login_id}`. It reads the PTY's screen for the first URL:
+  `role_not_allowed`), runs `claude mcp login -- <id>` in an rlxd PTY, by Claude Code's
+  absolute path, and returns `{login_id}`. An id that begins with `-` is refused
+  (`invalid_params`). It reads the PTY's screen for the first URL:
   an `https://` one is `connector.login.open_url` then `connector.login.waiting`, and
   the login's exit 0 is `connector.login.done {status: "connected"}`; anything else is
   `connector.login.error {code}` (`not_https`, `no_url`, `failed`, `timed_out`,

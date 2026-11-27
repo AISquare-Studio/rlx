@@ -17,7 +17,8 @@ mod common;
 use std::time::Duration;
 
 use common::runs::{
-    fixture_log, gated_start, home_with, home_with_scenario_file, run_id, seq, start,
+    fixture_log, gated_start, home_with, home_with_scenario_file, home_with_scenario_file_and,
+    resumed, run_id, seq, session_file, start,
 };
 use common::{TestHome, assert_valid, eventually};
 use serde_json::{Value, json};
@@ -29,6 +30,28 @@ fn widget() -> Value {
     json!({"kind": "widget_refresh", "prompt": "digest",
         "mount": {"kind": "connectors", "connectors": [SLACK]},
         "needs_connectors": [SLACK], "space": "default"})
+}
+
+/// A task, whose session is kept, mounting Slack and needing it.
+fn task() -> Value {
+    json!({"kind": "task", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]},
+        "needs_connectors": [SLACK], "space": "default"})
+}
+
+/// What `connectors-later-noisy` writes before a start can be confirmed.
+const NOISE: &str = "Before the connectors are in: nothing to say yet.";
+
+/// The `connector` topic's events after `since`.
+fn connector_events(home: &TestHome, since: u64) -> Vec<Value> {
+    home.rlxd(&[
+        "events",
+        "--topics",
+        "connector",
+        "--since",
+        &since.to_string(),
+    ])
+    .lines()
 }
 
 /// A run that mounts Slack and doesn't need it, as 5.3's list check starts.
@@ -156,6 +179,17 @@ fn later(route1: bool) {
     let home = home_with("connectors-later", &route(route1));
     let (id, events) = gated_start(&home, &widget(), 60).wait();
     assert_one_started_with_slack(&events, &id);
+    // Slack warming up is no change: the delivered try's init adds it, connected, and
+    // nothing of a missed try's init is seen.
+    let changes = connector_events(&home, 0);
+    let types: Vec<&str> = changes
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["connector.added"], "{changes:#?}");
+    assert_eq!(changes[0]["data"]["id"], SLACK, "{changes:#?}");
+    let list = home.rlxd(&["call", "connectors.list"]).data();
+    assert_eq!(list["connectors"][0]["status"], "connected", "{list:#}");
     let log = fixture_log(&home);
     if route1 {
         // The first try waits it out.
@@ -181,6 +215,101 @@ fn later_route_2_misses_once_then_delivers_the_second_try() {
 #[test]
 fn later_route_1_waits_it_out_in_the_first_try() {
     later(true);
+}
+
+fn later_noisy(route1: bool) {
+    let home = home_with("connectors-later-noisy", &route(route1));
+    let (id, events) = gated_start(&home, &widget(), 60).wait();
+    assert_one_started_with_slack(&events, &id);
+    // Every start wrote text before it could be confirmed; none of it is the run's.
+    let mine = of(&events, &id);
+    assert!(mine.iter().any(|e| e["type"] == "run.text"), "{events:#?}");
+    assert!(
+        !mine.iter().any(|e| e.to_string().contains(NOISE)),
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn text_before_the_connectors_are_confirmed_is_never_delivered_route_2() {
+    later_noisy(false);
+}
+
+#[test]
+fn text_before_the_connectors_are_confirmed_is_never_delivered_route_1() {
+    later_noisy(true);
+}
+
+/// The reviewer's and the tester's case (#2747, #2750): a task done, then resumed while
+/// Slack never connects. Its tries are `--resume`s of the run's own session, so the
+/// session file stays, as it was before the resume, and the run resumes on after.
+fn resumed_miss(route1: bool) {
+    let home = home_with_scenario_file_and("init-connectors", &route(route1));
+    let (id, events) = gated_start(&home, &task(), 60).wait();
+    assert_eq!(
+        of(&events, &id).last().unwrap()["type"],
+        "run.done",
+        "{events:#?}"
+    );
+    let file = session_file(&home, &id).expect("the task's session file");
+    let before = std::fs::read(&file).unwrap();
+    assert!(!before.is_empty());
+    std::fs::write(home.root().join("scenario"), "connectors-never").unwrap();
+    let events = resumed(&home, &id, "again", 90);
+    assert_failed_naming_slack(&events, &id, "pending");
+    let log = fixture_log(&home);
+    let starts = log["starts"].as_array().unwrap();
+    assert_eq!(starts.len(), 4, "{log:#}");
+    for start in &starts[1..] {
+        assert_eq!(start["delivered"], false, "{log:#}");
+        assert!(
+            start["argv"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("--resume")),
+            "{log:#}"
+        );
+    }
+    if !route1 {
+        // Each try was sent the reply, and wrote it to the session, as Claude Code does.
+        assert!(
+            starts[1..]
+                .iter()
+                .all(|s| s["stdin"].as_array().unwrap().len() == 1),
+            "{log:#}"
+        );
+    }
+    // The run's session is there still, holding nothing of the missed tries.
+    assert_eq!(std::fs::read(&file).unwrap(), before, "{}", file.display());
+    // And it goes on from it once Slack is connected.
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    let events = resumed(&home, &id, "once more", 60);
+    assert_eq!(
+        of(&events, &id).last().unwrap()["type"],
+        "run.done",
+        "{events:#?}"
+    );
+    let after = std::fs::read(&file).unwrap();
+    assert!(after.len() > before.len() && after.starts_with(&before));
+}
+
+#[test]
+fn a_resumed_runs_missed_tries_keep_its_session_route_2() {
+    resumed_miss(false);
+}
+
+#[test]
+fn a_resumed_runs_missed_tries_keep_its_session_route_1() {
+    resumed_miss(true);
+}
+
+#[test]
+fn a_first_attempts_missed_tries_leave_no_session_file() {
+    // Route 2: each try was sent the prompt, and wrote its session file.
+    let home = home_with("connectors-never", &[]);
+    let (id, events) = gated_start(&home, &task(), 60).wait();
+    assert_failed_naming_slack(&events, &id, "pending");
+    assert_eq!(session_file(&home, &id), None);
 }
 
 fn never(route1: bool) {
@@ -253,6 +382,109 @@ fn needs_auth_route_2_stops_at_once_and_needs_you() {
 #[test]
 fn needs_auth_route_1_stops_at_once_and_needs_you() {
     needs_auth(true);
+}
+
+#[test]
+fn a_lapsed_sign_ins_needs_you_is_cleared_once_slack_is_signed_in_again() {
+    let home = home_with_scenario_file("connectors-needs-auth");
+    let (id, events) = gated_start(&home, &widget(), 60).wait();
+    assert_failed_naming_slack(&events, &id, "needs-auth");
+    let raised = events
+        .iter()
+        .find(|e| e["type"] == "needs_you.raised" && e["data"]["reason"] == "auth")
+        .unwrap_or_else(|| panic!("{events:#?}"));
+    let needs = raised["data"]["id"].clone();
+    // The run never started, so there is no session to resume: a sign-in settles it.
+    let resume = json!({"run_id": id, "reply": "again"}).to_string();
+    let refused = home.rlxd(&["call", "--as-app", "run.resume", &resume]);
+    assert_eq!(refused.error_code(), "no_session", "{refused:?}");
+    // It is out across a restart, kept in the run's record.
+    home.stop();
+    home.start_dev();
+    let since = seq(&home);
+    std::fs::write(home.root().join("scenario"), "mcp-login").unwrap();
+    login(&home);
+    let ended = login_events(&home, since);
+    assert_eq!(
+        ended.last().unwrap()["type"],
+        "connector.login.done",
+        "{ended:#?}"
+    );
+    let cleared = || -> Vec<Value> {
+        home.rlxd(&[
+            "events",
+            "--as-app",
+            "--topics",
+            "needs_you",
+            "--since",
+            &since.to_string(),
+        ])
+        .lines()
+        .into_iter()
+        .filter(|e| e["type"] == "needs_you.cleared")
+        .collect()
+    };
+    eventually("the needs-you is cleared", || !cleared().is_empty());
+    let cleared = cleared();
+    assert_eq!(cleared.len(), 1, "{cleared:#?}");
+    assert_eq!(cleared[0]["data"]["id"], needs, "{cleared:#?}");
+    // Cleared in the record too: the next rlxd has it out no more.
+    let record = home
+        .root()
+        .join("rlxd")
+        .join("runs")
+        .join(&id)
+        .join("run.json");
+    let record: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+    assert_eq!(record.get("auth"), None, "{record:#}");
+}
+
+#[test]
+fn a_fired_job_whose_run_needs_connectors_goes_through_the_gate() {
+    let home = home_with("connectors-needs-auth", &[]);
+    let since = seq(&home);
+    let capture = home.spawn(&[
+        "events",
+        "--as-app",
+        "--topics",
+        "run,needs_you",
+        "--since",
+        &since.to_string(),
+        "--follow",
+        "--until",
+        "run.done,run.failed,run.needs_you",
+        "--timeout",
+        "60",
+    ]);
+    eventually("the capture holds the app role", || home.app_clients() >= 1);
+    let job = json!({"job_id": "gated", "type": "run", "schedule": {"every_minutes": 60},
+        "run": widget(), "catch_up": "skip", "enabled": true});
+    let put = home.rlxd(&["call", "--as-app", "job.put", &job.to_string()]);
+    assert_eq!(put.code(), Some(0), "{put:?}");
+    let fired = home.rlxd(&["call", "--as-app", "job.run_now", r#"{"job_id":"gated"}"#]);
+    assert_eq!(fired.code(), Some(0), "{fired:?}");
+    let id = fired.data()["run_id"].as_str().unwrap().to_owned();
+    let run = common::finish(capture);
+    assert_eq!(run.code(), Some(0), "the capture: {run:?}");
+    let events = run.lines();
+    assert_failed_naming_slack(&events, &id, "needs-auth");
+    let log = fixture_log(&home);
+    assert_eq!(log["starts"].as_array().unwrap().len(), 1, "{log:#}");
+}
+
+#[test]
+fn a_run_with_needs_connectors_and_no_tools_is_refused() {
+    let home = home_with("init-connectors", &[]);
+    let mut params = widget();
+    params["kind"] = json!("task");
+    params["mount"] = json!({"kind": "no_tools"});
+    params["run_id"] = json!(run_id());
+    let refused = home.rlxd(&["call", "run.start", &params.to_string()]);
+    assert_eq!(refused.error_code(), "kind_mount_mismatch", "{refused:?}");
+    params["mount"] = json!({"kind": "connectors", "connectors": [SLACK]});
+    params["needs_connectors"] = json!(["a\u{7}b"]);
+    let refused = home.rlxd(&["call", "run.start", &params.to_string()]);
+    assert_eq!(refused.error_code(), "invalid_params", "{refused:?}");
 }
 
 fn stdin_held_open(route1: bool) {
@@ -475,6 +707,56 @@ fn a_status_change_is_one_connector_changed() {
     assert_eq!(list["connectors"][0]["tools"], json!([]), "{list:#}");
 }
 
+#[test]
+fn a_connector_an_init_no_longer_lists_is_removed_and_one_it_lists_new_is_added() {
+    let home = home_with_scenario_file("init-connectors");
+    let (_, events) = gated_start(&home, &mounting(), 60).wait();
+    assert!(
+        events.iter().any(|e| e["type"] == "run.done"),
+        "{events:#?}"
+    );
+    let added = connector_events(&home, 0);
+    assert_eq!(added.len(), 1, "{added:#?}");
+    assert_eq!(added[0]["type"], "connector.added", "{added:#?}");
+    assert_eq!(added[0]["data"], json!({"id": SLACK}), "{added:#?}");
+    assert_valid("connector-id.json", &added[0]["data"]);
+    let since = seq(&home);
+    std::fs::write(home.root().join("scenario"), "init-other").unwrap();
+    let (_, events) = gated_start(&home, &mounting(), 60).wait();
+    assert!(
+        events.iter().any(|e| e["type"] == "run.done"),
+        "{events:#?}"
+    );
+    let mut changes: Vec<(String, String)> = connector_events(&home, since)
+        .iter()
+        .map(|e| {
+            assert_valid("connector-id.json", &e["data"]);
+            (
+                e["type"].as_str().unwrap().to_owned(),
+                e["data"]["id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    changes.sort();
+    assert_eq!(
+        changes,
+        [
+            ("connector.added".to_owned(), "fixture-local".to_owned()),
+            ("connector.removed".to_owned(), SLACK.to_owned())
+        ]
+    );
+    let list = home.rlxd(&["call", "connectors.list"]).data();
+    assert_eq!(list["connectors"].as_array().unwrap().len(), 1, "{list:#}");
+    assert_eq!(list["connectors"][0]["id"], "fixture-local", "{list:#}");
+    // A local server, as init's source says.
+    assert_eq!(list["connectors"][0]["source"], "mcp", "{list:#}");
+    assert_eq!(
+        list["connectors"][0]["tools"],
+        json!([{"name": "mcp__fixture-local__echo", "read_only_hint": null}]),
+        "{list:#}"
+    );
+}
+
 // --- 7.7: the login -----------------------------------------------------------------------
 
 /// The `connector.login.*` events after `since`, once one ends the login.
@@ -573,7 +855,7 @@ fn a_login_opens_its_https_url_waits_and_is_done_and_its_query_is_never_logged()
     );
     assert_eq!(
         argv.as_array().unwrap()[1..],
-        [json!("mcp"), json!("login"), json!(SLACK)],
+        [json!("mcp"), json!("login"), json!("--"), json!(SLACK)],
         "{argv}"
     );
     // The connector is connected now, and its PTY is gone.
@@ -660,6 +942,20 @@ fn every_role_lists_and_remote_may_not_log_in() {
     assert_eq!(refused.error_code(), "role_not_allowed", "{refused:?}");
     let invalid = home.rlxd(&["call", "connectors.login", r#"{"id":""}"#]);
     assert_eq!(invalid.error_code(), "invalid_params", "{invalid:?}");
+    // An id `claude mcp login` would read as an option is refused, and starts nothing.
+    let option = home.rlxd(&["call", "connectors.login", r#"{"id":"--help"}"#]);
+    assert_eq!(option.error_code(), "invalid_params", "{option:?}");
+    assert!(!home.root().join("fake-claude.log.json").exists());
+    // Remote lists, but may not spend a model turn on a refresh.
+    let turn = home.rlxd(&[
+        "call",
+        "--role",
+        "remote",
+        "connectors.list",
+        r#"{"refresh":true,"allow_turn":true}"#,
+    ]);
+    assert_eq!(turn.error_code(), "role_not_allowed", "{turn:?}");
+    assert!(!home.root().join("fake-claude.log.json").exists());
 }
 
 // --- 7.7: the CLI -------------------------------------------------------------------------

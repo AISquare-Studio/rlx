@@ -38,11 +38,58 @@ pub fn home_with(scenario: &str, envs: &[(&str, &str)]) -> TestHome {
 /// [`home_with`] `first`, whose fake-claude plays the scenario `<home>/scenario` names at
 /// each start (`FAKE_CLAUDE_SCENARIO_FILE`): write another name there to switch.
 pub fn home_with_scenario_file(first: &str) -> TestHome {
+    home_with_scenario_file_and(first, &[])
+}
+
+/// [`home_with_scenario_file`], with `envs` set too.
+pub fn home_with_scenario_file_and(first: &str, envs: &[(&str, &str)]) -> TestHome {
     let home = TestHome::new();
     let file = home.root().join("scenario");
     std::fs::write(&file, first).unwrap();
     let file = file.to_str().unwrap().to_owned();
-    home_in(home, first, &[("FAKE_CLAUDE_SCENARIO_FILE", &file)])
+    let mut all = vec![("FAKE_CLAUDE_SCENARIO_FILE", file.as_str())];
+    all.extend_from_slice(envs);
+    home_in(home, first, &all)
+}
+
+/// `run.resume {run_id: id, reply}` as the app, captured as [`gated_start`] captures a
+/// start: the events from the resume to the run's next end.
+pub fn resumed(home: &TestHome, id: &str, reply: &str, seconds: u64) -> Vec<Value> {
+    let since = seq(home);
+    let capture = home.spawn(&[
+        "events",
+        "--as-app",
+        "--topics",
+        "run,needs_you",
+        "--since",
+        &since.to_string(),
+        "--follow",
+        "--until",
+        "run.done,run.failed,run.needs_you",
+        "--timeout",
+        &seconds.to_string(),
+    ]);
+    eventually("the capture holds the app role", || home.app_clients() >= 1);
+    let params = serde_json::json!({"run_id": id, "reply": reply});
+    let run = home.rlxd(&["call", "--as-app", "run.resume", &params.to_string()]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let run = finish(capture);
+    assert_eq!(run.code(), Some(0), "the capture: {run:?}");
+    run.lines()
+}
+
+/// Run `id`'s session file, where Claude Code keeps it under the home's
+/// `CLAUDE_CONFIG_DIR`: `None` when there is none.
+pub fn session_file(home: &TestHome, id: &str) -> Option<PathBuf> {
+    let projects = home.root().join("claude-config").join("projects");
+    let found: Vec<PathBuf> = std::fs::read_dir(projects)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| Some(entry.ok()?.path().join(format!("{id}.jsonl"))))
+        .filter(|path| path.is_file())
+        .collect();
+    assert!(found.len() <= 1, "{found:?}");
+    found.into_iter().next()
 }
 
 /// Plays `scenario` in `home`, as [`home_with`] says.

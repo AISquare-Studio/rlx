@@ -545,7 +545,7 @@ impl Daemon {
             methods::GATE_PAIR_REQUESTS => self.gate_pair_requests(session),
             methods::GATE_PAIR_ANSWER => self.gate_pair_answer(session, &request.params),
             methods::GATE_DEVICES => Ok(object(&json!({"devices": self.gate.devices()}))),
-            methods::CONNECTORS_LIST => self.connectors_list(request.params).await,
+            methods::CONNECTORS_LIST => self.connectors_list(session, request.params).await,
             methods::CONNECTORS_LOGIN => self.connectors_login(session, request.params),
             methods::GATE_UNPAIR => self.gate_unpair(session, &request.params),
             methods::HELLO => Err(error(
@@ -2070,10 +2070,12 @@ impl Daemon {
     /// `connectors.list {refresh?, allow_turn?}`: the latest `system/init`'s connectors.
     /// A refresh needs a route with no turn, which there is not yet: `no_route`, unless
     /// `allow_turn` lets rlxd run its one-turn probe (5.3).
-    async fn connectors_list(&self, params: Params) -> Result<Data, ErrorBody> {
-        let params = params_of::<ConnectorsListParams>(methods::CONNECTORS_LIST, params)?;
+    async fn connectors_list(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let method = methods::CONNECTORS_LIST;
+        let params = params_of::<ConnectorsListParams>(method, params)?;
         if !params.refresh() {
-            return printed(&self.connectors.list(0));
+            // The cache's lock is held while its file is written.
+            return printed(&off_worker(|| self.connectors.list(0)));
         }
         if !params.allow_turn() {
             return Err(error(
@@ -2086,8 +2088,17 @@ impl Daemon {
                  true to let rlxd run a one-turn probe.",
             ));
         }
+        // A model turn is the user's to spend: not remote's.
+        if !matches!(session.role, Role::App | Role::Cli | Role::Tui) {
+            return Err(role_refused(
+                session.role,
+                method,
+                "app, cli and tui may let rlxd make a model turn (allow_turn); remote may list \
+                 without refresh.",
+            ));
+        }
         self.runner.probe_connectors().await?;
-        printed(&self.connectors.list(1))
+        printed(&off_worker(|| self.connectors.list(1)))
     }
 
     /// `connectors.login {id}`: for `app`, `cli` and `tui`; `remote` is refused.

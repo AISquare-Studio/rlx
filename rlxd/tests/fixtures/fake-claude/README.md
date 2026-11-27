@@ -43,14 +43,16 @@ the same files.
 
 ### The connectors' scenarios (5.5 and 7.7)
 
-One connector, `claude.ai Slack`, with made-up tools (`init-connectors/expected-tools.json`). Its status follows the fixture clock from the run's first start, and doesn't start again with each try. As Claude Code does, a start writes `system/init` after its first message, listing Slack's status then and mounting its tools only when connected. With `RLXD_TEST_CONNECTOR_ROUTE=1` (rlxd's route-1 switch, which rlxd passes on), it plays a Claude Code that also reports the states before the first message: an init as it starts and another at each change. `connected_at` is when the start saw Slack connected. With `FAKE_CLAUDE_TRY_TOOL=<tool>`, a start that sees Slack connected asks its `--settings`' PreToolUse hooks about one call of that tool, and logs the answer in `hook_replies`.
+One connector, `claude.ai Slack`, with made-up tools (`init-connectors/expected-tools.json`). Its status follows the fixture clock from the run's first start, and doesn't start again with each try. As Claude Code does, a start writes `system/init` after its first message, listing Slack's status then and mounting its tools only when connected. With `RLXD_TEST_CONNECTOR_ROUTE=1` (rlxd's route-1 switch, which rlxd passes on), it plays a Claude Code that also reports the states before the first message: an init as it starts and another at each change. `connected_at` is when the start saw Slack connected. A start writes the user message to its session file as it comes, before `system/init`, as Claude Code does, so a try rlxd ends unconfirmed has added it. Slack's entry carries `source: "claudeai"`. `claude mcp login` is played with or without `--` before the name. With `FAKE_CLAUDE_TRY_TOOL=<tool>`, a start that sees Slack connected asks its `--settings`' PreToolUse hooks about one call of that tool, and logs the answer in `hook_replies`.
 
 | Scenario | What it does |
 |---|---|
 | `init-connectors` | Slack connected from the start |
 | `init-needs-auth` | Slack `needs-auth`, its tools not mounted |
+| `init-other` | One made-up local server, `fixture-local` (`source: "local"`), connected, with one tool; no Slack |
 | `connectors-late` | Slack `pending`, then connected from 3 s |
 | `connectors-later` | Slack `pending`, then connected from 8 s |
+| `connectors-later-noisy` | `connectors-later`, writing assistant text before each start can be confirmed: before its `system/init` on route 2, after its first one on route 1 |
 | `connectors-never` | Slack `pending` throughout |
 | `connectors-needs-auth` | Slack `needs-auth` throughout |
 | `stdin-eof-empty` | No servers in `system/init` when stdin is at EOF by then, as E9 found; Slack connected while it is open |

@@ -46,7 +46,7 @@ pub enum Line {
 }
 
 /// `system/init`'s facts.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Init {
     pub cwd: String,
     pub model: String,
@@ -61,6 +61,18 @@ pub struct Init {
     /// claude.ai connector, else `sdk`, `plugin` or the config's scope (`local`, `user`,
     /// `project`). Claude Code 2.1.332 writes it; the tool-call gate needs it (5.1).
     pub sources: HashMap<String, String>,
+}
+
+impl Init {
+    /// What the connectors' cache takes of it ([`crate::connectors::Connectors::observe`]).
+    pub fn observed(&self) -> crate::connectors::Observed<'_> {
+        crate::connectors::Observed {
+            servers: &self.mcp_servers,
+            sources: &self.sources,
+            tools: &self.tools,
+            hints: &self.hints,
+        }
+    }
 }
 
 /// A `result` line.

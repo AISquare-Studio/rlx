@@ -5,10 +5,11 @@
   "type": "object",
   "properties": {
     "id": {
-      "description": "The connector, such as `claude.ai Slack`.",
+      "description": "The connector, such as `claude.ai Slack`. Never one that begins with `-`, which\n`claude mcp login` would read as an option.",
       "type": "string",
       "maxLength": 256,
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "^[^-]"
     }
   },
   "required": [

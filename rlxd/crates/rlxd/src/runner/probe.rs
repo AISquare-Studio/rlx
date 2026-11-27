@@ -95,8 +95,7 @@ impl Runner {
         match read {
             Ok(init) => {
                 blocking(|| {
-                    self.connectors
-                        .observe(&init.mcp_servers, &init.tools, &init.hints);
+                    self.connectors.observe(init.observed());
                 });
                 info!("connectors: the probe ended");
                 Ok(())

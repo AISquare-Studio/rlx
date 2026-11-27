@@ -11,6 +11,15 @@
 //! `connected_at`, in the fixture log, is when this start saw Slack connected: the time
 //! it connected, or this start's own start when it was connected already.
 //!
+//! As Claude Code does, a start writes the user message to its session file as it comes,
+//! before `system/init`: so a try rlxd ends unconfirmed has added it.
+//!
+//! `connectors-later-noisy` is `connectors-later`, but each start also writes assistant
+//! text ([`NOISE`]) before it can be confirmed: before its `system/init` on route 2, and
+//! after its first one on route 1. rlxd must deliver none of it.
+//!
+//! `init-other` lists one made-up local server, `fixture-local`, and no Slack.
+//!
 //! `stdin-eof-empty` is Claude Code as E9 found it: when stdin is at EOF by the time it
 //! writes `system/init`, it lists no servers and mounts no connector tools; held open, it
 //! lists Slack connected.
@@ -32,6 +41,13 @@ pub const ROUTE_ENV: &str = "RLXD_TEST_CONNECTOR_ROUTE";
 /// A variable naming a tool the scenarios call once Slack is connected, before they
 /// answer: its PreToolUse hooks decide it ([`Fake::pre_tool_use`]).
 pub const TRY_TOOL_ENV: &str = "FAKE_CLAUDE_TRY_TOOL";
+
+/// What `connectors-later-noisy` writes before it can be confirmed.
+pub const NOISE: &str = "Before the connectors are in: nothing to say yet.";
+
+/// `init-other`'s one server, local and made up, and its tool.
+pub const OTHER: &str = "fixture-local";
+const OTHER_TOOL: &str = "mcp__fixture-local__echo";
 
 /// Slack's tools, made up, as `init-connectors/expected-tools.json` lists them.
 pub fn tools() -> Vec<String> {
@@ -107,14 +123,37 @@ fn init(fake: &mut Fake, schedule: Schedule, status: &str) {
     }
 }
 
+/// Writes [`NOISE`] as an assistant message, kept out of the session.
+fn noise(fake: &mut Fake) {
+    let session = fake.session_id().to_owned();
+    fake.emit(
+        &json!({"type": "assistant", "message": {"id": "msg_noise", "type": "message",
+        "role": "assistant", "model": "claude-fake", "content": [{"type": "text", "text": NOISE}],
+        "stop_reason": null, "usage": {"input_tokens": 1, "output_tokens": 1}},
+        "parent_tool_use_id": null, "session_id": session}),
+    );
+}
+
 /// Plays a start of a connector scenario: the states before the first message on route
 /// 1, then the first message, `system/init`, and an answer. On a miss (Slack not
 /// connected), it answers after a moment, as Claude Code does without the connector;
 /// rlxd has ended the start by then.
 pub fn play(fake: &mut Fake, schedule: Schedule, answer: &str) -> i32 {
+    play_as(fake, schedule, answer, false)
+}
+
+/// [`play`], writing [`NOISE`] before each start can be confirmed.
+pub fn play_noisy(fake: &mut Fake, schedule: Schedule, answer: &str) -> i32 {
+    play_as(fake, schedule, answer, true)
+}
+
+fn play_as(fake: &mut Fake, schedule: Schedule, answer: &str, noisy: bool) -> i32 {
     let message = if route_1() {
         let mut said = schedule.status_at(now(fake));
         init(fake, schedule, said);
+        if noisy {
+            noise(fake);
+        }
         loop {
             let wait = schedule
                 .next_change(now(fake))
@@ -141,6 +180,10 @@ pub fn play(fake: &mut Fake, schedule: Schedule, answer: &str) -> i32 {
         }
     };
     fake.remember(&message);
+    fake.persist();
+    if noisy && !route_1() {
+        noise(fake);
+    }
     let status = schedule.status_at(now(fake));
     init(fake, schedule, status);
     if status != "connected" {
@@ -173,6 +216,22 @@ pub fn stdin_eof_empty(fake: &mut Fake) -> i32 {
     fake.succeed(ANSWER_EOF, None);
     0
 }
+
+/// `init-other`: one local server, connected, and no Slack.
+pub fn other(fake: &mut Fake) -> i32 {
+    let Some(message) = fake.next_user_message() else {
+        return super::NO_PROMPT;
+    };
+    fake.remember(&message);
+    let servers = json!([{"name": OTHER, "status": "connected", "source": "local"}]);
+    fake.init(json!([OTHER_TOOL]), servers);
+    fake.say(ANSWER_OTHER);
+    fake.succeed(ANSWER_OTHER, None);
+    0
+}
+
+/// What `init-other` answers.
+const ANSWER_OTHER: &str = "Nothing local needs you.";
 
 /// What `stdin-eof-empty` answers.
 const ANSWER_EOF: &str = "Nothing in Slack needs you.";

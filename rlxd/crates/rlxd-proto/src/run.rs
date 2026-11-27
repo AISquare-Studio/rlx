@@ -316,8 +316,10 @@ pub struct RunStartParams {
     pub mount: Mount,
     /// The connectors that must be `connected` before the first turn (5.5): rlxd makes
     /// up to 3 tries, and ends the run `run.failed {reason: "connectors"}` when they run
-    /// out, or at once when one is `needs-auth` or `failed`.
+    /// out, or at once when one is `needs-auth` or `failed`. Each is a connector's id, as
+    /// `connectors.list` gives it. A `no_tools` run loads none, so it names none.
     #[serde(default)]
+    #[schemars(inner(length(min = 1, max = 256)))]
     pub needs_connectors: Vec<String>,
     /// A JSON Schema the final output must match (`--json-schema`); `run.done` then
     /// carries `structured_output`.
@@ -464,7 +466,7 @@ impl RunStartParams {
             }
         }
         for connector in &self.needs_connectors {
-            check::non_empty("needs_connectors", connector)?;
+            crate::connector::check_id("needs_connectors", connector)?;
         }
         if let Some(timeout) = self.timeout_s {
             check::at_least("timeout_s", timeout, 1)?;
