@@ -1937,7 +1937,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         keeps what was typed, to try again."""
         for wid in changed:
             control = self.query_one(f"#{wid}")
-            if not isinstance(control, CommitInput):
+            if isinstance(control, CommitInput):
+                control.release()  # committed again, to try again (#53)
+            else:
                 self._put_shown(control, self._shown_value(wid))
 
     @staticmethod
