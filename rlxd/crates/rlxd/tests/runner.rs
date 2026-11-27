@@ -576,23 +576,32 @@ fn a_rate_limit_event_is_run_rate_limited_with_its_reset() {
 fn a_run_past_its_timeout_fails_timeout_and_leaves_no_process() {
     let home = home("slow");
     let mut params = task("take your time");
-    params["timeout_s"] = json!(2);
+    params["timeout_s"] = json!(6);
     let begun = Instant::now();
     let (r, _, events) = gated_start(&home, &params).wait();
     assert!(
-        begun.elapsed() < Duration::from_secs(10),
-        "{:?}",
+        begun.elapsed() < Duration::from_secs(30),
+        "{:?}: {events:#?}",
         begun.elapsed()
     );
     let last = of(&events, &r, None).last().copied().unwrap().clone();
     assert_eq!(last["type"], "run.failed", "{events:#?}");
-    assert_eq!(last["data"]["reason"], "timeout");
+    assert_eq!(last["data"]["reason"], "timeout", "{events:#?}");
+    // What the run said before its timeout, as its run.text events say, is what it kept:
+    // not a fixed "Working", which a loaded runner may not have read within 2 s (run
+    // 46036175108). Its 6 s leave room for that.
+    let said: Vec<&str> = of(&events, &r, Some("run.text"))
+        .iter()
+        .filter_map(|e| e["data"]["text"].as_str())
+        .collect();
     assert!(
-        last["data"]["partial_text"]
-            .as_str()
-            .unwrap()
-            .contains("Working")
+        !said.is_empty(),
+        "nothing said before the timeout: {events:#?}"
     );
+    let kept = last["data"]["partial_text"].as_str().unwrap();
+    for text in said {
+        assert!(kept.contains(text), "{text:?} not in {kept:?}: {events:#?}");
+    }
     common::eventually("no slow process is left", || {
         processes_matching(&pattern(&home, "slow")) == 0
     });
@@ -833,6 +842,20 @@ fn status_counts_live_and_queued_runs() {
 fn call(home: &TestHome, method: &str, params: &Value) -> Value {
     let run = home.rlxd(&["call", method, &params.to_string()]);
     assert_eq!(run.code(), Some(0), "{method}: {run:?}");
+    run.data()
+}
+
+/// [`call`] about run `r`: when it is refused, the failure says what the run's events
+/// since `since` were, which a timing race on a slow runner needs to be read.
+fn call_for(home: &TestHome, since: u64, r: &str, method: &str, params: &Value) -> Value {
+    let run = home.rlxd(&["call", method, &params.to_string()]);
+    if run.code() != Some(0) {
+        let events = replay(home, since);
+        panic!(
+            "{method}: {run:?}\nrun {r}'s events: {:#?}",
+            of(&events, r, None)
+        );
+    }
     run.data()
 }
 
@@ -1413,11 +1436,11 @@ fn a_result_too_large_for_run_done_still_ends_the_run_with_its_reason() {
 
 #[test]
 fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
-    // Test builds only: the state events of runs in the space "slowdisk" wait 4 s before
+    // Test builds only: the state events of runs in the space "slowdisk" wait 12 s before
     // they are made durable, as under a slow fsync.
     // A takes its time, so it is still running when the resume below decides; every
     // other run answers at once ("quick").
-    let home = home_with("slow", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:4000")]);
+    let home = home_with("slow", &[("RLXD_TEST_SLOW_PERSIST", "slowdisk:12000")]);
     let since = seq(&home);
     let mut slow = task("take your time");
     slow["space"] = json!("slowdisk");
@@ -1429,18 +1452,27 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
             .is_ok_and(|log| log.contains(&a))
     });
     thread::sleep(Duration::from_millis(300));
-    let quick = |what: &str, args: &[&str]| {
-        let began = Instant::now();
+    // Each call below comes back while A's state event `pending` is still being made
+    // durable: one held up behind A's slow disk would come back only once it was, and
+    // then finds it replayed. No fixed time is asked of it, as a loaded runner takes
+    // seconds to start a command (5.4 s for a run.start, run 46036175108).
+    let quick = |what: &str, args: &[&str], pending: &str| {
         let run = home.rlxd(args);
         assert_eq!(run.code(), Some(0), "{what}: {run:?}");
+        let events = replay(&home, since);
         assert!(
-            began.elapsed() < Duration::from_secs(1),
-            "{what} waited {:?}",
-            began.elapsed()
+            of(&events, &a, Some(pending)).is_empty(),
+            "{what} came back once A's {pending} was durable: A's events {:#?}",
+            of(&events, &a, None)
         );
         run
     };
-    let emitted = quick("debug.emit", &["call", "debug.emit", r#"{"count":3}"#]);
+    let started = "run.started";
+    let emitted = quick(
+        "debug.emit",
+        &["call", "debug.emit", r#"{"count":3}"#],
+        started,
+    );
     let last = emitted.data()["last"].as_u64().unwrap();
     quick(
         "a follower of another topic",
@@ -1451,24 +1483,31 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
             "--since",
             &(last - 1).to_string(),
         ],
+        started,
     );
-    quick("status", &["call", "status"]);
+    quick("status", &["call", "status"], started);
     quick(
         "space.ensure",
         &["call", "space.ensure", r#"{"name":"other"}"#],
+        started,
     );
     // A listing reads each run with the runner's lock let go; a resume of the slow run
     // waits for that run's lock alone.
-    quick("run.list", &["call", "run.list", "{}"]);
+    quick("run.list", &["call", "run.list", "{}"], started);
     thread::scope(|scope| {
         let resume =
             scope.spawn(|| home.rlxd(&["call", "run.resume", &json!({"run_id": a}).to_string()]));
         thread::sleep(Duration::from_millis(200));
-        quick("status during a resume", &["call", "status"]);
-        quick("run.list during a resume", &["call", "run.list", "{}"]);
+        quick("status during a resume", &["call", "status"], started);
+        quick(
+            "run.list during a resume",
+            &["call", "run.list", "{}"],
+            started,
+        );
         quick(
             "run.start during a resume",
             &["call", "run.start", &with_id(&task("quick"), &run_id())],
+            started,
         );
         // Another run, in another space, starts and ends meanwhile.
         let b = run_id();
@@ -1486,11 +1525,16 @@ fn a_slow_disk_under_one_run_holds_up_no_other_run_or_topic() {
         let cancel =
             scope.spawn(|| home.rlxd(&["call", "run.cancel", &json!({"run_id": a}).to_string()]));
         thread::sleep(Duration::from_millis(300));
-        quick("status during a cancel", &["call", "status"]);
-        quick("run.list during a cancel", &["call", "run.list", "{}"]);
+        quick("status during a cancel", &["call", "status"], "run.failed");
+        quick(
+            "run.list during a cancel",
+            &["call", "run.list", "{}"],
+            "run.failed",
+        );
         quick(
             "run.start during a cancel",
             &["call", "run.start", &with_id(&task("quick"), &run_id())],
+            "run.failed",
         );
         assert_eq!(cancel.join().unwrap().code(), Some(0));
     });
@@ -1659,8 +1703,15 @@ fn a_cancel_answers_for_the_attempt_it_cancelled_though_a_resume_follows() {
     });
     thread::scope(|scope| {
         let cancel = scope.spawn(|| call(&home, "run.cancel", &json!({"run_id": r})));
-        thread::sleep(Duration::from_millis(300));
-        let resumed = call(&home, "run.resume", &json!({"run_id": r}));
+        // The resume lands once attempt 1 has ended and before the cancel answers: wait
+        // for that end, not a fixed 300 ms, which a Windows runner's slower kill outlasted
+        // (run_alive, run 46036175108).
+        wait_until(&home, since, 30, "attempt 1 ends", |e| {
+            of(e, &r, Some("run.failed"))
+                .iter()
+                .any(|failed| failed["data"]["attempt"] == 1)
+        });
+        let resumed = call_for(&home, since, &r, "run.resume", &json!({"run_id": r}));
         assert_eq!(resumed["attempt"], 2, "{resumed:#}");
         let cancelled = cancel.join().unwrap();
         assert_eq!(cancelled["cancelled"], true, "{cancelled:#}");
