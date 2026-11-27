@@ -1679,8 +1679,10 @@ def board_sessions(
         # As ``cli.board_names`` keeps a name: sorted stably, in team_sessions' order.
         kept, *others = sorted(group, key=lambda row: (not row.ended, row.started_at), reverse=True)
         wanted.add(kept.id)
-        minutes = {_minute(row) for row in others if row.id in have}
-        wanted.update(row.id for row in others if _minute(row) in minutes)
+        minutes = {event_time.clock_minute(row.started_at) for row in others if row.id in have}
+        wanted.update(
+            row.id for row in others if event_time.clock_minute(row.started_at) in minutes
+        )
     wanted -= have
     if not wanted:
         return read, labels
@@ -1689,11 +1691,6 @@ def board_sessions(
     sessions = sorted([*read, *more], key=lambda session: order.get(session.id, -1))
     labels.update({sid: label for sid, label in their_labels.items() if sid in wanted})
     return sessions, labels
-
-
-def _minute(row: SessionNameRow) -> str:
-    """The minute a session started, as ``cli.board_names`` tells namesakes apart by it."""
-    return f"{row.started_at.astimezone():%H:%M}"
 
 
 def _fleet_labels_of(store: ContextStore, session_ids: Collection[str]) -> dict[str, str]:

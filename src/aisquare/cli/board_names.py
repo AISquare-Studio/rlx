@@ -5,7 +5,8 @@ to understand, can that be just the name shown on left pane". asq's board, ``boa
 ``aisquare board``'s text name a session by ``services.team.board_name`` (its fleet row's label,
 live or ended, as a relabel left it, else its own, else its role), and tell two sessions of one
 name apart
-here, by the time each started, as the board shows its other times (``cli.common.local_time``).
+here, by the minute each started (``core.event_time.clock_minute``, which the board's paged read
+groups namesakes by too).
 The agent-facing text keeps ids (``services.team.authors_of``, ``event_line`` without names).
 """
 
@@ -14,7 +15,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 
-from aisquare.cli.common import local_time
+from aisquare.core import event_time
 from aisquare.core.store import store_session
 from aisquare.models import TeamSession
 from aisquare.services import team as team_service
@@ -53,7 +54,7 @@ def board_names(
         kept, *others = sorted(
             group, key=lambda s: (s.ended_at is None, s.started_at), reverse=True
         )
-        stamps = {s.id: f"{local_time(s.started_at):%H:%M}" for s in others}
+        stamps = {s.id: event_time.clock_minute(s.started_at) for s in others}
         for session in others:
             stamp = stamps[session.id]
             shared = sum(1 for other in stamps.values() if other == stamp) > 1
