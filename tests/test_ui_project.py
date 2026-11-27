@@ -2568,6 +2568,72 @@ def test_enter_then_leaving_the_nickname_before_its_save_lands_keeps_it_once(
     assert seen["undone"] == (None, "", 0, ["Auth", None]), seen["undone"]
 
 
+def test_a_refresh_between_the_nicknames_write_and_its_report_leaves_ctrl_z_the_old_name(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #53 (#3320, from #3285/#3307): the Undo's name to put back was read from the
+    tab's project when the worker reported. A frame landing between the store's write and that
+    report (``show_project``, the store's project) already held the new name, so the one Undo
+    wrote the new name again and the first ctrl+z did nothing. It is taken as the save is asked
+    now. The save is held after its write by a gate, the frame lands, then the save is let go:
+    one ctrl+z puts the OLD name back, on disk and shown."""
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)
+    real_rename = fleet_service.rename_project
+    written = threading.Event()
+    let_go = threading.Event()
+
+    def slowed(target: ProjectInfo, nickname: str | None, **kwargs: Any) -> ProjectInfo:
+        renamed = real_rename(target, nickname, **kwargs)
+        if nickname == "Auth":  # the save under test; its Undo's goes straight through
+            written.set()
+            let_go.wait(timeout=10)
+        return renamed
+
+    monkeypatch.setattr(fleet_service, "rename_project", slowed)
+
+    def from_store() -> ProjectInfo:
+        with store_session() as store:
+            found = store.get_project(project.id)
+        assert found is not None
+        return found
+
+    async def scenario(pilot: Pilot[None], host: Host) -> dict[str, Any]:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        page = host.query_one(SettingsView)
+        field = host.query_one("#nickname", CommitInput)
+        await pilot.click("#nickname")
+        field.value = "Auth"
+        await pilot.press("enter")
+        for _ in range(500):  # bounded: the worker's store write, on its own thread
+            if written.is_set():
+                break
+            await pilot.pause(0.01)
+        page.show_project(from_store())  # the frame: the store's project, the new name in it
+        await pilot.pause()
+        seen: dict[str, Any] = {"framed": (written.is_set(), page.project.nickname)}
+        let_go.set()
+        await settle(pilot)
+        seen["kept"] = (from_store().nickname, len(page.changes))
+        field.focus()  # ctrl+z reaches the page from its field
+        await pilot.pause()
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen["undone"] = (from_store().nickname, field.value, len(page.changes))
+        return seen
+
+    try:
+        seen = drive(project, scenario)
+    finally:
+        let_go.set()  # never a worker left waiting
+    assert seen["framed"] == (True, "Auth"), "the premise: the frame held the new name"
+    assert seen["kept"] == ("Auth", 1), seen["kept"]
+    assert seen["undone"] == (None, "", 0), "one ctrl+z: the old name, on disk and shown"
+
+
 def test_a_nickname_whose_save_failed_is_saved_again_on_enter(
     project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:

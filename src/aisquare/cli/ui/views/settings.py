@@ -247,17 +247,22 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         Always written, never compared with the tab's copy of the project first: a
         rename made elsewhere may not have reached it, and writing the same name
         again changes nothing.
+
+        The project as the tab has it NOW, as the save is asked, goes back with the result:
+        what its Undo puts back and the codename it replaces. Read when the worker reports, a
+        frame landing between the store's write and the report (``show_project``) already
+        held the new name, and the one Undo wrote that again (reviewer of #53, #3320).
         """
         project = self.project
 
-        def rename() -> tuple[ProjectInfo, list[str], bool]:
+        def rename() -> tuple[ProjectInfo, list[str], bool, ProjectInfo]:
             notes: list[str] = []
             before = project.codename
             renamed = fleet_service.rename_project(
                 project, wanted or None, notes=notes, follow_unchanged=False
             )
             works = bool(before) and fleet_service.old_codename_works(renamed.id, before or "")
-            return renamed, notes, works
+            return renamed, notes, works, project
 
         self.run_worker(
             rename,
@@ -304,11 +309,11 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         result = event.worker.result
         if not isinstance(result, tuple):
             return
-        updated, notes, _old_works = result
-        if not isinstance(updated, ProjectInfo):
+        updated, notes, _old_works, asked_of = result
+        if not isinstance(updated, ProjectInfo) or not isinstance(asked_of, ProjectInfo):
             return
-        before = self.project.codename
-        previous = self.project.nickname or ""
+        before = asked_of.codename  # as the save was asked: see _save_nickname
+        previous = asked_of.nickname or ""
         self.project = updated
         field = self.query_one("#nickname", CommitInput)
         field.keep(updated.nickname or "")
