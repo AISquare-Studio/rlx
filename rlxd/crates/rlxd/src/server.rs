@@ -262,7 +262,7 @@ impl Daemon {
 
     /// Publishes `daemon.started {version, pid}`, the first event of this rlxd's life.
     pub fn started(&self) {
-        self.claude.start(&self.env, true);
+        self.claude.start(&self.env);
         let data = object(&json!({"version": VERSION, "pid": self.pid}));
         if let Err(e) = self
             .bus
@@ -423,7 +423,7 @@ impl Daemon {
             if let Err(e) = off_worker(|| self.env.set(&change, &who)) {
                 return Err(reply_err(id, codes::INTERNAL, e.to_string()));
             }
-            self.claude.start(&self.env, true);
+            self.claude.start(&self.env);
         }
         info!(
             "hello: {} {} as {}{}",
@@ -695,7 +695,7 @@ impl Daemon {
         let who = format!("{} {}", role_name(session.role), session.client);
         let values = off_worker(|| self.env.set(&change, &who))
             .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
-        self.claude.start(&self.env, true);
+        self.claude.start(&self.env);
         printed(&values)
     }
 

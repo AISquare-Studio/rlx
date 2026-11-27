@@ -130,7 +130,8 @@ fn is_batch_file(program: &Path) -> bool {
 }
 
 /// How long a probe's answer is reused: a client polling `status` doesn't start Claude
-/// Code each time. An env change or rlxd's start probes again at once.
+/// Code each time. A change to the app's values or the `claude` they resolve to, or
+/// rlxd's start, probes again at once.
 pub const FRESH: Duration = Duration::from_secs(30);
 
 /// How long `status` waits for a probe in flight before it answers with what it has: a
@@ -140,18 +141,28 @@ pub const WAIT: Duration = Duration::from_millis(500);
 /// `status.claude`, probed in the background (7.4): `status` gets the last answer and
 /// never waits on Claude Code for more than [`WAIT`]. Each probe has a generation, and
 /// one started for an older environment never overwrites a newer one's answer.
+///
+/// The answer is for what it was probed with ([`Probed`]): only a change to that drops
+/// it. An app's `hello` or `env.set` with the values it had (every reconnect) changes
+/// nothing, and `status` goes on with the answer and its `as_of`.
 pub struct Probe {
     state: std::sync::Mutex<ProbeState>,
     /// The generation of the last probe that ended.
     done: tokio::sync::watch::Sender<u64>,
 }
 
+/// What a probe runs with: the app's values, and the `claude` they resolved to and where
+/// it was looked for (`Env::snapshot`).
+type Probed = (EnvValues, (Resolved, Source));
+
 #[derive(Default)]
 struct ProbeState {
-    /// The last answer, for the environment now; none while the first is running.
+    /// The last answer, for [`ProbeState::probed`]; none while its first probe runs.
     answer: Option<Claude>,
     /// When it ended.
     at: Option<std::time::Instant>,
+    /// What the answer, and the probe running, are for.
+    probed: Option<Probed>,
     /// The latest probe started.
     generation: u64,
     /// The probe running, by generation.
@@ -168,45 +179,65 @@ impl Probe {
     }
 
     /// Starts a probe in the background, with `env`'s values and the `claude` they
-    /// resolve to. With `fresh_env` (rlxd's start, an env change) always, and the answer
-    /// so far is dropped, as it was for other values. Otherwise only when none is running
-    /// and the last answer is older than [`FRESH`]. Needs the runtime.
-    pub fn start(self: &Arc<Self>, env: &Arc<Env>, fresh_env: bool) {
+    /// resolve to, read together. When the answer so far is for other values or another
+    /// `claude` (rlxd's start, an env change that changed them), always, and that answer
+    /// is dropped. For the same, only when none is running and the answer is older than
+    /// [`FRESH`], which is kept meanwhile. Needs the runtime.
+    pub fn start(self: &Arc<Self>, env: &Env) {
+        let now = env.snapshot();
         let generation = {
             let mut state = self.state();
-            let stale = state.at.is_none_or(|at| at.elapsed() >= FRESH);
-            if !fresh_env && (state.running.is_some() || !stale) {
-                return;
-            }
-            if fresh_env {
+            if state.probed.as_ref() == Some(&now) {
+                let stale = state.at.is_none_or(|at| at.elapsed() >= FRESH);
+                if state.running.is_some() || !stale {
+                    return;
+                }
+            } else {
                 state.answer = None;
                 state.at = None;
+                state.probed = Some(now.clone());
             }
             state.generation += 1;
             state.running = Some(state.generation);
             state.generation
         };
-        let (probe, env) = (Arc::clone(self), Arc::clone(env));
+        let (values, (resolved, source)) = now;
+        self.run(generation, async move {
+            probe_at(&resolved, source, &values).await
+        });
+    }
+
+    /// Runs `probe` as generation `generation`, in the background: its answer is kept
+    /// unless a later generation started meanwhile. However it ends, a panic included,
+    /// the generation no longer runs ([`Ending`]), so a later `status` probes again.
+    fn run(
+        self: &Arc<Self>,
+        generation: u64,
+        probe: impl Future<Output = Claude> + Send + 'static,
+    ) {
+        let ending = Ending {
+            probe: Arc::clone(self),
+            generation,
+        };
         tokio::spawn(async move {
-            let (resolved, source) = env.claude();
-            let mut claude = probe_at(&resolved, source, &env.values()).await;
+            let mut claude = probe.await;
             claude.as_of = Some(clock::now());
-            let mut state = probe.state();
-            if state.generation == generation {
-                state.answer = Some(claude);
-                state.at = Some(std::time::Instant::now());
-                state.running = None;
-                drop(state);
-                probe.done.send_replace(generation);
+            {
+                let mut state = ending.probe.state();
+                if state.generation == generation {
+                    state.answer = Some(claude);
+                    state.at = Some(std::time::Instant::now());
+                }
             }
+            drop(ending);
         });
     }
 
     /// The answer for `status`: the last probe's, a running one's when it ends within
     /// [`WAIT`], else, before any has ended, what the resolution alone says, with no
-    /// `as_of`. Starts a probe when the answer is stale.
-    pub async fn answer(self: &Arc<Self>, env: &Arc<Env>) -> Claude {
-        self.start(env, false);
+    /// `as_of`. Starts a probe when the answer is stale, or for other values.
+    pub async fn answer(self: &Arc<Self>, env: &Env) -> Claude {
+        self.start(env);
         let running = self.state().running;
         if let Some(generation) = running {
             let mut done = self.done.subscribe();
@@ -229,6 +260,32 @@ impl Probe {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Ends a probe's generation when dropped, as its task ends or unwinds: it no longer
+/// runs, and `status` waiting for it ([`Probe::answer`]) is told.
+struct Ending {
+    probe: Arc<Probe>,
+    generation: u64,
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        {
+            let mut state = self.probe.state();
+            if state.running == Some(self.generation) {
+                state.running = None;
+            }
+        }
+        let generation = self.generation;
+        self.probe.done.send_if_modified(|done| {
+            let later = *done < generation;
+            if later {
+                *done = generation;
+            }
+            later
+        });
     }
 }
 
@@ -411,6 +468,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// Review #3345's nit: a probe whose task panics must not leave its generation
+    /// running, which would keep every later `status` waiting [`WAIT`] and starting none.
+    #[tokio::test]
+    async fn a_probe_that_panics_no_longer_runs_and_the_next_status_probes_again() {
+        let probe = Arc::new(Probe::new());
+        {
+            let mut state = probe.state();
+            state.generation = 1;
+            state.running = Some(1);
+        }
+        let mut done = probe.done.subscribe();
+        probe.run(1, async { panic!("a probe that panics") });
+        tokio::time::timeout(Duration::from_secs(5), done.wait_for(|ended| *ended >= 1))
+            .await
+            .expect("its generation ends")
+            .unwrap();
+        let state = probe.state();
+        assert_eq!(state.running, None);
+        assert!(state.answer.is_none());
+        // Stale (no answer), and none running: `start` would probe again.
+        assert!(state.at.is_none_or(|at| at.elapsed() >= FRESH));
+    }
 
     #[cfg(unix)]
     #[test]

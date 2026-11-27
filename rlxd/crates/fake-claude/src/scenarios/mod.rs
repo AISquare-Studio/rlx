@@ -43,6 +43,8 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("signed-out", hello::run),
     ("probe-hangs", hello::run),
     ("auth-env", hello::run),
+    ("probe-slow", hello::run),
+    ("probe-markers", hello::run),
     ("rate-limit", rate_limit::run),
     ("slow", slow::run),
     ("structured", structured::run),

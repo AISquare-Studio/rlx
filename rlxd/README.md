@@ -148,12 +148,16 @@ Claude Code for long:
   `loggedIn`. `account` is its `email`, and `plan` its `subscriptionType`. `auth_method` is
   its `authMethod` (`claude.ai`, `api_key`, `oauth_token`), or for `third_party` the
   provider it names (`bedrock`, `vertex`, `foundry`, …).
-- **When.** At rlxd's start, on every change to the app's environment (`env.set`, an app
-  `hello`'s `env`), and when `status` finds the last answer older than 30 s. A probe for an
-  older environment never overwrites a newer one's answer.
+- **When.** At rlxd's start, when the app's values or the `claude` they resolve to
+  change (`env.set`, an app `hello`'s `env`), and when `status` finds the last answer
+  older than 30 s. A probe for an older environment never overwrites a newer one's answer.
+  An `env.set` or app `hello` with the values rlxd has, as on each reconnect, changes
+  nothing: `status` keeps the answer and its `as_of`.
 - **What `status` gets.** The last answer, with `as_of`, when its probe ended. A probe
-  in flight is waited for at most 500 ms. Before the first one ends, there is no `as_of`,
-  and `signed_in` is false.
+  in flight is waited for at most 500 ms. Before the first one ends, and after a change
+  until the new one ends, there is no `as_of`, and `signed_in` is false: no `as_of` means
+  still checking, not signed out. A probe that ends however it ends, a panic included, no
+  longer runs, so a later `status` probes again.
 - **A probe that fails** (Claude Code won't start, doesn't answer within its time, prints
   no JSON) reads as signed out, with `error` saying why. `error` never holds what Claude
   Code printed.
