@@ -69,7 +69,9 @@ def _daemon(kind: str) -> None:
         nonlocal asked
         asked = True  # taken, and finished once not stuck
 
-    signal.signal(signal.SIGTERM, stop)
+    # As rlx's watch does (services.watch._stop_on): a SIGTERM ignored at start stays so.
+    if signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN:
+        signal.signal(signal.SIGTERM, stop)
     version = (DIR / "version").read_text(encoding="utf-8").strip()
     argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
     planted = DIR / f"argv-{kind}"  # a record that names another program (a review's H1a)

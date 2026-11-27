@@ -191,7 +191,14 @@ def test_the_census_counts_daemons_runs_in_flight_and_live_ptys(fake: Daemons) -
     assert [run["run_id"] for run in found.runs] == ["r1"], "queued and running only"
     assert [pty["pty_id"] for pty in found.ptys] == ["p1"], "live ones only"
     shown = found.as_json()
-    assert set(shown) == {"daemons", "runs_in_flight", "ptys", "rlxd_error", "restarts_pending"}
+    assert set(shown) == {
+        "daemons",
+        "runs_in_flight",
+        "ptys",
+        "rlxd_error",
+        "rlxd_version",
+        "restarts_pending",
+    }
     assert shown["daemons"][0]["kind"] == "rlxd" and shown["daemons"][0]["restartable"]
     assert shown["runs_in_flight"] == [
         {"run_id": "r1", "kind": "task", "state": "running", "job_id": None}
@@ -352,6 +359,7 @@ def test_a_tampered_archive_keeps_the_old_rlxd_and_starts_it_again(fake: Daemons
     assert around.failure is not None
     assert around.failure.code == "rlxd_install_failed"
     assert around.failure.detail == "checksum_mismatch"
+    assert "daemon install" in around.failure.message, "what installs rlxd, said (#3107)"
     assert ("rlxd", "failed") in _steps(_events(out))
     assert around.restarted == ["rlxd"]
 
@@ -1391,3 +1399,63 @@ def test_check_asks_rlxd_with_a_short_timeout(tool: Path, monkeypatch: pytest.Mo
     result = CliRunner().invoke(app, ["--json", "upgrade", "--check"])
     assert result.exit_code == 0, result.output
     assert asked == {"timeout": upgrade_daemons.CHECK_CALL_TIMEOUT_SECONDS}
+
+
+# --- tester-upgrade's round 2 (#3107) -------------------------------------------------------
+
+
+@posix_only
+def test_a_watch_started_again_after_a_ctrl_c_stops_on_sigterm(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(B): the guard starts the watch again after a Ctrl-C during uv. It must take SIGTERM by
+    default (the fake, like rlx's watch, keeps a SIGTERM ignored at its start ignored), or
+    the next upgrade's stop of it fails, 31 s later."""
+    fake.start()
+    watch = fake.start("watch")
+
+    def interrupted(argv: Any, **kwargs: Any) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(install_route, "run_installer", interrupted)
+    assert _lines(_upgrade("--restart-daemons"))[-1]["data"]["code"] == "interrupted"
+    again = fake.wait_live("watch", not_pid=watch.pid)
+    os.kill(again.pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while again.id in upgrade_daemons._live_ids():
+        assert time.monotonic() < deadline, "the watch started again ignores SIGTERM"
+        time.sleep(0.1)
+
+
+@posix_only
+def test_check_flags_an_rlxd_of_another_version_and_says_what_installs_it(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a swap that failed rlx is new and rlxd is not: the check says so (#3107)."""
+    fake.start()
+    same = json.loads(CliRunner().invoke(app, ["--json", "upgrade", "--check"]).stdout)
+    assert same["rlxd_version"] == "1.0.0" and same["rlxd_version_mismatch"] is False
+    fake.version("0.9.0")
+    fake.state(rlxd={**fake.read_state()["rlxd"], "version": "0.9.0"})
+    behind = json.loads(CliRunner().invoke(app, ["--json", "upgrade", "--check"]).stdout)
+    assert behind["rlxd_version"] == "0.9.0" and behind["rlxd_version_mismatch"] is True
+    said = CliRunner().invoke(app, ["upgrade", "--check"]).output
+    assert "rlxd runs 0.9.0, not rlx's 1.0.0: install it with" in said
+    assert "daemon install" in said
+
+
+@posix_only
+def test_an_upgrade_with_nothing_to_install_says_rlxd_lags(
+    fake: Daemons, tool: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-run after rlxd_install_failed: nothing newer for rlx, and rlxd behind (#3107)."""
+    monkeypatch.setattr(install_route, "fetch_latest", lambda *a, **k: LatestRelease("1.0.0"))
+    fake.start()
+    fake.state(rlxd={**fake.read_state()["rlxd"], "version": "0.9.0"})
+    plain = CliRunner().invoke(app, ["upgrade", "--yes"])
+    assert plain.exit_code == 0, plain.output
+    assert "rlxd runs 0.9.0, not rlx's 1.0.0" in plain.stderr
+    lines = _lines(_upgrade())
+    assert lines[-1]["type"] == "upgrade.done"
+    checked = [e["data"] for e in lines if e["data"].get("step") == "check"]
+    assert "rlxd runs 0.9.0" in checked[-1]["detail"], checked

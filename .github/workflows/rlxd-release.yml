@@ -645,7 +645,7 @@ jobs:
           EOF
           for _ in $(seq 150); do test -s "$plant/pid" && break; sleep 0.2; done
           # Whatever ends the step, the holder goes too: left, it keeps its records alive.
-          trap 'rlxd stop >/dev/null 2>&1 || true; kill $stub "$(cat "$plant/pid")" 2>/dev/null || true' EXIT
+          trap 'rlxd stop >/dev/null 2>&1 || true; kill $stub "$(cat "$plant/pid" 2>/dev/null)" 2>/dev/null || true' EXIT
           rlx --json upgrade --check > check.json
           jq -e '[.daemons[].kind] | (map(select(. == "watch")) | length == 2) and (map(select(. == "rlxd")) | length == 2)' check.json
           test ! -e "$plant/ran-script"
@@ -655,14 +655,15 @@ jobs:
           jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "daemon_unrecognized" and (.[-1].data.detail | contains("/usr/bin/touch") and contains("rlxd ("))' up.jsonl
           sleep 1
           test ! -e "$plant/ran-touch"; test ! -e "$plant/ran-script"; test ! -e "$plant/ran-dash-c"
-          kill -0 "$(cat "$plant/pid")"
+          holder=$(cat "$plant/pid"); kill -0 "$holder"
           rlxd status --json | jq -e --argjson p "$REAL" '.data.pid == $p'
-          kill "$(cat "$plant/pid")" && rm "$plant/pid"  # the trap kills no pid reused since
+          kill "$holder" && rm "$plant/pid"  # the trap kills no pid reused since
+          # Its three records go with it (rlxd's brain, rlxd's child, has one of its own).
           for _ in $(seq 100); do
-            rlx --json upgrade --check | jq -e '.daemons | length == 1' > /dev/null && break
+            rlx --json upgrade --check | jq -e --argjson h "$holder" '[.daemons[] | select(.pid == $h)] | length == 0' > /dev/null && break
             sleep 0.2
           done
-          rlx --json upgrade --check | jq -e '.daemons | length == 1'
+          rlx --json upgrade --check | jq -e --argjson h "$holder" '[.daemons[] | select(.pid == $h)] | length == 0'
 
           # M4: a frozen rlxd (SIGSTOP) can't say its runs and PTYs, so the upgrade refuses
           # (ptys_live, the error its detail) and stops nothing.

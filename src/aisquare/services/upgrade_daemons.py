@@ -94,7 +94,7 @@ parent never waits for it stays a zombie)."""
 RLXD_CALL_TIMEOUT_SECONDS = 30.0
 """How long one ``rlxd`` command may take."""
 
-CHECK_CALL_TIMEOUT_SECONDS = 5.0
+CHECK_CALL_TIMEOUT_SECONDS = 3.0
 """How long one ``rlxd`` command may take for ``upgrade --check``, which the app reads: a
 frozen rlxd makes it say its runs and PTYs are unknown, not wait."""
 
@@ -351,6 +351,8 @@ class Census:
     refuses as some would."""
     pending: tuple[dict[str, Any], ...] = ()
     """Helpers waiting to start a daemon again once it has ended (:func:`pending_restarts`)."""
+    rlxd_version: str | None = None
+    """The version this host's rlxd says it is (``status``), when it answers."""
 
     @property
     def here(self) -> tuple[daemons_core.Daemon, ...]:
@@ -412,6 +414,7 @@ class Census:
                 for pty in self.ptys
             ],
             "rlxd_error": self.rlxd_error,
+            "rlxd_version": self.rlxd_version,
             "restarts_pending": list(self.pending),
         }
 
@@ -457,11 +460,34 @@ def census(rlxd: Rlxd | None = None, *, ask_rlxd: bool = True) -> Census:
         ptys = rlxd.call("pty.list").get("ptys") or []
     except RlxdError as exc:
         return replace(found, rlxd_error=str(exc))
+    version = (rlxd.daemon_status() or {}).get("version")
     return replace(
         found,
         runs=runs,
         ptys=tuple(pty for pty in ptys if isinstance(pty, dict) and not pty.get("exited")),
+        rlxd_version=version if isinstance(version, str) else None,
     )
+
+
+def rlxd_lags(current: str) -> str | None:
+    """:func:`rlxd_behind` for an upgrade with nothing to install: only rlxd's ``status``,
+    asked with the check's short timeout, and only when this host's rlxd is registered."""
+    if not census(ask_rlxd=False).rlxd_runs:
+        return None
+    rlxd = find_rlxd(timeout=CHECK_CALL_TIMEOUT_SECONDS)
+    version = (rlxd.daemon_status() or {}).get("version") if rlxd is not None else None
+    return rlxd_behind(Census(rlxd_version=version if isinstance(version, str) else None), current)
+
+
+def rlxd_behind(found: Census, current: str) -> str | None:
+    """What to do when this host's rlxd runs another version than rlx's ``current`` (after
+    a swap that failed, say: rlx moved on and rlxd did not), or ``None`` when it doesn't,
+    or doesn't say."""
+    version = found.rlxd_version
+    if version is None or install_route.same_version(version, current):
+        return None
+    install = prog.shell_advice(f": install it with {prog.words('daemon', 'install')}")
+    return f"rlxd runs {version}, not rlx's {current}{install}"
 
 
 # --- refusals -------------------------------------------------------------------------------
@@ -1194,7 +1220,12 @@ class Around:
         ended = self._end_ptys(fresh)
         # What refusal() let through: rlx's own records, or ones the upgrade does not stop.
         targets = [daemon for daemon in fresh.here if restart_refusal(daemon) is None]
-        self.left = [f"{d.kind} (not restartable)" for d in fresh.here if not d.restartable]
+        # rlxd's brain is its child: it stops with rlxd, and rlxd starts it again.
+        self.left = [
+            f"{d.kind} (not restartable)"
+            for d in fresh.here
+            if not d.restartable and d.kind != "brain"
+        ]
         targets.sort(key=lambda daemon: daemon.kind == "rlxd")
         for daemon in targets:
             if daemon.kind == "rlxd":
@@ -1297,11 +1328,13 @@ class Around:
             f"rlx is upgraded to {self.to_version}, but rlxd is not ({code}): the rlxd in "
             "place is kept"
         )
+        # rlx is the new release now, so running the upgrade again finds nothing to do:
+        # what installs rlxd is said here (tester #3107).
+        advice = prog.shell_advice(f" Install it with: {prog.words('daemon', 'install')}")
         if not self.options.restart_daemons:
-            advice = prog.shell_advice(f" Install it with: {prog.words('daemon', 'install')}")
             self.events.say_line(f"! {message}.{advice}")
             return
-        self.failure = Refused("rlxd_install_failed", f"{message}, and runs again", code)
+        self.failure = Refused("rlxd_install_failed", f"{message}, and runs again.{advice}", code)
 
     def finish(self, hooks: Sequence[HookRefresh] | None) -> None:
         """After the install: ``refresh_hooks`` (what the install's hook refresh did, when it

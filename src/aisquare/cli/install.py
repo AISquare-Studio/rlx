@@ -150,12 +150,17 @@ def _emit_check(plan: lifecycle_service.UpgradePlan) -> None:
     found = upgrade_daemons.census(
         upgrade_daemons.find_rlxd(timeout=upgrade_daemons.CHECK_CALL_TIMEOUT_SECONDS)
     )
+    behind = upgrade_daemons.rlxd_behind(found, plan.current)
     if get_state().json_output:
-        _echo_json({**_plan_json(plan), **found.as_json()})
+        _echo_json(
+            {**_plan_json(plan), **found.as_json(), "rlxd_version_mismatch": behind is not None}
+        )
         return
     _say(f"rlx {plan.current} — {plan.route.describe()}")
     _say(_latest_line(plan))
     _daemon_lines(found)
+    if behind is not None:
+        _say(behind)
     # A release PyPI does not list may be on an index the command reads and this CLI does
     # not: PIP_INDEX_URL, pip.conf, pipx's default index, uv.toml, UV_INDEX_URL. Every
     # route's, a uv tool's too, whose receipt does not record an index set in uv's own
@@ -740,6 +745,9 @@ def _upgrade(
                 f"rlx {plan.current} is up to date (PyPI's latest is "
                 f"{plan.latest_version}) — nothing to do"
             )
+        behind = upgrade_daemons.rlxd_lags(plan.current)
+        if behind is not None:  # after a swap that failed, rlx is new and rlxd is not
+            stderr_console().print(f"! {behind}", markup=False, highlight=False)
         _reopen(reopen, one_click=one_click, started=started)
         return
     if plan.asqs_refusal is not None and yes and not dry_run:
@@ -955,7 +963,9 @@ def _json_lines_run(
             plan.route.describe(),
         )
     if plan.up_to_date:
-        events.step("check", "done", "nothing newer to install")
+        behind = upgrade_daemons.rlxd_lags(plan.current)
+        said = "; ".join(filter(None, ["nothing newer to install", behind]))
+        events.step("check", "done", said)
         return None, None
     if plan.asqs_refusal is not None:
         raise upgrade_daemons.Refused(
