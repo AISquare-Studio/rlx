@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JobRunNowData",
+  "description": "`job.run_now`'s reply: the run it started.",
+  "type": "object",
+  "properties": {
+    "job_id": {
+      "description": "The job's id.",
+      "$ref": "#/$defs/JobId"
+    },
+    "run_id": {
+      "description": "The run it started.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "required": [
+    "job_id",
+    "run_id"
+  ],
+  "$defs": {
+    "JobId": {
+      "description": "A job's id, which the app picks: 1 to 128 ASCII letters, digits, `.`, `_`, `-` and\n`:`, starting with a letter or a digit.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+}

@@ -8,7 +8,9 @@
 
 use rlxd_proto::{
     Auth, DaemonRecord, Data, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData,
-    InstalledRlx, InstalledRlxd, Paths, Request, RequestId, Role, RunScope, Setting,
+    InstalledRlx, InstalledRlxd, Paths, PtyCursor, PtyExited, PtyInfo, PtyKillParams, PtyList,
+    PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
+    PtySubscribeParams, PtyWriteParams, Request, RequestId, Role, RunScope, Setting,
     SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
     SettingsSetParams, StatusData, SubscribeParams,
 };
@@ -75,6 +77,28 @@ fn deserialize_called_by_path_refuses_what_the_schema_refuses() {
     assert!(SettingsChanged::deserialize(json!({"key": "theme", "version": 0})).is_err());
     assert!(SettingsDeleteParams::deserialize(json!({"key": ""})).is_err());
     assert!(ErrorBody::deserialize(json!({"code": "since_ahead", "message": "m"})).is_err());
+
+    let pty = "6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b";
+    let spawn = json!({"argv": [], "cols": 80, "rows": 24});
+    assert!(PtySpawnParams::deserialize(spawn).is_err());
+    assert!(PtyRef::deserialize(json!({"pty_id": "x"})).is_err());
+    let both = json!({"pty_id": pty, "text": "a", "paste": "b"});
+    assert!(PtyWriteParams::deserialize(both).is_err());
+    let resize = json!({"pty_id": pty, "cols": 0, "rows": 24});
+    assert!(PtyResizeParams::deserialize(resize).is_err());
+    let screen = json!({"pty_id": pty, "scrollback": 50_001});
+    assert!(PtyScreenParams::deserialize(screen).is_err());
+    assert!(PtyKillParams::deserialize(json!({"pty_id": ""})).is_err());
+    assert!(PtySubscribeParams::deserialize(json!({"pty_id": pty})).is_err());
+    let unexited = json!({"pty_id": pty, "text": "", "cursor": {"x": 0, "y": 0,
+        "visible": true}, "cols": 80, "rows": 24, "alternate": false, "history": 0,
+        "exited": false, "status": 1, "seq": 0});
+    assert!(PtyScreen::deserialize(unexited).is_err());
+    let no_pid = json!({"ptys": [{"pty_id": pty, "argv": ["sh"], "cwd": "/", "pid": 0,
+        "cols": 80, "rows": 24, "started_at": TIME, "exited": false}]});
+    assert!(PtyList::deserialize(no_pid).is_err());
+    assert!(PtyOutput::deserialize(json!({"pty_id": pty, "bytes_b64": "abc"})).is_err());
+    assert!(PtyExited::deserialize(json!({"pty_id": pty, "status": 1, "signal": 0})).is_err());
 
     // And they still read what is valid.
     assert!(Request::deserialize(json!({"id": 1, "method": "status"})).is_ok());
@@ -169,6 +193,53 @@ fn serialize_called_by_path_does_not_print_an_invalid_value() {
     assert!(printed(&subscribe).is_ok());
     subscribe.topics = Some(vec!["Run".to_owned()]);
     assert!(printed(&subscribe).is_err());
+
+    let pty = "6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b";
+    let mut spawn = PtySpawnParams::new(vec!["sh".to_owned()], 80, 24).unwrap();
+    assert!(printed(&spawn).is_ok());
+    spawn.argv.clear();
+    assert!(printed(&spawn).is_err());
+    let mut one = PtyRef::new(pty).unwrap();
+    assert!(printed(&one).is_ok());
+    one.pty_id.push('0');
+    assert!(printed(&one).is_err());
+    let mut write = PtyWriteParams::text(pty, "a").unwrap();
+    assert!(printed(&write).is_ok());
+    write.paste = Some("b".to_owned());
+    assert!(printed(&write).is_err());
+    let mut resize = PtyResizeParams::new(pty, 80, 24).unwrap();
+    assert!(printed(&resize).is_ok());
+    resize.rows = 0;
+    assert!(printed(&resize).is_err());
+    let mut screen_params = PtyScreenParams::new(pty).unwrap();
+    assert!(printed(&screen_params).is_ok());
+    screen_params.scrollback = Some(50_001);
+    assert!(printed(&screen_params).is_err());
+    let mut kill = PtyKillParams::new(pty).unwrap();
+    assert!(printed(&kill).is_ok());
+    kill.pty_id.clear();
+    assert!(printed(&kill).is_err());
+    let mut subscribe_pty = PtySubscribeParams::new(pty, true).unwrap();
+    assert!(printed(&subscribe_pty).is_ok());
+    subscribe_pty.pty_id = "X".repeat(32);
+    assert!(printed(&subscribe_pty).is_err());
+    let mut screen = PtyScreen::new(pty, "", PtyCursor::new(0, 0, true), 80, 24, 0).unwrap();
+    assert!(printed(&screen).is_ok());
+    screen.exited = true;
+    assert!(printed(&screen).is_err());
+    let info = PtyInfo::new(pty, vec!["sh".to_owned()], "/", 1, 80, 24, TIME).unwrap();
+    let mut ptys = PtyList::new(vec![info]).unwrap();
+    assert!(printed(&ptys).is_ok());
+    ptys.ptys[0].pid = 0;
+    assert!(printed(&ptys).is_err());
+    let mut output = PtyOutput::new(pty, "AA==").unwrap();
+    assert!(printed(&output).is_ok());
+    output.bytes_b64 = "A".to_owned();
+    assert!(printed(&output).is_err());
+    let mut exited = PtyExited::new(pty, 3, None).unwrap();
+    assert!(printed(&exited).is_ok());
+    exited.signal = Some(0);
+    assert!(printed(&exited).is_err());
 
     let rlxd = InstalledRlxd::new("0.10.3", "/b/rlxd");
     let auth = Auth::new("/h/rlxd/token");

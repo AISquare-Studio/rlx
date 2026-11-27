@@ -47,31 +47,41 @@ struct TestSigner {
     thumbprint: String,
 }
 
+/// The certificate work of this file's tests, one at a time: CertEnroll refuses a key
+/// made while another test makes one ("CX509Enrollment::_CreateRequest: Access is
+/// denied", seen in CI with three tests making signers at once).
+static CERTIFICATES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn certificates() -> std::sync::MutexGuard<'static, ()> {
+    CERTIFICATES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 impl TestSigner {
     /// The signer, or `None` (with a note) where no root can be trusted.
     fn new() -> Option<Self> {
-        let made = powershell(&format!(
-            "$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN={SIGNER}' \
-             -CertStoreLocation Cert:\\CurrentUser\\My -NotAfter (Get-Date).AddDays(2); \
-             $f = Join-Path ([IO.Path]::GetTempPath()) ('rlxd-gate-' + $c.Thumbprint + '.cer'); \
-             Export-Certificate -Cert $c -FilePath $f | Out-Null; \
-             try {{ Import-Certificate -FilePath $f -CertStoreLocation Cert:\\LocalMachine\\Root \
-             -ErrorAction Stop | Out-Null }} catch {{ Remove-Item Cert:\\CurrentUser\\My\\$($c.Thumbprint); \
-             Remove-Item $f; throw }}; Remove-Item $f; $c.Thumbprint"
-        ));
+        let _one_at_a_time = certificates();
+        // Once more after a refused key, in case another process's CertEnroll held it.
+        let mut made = Self::make();
+        if matches!(&made, Ok((out, said)) if out.trim().is_empty() && said.contains("Access is denied"))
+        {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            made = Self::make();
+        }
         // PowerShell may print more before it; the thumbprint is the last line.
-        let thumbprint = made.map(|out| {
-            out.lines()
+        let thumbprint = made.map(|(out, said)| {
+            let thumbprint = out
+                .lines()
                 .map(str::trim)
                 .rfind(|line| !line.is_empty())
                 .unwrap_or_default()
-                .to_owned()
+                .to_owned();
+            (thumbprint, out, said)
         });
         match thumbprint {
-            Ok(thumbprint) => {
+            Ok((thumbprint, out, said)) => {
                 assert!(
                     thumbprint.len() == 40 && thumbprint.bytes().all(|b| b.is_ascii_hexdigit()),
-                    "not a thumbprint: {thumbprint:?}"
+                    "not a thumbprint: {thumbprint:?} (stdout {out:?}, stderr {said:?})"
                 );
                 Some(Self { thumbprint })
             }
@@ -86,8 +96,23 @@ impl TestSigner {
         }
     }
 
+    /// A new self-signed code-signing certificate, its root trusted by the machine: what
+    /// PowerShell printed (the thumbprint last) and said.
+    fn make() -> Result<(String, String), String> {
+        powershell_said(&format!(
+            "$c = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN={SIGNER}' \
+             -CertStoreLocation Cert:\\CurrentUser\\My -NotAfter (Get-Date).AddDays(2); \
+             $f = Join-Path ([IO.Path]::GetTempPath()) ('rlxd-gate-' + $c.Thumbprint + '.cer'); \
+             Export-Certificate -Cert $c -FilePath $f | Out-Null; \
+             try {{ Import-Certificate -FilePath $f -CertStoreLocation Cert:\\LocalMachine\\Root \
+             -ErrorAction Stop | Out-Null }} catch {{ Remove-Item Cert:\\CurrentUser\\My\\$($c.Thumbprint); \
+             Remove-Item $f; throw }}; Remove-Item $f; $c.Thumbprint"
+        ))
+    }
+
     /// Signs `path` with Authenticode.
     fn sign(&self, path: &Path) {
+        let _one_at_a_time = certificates();
         let signed = powershell(&format!(
             "$c = Get-Item Cert:\\CurrentUser\\My\\{}; \
              $r = Set-AuthenticodeSignature -FilePath '{}' -Certificate $c -HashAlgorithm SHA256; \
@@ -103,6 +128,7 @@ impl TestSigner {
 
 impl Drop for TestSigner {
     fn drop(&mut self) {
+        let _one_at_a_time = certificates();
         let _ = powershell(&format!(
             "Remove-Item Cert:\\LocalMachine\\Root\\{0} -ErrorAction SilentlyContinue; \
              Remove-Item Cert:\\CurrentUser\\My\\{0} -ErrorAction SilentlyContinue",
@@ -113,13 +139,21 @@ impl Drop for TestSigner {
 
 /// Runs `script` in Windows PowerShell: its stdout, or why it failed.
 fn powershell(script: &str) -> Result<String, String> {
+    powershell_said(script).map(|(out, _)| out)
+}
+
+/// Runs `script` in Windows PowerShell: its stdout and stderr, or why it failed.
+fn powershell_said(script: &str) -> Result<(String, String), String> {
     let out = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
     } else {
         Err(format!(
             "{}{}",

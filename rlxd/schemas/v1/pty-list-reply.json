@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PtyList",
+  "description": "`pty.list`'s reply: every PTY of the home, whichever connection spawned it, in the\norder they started.\n\n```json\n{\"ptys\": [{\"pty_id\": \"6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b\", \"label\": \"coder\",\n  \"argv\": [\"sh\"], \"cwd\": \"/Users/sam\", \"pid\": 4242, \"cols\": 80, \"rows\": 24,\n  \"started_at\": \"2026-11-26T12:00:00.000Z\", \"exited\": false}]}\n```",
+  "type": "object",
+  "properties": {
+    "ptys": {
+      "description": "The PTYs.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PtyInfo"
+      }
+    }
+  },
+  "required": [
+    "ptys"
+  ],
+  "$defs": {
+    "PtyInfo": {
+      "description": "One PTY, as `pty.list` lists it.",
+      "type": "object",
+      "properties": {
+        "argv": {
+          "description": "What it runs, as `pty.spawn` gave it.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "cols": {
+          "description": "The width, in cells.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 1000,
+          "minimum": 1
+        },
+        "cwd": {
+          "description": "The directory it started in.",
+          "type": "string"
+        },
+        "error": {
+          "description": "Why rlxd is ending, or has ended, the process itself, as [`PtyScreen`]'s says.",
+          "type": "string",
+          "pattern": "^[a-z_]{1,64}$"
+        },
+        "exited": {
+          "description": "Whether the process has ended.",
+          "type": "boolean"
+        },
+        "label": {
+          "description": "Its label, when `pty.spawn` gave one.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "not": {
+            "pattern": "[\\x00-\\x1f\\x7f-\\x9f]"
+          }
+        },
+        "pid": {
+          "description": "Its process's id.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2147483647,
+          "minimum": 1
+        },
+        "pty_id": {
+          "description": "The PTY.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "rows": {
+          "description": "The height, in cells.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 1000,
+          "minimum": 1
+        },
+        "signal": {
+          "description": "The signal that ended it, when one did.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 127,
+          "minimum": 1
+        },
+        "started_at": {
+          "description": "When it started, in RFC 3339 UTC.",
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$"
+        },
+        "status": {
+          "description": "Its exit status, once it has ended, as [`PtyScreen`]'s.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "status"
+                  ]
+                },
+                {
+                  "required": [
+                    "signal"
+                  ]
+                }
+              ]
+            }
+          },
+          "if": {
+            "properties": {
+              "exited": {
+                "const": true
+              }
+            },
+            "required": [
+              "exited"
+            ]
+          },
+          "then": {
+            "required": [
+              "status"
+            ]
+          }
+        }
+      ],
+      "required": [
+        "pty_id",
+        "argv",
+        "cwd",
+        "pid",
+        "cols",
+        "rows",
+        "started_at",
+        "exited"
+      ]
+    }
+  }
+}

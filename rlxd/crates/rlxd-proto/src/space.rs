@@ -137,8 +137,12 @@ impl SpaceEnsureData {
     }
 }
 
-/// `space.erase`'s reply: every path it removed. It refuses with `runs_live` while a run
-/// in the space is queued or running, and removes nothing then.
+/// `space.erase`'s reply: every path it removed, and the links inside the space that went
+/// as links. It refuses with `runs_live` while a run in the space is queued or running (or
+/// being started), with `erase_in_progress` while another erase of it runs,
+/// and with `link_refused` when a link is on the way to what it removes (`<home>/spaces`,
+/// the space, a Claude Code config directory, its `projects` or the space's folder
+/// there), and removes nothing then.
 ///
 /// ```json
 /// {"removed": ["/Users/u/.aisquare/spaces/default",
@@ -151,11 +155,15 @@ pub struct SpaceEraseData {
     /// The paths removed: the space's folder, its runs' session files, and rlxd's records
     /// of its runs.
     pub removed: Vec<String>,
+    /// Every link that was inside the space, removed as a link: what it named is left as
+    /// it was. Named under the space's resolved path, as `removed` names the space.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
 }
 
 impl SpaceEraseData {
-    /// The reply that names `removed`.
-    pub fn new(removed: Vec<String>) -> Self {
-        Self { removed }
+    /// The reply that names `removed`, and the `links` that went as links.
+    pub fn new(removed: Vec<String>, links: Vec<String>) -> Self {
+        Self { removed, links }
     }
 }

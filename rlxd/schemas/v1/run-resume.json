@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunResumeParams",
+  "description": "`run.resume`'s params: go on with a run that has no live process, as a new attempt\nwith the same `run_id` (`--resume <run_id>`). `reply`, when given, is the new\nattempt's first user message; without it, Claude Code is told to continue.\n\n```json\n{\"run_id\": \"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f\", \"reply\": \"#dev\"}\n```\n\nIt resumes a run that needs the user, is done, or failed (`engine_restarted`\nincluded), and refuses: a queued or running run (`run_alive`), a session-less one\n(`no_session`), and a `send_executor` (`not_resumable`): a send is never retried.",
+  "type": "object",
+  "properties": {
+    "reply": {
+      "description": "The user's reply, sent as the new attempt's first message.",
+      "type": "string"
+    },
+    "run_id": {
+      "description": "The run.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "required": [
+    "run_id"
+  ]
+}

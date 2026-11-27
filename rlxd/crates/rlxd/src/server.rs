@@ -40,11 +40,13 @@ use std::time::Duration;
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Claude, Clients, Data, EnvRefusal, EnvValues, Envelope, ErrorBody, HelloData, HelloParams,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, Request, RequestId, Role, RunRef,
-    RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
-    SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
-    methods, setting_keys, topics,
+    Claude, Clients, Data, EnvRefusal, EnvValues, Envelope, ErrorBody, Event, HelloData,
+    HelloParams, JobListParams, JobPutParams, JobRef, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params,
+    Paths, PtyKillParams, PtyResizeParams, PtyScreenParams, PtySpawnParams, PtySubscribeParams,
+    PtyWriteParams, Request, RequestId, Role, RunEventsParams, RunListParams, RunRef,
+    RunResumeParams, RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams,
+    SettingsSetParams, SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes,
+    event_types, methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -57,16 +59,23 @@ use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
-use crate::runner::Runner;
+use crate::pty::{self, Host};
+use crate::runner::{Replay, Runner};
+use crate::scheduler::Scheduler;
 use crate::settings::{self, Settings};
 use crate::{claude, spaces, token};
 
 /// `daemon.stopping`'s `reason` when a client asked rlxd to stop.
 pub const STOP_REQUESTED: &str = "stop";
 
-/// The longest frame rlxd reads: 1 MiB. A longer one gets `invalid_request`, and the
-/// connection closes.
+/// The longest frame rlxd reads: 1 MiB. After `hello`, a longer one gets
+/// `frame_too_large`, and rlxd skips the rest of it and reads on; as the first frame, it
+/// is no `hello`, and the connection closes, as for any other.
 pub const MAX_FRAME: usize = 1 << 20;
+
+// The longest `pty.write` fits a frame however it is escaped: six bytes of JSON for each
+// of its bytes at most, and room for the envelope.
+const _: () = assert!(6 * rlxd_proto::MAX_PTY_WRITE + 64 * 1024 <= MAX_FRAME);
 
 /// How long a new connection has to send its `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,9 +100,12 @@ pub struct Daemon {
     claude: Arc<claude::Probe>,
     bus: Arc<Bus>,
     runner: Arc<Runner>,
+    /// The scheduler, or why it couldn't start (its database couldn't be made).
+    scheduler: Result<Arc<Scheduler>, String>,
     settings: Settings,
     /// The app's environment for Claude Code (4.3), and the `claude` it resolves to.
     env: Arc<Env>,
+    ptys: Host,
     stopping: AtomicBool,
     stop: watch::Sender<bool>,
     gate: Arc<Gate>,
@@ -110,6 +122,8 @@ struct Session {
     /// connections are counted by the gate.
     app: Option<Hold>,
     _counted: Option<Counted>,
+    /// The PTY this connection's stream watches, and whether read-only, while it does.
+    watching: Mutex<Option<(String, bool)>>,
 }
 
 /// A connection counted in `status`'s `clients` while it is open.
@@ -128,6 +142,8 @@ enum Answer {
     Paired(Envelope, Minted),
     /// The event stream, whose last frame is the reply.
     Stream(Subscription),
+    /// A run's events from its log (`run.events`), whose last frame is the reply.
+    RunStream(RequestId, Box<Replay>),
 }
 
 /// A gate credential `gate.pair` minted for `device`, whose SHA-256 is `sha256`. If its
@@ -146,6 +162,14 @@ struct Minted {
 struct Subscription {
     id: RequestId,
     cursor: Cursor,
+    /// For `pty.subscribe`: the PTY, and the snapshot that starts the stream.
+    pty: Option<PtyWatch>,
+}
+
+/// A `pty.subscribe` stream's PTY.
+struct PtyWatch {
+    id: String,
+    snapshot: Line,
 }
 
 /// What the connection does once a stream has ended.
@@ -183,6 +207,14 @@ impl Daemon {
         let env = Arc::new(Env::open(&home));
         let bus = Arc::new(bus);
         let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&env));
+        let gate = Arc::new(gate);
+        let scheduler = Scheduler::new(&home, Arc::clone(&bus), Arc::clone(&runner), gate.apps());
+        match &scheduler {
+            Ok(scheduler) => {
+                tokio::spawn(Arc::clone(scheduler).run(runner.notes()));
+            }
+            Err(why) => crate::log::error!("scheduler: not started: {why}"),
+        }
         Arc::new(Self {
             home,
             token,
@@ -190,19 +222,26 @@ impl Daemon {
             pipe_acl,
             clients: Mutex::new(Clients::default()),
             claude: Arc::new(claude::Probe::new()),
+            ptys: Host::new(Arc::clone(&bus)),
             bus,
             runner,
+            scheduler,
             settings,
             env,
             stopping: AtomicBool::new(false),
             stop: watch::Sender::new(false),
-            gate: Arc::new(gate),
+            gate,
         })
     }
 
     /// The home's event bus.
     pub fn bus(&self) -> &Bus {
         &self.bus
+    }
+
+    /// Ends every PTY's process, as rlxd stops: none outlives it.
+    pub fn end_ptys(&self) {
+        self.ptys.kill_all();
     }
 
     /// Publishes `daemon.started {version, pid}`, the first event of this rlxd's life.
@@ -247,6 +286,9 @@ impl Daemon {
     /// seen. Ends the runs in flight first, killing their process trees: runs don't
     /// outlive rlxd.
     pub fn flush(&self) {
+        if let Ok(scheduler) = &self.scheduler {
+            scheduler.shutdown();
+        }
         self.runner.shutdown();
         self.gate.flush();
     }
@@ -379,6 +421,7 @@ impl Daemon {
             peer,
             app,
             _counted: counted,
+            watching: Mutex::new(None),
         };
         Ok((session, reply))
     }
@@ -438,30 +481,72 @@ impl Daemon {
         let id = request.id;
         let outcome = match request.method.as_str() {
             methods::STATUS => self.status(session).await,
-            methods::RUN_START | methods::RUN_CANCEL | methods::SPACE_ENSURE => {
+            methods::RUN_EVENTS | methods::EVENTS_SUBSCRIBE if streaming => Err(error(
+                codes::INVALID_REQUEST,
+                "this connection carries an event stream already: open another for a second",
+            )),
+            methods::RUN_EVENTS => {
+                match params_of::<RunEventsParams>(methods::RUN_EVENTS, request.params)
+                    .and_then(|params| self.runner.replay(&params))
+                {
+                    Ok(replay) => return Answer::RunStream(id, Box::new(replay)),
+                    Err(error) => Err(error),
+                }
+            }
+            methods::RUN_START
+            | methods::RUN_CANCEL
+            | methods::RUN_RESUME
+            | methods::RUN_GET
+            | methods::RUN_LIST
+            | methods::SPACE_ENSURE
+            | methods::SPACE_ERASE => {
                 self.runs_and_spaces(session, &request.method, request.params)
                     .await
+            }
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_RUN_START => self.debug_run_start(session, request.params),
+            methods::JOB_PUT
+            | methods::JOB_LIST
+            | methods::JOB_DELETE
+            | methods::JOB_PAUSE
+            | methods::JOB_RESUME
+            | methods::JOB_RUN_NOW => self.jobs(&request.method, request.params),
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_CLOCK_ADVANCE | methods::DEBUG_CLOCK_SET => {
+                self.debug_clock(&request.method, request.params)
             }
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
                 return Answer::Stop(Envelope::ok(data).with_id(id));
             }
-            methods::EVENTS_SUBSCRIBE if streaming => Err(error(
-                codes::INVALID_REQUEST,
-                "this connection carries an event stream already: open another for a second",
-            )),
             methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
                 Ok(subscription) => return Answer::Stream(subscription),
                 Err(error) => Err(error),
             },
             #[cfg(feature = "debug-methods")]
             methods::DEBUG_EMIT => self.debug_emit(&request.params).await,
+            #[cfg(feature = "debug-methods")]
+            methods::DEBUG_PTY_PANIC => self.debug_pty_panic(&request.params),
             methods::SETTINGS_GET => self.settings_get(request.params),
             methods::SETTINGS_SET => self.settings_set(session, request.params),
             methods::SETTINGS_LIST => self.settings_list(request.params),
             methods::SETTINGS_DELETE => self.settings_delete(session, request.params),
             methods::ENV_GET => printed(&self.env.values()),
             methods::ENV_SET => self.env_set(session, request.params).await,
+            methods::PTY_SUBSCRIBE if streaming => Err(error(
+                codes::INVALID_REQUEST,
+                "this connection carries a stream already: open another for a second",
+            )),
+            methods::PTY_SUBSCRIBE => match self.pty_subscribe(session, id, request.params) {
+                Ok(subscription) => return Answer::Stream(subscription),
+                Err(error) => Err(error),
+            },
+            methods::PTY_SPAWN
+            | methods::PTY_WRITE
+            | methods::PTY_RESIZE
+            | methods::PTY_SCREEN
+            | methods::PTY_KILL
+            | methods::PTY_LIST => self.pty_call(session, &request.method, request.params),
             methods::GATE_PAIR => match self.gate_pair(session, &request.params).await {
                 Ok((data, minted)) => {
                     return Answer::Paired(Envelope::ok(data).with_id(id), minted);
@@ -516,7 +601,11 @@ impl Daemon {
             .bus
             .cursor(topics, params.since, params.follow)
             .map_err(|head| ErrorBody::since_ahead(params.since.unwrap_or_default(), head))?;
-        Ok(Subscription { id, cursor })
+        Ok(Subscription {
+            id,
+            cursor,
+            pty: None,
+        })
     }
 
     /// `settings.get {key}`. Every settings call runs as blocking work (`off_worker`): a
@@ -574,6 +663,116 @@ impl Daemon {
         printed(&list)
     }
 
+    /// A `pty.*` call, if the connection's role may make it (`pty_allowed`). Each runs
+    /// as blocking work: a spawn forks, a kill waits for the process group to go.
+    fn pty_call(&self, session: &Session, method: &str, params: Params) -> Result<Data, ErrorBody> {
+        if !pty_allowed(session.role, method) {
+            return Err(role_not_allowed(session.role, method));
+        }
+        let who = format!("{} {}", role_name(session.role), session.client);
+        match method {
+            methods::PTY_SPAWN => {
+                let params = params_of::<PtySpawnParams>(method, params)?;
+                let spawned = off_worker(|| self.ptys.spawn(&params, &who));
+                printed(&spawned.map_err(pty_refused)?)
+            }
+            methods::PTY_WRITE => {
+                write_fits(&params)?;
+                let params = params_of::<PtyWriteParams>(method, params)?;
+                if watching_read_only(session, &params.pty_id) {
+                    return Err(error(
+                        codes::READ_ONLY,
+                        &format!("this connection watches pty {} read-only", params.pty_id),
+                    )
+                    .with_hint("Write from a connection that doesn't watch it read-only."));
+                }
+                printed(&off_worker(|| self.ptys.write(&params)).map_err(pty_refused)?)
+            }
+            methods::PTY_RESIZE => {
+                let params = params_of::<PtyResizeParams>(method, params)?;
+                printed(&off_worker(|| self.ptys.resize(&params)).map_err(pty_refused)?)
+            }
+            methods::PTY_SCREEN => {
+                let params = params_of::<PtyScreenParams>(method, params)?;
+                let data =
+                    printed(&off_worker(|| self.ptys.screen(&params)).map_err(pty_refused)?)?;
+                let long = serde_json::to_vec(&data).map_or(usize::MAX, |data| data.len());
+                // The reply's envelope around it, an id among it, takes far less than this.
+                if long + 4096 > bus::MAX_EVENT {
+                    return Err(screen_too_long(long));
+                }
+                Ok(data)
+            }
+            methods::PTY_KILL => {
+                let params = params_of::<PtyKillParams>(method, params)?;
+                printed(&off_worker(|| self.ptys.kill(&params, &who)).map_err(pty_refused)?)
+            }
+            _ => printed(&off_worker(|| self.ptys.list()).map_err(pty_refused)?),
+        }
+    }
+
+    /// `pty.subscribe {pty_id, read_only}`: the stream of one PTY, which starts with its
+    /// snapshot. Only `cli` and `tui` may watch with `read_only: false`.
+    fn pty_subscribe(
+        &self,
+        session: &Session,
+        id: RequestId,
+        params: Params,
+    ) -> Result<Subscription, ErrorBody> {
+        let method = methods::PTY_SUBSCRIBE;
+        if !pty_allowed(session.role, method) {
+            return Err(role_not_allowed(session.role, method));
+        }
+        let params = params_of::<PtySubscribeParams>(method, params)?;
+        if !params.read_only && !matches!(session.role, Role::Cli | Role::Tui) {
+            return Err(role_not_allowed(session.role, method).with_hint(
+                "Only cli and tui may watch a pty with read_only false; subscribe with \
+                 read_only true.",
+            ));
+        }
+        let (snapshot, seq) = off_worker(|| self.pty_snapshot(&params.pty_id))?;
+        let topics = Topics::of([topics::PTY]).expect("the bus carries pty events");
+        let cursor = self
+            .bus
+            .cursor(topics, Some(seq), true)
+            .map_err(|head| ErrorBody::since_ahead(seq, head))?;
+        *session.watching.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((params.pty_id.clone(), params.read_only));
+        Ok(Subscription {
+            id,
+            cursor,
+            pty: Some(PtyWatch {
+                id: params.pty_id,
+                snapshot,
+            }),
+        })
+    }
+
+    /// `pty_id`'s screen as a `pty.snapshot` event's line, and the seq it is pinned to.
+    fn pty_snapshot(&self, pty_id: &str) -> Result<(Line, u64), ErrorBody> {
+        let params = PtyScreenParams::new(pty_id)
+            .map_err(|e| error(codes::INVALID_PARAMS, &e.to_string()))?;
+        let screen = self.ptys.screen(&params).map_err(pty_refused)?;
+        let data = screen
+            .to_data()
+            .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        let event = Event::new(
+            screen.seq.max(1),
+            crate::clock::now(),
+            topics::PTY,
+            event_types::PTY_SNAPSHOT,
+            data,
+        )
+        .map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        let mut line =
+            serde_json::to_vec(&event).map_err(|e| error(codes::INTERNAL, &e.to_string()))?;
+        if line.len() >= bus::MAX_EVENT {
+            return Err(screen_too_long(line.len()));
+        }
+        line.push(b'\n');
+        Ok((Line::from(line), screen.seq))
+    }
+
     /// `debug.emit {count}`: `count` events, `daemon.debug {index, count}`, published one
     /// at a time, letting other tasks run every [`bus::BATCH`] of them, as any publisher
     /// that loops must, or its followers starve on rlxd's two workers. Test builds only.
@@ -606,6 +805,27 @@ impl Daemon {
         Ok(object(&json!({"first": first, "last": last})))
     }
 
+    /// `debug.pty_panic {pty_id, at}`: the PTY's screen model panics the next time rlxd
+    /// calls it `at` (`output`, `screen` or `resize`), as a bug there would, to show the
+    /// panic ends that PTY alone. Test builds only.
+    #[cfg(feature = "debug-methods")]
+    fn debug_pty_panic(&self, params: &Params) -> Result<Data, ErrorBody> {
+        use crate::vt::TestPanic;
+        let at = match params.get("at").and_then(Value::as_str) {
+            Some("output") => Some(TestPanic::Output),
+            Some("screen") => Some(TestPanic::Screen),
+            Some("resize") => Some(TestPanic::Resize),
+            _ => None,
+        };
+        let (Some(pty_id), Some(at)) = (params.get("pty_id").and_then(Value::as_str), at) else {
+            return Err(error(
+                codes::INVALID_PARAMS,
+                "debug.pty_panic takes {\"pty_id\": ID, \"at\": \"output\"|\"screen\"|\"resize\"}",
+            ));
+        };
+        printed(&off_worker(|| self.ptys.panic_next(pty_id, at)).map_err(pty_refused)?)
+    }
+
     /// `status`'s reply data (7.4).
     async fn status(&self, session: &Session) -> Result<Data, ErrorBody> {
         let home = &self.home;
@@ -629,8 +849,15 @@ impl Daemon {
         status.dev_features = crate::dev_features();
         status.claude = self.claude().await;
         (status.runs.live, status.runs.queued) = self.runner.counts();
-        // Scheduler jobs (7.6): none until the scheduler (#34) counts its own here.
-        status.jobs.count = 0;
+        status.jobs = match &self.scheduler {
+            Ok(scheduler) => scheduler.status(),
+            Err(why) => {
+                let mut jobs = rlxd_proto::Jobs::default();
+                jobs.db = Some("unavailable".to_owned());
+                jobs.reason = Some(why.clone());
+                jobs
+            }
+        };
         status.pipe_acl = self.pipe_acl.map(str::to_owned);
         match serde_json::to_value(&status) {
             Ok(Value::Object(data)) => Ok(data),
@@ -644,9 +871,99 @@ impl Daemon {
         self.claude.answer(&self.env).await
     }
 
-    /// The runner's methods (handoff 0.10.3, 7.5) and spaces' (2.5): `run.start`,
-    /// `run.cancel` and `space.ensure`. A run's client, in `run.list`, is the `client` the
-    /// connection's hello named.
+    /// `debug.run_start`: `run.start`'s params plus a scheduler `job_id`, which only rlxd
+    /// sets otherwise (7.6), so tests can check `run.list {job_id}`. Test builds only.
+    #[cfg(feature = "debug-methods")]
+    fn debug_run_start(&self, session: &Session, mut params: Params) -> Result<Data, ErrorBody> {
+        let job_id = match params.remove("job_id") {
+            Some(Value::String(job_id)) if !job_id.is_empty() => job_id,
+            _ => {
+                return Err(error(
+                    codes::INVALID_PARAMS,
+                    "debug.run_start takes run.start's params and a job_id, a string",
+                ));
+            }
+        };
+        let params = params_of::<RunStartParams>(methods::DEBUG_RUN_START, params)?;
+        printed(&off_worker(|| {
+            self.runner.start(
+                params,
+                &session.client,
+                Some(crate::runner::JobTag {
+                    job_id,
+                    loud: false,
+                }),
+            )
+        })?)
+    }
+
+    /// The scheduler's methods (handoff 0.10.3, 7.6): `job.put`, `job.list`, `job.delete`,
+    /// `job.pause`, `job.resume` and `job.run_now`. They write its store: blocking work.
+    fn jobs(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
+        let scheduler = self.scheduler.as_ref().map_err(|why| {
+            error(
+                codes::INTERNAL,
+                &format!("the scheduler is not running: {why}"),
+            )
+        })?;
+        match method {
+            methods::JOB_PUT => {
+                let params = params_of::<JobPutParams>(method, params)?;
+                printed(&off_worker(|| scheduler.put(params))?)
+            }
+            methods::JOB_LIST => {
+                params_of::<JobListParams>(method, params)?;
+                printed(&off_worker(|| scheduler.list()))
+            }
+            methods::JOB_DELETE => {
+                let job = params_of::<JobRef>(method, params)?;
+                printed(&off_worker(|| scheduler.delete(&job))?)
+            }
+            methods::JOB_PAUSE | methods::JOB_RESUME => {
+                let job = params_of::<JobRef>(method, params)?;
+                let paused = method == methods::JOB_PAUSE;
+                printed(&off_worker(|| scheduler.pause(&job, paused))?)
+            }
+            methods::JOB_RUN_NOW => {
+                let job = params_of::<JobRef>(method, params)?;
+                printed(&off_worker(|| scheduler.run_now(&job))?)
+            }
+            _ => Err(error(codes::UNKNOWN_METHOD, method)),
+        }
+    }
+
+    /// Test builds only: `debug.clock_advance {seconds}` and `debug.clock_set {at}` move
+    /// the scheduler's test clock, and answer `{now}` once every decision due by then is
+    /// made.
+    #[cfg(feature = "debug-methods")]
+    fn debug_clock(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
+        let scheduler = self.scheduler.as_ref().map_err(|why| {
+            error(
+                codes::INTERNAL,
+                &format!("the scheduler is not running: {why}"),
+            )
+        })?;
+        let at = if method == methods::DEBUG_CLOCK_ADVANCE {
+            let params = params_of::<rlxd_proto::ClockAdvanceParams>(method, params)?;
+            let seconds = i64::try_from(params.seconds).unwrap_or(i64::MAX);
+            scheduler
+                .now()
+                .checked_add(jiff::SignedDuration::from_secs(seconds))
+                .map_err(|e| error(codes::INVALID_PARAMS, &e.to_string()))?
+        } else {
+            let params = params_of::<rlxd_proto::ClockSetParams>(method, params)?;
+            params
+                .at
+                .parse::<jiff::Timestamp>()
+                .map_err(|e| error(codes::INVALID_PARAMS, &format!("at: {e}")))?
+        };
+        let now = off_worker(|| scheduler.clock_to(at))?;
+        Ok(object(&json!({"now": now.to_string()})))
+    }
+
+    /// The runner's methods (handoff 0.10.3, 5.4 and 7.5) and spaces' (2.5): `run.start`,
+    /// `run.cancel`, `run.resume`, `run.get`, `run.list`, `space.ensure` and `space.erase`.
+    /// A run's client, in `run.list`, is the `client` the connection's hello named.
     async fn runs_and_spaces(
         &self,
         session: &Session,
@@ -664,6 +981,22 @@ impl Daemon {
             methods::RUN_CANCEL => {
                 let params = params_of::<RunRef>(method, params)?;
                 printed(&self.runner.cancel(&params.run_id).await?)
+            }
+            methods::RUN_RESUME => {
+                let params = params_of::<RunResumeParams>(method, params)?;
+                printed(&off_worker(|| self.runner.resume(params))?)
+            }
+            methods::RUN_GET => {
+                let params = params_of::<RunRef>(method, params)?;
+                printed(&off_worker(|| self.runner.get(&params.run_id))?)
+            }
+            methods::RUN_LIST => {
+                let params = params_of::<RunListParams>(method, params)?;
+                printed(&off_worker(|| self.runner.list(&params)))
+            }
+            methods::SPACE_ERASE => {
+                let params = params_of::<SpaceParams>(method, params)?;
+                printed(&off_worker(|| self.runner.erase(&params.name))?)
             }
             _ => {
                 let params = params_of::<SpaceParams>(method, params)?;
@@ -1024,6 +1357,7 @@ where
     let mut frames = Frames {
         reader: BufReader::new(reader),
         line: Vec::new(),
+        skipping: false,
     };
     let first = tokio::select! {
         first = tokio::time::timeout(HELLO_TIMEOUT, frames.next()) => first,
@@ -1080,9 +1414,10 @@ where
                 continue;
             }
             Ok(Some(Frame::TooLong)) => {
-                let message = format!("the frame is longer than {MAX_FRAME} bytes");
-                let reply = reply_err(None, codes::INVALID_REQUEST, message);
-                return refuse(&mut frames, &mut writer, &reply).await;
+                if send(&mut writer, &frame_too_large()).await.is_err() {
+                    return;
+                }
+                continue;
             }
             Ok(None) | Err(_) => return,
         };
@@ -1115,6 +1450,24 @@ where
                 }
                 if minted.close {
                     return dropped(&session, &mut frames, &mut writer).await;
+                }
+            }
+            Answer::RunStream(id, replay) => {
+                let flow = send_run_stream(
+                    &daemon,
+                    &session,
+                    &mut frames,
+                    &mut writer,
+                    &mut watch,
+                    id,
+                    *replay,
+                )
+                .await;
+                match flow {
+                    Flow::GoOn => {}
+                    Flow::Linger => return linger(&mut frames).await,
+                    Flow::Dropped => return dropped(&session, &mut frames, &mut writer).await,
+                    Flow::Close => return,
                 }
             }
             Answer::Stream(subscription) => {
@@ -1274,7 +1627,15 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut head = daemon.bus.watch();
+    let mut gone = daemon.ptys.gone();
     let mut stopping = false;
+    if let Some(pty) = &subscription.pty
+        && send_lines(writer, std::slice::from_ref(&pty.snapshot))
+            .await
+            .is_err()
+    {
+        return end_watch(session, Flow::Close);
+    }
     loop {
         loop {
             let lines = daemon
@@ -1283,23 +1644,142 @@ where
             if lines.is_empty() {
                 break;
             }
+            let lines = match &subscription.pty {
+                None => lines,
+                Some(pty) => match pty_lines(daemon, &mut subscription.cursor, pty, lines) {
+                    Ok(lines) => lines,
+                    Err(()) => break,
+                },
+            };
             if send_lines(writer, &lines).await.is_err() {
-                return Flow::Close;
+                return end_watch(session, Flow::Close);
             }
         }
-        if stopping || subscription.cursor.is_done() {
+        let pty_gone = subscription
+            .pty
+            .as_ref()
+            .is_some_and(|pty| !daemon.ptys.exists(&pty.id));
+        if stopping || subscription.cursor.is_done() || pty_gone {
             let data = object(&json!({"seq": subscription.cursor.after()}));
             let reply = Envelope::ok(data).with_id(subscription.id);
             if send(writer, &reply).await.is_err() {
                 return Flow::Close;
             }
-            return if stopping { Flow::Linger } else { Flow::GoOn };
+            return end_watch(session, if stopping { Flow::Linger } else { Flow::GoOn });
         }
         let after = subscription.cursor.after();
         tokio::select! {
             moved = async { head.wait_for(|&seq| seq > after).await.map(|_| ()) } => {
                 stopping = moved.is_err();
             }
+            _ = gone.changed(), if subscription.pty.is_some() => {}
+            () = daemon.stopped() => stopping = true,
+            () = kicked(session) => return end_watch(session, Flow::Dropped),
+            frame = watch.next_line(frames) => {
+                if let Some(flow) =
+                    answer_in_stream(daemon, session, frames, writer, watch, frame).await
+                {
+                    return end_watch(session, flow);
+                }
+            }
+        }
+    }
+}
+
+/// Ends a stream's watch of a PTY, if it had one: the connection may write to it again.
+fn end_watch(session: &Session, flow: Flow) -> Flow {
+    session
+        .watching
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    flow
+}
+
+/// Whether this connection watches `pty_id` read-only.
+fn watching_read_only(session: &Session, pty_id: &str) -> bool {
+    session
+        .watching
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|(id, read_only)| *read_only && id == pty_id)
+}
+
+/// A `pty.subscribe` stream's lines out of a batch the bus gave: its PTY's events only.
+/// A gap means output it had not read was dropped: it gets a fresh snapshot instead, and
+/// its cursor goes on from that. `Err` when the snapshot can't be taken, as when the PTY
+/// has just gone.
+fn pty_lines(
+    daemon: &Daemon,
+    cursor: &mut Cursor,
+    pty: &PtyWatch,
+    lines: Vec<Line>,
+) -> Result<Vec<Line>, ()> {
+    let id = format!("\"pty_id\":\"{}\"", pty.id);
+    let mut kept = Vec::with_capacity(lines.len());
+    for line in lines {
+        if contains(&line, b"\"type\":\"daemon.gap\"") {
+            let (snapshot, seq) = off_worker(|| daemon.pty_snapshot(&pty.id)).map_err(|_| ())?;
+            let topics = Topics::of([topics::PTY]).expect("the bus carries pty events");
+            *cursor = daemon.bus.cursor(topics, Some(seq), true).map_err(|_| ())?;
+            // The snapshot stands for the output before it, not for the PTY's end: a
+            // pty.exited of this PTY's already read goes before it (#2641 minor 5).
+            kept.retain(|kept: &Line| contains(kept, b"\"type\":\"pty.exited\""));
+            kept.push(snapshot);
+            return Ok(kept);
+        }
+        if contains(&line, id.as_bytes()) {
+            kept.push(line);
+        }
+    }
+    Ok(kept)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Sends a `run.events` stream: the run's events from its log on disk, read as they are
+/// logged, then its reply `{run_id, last_run_seq}` once the run has no live process and
+/// every event it logged is sent. Answers the client's requests meanwhile, as
+/// [`send_stream`] does. When rlxd stops, the reply comes at once.
+async fn send_run_stream<R, W>(
+    daemon: &Arc<Daemon>,
+    session: &Session,
+    frames: &mut Frames<R>,
+    writer: &mut W,
+    watch: &mut Watch,
+    id: RequestId,
+    mut replay: Replay,
+) -> Flow
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut stopping = false;
+    loop {
+        loop {
+            let lines = off_worker(|| replay.read());
+            if lines.is_empty() {
+                break;
+            }
+            if send_lines(writer, &lines).await.is_err() {
+                return Flow::Close;
+            }
+        }
+        if stopping || off_worker(|| replay.done()) {
+            let reply = match printed(&replay.reply()) {
+                Ok(data) => Envelope::ok(data).with_id(id),
+                Err(error) => Envelope::err(error).with_id(id),
+            };
+            if send(writer, &reply).await.is_err() {
+                return Flow::Close;
+            }
+            return if stopping { Flow::Linger } else { Flow::GoOn };
+        }
+        tokio::select! {
+            () = replay.changed() => {}
             () = daemon.stopped() => stopping = true,
             () = kicked(session) => return Flow::Dropped,
             frame = watch.next_line(frames) => {
@@ -1336,10 +1816,10 @@ where
             return send(writer, &reply).await.is_err().then_some(Flow::Close);
         }
         Ok(Some(Frame::TooLong)) => {
-            let message = format!("the frame is longer than {MAX_FRAME} bytes");
-            let reply = reply_err(None, codes::INVALID_REQUEST, message);
-            refuse(frames, writer, &reply).await;
-            return Some(Flow::Close);
+            return send(writer, &frame_too_large())
+                .await
+                .is_err()
+                .then_some(Flow::Close);
         }
         Ok(None) | Err(_) => return Some(Flow::Close),
     };
@@ -1366,7 +1846,9 @@ where
             }
             minted.close.then_some(Flow::Dropped)
         }
-        Answer::Stream(_) => unreachable!("a streaming connection takes no second stream"),
+        Answer::Stream(_) | Answer::RunStream(..) => {
+            unreachable!("a streaming connection takes no second stream")
+        }
     }
 }
 
@@ -1460,6 +1942,8 @@ struct Frames<R> {
     reader: BufReader<R>,
     /// The frame read so far, until its newline comes.
     line: Vec<u8>,
+    /// The rest of a frame too long to read is being skipped, to its newline.
+    skipping: bool,
 }
 
 impl<R: AsyncRead + Unpin> Frames<R> {
@@ -1489,9 +1973,16 @@ impl<R: AsyncRead + Unpin> Frames<R> {
                 Some(at) => (&chunk[..at], at + 1, true),
                 None => (chunk, chunk.len(), false),
             };
+            if self.skipping {
+                // The rest of a frame too long to read: dropped as it comes.
+                self.skipping = !ended;
+                self.reader.consume(used);
+                continue;
+            }
             if self.line.len() + part.len() > MAX_FRAME {
                 self.reader.consume(used);
                 self.line.clear();
+                self.skipping = !ended;
                 return Ok(Some(Frame::TooLong));
             }
             self.line.extend_from_slice(part);
@@ -1609,6 +2100,130 @@ fn refused(refused: settings::Refused) -> ErrorBody {
     }
 }
 
+/// Whether a connection of `role` may call the PTY `method` (1.4): `cli` and `tui`, the
+/// fleet and the user, every one; `remote` the reads and `pty.write`, as the phone answers
+/// prompts; `app` the reads only, its panes being read-only.
+fn pty_allowed(role: Role, method: &str) -> bool {
+    let read = matches!(
+        method,
+        methods::PTY_LIST | methods::PTY_SCREEN | methods::PTY_SUBSCRIBE
+    );
+    match role {
+        Role::Cli | Role::Tui => true,
+        Role::Remote => read || method == methods::PTY_WRITE,
+        Role::App => read,
+        _ => false,
+    }
+}
+
+fn role_not_allowed(role: Role, method: &str) -> ErrorBody {
+    let name = role_name(role);
+    let mut detail = Data::new();
+    detail.insert("role".to_owned(), Value::from(name.clone()));
+    detail.insert("method".to_owned(), Value::from(method));
+    error(
+        codes::ROLE_NOT_ALLOWED,
+        &format!("a {name} connection may not call {method}"),
+    )
+    .with_hint(
+        "cli and tui may use every pty method; remote may list, read, subscribe read-only \
+         and write; app may list, read and subscribe read-only.",
+    )
+    .with_detail(detail)
+    .expect("role_not_allowed's detail is an object")
+}
+
+/// The error a refused PTY call gets.
+fn pty_refused(refused: pty::Refused) -> ErrorBody {
+    match refused {
+        pty::Refused::TooMany => {
+            let mut detail = Data::new();
+            detail.insert("max".to_owned(), Value::from(pty::MAX_PTYS));
+            error(
+                codes::TOO_MANY_PTYS,
+                &format!("the home holds {} ptys, the most it may", pty::MAX_PTYS),
+            )
+            .with_hint("pty.kill one first: an exited pty counts until it is killed.")
+            .with_detail(detail)
+            .expect("too_many_ptys' detail is an object")
+        }
+        pty::Refused::Unknown(id) => error(codes::UNKNOWN_PTY, &format!("no pty {id}"))
+            .with_hint("pty.list names every pty of the home."),
+        pty::Refused::Exited(id) => {
+            error(codes::PTY_EXITED, &format!("pty {id}'s process has ended"))
+                .with_hint("Its screen stays until pty.kill.")
+        }
+        pty::Refused::SpawnFailed(why) => error(codes::SPAWN_FAILED, &why),
+        pty::Refused::Invalid(why) => error(codes::INVALID_PARAMS, &why),
+        pty::Refused::Busy(why) => error(codes::PTY_BUSY, &why)
+            .with_hint("Nothing of it was taken: write again once the program reads its input."),
+        pty::Refused::ScreenFailed(id) => error(
+            codes::PTY_EXITED,
+            &format!("pty {id}'s screen model failed, so rlxd is ending its process"),
+        )
+        .with_hint("Its screen says error: screen_failed, and stays, blank, until pty.kill."),
+    }
+}
+
+/// `frame_too_large`'s reply, to a frame rlxd skipped.
+fn frame_too_large() -> Envelope {
+    let mut detail = Data::new();
+    detail.insert("max".to_owned(), Value::from(MAX_FRAME));
+    let body = error(
+        codes::FRAME_TOO_LARGE,
+        &format!("the frame is longer than the {MAX_FRAME} bytes rlxd reads: it was skipped"),
+    )
+    .with_hint("Send less in one request: a pty.write carries at most 128 KiB.")
+    .with_detail(detail)
+    .expect("frame_too_large's detail is an object");
+    Envelope::err(body)
+}
+
+/// Refuses a `pty.write` whose input is more than [`MAX_PTY_WRITE`] bytes, by name,
+/// before its params are read: `write_too_large {max, bytes}`.
+fn write_fits(params: &Params) -> Result<(), ErrorBody> {
+    // Each input there is, whatever else is there (a `null` beside it, or a second
+    // input, which the params refuse after): the largest is the write's size (#2649).
+    let size = |value: Option<&Value>| match value {
+        Some(Value::String(text)) => text.len(),
+        Some(Value::Array(keys)) => keys.iter().filter_map(Value::as_str).map(str::len).sum(),
+        _ => 0,
+    };
+    let bytes = ["text", "paste", "keys"]
+        .into_iter()
+        .map(|field| size(params.get(field)))
+        .max()
+        .unwrap_or(0);
+    if bytes <= rlxd_proto::MAX_PTY_WRITE {
+        return Ok(());
+    }
+    let mut detail = Data::new();
+    detail.insert("max".to_owned(), Value::from(rlxd_proto::MAX_PTY_WRITE));
+    detail.insert("bytes".to_owned(), Value::from(bytes));
+    Err(error(
+        codes::WRITE_TOO_LARGE,
+        &format!(
+            "the write is {bytes} bytes, more than the {} one carries",
+            rlxd_proto::MAX_PTY_WRITE
+        ),
+    )
+    .with_hint("Nothing of it was taken: send it in parts.")
+    .with_detail(detail)
+    .expect("write_too_large's detail is an object"))
+}
+
+/// A screen of `long` bytes, longer than a client reads.
+fn screen_too_long(long: usize) -> ErrorBody {
+    error(
+        codes::SCREEN_TOO_LONG,
+        &format!(
+            "the screen is {long} bytes, longer than the {} a client reads",
+            bus::MAX_EVENT
+        ),
+    )
+    .with_hint("Ask for less scrollback.")
+}
+
 /// The methods this rlxd serves after `hello`.
 fn served() -> Vec<&'static str> {
     let mut served = vec![
@@ -1626,12 +2241,34 @@ fn served() -> Vec<&'static str> {
         methods::GATE_PAIR_ANSWER,
         methods::GATE_DEVICES,
         methods::GATE_UNPAIR,
+        methods::PTY_SPAWN,
+        methods::PTY_WRITE,
+        methods::PTY_RESIZE,
+        methods::PTY_SCREEN,
+        methods::PTY_SUBSCRIBE,
+        methods::PTY_KILL,
+        methods::PTY_LIST,
         methods::RUN_START,
         methods::RUN_CANCEL,
+        methods::RUN_RESUME,
+        methods::RUN_GET,
+        methods::RUN_LIST,
+        methods::RUN_EVENTS,
         methods::SPACE_ENSURE,
+        methods::SPACE_ERASE,
+        methods::JOB_PUT,
+        methods::JOB_LIST,
+        methods::JOB_DELETE,
+        methods::JOB_PAUSE,
+        methods::JOB_RESUME,
+        methods::JOB_RUN_NOW,
     ];
     if cfg!(feature = "debug-methods") {
         served.push(methods::DEBUG_EMIT);
+        served.push(methods::DEBUG_PTY_PANIC);
+        served.push(methods::DEBUG_RUN_START);
+        served.push(methods::DEBUG_CLOCK_ADVANCE);
+        served.push(methods::DEBUG_CLOCK_SET);
     }
     served
 }

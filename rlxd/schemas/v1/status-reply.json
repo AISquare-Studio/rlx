@@ -236,6 +236,18 @@
           "format": "uint64",
           "maximum": 18446744073709551615,
           "minimum": 0
+        },
+        "db": {
+          "description": "The scheduler's database, `<home>/rlxd/rlxd.db`. Absent: `ok`. `set_aside`: rlxd\nfound one it could not read (corrupt, or from a newer rlxd), moved it aside\n(`set_aside` says where) and began a fresh one. `unavailable`: it could not be\nopened for another reason (busy, locked, no access), so the scheduler isn't running\nand the file is as it was (`reason` says why).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "For `unavailable`: why the database could not be opened.",
+          "type": "string"
+        },
+        "set_aside": {
+          "description": "For `set_aside`: where the database it could not read was moved, with why.",
+          "type": "string"
         }
       },
       "required": [

@@ -161,8 +161,8 @@ Claude Code for long:
 - Only §7.4's fields of Claude Code's answer reach `status`: never its org, folders or
   sign-in expiry. The probe's output is never logged.
 
-The rest of `status`: `runs` counts the runner's live and queued runs, `jobs.count` is 0
-until the scheduler (7.6), and `capabilities` lists what this rlxd can do by 5.3's names
+The rest of `status`: `runs` counts the runner's live and queued runs, `jobs` is the
+scheduler's ([The scheduler](#the-scheduler)), and `capabilities` lists what this rlxd can do by 5.3's names
 (`connectors.call`, `connectors.no_turn`, `connectors.gate_before_turn`), none of which
 exist yet. `crates/rlxd/tests/status.rs` runs 7.4's Accept lines and these, on three
 OSes, and `rlxd-proto`'s schema tests check `status` declares every field of 7.4's JSON.
@@ -302,9 +302,10 @@ rlxd call env.get
 - **Runs** start that `claude`, by its absolute path, with the values raw on top of
   rlxd's own environment. A run takes the values and the `claude` current when its
   attempt's process starts: one still queued picks up a change made before it starts,
-  and one running keeps what it started with. `run.start` refuses `claude_not_found`
-  when no `claude` was found where rlxd looked, and `claude_not_runnable` when the one
-  found is a batch file. The message says where it looked.
+  and one running keeps what it started with. `run.start` and `run.resume` refuse
+  `claude_not_found` when no `claude` was found where rlxd looked, and
+  `claude_not_runnable` when the one found is a batch file. The message says where it
+  looked.
 - **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
   links no Keychain crate: `rlxd.yml`'s `deny` job fails when `cargo tree --target all
   -e normal` holds `security-framework` or `keyring`.
@@ -312,6 +313,65 @@ rlxd call env.get
 `crates/rlxd/tests/env.rs` runs 4.3's Accept lines that start no run, and
 `crates/rlxd/tests/env_runs.rs` those that do, with fake-claude's `print-env`, on three
 OSes.
+
+## PTYs
+
+rlxd holds processes on pseudo-terminals (handoff 1.4), as tmux held the fleet's panes:
+ConPTY on Windows. The `crate::pty` module is the host, and `crate::vt` is the screen.
+
+- **The methods:** `pty.spawn {argv, cols, rows, cwd?, env?, label?}`, `pty.write
+  {pty_id, text | keys | paste}`, `pty.resize`, `pty.screen {pty_id, scrollback?}`,
+  `pty.subscribe {pty_id, read_only}`, `pty.kill` and `pty.list`, each through `rlxd
+  call` but the stream. Their shapes are in `schemas/v1/README.md`.
+- **The stream:** `pty.subscribe` sends the screen (`pty.snapshot`), then the PTY's
+  `pty.output` and `pty.exited`. A client too slow to keep up gets a fresh snapshot
+  instead of what it missed; the PTY never waits for it. `pty.output` has a partition of
+  the bus to itself (20,000 events, 32 MiB), so it never pushes another topic's events
+  out.
+- **The screen is tmux's.** `pty.screen`'s `text` is what `tmux capture-pane -e -p`
+  prints for the same screen, byte for byte. `crate::vt` is tmux 3.8's own grid, screen
+  writes and input parser, ported. Each ported file keeps tmux's ISC notice.
+  `tests/vt_tmux.rs` checks it against tmux itself on 41 screens, and `tests/pty.rs`
+  runs the handoff's own `cmp`.
+- **A program's output can't take rlxd down.** The model parses what a program writes,
+  so it takes hostile bytes too; a seeded random test feeds it such bytes, with resizes
+  in the middle of sequences, and checks it never panics and its memory stays bounded.
+  Should it panic anyway, that PTY alone ends: rlxd catches the panic, ends the
+  process's group, and the PTY's screen (blank from then on), list entry and
+  `pty.exited` say `error: "screen_failed"`. rlxd, its other PTYs and every connection
+  go on. Unlike tmux, a hyperlink whose id is over 1 KiB is dropped, as one whose URI is:
+  tmux keeps up to 5,000 ids of any length.
+- **A PTY outlives every client,** and one any connection spawned is in every
+  connection's `pty.list`. A process that ends keeps its screen and exit status until
+  `pty.kill`, as tmux's `remain-on-exit on` keeps a pane. `rlxd stop` ends them all.
+- **`rlxd attach <pty_id> [--read-only]`** puts a PTY in this terminal, as `tmux -L asq
+  attach` did: its screen, then its output; this terminal's keys sent by name and its
+  pastes as pastes, so rlxd sends them as the program's modes need; the PTY sized to
+  this terminal. Ctrl-] detaches. `--read-only` sends nothing and leaves the size alone.
+- **`pty.kill`** ends the process's whole group: SIGHUP and SIGTERM, then SIGKILL after
+  two seconds. It replies once the group is gone.
+- **On Windows** each PTY's processes are in a Job Object that rlxd makes, named with
+  128 random bits, with `KILL_ON_JOB_CLOSE`; `pty.kill` ends the job. The ConPTY's
+  process is rlxd itself in a hidden mode, `rlxd __pty-shim`, which joins the job before
+  it starts the program, so nothing the program starts escapes it, and exits with the
+  program's exit code, all 32 bits. The shim lives through Ctrl-C and Ctrl-Break, which
+  the console sends the program too, and turns Ctrl-C back on for the program first: a
+  detached rlxd's process group ignores it, and every process would inherit that.
+  `pty.list`'s `pid` there is the shim's.
+- **Who may do what:** `cli` and `tui` every method; `remote` the reads and
+  `pty.write`; `app` the reads only. Any other call gets `role_not_allowed`.
+- **Limits:** 64 PTYs a home, the exited ones included; 50,000 lines of history each;
+  128 KiB a write, so the longest one fits a frame however it is escaped. A longer write
+  gets `write_too_large`, and a frame over 1 MiB `frame_too_large`; the connection stays
+  open for both. A paste over 128 KiB would need a paste in parts: §1.8's to decide.
+- **The terminal** is `TERM=xterm-256color`, `COLORTERM=truecolor`, unless `env` says
+  otherwise.
+- **The environment** is rlxd's, less what the fleet's tmux server takes out of a
+  window's (`core/spawn.py`'s `tmux_client_env`) and tmux's own `TMUX`, `TMUX_PANE`,
+  `TERM_PROGRAM` and `TERM_PROGRAM_VERSION` (`src/pty/env.rs`). `tests/pty.rs` checks
+  the lists against Python's through `uv run`, so they can't drift.
+- **A process that ends** stays a zombie until `pty.kill` or `rlxd stop` reaps it, after
+  signalling its group, so the group's id is never another's by then.
 
 ## The runner and spaces
 
@@ -332,7 +392,7 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   environment, or when rlxd started (4.3, never a lookup at the run's start), with the
   app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` on top of rlxd's
   own environment ([The app's environment](#the-apps-environment-for-claude-code)).
-  `run.start` refuses `claude_not_found` when that resolved to none, and
+  `run.start` and `run.resume` refuse `claude_not_found` when that resolved to none, and
   `claude_not_runnable` when to a batch file.
 - **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
   pre-tool-use --run <run_id> --attempt <n>` by the absolute path of the `rlxd-hook`
@@ -348,13 +408,16 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   without rlxd holding it, and a result or structured output over 1 MiB fails it
   (`output_too_large`), so a run always gets its end.
 - **The process tree.** On macOS and Linux Claude Code runs under a guard, the hidden
-  `rlxd __run-guard`: Claude Code leads a process group of its own, and the guard kills
-  that group when Claude Code exits (what it left running goes with it), when rlxd tells
-  it to (cancel, timeout), and when rlxd dies (it checks its parent every 100 ms; on Linux
-  its parent-death signal too). It kills the group only while Claude Code is unreaped,
-  so the group's id can't be another's, and it exits as Claude Code did, a signal
-  included. On Windows Claude Code is started suspended inside a Job Object with
-  `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
+  `rlxd __run-guard`, which leads a new session and process group (ids: its pid, which
+  stays held while it is unreaped); Claude Code and what it starts run in that group,
+  with no terminal. The guard kills the group when Claude Code exits (what it left
+  running goes with it), and when rlxd dies (it checks its parent every 100 ms; on Linux
+  its parent-death signal too, and Claude Code's from the guard). rlxd kills the group
+  on a cancel or a timeout, and as soon as it sees the guard exit, before it reaps it,
+  so a guard killed alone leaves nothing. The guard tells rlxd how Claude Code ended
+  (`exit 1`, `signal 6`) over an inherited pipe, for `run.failed`'s message, and never
+  re-raises the signal. On Windows Claude Code is started suspended inside a Job Object
+  with `KILL_ON_JOB_CLOSE`. A clean stop ends every run in flight `failed {reason:
   "engine_restarted"}`.
 - **The log** of each run is `<home>/rlxd/runs/<run_id>/`: `run.json`, rewritten whole and
   durably, and `events.jsonl`, each event as published. The runner numbers each run's
@@ -364,10 +427,122 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   and fsynced with the run's next state event or every 64. No fsync happens under the
   bus's lock or the runner's, so a slow disk under one run holds up no other run and no
   other topic.
+- **The lifecycle** (5.4). `run.get {run_id}` and `run.list {states?, job_id?, limit?}`
+  read the runs rlxd knows, those from before a restart too: rlxd reads every run's record
+  when it starts. `run.events {run_id, from_run_seq}` replays a run's log from disk,
+  never from the bus's buffer, then follows a live run until it ends; `rlxd call` prints
+  each event as a line and exits 0 when the stream closes.
+- **Needs-you and resume.** A finished run whose output matches `needs_you_when` ends
+  `run.needs_you {reason: "question", question}`, after `needs_you.raised` on the
+  `needs_you` topic. `run.resume {run_id, reply?}` goes on with a run that has no live
+  process as a new attempt (`--resume <run_id>`, its own settings file, the reply as its
+  first message), and `needs_you.cleared` follows, after a restart too. It refuses
+  `run_alive`, `not_resumable` (a `send_executor`) and `no_session`, also for a run that
+  never reached `run.started` (cancelled while queued, failed before it started), which
+  has no session to resume.
+- **After a crash or a `kill -9`,** the guard has already ended the run's process group.
+  Should the guard have died with rlxd (`killall -9 rlxd`), the next rlxd, in the same
+  boot only, kills the guard's group if the guard still runs with the recorded pid and
+  start time. Otherwise the group is the run's only when one of its processes, in the
+  guard's session and started at or after the run, carries `RLXD_RUN_ID=<run_id>`, which
+  every process of a run inherits (a group's id can't be taken while one of its
+  processes lives); then each such process is killed. On macOS an Apple binary's
+  environment is hidden, even from its own user, so a run whose leftovers are all
+  Apple's (a Bash tool's `zsh`, `sleep` or `tail -f`, with Claude Code gone) can't be
+  told from another group, and is left: the sweep never kills what it can't tell is the
+  run's. On Linux Claude Code dies with the guard (its parent-death signal), and
+  `/proc` shows the environment of each of the user's own processes. It cuts a torn last line from the run's log,
+  puts back a state event its record holds that the log lost, and ends the run `failed
+  {reason: "engine_restarted"}`, numbered on from its log.
+- **`job_id`** is set by rlxd alone, for the scheduler (7.6). Test builds have
+  `debug.run_start`, `run.start`'s params plus a `job_id`.
 - **Spaces.** `space.ensure {name}` makes `<home>/spaces/<name>/` with an empty project
   `.claude/settings.json`, and returns its resolved path. It is not a project: no `.git`,
   not onboarded. Names are 1 to 64 lower-case letters, digits, `-`, `_` and `.`, with no
-  separator, no `..` and no leading dot.
+  separator, no `..` and no leading dot. `space.erase {name}` deletes the folder, the
+  Claude Code session files of its runs, and rlxd's records of them. Session files are
+  `projects/<encoded space dir>/<run_id>.jsonl` under `CLAUDE_CONFIG_DIR` and `~/.claude`
+  (every account's config directory once the brain serves rlx's list), the space dir
+  encoded as Claude Code does: no other project folder is touched.
+  It refuses `runs_live` while a run in the space is queued, running, being started or
+  being resumed, and `link_refused` (`detail.paths`) when a link, a junction or a mount
+  point is below a root on the way: `spaces/`, the space itself, a config directory's
+  `projects/`, or the space's folder there; nothing is removed then. `<home>` and each
+  config directory are roots, taken as they resolve once (a `~/.claude` kept in dotfiles
+  is fine), and the config directories are only gone into when the space has runs. Every folder on the way is
+  opened once without following a link, and checked and removed through what was opened
+  (`openat` and `unlinkat` on macOS and Linux; on Windows, handles that keep the folders
+  from being renamed meanwhile), so a link put there after the check is never followed.
+  A link inside the space goes as a link and is named in `links`, every one, under the
+  space's resolved path. A mount point inside the space (another filesystem, or on Linux
+  a bind mount of the same one) is never gone into, and a tree more than 256 folders
+  deep is not removed past that: either fails the erase `erase_incomplete`, naming it.
+  A second erase of a space being erased gets `erase_in_progress`. Paths it can't remove
+  fail it `erase_incomplete` (`detail {removed, failed}`, each failure named under the
+  space's resolved path), the runs concerned keep their records, and erasing again
+  finishes.
+
+## The scheduler
+
+rlxapp's jobs (handoff 0.10.3, 2.3 and 7.6). The app owns their definitions and pushes
+them by `job_id`; rlxd keeps a definition only to fire it, and records what each fire did.
+
+- **Methods.** `job.put` creates or replaces a job, idempotently: `{job_id, type: "run",
+  schedule, run, catch_up, enabled?, loud?}`. `schedule` is `{"every_minutes": N}` or
+  `{"cron": "*/15 * * * *", "tz": "Europe/London"}`. `run` is a `run.start` template
+  without `run_id`, checked as `run.start` checks its params, so a template it would
+  refuse is refused at `job.put`, with the same code. The job's own unknown fields are
+  refused; the template's follow `run.start`'s rule, which ignores them. The same
+  definition put again (the app pushes its jobs on each connect) changes nothing. A
+  replace starts the schedule again from now only when its `schedule` changes or it is
+  enabled again; otherwise it keeps where the schedule is, a fire it owes, and a missed
+  fire waiting for an app. A replace keeps the job's record and whether it is paused. `job.list`, `job.delete`, `job.pause`, `job.resume`, and `job.run_now`, which
+  fires the job now. `job.run_now` needs an app gate client (`app_absent` otherwise);
+  `paused` doesn't stop it, a live run of the job (`job_running`) or its rate limit
+  (`rate_limited`, `detail.resets_at`) do. `watch` jobs come with the tool gate (5.1).
+  `job.list`'s `last_state` is the job's last run's state as the runner has it now.
+- **When.** `every_minutes` fires on a grid from `job.put`, so a late fire never drifts
+  it. Cron matches civil minutes in its IANA zone (jiff's bundled tz database, the same
+  on every OS), each once: a time a DST gap skips fires once at the gap's end, and a time
+  a fold repeats fires once, at its first occurrence.
+- **Whether.** One function decides each fire, in this order: a paused job's due fire is
+  skipped `paused`; with no app gate client connected, `app_absent` (2.3); while the
+  job's last run is queued or running, `overlap`; while a run of the job hit its rate
+  limit (a `run.rate_limited` whose `status` isn't `allowed` or `allowed_warning`, until
+  its `resets_at`, else 5 minutes; a warning holds nothing), `rate_limited`. A fire
+  rlxd couldn't make on time (it was down, or the clock jumped) is one decision however
+  many it passed: `catch_up: "once"` fires once, `"skip"` records `missed`. A fire missed
+  while rlxd was down waits 10 s after rlxd starts for an app to connect, then is
+  `app_absent`. Each `app_absent` skip is owed: when an app connects, `once` fires it
+  once, and `skip` waits for the next time.
+- **A fire** is a run of the template with a fresh `run_id`, the job's `job_id` on all
+  its events, and the job's `loud`, which rlxd only echoes, on `job.fired` and on the
+  run's `run.done` and `run.needs_you`. Events on topic `job`: `job.put`, `job.deleted`,
+  `job.paused`, `job.resumed`, `job.fired {job_id, run_id, scheduled_for, fired_at,
+  cause, loud}` and `job.skipped {job_id, scheduled_for, reason, code?}`. `job.fired`
+  goes out once the run has started, so its first run events may come before it. A run
+  that can't start is `job.skipped {reason: "start_failed", code}`, `code` being
+  `run.start`'s refusal.
+- **Once.** Before a fire's run starts, the job (its schedule moved past the fire) and a
+  `starting` record of the fire, with its `run_id`, are written in one transaction. So
+  a crash while the run starts never fires that time again: the next rlxd settles the
+  fire as `job.fired` when the run was made, or `job.skipped start_failed
+  (engine_restarted)` when it wasn't.
+- **Storage.** `<home>/rlxd/rlxd.db`, SQLite (built in): one writer, WAL, `synchronous =
+  FULL`, migrations numbered in `schema_migrations`. The folder is 0700 and the database,
+  its `-wal` and its `-shm` 0600 on macOS and Linux (the templates hold prompts). One that
+  can't be read (corrupt, or from a newer rlxd) is moved to `rlxd.db.unreadable-<time>`,
+  logged, and reported in `status` (`jobs.db: "set_aside"`, `jobs.set_aside`), and a fresh
+  one begun; it is never reset in place. Another failure to open it (busy, locked, no
+  access) is tried three times, then the scheduler doesn't start (`jobs.db:
+  "unavailable"`, and why) and the file is left as it is. Each job keeps its last 1000
+  fire records.
+- **Tests.** Test builds have a test clock: `RLXD_TEST_CLOCK=<RFC 3339>` starts the
+  scheduler there, and `debug.clock_advance {seconds}` and `debug.clock_set {at}` move it,
+  answering once every decision due by then is made (`tests/scheduler.rs`). A release
+  build has neither. 7.6's Accept lines run on real one-minute schedules in
+  `tests/scheduler_accept.rs`, `#[ignore]`d in the test job and run by rlxd.yml's
+  `scheduler accept` job: `cargo test -p rlxd --test scheduler_accept -- --ignored`.
 
 ## `rlxd here`: what rlx.app asks a host before it connects
 
@@ -773,3 +948,20 @@ is renamed aside, and the next install removes it.
 ## Licence
 
 MIT, as rlx is (`../LICENSE`).
+
+Parts of `crates/rlxd` are ported from tmux 3.8 and stay under tmux's ISC licence, so
+the crate's licence is `MIT AND ISC`:
+
+- `src/vt/` (its grid, screen writes, input parser, UTF-8 handling, hyperlinks and
+  `capture-pane`'s loop: grid.c, grid-view.c, screen.c, screen-write.c, input.c,
+  utf8.c, utf8-combined.c, hyperlinks.c and cmd-capture-pane.c);
+- `src/pty/keys.rs` (key names, the bytes for keys, and `paste-buffer -p`:
+  key-string.c, input-keys.c, cmd-send-keys.c and cmd-paste-buffer.c).
+
+Each of those files starts with the copyright lines and the permission notice of the
+tmux files it comes from.
+
+Every rlxd binary carries those notices too: `THIRD_PARTY_NOTICES` here holds tmux's
+copyright and permission notice for each file ported from it, rlxd embeds it when it is
+built, and `rlxd licenses` prints it. The release archives hold just `rlxd` and
+`rlxd-hook`, so the notice travels inside the binary.

@@ -244,6 +244,14 @@ async fn serve_until_stopped(
             warning!("connections still not closed after their abort");
         }
     }
+    // No PTY outlives rlxd: each process and its group end before it does.
+    let ending = Arc::clone(&daemon);
+    if tokio::task::spawn_blocking(move || ending.end_ptys())
+        .await
+        .is_err()
+    {
+        warning!("the ptys could not all be ended");
+    }
     daemon.flush();
     daemon.bus().close();
     keeper.stop();

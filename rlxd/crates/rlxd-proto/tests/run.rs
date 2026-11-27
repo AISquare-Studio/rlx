@@ -274,3 +274,67 @@ fn every_new_schema_is_generated() {
     }
     let _: Option<RunEvent> = None;
 }
+
+#[test]
+fn the_lifecycle_params_refuse_what_their_schemas_refuse() {
+    use rlxd_proto::{RunEventsParams, RunListParams, RunResumeParams};
+    let cases: [(&str, Value, bool); 12] = [
+        ("run-resume.json", json!({"run_id": ID}), true),
+        (
+            "run-resume.json",
+            json!({"run_id": ID, "reply": "#dev"}),
+            true,
+        ),
+        (
+            "run-resume.json",
+            json!({"run_id": ID, "reply": null}),
+            false,
+        ),
+        ("run-resume.json", json!({"run_id": "nope"}), false),
+        ("run-list.json", json!({}), true),
+        (
+            "run-list.json",
+            json!({"states": ["running", "done"], "job_id": "j", "limit": 5}),
+            true,
+        ),
+        ("run-list.json", json!({"limit": 0}), false),
+        ("run-list.json", json!({"job_id": ""}), false),
+        ("run-list.json", json!({"states": ["sleeping"]}), false),
+        ("run-events.json", json!({"run_id": ID}), true),
+        (
+            "run-events.json",
+            json!({"run_id": ID, "from_run_seq": 0}),
+            false,
+        ),
+        (
+            "run-events.json",
+            json!({"run_id": ID, "from_run_seq": 2}),
+            true,
+        ),
+    ];
+    for (schema, params, ok) in cases {
+        assert_eq!(valid(schema, &params), ok, "{schema}: {params}");
+        let parsed = match schema {
+            "run-resume.json" => RunResumeParams::deserialize(params.clone()).is_ok(),
+            "run-list.json" => RunListParams::deserialize(params.clone()).is_ok(),
+            _ => RunEventsParams::deserialize(params.clone()).is_ok(),
+        };
+        assert_eq!(parsed, ok, "the type and {schema} disagree on {params}");
+    }
+    let events = RunEventsParams::deserialize(json!({"run_id": ID})).unwrap();
+    assert_eq!(events.from_run_seq, 1, "absent means the run's first event");
+}
+
+#[test]
+fn needs_you_events_validate_on_their_topic() {
+    let raised = json!({"schema_version": 1, "seq": 5, "time": "2026-11-26T12:00:00.000Z",
+        "topic": "needs_you", "type": "needs_you.raised", "data": {"id": "run:x:1",
+        "source": "run", "run_id": ID, "reason": "question", "text": "Which channel?"}});
+    assert!(valid("run-event.json", &raised));
+    let mut broken = raised.clone();
+    broken["data"]["source"] = json!("phone");
+    assert!(!valid("run-event.json", &broken));
+    let mut no_id = raised;
+    no_id["data"].as_object_mut().unwrap().remove("id");
+    assert!(!valid("run-event.json", &no_id));
+}
