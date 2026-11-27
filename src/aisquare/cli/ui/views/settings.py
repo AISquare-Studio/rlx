@@ -281,6 +281,11 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         """How ctrl+z takes this rename back: the name it replaced, written again."""
 
         def undo() -> None:
+            # The tab's project takes the name Undo is writing, as it asks: a name asked before
+            # Undo's report is heard snapshots it (``_save_nickname``), and its own Undo goes
+            # back to it, not to the name just taken back (tester of #53, m3; #56). A frame
+            # from the store puts the project right if Undo's save fails.
+            self.project = self.project.model_copy(update={"nickname": previous or None})
             self._save_nickname(previous, undoing=True)
 
         return Change(f"{folder}'s nickname", undo)
