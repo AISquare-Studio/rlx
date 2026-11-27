@@ -8,7 +8,9 @@
 //!   flag, `gate.dev_mode` in the config ignored, no marker in `rlxd --version` or in
 //!   status, and not even the feature's name in the binary;
 //! - no `fake-claude`: the runner tests' stand-in for Claude Code is a binary only the
-//!   test-only `fake-claude` feature builds.
+//!   test-only `fake-claude` feature builds;
+//! - no scheduler test clock: no `debug.clock_advance` or `debug.clock_set`, and
+//!   `RLXD_TEST_CLOCK` is not read, so its jobs run on the system's clock.
 
 mod common;
 
@@ -35,9 +37,17 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "it published daemon.started only"
     );
 
-    // Nor the runner's test-only start with a scheduler job_id.
+    // Nor the runner's test-only start with a scheduler job_id, nor the scheduler's
+    // test clock.
     let run = release.rlxd(&["call", "debug.run_start", r#"{"job_id":"j"}"#]);
     assert_eq!(run.error_code(), "unknown_method", "{run:?}");
+    for (method, params) in [
+        ("debug.clock_advance", r#"{"seconds":60}"#),
+        ("debug.clock_set", r#"{"at":"2030-01-01T00:00:00Z"}"#),
+    ] {
+        let run = release.rlxd(&["call", method, params]);
+        assert_eq!(run.error_code(), "unknown_method", "{method}: {run:?}");
+    }
 
     let test_build = TestHome::new();
     test_build.start();
@@ -113,6 +123,24 @@ fn a_release_build_carries_tmuxs_notice_for_every_ported_file() {
         notices.matches("Permission to use, copy, modify").count(),
         13
     );
+}
+
+#[test]
+fn a_release_builds_scheduler_ignores_a_test_clock() {
+    let release = TestHome::new()
+        .with_binary(release_rlxd())
+        .with_env("RLXD_TEST_CLOCK", "2030-01-01T00:00:00Z");
+    release.start();
+    let job = r#"{"job_id":"t1","type":"run","schedule":{"every_minutes":1},
+        "run":{"kind":"task","prompt":"hi","mount":{"kind":"no_tools"}},"catch_up":"skip"}"#;
+    let put = release.rlxd(&["call", "job.put", job]);
+    assert_eq!(put.code(), Some(0), "{put:?}");
+    let list = release.rlxd(&["call", "job.list", "{}"]);
+    let next = list.data()["jobs"][0]["next_fire_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!next.starts_with("2030"), "the system's clock: {next}");
 }
 
 #[test]

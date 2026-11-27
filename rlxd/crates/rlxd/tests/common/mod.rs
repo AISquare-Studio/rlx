@@ -129,6 +129,13 @@ impl TestHome {
         self
     }
 
+    /// Sets `name` to `value` for every `rlxd` run in this home from now on, replacing
+    /// what it was: for a restart with another environment.
+    pub fn set_env(&mut self, name: &str, value: &str) {
+        self.envs.retain(|(each, _)| each != name);
+        self.envs.push((name.to_owned(), value.to_owned()));
+    }
+
     /// This home, run by the rlxd at `binary` rather than this test build's.
     pub fn with_binary(mut self, binary: PathBuf) -> Self {
         self.binary = Some(binary);
@@ -339,10 +346,21 @@ pub fn finish(child: Child) -> Run {
     end(child).unwrap_or_else(|failure| panic!("{failure}"))
 }
 
-fn end(mut child: Child) -> Result<Run, String> {
+/// [`finish`], for a command that may run up to `limit`, such as an `rlxd events
+/// --follow` with a `--timeout` past [`COMMAND_LIMIT`].
+#[allow(dead_code)]
+pub fn finish_within(child: Child, limit: Duration) -> Run {
+    end_within(child, limit).unwrap_or_else(|failure| panic!("{failure}"))
+}
+
+fn end(child: Child) -> Result<Run, String> {
+    end_within(child, COMMAND_LIMIT)
+}
+
+fn end_within(mut child: Child, limit: Duration) -> Result<Run, String> {
     let stdout = read_all(child.stdout.take().unwrap());
     let stderr = read_all(child.stderr.take().unwrap());
-    let status = wait(&mut child)?;
+    let status = wait(&mut child, limit)?;
     let deadline = Instant::now() + OUTPUT_LIMIT;
     let rest = |output: mpsc::Receiver<String>, name: &str| {
         output
@@ -373,8 +391,8 @@ fn read_all(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     text
 }
 
-fn wait(child: &mut Child) -> Result<ExitStatus, String> {
-    let deadline = Instant::now() + COMMAND_LIMIT;
+fn wait(child: &mut Child, limit: Duration) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -382,10 +400,7 @@ fn wait(child: &mut Child) -> Result<ExitStatus, String> {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "rlxd ran longer than {} s",
-                    COMMAND_LIMIT.as_secs()
-                ));
+                return Err(format!("rlxd ran longer than {} s", limit.as_secs()));
             }
             Err(e) => return Err(format!("cannot wait for rlxd: {e}")),
         }

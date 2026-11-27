@@ -56,6 +56,9 @@ pub struct Record {
     /// The scheduler job that fired the run (7.6).
     #[serde(default)]
     pub job_id: Option<String>,
+    /// That job's `loud`, echoed on the run's `run.done` and `run.needs_you`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loud: Option<bool>,
     /// The run's last state event, `{run_seq, type, data}`, written here before it was
     /// published: a crash before its line reached the log leaves it here.
     #[serde(default)]

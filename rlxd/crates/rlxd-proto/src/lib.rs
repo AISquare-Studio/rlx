@@ -192,6 +192,7 @@ mod envelope;
 mod event;
 mod hello;
 mod here;
+mod job;
 mod marker;
 mod pty;
 mod request;
@@ -208,6 +209,11 @@ pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};
 pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};
 pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
+pub use job::{
+    CatchUp, ClockAdvanceParams, ClockSetParams, FireCause, JobEvent, JobFiredData, JobId,
+    JobListData, JobListParams, JobPutParams, JobRef, JobRunNowData, JobSkippedData, JobSummary,
+    JobType, RunTemplate, Schedule, SkipReason, job_types,
+};
 pub use marker::{False, True, V1};
 pub use pty::{
     ID_LENGTH as PTY_ID_LENGTH, MAX_KEY_NAME as MAX_PTY_KEY_NAME, MAX_LABEL as MAX_PTY_LABEL,

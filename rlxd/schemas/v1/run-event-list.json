@@ -529,6 +529,10 @@
           "maximum": 18446744073709551615,
           "minimum": 0
         },
+        "loud": {
+          "description": "For a run a scheduler job fired: the job's `loud`, opaque to rlxd.",
+          "type": "boolean"
+        },
         "num_turns": {
           "description": "How many turns it took.",
           "type": "integer",
@@ -797,6 +801,10 @@
         "call_id": {
           "description": "The denied call, for `reason: \"denied\"`.",
           "type": "string"
+        },
+        "loud": {
+          "description": "For a run a scheduler job fired: the job's `loud`, opaque to rlxd.",
+          "type": "boolean"
         },
         "question": {
           "description": "The question, read at `needs_you_when.question_pointer`.",

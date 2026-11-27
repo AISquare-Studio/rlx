@@ -9,8 +9,9 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, PtyExited, PtyKillParams,
-    PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
+    DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData, JobEvent, JobListData,
+    JobListParams, JobPutParams, JobRef, JobRunNowData, PtyExited, PtyKillParams, PtyList,
+    PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams, PtySpawnParams,
     PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunEvent, RunEventsData,
     RunEventsParams, RunGetData, RunListData, RunListParams, RunRef, RunResumeData,
     RunResumeParams, RunStartParams, Setting, SettingsChanged, SettingsDeleteParams,
@@ -42,6 +43,12 @@ pub fn all() -> Vec<SchemaFile> {
         file::<HelloParams>("hello.json"),
         file::<HelloData>("hello-reply.json"),
         file::<HereData>("here-reply.json"),
+        file::<JobEvent>("job-event.json"),
+        file::<JobListParams>("job-list.json"),
+        file::<JobListData>("job-list-reply.json"),
+        file::<JobPutParams>("job-put.json"),
+        file::<JobRef>("job-ref.json"),
+        file::<JobRunNowData>("job-run-now-reply.json"),
         file::<PtyExited>("pty-exited.json"),
         file::<PtyKillParams>("pty-kill.json"),
         file::<PtyList>("pty-list-reply.json"),
