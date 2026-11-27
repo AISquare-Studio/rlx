@@ -1402,6 +1402,7 @@ def test_check_asks_rlxd_with_a_short_timeout(tool: Path, monkeypatch: pytest.Mo
     result = CliRunner().invoke(app, ["--json", "upgrade", "--check"])
     assert result.exit_code == 0, result.output
     assert asked == {"timeout": upgrade_daemons.CHECK_CALL_TIMEOUT_SECONDS}
+    assert 0 < asked["timeout"] <= 3, "the check waits on a hung rlxd 3 s at most (#3486 M4)"
 
 
 # --- tester-upgrade's round 2 (#3107) -------------------------------------------------------
@@ -1522,6 +1523,11 @@ def test_an_rlxd_linked_from_another_folder_is_not_rlxds(
     planted.symlink_to(real)
     said = upgrade_daemons.restart_refusal(_record(argv=(str(planted), "serve", "--detach")))
     assert said == f"it runs {planted}, not {real}", said
+    hard = tmp_path / "hard" / "rlxd"
+    hard.parent.mkdir()
+    os.link(real, hard)  # the same file, by a hard link in another folder (#3486)
+    said = upgrade_daemons.restart_refusal(_record(argv=(str(hard), "serve", "--detach")))
+    assert said == f"it runs {hard}, not {real}", said
     alias = tmp_path / "bin-alias"
     alias.symlink_to(real.parent, target_is_directory=True)
     beside = _record(argv=(str(alias / "rlxd"), "serve", "--detach"))
@@ -1540,3 +1546,35 @@ def test_a_checkouts_venv_is_not_this_installs_interpreter(tmp_path: Path) -> No
     argv = (str(python), "-P", "-m", "aisquare", "watch", "--detach")
     said = upgrade_daemons.restart_refusal(_record(kind="watch", argv=argv))
     assert said == f"it runs {python}, not {sys.executable}", said
+
+
+# --- tester-upgrade's round 3 (#3486) -------------------------------------------------------
+
+
+def test_a_held_unreadable_record_refuses_a_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M14: a running daemon whose record can't be read can be neither stopped nor started
+    again: --restart-daemons refuses, by name, before anything stops."""
+    unread = registry.Unreadable(
+        id="abcdefabcdef",
+        path=Path("abcdefabcdef.json"),
+        written_at=None,
+        held=True,
+        said={"kind": "watch"},
+    )
+    roll: registry.Roll[daemons_core.Daemon] = registry.Roll(
+        live=[], unreadable=[unread], pruned=[]
+    )
+    monkeypatch.setattr(daemons_core, "roll", lambda **k: roll)
+    found = upgrade_daemons.census()
+    refused = upgrade_daemons.refusal(found, Options(restart_daemons=True), windows=False)
+    assert refused is not None and refused.code == "daemon_unrecognized"
+    assert refused.detail == "watch (record abcdefabcdef): not readable"
+    assert upgrade_daemons.refusal(found, Options(), windows=False) is None, "warned of only"
+
+
+@pytest.mark.parametrize("kind", ["rlxd", "watch", "serve"])
+def test_a_record_with_no_command_is_refused_by_name(kind: str) -> None:
+    """L2: the format says argv is never empty; a record whose argv is gets a named refusal,
+    not an IndexError."""
+    said = upgrade_daemons.restart_refusal(_record(kind=kind, argv=()))
+    assert said == "its record names no command"

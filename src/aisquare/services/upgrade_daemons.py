@@ -850,6 +850,8 @@ def restart_refusal(daemon: daemons_core.Daemon) -> str | None:
     if not daemon.restartable:
         return "not restartable"
     argv = list(daemon.argv)
+    if not argv:  # the format says never empty; a record that is still names nothing to run
+        return "its record names no command"
     if daemon.kind == "rlxd":
         command = rlxd_command()
         if command is None:
