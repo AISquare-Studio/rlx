@@ -517,7 +517,7 @@ def test_a_child_started_in_a_checkout_inside_a_guarded_dir_is_let_through(
     at import: let through while the lift test's run roots keep the checkout, and refused
     under round 2's narrowing, which shows this shape is the one that went red."""
     guarded = tmp_path.resolve() / "home" / ".aisquare"
-    checkout = guarded / "cache" / "claude-accounts" / "2" / "scratchpad" / "wt"
+    checkout = guarded / "cache" / "scratch" / "wt"
     copy = checkout / "tests" / "keychain_guard"
     shutil.copytree(KEYCHAIN_GUARD_DIR, copy, ignore=shutil.ignore_patterns("__pycache__"))
     rest = os.environ["PYTHONPATH"].split(os.pathsep)[1:]
