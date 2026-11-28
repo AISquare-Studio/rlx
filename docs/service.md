@@ -22,18 +22,22 @@ rlx service status     # whether it runs, its version, uptime, and how each part
 rlx service stop       # stop it: Remote and ngrok are wound down cleanly
 rlx service restart
 rlx service run        # run it in this terminal instead (Ctrl-C stops it)
+rlx service install    # start it at each login (on by default), and now
+rlx service uninstall  # stop starting it at login, and stop the one the OS started
 ```
 
 `rlx service status --json` prints the same as one object: `running`, `pid`, `version`,
 `this_version`, `version_mismatch`, `host`, `started_at`, `uptime_s` and `parts`, one entry per
-part with its `state` (`ok`, `off`, `waiting` or `error`), a `detail` line and `last_run`. It
-exits 3 when no service runs.
+part with its `state` (`ok`, `off`, `waiting` or `error`), a `detail` line and `last_run`, and
+`at_login`: `on`, `how` (`launchd` or `systemd`), `item` (the login item's file), `chosen` (`on`,
+`off`, or `null` when nothing was chosen yet) and `why_off`. It exits 3 when no service runs.
 
 There is one service per home (`~/.aisquare`). Its status is in `~/.aisquare/service/`, and
 its log in `~/.aisquare/log/service.log`, which rolls over at 1 MB with one old file kept.
 
 `rlx upgrade` stops the service before it replaces rlx and starts it again on the new release.
-`rlx uninstall` stops it. Neither refuses to run beside it, as they do beside an rlx window.
+`rlx uninstall` stops it and takes its login item away. Neither refuses to run beside it, as they
+do beside an rlx window.
 
 ## With rlx windows open
 
@@ -71,8 +75,116 @@ login session. Start the service from a terminal at the Mac. A service started f
 session can't read the Keychain, so its usage reads come back empty. `rlx service start` warns
 when you run it over SSH, and the `usage` part says `Keychain locked` in `rlx service status`.
 
-Starting the service at login comes in a later release. The tray icon is below: it is in
-the menu bar only in your login session too.
+The service that starts at login runs inside your login session, so its usage reads work, and
+its tray icon (below) shows in the menu bar.
+
+## Starting at login
+
+The service starts when you log in, and it is on by default: the installers, and the first
+`rlx init`, set it up. It starts **at login, not at boot**: on macOS the Keychain that holds your
+Claude Code logins answers only inside your login session, and the usage reads need it.
+
+- **macOS:** a LaunchAgent, `~/Library/LaunchAgents/studio.aisquare.rlx.service.plist`. It
+  loads in your login session at the Mac only (`LimitLoadToSessionType` is `Aqua`), and launchd
+  starts the service again if it crashes (`KeepAlive` on an unclean exit), never after a stop.
+  It is not a LaunchDaemon, which would start at boot, outside any login session, where the
+  Keychain does not answer. Its end never takes the fleet's tmux server with it
+  (`AbandonProcessGroup`), and what it says before its own log opens goes to
+  `~/Library/Logs/rlx/studio.aisquare.rlx.service.log`.
+- **Linux:** a systemd user unit, `~/.config/systemd/user/rlx.service`, enabled for your user's
+  `default.target`, and started again 5 seconds after a failure. A stop ends the service alone,
+  never the fleet's tmux server and its agents (`KillMode=process`). It runs while you are logged
+  in. On a headless server where it should run with nobody logged in, `rlx service install`
+  asks whether to turn on systemd's lingering for your user (`loginctl enable-linger`). That is
+  a system-wide setting, so it is never turned on without asking; `--linger` answers yes.
+- **Windows:** the fleet runs in WSL, and so does the service: the same systemd user unit inside
+  WSL, which needs systemd turned on there (`systemd=true` under `[boot]` in `/etc/wsl.conf`,
+  the default for new installs). **A WSL distribution does not start when you sign in to
+  Windows**, so the service starts when WSL does (when you open your WSL terminal, say), not at
+  your Windows sign-in. A Windows logon task comes with rlxd in 0.10.3. On Windows itself,
+  outside WSL, there is nothing to set up: `rlx service install` says so, and nothing is
+  recorded.
+
+The login item runs this install's `rlx` (the one uv put in `~/.local/bin`) as
+`rlx service run --at-login`, with the PATH of the shell that installed it, and the variable that
+names the home when one does; nothing else. From a checkout or a development virtual
+environment, `rlx service install` refuses: a login item should not run that code.
+
+`rlx service start`, and `rlx upgrade`'s restart, start the service through launchd or systemd
+when its login item is set up, so the service that runs is the one they keep alive (on macOS, a
+login item launchd has not loaded yet is loaded, which starts it). `rlx service
+stop` stops it as before: a stop is not a crash, so it stays stopped. If a service already runs
+when you log in, the one at login exits quietly, and is not started again either.
+
+### Which homes
+
+One login item per home. Only the default home's is set up by itself. A home named by `RLX_HOME`
+or `AISQUARE_HOME` (a scratch home, a test's) gets one only from `rlx service install` run with
+that variable set: its item is `studio.aisquare.rlx.service.<8 hex>` (`rlx-<8 hex>.service` on
+Linux), so two homes never share one. A variable that names the default home's own path, as the
+captain's windows are given, still means the default home and its one item. `rlx init` sets nothing up under CI, and says so; the
+installers still do, since installing is your act.
+
+### Turning it off
+
+Any of these turns it off:
+
+- App settings ▸ User preferences ▸ *Start rlx at login*;
+- `rlx service uninstall`;
+- the OS's own startup settings: on macOS, System Settings ▸ General ▸ Login Items, under *Allow
+  in the Background*; on Linux, `systemctl --user disable rlx.service`.
+
+The switch and `rlx service uninstall` take the login item away and stop the service the OS
+started from it. rlx remembers the choice, in `config.toml` (`[service] start_at_login`), and
+never turns it back on by itself: `rlx init` and the installers set it up only while nothing has
+been chosen, and otherwise only refresh a login item that is there (a new path to rlx, a new
+PATH), never make one. So a removal in the OS's settings stays removed. Only `rlx service
+install`, or the switch in App settings, adds it back; on macOS, an item turned off under Login
+Items has to be turned on there, and `rlx service install` says so. `rlx init --no-service`, and
+the installers' `--no-service`, leave it off and keep that: later runs of `rlx init` and the
+installers never add it (a choice made before stays as it is). App settings' *Reset all settings*
+and `rlx init --reinit` keep this choice: it is about a login item, not a setting of rlx's.
+While `config.toml` cannot be read, `rlx init`, the installers, `rlx service install` and
+`uninstall` and the switch leave the login item as it is (they add none, refresh none and take
+none away) and say why; `rlx uninstall` and a move back to a release before the service still
+take it away, as that release could not. `rlx uninstall` takes every
+home's login item away too, and so does `rlx upgrade` to a release before the service (0.10.1
+and earlier), which has no command for them to run and none to take them away: a choice of on
+whose item was in place and on is forgotten with it, so a later release sets it up again; a choice
+of off, or of on whose item you removed or turned off in the OS, is kept. If that upgrade's
+installer fails, or installs a release that has the service after all, the items are put back
+as they were (but one whose file you could not read, which is taken away all the same: `rlx
+service status` then says how it stands). Putting them back starts nothing: each starts at your
+next login, and the upgrade starts the service again only if it was running before. A reset (App settings' *Reset all*, `rlx config reset`) or `--reinit` of a
+`config.toml` that does not parse carries the choice over from its text, or, when the text holds
+none or cannot be read (`chmod 000`), records the default home's as the OS has it (an item in
+place is on, none is off). `--reinit --yes` writes its defaults readable, never at a mode that
+keeps you out.
+
+`rlx service status` says whether it starts at login, and if not, why.
+
+### Checking it by hand
+
+The suite never runs the real `launchctl` or `systemctl`. Before a release, check it once on a
+throwaway macOS user and on a Linux VM, never on a machine you work on:
+
+1. Install rlx with the installer. `rlx service status` says `starts at login: yes`, and the
+   service runs.
+2. Log out and in again (on Linux, or reboot). With no rlx window open, `rlx service status`
+   says it runs, and its `usage` part reads your accounts (on macOS: not `Keychain locked`).
+3. Kill the service (`kill -9` its pid). Within a minute it runs again, with a new pid.
+4. `rlx service stop`: it stays stopped (a stop is no crash). `rlx service start`: it runs
+   again, started by launchd or systemd (`launchctl print gui/$(id -u)/studio.aisquare.rlx.service`
+   or `systemctl --user status rlx.service` shows it running).
+5. Start an agent from the TUI, then `rlx service restart`: the agent's tmux pane is still there.
+6. Turn it off in the OS's settings (macOS: Login Items; Linux: `systemctl --user disable
+   rlx.service`). `rlx service status` says it does not start at login, and why. Log out and in:
+   it does not start. Run `rlx init` and the installer again: it is still off.
+7. `rlx service install`: it is back on (on macOS after turning it on under Login Items, as it
+   says), and runs after the next login.
+8. App settings ▸ User preferences: turn *Start rlx at login* off: the service stops, and it does
+   not start at the next login. Turn it back on: it runs again.
+9. With `AISQUARE_HOME` set to a scratch folder, `rlx init`: no second login item appears.
 
 ## The tray
 

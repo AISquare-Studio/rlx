@@ -18,6 +18,7 @@ import errno
 import os
 import re
 import shutil
+import stat
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -1228,6 +1229,20 @@ DONT_ASK_STOP = "stop"
 """The kind ``[ui] confirm_stop`` stands for in ``dont_ask``: the Stop box's."""
 
 
+class ServiceSettings(BaseModel):
+    """``[service]`` — the rlx service (``rlx service``, S1) and its start at login (S2, #33).
+
+    ``start_at_login`` is the person's choice, absent until one is made: ``rlx init`` and the
+    installers add the login item only while it is absent (and for the default home alone),
+    and write ``true``; ``rlx service install`` and App settings' *Start rlx at login* write
+    ``true``, ``rlx service uninstall`` and the switch turned off ``false``. A login item
+    removed in the OS's own settings is never added back while it says ``true``: only an
+    explicit install adds it (``services.service_login``).
+    """
+
+    start_at_login: bool | None = None
+
+
 class SharingSettings(BaseModel):
     """``[sharing]`` — opt-in anonymous usage sharing (docs/usage-telemetry.md).
 
@@ -1274,6 +1289,7 @@ class AppConfig(BaseModel):
     ui: UiSettings = Field(default_factory=UiSettings)
     tray: TraySettings = Field(default_factory=TraySettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
+    service: ServiceSettings = Field(default_factory=ServiceSettings)
 
 
 #: Sections an older build read and this one does not, each with why. An unknown section
@@ -1430,6 +1446,9 @@ def holds_a_setting(path: Path | None = None) -> bool:
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
         return True
     _migrate(data)
+    # [service] is not a reset's to undo (``services.settings.reset_settings`` keeps it): a
+    # file that holds nothing else holds no setting a reset would undo.
+    data.pop("service", None)
     return bool(_overrides(data, system_defaults()))
 
 
@@ -1830,8 +1849,9 @@ def save_config(
     # recipe gets the retry, not only this one.
     try:
         # keep_mode: a config the operator tightened to 0600 stays 0600 — the
-        # rewrite used to reset it to the umask default.
-        write_replacing(written, payload, keep_mode=True)
+        # rewrite used to reset it to the umask default. But not a mode its owner
+        # cannot read (_a_mode_to_keep).
+        write_replacing(written, payload, keep_mode=_a_mode_to_keep(written))
     except OSError as exc:
         if written == target:
             raise
@@ -1850,6 +1870,19 @@ def save_config(
         except TypeError:  # an OSError subclass with an unusual signature
             raise OSError(exc.errno, detail, str(written)) from exc
     return target
+
+
+def _a_mode_to_keep(written: Path) -> bool:
+    """Whether a rewrite of ``written`` keeps its mode: not one its owner cannot read, which
+    only ``init --reinit --yes`` writes over (``discard_unreadable``). Kept, the defaults it
+    wrote over a ``chmod 000`` file were as unreadable as that file, so whatever reads them
+    next, the login item's choice among them, still could not; and once the mode was fixed, a
+    login item the person had taken away was added back (tester of #33, round 4, KEPT-1).
+    Written as a new file is, at the umask's mode, they can be read."""
+    try:
+        return bool(os.stat(written).st_mode & stat.S_IRUSR)
+    except OSError:
+        return True  # gone since: nothing to keep, and write_replacing knows
 
 
 #: The UTC stamp a reset's backup is named with: ``config.toml.bak-20261014T031700Z``, the
@@ -1871,11 +1904,17 @@ def reset_config(path: Path | None = None) -> Path | None:
     Through a symlink the file it points at is copied aside and emptied, never the link
     moved: moved, the next save would put a regular file where it was, the severed
     dotfiles link :func:`save_config` takes care never to make.
+
+    But ``[service]``, which the reset leaves in place (:func:`_kept_by_a_reset`): the
+    person's choice about the rlx service's login item, not a setting of rlx's. Forgotten,
+    the next ``rlx init`` would add back an item they had turned off (the manager's decision
+    on #33). The new file holds that table and ``config_version`` alone.
     """
     target = path or paths.config_path()
     written = Path(os.path.realpath(target))
     if not written.is_file() or not holds_a_setting(target):
         return None
+    kept = _kept_by_a_reset(written)
     stamp = datetime.now(UTC).strftime(_BACKUP_STAMP)
     backup = target.with_name(f"{target.name}.bak-{stamp}")
     counter = 1
@@ -1888,4 +1927,56 @@ def reset_config(path: Path | None = None) -> Path | None:
         # copy2: the mode too, so a config tightened to 0600 is not copied out readable.
         despite_windows_contention(lambda: shutil.copy2(written, backup))
         write_replacing(written, "", keep_mode=True)
+    if kept is not None:
+        left = _KeptByAReset(service=ServiceSettings(start_at_login=kept))
+        body = tomli_w.dumps(left.model_dump(mode="json", exclude_none=True))
+        write_replacing(written, body, keep_mode=True)
+        with contextlib.suppress(OSError):  # the mode the user's file had, 0600 kept 0600
+            written.chmod(stat.S_IMODE(backup.stat().st_mode))
     return backup
+
+
+class _KeptByAReset(BaseModel):
+    """What a reset leaves in ``config.toml``: its version, and ``[service]``."""
+
+    config_version: int = CONFIG_VERSION
+    service: ServiceSettings
+
+
+def _kept_by_a_reset(written: Path) -> bool | None:
+    """What of the file at ``written`` a reset leaves in place: its ``[service]`` table's
+    ``start_at_login``, when it holds one, read from its text when the file does not parse
+    (:func:`salvaged_start_at_login`): the reset rlx recommends for a broken file must not
+    lose an off (tester of #33, round 2)."""
+    try:
+        raw = despite_windows_contention(written.read_bytes)
+    except OSError:
+        return None
+    try:
+        data = _parse_toml(raw)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return salvaged_start_at_login(raw)
+    service = data.get("service")
+    if not isinstance(service, dict) or not isinstance(service.get("start_at_login"), bool):
+        return None
+    return bool(service["start_at_login"])
+
+
+_SERVICE_TABLE = re.compile(r"^\s*\[\s*service\s*\]\s*(?:#.*)?$")
+_A_TABLE = re.compile(r"^\s*\[")
+_START_AT_LOGIN = re.compile(r"^\s*start_at_login\s*=\s*(true|false)\s*(?:#.*)?$")
+
+
+def salvaged_start_at_login(raw: bytes) -> bool | None:
+    """``[service] start_at_login`` read line by line from a ``config.toml`` that does not parse
+    as a whole (a syntax error elsewhere, bytes that are not UTF-8): ``None`` when it holds no
+    such line. What a reset or ``init --reinit --yes`` of a broken file carries over."""
+    in_service = False
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if _SERVICE_TABLE.match(line):
+            in_service = True
+        elif _A_TABLE.match(line):
+            in_service = False
+        elif in_service and (found := _START_AT_LOGIN.match(line)):
+            return found.group(1) == "true"
+    return None

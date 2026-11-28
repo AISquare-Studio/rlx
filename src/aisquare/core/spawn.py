@@ -402,6 +402,12 @@ SEAMS: dict[str, Seam] = {
         "either stops the service and the service stops the tray; aisquare's own command (#34)",
         strips_identity=True,
     ),
+    "aisquare/services/service_login.py::_service_manager": Seam(
+        EXCLUDED,
+        "`launchctl`, `systemctl --user` and `loginctl`: the rlx service's login item added, "
+        "read and taken away (#33); the OS's own tools, never a model process",
+        strips_identity=True,
+    ),
     "aisquare/services/active_ping.py::_spawn": Seam(
         EXCLUDED,
         "a detached `aisquare metrics ping` of ours — the anonymous daily active ping, started "

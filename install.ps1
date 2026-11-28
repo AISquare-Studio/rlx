@@ -146,6 +146,10 @@ if (-not $target) {
 }
 
 Write-Note "found WSL distribution(s): $($distros -join ', ')"
+# install.sh also sets the rlx service to start at each login inside WSL (S2): its
+# `aisquare service install --if-undecided`, a systemd user unit there. Nothing is set up on
+# Windows itself, where a WSL distribution does not start at sign-in (rlxd's, 0.10.3).
+# --no-service, like every option, passes through to it.
 Write-Step "Running the installer inside $target"
 Write-Host ''
 

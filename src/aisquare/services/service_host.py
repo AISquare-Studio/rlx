@@ -20,7 +20,7 @@ it live leaves them to it, and takes them back when it dies (``cli.ui.app``).
 Not here: the daily active ping (a service up every day would count days on which nobody
 opened rlx), the release check (its answer is a TUI's to show), the captain's ui socket (its
 actions are on screen), the limit hand-overs (an agent's own hooks run them, in a detached
-process of their own), login registration (S2) and the tray (S3).
+process of their own), the login item (S2, ``services.service_login``) and the tray (S3).
 
 The service is one more instance in the registry (``core.instances``, kind ``service``): the
 version gate counts it, a quit request stops it, and :func:`stop` and :func:`start` are what
@@ -869,6 +869,16 @@ def start_service(
     already = running_service()
     if already is not None:
         return already
+    # Set to start at login (S2, #33): the OS starts it from its login item, so the service that
+    # holds the lock is the one the OS keeps alive, not a copy it does not know. Started here
+    # when the OS will not (no item, or one turned off), or did not within ``timeout``.
+    from aisquare.services import service_login
+
+    if service_login.start_through_the_os():
+        found = service_login.wait_for(running_service, timeout)
+        if found is not None:
+            return found
+        _log.warning("the OS did not start the %s in %.0f s; starting it here", SERVICE, timeout)
     log = log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
     command = list(argv) if argv is not None else selfcli.argv_for(["service", "run"])

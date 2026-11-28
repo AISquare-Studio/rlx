@@ -38,6 +38,7 @@ from aisquare.core.config import (
     ExplainabilitySettings,
     defaults_a_whole_file_reader_lacks,
     load_config,
+    salvaged_start_at_login,
     save_config,
     split_denied_tools,
 )
@@ -139,10 +140,18 @@ def initialize(
 
     discarded: str | None = None
     unreadable: str | None = None
+    # The rlx service's login choice (S2): carried across a reset, as Reset all carries it,
+    # or the init after it would add back a login item the person turned off (#33's ruling).
+    start_at_login: bool | None = None
     if reinit and paths.config_path().exists():
         try:
-            existing: ExplainabilitySettings | None = load_config().explainability
+            loaded = load_config()
+            existing: ExplainabilitySettings | None = loaded.explainability
+            start_at_login = loaded.service.start_at_login
         except Exception as exc:
+            # Read from its text: the reset of a broken file must not lose an off (#33).
+            with contextlib.suppress(OSError):
+                start_at_login = salvaged_start_at_login(paths.config_path().read_bytes())
             # Nothing can say what it configures, so the reset needs consent
             # (UnreadableConfigResetRefused).
             existing, unreadable = None, str(exc)
@@ -154,7 +163,9 @@ def initialize(
                 raise ExplainabilityResetRefused(discarded)
 
     if reinit or not paths.config_path().exists():
-        save_config(AppConfig(), discard_unreadable=unreadable is not None)
+        fresh = AppConfig()
+        fresh.service.start_at_login = start_at_login
+        save_config(fresh, discard_unreadable=unreadable is not None)
 
     project = ProjectInfo(id=project_id_for(root), root=root, linked_repos=[])
     with store_session() as store:
@@ -946,6 +957,13 @@ def lacks_refresh_hooks(release: str) -> bool:
     return install_route.is_newer(FIRST_REFRESH_HOOKS, release) is True
 
 
+def lacks_the_service(release: str) -> bool:
+    """Whether ``release`` predates ``rlx service`` (:data:`FIRST_SERVICE`): its login item
+    would run ``service run --at-login`` there, exit 2 on "No such command", and be started
+    again by the OS every few seconds at every login (review of #33, M1)."""
+    return install_route.is_newer(FIRST_SERVICE, release) is True
+
+
 def lacks_agent_hooks(agent: str, release: str) -> bool:
     """Whether ``release`` has no hooks for ``agent`` to write: one up to the adapter's
     ``capabilities.hookless_through`` (Codex's 0.8.2). Claude Code's have been there since
@@ -1418,30 +1436,47 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     if plan.reason is not None:
         raise UpgradeRefused(plan.reason, plan.command)
     unkept = _keep_the_numbers(plan)
-    from aisquare.services import service_host  # before the installer: nothing is imported after
+    # Before the installer: nothing is imported after.
+    from aisquare.services import service_host, service_login
 
     service_ran = _stop_the_service(plan.command)
+    # Into a release with no service, its login item goes first: there it would run a command
+    # that release does not have at every login, and nothing there could take it away (M1).
+    item_said, taken = _no_login_item_for(service_login, plan.target or plan.latest_version)
     code = install_route.run_installer(plan.argv, env=plan.env, to_stderr=to_stderr)
     if code != 0:
         # Asked too: uv resolves before it replaces anything (measured, uv 0.12.19), so a
         # run it could not resolve, as under a cutoff that excludes even the release that
         # runs, leaves that release installed, and no reinstall from nothing is needed.
         kept, _ = _installed_version(plan)
+        if taken is not None and (kept is None or not lacks_the_service(kept)):
+            # The move did not happen: what was taken away for it comes back as it was.
+            item_said = _put_the_login_items_back(service_login, taken) or item_said
         service_said = _start_the_service_again(service_host, plan, kept) if service_ran else None
         return UpgradeReport(
             plan,
             exit_code=code,
             version=kept,
             problem=f"{plan.argv[0]} exited {code}",
-            notes=(service_said,) if service_said else (),
+            notes=tuple(note for note in (item_said, service_said) if note),
         )
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
+    # The login items first, by what is in place now (S2, #33): into a release with no service,
+    # the item goes; where the installer said yes but the release in place has the service (one
+    # other than asked for, or this one still), what was taken away for the move comes back as
+    # it was (reviewer of #33, round 4).
+    if version is not None and lacks_the_service(version):
+        item_said = item_said or _no_login_item_for(service_login, version)[0]
+    elif version is not None and taken is not None:
+        item_said = _put_the_login_items_back(service_login, taken) or item_said
     if problem is not None:
+        if version is not None and not lacks_the_service(version):
+            _refresh_the_login_item(plan)
         service_said = (
             _start_the_service_again(service_host, plan, version) if service_ran else None
         )
-        said = (service_said,) if service_said else ()
+        said = tuple(note for note in (item_said, service_said) if note)
         return UpgradeReport(plan, exit_code=code, version=version, problem=problem, notes=said)
     home = None
     if plan.home_move is not None and not plan.backwards:
@@ -1449,8 +1484,13 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         # stopped and before any hook is rewritten (#31): the service then starts on the home
         # where it now is, and the sites are read again at their new places.
         home = move_home_in(_new_install_script(plan.route.facts))
+    if version is not None and not lacks_the_service(version):
+        # Only ever refreshed, never made (design #1875), by the install now in place, as its
+        # hooks are: a new path to rlx, a new PATH, and after the home moved (#31), the home
+        # where it now is.
+        _refresh_the_login_item(plan)
     service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
-    notes: list[str] = [service_said] if service_said else []
+    notes: list[str] = [note for note in (item_said, service_said) if note]
     latest = plan.latest_version
     moved_elsewhere = latest is not None and not install_route.same_version(version or "", latest)
     pypis = plan.latest is not None and plan.latest.cutoff is None
@@ -1493,6 +1533,48 @@ def _sites_after_move(plan: UpgradePlan) -> tuple[HookSite, ...]:
     if plan.target is not None:
         refresh, _held = _held_by_target(refresh, plan.target)
     return refresh
+
+
+def _no_login_item_for(
+    service_login: ModuleType, release: str | None
+) -> tuple[str | None, Any | None]:
+    """Every home's rlx login item taken away on a move to ``release`` when it has no service
+    (:func:`lacks_the_service`), this home's ON choice with it only when its item was there
+    and on (``service_login.forget_at_login``); what to say of it, and what was taken away
+    (``service_login.Taken``), which an installer that fails puts back."""
+    if release is None or not lacks_the_service(release):
+        return None, None
+    service = service_login.SERVICE
+    try:
+        taken = service_login.forget_at_login()
+    except (service_login.LoginError, OSError) as exc:
+        # What was taken away before an item that stayed, kept to put back (NotAllTaken).
+        return (
+            f"the {service}'s login item could not be taken away ({exc}): {release} has none",
+            getattr(exc, "taken", None),
+        )
+    if not taken.gone:
+        return None, taken
+    return f"the {service} no longer starts at login: {release} has no {service}", taken
+
+
+def _put_the_login_items_back(service_login: ModuleType, taken: Any) -> str | None:
+    """What :func:`_no_login_item_for` took away, put back as it was after an install that
+    failed, which left this release, with its service, in place (review of #33, round 3)."""
+    service = service_login.SERVICE
+    try:
+        said: str | None = service_login.put_back(taken)
+    except (service_login.LoginError, OSError) as exc:
+        return f"the {service}'s login items, taken away for the move, could not be put back: {exc}"
+    return said
+
+
+def _refresh_the_login_item(plan: UpgradePlan) -> None:
+    """The install now in place rewrites the login item that is there (``rlx service refresh``,
+    which never makes one), as its own hooks are rewritten by its own process. Best effort:
+    an item left as it was still starts the service."""
+    command = [str(plan.route.facts.executable), "-P", "-m", "aisquare", "service", "refresh"]
+    install_route.run_captured(command, timeout=VERSION_CHECK_TIMEOUT_SECONDS)
 
 
 def _stop_the_service(command: str) -> bool:
@@ -1654,6 +1736,9 @@ FIRST_ENV_FILES = "0.8.1"
 #: The first release whose store keeps the accounts' order in a table of its own
 #: (``account_rank``, store v50): a release before it orders them by what it writes itself.
 FIRST_ACCOUNT_RANK = "0.10.0"
+#: The first release with ``rlx service`` (S1) and its login item (S2): a release before it
+#: has no command for the item to run, and none to take it away.
+FIRST_SERVICE = "0.10.2.dev0"
 
 
 def refresh_hooks_argv(agent: str = HOOK_AGENT) -> tuple[str, ...]:
@@ -2818,14 +2903,19 @@ def _uninstall_plan(purge: bool) -> UninstallPlan:
 
 
 def _stop_the_service_for_good() -> None:
-    """Stop the rlx service before the uninstall removes what it runs (#32);
-    :class:`UninstallRefused` when it will not stop."""
-    from aisquare.services import service_host
+    """Stop the rlx service before the uninstall removes what it runs (#32), and take its
+    login item away (#33), or the OS would start a program that is gone at every login;
+    :class:`UninstallRefused` when either stays."""
+    from aisquare.services import service_host, service_login
 
     try:
         service_host.stop_service()
     except service_host.ServiceError as exc:
         raise UninstallRefused(f"{exc}: nothing was removed", "service_running") from exc
+    try:
+        service_login.forget_at_login()
+    except (service_login.LoginError, OSError) as exc:
+        raise UninstallRefused(f"{exc}: nothing else was removed", "service_at_login") from exc
 
 
 def uninstall(plan: UninstallPlan) -> UninstallReport:

@@ -3965,7 +3965,12 @@ def test_the_refresh_runs_after_init_only_with_an_agent(
     result = sh(f"parse_args {flags}; DRY_RUN=0; init_home", path=f"{cli}:{base_path(tmp_path)}")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    ran = calls.read_text(encoding="utf-8").splitlines()
+    # Less the rlx service's login item (S2, #33): its probe and its step.
+    ran = [
+        line
+        for line in calls.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("service install")
+    ]
     assert ran[0].startswith("init --local --yes"), ran
     assert (ran[1:] == ["agents refresh-hooks --recorded"]) is refreshed, ran
     assert any("refresh-hooks" in line for line in ran) is refreshed, ran
@@ -4792,3 +4797,126 @@ def test_the_word_a_line_tells_a_person_to_type_is_rlx_while_rlx_is_ours(
     )
     ps1_word = "rlx" if not found or found == f"{bin_dir}/rlx" else "aisquare"  # its `if`
     assert ps1_word == word, (found, bin_dir)
+
+
+# ---------------------------------------------------------------------------
+# The rlx service at login (S2, #33): init adds it by default; --no-service
+# ---------------------------------------------------------------------------
+
+
+def _an_init(tmp_path: Path, *, has_no_service: bool) -> tuple[Path, Path]:
+    """An ``aisquare`` that logs what it is asked, and that has the rlx service's login item
+    (0.10.2's: ``service install --help`` exits 0) or not (a release before it, exit 2)."""
+    calls = tmp_path / "calls.log"
+    body = (
+        f'printf "%s\\n" "$*" >> "{calls}"\n'
+        f'[ "$*" = "service install --help" ] && exit {0 if has_no_service else 2}\n'
+        "exit 0"
+    )
+    return stub_dir(tmp_path, "cli", "aisquare", body=body), calls
+
+
+@pytest.mark.parametrize(
+    ("flags", "has_it", "passed", "asked"),
+    [
+        ("--yes --no-project --no-agent", True, False, True),
+        ("--yes --no-project --no-agent --no-service", True, True, False),
+        ("--yes --no-project --no-agent --no-service", False, False, False),
+        ("--yes --no-project --no-agent", False, False, False),
+    ],
+    ids=["by-default", "no-service", "no-service-to-a-release-without-it", "a-release-without-it"],
+)
+def test_the_installer_sets_the_service_at_login_unless_no_service_says_not_to(
+    tmp_path: Path, flags: str, has_it: bool, passed: bool, asked: bool
+) -> None:
+    """The installer registers the login item on an undecided default home: init does, and
+    `service install --if-undecided` after it, which does so under CI too (installing is the
+    person's act; init alone does not there). --no-service reaches an init that has it and asks
+    nothing more; a release before 0.10.2 is asked neither, for options it does not know."""
+    cli, calls = _an_init(tmp_path, has_no_service=has_it)
+    result = sh(f"parse_args {flags}; DRY_RUN=0; init_home", path=f"{cli}:{base_path(tmp_path)}")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    ran = calls.read_text(encoding="utf-8").splitlines()
+    init = next(line for line in ran if line.startswith("init --local"))
+    assert init.startswith("init --local --yes"), init
+    assert ("--no-service" in init.split()) is passed, init
+    assert ("service install --if-undecided" in ran) is asked, ran
+    if asked:
+        assert ran.index("service install --if-undecided") > ran.index(init), ran
+
+
+_STARTS = "  start    the rlx service, now and at each login (unless turned off before)\n"
+_NAMED = (
+    "  skip     the rlx service at login (a home RLX_HOME or AISQUARE_HOME names: "
+    "`rlx service install` there sets it)\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("flags", "named", "line"),
+    [
+        ("", "", _STARTS),
+        (" --no-service", "", "  skip     the rlx service at login (--no-service)\n"),
+        ("", "{home}/.rlx", _STARTS),
+        ("", "{home}/.rlx/", _STARTS),
+        ("", "{home}/scratch-home", _NAMED),
+    ],
+    ids=["by-default", "no-service", "the-default-home-by-name", "with-a-slash", "a-named-home"],
+)
+def test_the_plan_says_the_service_starts_at_login(
+    tmp_path: Path, flags: str, named: str, line: str
+) -> None:
+    """The plan promises the login item only where it is set up by itself: the default home,
+    named by its own path or not (review of #33: not a home a variable names elsewhere)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    result = sh(
+        f"main --dry-run --yes --no-project --offline --no-agent --no-system-deps{flags}",
+        env={
+            "AISQUARE_INSTALL_VERSION": "",
+            "HOME": str(home),
+            "AISQUARE_HOME": named.format(home=home),
+            "RLX_HOME": "",
+        },
+        path=f"{_machine(tmp_path, _ABSENT)}:{base_path(tmp_path)}",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert line in result.stdout, result.stdout
+    init = next(text for text in result.stdout.splitlines() if "would run: aisquare init" in text)
+    assert ("--no-service" in init.split()) is bool(flags), init
+    step = "would run: aisquare service install --if-undecided\n"
+    assert (step in result.stdout) is not bool(flags), result.stdout
+
+
+@pytest.mark.parametrize(
+    ("folders", "named", "elsewhere"),
+    [
+        ((".rlx",), "{home}/.rlx", False),
+        ((".aisquare",), "{home}/.aisquare", False),
+        ((".rlx", ".aisquare"), "{home}/.aisquare", True),
+        ((".rlx",), "{home}/via-a-link", False),
+        ((), "{home}/scratch-home", True),
+        ((), "", False),
+    ],
+    ids=["rlx", "aisquare", "aisquare-beside-rlx", "a-link-to-it", "scratch", "none-named"],
+)
+def test_named_home_elsewhere_decides_as_the_cli_does(
+    tmp_path: Path, folders: tuple[str, ...], named: str, elsewhere: bool
+) -> None:
+    """The plan line's rule is the CLI's (``service_login._named_home``): the default home is
+    ~/.rlx if it is there, else ~/.aisquare if it is, else ~/.rlx, compared by the folder a
+    link leads to (reviewer of #33, round 2, nit)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for folder in folders:
+        (home / folder).mkdir()
+    (home / "via-a-link").symlink_to(home / ".rlx")
+    result = sh(
+        "if named_home_elsewhere; then echo ELSEWHERE; else echo DEFAULT; fi",
+        env={"HOME": str(home), "AISQUARE_HOME": named.format(home=home), "RLX_HOME": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ("ELSEWHERE" if elsewhere else "DEFAULT"), result.stdout

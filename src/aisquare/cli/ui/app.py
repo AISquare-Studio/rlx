@@ -5044,11 +5044,13 @@ def _writing_workers() -> dict[str, str]:
         project,
         settings,
         settings_remote,
+        start_at_login,
         tmux_page,
         welcome,
     )
 
     return {
+        start_at_login.WRITE_WORKER: "the login item's change",
         doctor.FIX_WORKER: "a fix",
         doctor.ASK_WORKER: "a question to the manager",
         onboard.ONBOARD_WORKER: "a folder's setup",
@@ -5109,11 +5111,13 @@ def _waited_reads() -> dict[str, str]:
         fleet_bulk,
         resources,
         settings_remote,
+        start_at_login,
         tmux_page,
         welcome,
     )
 
     return {
+        start_at_login.READ_WORKER: "whether rlx starts at login",
         _DOCTOR_WORKER: "the doctor's checks",
         FLEET_WORKER: "the sidebar's read of the fleet",
         CHECK_WORKER: "the release check",
