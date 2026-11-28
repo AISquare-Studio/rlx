@@ -1642,13 +1642,18 @@ impl Runner {
                 )
             }
             End::Failed(failed) => {
-                auth = failed
-                    .connectors
-                    .iter()
-                    .flatten()
-                    .filter(|c| c.status == rlxd_proto::ConnectorState::NeedsAuth.as_str())
-                    .map(|c| c.id.clone())
-                    .collect::<Vec<_>>();
+                // An identity read raises no needs-you (#4218): nobody waits on it, it is
+                // never resumed, and what it found is filed under its account already
+                // (`connector.changed` tells the app).
+                if !run.call.as_ref().is_some_and(call::CallRun::is_identity) {
+                    auth = failed
+                        .connectors
+                        .iter()
+                        .flatten()
+                        .filter(|c| c.status == rlxd_proto::ConnectorState::NeedsAuth.as_str())
+                        .map(|c| c.id.clone())
+                        .collect::<Vec<_>>();
+                }
                 (
                     RunState::Failed,
                     run_types::FAILED,

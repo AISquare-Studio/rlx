@@ -1405,3 +1405,151 @@ fn a_retried_runs_init_is_filed_by_the_home_its_attempt_ran_on() {
         "{events:#?}"
     );
 }
+
+/// A widget run that needs Slack: it fails needing you to sign Slack in again when Slack
+/// is signed out.
+fn needs_slack() -> Value {
+    json!({"kind": "widget_refresh", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]},
+        "needs_connectors": [SLACK], "space": "default"})
+}
+
+/// Starts a run of `params` on `scenario` and waits for its end: its `needs_you {auth}`
+/// id.
+fn auth_needs_you(home: &TestHome, scenario: &str) -> Value {
+    std::fs::write(home.root().join("scenario"), scenario).unwrap();
+    let since = seq(home);
+    let id = run_id();
+    start(home, &needs_slack(), &id);
+    ended(home, &id);
+    let raised = needs_you_events(home, since, "needs_you.raised");
+    raised
+        .iter()
+        .find(|e| e["data"]["run_id"] == id.as_str() && e["data"]["reason"] == "auth")
+        .unwrap_or_else(|| panic!("{id}'s needs-you: {raised:#?}"))["data"]["id"]
+        .clone()
+}
+
+/// A login of Slack on `scenario`, run to its end, as the app's values are now.
+fn login_to_end(home: &TestHome) {
+    std::fs::write(home.root().join("scenario"), "mcp-login").unwrap();
+    let since = seq(home);
+    login(home);
+    let events = login_events(home, since);
+    assert_eq!(
+        events.last().unwrap()["type"],
+        "connector.login.done",
+        "{events:#?}"
+    );
+}
+
+#[test]
+fn a_runs_needs_you_waits_for_its_own_accounts_sign_in_across_a_restart() {
+    // #4216 Q4/Q5: a run on slot 2's home needs Slack signed in again. Its home is kept
+    // in its record: after a restart, a sign-in on the plain home leaves it out, and one
+    // on slot 2's home clears it.
+    let (home, accounts) = read_home("needs-auth", "needs-auth", &[]);
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    let needs = auth_needs_you(&home, "connectors-needs-auth");
+    home.stop();
+    home.start_dev();
+    let since = seq(&home);
+    app_sets(&home, &json!({"CLAUDE_CONFIG_DIR": ""}));
+    login_to_end(&home);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(slack_status(&home, 1), "connected");
+    assert!(
+        needs_you_events(&home, since, "needs_you.cleared").is_empty(),
+        "a plain sign-in clears none of slot 2's"
+    );
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    login_to_end(&home);
+    eventually("slot 2's sign-in clears it", || {
+        !needs_you_events(&home, since, "needs_you.cleared").is_empty()
+    });
+    let cleared = needs_you_events(&home, since, "needs_you.cleared");
+    assert_eq!(cleared.len(), 1, "{cleared:#?}");
+    assert_eq!(cleared[0]["data"]["id"], needs, "{cleared:#?}");
+}
+
+#[test]
+fn a_listing_read_clears_the_needs_you_of_runs_on_its_own_account() {
+    // #4216 Q9: a no-turn read of slot 2 that finds Slack connected clears the needs-you
+    // of a run on slot 2's home, and not that of one on the plain home.
+    let (home, accounts) = read_home("needs-auth", "needs-auth", &[]);
+    let plain_needs = auth_needs_you(&home, "connectors-needs-auth");
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    let managed_needs = auth_needs_you(&home, "connectors-needs-auth");
+    std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
+    accounts.set(2, &slack("connected"));
+    let since = seq(&home);
+    list(&home, &json!({"refresh": true, "account": 2}));
+    assert_eq!(slack_status(&home, 2), "connected");
+    eventually("slot 2's run's needs-you is cleared", || {
+        !needs_you_events(&home, since, "needs_you.cleared").is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let cleared = needs_you_events(&home, since, "needs_you.cleared");
+    assert_eq!(cleared.len(), 1, "{cleared:#?}");
+    assert_eq!(cleared[0]["data"]["id"], managed_needs, "{cleared:#?}");
+    assert_ne!(cleared[0]["data"]["id"], plain_needs);
+}
+
+#[test]
+fn a_calls_read_only_hint_is_the_one_its_own_account_listed() {
+    // #4216 Q8: slot 2's listing says Slack's search is not read-only, slot 1's that it
+    // is. A call on slot 2's home is denied before its Claude Code starts; one on the
+    // plain home starts.
+    let (home, accounts) = read_home(
+        "connected",
+        "connected",
+        &[("RLXD_TEST_CONNECTORS_CALL", "1")],
+    );
+    home.stop();
+    let file = home.root().join("rlxd").join("connectors.json");
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    let path = "/accounts/2/connectors/0/tools/0";
+    assert_eq!(
+        saved.pointer(path).map(|tool| tool["name"].clone()),
+        Some(json!("mcp__claude_ai_Slack__slack_search_public")),
+        "{saved:#}"
+    );
+    saved.pointer_mut(path).unwrap()["read_only_hint"] = Value::Bool(false);
+    std::fs::write(&file, saved.to_string()).unwrap();
+    home.start_dev();
+    std::fs::write(home.root().join("scenario"), "mcp-direct").unwrap();
+    let params = || {
+        json!({"run_id": run_id(), "connector": SLACK,
+            "tool": "mcp__claude_ai_Slack__slack_search_public", "input": {"query": "probe"}})
+        .to_string()
+    };
+    app_sets(
+        &home,
+        &json!({"CLAUDE_CONFIG_DIR": accounts.managed.to_str().unwrap()}),
+    );
+    let before = starts(&home).len();
+    let run = home.rlxd(&["call", "connectors.call", &params()]);
+    assert_eq!(run.error_code(), "denied", "{run:?}");
+    assert_eq!(run.json()["error"]["detail"]["by"], "rlxd", "{run:?}");
+    assert_eq!(starts(&home).len(), before, "no Claude Code was started");
+    // On the plain home, whose listing says read-only, the call starts (and, with no app,
+    // is denied by the gate).
+    app_sets(&home, &json!({"CLAUDE_CONFIG_DIR": ""}));
+    let run = home.rlxd(&["call", "connectors.call", &params()]);
+    assert_eq!(run.error_code(), "denied", "{run:?}");
+    assert_eq!(
+        run.json()["error"]["detail"]["by"],
+        "unreachable",
+        "{run:?}"
+    );
+    assert_eq!(starts(&home).len(), before + 1);
+}
