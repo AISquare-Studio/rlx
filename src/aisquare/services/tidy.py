@@ -45,8 +45,9 @@ explicit confirmation per path.
    liveness: the process it was made for gone, and a fleet agent's newest row ended, not
    paused, past ``agent_tmp.GRACE``). One that holds a repository is kept, each repository
    named with its size; any other goes whole, its owner record beside it. The end paths (reap,
-   the watcher, every listing: ``agent_tmp.sweep_ended``) remove them too; tidy frees what they
-   have not reached yet.
+   the watcher, every listing: ``agent_tmp.sweep_ended``) remove them too, and keep the same
+   ones by the same test (``cachedir.holds_repository``); tidy frees what they have not reached
+   yet, and names what both keep.
 
 **Never touched:** anything outside rlx-owned roots (each project's ``.aisquare-worktrees``,
 the accounts' temp root, the agents' temp root, and those lock names in the system temp

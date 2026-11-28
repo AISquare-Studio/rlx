@@ -52,7 +52,7 @@ from aisquare.services import agent_tmp, store_broker, tidy, usage_stats
 from aisquare.services import fleet as fleet_service
 from tests import test_fleet_service as fleet_suite
 from tests import test_launch as launch_suite
-from tests.test_fleet_service import FakeTmux
+from tests.test_fleet_service import FakeTmux, _git
 
 tmux = fleet_suite.tmux
 clock = fleet_suite.clock
@@ -414,12 +414,19 @@ def test_every_listing_sweeps_at_most_once_a_minute(
 def test_removal_clears_what_the_agent_left_read_only_and_never_follows_a_link(
     processes: dict[int, str], tmp_path: Path
 ) -> None:
+    """Read-only folders (Go's module cache is ``0555``) are made writable and go. A folder no
+    one can read keeps its directory: what is in it cannot be seen, and a repository could
+    be (manager on #57, as ``rlx tidy`` keeps it)."""
     directory = _dir("aaaaaa", kind="launch", pid=12)
     locked = directory / "locked"
     (locked / "deeper").mkdir(parents=True)
     (locked / "deeper" / "file").write_text("x")
     (locked / "deeper").chmod(0o500)
-    locked.chmod(0o000)
+    locked.chmod(0o500)
+    unseen = _dir("bbbbbb", kind="launch", pid=13)
+    hidden = unseen / "hidden"
+    hidden.mkdir()
+    hidden.chmod(0o000)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "keep").write_text("mine")
@@ -429,8 +436,9 @@ def test_removal_clears_what_the_agent_left_read_only_and_never_follows_a_link(
         assert agent_tmp.sweep_ended(now=NOW) == [directory] and not directory.exists()
         assert stat.S_IMODE(outside.stat().st_mode) == 0o500, "a link's target is never changed"
         assert (outside / "keep").read_text() == "mine"
+        assert hidden.exists() and agent_tmp.owner_path("bbbbbb").exists()
     finally:  # what a failure leaves, pytest can still clean
-        for each in (outside, locked, locked / "deeper"):
+        for each in (outside, locked, locked / "deeper", hidden):
             if os.path.lexists(each):
                 with contextlib.suppress(OSError):
                     each.chmod(0o700)
@@ -740,3 +748,41 @@ def test_tidys_one_delete_takes_an_agents_dir_never_the_root_nor_through_a_link(
         with pytest.raises(tidy.Refused):
             tidy._remove(root / "zzzzzz", roots)
         assert elsewhere.exists()
+
+
+def test_an_ended_agents_scratch_clone_with_unpushed_work_is_never_swept_and_tidy_names_it(
+    tmux: FakeTmux, project: ProjectInfo, processes: dict[int, str], tmp_path: Path
+) -> None:
+    """Manager on #57: no path of rlx's deletes a git repository (#3585). An agent that cloned
+    into its TMPDIR and committed there, pushing nowhere, ends: the sweep (reap, the watcher,
+    every listing) keeps the whole directory and the commit in it, and ``rlx tidy`` names the
+    clone with its size. The ended directory beside it, with no repository, goes."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git("init", "-q", "-b", "main", cwd=origin)
+    (origin / "README").write_text("v1\n")
+    _git("add", "README", cwd=origin)
+    _git("commit", "-qm", "v1", cwd=origin)
+    now = datetime.now(UTC)
+    scratch, plain = (_dir(k, pid=9999, at=now - timedelta(hours=1)) for k in ("aaaaaa", "bbbbbb"))
+    _row(project, "aaaaaa", ended=now - timedelta(hours=1), label="coder-1")
+    _row(project, "bbbbbb", ended=now - timedelta(hours=1), label="coder-2")
+    clone = scratch / "work"
+    _git("clone", "-q", str(origin), str(clone), cwd=tmp_path)
+    (clone / "README").write_text("v2, pushed nowhere\n")
+    _git("commit", "-qam", "unpushed", cwd=clone)
+    unpushed = _git("rev-parse", "HEAD", cwd=clone)
+    assert _git("rev-parse", "origin/main", cwd=clone) != unpushed, "no ref outside has it"
+
+    assert agent_tmp.ended_dirs(now=now) == [scratch, plain], "both agents ended"
+    assert agent_tmp.sweep_ended(now=now) == [plain] and not plain.exists()
+    assert fleet_service.reap(project).temp_dirs_removed == []
+
+    assert _git("rev-parse", "HEAD", cwd=clone) == unpushed, "the unpushed commit is there"
+    assert (clone / "README").read_text() == "v2, pushed nowhere\n"
+    assert agent_tmp.owner_path("aaaaaa").exists()
+    made = tidy.plan()
+    named = [(k.path, k.why) for k in made.kept if k.rule == tidy.AGENT_TMPDIR]
+    assert named == [(clone, tidy.NEVER_A_REPOSITORY)]
+    assert all((k.bytes or 0) > 0 for k in made.kept if k.path == clone), "with its size"
+    assert _agent_items(made) == [], "tidy frees nothing of it either"

@@ -32,7 +32,9 @@ same list. A directory is ended when the process it was made for no longer runs,
 - a directory with no owner record is older than :data:`ORPHAN_AGE`.
 
 Liveness decides, never age alone; a paused agent's directory is never touched. Nothing
-outside ``<home>/tmp`` is removed, and a link is never followed.
+outside ``<home>/tmp`` is removed, and a link is never followed. No git repository is ever
+removed (manager #3585, and on #57): an ended directory that holds one, or a folder that cannot
+be looked through, stays, and ``rlx tidy`` names it with its size.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from aisquare.core import atomic, paths, procs
+from aisquare.core import atomic, cachedir, paths, procs
 from aisquare.core.spawn import OUTER_TMPDIR_ENV, TMP_KEY_ENV
 from aisquare.core.store import ContextStore, store_session
 from aisquare.models import FleetAgent, LaunchSpec
@@ -280,9 +282,14 @@ def _owner_runs(owner: Owner) -> bool:
 
 def sweep_ended(store: ContextStore | None = None, *, now: datetime | None = None) -> list[Path]:
     """Remove every :func:`ended_dirs` directory and its owner record; the ones removed. A
-    directory that cannot be removed is left for the next sweep."""
+    directory that cannot be removed is left for the next sweep. One that holds a git
+    repository (a scratch clone with commits no ref has) or a folder that cannot be looked
+    through stays, by ``rlx tidy``'s own test (``cachedir.holds_repository``): nothing of rlx's
+    deletes a repository, and tidy names it with its size."""
     removed: list[Path] = []
     for directory in ended_dirs(store, now=now):
+        if cachedir.holds_repository(directory):
+            continue
         if remove_dir(directory):
             removed.append(directory)
     return removed
