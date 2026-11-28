@@ -24,7 +24,8 @@
 //!   - When rlxd and the guard die together (`killall -9 rlxd` kills both, since the
 //!     guard is an rlxd), rlxd's next start in the same boot sweeps the run's group
 //!     ([`sweep`]) by the recorded guard pid and start time: the whole group if the guard
-//!     still runs with that start time, nothing if another process has that pid, and
+//!     still runs with that start time and the run's id ([`RUN_ID_ENV`]), nothing if
+//!     another process has that pid, and
 //!     otherwise, once one of them carries the run's id ([`RUN_ID_ENV`]), each process of
 //!     the guard's group and session that started at or after the run. macOS hides an
 //!     Apple binary's environment, so a run whose leftovers are all Apple's is not
@@ -41,6 +42,9 @@ use std::thread;
 
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
+
+#[cfg(unix)]
+use crate::log::warning;
 
 /// The variable every process of a run inherits, set to its run's id: how rlxd's start
 /// sweep knows a process for the run's, when nothing else is left of the run to go by.
@@ -414,7 +418,10 @@ fn kill_tree(tree: &Tree) {
 /// Ends what is left of a run whose guard `pid`, started at `started` (as [`start_time`]
 /// said), an earlier rlxd recorded: rlxd's start sweep, for a run in flight when it died.
 ///
-/// - The guard still runs with that start time: its whole group is killed.
+/// - The guard still runs with that start time, and carries `RLXD_RUN_ID=<run_id>`: its
+///   whole group is killed. Without the run's id in its environment, or with an
+///   environment that can't be read, it is left alone, and the reason logged: a pid and
+///   a start time in clock ticks alone could, in principle, be another's.
 /// - Another process now has that pid: the run's group is gone (no pid is given out
 ///   while a group of that id exists), and nothing is killed.
 /// - No process has it: the guard died too, as `killall -9 rlxd` does, and the group may
@@ -426,18 +433,45 @@ fn kill_tree(tree: &Tree) {
 ///   started at or after `started` is killed, one whose environment the OS hides
 ///   included (macOS hides an Apple binary's). Otherwise nothing is.
 ///
+/// Linux counts start times in clock ticks (10 ms at USER_HZ 100), so what the guard
+/// started may share its tick: "at or after" counts that tick in, or Claude Code started
+/// in it would be left behind. It takes in nothing older: session `pid` holds only what
+/// the guard started, none of which started before it. Membership is what decides; the
+/// start time keeps out only a later group that took the id, which the run's id tells
+/// apart when their ticks tie.
+///
 /// Only for a run of this boot ([`boot_id`]): across a reboot a pid, a group id and (on
 /// Linux) a start time may be anyone's. Whether it killed anything.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub fn sweep(pid: u32, started: &str, run_id: &str) -> bool {
+    sweep_reading(pid, started, run_id, environment)
+}
+
+/// [`sweep`], with `environment` reading a process's environment: the OS's, or a test's.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn sweep_reading(
+    pid: u32,
+    started: &str,
+    run_id: &str,
+    environment: impl Fn(u32) -> io::Result<Vec<u8>>,
+) -> bool {
     let Ok(guard) = libc::pid_t::try_from(pid) else {
         return false;
     };
     match start_time(pid) {
         Some(now) if now == started && session_of(guard) == Some(guard) => {
-            kill_group(pid);
-            return true;
+            return match guards_run(pid, run_id, &environment) {
+                Ok(()) => {
+                    kill_group(pid);
+                    true
+                }
+                Err(why) => {
+                    warning!("{why}: its process group is left alone");
+                    false
+                }
+            };
         }
         Some(_) => return false,
         None => {}
@@ -456,9 +490,10 @@ pub fn sweep(pid: u32, started: &str, run_id: &str) -> bool {
         .filter_map(|member| libc::pid_t::try_from(member).ok())
         .filter(|member| session_of(*member) == Some(guard))
         .collect();
-    let known = members
-        .iter()
-        .any(|member| u32::try_from(*member).is_ok_and(|member| carries(member, run_id)));
+    let known = members.iter().any(|member| {
+        u32::try_from(*member)
+            .is_ok_and(|member| environment(member).is_ok_and(|env| holds_run(&env, run_id)))
+    });
     if !known {
         return false;
     }
@@ -471,22 +506,43 @@ pub fn sweep(pid: u32, started: &str, run_id: &str) -> bool {
     killed
 }
 
-/// Whether process `pid`'s environment, as it started, holds `RLXD_RUN_ID=<run_id>`: from
-/// `/proc/<pid>/environ` on Linux, `KERN_PROCARGS2` on macOS (rlxd's own user's processes
-/// only, as the run's are).
+/// Whether `env`, a process's environment as [`environment`] reads it, holds
+/// `RLXD_RUN_ID=<run_id>`.
 #[cfg(unix)]
-fn carries(pid: u32, run_id: &str) -> bool {
+fn holds_run(env: &[u8], run_id: &str) -> bool {
     let wanted = format!("{RUN_ID_ENV}={run_id}");
-    environment(pid).is_some_and(|env| {
-        env.split(|&b| b == 0)
-            .any(|entry| entry == wanted.as_bytes())
-    })
+    env.split(|&b| b == 0)
+        .any(|entry| entry == wanted.as_bytes())
 }
 
-/// Process `pid`'s environment as it started, its entries NUL-separated.
+/// Whether process `pid`, which has run `run_id`'s guard's pid and start time, is its
+/// guard by its environment too, which the run's id is in ([`RUN_ID_ENV`]): `Err` says why
+/// it is not taken for it.
+#[cfg(unix)]
+fn guards_run(
+    pid: u32,
+    run_id: &str,
+    environment: &impl Fn(u32) -> io::Result<Vec<u8>>,
+) -> Result<(), String> {
+    match environment(pid) {
+        Ok(env) if holds_run(&env, run_id) => Ok(()),
+        Ok(_) => Err(format!(
+            "process {pid} has run {run_id}'s guard's pid and start time, but not its \
+             {RUN_ID_ENV}"
+        )),
+        Err(e) => Err(format!(
+            "process {pid} has run {run_id}'s guard's pid and start time, but its \
+             environment could not be read ({e})"
+        )),
+    }
+}
+
+/// Process `pid`'s environment as it started, its entries NUL-separated: from
+/// `/proc/<pid>/environ` on Linux, `KERN_PROCARGS2` on macOS (rlxd's own user's processes
+/// only, as the run's are).
 #[cfg(target_os = "linux")]
-fn environment(pid: u32) -> Option<Vec<u8>> {
-    std::fs::read(format!("/proc/{pid}/environ")).ok()
+fn environment(pid: u32) -> io::Result<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ"))
 }
 
 /// Process `pid`'s arguments and environment as it started (`KERN_PROCARGS2`: its argument
@@ -494,7 +550,13 @@ fn environment(pid: u32) -> Option<Vec<u8>> {
 /// count and path left out. What follows the environment is not one of its entries.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn environment(pid: u32) -> Option<Vec<u8>> {
+fn environment(pid: u32) -> io::Result<Vec<u8>> {
+    let unparsed = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "its arguments are not as expected",
+        )
+    };
     let mut argmax: libc::c_int = 0;
     let mut size = std::mem::size_of::<libc::c_int>();
     let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -510,14 +572,14 @@ fn environment(pid: u32) -> Option<Vec<u8>> {
         )
     };
     if read != 0 {
-        return None;
+        return Err(io::Error::last_os_error());
     }
-    let mut buffer = vec![0_u8; usize::try_from(argmax).ok()?];
+    let mut buffer = vec![0_u8; usize::try_from(argmax).map_err(|_| unparsed())?];
     let mut size = buffer.len();
     let mut mib = [
         libc::CTL_KERN,
         libc::KERN_PROCARGS2,
-        libc::c_int::try_from(pid).ok()?,
+        libc::c_int::try_from(pid).map_err(|_| unparsed())?,
     ];
     // SAFETY: sysctl(3) of the process's arguments into `buffer`, writable for `size`
     // bytes; it says how many it wrote.
@@ -532,28 +594,31 @@ fn environment(pid: u32) -> Option<Vec<u8>> {
         )
     };
     if read != 0 {
-        return None;
+        return Err(io::Error::last_os_error());
     }
     buffer.truncate(size);
-    let count = buffer.get(..4)?;
-    let argc = usize::try_from(i32::from_ne_bytes(count.try_into().ok()?)).ok()?;
+    let count = buffer.get(..4).ok_or_else(unparsed)?;
+    let argc = usize::try_from(i32::from_ne_bytes(
+        count.try_into().map_err(|_| unparsed())?,
+    ))
+    .map_err(|_| unparsed())?;
     // The executable's path, then the NULs that pad it.
     let mut rest = &buffer[4..];
-    let path_end = rest.iter().position(|&b| b == 0)?;
+    let path_end = rest.iter().position(|&b| b == 0).ok_or_else(unparsed)?;
     rest = &rest[path_end..];
-    let start = rest.iter().position(|&b| b != 0)?;
+    let start = rest.iter().position(|&b| b != 0).ok_or_else(unparsed)?;
     rest = &rest[start..];
     // The arguments.
     for _ in 0..argc {
-        let end = rest.iter().position(|&b| b == 0)?;
-        rest = rest.get(end + 1..)?;
+        let end = rest.iter().position(|&b| b == 0).ok_or_else(unparsed)?;
+        rest = rest.get(end + 1..).ok_or_else(unparsed)?;
     }
-    Some(rest.to_vec())
+    Ok(rest.to_vec())
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn environment(_pid: u32) -> Option<Vec<u8>> {
-    None
+fn environment(_pid: u32) -> io::Result<Vec<u8>> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Raises the soft limit on open files to the hard one (capped at 65,536, and on macOS at
@@ -1161,6 +1226,24 @@ mod tests {
         !stat.trim().is_empty() && !stat.trim().starts_with('Z')
     }
 
+    /// A [`start_time`] one step of its clock after `started`: a clock tick on Linux, a
+    /// microsecond on macOS.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn one_tick_after(started: &str) -> String {
+        match started.split_once('.') {
+            Some((sec, usec)) => {
+                let (sec, usec): (u64, u64) = (sec.parse().unwrap(), usec.parse().unwrap());
+                let (sec, usec) = if usec == 999_999 {
+                    (sec + 1, 0)
+                } else {
+                    (sec, usec + 1)
+                };
+                format!("{sec}.{usec:06}")
+            }
+            None => (started.parse::<u64>().unwrap() + 1).to_string(),
+        }
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[allow(unsafe_code)]
     #[test]
@@ -1196,20 +1279,14 @@ mod tests {
         // hides.
         let (group, both) = leaderless_group(true, Some("r1"));
         started.0.extend(both);
-        // Recorded as started after them, it is not the run's: nothing is killed.
-        // (A cat that waits on its stdin, so its start time can be read before it exits.)
-        let mut later = std::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let after = start_time(later.id()).unwrap();
-        drop(later.stdin.take());
-        later.wait().unwrap();
-        assert!(
-            start_key(&after) > start_key(&before),
-            "{after} after {before}"
-        );
+        let mut starts: Vec<String> = both.iter().map(|pid| start_time(*pid).unwrap()).collect();
+        starts.sort_by_key(|started| start_key(started));
+        // Recorded as started one tick after the newest of them, it is not the run's:
+        // nothing is killed. One tick past their own start time, so later at any clock's
+        // resolution; a process started after them could share their tick on Linux (10 ms
+        // at USER_HZ 100), as a cat did (run 46144197121).
+        let after = one_tick_after(&starts[1]);
+        assert!(start_key(&after) > start_key(&starts[1]), "{after}");
         assert!(
             !sweep(group, &after, "r1"),
             "processes started before the run are not the run's"
@@ -1217,8 +1294,10 @@ mod tests {
         for pid in both {
             assert!(runs(pid), "started before the run: runs on");
         }
+        // Recorded as started in the same tick as the older of them, they are the run's:
+        // a process that shares the run's tick is the run's, and is not left behind.
         assert!(
-            sweep(group, &before, "r1"),
+            sweep(group, &starts[0], "r1"),
             "the guard's group and session, with the run's id, are swept"
         );
         let gone = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1229,6 +1308,98 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// This test binary as a [`sleeper`] that leads a session of its own, as a run's guard
+    /// does, with `RLXD_RUN_ID=<run_id>` in its environment when given.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(unsafe_code)]
+    fn session_leader(run_id: Option<&str>) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", "runner::process::tests::sleeper"])
+            .env_remove(RUN_ID_ENV)
+            .env("RLXD_TEST_SLEEPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(run_id) = run_id {
+            command.env(RUN_ID_ENV, run_id);
+        }
+        // SAFETY: setsid(2) in the child between fork and exec, async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    /// A guard that still runs with the recorded pid and start time is swept only when its
+    /// environment says it is the run's: a pid and a start time in clock ticks alone could
+    /// be another's. One without the run's id, or whose environment can't be read (EPERM,
+    /// or its /proc entry gone), is left alone, and the reason said.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_running_guard_is_swept_only_when_it_carries_the_runs_id() {
+        /// Ends and reaps the processes it holds when the test ends, passed or failed.
+        struct Held(Vec<std::process::Child>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut held = Held(Vec::new());
+
+        held.0.push(session_leader(None));
+        let stranger = held.0[0].id();
+        let started = start_time(stranger).unwrap();
+        assert!(
+            !sweep(stranger, &started, "r1"),
+            "a session leader without the run's id is left alone"
+        );
+        assert!(runs(stranger), "without the run's id: runs on");
+        let why = guards_run(stranger, "r1", &environment).unwrap_err();
+        assert!(why.contains(&format!("not its {RUN_ID_ENV}")), "{why}");
+
+        held.0.push(session_leader(Some("r1")));
+        let guard = held.0[1].id();
+        let started = start_time(guard).unwrap();
+        for errno in [libc::EPERM, libc::ENOENT] {
+            let said = io::Error::from_raw_os_error(errno).to_string();
+            let unreadable = |_: u32| Err(io::Error::from_raw_os_error(errno));
+            let why = guards_run(guard, "r1", &unreadable).unwrap_err();
+            assert!(
+                why.contains("could not be read") && why.contains(&said),
+                "{why}"
+            );
+            assert!(
+                !sweep_reading(guard, &started, "r1", unreadable),
+                "an environment that can't be read ({said}) is no sweep"
+            );
+            assert!(runs(guard), "{said}: runs on");
+        }
+
+        assert!(
+            sweep(guard, &started, "r1"),
+            "the guard, with the run's id, is swept with its group"
+        );
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runs(guard) {
+            assert!(
+                std::time::Instant::now() < gone,
+                "the swept guard still runs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(runs(stranger), "the other session's leader runs on");
     }
 
     /// On Windows a run's tree is a job, which this starts directly. (On macOS and Linux a

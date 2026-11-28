@@ -2181,6 +2181,11 @@ fn a_needs_you_whose_raise_a_crash_cut_off_is_held_again_after_the_restart() {
         "{heard:#?}"
     );
     common::kill_hard(home.status()["pid"].as_u64().unwrap());
+    // The kill takes a moment to land: started before it has, the next rlxd found the
+    // killed one still holding the home (already_running) under load.
+    common::eventually("the killed rlxd is not running", || {
+        home.rlxd(&["status", "--json"]).code() == Some(3)
+    });
     home.start_dev();
     assert_eq!(
         call(&home, "run.get", &json!({"run_id": r}))["state"],
