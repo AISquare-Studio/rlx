@@ -51,7 +51,11 @@ pub struct Launch {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
+    /// What the process's environment adds to rlxd's own, which it inherits.
     pub env: Vec<(OsString, OsString)>,
+    /// What it takes away from rlxd's own: these variables are not set, whatever `env` and
+    /// rlxd's own say.
+    pub unset: Vec<OsString>,
 }
 
 /// A started run's process tree, to kill. The leader's [`Child`] is apart from it, so
@@ -207,6 +211,9 @@ fn command(launch: Launch) -> Command {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for name in &launch.unset {
+        command.env_remove(name);
+    }
     // Not kill_on_drop: a kill of the guard alone would leave Claude Code behind. A
     // dropped run's guard sees rlxd go, or rlxd's shutdown kills its group.
     command
@@ -262,6 +269,7 @@ fn spawn(launch: Launch) -> io::Result<(Child, Tree)> {
         args,
         cwd: launch.cwd,
         env: launch.env,
+        unset: launch.unset,
     };
     let mut command = command(launch);
     #[cfg(target_os = "linux")]
@@ -1235,6 +1243,7 @@ mod tests {
                 args: vec!["/c".into(), "ping -n 30 127.0.0.1 > NUL".into()],
                 cwd: std::env::temp_dir(),
                 env: Vec::new(),
+                unset: Vec::new(),
             })
             .await
             .unwrap();

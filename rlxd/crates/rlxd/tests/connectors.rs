@@ -551,8 +551,17 @@ fn stdin_held_open(route1: bool) {
     let home = home_with("stdin-eof-empty", &route(route1));
     let (id, events) = gated_start(&home, &widget(), 60).wait();
     assert_one_started_with_slack(&events, &id);
+    // The start that delivered: under a loaded machine an earlier try may have missed its
+    // wait and been ended, which is the gate working, not stdin closing early.
     let log = fixture_log(&home);
-    assert_eq!(log["starts"][0]["stdin_eof_at"], Value::Null, "{log:#}");
+    let delivered: Vec<&Value> = log["starts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|start| start["delivered"] == true)
+        .collect();
+    assert_eq!(delivered.len(), 1, "{log:#}");
+    assert_eq!(delivered[0]["stdin_eof_at"], Value::Null, "{log:#}");
 }
 
 #[test]
@@ -778,7 +787,11 @@ fn a_connector_an_init_no_longer_lists_is_removed_and_one_it_lists_new_is_added(
     let added = connector_events(&home, 0);
     assert_eq!(added.len(), 1, "{added:#?}");
     assert_eq!(added[0]["type"], "connector.added", "{added:#?}");
-    assert_eq!(added[0]["data"], json!({"id": SLACK}), "{added:#?}");
+    assert_eq!(
+        added[0]["data"],
+        json!({"account": 1, "id": SLACK}),
+        "{added:#?}"
+    );
     assert_valid("connector-id.json", &added[0]["data"]);
     let since = seq(&home);
     std::fs::write(home.root().join("scenario"), "init-other").unwrap();
@@ -1109,8 +1122,8 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
     let (path, config) = (path.to_str().unwrap(), config.to_str().unwrap());
     app_sets(&home, &json!({"PATH": path, "CLAUDE_CONFIG_DIR": config}));
     // The last start in fake-claude's log: the app's claude, by the path resolved when
-    // the app set PATH, with the app's values, raw.
-    let last_start = |what: &str| {
+    // the app set PATH, with the app's PATH, raw, and `config` its CLAUDE_CONFIG_DIR.
+    let last_start = |what: &str, config: Option<&str>| {
         let log = fixture_log(&home);
         let start = log["starts"].as_array().unwrap().last().unwrap().clone();
         assert_eq!(
@@ -1119,7 +1132,10 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
             "{what}: {start:#}"
         );
         assert_eq!(
-            start["env"]["CLAUDE_CONFIG_DIR"], config,
+            start["env"]
+                .get("CLAUDE_CONFIG_DIR")
+                .and_then(Value::as_str),
+            config,
             "{what}: {start:#}"
         );
         assert_eq!(start["env"]["PATH"], path, "{what}: {start:#}");
@@ -1129,7 +1145,10 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
     let probed = refresh(&home);
     assert_eq!(probed.code(), Some(0), "{probed:?}");
     assert_eq!(probed.data()["model_turns"], 1, "{probed:?}");
-    last_start("the refresh probe");
+    // The probe is the default account's (#660): the plain account's home, neither of the
+    // two variables, though the app set CLAUDE_CONFIG_DIR.
+    let start = last_start("the refresh probe", None);
+    assert_eq!(start["env"].get("CLAUDE_CODE_TMPDIR"), None, "{start:#}");
 
     std::fs::write(home.root().join("scenario"), "mcp-login").unwrap();
     let since = seq(&home);
@@ -1140,7 +1159,8 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
         "connector.login.done",
         "{events:#?}"
     );
-    let start = last_start("the login");
+    // A login runs where a run does: on the app's CLAUDE_CONFIG_DIR.
+    let start = last_start("the login", Some(config));
     assert_eq!(start["argv"][1], "mcp", "{start:#}");
 
     // With no claude on the app's PATH, neither starts, and each says where rlxd looked.

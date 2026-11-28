@@ -67,7 +67,7 @@ use tokio::sync::watch;
 
 use crate::bus::{self, Bus};
 use crate::claude::{self, Resolved};
-use crate::connectors::Connectors;
+use crate::connectors::{Account, Connectors};
 use crate::env::Env;
 use crate::log::{info, warning};
 use crate::{clock, spaces};
@@ -75,6 +75,7 @@ use crate::{clock, spaces};
 mod argv;
 mod call;
 mod connector_gate;
+mod discover;
 mod gate;
 #[cfg(unix)]
 pub(crate) mod guard;
@@ -2047,6 +2048,7 @@ impl Runner {
             args: argv::args(params, attempt, settings),
             cwd: space.to_owned(),
             env,
+            unset: Vec::new(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -2940,6 +2942,26 @@ pub(crate) fn run_env(values: &EnvValues) -> Vec<(OsString, OsString)> {
         .into_iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect()
+}
+
+/// The environment of an account's own Claude Code, the connectors' reads (no-turn
+/// discovery and the one-turn probe), and what it takes away: a run's ([`run_env`], the
+/// app's values), then the account's. A managed slot's `CLAUDE_CONFIG_DIR` and
+/// `CLAUDE_CODE_TMPDIR` are those of its record, in place of the app's. The plain account
+/// gets neither, even when the app's values carry `CLAUDE_CONFIG_DIR`: both are left out
+/// and taken away from rlxd's own ([`Account::env`], [`Account::unset`]).
+pub(crate) fn account_env(
+    values: &EnvValues,
+    account: &Account,
+) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
+    let set = account.env();
+    let unset = account.unset();
+    let mut env: Vec<(OsString, OsString)> = run_env(values)
+        .into_iter()
+        .filter(|(name, _)| !unset.contains(name) && !set.iter().any(|(own, _)| own == name))
+        .collect();
+    env.extend(set);
+    (env, unset)
 }
 
 /// Adds `text` to `kept`, which holds at most the last [`PARTIAL_TEXT`] bytes.
