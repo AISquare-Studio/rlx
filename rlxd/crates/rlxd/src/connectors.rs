@@ -369,7 +369,8 @@ pub struct Connectors {
     home: Home,
     bus: Arc<Bus>,
     cache: Mutex<Saved>,
-    /// The accounts rlx knows, by slot: the default one at least.
+    /// The accounts rlx knows, by slot: the default one at least. Lock order: the
+    /// cache's, then this; never this, then the cache's.
     accounts: Mutex<BTreeMap<u32, Account>>,
     /// rlxd's own `CLAUDE_CONFIG_DIR`, resolved once: the home its runs, calls and logins
     /// use, when its environment names one.
@@ -669,8 +670,10 @@ impl Connectors {
         for gone in removed {
             self.publish(connector_types::REMOVED, json_of(&gone));
         }
-        drop(cache);
+        // The accounts rlx knows change under the cache's lock, as its forgets do: a
+        // set_identity, which reads them under that lock too, sees both or neither.
         *self.known() = now;
+        drop(cache);
         self.settle_runs(runs);
         to_read
     }
@@ -885,10 +888,13 @@ impl Connectors {
         id: &str,
         identity: ConnectorIdentity,
     ) -> bool {
-        let known = self
-            .account(slot)
-            .is_some_and(|account| account.login.as_deref() == login);
+        // rlx's account read under the cache's lock, as set_accounts changes it: so no
+        // forget of a new sign-in can come between this check and the store.
         let mut cache = self.cache();
+        let known = self
+            .known()
+            .get(&slot)
+            .is_some_and(|account| account.login.as_deref() == login);
         let Some(entry) = cache.accounts.get_mut(&slot) else {
             return false;
         };
@@ -1610,6 +1616,46 @@ mod tests {
         let other = ["mcp__claude_ai_Fixture__whois".to_owned()];
         let other_read_only = HashMap::from([(other[0].clone(), true)]);
         assert!(read("connected", &other, &other_read_only).is_empty());
+    }
+
+    #[test]
+    fn an_identity_whose_call_spans_a_new_sign_in_is_dropped() {
+        let dir = Dir::new();
+        let connectors = dir.connectors();
+        let whoami = "mcp__claude_ai_Fixture__whoami".to_owned();
+        let hints = HashMap::from([(whoami.clone(), true)]);
+        let sources = HashMap::new();
+        let servers = [McpServer::new("claude.ai Fixture", "connected")];
+        let tools = [whoami];
+        let fixture = Observed {
+            servers: &servers,
+            sources: &sources,
+            tools: &tools,
+            hints: &hints,
+        };
+        connectors.set_accounts(vec![managed(2, "b")]);
+        connectors.observe_on(&managed(2, "b"), fixture, Read::Listing);
+        let said = |user: &str| {
+            let mut identity = ConnectorIdentity::default();
+            identity.user = Some(user.to_owned());
+            identity
+        };
+        // A call under b that lands under b: stored.
+        assert!(connectors.set_identity(2, Some("b"), "claude.ai Fixture", said("ada-b")));
+        // A call started under b (its mark taken then); rlxd hears c before it lands.
+        let asked_under = connectors.account(2).unwrap().login;
+        connectors.set_accounts(vec![managed(2, "c")]);
+        assert!(!connectors.set_identity(
+            2,
+            asked_under.as_deref(),
+            "claude.ai Fixture",
+            said("old-b")
+        ));
+        let list = connectors.list(0, Some(2));
+        assert_eq!(
+            list.accounts[0].connectors[0].identity, None,
+            "forgotten, not restored"
+        );
     }
 
     #[test]
