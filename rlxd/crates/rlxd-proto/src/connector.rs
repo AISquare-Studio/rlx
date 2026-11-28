@@ -6,6 +6,10 @@
 //!   or a refresh. A plain list never makes a model turn. `refresh: true` needs a route
 //!   with no turn (capability [`capabilities::CONNECTORS_NO_TURN`]), and until there is
 //!   one it is `no_route`, unless `allow_turn: true` lets rlxd run a one-turn probe.
+//! - `connectors.call {run_id, connector, tool, input}` ([`ConnectorsCallParams`]) makes
+//!   one read call through Claude Code's MCP client with no model turn (capability
+//!   [`capabilities::CONNECTORS_CALL`]), as a gated `watch` run, and gives
+//!   [`ConnectorsCallData`]; a denial is `denied`, and with no route it is `no_route`.
 //! - `connectors.login {id}` ([`ConnectorsLoginParams`]) gives `{login_id}`
 //!   ([`ConnectorsLoginData`]), and the login's steps come as `connector.login.*` events.
 //! - The `connector` topic carries [`connector_types`]: a connector added, removed, or
@@ -17,6 +21,7 @@ use serde_json::Value;
 
 use crate::check::{self, Invalid, drop_null, present};
 use crate::envelope::Data;
+use crate::{Decision, RunId};
 
 /// The capabilities `status` and `hello` announce for connectors.
 pub mod capabilities {
@@ -334,8 +339,117 @@ macro_rules! checked_serde {
     };
 }
 
+/// The longest tool name `connectors.call` takes, in bytes.
+pub const MAX_TOOL: usize = 512;
+
+/// `connectors.call`'s params (5.3): `{run_id, connector, tool, input}`, one call of the
+/// connector's `tool` with `input`, made as the `watch` run `run_id` with no model turn.
+#[derive(Clone, Debug, PartialEq, JsonSchema)]
+#[schemars(title = "ConnectorsCallParams")]
+#[non_exhaustive]
+pub struct ConnectorsCallParams {
+    /// The run the call is made as: a new lower-case UUID, the app's to pick.
+    pub run_id: RunId,
+    /// The connector, such as `claude.ai Slack`: the run's mount.
+    #[schemars(length(min = 1, max = 256))]
+    pub connector: String,
+    /// The tool, as Claude Code names it: `mcp__<connector as Claude Code writes it>__…`.
+    #[schemars(length(min = 6, max = 512), regex(pattern = r"^mcp__"))]
+    pub tool: String,
+    /// The tool's input: the run's pinned call is its RFC 8785 SHA-256, and it is the very
+    /// input the call is made with.
+    pub input: serde_json::Map<String, Value>,
+}
+
+impl ConnectorsCallParams {
+    /// A call of `connector`'s `tool` with `input`, as the run `run_id`.
+    pub fn new(
+        run_id: RunId,
+        connector: impl Into<String>,
+        tool: impl Into<String>,
+        input: serde_json::Map<String, Value>,
+    ) -> Result<Self, Invalid> {
+        let params = Self {
+            run_id,
+            connector: connector.into(),
+            tool: tool.into(),
+            input,
+        };
+        params.validate()?;
+        Ok(params)
+    }
+
+    /// Whether these params keep every rule of `connectors-call.json`.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        check_id("connector", &self.connector)?;
+        check::non_empty("tool", &self.tool)?;
+        check::at_most("tool", self.tool.len() as u64, MAX_TOOL as u64)?;
+        if !self.tool.starts_with("mcp__") || self.tool.len() < 6 {
+            return Err(Invalid::new("tool", "is not an MCP tool's name (mcp__…)"));
+        }
+        if self.tool.chars().any(char::is_control) {
+            return Err(Invalid::new("tool", "holds a control character"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "ConnectorsCallParams")]
+struct UncheckedCall {
+    run_id: RunId,
+    connector: String,
+    tool: String,
+    input: serde_json::Map<String, Value>,
+}
+
+/// `connectors.call`'s reply (5.3): `{run_id, decision, content?, is_error?, model_turns}`.
+/// A denied call is an error (`denied`, with `detail.by`), never this reply, so `decision`
+/// is `allow`; `content` is the tool's result exactly as Claude Code gave it, up to 1 MiB,
+/// and `is_error` whether the tool said it failed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(title = "ConnectorsCallData")]
+#[non_exhaustive]
+pub struct ConnectorsCallData {
+    /// The call's run.
+    pub run_id: RunId,
+    /// The gate's decision.
+    pub decision: Decision,
+    /// The tool's result content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub content: Option<Value>,
+    /// Whether the tool said it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub is_error: Option<bool>,
+    /// Always 0: the call is made with no model turn.
+    #[schemars(range(max = 0))]
+    pub model_turns: u32,
+}
+
+impl ConnectorsCallData {
+    /// Run `run_id`'s call, decided `decision`, which gave `content` (`is_error` when the
+    /// tool said it failed).
+    pub fn new(
+        run_id: RunId,
+        decision: Decision,
+        content: Option<Value>,
+        is_error: Option<bool>,
+    ) -> Self {
+        Self {
+            run_id,
+            decision,
+            content,
+            is_error,
+            model_turns: 0,
+        }
+    }
+}
+
 checked_serde!(ConnectorsListParams, UncheckedList);
 checked_serde!(ConnectorsLoginParams, UncheckedLogin);
+checked_serde!(ConnectorsCallParams, UncheckedCall);
 
 /// `connectors.login`'s reply: `{login_id}`, which its events carry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

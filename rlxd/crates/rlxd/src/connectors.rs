@@ -96,6 +96,9 @@ pub struct Connectors {
     /// Whether this Claude Code reports connector states before the first message (5.5,
     /// route 1): the capability `connectors.gate_before_turn`.
     route_1: bool,
+    /// Whether this rlxd makes `connectors.call` (capability `connectors.call`, 5.3): off
+    /// until the owner-run probe confirms Claude Code's route.
+    call_route: bool,
     gate: GateTimes,
     /// The logins running, by connector: their `login_id`s.
     logins: Mutex<HashMap<String, String>>,
@@ -123,6 +126,7 @@ impl Connectors {
             bus,
             cache: Mutex::new(saved),
             route_1: test_route_1(),
+            call_route: test_call_route(),
             gate: GateTimes::default(),
             logins: Mutex::new(HashMap::new()),
             on_connected: OnceLock::new(),
@@ -154,6 +158,11 @@ impl Connectors {
         self.route_1
     }
 
+    /// Whether this rlxd makes `connectors.call` (5.3).
+    pub fn call_route(&self) -> bool {
+        self.call_route
+    }
+
     /// The gate's times.
     pub fn gate_times(&self) -> GateTimes {
         self.gate
@@ -161,11 +170,14 @@ impl Connectors {
 
     /// The capabilities connectors add to `hello` and `status`.
     pub fn capabilities(&self) -> Vec<&'static str> {
+        let mut named = Vec::new();
         if self.route_1 {
-            vec![capabilities::CONNECTORS_GATE_BEFORE_TURN]
-        } else {
-            Vec::new()
+            named.push(capabilities::CONNECTORS_GATE_BEFORE_TURN);
         }
+        if self.call_route {
+            named.push(capabilities::CONNECTORS_CALL);
+        }
+        named
     }
 
     /// `connectors.list`: the cache, as of its `system/init`, having made `model_turns`.
@@ -676,6 +688,20 @@ fn test_route_1() -> bool {
 /// A release build takes route 2 until the probe has found route 1 in Claude Code.
 #[cfg(not(feature = "debug-methods"))]
 fn test_route_1() -> bool {
+    false
+}
+
+/// Test builds only: `RLXD_TEST_CONNECTORS_CALL=1` makes this rlxd serve `connectors.call`
+/// and announce it, as the owner-run probe confirming Claude Code's route would.
+#[cfg(feature = "debug-methods")]
+fn test_call_route() -> bool {
+    std::env::var("RLXD_TEST_CONNECTORS_CALL").is_ok_and(|on| on == "1")
+}
+
+/// A release build makes no `connectors.call` until the owner-run probe confirms the
+/// route (spike #5): `connectors.call` is `no_route`, and watch jobs take the fallback.
+#[cfg(not(feature = "debug-methods"))]
+fn test_call_route() -> bool {
     false
 }
 

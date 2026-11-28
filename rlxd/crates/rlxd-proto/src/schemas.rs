@@ -10,16 +10,16 @@ use serde_json::Value;
 
 use crate::{
     BrainInput, BrainOutput, ConnectorChanged, ConnectorId, ConnectorLoginDone,
-    ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorsList,
-    ConnectorsListParams, ConnectorsLoginData, ConnectorsLoginParams, DaemonRecord, Envelope,
-    Event, HelloData, HelloParams, HereData, JobEvent, JobListData, JobListParams, JobPutParams,
-    JobRef, JobRunNowData, PtyExited, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams,
-    PtyScreen, PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request,
-    RunCancelData, RunDecideData, RunDecideParams, RunEvent, RunEventsData, RunEventsParams,
-    RunGetData, RunListData, RunListParams, RunRef, RunResumeData, RunResumeParams, RunStartParams,
-    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
-    SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceEraseData, SpaceParams,
-    StatusData, SubscribeParams,
+    ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorsCallData,
+    ConnectorsCallParams, ConnectorsList, ConnectorsListParams, ConnectorsLoginData,
+    ConnectorsLoginParams, DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData,
+    JobEvent, JobListData, JobListParams, JobPutParams, JobRef, JobRunNowData, PtyExited,
+    PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams,
+    PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunDecideData,
+    RunDecideParams, RunEvent, RunEventsData, RunEventsParams, RunGetData, RunListData,
+    RunListParams, RunRef, RunResumeData, RunResumeParams, RunStartParams, Setting,
+    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
+    SettingsSetParams, SpaceEnsureData, SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
 };
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
@@ -43,6 +43,8 @@ pub fn all() -> Vec<SchemaFile> {
         file::<ConnectorLoginOpenUrl>("connector-login-open-url.json"),
         file::<ConnectorLoginWaiting>("connector-login-waiting.json"),
         file::<ConnectorsList>("connectors.json"),
+        file::<ConnectorsCallParams>("connectors-call.json"),
+        file::<ConnectorsCallData>("connectors-call-reply.json"),
         file::<ConnectorsListParams>("connectors-list.json"),
         file::<ConnectorsLoginParams>("connectors-login.json"),
         file::<ConnectorsLoginData>("connectors-login-reply.json"),

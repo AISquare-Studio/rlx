@@ -68,6 +68,7 @@ use crate::log::{info, warning};
 use crate::{claude, clock, spaces};
 
 mod argv;
+mod call;
 mod connector_gate;
 mod gate;
 #[cfg(unix)]
@@ -126,6 +127,10 @@ pub enum RunNote {
         run_id: RunId,
         state: RunState,
     },
+    /// A `connectors.call` run found no route to a call with no model turn (a Claude
+    /// Code without `mcp_call_check_permissions_v1`): its watch fire falls back (5.3).
+    /// Noted before the run's `Ended`.
+    NoRoute { job_id: String, run_id: RunId },
     /// A watch run's pinned call, allowed, gave its result (7.6): `content` as
     /// `run.tool_result` carries it, bounded.
     WatchResult {
@@ -231,6 +236,9 @@ struct Run {
     /// Whether a watch job fired the run: then its pinned call's result goes to the
     /// scheduler as `job.watch_result`. Not kept across a restart, which ends the run.
     watch_job: bool,
+    /// A `connectors.call` run's own facts ([`call`]): its attempt is one call on a
+    /// control channel, and it is never resumed.
+    call: Option<call::CallRun>,
     client: String,
     dir: RunDir,
     inner: Mutex<RunInner>,
@@ -580,6 +588,7 @@ impl Runner {
                 job_id: record.job_id.clone(),
                 loud: record.loud,
                 watch_job: false,
+                call: record.connectors_call.then(call::CallRun::ended),
                 client: record.client.clone(),
                 dir,
                 inner: Mutex::new(RunInner {
@@ -735,10 +744,10 @@ impl Runner {
             Some(job) => (Some(job.job_id), Some(job.loud), job.watch),
             None => (None, None, false),
         };
-        self.start_checked(params, client, job_id, loud, watch_job)
+        self.start_checked(params, client, job_id, loud, watch_job, None)
     }
 
-    /// [`Runner::start`], its params checked.
+    /// [`Runner::start`], its params checked; `call` for a `connectors.call` run.
     fn start_checked(
         self: &Arc<Self>,
         params: RunStartParams,
@@ -746,6 +755,7 @@ impl Runner {
         job_id: Option<String>,
         loud: Option<bool>,
         watch_job: bool,
+        call: Option<call::CallRun>,
     ) -> Result<RunRef, ErrorBody> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(refusal(
@@ -798,6 +808,7 @@ impl Runner {
             job_id,
             loud,
             watch_job,
+            call,
             client: client.to_owned(),
             dir,
             inner: Mutex::new(RunInner {
@@ -1076,6 +1087,14 @@ impl Runner {
                 format!(
                     "run {id} is {}: only a run with no live process resumes",
                     inner.state
+                ),
+            ));
+        }
+        if run.call.is_some() {
+            return Err(refusal(
+                codes::NOT_RESUMABLE,
+                format!(
+                    "run {id} is a connectors.call, which is never resumed: make the call again"
                 ),
             ));
         }
@@ -1503,7 +1522,11 @@ impl Runner {
         let runner = Arc::clone(self);
         let run = Arc::clone(run);
         tokio::spawn(async move {
-            let end = runner.attempt(&run).await;
+            let end = if run.call.is_some() {
+                runner.call_attempt(&run).await
+            } else {
+                runner.attempt(&run).await
+            };
             let mut inner = run.inner();
             let placed = runner.end(&run, &mut inner, end);
             drop(inner);
@@ -2599,6 +2622,7 @@ impl Run {
             calls: inner.calls.clone(),
             pinned_call_used: inner.pinned_call_used,
             auth: inner.auth.clone(),
+            connectors_call: self.call.is_some(),
         }
     }
 }

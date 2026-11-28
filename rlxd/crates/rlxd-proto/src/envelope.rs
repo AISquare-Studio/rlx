@@ -416,8 +416,15 @@ pub mod codes {
     /// why.
     pub const HOOK_NOT_FOUND: &str = "hook_not_found";
     /// `connectors.list {refresh: true}`: rlxd has no route to Claude Code's connectors
-    /// that makes no model turn yet. `allow_turn: true` lets it take one.
+    /// that makes no model turn yet. `allow_turn: true` lets it take one. And
+    /// `connectors.call`: no route to one call with no model turn (no capability
+    /// `connectors.call`, or a Claude Code without `mcp_call_check_permissions_v1`).
     pub const NO_ROUTE: &str = "no_route";
+    /// `connectors.call`: the gate denied the call; `detail.by` says who (5.1, 5.3).
+    pub const DENIED: &str = "denied";
+    /// `connectors.call`: the call's run ended otherwise (`detail.reason`, its
+    /// `run.failed` reason; `detail.run_id`). The message says why.
+    pub const CALL_FAILED: &str = "call_failed";
     /// `connectors.list {refresh: true, allow_turn: true}`: Claude Code was not found.
     pub const CLAUDE_NOT_FOUND: &str = "claude_not_found";
     /// `connectors.list {refresh: true, allow_turn: true}`: the one-turn probe ended

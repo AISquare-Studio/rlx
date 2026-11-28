@@ -104,6 +104,30 @@ the hook. Allowed, the tool gives `watch-call/content.json`, which `job.watch_re
 carries; for the input `{"ref": "missing"}` an error, and for `{"ref": "huge"}` 2 MiB of
 text, as a tool would. Then it tries the identical call again, which rlxd denies `pinned_call_used`.
 
+**`mcp-direct`** plays Claude Code on a `connectors.call` run's control channel (5.3), as
+spike #5 found 2.1.332: no user message, no `system/init`, only answers to rlxd's
+control requests. `initialize` lists `mcp_call_check_permissions_v1`; `mcp_status` lists
+no server for its first 300 ms, then `claude.ai GitHub` connected (`source: "claudeai"`)
+with `get_check_runs` (`readOnly: true`) and `create_issue` (`openWorld: true` only); an
+`mcp_call` with `check_permissions: true` asks rlxd one `can_use_tool` (a
+`toolu_mcp_call_…` id), and runs the tool with the answer's `updatedInput` only on an
+allow, giving `mcp-direct/content.json` (an error result for `{"ref": "missing"}`). The
+log adds `control_requests` (each request rlxd sent), `control_answers` (each answer to
+a `can_use_tool`) and `tool_inputs`. Started as a conversation (with `--settings`, as a
+watch job's fallback run is), each plays `watch-call`.
+
+| Scenario | What it does |
+|---|---|
+| `mcp-direct` | As above |
+| `mcp-direct-old` | `initialize` lists no `mcp_call_check_permissions_v1` |
+| `mcp-direct-unasked` | Ignores `check_permissions`: runs the call with no `can_use_tool` |
+| `mcp-direct-respelled` | Asks `can_use_tool` with the input's whole numbers written as `1.0` |
+| `mcp-direct-needs-auth` | Lists the connector `needs-auth` |
+| `mcp-direct-silent` | Never answers `initialize` |
+| `mcp-direct-huge` | Writes a 5 MiB line after `initialize` |
+| `mcp-direct-turn` | Writes an `assistant` line after `initialize` |
+| `mcp-direct-hang` | Never answers the allowed call |
+
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for
 `-p --output-format stream-json` without `--verbose`, waits for its first stream-json user

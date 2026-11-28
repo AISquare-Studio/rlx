@@ -212,9 +212,11 @@ pub use brain::{BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, codes 
 pub use check::Invalid;
 pub use connector::{
     Connector, ConnectorChanged, ConnectorId, ConnectorLoginDone, ConnectorLoginError,
-    ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorState, ConnectorTool, ConnectorsList,
-    ConnectorsListParams, ConnectorsLoginData, ConnectorsLoginParams, ListedFrom, LoginErrorCode,
-    MAX_ID as MAX_CONNECTOR_ID, capabilities, check_id as check_connector_id, connector_types,
+    ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorState, ConnectorTool,
+    ConnectorsCallData, ConnectorsCallParams, ConnectorsList, ConnectorsListParams,
+    ConnectorsLoginData, ConnectorsLoginParams, ListedFrom, LoginErrorCode,
+    MAX_ID as MAX_CONNECTOR_ID, MAX_TOOL as MAX_CONNECTOR_TOOL, capabilities,
+    check_id as check_connector_id, connector_types,
 };
 pub use daemon::{DaemonRecord, kinds as daemon_kinds};
 pub use envelope::{Data, Detail, Envelope, ErrorBody, Outcome, codes};

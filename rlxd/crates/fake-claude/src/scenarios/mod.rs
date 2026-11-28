@@ -14,6 +14,7 @@ pub mod gate;
 mod hello;
 mod huge;
 pub mod login;
+pub mod mcp_direct;
 mod orphan;
 mod persist;
 mod rate_limit;
@@ -26,6 +27,7 @@ pub use connectors::{ROUTE_ENV, SLACK, TRY_TOOL_ENV, tools as slack_tools};
 pub use orphan::LINGER;
 
 use connectors::Schedule;
+use mcp_direct::Variant;
 
 /// One scenario: plays a start, and returns its exit code.
 pub type Scenario = fn(&mut Fake) -> i32;
@@ -61,6 +63,31 @@ pub const ALL: &[(&str, Scenario)] = &[
         connectors::play(fake, Schedule::NeedsAuth, ANSWER)
     }),
     ("init-other", connectors::other),
+    ("mcp-direct", |fake| mcp_direct::play(fake, Variant::Gated)),
+    ("mcp-direct-hang", |fake| {
+        mcp_direct::play(fake, Variant::Hang)
+    }),
+    ("mcp-direct-huge", |fake| {
+        mcp_direct::play(fake, Variant::Huge)
+    }),
+    ("mcp-direct-needs-auth", |fake| {
+        mcp_direct::play(fake, Variant::NeedsAuth)
+    }),
+    ("mcp-direct-old", |fake| {
+        mcp_direct::play(fake, Variant::Old)
+    }),
+    ("mcp-direct-respelled", |fake| {
+        mcp_direct::play(fake, Variant::Respelled)
+    }),
+    ("mcp-direct-silent", |fake| {
+        mcp_direct::play(fake, Variant::Silent)
+    }),
+    ("mcp-direct-turn", |fake| {
+        mcp_direct::play(fake, Variant::Turn)
+    }),
+    ("mcp-direct-unasked", |fake| {
+        mcp_direct::play(fake, Variant::Unasked)
+    }),
     ("orphan", orphan::run),
     ("persist", persist::run),
     ("rate-limit", rate_limit::run),
