@@ -1424,6 +1424,18 @@ async function limitTimes() {
   }
 }
 
+/* The Fleet tab with GET api/fleet's body as the machine builds it: ASQ_PAUSED_FLEET, made by
+ * the server's own agents_json in tests/test_remote_page.py, a paused coder (its detail the
+ * fleet's PAUSED_DETAIL) and an exited one. Each row's second line; null when none was sent. */
+async function pausedRows() {
+  const sent = process.env.ASQ_PAUSED_FLEET;
+  if (!sent) return null;
+  const fleet = JSON.parse(sent);
+  const page = bootPage("#/p/" + PROJECT + "/fleet", signedIn({ "GET api/fleet": () => ({ status: 200, json: fleet }) }));
+  await settle();
+  return page.main().querySelectorAll("span.muted").map((line) => line.textContent);
+}
+
 /* The Board tab on a phone in UTC-7, from a machine in UTC+5:30 whose board's limited lines
  * say the reset by its own clock: coder-1 parked on a limit that lifts at 13:10 UTC (18:40
  * on the machine, 06:10 on the phone), an older limited line of coder-1's, one of coder-2's
@@ -4006,6 +4018,7 @@ async function main() {
     fleetUnread: await fleetUnread(),
     transcriptTimes: await transcriptTimes(),
     limitTimes: await limitTimes(),
+    pausedRows: await pausedRows(),
     boardLimitTimes: await boardLimitTimes(),
     readsAfterFrames: await readsAfterFrames(),
     backLeaves: await backLeaves(),

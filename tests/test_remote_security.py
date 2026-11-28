@@ -622,7 +622,11 @@ def test_a_spent_budget_refuses_a_stranger_without_evaluating_the_guess(
     monkeypatch.setattr(runtime, "password_matches", counted)
     refused = unlock(_from(app, "198.51.100.7"), runtime, PASSWORD)
     assert refused.status_code == 429 and refused.json()["error"] == "locked_out"
-    assert "regenerate-password --new-link" in refused.json()["message"]
+    # The phone's unlock screen shows it: rlx's own way, never a command (R13; #4320 on #71).
+    said = refused.json()["message"]
+    assert said == remote_server.locked_out()
+    assert "New link in rlx's Settings > Remote control" in said, said
+    assert "regenerate-password" not in said and "--new-link" not in said, said
     assert 1700 < int(refused.headers["retry-after"]) <= 1800
     assert evaluated == [], "the passphrase was never compared"
     assert runtime.device_rows() == []
@@ -833,6 +837,10 @@ def test_the_trip_is_said_once_logged_and_pushed(
         for n in range(3):  # refused, not counted: no second trip
             unlock(_from(app, f"198.51.100.{120 + n}"), runtime, "wrong")
     assert alerts == [([device_id], remote_server.lockout_alert())]
+    # Pushed to a phone: rlx's own way (R13; #4320 on #71). The log is the shell's: its command.
+    pushed = alerts[0][1]
+    assert "New link in rlx's Settings > Remote control" in pushed, pushed
+    assert "regenerate-password" not in pushed and "--new-link" not in pushed, pushed
     said = [r.getMessage() for r in caplog.records if "new unlocks are paused" in r.getMessage()]
     assert len(said) == 1 and "regenerate-password --new-link" in said[0]
 

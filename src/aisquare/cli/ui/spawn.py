@@ -317,7 +317,7 @@ LABEL_RULE = (
 
 
 class PickTargetRequested(Message):
-    """Choose who runs the new agent — a bind or an account — in the target picker (§4.6)."""
+    """Choose who runs the new agent — a preset or an account — in the target picker (§4.6)."""
 
     def __init__(self, project_id: str) -> None:
         self.project_id = project_id
@@ -422,7 +422,7 @@ def default_account_label(
     if source == "preferred":
         why = f"rank {account.position}" if account.position is not None else "preferred"
     elif source == "role binding":
-        why = f"bound to {role}"
+        why = f"{role}'s preset"  # a role binding is a preset in the app's words (Q15)
     else:
         why = source or "picked"
     return f"(default: {why} · {account_name(account, statuses)})"

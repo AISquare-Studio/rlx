@@ -5026,19 +5026,23 @@ async def remote_gate_body(scope: Any, receive: Any) -> Any | None:
     return receive_replayed
 
 
+NEW_LINK_IN_RLX = "New link in rlx's Settings > Remote control, on the machine"
+"""Where a person replaces a leaked link, in the app's words: a phone is a person's page and
+names no command (R13; manager #4320 on #71). The shell's ``remote regenerate-password
+--new-link`` does the same, and the server's own log line still names it."""
+
+
 def locked_out() -> str:
+    """429 ``locked_out``, which the phone's unlock screen shows."""
     return (
         "too many wrong passwords in the last 30 min — new unlocks are paused; a phone that was "
-        "unlocked here before can still unlock. On the machine: "
-        f"{prog.word()} remote regenerate-password --new-link"
+        f"unlocked here before can still unlock. If the link leaked, press {NEW_LINK_IN_RLX}."
     )
 
 
 def lockout_alert() -> str:
-    return (
-        "New unlocks are paused for 30 min. If that is not you, run "
-        f"`{prog.word()} remote regenerate-password --new-link` at the machine."
-    )
+    """The alert pushed to every phone when the unlock budget is spent."""
+    return f"New unlocks are paused for 30 min. If that is not you, press {NEW_LINK_IN_RLX}."
 
 
 def _unlock_lockout_alert(runtime: Runtime) -> None:

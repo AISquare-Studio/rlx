@@ -19,6 +19,7 @@ into the developer's own fleet.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import re
@@ -1092,6 +1093,37 @@ def test_accounts_are_read_in_a_worker_and_listed_by_slot(git_project: ProjectIn
     ]
 
 
+def test_an_aliased_account_is_listed_by_its_alias_then_its_email(git_project: ProjectInfo) -> None:
+    """Q1 (the review of #676, its nit): an aliased account reads as the Accounts page and the
+    target picker read it, its alias then its email, one signed out as its alias then that it
+    is not signed in; never ``account 3`` beside them."""
+
+    def aliased(slot: int, alias: str, email: str | None) -> ClaudeAccountStatus:
+        return ClaudeAccountStatus(
+            account=ClaudeAccount(slot=slot, config_dir=Path(f"/accounts/{slot}"), alias=alias),
+            label=alias,
+            identity=ClaudeIdentity(email=email) if email else None,
+            signed_in=email is not None,
+        )
+
+    def accounts() -> AccountsOverview:
+        listed = overview((2, "two@example.com"))
+        listed.accounts += [aliased(3, "work", "w@example.com"), aliased(4, "spare", None)]
+        return listed
+
+    async def scenario(pilot: Pilot[None], host: Host, dialog: SpawnDialog) -> list[str]:
+        overlay = select(dialog, "account").query_one(OptionList)
+        return [str(overlay.get_option_at_index(i).prompt) for i in range(overlay.option_count)]
+
+    options = drive(git_project, scenario, accounts=accounts)
+    assert options[1:] == [
+        "2 · two@example.com",
+        "3 · work · w@example.com",
+        "4 · spare · not signed in",
+    ]
+    assert not any("account " in option for option in options[1:]), options
+
+
 def test_an_accounts_reader_that_fails_costs_the_list_not_the_dialog(
     git_project: ProjectInfo, spawns: SpawnRecorder
 ) -> None:
@@ -1193,7 +1225,7 @@ def test_the_label_follows_the_role_and_says_which_rung_picked(git_project: Proj
 
     seen = drive(git_project, scenario, defaults=defaults)
     assert seen[0] == "(default: rank 1 · work)"
-    assert seen[1] == ("(default: bound to tester · account 2)", None)
+    assert seen[1] == ("(default: tester's preset · account 2)", None)
     assert seen[2] == (
         "(default)",
         "with no account the spawn is refused: the role binding for 'reviewer' names 9",
@@ -1301,7 +1333,7 @@ def test_default_account_label_names_each_rung() -> None:
     work = _account(2, alias="work", position=2)
     assert label(choice(work, "preferred")) == "(default: rank 2 · work)"
     assert label(choice(work, "headroom")) == "(default: headroom · work)"
-    assert label(choice(work, "role binding")) == "(default: bound to coder · work)"
+    assert label(choice(work, "role binding")) == "(default: coder's preset · work)"
     assert label(choice(work, "project default")) == "(default: project default · work)"
     assert label(choice(None, None)) == "(this shell's)"
     assert label(choice(None, None), bound=True) == "(default: coder's CLAUDE_CONFIG_DIR)"
@@ -3291,6 +3323,69 @@ def test_the_preset_row_says_preset_as_its_label_tooltip_and_picker_do(
     assert tooltip == "choose a preset or an account"
     assert SECTION_TITLES["binds"].startswith("Presets — "), "the picker's word for it"
     assert re.search(r"\bbind\b", said) is None, said
+
+
+PRESET_SURFACES = ("spawn.py", "attach.py", "views/app_settings.py")
+"""The Spawn dialog, the target picker with its New preset form, and App settings, under
+``cli/ui``: where a role binding is shown, and is a *preset* (Q15)."""
+
+BIND_WORDS = re.compile(r"\b(?:un|re)?(?:bind|binds|bound|binding|bindings)\b", re.IGNORECASE)
+"""The old word, in any of its forms: what a person reads as rlx's own word for a preset."""
+
+
+def _shown_literals(source: str) -> Iterator[tuple[int, str]]:
+    """The string literals of ``source`` a person can read, f-strings' parts included. Not a
+    docstring; not an id, a key or a selector (no whitespace: ``bindings-new``, ``bind:``);
+    not CSS (a ``DEFAULT_CSS``); not a value compared against (``source == "role binding"``)."""
+    tree = ast.parse(source)
+    skip: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            skip.add(id(node.value))
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "DEFAULT_CSS" for target in node.targets
+        ):
+            skip.update(id(inner) for inner in ast.walk(node.value))
+        elif isinstance(node, ast.Compare):
+            skip.update(id(side) for side in (node.left, *node.comparators))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in skip
+            and re.search(r"\s", node.value)
+        ):
+            yield node.lineno, node.value
+
+
+def test_the_spawn_dialog_the_picker_and_app_settings_say_preset_never_bind() -> None:
+    """Q15 (the test of #676, #4324, and manager #4326): the row is *Preset* and App settings'
+    section *Presets*, and five strings on the same surfaces still said bound or binding,
+    "a new one as a bound teammate", "(default: bound to coder · …)", "(no account binding)",
+    "(as bound)" and "… or a name already bound". None of their shown strings does now, so a
+    new one fails here."""
+    ui = Path(spawn_module.__file__).parent
+    found = [
+        f"{name}:{line}: {text.strip()[:70]!r}"
+        for name in PRESET_SURFACES
+        for line, text in _shown_literals((ui / name).read_text(encoding="utf-8"))
+        if BIND_WORDS.search(text)
+    ]
+    assert found == []
+
+
+def test_the_bind_sweep_reads_what_a_person_sees_and_skips_ids_css_and_compared_values() -> None:
+    source = (
+        'Static(Text("no role bindings — + New bind makes one"), id="bindings-empty")\n'
+        'why = f"bound to {role}"\n'
+        'options.append((f"{current} (as bound)", current))\n'
+        'note = "the role then launches as an unbound one."\n'
+        'DEFAULT_CSS = "NewBindScreen #bind-env { height: 4; }"\n'
+        'if source == "role binding":\n    pass\n'
+        'Button("+ New preset", id="picker-new-bind")\n'
+    )
+    caught = sorted(line for line, text in _shown_literals(source) if BIND_WORDS.search(text))
+    assert caught == [1, 2, 3, 4], "each shown one; never an id, CSS or a compared value"
 
 
 @pytest.mark.needs_captain

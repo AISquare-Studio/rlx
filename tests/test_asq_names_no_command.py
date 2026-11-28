@@ -297,13 +297,27 @@ def test_the_phone_guard_catches_what_it_is_for() -> None:
     caught = [line for line, text in _js_strings(source) if PHONE_GUARD.search(text)]
     assert caught == [1, 2, 3], "each command, and never a comment's, a URL, a CSS name or prose"
     for prose in (
-        "paused (Resume in rlx brings it back where it was)",
-        "the link changes when ngrok restarts without a static domain, and when New link is "
-        "pressed on rlx's Remote page.",
+        "paused: Resume in rlx brings it back",
+        "the link changes when ngrok restarts without a static domain, and with New link in rlx.",
         "Turn Remote on again on the machine, then retry.",
         "--cols",
     ):
         assert not PHONE_GUARD.search(prose), prose
+
+
+def test_what_the_machine_says_on_the_phone_names_no_command() -> None:
+    """The server's own words a phone shows: the unlock screen's lockout (a 429) and the alert
+    pushed when the unlock budget is spent, which named ``rlx remote regenerate-password
+    --new-link``; and a paused row's detail, which names the shell's resume, so the Fleet tab
+    says its own words instead (manager #4320 on #71). The guard sees what each said."""
+    from aisquare.services import fleet as fleet_service
+    from aisquare.services import remote_server
+
+    for said in (remote_server.locked_out(), remote_server.lockout_alert()):
+        assert not PHONE_GUARD.search(said), said
+        assert remote_server.NEW_LINK_IN_RLX in said, said
+    assert PHONE_GUARD.search("On the machine: rlx remote regenerate-password --new-link")
+    assert PHONE_GUARD.search(fleet_service.PAUSED_DETAIL), "why the Fleet tab says its own"
 
 
 # --- the Doctor's own list (#69) ---------------------------------------------------------------

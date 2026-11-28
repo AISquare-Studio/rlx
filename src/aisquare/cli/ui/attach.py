@@ -14,7 +14,7 @@ machine with two dozen binds needs one.
 The picker answers WHO; it does not act. It dismisses with a :class:`Target`
 and the screen that opened it decides what that means — the Personas tab
 attaches to an agent (``fleet_service.attach_persona``) or opens the Spawn
-dialog preset for a bind or an account; the Spawn dialog's *Pick…* fills its
+dialog filled in from a preset or an account; the Spawn dialog's *Pick…* fills its
 own fields — so there is one picker and no second spawn or attach path.
 
 Opened to attach (``attaching``, the Personas tab), a running agent's row asks first, in
@@ -25,7 +25,7 @@ and names the persona it replaces; a second choice of the same row answers it. I
 seconds, on Esc, when the list loses the focus or another row is highlighted, and when the
 list is drawn again or another screen comes over it.
 
-Two footer actions make a target without leaving the flow. **+ New bind** is
+Two footer actions make a target without leaving the flow. **+ New preset** is
 :class:`NewBindScreen`, saved through ``services.settings.bind_role`` — the
 writer ``aisquare team bind`` uses — after which the list is read again with the
 new bind selected. Its Agent field picks the coding agent (blank: the binary's), and
@@ -119,8 +119,8 @@ TARGETS_WORKER = "attach-targets"
 def seat_rule() -> str:
     """What a seat may be: the names ``launch`` accepts, said without the command (R13)."""
     return (
-        "a seat is a role (coder, tester, …), a numbered seat of one (coder2), or a name "
-        "already bound"
+        "a seat is a role (coder, tester, …), a numbered seat of one (coder2), or an existing "
+        "preset's name"
     )
 
 
@@ -389,7 +389,7 @@ class AttachTargetScreen(ModalScreen[Target | None]):
         else:
             text.append("Who runs the new agent?", style="bold")
         text.append(
-            "\nan agent that is running now, or a new one as a bound teammate or on an account",
+            "\nan agent that is running now, or a new one from a preset or on an account",
             style="dim",
         )
         return text
@@ -773,7 +773,7 @@ class NewBindScreen(ModalScreen[str | None]):
                     yield Switch(False, id="bind-env-reveal")
             if bound.env_files:
                 # Their values are secrets read at launch: named, never shown, kept as bound.
-                kept = Text("kept, bound to a file: ", style="dim")
+                kept = Text("kept, read from a file: ", style="dim")
                 kept.append(", ".join(sorted(bound.env_files)))
                 yield Static(kept, id="bind-env-files", classes="picker-note")
             with Horizontal(classes="picker-row"):

@@ -41,13 +41,14 @@ Model and effort per role are NOT here on purpose: they live in ``team harness``
 ``AISQUARE_MODEL_<ROLE>`` / ``AISQUARE_EFFORT_<ROLE>``, one home per concept, the rule
 that deleted ``bins`` in #56. #98 asked to reverse that; the proposed default, kept until
 the owner decides, is that they stay out. The binary is a binding's, and bindings ARE here
-(#98): the *Role bindings* section, last in *Agent settings*' Advanced, lists each role
-``team bind`` bound, with its binary, its environment (its agent's home variable and
-its temp-files variable called out with their values, any other variable by name only,
-since a value may be a token) and its args. *Edit* opens the bind form on it, *Unset
-key…* and *Clear* are ``team bind --unset`` and ``--clear`` (*Clear* asks in place, and
-the note line under the buttons says the whole binding goes); each writes at once through
-``services.settings``, the writers ``team bind`` uses, apart from the form's Save. The
+(#98): the *Presets* section (*Role bindings* until Q15), last in *Agent settings*'
+Advanced, lists each role ``team bind`` bound, with its binary, its environment (its
+agent's home variable and its temp-files variable called out with their values, any other
+variable by name only, since a value may be a token) and its args. *Edit* opens the bind
+form on it, *Unset key…* and *Clear* are ``team bind --unset`` and ``--clear`` (*Clear*
+asks in place, and the note line under the buttons says the whole binding goes); each
+writes at once through ``services.settings``, the writers ``team bind`` uses, apart from
+the form's Save. The
 ``[team]`` values here are the AGENT and the ACCOUNT per role (#145): the selects beside each role
 write ``team.profiles.<role>.agent`` and ``.account`` — exactly what ``aisquare
 team bind <role> --agent/--account`` write — through the same one writer. The
@@ -374,7 +375,7 @@ def binding_text(role: str, profile: RoleLaunchProfile) -> Text:
     if named:
         text.append(f"\n  env {', '.join(named)}", style="dim")
     if profile.env_files:
-        text.append(f"\n  bound to a file: {', '.join(sorted(profile.env_files))}", style="dim")
+        text.append(f"\n  read from a file: {', '.join(sorted(profile.env_files))}", style="dim")
     if profile.args:
         text.append(f"\n  args {shlex.join(profile.args)}")
     if profile.account:
@@ -636,21 +637,23 @@ def account_options(
     Values are SLOT NUMBERS as strings: the binding stores a reference the
     resolver reads, and the slot is the one spelling that cannot be renamed
     out from under it. A binding written by hand as an alias or an email is
-    shown as its own row (``work (as bound)``) so the form never silently
+    shown as its own row (``work (as written)``) so the form never silently
     rewrites what the operator typed just by being opened and saved. Prompts are
     :class:`Text`, as :func:`permission_options`' are: an alias and a binding written by
     hand are free text.
     """
-    options: list[tuple[str, str]] = [("(no account binding)", NO_ACCOUNT)]
+    options: list[tuple[str, str]] = [("(no preset account)", NO_ACCOUNT)]
     for account in accounts:
         identity = accounts_core.identity(account)
         who = f" · {identity.email}" if identity else " · not signed in"
         # Another agent's slot says whose it is: a launch refuses one for the wrong agent.
         if account.agent != agent:
             who += f" · {accounts_core.agent_label(account.agent)}"
-        options.append((f"{account.slot} · {accounts_core.label(account)}{who}", str(account.slot)))
+        # Named as the Accounts page names it (Q1): the alias, then the email; never ``account 2``.
+        alias = f" · {account.alias}" if account.alias else ""
+        options.append((f"{account.slot}{alias}{who}", str(account.slot)))
     if current and current not in {value for _, value in options}:
-        options.append((f"{current} (as bound)", current))
+        options.append((f"{current} (as written)", current))
     return [(Text(label), value) for label, value in options]
 
 
@@ -691,11 +694,10 @@ class UiSettingsChanged(Message):
 def clear_note(role: str) -> Text:
     """What a role binding's *Clear* does, in the note line under the buttons while it is
     armed: the whole binding goes first, where the line's ellipsis cannot cut it."""
-    text = Text("The whole binding of ", style="bold")
+    text = Text("The whole preset of ", style="bold")
     text.append(role, style="bold")
     text.append(
-        " goes: its binary, environment, args and account; the role then launches as an "
-        "unbound one."
+        " goes: its binary, environment, args and account; the role then launches with no preset."
     )
     return text
 
@@ -2030,7 +2032,7 @@ class AppSettingsView(SavesAsYouGo, Vertical):
             if current != self._role_bindings.get(role):
                 self.call_later(self.reload_bindings)
             if current is None:
-                self.notify(f"{role} is no longer bound (changed outside this page)", markup=False)
+                self.notify(f"{role} has no preset now (changed outside this page)", markup=False)
                 return
             self.app.push_screen(NewBindScreen([], editing=(role, current)), self._binding_saved)
         elif (role := self._binding_role(button, "unset")) is not None:
@@ -2044,7 +2046,7 @@ class AppSettingsView(SavesAsYouGo, Vertical):
 
     def _binding_saved(self, seat: str | None) -> None:
         if seat is not None:
-            self.notify(f"bound {seat} — saved to {paths.config_path()}", markup=False)
+            self.notify(f"preset {seat} — saved to {paths.config_path()}", markup=False)
             self.call_later(self.reload_bindings)
 
     def _unset(self, role: str, key: str | None) -> None:
@@ -2062,9 +2064,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         try:
             settings_service.clear_role_binding(role)
         except Exception as exc:
-            self.notify(f"{role}'s binding not cleared: {exc}", severity="error", markup=False)
+            self.notify(f"{role}'s preset not cleared: {exc}", severity="error", markup=False)
             return
-        self.notify(f"{role}: binding cleared", markup=False)
+        self.notify(f"{role}: preset cleared", markup=False)
         self.call_later(self.reload_bindings)
 
     # --- reset -------------------------------------------------------------------------
