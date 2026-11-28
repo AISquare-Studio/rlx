@@ -9,16 +9,18 @@ by ``tests/conftest.py``'s ``keychain_guard`` and ``no_real_keychain``) refuses 
 pytest process and in every Python child that inherits the suite's environment, and fails the
 test that tried, naming it.
 
-Every probe here is harmless even if the guard were broken: ``security -h`` prints its usage,
-and the product's read asks for an item no one has (:data:`PROBE_SERVICE`). Each probe writes
-its refusal to a log of its own (:func:`own_log`), so the run's log, where any line fails the
-test, stays clean.
+Every probe aims at a STAND-IN ``security`` (:func:`stand_in`), which the guard is told to refuse
+as the real tool, besides it and never instead (``RLX_TESTS_REFUSED_STAND_INS``): even a broken
+guard would start only the stand-in, which leaves a mark, and never the real
+``/usr/bin/security`` (manager #3718, the #3632 rule). The real path is only ever asked of
+:func:`guard.refused`, which starts nothing. The product's read asks for an item no one has
+(:data:`PROBE_SERVICE`). Each probe writes its refusal to a log of its own (:func:`own_log`), so the
+run's log, where any line fails the test, stays clean.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -34,6 +36,8 @@ from tests.keychain_guard import rlx_keychain_guard as guard
 REAL = guard.REAL_TOOL
 PROBE_SERVICE = "rlx-tests-keychain-guard-probe-no-such-item"
 REPO = Path(__file__).resolve().parents[1]
+#: How a stand-in is named where it must be found on PATH (PATHEXT on Windows).
+SUFFIX = ".cmd" if os.name == "nt" else ""
 
 
 @pytest.fixture
@@ -42,6 +46,28 @@ def own_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     log = tmp_path / "refusals.jsonl"
     monkeypatch.setenv(guard.LOG_VAR, str(log))
     return log
+
+
+def write_stand_in(where: Path) -> Path:
+    """A ``security`` in ``where`` that leaves ``where/ran`` if it ever runs."""
+    where.mkdir(parents=True, exist_ok=True)
+    tool, mark = where / f"security{SUFFIX}", where / "ran"
+    if os.name == "nt":
+        tool.write_text(f'@echo ran> "{mark}"\r\n', encoding="utf-8")
+    else:
+        tool.write_text(f'#!/bin/sh\necho ran > "{mark}"\n', encoding="utf-8")
+        tool.chmod(0o755)
+    return tool
+
+
+@pytest.fixture
+def stand_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """This test's stand-in ``security``, which the guard refuses as the real tool, here and in
+    children (``RLX_TESTS_REFUSED_STAND_INS``). If it ever ran, the test fails at teardown."""
+    tool = write_stand_in(tmp_path / "stand-in")
+    monkeypatch.setenv(guard.STAND_IN_VAR, str(tool))
+    yield str(tool)
+    assert not (tool.parent / "ran").exists(), "the stand-in ran: the guard let it start"
 
 
 def refusals(log: Path) -> list[tuple[str | None, str, str]]:
@@ -60,43 +86,52 @@ def test_the_guard_is_in_force_for_every_test() -> None:
     assert Path(os.environ[guard.LOG_VAR]).is_file()
 
 
-SPAWNS = [
-    pytest.param(lambda: subprocess.run([REAL, "-h"], capture_output=True), id="subprocess"),
-    pytest.param(lambda: subprocess.run(f"{REAL} -h", shell=True, capture_output=True), id="shell"),
-    pytest.param(lambda: os.system(f"{REAL} -h"), id="os.system"),
+def _on_path(tool: str) -> dict[str, str]:
+    return {**os.environ, "PATH": os.pathsep.join([str(Path(tool).parent), os.environ["PATH"]])}
+
+
+SPAWNS: list[object] = [
+    pytest.param(lambda t: subprocess.run([t, "-h"], capture_output=True), id="subprocess"),
+    pytest.param(lambda t: subprocess.run(f"{t} -h", shell=True, capture_output=True), id="shell"),
+    pytest.param(lambda t: os.system(f"{t} -h"), id="os.system"),
+    pytest.param(
+        lambda t: subprocess.run(["security", "-h"], env=_on_path(t), capture_output=True),
+        id="on PATH",
+    ),
 ]
 if hasattr(os, "posix_spawn"):
     SPAWNS.append(
-        pytest.param(lambda: os.posix_spawn(REAL, [REAL, "-h"], dict(os.environ)), id="posix_spawn")
-    )
-if shutil.which("security") and os.path.realpath(shutil.which("security") or "") == REAL:
-    SPAWNS.append(
-        pytest.param(lambda: subprocess.run(["security", "-h"], capture_output=True), id="on PATH")
+        pytest.param(lambda t: os.posix_spawn(t, [t, "-h"], dict(os.environ)), id="posix_spawn")
     )
 
 
 @pytest.mark.parametrize("spawn", SPAWNS)
-def test_the_real_tool_is_refused_in_this_process(spawn: object, own_log: Path) -> None:
+def test_the_tool_is_refused_in_this_process(spawn: object, stand_in: str, own_log: Path) -> None:
     with pytest.raises(guard.KeychainRefused, match="use the suite's fake security"):
-        spawn()  # type: ignore[operator]
-    assert [program for program, _, _ in refusals(own_log)] in ([REAL], ["security"])
+        spawn(stand_in)  # type: ignore[operator]
+    assert [program for program, _, _ in refusals(own_log)] in ([stand_in], ["security"])
 
 
-def test_a_fake_security_of_its_own_is_not_refused(tmp_path: Path, own_log: Path) -> None:
-    """The guard refuses the real tool, not every program called ``security``."""
-    fake = tmp_path / "security"
+def test_the_real_path_is_refused_and_a_fake_of_its_own_is_not(
+    tmp_path: Path, stand_in: str, own_log: Path
+) -> None:
+    """Asked of :func:`guard.refused`, which starts nothing: the real tool, the sentinel and a
+    registered stand-in are refused; a ``security`` the guard wasn't told of is not."""
+    fake = tmp_path / "other" / "security"
+    fake.parent.mkdir()
     fake.write_text("", encoding="utf-8")
     assert not guard.refused(str(fake))
-    assert guard.refused(REAL) and guard.refused(guard.SENTINEL)
+    assert guard.refused(REAL) and guard.refused(guard.SENTINEL) and guard.refused(stand_in)
     assert refusals(own_log) == []
 
 
-@pytest.mark.parametrize("tool", [REAL, guard.SENTINEL], ids=["real tool", "sentinel"])
+@pytest.mark.parametrize("which", ["stand-in", "sentinel"])
 def test_the_products_keychain_read_is_refused_and_reads_nothing(
-    tool: str, own_log: Path, monkeypatch: pytest.MonkeyPatch
+    which: str, stand_in: str, own_log: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``core.read_keychain`` with the Keychain on, through the real tool put back (as a
-    test that undid the autouse would) or through the sentinel the autouse leaves."""
+    """``core.read_keychain`` with the Keychain on, through a tool put back (as a test that
+    undid the autouse would) or through the sentinel the autouse leaves."""
+    tool = stand_in if which == "stand-in" else guard.SENTINEL
     monkeypatch.setattr(core, "keychain_platform", lambda: True)
     monkeypatch.setattr(core, "KEYCHAIN_TOOL", tool)
     read = core.read_keychain(PROBE_SERVICE, "rlx-tests", fresh=True)
@@ -106,33 +141,37 @@ def test_the_products_keychain_read_is_refused_and_reads_nothing(
 
 
 CHILD_PROBES = [
-    pytest.param(
-        f"import subprocess; subprocess.run([{REAL!r}, '-h'])", (REAL, "-h", ""), id="subprocess"
-    ),
-    pytest.param(f"import os; os.execv({REAL!r}, ['security', '-h'])", (REAL, "-h", ""), id="exec"),
+    pytest.param("import subprocess; subprocess.run([{tool!r}, '-h'])", "-h", id="subprocess"),
+    pytest.param("import os; os.execv({tool!r}, ['security', '-h'])", "-h", id="exec"),
     pytest.param(
         "from aisquare.core import claude_accounts as c\n"
         "c.keychain_platform = lambda: True\n"
+        "c.KEYCHAIN_TOOL = {tool!r}\n"
         f"read = c.read_keychain({PROBE_SERVICE!r}, 'rlx-tests')\n"
         "print(read.problem, read.credentials)\n",
-        (REAL, "find-generic-password", PROBE_SERVICE),
+        "find-generic-password",
         id="the product's read",
     ),
 ]
 
 
-@pytest.mark.parametrize(("code", "refusal"), CHILD_PROBES)
-def test_a_python_child_that_runs_the_real_tool_is_refused(
-    code: str, refusal: tuple[str, str, str], own_log: Path
+@pytest.mark.parametrize(("code", "subcommand"), CHILD_PROBES)
+def test_a_python_child_that_runs_the_tool_is_refused(
+    code: str, subcommand: str, stand_in: str, own_log: Path
 ) -> None:
     """A child with the suite's environment, as ``test_persona_import``'s ``aisquare`` was."""
     child = subprocess.run(
-        [sys.executable, "-c", code], env=os.environ, capture_output=True, text=True, timeout=60
+        [sys.executable, "-c", code.format(tool=stand_in)],
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
-    assert refusals(own_log) == [refusal], child.stderr
+    service = PROBE_SERVICE if subcommand == "find-generic-password" else ""
+    assert refusals(own_log) == [(stand_in, subcommand, service)], child.stderr
     entries, _ = guard.read_log(own_log)
     assert entries[0]["pid"] != os.getpid()
-    assert "test_a_python_child_that_runs_the_real_tool_is_refused" in entries[0]["test"]
+    assert "test_a_python_child_that_runs_the_tool_is_refused" in entries[0]["test"]
     if "read_keychain" in code:
         assert child.stdout.split() == ["failed", "None"], child.stderr
     else:
@@ -175,8 +214,8 @@ def test_the_failure_names_the_test_what_it_ran_and_the_fake() -> None:
     assert "tests/test_claude_keychain.py's FakeKeychain" in said and guard.FAKE_VAR in said
 
 
-def test_a_test_that_reaches_the_real_tool_fails_at_teardown_naming_itself(
-    tmp_path: Path,
+def test_a_test_that_reaches_the_tool_fails_at_teardown_naming_itself(
+    tmp_path: Path, stand_in: str
 ) -> None:
     """End to end, in a pytest of its own with the suite's two Keychain fixtures: a test
     that swallows the refusal (as product code catching ``OSError`` does) still fails, at
@@ -192,12 +231,12 @@ def test_a_test_that_reaches_the_real_tool_fails_at_teardown_naming_itself(
 
             def test_swallows_the_refusal():
                 try:
-                    subprocess.run([{REAL!r}, "-h"], capture_output=True)
+                    subprocess.run([{stand_in!r}, "-h"], capture_output=True)
                 except OSError:
                     pass
 
             def test_its_child_tries():
-                code = "import subprocess; subprocess.run([{REAL!r}, '-h'])"
+                code = "import subprocess; subprocess.run([{stand_in!r}, '-h'])"
                 subprocess.run([sys.executable, "-c", code], env=os.environ, capture_output=True)
 
             def test_never_tries():
@@ -229,8 +268,8 @@ def test_a_test_that_reaches_the_real_tool_fails_at_teardown_naming_itself(
 # --- the tool behind any shell form (#54's m1) ---------------------------------------------
 
 #: Each line runs the tool, in command position, behind a shell form a word scan missed or
-#: would miss (tester #3258, reviewer #3289). ``{tool}`` is the real path, so the table holds
-#: on every platform (a bare ``security`` resolves only on a Mac: ``SPAWNS``' "on PATH").
+#: would miss (tester #3258, reviewer #3289). ``{tool}`` is the test's stand-in, refused as the
+#: real tool is, so the table holds on every platform and nothing real is ever named.
 REFUSED_LINES = [
     "{tool} -h",
     "sh -c '{tool} -h'",
@@ -286,19 +325,23 @@ def _sh(line: str) -> tuple[object, ...]:
 
 
 @pytest.mark.parametrize("line", REFUSED_LINES)
-def test_the_tool_behind_any_shell_form_is_refused(line: str, own_log: Path) -> None:
-    line = line.format(tool=REAL)
-    assert REAL in [argv[0] for argv in guard.commands(line)]
+def test_the_tool_behind_any_shell_form_is_refused(line: str, stand_in: str, own_log: Path) -> None:
+    tool = Path(stand_in).as_posix()  # a POSIX line: its backslashes would be escapes
+    line = line.format(tool=tool)
+    assert tool in [argv[0] for argv in guard.commands(line)]
     with pytest.raises(guard.KeychainRefused):
         guard._hook("subprocess.Popen", _sh(line))
-    assert [program for program, _, _ in refusals(own_log)] == [REAL]
+    assert [program for program, _, _ in refusals(own_log)] == [tool]
 
 
 @pytest.mark.parametrize("line", ALLOWED_LINES)
-def test_the_word_outside_command_position_is_not_the_tool(line: str, own_log: Path) -> None:
-    line = line.format(tool=REAL)
+def test_the_word_outside_command_position_is_not_the_tool(
+    line: str, stand_in: str, own_log: Path
+) -> None:
+    tool = Path(stand_in).as_posix()
+    line = line.format(tool=tool)
     words = [argv[0] for argv in guard.commands(line)]
-    assert REAL not in words and "security" not in words, words
+    assert tool not in words and "security" not in words, words
     guard._hook("subprocess.Popen", _sh(line))
     assert refusals(own_log) == []
 
@@ -307,19 +350,19 @@ def test_the_word_outside_command_position_is_not_the_tool(line: str, own_log: P
 @pytest.mark.parametrize(
     "line",
     [
-        "sh -ec '/usr/bin/security -h'",
-        "env -i PATH=/usr/bin /usr/bin/security -h",
-        "echo $(/usr/bin/security -h)",
+        "sh -ec '{tool} -h'",
+        "env -i PATH=/usr/bin {tool} -h",
+        "echo $({tool} -h)",
     ],
 )
 def test_a_real_shell_running_the_tool_is_refused_before_it_starts(
-    line: str, own_log: Path
+    line: str, stand_in: str, own_log: Path
 ) -> None:
-    """Through ``subprocess`` for real, ``shell=True``: harmless even with the guard broken
-    (``security -h`` prints its usage)."""
+    """Through ``subprocess`` for real, ``shell=True``: refused before the shell starts. With
+    the guard broken, only the stand-in would run, and :func:`stand_in` would say so."""
     with pytest.raises(guard.KeychainRefused):
-        subprocess.run(line, shell=True, capture_output=True)
-    assert [program for program, _, _ in refusals(own_log)] == [REAL]
+        subprocess.run(line.format(tool=stand_in), shell=True, capture_output=True)
+    assert [program for program, _, _ in refusals(own_log)] == [stand_in]
 
 
 # --- the other credential stores, and the real agents (#3381, #54) -------------------------
@@ -409,12 +452,36 @@ def test_a_stand_in_agent_or_one_not_installed_is_not_refused(
     assert refusals(own_log) == []
 
 
-@pytest.mark.usefixtures("real_agent_binaries")
-def test_real_agent_binaries_lifts_the_refusal_here_and_in_children(
-    agents_elsewhere: Path, own_log: Path
+def test_real_agent_binaries_is_refused_to_a_test_outside_its_files(
+    request: pytest.FixtureRequest,
 ) -> None:
-    assert os.environ[guard.AGENTS_VAR] == "1"
-    assert guard.refusal_kind(str(agents_elsewhere / f"claude{AGENT_SUFFIX}")) is None
+    """Enforced in the fixture, by the asking test's file (reviewer #3717, minor 1)."""
+    with pytest.raises(pytest.fail.Exception, match="may not ask for real_agent_binaries"):
+        request.getfixturevalue("real_agent_binaries")
+    assert guard.AGENTS_VAR not in os.environ
+
+
+def test_the_lift_lets_a_real_agent_through_here_and_in_a_child_told_so(
+    agents_elsewhere: Path, own_log: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """What ``real_agent_binaries`` does, asked of the guard itself (nothing is started)."""
+    claude = str(agents_elsewhere / f"claude{AGENT_SUFFIX}")
+    before, _ = guard.lift(agents=True)
+    try:
+        assert guard.refusal_kind(claude) is None
+    finally:
+        guard.lift(agents=before)
+    assert guard.refusal_kind(claude) == "agent"
+    monkeypatch.setenv(guard.ALLOWED_VAR, str(tmp_path / "run-root"))  # elsewhere is none of it
+    code = f"import rlx_keychain_guard as g; print(g.refusal_kind({claude!r}))"
+    for told, said in ((None, "agent"), ("1", "None")):
+        env = {k: v for k, v in os.environ.items() if k != guard.AGENTS_VAR}
+        if told:
+            env[guard.AGENTS_VAR] = told
+        child = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60
+        )
+        assert child.stdout.strip() == said, child.stderr
     assert refusals(own_log) == []
 
 

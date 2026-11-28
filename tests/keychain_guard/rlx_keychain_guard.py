@@ -24,6 +24,9 @@ It refuses, by raising a ``PermissionError`` before anything runs or opens:
   run's own roots (its temp dir, the checkout) is not refused, should one sit inside a guarded
   directory. ``os.stat`` raises no audit event, so a test may still ask whether such a path
   exists; it can't read, list or change it.
+- **anything written directly in the developer's real home** (or to the home itself): a file
+  or project folder made, changed, renamed or removed beside the person's own, outside the
+  run's roots (manager #3718). Reading there, and writing deeper, are left to the rules above.
 
 A program is found in what a spawn starts the way a shell would (:func:`commands`): past
 ``VAR=value`` assignments and wrapper prefixes (``env``, ``nohup``, ``timeout``, ``xargs``,
@@ -46,7 +49,9 @@ swallows as an ``OSError`` still fails the test that caused it.
 
 A child test that needs the Keychain read through the suite's fake sets :data:`FAKE_VAR` to the
 fake's path (``tests/test_claude_keychain.py``'s ``FakeKeychain``): ``sitecustomize`` points that
-child's ``claude_accounts.KEYCHAIN_TOOL`` at it.
+child's ``claude_accounts.KEYCHAIN_TOOL`` at it. The guard's own tests aim every probe at a
+stand-in ``security`` they register in :data:`STAND_IN_VAR`, refused besides the real tool and
+never instead, so not even a broken guard starts the real one.
 """
 
 from __future__ import annotations
@@ -86,6 +91,12 @@ and where a stand-in ``claude`` or ``codex`` may live."""
 AGENTS_VAR = "RLX_TESTS_REAL_AGENTS"
 """``1`` in a native suite's children: a real ``claude`` or ``codex`` may run there."""
 
+STAND_IN_VAR = "RLX_TESTS_REFUSED_STAND_INS"
+"""Stand-in ``security`` programs refused exactly as the real tool is, BESIDES it, never instead:
+the guard's own tests aim every probe at one, so even a broken guard never starts the real
+``/usr/bin/security`` (manager #3718, the #3632 rule). Read at each spawn, so a child inherits it.
+"""
+
 HOME_NAME_PREFIXES = (".claude", ".codex")
 """Every entry of the real home whose name starts so is Claude Code's or Codex's state."""
 
@@ -123,11 +134,16 @@ ADVICE_BY_KIND = {
         " tmp_path instead"
     ),
 }
+ADVICE_BY_KIND["home-write"] = (
+    "no test may create, change, rename or remove anything directly in the developer's real"
+    " home: HOME is the test's own (tests/conftest.py's isolated_user_home); write under tmp_path"
+)
 REACHED = {
     "keychain": "reached the real macOS Keychain tool, and the guard refused it",
     "credential-tool": "ran a credential store's tool, and the guard refused it",
     "agent": "ran a real agent binary, and the guard refused it",
     "home": "reached the developer's real home, and the guard refused it",
+    "home-write": "wrote directly in the developer's real home, and the guard refused it",
 }
 
 _SPAWNS = frozenset({"subprocess.Popen", "os.posix_spawn", "os.exec", "os.spawn", "os.system"})
@@ -164,7 +180,38 @@ _FILE_EVENTS: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
     "sqlite3.connect": ((0,), ()),
     "glob.glob": ((0,), ()),
     "glob.glob/2": ((0, 2), (3,)),
+    "tempfile.mkdtemp": ((0,), ()),
+    "tempfile.mkstemp": ((0,), ()),
 }
+
+#: Each event that creates, changes, renames or removes, and the positions of the paths it
+#: writes: what :func:`home_write_refused` asks of. ``open`` writes when its flags say so.
+_WRITES: dict[str, tuple[int, ...]] = {
+    "open": (0,),
+    "os.mkdir": (0,),
+    "os.remove": (0,),
+    "os.rmdir": (0,),
+    "os.rename": (0, 1),
+    "os.link": (1,),
+    "os.symlink": (1,),
+    "os.chmod": (0,),
+    "os.chown": (0,),
+    "os.chflags": (0,),
+    "os.utime": (0,),
+    "os.truncate": (0,),
+    "os.setxattr": (0,),
+    "os.removexattr": (0,),
+    "shutil.copyfile": (1,),
+    "shutil.copymode": (1,),
+    "shutil.copystat": (1,),
+    "shutil.copytree": (1,),
+    "shutil.move": (0, 1),
+    "shutil.rmtree": (0,),
+    "sqlite3.connect": (0,),
+    "tempfile.mkdtemp": (0,),
+    "tempfile.mkstemp": (0,),
+}
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
 
 class KeychainRefused(PermissionError):
@@ -179,11 +226,13 @@ class RealHomeRefused(PermissionError):
     """Raised where a test would have opened, listed or changed the developer's real state."""
 
 
+_PATH_KINDS = frozenset({"home", "home-write"})
 _EXCEPTIONS: dict[str, type[PermissionError]] = {
     "keychain": KeychainRefused,
     "credential-tool": KeychainRefused,
     "agent": AgentBinaryRefused,
     "home": RealHomeRefused,
+    "home-write": RealHomeRefused,
 }
 
 
@@ -194,6 +243,7 @@ class _State:
     prefixes: tuple[str, ...] = ()
     starts: tuple[str, ...] = ()  # every root and prefix, for str.startswith's quick no
     allowed: tuple[str, ...] = ()
+    homes: tuple[str, ...] = ()  # the real home, normalised: nothing is written directly in it
     agents_allowed = False
     home_allowed = False
 
@@ -231,12 +281,14 @@ def configure(
     guarded: Iterable[str],
     allowed: Iterable[str],
     *,
+    real_home: str | os.PathLike[str] | None = None,
     agents_allowed: bool = False,
     home_allowed: bool = False,
 ) -> None:
     """What this process refuses: ``guarded`` paths (:func:`guarded_paths`'s form), never a path
-    under one of ``allowed``; a real agent binary unless ``agents_allowed``; the guarded paths
-    not at all while ``home_allowed``."""
+    under one of ``allowed``; anything created, changed, renamed or removed directly in
+    ``real_home`` (:func:`home_write_refused`); a real agent binary unless ``agents_allowed``;
+    none of the paths while ``home_allowed``."""
     roots: list[str] = []
     prefixes: list[str] = []
     for entry in guarded:
@@ -250,6 +302,7 @@ def configure(
     _State.starts = _State.roots + _State.prefixes
     own = (form for entry in allowed if entry for form in _forms(entry))
     _State.allowed = tuple(dict.fromkeys(own))
+    _State.homes = tuple(_forms(os.fspath(real_home))) if real_home else ()
     _State.agents_allowed = agents_allowed
     _State.home_allowed = home_allowed
 
@@ -259,6 +312,7 @@ def configure_from(environ: Mapping[str, str]) -> None:
     configure(
         _split_paths(environ.get(GUARDED_VAR, "")),
         _split_paths(environ.get(ALLOWED_VAR, "")),
+        real_home=environ.get(REAL_HOME_VAR) or None,
         agents_allowed=environ.get(AGENTS_VAR) == "1",
     )
 
@@ -282,7 +336,7 @@ def guarded_now() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
 def snapshot() -> dict[str, Any]:
     """What is in force now, for :func:`restore` (the guard's own tests aim it at a scratch
     "real home" and put the run's back after)."""
-    names = ("roots", "prefixes", "starts", "allowed", "agents_allowed", "home_allowed")
+    names = ("roots", "prefixes", "starts", "allowed", "homes", "agents_allowed", "home_allowed")
     return {name: getattr(_State, name) for name in names}
 
 
@@ -301,13 +355,14 @@ def refused(program: object, env: object = None) -> bool:
     name = _text(program)
     if name is None:
         return False
-    if name in (SENTINEL, REAL_TOOL):
+    tools = (REAL_TOOL, *_split_paths(os.environ.get(STAND_IN_VAR, "")))
+    if name == SENTINEL or name in tools:
         return True
     if _has_separator(name):
-        return _same_file(name, REAL_TOOL)
-    if name == "security":
+        return any(_same_file(name, tool) for tool in tools)
+    if _program_name(name) == "security":
         found = shutil.which(name, path=_env_path(env))
-        return found is not None and _same_file(found, REAL_TOOL)
+        return found is not None and any(_same_file(found, tool) for tool in tools)
     return False
 
 
@@ -504,7 +559,7 @@ def _hook(event: str, args: tuple[Any, ...]) -> None:
             kind = refusal_kind(argv[0], env)
             if kind is not None:
                 _refuse(kind, program=argv[0], argv=argv)
-    elif _State.starts and not _State.home_allowed:
+    elif (_State.starts or _State.homes) and not _State.home_allowed:
         where = _FILE_EVENTS.get(event)
         if where is not None:
             _check_paths(event, args, *where)
@@ -517,6 +572,9 @@ def _check_paths(
     event: str, args: tuple[Any, ...], paths: tuple[int, ...], dir_fds: tuple[int, ...]
 ) -> None:
     relative_to_fd = any(at < len(args) and isinstance(args[at], int) for at in dir_fds)
+    writes = _WRITES.get(event, ())
+    if event == "open" and not _opens_to_write(args):
+        writes = ()
     for at in paths:
         if at >= len(args):
             continue
@@ -525,6 +583,32 @@ def _check_paths(
             continue
         if home_refused(path):
             _refuse("home", event=event, path=path)
+        if at in writes and home_write_refused(path):
+            _refuse("home-write", event=event, path=path)
+
+
+def _opens_to_write(args: tuple[Any, ...]) -> bool:
+    """Whether an ``open`` event's mode or flags create, truncate, append or write."""
+    mode = args[1] if len(args) > 1 else None
+    flags = args[2] if len(args) > 2 else None
+    if isinstance(mode, str) and any(letter in mode for letter in "wax+"):
+        return True
+    return isinstance(flags, int) and bool(flags & _WRITE_FLAGS)
+
+
+def home_write_refused(path: str | os.PathLike[str]) -> bool:
+    """Whether writing ``path`` creates, changes, renames or removes something DIRECTLY in the
+    developer's real home (or the home itself), outside the run's own roots (manager #3718): a
+    project folder made beside the person's own, a file dropped in ``~``. Deeper paths are the
+    tripwire's guarded roots' business (:func:`home_refused`)."""
+    if not _State.homes:
+        return False
+    norm = _norm(os.fspath(path))
+    if norm is None:
+        return False
+    if norm not in _State.homes and os.path.dirname(norm) not in _State.homes:
+        return False
+    return not any(_under(norm, own) for own in _State.allowed)
 
 
 def home_refused(path: str | os.PathLike[str]) -> bool:
@@ -568,7 +652,7 @@ def _refuse(
         "pid": os.getpid(),
         "kind": kind,
     }
-    if kind == "home":
+    if kind in _PATH_KINDS:
         entry.update(event=event, path=path, program=None, subcommand="", service="")
         said = f"{event} {path}"
     else:
@@ -605,7 +689,7 @@ def failure(nodeid: str, entries: Sequence[dict[str, Any]]) -> str:
         ran = "; ".join(
             (
                 f"{entry.get('event')} {entry.get('path')}"
-                if kind == "home"
+                if kind in _PATH_KINDS
                 else f"{entry.get('program')} {entry.get('subcommand')} {entry.get('service')!r}"
             )
             + f" (pid {entry.get('pid')}, {entry.get('test')})"

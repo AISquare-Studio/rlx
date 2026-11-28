@@ -19,6 +19,7 @@ so even with the guard broken it would open a file the test wrote, never the dev
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -47,19 +48,22 @@ def own_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def scratch_real_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """The guard aimed at a home of this test's, as if it were the developer's: its
     ``.claude.json``, ``.claude/``, ``.claude-2/``, ``.codex/``, ``.aisquare/`` and ``.rlx/``
-    exist and hold a file each. The run's own configuration is put back after."""
+    exist and hold a file each, and a ``notes.txt`` sits directly in it. The run's own
+    configuration is put back after."""
     home = tmp_path / "real-home"
     for name in (".claude", ".claude-2", ".codex", ".aisquare", ".rlx", "Documents"):
         (home / name).mkdir(parents=True)
         (home / name / "kept").write_text("x", encoding="utf-8")
     (home / ".claude.json").write_text("{}", encoding="utf-8")
+    (home / "notes.txt").write_text("mine", encoding="utf-8")
     sqlite3.connect(home / "Documents" / "board.db").close()
     before = guard.snapshot()
     guarded = guard.guarded_paths(home, {})
-    allowed = [str(REPO), str(tmp_path / "run-root")]
-    guard.configure(guarded, allowed)
+    allowed = [str(REPO), str(tmp_path / "run-root"), str(home / "work")]
+    guard.configure(guarded, allowed, real_home=home)
     monkeypatch.setenv(guard.GUARDED_VAR, os.pathsep.join(guarded))
     monkeypatch.setenv(guard.ALLOWED_VAR, os.pathsep.join(allowed))
+    monkeypatch.setenv(guard.REAL_HOME_VAR, str(home))
     yield home
     guard.restore(before)
 
@@ -214,24 +218,224 @@ def test_a_relative_path_is_read_from_where_the_test_stands(
     assert refusals(own_log) == [("home", "open", ".claude.json")]
 
 
-def test_real_home_lifts_the_tripwire_and_gives_children_nothing_to_guard(
-    real_home: Path,
+# --- nothing is written directly in the real home (manager #3718) --------------------------
+
+WRITES: list[tuple[str, Callable[[Path], object], str]] = [
+    ("a file made", lambda h: (h / "new.txt").write_text("x"), "new.txt"),
+    ("a file appended to", lambda h: open(h / "notes.txt", "a").close(), "notes.txt"),
+    ("a folder made", lambda h: (h / "project").mkdir(), "project"),
+    ("a file moved in", lambda h: (h / "Documents" / "kept").rename(h / "kept"), "kept"),
+    ("a file removed", lambda h: (h / "notes.txt").unlink(), "notes.txt"),
+    ("a database made", lambda h: sqlite3.connect(h / "rows.sqlite3"), "rows.sqlite3"),
+    ("a temp dir made", lambda h: tempfile.mkdtemp(dir=h), ""),
+    ("the home itself", lambda h: os.chmod(h, 0o700), "real-home"),
+]
+
+
+@pytest.mark.parametrize(
+    ("write", "name"), [(w[1], w[2]) for w in WRITES], ids=[w[0] for w in WRITES]
+)
+def test_nothing_is_written_directly_in_the_real_home(
+    write: Callable[[Path], object], name: str, scratch_real_home: Path, own_log: Path
 ) -> None:
-    """The opt-in, touching nothing: the real ``HOME`` is back, this process lets the guarded
-    paths through, and a child is told to guard none."""
-    assert real_home == conftest._DEVELOPERS_HOME == Path.home()
-    assert guard.snapshot()["home_allowed"] is True
-    assert guard.GUARDED_VAR not in os.environ
+    """What reviewer #3717 found unguarded: a project folder or a file dropped beside the
+    person's own, outside ``.claude*``, ``.codex*``, ``.aisquare`` and ``.rlx``."""
+    with pytest.raises(guard.RealHomeRefused, match="directly in the developer's real home"):
+        write(scratch_real_home)
+    entries, _ = guard.read_log(own_log)
+    assert [entry["kind"] for entry in entries] == ["home-write"]
+    if name:
+        assert Path(entries[0]["path"]).name == name
+    assert (scratch_real_home / "notes.txt").read_text(encoding="utf-8") == "mine"
 
 
-def test_only_the_real_account_e2e_asks_for_the_real_home() -> None:
-    """By name, as a parameter or in ``usefixtures``: the guard test above, and the e2e."""
-    askers = []
-    for path in sorted((REPO / "tests").rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        if '"real_home"' in text or "real_home: Path" in text:
-            askers.append(path.name)
-    assert askers == ["test_cross_account_e2e.py", Path(__file__).name]
+def test_reading_in_the_real_home_and_writing_deeper_or_in_a_run_root_are_not_refused(
+    scratch_real_home: Path, own_log: Path
+) -> None:
+    """Directly in the home is the rule; deeper is the guarded roots' (``Documents`` is the
+    person's, and nobody's business here, but not the guard's); a run root is the run's."""
+    assert (scratch_real_home / "notes.txt").read_text(encoding="utf-8") == "mine"
+    (scratch_real_home / "Documents" / "new.txt").write_text("x", encoding="utf-8")
+    (scratch_real_home / "work").mkdir()
+    (scratch_real_home / "work" / "x").write_text("x", encoding="utf-8")
+    assert refusals(own_log) == []
+
+
+def test_a_child_that_writes_directly_in_the_real_home_is_refused(
+    scratch_real_home: Path, own_log: Path
+) -> None:
+    code = f"open({str(scratch_real_home / 'dropped.txt')!r}, 'w').close()"
+    child = subprocess.run(
+        [sys.executable, "-c", code], env=os.environ, capture_output=True, text=True, timeout=60
+    )
+    assert child.returncode != 0 and "RealHomeRefused" in child.stderr, child.stderr
+    assert [entry["kind"] for entry in guard.read_log(own_log)[0]] == ["home-write"]
+    assert not (scratch_real_home / "dropped.txt").exists()
+
+
+# --- no test's folder is in the real home, so no walk reaches it (#3717's MAJOR) -----------
+
+
+def test_this_runs_folders_are_outside_the_real_home_and_git_stops_below_it(
+    tmp_path: Path, isolated_user_home: Path
+) -> None:
+    """On Windows ``%TEMP%`` is always in the home; on POSIX a ``TMPDIR`` under ``~/.rlx`` is
+    (#57). There a markerless folder walked up past the test's own ``HOME`` to the real one,
+    and ``core.workspace`` took the real home, with a dotfiles ``.git``, for its project."""
+    real = conftest._DEVELOPERS_HOME
+    for folder in (tmp_path, isolated_user_home, Path(tempfile.gettempdir())):
+        assert not conftest.inside(folder, real), folder
+    assert str(real) in os.environ["GIT_CEILING_DIRECTORIES"].split(os.pathsep)
+
+
+def test_the_temp_root_moves_only_when_it_is_in_the_home(tmp_path: Path) -> None:
+    home, outside = tmp_path / "home", tmp_path / "elsewhere"
+    in_home = home / ".rlx" / "tmp" / "agent"
+    in_home.mkdir(parents=True)
+    assert conftest.temp_root_outside(home, str(outside), [str(in_home)]) == str(outside)
+    candidates = [str(home / "AppData" / "Temp"), str(outside / "rlx-tests")]
+    assert conftest.temp_root_outside(home, str(in_home), candidates) == str(outside / "rlx-tests")
+    assert (outside / "rlx-tests").is_dir()
+    assert conftest.temp_root_outside(home, str(in_home), [str(home / "x")]) is None
+    said = conftest.temp_problem(home, str(in_home))
+    assert conftest.TEMP_ROOT_VAR in said and str(in_home) in said
+
+
+def test_where_the_temp_root_may_go_starts_with_the_developers_pick() -> None:
+    found = conftest.temp_candidates({conftest.TEMP_ROOT_VAR: "/picked", "RUNNER_TEMP": "/rt"})
+    assert found[0] == "/picked"
+    if os.name == "nt":
+        assert found[1].endswith("rlx-tests") and found[2] == "/rt"
+    else:
+        assert found[1:] == ["/tmp", "/var/tmp"]
+
+
+def _inner_run(
+    tmp_path: Path, files: dict[str, str], env: dict[str, str], *args: str
+) -> subprocess.CompletedProcess[str]:
+    """A pytest of its own in ``tmp_path``, with the suite's conftest, ``files`` as its tests,
+    and ``env`` over the suite's environment less what the inner run names for itself."""
+    for name, source in files.items():
+        (tmp_path / name).write_text(textwrap.dedent(source), encoding="utf-8")
+    full = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO), os.environ["PYTHONPATH"]])}
+    for name in (guard.LOG_VAR, guard.GUARDED_VAR, guard.ALLOWED_VAR, guard.REAL_HOME_VAR):
+        full.pop(name, None)  # the inner run names its own
+    full.pop("PYTEST_DEBUG_TEMPROOT", None)
+    full.update(env)
+    argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:xdist"]
+    argv += ["-o", "addopts=", *args, *files]
+    return subprocess.run(argv, cwd=tmp_path, env=full, capture_output=True, text=True, timeout=300)
+
+
+INNER_CONFTEST = (
+    "from tests.conftest import (  # noqa: F401\n"
+    "    _home_of_the_run, isolated_user_home, keychain_guard, no_real_keychain,\n"
+    ")\n"
+)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+@pytest.mark.parametrize(
+    "inside",
+    [".rlx/tmp/agent", "AppData/Local/Temp"],
+    ids=["TMPDIR under ~/.rlx", "Windows' %TEMP%"],
+)
+def test_a_temp_dir_in_the_real_home_is_moved_out_so_no_walk_reaches_the_home(
+    inside: str, tmp_path: Path
+) -> None:
+    """The reviewer's probe, through the suite's conftest: a "developer" whose home is a git
+    repository (dotfiles) and whose temp dir is inside it. The run moves its temp root out
+    (here to :data:`conftest.TEMP_ROOT_VAR`'s pick), so a markerless folder of a test has no
+    project, and git, a C child the hook can't see, finds no repository for it."""
+    real = tmp_path / "developer"
+    (real / inside).mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=real, check=True)
+    moved = tmp_path / "moved-here"
+    probe = f"""
+        import os, subprocess, tempfile
+        from pathlib import Path
+        from aisquare.core import workspace
+        from tests import conftest
+
+        def test_no_walk_reaches_the_home(tmp_path):
+            real = Path({str(real)!r})
+            start = tmp_path / "markerless"
+            start.mkdir()
+            assert workspace.real_project_root(start) is None
+            assert workspace.project_tree(start) is None
+            assert workspace.find_project_root(start) == start.resolve()
+            assert not conftest.inside(start, real)
+            assert conftest.inside(tempfile.gettempdir(), {str(moved)!r})
+            assert str(real) in os.environ["GIT_CEILING_DIRECTORIES"].split(os.pathsep)
+            done = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"], cwd=start, capture_output=True, text=True
+            )
+            assert done.returncode != 0, done.stdout
+    """
+    temp = str(real / inside)
+    env = {name: str(real) for name in conftest.USER_HOME_VARS}
+    env.update(TMPDIR=temp, TEMP=temp, TMP=temp, **{conftest.TEMP_ROOT_VAR: str(moved)})
+    env["GIT_CEILING_DIRECTORIES"] = ""
+    inner = _inner_run(tmp_path, {"conftest.py": INNER_CONFTEST, "test_probe.py": probe}, env)
+    assert inner.returncode == 0, inner.stdout + inner.stderr
+    assert "1 passed" in inner.stdout
+
+
+def test_a_basetemp_named_in_the_real_home_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "developer"
+    real.mkdir()
+    env = {name: str(real) for name in conftest.USER_HOME_VARS}
+    files = {"conftest.py": INNER_CONFTEST, "test_any.py": "def test_any():\n    pass\n"}
+    inner = _inner_run(tmp_path, files, env, "--basetemp", str(real / "projects" / "base"))
+    assert inner.returncode == 4, inner.stdout + inner.stderr
+    assert "is inside your home" in inner.stdout + inner.stderr
+
+
+# --- the opt-ins, enforced by the asking test's file (reviewer #3717, minor 1) -------------
+
+
+def test_real_home_is_refused_to_a_test_outside_its_file(request: pytest.FixtureRequest) -> None:
+    with pytest.raises(pytest.fail.Exception, match="may not ask for real_home"):
+        request.getfixturevalue("real_home")
+    assert Path.home() != conftest._DEVELOPERS_HOME
+
+
+def test_the_opt_ins_go_by_file_name_in_a_run_of_their_own(tmp_path: Path) -> None:
+    """With a scratch "developer": the e2e's file gets the real home and real agents, a native
+    suite's file gets real agents unasked, and any other file asking for the home fails."""
+    real = tmp_path / "developer"
+    real.mkdir()
+    files = {
+        "conftest.py": INNER_CONFTEST
+        + "from tests.conftest import real_agent_binaries, real_home  # noqa: F401\n",
+        "test_cross_account_e2e.py": f"""
+            from pathlib import Path
+            import pytest
+            from tests.keychain_guard import rlx_keychain_guard as guard
+
+            @pytest.mark.usefixtures("real_agent_binaries")
+            def test_the_e2e_gets_both(real_home):
+                assert real_home == Path.home() == Path({str(real)!r})
+                state = guard.snapshot()
+                assert state["home_allowed"] and state["agents_allowed"]
+        """,
+        "test_claude_native_probe.py": """
+            from tests.keychain_guard import rlx_keychain_guard as guard
+
+            def test_a_native_file_gets_real_agents():
+                state = guard.snapshot()
+                assert state["agents_allowed"] and not state["home_allowed"]
+        """,
+        "test_other.py": """
+            def test_asks_for_the_home(real_home):
+                pass
+        """,
+    }
+    env = {name: str(real) for name in conftest.USER_HOME_VARS}
+    inner = _inner_run(tmp_path, files, env, "--basetemp", str(tmp_path / "base"))
+    out = inner.stdout
+    assert "2 passed, 1 error" in out, out + inner.stderr
+    assert "test_other.py::test_asks_for_the_home may not ask for real_home" in out, out
 
 
 # --- the tripwire, in a child --------------------------------------------------------------
