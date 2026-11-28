@@ -383,9 +383,12 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   - **By connectors** (`connectors` and no `account`): the accounts whose connector map
     holds every one of them `connected` now, with both homes known, may take it. None:
     `connector_unavailable {connector, accounts: [{account, status}]}`, for the first of
-    `connectors` that leaves none, `status` being the map's (`connected`, `needs-auth`,
-    `pending`, `failed`), `absent` (read, and not listed) or `unread` (never read, or its
-    homes not known). Two or more: `ambiguous_account {connector, candidates: [{account,
+    `connectors` that leaves none, `status` being the map's (`needs-auth`, `pending`,
+    `failed`), `absent` (read, and not listed) or `unread` (never read, or its homes not
+    known). `accounts` are those that hold every connector named before it (every
+    account, for the first), so connecting it on any of them is what the run needs, and
+    it is never `connected` there; an account dropped for an earlier one isn't listed.
+    For a pin, `accounts` are every account rlx knows. Two or more: `ambiguous_account {connector, candidates: [{account,
     identity}]}`, unless every one's identity on every connector is known and they are
     all the same (manager #4188, the strict rule: a release build reads no identity yet,
     so a send never picks an account by its headroom alone); `identity` is `null` where

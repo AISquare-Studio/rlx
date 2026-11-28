@@ -7,7 +7,9 @@
 //!   the run may end `rate_limited`.
 //! - **By connectors** (no `account`): the accounts that hold every one of `connectors`
 //!   `connected` now, with both homes known, are the run's to start on. None:
-//!   `connector_unavailable`, for the first connector that leaves none. Two or more:
+//!   `connector_unavailable`, for the first connector that leaves none, with its status on
+//!   each account that held every connector before it (every account, for the first): so
+//!   it is never `connected` there. Two or more:
 //!   `ambiguous_account`, unless each one's identity on every connector is known and they
 //!   are all the same (the STRICT rule, manager #4188: a release build reads no identity,
 //!   so a send never picks an account by its headroom alone). Then the brain's usage
@@ -190,15 +192,31 @@ pub fn eligible(
     if connectors.is_empty() {
         return Ok(Step::Default);
     }
-    let mut holders: Vec<&Seen> = accounts.iter().filter(|seen| seen.homes_known).collect();
+    // Narrowed connector by connector. The first that leaves none is named, with its
+    // status on each account that held every one before it (every account, for the
+    // first): connecting it on any of those is what the run needs, and none holds it
+    // connected, so the refusal never says `connected` for it.
+    let mut holders: Vec<&Seen> = accounts.iter().collect();
     for connector in connectors {
-        holders.retain(|seen| seen.holds(connector));
-        if holders.is_empty() {
+        let next: Vec<&Seen> = holders
+            .iter()
+            .copied()
+            .filter(|seen| seen.holds(connector))
+            .collect();
+        if next.is_empty() {
+            let detail = ConnectorUnavailable::new(
+                connector,
+                holders
+                    .iter()
+                    .map(|seen| AccountStatus::new(seen.slot, seen.status(connector)))
+                    .collect(),
+            );
             return Err(Refused::Unavailable {
-                detail: statuses(connector),
+                detail,
                 pinned: None,
             });
         }
+        holders = next;
     }
     holders.sort_by_key(|seen| seen.slot);
     if holders.len() > 1 {
@@ -698,16 +716,58 @@ mod tests {
             Ok(Step::Candidates(vec![2]))
         );
         // Slack on 1 alone, Gmail on 3 alone: none holds both, and Gmail is the one that
-        // leaves none after Slack.
+        // leaves none after Slack. It is named with its status on account 1 alone, the
+        // one that holds Slack: connecting Gmail there is what the run needs. Account 3,
+        // which lacks Slack, is not listed: its Gmail is connected, which would mislead.
         let apart = vec![connected(1, SLACK, None), connected(3, GMAIL, None)];
         let (detail, _) = unavailable(eligible(None, &names(&[SLACK, GMAIL]), &apart));
         assert_eq!(detail.connector, GMAIL);
         assert_eq!(
             detail.accounts,
+            vec![AccountStatus::new(1, RouteStatus::Absent)]
+        );
+    }
+
+    #[test]
+    fn an_unavailable_connector_is_never_said_connected_where_it_is_listed() {
+        let both = |slot, slack: ConnectorState, gmail: ConnectorState| {
+            account(slot, vec![row(SLACK, slack, None), row(GMAIL, gmail, None)])
+        };
+        let mut unknown = both(4, ConnectorState::Connected, ConnectorState::Connected);
+        unknown.homes_known = false;
+        let cases = vec![
             vec![
-                AccountStatus::new(1, RouteStatus::Absent),
-                AccountStatus::new(3, RouteStatus::Connected),
-            ]
+                both(1, ConnectorState::Connected, ConnectorState::NeedsAuth),
+                both(2, ConnectorState::NeedsAuth, ConnectorState::Connected),
+                unknown.clone(),
+            ],
+            vec![
+                both(1, ConnectorState::Failed, ConnectorState::Connected),
+                both(2, ConnectorState::Pending, ConnectorState::Connected),
+            ],
+            vec![unknown],
+        ];
+        for accounts in cases {
+            let (detail, _) = unavailable(eligible(None, &names(&[SLACK, GMAIL]), &accounts));
+            assert!(
+                detail
+                    .accounts
+                    .iter()
+                    .all(|a| a.status != RouteStatus::Connected),
+                "{detail:?}"
+            );
+        }
+        // Slack on 1 (Gmail needs-auth there) and on 2 (Gmail connected there, Slack not):
+        // Gmail is named, with account 1's status alone.
+        let accounts = vec![
+            both(1, ConnectorState::Connected, ConnectorState::NeedsAuth),
+            both(2, ConnectorState::NeedsAuth, ConnectorState::Connected),
+        ];
+        let (detail, _) = unavailable(eligible(None, &names(&[SLACK, GMAIL]), &accounts));
+        assert_eq!(detail.connector, GMAIL);
+        assert_eq!(
+            detail.accounts,
+            vec![AccountStatus::new(1, RouteStatus::NeedsAuth)]
         );
     }
 

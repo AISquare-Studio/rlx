@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ConnectorUnavailable",
-  "description": "`connector_unavailable`'s detail: no account rlxd may start the run on holds\n`connector` connected (with the run's connectors before it), or the pinned account\ndoesn't. `accounts` gives its status on each account rlx knows.\n\n```json\n{\"connector\": \"claude.ai Slack\",\n \"accounts\": [{\"account\": 1, \"status\": \"needs-auth\"}, {\"account\": 2, \"status\": \"absent\"}]}\n```",
+  "description": "`connector_unavailable`'s detail: no account rlxd may start the run on holds\n`connector` connected (with the run's connectors before it), or the pinned account\ndoesn't.\n\n`accounts` gives its status: for a pinned run, on each account rlx knows; else on each\naccount that holds every connector the run names before it (each account rlx knows,\nfor its first), so connecting it on any of them is what the run needs, and none of\nthem is ever `connected`. An account dropped for lacking an earlier connector isn't\nlisted: its status for this one would mislead.\n\n```json\n{\"connector\": \"claude.ai Slack\",\n \"accounts\": [{\"account\": 1, \"status\": \"needs-auth\"}, {\"account\": 2, \"status\": \"absent\"}]}\n```",
   "type": "object",
   "properties": {
     "accounts": {
-      "description": "Its status on each account rlx knows, by slot.",
+      "description": "Its status on each account the run could start on once it is connected there (each\naccount rlx knows, for a pin), by slot.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/AccountStatus"

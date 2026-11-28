@@ -99,7 +99,13 @@ impl ConnectorAccountLimited {
 
 /// `connector_unavailable`'s detail: no account rlxd may start the run on holds
 /// `connector` connected (with the run's connectors before it), or the pinned account
-/// doesn't. `accounts` gives its status on each account rlx knows.
+/// doesn't.
+///
+/// `accounts` gives its status: for a pinned run, on each account rlx knows; else on each
+/// account that holds every connector the run names before it (each account rlx knows,
+/// for its first), so connecting it on any of them is what the run needs, and none of
+/// them is ever `connected`. An account dropped for lacking an earlier connector isn't
+/// listed: its status for this one would mislead.
 ///
 /// ```json
 /// {"connector": "claude.ai Slack",
@@ -111,7 +117,8 @@ impl ConnectorAccountLimited {
 pub struct ConnectorUnavailable {
     /// The connector, by its id.
     pub connector: String,
-    /// Its status on each account rlx knows, by slot.
+    /// Its status on each account the run could start on once it is connected there (each
+    /// account rlx knows, for a pin), by slot.
     pub accounts: Vec<AccountStatus>,
 }
 

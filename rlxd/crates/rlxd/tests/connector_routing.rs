@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 
 use common::runs::{fixture_log, home_with_scenario_file_in, run_id, seq};
-use common::{TestHome, assert_valid, eventually};
+use common::{TestHome, assert_valid, eventually, real_rlx};
 use serde_json::{Value, json};
 
 const SLACK: &str = "claude.ai Slack";
@@ -809,6 +809,153 @@ fn a_routed_attempt_takes_none_of_the_apps_homes_and_records_its_accounts() {
     );
 }
 
+#[test]
+fn a_queued_run_keeps_the_account_it_was_routed_to() {
+    // Two holders of one workspace; slot 2 has the room. A refresh run holds the pool
+    // (refreshes run one at a time), so the routed refresh queues, its route decided.
+    let (home, accounts) = routing_home(
+        Some("connected"),
+        Some("connected"),
+        Some((Some("Gizmo"), Some("Gizmo"))),
+    );
+    accounts.usage(&json!([
+        {"slot": 1, "used_percent": 80.0, "limited": false},
+        {"slot": 2, "used_percent": 10.0, "limited": false},
+    ]));
+    std::fs::write(home.root().join("scenario"), "slow").unwrap();
+    let holder = run_id();
+    let refresh =
+        json!({"kind": "widget_refresh", "prompt": "hold", "mount": {"kind": "no_tools"}});
+    assert_eq!(start(&home, &refresh, &holder).code(), Some(0));
+    eventually("the holder runs", || {
+        let got = home.rlxd(&["call", "run.get", &json!({"run_id": holder}).to_string()]);
+        got.data()["state"] == "running"
+    });
+    let since = seq(&home);
+    let id = run_id();
+    let routed = json!({"kind": "widget_refresh", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]}, "connectors": [SLACK]});
+    assert_eq!(start(&home, &routed, &id).code(), Some(0));
+    let queued = home
+        .rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+        .data();
+    assert_eq!(queued["state"], "queued", "{queued:#}");
+    assert_eq!(queued["account"], json!({"slot": 2, "by": "connectors"}));
+    // Slot 2 limited now: a route picked again would go to slot 1. None is.
+    accounts.usage(&json!([
+        {"slot": 1, "used_percent": 0.0, "limited": false},
+        {"slot": 2, "limited": true, "resets_at": RESETS},
+    ]));
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    let cancel = home.rlxd(&["call", "run.cancel", &json!({"run_id": holder}).to_string()]);
+    assert_eq!(cancel.code(), Some(0), "{cancel:?}");
+    ended(&home, &id, "done");
+    assert_eq!(
+        started(&home, since, &id)[0]["data"]["account"],
+        json!({"slot": 2, "by": "connectors"})
+    );
+    on_slot_2(&starts_of(&home, &id)[0], &accounts);
+}
+
+#[test]
+fn the_real_brains_usage_routes_and_refuses_a_limited_sole_holder() {
+    let Some(rlx) = real_rlx() else { return };
+    let root = TestHome::new().with_rlx(rlx);
+    // Slot 2, a managed slot as rlx makes one, signed in, Slack connected there alone.
+    let slot = root.root().join("claude-accounts").join("2");
+    std::fs::create_dir_all(&slot).unwrap();
+    std::fs::write(
+        slot.join(".aisquare-account.json"),
+        r#"{"slot": 2, "created_at": "2026-11-28T00:00:00+00:00"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        slot.join(".claude.json"),
+        json!({"oauthAccount": {"emailAddress": "fixture@example.com",
+            "accountUuid": "0e9d6c1a-uuid-of-the-fixture"}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        slot.join("fake-connectors.json"),
+        slack("connected").to_string(),
+    )
+    .unwrap();
+    let plain = root.root().join("user-home").join(".claude");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(
+        plain.join("fake-connectors.json"),
+        slack("needs-auth").to_string(),
+    )
+    .unwrap();
+    let home = home_with_scenario_file_in(
+        root,
+        "mcp-accounts",
+        &[
+            ("RLXD_TEST_CONNECTORS_NO_TURN", "1"),
+            ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
+            ("RLXD_TEST_CONNECTOR_ROUTE", "1"),
+        ],
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while home
+        .rlxd(&["call", "connectors.list", r#"{"account":2}"#])
+        .code()
+        != Some(0)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the brain never listed slot 2"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    read_map(&home);
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    // The brain's usage says slot 2 has room: the run goes there.
+    let id = run_id();
+    assert_eq!(start(&home, &task(&[SLACK], None), &id).code(), Some(0));
+    ended(&home, &id, "done");
+    assert!(!home.log().contains("route: no usage"), "{}", home.log());
+    // A weekly limit rlx remembers for slot 2 (as a refused turn's hook would): refused.
+    // In rlx's own store for this home (AISQUARE_HOME), as the brain reads it; uv as
+    // real_rlx finds rlx, nothing of the agent the tests run under passed on.
+    let mut python = std::process::Command::new("uv");
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy().into_owned();
+        if name.starts_with("AISQUARE_") || name.starts_with("CLAUDE") || name == "RLX_HOME" {
+            python.env_remove(name);
+        }
+    }
+    let seeded = python
+        .args([
+            "run",
+            "--quiet",
+            "python",
+            "-c",
+            "from datetime import UTC, datetime, timedelta\n\
+             from aisquare.services import claude_accounts as s\n\
+             until = (datetime.now(UTC) + timedelta(hours=5)).replace(microsecond=0)\n\
+             s.remember_limit(2, 'week', until)\n\
+             print(until.isoformat().replace('+00:00', 'Z'), end='')",
+        ])
+        .env("AISQUARE_HOME", home.root())
+        .env("HOME", home.root().join("user-home"))
+        .env("USERPROFILE", home.root().join("user-home"))
+        .current_dir(common::workspace().parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(seeded.status.success(), "{seeded:?}");
+    let until = String::from_utf8(seeded.stdout).unwrap();
+    let (code, detail) = refused(
+        &home,
+        &task(&[SLACK], None),
+        "connector-account-limited.json",
+    );
+    assert_eq!(code, "connector_account_limited");
+    assert_eq!(detail["account"], 2);
+    assert_eq!(detail["resets_at"], until.as_str());
+}
+
 /// #4291's setup: slot 1 (the plain account) and slot 3 (B) without Slack, slot 2 (A)
 /// with it connected; a run routed by Slack in the space `sx`, its session kept, done.
 /// Its id, and its transcript in A's home.
@@ -929,6 +1076,50 @@ fn a_routed_runs_transcript_is_erased_from_its_recorded_home_after_its_account_i
         home.rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
             .error_code(),
         "unknown_run"
+    );
+}
+
+#[test]
+fn a_queued_routed_run_whose_account_is_dropped_fails_and_moves_nowhere() {
+    // #4291 F3: routed to slot 2 and queued; slot 2 then no longer rlx's. Its attempt runs
+    // there or nowhere: it fails, and no Claude Code starts, on the app's environment or
+    // any other.
+    let (home, accounts) = routing_home(Some("needs-auth"), Some("connected"), None);
+    std::fs::write(home.root().join("scenario"), "slow").unwrap();
+    let holder = run_id();
+    let refresh =
+        json!({"kind": "widget_refresh", "prompt": "hold", "mount": {"kind": "no_tools"}});
+    assert_eq!(start(&home, &refresh, &holder).code(), Some(0));
+    eventually("the holder runs", || {
+        let got = home.rlxd(&["call", "run.get", &json!({"run_id": holder}).to_string()]);
+        got.data()["state"] == "running"
+    });
+    let id = run_id();
+    let routed = json!({"kind": "widget_refresh", "prompt": "digest",
+        "mount": {"kind": "connectors", "connectors": [SLACK]}, "connectors": [SLACK]});
+    assert_eq!(start(&home, &routed, &id).code(), Some(0));
+    let queued = home
+        .rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+        .data();
+    assert_eq!(queued["state"], "queued", "{queued:#}");
+    assert_eq!(queued["account"], json!({"slot": 2, "by": "connectors"}));
+    std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
+    accounts.list(false);
+    read_map(&home);
+    std::fs::write(home.root().join("scenario"), "init-connectors").unwrap();
+    let cancel = home.rlxd(&["call", "run.cancel", &json!({"run_id": holder}).to_string()]);
+    assert_eq!(cancel.code(), Some(0), "{cancel:?}");
+    ended(&home, &id, "failed");
+    let got = home
+        .rlxd(&["call", "run.get", &json!({"run_id": id}).to_string()])
+        .data();
+    let message = got["last_event"]["data"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("rlx no longer knows account 2"), "{got:#}");
+    assert!(
+        starts_of(&home, &id).is_empty(),
+        "a Claude Code started for it"
     );
 }
 

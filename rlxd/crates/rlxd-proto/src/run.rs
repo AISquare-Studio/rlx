@@ -299,6 +299,11 @@ pub struct NeedsYouWhen {
 /// - `kind_mount_mismatch`: a `check`, `parse_instruction` or `widget_author` run whose
 ///   mount is not `no_tools`;
 /// - `pinned_call_required`: a `send_executor` or `watch` run without `pinned_call`;
+/// - by its route (#15): `no_such_account` and `account_unknown` for a pinned `account`
+///   rlx doesn't know, or whose homes rlxd doesn't; `connector_unavailable` when no
+///   account it may start on holds `connectors` connected; `ambiguous_account` when two or
+///   more do and aren't known to be the same one there; `connector_account_limited` when
+///   every one that does is usage-limited;
 /// - `invalid_params`: anything else these rules or the schema refuse.
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[schemars(title = "RunStartParams")]
