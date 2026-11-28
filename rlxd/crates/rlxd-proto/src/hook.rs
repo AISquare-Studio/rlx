@@ -9,8 +9,10 @@
 //! write on its stdout and stderr. `pre-tool-use` is the gate's (5.1): rlxd answers it
 //! itself, from its gate, with the run's attempt and its key ([`HookParams::hook_key`], from
 //! [`HOOK_KEY_ENV`]), and the answer is an allow ([`allow_output`]) or a deny
-//! ([`deny_output`]): rlxd-hook prints nothing else ([`is_gate_output`]). Each `hook` that
-//! reaches rlxd publishes one `hook.<event>` ([`HookEventData`]) on the `hook` topic.
+//! ([`deny_output`]): rlxd-hook prints nothing else ([`is_gate_output`]). Each fleet `hook`
+//! that reaches rlxd publishes one `hook.<event>` ([`HookEventData`]) on the `hook` topic; a
+//! `pre-tool-use` publishes none (the gate's `run.tool_call` and `run.tool_decided` are its
+//! events).
 //!
 //! A hook rlxd could not hand to the brain gets [`codes::HOOK_NOT_DELIVERED`]: it never ran,
 //! and rlxd-hook runs `rlx hook <event>` itself. Once the brain accepted it, a failure is
@@ -322,7 +324,8 @@ pub struct HookEventData {
     /// The session's working directory: the hook JSON's `cwd`, else rlxd-hook's; empty
     /// when neither is known.
     pub cwd: String,
-    /// The run the hook belongs to, for a run's `pre-tool-use` (5.1).
+    /// The run the hook belongs to. A run's `pre-tool-use` (5.1), the one hook that names
+    /// a run, publishes no event, so no event rlxd publishes today carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, length(min = 1))]
     pub run_id: Option<String>,

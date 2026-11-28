@@ -4,9 +4,11 @@
 //!   variables rlxd-hook sent) is not this rlxd's is `hook_not_delivered`, so rlxd-hook runs
 //!   `rlx hook` in its own; and nothing is published here. Only a `cli` client may call
 //!   `hook` (`role_not_allowed`).
-//! - **The event.** Every other `hook` that parses publishes one `hook.<event>` on the
-//!   `hook` topic first, `{session_id, cwd, run_id?}` (7.3): the session and directory from the
-//!   hook's JSON (the directory rlxd-hook ran in when the JSON names none).
+//! - **The event.** Every other fleet `hook` that parses publishes one `hook.<event>` on
+//!   the `hook` topic first, `{session_id, cwd}` (7.3): the session and directory from the
+//!   hook's JSON (the directory rlxd-hook ran in when the JSON names none). A
+//!   `pre-tool-use` publishes none, bound or not: the gate's `run.tool_call` and
+//!   `run.tool_decided` are its events, and a request the gate refuses reaches no topic.
 //! - **The fleet's six** go to the resident brain (`crate::brain`), which runs `rlx hook
 //!   <event>`'s own code with the hook's stdin, directory and allowlisted environment
 //!   (`hook_env_forwarded`; any other name is dropped here), and answers the bytes for
@@ -74,10 +76,11 @@ pub async fn hook(
         return Err(error(hook_codes::HOOK_NOT_DELIVERED, &why));
     }
     let stdin = b64::decode(&params.stdin_b64).unwrap_or_default();
-    publish(daemon, &params, &stdin);
+    // The gate's: no hook event, before its bind or after it (the module's doc).
     if params.event == PRE_TOOL_USE {
         return pre_tool_use(daemon, peer, params, &stdin).await;
     }
+    publish(daemon, &params, &stdin);
     if let Err(why) = same_start(&params.env, |name| std::env::var(name).ok()) {
         return Err(error(hook_codes::HOOK_NOT_DELIVERED, &why));
     }

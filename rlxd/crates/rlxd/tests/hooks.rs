@@ -1,5 +1,6 @@
 //! Hooks over the socket (handoff 0.10.3, 1.5, and 7.3's hook bullet): `rlxd-hook <event>`
-//! prints what `rlx hook <event>` prints, has its side effect, publishes one `hook.<event>`,
+//! prints what `rlx hook <event>` prints, has its side effect, publishes one `hook.<event>`
+//! (none for the gate's `pre-tool-use`),
 //! falls back to `rlx hook` with rlxd stopped, and turns on the brain's `accepted`: before
 //! it, the hook runs as `rlx hook`; after it, never again. `pre-tool-use` always denies.
 //! And 1.6's twenty hooks through one brain.
@@ -198,7 +199,8 @@ fn every_hook_prints_what_rlx_hook_prints_and_publishes_one_event() {
             );
         }
     }
-    // The gate's hook: denied, never allowed, and its event too (7.3: all seven).
+    // The gate's hook: denied, never allowed, and it publishes no hook event: the gate's run
+    // events are its own, and a request the gate refuses reaches no topic.
     let payload = seeded.payload(
         "PreToolUse",
         json!({"tool_name": "mcp__claude_ai_Slack__slack_send_message", "tool_input": {}}),
@@ -231,10 +233,12 @@ fn every_hook_prints_what_rlx_hook_prints_and_publishes_one_event() {
     assert!(!String::from_utf8_lossy(&denied).contains(&key));
     assert!(!stderr.contains(&key), "{stderr}");
     let events = seeded.hook_events();
-    for (event, _, _) in fleet_events()
-        .into_iter()
-        .chain([("pre-tool-use", "", json!({}))])
-    {
+    assert!(
+        events.iter().all(|e| e["type"] != "hook.pre_tool_use"),
+        "{events:?}"
+    );
+    assert!(!serde_json::to_string(&events).unwrap().contains(&key));
+    for (event, _, _) in fleet_events() {
         let r#type = format!("hook.{}", event.replace('-', "_"));
         let matching: Vec<&Value> = events.iter().filter(|e| e["type"] == r#type).collect();
         assert_eq!(matching.len(), 1, "{type}: {events:?}");

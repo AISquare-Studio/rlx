@@ -329,6 +329,16 @@ fn through_rlxd_hook_the_apps_allow_runs_the_tool_and_its_deny_is_claude_codes()
     assert_eq!(answers[0]["decision"], "deny", "{answers:#?}");
     assert_eq!(answers[0]["reason"], "not this channel");
     assert_eq!(tool_runs(&home, &b), 0);
+    // The gate's run events are its own: its hook requests, allowed or denied, put nothing
+    // on the hook topic.
+    assert_eq!(hook_events(&home), Vec::<Value>::new());
+}
+
+/// Every event on the `hook` topic.
+fn hook_events(home: &TestHome) -> Vec<Value> {
+    let run = home.rlxd(&["events", "--topics", "hook", "--since", "0"]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    run.lines()
 }
 
 #[test]
@@ -404,6 +414,8 @@ fn through_rlxd_hook_a_request_not_bound_to_the_run_is_refused_and_no_key_leaks(
             .all(|e| !e.to_string().contains("toolu_outsider")),
         "{events:#?}"
     );
+    // Nor do requests the gate refused, from inside a run or outside every run.
+    assert_eq!(hook_events(&home), Vec::<Value>::new());
     // No key is anywhere in the home: rlxd's log, the run records and logs, the settings,
     // the hook events, the fixture log.
     let all = home.rlxd(&["events", "--since", "0"]);
