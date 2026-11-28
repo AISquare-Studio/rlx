@@ -355,6 +355,20 @@ impl Tmux {
         out.stdout
     }
 
+    /// One idle session for the test's whole life, so the server, and any server option
+    /// set on it, stays up while each case's own session is opened and closed in turn.
+    fn hold(&self) {
+        self.run(&["new-session", "-d", "-s", "hold", "exec sleep 3600"]);
+    }
+
+    /// Ends `session`, and with it its pseudo-terminal. Each case's session is closed once
+    /// captured: left open to the test's end, a session per fixture and per input held
+    /// about 65 at once with the tests in parallel, and a macOS runner ran out ("fork
+    /// failed: Device not configured", rlxd.yml run 46107527723).
+    fn close(&self, session: &str) {
+        self.run(&["kill-session", "-t", session]);
+    }
+
     /// Waits until the pane's screen stops changing.
     fn settle(&self, session: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -384,7 +398,7 @@ impl Tmux {
     }
 
     /// Shows `fixture` in a pane of its own, and once the screen is still, returns its
-    /// capture and the cursor.
+    /// capture and the cursor, and closes the pane's session.
     fn show(&self, n: usize, fixture: &Fixture) -> (Vec<u8>, String) {
         let file = self.dir.join(format!("{n}.bin"));
         std::fs::write(&file, &fixture.bytes).unwrap();
@@ -426,14 +440,16 @@ impl Tmux {
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut last = capture(&session);
-        loop {
+        let shown = loop {
             std::thread::sleep(Duration::from_millis(150));
             let now = capture(&session);
             if now == last || Instant::now() > deadline {
-                return now;
+                break now;
             }
             last = now;
-        }
+        };
+        self.close(&session);
+        shown
     }
 }
 
@@ -467,6 +483,7 @@ fn first_difference(a: &[u8], b: &[u8]) -> String {
 fn check(tmux: &Tmux, fixtures: &[Fixture]) -> Vec<String> {
     let mut failures = Vec::new();
     let version = tmux.numbers();
+    tmux.hold();
     for (n, fixture) in fixtures.iter().enumerate() {
         if let Some(since) = fixture.since
             && version < since
@@ -797,6 +814,7 @@ impl Tmux {
         }
         self.settle(&session);
         let text = self.run(&["capture-pane", "-p", "-J", "-S", "-", "-t", &session]);
+        self.close(&session);
         let text = String::from_utf8_lossy(&text);
         text.split_once("READY")
             .map(|(_, after)| after.split_whitespace().collect())
@@ -818,7 +836,7 @@ fn keys_and_pastes_send_tmuxs_bytes() {
         return;
     }
     // Extended keys as the fleet's tmux has them, before any pane asks.
-    tmux.run(&["new-session", "-d", "-s", "base", "exec sleep 60"]);
+    tmux.hold();
     tmux.run(&["set-option", "-s", "extended-keys", "on"]);
     let version = tmux.numbers();
     let mut failures = Vec::new();
