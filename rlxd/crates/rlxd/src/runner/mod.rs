@@ -144,9 +144,10 @@ pub enum RunNote {
     },
 }
 
+pub use gate::Ask;
 pub(crate) use gate::claude_server_name;
 #[cfg(feature = "debug-methods")]
-pub use gate::{Ask, HOOK_KEY_ENV, output as hook_output};
+pub use gate::{HOOK_KEY_ENV, output as hook_output};
 
 /// The runner of one rlxd.
 pub struct Runner {

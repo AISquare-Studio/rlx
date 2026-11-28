@@ -218,6 +218,8 @@ fn pre_tool_use_with_an_argument_that_is_not_utf8_still_denies() {
 struct FakeRlxd {
     socket: std::path::PathBuf,
     hooks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Each `hook` request's params, as it came.
+    seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 #[cfg(unix)]
@@ -253,11 +255,14 @@ impl FakeRlxd {
         let listener = UnixListener::bind(&socket).unwrap();
         let hooks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = std::sync::Arc::clone(&hooks);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = std::sync::Arc::clone(&seen);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let told = reply.clone();
                 let counted = std::sync::Arc::clone(&counted);
+                let kept = std::sync::Arc::clone(&kept);
                 std::thread::spawn(move || {
                     let mut writer = &stream;
                     for line in BufReader::new(&stream).lines() {
@@ -269,6 +274,7 @@ impl FakeRlxd {
                                 "capabilities": []}}),
                             _ => {
                                 counted.fetch_add(1, Ordering::SeqCst);
+                                kept.lock().unwrap().push(request["params"].clone());
                                 told.clone()
                             }
                         };
@@ -281,7 +287,16 @@ impl FakeRlxd {
                 });
             }
         });
-        Self { socket, hooks }
+        Self {
+            socket,
+            hooks,
+            seen,
+        }
+    }
+
+    /// The `hook` requests' params, as they came.
+    fn seen(&self) -> Vec<serde_json::Value> {
+        self.seen.lock().unwrap().clone()
     }
 
     /// How many `hook` requests reached it.
@@ -297,34 +312,56 @@ impl Drop for FakeRlxd {
     }
 }
 
-/// Until the gate decides tool calls (5.1), rlxd-hook prints rlxd's `pre-tool-use` reply
-/// only when it is a deny: an empty reply (on which Claude Code would ask no one), text,
-/// `{}` or an allow is denied as unreached, and never goes to `rlx hook`.
+/// A hook key, as rlxd makes one: 64 hex digits.
+#[cfg(unix)]
+const KEY: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+
+/// A run's `pre-tool-use` command line.
+#[cfg(unix)]
+const GATED: &[&str] = &[
+    "pre-tool-use",
+    "--run",
+    "0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f",
+    "--attempt",
+    "1",
+    "--deadline-ms",
+    "120000",
+];
+
+/// rlxd-hook prints rlxd's `pre-tool-use` reply only when it is the gate's answer, an
+/// allow or a deny and nothing else: an empty reply (on which Claude Code would ask no
+/// one), text, `{}`, an ask or an answer with more in it is a deny, and never goes to
+/// `rlx hook`.
 #[cfg(unix)]
 #[test]
-fn pre_tool_use_prints_only_a_deny_whatever_rlxd_answers() {
+fn pre_tool_use_prints_only_the_gates_answer_whatever_rlxd_answers() {
     const UNREACHED: &str = "rlxd could not be asked about this tool call, so it is denied";
-    let allow = r#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "fine"}}"#;
+    let allow = rlxd_client::proto::allow_output("the app allowed it");
     let deny = rlxd_client::proto::deny_output("rlxd's own reason");
+    let ask = r#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": "r"}}"#;
+    let more = r#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "r", "updatedInput": {"x": 1}}}"#;
     for (case, stdout, passes) in [
         ("empty", &b""[..], false),
         ("text", b"just some text\n", false),
         ("object", b"{}", false),
-        ("allow", allow.as_bytes(), false),
+        ("ask", ask.as_bytes(), false),
+        ("allow-and-more", more.as_bytes(), false),
+        ("allow", allow.as_bytes(), true),
         ("deny", deny.as_bytes(), true),
     ] {
         let here = NoRlxd::new(&format!("gate-{case}"));
         let _rlxd = FakeRlxd::answering(&here, stdout);
-        let output = here.run(
-            &["pre-tool-use"],
+        let output = here.run_with(
+            GATED,
             b"{\"tool_name\":\"t\",\"tool_input\":{}}",
+            &[("RLXD_HOOK_KEY", KEY)],
         );
         assert_eq!(output.status.code(), Some(0), "{case}: {output:?}");
         assert!(output.stderr.is_empty(), "{case}: {output:?}");
         if passes {
             assert_eq!(
                 output.stdout, stdout,
-                "{case}: a deny goes through as it is"
+                "{case}: the gate's answer goes through as it is"
             );
             continue;
         }
@@ -338,6 +375,99 @@ fn pre_tool_use_prints_only_a_deny_whatever_rlxd_answers() {
             "{case}"
         );
     }
+}
+
+/// With no run or no key, `pre-tool-use` asks rlxd nothing, and denies.
+#[cfg(unix)]
+#[test]
+fn pre_tool_use_with_no_run_or_no_key_asks_nothing_and_denies() {
+    let here = NoRlxd::new("gate-unasked");
+    let rlxd = FakeRlxd::answering(&here, rlxd_client::proto::allow_output("never").as_bytes());
+    let stdin = b"{\"tool_name\":\"t\",\"tool_input\":{}}";
+    for (args, envs, says) in [
+        (
+            &["pre-tool-use"][..],
+            &[("RLXD_HOOK_KEY", KEY)][..],
+            "no --run",
+        ),
+        (GATED, &[][..], "no RLXD_HOOK_KEY"),
+        (GATED, &[("RLXD_HOOK_KEY", "")][..], "no RLXD_HOOK_KEY"),
+    ] {
+        let output = here.run_with(args, stdin, envs);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let said = &reply["hookSpecificOutput"];
+        assert_eq!(said["permissionDecision"], "deny", "{args:?}");
+        assert!(
+            said["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains(says),
+            "{reply}"
+        );
+    }
+    assert_eq!(rlxd.hooks(), 0, "nothing reached rlxd");
+}
+
+/// The key goes to rlxd as `hook_key` only, never with the variables, and nothing
+/// rlxd-hook writes holds it, on any path: an answer, a refusal, no rlxd, a key rlxd-proto
+/// refuses.
+#[cfg(unix)]
+#[test]
+fn pre_tool_use_sends_the_key_as_hook_key_only_and_never_prints_it() {
+    let stdin = b"{\"tool_name\":\"t\",\"tool_input\":{}}";
+    let no_key_in = |case: &str, output: &Output, key: &str| {
+        assert_eq!(output.status.code(), Some(0), "{case}: {output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(key),
+            "{case}: {output:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains(key),
+            "{case}: {output:?}"
+        );
+    };
+    let here = NoRlxd::new("gate-key");
+    let rlxd = FakeRlxd::answering(&here, rlxd_client::proto::allow_output("ok").as_bytes());
+    let output = here.run_with(GATED, stdin, &[("RLXD_HOOK_KEY", KEY)]);
+    no_key_in("answered", &output, KEY);
+    let seen = rlxd.seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0]["hook_key"], KEY);
+    assert_eq!(seen[0]["run_id"], "0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f");
+    assert_eq!(seen[0]["attempt"], 1);
+    assert!(seen[0]["env"].get("RLXD_HOOK_KEY").is_none(), "{}", seen[0]);
+    drop(rlxd);
+    for (case, reply) in [
+        (
+            "refused",
+            serde_json::json!({"ok": false, "error": {"code": "invalid_params",
+                "message": "hook's params are not valid"}}),
+        ),
+        (
+            "failed",
+            serde_json::json!({"ok": false, "error": {"code": "hook_failed",
+                "message": "the hook's connection was dropped"}}),
+        ),
+    ] {
+        let here = NoRlxd::new(&format!("gate-key-{case}"));
+        let _rlxd = FakeRlxd::replying(&here, reply);
+        let output = here.run_with(GATED, stdin, &[("RLXD_HOOK_KEY", KEY)]);
+        no_key_in(case, &output, KEY);
+    }
+    // No rlxd at all.
+    let here = NoRlxd::new("gate-key-none");
+    let output = here.run_with(GATED, stdin, &[("RLXD_HOOK_KEY", KEY)]);
+    no_key_in("no rlxd", &output, KEY);
+    // A key rlxd-proto refuses (not 64 hex digits): never sent, never said.
+    let here = NoRlxd::new("gate-key-bad");
+    let rlxd = FakeRlxd::answering(&here, rlxd_client::proto::allow_output("never").as_bytes());
+    let bad = "NOT-A-KEY-but-a-secret-all-the-same";
+    let output = here.run_with(GATED, stdin, &[("RLXD_HOOK_KEY", bad)]);
+    no_key_in("bad key", &output, bad);
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert_eq!(rlxd.hooks(), 0);
 }
 
 /// A hook rlxd-hook cannot send as it is runs as `rlx hook`, with the same stdin, before

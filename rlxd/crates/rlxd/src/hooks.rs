@@ -20,11 +20,16 @@
 //!   fails with `hook_not_delivered`: nothing of it ran, and rlxd-hook runs `rlx hook
 //!   <event>` itself. Once accepted, a failure is `hook_failed` and an overrun
 //!   `hook_timeout`, and rlxd-hook runs nothing more: the prompt is never logged twice.
-//! - **`pre-tool-use`** is the gate's (5.1). Until the gate decides tool calls, rlxd
-//!   denies every one itself, and nothing here can allow one.
+//! - **`pre-tool-use`** is the gate's (5.1), and never reaches the brain. Its run, attempt
+//!   and key (`hook_key`), with the process that connected (the connection's peer, pinned
+//!   when it was accepted), go to [`crate::runner::Runner::pre_tool_use`], which binds them
+//!   to the run's live attempt and answers allow or deny; one that names no run, no
+//!   attempt or no key, or whose stdin is not JSON, is denied here. The key is never logged,
+//!   published or forwarded.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rlxd_client::Home;
@@ -47,12 +52,18 @@ const ACCEPT_MOST: Duration = Duration::from_secs(30);
 const DEADLINE_DEFAULT: Duration = Duration::from_secs(50);
 const DEADLINE_MOST: Duration = Duration::from_secs(600);
 
-/// Why every `pre-tool-use` is denied, until the gate decides them (5.1).
-pub const NO_GATE_YET: &str =
-    "rlxd's gate does not decide tool calls yet, so every one is denied (rlx 0.10.3, 5.1)";
+/// Why a `pre-tool-use` that names no run, attempt or key is denied.
+const UNBOUND: &str = "rlxd refused the hook request: it names no run, attempt or hook key";
 
-/// `hook`: publishes its event, then runs it, as the module says.
-pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
+/// Why a `pre-tool-use` whose stdin is not JSON is denied.
+const NOT_JSON: &str = "rlxd refused the hook request: its stdin is not JSON";
+
+/// `hook` from the process `peer`: publishes its event, then runs it, as the module says.
+pub async fn hook(
+    daemon: &Daemon,
+    peer: Arc<crate::peer::Peer>,
+    params: Data,
+) -> Result<Data, ErrorBody> {
     let params = HookParams::deserialize(Value::Object(params)).map_err(|e| {
         error(
             codes::INVALID_PARAMS,
@@ -65,7 +76,7 @@ pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
     let stdin = b64::decode(&params.stdin_b64).unwrap_or_default();
     publish(daemon, &params, &stdin);
     if params.event == PRE_TOOL_USE {
-        return Ok(reply(deny_output(NO_GATE_YET).as_bytes()));
+        return pre_tool_use(daemon, peer, params, &stdin).await;
     }
     if let Err(why) = same_start(&params.env, |name| std::env::var(name).ok()) {
         return Err(error(hook_codes::HOOK_NOT_DELIVERED, &why));
@@ -121,6 +132,37 @@ pub async fn hook(daemon: &Daemon, params: Data) -> Result<Data, ErrorBody> {
                  it had",
                 deadline.as_millis()
             ),
+        )),
+    }
+}
+
+/// A `pre-tool-use`, to the gate: its answer, allow or deny.
+async fn pre_tool_use(
+    daemon: &Daemon,
+    peer: Arc<crate::peer::Peer>,
+    params: HookParams,
+    stdin: &[u8],
+) -> Result<Data, ErrorBody> {
+    let (Some(run_id), Some(attempt), Some(key)) = (params.run_id, params.attempt, params.hook_key)
+    else {
+        return Ok(reply(deny_output(UNBOUND).as_bytes()));
+    };
+    let Ok(stdin) = serde_json::from_slice::<Value>(stdin) else {
+        return Ok(reply(deny_output(NOT_JSON).as_bytes()));
+    };
+    let ask = crate::runner::Ask {
+        run_id,
+        attempt,
+        key,
+        peer,
+        stdin,
+    };
+    match daemon.runner().pre_tool_use(ask).await {
+        Some(output) => Ok(reply(output.as_bytes())),
+        // Test builds' dropped hook connections: no answer, which rlxd-hook denies.
+        None => Err(error(
+            hook_codes::HOOK_FAILED,
+            "the hook's connection was dropped before the call was decided",
         )),
     }
 }

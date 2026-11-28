@@ -44,6 +44,11 @@
       "type": "string",
       "pattern": "^[a-z]+(-[a-z]+)*$"
     },
+    "hook_key": {
+      "description": "`pre-tool-use`: the attempt's hook key, from rlxd-hook's [`HOOK_KEY_ENV`] (5.1), 64\nhex digits. Only a `pre-tool-use` carries one. It is a secret: rlxd never logs,\npublishes or forwards it, and this type's `Debug` doesn't show it.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "run_id": {
       "description": "`pre-tool-use --run`: the run whose tool call this is (5.1).",
       "type": "string",
