@@ -1007,6 +1007,14 @@ def _helper_holds(lock: Path) -> bool:
 
 _CLAIM_KEYS = ("id", "kind", "pid", "helper_pid", "since", "log")
 
+#: How long :func:`restart_when_gone` waits for its helper's claim, whole, before it goes
+#: on: a Python takes its time to start on a loaded or Windows machine.
+CLAIM_WAIT_SECONDS = 10.0
+
+#: Tests only: how long a helper waits between creating its claim's file and writing it,
+#: to show no reader ever sees one half-written. Rides in the helper's payload.
+_CLAIM_GAP_SECONDS = 0.0
+
 
 def restart_when_gone(daemon: daemons_core.Daemon) -> Path:
     """Starts a detached helper that waits (up to :data:`RESTART_WHEN_GONE_SECONDS`) for
@@ -1021,14 +1029,62 @@ def restart_when_gone(daemon: daemons_core.Daemon) -> Path:
         "cwd": daemon.cwd,
         "wait": RESTART_WHEN_GONE_SECONDS,
         "grace": RESTART_GRACE_SECONDS,
+        "claim_gap": _CLAIM_GAP_SECONDS,
     }
     helper = [sys.executable, "-P", "-m", __name__, _RESTART_WHEN_GONE, json.dumps(payload)]
     spawn_detached(helper, None)
     claim = restarts_dir() / f"{daemon.id}.json"
-    deadline = time.monotonic() + 5.0
-    while not claim.exists() and time.monotonic() < deadline:
+    deadline = time.monotonic() + CLAIM_WAIT_SECONDS
+    while _claim_helper_pid(claim) is None and time.monotonic() < deadline:
         time.sleep(0.05)
     return restarts_dir() / RESTART_LOG
+
+
+def _claim_helper_pid(claim: Path) -> int | None:
+    """The helper pid ``claim`` names, once it is there whole: ``None`` until then."""
+    try:
+        said = _json_object(claim.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    pid = said.get("helper_pid")
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+
+
+def _write_claim(claim: Path, said: dict[str, Any], gap: float) -> None:
+    """Writes a helper's claim whole: into a file of its own beside it (made new, a link
+    planted at its name not followed), then moved over the claim's name in one step, so a
+    reader finds the whole claim or none, never one made and not yet written. Only the
+    helper that holds the claim's lock (:func:`_claim`, which is what makes it one helper
+    per daemon) writes it, so the move takes the place of nothing but a claim a helper that
+    was killed left behind. ``gap`` (tests only) waits between making the file and writing
+    it."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    temp = claim.with_name(f".{claim.stem}.{os.getpid()}.tmp")
+    temp.unlink(missing_ok=True)  # one this pid's earlier owner left
+    handle = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow, 0o600)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            if gap > 0:
+                time.sleep(gap)
+            json.dump(said, out)
+        _replace(temp, claim)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+
+
+def _replace(source: Path, target: Path) -> None:
+    """``os.replace``, tried again for a moment while Windows refuses it: a reader that has
+    ``target`` open (Python opens files without sharing their deletion) blocks the move."""
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if sys.platform != "win32" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def _say_in_log(log: Path, line: str) -> None:
@@ -1092,13 +1148,11 @@ def _helper(argv: Sequence[str]) -> int:
     if held is None:
         _say_in_log(log, f"another helper waits for {kind} (record {record_id}): nothing to do")
         return 0
-    no_follow = getattr(os, "O_NOFOLLOW", 0)
-    with os.fdopen(
-        os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | no_follow, 0o600),
-        "w",
-        encoding="utf-8",
-    ) as out:
-        json.dump(said, out)
+    try:
+        _write_claim(claim, said, float(payload.get("claim_gap", 0.0)))
+    except BaseException:
+        os.close(held)
+        raise
     try:
         _say_in_log(log, f"waiting for {kind} (record {record_id}, pid {pid}) to end")
         deadline = time.monotonic() + float(payload.get("wait", RESTART_WHEN_GONE_SECONDS))

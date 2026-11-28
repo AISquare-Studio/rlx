@@ -1161,6 +1161,102 @@ def test_the_helper_is_shown_logs_each_step_and_starts_rlxd_once(fake: Daemons, 
     assert upgrade_daemons.pending_restarts() == ()
 
 
+class _ClaimWatch:
+    """Reads the helpers' claims over and over while it runs, as ``upgrade --check`` and
+    the upgrade's end may at any moment: each one it ever saw without its helper pid, and
+    the most claims it saw at once."""
+
+    def __init__(self) -> None:
+        self.half_written: list[object] = []
+        self.most = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+
+    def __enter__(self) -> _ClaimWatch:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    def _watch(self) -> None:
+        folder = upgrade_daemons.restarts_dir()
+        while not self._stop.is_set():
+            for entry in upgrade_daemons.pending_restarts():
+                if not isinstance(entry["helper_pid"], int):
+                    self.half_written.append(entry)
+            claims = list(folder.glob("*.json")) if folder.is_dir() else []
+            self.most = max(self.most, len(claims))
+            for claim in claims:
+                try:
+                    text = claim.read_text(encoding="utf-8")
+                except OSError:  # gone (its helper ended) or being moved into place
+                    continue
+                if upgrade_daemons._claim_helper_pid(claim) is None and claim.exists():
+                    self.half_written.append(text)
+            time.sleep(0.005)
+
+
+def test_a_reader_never_sees_a_claim_without_its_helper_pid(
+    fake: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#41 (ci.yml 46129582919): a helper's claim was made, then written, and a reader in
+    between read it empty (``helper_pid`` None). Now it is moved into place whole, and
+    restart_when_gone waits for it: under a forced second between the claim's file being
+    made and written, no reader ever sees one without its helper pid."""
+    monkeypatch.setattr(upgrade_daemons, "_CLAIM_GAP_SECONDS", 1.0)
+    with _ClaimWatch() as watch:
+        began = time.monotonic()
+        old, _ = _given_up_on(fake)
+        took = time.monotonic() - began
+        pending = upgrade_daemons.pending_restarts()
+    assert watch.half_written == [], watch.half_written
+    assert len(pending) == 1, pending
+    assert isinstance(pending[0]["helper_pid"], int), pending
+    assert pending[0]["id"] == old.id
+    assert took >= 1.0, "restart_when_gone waited for the claim, whole"
+    assert list(upgrade_daemons.restarts_dir().glob("*.tmp")) == []
+    (fake.dir / "stuck-rlxd").unlink()  # rlxd finishes its stop: the helper ends
+    fake.wait_live("rlxd", not_pid=old.pid)
+
+
+def test_two_helpers_racing_for_one_daemon_give_exactly_one_claim(
+    fake: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#41: the claim's lock, not its file, makes one helper per daemon, and writing the
+    claim whole keeps that: two helpers started at once for the same daemon (each holding
+    its claim's file open a second before writing it) give exactly one claim, and the other
+    says it has nothing to do."""
+    monkeypatch.setattr(upgrade_daemons, "_CLAIM_GAP_SECONDS", 1.0)
+    old = fake.start()
+    with _ClaimWatch() as watch:
+        racing = [
+            threading.Thread(target=upgrade_daemons.restart_when_gone, args=(old,))
+            for _ in range(2)
+        ]
+        for thread in racing:
+            thread.start()
+        for thread in racing:
+            thread.join(timeout=60)
+        log = upgrade_daemons.restarts_dir() / upgrade_daemons.RESTART_LOG
+        refused = f"another helper waits for rlxd (record {old.id}): nothing to do"
+        deadline = time.monotonic() + 30
+        while refused not in (log.read_text(encoding="utf-8") if log.exists() else ""):
+            assert time.monotonic() < deadline, log.read_text(encoding="utf-8")
+            time.sleep(0.1)
+        pending = upgrade_daemons.pending_restarts()
+    assert watch.half_written == [], watch.half_written
+    assert watch.most == 1, watch.most
+    claims = list(upgrade_daemons.restarts_dir().glob("*.json"))
+    assert [claim.name for claim in claims] == [f"{old.id}.json"]
+    assert list(upgrade_daemons.restarts_dir().glob("*.tmp")) == []
+    assert len(pending) == 1 and isinstance(pending[0]["helper_pid"], int), pending
+    said = log.read_text(encoding="utf-8")
+    assert said.count(refused) == 1, said
+    assert said.count(f"waiting for rlxd (record {old.id}, pid {old.pid}) to end") == 1, said
+
+
 def test_an_rlxd_started_by_hand_while_the_helper_waits_is_the_one_kept(fake: Daemons) -> None:
     old, _ = _given_up_on(fake)
     before = upgrade_daemons._live_ids()
