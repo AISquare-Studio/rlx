@@ -43,7 +43,12 @@ pub fn home_with_scenario_file(first: &str) -> TestHome {
 
 /// [`home_with_scenario_file`], with `envs` set too.
 pub fn home_with_scenario_file_and(first: &str, envs: &[(&str, &str)]) -> TestHome {
-    let home = TestHome::new();
+    home_with_scenario_file_in(TestHome::new(), first, envs)
+}
+
+/// [`home_with_scenario_file_and`], in `home`, which may hold files its rlxd reads at
+/// its start.
+pub fn home_with_scenario_file_in(home: TestHome, first: &str, envs: &[(&str, &str)]) -> TestHome {
     let file = home.root().join("scenario");
     std::fs::write(&file, first).unwrap();
     let file = file.to_str().unwrap().to_owned();

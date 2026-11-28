@@ -43,8 +43,8 @@
 //! ```
 //!
 //! - `argv` is the whole command line, the program as rlxd named it first.
-//! - `env` holds `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` and `PATH`, those
-//!   that are set.
+//! - `env` holds `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_TMPDIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+//!   and `PATH`, those that are set.
 //! - Times are milliseconds since the first start in this home, one clock across every
 //!   start: its origin is kept in `$AISQUARE_HOME/fake-claude.clock`.
 //! - `stdin_eof_at` is when stdin closed while the scenario still ran: an early close. A
@@ -674,6 +674,7 @@ fn printable(argv: &[String]) -> Vec<Value> {
 fn recorded_env() -> serde_json::Map<String, Value> {
     [
         "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_TMPDIR",
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         "PATH",
     ]

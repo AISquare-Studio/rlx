@@ -39,3 +39,29 @@ It keeps what it saw in a temp folder it names, and writes `summary.tsv` there. 
 
 P6's "otherwise" count must be 0. P1's and P2's answers decide the route rlxd announces
 and whether hints are read; P5's whether the removal is needed.
+
+## `connector_map.sh`: each account's connectors, with no turn
+
+For task #14 (acceptance 6): rlxd's connector map on your real accounts. It makes no
+model turn and calls no connector's tool. It needs Claude Code signed in, `jq`, `uv`, and
+rlxd built with its test methods (`cargo build -p rlxd --features debug-methods`), whose
+`RLXD_TEST_*` switches turn the no-turn route on (a release build keeps it off until this
+probe has passed).
+
+```sh
+rlxd/tests/probes/connector_map.sh
+```
+
+It prints slots, connector names, kinds and statuses only: never an email, an account
+id, a login mark or a home's path. Its folder keeps only that (`summary.tsv` and
+`map.txt`); what it reads to get there (the brain's reply, the temp rlxd home, `claude mcp
+list`'s output) is in a private temp folder it deletes when it ends. Each read starts Claude Code in an empty folder of the
+probe's rlxd home with no session (`--no-session-persistence`) and project settings only,
+on that account's home, which Claude Code may update as any start of it does. M3 runs
+`claude mcp list` in each account's home, which starts each local MCP server to check it.
+
+| Step | What it finds | What rlxd does with it |
+|---|---|---|
+| M1 | The brain's `accounts` (this checkout's), read-only: the slots, and whether each has a login mark | The accounts the map holds |
+| M2 | `connectors.list {refresh: true}` through a test build of rlxd in a temp home, with `connectors.no_turn` on: `model_turns` 0, valid against `connectors.json`, and each account's connectors (name, kind, status, tool count) | The map; a release build announces `connectors.no_turn` once this matches the brief's measured table |
+| M3 | Whether user-scope local MCP servers (kind `mcp`) show up under rlxd's `--setting-sources project`, against `claude mcp list` in each account's home | Whether the map's local servers are complete |

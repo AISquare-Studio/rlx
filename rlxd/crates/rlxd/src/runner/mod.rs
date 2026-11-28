@@ -70,6 +70,7 @@ use crate::{claude, clock, spaces};
 mod argv;
 mod call;
 mod connector_gate;
+mod discover;
 mod gate;
 #[cfg(unix)]
 pub(crate) mod guard;
@@ -2025,6 +2026,7 @@ impl Runner {
             args: argv::args(params, attempt, settings),
             cwd: space.to_owned(),
             env,
+            unset: Vec::new(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,

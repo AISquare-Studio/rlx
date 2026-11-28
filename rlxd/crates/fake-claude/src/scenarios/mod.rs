@@ -14,6 +14,7 @@ pub mod gate;
 mod hello;
 mod huge;
 pub mod login;
+pub mod mcp_accounts;
 pub mod mcp_direct;
 mod orphan;
 mod persist;
@@ -64,6 +65,8 @@ pub const ALL: &[(&str, Scenario)] = &[
         connectors::play(fake, Schedule::NeedsAuth, ANSWER)
     }),
     ("init-other", connectors::other),
+    ("mcp-accounts", |fake| mcp_accounts::play(fake, false)),
+    ("mcp-accounts-old", |fake| mcp_accounts::play(fake, true)),
     ("mcp-direct", |fake| mcp_direct::play(fake, Variant::Gated)),
     ("mcp-direct-defiant", |fake| {
         mcp_direct::play(fake, Variant::Defiant)

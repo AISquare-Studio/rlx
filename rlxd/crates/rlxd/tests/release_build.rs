@@ -80,6 +80,10 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "RLXD_TEST_CONNECTORS_CALL",
         "RLXD_TEST_CALL_WAIT_MS",
         "RLXD_TEST_CALL_DEADLINE_MS",
+        "RLXD_TEST_CONNECTORS_NO_TURN",
+        "RLXD_TEST_ACCOUNTS",
+        "RLXD_TEST_CONNECTOR_MAP_MS",
+        "RLXD_TEST_CONNECTORS_SETTLE_MS",
         "RLXD_TEST_HOOK_HOLD_MS",
     ] {
         let found = bytes
@@ -117,6 +121,24 @@ fn check_7_a_release_build_has_no_debug_methods() {
         r#"{"run_id":"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f","connector":"claude.ai GitHub","tool":"mcp__claude_ai_GitHub__get_check_runs","input":{}}"#,
     ]);
     assert_eq!(call.error_code(), "no_route", "{call:?}");
+
+    // Nor does the connectors' read with no turn (task #14): no capability, and a refresh
+    // without allow_turn is no_route, even with the test build's switch set.
+    let release = TestHome::new()
+        .with_binary(release_rlxd())
+        .with_env("RLXD_TEST_CONNECTORS_NO_TURN", "1");
+    release.start();
+    let capabilities = release.status()["capabilities"].clone();
+    assert!(
+        !capabilities
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "connectors.no_turn"),
+        "{capabilities}"
+    );
+    let refresh = release.rlxd(&["call", "connectors.list", r#"{"refresh":true}"#]);
+    assert_eq!(refresh.error_code(), "no_route", "{refresh:?}");
 
     let test_build = TestHome::new();
     test_build.start();

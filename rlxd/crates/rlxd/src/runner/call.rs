@@ -64,9 +64,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rlxd_proto::{
-    CallState, ConnectorStatus, ConnectorsCallData, ConnectorsCallParams, DecidedBy, Decision,
-    ErrorBody, FailReason, McpServer, Mount, PinnedCall, RunDoneData, RunFailedData, RunId,
-    RunKind, RunRef, RunStartParams, RunStartedData, RunState, RunToolResultData, codes, run_types,
+    CallState, ConnectorState, ConnectorStatus, ConnectorsCallData, ConnectorsCallParams,
+    DecidedBy, Decision, ErrorBody, FailReason, McpServer, Mount, PinnedCall, RunDoneData,
+    RunFailedData, RunId, RunKind, RunRef, RunStartParams, RunStartedData, RunState,
+    RunToolResultData, codes, run_types,
 };
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
@@ -391,6 +392,7 @@ impl Runner {
             args: argv::call_args(),
             cwd: cwd.clone(),
             env,
+            unset: Vec::new(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -607,7 +609,20 @@ impl Runner {
                 .collect();
             match named.verdict(&servers) {
                 Verdict::Connected => break (listed_of(&rows), servers),
-                Verdict::Stopped(connectors) => return Driven::Connectors(connectors),
+                Verdict::Stopped(connectors) => {
+                    // A connector the call found signed out or failing is so in the map
+                    // too, with no refresh (task #14).
+                    blocking(|| {
+                        for connector in &connectors {
+                            let status = ConnectorState::of(&connector.status);
+                            if matches!(status, ConnectorState::NeedsAuth | ConnectorState::Failed)
+                            {
+                                self.connectors.set_status(&connector.id, status);
+                            }
+                        }
+                    });
+                    return Driven::Connectors(connectors);
+                }
                 Verdict::Missed(connectors) => last = connectors,
             }
             let next = Instant::now() + STATUS_EVERY;
@@ -1073,7 +1088,7 @@ const PROJECT_SETTINGS: [&str; 2] = ["settings.json", "settings.local.json"];
 /// or its `.claude` when that is anything but a folder: `None` when there is none. It fails
 /// closed, the same on every OS: any answer but "not there" (anything there, or an error
 /// reading it) is one.
-fn untrusted(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(super) fn untrusted(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let not_there = |path: &std::path::Path| {
         matches!(
             std::fs::symlink_metadata(path),
@@ -1105,7 +1120,7 @@ fn untrusted_message(path: &std::path::Path) -> String {
 /// The gate's listing of `mcp_status`'s `rows`: each tool as Claude Code names it
 /// (`mcp__<server>__<tool>`), each server with its source, and each tool's read-only hint
 /// where it is `readOnly: true` (`mcp_status` gives no other value: absent is a write).
-fn listed_of(rows: &[Value]) -> gate::Listed {
+pub(super) fn listed_of(rows: &[Value]) -> gate::Listed {
     let mut listed = gate::Listed::default();
     for row in rows {
         let Some(name) = row["name"].as_str() else {
@@ -1144,7 +1159,7 @@ fn lists(capabilities: &Value, name: &str) -> bool {
 }
 
 /// One message of the control channel, as the driver reads it.
-enum Message {
+pub(super) enum Message {
     /// A `control_request` of Claude Code's: its id and its `request`.
     Asked { request_id: Value, request: Value },
     /// A `control_response` to one of rlxd's: its id, and its `response` or its error.
@@ -1159,7 +1174,7 @@ enum Message {
 }
 
 impl Message {
-    fn of(message: &Value) -> Self {
+    pub(super) fn of(message: &Value) -> Self {
         match message["type"].as_str() {
             Some("control_request") => match message.get("request_id") {
                 Some(id) if !id.is_null() => Self::Asked {
