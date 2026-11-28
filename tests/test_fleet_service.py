@@ -1088,6 +1088,8 @@ def test_spawn_manager_builds_the_launch_command_and_records_the_row(
         "AISQUARE_EXPLAINABILITY_TARGET": "",  # nor a deployment override
         "AISQUARE_PERSONA": "",  # no persona: blank, never the server's (review of #201, F3)
         "AISQUARE_BOARD_CONTEXT": "all",  # the role's, per window (P1 WS-2, #279)
+        # Its own temporary directory's key, the one its launch spec records (#57).
+        "AISQUARE_TMP_KEY": agent.launch_spec.tmp_key if agent.launch_spec else None,
     }
     assert spawned["cwd"] == project.root and agent.cwd == project.root and not agent.worktree
     assert agent.pane_id == "%1" and agent.binary == "claude" and agent.spawned_by == "user"
@@ -2550,6 +2552,7 @@ def test_spawn_can_keep_native_agent_teams_on(
         "AISQUARE_EXPLAINABILITY_TARGET": "",
         "AISQUARE_PERSONA": "",
         "AISQUARE_BOARD_CONTEXT": "all",
+        "AISQUARE_TMP_KEY": agent.launch_spec.tmp_key if agent.launch_spec else None,
     }
 
 

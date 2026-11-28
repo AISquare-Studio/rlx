@@ -29,6 +29,7 @@ import aisquare
 from aisquare.core import agents as agent_core
 from aisquare.core import code_index, experimental, insights, instance_scan, login_session, program
 from aisquare.core.paths import HOME_ENV_VAR
+from aisquare.core.spawn import OUTER_TMPDIR_ENV
 from aisquare.core.state import reset_state
 from aisquare.models import ProjectInfo
 from aisquare.services import ci_client
@@ -560,6 +561,16 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Cached once per process (core.agents.current_install), and tests change what it
     # reads: the interpreter (sys.executable) and the distribution's RECORD on sys.path.
     agent_core.current_install.cache_clear()
+    # A launch run in-process points THIS process at its agent's own temporary directory
+    # (`agent_tmp.prepare`, #57), as the real launcher does before it execs: each variable
+    # and tempfile's cached answer go back to what they were after every test.
+    for var in ("TMPDIR", "TEMP", "TMP", OUTER_TMPDIR_ENV):
+        if var in os.environ:
+            monkeypatch.setenv(var, os.environ[var])
+        else:
+            monkeypatch.setenv(var, "")
+            monkeypatch.delenv(var)
+    monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir)
     return home
 
 

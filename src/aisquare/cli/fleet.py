@@ -1631,6 +1631,7 @@ def reap(
                     "claims_released": list(report.claims_released),
                     "release_failures": list(report.release_failures),
                     "held": [_row_json(row) for row in report.held],
+                    "temp_dirs_removed": [str(p) for p in report.temp_dirs_removed],
                 }
             )
         )
@@ -1657,6 +1658,8 @@ def reap(
         console.print(f"  ⚠ {row.agent.label}  LEFT LIVE — {row.reason}")
     for path in report.worktrees_removed:
         console.print(f"  🗑 {path}")
+    for path in report.temp_dirs_removed:
+        console.print(f"  🗑 {path} (an ended agent's temporary directory)")
     for root, branch in report.branches_deleted:
         console.print(f"  🗑 branch {branch} in {root}")
     for root, branch in report.branches_kept:

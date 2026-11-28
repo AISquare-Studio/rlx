@@ -105,7 +105,7 @@ from aisquare.core.config import (
 from aisquare.core.ids import new_agent_id
 from aisquare.core.locking import holding
 from aisquare.core.process_table import PaneProcesses
-from aisquare.core.spawn import git_env, untraced_env
+from aisquare.core.spawn import TMP_KEY_ENV, git_env, untraced_env
 from aisquare.core.store import (
     FLEET_RENAMED,
     RETIRED_LABEL,
@@ -155,6 +155,7 @@ from aisquare.models import (
 from aisquare.services import (
     agent_events,
     agent_launch,
+    agent_tmp,
     auto_mode,
     autostop,
     delivery,
@@ -578,6 +579,8 @@ class ReapReport:
     socket file taken from under its server or a socket that could not be asked
     (:func:`_hold_on_absent_server`). The reason says which. Said as ``shutdown`` says a row
     it left live (follow-up of #257; review of #259, round 5)."""
+    temp_dirs_removed: list[Path] = field(default_factory=list)
+    """Ended agents' own temporary directories removed (:func:`agent_tmp.sweep_ended`, #57)."""
 
 
 @dataclass(frozen=True)
@@ -6462,7 +6465,12 @@ def spawn(
                 else models.added.effort
             ),
             board_context=reads,
+            # Its own temporary directory: a replay's (a restart, a switch, a resume) is the
+            # one it had; a new agent's, a fork's included, is new (#57).
+            tmp_key=agent_tmp.key_for(spec, fork=fork),
         )
+        if launch_spec.tmp_key is not None:
+            env[TMP_KEY_ENV] = launch_spec.tmp_key
         if session is not None:
             # The predecessor's start is not this launch's: its own hook says when it started.
             session = session.model_copy(update={"started_at": None})
@@ -10298,7 +10306,12 @@ def _end_dead_rows(
     reaches on the same name is another, and a dead ``%N`` there ended a live row under its
     running agent (round 28 of #257). Where its launch record places it: a row no record
     places has no view, and is ended by nothing here.
+
+    Every read also sweeps the ended agents' own temporary directories, at most once a
+    minute per process (:func:`agent_tmp.maybe_sweep_ended`, #57): it opens nothing while no agent
+    has one, and fails open.
     """
+    agent_tmp.maybe_sweep_ended()
     dead = [
         (placement.row, pane)
         for placement in placements
@@ -18470,6 +18483,10 @@ def reap(project: ProjectInfo | None = None, *, server_down: bool = False) -> Re
         launch_seal.forget_row_windows(project_id, rows)
     for ended in waking:  # only an exit that wakes is nudged (P1 WS-2, #279)
         nudge_manager(ended.project_id, reason=f"{ended.label} exited", board=_board_of_row(ended))
+    # Every ended agent's own temporary directory, the whole home's (#57): a sweep that fails
+    # costs nothing but the sweep, never the reap.
+    with suppress(Exception):
+        report.temp_dirs_removed.extend(agent_tmp.sweep_ended())
     return report
 
 

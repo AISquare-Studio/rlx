@@ -28,6 +28,7 @@ until `rlx upgrade` moves it ([Moving a home from before 0.10.2](#moving-a-home-
   watch/                    what the watcher keeps
   logs/
   cache/                    regenerable: each account's scratch, the usage readings' cache
+  tmp/<key>/                each agent's own TMPDIR, removed when the agent ends
 ```
 
 Some folders are the same in both layouts and not listed above: `briefs/`, `reports/`,

@@ -387,13 +387,17 @@ def repo_of(cwd: Path | None) -> tuple[str, Path] | None:
 
 def _ephemeral_roots() -> tuple[Path, ...]:
     """Directories whose repositories are throwaways: the system's temporary folders and the
-    scratch space aisquare and Claude Code keep under the home (the cache, benchmark runs)."""
+    scratch space aisquare and Claude Code keep under the home (the cache, benchmark runs,
+    the agents' own temporary directories)."""
     candidates = {
         Path(tempfile.gettempdir()),
         Path("/tmp"),
         Path("/var/tmp"),
         paths.cache_dir(),
         paths.bench_dir(),
+        # Every agent's own TMPDIR (#57): a process outside the agent reads them as it reads
+        # the system's temporary folder.
+        paths.agent_tmp_root(),
     }
     roots: set[Path] = set()
     for candidate in candidates:
