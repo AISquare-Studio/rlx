@@ -120,10 +120,10 @@ pub fn hook_env_forwarded(name: &str) -> bool {
 }
 
 /// The `hook.*` event type of a hook named as rlxd-hook's command line names it:
-/// `session-start` is `hook.session_start`.
+/// `session-start` is `hook.session_start`. None for `pre-tool-use`: the gate answers it
+/// and publishes no hook event for it (5.1).
 pub fn event_type(event: &str) -> Option<String> {
-    HOOK_EVENTS
-        .contains(&event)
+    (HOOK_EVENTS.contains(&event) && event != PRE_TOOL_USE)
         .then(|| format!("hook.{}", event.replace('-', "_")))
 }
 
@@ -601,10 +601,8 @@ mod tests {
             event_type("session-start").as_deref(),
             Some("hook.session_start")
         );
-        assert_eq!(
-            event_type("pre-tool-use").as_deref(),
-            Some("hook.pre_tool_use")
-        );
+        // The gate's: answered, never published.
+        assert_eq!(event_type("pre-tool-use"), None);
         assert_eq!(event_type("codex"), None);
         assert_eq!(HOOK_EVENTS.len(), 7);
     }
