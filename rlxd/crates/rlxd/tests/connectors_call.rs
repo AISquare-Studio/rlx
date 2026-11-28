@@ -1102,3 +1102,66 @@ fn a_call_whose_result_never_comes_is_killed_and_left_unknown() {
     assert_eq!(calls.len(), 1, "{calls:#?}");
     assert_eq!(calls[0]["state"], "unknown");
 }
+
+#[test]
+fn a_call_starts_the_apps_claude_with_its_environment() {
+    // rlxd with no RLXD_CLAUDE_BIN, so it starts the `claude` the app's PATH resolves to
+    // (4.3): `<home>/bin/claude`, fake-claude playing `mcp-direct` by its scenario file.
+    let home = TestHome::new().with_own_user();
+    let file = home.root().join("scenario");
+    std::fs::write(&file, "mcp-direct").unwrap();
+    let home = home
+        .with_env("FAKE_CLAUDE_SCENARIO_FILE", file.to_str().unwrap())
+        .with_env(ON.0, ON.1);
+    let mut serve = home.command(&["serve", "--detach", "--gate-dev-mode"]);
+    serve
+        .env_remove("RLXD_CLAUDE_BIN")
+        .stdin(std::process::Stdio::null());
+    let started = common::run(serve, None);
+    assert_eq!(started.code(), Some(0), "{started:?}");
+    let bin = home.root().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join(if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    });
+    let fake = std::path::Path::new(env!("CARGO_BIN_EXE_fake-claude"));
+    if std::fs::hard_link(fake, &claude).is_err() {
+        std::fs::copy(fake, &claude).unwrap();
+    }
+    let config = home.root().join("cc-app");
+    std::fs::create_dir_all(&config).unwrap();
+    let mut dirs = vec![bin.clone()];
+    dirs.extend(home.path_without_real_claude());
+    let path = std::env::join_paths(dirs).unwrap();
+    let (path, config) = (path.to_str().unwrap(), config.to_str().unwrap());
+    let app_sets = |change: Value| {
+        let run = home.rlxd(&["call", "--as-app", "env.set", &change.to_string()]);
+        assert_eq!(run.code(), Some(0), "{run:?}");
+        common::eventually("the app's call is gone", || home.app_clients() == 0);
+    };
+    app_sets(json!({"PATH": path, "CLAUDE_CONFIG_DIR": config}));
+
+    // With no app the call is denied, but its Claude Code started: the app's claude, by
+    // the path resolved when the app set PATH, with the app's values, raw.
+    let r = run_id();
+    let run = call(&home, &accept_params(&r));
+    assert_eq!(refusal(&run).0, "denied", "{run:?}");
+    let start = the_start(&home);
+    assert_eq!(start["argv"][0], claude.display().to_string(), "{start:#}");
+    assert_eq!(start["env"]["CLAUDE_CONFIG_DIR"], config, "{start:#}");
+    assert_eq!(start["env"]["PATH"], path, "{start:#}");
+
+    // With no claude on the app's PATH, the call is refused, saying where rlxd looked, and
+    // nothing starts.
+    let empty = home.root().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    app_sets(json!({"PATH": empty.to_str().unwrap()}));
+    let run = call(&home, &accept_params(&run_id()));
+    assert_eq!(run.code(), Some(1), "{run:?}");
+    assert_eq!(run.error_code(), "claude_not_found", "{run:?}");
+    let message = run.json()["error"]["message"].as_str().unwrap().to_owned();
+    assert!(message.contains("on the app's PATH"), "{message}");
+    the_start(&home);
+}
