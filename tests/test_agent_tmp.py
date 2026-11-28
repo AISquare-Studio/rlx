@@ -478,10 +478,14 @@ def test_a_sandboxed_codex_may_write_its_own_tmpdir_in_the_home_it_holds_read_on
     """Review of #643, the MAJOR: under the store's profile a sandboxed Codex holds the whole
     rlx home read-only, and its TMPDIR is in it. Its own directory is writable within (the
     more specific path winning, as its broker's inbox is), to every seat; its owner record
-    stays read-only; another TMPDIR adds nothing."""
+    stays read-only; another TMPDIR adds nothing.
+
+    The env names it as a launch does here (:func:`agent_tmp.prepare`): ``TMPDIR`` on POSIX,
+    ``TEMP`` and ``TMP`` on Windows, where Codex runs under the same profile (CI on 3e689512
+    set ``TMPDIR`` alone, which no Windows launch does)."""
     monkeypatch.chdir(tmp_path)
     mine = paths.agent_tmp_dir("abc234").resolve() if own else tmp_path / "T"
-    env = {"AISQUARE_LAUNCH_ID": "launch-57", "TMPDIR": str(mine)}
+    env = {"AISQUARE_LAUNCH_ID": "launch-57", **dict.fromkeys(agent_tmp.VARS, str(mine))}
     codex = get_adapter("codex")
     argv = (
         ["codex", *codex.store_access(seat, store_dir())]  # type: ignore[arg-type]
