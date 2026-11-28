@@ -49,6 +49,7 @@ mod claude;
 mod cli;
 mod clock;
 mod config;
+mod connectors;
 mod durable;
 mod events;
 mod files;
@@ -175,6 +176,11 @@ enum Action {
         )]
         argv: Vec<std::ffi::OsString>,
     },
+    /// The connectors' probe's hook (handoff 0.10.3, 5.3): denies the tool call Claude
+    /// Code hands it, by rlxd, and opens no connection. rlxd's probe names it; nobody
+    /// else does.
+    #[command(name = "__probe-deny", hide = true)]
+    ProbeDeny,
     /// Test builds only: a run's hook, as rlxd-hook's will be: asks rlxd's gate about the
     /// call on stdin (`debug.pre_tool_use`), and prints its answer, or a deny.
     #[cfg(feature = "debug-methods")]
@@ -338,6 +344,7 @@ pub fn main() -> ExitCode {
         } => serve::serve(background, gate_dev_mode),
         Action::Status { json } => cli::status(json),
         Action::Stop => cli::stop(),
+        Action::ProbeDeny => runner::probe_deny(),
         Action::Licenses => {
             print!("{THIRD_PARTY_NOTICES}");
             ExitCode::SUCCESS

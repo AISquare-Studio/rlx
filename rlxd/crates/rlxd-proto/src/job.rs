@@ -209,10 +209,10 @@ impl JsonSchema for RunTemplate {
 ///  "input": {"ref": "main"}, "catch_up": "skip", "enabled": true}
 /// ```
 ///
-/// rlxd refuses, by error code: `kind_mount_mismatch`, `pinned_call_required` and
-/// `not_implemented` (a `needs_connectors`) for a template `run.start` would refuse;
-/// `invalid_params` for anything else, an unknown field, a cron expression it can't read,
-/// a time zone it doesn't know, or a watch job's tool that isn't its connector's included.
+/// rlxd refuses, by error code: `kind_mount_mismatch` and `pinned_call_required` for a
+/// template `run.start` would refuse; `invalid_params` for anything else, an unknown
+/// field, a cron expression it can't read, a time zone it doesn't know, or a watch job's
+/// tool that isn't its connector's included.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(title = "JobPutParams")]

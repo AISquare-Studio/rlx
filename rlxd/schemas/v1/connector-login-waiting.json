@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorLoginWaiting",
+  "description": "`connector.login.waiting`: `{login_id}`.",
+  "type": "object",
+  "properties": {
+    "login_id": {
+      "description": "The login.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "login_id"
+  ]
+}

@@ -1036,8 +1036,29 @@ fn a_hook_connection_dropped_mid_call_fails_closed() {
     let since = seq(&home);
     let r = start(&home, &task("slack-send"));
     calls_out(&home, since, &r, 1);
-    let dropped = call(&home, "debug.drop_hook_connections", &json!({}));
-    assert_eq!(dropped["dropped"], 1, "{dropped}");
+    // The gate publishes run.tool_call just before the hook's connection starts waiting on
+    // it, and a drop ends only the connections waiting then: a drop that comes between ends
+    // nothing (`{"dropped": 0}`, #2840). So drop until it ends the one connection. A drop
+    // counts the connections as it starts, so one that began waiting in that same instant
+    // is ended uncounted: then its decision comes, and is checked below like any other.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (dropped, uncounted) = loop {
+        let dropped = call(&home, "debug.drop_hook_connections", &json!({}));
+        if dropped["dropped"] != 0 {
+            break (dropped, false);
+        }
+        if !decided(&replay(&home, since), &r).is_empty() {
+            break (dropped, true);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hook's connection never waited"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    if !uncounted {
+        assert_eq!(dropped["dropped"], 1, "{dropped}");
+    }
     // Decided by rlxd as the connection ends, not left for the run's end.
     let events = wait_until(&home, since, 30, "the dropped call's decision", |e| {
         !decided(e, &r).is_empty()

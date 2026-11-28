@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorLoginError",
+  "description": "`connector.login.error`: `{login_id, code, message}`.",
+  "type": "object",
+  "properties": {
+    "code": {
+      "description": "Why it failed.",
+      "$ref": "#/$defs/LoginErrorCode"
+    },
+    "login_id": {
+      "description": "The login.",
+      "type": "string",
+      "minLength": 1
+    },
+    "message": {
+      "description": "What happened, for a person.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "login_id",
+    "code",
+    "message"
+  ],
+  "$defs": {
+    "LoginErrorCode": {
+      "description": "Why a login failed.",
+      "oneOf": [
+        {
+          "description": "Claude Code was not found.",
+          "type": "string",
+          "const": "claude_not_found"
+        },
+        {
+          "description": "It printed no URL to open.",
+          "type": "string",
+          "const": "no_url"
+        },
+        {
+          "description": "The URL it printed is not `https://`: rlxd doesn't pass it on.",
+          "type": "string",
+          "const": "not_https"
+        },
+        {
+          "description": "It ended without signing in.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "It took longer than rlxd waits.",
+          "type": "string",
+          "const": "timed_out"
+        }
+      ]
+    }
+  }
+}

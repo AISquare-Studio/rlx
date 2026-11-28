@@ -31,6 +31,10 @@
 //!   holds every event in `run_seq` order, and a slow disk under one run holds up no
 //!   other run and no other topic: the bus's lock is held only in memory, and the
 //!   runner's never across a write.
+//! - **The connector gate** (5.5, [`gate`]): a run with `needs_connectors` makes up to
+//!   three tries, each its own Claude Code, and starts no turn until each named
+//!   connector is `connected`. Each `system/init` taken as a run's truth updates the
+//!   connectors' cache ([`crate::connectors`]).
 //! - **Claude Code's environment** is rlxd's own ([`run_env`] is where the app's `PATH`
 //!   and config directories plug in, 4.3). `RLXD_CLAUDE_BIN` is read from rlxd's own
 //!   environment only, when each attempt starts; no client names the program.
@@ -59,19 +63,24 @@ use tokio::process::{ChildStderr, ChildStdin};
 use tokio::sync::watch;
 
 use crate::bus::{self, Bus};
+use crate::connectors::Connectors;
 use crate::log::{info, warning};
 use crate::{claude, clock, spaces};
 
 mod argv;
+mod connector_gate;
 mod gate;
 #[cfg(unix)]
 pub(crate) mod guard;
 pub(crate) mod jcs;
+mod probe;
 mod process;
 mod remove;
 mod store;
 mod stream;
 
+use connector_gate::{Gate, Verdict};
+pub use probe::probe_deny;
 use process::{Launch, Spawner, Tree};
 use store::{Record, RunDir};
 use stream::Line;
@@ -138,6 +147,8 @@ pub use gate::{Ask, HOOK_KEY_ENV, output as hook_output};
 pub struct Runner {
     home: Home,
     bus: Arc<Bus>,
+    /// The connectors' cache, which each run's `system/init` updates.
+    connectors: Arc<Connectors>,
     spawner: Spawner,
     /// `rlxd-hook` beside this rlxd, which each run's settings name, or why it can't be
     /// named: then `run.start` refuses `hook_not_found`.
@@ -167,6 +178,10 @@ pub struct Runner {
     runs: Mutex<Runs>,
     /// Set once rlxd stops: no run starts from then on.
     stopping: AtomicBool,
+    /// Held while the connectors' probe runs: one at a time.
+    probing: tokio::sync::Mutex<()>,
+    /// The probe's tree while it runs, for rlxd's stop to end.
+    probe_tree: Mutex<Option<Arc<Tree>>>,
     /// The app gate's connections, as the gate counts them ([`Runner::follow_apps`]).
     apps: std::sync::OnceLock<watch::Receiver<u32>>,
     /// Test builds only: bumped to end every hook connection waiting on the gate
@@ -288,6 +303,9 @@ struct RunInner {
     reply: Option<String>,
     /// The `needs_you.raised` the run has out, to clear when it goes on or ends.
     needs_you: Option<String>,
+    /// The connectors its `needs_you {reason: "auth"}` waits on (5.5): it is cleared,
+    /// too, once each is `connected` again. Empty when it has none out.
+    auth: Vec<String>,
     /// Events appended to the log since its last fsync.
     unsynced: u32,
     /// The last `run_seq` in the run's log: an event whose append failed is not counted,
@@ -346,6 +364,36 @@ enum End {
     Failed(RunFailedData),
 }
 
+/// How one try of an attempt ended.
+enum Tried {
+    /// The attempt's end.
+    End(End),
+    /// A gated try that was not confirmed (see [`Streamed::Missed`]).
+    Missed {
+        connectors: Vec<rlxd_proto::ConnectorStatus>,
+        stop: bool,
+        init: Option<stream::Init>,
+    },
+}
+
+/// Writes the first user message to Claude Code.
+async fn send(stdin: &mut ChildStdin, first: &str) -> std::io::Result<()> {
+    stdin.write_all(first.as_bytes()).await?;
+    stdin.flush().await
+}
+
+/// What a read of Claude Code's output that failed says.
+fn read_error(e: &stream::ReadError) -> String {
+    match e {
+        stream::ReadError::TooLong => format!(
+            "line_too_long: Claude Code wrote a stream-json line longer than {} bytes, which \
+             rlxd does not read",
+            stream::MAX_LINE
+        ),
+        stream::ReadError::Io(e) => format!("Claude Code's output could not be read: {e}"),
+    }
+}
+
 /// What `resume` says a Claude Code told to go on, when the app sends no reply.
 const CONTINUE: &str = "Continue.";
 
@@ -353,6 +401,13 @@ const CONTINUE: &str = "Continue.";
 enum Streamed {
     /// Its `result`, and its stdin, still open.
     Result(stream::Outcome, ChildStdin),
+    /// A gated try that was not confirmed: the named connectors not connected, whether
+    /// another try may find them (`stop` when not), and the `system/init` it read.
+    Missed {
+        connectors: Vec<rlxd_proto::ConnectorStatus>,
+        stop: bool,
+        init: Option<stream::Init>,
+    },
     /// rlxd ended it, for this reason.
     Ended(FailReason),
     /// It could not go on: why.
@@ -369,7 +424,7 @@ impl Runner {
     /// "engine_restarted"}`, after its process tree, if it still runs, is killed: its
     /// leader's pid is killed only when the process with that pid started when the
     /// record says, so a pid the OS has given another process since is left alone.
-    pub fn new(home: Home, bus: Arc<Bus>) -> Arc<Self> {
+    pub fn new(home: Home, bus: Arc<Bus>, connectors: Arc<Connectors>) -> Arc<Self> {
         let rlxd = std::env::current_exe().ok();
         // An erase holds a folder open per level it is down.
         #[cfg(unix)]
@@ -379,6 +434,7 @@ impl Runner {
         let runner = Arc::new(Self {
             home,
             bus,
+            connectors,
             spawner: Spawner::start(),
             hook: argv::hook_beside(rlxd.as_deref()),
             launch_delay: test_delay("RLXD_TEST_LAUNCH_DELAY_MS"),
@@ -390,6 +446,8 @@ impl Runner {
             resume_delay: test_delay("RLXD_TEST_RESUME_DELAY_MS"),
             runs: Mutex::new(Runs::default()),
             stopping: AtomicBool::new(false),
+            probing: tokio::sync::Mutex::new(()),
+            probe_tree: Mutex::new(None),
             apps: std::sync::OnceLock::new(),
             #[cfg(feature = "debug-methods")]
             hooks_dropped: watch::Sender::new(0),
@@ -400,6 +458,12 @@ impl Runner {
             notes: std::sync::OnceLock::new(),
         });
         runner.load();
+        let told = Arc::downgrade(&runner);
+        runner.connectors.on_connected(Box::new(move |connected| {
+            if let Some(runner) = told.upgrade() {
+                runner.signed_in(connected);
+            }
+        }));
         runner
     }
 
@@ -504,7 +568,13 @@ impl Runner {
             if lost.is_none() {
                 last_run_seq += skip;
             }
-            let needs_you = (record.state == RunState::NeedsYou)
+            // A failed run's sign-in needs-you stays out until its connectors are back.
+            let auth = if record.state == RunState::Failed {
+                record.auth.clone()
+            } else {
+                Vec::new()
+            };
+            let needs_you = (record.state == RunState::NeedsYou || !auth.is_empty())
                 .then(|| format!("run:{id}:{}", record.attempt));
             let run = Arc::new(Run {
                 job_id: record.job_id.clone(),
@@ -531,6 +601,7 @@ impl Runner {
                     last_line: tail.last_line.map(bus::Line::from),
                     reply: None,
                     needs_you,
+                    auth,
                     unsynced: 0,
                     logged: tail.last_run_seq,
                     // A call still executing when its rlxd stopped may have run: unknown.
@@ -651,9 +722,8 @@ impl Runner {
 
     /// `run.start`: the run is recorded, and started or queued. Refused with
     /// `kind_mount_mismatch`, `pinned_call_required` (only that it is there: the gate
-    /// enforces it, 5.1), `not_implemented` for a non-empty `needs_connectors` (until
-    /// 5.5), `run_exists`, or `run_start_failed` when rlxd is stopping or the run's record
-    /// can't be written.
+    /// enforces it, 5.1), `run_exists`, or `run_start_failed` when rlxd is stopping or the
+    /// run's record can't be written.
     pub fn start(
         self: &Arc<Self>,
         params: RunStartParams,
@@ -748,6 +818,7 @@ impl Runner {
                 last_line: None,
                 reply: None,
                 needs_you: None,
+                auth: Vec::new(),
                 unsynced: 0,
                 logged: 0,
                 session_started: false,
@@ -1366,6 +1437,14 @@ impl Runner {
     /// "engine_restarted"}`, which `run.resume` goes on from.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        if let Some(tree) = self
+            .probe_tree
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            tree.kill();
+        }
         for run in self.snapshot() {
             let mut inner = run.inner();
             if !inner.state.is_live() {
@@ -1440,6 +1519,7 @@ impl Runner {
             return false;
         }
         let mut question = None;
+        let mut auth = Vec::new();
         let (state, r#type, data) = match end {
             End::Done(done) => {
                 inner.session.clone_from(&done.session);
@@ -1456,11 +1536,20 @@ impl Runner {
                     serde_json::to_value(&needs),
                 )
             }
-            End::Failed(failed) => (
-                RunState::Failed,
-                run_types::FAILED,
-                serde_json::to_value(&failed),
-            ),
+            End::Failed(failed) => {
+                auth = failed
+                    .connectors
+                    .iter()
+                    .flatten()
+                    .filter(|c| c.status == rlxd_proto::ConnectorState::NeedsAuth.as_str())
+                    .map(|c| c.id.clone())
+                    .collect::<Vec<_>>();
+                (
+                    RunState::Failed,
+                    run_types::FAILED,
+                    serde_json::to_value(&failed),
+                )
+            }
         };
         // A needs-you that was out is settled by any end, a new needs-you included.
         self.clear_needs_you(inner);
@@ -1492,6 +1581,24 @@ impl Runner {
             let raised = NeedsYouRaisedData::run(&id, run.params.run_id.as_str(), reason, text);
             self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
             inner.needs_you = Some(id);
+        }
+        if !auth.is_empty() {
+            // A connector's sign-in lapsed (5.5). Raised before run.failed, as a question
+            // is, and kept in the run's record. The user signs it in again
+            // (`connectors.login`, or Claude Code itself), and once rlxd sees each
+            // connector `connected` again (the login's end, or a later system/init) it is
+            // cleared ([`Runner::signed_in`]); a resume or the space's erase clears it
+            // too. A run that never reached run.started has no session to resume
+            // (`no_session`): a new run is the way on.
+            let id = format!("run:{}:{}", run.params.run_id, inner.attempt);
+            let text = format!(
+                "Sign in again to {}: its sign-in has lapsed.",
+                auth.join(", ")
+            );
+            let raised = NeedsYouRaisedData::run(&id, run.params.run_id.as_str(), "auth", text);
+            self.publish_needs_you(run_types::NEEDS_YOU_RAISED, &raised);
+            inner.needs_you = Some(id);
+            inner.auth = auth;
         }
         let published = match data {
             Ok(Value::Object(data)) => self.publish(run, inner, r#type, data, Durability::State),
@@ -1542,8 +1649,29 @@ impl Runner {
 
     /// Clears the `needs_you.raised` the run has out, if it has one.
     fn clear_needs_you(&self, inner: &mut RunInner) {
+        inner.auth.clear();
         if let Some(id) = inner.needs_you.take() {
             self.publish_needs_you(run_types::NEEDS_YOU_CLEARED, &NeedsYouClearedData::new(id));
+        }
+    }
+
+    /// Clears each failed run's `needs_you {reason: "auth"}` whose connectors are all
+    /// among `connected` (5.5): their sign-in is back. Called with no run's lock held.
+    fn signed_in(&self, connected: &[String]) {
+        for run in self.snapshot() {
+            let mut inner = run.inner();
+            if inner.auth.is_empty() || !inner.auth.iter().all(|id| connected.contains(id)) {
+                continue;
+            }
+            info!(
+                "run {}: its connectors are signed in again; its needs-you is cleared",
+                run.params.run_id
+            );
+            self.clear_needs_you(&mut inner);
+            let record = run.record(&inner);
+            if let Err(e) = blocking(|| run.dir.write_record(&record)) {
+                warning!("run {}: its record was not written: {e}", run.params.run_id);
+            }
         }
     }
 
@@ -1635,6 +1763,218 @@ impl Runner {
         if let Some(reason) = ending {
             return ended_early(run, reason);
         }
+        let gate = self.gate_of(params);
+        let deadline = params
+            .timeout_s
+            .map(|s| Instant::now() + Duration::from_secs(s));
+        // What a missed try may add to the session, to take back: a resumed attempt's
+        // session as it was before its first try.
+        let kept = gate
+            .as_ref()
+            .map(|_| self.session_kept(run, &space, attempt));
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let mut confirmed = false;
+            let end = match self
+                .try_once(
+                    run,
+                    attempt,
+                    &program,
+                    &space,
+                    &settings,
+                    gate.as_ref(),
+                    deadline,
+                    &mut confirmed,
+                )
+                .await
+            {
+                Tried::End(end) => {
+                    // A gated try that ended before its connectors were confirmed (a
+                    // cancel, the timeout, rlxd stopping, a broken read, Claude Code's
+                    // exit) is taken back as a miss is: on route 2 it may have written
+                    // the undelivered message to the session.
+                    if !confirmed && let Some(kept) = &kept {
+                        blocking(|| self.forget_try(run, kept));
+                    }
+                    end
+                }
+                Tried::Missed {
+                    connectors,
+                    stop,
+                    init,
+                } => {
+                    info!(
+                        "run {}: try {tries} of {}: {}",
+                        params.run_id,
+                        connector_gate::TRIES,
+                        connector_gate::failure_message(&connectors, tries)
+                    );
+                    if let Some(kept) = &kept {
+                        blocking(|| self.forget_try(run, kept));
+                    }
+                    if !stop && tries < connector_gate::TRIES {
+                        if let Some(reason) = self
+                            .back_off(run, connector_gate::backoff(tries), deadline)
+                            .await
+                        {
+                            return ended_early(run, reason);
+                        }
+                        continue;
+                    }
+                    if let Some(init) = init.filter(|_| reads_connectors(params)) {
+                        blocking(|| self.connectors.observe(init.observed()));
+                    }
+                    End::Failed(
+                        RunFailedData::new(
+                            FailReason::Connectors,
+                            connector_gate::failure_message(&connectors, tries),
+                            "",
+                        )
+                        .with_connectors(connectors),
+                    )
+                }
+            };
+            let ending = run.inner().ending;
+            return match ending {
+                // rlxd ended the run as its result came: rlxd's reason stands.
+                Some(reason) if !matches!(&end, End::Failed(f) if f.reason == reason) => {
+                    ended_early(run, reason)
+                }
+                _ => end,
+            };
+        }
+    }
+
+    /// The gate of a run with `needs_connectors`, on this rlxd's route; `None` for a run
+    /// without.
+    fn gate_of(&self, params: &RunStartParams) -> Option<Gate> {
+        if params.needs_connectors.is_empty() {
+            return None;
+        }
+        let times = self.connectors.gate_times();
+        Some(Gate {
+            named: params.needs_connectors.clone(),
+            route_1: self.connectors.route_1(),
+            wait: times.wait,
+            settle: times.settle,
+        })
+    }
+
+    /// The session files a gated attempt's tries write to, each with its length before
+    /// the first try when the attempt resumes one ([`Kept`]). None for a run whose
+    /// session isn't kept.
+    fn session_kept(&self, run: &Run, space: &std::path::Path, attempt: u64) -> Kept {
+        if !run.params.persists() {
+            return Kept::default();
+        }
+        let file = format!("{}.jsonl", run.params.run_id);
+        let files = config_dirs()
+            .into_iter()
+            .map(|dir| {
+                let path = dir.join("projects").join(project_folder(space)).join(&file);
+                let length = std::fs::symlink_metadata(&path)
+                    .ok()
+                    .filter(|m| m.file_type().is_file())
+                    .map(|m| m.len());
+                (path, length)
+            })
+            .collect();
+        Kept {
+            resumed: attempt > 1,
+            files,
+        }
+    }
+
+    /// After a gated try that was ended unconfirmed (a miss, or any other end before its
+    /// connectors were confirmed): what it wrote to its session is taken back, so the
+    /// next try (or a later resume) has nothing the run didn't deliver. A first attempt's
+    /// session started with the try, so its file goes. A resumed attempt's file is the
+    /// run's whole session: it is never removed, only cut back to its length before the
+    /// attempt's first try, and left as it is (with a warning) when it is shorter than
+    /// that or is no file.
+    fn forget_try(&self, run: &Run, kept: &Kept) {
+        for (path, before) in &kept.files {
+            let now = std::fs::symlink_metadata(path)
+                .ok()
+                .filter(|m| m.file_type().is_file())
+                .map(|m| m.len());
+            let forgotten = match (kept.resumed, before, now) {
+                (_, _, None) => Ok(()),
+                (false, _, Some(_)) => std::fs::remove_file(path),
+                (true, Some(before), Some(now)) if now > *before => std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .and_then(|file| file.set_len(*before)),
+                (true, Some(before), Some(now)) if now < *before => Err(std::io::Error::other(
+                    "it is shorter than before the attempt, so it is left as it is",
+                )),
+                (true, Some(_), Some(_)) => Ok(()),
+                (true, None, Some(_)) => Err(std::io::Error::other(
+                    "it was not there before the attempt, so it is left as it is",
+                )),
+            };
+            if let Err(e) = forgotten {
+                warning!(
+                    "run {}: the last try's session was not taken back from {}: {e}",
+                    run.params.run_id,
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Waits `wait` between a gated run's tries: the reason when a cancel, rlxd stopping
+    /// or the timeout ends the run meanwhile.
+    async fn back_off(
+        &self,
+        run: &Run,
+        wait: Duration,
+        deadline: Option<Instant>,
+    ) -> Option<FailReason> {
+        let until = Instant::now() + wait;
+        loop {
+            if let Some(reason) = run.inner().ending {
+                return Some(reason);
+            }
+            let now = Instant::now();
+            if deadline.is_some_and(|at| now >= at) {
+                return Some(*run.inner().ending.get_or_insert(FailReason::Timeout));
+            }
+            if now >= until {
+                return None;
+            }
+            let step = (until - now).min(Duration::from_millis(50));
+            tokio::time::sleep(step).await;
+        }
+    }
+
+    /// One Claude Code of an attempt: started, streamed, and ended. `confirmed` says,
+    /// after, whether its connectors were confirmed (always, ungated).
+    #[allow(clippy::too_many_arguments, reason = "one try's facts, each its own")]
+    async fn try_once(
+        &self,
+        run: &Arc<Run>,
+        attempt: u64,
+        program: &std::path::Path,
+        space: &std::path::Path,
+        settings: &std::path::Path,
+        gate: Option<&Gate>,
+        deadline: Option<Instant>,
+        confirmed: &mut bool,
+    ) -> Tried {
+        let params = &run.params;
+        let failed = |message: String| {
+            Tried::End(End::Failed(RunFailedData::new(
+                FailReason::Error,
+                message,
+                run.inner().text.clone(),
+            )))
+        };
+        let ending = run.inner().ending;
+        if let Some(reason) = ending {
+            return Tried::End(ended_early(run, reason));
+        }
         let mut env = run_env();
         // Every process of the run inherits it: the start sweep's way to know them.
         env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
@@ -1650,9 +1990,9 @@ impl Runner {
             inner.stopped = None;
         }
         let launch = Launch {
-            program: program.clone(),
-            args: argv::args(params, attempt, &settings),
-            cwd: space,
+            program: program.to_owned(),
+            args: argv::args(params, attempt, settings),
+            cwd: space.to_owned(),
             env,
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
@@ -1688,7 +2028,16 @@ impl Runner {
         };
         let stderr = tokio::spawn(tail(stderr));
         let streamed = self
-            .stream(run, attempt, stdin, BufReader::new(stdout), &tree)
+            .stream(
+                run,
+                attempt,
+                stdin,
+                BufReader::new(stdout),
+                &tree,
+                gate,
+                deadline,
+                confirmed,
+            )
             .await;
         let end = match streamed {
             Streamed::Result(outcome, mut stdin) => {
@@ -1703,6 +2052,23 @@ impl Runner {
                 }
                 outcome_of(run, outcome)
             }
+            Streamed::Missed {
+                connectors,
+                stop,
+                init,
+            } => {
+                tree.kill();
+                tree.reap(&mut child, None).await;
+                let mut inner = run.inner();
+                inner.tree = None;
+                inner.process = None;
+                drop(inner);
+                return Tried::Missed {
+                    connectors,
+                    stop,
+                    init,
+                };
+            }
             Streamed::Ended(reason) => {
                 tree.kill();
                 tree.reap(&mut child, None).await;
@@ -1711,7 +2077,7 @@ impl Runner {
             Streamed::Broken(message) => {
                 tree.kill();
                 tree.reap(&mut child, None).await;
-                failed(message)
+                return failed(message);
             }
             Streamed::Eof => {
                 let mut status = tree.reap(&mut child, Some(EXIT_GRACE)).await;
@@ -1721,7 +2087,7 @@ impl Runner {
                 }
                 let ending = run.inner().ending;
                 if let Some(reason) = ending {
-                    return ended_early(run, reason);
+                    return Tried::End(ended_early(run, reason));
                 }
                 let said = stderr.await.unwrap_or_default();
                 let how = how_it_ended(status, &tree);
@@ -1730,14 +2096,14 @@ impl Runner {
                     message.push_str(": ");
                     message.push_str(said.trim());
                 }
-                failed(message)
+                return failed(message);
             }
         };
         let (ending, stopped) = {
             let mut inner = run.inner();
             (inner.ending, inner.stopped.take())
         };
-        match ending {
+        Tried::End(match ending {
             // rlxd ended the run as its result came: rlxd's reason stands.
             Some(reason) if !matches!(&end, End::Failed(f) if f.reason == reason) => {
                 ended_early(run, reason)
@@ -1753,11 +2119,17 @@ impl Runner {
                 End::NeedsYou(needs, done)
             }
             _ => end,
-        }
+        })
     }
 
     /// Sends the prompt, then reads the stream until its `result`, its end, or the
     /// timeout. A cancel kills the tree, which ends the stream.
+    ///
+    /// A gated try ([`connector_gate`]) settles first on route 2, or holds the prompt on route 1
+    /// until a `system/init` shows each named connector connected. Until its connectors
+    /// are confirmed, nothing it reads is published, and a miss ends the read
+    /// ([`Streamed::Missed`]). `delivered` is set once they are (at once, ungated).
+    #[allow(clippy::too_many_arguments, reason = "one try's facts, each its own")]
     async fn stream<R: AsyncBufRead + Unpin>(
         &self,
         run: &Run,
@@ -1765,45 +2137,99 @@ impl Runner {
         mut stdin: ChildStdin,
         mut stdout: R,
         tree: &Tree,
+        gate: Option<&Gate>,
+        deadline: Option<Instant>,
+        delivered: &mut bool,
     ) -> Streamed {
         let params = &run.params;
-        // A resumed attempt starts with the app's reply, or is told to go on.
-        let text = match run.inner().reply.take() {
-            Some(reply) => reply,
-            None if attempt > 1 => CONTINUE.to_owned(),
-            None => params.prompt.clone(),
+        let try_started = Instant::now();
+        // A resumed attempt starts with the app's reply, or is told to go on. A try after
+        // a gated miss sends what the missed one would have.
+        let text = {
+            let inner = run.inner();
+            match &inner.reply {
+                Some(reply) => reply.clone(),
+                None if attempt > 1 => CONTINUE.to_owned(),
+                None => params.prompt.clone(),
+            }
         };
         let prompt = json!({"type": "user", "message": {"role": "user",
             "content": [{"type": "text", "text": text}]},
             "parent_tool_use_id": null, "session_id": params.run_id.as_str()});
         let mut first = prompt.to_string();
         first.push('\n');
-        let sent = async {
-            stdin.write_all(first.as_bytes()).await?;
-            stdin.flush().await
+        let timeout = move || async move {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at.into()).await,
+                None => std::future::pending().await,
+            }
         };
-        if let Err(e) = sent.await {
-            return Streamed::Broken(format!("the prompt could not be sent to Claude Code: {e}"));
-        }
-        let deadline = params
-            .timeout_s
-            .map(|s| Instant::now() + Duration::from_secs(s));
         let mut line = Vec::new();
+        if let Some(gate) = gate.filter(|gate| !gate.route_1) {
+            // Route 2: stdin open, nothing sent, for the settle. Claude Code writes
+            // nothing before the first message; what it might is not read as the run's.
+            let settled = tokio::time::Instant::from(
+                try_started + gate.settle + connector_gate::START_ALLOWANCE,
+            );
+            loop {
+                let read = tokio::select! {
+                    read = stream::next_line(&mut stdout, &mut line, stream::MAX_LINE) => read,
+                    () = tokio::time::sleep_until(settled) => break,
+                    () = timeout() => {
+                        let reason = *run.inner().ending.get_or_insert(FailReason::Timeout);
+                        tree.kill();
+                        return Streamed::Ended(reason);
+                    }
+                };
+                let ending = run.inner().ending;
+                if let Some(reason) = ending {
+                    return Streamed::Ended(reason);
+                }
+                match read {
+                    Ok(Some(())) => {}
+                    Ok(None) => return Streamed::Eof,
+                    Err(e) => return Streamed::Broken(read_error(&e)),
+                }
+            }
+        }
+        let mut sent = false;
+        if !gate.is_some_and(|gate| gate.route_1) {
+            if let Err(e) = send(&mut stdin, &first).await {
+                return Streamed::Broken(format!(
+                    "the prompt could not be sent to Claude Code: {e}"
+                ));
+            }
+            sent = true;
+        }
+        let mut confirmed = gate.is_none();
+        *delivered = confirmed;
+        if confirmed {
+            run.inner().reply = None;
+        }
+        // Route 1: the last states a try saw before its wait ran out.
+        let mut last: Option<(Vec<rlxd_proto::ConnectorStatus>, stream::Init)> = None;
         let mut tools: HashMap<String, String> = HashMap::new();
         let mut started = false;
         loop {
-            let timeout = async {
-                match deadline {
-                    Some(at) => tokio::time::sleep_until(at.into()).await,
+            let waited = async {
+                match gate.filter(|gate| gate.route_1 && !confirmed) {
+                    Some(gate) => tokio::time::sleep_until((try_started + gate.wait).into()).await,
                     None => std::future::pending().await,
                 }
             };
             let read = tokio::select! {
                 read = stream::next_line(&mut stdout, &mut line, stream::MAX_LINE) => read,
-                () = timeout => {
+                () = timeout() => {
                     let reason = *run.inner().ending.get_or_insert(FailReason::Timeout);
                     tree.kill();
                     return Streamed::Ended(reason);
+                }
+                () = waited => {
+                    let (connectors, init) = match last.take() {
+                        Some((connectors, init)) => (connectors, Some(init)),
+                        None => (gate.map(Gate::none_seen).unwrap_or_default(), None),
+                    };
+                    return Streamed::Missed { connectors, stop: false, init };
                 }
             };
             let ending = run.inner().ending;
@@ -1813,24 +2239,68 @@ impl Runner {
             match read {
                 Ok(Some(())) => {}
                 Ok(None) => return Streamed::Eof,
-                Err(stream::ReadError::TooLong) => {
-                    return Streamed::Broken(format!(
-                        "line_too_long: Claude Code wrote a stream-json line longer than {} \
-                         bytes, which rlxd does not read",
-                        stream::MAX_LINE
-                    ));
-                }
-                Err(stream::ReadError::Io(e)) => {
-                    return Streamed::Broken(format!(
-                        "Claude Code's output could not be read: {e}"
-                    ));
-                }
+                Err(e) => return Streamed::Broken(read_error(&e)),
             }
             for parsed in stream::parse(&line) {
+                let parsed = match (parsed, confirmed, gate) {
+                    (parsed, true, _) | (parsed, _, None) => parsed,
+                    (Line::Init(init), false, Some(gate)) => {
+                        match gate.verdict(&init.mcp_servers) {
+                            Verdict::Connected => {
+                                confirmed = true;
+                                *delivered = true;
+                                // Delivered from here on: a later attempt is a resume's.
+                                run.inner().reply = None;
+                                if !sent {
+                                    if let Err(e) = send(&mut stdin, &first).await {
+                                        return Streamed::Broken(format!(
+                                            "the prompt could not be sent to Claude Code: {e}"
+                                        ));
+                                    }
+                                    sent = true;
+                                }
+                                Line::Init(init)
+                            }
+                            Verdict::Stopped(connectors) => {
+                                return Streamed::Missed {
+                                    connectors,
+                                    stop: true,
+                                    init: Some(init),
+                                };
+                            }
+                            Verdict::Missed(connectors) if gate.route_1 => {
+                                last = Some((connectors, init));
+                                continue;
+                            }
+                            Verdict::Missed(connectors) => {
+                                return Streamed::Missed {
+                                    connectors,
+                                    stop: false,
+                                    init: Some(init),
+                                };
+                            }
+                        }
+                    }
+                    (Line::Result(_), false, Some(_)) => {
+                        return Streamed::Broken(
+                            "Claude Code ended its turn before its system/init named the \
+                             run's connectors"
+                                .to_owned(),
+                        );
+                    }
+                    // Nothing of a try is the run's before its connectors are confirmed.
+                    (_, false, Some(_)) => continue,
+                };
+                // The init to take as the truth of the connectors, once the run has it.
+                let mut seen = None;
                 let mut inner = run.inner();
                 match parsed {
                     Line::Init(init) if !started => {
                         started = true;
+                        // A no_tools run loads none, and says nothing of them.
+                        if reads_connectors(params) {
+                            seen = Some(init.clone());
+                        }
                         inner.listed = gate::Listed {
                             tools: init.tools.iter().cloned().collect(),
                             servers: init
@@ -1915,6 +2385,13 @@ impl Runner {
                     }
                     Line::Result(outcome) => return Streamed::Result(outcome, stdin),
                     Line::Init(_) | Line::Partial(_) | Line::Other => {}
+                }
+                drop(inner);
+                // Into the connectors' cache, its file written with no run's lock held, and
+                // only after the gate has what the init listed: a hook that asks about the
+                // turn's first call never waits on the cache (5.1).
+                if let Some(init) = seen {
+                    blocking(|| self.connectors.observe(init.observed()));
                 }
             }
         }
@@ -2139,6 +2616,7 @@ impl Run {
             session_started: inner.session_started,
             calls: inner.calls.clone(),
             pinned_call_used: inner.pinned_call_used,
+            auth: inner.auth.clone(),
         }
     }
 }
@@ -2215,6 +2693,22 @@ impl Replay {
     pub fn reply(&self) -> RunEventsData {
         RunEventsData::new(self.run.params.run_id.clone(), self.through)
     }
+}
+
+/// Whether a run's `system/init` is the truth of the connectors: a `no_tools` run loads
+/// none (`--strict-mcp-config`), so it says nothing of them.
+fn reads_connectors(params: &RunStartParams) -> bool {
+    params.mount != Mount::NoTools
+}
+
+/// A gated attempt's session files ([`Runner::session_kept`]).
+#[derive(Debug, Default)]
+struct Kept {
+    /// Whether the attempt resumes the run's session (`--resume`).
+    resumed: bool,
+    /// Each file a try may write, with its length before the attempt's first try where
+    /// it was a file then.
+    files: Vec<(PathBuf, Option<u64>)>,
 }
 
 /// The Claude Code config directories whose sessions `space.erase` deletes:
@@ -2353,7 +2847,7 @@ fn needs_you(params: &RunStartParams, done: &RunDoneData) -> Option<RunNeedsYouD
 /// The environment a run's Claude Code gets beyond rlxd's own, which it inherits. The
 /// app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3) plug in
 /// here; until then there is nothing to add.
-fn run_env() -> Vec<(OsString, OsString)> {
+pub(crate) fn run_env() -> Vec<(OsString, OsString)> {
     Vec::new()
 }
 
@@ -2471,8 +2965,8 @@ pub(crate) fn project_folder(path: &std::path::Path) -> String {
 }
 
 /// What `run.start` refuses of its params before it looks at anything else, with its own
-/// codes: `kind_mount_mismatch`, `pinned_call_required`, and `not_implemented` for a
-/// `needs_connectors` (until 5.5). The scheduler checks a run job's template with it at
+/// codes: `kind_mount_mismatch` and `pinned_call_required`. A `needs_connectors` passes:
+/// the gate (5.5) serves it at each start. The scheduler checks a run job's template with it at
 /// `job.put`, so a template `run.start` would refuse is refused then, not at each fire.
 pub fn check_start(params: &RunStartParams) -> Result<(), ErrorBody> {
     if params.kind.needs_no_tools() && params.mount != Mount::NoTools {
@@ -2484,6 +2978,14 @@ pub fn check_start(params: &RunStartParams) -> Result<(), ErrorBody> {
             ),
         ));
     }
+    if !params.needs_connectors.is_empty() && params.mount == Mount::NoTools {
+        return Err(refusal(
+            codes::KIND_MOUNT_MISMATCH,
+            "a run with needs_connectors takes a mount that loads them: mount \
+             {\"kind\": \"no_tools\"} loads none"
+                .to_owned(),
+        ));
+    }
     if params.kind.needs_pinned_call() && params.pinned_call.is_none() {
         return Err(refusal(
             codes::PINNED_CALL_REQUIRED,
@@ -2491,14 +2993,6 @@ pub fn check_start(params: &RunStartParams) -> Result<(), ErrorBody> {
                 "a {} run needs pinned_call {{tool, input_sha256}}",
                 params.kind
             ),
-        ));
-    }
-    if !params.needs_connectors.is_empty() {
-        return Err(refusal(
-            codes::NOT_IMPLEMENTED,
-            "needs_connectors is not served yet: the connector gate (handoff 0.10.3, 5.5) \
-             is a later item. Leave it empty."
-                .to_owned(),
         ));
     }
     Ok(())

@@ -16,7 +16,7 @@
 //! - **`pty.kill`** sends SIGHUP and SIGTERM to the process's whole group, SIGKILL to
 //!   what is left after two seconds, and returns once the group is gone. A process that
 //!   left the group itself is not ended, as under tmux.
-//! - **Limits:** [`MAX_PTYS`] PTYs a home, the exited ones included, and
+//! - **Limits:** [`MAX_PTYS`] PTYs a home, the exited ones included ([`max_ptys`]), and
 //!   [`SCROLLBACK`] lines of history each.
 
 pub mod env;
@@ -52,6 +52,35 @@ use crate::vt::Terminal;
 /// The most PTYs a home holds, live and exited.
 pub const MAX_PTYS: usize = 64;
 
+/// The most PTYs this rlxd's home holds: [`MAX_PTYS`]. A test build takes a smaller
+/// `RLXD_TEST_MAX_PTYS` (1 to [`MAX_PTYS`]), so the check of the cap needs no 64
+/// pseudo-terminals at once on a shared machine.
+pub fn max_ptys() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| limit(test_max_ptys().as_deref()))
+}
+
+/// The limit `named` asks for, when it is a number from 1 to [`MAX_PTYS`]; else
+/// [`MAX_PTYS`].
+fn limit(named: Option<&str>) -> usize {
+    named
+        .and_then(|n| n.parse().ok())
+        .filter(|n| (1..=MAX_PTYS).contains(n))
+        .unwrap_or(MAX_PTYS)
+}
+
+/// Test builds only: `RLXD_TEST_MAX_PTYS`.
+#[cfg(feature = "debug-methods")]
+fn test_max_ptys() -> Option<String> {
+    std::env::var("RLXD_TEST_MAX_PTYS").ok()
+}
+
+/// A release build holds [`MAX_PTYS`].
+#[cfg(not(feature = "debug-methods"))]
+fn test_max_ptys() -> Option<String> {
+    None
+}
+
 /// The lines of history each PTY keeps, as the fleet's tmux does (`history-limit`).
 pub const SCROLLBACK: u32 = MAX_PTY_SCROLLBACK;
 
@@ -70,7 +99,7 @@ const READ_CHUNK: usize = 32 << 10;
 /// Why a PTY call was refused.
 #[derive(Debug)]
 pub enum Refused {
-    /// The home holds [`MAX_PTYS`] already.
+    /// The home holds [`max_ptys`] already.
     TooMany,
     /// No PTY has that id.
     Unknown(String),
@@ -84,6 +113,20 @@ pub enum Refused {
     Busy(String),
     /// The PTY's screen model failed, and rlxd is ending it, or has.
     ScreenFailed(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooMany => write!(f, "the home holds {MAX_PTYS} ptys, the most it may"),
+            Self::Unknown(id) => write!(f, "no pty {id}"),
+            Self::Exited(id) => write!(f, "pty {id}'s process has ended"),
+            Self::SpawnFailed(why)
+            | Self::Invalid(why)
+            | Self::Busy(why)
+            | Self::ScreenFailed(why) => f.write_str(why),
+        }
+    }
 }
 
 /// How a PTY's process ended.
@@ -252,7 +295,7 @@ impl Host {
     /// Starts `params.argv` on a new PTY, for `who`, as logged.
     pub fn spawn(&self, params: &PtySpawnParams, who: &str) -> Result<PtyRef, Refused> {
         let mut ptys = self.ptys();
-        if ptys.len() >= MAX_PTYS {
+        if ptys.len() >= max_ptys() {
             return Err(Refused::TooMany);
         }
         let cwd = match &params.cwd {
@@ -324,13 +367,29 @@ impl Host {
         let failed = |what: &str, e: &dyn std::fmt::Display| {
             Refused::SpawnFailed(format!("{what} {:?}: {e}", params.argv[0]))
         };
-        let pair = native_pty_system()
-            .openpty(size)
-            .map_err(|e| failed("no pseudo-terminal for", &e))?;
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|e| failed("cannot start", &e))?;
+        // One program start at a time across rlxd (`crate::spawn`): the pseudo-terminal's
+        // descriptors made, the program started, and the master's copies taken, never the
+        // wait for its end. So no other start inherits this one's descriptors before they
+        // are close-on-exec, nor this one another's.
+        let (pair, child, reader, writer) = {
+            let _alone = crate::spawn::alone();
+            let pair = native_pty_system()
+                .openpty(size)
+                .map_err(|e| failed("no pseudo-terminal for", &e))?;
+            let child = pair
+                .slave
+                .spawn_command(command)
+                .map_err(|e| failed("cannot start", &e))?;
+            let reader = pair
+                .master
+                .try_clone_reader()
+                .map_err(|e| failed("no output for", &e))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|e| failed("no input for", &e))?;
+            (pair, child, reader, writer)
+        };
         drop(pair.slave);
         let Some(pid) = child.process_id() else {
             return Err(Refused::SpawnFailed(format!(
@@ -338,14 +397,6 @@ impl Host {
                 params.argv[0]
             )));
         };
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| failed("no output for", &e))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| failed("no input for", &e))?;
         let id = new_id();
         let (input, queue) = mpsc::channel::<Vec<u8>>();
         let queued = Arc::new(AtomicUsize::new(0));
@@ -895,6 +946,16 @@ fn home_dir() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_limit_is_64_unless_a_test_build_asks_for_fewer() {
+        assert_eq!(MAX_PTYS, 64);
+        assert_eq!(limit(None), MAX_PTYS);
+        assert_eq!(limit(Some("4")), 4);
+        for named in ["0", "65", "-1", "x", ""] {
+            assert_eq!(limit(Some(named)), MAX_PTYS, "{named:?}");
+        }
+    }
 
     #[test]
     fn base64_goes_there_and_back() {

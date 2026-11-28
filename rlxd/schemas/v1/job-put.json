@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "JobPutParams",
-  "description": "`job.put`'s params (7.6). It creates or replaces the job by `job_id`, idempotently,\nand returns `{job_id}` (`job-ref.json`).\n\n```json\n{\"job_id\": \"slack-digest\", \"type\": \"run\", \"schedule\": {\"every_minutes\": 15},\n \"run\": {\"kind\": \"widget_refresh\", \"prompt\": \"…\", \"mount\": {\"kind\": \"no_tools\"},\n         \"space\": \"default\"},\n \"catch_up\": \"once\", \"enabled\": true, \"loud\": false}\n{\"job_id\": \"ci-green\", \"type\": \"watch\", \"schedule\": {\"every_minutes\": 5},\n \"connector\": \"claude.ai GitHub\", \"tool\": \"mcp__claude_ai_GitHub__get_check_runs\",\n \"input\": {\"ref\": \"main\"}, \"catch_up\": \"skip\", \"enabled\": true}\n```\n\nrlxd refuses, by error code: `kind_mount_mismatch`, `pinned_call_required` and\n`not_implemented` (a `needs_connectors`) for a template `run.start` would refuse;\n`invalid_params` for anything else, an unknown field, a cron expression it can't read,\na time zone it doesn't know, or a watch job's tool that isn't its connector's included.",
+  "description": "`job.put`'s params (7.6). It creates or replaces the job by `job_id`, idempotently,\nand returns `{job_id}` (`job-ref.json`).\n\n```json\n{\"job_id\": \"slack-digest\", \"type\": \"run\", \"schedule\": {\"every_minutes\": 15},\n \"run\": {\"kind\": \"widget_refresh\", \"prompt\": \"…\", \"mount\": {\"kind\": \"no_tools\"},\n         \"space\": \"default\"},\n \"catch_up\": \"once\", \"enabled\": true, \"loud\": false}\n{\"job_id\": \"ci-green\", \"type\": \"watch\", \"schedule\": {\"every_minutes\": 5},\n \"connector\": \"claude.ai GitHub\", \"tool\": \"mcp__claude_ai_GitHub__get_check_runs\",\n \"input\": {\"ref\": \"main\"}, \"catch_up\": \"skip\", \"enabled\": true}\n```\n\nrlxd refuses, by error code: `kind_mount_mismatch` and `pinned_call_required` for a\ntemplate `run.start` would refuse; `invalid_params` for anything else, an unknown\nfield, a cron expression it can't read, a time zone it doesn't know, or a watch job's\ntool that isn't its connector's included.",
   "type": "object",
   "properties": {
     "catch_up": {
@@ -243,11 +243,13 @@
           "$ref": "#/$defs/Mount"
         },
         "needs_connectors": {
-          "description": "The connectors that must be `connected` before the first turn (5.5). Not yet\nserved: a non-empty list is refused with `not_implemented`.",
+          "description": "The connectors that must be `connected` before the first turn (5.5): rlxd makes\nup to 3 tries, and ends the run `run.failed {reason: \"connectors\"}` when they run\nout, or at once when one is `needs-auth` or `failed`. Each is a connector's id, as\n`connectors.list` gives it. A `no_tools` run loads none, so it names none.",
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
           }
         },
         "needs_you_when": {

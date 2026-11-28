@@ -100,6 +100,10 @@ pub fn serve(background: bool, gate_dev_mode: bool) -> ExitCode {
         std::process::id(),
         home.root().display()
     );
+    #[cfg(windows)]
+    if std::env::var_os(IN_JOB_VAR).is_some() {
+        warning!("{IN_JOB}; started inside it, rlxd ends when that job is closed");
+    }
     let result = token::ensure(&home.token())
         .map_err(|e| format!("cannot make {}: {e}", home.token().display()))
         .and_then(|token| {
@@ -403,8 +407,9 @@ pub enum StartError {
 
 /// Starts rlxd for `home` in the background, detached from this terminal, and returns its
 /// `status` reply once it takes a connection. `adjust` changes its command first, such as
-/// its environment.
-pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, StartError> {
+/// its environment (each time it is made: on Windows it may be made twice,
+/// [`background_command`]).
+pub fn start(home: &Home, adjust: impl Fn(&mut Command)) -> Result<Reply, StartError> {
     let failed = |message: String, hint: Option<String>| StartError::Failed { message, hint };
     match lock::is_held(&home.lock()) {
         Ok(true) => return Err(StartError::AlreadyRunning),
@@ -416,11 +421,24 @@ pub fn start(home: &Home, adjust: impl FnOnce(&mut Command)) -> Result<Reply, St
     }
     // Only what this start writes to the log can say why it failed.
     let logged_before = fs::metadata(home.log_file()).map_or(0, |m| m.len());
-    let command = background_command().map(|mut command| {
-        adjust(&mut command);
-        command
-    });
-    let mut child = match command.and_then(|mut c| c.spawn()) {
+    let spawn = |leave_job: bool| {
+        background_command(leave_job).and_then(|mut command| {
+            adjust(&mut command);
+            command.spawn()
+        })
+    };
+    let spawned = spawn(true);
+    // A Job Object that lets no process break away refuses the start: rlxd starts in it,
+    // as it did before it could leave one.
+    #[cfg(windows)]
+    let spawned = match spawned {
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            warning!("{IN_JOB}; rlxd is started inside it, and ends when that job is closed");
+            spawn(false)
+        }
+        spawned => spawned,
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             let message = format!("cannot start rlxd in the background: {e}");
@@ -483,9 +501,19 @@ fn wait_for_loser(child: &mut Child) {
 }
 
 /// `rlxd serve` in the background: no stdin, its output to nowhere (it logs to its file),
-/// in a process group or console of its own, so the terminal's signals do not reach it.
-/// On POSIX it closes, first, any other descriptor it inherits ([`close_inherited`]).
-fn background_command() -> io::Result<Command> {
+/// so nothing that ends its starter ends it (task #38: a background task of an interactive
+/// Claude Code session is ended at about 26 to 30 minutes, with everything it started).
+///
+/// - **POSIX:** a session of its own (`setsid`, and so a process group of its own) with no
+///   controlling terminal: neither a hangup nor a signal to the starter's session or
+///   process group reaches it. It closes, first, any other descriptor it inherits
+///   ([`close_inherited`]).
+/// - **Windows:** no console, a process group of its own, and, with `leave_job`, out of
+///   the starter's Job Object (`CREATE_BREAKAWAY_FROM_JOB`), so closing a kill-on-close job,
+///   such as the one Node gives its children, does not end it. A job that lets no process
+///   break away makes the start fail with `ERROR_ACCESS_DENIED`; [`start`] then starts it
+///   without `leave_job`, inside that job.
+fn background_command(leave_job: bool) -> io::Result<Command> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["serve", BACKGROUND_FLAG])
@@ -495,18 +523,47 @@ fn background_command() -> io::Result<Command> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        let _ = leave_job; // a session of its own leaves whatever held the starter's
+        // SAFETY: setsid is async-signal-safe, and is all that runs between fork and exec.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         /// DETACHED_PROCESS: no console. CREATE_NEW_PROCESS_GROUP: no Ctrl-C from ours.
         const FLAGS: u32 = 0x0000_0008 | 0x0000_0200;
-        command.creation_flags(FLAGS);
+        /// CREATE_BREAKAWAY_FROM_JOB: out of the starter's Job Object.
+        const LEAVE_JOB: u32 = 0x0100_0000;
+        command.creation_flags(if leave_job { FLAGS | LEAVE_JOB } else { FLAGS });
+        if !leave_job {
+            command.env(IN_JOB_VAR, "1"); // for its log
+        }
         crate::windows::keep_std_handles_from_children();
     }
     Ok(command)
 }
+
+/// What `CreateProcessW` fails with when the caller's Job Object lets no process break
+/// away from it (winerror.h).
+#[cfg(windows)]
+const ERROR_ACCESS_DENIED: i32 = 5;
+
+/// Set for an rlxd [`start`] could not take out of its starter's Job Object, which says so
+/// in its log as it starts.
+#[cfg(windows)]
+const IN_JOB_VAR: &str = "RLXD_STARTED_IN_JOB";
+
+/// What is logged, by the starter and by rlxd, when rlxd could not leave the starter's job.
+#[cfg(windows)]
+const IN_JOB: &str = "the Job Object rlxd serve --detach runs in lets no process break away";
 
 /// Closes every descriptor above stderr this process was started with. A detached rlxd
 /// outlives the process that starts it, so a descriptor it inherited would stay open as

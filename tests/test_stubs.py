@@ -94,6 +94,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("code", "similar"),
     ("code", "index"),
     ("accounts", "share"),
+    ("connectors", "list"),
     ("explainability", "status"),
     ("explainability", "doctor"),
     ("explainability", "env"),

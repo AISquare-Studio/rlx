@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorsLoginData",
+  "description": "`connectors.login`'s reply: `{login_id}`, which its events carry.",
+  "type": "object",
+  "properties": {
+    "login_id": {
+      "description": "The login, as its `connector.login.*` events name it.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "login_id"
+  ]
+}
