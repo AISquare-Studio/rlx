@@ -415,6 +415,12 @@ fn pre_tool_use_with_no_run_or_no_key_asks_nothing_and_denies() {
             &[("RLXD_HOOK_KEY", KEY)][..],
             "no --run",
         ),
+        // --deadline-ms is a run's too: without it, nothing is asked.
+        (
+            &["pre-tool-use", "--run", "r", "--attempt", "1"][..],
+            &[("RLXD_HOOK_KEY", KEY)][..],
+            "arguments it does not take",
+        ),
         (GATED, &[][..], "no RLXD_HOOK_KEY"),
         (GATED, &[("RLXD_HOOK_KEY", "")][..], "no RLXD_HOOK_KEY"),
     ] {
@@ -432,6 +438,58 @@ fn pre_tool_use_with_no_run_or_no_key_asks_nothing_and_denies() {
         );
     }
     assert_eq!(rlxd.hooks(), 0, "nothing reached rlxd");
+}
+
+/// `pre-tool-use`'s timer runs from its start, stdin's reading included: a stdin that never
+/// ends is a deny at about `deadline_ms` and 5 s, never a hook that outlives Claude Code's
+/// timeout.
+#[test]
+fn pre_tool_use_whose_stdin_never_ends_is_denied_by_its_own_timer() {
+    use std::io::Read;
+    let here = NoRlxd::new("gate-open-stdin");
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rlxd-hook"))
+        .args([
+            "pre-tool-use",
+            "--run",
+            "0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f",
+            "--attempt",
+            "1",
+            "--deadline-ms",
+            "1000",
+        ])
+        .env("AISQUARE_HOME", here.root.join("home"))
+        .env_remove("RLX_HOME")
+        .env("RLXD_RLX_BIN", &here.rlx)
+        .env(
+            "RLXD_HOOK_KEY",
+            "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("rlxd-hook runs");
+    // Kept open, and never written: Claude Code's stdin as a stalled one would be.
+    let stdin = child.stdin.take();
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    let status = child.wait().unwrap();
+    let took = started.elapsed();
+    drop(stdin);
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        took >= std::time::Duration::from_millis(5_500)
+            && took < std::time::Duration::from_secs(20),
+        "{took:?}"
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
 }
 
 /// The key goes to rlxd as `hook_key` only, never with the variables, and nothing

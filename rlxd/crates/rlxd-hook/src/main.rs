@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! rlxd-hook <event>                         one of Claude Code's six fleet hooks
-//! rlxd-hook pre-tool-use --run R --attempt N [--deadline-ms D]   the gate's hook (5.1)
+//! rlxd-hook pre-tool-use --run R --attempt N --deadline-ms D   the gate's hook (5.1)
 //! rlxd-hook ping                            rlxd and its brain answer, for the speed check
 //! ```
 //!
@@ -48,10 +48,11 @@
 //! stdout or stderr). rlxd's gate binds the request to the run's live attempt by the key and
 //! by this process, which must be inside the run, and answers allow or deny.
 //! - With no run or no key, it asks nothing: it prints a deny.
-//! - Its timer is the run's `deadline_ms` and 5 s (the default `deadline_ms` when the
-//!   command line names none): past the gate's own deadline, which denies the call
+//! - Its timer is the run's `deadline_ms` (`--deadline-ms`, which rlxd always writes; a
+//!   command line without it is a deny that asks nothing) and 5 s, from the moment it
+//!   starts, stdin's reading included: past the gate's own deadline, which denies the call
 //!   `by: "timeout"`, and below Claude Code's timeout for the hook, which rlxd writes as
-//!   `deadline_ms` and 10 s.
+//!   `deadline_ms` and 10 s, whatever stdin does.
 //! - It prints the gate's answer only, rebuilt from the decision and the reason it read
 //!   (`allow_output` or `deny_output`), never rlxd's bytes as they came nor anything on
 //!   stderr, and only when rlxd's reply is that answer and nothing else (`is_gate_output`).
@@ -70,18 +71,18 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rlxd_client::proto::{
-    DEFAULT_DEADLINE_MS, Data, HOOK_ENV_NAMES, HOOK_EVENTS, HOOK_FRAME_MOST, HOOK_KEY_ENV,
-    HelloParams, HookParams, HookReply, PRE_TOOL_USE, Role, VERSION, allow_output, b64, codes,
-    deny_output, hook_codes, is_gate_output, methods,
+    Data, HOOK_ENV_NAMES, HOOK_EVENTS, HOOK_FRAME_MOST, HOOK_KEY_ENV, HelloParams, HookParams,
+    HookReply, PRE_TOOL_USE, Role, VERSION, allow_output, b64, codes, deny_output, hook_codes,
+    is_gate_output, methods,
 };
 use rlxd_client::{CallError, ConnectError, Connection, Home, install};
 use serde::Deserialize;
 
 const USAGE: &str =
-    "usage: rlxd-hook <event> | pre-tool-use --run R --attempt N [--deadline-ms D] | ping
+    "usage: rlxd-hook <event> | pre-tool-use --run R --attempt N --deadline-ms D | ping
 
 Hands a Claude Code hook to rlxd, or runs `rlx hook <event>` when rlxd cannot take it.
 <event> is one of session-start, user-prompt-submit, session-end, stop,
@@ -185,12 +186,12 @@ fn say(message: &str) {
 struct Run {
     id: String,
     attempt: u64,
-    /// The run's `deadline_ms`, when the command line says it.
-    deadline_ms: Option<u64>,
+    /// The run's `deadline_ms`.
+    deadline_ms: u64,
 }
 
-/// `--run R --attempt N [--deadline-ms D]`, in any order, `--run` and `--attempt` both or
-/// none of them: `Some(None)` for none. `None` for anything else.
+/// `--run R --attempt N --deadline-ms D`, in any order, all three or none of them:
+/// `Some(None)` for none. `None` for anything else.
 fn run_of(args: &[&str]) -> Option<Option<Run>> {
     if args.is_empty() {
         return Some(None);
@@ -212,10 +213,7 @@ fn run_of(args: &[&str]) -> Option<Option<Run>> {
     }
     let id = id.filter(|id| !id.is_empty())?.to_owned();
     let attempt = attempt?.parse().ok().filter(|&n: &u64| n >= 1)?;
-    let deadline_ms = match deadline_ms {
-        Some(ms) => Some(ms.parse().ok().filter(|&n: &u64| n >= 1)?),
-        None => None,
-    };
+    let deadline_ms = deadline_ms?.parse().ok().filter(|&n: &u64| n >= 1)?;
     Some(Some(Run {
         id,
         attempt,
@@ -223,10 +221,9 @@ fn run_of(args: &[&str]) -> Option<Option<Run>> {
     }))
 }
 
-/// A `pre-tool-use`'s timer: the run's `deadline_ms` (the default when unsaid) and
-/// [`GATE_SLACK`].
-fn gate_budget(deadline_ms: Option<u64>) -> Duration {
-    Duration::from_millis(deadline_ms.unwrap_or(DEFAULT_DEADLINE_MS)).saturating_add(GATE_SLACK)
+/// A `pre-tool-use`'s timer: the run's `deadline_ms` and [`GATE_SLACK`].
+fn gate_budget(deadline_ms: u64) -> Duration {
+    Duration::from_millis(deadline_ms).saturating_add(GATE_SLACK)
 }
 
 /// Claude Code's timeout for the hook as rlx installs it, less a margin: rlxd-hook's own.
@@ -290,8 +287,8 @@ fn fleet_hook(event: &str) -> ExitCode {
 /// The gate's hook: the gate's answer, or a deny on anything else. Nothing it writes, on
 /// any path, holds the key.
 fn pre_tool_use(run: Option<Run>) -> ExitCode {
-    let mut stdin = Vec::new();
-    let _ = io::stdin().read_to_end(&mut stdin);
+    // The timer runs from here, stdin's reading included.
+    let started = Instant::now();
     let Some(run) = run else {
         write_out(deny_output(NO_RUN).as_bytes());
         return ExitCode::SUCCESS;
@@ -305,6 +302,11 @@ fn pre_tool_use(run: Option<Run>) -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let budget = gate_budget(run.deadline_ms);
+    let Some(stdin) = read_stdin_within(budget) else {
+        write_out(deny_output(UNREACHED).as_bytes());
+        return ExitCode::SUCCESS;
+    };
+    let budget = budget.saturating_sub(started.elapsed());
     // Only the gate's answer goes through, rebuilt: any other reply, an empty one included
     // (on which Claude Code asks no one), is a deny, and rlxd's stderr is never written.
     let answer = match ask_in_time(
@@ -321,6 +323,20 @@ fn pre_tool_use(run: Option<Run>) -> ExitCode {
     };
     write_out(answer.unwrap_or_else(|| deny_output(UNREACHED)).as_bytes());
     ExitCode::SUCCESS
+}
+
+/// The hook's stdin, read to its end within `wait`, on a thread of its own: `None` when it
+/// doesn't end in time, or the thread can't start.
+fn read_stdin_within(wait: Duration) -> Option<Vec<u8>> {
+    let (said, read) = mpsc::channel();
+    thread::Builder::new()
+        .spawn(move || {
+            let mut stdin = Vec::new();
+            let _ = io::stdin().read_to_end(&mut stdin);
+            let _ = said.send(stdin);
+        })
+        .ok()?;
+    read.recv_timeout(wait).ok()
 }
 
 /// The gate's answer in `stdout`, rebuilt from its decision and its reason alone: `None`
@@ -602,7 +618,7 @@ mod tests {
         }
     }
 
-    fn run(id: &str, attempt: u64, deadline_ms: Option<u64>) -> Option<Option<Run>> {
+    fn run(id: &str, attempt: u64, deadline_ms: u64) -> Option<Option<Run>> {
         Some(Some(Run {
             id: id.to_owned(),
             attempt,
@@ -625,22 +641,18 @@ mod tests {
 
     #[test]
     fn a_gates_timer_is_the_runs_deadline_and_5_s_below_claude_codes_timeout() {
-        assert_eq!(gate_budget(Some(120_000)), Duration::from_secs(125));
-        assert_eq!(gate_budget(None), Duration::from_secs(125));
-        assert_eq!(gate_budget(Some(3_000)), Duration::from_secs(8));
+        assert_eq!(gate_budget(120_000), Duration::from_secs(125));
+        assert_eq!(gate_budget(3_000), Duration::from_secs(8));
         // Longer than the old 58 s, so a 120 s decision is waited for.
-        assert!(gate_budget(None) > budget(PRE_TOOL_USE));
+        assert!(gate_budget(120_000) > budget(PRE_TOOL_USE));
         for deadline_ms in [1_u64, 999, 1_000, 120_000, 600_000] {
             // rlxd writes Claude Code's timeout as ceil(deadline_ms / 1000) + 10 s.
             let claude_code = Duration::from_secs(deadline_ms.div_ceil(1000) + 10);
-            assert!(
-                gate_budget(Some(deadline_ms)) < claude_code,
-                "{deadline_ms}"
-            );
+            assert!(gate_budget(deadline_ms) < claude_code, "{deadline_ms}");
         }
         // No overflow, however long the deadline.
-        assert!(gate_budget(Some(u64::MAX)) > Duration::from_millis(u64::MAX - 1));
-        let (accept, deadline) = times_within(gate_budget(Some(120_000)));
+        assert!(gate_budget(u64::MAX) > Duration::from_millis(u64::MAX - 1));
+        let (accept, deadline) = times_within(gate_budget(120_000));
         assert!(accept <= deadline);
     }
 
@@ -648,36 +660,44 @@ mod tests {
     fn a_run_is_named_whole_or_not_at_all() {
         assert_eq!(run_of(&[]), Some(None));
         assert_eq!(
-            run_of(&["--run", "r1", "--attempt", "2"]),
-            run("r1", 2, None)
-        );
-        assert_eq!(
             run_of(&["--attempt", "1", "--run", "r1", "--deadline-ms", "3000"]),
-            run("r1", 1, Some(3000))
+            run("r1", 1, 3000)
         );
         assert_eq!(
-            run_of(&["--deadline-ms", "5", "--run", "r1", "--attempt", "1"]),
-            run("r1", 1, Some(5))
+            run_of(&["--deadline-ms", "5", "--run", "r1", "--attempt", "2"]),
+            run("r1", 2, 5)
         );
         for bad in [
-            &["--deadline-ms", "5"][..],
+            // --deadline-ms is a run's too: rlxd always writes it.
+            &["--run", "r1", "--attempt", "2"][..],
+            &["--deadline-ms", "5"],
+            &["--run", "r1"],
+            &["--run", "", "--attempt", "1", "--deadline-ms", "5"],
+            &["--run", "r1", "--attempt", "0", "--deadline-ms", "5"],
+            &["--run", "r1", "--attempt", "x", "--deadline-ms", "5"],
             &["--run", "r1", "--attempt", "1", "--deadline-ms", "0"],
             &["--run", "r1", "--attempt", "1", "--deadline-ms", "x"],
             &["--run", "r1", "--attempt", "1", "--deadline-ms"],
-            &["--run", "r1", "--run", "r2", "--attempt", "1"],
-            &["--run", "r1", "--attempt", "1", "--key", "k"],
-        ] {
-            assert_eq!(run_of(bad), None, "{bad:?}");
-        }
-        assert_eq!(
-            run_of(&["--attempt", "1", "--run", "r1"]),
-            run("r1", 1, None)
-        );
-        for bad in [
-            &["--run", "r1"][..],
-            &["--run", "", "--attempt", "1"],
-            &["--run", "r1", "--attempt", "0"],
-            &["--run", "r1", "--attempt", "x"],
+            &[
+                "--run",
+                "r1",
+                "--run",
+                "r2",
+                "--attempt",
+                "1",
+                "--deadline-ms",
+                "5",
+            ],
+            &[
+                "--run",
+                "r1",
+                "--attempt",
+                "1",
+                "--deadline-ms",
+                "5",
+                "--key",
+                "k",
+            ],
         ] {
             assert_eq!(run_of(bad), None, "{bad:?}");
         }
