@@ -18,6 +18,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The rlx service shows rlx's `\` in the macOS menu bar or the Linux tray (Open rlx, Restart
   rlx, Quit rlx, the agents and accounts at a glance), with the `tray` extra the installer
   adds; App settings ▸ User preferences ▸ Tray switches it.
+- `rlx tidy` frees the disk rlx's ended agents and sessions left (their worktrees, temp
+  checkouts and build output, by the CACHEDIR.TAG standard), keeping anything with work
+  found nowhere else; `--dry-run` lists every path with its size and why.
+- The watcher runs `rlx tidy`'s rules on its own every hour (`[tidy] every_minutes`), one
+  pass at a time and never during a home move, and says so on a board only when it frees 1
+  GB or more.
+- `rlx doctor` gains a disk row: what rlx's worktrees, build caches and temp take, and what
+  `rlx tidy` would free, warning at 1 GB or more.
 - Settings has a tmux page: every window on rlx's tmux server and whose it is, with Open,
   Stop for windows no agent owns, and Adopt for a Claude Code or Codex left running outside
   the fleet; other tmux servers are listed read-only.
@@ -51,6 +59,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`~/.aisquare`) to `~/.rlx` in the new layout, only while nothing runs on it, and leave
   `~/.aisquare` as a link for one release (from 0.10.1, run `rlx upgrade` twice; do not move
   back to a release before 0.10.2 afterwards).
+- Each agent now runs with a temporary folder of its own under rlx's home (`TMPDIR`),
+  removed after the agent ends, so the test files and build scraps agents leave behind no
+  longer pile up on disk.
 - rlx opens on your last-used project's Manager tab instead of Welcome, and the logo and the
   Home key take you back there; `w` still opens Welcome.
 - The board is laid out as what needs you, the work and the stream: a "needs you" lane you
@@ -82,6 +93,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   link and Regenerate ask first; the phone page says why writes are off in the machine's own
   words and shows the `r\x` logo; the Captain box moves to the end of App settings' Agent
   settings.
+- Settings has an Experimental section with Captain and Remote, both off by default; a Mac
+  where Remote was already set up keeps it on, and Remote off loads nothing of it.
 - Settings ▸ Accounts names each account by its email, says why a row has no usage in words,
   and fits a 120-column terminal; the AISquare sign-in's outcome shows beside its button,
   and `aisquare login` keeps "The code expired before it was approved" on screen.
@@ -110,6 +123,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An agent's pane keeps far fewer rendered rows in memory: four screens' worth at most, and
   none while it is hidden. Long-running rlx windows stay much smaller, and scrolling looks
   and feels the same.
+- rlx now drops a stopped agent's view once it is off screen, freeing its pane, and builds
+  it again when the agent is opened; a long-running rlx window no longer grows with every
+  agent ever opened.
+- The rlx app starts lighter: its pages and dialogs load when first opened.
 - The board reads only what it shows at each tick (its open tasks, and the sessions its
   lines and cards name), so rlx stays lighter and quicker with a long board history.
 - rlx reads each account's identity file only when it has changed, and of a collapsed
@@ -123,8 +140,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   included, use typer's new pydantic wording ("Input should be less than or equal to 65535",
   "Input should be a valid integer…" without the value given, "Value error, 'x' is not one
   of …").
-<!-- PLACEHOLDER: the Experimental section in Settings (Captain and Remote, both off on a fresh home; Remote stays on where it was set up), from its PR's Changelog line. -->
-<!-- PLACEHOLDER (lands on or after 2026-12-01): gpt-5.6-sol's price once its promo ends. -->
+<!-- PLACEHOLDER, prices (lands on or after 2026-12-01): gpt-5.6-sol's price once its
+     promotional price ends. Replace this comment with that PR's Changelog line, or delete
+     it if the price did not change. -->
 
 ### Fixed
 
@@ -135,6 +153,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Fixed a rare crash when a notification was redrawn just as it was being dismissed.
 - The needs-you bar's F6 or click, on a project not opened yet, no longer shows that
   project's Manager tab now and then instead of opening the card it named.
+- A settings field saved with Enter and then left before its save finished no longer saves
+  twice, and one `ctrl+z` undoes it.
+- On a settings page, an undo after a name typed while another was still saving goes back to
+  the right name, and a save that finishes while you type no longer replaces what you typed.
+- rlx no longer leaves an empty lock file in the temp folder after moving a home; the lock
+  now sits beside the home and is removed when the move ends.
 - A Codex agent spawned with Claude Code flags now starts. `--effort` reaches Codex as its
   reasoning effort, `--model` and `--add-dir` pass as they are, and any flag Codex has no
   equivalent for is refused before its window opens, with the setting it came from and why.
@@ -147,9 +171,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### For contributors
 
-- The test suite can no longer read your real macOS Keychain: a guard in the test process
-  and in every process a test starts refuses `/usr/bin/security`, so running the tests never
-  reads your Claude Code sign-in.
+- The test suite can no longer reach your real home or your macOS Keychain: every test runs
+  in a home of its own, and a guard in the test process and in every process a test starts
+  refuses the real home, `/usr/bin/security` and real agents, so running the tests never
+  reads or writes your Claude Code, Codex or rlx state.
 
 ## [0.10.1] - 2026-11-18
 
