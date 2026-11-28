@@ -56,7 +56,7 @@ def init(
         typer.Option(
             "--reinit",
             help="Re-run setup, resetting config.toml to defaults. Discards role "
-            "bindings made with team bind.",
+            "bindings made with team bind; keeps whether the rlx service starts at login.",
         ),
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Answer yes to every prompt.")] = False,
@@ -68,8 +68,22 @@ def init(
             "explainability gateway. Off unless you ask for it.",
         ),
     ] = None,
+    no_service: Annotated[
+        bool,
+        typer.Option(
+            "--no-service",
+            help="Do not set the rlx service to start at login, and keep that: later inits and "
+            "installer runs leave it off (a choice already made stays as it is). The first init "
+            "of the default home sets it, unless CI is set; `rlx service install` turns it on.",
+        ),
+    ] = False,
 ) -> None:
     """Set up rlx on this machine and connect your agents."""
+    from aisquare.services import service_login
+
+    # What --reinit --yes replaces with the defaults: a file it could not read held a choice
+    # about the login item nobody can tell now, so that item is left as it is (#33, round 2).
+    unreadable_before = service_login.config_unreadable() if reinit else None
     try:
         with expected_config_write_errors():
             report = lifecycle_service.initialize(
@@ -100,6 +114,24 @@ def init(
             error="reinit_would_discard_explainability",
             hint=f"{prog.word()} init --reinit --yes",
         )
+    # On by default (S2, #33): the first init of the default home adds the login item, not
+    # under CI; a choice on record, a removal in the OS's own settings with it, is left as it
+    # is, the item only refreshed. --no-service records the no, for every later init.
+    with expected_config_write_errors():
+        if unreadable_before is not None:
+            # Carried from its text when it held one (lifecycle.initialize); else recorded as
+            # the OS has it, so no later init adds an item the person had turned off.
+            report.notes.append(
+                f"the {service_login.SERVICE}'s login item was left as it is: {unreadable_before}"
+                " before --reinit replaced it"
+                + ("; --no-service changed nothing there" if no_service else "")
+                + "; "
+                + service_login.record_from_the_item()
+            )
+        elif no_service:
+            report.notes.append(service_login.decline_by_default())
+        else:
+            report.notes.append(service_login.register_by_default())
     emit_setup(report)
 
 

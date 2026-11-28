@@ -14,6 +14,7 @@ from collections.abc import Callable, Collection, Container, Iterable, Mapping, 
 from datetime import UTC, datetime, timedelta
 from importlib import metadata
 from pathlib import Path, PurePath
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from aisquare.core import agents as agent_core
@@ -77,6 +78,9 @@ from aisquare.services import project as project_service
 from aisquare.services import settings as settings_service
 from aisquare.services import team as team_service
 from aisquare.services.onboarding import BROWSER_TOOLS_ARGV
+
+if TYPE_CHECKING:
+    from aisquare.services.tidy import DiskUse
 
 
 def status() -> StatusReport:
@@ -165,6 +169,8 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             _check_provenance(),
             _check_home(),
             _check_home_filesystem(),
+            # Only for a home from before 0.10.2 that no upgrade has moved yet (#31).
+            *_optional(_check_home_layout()),
             _check_config(),
             _check_database(),
             _check_claude_code(cwd),
@@ -212,12 +218,15 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             # Can warn (memory below the floor, pressure at warn), so it waits with the late rows.
             _check_fleet_capacity(),
             _check_watcher(),
+            # Beside the watcher, whose periodic tidy frees what it counts (#60). Late: it warns
+            # at 1 GB to free, which never pushes an urgent row out of the sidebar's first three.
+            _check_disk(),
             # Warns when two asqs, or an asq and this aisquare, run different releases (#20), so
             # it waits with the late rows.
             _check_instances(),
-            # Only while the experimental captain is off: one ok row saying how to turn it
-            # on. On, doctor is as it was before the switch.
-            *_optional(_captain_check()),
+            # The experimental switches, captain and Remote (#46): one ok row, and how to
+            # turn one on while it is off.
+            _experimental_check(),
             # A stale ANTHROPIC_BASE_URL kills a launch whether or not tracing or the team is on
             # (#51), so it is a machine check of its own, and not part of explainability's
             # section.
@@ -698,6 +707,40 @@ def _config_file_kind() -> str:
         return "not created yet"
     except OSError:
         return "unreadable"
+
+
+HOME_LAYOUT_UI_FIX = "Move it with ⬆ Move rlx's home in the sidebar, once nothing runs on it"
+"""The home-layout row's fix in asq, which names no command (R13): the update row's own action
+(``cli.ui.sidebar.HOME_MOVE_ROW``), which hands off to the one-click upgrade."""
+
+
+def _check_home_layout() -> DoctorCheck | None:
+    """A home laid out before 0.10.2 that the move has not moved yet (#31): ``rlx upgrade`` moves
+    it, on the release that runs too (an upgrade from 0.10.1 is 0.10.1's code, which cannot). A
+    warning, never a failure: the old home works as it is. ``None`` for a home in the new
+    layout. Reads only (``lifecycle.planned_home_move``)."""
+    from aisquare.services import lifecycle
+
+    try:
+        move, refusal = lifecycle.planned_home_move()
+    except Exception:
+        return None
+    if refusal is not None:
+        return _warn(
+            "home-layout",
+            f"laid out before 0.10.2, and it cannot be moved as it stands: {refusal}",
+            f"Move what is in the way aside, then run `{prog.word()} upgrade`",
+            ui_fix="Move what is in the way aside, then use ⬆ Move rlx's home in the sidebar",
+        )
+    if move is None:
+        return None
+    return _warn(
+        "home-layout",
+        f"laid out before 0.10.2 ({move})"
+        + prog.detail_advice(f": `{prog.word()} upgrade` moves it, once nothing runs on it"),
+        f"Move it: `{prog.word()} upgrade` (run it again if it installed a release)",
+        ui_fix=HOME_LAYOUT_UI_FIX,
+    )
 
 
 def _check_home_filesystem() -> DoctorCheck:
@@ -2951,8 +2994,7 @@ def _check_fleet_terminal(
     """What an agent pane's keys have to cross (#147): the outer terminal, tmux, the server.
 
     Three facts an operator otherwise learns one broken chord at a time: whether
-    the terminal this shell runs in speaks the kitty keyboard protocol (without
-    it shift+enter arrives as enter and the UI never fakes it), whether the tmux
+    the terminal this shell runs in speaks the kitty keyboard protocol, whether the tmux
     the keys cross carries extended keys (3.5+; below it shift+enter travels as
     ``C-j``, the same newline to Claude Code; the running server's version, which
     an in-place upgrade leaves older than the binary here, else the binary's),
@@ -2961,6 +3003,9 @@ def _check_fleet_terminal(
     pre-#147 conf keeps ``C-b``, Claude Code's background-tasks chord, in
     ``fleet attach``) and which of the desktop variables it holds stale (each new
     spawn carries this shell's, agents already running keep the server's).
+
+    The outer terminal's keyboard protocol determines whether Shift+Enter reaches the pane
+    as a distinct key. Ctrl+J adds a line in Claude Code and Codex.
 
     ``ok`` for everything but the stale prefix, which only a server restart
     fixes and which eats a documented Claude Code key.
@@ -2975,11 +3020,11 @@ def _check_fleet_terminal(
             )
         elif kitty is False:
             outer = (
-                f"outer terminal {terminal} (no kitty keyboard protocol: shift+enter arrives as "
-                "enter — `\\` then Enter, or ctrl+j, is the newline)"
+                f"outer terminal {terminal} (no kitty keyboard protocol, shift+enter arrives as "
+                "enter. Use ctrl+j for a newline)"
             )
         else:
-            outer = f"outer terminal {terminal} (protocol unknown: try shift+enter in a pane)"
+            outer = f"outer terminal {terminal} (protocol unknown, use ctrl+j for a newline)"
         if env.get("TMUX"):
             outer += "; this shell is itself inside tmux, which adds its own translation"
         if server is None and _uncreated_home(name) is not None:
@@ -3154,6 +3199,121 @@ def _check_watcher() -> DoctorCheck:
             f"{prog.word()} watch --stop; then {prog.word()} watch --detach",
         )
     return _ok(name, f"running (pid {found.pid}), {looked}")
+
+
+def _check_disk() -> DoctorCheck:
+    """``disk`` (#60, the owner's disk tidy, item 4): what rlx's folders take (the agents'
+    worktrees, the build output in them, the sessions' temp) and what tidy would free. Warns at
+    ``tidy.RECEIPT_BYTES`` (1 GB) to free, or at a folder it cannot read. One look, within
+    ``tidy.DISK_BUDGET_S``, per Doctor run (``tidy.disk_use``): the last periodic pass's stamp
+    while fresh, else a dry run; past the budget each size is a lower bound. It never frees:
+    the fix is ``tidy``'s, or the watcher's (R13: in asq, rlx's own words, never a command).
+    asq runs the Doctor on a worker, never on its UI thread."""
+    name = "disk"
+    try:
+        if (uncreated := _uncreated_home(name)) is not None:
+            return uncreated
+        from aisquare.services import tidy
+        from aisquare.services import watch as watch_service
+
+        use = tidy.disk_use()
+        every = tidy._settings().every_minutes
+        watching = watch_service.watch_status().pid is not None
+    except Exception as exc:  # diagnostics must never crash
+        return _ok(name, f"not evaluated ({exc})")
+    detail = _disk_detail(use)
+    named = ", ".join(str(root) for root in use.unreadable)
+    if named:
+        detail += f"; {named} could not be read, so nothing in it was measured"
+    to_free = use.would_free >= tidy.RECEIPT_BYTES
+    if not (named or to_free):
+        return _ok(name, detail)
+    unread = [f"make {named} readable by you: nothing in it is measured or freed"] if named else []
+    return _warn(
+        name,
+        detail,
+        "; ".join(
+            [
+                *unread,
+                *(
+                    [
+                        f"{prog.word()} tidy"
+                        if tidy.DELETES
+                        else f"{prog.word()} tidy in WSL, where the fleet runs: on native "
+                        "Windows it only reports"
+                    ]
+                    if to_free
+                    else []
+                ),
+            ]
+        ),
+        ui_fix="; ".join(
+            [
+                *(f"{way[0].upper()}{way[1:]}" for way in unread),
+                *([_disk_way_in_app(every, watching, deletes=tidy.DELETES)] if to_free else []),
+            ]
+        ),
+    )
+
+
+def _disk_detail(use: DiskUse) -> str:
+    """``disk``'s detail: the sizes, "at least" where the look ran out of time, and what tidy
+    would free, now or as of the last pass (local time). A size the look never reached is
+    said so, never as "at least 0 B" (reviewer #4085, NIT 1)."""
+    from aisquare.services.tidy import size_text
+
+    def amount(count: int, whole: bool) -> str:
+        return size_text(count) if whole else f"at least {size_text(count)}"
+
+    whole, trees = use.use_whole, use.trees_whole
+    if not (trees or use.worktrees):
+        sizes = "rlx's folders: not reached in time"
+    else:
+        head = (
+            f"rlx's folders take {amount(use.total, whole)}"
+            if whole or use.total
+            else "rlx's folders"
+        )
+        caches = (
+            f" (build caches {amount(use.build_caches, trees)} of it)"
+            if trees or use.build_caches
+            else ""
+        )
+        temp = (
+            amount(use.session_temp, whole) if whole or use.session_temp else "not reached in time"
+        )
+        sizes = (
+            f"{head}: worktrees {amount(use.worktrees, trees)}{caches}, session and agent temp "
+            f"{temp}"
+        )
+    free = (
+        f"tidy would free {amount(use.would_free, use.free_whole)}"
+        if use.free_whole or use.would_free
+        else "what tidy would free was not reached in time"
+    )
+    said = f"{sizes}; {free}"
+    if use.as_of_said is not None:  # tidy's to say: no clock is spelt here (#152)
+        said += f" as of its last pass {use.as_of_said}, which freed {size_text(use.freed_then)}"
+    return said
+
+
+def _disk_way_in_app(every: float, watching: bool, *, deletes: bool) -> str:
+    """What asq says under a ``disk`` row with GBs to free (R13, manager #3817): rlx's own
+    way, never a command. Native Windows only reports; the watcher's periodic tidy frees it,
+    while it runs and is on."""
+    if not deletes:
+        return "rlx only reports this here: on native Windows it frees nothing"
+    if every <= 0:
+        return "rlx's own tidy is off in its settings, so nothing frees it by itself"
+    if not watching:
+        return "The fleet watcher isn't running, so rlx doesn't free it by itself"
+    if every == 60:
+        within = "within the hour"
+    elif every > 60 and every % 60 == 0:
+        within = f"within {every / 60:g} hours"
+    else:
+        within = f"within {every:g} minutes"
+    return f"rlx frees it by itself {within}"
 
 
 def _check_instances() -> DoctorCheck:
@@ -3951,22 +4111,40 @@ def _check_code_index(cwd: Path | None = None) -> DoctorCheck:
     return _ok(name, detail)
 
 
-def _captain_check() -> DoctorCheck | None:
-    """``captain: off (experimental)`` while the switch is off; ``None`` while it is on.
+def _experimental_check() -> DoctorCheck:
+    """``experimental: captain off, remote on``: both switches of Settings' *Experimental*
+    (#46), each with what decides it when that is not the config alone.
 
-    Ok, not a warning: off is the shipped state (``core.experimental``), and the row
-    is there to say how to turn it on.
+    Ok either way: off is how each ships (``core.experimental``). While one is off, the row
+    says how to turn it on: by command at a shell, by Settings in rlx (R13).
     """
-    if experimental.captain_enabled():
-        return None
-    return _ok(
-        "captain",
-        "off (experimental)"
-        + prog.detail_advice(
-            f" — turn it on with: {prog.word()} config set experimental.captain true "
-            f"(or {experimental.CAPTAIN_ENV}=1)"
-        ),
+    captain = experimental.captain_enabled()
+    remote = experimental.remote_enabled()
+    detail = (
+        f"captain {_switch_state(captain, experimental.captain_forced(), experimental.CAPTAIN_ENV)}"
+        f", remote {_switch_state(remote, experimental.remote_forced(), experimental.REMOTE_ENV)}"
     )
+    if remote and experimental.remote_forced() is None and _remote_undecided():
+        detail += " (set up before it had a switch)"
+    if not (captain and remote):
+        names = [name for name, on in (("captain", captain), ("remote", remote)) if not on]
+        detail += prog.detail_advice(
+            " — turn one on with: "
+            + " or ".join(f"{prog.word()} config set experimental.{name} true" for name in names),
+            app=" — turn one on in Settings > App settings > Experimental",
+        )
+    return _ok("experimental", detail)
+
+
+def _switch_state(on: bool, forced: bool | None, variable: str) -> str:
+    return ("on" if on else "off") + (f" ({variable})" if forced is not None else "")
+
+
+def _remote_undecided() -> bool:
+    try:
+        return load_config(copy=False).experimental.remote is None
+    except Exception:  # doctor's config row says why
+        return False
 
 
 def last_injection() -> InjectionRecord | None:

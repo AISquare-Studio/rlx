@@ -37,7 +37,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_for_futures
 from dataclasses import dataclass, replace
@@ -315,6 +315,11 @@ class RemoteController:
         saves its switch there, once its deadline is written, so that the save and a turn-off
         meanwhile come in the order they happened. The fleet UI hands it Textual's
         ``call_later``; with nothing else driving the controller, the step runs at once."""
+        self.others_stopping: Callable[[], Iterable[RemoteController]] = tuple
+        """The other Remotes of this process still turning off, which a start waits for as it
+        waits for its own (:meth:`_turn_on`). The fleet UI hands it those it turned off from
+        Settings' Experimental switch: they share ``remote.json`` and the server's runtime,
+        and their locks are each their own (review of #45, #3931). None by default."""
         self.on_done: NewsListener | None = None
         """Told, on the writer's thread, what a control's write did once it has: a new
         passphrase, a device revoked. The panel said so as the button was pressed, which
@@ -414,7 +419,7 @@ class RemoteController:
         the TUI's, whose trouble is news (:meth:`restore`)."""
         if self.remote_serving:
             return True
-        if not self.wait_until_off(OFF_WAIT_SECONDS):
+        if not self._all_off(OFF_WAIT_SECONDS):
             self.message = STILL_TURNING_OFF
             return False
         self.public_origin = None
@@ -782,6 +787,17 @@ class RemoteController:
             return True
         stopper.join(timeout)
         return not stopper.is_alive()
+
+    def _all_off(self, timeout: float) -> bool:
+        """Whether this Remote's own stopping is done, and every other one still turning off
+        (:attr:`others_stopping`) is off with its writes landed, all within ``timeout``."""
+        deadline = time.monotonic() + timeout
+        for remote in (self, *self.others_stopping()):
+            if not remote.wait_until_off(max(0.0, deadline - time.monotonic())):
+                return False
+            if remote is not self and not remote.writes_done(max(0.0, deadline - time.monotonic())):
+                return False
+        return True
 
     def stop_tunnel_now(self) -> None:
         """Stop the ngrok of a Remote still turning off, on the calling thread, server or not.

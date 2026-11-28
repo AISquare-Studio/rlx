@@ -1743,8 +1743,8 @@ def test_each_tab_shows_the_bare_minimum_and_folds_the_rest_under_advanced() -> 
 
     seen = drive(scenario)
     agent_tab = cast(list[str], seen["agent tab"])
-    assert agent_tab[-1] == "settings-captain", agent_tab
-    assert agent_tab.index(AGENT_ADVANCED) < agent_tab.index("settings-captain"), "under it"
+    assert agent_tab[-1] == "settings-experimental", agent_tab
+    assert agent_tab.index(AGENT_ADVANCED) < agent_tab.index("settings-experimental"), "under it"
     for tab in TABS_IN_ORDER:
         assert seen[f"{tab} in view"] == [], f"{tab}: shown as it opens"
         assert seen[f"{tab} folded"] == [], f"{tab}: folded until Advanced is opened"
@@ -1888,6 +1888,45 @@ def test_the_page_holds_no_save_reload_apply_or_cancel_button() -> None:
         ]
 
     assert drive(scenario) == []
+
+
+def test_a_field_whose_config_write_failed_is_written_again_on_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#53: the config could not be written (the filesystem said no), so the text field keeps
+    what was typed to try again (``_show_file_value``), and Enter with it unchanged writes again:
+    the value in flight is released."""
+    from aisquare.cli.ui.views import app_settings as settings_view
+
+    real_save = save_config  # the one writer, which the view calls by this name
+    calls: list[str] = []
+
+    def once_refused(config: AppConfig) -> None:
+        calls.append(config.fleet.escape_key)
+        if len(calls) == 1:
+            raise OSError("read-only file system")
+        real_save(config)
+
+    monkeypatch.setattr(settings_view, "save_config", once_refused)
+
+    async def scenario(pilot: Pilot[None], host: AppHost) -> tuple[list[str], str, bool]:
+        await settle(pilot)
+        host.query_one(f"#{AGENT_ADVANCED}", Collapsible).collapsed = False
+        await settle(pilot)
+        escape = host.query_one("#escape-key", Input)
+        escape.focus()
+        await settle(pilot)
+        escape.value = "f11"
+        await pilot.press("enter")
+        await settle(pilot)
+        failed = any("could not write the config" in m for m, _ in host.notices)
+        await pilot.press("enter")  # the same value, again
+        await settle(pilot)
+        return list(calls), load_config().fleet.escape_key, failed
+
+    calls_seen, on_disk, failed = drive(scenario)
+    assert failed, "the premise: the first write failed"
+    assert calls_seen == ["f11", "f11"] and on_disk == "f11"
 
 
 def test_a_field_typed_and_not_left_is_kept_when_rlx_quits() -> None:

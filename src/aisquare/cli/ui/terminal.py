@@ -206,11 +206,12 @@ import sys
 import time
 import weakref
 from bisect import bisect_left
-from collections.abc import Callable, Mapping
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Mapping
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Any, ClassVar, Literal, NamedTuple, assert_never
+from typing import Any, ClassVar, Generic, Literal, NamedTuple, TypeVar, assert_never
 
 from rich.cells import cell_len, set_cell_size, split_graphemes
 from rich.segment import Segment
@@ -435,6 +436,50 @@ class Shown(NamedTuple):
     lines: list[str]
     notice: str | None
     marker: Corner | None
+
+
+_Key = TypeVar("_Key", bound=Hashable)
+_Value = TypeVar("_Value")
+
+
+class RenderCache(Generic[_Key, _Value]):
+    """The rows a pane rendered last, at most :attr:`limit`: the least recently used goes
+    first (#42).
+
+    A render cache, not history: a row it no longer holds is rendered again from the frame
+    line, the same row. Before, a pane kept up to 4,096 rows (19-28 MB at full width) and
+    dropped them only all at once when full, and never on hide or attach: live apps grew to
+    167-210 MB in 18 minutes and 288 MB in a week (the hub's measurement, 2026-11-26)."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._entries: OrderedDict[_Key, _Value] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, key: _Key) -> _Value | None:
+        value = self._entries.get(key)
+        if value is not None:
+            self._entries.move_to_end(key)
+        return value
+
+    def put(self, key: _Key, value: _Value) -> None:
+        self._entries[key] = value
+        self._entries.move_to_end(key)
+        self._trim()
+
+    def resize(self, limit: int) -> None:
+        """Hold at most ``limit`` rows from now on: past it, the least recently used go."""
+        self.limit = limit
+        self._trim()
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def _trim(self) -> None:
+        while len(self._entries) > self.limit:
+            self._entries.popitem(last=False)
 
 
 def _extract(selection: Selection, rows: list[DisplayedRow], width: int) -> str:
@@ -1351,8 +1396,11 @@ class TerminalPane(Widget, can_focus=True):
     Terminal depending on its bindings), and alt+PgUp is rarely claimed by
     anyone. The wheel is not a given either — reported 2026-09-08 from WSL2 as
     "scroll not working", with no other way into the history."""
-    CACHE_LIMIT: int = 4096
-    """Distinct row strings kept as Strips before the cache is emptied."""
+    CACHE_SCREENS: ClassVar[int] = 4
+    CACHE_FLOOR: ClassVar[int] = 512
+    """The render cache holds the last ``max(CACHE_SCREENS x the pane's height, CACHE_FLOOR)``
+    rows it rendered (:class:`RenderCache`, #42): a screen's rows and the screens around it
+    while scrolling, and no more."""
 
     def __init__(
         self,
@@ -1404,8 +1452,9 @@ class TerminalPane(Widget, can_focus=True):
         self._wrapped: list[bool] = []
         """Per row of ``_lines``, whether tmux soft-wrapped it into the next (``-F``)."""
         self._cursor: tuple[int, int] | None = None
-        self._strip_cache: dict[str, Strip] = {}
-        self._row_cache: dict[tuple[str, int], DisplayedRow] = {}
+        self._strip_cache: RenderCache[str, Strip] = RenderCache(self.CACHE_FLOOR)
+        """Each frame line rendered as a Strip, by the line (:meth:`_strip_for`)."""
+        self._row_cache: RenderCache[tuple[str, int], DisplayedRow] = RenderCache(self.CACHE_FLOOR)
         """The text model of a frame line shown in a row of N cells, beside its Strip."""
         self._timer: Timer | None = None
         self._deadline = 0.0
@@ -1603,6 +1652,8 @@ class TerminalPane(Widget, can_focus=True):
         self._polling = False
         self._unconfirmed = False
         self._urgent = 0
+        if pane_id != self.pane_id:
+            self._clear_render_cache()  # another pane's rows (#42)
         self.pane_id = pane_id
         self.scrollback = 0
         self.facts = None
@@ -1663,6 +1714,7 @@ class TerminalPane(Widget, can_focus=True):
 
     def on_mount(self) -> None:
         _MOUNTED_PANES.add(self)
+        self._fit_render_cache()
         self._frame_now()
         self._schedule(self.FAST_INTERVAL)
 
@@ -1671,8 +1723,8 @@ class TerminalPane(Widget, can_focus=True):
 
         ``on_hide`` clears it because a hidden pane's highlight can go stale;
         an unmounted pane's entry was left behind, a strong reference from the
-        screen's dict to a dead widget — and its strip cache, up to
-        ``CACHE_LIMIT`` rows — that nothing short of ``clear_selection`` could
+        screen's dict to a dead widget — and its render cache, up to
+        :meth:`_cache_limit` rows — that nothing short of ``clear_selection`` could
         drop (review of #135, second round, finding 6). Textual dispatches
         ``Unmount`` while the widget still hangs in the DOM, so the screen is
         reachable here.
@@ -1713,12 +1765,30 @@ class TerminalPane(Widget, can_focus=True):
         at the hide (:meth:`_interrupt_gesture`).
 
         A hidden pane is not captured, so the control client is told it left the
-        screen: it is paused there, and sends nothing.
+        screen: it is paused there, and sends nothing. Nor does it keep the rows it
+        rendered (#42): shown again, its next frame renders them anew.
         """
         self._interrupt_gesture()
         if self.text_selection is not None:
             self._clear_own_selection()
         self._unwatch()
+        self._clear_render_cache()
+
+    # --- the render cache (#42) ------------------------------------------------------------
+
+    def _cache_limit(self) -> int:
+        """How many rows the render cache holds: four screens of this pane, 512 at least."""
+        return max(self.CACHE_SCREENS * self.content_size.height, self.CACHE_FLOOR)
+
+    def _fit_render_cache(self) -> None:
+        """Size the render cache to this pane's height now: smaller, the oldest rows go."""
+        limit = self._cache_limit()
+        self._strip_cache.resize(limit)
+        self._row_cache.resize(limit)
+
+    def _clear_render_cache(self) -> None:
+        self._strip_cache.clear()
+        self._row_cache.clear()
 
     def on_focus(self) -> None:
         self._refresh_cursor_row()
@@ -2397,13 +2467,11 @@ class TerminalPane(Widget, can_focus=True):
         key = (line, width)
         row = self._row_cache.get(key)
         if row is None:
-            if len(self._row_cache) >= self.CACHE_LIMIT:
-                self._row_cache.clear()
             text = self._strip_for(line).text
             if cell_len(text) > width:
                 text = set_cell_size(text, width)
             row = DisplayedRow(text.rstrip())
-            self._row_cache[key] = row
+            self._row_cache.put(key, row)
         return row
 
     def _displayed_row(
@@ -2727,13 +2795,10 @@ class TerminalPane(Widget, can_focus=True):
     def _strip_for(self, line: str) -> Strip:
         strip = self._strip_cache.get(line)
         if strip is None:
-            if len(self._strip_cache) >= self.CACHE_LIMIT:
-                self._strip_cache.clear()
-                self._row_cache.clear()
             text = Text.from_ansi(line, end="")
             text.expand_tabs(self.TAB_STOPS)
             strip = Strip(text.render(self.app.console)).simplify()
-            self._strip_cache[line] = strip
+            self._strip_cache.put(line, strip)
         return strip
 
     def _with_cursor(self, strip: Strip, x: int, row: DisplayedRow) -> Strip:
@@ -3933,6 +3998,7 @@ class TerminalPane(Widget, can_focus=True):
     # --- size ----------------------------------------------------------------------------
 
     def on_resize(self, event: events.Resize) -> None:
+        self._fit_render_cache()  # four of the new height's screens (#42)
         if self._resize_timer is not None:
             self._resize_timer.stop()
         self._resize_retry = self.RESIZE_RETRY  # a new size, not the failed one's backoff

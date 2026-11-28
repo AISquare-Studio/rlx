@@ -143,6 +143,9 @@ ASSUME_YES=${AISQUARE_INSTALL_YES:-0}
 WANT_AGENT=1
 WANT_SYSTEM_DEPS=1
 WANT_PROJECT=1
+# The rlx service at each login (S2): `aisquare init` adds its login item, the first time,
+# unless --no-service (WANT_SERVICE=0) says not to.
+WANT_SERVICE=1
 PROJECT_DIR=""
 # THE RELEASE STAMP. Empty in the repository, so the copy on `main` installs the
 # latest release. A release asset (releases/download/vX.Y.Z/install.sh) has this
@@ -289,6 +292,34 @@ aisquare_home_dir() {
     fi
     printf '%s' "${_ah_dir%/}"
 }
+
+# Whether RLX_HOME or AISQUARE_HOME names a home other than the default one, as the CLI
+# decides it (services/service_login.py _named_home): the default is ~/.rlx if it is there,
+# else ~/.aisquare if it is, else ~/.rlx, and each side is compared by the folder a link
+# leads to. No login item is set up for another home by itself (S2, #33).
+named_home_elsewhere() {
+    _nh_named=${RLX_HOME:-${AISQUARE_HOME:-}}
+    [ -n "$_nh_named" ] || return 1
+    if [ -d "$HOME/.rlx" ]; then
+        _nh_default=$HOME/.rlx
+    elif [ -d "$HOME/.aisquare" ]; then
+        _nh_default=$HOME/.aisquare
+    else
+        _nh_default=$HOME/.rlx
+    fi
+    [ "$(real_folder "$_nh_named")" != "$(real_folder "$_nh_default")" ]
+}
+
+# A folder by the path its links lead to (`pwd -P`), or as written, less a trailing /, when
+# it is not there.
+real_folder() {
+    if [ -d "$1" ]; then
+        (cd "$1" 2>/dev/null && pwd -P) || printf '%s' "${1%/}"
+    else
+        printf '%s' "${1%/}"
+    fi
+}
+
 aisquare_home_shown() {
     shown_path "$(aisquare_home_dir)"
 }
@@ -1397,6 +1428,13 @@ banner() {
     # Its own line: init connects the hooks with or without a project, and not
     # at all under --no-agent.
     [ "$WANT_AGENT" = 1 ] && _plan="$_plan$_bn_nl  connect  $(agents_connected_shown) hooks"
+    if [ "$WANT_SERVICE" = 0 ]; then
+        _plan="$_plan$_bn_nl  skip     the rlx service at login (--no-service)"
+    elif named_home_elsewhere; then
+        _plan="$_plan$_bn_nl  skip     the rlx service at login (a home RLX_HOME or AISQUARE_HOME names: \`rlx service install\` there sets it)"
+    else
+        _plan="$_plan$_bn_nl  start    the rlx service, now and at each login (unless turned off before)"
+    fi
 
     # As text: as the format a % in a path was a conversion, and under %b a \c
     # ended the banner there and \t or \0NNN were rewritten (review of #257).
@@ -1528,10 +1566,23 @@ Open a new shell and rerun, or add it by hand:
 # once 0.9.0 is the latest. Gate it, with RELEASE_ERA_AMBER, on the version
 # being installed (below 0.9.0) instead.
 
+# The package with the extras this OS takes: the tray's on macOS and on Linux outside WSL
+# (#34, the rlx service's menu bar / tray icon), none on WSL or Windows, which have no tray
+# in 0.10.2. Only for the PyPI package: a path (CI's) installs as given, so CI runs the
+# no-extra path. `rlx upgrade` keeps it, as uv's receipt records the extra.
+cli_package() {
+    if [ "$OS" = macos ] || { [ "$OS" = linux ] && [ "${IS_WSL:-0}" != 1 ]; }; then
+        printf '%s[tray]' "$PYPI_PACKAGE"
+    else
+        printf '%s' "$PYPI_PACKAGE"
+    fi
+}
+
 install_cli() {
     _target=$INSTALL_TARGET
+    [ "$INSTALL_TARGET" = "$PYPI_PACKAGE" ] && _target=$(cli_package)
     [ -n "$PIN_VERSION" ] && [ "$INSTALL_TARGET" = "$PYPI_PACKAGE" ] &&
-        _target="$PYPI_PACKAGE==$PIN_VERSION"
+        _target="$(cli_package)==$PIN_VERSION"
 
     case "$CLI_ACTION" in
         current)
@@ -1570,8 +1621,8 @@ Rerun with --verbose to see uv's own output."
                 # treat the whole thing as a package name.
                 _spec=$INSTALL_TARGET
             else
-                _spec="$PYPI_PACKAGE@latest"
-                [ -n "$PIN_VERSION" ] && _spec="$PYPI_PACKAGE@$PIN_VERSION"
+                _spec="$(cli_package)@latest"
+                [ -n "$PIN_VERSION" ] && _spec="$(cli_package)@$PIN_VERSION"
             fi
             if ! run uv tool install --force --python "$PYTHON_VERSION" \
                 --with tiktoken "$_spec"; then
@@ -2520,6 +2571,13 @@ codex_installer_sh() {
 # 15  init (§3.4) — NEVER --reinit
 # ---------------------------------------------------------------------------
 
+# Whether the installed aisquare has the rlx service's login item (0.10.2 on): its init
+# has --no-service, and `service install` its --if-undecided. Asked by the exit code, never
+# by grepping the help, which Rich shortens to `--no-…` on a terminal under 60 columns.
+has_the_login_item() {
+    aisquare service install --help >/dev/null 2>&1
+}
+
 # A tilde inside quotes does not expand — which is exactly what is wanted here:
 # these strings are DISPLAY TEXT telling a person where things went, and `~` is
 # how a person writes that. shellcheck cannot tell a path being used from a path
@@ -2541,6 +2599,11 @@ init_home() {
     set -- init --local --yes
     wants_claude && set -- "$@" --agent claude-code
     wants_codex && set -- "$@" --agent codex
+    # --no-service only to a release whose init has it (0.10.2 on): one before it adds no
+    # login item to leave out, and would refuse the option it does not know.
+    if [ "$WANT_SERVICE" = 0 ] && { [ "$DRY_RUN" = 1 ] || has_the_login_item; }; then
+        set -- "$@" --no-service
+    fi
     if [ "$WANT_PROJECT" = 1 ] && [ -n "$PROJECT_DIR" ]; then
         set -- "$@" "$PROJECT_DIR"
     else
@@ -2554,6 +2617,9 @@ init_home() {
         fi
         if wants_codex && ! wants_claude; then
             printf '  %swould run:%s aisquare agents use codex\n' "$C_DIM" "$C_RESET"
+        fi
+        if [ "$WANT_SERVICE" = 1 ]; then
+            printf '  %swould run:%s aisquare service install --if-undecided\n' "$C_DIM" "$C_RESET"
         fi
         return 0
     fi
@@ -2575,6 +2641,14 @@ init_home() {
     # (the account order, `core.agent_adapters`). With both, Claude Code stays it.
     if wants_codex && ! wants_claude; then
         run aisquare agents use codex || die "\`aisquare agents use codex\` failed. Rerun with --verbose to see its output."
+    fi
+    # The rlx service at each login (S2): installing is the person's act, so this registers an
+    # undecided default home even under CI, where init alone does not. A choice on record, and
+    # a home a variable names, are left as they are. Said, never fatal.
+    if [ "$WANT_SERVICE" = 1 ] && has_the_login_item; then
+        if ! run aisquare service install --if-undecided; then
+            warn "\`aisquare service install --if-undecided\` failed: the rlx service may not start at login. Rerun with --verbose to see its output."
+        fi
     fi
     if [ "$WANT_PROJECT" = 1 ] && [ -n "$PROJECT_DIR" ]; then
         good "$(aisquare_home_shown) set up, $PROJECT_DIR registered"
@@ -3244,6 +3318,11 @@ Options
                        no; --yes asks nothing.
       --project DIR    Register DIR as the project (default: $PWD if a git repo).
       --no-project     Machine setup only; register nothing.
+      --no-service     Do not start the rlx service at each login, and keep
+                       that for later runs. It does by default: a LaunchAgent
+                       on macOS, a systemd user unit on Linux and in WSL
+                       (turn it on later in App settings, or with: rlx
+                       service install).
       --version V      Pin aisquare-cli to V, or `latest` (default: latest, or
                        the release a release asset was downloaded from).
       --python V       Interpreter uv resolves for the tool env (default: 3.13).
@@ -3302,6 +3381,7 @@ parse_args() {
             --no-agent) WANT_AGENT=0 ;;
             --no-system-deps) WANT_SYSTEM_DEPS=0 ;;
             --no-project) WANT_PROJECT=0 ;;
+            --no-service) WANT_SERVICE=0 ;;
             --with)
                 [ $# -ge 2 ] || die "--with needs an extra (there is: $OPTIONAL_EXTRAS)"
                 choose_extra "$2"

@@ -2,9 +2,10 @@
 
 Nine links, each a button with one line saying what is behind it — *App
 settings* (the machine-wide settings, ``views.app_settings``), *Remote control* (the one
-Remote page, which ``R`` opens too: ``views.remote``, Q17), *Captain* (App settings again,
-its *Agent settings* scrolled to the captain's box, its last section, Q18: one obvious way
-in, #41), *Accounts* (the AISquare sign-in
+Remote page, which ``R`` opens too: ``views.remote``, Q17; only while Remote is on, #46),
+*Experimental* (App settings again, its *Agent settings* scrolled to *Experimental*, its last
+section, Q18: one obvious way in, #41; the captain's and Remote's switches, #46), *Accounts*
+(the AISquare sign-in
 and the Claude Code and Codex accounts, ``views.accounts``), *Personas* (yours and the
 bundled ones, for every project: ``views.personas_tab`` with no project, R27), *Usage &
 stats* (what all your agents' sessions on this machine spent, ``views.usage_stats``), *Agent
@@ -51,7 +52,7 @@ from aisquare.cli.ui.sidebar import (
     doctor_badge,
 )
 from aisquare.cli.ui.views import tmux_page
-from aisquare.cli.ui.views.app_settings import CAPTAIN
+from aisquare.cli.ui.views.app_settings import EXPERIMENTAL
 from aisquare.cli.ui.views.fleet_bulk import (
     BULK_WORKER,
     ConfirmBulk,
@@ -59,7 +60,7 @@ from aisquare.cli.ui.views.fleet_bulk import (
     bulk_running,
     report_toast,
 )
-from aisquare.cli.ui.views.remote import open_remote_page
+from aisquare.core import experimental
 from aisquare.services import fleet as fleet_service
 
 LINKS: tuple[tuple[str, str, str], ...] = (
@@ -69,7 +70,11 @@ LINKS: tuple[tuple[str, str, str], ...] = (
         "agent settings (roles, the fleet, accounts' rules) and your preferences",
     ),
     ("remote", "Remote control", "the fleet on your phone: a link, its QR code and a password"),
-    ("captain", "Captain", "the experimental captain, on or off (App settings, last)"),
+    (
+        "experimental",
+        "Experimental",
+        "the captain and Remote, each off until you turn it on (App settings, last)",
+    ),
     ("accounts", "Accounts", "the AISquare sign-in and the Claude Code and Codex accounts"),
     ("personas", "Personas", "who an agent can be: browse, edit and import personas"),
     (
@@ -124,8 +129,11 @@ class SettingsHubView(VerticalScroll, can_focus=False):
 
     def compose(self) -> ComposeResult:
         yield Static(Text(f"{SETTINGS_ICON} Settings"), id="settings-title")
+        remote = bool(getattr(self.app, "remote_on", experimental.remote_enabled()))
         for stem, label, about in LINKS:
-            with Vertical(classes="hub-row"):
+            # Remote's only while it is on (#46): off, there is nothing of it to open.
+            with Vertical(classes="hub-row", id=f"hub-{stem}-row") as row:
+                row.display = stem != "remote" or remote
                 yield Button(label, id=f"hub-{stem}", classes="hub-link", compact=True)
                 yield Static(Text(about), classes="hub-about", id=f"hub-{stem}-about")
         yield Static(Text("Fleet"), id="hub-fleet-title")
@@ -161,6 +169,8 @@ class SettingsHubView(VerticalScroll, can_focus=False):
         stem = (event.button.id or "").removeprefix("hub-")
         if stem == "remote":  # the one Remote page, as R opens it (Q17)
             event.stop()
+            from aisquare.cli.ui.views.remote import open_remote_page  # loaded: Remote is on
+
             open_remote_page(self.app)
             return
         if stem == "tmux":  # a page of its own, shown among the app's (``views.tmux_page``)
@@ -169,7 +179,7 @@ class SettingsHubView(VerticalScroll, can_focus=False):
             return
         message: Message | None = {
             "app-settings": AppSettingsSelected(),
-            "captain": AppSettingsSelected(CAPTAIN),
+            "experimental": AppSettingsSelected(EXPERIMENTAL),
             "accounts": AccountsSelected(),
             "personas": PersonasSelected(),
             "usage-stats": UsageStatsSelected(),
@@ -182,13 +192,21 @@ class SettingsHubView(VerticalScroll, can_focus=False):
 
     def action_step(self, delta: int) -> None:
         """↑/↓: the link above or below the focused one, stopping at the ends."""
-        links = list(self.query(".hub-link").results(Button))
+        links = [
+            link
+            for link in self.query(".hub-link").results(Button)
+            if getattr(link.parent, "display", True)  # Remote's row hides while it is off
+        ]
         focused = self.app.focused
         if isinstance(focused, Button) and focused in links:
             at = links.index(focused)
         else:
             at = -1 if delta > 0 else len(links)
         links[max(0, min(len(links) - 1, at + delta))].focus()
+
+    def show_remote(self, on: bool) -> None:
+        """Remote turned on or off while rlx runs (#46): its link shown, or hidden."""
+        self.query_one("#hub-remote-row").display = on
 
     def focus_first(self) -> None:
         """Put the keyboard on the first link, as the page opens from the keyboard."""

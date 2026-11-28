@@ -306,3 +306,172 @@ def test_forgetting_none_forgets_nothing() -> None:
         return kept_before + ["|"] + [change.what for change in page.changes]
 
     assert drive(go) == ["unkeyed", "keyed", "|", "unkeyed"]
+
+
+# --- #53: a value in flight is committed once -------------------------------------------
+
+
+class LatePage(Page):
+    """A page that answers later, as one saving off the UI thread does: each commit is held in
+    :attr:`asked` until the test answers it with :meth:`land`, :meth:`fail` or ``refuse``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.asked: list[str] = []
+
+    def on_commit_input_committed(self, event: CommitInput.Committed) -> None:
+        event.prevent_default()  # not Page's handler too, which keeps at once
+        self.asked.append(event.value)
+
+    def land(self) -> None:
+        """The save of the last value asked lands: on disk, kept, with its Undo."""
+        field = self.query_one(CommitInput)
+        previous, self.disk = self.disk, self.asked[-1]
+        self.writes.append(self.disk)
+        field.keep(self.disk)
+
+        def undo() -> None:
+            self.disk = previous
+            self.writes.append(previous)
+            field.keep(previous)
+
+        self.kept(f"the field ({self.disk})", undo)
+
+    def fail(self) -> None:
+        """The save failed: nothing written, the typed value left to try again."""
+        self.query_one(CommitInput).release()
+
+
+class LateHost(Host):
+    def compose(self) -> ComposeResult:
+        yield LatePage()
+        yield Input(id="elsewhere")
+
+
+def drive_late(fn: Any) -> Any:
+    async def run() -> Any:
+        app = LateHost()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return await fn(pilot, app, app.query_one(LatePage))
+
+    return asyncio.run(run())
+
+
+async def _enter_then_leave(pilot: Any, app: App[None], field: CommitInput, value: str) -> None:
+    field.focus()
+    await pilot.pause()
+    field.value = value
+    await pilot.press("enter")
+    await pilot.pause()
+    app.query_one("#elsewhere").focus()  # left before the page has answered
+    await pilot.pause()
+
+
+def test_enter_then_leaving_before_the_save_lands_commits_once_and_undoes_in_one() -> None:
+    """#53: Enter, then leaving the field before the page has heard its save, asks the page
+    once; the save lands as one write and one Undo, and one ctrl+z puts the old value back."""
+
+    async def go(pilot: Any, app: LateHost, page: LatePage) -> dict[str, Any]:
+        field = page.query_one(CommitInput)
+        await _enter_then_leave(pilot, app, field, "new")
+        seen: dict[str, Any] = {"asked": list(page.asked), "in_flight": field.in_flight}
+        page.land()
+        seen["landed"] = (page.writes[:], len(page.changes), field.kept, field.in_flight)
+        field.focus()
+        await pilot.pause()
+        app.query_one("#elsewhere").focus()  # the value on disk now: nothing to ask
+        await pilot.pause()
+        seen["asked_after"] = list(page.asked)
+        field.focus()  # ctrl+z reaches the page from a control on it
+        await pilot.pause()
+        await pilot.press("ctrl+z")
+        await pilot.pause()
+        seen["undone"] = (page.disk, field.value, len(page.changes))
+        return seen
+
+    seen = drive_late(go)
+    assert seen["asked"] == ["new"] and seen["in_flight"] == "new", seen
+    assert seen["landed"] == (["new"], 1, "new", None), seen
+    assert seen["asked_after"] == ["new"], "kept: leaving the field again asks nothing"
+    assert seen["undone"] == ("old", "old", 0), "one ctrl+z: the old value, on disk and shown"
+
+
+def test_a_value_whose_save_failed_or_was_refused_is_committed_again() -> None:
+    """The guard lasts until the page answers: a save that failed (``release``) or a value it
+    refused (``refuse``) leaves the typed value to try again, and Enter asks again."""
+
+    async def go(pilot: Any, app: LateHost, page: LatePage) -> tuple[list[str], list[str]]:
+        field = page.query_one(CommitInput)
+        await _enter_then_leave(pilot, app, field, "new")
+        page.fail()
+        await _enter_then_leave(pilot, app, field, "new")
+        after_failure = list(page.asked)
+        page.refuse(field, "not saved: try again")
+        await _enter_then_leave(pilot, app, field, "new")
+        return after_failure, list(page.asked)
+
+    after_failure, after_refusal = drive_late(go)
+    assert after_failure == ["new", "new"], "released: asked again"
+    assert after_refusal == ["new", "new", "new"], "refused: asked again"
+
+
+def test_a_page_s_re_read_of_what_is_on_disk_answers_the_value_in_flight() -> None:
+    """Setting :attr:`CommitInput.kept` (a page's re-read) answers the value in flight, and a
+    new value is asked at once even while another is in flight."""
+
+    async def go(pilot: Any, app: LateHost, page: LatePage) -> tuple[str | None, list[str]]:
+        field = page.query_one(CommitInput)
+        await _enter_then_leave(pilot, app, field, "new")
+        await _enter_then_leave(pilot, app, field, "newer")  # another value: asked
+        field.kept = "old"
+        cleared = field.in_flight
+        await _enter_then_leave(pilot, app, field, "newer")
+        return cleared, list(page.asked)
+
+    cleared, asked = drive_late(go)
+    assert cleared is None
+    assert asked == ["new", "newer", "newer"]
+
+
+def test_keep_leaves_text_typed_since_and_shows_what_it_answers() -> None:
+    """#56: an earlier save's answer keeps its value (``kept``) but does not replace text typed
+    in the field since: that is the person's. What it answers (the value in flight, here
+    normalised) and a field showing the value kept (Undo's keep) are shown as before."""
+
+    async def go(pilot: Any, app: LateHost, page: LatePage) -> dict[str, Any]:
+        field = page.query_one(CommitInput)
+        field.focus()
+        await pilot.pause()
+        field.value = "new"
+        await pilot.press("enter")
+        await pilot.pause()
+        field.value = "typed"  # typed after Enter, not committed
+        page.land()
+        seen: dict[str, Any] = {"typing": (field.value, field.kept)}
+        field.value = " padded "
+        await pilot.press("enter")
+        await pilot.pause()
+        field.keep("padded")  # the store's own spelling of the value it answers
+        seen["answered"] = (field.value, field.kept)
+        field.keep("old")  # Undo's: the field shows what was kept
+        seen["undone"] = (field.value, field.kept)
+        return seen
+
+    seen = drive_late(go)
+    assert seen["typing"] == ("typed", "new"), "the typed text stays; the value is kept"
+    assert seen["answered"] == ("padded", "padded")
+    assert seen["undone"] == ("old", "old")
+
+
+def test_undos_keep_shows_its_value_over_text_typed_since() -> None:
+    """#3597: Undo's keep (``over_typing``) shows the value it puts back over text typed in the
+    field since; a save's keep leaves that text (the test above)."""
+
+    async def go(pilot: Any, app: Host, page: Page) -> tuple[str, str]:
+        field = page.query_one(CommitInput)
+        field.value = "half-typed"
+        field.keep("old", over_typing=True)
+        return field.value, field.kept
+
+    assert drive(go) == ("old", "old")

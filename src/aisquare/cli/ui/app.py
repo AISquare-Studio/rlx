@@ -6,7 +6,9 @@ the first ``+``, Accounts on the first click of its section
 (docs/plans/claude-accounts.md), one ``ProjectView`` / ``AgentView`` per
 selection, created the first time it is asked for and kept (a view hosts a live
 terminal pane; re-creating it on every click would restart that pane's render
-loop).
+loop). An agent's view is kept while its agent lives: once the agent has stopped or
+left the fleet's list and its view is off screen, the view goes, its pane with it,
+and opening the agent again builds it anew (#43, ``FleetApp._views_left``).
 
 **The TUI holds no state that matters** (§2). Projects come from the store,
 agents from the fleet service, both re-read every two seconds exactly as
@@ -40,7 +42,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -58,12 +60,10 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Button, ContentSwitcher, Footer, Static, TextArea
 from textual.widgets._footer import FooterKey
-from textual.worker import Worker, WorkerState, WorkType
+from textual.worker import Worker, WorkerState, WorkType, active_worker, get_current_worker
 from textual.worker_manager import WorkerManager
 
-from aisquare.cli.ui.agent_menu import RENAME as AGENT_RENAME
-from aisquare.cli.ui.agent_menu import RESUME as AGENT_RESUME
-from aisquare.cli.ui.agent_menu import AgentMenu
+from aisquare.cli.ui import remote_workers  # Remote's worker names alone: no Remote
 from aisquare.cli.ui.attach import NewAccountRequested, ReturnTo
 from aisquare.cli.ui.autosave import Autosave
 from aisquare.cli.ui.board import BoardPanel, board_help
@@ -77,23 +77,30 @@ from aisquare.cli.ui.groups import (
     GroupPicker,
     GroupProjects,
     MoveRow,
+    OpenGroupMenu,
+    RenameGroup,
     ToggleCollapse,
     TogglePin,
     UndoLayout,
 )
 from aisquare.cli.ui.needs_you_bar import BAR_WORKER, OPEN_KEY, NeedsYouBar
 from aisquare.cli.ui.project_menu import (
+    COLLAPSE,
+    DELETE,
     FRESH,
+    MOVE_DOWN,
+    MOVE_UP,
     PAUSE,
     PIN,
     REMOVE,
     RENAME,
     RESUME,
     SETTINGS,
+    GroupMenu,
     ProjectMenu,
 )
 from aisquare.cli.ui.receiver import listen_for_ui, stop_listening_for_ui
-from aisquare.cli.ui.remote_control import SWITCHES, RemoteController, ngrok_ends_with
+from aisquare.cli.ui.save_model import UNDO_SAID
 from aisquare.cli.ui.service_client import ServiceClient
 from aisquare.cli.ui.sidebar import (
     ALIVE_STATES,
@@ -131,15 +138,8 @@ from aisquare.cli.ui.sidebar import (
     UsageStatsSelected,
     ViewSelected,
     agent_name,
+    group_name_refusal,
     rename_refusal_words,
-)
-from aisquare.cli.ui.spawn import SpawnCompleted, SpawnDialog
-from aisquare.cli.ui.stop import (
-    STOP_WORKER,
-    StopAgentScreen,
-    start_stop,
-    stop_answer,
-    warn_release_failed,
 )
 from aisquare.cli.ui.terminal import (
     EscapeToSidebar,
@@ -171,7 +171,6 @@ from aisquare.cli.ui.update import (
     REFRESH_WORKER,
     UpdateScreen,
 )
-from aisquare.cli.ui.views import usage_sharing
 from aisquare.cli.ui.views.accounts import (
     AccountsChanged,
     AccountsView,
@@ -195,7 +194,6 @@ from aisquare.cli.ui.views.agent import (
     start_restart,
 )
 from aisquare.cli.ui.views.app_settings import AppSettingsView, UiSettingsChanged
-from aisquare.cli.ui.views.captain import CaptainView
 from aisquare.cli.ui.views.doctor import ASK_WORKER, DoctorRefreshed, DoctorView, ask_text
 from aisquare.cli.ui.views.fleet_bulk import (
     BULK_WORKER,
@@ -206,16 +204,8 @@ from aisquare.cli.ui.views.fleet_bulk import (
     bulk_running,
     report_toast,
 )
-from aisquare.cli.ui.views.onboard import OnboardFailed, OnboardView, ProjectOnboarded
-from aisquare.cli.ui.views.personas_tab import PersonasTab
 from aisquare.cli.ui.views.project import ProjectView
-from aisquare.cli.ui.views.remote import RemotePanel
-from aisquare.cli.ui.views.resources import ResourcesView
-from aisquare.cli.ui.views.settings_captain import CaptainSwitched
-from aisquare.cli.ui.views.settings_hub import SettingsHubView
-from aisquare.cli.ui.views.settings_remote import RemoteChip
-from aisquare.cli.ui.views.usage_stats import UsageStatsView
-from aisquare.cli.ui.views.welcome import WelcomeView
+from aisquare.cli.ui.views.settings_captain import CaptainSwitched, RemoteSwitched
 from aisquare.core import clipboard, experimental, feature_use, instances, paths
 from aisquare.core import program as prog
 from aisquare.core import sharing as usage_share_core
@@ -253,6 +243,39 @@ from aisquare.services import project as project_service
 from aisquare.services import settings as settings_service
 from aisquare.services import updates as updates_service
 from aisquare.services import usage_stats as usage_service
+
+if TYPE_CHECKING:
+    # Imported where each is first opened (#45, :func:`_opened`): here for annotations alone.
+    from aisquare.cli.ui.remote_control import RemoteController  # loads only while on (#46)
+    from aisquare.cli.ui.spawn import SpawnCompleted
+    from aisquare.cli.ui.views import usage_sharing
+    from aisquare.cli.ui.views.onboard import OnboardFailed, ProjectOnboarded
+    from aisquare.cli.ui.views.welcome import WelcomeView
+
+#: Views and dialogs imported where each is first opened, not at the start (#45): a TUI
+#: that never opens Settings never loads them. :func:`_opened` asks for one by these.
+STOP_MODULE = "aisquare.cli.ui.stop"
+ONBOARD_MODULE = "aisquare.cli.ui.views.onboard"
+SETTINGS_HUB_MODULE = "aisquare.cli.ui.views.settings_hub"
+WELCOME_MODULE = "aisquare.cli.ui.views.welcome"
+
+
+def _opened(module: str) -> bool:
+    """Whether ``module``, one of the views and dialogs imported where it is first opened
+    (#45), has been imported yet. Until it is, nothing of it can be on screen or running (no
+    view, dialog or worker of it), so a look for one is skipped rather than importing it to
+    find none: the two-second tick would load it for nothing."""
+    return module in sys.modules
+
+
+def _sharing_question_due() -> bool:
+    """Whether the usage-sharing question is still to be asked: ``usage_sharing.Sharing``'s
+    own ``consent_due``, read without importing that page, which comes with the question's
+    dialog only when the question is due (#45)."""
+    from aisquare.services import usage_share
+
+    return usage_share.consent_due()
+
 
 DoctorRunner = Callable[[], list[DoctorCheck]]
 """What the Doctor page runs: ``diagnostics.doctor`` in production, a stub in tests."""
@@ -302,6 +325,11 @@ call) raises nothing for the store-unreadable notice to say, and each tick only 
 more read: the sidebar went silently stale (review of #272)."""
 ACCOUNTS_WORKER = "shell-accounts"
 """The thread worker that reads the accounts' frame (``FleetApp.refresh_accounts``)."""
+FOLDED_SWEEP_SECONDS = 30.0
+"""How often, at most, a fleet read lists the projects a collapsed group folds away, so the rows of
+panes that died there are ended (:func:`_read_fleet`'s ``sweep_folded``): a frame reads only
+what it shows (#83), and the view left behind another no longer keeps its folded project read
+(rlx#557). A read that fails does not count (:meth:`FleetApp._fleet_read`): the next one sweeps."""
 HEADROOM_WORKER = "sidebar-headroom"
 """The thread worker that reads the status line's headroom (``FleetApp.refresh_headroom``)."""
 HOUSEKEEPING_SECONDS = 30.0
@@ -368,6 +396,12 @@ _QUIT_POLL = 0.1
 """Seconds between the looks a hand-over takes at the reads it waits out (``_exit_when_read``)."""
 _HAND_OFF_PATIENCE = 10.0
 """Seconds a hand-over waits for the reads running before it names them and can be called off."""
+_RESTORE_PATIENCE = 30.0
+"""Seconds a Remote turned on again waits for the one still turning off before it gives up and
+says so (``FleetApp._restore_after``). Each of stopping's steps is bounded, and the wait was
+not: one that never ended parked its worker for good (review of #46, #3839)."""
+_RESTORE_SLICE = 0.2
+"""Seconds between that wait's looks at whether rlx is quitting or Remote was turned off again."""
 _hand_off_clock: Callable[[], float] = time.monotonic
 """What a hand-over's wait is timed by: the injection point a test's own clock takes, so the
 seconds its toast names are the test's, not a runner's (a slow one said 1 s for 0)."""
@@ -553,13 +587,22 @@ def _read_frame(
     captain: bool,
     viewed: Collection[str] | None = None,
     scope: Collection[str] | None = None,
+    *,
+    sweep_folded: bool = False,
 ) -> _FleetRead:
     """One frame of the sidebar, read on the calling thread: the fleet, then the captain's
-    home board and row when the captain is on (``experimental.captain``). ``viewed`` and
-    ``scope`` as for :func:`_read_fleet`."""
+    home board and row when the captain is on (``experimental.captain``). ``viewed``,
+    ``scope`` and ``sweep_folded`` as for :func:`_read_fleet`."""
     asqs = _live_asqs()
     service = service_host.hosting(asqs)  # it retries held-back nudges then, not this TUI (#32)
-    read = _read_fleet(show_captured, viewed, scope, captain=captain, nudges=service is None)
+    read = _read_fleet(
+        show_captured,
+        viewed,
+        scope,
+        captain=captain,
+        nudges=service is None,
+        sweep_folded=sweep_folded,
+    )
     read = replace(_read_captain(read), captain_asked=True) if captain else read
     return replace(read, asqs=asqs, service=service)
 
@@ -582,6 +625,7 @@ def _read_fleet(
     *,
     captain: bool = False,
     nudges: bool = True,
+    sweep_folded: bool = False,
 ) -> _FleetRead:
     """One frame of the fleet, read on the calling thread: the projects and their groups,
     then their agents. One store session reads them all; ``list_agents_many`` then asks
@@ -593,6 +637,12 @@ def _read_fleet(
     ``viewed``: the projects an open view shows, read even when folded away, whose view a
     frame without them would leave to age; ``None`` folds nothing (the first frame, read
     before the views it reopens). ``scope``: the only projects listed (``ui --project``).
+
+    ``sweep_folded``: the folded projects are listed too, so the rows of panes that died there
+    are ended (``list_agents_many``) as everywhere else, and the frame still holds none of their
+    rows: what it shows is as without it. :data:`FOLDED_SWEEP_SECONDS` apart at most, so a folded
+    project's agent never reads running much longer than that after it died (the manager's
+    condition on rlx#557's skip of a left view's folded project, #51).
 
     With ``captain``, the captain's home board is read in the same session, by the id
     resolved here: :func:`_read_captain` opened a second session and resolved the home
@@ -615,7 +665,8 @@ def _read_fleet(
             groups = store.project_groups()
             home = store.get_project(home_id) if captain else None
             folded = set() if viewed is None else _folded(projects, groups) - set(viewed)
-            listings = fleet_service.read_listings(store, projects, skip=folded)
+            listed = set() if sweep_folded else folded
+            listings = fleet_service.read_listings(store, projects, skip=listed)
             # A manager nudge a draft held back (P0-W2, #276), read in this frame's session.
             owed = fleet_service.deferred_nudge_targets(store)
             # Which are fleet-paused, for their Resume (one read of the signals, any board).
@@ -634,6 +685,8 @@ def _read_fleet(
     agents = {p.id: many.agents.get(p.id, []) for p in projects if p.id not in folded}
     notices: dict[str, str] = {}
     for project_id, failure in many.errors.items():
+        if project_id in folded:
+            continue  # swept, not shown: its card is folded away, as when it is not read
         # A bug in the fleet path must not take the view down: said, with its class.
         notices[project_id] = f"agents unavailable — {_why_unread(failure)}"
     if home_id in agents:  # the captain is the captain section's, never the card's
@@ -671,6 +724,11 @@ def _folded(projects: list[ProjectInfo], groups: list[ProjectGroup]) -> set[str]
     Pinned section shows (``project_groups.arrange``)."""
     collapsed = {group.id for group in groups if group.collapsed}
     return {p.id for p in projects if p.pinned_at is None and p.group_id in collapsed}
+
+
+def _inside(node: object, view: Widget) -> bool:
+    """Whether ``node`` (the focused widget, a worker's node) is ``view`` or inside it."""
+    return node is view or (isinstance(node, DOMNode) and view in node.ancestors)
 
 
 def _read_captain(read: _FleetRead) -> _FleetRead:
@@ -798,6 +856,7 @@ class HelpScreen(ModalScreen[None]):
         at_board: bool = False,
         capturing: bool = False,
         confirm_stop: bool = True,
+        remote_on: bool = True,
     ) -> None:
         super().__init__()
         self.escape_key = escape_key
@@ -805,6 +864,8 @@ class HelpScreen(ModalScreen[None]):
         self.capturing = capturing
         self.confirm_stop = confirm_stop
         """``[ui] confirm_stop``: whether ``x`` asks first, or stops at once."""
+        self.remote_on = remote_on
+        """Whether Remote is on (#46): off, ``R`` is no key of the fleet's."""
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="helpbox"):
@@ -823,7 +884,7 @@ class HelpScreen(ModalScreen[None]):
             # Arranging the sidebar (#140): every one of these has a CLI twin.
             ("shift+↑ ↓", "move the highlighted row one place"),
             ("g p space", "group · pin · fold the highlighted row"),
-            ("u", "undo the last arrangement; a toast says what"),
+            ("u ctrl+z", "undo the last arrangement; a toast says what"),
             ("m", "mark the highlighted card, as shift+click does"),
             ("shift+g", "group the marked cards; Esc clears the marks"),
             ("drag title", "move a card or a group header to a new place"),
@@ -840,6 +901,11 @@ class HelpScreen(ModalScreen[None]):
             (
                 ". ⋯ r-click",
                 "on an agent's row, its menu: Pause or Resume, Stop, Restart, Rename",
+            ),
+            (
+                ". ⋯ r-click",
+                "on a group's header, its menu: rename, pin, fold, move, delete the group "
+                "(its projects stay); F2 renames it in place",
             ),
             (self.escape_key.upper(), "hand focus from an agent's pane back to the sidebar"),
             (
@@ -858,7 +924,11 @@ class HelpScreen(ModalScreen[None]):
                 + ("(asks first)" if self.confirm_stop else "(at once: Settings says not to ask)"),
             ),
             ("t", "themes (applied live, autosaved)"),
-            ("R", "remote control — the fleet on your phone: link, QR, password, devices"),
+            *(
+                [("R", "remote control — the fleet on your phone: link, QR, password, devices")]
+                if self.remote_on
+                else []
+            ),
             ("r", "refresh now"),
             # Only while `[projects] capture` is on: off, nothing is captured to show.
             *(
@@ -1372,6 +1442,17 @@ class _WorkerThreads(WorkerManager):
         super()._remove_worker(worker)
 
     def _counted(self, work: Callable[[], Any], name: str) -> Callable[[], Any]:
+        """``work`` counted while its thread runs it (:meth:`still_running`), and its worker let
+        go of by that thread once it ends.
+
+        Textual runs a thread worker's callable in the loop's executor and sets its
+        ``active_worker`` there first (``Worker._run_threaded``). ``run_in_executor`` copies no
+        context, so the set lands in the pool thread's own and stays: an idle thread held the
+        last worker it ran and, through its ``node``, the widget that started it. A removed
+        agent view, and its pane, outlived the removal for as long as its thread idled (#43:
+        windows-py3.12, CI 46092818407; 3 runs in 5 on Python 3.12). Cleared here, the last
+        thing the thread does for it."""
+
         def counted() -> Any:
             with self._lock:
                 self._threads[name] += 1
@@ -1380,6 +1461,7 @@ class _WorkerThreads(WorkerManager):
             finally:
                 with self._lock:
                     self._threads[name] -= 1
+                active_worker.set(None)  # type: ignore[arg-type]  # Textual's var takes a Worker
 
         return counted
 
@@ -1506,25 +1588,32 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self._hand_off_overdue = False
         """The pending hand-over has waited ``_HAND_OFF_PATIENCE``: a second press calls it off."""
         self._hand_off_poll: Timer | None = None
-        self.remote = remote if remote is not None else RemoteController()
-        """The Remote (``R``) model — one per app, so the tunnel outlives the dialog."""
-        self._remote_savers = {
-            key: Autosave(self, key, what=what) for key, what in SWITCHES.items()
-        }
+        self.remote_on = remote is not None or experimental.remote_enabled()
+        """Remote (#46), read at the start and set by Settings' *Remote* box: off, nothing of
+        it is built, loaded, started or shown (:meth:`on_remote_switched`)."""
+        self._remote: RemoteController | None = None
+        """The Remote (``R``) model — one per app, so the tunnel outlives the dialog; ``None``
+        while Remote is off (:attr:`remote`)."""
+        self.remotes_stopping: list[RemoteController] = []
+        """Remotes turned off while the TUI runs, still stopping on their own threads: run_ui
+        waits for them as for :attr:`remote`, and their saves are the app's (Autosave)."""
+        self._remote_savers: dict[str, Autosave] = {}
         """Remote's switches' saves, and its deadline's, as the theme's (``autosave.py``)."""
-        self.remote.save_switch = self._save_remote_switch
-        self.remote.on_news = self._post_remote_news
-        self.remote.on_done = self._post_remote_done
-        # A start saves its switch here once its deadline is written on the controller's
-        # writer thread, in order with a turn-off's own save (post_message is thread-safe).
-        self.remote.call_back = self.call_later
+        self._remote_revive: Timer | None = None
+        self.remote_guard = contextlib.ExitStack()
+        """While a run_ui's Remote is up, a hangup or a SIGTERM ends its ngrok first
+        (``remote_control.ngrok_ends_with``); run_ui closes it once Remote's waits are done."""
+        self.ends_ngrok_on_signals = False
+        """Set by run_ui: a Remote built here then guards its ngrok (:attr:`remote_guard`)."""
         self.service_client = ServiceClient(
-            self.remote,
+            None,
             lambda said: self.notify(
                 said, title=service_host.SERVICE, severity="warning", timeout=10
             ),
         )
         """The rlx service, if one runs: this TUI is then its client (#32)."""
+        if self.remote_on:
+            self._build_remote(remote)
         self.refresh_seconds = refresh_seconds
         self._doctor = doctor
         self._release_check = release_check
@@ -1629,6 +1718,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """The fleet read in flight, or the last one; only one runs at a time."""
         self._fleet_owed = False
         """A frame was asked for while a read was in flight: read once more after it."""
+        self._fleet_viewed: frozenset[str] = frozenset()
+        """The project the next fleet read reads though folded (:meth:`_viewed_projects`)."""
+        self._folded_swept_at = time.monotonic()
+        """When the last fleet read that listed the folded projects too and painted its frame
+        began (:data:`FOLDED_SWEEP_SECONDS`); the first frame folds nothing."""
+        self._fleet_sweeps: dict[Worker[_FleetRead], float] = {}
+        """When each read that lists the folded projects too began, by read, until it ends."""
         self._fleet_calls = 0
         """How many calls have asked for a fleet frame (:meth:`refresh_data`): the newest
         one's number. It orders a call against an accounts read where a clock cannot:
@@ -1694,8 +1790,9 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             yield Divider(
                 "#sidebar", state_key=SIDEBAR_WIDTH_KEY, what="the navigator's width", id="divider"
             )
-            with ContentSwitcher(id="content", initial="welcome"):
-                yield WelcomeView(escape_key=self.escape_key, id="welcome")
+            # Welcome is built when first shown (#45, :meth:`_new_welcome`): on a home with a
+            # project, start opens that project, and Welcome only when asked for.
+            with ContentSwitcher(id="content"):
                 # The Onboard view is built on the first `+` (on_add_project): its
                 # DirectoryTree scans the home directory and keeps a loader worker
                 # alive for its whole life — not a cost to pay at every start-up.
@@ -1729,6 +1826,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.doctor_scope = home
             self.call_later(self.go_home)
         else:
+            self.content.add_content(self._new_welcome(), set_current=True)
             # Start lands on Welcome, no project listed. While one side shows at a time (L2,
             # under ONE_PANE_BELOW) it is the side shown, as any view a person asks for is: the
             # focus sat in the sidebar, so the narrow layout showed that, with Welcome hidden
@@ -1742,13 +1840,9 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self._reattach()
         if self._release_check is not None:
             self.check_release()
-        # wait=False here and below: a Remote that stops runs down on a thread of its own,
-        # since stopping uvicorn and ngrok froze the fleet UI for seconds (r3 review of #243).
-        self.remote.restore(wait=False)
-        # "📡 remote · N devices" under the status line while Remote is on (#33).
-        self.query_one("#others").mount(RemoteChip(self.remote, id="remote-chip"))
+        if self._remote is not None:
+            self._start_remote()
         self.set_interval(HOUSEKEEPING_SECONDS, self._housekeeping)
-        self.set_interval(30.0, self.remote.revive_tunnel_if_dead)
         # The captain's ui actions (T4): after the first frame, which they resolve against.
         # Only with the captain on, read once at start as the rest of the shell reads it: off,
         # asq bound a socket, made its folder and ran a thread that main 0.8.2 has none of,
@@ -1774,6 +1868,162 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         else:
             stop_listening_for_ui(self)
         self.refresh_data()
+
+    @property
+    def remote(self) -> RemoteController:
+        """The Remote (``R``) model while Remote is on. Off (#46) there is none, and this raises
+        ``AttributeError``, so ``getattr(app, "remote", None)`` reads ``None``
+        (``_run_registered``); the app itself reads :attr:`_remote`."""
+        if self._remote is None:
+            raise AttributeError("remote: Remote is off")
+        return self._remote
+
+    async def on_remote_switched(self, event: RemoteSwitched) -> None:
+        """Settings' *Remote* box (#46): all that :attr:`remote_on` gates, at once, with no
+        restart. On: Remote loaded and built, as its own switch left it (serving again if that
+        was on), its chip and tunnel check, R, the palette's entry, App settings' *Remote* tab
+        and the hub's link. Off: those gone at once, and Remote stopped on a thread of its own
+        (its saved switches kept, its writes and saves landing as at a quit: run_ui waits for
+        them). The modules it loaded stay until rlx's next start, as the box says."""
+        if event.on == self.remote_on:
+            return
+        self.remote_on = event.on
+        if event.on:
+            self._build_remote()
+            if self.ends_ngrok_on_signals:  # run_ui's: its ngrok ends with the process
+                from aisquare.cli.ui.remote_control import ngrok_ends_with
+
+                self.remote_guard.enter_context(ngrok_ends_with())
+            self._start_remote()
+        else:
+            await self._bring_remote_down()
+        self.refresh_bindings()
+        from aisquare.cli.ui.views.app_settings import AppSettingsView
+
+        for view in self.query(AppSettingsView):
+            await view.show_remote(event.on)
+        if _opened(SETTINGS_HUB_MODULE):
+            from aisquare.cli.ui.views.settings_hub import SettingsHubView
+
+            for hub in self.query(SettingsHubView):
+                hub.show_remote(event.on)
+
+    def _build_remote(self, remote: RemoteController | None = None) -> None:
+        """Remote's controller, wired to this app: only once Remote is on (#46). A run_ui
+        guards its ngrok against a hangup (:attr:`remote_guard`), for this one built at the
+        start, and :meth:`on_remote_switched` for one turned on later."""
+        from aisquare.cli.ui.remote_control import SWITCHES, RemoteController
+
+        controller = remote if remote is not None else RemoteController()
+        if not self._remote_savers:  # one per switch for the app's life, as the theme's
+            self._remote_savers = {
+                key: Autosave(self, key, what=what) for key, what in SWITCHES.items()
+            }
+        controller.save_switch = self._save_remote_switch
+        controller.on_news = self._post_remote_news
+        controller.on_done = self._post_remote_done
+        # A start saves its switch here once its deadline is written on the controller's
+        # writer thread, in order with a turn-off's own save (post_message is thread-safe).
+        controller.call_back = self.call_later
+        # The R panel's switch waits for those still turning off too (review of #45, #3931).
+        controller.others_stopping = lambda: [
+            old for old in self.remotes_stopping if old is not controller
+        ]
+        self._remote = controller
+        self.service_client.use_remote(controller)
+
+    def _start_remote(self) -> None:
+        """Remote, built, brought up as its saved switch says, with its chip and tunnel check.
+
+        One turned off a moment ago may still be stopping, a write of it still in flight
+        (Remote off and on again at once). The two share ``remote.json`` and the server's
+        runtime, and their locks are each their own, so this one comes up only once that one
+        is off and its writes have landed: waited for off the UI thread
+        (:meth:`_restore_after`), as stopping takes seconds (review of #46, #3780)."""
+        from aisquare.cli.ui.views.settings_remote import RemoteChip
+
+        remote = self._remote
+        assert remote is not None
+        stopping = [
+            old
+            for old in self.remotes_stopping
+            if not (old.wait_until_off(0) and old.writes_done(0))
+        ]
+        if stopping:
+            self.run_worker(
+                lambda: self._restore_after(remote, stopping),
+                name=remote_workers.RESTORE_WORKER,
+                thread=True,
+                exit_on_error=False,
+            )
+        else:
+            # wait=False here and below: a Remote that stops runs down on a thread of its own,
+            # since stopping uvicorn and ngrok froze the fleet UI for seconds (r3 review of #243).
+            remote.restore(wait=False)
+        # "📡 remote · N devices" under the status line while Remote is on (#33).
+        self.query_one("#others").mount(RemoteChip(remote, id="remote-chip"))
+        self._remote_revive = self.set_interval(30.0, remote.revive_tunnel_if_dead)
+
+    def _restore_after(self, remote: RemoteController, stopping: list[RemoteController]) -> None:
+        """On a worker's thread: wait for ``stopping`` to be off, their writes landed, then
+        bring ``remote`` up on the UI thread, unless it was turned off again meanwhile.
+
+        The wait is bounded (review of #46, #3839). Every :data:`_RESTORE_SLICE` it looks
+        whether rlx is quitting (Textual cancels every worker as it exits) or ``remote`` was
+        turned off again, and ends at once if so: there is nothing to bring up, and a worker
+        left waiting held the process's end, whose executor joins its thread. Past
+        :data:`_RESTORE_PATIENCE` it gives up and says so (:meth:`_restore_overdue`)."""
+        worker = get_current_worker()
+        deadline = time.monotonic() + _RESTORE_PATIENCE
+        for old in stopping:
+            while not (old.wait_until_off(_RESTORE_SLICE) and old.writes_done(_RESTORE_SLICE)):
+                if worker.is_cancelled or self._remote is not remote:
+                    return
+                if time.monotonic() >= deadline:
+                    self._from_its_thread(self._restore_overdue, remote)
+                    return
+        self._from_its_thread(self._restore_if_current, remote)
+
+    def _from_its_thread(
+        self, then: Callable[[RemoteController], None], remote: RemoteController
+    ) -> None:
+        with contextlib.suppress(RuntimeError):  # rlx quit meanwhile: nothing to bring up
+            self.call_from_thread(then, remote)
+
+    def _restore_if_current(self, remote: RemoteController) -> None:
+        """Bring ``remote`` up: still the app's, and rlx still running. A look that passed
+        just before Textual's cancel at the quit hops here as rlx goes (``is_running`` is
+        false by then, before the app's unmount on both of its exit paths), and a Remote
+        started then came up after its own ``shutdown_for_exit``, run_ui's wait passing
+        over it: it served on after rlx quit (review of #45, #3931)."""
+        if self._remote is remote and self.is_running:
+            remote.restore(wait=False)
+
+    def _restore_overdue(self, remote: RemoteController) -> None:
+        """The one turning off still is after :data:`_RESTORE_PATIENCE`: ``remote`` stays
+        down, and the toast says what Remote's own switch says to a start it refuses."""
+        if self._remote is remote:
+            from aisquare.cli.ui.remote_control import STILL_TURNING_OFF
+
+            self.notify(STILL_TURNING_OFF, severity="warning", timeout=10)
+
+    async def _bring_remote_down(self) -> None:
+        """Remote turned off from Settings: what shows of it gone, and it stopped on its own
+        thread, its saved switches kept (``shutdown_for_exit``, as at a quit)."""
+        remote = self._remote
+        if remote is None:
+            return
+        if self._remote_revive is not None:
+            self._remote_revive.stop()
+            self._remote_revive = None
+        await self.query("#remote-chip").remove()
+        remote_page = sys.modules.get("aisquare.cli.ui.views.remote")
+        if remote_page is not None and isinstance(self.screen, remote_page.RemotePanel):
+            self.pop_screen()
+        remote.shutdown_for_exit(wait=False)
+        self.remotes_stopping.append(remote)
+        self._remote = None
+        self.service_client.use_remote(None)
 
     # --- what was open (#144), and home (L1) ------------------------------------------
 
@@ -1867,6 +2117,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             )
         if action == "toggle_captured" and not self.capturing:
             return False  # nothing is captured, so there is nothing to show (#139)
+        if action == "remote_panel" and not self.remote_on:
+            return False  # Remote is off (#46): no R, in the footer either
         if action == "switch_pane":
             panes = next(iter(self.query(Panes)), None)
             return panes is not None and panes.one_pane
@@ -1908,6 +2160,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     def action_remote_panel(self) -> None:
         """The one Remote page (Q17), as the hub's *Remote control* and App settings open it."""
+        if self._remote is None:
+            return
         from aisquare.cli.ui.views.remote import open_remote_page
 
         open_remote_page(self)
@@ -1939,6 +2193,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             screen = self.screen
         except (ScreenStackError, UnknownModeError):
             return
+        from aisquare.cli.ui.views.remote import RemotePanel  # loaded: Remote sent this
+
         if not news.done and isinstance(screen, RemotePanel):
             return
         severity: SeverityLevel = "warning" if news.trouble else "information"
@@ -1973,15 +2229,17 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     def _remote_auto_off(self) -> None:
         """The 30 s auto-off check; a Remote whose timer ran out stops without this thread."""
-        self.remote.enforce_auto_off(wait=False)
+        if self._remote is not None:
+            self._remote.enforce_auto_off(wait=False)
 
     def get_system_commands(self, screen: Screen[Any]) -> Iterable[SystemCommand]:
         yield from super().get_system_commands(screen)
-        yield SystemCommand(
-            "Remote control",
-            "Remote on/off, link + QR, password, devices (R)",
-            self.action_remote_panel,
-        )
+        if self.remote_on:
+            yield SystemCommand(
+                "Remote control",
+                "Remote on/off, link + QR, password, devices (R)",
+                self.action_remote_panel,
+            )
 
     def watch_theme(self, theme_name: str) -> None:
         # Fires on ANY theme change (our picker or the palette): every change is
@@ -2001,7 +2259,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # Remote that was on comes back on at the next start (restore()). It stops on a
         # thread of its own, started first so the saves below overlap it; run_ui waits
         # for it once the terminal is back.
-        self.remote.shutdown_for_exit(wait=False)
+        if self._remote is not None:
+            self._remote.shutdown_for_exit(wait=False)
         # Every saver — the theme's here, the divider's — started first and joined
         # against ONE deadline, so quit waits once, not once per preference.
         self.unsaved = Autosave.flush_all(self)
@@ -2019,6 +2278,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 at_board=self._focus_on_the_board(),
                 capturing=self.capturing,
                 confirm_stop=self.confirm_stop,
+                remote_on=self.remote_on,
             )
         )
 
@@ -2122,18 +2382,27 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """Start the fleet read that answers the calls up to number ``asked``, the newest."""
         after = [*self._fleet_owed_after, *([] if then is None else [then])]
         self._fleet_owed, self._fleet_owed_after = False, []
-        # `a`'s choice is read as the read begins, so one held for a hand-over and started
-        # when it is called off reads what is shown then.
+        # `a`'s choice and the viewed project are read as the read begins, so one held for a
+        # hand-over and started when it is called off reads what is shown then.
         self._fleet_since = time.monotonic()
-        viewed = self._viewed_projects()  # asked here, on the UI thread, not in the worker
+        self._fleet_viewed = self._viewed_projects()  # asked here, on the UI thread
+        sweep = self._fleet_since - self._folded_swept_at >= FOLDED_SWEEP_SECONDS
         self._fleet_worker = self.run_worker(
-            lambda: _read_frame(self.show_captured, self.captain_on, viewed, self.scope),
+            lambda: _read_frame(
+                self.show_captured,
+                self.captain_on,
+                self._fleet_viewed,
+                self.scope,
+                sweep_folded=sweep,
+            ),
             name=FLEET_WORKER,
             group=FLEET_WORKER,
             thread=True,
             exit_on_error=False,
         )
         self._fleet_asked[self._fleet_worker] = asked
+        if sweep:
+            self._fleet_sweeps[self._fleet_worker] = self._fleet_since
         if after:
             self._fleet_after[self._fleet_worker] = after
 
@@ -2149,6 +2418,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if event.state is WorkerState.CANCELLED:
             self._fleet_after.pop(worker, None)  # with the app: nothing to paint or owe
             self._fleet_asked.pop(worker, None)
+            self._fleet_sweeps.pop(worker, None)
             return
         result = worker.result if event.state is WorkerState.SUCCESS else None
         if isinstance(result, _FleetRead):
@@ -2161,6 +2431,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             if event.state is WorkerState.RUNNING:
                 self._fleet_since = time.monotonic()  # a read held for a hand-over begins now
             return  # still running
+        swept = self._fleet_sweeps.pop(worker, None)
+        if swept is not None and read.error is None:
+            # Swept only by a read that painted its frame: one that failed listed nothing, so the
+            # next read sweeps, and a folded project's dead pane is still ended within the bound.
+            self._folded_swept_at = max(self._folded_swept_at, swept)
         self._paint_fleet(read, asked=self._fleet_asked.pop(worker, None))
         newer = self._fleet_worker
         if self._fleet_owed and (newer is None or newer.is_finished):
@@ -2247,6 +2522,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         )
         sidebar.show_live_total(read.live_total)
         self._feed_open_views(self.snapshot)
+        if self._views_stopped_off_screen():
+            self.call_later(self._remove_views_left)
         if asked is None or self._accounts_began < asked:
             self.refresh_accounts()
 
@@ -2426,12 +2703,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.refresh_headroom()
 
     def _viewed_projects(self) -> frozenset[str]:
-        """The projects an open Project or Agent view shows (:func:`_read_fleet`'s ``viewed``)."""
-        content = self.content
-        return frozenset(
-            [view.project.id for view in content.query_children(ProjectView)]
-            + [view.status.agent.project_id for view in content.query_children(AgentView)]
-        )
+        """The project the right pane's Project or Agent view shows now (:func:`_read_fleet`'s
+        ``viewed``): a view left open behind another keeps its folded project unread."""
+        shown = self._shown_project_id()
+        return frozenset() if shown is None else frozenset({shown})
 
     def _feed_open_views(self, snapshot: FleetSnapshot) -> None:
         """Hand every open Project/Agent view its row from the new frame.
@@ -2458,8 +2733,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         at: a query of the app walked every widget on the screen, three times a frame.
         """
         content = self.content
-        for welcome in content.query_children(WelcomeView):
-            welcome.note_frame()  # shown or not: what step 3's refusals were about still stands
+        if _opened(WELCOME_MODULE):
+            from aisquare.cli.ui.views.welcome import WelcomeView
+
+            for welcome in content.query_children(WelcomeView):
+                welcome.note_frame()  # shown or not: what step 3's refusals were about stands
         for agent_view in content.query_children(AgentView):
             fresh = snapshot.agent(agent_view.status.agent.project_id, agent_view.status.agent.id)
             if fresh is not None and fresh != agent_view.status:
@@ -2481,6 +2759,108 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 snapshot.agents.get(fresh_project.id, []),
                 fleet_paused=fresh_project.id in snapshot.fleet_paused,
             )
+
+    def _views_stopped_off_screen(self) -> list[AgentView]:
+        """The agent views off screen whose agent has stopped (#43): its row is no longer
+        ``ALIVE_STATES`` (exited, lost or paused), or it has left the list of a project this
+        frame read. Each is to go, its pane and the rows it rendered with it, and opening the
+        agent again builds it anew; :meth:`_views_left` says which may go now. The owner's
+        TUI had built about 414 agent views in three days, a new agent id on every launch,
+        and removed none but with its project.
+
+        Not the view shown, whatever its agent does: it goes once it is left. Nor a view of a
+        project this frame did not answer for, folded away and not read or read and failed
+        (a notice): not read is not "gone", as :meth:`_feed_open_views` keeps what such a
+        view has."""
+        snapshot = self.snapshot
+        if snapshot is None:
+            return []
+        shown = self.current_view()
+        stopped: list[AgentView] = []
+        for view in self.content.query_children(AgentView):
+            agent = view.status.agent
+            if view is shown or agent.project_id not in snapshot.agents:
+                continue
+            if snapshot.notices.get(agent.project_id) is not None:
+                continue
+            row = snapshot.agent(agent.project_id, agent.id)
+            if row is None or row.state not in ALIVE_STATES:
+                stopped.append(view)
+        return stopped
+
+    def _views_left(self) -> list[AgentView]:
+        """The views of :meth:`_views_stopped_off_screen` that may go now. A later frame takes
+        the others, once what keeps each is over:
+
+        - a worker of its own (or of a widget in it) still running: Pause, Restart, Move,
+          the labels' or the task's read, a pane's paste. Textual cancels a removed widget's
+          workers, and a cancelled worker's answer is never handled: a pause's toast would be
+          lost, and a quit would no longer wait for its write. The frame that brings the
+          stopped row starts the labels' and the task's reads itself (``refresh_status``), so
+          the view goes at the frame after it;
+        - the keyboard in it while a dialog is up: the dialog gives the keyboard back to it
+          as it closes. With no dialog up, the keyboard leaves it first
+          (:meth:`_keyboard_from`).
+
+        A worker that has just finished keeps nothing. Its state setter queues its answer on
+        its widget at once, so the ``Prune`` a removal posts lands behind it (Textual 8.2.8),
+        and the view handles its whole queue before the close that ``Prune`` queues in turn.
+        A pause's toast is said (``notify`` goes to the app directly), and a Restart's or a
+        Move's ``AgentRestarted``, which the view posts to itself as it handles the answer,
+        is handled before that close and bubbles to the shell: the view's own parent is
+        still active. Each child of the view drains its own queue too, after the view's, but
+        a message a child BUBBLES then is dropped, its parent the view being closed by then
+        (``is_parent_active``). That loses nothing today: the only child message the shell
+        handles is the pane's ``EscapeToSidebar``, a keystroke, and a view that goes holds
+        no keyboard (:meth:`_keyboard_from`). Waiting for a quiet queue instead kept a view
+        for frame after frame of its widgets' own layout traffic (#644, round 3: CI
+        46097779329; reviewer #3797 for the child's bubble).
+        """
+        content = self.content
+        under_a_dialog = content.screen.focused if self.screen is not content.screen else None
+        busy = [worker.node for worker in self.workers if not worker.is_finished]
+        return [
+            view
+            for view in self._views_stopped_off_screen()
+            if not any(_inside(node, view) for node in (under_a_dialog, *busy))
+        ]
+
+    async def _remove_views_left(self) -> None:
+        """Remove what :meth:`_views_left` finds now, not what the frame that asked found: this
+        runs after that frame's handler, and a view opened or shown since is no longer left.
+        Awaited here, in the app's own turn, so no click on the agent's row lands between
+        the look and the removal and opens a view on its way out."""
+        views = self._views_left()
+        self._keyboard_from(views)
+        await self._remove_views(views)
+
+    def _keyboard_from(self, views: Sequence[Widget]) -> None:
+        """The keyboard out of ``views``, which are going, so it is never left on a removed
+        widget: put where showing the side shown puts it.
+
+        A view that is not shown can still hold it: after Stop pressed in an agent's view,
+        ``stop_finished`` shows the project and the keyboard stays behind in the hidden
+        view (on its Restart button, measured). With both sides shown, or the
+        sidebar alone, the sidebar takes it, as the click on a project's title a stop goes
+        back by gives it; with the content alone, the view shown, as
+        ``Panes.show_content`` gives it."""
+        screen = self.content.screen
+        if not any(_inside(screen.focused, view) for view in views):
+            return
+        panes = self.query_one(Panes)
+        if panes.one_pane and panes.side == CONTENT_SIDE:
+            screen.set_focus(None)
+            panes._focus_content()
+        else:
+            screen.set_focus(self.sidebar)
+
+    async def _remove_views(self, views: Sequence[Widget]) -> None:
+        """Take ``views`` off the content switcher: a removed project's (:meth:`_leave_forgotten`)
+        and the agent views no longer needed (:meth:`_remove_views_left`). A pane goes with its
+        view, its timers, its control client and its selection with it
+        (``TerminalPane.on_unmount``)."""
+        if views:
+            await self.content.remove_children(views)
 
     # --- doctor -------------------------------------------------------------------------
 
@@ -2571,9 +2951,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if event.worker.name == AGENT_RENAME_WORKER:
             self._agent_renamed(event)
             return
-        if event.worker.name == STOP_WORKER:
-            self._stopped_at_once(event)
-            return
+        if _opened(STOP_MODULE):
+            from aisquare.cli.ui.stop import STOP_WORKER
+
+            if event.worker.name == STOP_WORKER:
+                self._stopped_at_once(event)
+                return
         if event.worker.name in (PAUSE_WORKER, RESTART_WORKER):
             self._menu_action_answered(event)
             return
@@ -2648,8 +3031,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         failing = sum(check.status is CheckStatus.fail for check in self.doctor_checks)
         warning = sum(check.status is CheckStatus.warn for check in self.doctor_checks)
         self.query_one(SettingsRow).show_findings(failing, warning)
-        for hub in self.query(SettingsHubView):
-            hub.show_findings(failing, warning)
+        if _opened(SETTINGS_HUB_MODULE):
+            from aisquare.cli.ui.views.settings_hub import SettingsHubView
+
+            for hub in self.query(SettingsHubView):
+                hub.show_findings(failing, warning)
 
     @staticmethod
     def _feed_doctor(
@@ -2709,6 +3095,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.call_after_refresh(self._maybe_ask_sharing)  # once, after onboarding: see there
 
     async def on_add_project(self, event: AddProject) -> None:
+        from aisquare.cli.ui.views.onboard import OnboardView
+
         kept = next(iter(self.content.query_children(OnboardView)), None)
         await self._show("onboard", lambda: OnboardView(id="onboard"))
         if kept is not None:
@@ -2839,6 +3227,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     def _agent_view(self, status: FleetAgentStatus, view_id: str) -> AgentView:
         """The view for one agent's row: the captain's has its own bar (T4)."""
         if self._is_the_captain(status.agent):
+            from aisquare.cli.ui.views.captain import CaptainView
+
             return CaptainView(status, usage=self.shown_usage, named=self.agents_named, id=view_id)
         return AgentView(status, usage=self.shown_usage, named=self.agents_named, id=view_id)
 
@@ -2876,6 +3266,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                     markup=False,
                 )
                 return
+        from aisquare.cli.ui.spawn import SpawnDialog
+
         self.push_screen(
             SpawnDialog(
                 home,
@@ -2981,26 +3373,28 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     # --- groups, pins and order (#140) -------------------------------------------------
 
-    def _layout(self, what: Callable[[ContextStore], project_groups.UndoEntry], said: str) -> None:
-        """Apply one gesture through the service, remember its way back, repaint, say so."""
+    def _layout(self, what: Callable[[ContextStore], project_groups.UndoEntry], said: str) -> bool:
+        """Apply one gesture through the service, remember its way back, repaint, say so;
+        whether it was applied."""
         try:
             with store_session() as store:
                 entry = what(store)
         except KeyError as exc:
             self.notify(f"nothing to do: {exc.args[0]!r} is gone", severity="warning", timeout=4)
-            return
+            return False
         except ValueError as exc:
             self.notify(str(exc), severity="error", timeout=6, markup=False)
-            return
+            return False
         except Exception as exc:  # the store said no: the frame stands, the gesture is lost
             self.notify(f"could not {said}: {exc}", severity="error", timeout=6, markup=False)
-            return
+            return False
         if entry.projects or entry.groups:
             # A gesture that touched no row ("nothing to move": a step at an end,
             # a pinned row) is no step back — `u` would undo nothing and say it did.
             self._undo.append(entry)
             del self._undo[:-UNDO_DEPTH]
         self.refresh_data()
+        return True
 
     def on_move_row(self, event: MoveRow) -> None:
         # One step is one row ON SCREEN: the captured rows count only while `a` shows them,
@@ -3092,6 +3486,43 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.sidebar.action_clear_marks()
 
         self.push_screen(GroupPicker(groups, len(ids)), chosen)
+
+    def on_open_group_menu(self, event: OpenGroupMenu) -> None:
+        """⋯, ``.`` or a right-click on a group's header (#39): its menu, then what was chosen,
+        each through the gesture's own handler, onto the one undo stack."""
+        group_id, name = event.group.id, event.group.name
+
+        def chosen(choice: str | None) -> None:
+            if choice == RENAME:
+                # Once the menu has gone: closing it hands the focus back to the sidebar.
+                self.call_after_refresh(self.sidebar.open_group_rename, group_id)
+            elif choice == PIN:
+                self.on_toggle_pin(TogglePin("group", group_id))
+            elif choice == COLLAPSE:
+                self.on_toggle_collapse(ToggleCollapse(group_id))
+            elif choice in (MOVE_UP, MOVE_DOWN):
+                self.on_move_row(MoveRow("group", group_id, -1 if choice == MOVE_UP else 1))
+            elif choice == DELETE and self._layout(
+                lambda s: project_groups.delete_group(s, group_id), "delete the group"
+            ):
+                self.notify(f"Deleted group {name} · Undo: {UNDO_SAID}", timeout=6, markup=False)
+
+        menu = GroupMenu(event.group, event.anchor, count=event.count, up=event.up, down=event.down)
+        self.push_screen(menu, chosen)
+
+    def on_rename_group(self, event: RenameGroup) -> None:
+        """A group header's name field was saved (#39). A name another shell took since the
+        frame was read is refused in the sidebar's words (``group_name_refusal``, asked of the
+        store's groups now), and the field opens again with what was typed."""
+
+        def rename(store: ContextStore) -> project_groups.UndoEntry:
+            refusal = group_name_refusal(event.typed, event.group_id, store.project_groups())
+            if refusal is not None:
+                raise ValueError(f"not renamed: {refusal}")
+            return project_groups.rename_group(store, event.group_id, event.typed)
+
+        if not self._layout(rename, "rename"):
+            self.sidebar.open_group_rename(event.group_id, event.typed)
 
     def on_undo_layout(self, event: UndoLayout) -> None:
         if not self._undo:
@@ -3284,6 +3715,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if status is None:
             self.notify("that agent is no longer listed", severity="warning", timeout=4)
             return
+        from aisquare.cli.ui.agent_menu import RENAME as AGENT_RENAME
+        from aisquare.cli.ui.agent_menu import RESUME as AGENT_RESUME
+        from aisquare.cli.ui.agent_menu import AgentMenu
+
         project_id, agent_id = event.project_id, event.agent_id
         refusal = rename_refusal_words(status.agent)
 
@@ -3318,6 +3753,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if view is not None:
             view.act(kind)
             return
+        from aisquare.cli.ui.agent_menu import RESUME as AGENT_RESUME
+
         if kind == AGENT_RESUME:
             self._menu_start(agent, AGENT_RESUME)
         elif kind == AGENT_PAUSE:
@@ -3639,8 +4076,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                 await self.on_project_selected(ProjectSelected(listed[0]))
             else:
                 await self.action_welcome()
-        for view in views:
-            await view.remove()
+        await self._remove_views(views)
 
     def on_paste(self, event: events.Paste) -> None:
         """A paste no focused widget took (#288): into the one live pane on screen.
@@ -3699,6 +4135,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if project is None:
             self.notify("that project is no longer listed", severity="warning", timeout=4)
             return
+        from aisquare.cli.ui.spawn import SpawnDialog
+
         self.push_screen(
             SpawnDialog(project, projects=listed, accounts=self._accounts),
             callback=self.spawn_finished,
@@ -3786,6 +4224,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # Read at the press (R17): a box ticked in another asq on this home holds here at once.
         self.confirm_stop = settings_service.asks_first(STOP)
         if self.confirm_stop or event.ask:
+            from aisquare.cli.ui.stop import StopAgentScreen
+
             self.push_screen(StopAgentScreen(project, status), callback=self.stop_finished)
             return
         self._stop_at_once(project, status.agent)
@@ -3803,6 +4243,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """
         if agent.id in {row.id for row, _toast in self._quick_stops.values()}:
             return
+        from aisquare.cli.ui.stop import start_stop
+
         toast = Notification(f"stopping {agent.label} …", timeout=STOPPING_TOAST_CAP)
         self.post_message(Notify(toast))
         self._quick_stops[start_stop(self, project, agent, force=False)] = (agent, toast)
@@ -3821,6 +4263,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self._unnotify(toast)
         if event.state is WorkerState.CANCELLED:
             return
+        from aisquare.cli.ui.stop import stop_answer, warn_release_failed
+
         answer = stop_answer(event.worker, event.state)
         if isinstance(answer, fleet_service.StopReceipt):
             warn_release_failed(self, answer)
@@ -3852,7 +4296,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if not (isinstance(view, AgentView) and view.status.agent.id == agent.id):
             return
         if self._is_the_captain(agent):
-            self.content.current = "welcome"
+            self.call_later(self._show, "welcome", self._new_welcome, counted=False)
             self.sidebar.select(None)
             self._remember_selection(None)
         else:
@@ -3870,9 +4314,15 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.query_one("#accounts", AccountsView).begin_claude_sign_in(None, agent=event.agent)
 
     def _content_switched(self, current: str | None) -> None:
-        """Any other page than Accounts drops the way back: the user went elsewhere first."""
+        """Any other page than Accounts drops the way back: the user went elsewhere first. A
+        Project or Agent view opened or gone back to, of a project the last frame did not
+        read, has it read at once."""
         if current != "accounts":
             self.after_sign_in = None
+        self._fleet_viewed = self._viewed_projects()  # what a read held for a hand-over reads
+        snapshot = self.snapshot
+        if snapshot is not None and self._fleet_viewed - snapshot.agents.keys():
+            self.refresh_data()
 
     async def on_sign_in_landed(self, event: SignInLanded) -> None:
         """A sign-in landed: back to where it was started from, used once — or, from
@@ -3882,6 +4332,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self._say_next_step()
         elif back.kind == "welcome":
             await self.action_welcome()
+            from aisquare.cli.ui.views.welcome import WelcomeView
+
             self.query_one(WelcomeView).back_from_sign_in()
         elif back.kind == "picker":
             self._reopen_picker(back, event.ref)
@@ -3926,6 +4378,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         or ``codex:5`` where two agents' accounts hold it (``SignInLanded.ref``). No project
         view has that tab since R27, and the Settings page attaches nothing: a path for the
         0.10.2 clean-up, which answers that the project is no longer open."""
+        from aisquare.cli.ui.views.personas_tab import PersonasTab
+
         try:
             tab = self.query_one(f"#project-{back.project_id}").query_one(PersonasTab)
         except NoMatches:
@@ -3945,6 +4399,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if project is None:
             self.notify("that project is no longer listed", severity="warning", timeout=6)
             return
+        from aisquare.cli.ui.spawn import SpawnDialog
+
         dialog = SpawnDialog(project, accounts=self._accounts, **{**back.form, "account": slot})
         self.push_screen(dialog, callback=self.spawn_finished)
 
@@ -3953,6 +4409,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         keyboard (the sidebar had it) — Enter, not an arrow passing over the row."""
         if self._moved_on(event, SETTINGS_KEY):
             return
+        from aisquare.cli.ui.views.settings_hub import SettingsHubView
+
         from_keyboard = self.focused is self.sidebar and not event.browsing
         if not await self._open_row(
             SETTINGS_KEY,
@@ -4005,7 +4463,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if offer is None:
             self.sidebar.show_update(None)
             return
-        self.sidebar.show_update(offer.version, runnable=offer.runnable)
+        self.sidebar.show_update(offer.version, runnable=offer.runnable, home=offer.home_only)
         if offer.announce:
             how = "restarts rlx to update" if offer.runnable else "says how to update this install"
             self.notify(
@@ -4101,7 +4559,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         An answer that nothing is newer than the version that runs takes the row away and
         says so, and closes the dialog, or keeps it from opening (:meth:`_update_planned`
         opens none without an offer): before the plan was read, the click opened nothing and
-        the row went in silence (review of #301, m2)."""
+        the row went in silence (review of #301, m2). But not with a home from before 0.10.2
+        to move (#31): the dialog and the row stay, as the move alone."""
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR):
             return
         if event.worker is not self._refresh_worker:
@@ -4113,8 +4572,14 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         offer = self.release
         screen = self.screen if isinstance(self.screen, UpdateScreen) else None
         current = offer.current if offer is not None else screen.plan.current if screen else None
+        home = offer.home_move if offer is not None else screen.plan.home_move if screen else None
         if found is not None and current is not None:
-            if lifecycle_service.newer_release(found, current) is not True:
+            newer = lifecycle_service.newer_release(found, current) is True
+            if not newer and home is not None:
+                if offer is not None and not offer.home_only:
+                    self.release = offer = replace(offer, version=current, announce=False)
+                    self.sidebar.show_update(current, runnable=offer.runnable, home=True)
+            elif not newer:
                 self.release = None
                 self.sidebar.show_update(None)
                 if screen is not None:
@@ -4125,7 +4590,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                     markup=False,
                 )
                 return
-            if offer is not None and found != offer.version:
+            elif offer is not None and found != offer.version:
                 self.release = replace(offer, version=found)
                 self.sidebar.show_update(found, runnable=offer.runnable)
                 if self._planned_runnable is not None:
@@ -4174,7 +4639,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             # The row was decided from the install's route alone; the dialog's plan has the
             # last word (uv gone from PATH since, say), and the row says what it says.
             self.release = offer = replace(offer, runnable=plan.runnable)
-            self.sidebar.show_update(offer.version, runnable=plan.runnable)
+            self.sidebar.show_update(offer.version, runnable=plan.runnable, home=offer.home_only)
         screen = UpdateScreen(plan, len(self._live_agents()), offer.version)
         if self._refreshed is not None:
             screen.show_latest(self._refreshed[0])  # PyPI answered before the plan was read
@@ -4349,6 +4814,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         does not even start it then)."""
         if not usage_share_core.enabled():
             return
+        from aisquare.cli.ui.views import usage_sharing  # sharing is on: in use (#45)
+
         if any(
             worker.name == usage_sharing.SHIP_WORKER and not worker.is_finished
             for worker in self.workers
@@ -4380,15 +4847,18 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
         if not any(first_run.fleet_is_up(snapshot.agents.get(p.id, [])) for p in snapshot.projects):
             return
-        if any(view.holds_the_sharing_ask() for view in self.query(WelcomeView)):
-            return
+        if _opened(WELCOME_MODULE):
+            from aisquare.cli.ui.views.welcome import WelcomeView
+
+            if any(view.holds_the_sharing_ask() for view in self.query(WelcomeView)):
+                return
         if self.after_sign_in is not None and self.after_sign_in.kind == "welcome":
             return
         self._sharing_asked = True
         if usage_share_core.forced_off_reason() is not None:
             return
         self.run_worker(
-            (self._sharing or usage_sharing.Sharing()).consent_due,
+            _sharing_question_due if self._sharing is None else self._sharing.consent_due,
             name=CONSENT_DUE_WORKER,
             group=CONSENT_DUE_WORKER,
             thread=True,
@@ -4399,11 +4869,15 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """The read of whether the question is still due came back: ask it, if so."""
         asked = event.state is WorkerState.SUCCESS and event.worker.result is True
         if asked and len(self.screen_stack) == 1:
+            from aisquare.cli.ui.views import usage_sharing
+
             self.push_screen(usage_sharing.ConsentDialog(self._sharing), self._consent_answered)
 
     def _consent_answered(self, answer: str | None) -> None:
         """Record the answer (``None`` is a dialog closed some other way: *No thanks*) and, on a
         yes, send the first shipment."""
+        from aisquare.cli.ui.views import usage_sharing  # its dialog asked: imported
+
         yes = answer == "share"
         sharing = self._sharing or usage_sharing.Sharing()
         self.run_worker(
@@ -4425,6 +4899,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             return
         if event.state is not WorkerState.SUCCESS:
             return
+        from aisquare.cli.ui.views import usage_sharing  # its dialog asked: imported
+
         for box in self.query(usage_sharing.SharingBox):
             box.refresh_status()
         # The answer is all this says. Whether the first shipment went is nothing a person is
@@ -4443,11 +4919,15 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if report.skipped or not (report.sessions_new or report.sessions_updated):
             return
         if self.content.current == "usage-stats":
+            from aisquare.cli.ui.views.usage_stats import UsageStatsView
+
             self.query_one("#usage-stats", UsageStatsView).reload()
 
     async def on_usage_stats_selected(self, event: UsageStatsSelected) -> None:
         """The hub's *Usage & stats*: the page of what the Claude Code sessions on this machine
         spent; *⚙ Settings* stays the highlighted row, the page being one of Settings' own."""
+        from aisquare.cli.ui.views.usage_stats import UsageStatsView
+
         await self._show(
             "usage-stats", lambda: UsageStatsView(sharing=self._sharing, id="usage-stats")
         )
@@ -4458,6 +4938,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """The hub's *Personas*: yours and the bundled ones, for every project, on a page of
         Settings' own (R27: no longer a tab of each project). Built when first opened, as it
         reads the catalogue; read again each later time, as the disk may have changed."""
+        from aisquare.cli.ui.views.personas_tab import PersonasTab
+
         kept = next(iter(self.content.query_children(PersonasTab)), None)
         await self._show("personas", lambda: PersonasTab(id="personas"))
         if kept is not None:
@@ -4468,6 +4950,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
     async def on_resources_selected(self, event: ResourcesSelected) -> None:
         """The hub's *Agent resources*: what each live agent consumes, sampled while it shows
         (``views.resources``); *⚙ Settings* stays the highlighted row, as for Usage & stats."""
+        from aisquare.cli.ui.views.resources import ResourcesView
+
         await self._show("resources", lambda: ResourcesView(id="resources"))
         self.sidebar.select(SETTINGS_KEY)
         self._remember_selection("resources")
@@ -4579,6 +5063,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """Open the project just onboarded, once a frame that lists it has painted."""
         # Asked BEFORE the switch, which hides whatever the content pane had focused:
         # only a keyboard still on the Onboard view (or nowhere) is handed on.
+        from aisquare.cli.ui.views.onboard import OnboardView  # it posted this: imported
+
         focused = self.focused
         onboarding = focused is None or any(isinstance(n, OnboardView) for n in focused.ancestors)
         self.refresh_data(then=lambda: self._open_onboarded(event.project_id, onboarding))
@@ -4620,7 +5106,9 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     async def action_welcome(self) -> None:
         """``w`` from the sidebar: back to the Welcome page, with nothing selected."""
-        await self._show("welcome")
+        from aisquare.cli.ui.views.welcome import WelcomeView
+
+        await self._show("welcome", self._new_welcome)
         self.sidebar.select(None)
         self._remember_selection(None)
         # The page says which project step 1 is on from its ``on_show``, but Textual sends
@@ -4628,6 +5116,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # before the next layout pass is sent none, and the doctor kept the scope of the
         # page just left (~1 in 6 runs of the welcome tests). Asked here as well.
         self.query_one(WelcomeView).tell_chosen()
+
+    def _new_welcome(self) -> Widget:
+        """The Welcome page, built when it is first shown (#45): at the start of a home with
+        no project, or when asked for (``w``, a sign-in it started, the captain's stop)."""
+        from aisquare.cli.ui.views.welcome import WelcomeView
+
+        return WelcomeView(escape_key=self.escape_key, id="welcome")
 
     def on_welcome_view_progress(self, event: WelcomeView.Progress) -> None:
         """Welcome added a project or started an agent: the sidebar shows it now."""
@@ -4812,14 +5307,14 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         running = self._holding_the_quit()
         if not running:
             self._worker_threads.drop_held()
-            if self.hand_off[:1] == ("uninstall",):
+            if self.hand_off[:1] == ("uninstall",) and self._remote is not None:
                 # Off, not only stopped as a quit leaves it: every phone signed out (its
                 # farewell drained before the exec, run_ui) and the switch saved off. Stopped,
                 # remote.json kept the devices, the link and the passphrase past an Uninstall
                 # without --purge, and the first asq after a reinstall brought Remote back,
                 # its phones let in by their cookies (review of #259, remote focus, 12/12).
                 # An Update's asq --reopen brings it back, read-only.
-                self.remote.turn_off(wait=False)
+                self._remote.turn_off(wait=False)
             self.exit()
             return
         waited = _hand_off_clock() - self._hand_off_since
@@ -4922,7 +5417,7 @@ def _writing_workers() -> dict[str, str]:
     (``FleetApp._holding_the_quit``), so a writer missing here is still never cut off;
     listed, it is refused with its name, before asq stops starting its reads.
     """
-    from aisquare.cli.ui import persona_dialogs, spawn, stop
+    from aisquare.cli.ui import persona_dialogs, remote_workers, spawn, stop
     from aisquare.cli.ui.views import (
         accounts,
         agent,
@@ -4933,12 +5428,14 @@ def _writing_workers() -> dict[str, str]:
         personas_tab,
         project,
         settings,
-        settings_remote,
+        start_at_login,
         tmux_page,
+        usage_sharing,
         welcome,
     )
 
     return {
+        start_at_login.WRITE_WORKER: "the login item's change",
         doctor.FIX_WORKER: "a fix",
         doctor.ASK_WORKER: "a question to the manager",
         onboard.ONBOARD_WORKER: "a folder's setup",
@@ -4956,7 +5453,7 @@ def _writing_workers() -> dict[str, str]:
         personas_tab.ATTACH_WORKER: "a persona's attachment",
         captain.TELL_WORKER: "a line to the captain",
         captain.VOICE_WORKER: "the captain's speaker switch",
-        settings_remote.TOKEN_WORKER: "Settings ▸ Remote's save of the ngrok token",
+        remote_workers.TOKEN_WORKER: "Settings ▸ Remote's save of the ngrok token",
         agent.RESTART_WORKER: "an agent's restart",
         agent.PAUSE_WORKER: "an agent's pause",
         agent.MOVE_WORKER: "an agent's move to another account",
@@ -4989,7 +5486,15 @@ def _waited_reads() -> dict[str, str]:
     ``shell-accounts``, ``welcome-validate`` (round 24 of #257). tests/test_ui_writing_workers.py
     checks that every read the UI starts is here.
     """
-    from aisquare.cli.ui import attach, board, fresh, persona_dialogs, spawn, terminal
+    from aisquare.cli.ui import (
+        attach,
+        board,
+        fresh,
+        persona_dialogs,
+        remote_workers,
+        spawn,
+        terminal,
+    )
     from aisquare.cli.ui.views import (
         accounts,
         agent,
@@ -4998,12 +5503,13 @@ def _waited_reads() -> dict[str, str]:
         doctor,
         fleet_bulk,
         resources,
-        settings_remote,
+        start_at_login,
         tmux_page,
         welcome,
     )
 
     return {
+        start_at_login.READ_WORKER: "whether rlx starts at login",
         _DOCTOR_WORKER: "the doctor's checks",
         FLEET_WORKER: "the sidebar's read of the fleet",
         CHECK_WORKER: "the release check",
@@ -5038,7 +5544,8 @@ def _waited_reads() -> dict[str, str]:
         persona_dialogs.SKILLS_WORKER: "the Import dialog's skill list",
         captain.BAR_WORKER: "the captain's bar",
         captain.MIC_WORKER: "the captain's microphone check",
-        settings_remote.CHECK_WORKER: "what Remote needs",
+        remote_workers.CHECK_WORKER: "what Remote needs",
+        remote_workers.RESTORE_WORKER: "Remote's wait for the one turning off",
         terminal.WSLPATH_WORKER: "a pasted Windows path's conversion",
         fresh.PLAN_WORKER: "Start fresh's read of the project",
     }
@@ -5067,7 +5574,7 @@ def _cut_off_workers() -> frozenset[str]:
     else, while a first sweep over a long history can take half a minute. Every other
     thread worker is waited for, a new one too.
     """
-    from aisquare.cli.ui.views import accounts, usage_stats, welcome
+    from aisquare.cli.ui.views import accounts, usage_sharing, usage_stats, welcome
 
     return frozenset(
         {
@@ -5173,15 +5680,27 @@ def _run_registered(
 ) -> tuple[str, ...] | None:
     """:func:`run_ui` once the gate is passed: the app, run, and the waits after it; the
     command it hands over to, if one."""
-    from aisquare.services import remote_server
-
+    # A home whose Remote was set up before Remote had a switch has it written on, once,
+    # before the app reads it (#46: no one is cut off by the upgrade).
+    experimental.settle_remote()
     # The release check runs in the asq a person opens, never in an app a test builds unless
     # the test passes one: each FleetApp started a check worker and an hourly ask, one more
     # thread worker beside the reads the UI tests time (Windows CI on bff5c05e).
     app = FleetApp(**{"release_check": updates_service.check_for_release, **options})
     if registration is not None:
         registration.start()  # the heartbeat, and the look for another asq's quit request
-    with ngrok_ends_with():
+    # A hangup or a SIGTERM ends the ngrok of a Remote up here first, one turned on later
+    # included (``FleetApp.remote_guard``); Remote off, nothing of it is loaded for this (#46).
+    guard = getattr(app, "remote_guard", None)
+    if guard is None:
+        guard = contextlib.ExitStack()
+    if hasattr(app, "ends_ngrok_on_signals"):
+        app.ends_ngrok_on_signals = True
+    if getattr(app, "remote", None) is not None:
+        from aisquare.cli.ui.remote_control import ngrok_ends_with
+
+        guard.enter_context(ngrok_ends_with())
+    with guard:
         app.run()
         # Read with getattr so an app still needs only `run()`, `unsaved` and `remote` to be
         # run here.
@@ -5199,22 +5718,34 @@ def _run_registered(
             stderr_console().print(said, markup=False, highlight=False)
         for line in app.unsaved:
             stderr_console().print(f"⚠ {line}", markup=False, highlight=False)
+        # Remote, and any turned off while rlx ran and still stopping (#46); none while off.
+        remotes = [
+            remote
+            for remote in (getattr(app, "remote", None), *getattr(app, "remotes_stopping", ()))
+            if remote is not None
+        ]
+        remote_server = sys.modules.get("aisquare.services.remote_server")
         try:
-            if not app.remote.wait_until_off(REMOTE_QUIT_QUIET_SECONDS):
-                stderr_console().print("stopping Remote (its server and ngrok)…", markup=False)
-                app.remote.wait_until_off()
-            if hand_off is not None:
-                # The R panel's writes of remote.json (the write switch, a revoke) run on a
-                # thread an exit joins and the exec skips; the stop above waited for them
-                # only when this asq served Remote (round 4 of #259).
-                app.remote.writes_done()
+            for remote in remotes:
+                if not remote.wait_until_off(REMOTE_QUIT_QUIET_SECONDS):
+                    stderr_console().print("stopping Remote (its server and ngrok)…", markup=False)
+                    remote.wait_until_off()
+                if hand_off is not None:
+                    # The R panel's writes of remote.json (the write switch, a revoke) run on a
+                    # thread an exit joins and the exec skips; the stop above waited for them
+                    # only when this asq served Remote (round 4 of #259).
+                    remote.writes_done()
         except KeyboardInterrupt:
             try:  # the thread that would stop ngrok ends with the process
-                app.remote.stop_tunnel_now()
+                for remote in remotes:
+                    remote.stop_tunnel_now()
             finally:
+                if remote_server is None:  # nothing of Remote here: the Ctrl-C as ever
+                    raise
                 remote_server._remote_quit_now(undone)
         # A phone's write still running would hold the exit as long as it runs: said, not silent.
-        remote_server.remote_wait_for_writes(undone)
+        if remote_server is not None:
+            remote_server.remote_wait_for_writes(undone)
         if hand_off is not None:
             # The "Remote is off" a turn-off or the quit's auto-off sent the phones goes out on
             # a daemon thread, which an exit waits for (`push_drain`, at exit) and the exec
@@ -5228,5 +5759,7 @@ def _run_registered(
                 # so pbcopy got it cut short or never (review of #266, round 3).
                 clipboard.flush()
             except KeyboardInterrupt:
+                if remote_server is None:
+                    raise
                 remote_server._remote_quit_now(undone)
     return hand_off

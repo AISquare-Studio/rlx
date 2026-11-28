@@ -66,6 +66,9 @@ narrowing their environment would be change without a reason:
   * ``core/claude_accounts.py::_ask_keychain`` — ``/usr/bin/security
     find-generic-password`` on macOS: the Claude Code login an account's
     Keychain item holds, read for its usage. No model.
+  * ``core/claude_accounts.py::_run_security`` — ``/usr/bin/security`` on macOS, for the
+    home's move (#31): an account's Keychain item read, copied to its new name through
+    ``security -i`` on stdin, and the old one deleted. No model.
   * ``core/agents.py::hook_binary_version`` — ``<hook's aisquare> --version``,
     a string: doctor asking another install of this CLI what version it is,
     so hooks that name a stale binary stop grading as healthy (#84).
@@ -229,6 +232,16 @@ MARKER_ENV_VARS = (
 #: user-visible output and the reserved-var guard.
 IDENTITY_ENV_VARS = (*TRACING_ENV_VARS, *MARKER_ENV_VARS)
 
+TMP_KEY_ENV = "AISQUARE_TMP_KEY"
+"""The agent's own temporary directory's key, a fleet window's alone (``fleet.spawn``'s
+``-e`` pair, from its launch spec): ``aisquare launch`` makes ``<home>/tmp/<key>`` its
+``TMPDIR`` (``services.agent_tmp``, #57)."""
+
+OUTER_TMPDIR_ENV = "AISQUARE_OUTER_TMPDIR"
+"""The ``TMPDIR`` an agent's launch inherited (``""``: none), kept beside the agent's own: a
+tmux server started from the agent's tool shell gets it back (:func:`tmux_client_env`), so no
+window opened there by hand is left with a directory that goes when the agent ends."""
+
 #: The variables that tie a process to one board, seat or role. A fleet window gets
 #: each of its own (``fleet.spawn``'s ``-e`` pairs). A tmux server copies the
 #: environment of the client that starts it into its global environment, and every
@@ -244,6 +257,7 @@ TEAM_ENV_VARS = (
     "AISQUARE_ROLE",
     "AISQUARE_PERSONA",
     "AISQUARE_BOARD_CONTEXT",
+    TMP_KEY_ENV,
 )
 
 TRACED = "traced"
@@ -344,6 +358,12 @@ SEAMS: dict[str, Seam] = {
         "`/usr/bin/security find-generic-password` on macOS — reads the login Claude Code keeps "
         "in an account's Keychain item, for its usage; a string, no model",
     ),
+    "aisquare/core/claude_accounts.py::_run_security": Seam(
+        EXCLUDED,
+        "`/usr/bin/security` on macOS, for the home's move (#31): an account's Keychain item "
+        "read, copied to the name its new place hashes to through `security -i` on stdin, and "
+        "the old one deleted; strings, no model",
+    ),
     "aisquare/core/agents.py::hook_binary_version": Seam(
         EXCLUDED,
         "`<the aisquare a hook names> --version`, a string — doctor asking another "
@@ -376,8 +396,27 @@ SEAMS: dict[str, Seam] = {
     ),
     "aisquare/services/service_host.py::_detached": Seam(
         EXCLUDED,
-        "the rlx service's own workers, one at a time: the usage sweep and the anonymous usage "
-        "shipment (when sharing is on); aisquare's work for the home, not an agent session (#32)",
+        "the rlx service's own workers, one at a time: the usage sweep, the anonymous usage "
+        "shipment (when sharing is on) and the tray (#34); aisquare's work for the home, not an "
+        "agent session (#32)",
+        strips_identity=True,
+    ),
+    "aisquare/services/tray.py::_spawn_terminal": Seam(
+        EXCLUDED,
+        "the tray's Open rlx: the person's terminal app running rlx, on its own, so it outlives "
+        "the tray; a window for the person, not an agent session (#34)",
+        strips_identity=True,
+    ),
+    "aisquare/services/tray.py::_spawn_rlx": Seam(
+        EXCLUDED,
+        "the tray's Restart rlx and Quit rlx: a detached `rlx service restart` or `stop`, since "
+        "either stops the service and the service stops the tray; aisquare's own command (#34)",
+        strips_identity=True,
+    ),
+    "aisquare/services/service_login.py::_service_manager": Seam(
+        EXCLUDED,
+        "`launchctl`, `systemctl --user` and `loginctl`: the rlx service's login item added, "
+        "read and taken away (#33); the OS's own tools, never a model process",
         strips_identity=True,
     ),
     "aisquare/services/active_ping.py::_spawn": Seam(
@@ -637,9 +676,23 @@ def untraced_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     }
 
 
+GIT_REPOSITORY_VARS: tuple[str, ...] = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
+"""What points git at another repository than the one it is asked about: a git hook sets
+``GIT_DIR``, and an aisquare it runs judged the hook's repository, not the tree named with
+``-C`` (review of #58). None of them reaches a git aisquare runs."""
+
+
 def git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment of every git command aisquare runs: ``base`` (default the current
-    environment) without the tracing identity (:func:`untraced_env`), with
+    environment) without the tracing identity (:func:`untraced_env`) nor any variable that
+    points git at another repository (:data:`GIT_REPOSITORY_VARS`), with
     ``GIT_OPTIONAL_LOCKS=0`` and ``GIT_TERMINAL_PROMPT=0``.
 
     No git aisquare runs is a model process, and one started from a traced session's hook is
@@ -652,6 +705,8 @@ def git_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     so a fix to one did not reach the other (round 28, 10/10).
     """
     env = untraced_env(base)
+    for name in GIT_REPOSITORY_VARS:
+        env.pop(name, None)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
@@ -734,7 +789,8 @@ def run_agents(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
 def tmux_client_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """What a tmux client runs with: :func:`untraced_env` less :data:`TEAM_ENV_VARS`, every
     agent's process identity (:func:`agent_identity_env_vars`) and, from an agent's tool
-    shell, that agent's home (:func:`tool_shell_homes`).
+    shell, that agent's home (:func:`tool_shell_homes`). From an agent's tool shell, the
+    ``TMPDIR`` its launch inherited (:data:`OUTER_TMPDIR_ENV`) in place of the agent's own.
 
     The client that finds no server starts one, and the server keeps that client's
     environment as its global one, so a server the fleet starts holds no team
@@ -744,4 +800,11 @@ def tmux_client_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """
     env = untraced_env(base)
     dropped = {*TEAM_ENV_VARS, *agent_identity_env_vars(), *tool_shell_homes(env)}
-    return {k: v for k, v in env.items() if k not in dropped}
+    client = {k: v for k, v in env.items() if k not in dropped}
+    # An agent's own TMPDIR goes when the agent ends: the server keeps the one it inherited.
+    outer = client.pop(OUTER_TMPDIR_ENV, None)
+    if outer is not None:
+        client.pop("TMPDIR", None)
+        if outer:
+            client["TMPDIR"] = outer
+    return client

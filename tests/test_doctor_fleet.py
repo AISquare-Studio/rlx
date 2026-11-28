@@ -1287,12 +1287,12 @@ def test_the_fleet_terminal_row_names_the_outer_terminal_tmux_and_the_server() -
         ("show-options", "-gv", "prefix"): "None\n",
         ("show-environment", "-g"): "DISPLAY=:1\nWAYLAND_DISPLAY=wayland-0\n-SSH_AUTH_SOCK\n",
     }
-    env = {"KITTY_WINDOW_ID": "3", "DISPLAY": ":1", "WAYLAND_DISPLAY": "wayland-0"}
+    env = {"GHOSTTY_RESOURCES_DIR": "/x", "DISPLAY": ":1", "WAYLAND_DISPLAY": "wayland-0"}
 
     check = _terminal_row(server, env)
 
     assert check.name == "fleet terminal" and check.status is CheckStatus.ok
-    assert "outer terminal kitty (kitty keyboard protocol" in check.detail
+    assert "outer terminal ghostty (kitty keyboard protocol" in check.detail
     assert "tmux 3.7 carries extended keys" in check.detail
     assert "server prefix None" in check.detail and "stale" not in check.detail
 
@@ -1336,8 +1336,9 @@ def test_the_fleet_terminal_row_names_the_running_servers_tmux_not_the_binary_on
 
     check = _terminal_row(server, {"KITTY_WINDOW_ID": "3"})
 
+    tmux_note = diagnostics._extended_keys_note((3, 4))
     assert check.status is CheckStatus.ok
-    assert "tmux 3.4 has no extended keys" in check.detail and "ctrl+j" in check.detail
+    assert tmux_note in check.detail and "ctrl+j" in tmux_note
     assert "carries extended keys" not in check.detail
     assert "this shell's tmux is 3.7; the running server keeps 3.4 until it restarts" in (
         check.detail
@@ -1361,8 +1362,9 @@ def test_the_fleet_terminal_row_warns_about_a_kept_prefix_and_lists_stale_vars()
     check = _terminal_row(server, env)
 
     assert check.status is CheckStatus.warn
+    tmux_note = diagnostics._extended_keys_note((3, 4))
     assert "a VTE terminal" in check.detail and "no kitty keyboard protocol" in check.detail
-    assert "tmux 3.4 has no extended keys" in check.detail and "ctrl+j" in check.detail
+    assert tmux_note in check.detail and "ctrl+j" in tmux_note
     assert "stale on the running server: DISPLAY, WAYLAND_DISPLAY, COLORTERM" in check.detail
     assert "SSH_AUTH_SOCK" not in check.detail.split("stale on the running server:")[1]
     assert "still has prefix C-b" in check.detail
@@ -1389,6 +1391,87 @@ def test_the_fleet_terminal_row_never_starts_a_server_and_survives_an_unknown_te
     assert "fleet terminal" in _by_name(diagnostics.doctor()), "it reaches the real doctor"
 
 
+@pytest.mark.parametrize(
+    ("env", "name", "protocol"),
+    [
+        ({"KITTY_WINDOW_ID": "1"}, "kitty", "unknown"),
+        ({"TERM": "xterm-kitty"}, "kitty", "unknown"),
+        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2", "unknown"),
+        ({"LC_TERMINAL": "iTerm2"}, "iTerm2", "unknown"),
+        ({"TERM_PROGRAM": "vscode"}, "the VS Code terminal", "unknown"),
+        ({"WEZTERM_EXECUTABLE": "/x"}, "wezterm", "unknown"),
+        ({"TERM_PROGRAM": "WezTerm"}, "wezterm", "unknown"),
+        ({"TERM": "wezterm"}, "wezterm", "unknown"),
+        ({"WT_SESSION": "x"}, "Windows Terminal", "unknown"),
+        ({"TERM": "foot"}, "foot", "unknown"),
+        ({"TERM": "alacritty"}, "alacritty", "unknown"),
+        ({"TERM_PROGRAM": "Apple_Terminal"}, "Terminal.app", "no kitty"),
+    ],
+    ids=[
+        "kitty",
+        "kitty-term",
+        "iterm2",
+        "iterm2-over-ssh",
+        "vscode",
+        "wezterm",
+        "wezterm-term-program",
+        "wezterm-term",
+        "windows-terminal",
+        "foot",
+        "alacritty",
+        "terminal-app",
+    ],
+)
+def test_the_fleet_terminal_row_names_the_terminal_its_protocol_and_ctrl_j(
+    env: dict[str, str], name: str, protocol: str
+) -> None:
+    detail = _terminal_row(FakeServer(absent=True), env).detail
+
+    assert f"outer terminal {name} (" in detail
+    assert protocol in detail
+    assert "ctrl+j" in detail
+
+
+@pytest.mark.parametrize(
+    ("env", "name"),
+    [
+        ({"KITTY_WINDOW_ID": "1"}, "kitty"),
+        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2"),
+        ({"WT_SESSION": "x"}, "Windows Terminal"),
+        ({"TERM": "xterm-256color"}, "unknown (TERM=xterm-256color)"),
+    ],
+    ids=["kitty", "iterm2", "windows-terminal", "unrecognised"],
+)
+def test_a_terminal_with_unproven_shift_enter_is_given_the_ctrl_j_line(
+    env: dict[str, str], name: str
+) -> None:
+    """rlx#558: where Shift+Enter is not proven to reach an agent (the terminal's sign leaves
+    its keyboard protocol unknown, or no sign names it), the row's first part is the ctrl+j
+    line, which works in every terminal, and no longer "try shift+enter in a pane"."""
+    detail = _terminal_row(FakeServer(absent=True), env).detail
+
+    assert detail.split("; ")[0] == (
+        f"outer terminal {name} (protocol unknown, use ctrl+j for a newline)"
+    )
+    assert "try shift+enter" not in detail
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"GHOSTTY_RESOURCES_DIR": "/x"}, {"TERM_PROGRAM": "ghostty"}, {"TERM": "xterm-ghostty"}],
+    ids=["ghostty-resources", "ghostty-term-program", "ghostty-term"],
+)
+def test_a_terminal_with_proven_shift_enter_keeps_its_line(env: dict[str, str]) -> None:
+    """rlx#558 leaves a terminal whose every release speaks the kitty keyboard protocol as it
+    was: Shift+Enter reaches agents there, and the row gives no newline advice."""
+    detail = _terminal_row(FakeServer(absent=True), env).detail
+
+    assert detail.split("; ")[0] == (
+        "outer terminal ghostty (kitty keyboard protocol: shift+enter reaches agents)"
+    )
+    assert "ctrl+j" not in detail
+
+
 def test_the_fleet_terminal_row_comes_after_the_actionable_checks() -> None:
     """It can warn (a server's kept prefix), and the not-ok rows are read in doctor
     order (the fleet sidebar showed only the first three): inserted beside
@@ -1405,17 +1488,21 @@ def test_the_fleet_terminal_row_comes_after_the_actionable_checks() -> None:
 @pytest.mark.parametrize(
     ("env", "name", "kitty"),
     [
-        ({"KITTY_WINDOW_ID": "1"}, "kitty", True),
+        ({"KITTY_WINDOW_ID": "1"}, "kitty", None),
         ({"GHOSTTY_RESOURCES_DIR": "/x"}, "ghostty", True),
-        ({"WEZTERM_EXECUTABLE": "/x"}, "wezterm", True),
-        ({"WT_SESSION": "x"}, "Windows Terminal", False),
-        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2", False),
-        ({"TERM_PROGRAM": "vscode"}, "the VS Code terminal", False),
+        ({"WEZTERM_EXECUTABLE": "/x"}, "wezterm", None),
+        ({"WT_SESSION": "x"}, "Windows Terminal", None),
+        ({"TERM_PROGRAM": "iTerm.app"}, "iTerm2", None),
+        ({"TERM_PROGRAM": "WezTerm"}, "wezterm", None),
+        ({"TERM_PROGRAM": "ghostty"}, "ghostty", True),
+        ({"TERM_PROGRAM": "vscode"}, "the VS Code terminal", None),
         ({"TERM_PROGRAM": "Apple_Terminal"}, "Terminal.app", False),
         ({"VTE_VERSION": "7800"}, "a VTE terminal (GNOME Terminal, Tilix, …)", False),
-        ({"TERM": "xterm-kitty"}, "kitty", True),
-        ({"TERM": "foot"}, "foot", True),
-        ({"TERM": "alacritty"}, "alacritty", True),
+        ({"TERM": "xterm-kitty"}, "kitty", None),
+        ({"TERM": "xterm-ghostty"}, "ghostty", True),
+        ({"TERM": "wezterm"}, "wezterm", None),
+        ({"TERM": "foot"}, "foot", None),
+        ({"TERM": "alacritty"}, "alacritty", None),
         ({}, "unknown", None),
     ],
 )
@@ -1424,12 +1511,11 @@ def test_outer_terminal_recognition(env: dict[str, str], name: str, kitty: bool 
 
 
 def test_behind_a_multiplexer_the_terminal_ssh_named_is_nobody_s() -> None:
-    """Review of #266, round 3: the ``LC_TERMINAL`` ssh sends is kept by a tmux for as long
-    as it runs. Started over SSH from iTerm2 and reattached from kitty, the row said
-    iTerm2 with no kitty keyboard protocol, and sent the user after a shift+enter fix for
-    a terminal they were not using. The row said "unknown" there before that sign."""
+    """The ``LC_TERMINAL`` ssh sends is kept by a tmux for as long as it runs (review of #266,
+    round 3). This test reads ``outer_terminal`` for iTerm2's ``LC_TERMINAL`` alone, behind
+    tmux and behind screen, and the fleet terminal row behind tmux."""
     iterm = {"LC_TERMINAL": "iTerm2", "LC_TERMINAL_VERSION": "3.5.4"}
-    assert outer_terminal(iterm) == ("iTerm2", False), "over SSH, with nothing between"
+    assert outer_terminal(iterm) == ("iTerm2", None), "over SSH, with nothing between"
     behind_tmux = {**iterm, "TMUX": "/tmp/tmux-1/default,1,0", "TERM": "tmux-256color"}
     assert outer_terminal(behind_tmux) == ("unknown (TERM=tmux-256color)", None)
     behind_screen = {**iterm, "STY": "1234.pts-0.host", "TERM": "screen", "VTE_VERSION": "7800"}

@@ -8,8 +8,9 @@ waited for unless it is listed as safe to cut off, so this guard checks what tha
 rests on: every ``run_worker(…)`` and ``@work(…)`` in ``aisquare.cli.ui``, read from the
 source, is a thread worker (a task worker is left to the quit) and has a name. It follows a
 name passed down through a helper's parameter (Welcome's ``_start_work`` → ``_run`` →
-``worker_name``), so the app's lists and the hand-over's tests name only workers the UI
-starts, and those tests take every worker the walk finds.
+``worker_name``), and one read through an import in the starting function's own body, as
+the shell imports a view where it is first used (#45), so the app's lists and the hand-over's
+tests name only workers the UI starts, and those tests take every worker the walk finds.
 """
 
 from __future__ import annotations
@@ -66,6 +67,46 @@ def _calls_to(tree: ast.AST, function: str) -> Iterator[ast.Call]:
             yield node
 
 
+def _own_scope(where: ast.FunctionDef) -> Iterator[ast.AST]:
+    """Every node of ``where``'s own body, in source order, but not inside a nested function,
+    lambda or class: what those import is theirs, and ``where`` would raise ``NameError``
+    reading it (review of #45, #3879)."""
+    todo: list[ast.AST] = list(reversed(where.body))
+    while todo:
+        node = todo.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            todo.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _imported_in(where: ast.FunctionDef | None, name: str) -> Any:
+    """What ``name`` is bound to by an import in ``where``'s own body (:func:`_own_scope`),
+    ``None`` without one: a module, or a name of one, imported where it is first used (#45).
+    The last such import, as Python binds it (review of #45, #3931). The walk below has
+    imported every UI module already. One that cannot be imported fails in the guard's own
+    words, with why (#3879, #3931)."""
+    if where is None:
+        return None
+    bound: tuple[str, str] | None = None
+    for node in _own_scope(where):
+        if isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                if (alias.asname or alias.name) == name:
+                    bound = (node.module, alias.name)
+    if bound is None:
+        return None
+    module_name, attribute = bound
+    try:
+        module = importlib.import_module(module_name)
+        if hasattr(module, attribute):
+            return getattr(module, attribute)
+        return importlib.import_module(f"{module_name}.{attribute}")
+    except ImportError as exc:
+        raise AssertionError(
+            f"a worker name this guard cannot read: {name}, from {module_name} ({exc})"
+        ) from exc
+
+
 def _names(
     value: ast.expr,
     where: ast.FunctionDef | None,
@@ -77,7 +118,10 @@ def _names(
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         return {value.value}
     if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
-        found = getattr(namespace.get(value.value.id), value.attr, None)
+        holder = namespace.get(value.value.id)
+        if holder is None:
+            holder = _imported_in(where, value.value.id)
+        found = getattr(holder, value.attr, None)
         if isinstance(found, str):
             return {found}
     if isinstance(value, ast.Name):
@@ -96,6 +140,8 @@ def _names(
                 names |= _names(passed, _enclosing(call, parents), tree, parents, namespace)
             return names
         found = namespace.get(value.id)
+        if found is None:
+            found = _imported_in(where, value.id)
         if isinstance(found, str):
             return {found}
     if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and len(value.args) == 1:
@@ -279,6 +325,18 @@ SHAPES = {
         "def go(self):\n"
         "    self._start_work('read', job)\n"
     ),
+    "a first-use import of its module": (
+        "def go(self):\n"
+        "    from aisquare.cli.ui.views import usage_sharing\n"
+        "\n"
+        "    self.run_worker(job, name=usage_sharing.SHIP_WORKER, thread=True)\n"
+    ),
+    "a first-use import of the name": (
+        "def go(self):\n"
+        "    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER as SHIP\n"
+        "\n"
+        "    self.run_worker(job, name=SHIP, thread=True)\n"
+    ),
 }
 
 
@@ -291,10 +349,102 @@ def test_the_rule_reads_every_shape_and_accuses_a_start_that_is_not_a_thread(sha
     exec(compile(SHAPES[shape], shape, "exec"), dict(namespace))  # the shape is real Python
     as_task = SHAPES[shape].replace("thread=True", "thread=False")
 
+    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER
+
     expected = {"welcome-read"} if shape == "a helper's parameter" else {"new-read"}
+    if shape.startswith("a first-use import"):
+        expected = {SHIP_WORKER}
     assert started == expected
     with pytest.raises(AssertionError, match="not a thread worker"):
         started_workers(as_task, namespace)
+
+
+UNREADABLE_IMPORTS = {
+    "a module that is not there": (
+        "def go(self):\n"
+        "    from aisquare.cli.ui.views import no_such_view\n"
+        "\n"
+        "    self.run_worker(job, name=no_such_view.SHIP_WORKER, thread=True)\n"
+    ),
+    "a name from a module that is not there": (
+        "def go(self):\n"
+        "    from aisquare.no_such_module import SHIP_WORKER\n"
+        "\n"
+        "    self.run_worker(job, name=SHIP_WORKER, thread=True)\n"
+    ),
+    "a module only a nested function imports": (
+        "def go(self):\n"
+        "    def later():\n"
+        "        from aisquare.cli.ui.views import usage_sharing\n"
+        "\n"
+        "    self.run_worker(job, name=usage_sharing.SHIP_WORKER, thread=True)\n"
+    ),
+    "a name only a nested function imports": (
+        "def go(self):\n"
+        "    async def later():\n"
+        "        from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER\n"
+        "\n"
+        "    self.run_worker(job, name=SHIP_WORKER, thread=True)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", UNREADABLE_IMPORTS)
+def test_a_first_use_import_the_start_cannot_see_fails_in_the_guards_words(shape: str) -> None:
+    """Review of #45 (#3879): a module that cannot be imported raised ``ModuleNotFoundError``
+    rather than the guard's own words, and an import made only in a nested function was read
+    as the start's, where it would raise ``NameError``. Each is a name the guard cannot read."""
+    with pytest.raises(AssertionError, match="cannot read"):
+        started_workers(UNREADABLE_IMPORTS[shape], {})
+
+
+def test_the_last_first_use_import_of_a_name_is_the_one_read() -> None:
+    """Review of #45 (#3931): Python binds a name its last import made, and the guard read
+    the first. A start after two imports of one name is read as the second's."""
+    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER
+
+    source = (
+        "def go(self):\n"
+        "    from aisquare.cli.ui.views.usage_stats import LOAD_WORKER as NAME\n"
+        "    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER as NAME\n"
+        "\n"
+        "    self.run_worker(job, name=NAME, thread=True)\n"
+    )
+    assert started_workers(source, {}) == {SHIP_WORKER}
+
+
+def test_an_import_the_guard_cannot_make_says_why() -> None:
+    """Review of #45 (#3931): the guard's "cannot read" for an import it cannot make kept
+    back why; it says the module and what the import raised."""
+    source = (
+        "def go(self):\n"
+        "    from aisquare.no_such_module import SHIP_WORKER\n"
+        "\n"
+        "    self.run_worker(job, name=SHIP_WORKER, thread=True)\n"
+    )
+    with pytest.raises(AssertionError, match="cannot read") as failed:
+        started_workers(source, {})
+    assert "aisquare.no_such_module" in str(failed.value)
+    assert isinstance(failed.value.__cause__, ModuleNotFoundError)
+
+
+def test_a_first_use_import_anywhere_in_the_starts_own_body_is_read() -> None:
+    """The control: an import under an ``if`` or a ``with`` of the starting function is its
+    own, as Python reads it, and a nested function's import of the same name changes nothing."""
+    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER
+
+    source = (
+        "def go(self):\n"
+        "    def later():\n"
+        "        from aisquare.cli.ui.views.usage_stats import LOAD_WORKER as SHIP\n"
+        "\n"
+        "    if self.ready:\n"
+        "        with self.lock:\n"
+        "            from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER as SHIP\n"
+        "\n"
+        "            self.run_worker(job, name=SHIP, thread=True)\n"
+    )
+    assert started_workers(source, {}) == {SHIP_WORKER}
 
 
 def test_a_worker_name_the_guard_cannot_read_fails_rather_than_passing() -> None:

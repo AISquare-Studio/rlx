@@ -39,6 +39,8 @@ from textual.widgets import Button, Input, Static
 from textual.worker import Worker, WorkerState
 
 from aisquare.cli.ui.remote_control import RemoteController
+from aisquare.cli.ui.remote_workers import CHECK_WORKER as CHECK_WORKER
+from aisquare.cli.ui.remote_workers import TOKEN_WORKER as TOKEN_WORKER
 from aisquare.cli.ui.save_model import CommitInput
 from aisquare.cli.ui.ticks import while_running
 from aisquare.services import ngrok_sdk
@@ -49,11 +51,6 @@ from aisquare.services.ngrok_tunnel import AUTHTOKEN_HINT
 CHIP_TICK_S = 2.0
 """How often the sidebar's chip, and App settings' *Remote* tab, look whether Remote is on,
 and how many devices are in."""
-
-TOKEN_WORKER = "settings-remote-token"
-"""The worker that saves a pasted ngrok token (:func:`store_ngrok_token`)."""
-CHECK_WORKER = "settings-remote-check"
-"""The worker that looks at what Remote needs (:func:`remote_needs`)."""
 
 TITLE = ("Remote control", "the fleet on your phone")
 """The tab's heading: its name, and what it is, dim (``app_settings.section_title``)."""
@@ -326,6 +323,7 @@ class TokenSlot(Vertical):
             self.notify("✓ ngrok token saved", timeout=5, markup=False)
             self.post_message(TokenSaved())
             return
+        self.query_one("#settings-remote-token-field", CommitInput).release()  # to try again
         if isinstance(error, TokenRefused):
             said = str(error)
         elif event.state is WorkerState.ERROR:  # never the token: only what kind of failure

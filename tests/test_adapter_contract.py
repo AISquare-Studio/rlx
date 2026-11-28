@@ -74,7 +74,7 @@ from aisquare.core.orchestrator import team_project
 from aisquare.core.pricing import RequestTokens
 from aisquare.core.store import store_session
 from aisquare.models import ClaudeAccount
-from aisquare.services import agent_events, first_run, store_broker
+from aisquare.services import agent_events, agent_tmp, first_run, store_broker
 from aisquare.services import claude_accounts as accounts_service
 from aisquare.services import fleet as fleet_service
 from tests import fakebin
@@ -1138,13 +1138,18 @@ def test_the_fake_agent_runs_through_the_fleet_like_any_other(
     protect, writable = store_broker.launch_paths(launched_env, Path.cwd())
     # And the launch's own reports, the other place its sandbox writes (task #21): handed to
     # any adapter as one more writable path, so a new agent's sandboxed `asq exec` needs no
-    # more than its `broker_access` already takes.
+    # more than its `broker_access` already takes. And the agent's own TMPDIR (#57), where its
+    # launch made one, writable to every seat as its reports are: made on Windows here, which
+    # has no socket to fit; a POSIX tmp_path's home is past the 49 bytes, and keeps the
+    # inherited one, which adds nothing.
+    own_tmp = agent_tmp.own_dir(launched_env)
+    assert own_tmp is not None or sys.platform != "win32"
     expected = fake_agent.broker_access(
         native,
         store_dir(),
         broker / store_broker.INBOX,
         protect=protect,
-        writable=(*writable, broker / store_broker.REPORTS),
+        writable=(*writable, broker / store_broker.REPORTS, *([own_tmp] if own_tmp else [])),
     )
     assert expected is not None and argv[-len(expected) :] == expected
     if sys.platform != "win32":

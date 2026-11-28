@@ -22,16 +22,26 @@ other role, fleet row and board, and the store, are the same either way.
 
 The captain's own window is handed the variable as its starter has it
 (:func:`captain_environment`), so a switch set for one shell holds in the window too.
+
+``remote`` — Remote, the fleet on a phone (#46) — ships OFF too, its own switch beside the
+captain's in Settings' *Experimental*. ``[experimental] remote`` is ``None`` until decided:
+then a home where Remote was set up before it had a switch (:func:`remote_set_up`) reads as
+on, so no one is cut off by the upgrade, and :func:`settle_remote` writes that ``true`` once,
+from the CLI. ``AISQUARE_EXPERIMENTAL_REMOTE`` wins in both directions, as the captain's does.
+Off, nothing of Remote loads: no tab, worker, server or module (the TUI, the rlx service), and
+``rlx remote`` exits 2 with :func:`remote_off`. Nothing here imports Remote.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from aisquare.core import program as prog
-from aisquare.core.config import load_config
+from aisquare.core.config import load_config, save_config
 
 CAPTAIN_ENV = "AISQUARE_EXPERIMENTAL_CAPTAIN"
+REMOTE_ENV = "AISQUARE_EXPERIMENTAL_REMOTE"
 
 
 def captain_off() -> str:
@@ -101,3 +111,101 @@ def captain_environment() -> dict[str, str]:
     """
     value = os.environ.get(CAPTAIN_ENV)
     return {} if value is None else {CAPTAIN_ENV: value}
+
+
+# --- Remote (#46) ------------------------------------------------------------------------------
+
+
+def remote_off() -> str:
+    """The line ``rlx remote`` refuses with while Remote is off."""
+    where = "Settings > App settings > Experimental"
+    return f"Remote is experimental and off; turn it on in {where}" + prog.shell_advice(
+        f", or with {prog.word()} config set experimental.remote true, or {REMOTE_ENV}=1"
+    )
+
+
+def remote_enabled() -> bool:
+    """Whether Remote is on: the variable when set, else ``[experimental] remote``, else (not
+    decided) whether the home had Remote set up (:func:`remote_set_up`).
+
+    Read at every call, never cached, never a write, and nothing of Remote imported: the TUI
+    asks at its start, the rlx service at each of its ticks, ``rlx remote`` once.
+    """
+    forced = remote_forced()
+    if forced is not None:
+        return forced
+    try:
+        chosen = load_config(copy=False).experimental.remote
+    except Exception:  # an unreadable config is no opt-in
+        return False
+    return remote_set_up() if chosen is None else chosen
+
+
+def remote_forced() -> bool | None:
+    """What :data:`REMOTE_ENV` forces: on, off, or ``None`` when it is unset or empty."""
+    override = os.environ.get(REMOTE_ENV, "").strip().lower()
+    return override in _ON_VALUES if override else None
+
+
+#: The keys of Remote's own on/off in ``state.json`` (``cli.ui.remote_control.SWITCHES``):
+#: there only once that switch was used.
+_REMOTE_SWITCH_KEYS = ("remote_enabled", "auto_off_minutes", "remote_auto_off_at")
+
+
+def remote_set_up() -> bool:
+    """Whether this home had Remote set up before it had a switch (the manager's ruling on
+    #46): (a) a saved ngrok token; (b) a paired device in ``remote.json``, or what a paired
+    phone leaves (``push.json``, ``needs.json``, ``audit.log``), since a device is forgotten a
+    week after it paired; (c) Remote's own on/off in ``state.json``.
+
+    Not ``remote.json`` alone: any first look at Remote (its page, ``rlx remote status``)
+    makes one, with a fresh link and password. Stats and two small reads; nothing of Remote is
+    imported, and nothing that cannot be read counts.
+    """
+    from aisquare.core import paths
+
+    try:
+        if paths.ngrok_token_path().read_bytes().strip():
+            return True
+    except OSError:
+        pass
+    traces = (paths.remote_push_path(), paths.remote_needs_path(), paths.remote_audit_path())
+    if any(trace.is_file() for trace in traces):
+        return True
+    remote = _json_object(paths.remote_state_path())
+    if remote is not None and remote.get("devices"):
+        return True
+    state = _json_object(paths.state_path())
+    return state is not None and any(key in state for key in _REMOTE_SWITCH_KEYS)
+
+
+def _json_object(path: Path) -> dict[str, object] | None:
+    """The JSON object at ``path``; ``None`` when it is not one or cannot be read."""
+    import json
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def settle_remote() -> bool:
+    """Write ``[experimental] remote = true`` once, for a home :func:`remote_set_up` finds
+    set up while the key is undecided: whether it wrote. Afterwards the key is decided, so it
+    is never written again. Called from the CLI only (the TUI's start;
+    test_config_writes_stay_in_the_cli). A config that cannot be read or written is left as it
+    is: the reader still finds such a home on.
+    """
+    try:
+        config = load_config()
+    except Exception:
+        return False
+    if config.experimental.remote is not None or not remote_set_up():
+        return False
+    config.experimental.remote = True
+    try:
+        save_config(config)
+    except OSError:
+        return False
+    return True

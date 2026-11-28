@@ -20,7 +20,7 @@ it live leaves them to it, and takes them back when it dies (``cli.ui.app``).
 Not here: the daily active ping (a service up every day would count days on which nobody
 opened rlx), the release check (its answer is a TUI's to show), the captain's ui socket (its
 actions are on screen), the limit hand-overs (an agent's own hooks run them, in a detached
-process of their own), login registration (S2) and the tray (S3).
+process of their own), the login item (S2, ``services.service_login``) and the tray (S3).
 
 The service is one more instance in the registry (``core.instances``, kind ``service``): the
 version gate counts it, a quit request stops it, and :func:`stop` and :func:`start` are what
@@ -52,7 +52,7 @@ from pathlib import Path
 from types import FrameType
 from typing import IO, TYPE_CHECKING, Any, Literal, Protocol
 
-from aisquare.core import atomic, instances, locking, paths, selfcli
+from aisquare.core import atomic, experimental, instances, locking, paths, selfcli
 from aisquare.core.version import PRODUCT_NAME
 
 if TYPE_CHECKING:
@@ -81,6 +81,10 @@ first try, one more after each wait, about a minute in all; then the service sto
 saves the switch off and says why (#1717). It tried every follow, for ever, a WARNING each
 time, and the switch stayed on with no way off from a TUI."""
 REMOTE_TRIES = len(REMOTE_RETRY_SECONDS) + 1
+EXPERIMENTAL_OFF = "Remote is experimental and off"
+"""The Remote part's ``off`` detail while Remote is off in Settings' *Experimental* (#46)."""
+EXPERIMENTAL_OFF_REASON = "Remote turned off in Experimental"
+"""Why the service turned off a Remote it served, as its controller tells it."""
 LOG_BYTES = 1_000_000
 """``service.log`` is rolled over at this size, one old file kept: a service runs for weeks."""
 REMOTE_WATCH_SECONDS = 30.0
@@ -152,7 +156,13 @@ class RemotePart:
     the switch is on, and on or off within :data:`REMOTE_FOLLOW_SECONDS` when a TUI flips
     it. Every :data:`REMOTE_WATCH_SECONDS`, ngrok revived if it died and the auto-off
     enforced, as a TUI's housekeeping does. Stopped with the service, the switch kept: the
-    next start serves again."""
+    next start serves again.
+
+    Remote is experimental (#46, ``core.experimental``): while it is off, nothing of Remote is
+    imported and no controller made, and each follow asks again, so turning it on in Settings
+    starts the part within :data:`REMOTE_FOLLOW_SECONDS`, and turning it off stops a Remote
+    this part serves (:data:`EXPERIMENTAL_OFF_REASON`), its switch kept for when it is on again.
+    """
 
     name = "remote"
     every = REMOTE_FOLLOW_SECONDS
@@ -176,12 +186,27 @@ class RemotePart:
         """Why the service stopped trying, and when: told to a TUI (``status.json``) until the
         switch is turned on again."""
         self._logged: str | None = None
+        self._waits_for_the_switch = False
+        """Not started because Remote was off in Experimental: made at the follow that finds it
+        on, where a controller that would not start stays an error, as it was."""
 
     def start_part(self) -> None:
+        if experimental.remote_enabled():
+            self._load()
+        else:
+            self._waits_for_the_switch = True
+
+    def _load(self) -> RemoteController:
+        """Remote's controller, and with it Remote's modules: only once Remote is on. Made once:
+        one that raises is the part's error from then on, as at a start, not a traceback in
+        ``service.log`` every follow."""
         from aisquare.cli.ui import remote_control
 
-        self.controller = (self._make or remote_control.RemoteController)()
-        self.controller.on_news = self._hear
+        self._waits_for_the_switch = False
+        controller = (self._make or remote_control.RemoteController)()
+        controller.on_news = self._hear
+        self.controller = controller
+        return controller
 
     def _hear(self, news: str, trouble: bool) -> None:
         """The controller's news, to ``service.log`` once per change: each try of a start resets
@@ -193,11 +218,15 @@ class RemotePart:
         _log.log(logging.WARNING if trouble else logging.INFO, "remote: %s", news)
 
     def tick_part(self) -> PartHealth:
-        from aisquare.cli.ui import remote_control
-
+        if not experimental.remote_enabled():
+            return self._experimental_off()
         controller = self.controller
+        if controller is None and self._waits_for_the_switch:
+            controller = self._load()
         if controller is None:
             return PartHealth("error", "not started")
+        from aisquare.cli.ui import remote_control
+
         saved = remote_control.load_remote_state()
         minutes = controller.state.auto_off_minutes
         controller.state = saved  # the switches as any rlx on this home saved them last
@@ -242,6 +271,19 @@ class RemotePart:
         controller.switch_off_unstarted()
         self.gave_up = (why, datetime.now(UTC))
         self._hear(f"{why}; tried {REMOTE_TRIES} times, so its switch is saved off", True)
+
+    def _experimental_off(self) -> PartHealth:
+        """Remote off in Experimental: one this part serves turned off (its saved switch kept,
+        no device revoked, as a quit leaves them), said in ``service.log``, and no try to start
+        it until it is on."""
+        controller = self.controller
+        if controller is not None and controller.remote_serving:
+            why = EXPERIMENTAL_OFF_REASON
+            self._hear(why, False)  # and what turning off could not do, as trouble, after it
+            controller.turn_off(wait=True, persist=False, reason=why, status=why)
+        self._failures, self._retry_at, self.gave_up = 0, None, None
+        facts: dict[str, Any] = {"on": False, "public_origin": None, "auto_off_at": None}
+        return PartHealth("off", EXPERIMENTAL_OFF, extra=facts)
 
     def health(self) -> PartHealth:
         controller = self.controller
@@ -335,17 +377,24 @@ class UsagePart:
         from aisquare.services import claude_accounts as accounts_service
 
         read = self._read or accounts_service.read_fleet_headroom
-        agents = sorted({account.agent for account in accounts_service.list_accounts()})
+        accounts = accounts_service.list_accounts()
+        agents = sorted({account.agent for account in accounts})
         said: list[str] = []
+        room = 0
         for agent in agents or [accounts_service.AGENT]:
             summary = read(agent=agent)
             line = f"{agent}: {summary.level}, {summary.usable} usable"
             if summary.needs_login:
                 line += f", {summary.needs_login} to sign in"
             said.append(line)
+            lefts = getattr(summary, "left_by_slot", None) or {}
+            room += sum(1 for left in lefts.values() if left > 0)
+        # The tray's "Accounts with room: k of n" (#34): an account with any of its limiting
+        # window left, of the enabled ones.
+        counts = {"room": room, "accounts": sum(1 for a in accounts if not a.disabled)}
         if self._locked:
-            return PartHealth("error", f"{KEYCHAIN_OUT_OF_REACH} ({'; '.join(said)})")
-        return PartHealth("ok", "; ".join(said))
+            return PartHealth("error", f"{KEYCHAIN_OUT_OF_REACH} ({'; '.join(said)})", extra=counts)
+        return PartHealth("ok", "; ".join(said), extra=counts)
 
     def stop_part(self) -> None:
         return None
@@ -478,8 +527,11 @@ def _detached(command: Sequence[str]) -> subprocess.Popen[bytes]:
 
 
 def default_parts() -> list[Part]:
-    """What the service hosts, in the order they start (and stop in reverse)."""
-    return [RemotePart(), UsagePart(), NudgePart(), SweepPart(), ShipPart()]
+    """What the service hosts, in the order they start (and stop in reverse). The tray last
+    (#34): its child reads what the others wrote."""
+    from aisquare.services.service_tray import TrayPart
+
+    return [RemotePart(), UsagePart(), NudgePart(), SweepPart(), ShipPart(), TrayPart()]
 
 
 # --- the host ----------------------------------------------------------------------------------
@@ -859,6 +911,16 @@ def start_service(
     already = running_service()
     if already is not None:
         return already
+    # Set to start at login (S2, #33): the OS starts it from its login item, so the service that
+    # holds the lock is the one the OS keeps alive, not a copy it does not know. Started here
+    # when the OS will not (no item, or one turned off), or did not within ``timeout``.
+    from aisquare.services import service_login
+
+    if service_login.start_through_the_os():
+        found = service_login.wait_for(running_service, timeout)
+        if found is not None:
+            return found
+        _log.warning("the OS did not start the %s in %.0f s; starting it here", SERVICE, timeout)
     log = log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
     command = list(argv) if argv is not None else selfcli.argv_for(["service", "run"])

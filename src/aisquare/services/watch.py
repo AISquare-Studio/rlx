@@ -39,13 +39,14 @@ import os
 import signal
 import stat
 import subprocess
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aisquare.core import atomic, locking, selfcli
 from aisquare.core import program as prog
@@ -54,6 +55,9 @@ from aisquare.core.spawn import untraced_env
 from aisquare.core.store import store_session
 from aisquare.models import ProjectInfo
 from aisquare.services import github_prs
+
+if TYPE_CHECKING:
+    from aisquare.services.tidy import PassReport
 
 STATE_LOCK_WAIT = 10.0
 """How long a tick waits for ``state.json``'s lock."""
@@ -123,6 +127,9 @@ class TickReport:
     """Labels of the finished workers auto-stop stopped this tick."""
     notes: list[str] = field(default_factory=list)
     """Lines for the operator: a source failing (once per streak), a GitHub error."""
+    tidied: PassReport | None = None
+    """What tidy's periodic job did (``services.tidy.periodic_pass``, #59), in the tick that
+    found its pass finished: it runs off the tick, at most every ``[tidy] every_minutes``."""
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -133,6 +140,7 @@ class TickReport:
             "nudged": self.nudged,
             "stopped": self.stopped,
             "notes": self.notes,
+            "tidied": self.tidied.as_json() if self.tidied is not None else None,
         }
 
 
@@ -150,10 +158,14 @@ class Watcher:
         *,
         needs_sources: Callable[[], Any] | None = None,
         stale: bool = True,
+        tidy: bool = True,
     ) -> None:
         self.settings = settings or load_config().watch
         self._needs_sources = needs_sources
         self._stale = stale
+        self.tidy_job: TidyJob | None = TidyJob() if tidy else None
+        """Tidy's periodic job, run off the tick (#59); ``None``: this watcher runs none
+        (``watch --once``, which looks once and exits)."""
         self.first_seen: dict[str, datetime] = {}
         self.failing: set[str] = set()
         self.kept: list[Any] = []
@@ -413,6 +425,18 @@ class Watcher:
                 }
             )
         _release_woken_holds(item for item in items if item.id not in undelivered)
+        # A scheduled manager's routine news, held until due (#41): sent from here too, so a
+        # fleet run with neither the rlx service nor asq still hears it. Theirs alone: every
+        # other held nudge is the rlx service's and asq's to send, as before.
+        from aisquare.services import fleet as fleet_service
+
+        fleet_service.retry_deferred_nudges(scheduled_only=True)
+        # Ended agents' own temporary directories (#57), on every tick: quiet, and a sweep
+        # that fails costs the tick nothing.
+        with contextlib.suppress(Exception):
+            from aisquare.services import agent_tmp
+
+            agent_tmp.sweep_ended()
         if self.settings.auto_stop:
             with contextlib.suppress(Exception):  # a stop never costs the tick its news
                 from aisquare.services import autostop
@@ -422,7 +446,95 @@ class Watcher:
                     for done in autostop.reap_finished(autostop.every_project())
                     if done.stopped
                 ]
+        if self.tidy_job is not None:
+            report.tidied = self.tidy_job.after_tick(now, notes)
         return report
+
+
+TIDY_THREAD = "rlx-tidy-pass"
+"""The name of the thread a watcher runs tidy's periodic job on."""
+
+
+class TidyJob:
+    """Tidy's periodic job (#59), off the tick (reviewer #3894): one thread the watcher owns,
+    started by a tick when a pass is due (``services.tidy.pass_due``) and none runs; a later
+    tick reads what it did. A tick never waits on it, so a pass of minutes (an upgrade's
+    backlog) holds back no news, and the Doctor never finds the watcher stuck.
+
+    The thread is a daemon: a stop ends the watcher at once, and a pass ended mid-delete wrote
+    no stamp, so the next one is due and frees what is left. Quiet, one pass at a time on the
+    machine, its own lock and cadence: ``services.tidy.periodic_pass``. A pass that raised is
+    one line in the notes of the tick that reads it, and is tried again an interval on."""
+
+    def __init__(self) -> None:
+        self.thread: threading.Thread | None = None
+        self.began: datetime | None = None
+        """The time the running (or last) pass was started for."""
+        self.last_attempt: datetime | None = None
+        """When this watcher's last pass ran, in memory: a stamp that could not be written
+        still spaces the passes (reviewer #3894, MINOR 1)."""
+        self._outcome: PassReport | Exception | None = None
+
+    def after_tick(self, now: datetime, notes: list[str]) -> PassReport | None:
+        """Each tick: what a pass that finished since did (said in ``notes`` when it raised or
+        its stamp could not be written), and a pass started when one is due and none runs.
+        Never waits."""
+        done = self._finished(notes)
+        if self.thread is not None:
+            return done
+        try:
+            from aisquare.services import tidy
+
+            due = tidy.pass_due(now, last_attempt=self.last_attempt)
+        except Exception as exc:
+            notes.append(f"the tidy pass failed: {type(exc).__name__}: {exc}")
+            return done
+        if not due:
+            return done
+        thread = threading.Thread(
+            target=self._pass_off_the_tick,
+            args=(now, self.last_attempt),
+            name=TIDY_THREAD,
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception as exc:  # "can't start new thread": once, then an interval on
+            # Kept only once it runs (reviewer #3926, MINOR 1): a thread that never started
+            # cannot be joined, and every later tick would raise there, its news with it.
+            self.last_attempt = now
+            notes.append(f"the tidy pass could not start: {type(exc).__name__}: {exc}")
+            return done
+        self.began, self.thread = now, thread
+        return done
+
+    def _pass_off_the_tick(self, now: datetime, last_attempt: datetime | None) -> None:
+        try:
+            from aisquare.services import tidy
+
+            self._outcome = tidy.periodic_pass(now, last_attempt=last_attempt)
+        except Exception as exc:  # said by the tick that reads it
+            self._outcome = exc
+
+    def _finished(self, notes: list[str]) -> PassReport | None:
+        if self.thread is None or self.thread.is_alive():
+            return None
+        self.thread.join()
+        self.thread = None
+        outcome, self._outcome = self._outcome, None
+        if isinstance(outcome, Exception):
+            self.last_attempt = self.began
+            notes.append(f"the tidy pass failed: {type(outcome).__name__}: {outcome}")
+            return None
+        if outcome is None:  # not due after all, off, another pass ran, or a move of the home
+            return None
+        self.last_attempt = outcome.at
+        if outcome.stamp_error is not None:
+            notes.append(
+                f"tidy freed what it planned, but its stamp could not be written "
+                f"({outcome.stamp_error}): this watcher waits an interval before the next pass"
+            )
+        return outcome
 
 
 IDLE_BY_DESIGN_KINDS: frozenset[str] = frozenset({"result", "question", "task_review", "task_done"})
@@ -648,7 +760,9 @@ def _deliver(project_id: str, items: Sequence[WatchItem], path: Path) -> bool:
             project_id, fleet_service.MANAGER_LABEL, live_only=True
         )
     board = fleet_service.board_of_row(manager) if manager is not None else project_id
-    team_service.watch_event(board, event_text(items, path), urgent=any(map(_urgent, items)))
+    team_service.watch_event(
+        board, event_text(items, path), urgent=any(map(_urgent, items)), project_id=project_id
+    )
     if manager is None:
         return False
     return fleet_service.nudge_manager(project_id, reason="watch", board=board)

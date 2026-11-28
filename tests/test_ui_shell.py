@@ -31,7 +31,7 @@ from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Self, TypeVar
 
 import pytest
 from textual import Logger, events
@@ -139,7 +139,17 @@ from aisquare.services import settings as settings_service
 from aisquare.services.captain import state as captain_state
 from tests import guard_paint, toast_log
 from tests.fleet_fakes import list_agents_as
-from tests.pane_harness import FakePane, FakeTmux, asks_a_server, move, press, release, socket_of
+from tests.pane_harness import (
+    FakePane,
+    FakeTmux,
+    asks_a_server,
+    bracketed_paste,
+    move,
+    post_terminal_input,
+    press,
+    release,
+    socket_of,
+)
 from tests.ui_workers import released, settle_page, settle_until, settle_until_held, watch_until
 
 T = TypeVar("T")
@@ -976,9 +986,10 @@ def test_the_card_names_the_project_not_its_codename_and_a_path_tells_twins_apar
         "🗂 unique",
     ]
     # The two `api` projects are told apart by their path alone: no codename on a card (Q3);
-    # the unique one is not decorated.
-    assert cards["prj_w"][1] and cards["prj_w"][2].endswith("work/api")
-    assert cards["prj_o"][1] and cards["prj_o"][2].endswith("oss/api")
+    # the unique one is not decorated. In the platform's own spelling: on Windows the suite's
+    # temp root is outside the home (#54), so the path is not the home's `~/...`.
+    assert cards["prj_w"][1] and cards["prj_w"][2].replace("\\", "/").endswith("work/api")
+    assert cards["prj_o"][1] and cards["prj_o"][2].replace("\\", "/").endswith("oss/api")
     assert cards["prj_u"][1] is False and cards["prj_u"][2] == ""
 
 
@@ -7478,6 +7489,42 @@ def test_a_paste_the_sidebar_got_reaches_the_one_live_pane_and_focuses_it(
     assert focused, "the pane took the keyboard with it"
 
 
+class PressCountingButton(Button):
+    """A button that counts its presses: Enter on a focused button is one."""
+
+    presses = 0
+
+    def press(self) -> Self:
+        self.presses += 1
+        return super().press()
+
+
+def test_a_paste_holding_a_raw_escape_presses_no_focused_button_and_reaches_the_pane_whole(
+    tmp_path: Path, script: Script
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends what follows an Escape in a paste as keys, its Enter pressing the focused button;
+    the guard keeps it one paste (``cli.ui.paste_guard``). This test reads the button's
+    presses and what the one live pane forwarded."""
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[list[tuple[str, str | bytes]], int]:
+        app = fleet_app(pilot)
+        pane = PasteRecordingPane()
+        await app.content.add_content(pane, set_current=True)
+        button = PressCountingButton("press", id="paste-button")
+        await app.screen.mount(button)
+        button.focus()
+        await pilot.pause()
+        post_terminal_input(app, bracketed_paste("one\x1b\rtwo"))
+        await settle(app)
+        return pane.forwarded, button.presses
+
+    forwarded, presses = drive(go)
+    assert presses == 0
+    assert forwarded == [("paste", "one\x1b\rtwo")]
+
+
 def test_a_paste_with_no_live_pane_on_screen_is_one_toast_and_no_tmux_call(
     tmp_path: Path, script: Script, no_real_tmux: list[tuple[str, ...]]
 ) -> None:
@@ -7615,6 +7662,43 @@ def test_a_paste_into_a_dialogs_input_never_reaches_a_pane_and_nothing_passes_a_
     assert forwarded == []
 
 
+def test_a_paste_holding_a_raw_escape_into_a_dialogs_input_submits_nothing(
+    tmp_path: Path, script: Script
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends an Enter that follows an Escape in a paste to the field, submitting it; the guard
+    keeps it one paste (``cli.ui.paste_guard``). This test reads the messages the Spawn
+    dialog's label posts, and its value: the paste's first line, as ``Input`` takes any
+    paste."""
+    from aisquare.cli.ui.spawn import SpawnDialog
+
+    [project] = seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[list[str], str]:
+        app = fleet_app(pilot)
+        app.push_screen(SpawnDialog(project, accounts=None))
+        await settle(app)
+        label = app.screen.query_one("#spawn-label", Input)
+        label.value = ""
+        label.focus()
+        await pilot.pause()
+        posted: list[str] = []
+        post = label.post_message
+
+        def recorded(message: Any) -> bool:
+            posted.append(type(message).__name__)
+            return post(message)
+
+        label.post_message = recorded  # type: ignore[method-assign]
+        post_terminal_input(app, bracketed_paste("one\x1b\rtwo"))
+        await settle(app)
+        return posted, label.value
+
+    posted, value = drive(go)
+    assert "Submitted" not in posted, posted
+    assert value == "one\x1b"
+
+
 def test_a_paste_a_text_area_took_is_not_sent_to_the_pane_as_well(
     tmp_path: Path, script: Script
 ) -> None:
@@ -7638,6 +7722,39 @@ def test_a_paste_a_text_area_took_is_not_sent_to_the_pane_as_well(
 
     text, forwarded = drive(go)
     assert text == "a note"
+    assert forwarded == []
+
+
+def test_a_paste_holding_a_raw_escape_into_a_text_area_is_inserted_as_the_whole_paste_is(
+    tmp_path: Path, script: Script
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    types what follows an Escape in a paste into the text area as keys, ahead of a cut-short
+    paste; the guard keeps it one paste (``cli.ui.paste_guard``). This test reads two text
+    areas, one given the bytes and one given the same paste posted whole, and what the pane
+    behind them forwarded."""
+    from textual.widgets import TextArea
+
+    seed(tmp_path, ("prj_a", "alpha", None))
+
+    async def go(pilot: Pilot[None]) -> tuple[str, str, list[tuple[str, str | bytes]]]:
+        app = fleet_app(pilot)
+        pane = PasteRecordingPane()
+        await app.content.add_content(pane, set_current=True)
+        typed, posted = TextArea(id="typed-area"), TextArea(id="posted-area")
+        await app.screen.mount(typed, posted)
+        typed.focus()
+        await pilot.pause()
+        post_terminal_input(app, bracketed_paste("one\x1b\rtwo"))
+        await settle(app)
+        posted.focus()
+        await pilot.pause()
+        app.post_message(events.Paste("one\x1b\rtwo"))
+        await settle(app)
+        return typed.text, posted.text, pane.forwarded
+
+    typed, posted, forwarded = drive(go)
+    assert typed == posted != "", (typed, posted)
     assert forwarded == []
 
 

@@ -65,7 +65,7 @@ from tests.test_ui_remote import (  # noqa: F401 — the autouse fixtures, appli
     written,
 )
 from tests.toast_log import record
-from tests.ui_workers import settle_page
+from tests.ui_workers import pause_until, settle_page
 
 
 def path_with(tmp_path: Path, *tools: str) -> None:
@@ -260,17 +260,40 @@ def test_a_token_ngrok_refuses_is_said_beside_the_field_without_the_token(
     assert spaced == "that is not one token: it has spaces in it"
 
 
+@NEEDS_POSIX
+def test_a_refused_token_entered_again_is_checked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#53: a token ngrok refused stays in the field to try again, and Enter with it unchanged
+    asks ngrok again: the refusal answered the value in flight."""
+    bundled_ngrok_with(tmp_path, monkeypatch, refuse="ERR_NGROK_105")
+    token = "2abc-not-a-real-token"
+    real_store = settings_remote.store_ngrok_token
+    asked: list[str] = []
+
+    def counted(value: str) -> None:
+        asked.append(value)
+        real_store(value)
+
+    monkeypatch.setattr(settings_remote, "store_ngrok_token", counted)
+
+    async def go(pilot: Pilot[None]) -> list[str]:
+        section = await opened(pilot)
+        await paste(pilot, section, token)
+        await paste(pilot, section, token)  # the same token, Enter again
+        return list(asked)
+
+    assert drive(go, tunnel=missing_ngrok) == [token, token]
+
+
 OLD_TOKEN = "2oldTOKEN_0123456789abcdefghijklmnopqrstuvwxy"
 NEW_TOKEN = "2newTOKEN_9876543210zyxwvutsrqponmlkjihgfedcb"
 
 
 async def until(pilot: Pilot[None], done: Callable[[], bool], *, what: str) -> None:
-    """Pause until ``done()`` holds: ngrok's answer comes on a thread of its own."""
-    for _ in range(500):
-        if done():
-            return
-        await pilot.pause(0.01)
-    raise AssertionError(f"never: {what}")
+    """Pause until ``done()`` holds: ngrok's answer comes on a thread of its own. Bounded by
+    the wall clock, not a count of pauses (``pause_until``, #67)."""
+    await pause_until(pilot, done, what=what)
 
 
 def slot_seen(section: RemotePanel) -> tuple[bool, str, bool]:
