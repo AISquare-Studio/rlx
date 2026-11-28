@@ -1122,8 +1122,8 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
     let (path, config) = (path.to_str().unwrap(), config.to_str().unwrap());
     app_sets(&home, &json!({"PATH": path, "CLAUDE_CONFIG_DIR": config}));
     // The last start in fake-claude's log: the app's claude, by the path resolved when
-    // the app set PATH, with the app's values, raw.
-    let last_start = |what: &str| {
+    // the app set PATH, with the app's PATH, raw, and `config` its CLAUDE_CONFIG_DIR.
+    let last_start = |what: &str, config: Option<&str>| {
         let log = fixture_log(&home);
         let start = log["starts"].as_array().unwrap().last().unwrap().clone();
         assert_eq!(
@@ -1132,7 +1132,10 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
             "{what}: {start:#}"
         );
         assert_eq!(
-            start["env"]["CLAUDE_CONFIG_DIR"], config,
+            start["env"]
+                .get("CLAUDE_CONFIG_DIR")
+                .and_then(Value::as_str),
+            config,
             "{what}: {start:#}"
         );
         assert_eq!(start["env"]["PATH"], path, "{what}: {start:#}");
@@ -1142,7 +1145,10 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
     let probed = refresh(&home);
     assert_eq!(probed.code(), Some(0), "{probed:?}");
     assert_eq!(probed.data()["model_turns"], 1, "{probed:?}");
-    last_start("the refresh probe");
+    // The probe is the default account's (#660): the plain account's home, neither of the
+    // two variables, though the app set CLAUDE_CONFIG_DIR.
+    let start = last_start("the refresh probe", None);
+    assert_eq!(start["env"].get("CLAUDE_CODE_TMPDIR"), None, "{start:#}");
 
     std::fs::write(home.root().join("scenario"), "mcp-login").unwrap();
     let since = seq(&home);
@@ -1153,7 +1159,8 @@ fn the_refresh_probe_and_a_login_start_the_apps_claude_with_its_environment() {
         "connector.login.done",
         "{events:#?}"
     );
-    let start = last_start("the login");
+    // A login runs where a run does: on the app's CLAUDE_CONFIG_DIR.
+    let start = last_start("the login", Some(config));
     assert_eq!(start["argv"][1], "mcp", "{start:#}");
 
     // With no claude on the app's PATH, neither starts, and each says where rlxd looked.
