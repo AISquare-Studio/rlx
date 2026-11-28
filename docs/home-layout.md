@@ -146,6 +146,13 @@ The rlx service (`rlx service`, [service.md](service.md)) is not in that list: t
 first and starts it again afterwards, on the home where it then is. A service that does not stop
 refuses the move.
 
+Only one move of a home runs at a time, and a drop of its cache counts as one. While it runs,
+the move holds a lock file beside the home, in the folder that holds it, outside the folders the
+move renames: `~/.rlx-home-move-<digest>.lock` for `~/.aisquare`. The file is removed when the
+move ends. A move that was killed leaves its lock file, and the next run takes it and removes it.
+If rlx can't make that file, because the folder that holds a home named by a variable isn't
+yours to write, the move refuses and names the file.
+
 ### What it does
 
 Each step is written down first in a journal, `backups/home-migration/journal.json` in the home,
