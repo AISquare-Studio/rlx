@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorAccountLimited",
+  "description": "`connector_account_limited`'s detail: every account that holds `connector` (with the\nrun's other connectors) connected is usage-limited. rlxd starts the run on no other\naccount: the client says to wait, or to connect it on another account.\n\n```json\n{\"connector\": \"claude.ai Slack\", \"account\": 1, \"resets_at\": \"2026-11-28T17:00:00Z\"}\n```",
+  "type": "object",
+  "properties": {
+    "account": {
+      "description": "The account that holds it, limited: the one whose limit resets soonest, when\nseveral do.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "connector": {
+      "description": "The connector, by its id: the run's first.",
+      "type": "string"
+    },
+    "resets_at": {
+      "description": "When that account's limit resets, if rlx knows (RFC 3339).",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "connector",
+    "account"
+  ]
+}

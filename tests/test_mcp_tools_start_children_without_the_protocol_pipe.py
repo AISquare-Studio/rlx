@@ -198,7 +198,9 @@ def test_run_stdio_takes_the_pipe_once_before_it_builds_or_serves(
         order.append("build")
         return Stub()
 
-    async def until_idle(server: object, close_after: int, command: str) -> None:
+    async def until_idle(
+        server: object, close_after: int, command: str, before_exit: object = None
+    ) -> None:
         order.append("serve until idle")
 
     monkeypatch.setattr(mcp_server, "_stdio", False)  # run_stdio sets it: put back afterwards

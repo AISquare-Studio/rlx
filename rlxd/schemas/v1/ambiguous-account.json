@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AmbiguousAccount",
+  "description": "`ambiguous_account`'s detail: two or more accounts hold `connector` connected, and\ntheir identities on it aren't all known and the same, so rlxd won't pick one. The\nclient asks the user once and pins `account`.\n\n```json\n{\"connector\": \"claude.ai Slack\",\n \"candidates\": [{\"account\": 1, \"identity\": {\"workspace\": \"Acme\"}},\n                {\"account\": 3, \"identity\": null}]}\n```",
+  "type": "object",
+  "properties": {
+    "candidates": {
+      "description": "Every account that holds it connected, by slot.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Candidate"
+      }
+    },
+    "connector": {
+      "description": "The connector, by its id.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "connector",
+    "candidates"
+  ],
+  "$defs": {
+    "Candidate": {
+      "description": "One account `ambiguous_account` lists. `identity` is always there, `null` when\nunknown.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account's rlx slot.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "identity": {
+          "description": "Who the account is on the connector, or `null` when rlxd hasn't read it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "account",
+        "identity"
+      ]
+    },
+    "ConnectorIdentity": {
+      "description": "Who an account is on one connector, as a read call of the connector's own said.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "description": "The address, such as a Gmail account's or a calendar owner's.",
+          "type": "string"
+        },
+        "user": {
+          "description": "The user there, such as a Slack user's name.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "The workspace or organisation, such as a Slack workspace's name.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

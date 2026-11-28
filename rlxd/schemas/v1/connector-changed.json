@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorChanged",
+  "description": "`connector.changed`: `{account, id, status, previous_status}`.",
+  "type": "object",
+  "properties": {
+    "account": {
+      "description": "The account's rlx slot: 1 when absent, as in an event published before rlxd kept\nmore than one account.",
+      "type": "integer",
+      "format": "uint32",
+      "default": 1,
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "id": {
+      "description": "The connector.",
+      "type": "string",
+      "minLength": 1
+    },
+    "previous_status": {
+      "description": "Its status before.",
+      "$ref": "#/$defs/ConnectorState"
+    },
+    "status": {
+      "description": "Its status now.",
+      "$ref": "#/$defs/ConnectorState"
+    }
+  },
+  "required": [
+    "id",
+    "status",
+    "previous_status"
+  ],
+  "$defs": {
+    "ConnectorState": {
+      "description": "A connector's status, as Claude Code's `system/init` reports it.",
+      "oneOf": [
+        {
+          "description": "Connected: its tools are mounted.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "Its sign-in has lapsed: `connectors.login` signs in again.",
+          "type": "string",
+          "const": "needs-auth"
+        },
+        {
+          "description": "Still connecting.",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "It could not connect.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    }
+  }
+}

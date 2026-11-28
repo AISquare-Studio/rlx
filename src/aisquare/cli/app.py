@@ -17,6 +17,7 @@ from aisquare.cli import (
     accounts,
     agents,
     auth,
+    brain,
     brief,
     captain,
     capture,
@@ -40,6 +41,7 @@ from aisquare.cli import (
     watcher,
 )
 from aisquare.cli import config as config_cli
+from aisquare.cli import daemon as daemon_cli
 from aisquare.cli import instances as instances_cli
 from aisquare.cli import metrics as metrics_cli
 from aisquare.cli import outcomes as outcomes_cli
@@ -240,15 +242,19 @@ def _no_arguments(ctx: typer.Context) -> None:
 
 root.register(app)
 
-# Roadmap groups (connectors, capture, policy, enforce) are hidden: every
-# leaf still reports the not-implemented contract when invoked, but listing them
-# in --help alongside working commands made a third of the surface look real.
+# Roadmap groups (capture, policy, enforce) are hidden: every leaf still reports
+# the not-implemented contract when invoked, but listing them in --help alongside
+# working commands made a third of the surface look real. connectors is shown for
+# its list, rlxd's (0.10.3, 2.4); its roadmap leaves stay hidden.
 app.add_typer(auth.app, name="auth")
 app.add_typer(agents.app, name="agents")
 app.add_typer(accounts.app, name="accounts")
-app.add_typer(connectors.app, name="connectors", hidden=True)
+app.add_typer(connectors.app, name="connectors")
 app.add_typer(context.app, name="context")
 app.add_typer(context.app, name="ctx", hidden=True, help="Alias of 'context'.")
+app.add_typer(daemon_cli.app, name="daemon")  # rlxd on this machine (0.10.3, 1.2)
+app.add_typer(brain.app, name="brain", hidden=True)  # rlxd's resident brain (0.10.3, 1.6)
+_NOT_FEATURES |= {"brain"}  # rlxd starts it, never a person: no count, no active ping
 app.add_typer(project.app, name="project")
 app.add_typer(project.app, name="workspace", hidden=True, help="Alias of 'project'.")
 app.add_typer(capture.app, name="capture", hidden=True)

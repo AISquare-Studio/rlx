@@ -1,0 +1,148 @@
+[package]
+name = "rlxd"
+description = "The rlx engine: a local daemon that hosts processes and pushes events to its clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# MIT, as the workspace is, and ISC for the parts ported from tmux (crate::vt and
+# pty/keys.rs), whose notice each of those files keeps.
+license = "MIT AND ISC"
+repository.workspace = true
+publish.workspace = true
+
+# The binary is the daemon; the library holds it, so that its tests can call the registry
+# reader. `doc = false`, or the two would write the same docs.
+[[bin]]
+name = "rlxd"
+doc = false
+
+# The stand-in for Claude Code that the runner's tests start (handoff 0.10.3, "How to read
+# the checks"). Only the `fake-claude` feature builds it, which only the dev-dependency
+# below turns on, so `cargo test` gives the tests its path (CARGO_BIN_EXE_fake-claude) and
+# no release build has it: tests/release_build.rs checks.
+[[bin]]
+name = "fake-claude"
+path = "src/bin/fake-claude.rs"
+doc = false
+required-features = ["fake-claude"]
+
+# The counter the PTY tests start, native on every OS (src/bin/ticker.rs). Built only as
+# fake-claude is, for the tests (CARGO_BIN_EXE_ticker), never by a release build.
+[[bin]]
+name = "ticker"
+path = "src/bin/ticker.rs"
+doc = false
+required-features = ["fake-claude"]
+
+[features]
+# Test builds only. `debug-methods` adds the socket's debug.* methods (handoff 0.10.3,
+# 7.3: `debug.emit {count}`), which rlxd's own tests drive. Nothing turns it on but the
+# dev-dependency below, which cargo applies when it builds the tests (`cargo test`,
+# `cargo clippy --all-targets`), so a release build (`cargo build --release`) never has
+# it: tests/release_build.rs builds one and checks. Package exactly that build: with
+# `--all-targets` or `--tests`, or from `cargo test --release`, cargo builds the
+# dev-dependency, and the binary would have the debug methods.
+debug-methods = []
+# Development and CI builds only (handoff 0.10.3 rev 7, 5.1): gate dev mode, which
+# accepts an unsigned app as the gate. Without it, as in every release build, rlxd has no
+# --gate-dev-mode flag, ignores gate.dev_mode in its config, and `rlxd --version` says
+# the version alone; with it, `rlxd --version` adds "(dev: gate-dev-mode)" and status
+# lists it in dev_features. Like debug-methods, only the dev-dependency below turns it
+# on, for the tests; tests/release_build.rs checks a release build has none of it.
+gate-dev-mode = []
+# Tests only: lets RLXD_TEST_GATE_REQUIREMENT replace the gate peer's compiled-in identity
+# (handoff 0.10.3, 5.1), so the gate_peer_* tests can sign helpers with a test identity.
+# Release builds never enable it, and without it no config, variable or flag changes the
+# identity.
+gate-test-requirement = []
+# Tests only: builds the fake-claude and ticker binaries above. Like debug-methods, only the
+# dev-dependency below turns it on.
+fake-claude = ["dep:fake-claude"]
+
+[dependencies]
+fake-claude = { path = "../fake-claude", optional = true }
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+getrandom = "0.3"
+rlxd-client.workspace = true
+rlxd-proto.workspace = true
+serde.workspace = true
+# raw_value: the settings file is read key by key, so one bad value is set aside alone.
+# float_roundtrip: a number is read as the exact double its text names, as RFC 8785's
+# input hashes need (the tool-call gate, 5.1).
+serde_json = { workspace = true, features = ["raw_value", "float_roundtrip"] }
+sha2 = "0.11"
+tokio = { version = "1.54", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+# The scheduler's clock: UTC instants, cron in IANA time zones, its tz database bundled so
+# DST is the same on every OS (jiff-tzdb's data is public domain).
+jiff = { version = "1.0", default-features = false, features = ["std", "tzdb-bundle-always"] }
+# The scheduler's store, <home>/rlxd/rlxd.db: SQLite built in (bundled; public domain).
+rusqlite = { version = "0.43", features = ["bundled"] }
+# Gate device names: NFKC, single script, and UTS #39 skeletons to compare look-alikes.
+unicode-normalization = "0.1"
+unicode-security = "0.1"
+# The PTY screen model's character widths (handoff 0.10.3, 1.4).
+unicode-width = "0.2"
+# The PTY host (handoff 0.10.3, 1.4): pseudo-terminals, ConPTY on Windows.
+portable-pty = "0.9"
+# `rlxd attach`: the user's terminal in raw mode, its keys, pastes and size.
+crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste", "windows"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+jsonschema = { version = "0.63", default-features = false }
+# rlxd itself, with the debug methods and gate dev mode, so the binary the tests run has
+# them.
+rlxd = { path = ".", features = ["debug-methods", "gate-dev-mode", "fake-claude"] }
+toml = "0.9"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
+# The gate's peer checks, one per OS (handoff 0.10.3, 5.1). Each signs or builds helpers
+# that the feature's test identity names, so cargo builds them only with the feature:
+# `cargo test -p rlxd --features gate-test-requirement --test gate_peer_<os>`. On another
+# OS each compiles to nothing. gate_peer_macos_release needs no feature, and checks the
+# compiled-in requirement.
+[[test]]
+name = "gate_peer_macos"
+required-features = ["gate-test-requirement"]
+
+[[test]]
+name = "gate_peer_linux"
+required-features = ["gate-test-requirement"]
+
+[[test]]
+name = "gate_peer_windows"
+required-features = ["gate-test-requirement"]
+
+[lints]
+workspace = true

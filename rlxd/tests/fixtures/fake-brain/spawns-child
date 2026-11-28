@@ -1,0 +1,10 @@
+#!/bin/sh
+# fake-brain/spawns-child: says a good hello after it starts a child that would run five
+# minutes, whose pid it writes to $AISQUARE_HOME/fake-brain-child.pid, then waits for its
+# stdin to close. rlxd's stop must end that child too: it is in the brain's tree.
+# spawns-child.cmd is the same for Windows.
+read -r hello
+sleep 300 </dev/null >/dev/null 2>&1 &
+echo $! > "$AISQUARE_HOME/fake-brain-child.pid"
+printf '%s\n' "{\"type\":\"hello\",\"protocol\":1,\"pid\":$$,\"rlx_version\":\"0.0.0\"}"
+cat > /dev/null

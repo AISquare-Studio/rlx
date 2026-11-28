@@ -22,7 +22,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aisquare.core import agents as agent_core
 from aisquare.core import claude_accounts as accounts_core
@@ -56,6 +56,9 @@ from aisquare.services import agents as agents_service
 from aisquare.services import explainability as explainability_service
 from aisquare.services import install_route, onboarding
 from aisquare.services import project as project_service
+
+if TYPE_CHECKING:
+    from aisquare.services.upgrade_daemons import Around
 
 
 class ExplainabilityResetRefused(RuntimeError):
@@ -1244,10 +1247,14 @@ def hooks_stuck(
     return binaries, error
 
 
-def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
+def upgrade(
+    plan: UpgradePlan, *, to_stderr: bool = False, around: Around | None = None
+) -> UpgradeReport:
     """Run the plan: install, confirm the version in a NEW process, refresh the hooks.
 
-    ``to_stderr`` sends the installer's output to stderr, for ``--json``.
+    ``to_stderr`` sends the installer's output to stderr, for ``--json``. ``around`` is the
+    daemons' part (``services.upgrade_daemons``, 4.2): told before the installer runs and
+    once the new version is known or the install failed.
     Nothing after the installer imports anything (see the module docstring);
     the version check and the hook refresh are the new install's own
     processes. A hook site that fails is reported and the rest still run.
@@ -1255,17 +1262,23 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
     if plan.reason is not None:
         raise UpgradeRefused(plan.reason, plan.command)
     unkept = _keep_the_numbers(plan)
+    if around is not None:
+        around.before_install()  # the daemons stop (4.2)
     code = install_route.run_installer(plan.argv, env=plan.env, to_stderr=to_stderr)
     if code != 0:
         # Asked too: uv resolves before it replaces anything (measured, uv 0.12.19), so a
         # run it could not resolve, as under a cutoff that excludes even the release that
         # runs, leaves that release installed, and no reinstall from nothing is needed.
         kept, _ = _installed_version(plan)
+        if around is not None:
+            around.installed(kept, f"{plan.argv[0]} exited {code}")  # daemons start again
         return UpgradeReport(
             plan, exit_code=code, version=kept, problem=f"{plan.argv[0]} exited {code}"
         )
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
+    if around is not None:
+        around.installed(version, problem)  # rlxd swapped (4.2)
     if problem is not None:
         return UpgradeReport(plan, exit_code=code, version=version, problem=problem)
     notes: list[str] = []

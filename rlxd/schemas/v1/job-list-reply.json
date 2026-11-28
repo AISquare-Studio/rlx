@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JobListData",
+  "description": "`job.list`'s reply.",
+  "type": "object",
+  "properties": {
+    "jobs": {
+      "description": "Every job rlxd holds, by `job_id`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/JobSummary"
+      }
+    }
+  },
+  "required": [
+    "jobs"
+  ],
+  "$defs": {
+    "CatchUp": {
+      "description": "What a job does about fires it couldn't make (no app connected, rlxd down): `once`\nfires once when it can, `skip` waits for the next scheduled time.",
+      "oneOf": [
+        {
+          "description": "Fire once.",
+          "type": "string",
+          "const": "once"
+        },
+        {
+          "description": "Wait for the next scheduled time.",
+          "type": "string",
+          "const": "skip"
+        }
+      ]
+    },
+    "JobId": {
+      "description": "A job's id, which the app picks: 1 to 128 ASCII letters, digits, `.`, `_`, `-` and\n`:`, starting with a letter or a digit.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobSummary": {
+      "description": "One job, as `job.list` lists it.",
+      "type": "object",
+      "properties": {
+        "catch_up": {
+          "description": "What it does about fires it couldn't make.",
+          "$ref": "#/$defs/CatchUp"
+        },
+        "enabled": {
+          "description": "Whether it fires at all.",
+          "type": "boolean"
+        },
+        "job_id": {
+          "description": "The job's id.",
+          "$ref": "#/$defs/JobId"
+        },
+        "last_fire_at": {
+          "description": "When it last fired; `null` before its first fire.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_run_id": {
+          "description": "Its last fire's run.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "last_state": {
+          "description": "Its last fire's run's state, as last known.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "loud": {
+          "description": "Opaque: as `job.put` gave it.",
+          "type": "boolean"
+        },
+        "next_fire_at": {
+          "description": "When it is due next (RFC 3339, UTC); `null` when it isn't enabled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paused": {
+          "description": "Whether `job.pause` paused it.",
+          "type": "boolean"
+        },
+        "schedule": {
+          "description": "When it fires.",
+          "$ref": "#/$defs/Schedule"
+        },
+        "skipped_count": {
+          "description": "How many of its due fires were skipped.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "type": {
+          "description": "`run` or `watch`.",
+          "$ref": "#/$defs/JobType"
+        }
+      },
+      "required": [
+        "job_id",
+        "type",
+        "schedule",
+        "catch_up",
+        "enabled",
+        "paused",
+        "loud",
+        "skipped_count"
+      ]
+    },
+    "JobType": {
+      "description": "A job's type.",
+      "oneOf": [
+        {
+          "description": "Each fire is a run of the job's `run` template.",
+          "type": "string",
+          "const": "run"
+        },
+        {
+          "description": "Each fire is one pinned read call, with no prompt.",
+          "type": "string",
+          "const": "watch"
+        }
+      ]
+    },
+    "RunState": {
+      "description": "Where a run stands (7.5).",
+      "oneOf": [
+        {
+          "description": "Waiting for a place in its kind's pool.",
+          "type": "string",
+          "const": "queued"
+        },
+        {
+          "description": "Its Claude Code is running.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "It ended needing the user; `run.resume` goes on with it.",
+          "type": "string",
+          "const": "needs_you"
+        },
+        {
+          "description": "It ended with a result.",
+          "type": "string",
+          "const": "done"
+        },
+        {
+          "description": "It ended without one: `run.failed`'s `reason` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "Schedule": {
+      "description": "When a job fires: every so many minutes, measured from `job.put` (never drifting with\nhow late a fire ran), or at each match of a five-field cron expression in an IANA time\nzone.",
+      "anyOf": [
+        {
+          "description": "`{\"every_minutes\": N}`.",
+          "type": "object",
+          "properties": {
+            "every_minutes": {
+              "description": "Minutes between fires, 1 to 44,640 (31 days).",
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 44640,
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "every_minutes"
+          ]
+        },
+        {
+          "description": "`{\"cron\": \"*/15 * * * *\", \"tz\": \"Europe/London\"}`.",
+          "type": "object",
+          "properties": {
+            "cron": {
+              "description": "Minute, hour, day of month, month and day of week: `*`, numbers, lists,\nranges, steps, and month and day names.",
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            "tz": {
+              "description": "An IANA time zone, such as `UTC` or `Europe/London`.",
+              "type": "string",
+              "maxLength": 64,
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "cron",
+            "tz"
+          ]
+        }
+      ]
+    }
+  }
+}

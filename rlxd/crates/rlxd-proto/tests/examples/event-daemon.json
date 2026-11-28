@@ -1,0 +1,1 @@
+{"schema_version": 1, "seq": 41, "time": "2026-11-25T12:00:00.000Z", "topic": "daemon", "type": "daemon.started", "data": {"version": "0.10.1", "pid": 4242}}

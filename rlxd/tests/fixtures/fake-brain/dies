@@ -1,0 +1,6 @@
+#!/bin/sh
+# fake-brain/dies: a brain that dies as it starts, before any hello, as an rlx that
+# cannot import would. rlxd must start it again with backoff and say so in status.
+# dies.cmd is the same for Windows.
+echo "fake-brain/dies: dying at start" >&2
+exit 1

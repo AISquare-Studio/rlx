@@ -1,0 +1,7 @@
+#!/bin/sh
+# fake-brain/skewed: a brain of another release. It answers rlxd's hello with brain
+# protocol 99, then waits for its stdin to close. rlxd must name the error
+# (brain_incompatible) in status, not misread it. skewed.cmd is the same for Windows.
+read -r hello
+printf '%s\n' "{\"type\":\"hello\",\"protocol\":99,\"pid\":$$,\"rlx_version\":\"9.9.9\"}"
+cat > /dev/null

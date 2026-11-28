@@ -1,0 +1,1160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunEvent",
+  "description": "One event of a run's stream: an event (event.json) whose data, for each run event type 7.5 describes, carries that type's fields beside the run fields.",
+  "allOf": [
+    {
+      "$ref": "#/$defs/Event"
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.queued"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunQueuedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.started"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunStartedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.text"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunTextData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.tool_call"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunToolCallData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.tool_decided"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunToolDecidedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.tool_result"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunToolResultData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.rate_limited"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunRateLimitedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.needs_you"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunNeedsYouData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.done"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunDoneData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "run.failed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/RunFailedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "needs_you.raised"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/NeedsYouRaisedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "needs_you.cleared"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/NeedsYouClearedData"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "ConnectorStatus": {
+      "description": "A connector named in `needs_connectors`, and its status (5.5).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The connector.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Its status: `pending`, `needs-auth`, `failed` or `absent`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ]
+    },
+    "DecidedBy": {
+      "description": "Who decided a tool call (5.1).",
+      "oneOf": [
+        {
+          "description": "The app, with `run.decide`.",
+          "type": "string",
+          "const": "app"
+        },
+        {
+          "description": "rlxd's own rules: the mount, the kind, the pinned call.",
+          "type": "string",
+          "const": "rlxd"
+        },
+        {
+          "description": "No answer came before the deadline.",
+          "type": "string",
+          "const": "timeout"
+        },
+        {
+          "description": "No app-role connection was there to ask.",
+          "type": "string",
+          "const": "unreachable"
+        }
+      ]
+    },
+    "Decision": {
+      "description": "What a tool call was decided (5.1).",
+      "oneOf": [
+        {
+          "description": "It runs.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "It doesn't.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "It doesn't, and the app saved it as a draft (`draft_id`).",
+          "type": "string",
+          "const": "draft"
+        }
+      ]
+    },
+    "Event": {
+      "title": "Event",
+      "description": "One event on the stream `events.subscribe` opens.\n\n```json\n{\"schema_version\": 1, \"seq\": 42, \"time\": \"2026-11-25T12:00:00.000Z\", \"topic\": \"run\",\n \"type\": \"run.text\", \"data\": {\"run_id\": \"…\", \"run_seq\": 3, \"kind\": \"task\", \"attempt\": 1}}\n```\n\nTwo sequences number events. `seq` is per home: every event has one, and\n`events.subscribe {since}` resumes after it. `data.run_seq` is per run: every event\nwhose topic is `run` has one, with the run's `run_id`, `kind`, `attempt` and\n`job_id?`, so a client can replay one run from a known point.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "description": "The type's own fields. On the `run` topic, also `run_id`, `run_seq`, `kind`,\n`attempt` and `job_id?`.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "schema_version": {
+          "description": "The schema version this document follows.",
+          "type": "integer",
+          "const": 1
+        },
+        "seq": {
+          "description": "Strictly increasing per home, from 1, across every topic. `events.subscribe\n{since}` resumes after it.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 1
+        },
+        "time": {
+          "description": "When it happened: RFC 3339, in UTC, to the millisecond (`2026-11-25T12:00:00.000Z`).",
+          "type": "string",
+          "format": "date-time"
+        },
+        "topic": {
+          "description": "What it is about, in snake_case, such as `run` or `needs_you`. A client ignores\ntopics it does not know.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "type": {
+          "description": "What happened: `<topic>.<event>`, the event in snake_case, such as `run.text`,\n`fleet.agent_spawned` or `connector.login.open_url`. It starts with this event's\nown topic. A client ignores types it does not know.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "daemon"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^daemon\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^run\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "job"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^job\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "connector"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^connector\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "pty"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^pty\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "hook"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^hook\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "fleet"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^fleet\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "board"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^board\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "needs_you"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^needs_you\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "upgrade"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^upgrade\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "settings"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^settings\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "install"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^install\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "signin"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^signin\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "attempt": {
+                    "description": "Which attempt of the run, from 1.",
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 1
+                  },
+                  "job_id": {
+                    "description": "The scheduler job that fired the run, if one did.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "description": "The run's kind, such as task or widget_refresh.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "run_id": {
+                    "description": "The run this event belongs to.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "run_seq": {
+                    "description": "Strictly increasing per run, from 1.",
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "run_seq",
+                  "kind",
+                  "attempt"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "required": [
+        "schema_version",
+        "seq",
+        "time",
+        "topic",
+        "type",
+        "data"
+      ]
+    },
+    "FailReason": {
+      "description": "Why a run failed.",
+      "oneOf": [
+        {
+          "description": "`run.cancel`.",
+          "type": "string",
+          "const": "cancelled"
+        },
+        {
+          "description": "Claude Code failed, crashed or could not start; `message` says how.",
+          "type": "string",
+          "const": "error"
+        },
+        {
+          "description": "`timeout_s` ran out.",
+          "type": "string",
+          "const": "timeout"
+        },
+        {
+          "description": "Claude Code was rate limited.",
+          "type": "string",
+          "const": "rate_limited"
+        },
+        {
+          "description": "rlxd stopped or crashed while the run was in flight; `run.resume` goes on with it.",
+          "type": "string",
+          "const": "engine_restarted"
+        },
+        {
+          "description": "A connector in `needs_connectors` never connected (5.5).",
+          "type": "string",
+          "const": "connectors"
+        },
+        {
+          "description": "A `connectors.call` was denied (5.3).",
+          "type": "string",
+          "const": "denied"
+        }
+      ]
+    },
+    "McpServer": {
+      "description": "One MCP server `system/init` lists, with its status.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Its name, such as `claude.ai Slack`.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Its status, such as `connected`, `pending`, `needs-auth` or `failed`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ]
+    },
+    "NeedsYouClearedData": {
+      "description": "`needs_you.cleared`, on the `needs_you` topic: what `needs_you.raised` named no longer\nneeds the user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The `id` it was raised with.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "NeedsYouRaisedData": {
+      "description": "`needs_you.raised`, on the `needs_you` topic: something needs the user. A run raises\none with its `run.needs_you`, and `needs_you.cleared` with the same `id` follows when\nit is resumed or cancelled.",
+      "type": "object",
+      "properties": {
+        "agent_id": {
+          "description": "The agent, for `source: \"fleet\"`.",
+          "type": "string"
+        },
+        "id": {
+          "description": "What `needs_you.cleared` names: `run:<run_id>:<attempt>` for a run.",
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "description": "Why: for a run, `run.needs_you`'s `reason`.",
+          "type": "string"
+        },
+        "run_id": {
+          "description": "The run, for `source: \"run\"`.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where it comes from.",
+          "$ref": "#/$defs/NeedsYouSource"
+        },
+        "text": {
+          "description": "What to show the user: the question, when there is one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "reason",
+        "text"
+      ]
+    },
+    "NeedsYouReason": {
+      "description": "Why a run needs the user.",
+      "oneOf": [
+        {
+          "description": "Its output asked a question (`needs_you_when`).",
+          "type": "string",
+          "const": "question"
+        },
+        {
+          "description": "The app denied a call with `stop: true` (5.1).",
+          "type": "string",
+          "const": "denied"
+        }
+      ]
+    },
+    "NeedsYouSource": {
+      "description": "Where something that needs the user comes from.",
+      "oneOf": [
+        {
+          "description": "A run (`run_id`).",
+          "type": "string",
+          "const": "run"
+        },
+        {
+          "description": "A fleet agent (`agent_id`), after the fleet moves onto rlxd (1.8).",
+          "type": "string",
+          "const": "fleet"
+        }
+      ]
+    },
+    "RouteBy": {
+      "description": "Why a run is on the account it is on (#15).",
+      "oneOf": [
+        {
+          "description": "`run.start`'s `account` pinned it.",
+          "type": "string",
+          "const": "pinned"
+        },
+        {
+          "description": "rlxd picked it by the run's `connectors`.",
+          "type": "string",
+          "const": "connectors"
+        },
+        {
+          "description": "Neither was given: the run is on the app's environment, as every run was before\nrouting.",
+          "type": "string",
+          "const": "default"
+        }
+      ]
+    },
+    "RunAccount": {
+      "description": "The account a run is on, and why (#15): kept from its start, through every try and\n`run.resume`. A route is never picked again.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "Why it is on that account.",
+          "$ref": "#/$defs/RouteBy"
+        },
+        "slot": {
+          "description": "Its rlx slot, as `connectors.list` names accounts. Absent only for a `default` run\nwhose environment is no account rlx knows.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        }
+      },
+      "required": [
+        "by"
+      ]
+    },
+    "RunDoneData": {
+      "description": "`run.done`: the run ended with a result.",
+      "type": "object",
+      "properties": {
+        "cost_usd": {
+          "description": "What it cost, in US dollars, when Claude Code said.",
+          "type": "number",
+          "format": "double"
+        },
+        "duration_ms": {
+          "description": "How long it took, as Claude Code counts it.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "loud": {
+          "description": "For a run a scheduler job fired: the job's `loud`, opaque to rlxd.",
+          "type": "boolean"
+        },
+        "num_turns": {
+          "description": "How many turns it took.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "result": {
+          "description": "The result's text.",
+          "type": "string"
+        },
+        "session": {
+          "description": "The session to resume: the run's id, or `null` for a session-less run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "structured_output": {
+          "description": "The output matching `output_schema`, when the run had one."
+        },
+        "usage": {
+          "description": "Tokens used.",
+          "$ref": "#/$defs/Usage"
+        }
+      },
+      "required": [
+        "result",
+        "usage",
+        "duration_ms",
+        "num_turns"
+      ]
+    },
+    "RunFailedData": {
+      "description": "`run.failed`: the run ended without a result.",
+      "type": "object",
+      "properties": {
+        "connectors": {
+          "description": "For `reason: \"connectors\"`: each named connector that was not connected.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConnectorStatus"
+          }
+        },
+        "message": {
+          "description": "What happened, for a person.",
+          "type": "string"
+        },
+        "partial_text": {
+          "description": "The assistant text the run got out before it ended.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why.",
+          "$ref": "#/$defs/FailReason"
+        }
+      },
+      "required": [
+        "reason",
+        "message",
+        "partial_text"
+      ]
+    },
+    "RunNeedsYouData": {
+      "description": "`run.needs_you`: the run ended needing the user.",
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "description": "The denied call, for `reason: \"denied\"`.",
+          "type": "string"
+        },
+        "loud": {
+          "description": "For a run a scheduler job fired: the job's `loud`, opaque to rlxd.",
+          "type": "boolean"
+        },
+        "question": {
+          "description": "The question, read at `needs_you_when.question_pointer`.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why.",
+          "$ref": "#/$defs/NeedsYouReason"
+        }
+      },
+      "required": [
+        "reason"
+      ]
+    },
+    "RunQueuedData": {
+      "description": "`run.queued`: over its kind's pool, the run waits.",
+      "type": "object",
+      "properties": {
+        "position": {
+          "description": "Its place in its kind's queue, from 1: the next to start is 1.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        }
+      },
+      "required": [
+        "position"
+      ]
+    },
+    "RunRateLimitedData": {
+      "description": "`run.rate_limited`: a `rate_limit_event`.",
+      "type": "object",
+      "properties": {
+        "resets_at": {
+          "description": "When the limit resets, RFC 3339 in UTC, when Claude Code said.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "status": {
+          "description": "Claude Code's own word for it, such as `allowed_warning` or `rejected`.",
+          "type": "string"
+        }
+      }
+    },
+    "RunStartedData": {
+      "description": "`run.started`: Claude Code's stream-json `system/init`.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account the run is on, and why (#15).",
+          "$ref": "#/$defs/RunAccount"
+        },
+        "claude_version": {
+          "description": "Claude Code's version.",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "The working directory Claude Code reports: the run's space.",
+          "type": "string"
+        },
+        "mcp_servers": {
+          "description": "The MCP servers, connectors included, with their status.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpServer"
+          }
+        },
+        "model": {
+          "description": "The model.",
+          "type": "string"
+        },
+        "resumed": {
+          "description": "Whether this attempt resumed the run (`run.resume`).",
+          "type": "boolean"
+        },
+        "tools": {
+          "description": "The tools mounted.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "cwd",
+        "model",
+        "tools",
+        "mcp_servers",
+        "claude_version",
+        "resumed"
+      ]
+    },
+    "RunTextData": {
+      "description": "`run.text`: assistant text. With `partial`, a chunk as it streams; the whole message\nfollows as a `run.text` with `partial: false`.",
+      "type": "object",
+      "properties": {
+        "partial": {
+          "description": "Whether it is a partial chunk.",
+          "type": "boolean"
+        },
+        "text": {
+          "description": "The text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "partial"
+      ]
+    },
+    "RunToolCallData": {
+      "description": "`run.tool_call` (5.1): a call of the run's that only the app can decide, with\n`run.decide` before `deadline_ms`. It replays through `run.events`, so an app that\nreconnects while it is pending sees it again.",
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "description": "Claude Code's `tool_use_id`, which the call's other events share.",
+          "type": "string"
+        },
+        "deadline_ms": {
+          "description": "How long the app has to decide, in milliseconds, from this event.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "input": {
+          "description": "The tool's input, as Claude Code gave it."
+        },
+        "input_sha256": {
+          "description": "The SHA-256, in hex, of the input's RFC 8785 canonical JSON.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "tool": {
+          "description": "The tool, such as `mcp__claude_ai_Slack__slack_send_message`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool",
+        "input",
+        "input_sha256",
+        "deadline_ms"
+      ]
+    },
+    "RunToolDecidedData": {
+      "description": "`run.tool_decided` (5.1): how a call was decided, and by whom.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "`app`, `rlxd`, `timeout` or `unreachable`.",
+          "$ref": "#/$defs/DecidedBy"
+        },
+        "call_id": {
+          "description": "Claude Code's `tool_use_id`.",
+          "type": "string"
+        },
+        "decision": {
+          "description": "`allow`, `deny` or `draft`.",
+          "$ref": "#/$defs/Decision"
+        },
+        "draft_id": {
+          "description": "For `draft`: the app's draft.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why: the app's reason, or rlxd's. Data only: it decides nothing.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "call_id",
+        "decision",
+        "by",
+        "reason"
+      ]
+    },
+    "RunToolResultData": {
+      "description": "`run.tool_result`: a `tool_result` block in a stream-json `user` message.",
+      "type": "object",
+      "properties": {
+        "call_id": {
+          "description": "Claude Code's `tool_use_id`, which the call's other events share.",
+          "type": "string"
+        },
+        "content": {
+          "description": "The result's content, exactly as Claude Code gave it, up to 1 MiB of JSON; past\nthat, its first 1 MiB as a string."
+        },
+        "is_error": {
+          "description": "Whether the tool failed, or the call was denied.",
+          "type": "boolean"
+        },
+        "tool": {
+          "description": "The tool called, from the matching `tool_use` block; empty when none was seen.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Whether `content` was cut.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "call_id",
+        "tool",
+        "is_error",
+        "content",
+        "truncated"
+      ]
+    },
+    "Usage": {
+      "description": "Tokens a run used.",
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "description": "Input tokens.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "output_tokens": {
+          "description": "Output tokens.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens"
+      ]
+    }
+  }
+}

@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunListData",
+  "description": "`run.list`'s reply: the runs, the latest started first.",
+  "type": "object",
+  "properties": {
+    "runs": {
+      "description": "The runs.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RunSummary"
+      }
+    }
+  },
+  "required": [
+    "runs"
+  ],
+  "$defs": {
+    "RouteBy": {
+      "description": "Why a run is on the account it is on (#15).",
+      "oneOf": [
+        {
+          "description": "`run.start`'s `account` pinned it.",
+          "type": "string",
+          "const": "pinned"
+        },
+        {
+          "description": "rlxd picked it by the run's `connectors`.",
+          "type": "string",
+          "const": "connectors"
+        },
+        {
+          "description": "Neither was given: the run is on the app's environment, as every run was before\nrouting.",
+          "type": "string",
+          "const": "default"
+        }
+      ]
+    },
+    "RunAccount": {
+      "description": "The account a run is on, and why (#15): kept from its start, through every try and\n`run.resume`. A route is never picked again.",
+      "type": "object",
+      "properties": {
+        "by": {
+          "description": "Why it is on that account.",
+          "$ref": "#/$defs/RouteBy"
+        },
+        "slot": {
+          "description": "Its rlx slot, as `connectors.list` names accounts. Absent only for a `default` run\nwhose environment is no account rlx knows.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        }
+      },
+      "required": [
+        "by"
+      ]
+    },
+    "RunKind": {
+      "description": "What a run is for (7.5). Each kind has its own pool, and rlxd's gate rules for it\n(5.1).",
+      "oneOf": [
+        {
+          "description": "A task the user asked for. The only kind whose session persists by default.",
+          "type": "string",
+          "const": "task"
+        },
+        {
+          "description": "Sends one pinned call. Never resumed: a send is never retried.",
+          "type": "string",
+          "const": "send_executor"
+        },
+        {
+          "description": "Refreshes a widget's data.",
+          "type": "string",
+          "const": "widget_refresh"
+        },
+        {
+          "description": "One pinned read call for a scheduled watch.",
+          "type": "string",
+          "const": "watch"
+        },
+        {
+          "description": "rlxapp's send-time `Check`: no tools.",
+          "type": "string",
+          "const": "check"
+        },
+        {
+          "description": "Parses an instruction: no tools.",
+          "type": "string",
+          "const": "parse_instruction"
+        },
+        {
+          "description": "Writes a widget: no tools.",
+          "type": "string",
+          "const": "widget_author"
+        }
+      ]
+    },
+    "RunState": {
+      "description": "Where a run stands (7.5).",
+      "oneOf": [
+        {
+          "description": "Waiting for a place in its kind's pool.",
+          "type": "string",
+          "const": "queued"
+        },
+        {
+          "description": "Its Claude Code is running.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "It ended needing the user; `run.resume` goes on with it.",
+          "type": "string",
+          "const": "needs_you"
+        },
+        {
+          "description": "It ended with a result.",
+          "type": "string",
+          "const": "done"
+        },
+        {
+          "description": "It ended without one: `run.failed`'s `reason` says why.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "RunSummary": {
+      "description": "One run in `run.list`.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account it is on, and why (#15).",
+          "$ref": "#/$defs/RunAccount"
+        },
+        "attempt": {
+          "description": "Its attempt, from 1.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 1
+        },
+        "client": {
+          "description": "The `client` of the connection that started it.",
+          "type": "string"
+        },
+        "ended_at": {
+          "description": "When it last ended, if it has.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "job_id": {
+          "description": "The scheduler job that fired it.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Its kind.",
+          "$ref": "#/$defs/RunKind"
+        },
+        "last_run_seq": {
+          "description": "Its last event's `run_seq`, 0 before its first.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "run_id": {
+          "description": "The run.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "space": {
+          "description": "Its space.",
+          "type": "string"
+        },
+        "started_at": {
+          "description": "When `run.start` took it.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "state": {
+          "description": "Its state now.",
+          "$ref": "#/$defs/RunState"
+        }
+      },
+      "required": [
+        "run_id",
+        "kind",
+        "state",
+        "started_at",
+        "last_run_seq",
+        "client",
+        "attempt",
+        "space"
+      ]
+    }
+  }
+}

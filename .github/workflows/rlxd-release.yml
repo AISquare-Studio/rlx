@@ -1,0 +1,861 @@
+name: rlxd release
+
+# rlxd's binaries, which ship with rlx releases (handoff 0.10.3, 1.2). rlxd and
+# rlxd-hook are built for five targets and packed flat, one archive per target:
+#
+#   rlxd-aarch64-apple-darwin.tar.gz       rlxd-x86_64-unknown-linux-gnu.tar.gz
+#   rlxd-x86_64-apple-darwin.tar.gz        rlxd-aarch64-unknown-linux-gnu.tar.gz
+#   rlxd-x86_64-pc-windows-msvc.zip        rlxd-SHA256SUMS
+#
+# Each .tar.gz holds exactly `rlxd` and `rlxd-hook`, the .zip `rlxd.exe` and
+# `rlxd-hook.exe`, and rlxd-SHA256SUMS lists every archive as `shasum -a 256 -c`
+# reads it (scripts/rlxd_archive.py makes both).
+#
+#   build    the five targets, on the three standard runners only (owner decision
+#            2026-10-25, tests/test_ci_runs_on_standard_runners.py): both macOS
+#            targets on macos-latest (x86_64 by `rustup target add`, run under
+#            Rosetta), both Linux targets on ubuntu-latest, Windows on
+#            windows-latest. aarch64 Linux is therefore cross-linked
+#            (gcc-aarch64-linux-gnu) rather than built on an arm runner, which that
+#            rule excludes, and it is run under qemu-user, so every binary answers
+#            `--version` before it is packed. Both Linux targets are built in an
+#            Ubuntu 22.04 container, so they link glibc 2.35 whatever ubuntu-latest
+#            carries, and a step runs them there before they are packed.
+#   package  rlxd-SHA256SUMS, the handoff's check run over the result, and the
+#            artifact `rlxd-archives`: the pre-release form of the release assets.
+#   install  on ubuntu, macOS and Windows: `rlx daemon install` of the tree, from a
+#            stub releases server (tests/stub_releases.py) serving `rlxd-archives`,
+#            then the installed rlxd's version; and tests/test_rlxd_install.py.
+#   upgrade  on ubuntu, macOS and Windows: handoff 4.2's and 7.8's upgrade checks,
+#            rlx $V upgraded to a second build of the tree stamped $V+upgrade, with
+#            rlxd restarted, PTYs and a run in flight; not for a release's run.
+#   attach   only for a release: the archives and the sums onto GitHub Release
+#            vX.Y.Z, by `gh release upload` as installers.yml attaches the
+#            installers. It refuses a tag that is not `v` + pyproject.toml's version.
+#
+# rlxd.yml calls this on every PR that touches rlxd and every push to an rc/**
+# branch, so each head has `rlxd-archives`; no attach runs there. A published
+# release runs it on its own, and attaches. By hand, rlxd.yml's workflow_dispatch
+# takes `release_tag` and `dry_run` (default true), and passes them here. It must be
+# run on the tag itself, as `attach` checks: what is attached is built from the tag,
+# never from whatever branch a dispatch named.
+#
+#   gh workflow run rlxd.yml --ref vX.Y.Z -f release_tag=vX.Y.Z          # a dry run
+#
+# A dry run does everything an attach does, the ref and tag checks and `gh release
+# view` included, and prints the `gh release upload` it would run instead of running
+# it. After a failed release run, re-run its failed jobs: that run is the tag's.
+#
+# Not signed yet: notarization and Authenticode are owner step 1, which wires them
+# in at the marked step of `build`.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Attach to this release (vX.Y.Z). Empty builds and packages only.
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: With a tag, check everything and print the upload instead of running it.
+        required: false
+        type: boolean
+        default: true
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            run: qemu-aarch64 -L /usr/aarch64-linux-gnu
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    # rustup reads rlxd/rust-toolchain.toml only when cargo runs inside rlxd/.
+    defaults:
+      run:
+        shell: bash
+        working-directory: rlxd
+    env:
+      TARGET: ${{ matrix.target }}
+      # The C runtime linked into rlxd.exe, so it runs without the Visual C++
+      # Redistributable installed.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      # aarch64 Linux: cross-linked on the x86_64 runner, and run under qemu-user.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      RUN: ${{ matrix.run }}
+      # Ubuntu 22.04's and Debian 12's era: the newest glibc symbol version the
+      # Linux binaries may need.
+      GLIBC_OLDEST: "2.35"
+      # The cargo features a release is built with, listed rather than taken from the
+      # defaults or --all-features: none. Every rlxd feature is for tests or development
+      # (debug-methods, gate-test-requirement, and gate dev mode as a feature, #24 by
+      # the hub's decision in handoff rev 7), and a release never has one. The build
+      # below refuses a list naming any of them, and `package` checks each binary's
+      # --version for the dev build's marker.
+      RELEASE_FEATURES: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      # On the runner: qemu-user and the aarch64 libraries, to run that build here.
+      - name: The aarch64 Linux libraries and qemu-user
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+
+      # A Linux binary needs the newest version, on the build machine, of each glibc
+      # symbol it links, so ubuntu-latest's glibc would be the floor: #587's process
+      # spawning made it 2.39 there, past Ubuntu 22.04's and Debian 12's. So the Linux
+      # targets are built in Ubuntu 22.04 (glibc 2.35), with its gcc and its aarch64
+      # cross-gcc as the linkers. The image adds no Rust: the runner's rustup and
+      # toolchain are mounted into it, and rustup's builds need only glibc 2.17.
+      - name: The Ubuntu 22.04 build image (glibc ${{ env.GLIBC_OLDEST }})
+        if: runner.os == 'Linux'
+        run: |
+          # ubuntu:22.04 pinned by its image index's digest (amd64 and arm64 alike). apt's
+          # packages are jammy's current ones, so the step logs each one's version.
+          docker build -q -t rlxd-glibc-floor - <<'EOF'
+          FROM ubuntu:22.04@sha256:b000e69a50ff940390233025e7a337fb8469b509e2334fa4d018ac30f3e18cdb
+          RUN apt-get update -q \
+           && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+                gcc libc6-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user \
+           && rm -rf /var/lib/apt/lists/*
+          EOF
+          docker run --rm rlxd-glibc-floor sh -c 'ldd --version | head -1; dpkg-query -W \
+            gcc gcc-11 binutils libc6 libc6-dev gcc-aarch64-linux-gnu gcc-11-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user'
+
+      - name: Install the pinned toolchain and the target
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+
+      # Not for a release's own build: what ships is built from nothing cached. The
+      # Linux key names the build image, so nothing built on the runner itself (proc
+      # macros linked against its newer glibc) is loaded inside it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: github.event_name != 'release' && inputs.tag == ''
+        with:
+          workspaces: rlxd -> target
+          key: ${{ matrix.target }}${{ runner.os == 'Linux' && '-ubuntu22.04' || '' }}
+
+      - name: cargo build --release --target ${{ matrix.target }}
+        run: |
+          case ",$RELEASE_FEATURES," in
+            *debug-methods* | *gate-test-requirement* | *dev-mode*)
+              echo "::error::release_features: '$RELEASE_FEATURES' names a test or dev feature"
+              exit 1 ;;
+          esac
+          features=(--no-default-features --features "$RELEASE_FEATURES")
+          if [ "$RUNNER_OS" != Linux ]; then
+            cargo build --release --locked --target "$TARGET" -p rlxd -p rlxd-hook "${features[@]}"
+            exit 0
+          fi
+          # The crates are fetched here, on the runner, and the image builds offline
+          # (--frozen, --network none), so it needs neither network nor CA certificates.
+          cargo fetch --locked
+          # In the 22.04 image, as the runner's user, with the workspace, cargo's home
+          # and rustup's mounted at their own paths, so rlxd/rust-toolchain.toml, the
+          # toolchain installed above and rust-cache's files are the runner's.
+          cargo_home=${CARGO_HOME:-$HOME/.cargo}
+          rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" -w "$PWD" \
+            -v "$cargo_home:$cargo_home" -v "$rustup_home:$rustup_home" \
+            -e HOME -e CARGO_HOME="$cargo_home" -e RUSTUP_HOME="$rustup_home" \
+            -e PATH="$cargo_home/bin:/usr/local/bin:/usr/bin:/bin" \
+            -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL \
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER \
+            rlxd-glibc-floor cargo build --release --frozen --target "$TARGET" -p rlxd -p rlxd-hook \
+            "${features[@]}"
+
+      - name: Rosetta, to run the x86_64 macOS build
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Each binary is its target's, and answers rlx's version
+        run: |
+          V=$(python -c 'import tomllib; print(tomllib.load(open("../pyproject.toml", "rb"))["project"]["version"])')
+          exe=""; [[ "$TARGET" == *-windows-msvc ]] && exe=.exe
+          # Each answer, as this target's runner gave it, for `package`'s dev-build check.
+          mkdir -p "$RUNNER_TEMP/versions"
+          answers="$RUNNER_TEMP/versions/rlxd-version-$TARGET.txt"
+          for b in rlxd rlxd-hook; do
+            path="target/$TARGET/release/$b$exe"
+            case "$TARGET" in
+              aarch64-apple-darwin) test "$(lipo -archs "$path")" = arm64 ;;
+              x86_64-apple-darwin) test "$(lipo -archs "$path")" = x86_64 ;;
+              aarch64-unknown-linux-gnu) readelf -h "$path" | grep -q 'Machine:.*AArch64' ;;
+              x86_64-unknown-linux-gnu) readelf -h "$path" | grep -q 'Machine:.*X86-64' ;;
+            esac
+            # $RUN is empty but for aarch64 Linux's qemu, so it is left unquoted.
+            # shellcheck disable=SC2086
+            got=$($RUN "$path" --version)
+            if [ "$got" != "$b $V" ]; then
+              echo "::error::$b --version printed '$got', not '$b $V'"
+              exit 1
+            fi
+            echo "$path: $got"
+            printf '%s\t%s\n' "$b$exe" "$got" >> "$answers"
+          done
+
+      - name: The Linux binaries run on glibc ${{ env.GLIBC_OLDEST }}
+        if: endsWith(matrix.target, '-linux-gnu')
+        run: |
+          syms=$(for b in rlxd rlxd-hook; do readelf -W --dyn-syms "target/$TARGET/release/$b"; done)
+          need=$(grep -o 'GLIBC_[0-9][0-9.]*' <<<"$syms" | sed 's/^GLIBC_//' | sort -uV | tail -1)
+          echo "the newest glibc symbol version they need: ${need:-none}, for:"
+          { grep -F "@GLIBC_$need " <<<"$syms" || true; } | awk '{print "  " $5, $8}' | sort -u
+          test -n "$need"
+          if [ "$(printf '%s\n' "$need" "$GLIBC_OLDEST" | sort -V | tail -1)" != "$GLIBC_OLDEST" ]; then
+            echo "::error::the $TARGET binaries need glibc $need, newer than $GLIBC_OLDEST"
+            exit 1
+          fi
+          # And they run there: in the Ubuntu 22.04 image, on its glibc (aarch64 under
+          # its qemu-user, with its arm64 glibc).
+          V=$(python -c 'import tomllib; print(tomllib.load(open("../pyproject.toml", "rb"))["project"]["version"])')
+          docker run --rm -v "$PWD/target/$TARGET/release:/b:ro" -e TARGET -e V="$V" \
+            rlxd-glibc-floor bash -ec '
+              echo "Ubuntu 22.04: $(ldd --version | head -1)"
+              for b in rlxd rlxd-hook; do
+                case "$TARGET" in
+                  aarch64-*) got=$(qemu-aarch64 -L /usr/aarch64-linux-gnu "/b/$b" --version) ;;
+                  *) got=$("/b/$b" --version) ;;
+                esac
+                if [ "$got" != "$b $V" ]; then
+                  echo "::error::$b --version on Ubuntu 22.04 printed: $got"
+                  exit 1
+                fi
+                echo "$b on Ubuntu 22.04: $got"
+              done'
+
+      # ── OWNER STEP 1: CODE SIGNING GOES HERE (handoff 0.10.3, "Owner steps", 1). ──
+      # macOS: codesign --options runtime --timestamp, notarytool submit --wait, then
+      # `codesign --verify --strict` and `spctl -a -t exec -vv` on each binary.
+      # Windows: signtool sign /fd sha256 /tr <timestamp URL>, then
+      # (Get-AuthenticodeSignature rlxd.exe).Status is Valid. On the two built
+      # binaries, after the checks above and before they are archived, so the sums
+      # cover the signed files. The certificates are the owner's; until they are
+      # wired in, rlxd ships unsigned and this step only says so.
+      - name: Sign (owner step 1, not wired; the binaries ship unsigned)
+        run: echo "::notice::rlxd and rlxd-hook for $TARGET are unsigned (owner step 1)"
+
+      - name: Package
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python ../scripts/rlxd_archive.py pack --target "$TARGET" \
+            --bin-dir "target/$TARGET/release" --out "$RUNNER_TEMP/out"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rlxd-archive-${{ matrix.target }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rlxd-version-${{ matrix.target }}
+          path: ${{ runner.temp }}/versions/*
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: package (rlxd-archives)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      # What a gate-dev-mode build (#24, handoff rev 7: a cargo feature releases never
+      # enable) prints in `rlxd --version`, as #24's contract documents it: for example
+      # `rlxd 0.10.3 (dev: gate-dev-mode)`. Any answer but exactly `<binary> <version>`
+      # is refused as well, so a different spelling of the marker fails too.
+      DEV_MARKER: "(dev:"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rlxd-archive-*
+          merge-multiple: true
+          path: rlxd-archives
+
+      # Refuses unless all five archives are there.
+      - name: rlxd-SHA256SUMS
+        run: |
+          python3 scripts/rlxd_archive.py sums --dir rlxd-archives
+          cat rlxd-archives/rlxd-SHA256SUMS
+
+      # Handoff 1.2's Accept block, on a copy (it writes l.txt and w.txt beside the
+      # archives). Its lines as written, but for the `gh run download`, which is this
+      # job's download above, and the `|| { … }` on the Windows line: a failure there
+      # short of its last command would not stop bash -e.
+      - name: The handoff's check
+        run: |
+          cp -R rlxd-archives a && cd a
+          for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            grep -q " rlxd-$t.tar.gz\$" rlxd-SHA256SUMS && tar -tzf "rlxd-$t.tar.gz" > l.txt && grep -qx rlxd l.txt && grep -qx rlxd-hook l.txt || exit 1; done
+          grep -q ' rlxd-x86_64-pc-windows-msvc.zip$' rlxd-SHA256SUMS && unzip -Z1 rlxd-x86_64-pc-windows-msvc.zip > w.txt && grep -qx rlxd.exe w.txt && grep -qx rlxd-hook.exe w.txt || { echo "::error::the Windows archive's line failed"; exit 1; }
+          shasum -a 256 -c rlxd-SHA256SUMS
+
+      # The check above must be able to fail: shasum -c without --ignore-missing
+      # fails when a listed archive is gone.
+      - name: The check fails with an archive missing
+        run: |
+          cp -R rlxd-archives m && cd m
+          rm rlxd-aarch64-unknown-linux-gnu.tar.gz
+          if shasum -a 256 -c rlxd-SHA256SUMS; then
+            echo "::error::shasum -c passed with rlxd-aarch64-unknown-linux-gnu.tar.gz missing"
+            exit 1
+          fi
+
+      # No release binary is a dev build: each target's runner ran its two binaries'
+      # --version (the build job's version step, which also requires exactly
+      # `<binary> <version>`), and every answer is checked again here, for all ten.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rlxd-version-*
+          merge-multiple: true
+          path: versions
+
+      - name: No binary is a dev build (rlxd --version has no dev marker)
+        run: |
+          V=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          bad=0 seen=0
+          for answers in versions/rlxd-version-*.txt; do
+            target=${answers##*/rlxd-version-}; target=${target%.txt}
+            while IFS=$'\t' read -r bin got; do
+              seen=$((seen + 1))
+              echo "$target $bin: $got"
+              case "$got" in
+                *"$DEV_MARKER"*)
+                  echo "::error::dev_build: $target's $bin says '$got'; a release is never built with gate dev mode"
+                  bad=1 ;;
+                "${bin%.exe} $V") ;;
+                *)
+                  echo "::error::version_mismatch: $target's $bin says '$got', not '${bin%.exe} $V'"
+                  bad=1 ;;
+              esac
+            done < "$answers"
+          done
+          if [ "$seen" -ne 10 ]; then
+            echo "::error::expected the answers of 10 binaries (5 targets), got $seen"
+            bad=1
+          fi
+          exit "$bad"
+
+      # And the archive's own bytes, where this runner can run them: x86_64 Linux.
+      - name: The packed x86_64 Linux binaries, run here, are not dev builds
+        run: |
+          mkdir x && tar -xzf rlxd-archives/rlxd-x86_64-unknown-linux-gnu.tar.gz -C x
+          for b in rlxd rlxd-hook; do
+            got=$("x/$b" --version)
+            echo "rlxd-x86_64-unknown-linux-gnu.tar.gz $b: $got"
+            case "$got" in
+              *"$DEV_MARKER"*) echo "::error::dev_build: the packed $b says '$got'"; exit 1 ;;
+            esac
+          done
+
+      # "Exactly", which the handoff's grep -qx lines do not check by themselves.
+      - name: Six files, and each archive exactly its two binaries, flat
+        working-directory: rlxd-archives
+        run: |
+          export LC_ALL=C
+          test "$(ls | sort | tr '\n' ' ')" = "rlxd-SHA256SUMS rlxd-aarch64-apple-darwin.tar.gz rlxd-aarch64-unknown-linux-gnu.tar.gz rlxd-x86_64-apple-darwin.tar.gz rlxd-x86_64-pc-windows-msvc.zip rlxd-x86_64-unknown-linux-gnu.tar.gz "
+          for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            test "$(tar -tzf "rlxd-$t.tar.gz" | sort | tr '\n' ' ')" = "rlxd rlxd-hook "
+          done
+          test "$(unzip -Z1 rlxd-x86_64-pc-windows-msvc.zip | sort | tr '\n' ' ')" = "rlxd-hook.exe rlxd.exe "
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rlxd-archives
+          path: rlxd-archives/
+          if-no-files-found: error
+
+  install:
+    name: install (${{ matrix.os }})
+    needs: package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned as ci.yml pins it; no cache for a release's run.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.0"
+          enable-cache: ${{ github.event_name != 'release' }}
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rlxd-archives
+          path: ${{ runner.temp }}/a
+
+      - name: Sync the tree
+        run: uv sync --locked --extra dev
+
+      # Handoff 1.2's install lines, against the stub releases server serving
+      # `rlxd-archives` as release v$V, with `uv tool dir --bin` pointed at a fresh
+      # folder. $exe is .exe on Windows, where the binaries are rlxd.exe.
+      - name: rlx daemon install, from the stub releases server
+        run: |
+          exe=""; [ "$RUNNER_OS" = Windows ] && exe=.exe
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv-bin"
+          rlx() { uv run --locked --extra dev rlx "$@"; }
+          V=$(rlx --version | awk '{print $2}')
+          root="$RUNNER_TEMP/stub"; log="$RUNNER_TEMP/stub-requests.log"
+          mkdir -p "$root/v$V" && cp "$RUNNER_TEMP"/a/* "$root/v$V/"
+          uv run --locked --extra dev python tests/stub_releases.py "$root" \
+            --log "$log" --url-file "$RUNNER_TEMP/url" > "$RUNNER_TEMP/stub.out" 2>&1 &
+          trap 'kill $! 2>/dev/null || true' EXIT
+          for _ in $(seq 100); do test -s "$RUNNER_TEMP/url" && break; sleep 0.2; done
+          export AISQUARE_RELEASES_URL="$(cat "$RUNNER_TEMP/url")"
+          echo "rlx $V; releases at $AISQUARE_RELEASES_URL; uv tool dir --bin: $(uv tool dir --bin)"
+
+          rlx daemon install
+          test "$("$(uv tool dir --bin)/rlxd$exe" --version)" = "rlxd $V"
+          test "$("$(uv tool dir --bin)/rlxd-hook$exe" --version)" = "rlxd-hook $V"
+          rm "$(uv tool dir --bin)/rlxd$exe" && rlx daemon install && test -x "$(uv tool dir --bin)/rlxd$exe"
+          bin=$(uv tool dir --bin); [ "$RUNNER_OS" = Windows ] && bin=$(cygpath -u "$bin")
+          PATH="$bin:$PATH" sh -c 'test "$(rlxd --version)" = "rlxd $1"' _ "$V"
+          cat "$log"
+          grep -qx "/v$V/rlxd-SHA256SUMS" "$log"
+          grep -q "^/v$V/rlxd-" "$log"
+
+          # A tampered archive is refused by name, and the installed rlxd stays.
+          for f in "$root/v$V"/rlxd-*.tar.gz "$root/v$V"/rlxd-*.zip; do printf x >> "$f"; done
+          before=$(cksum < "$(uv tool dir --bin)/rlxd$exe")
+          out="$RUNNER_TEMP/tampered.json"
+          if rlx --json daemon install > "$out"; then
+            echo "::error::a tampered archive installed"; exit 1
+          fi
+          cat "$out"
+          grep -q '"error":"checksum_mismatch"' "$out"
+          test "$(cksum < "$(uv tool dir --bin)/rlxd$exe")" = "$before"
+
+      - name: tests/test_rlxd_install.py
+        run: uv run --locked --extra dev pytest tests/test_rlxd_install.py -q -p no:cacheprovider
+
+  # Handoff 4.2's and 7.8's upgrade checks (pre-release form), on the three OSes: rlx $V
+  # installed as a uv tool from the tree's wheel, its rlxd from the stub releases server
+  # serving `rlxd-archives`, running; on macOS and Linux a second build, dist2, stamped
+  # $V+upgrade (a wheel, this host's rlxd archive and its sums, served as v$V+upgrade), and
+  # fake-claude for a run in flight. Windows runs the daemon_running line: rlx can't
+  # replace itself there while it runs. Not for a release's run: `attach` needs none of it.
+  upgrade:
+    name: upgrade (${{ matrix.os }})
+    needs: package
+    if: github.event_name != 'release' && inputs.tag == ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rlxd-archives
+          path: ${{ runner.temp }}/a
+
+      - name: The Rust toolchain rlxd/rust-toolchain.toml names
+        if: runner.os != 'Windows'
+        working-directory: rlxd
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: runner.os != 'Windows'
+        with:
+          workspaces: rlxd -> target
+          key: upgrade-${{ matrix.target }}
+
+      - name: Sync the tree
+        run: uv sync --locked --extra dev
+
+      - name: rlx upgrade with rlx's daemons (handoff 4.2, 7.8)
+        run: |
+          set -euo pipefail
+          exe=""; [ "$RUNNER_OS" = Windows ] && exe=.exe
+          export AISQUARE_HOME="$RUNNER_TEMP/home" CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude"
+          export UV_TOOL_DIR="$RUNNER_TEMP/uv-tools" UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv-bin"
+          mkdir -p "$AISQUARE_HOME" "$CLAUDE_CONFIG_DIR"
+
+          # rlx $V, a uv tool from the tree's wheel, and the stub releases server.
+          uv build --wheel -o "$RUNNER_TEMP/dist"
+          uv tool install "$(ls "$RUNNER_TEMP"/dist/*.whl)"
+          bin=$(uv tool dir --bin); [ "$RUNNER_OS" = Windows ] && bin=$(cygpath -u "$bin")
+          export PATH="$bin:$PATH"
+          V=$(rlx --version | awk '{print $2}')
+          root="$RUNNER_TEMP/stub"; mkdir -p "$root/v$V" && cp "$RUNNER_TEMP"/a/* "$root/v$V/"
+          uv run --locked --extra dev python tests/stub_releases.py "$root" \
+            --log "$RUNNER_TEMP/stub.log" --url-file "$RUNNER_TEMP/url" > "$RUNNER_TEMP/stub.out" 2>&1 &
+          stub=$!
+          trap 'rlxd stop >/dev/null 2>&1 || true; kill $stub 2>/dev/null || true' EXIT
+          for _ in $(seq 100); do test -s "$RUNNER_TEMP/url" && break; sleep 0.2; done
+          export AISQUARE_RELEASES_URL="$(cat "$RUNNER_TEMP/url")"
+          rlx daemon install
+          rlxd serve --detach
+          echo "rlx $V; rlxd $(rlxd status --json | jq -r .data.version)"
+
+          # 4.1 and 7.8: the check counts rlxd, and keeps every key the app reads.
+          rlx --json upgrade --check > check.json
+          jq -e '.daemons | map(.kind) | index("rlxd") != null' check.json
+          jq -e '(["current","latest","update_available","live_agents","remote","asqs","launchers","commands_taken","daemons","runs_in_flight","ptys"] - keys) == []' check.json
+
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Without --restart-daemons, a running daemon refuses the upgrade.
+            set +e; rlx upgrade --yes --json-lines > up.jsonl; code=$?; set -e
+            cat up.jsonl; test "$code" = 1
+            jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "daemon_running"' up.jsonl
+            jq -c . up.jsonl > /dev/null
+            exit 0
+          fi
+
+          # dist2: the tree stamped $V+upgrade, a wheel and this host's rlxd archive. It is
+          # built in a worktree of this commit, so the checkout's pyproject.toml and uv.lock
+          # are never touched and every `uv run --locked` here checks the real lock. Cargo
+          # builds into the checkout's target dir, whose cached dependencies build once.
+          W="$V+upgrade"
+          tree2="$RUNNER_TEMP/tree2"
+          target="$PWD/rlxd/target"
+          git worktree add --detach "$tree2" HEAD
+          uv run --locked --extra dev python - "$tree2" "$W" <<'EOF'
+          import re, sys
+          from pathlib import Path
+          root, version = Path(sys.argv[1]), sys.argv[2]
+          for name in ("pyproject.toml", "rlxd/Cargo.toml"):
+              path = root / name
+              text = path.read_text(encoding="utf-8")
+              text, n = re.subn(r'(?m)^version = "[^"]+"', f'version = "{version}"', text, count=1)
+              assert n == 1, name
+              path.write_text(text, encoding="utf-8")
+          EOF
+          (cd "$tree2" && uv build --wheel -o "$RUNNER_TEMP/dist2")
+          (cd "$tree2/rlxd" && CARGO_TARGET_DIR="$target" cargo build --release -p rlxd -p rlxd-hook)
+          mkdir -p "$root/v$W"
+          uv run --locked --extra dev python scripts/rlxd_archive.py pack --target "$TARGET" \
+            --bin-dir "$target/release" --out "$root/v$W"
+          # Sums for this host's archive alone: `rlxd_archive.py sums` refuses a release
+          # missing any of the five targets, as it must for a real one, and `rlx daemon
+          # install` reads only its own target's line.
+          (cd "$root/v$W" && shasum -a 256 "rlxd-$TARGET.tar.gz" > rlxd-SHA256SUMS)
+          (cd "$tree2/rlxd" && CARGO_TARGET_DIR="$target" cargo build --release -p rlxd --features fake-claude --bin fake-claude)
+          fc="$RUNNER_TEMP/fake-claude"; mkdir -p "$fc"; cp "$target/release/fake-claude" "$fc/slow"
+          git worktree remove --force "$tree2"
+          git diff --exit-code -- pyproject.toml uv.lock rlxd/Cargo.toml rlxd/Cargo.lock
+          v1_wheel="$(ls "$RUNNER_TEMP"/dist/*.whl)"
+          v2_wheel="$(ls "$RUNNER_TEMP"/dist2/*.whl)"
+          export AISQUARE_INSTALL_PACKAGE="$v2_wheel"
+
+          # Live findings of #626's test (#2831) and review (#3038), against this real rlxd.
+          # H1a, H1c and R1: three live, restartable records that name what rlx doesn't
+          # write: an rlxd whose argv[0] is a script, a watch running /usr/bin/touch, and a
+          # watch running rlx's own interpreter with `-c`. `upgrade --check` runs none of
+          # them (rlxd is asked through the rlxd beside rlx), and the upgrade refuses
+          # (daemon_unrecognized) before it signals or runs any.
+          plant="$RUNNER_TEMP/plant"; mkdir -p "$plant"
+          tool_python="$UV_TOOL_DIR/aisquare-cli/bin/python"; test -x "$tool_python"
+          printf '#!/bin/sh\ntouch "%s/ran-script"\n' "$plant" > "$plant/rlxd"
+          chmod +x "$plant/rlxd"
+          uv run --locked --extra dev python - "$plant" "$tool_python" <<'EOF' &
+          import os, sys, time
+          from pathlib import Path
+          from aisquare.core import daemons
+          plant, tool_python = Path(sys.argv[1]), sys.argv[2]
+          code = f"open({str(plant / 'ran-dash-c')!r}, 'w')"
+          held = [
+              daemons.register("rlxd", argv=[str(plant / "rlxd"), "serve", "--detach"], restartable=True),
+              daemons.register("watch", argv=["/usr/bin/touch", str(plant / "ran-touch")], restartable=True),
+              daemons.register("watch", argv=[tool_python, "-c", code], restartable=True),
+          ]
+          (plant / "pid").write_text(str(os.getpid()), encoding="utf-8")
+          time.sleep(3600)
+          EOF
+          for _ in $(seq 150); do test -s "$plant/pid" && break; sleep 0.2; done
+          # Whatever ends the step, the holder goes too: left, it keeps its records alive.
+          trap 'rlxd stop >/dev/null 2>&1 || true; kill $stub "$(cat "$plant/pid" 2>/dev/null)" 2>/dev/null || true' EXIT
+          rlx --json upgrade --check > check.json
+          jq -e '[.daemons[].kind] | (map(select(. == "watch")) | length == 2) and (map(select(. == "rlxd")) | length == 2)' check.json
+          test ! -e "$plant/ran-script"
+          REAL=$(rlxd status --json | jq .data.pid)
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "daemon_unrecognized" and (.[-1].data.detail | contains("/usr/bin/touch") and contains("rlxd ("))' up.jsonl
+          sleep 1
+          test ! -e "$plant/ran-touch"; test ! -e "$plant/ran-script"; test ! -e "$plant/ran-dash-c"
+          holder=$(cat "$plant/pid"); kill -0 "$holder"
+          rlxd status --json | jq -e --argjson p "$REAL" '.data.pid == $p'
+          kill "$holder" && rm "$plant/pid"  # the trap kills no pid reused since
+          # Its three records go with it (rlxd's brain, rlxd's child, has one of its own).
+          for _ in $(seq 100); do
+            rlx --json upgrade --check | jq -e --argjson h "$holder" '[.daemons[] | select(.pid == $h)] | length == 0' > /dev/null && break
+            sleep 0.2
+          done
+          rlx --json upgrade --check | jq -e --argjson h "$holder" '[.daemons[] | select(.pid == $h)] | length == 0'
+
+          # M4: a frozen rlxd (SIGSTOP) can't say its runs and PTYs, so the upgrade refuses
+          # (ptys_live, the error its detail) and stops nothing.
+          FROZEN=$(rlxd status --json | jq .data.pid)
+          kill -STOP "$FROZEN"
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          kill -CONT "$FROZEN"
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "ptys_live" and (.[-1].data.detail | length > 0)' up.jsonl
+          rlxd status --json | jq -e --argjson p "$FROZEN" '.data.pid == $p'
+
+          # 4.2: the upgrade with --restart-daemons ends upgrade.done, rlxd restarted at
+          # the new version with a new pid.
+          OLD_PID=$(rlxd status --json | jq .data.pid)
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; echo "$code"; test "$code" = 0
+          jq -s -e 'length > 0 and .[-1].type == "upgrade.done" and (.[-1].data.restarted | index("rlxd") != null)' up.jsonl
+          rlxd status --json | jq -e --arg v "$(rlx --version | awk '{print $2}')" --argjson p "$OLD_PID" '.data.version == $v and .data.pid != $p and .data.pid > 0'
+          test "$(rlx --version | awk '{print $2}')" = "$W"
+          [ "$(jq -c . up.jsonl | wc -l)" -eq "$(wc -l < up.jsonl)" ]
+
+          # PTYs: a live one refuses a restart (ptys_live), and --end-ptys ends it. rlx is
+          # $W now, so this leg swaps back to $V (the first wheel; the stub serves v$V's
+          # archive): a real swap, not "nothing newer to install".
+          export AISQUARE_INSTALL_PACKAGE="$v1_wheel"
+          rlxd call pty.spawn '{"argv":["sh","-c","sleep 300"],"cols":80,"rows":24}'
+          rlx --json upgrade --check | jq -e '.ptys | length == 1'
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "ptys_live"' up.jsonl
+          rlx upgrade --yes --restart-daemons --end-ptys --json-lines > up.jsonl
+          cat up.jsonl
+          jq -s -e 'any(.[]; .data.step == "stop_daemons" and .data.status == "done" and ((.data.detail // "") | startswith("ended 1 PTY;")))' up.jsonl
+          jq -s -e --arg v "$V" '.[-1].type == "upgrade.done" and .[-1].data.to == $v and (.[-1].data.restarted | index("rlxd") != null)' up.jsonl
+          rlxd status --json | jq -e --arg v "$V" '.data.version == $v'
+
+          # F4: Ctrl-C (SIGINT to the process group) while uv installs, under
+          # --restart-daemons --json-lines: upgrade.error interrupted, rlx still $V, and rlxd
+          # started again at $V with a new pid. A wrapper holds `uv tool install` 30 s, so
+          # the signal lands while uv runs.
+          export AISQUARE_INSTALL_PACKAGE="$v2_wheel"
+          slow="$RUNNER_TEMP/slow-uv"; mkdir -p "$slow"
+          printf '#!/bin/sh\ncase "$1 $2" in "tool install") sleep 30;; esac\nexec "%s" "$@"\n' "$(command -v uv)" > "$slow/uv"
+          chmod +x "$slow/uv"
+          OLD_PID=$(rlxd status --json | jq .data.pid)
+          set -m
+          PATH="$slow:$PATH" rlx upgrade --yes --restart-daemons --json-lines > up.jsonl &
+          job=$!
+          set +m
+          for _ in $(seq 150); do grep -q '"step":"install","status":"started"' up.jsonl && break; sleep 0.2; done
+          sleep 2
+          kill -INT -- "-$job"
+          set +e; wait "$job"; code=$?; set -e
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].type == "upgrade.error" and .[-1].data.code == "interrupted"' up.jsonl
+          rlxd status --json | jq -e --arg v "$V" --argjson p "$OLD_PID" '.data.version == $v and .data.pid != $p'
+          test "$(rlx --version | awk '{print $2}')" = "$V"
+
+          # Runs in flight: a fake-claude/slow run (30 s) refuses (runs_in_flight), and
+          # --wait-runs 1 waits for it to end, then swaps to $W again.
+          rlxd stop
+          RLXD_CLAUDE_BIN="$fc/slow" FAKE_CLAUDE_SLOW_MS=30000 rlxd serve --detach
+          run=$(uv run --locked --extra dev python -c 'import uuid; print(uuid.uuid4())')
+          rlxd call run.start "{\"run_id\":\"$run\",\"kind\":\"task\",\"prompt\":\"go\",\"mount\":{\"kind\":\"no_tools\"},\"space\":\"default\"}"
+          for _ in $(seq 50); do
+            rlxd call run.get "{\"run_id\":\"$run\"}" | jq -e '.data.state == "running"' > /dev/null && break
+            sleep 0.2
+          done
+          rlx --json upgrade --check | jq -e '.runs_in_flight | length == 1'
+          set +e; rlx upgrade --yes --restart-daemons --json-lines > up.jsonl; code=$?; set -e
+          cat up.jsonl; test "$code" = 1
+          jq -s -e '.[-1].data.code == "runs_in_flight"' up.jsonl
+          # M6: with the run in flight, an up-to-date upgrade is still nothing to do (and
+          # warns of nothing), and a plain one still gives the route's own refusal (a wheel
+          # install's, without the package).
+          env -u AISQUARE_INSTALL_PACKAGE rlx upgrade --yes --version "$V" > same.out 2> same.err
+          grep -q "already the version asked for" same.out
+          if grep -q "keeps running the release" same.err; then echo "warned on a no-op"; exit 1; fi
+          set +e; env -u AISQUARE_INSTALL_PACKAGE rlx --json upgrade --yes > plain.json; code=$?; set -e
+          test "$code" = 1; jq -e '.error == "upgrade_unsupported_route"' plain.json
+          rlx upgrade --yes --restart-daemons --wait-runs 1 --json-lines > up.jsonl
+          cat up.jsonl
+          jq -s -e --arg w "$W" '.[-1].type == "upgrade.done" and .[-1].data.to == $w and (.[-1].data.restarted | index("rlxd") != null)' up.jsonl
+          rlxd call run.get "{\"run_id\":\"$run\"}" | jq -e '.data.state == "done"'
+          rlxd status --json | jq -e --arg w "$W" '.data.version == $w'
+
+  attach:
+    name: attach to the release
+    needs: [package, install]
+    if: github.event_name == 'release' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # gh release upload
+    concurrency:
+      group: rlxd-attach-${{ github.event.release.tag_name || inputs.tag }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Inputs reach the shell through the environment, never through ${{ }} inside a
+      # script, so a tag cannot inject a command.
+      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+      DRY_RUN: ${{ github.event_name != 'release' && inputs.dry_run }}
+      # GH_TOKEN (contents: write) is given to the two gh steps alone.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # What is attached is built from the tag, never from a ref a dispatch picked: every
+      # branch cut after a release carries its version until the bump, so the version
+      # check below would pass a build of any of them, and --clobber would replace the
+      # release's archives and its sums with it. So the run's ref must be the tag (a
+      # release's own run, or a dispatch with --ref vX.Y.Z), and the tag must still name
+      # the commit this run built: one moved since the run started is refused too. A dry
+      # run checks this as well. The repo is public: ls-remote needs no token.
+      - name: The run is the tag's, and built the tag's commit
+        run: |
+          if [ "$GITHUB_REF" != "refs/tags/$TAG" ]; then
+            echo "::error::ref_not_tag: this run is for $GITHUB_REF, not refs/tags/$TAG. Attach only from the tag: gh workflow run rlxd.yml --ref $TAG -f release_tag=$TAG"
+            exit 1
+          fi
+          refs=$(git ls-remote --tags origin)
+          tagged=""
+          while read -r sha ref; do
+            case "$ref" in
+              "refs/tags/$TAG^{}") tagged=$sha; break ;; # an annotated tag, peeled
+              "refs/tags/$TAG") tagged=$sha ;;
+            esac
+          done <<<"$refs"
+          built=$(git rev-parse HEAD)
+          if [ "$built" != "$GITHUB_SHA" ] || [ "$tagged" != "$built" ]; then
+            echo "::error::tag_moved: $TAG names ${tagged:-nothing} at origin, but this run built $GITHUB_SHA"
+            exit 1
+          fi
+          echo "$TAG is $built, the commit this run built"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rlxd-archives
+          path: r
+
+      - name: The tag is v + pyproject.toml's version
+        run: |
+          V=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$TAG" != "v$V" ]; then
+            echo "::error::tag_version_mismatch: $TAG is not v$V, this tree's version"
+            exit 1
+          fi
+          echo "attaching rlxd $V to $TAG (dry run: $DRY_RUN)"
+
+      - name: The release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,assets \
+            --jq '"\(.tagName): draft=\(.isDraft), assets now: \([.assets[].name] | join(", "))"'
+
+      - name: The archives match their sums
+        working-directory: r
+        run: |
+          ls -l
+          test "$(ls | wc -l)" -eq 6
+          shasum -a 256 -c rlxd-SHA256SUMS
+
+      # --clobber, as installers.yml's, so a rerun of a failed job replaces what it
+      # attached. Only an explicit "false" uploads: a published release's event gives
+      # one, and so does dry_run=false by hand. Anything else, an empty or unexpected
+      # value included, is a dry run, so this step fails closed.
+      - name: Upload to the release (a dry run prints it)
+        working-directory: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=(rlxd-*.tar.gz rlxd-*.zip rlxd-SHA256SUMS)
+          cmd=(gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY")
+          if [ "$DRY_RUN" != false ]; then
+            echo "DRY RUN (dry_run=$DRY_RUN), nothing attached. Would run: ${cmd[*]}"
+            {
+              echo "## Dry run: nothing attached to $TAG"
+              echo '```'
+              echo "${cmd[*]}"
+              echo '```'
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          "${cmd[@]}"
+          {
+            echo "## Attached to $TAG"
+            for f in "${files[@]}"; do
+              echo "- https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$f"
+            done
+          } >>"$GITHUB_STEP_SUMMARY"

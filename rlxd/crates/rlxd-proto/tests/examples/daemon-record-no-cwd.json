@@ -1,0 +1,1 @@
+{"id": "fedcba987654", "kind": "rlxd", "pid": 77, "host": "build-01", "version": "0.10.1", "started_at": "2026-11-25T18:00:00Z", "heartbeat_at": "2026-11-25T18:00:05Z", "argv": ["rlxd", "serve"], "restartable": false, "cwd": null}

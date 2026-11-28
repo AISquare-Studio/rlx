@@ -56,6 +56,13 @@ otherwise inherit a live identity:
     our own. A background worker of ours is not an agent session and has no
     business wearing one's identity; it also outlives the pane whose hook
     started it, which is the whole point of detaching it.
+  * ``services/upgrade_daemons.py::spawn_detached`` — one of rlx's own daemons
+    (rlxd, ``watch``, ``serve``) started again from its recorded argv after
+    ``upgrade --restart-daemons``, or the helper that starts one again once it
+    has stopped. Not an agent session, and it outlives the upgrade.
+  * ``services/upgrade_daemons.py::_run`` — rlxd's own command line
+    (``rlxd status``, ``rlxd call``, ``rlxd stop``) asked by ``upgrade``. The
+    engine's CLI talking to its daemon, no model process.
   * ``services/claude_accounts.py::_run_token_refresh`` — ``claude mcp get``
     of a server no one has, on an account whose token went stale: Claude
     Code's own startup refreshes the token. No model request; a chore on the
@@ -100,6 +107,8 @@ narrowing their environment would be change without a reason:
     such asq's ``AISQUARE_HOME``/``HOME``, whether it runs on this home (#21). No model.
   * ``core/process_table.py::ps_text`` — ``ps -A -o pid=,ppid=,pcpu=,rss=,etime=``: every
     process at once, for ``fleet top`` and asq's Agent resources page. A listing, no model.
+  * ``cli/connectors.py::run_rlxd`` — ``rlxd call connectors.list``, one request to
+    this machine's rlxd; no model.
   * ``cli/watch.py::action_open_transcript`` — a pager/viewer on a file.
   * ``cli/ui/terminal.py::wsl_path`` — ``wslpath -u`` on a Windows path pasted into a
     pane under WSL (#288). A path converter, no model.
@@ -116,8 +125,8 @@ narrowing their environment would be change without a reason:
     ``aisquare upgrade`` replacing its own install. A package manager, not a
     model process.
   * ``services/install_route.py::run_captured`` — the NEW install after an
-    upgrade, asked ``--version`` and ``agents refresh-hooks``. Our own CLI, like
-    ``core/selfcli.py::run`` below.
+    upgrade, asked ``--version``, ``agents refresh-hooks`` and ``daemon install``.
+    Our own CLI, like ``core/selfcli.py::run`` below.
   * ``services/install_route.py::exec_replace`` — ``uv tool uninstall``, the
     last step of ``aisquare uninstall``, which this process becomes.
   * ``core/selfcli.py::exec_self`` — asq handing its terminal to ``aisquare
@@ -426,6 +435,11 @@ SEAMS: dict[str, Seam] = {
         "`ps -A -o pid=,ppid=,pcpu=,rss=,etime=`: every process at once, for `fleet top` and "
         "asq's Agent resources page. A listing, no model",
     ),
+    "aisquare/cli/connectors.py::run_rlxd": Seam(
+        EXCLUDED,
+        "`rlxd call connectors.list`: one request to this machine's rlxd over its socket, "
+        "for `connectors list`. rlxd answers from its cache; no model",
+    ),
     "aisquare/cli/watch.py::action_open_transcript": Seam(
         EXCLUDED, "a pager/viewer on a transcript file"
     ),
@@ -450,8 +464,22 @@ SEAMS: dict[str, Seam] = {
     ),
     "aisquare/services/install_route.py::run_captured": Seam(
         EXCLUDED,
-        "the upgraded install asked `--version` and `agents refresh-hooks`: our own CLI as "
-        "a subprocess, no model process; not stripped, like `core/selfcli.py::run`",
+        "the upgraded install asked `--version`, `agents refresh-hooks` and `daemon install`: "
+        "our own CLI as a subprocess, no model process; not stripped, like "
+        "`core/selfcli.py::run`",
+    ),
+    "aisquare/services/upgrade_daemons.py::_run": Seam(
+        EXCLUDED,
+        "rlxd's own command line (`rlxd status`, `rlxd call`, `rlxd stop`) asked by "
+        "`upgrade` (4.2): the engine's CLI talking to its daemon, no model process",
+        strips_identity=True,
+    ),
+    "aisquare/services/upgrade_daemons.py::spawn_detached": Seam(
+        EXCLUDED,
+        "one of rlx's own daemons (rlxd, `watch`, `serve`) started again from its recorded "
+        "argv after `upgrade --restart-daemons` (4.2), or the helper that starts one again "
+        "once it has stopped: not an agent session, and it outlives the upgrade",
+        strips_identity=True,
     ),
     "aisquare/services/install_route.py::exec_replace": Seam(
         EXCLUDED,

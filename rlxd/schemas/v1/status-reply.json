@@ -1,0 +1,441 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StatusData",
+  "description": "`status`'s reply data.\n\n```json\n{\"version\": \"0.10.3\", \"pid\": 4242, \"platform\": \"macos\", \"protocol_version\": 1,\n \"capabilities\": [], \"seq\": 0, \"clients\": {\"app\": 0, \"tui\": 0, \"remote\": 0, \"cli\": 1},\n \"gate\": \"signed app only\", \"brain\": {\"pid\": 4243, \"restarts\": 0, \"handled\": 12, \"queued\": 0},\n \"claude\": {\"installed\": true, \"version\": \"2.1.314\", \"signed_in\": true,\n            \"auth_method\": \"claude.ai\", \"account\": \"…\", \"plan\": \"pro\"},\n \"runs\": {\"live\": 0, \"queued\": 0}, \"jobs\": {\"count\": 0},\n \"paths\": {\"home\": \"…\", \"socket\": \"…\", \"lock\": \"…\", \"token\": \"…\", \"logs\": \"…\"}}\n```\n\n`runs` and `jobs` hold zeros until the runner and the scheduler fill them, and `seq` is\n0 until the event bus does.",
+  "type": "object",
+  "properties": {
+    "brain": {
+      "description": "The resident Python brain (1.6).",
+      "$ref": "#/$defs/Brain"
+    },
+    "capabilities": {
+      "description": "What this rlxd can do, by name, as `hello`'s reply lists it. A client ignores names\nit does not know.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "claude": {
+      "description": "The Claude Code rlxd runs: `RLXD_CLAUDE_BIN`, or `claude` on `PATH`.",
+      "$ref": "#/$defs/Claude"
+    },
+    "clients": {
+      "description": "The connections open now, by the role their `hello` was let in as. A refused\n`hello` is never counted.",
+      "$ref": "#/$defs/Clients"
+    },
+    "dev_features": {
+      "description": "The development-only cargo features this rlxd was built with, by name, such as\nthe one that lets it run in gate dev mode (5.1): a build for development and CI.\nAbsent from a release build, which has none.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "gate": {
+      "description": "Who may be the tool-call gate (5.1): `signed app only`, or `dev mode (unsigned\napp accepted)` while rlxd runs in gate dev mode.",
+      "type": "string",
+      "minLength": 1
+    },
+    "jobs": {
+      "description": "Scheduler jobs (7.6).",
+      "$ref": "#/$defs/Jobs"
+    },
+    "paths": {
+      "description": "Where this rlxd keeps what it serves and writes.",
+      "$ref": "#/$defs/Paths"
+    },
+    "pid": {
+      "description": "rlxd's process id, from 1 to 2147483647 (2^31 - 1), so a client's `kill` of it, a\nC `int`, can never be `kill(-1)`.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 2147483647,
+      "minimum": 1
+    },
+    "pipe_acl": {
+      "description": "Windows only: whom the named pipe's DACL admits. `current_user` says it holds one\nentry, for the user rlxd runs as, which rlxd read back from the live pipe. Absent\non macOS and Linux, where the socket's mode, 0600, does that.",
+      "type": "string",
+      "minLength": 1
+    },
+    "platform": {
+      "description": "The OS rlxd runs on: `macos`, `linux` or `windows`.",
+      "type": "string",
+      "minLength": 1
+    },
+    "protocol_version": {
+      "description": "The protocol version of the connection that asked.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "runs": {
+      "description": "Headless runs (7.5).",
+      "$ref": "#/$defs/Runs"
+    },
+    "seq": {
+      "description": "The `seq` of the latest event on this home's event stream, or 0 before the first.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 0
+    },
+    "version": {
+      "description": "rlxd's version, which is rlx's.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "version",
+    "pid",
+    "platform",
+    "protocol_version",
+    "capabilities",
+    "seq",
+    "clients",
+    "gate",
+    "brain",
+    "claude",
+    "runs",
+    "jobs",
+    "paths"
+  ],
+  "$defs": {
+    "Brain": {
+      "description": "The resident Python brain, `rlx brain --stdio`, which rlxd starts and keeps running\n(1.6).",
+      "type": "object",
+      "properties": {
+        "backoff_ms": {
+          "description": "While rlxd waits to start it again: how long that wait is, in milliseconds. It\ndoubles with each start that fails, up to 30 s, so a brain that keeps dying does\nnot spin.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "error": {
+          "description": "Why no brain runs now, or why the last one ended: `brain_not_found`,\n`brain_start_failed`, `brain_incompatible` (rlx and rlxd are of releases that share\nno brain protocol), `brain_exited` or `brain_unresponsive`. Absent once a brain\nruns. A client ignores codes it does not know.",
+          "$ref": "#/$defs/Error"
+        },
+        "handled": {
+          "description": "How many requests it answered.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "pid": {
+          "description": "Its process id, while one runs and speaks rlxd's protocol: from 1 to 2147483647\n(2^31 - 1), as rlxd's. Absent while it starts, waits to start again, or is missing.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 2147483647,
+          "minimum": 1
+        },
+        "queued": {
+          "description": "How many requests wait for it now, in its queue: at most 64, after which a request\nis refused at once. Absent from a status before the queue had a bound reads as 0.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "restarts": {
+          "description": "How many times rlxd started it again after it ended: 0 for the first brain.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "restarts",
+        "handled"
+      ]
+    },
+    "Claude": {
+      "description": "The Claude Code rlxd runs, and its sign-in, as `claude --version` and\n`claude auth status --json` report them. rlxd reads no credential store itself.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "The account it is signed in as: its email address.",
+          "type": "string"
+        },
+        "as_of": {
+          "description": "When the probe these values come from ended, RFC 3339 in UTC: `claude --version`\nand `claude auth status --json`, run with the app's environment. Absent while the\nfirst probe since rlxd started, or since the app's environment changed, is still\nrunning: `status` never waits on one for long, so `signed_in` is then false.",
+          "type": "string",
+          "minLength": 1
+        },
+        "auth_method": {
+          "description": "How it is signed in, such as `claude.ai`.",
+          "type": "string"
+        },
+        "error": {
+          "description": "Why that probe gave no answer, when it didn't: Claude Code would not start, did\nnot answer within its time, or printed no JSON. `signed_in` is then false. It\nnever holds what Claude Code printed.",
+          "type": "string",
+          "minLength": 1
+        },
+        "installed": {
+          "description": "Whether rlxd found the program: `RLXD_CLAUDE_BIN` when it is set, else `claude`\non the app's `PATH` (4.3), else on rlxd's own.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "The program rlxd starts as Claude Code, an absolute path as it was found, links\nkept: resolved when the app sets `PATH` and when rlxd starts, never at a run's\nstart (4.3). Absent when it is not installed.",
+          "type": "string",
+          "minLength": 1
+        },
+        "path_source": {
+          "description": "Where rlxd looked for it: `app`, the app's `PATH` (4.3); `rlxd`, rlxd's own `PATH`,\nas the app set none; or `rlxd_claude_bin`, `RLXD_CLAUDE_BIN` in rlxd's own\nenvironment, which tests set ([`Claude::PATH_SOURCES`]). Set whether or not it was\nfound, so the app can tell when its `PATH` was not the one searched.",
+          "type": "string",
+          "minLength": 1
+        },
+        "plan": {
+          "description": "The account's plan, such as `pro` or `max`.",
+          "type": "string"
+        },
+        "signed_in": {
+          "description": "Whether it is signed in. False when it is not installed, or would not say.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "Its version, such as `2.1.314`, when `claude --version` said one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "installed",
+        "signed_in"
+      ]
+    },
+    "Clients": {
+      "description": "The connections open now, by `hello` role.",
+      "type": "object",
+      "properties": {
+        "app": {
+          "description": "rlxapp, the gate: connections whose `hello {role: \"app\"}` passed the gate checks.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        },
+        "cli": {
+          "description": "Command-line clients, such as `rlxd call` and `rlxd-hook`, the one asking included.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        },
+        "remote": {
+          "description": "rlx's Remote server.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        },
+        "tui": {
+          "description": "rlx's terminal UI.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "app",
+        "tui",
+        "remote",
+        "cli"
+      ]
+    },
+    "Error": {
+      "title": "Error",
+      "description": "Why a request was refused or failed.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "A stable, machine-readable code, such as `unauthorized`, `unknown_method`,\n`incompatible_protocol`, `not_gate` or `not_a_tty`. A client also accepts codes it\ndoes not know.",
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "description": "More about what went wrong: a string, such as an underlying error's text, or an\nobject whose fields the code defines, such as `incompatible_protocol`'s\n`{\"supported\": [1]}` or `denied`'s `{\"by\": …}`. Never `null`: absent instead.",
+          "type": [
+            "string",
+            "object"
+          ]
+        },
+        "hint": {
+          "description": "What to do about it, for a person.",
+          "type": "string"
+        },
+        "message": {
+          "description": "What went wrong, for a person.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "incompatible_protocol"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "object",
+                "properties": {
+                  "supported": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "maximum": 4294967295,
+                      "minimum": 1
+                    },
+                    "minItems": 1
+                  }
+                },
+                "required": [
+                  "supported"
+                ]
+              }
+            },
+            "required": [
+              "detail"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "since_ahead"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "detail": {
+                "type": "object",
+                "properties": {
+                  "head": {
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 0
+                  },
+                  "since": {
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "head"
+                ]
+              }
+            },
+            "required": [
+              "detail"
+            ]
+          }
+        }
+      ],
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "Jobs": {
+      "description": "Scheduler jobs.",
+      "type": "object",
+      "properties": {
+        "count": {
+          "description": "Jobs defined.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "db": {
+          "description": "The scheduler's database, `<home>/rlxd/rlxd.db`. Absent: `ok`. `set_aside`: rlxd\nfound one it could not read (corrupt, or from a newer rlxd), moved it aside\n(`set_aside` says where) and began a fresh one. `unavailable`: it could not be\nopened for another reason (busy, locked, no access), so the scheduler isn't running\nand the file is as it was (`reason` says why).",
+          "type": "string"
+        },
+        "reason": {
+          "description": "For `unavailable`: why the database could not be opened.",
+          "type": "string"
+        },
+        "set_aside": {
+          "description": "For `set_aside`: where the database it could not read was moved, with why.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "count"
+      ]
+    },
+    "Paths": {
+      "description": "Where this rlxd keeps what it serves and writes, as it resolved them from the home.",
+      "type": "object",
+      "properties": {
+        "home": {
+          "description": "The home: `RLX_HOME`, else `AISQUARE_HOME`, else `~/.aisquare`.",
+          "type": "string"
+        },
+        "lock": {
+          "description": "The lock file rlxd holds while it runs, one rlxd per home.",
+          "type": "string"
+        },
+        "logs": {
+          "description": "The directory of rlxd's logs.",
+          "type": "string"
+        },
+        "socket": {
+          "description": "Where clients connect: the socket's path on macOS and Linux, the named pipe's\nname on Windows.",
+          "type": "string"
+        },
+        "token": {
+          "description": "The file holding the shared client token.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "home",
+        "socket",
+        "lock",
+        "token",
+        "logs"
+      ]
+    },
+    "Runs": {
+      "description": "Headless runs.",
+      "type": "object",
+      "properties": {
+        "live": {
+          "description": "Runs going now.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        },
+        "queued": {
+          "description": "Runs waiting to start.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "live",
+        "queued"
+      ]
+    }
+  }
+}

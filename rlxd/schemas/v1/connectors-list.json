@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorsListParams",
+  "description": "`connectors.list`'s params: `{refresh?, allow_turn?, account?}`; `refresh` and\n`allow_turn` are `false` when absent, and with no `account` it is every account.",
+  "type": "object",
+  "properties": {
+    "account": {
+      "description": "The one account to list, and to refresh, by its rlx slot. An account rlx doesn't\nknow is `no_such_account`.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "allow_turn": {
+      "description": "With `refresh`, and no route without a turn: run a one-turn probe for it, of\n`account` (the default account without one). For `app`, `cli` and `tui`; `remote`\ngets `role_not_allowed`.",
+      "type": "boolean"
+    },
+    "refresh": {
+      "description": "Read the connectors from Claude Code now, rather than as rlxd last saw them.",
+      "type": "boolean"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SettingsChanged",
+  "description": "`settings.changed`'s and `settings.deleted`'s data, on the `settings` topic: a setting\nwas set, at `version`, or deleted, from `version`. Read a new value with `settings.get`.\n\n```json\n{\"key\": \"theme\", \"version\": 4, \"by_device\": \"Sam MacBook\"}\n```",
+  "type": "object",
+  "properties": {
+    "by_device": {
+      "description": "The paired device that set or deleted it, when an app-role connection did.",
+      "type": "string",
+      "minLength": 1
+    },
+    "key": {
+      "description": "The setting's key.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "version": {
+      "description": "Its version now, from 1; for `settings.deleted`, the version it was deleted at.",
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 18446744073709551615,
+      "minimum": 1
+    }
+  },
+  "required": [
+    "key",
+    "version"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorId",
+  "description": "`connector.added` and `connector.removed`: `{account, id}`.",
+  "type": "object",
+  "properties": {
+    "account": {
+      "description": "The account's rlx slot: 1 when absent, as in an event published before rlxd kept\nmore than one account.",
+      "type": "integer",
+      "format": "uint32",
+      "default": 1,
+      "maximum": 4294967295,
+      "minimum": 1
+    },
+    "id": {
+      "description": "The connector.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "id"
+  ]
+}

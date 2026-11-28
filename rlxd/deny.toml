@@ -1,0 +1,48 @@
+# cargo-deny's checks for the rlxd workspace: `cargo deny check`, run by
+# .github/workflows/rlxd.yml (handoff 0.10.3, 1.1). Every target counts, so a
+# Windows-only or macOS-only dependency is checked on whichever runner runs this.
+
+[advisories]
+# A RustSec advisory, or an unmaintained crate, fails the check; so does a yanked
+# version in Cargo.lock. To accept one, add its id to `ignore` with the reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# rlx is MIT. These are the licences of what rlxd's crates are built from today,
+# each permissive and compatible with shipping rlxd's binaries under MIT. A
+# dependency under anything else fails the check: add its licence here only after
+# reading it. The licence check leaves out dev-dependencies, which never ship
+# (`[licenses] include-dev` defaults to false). They stay in the graph for the
+# advisories, bans and sources checks.
+allow = [
+    "Apache-2.0",
+    # rlxd's own parts ported from tmux (crates/rlxd's licence is "MIT AND ISC").
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+# foldhash alone (hashbrown's default hasher, under rusqlite's hashlink, for the
+# scheduler's rlxd.db) is under the zlib licence, which asks only that its origin isn't
+# misrepresented and that altered sources say so: permissive, OSI approved, fine in MIT
+# binaries. Allowed for it, not the graph.
+exceptions = [{ allow = ["Zlib"], crate = "foldhash" }]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+# A `*` version is refused, except a path dependency inside this workspace.
+wildcards = "deny"
+allow-wildcard-paths = true
+# No Keychain or Security.framework crate (handoff 0.10.3, 4.3 and 5.1): rlxd reads no
+# credential store, and the gate's macOS peer check is raw FFI to Security.framework.
+deny = [
+    { crate = "security-framework", reason = "4.3: no Keychain crate; 5.1's check is raw FFI" },
+    { crate = "security-framework-sys", reason = "4.3: no Keychain crate; 5.1's check is raw FFI" },
+    { crate = "keyring", reason = "4.3: rlxd reads no credential store" },
+]
+
+[sources]
+# crates.io only: a crate from another registry or a git repository fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"

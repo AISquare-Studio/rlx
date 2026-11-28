@@ -1,0 +1,701 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JobEvent",
+  "description": "One event of the job topic: an event (event.json) whose data, for each job event type 7.6 describes, carries that type's fields.",
+  "allOf": [
+    {
+      "$ref": "#/$defs/Event"
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.put"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.deleted"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.paused"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.resumed"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.fired"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobFiredData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.skipped"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobSkippedData"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "job.watch_result"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/JobWatchResultData"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Event": {
+      "title": "Event",
+      "description": "One event on the stream `events.subscribe` opens.\n\n```json\n{\"schema_version\": 1, \"seq\": 42, \"time\": \"2026-11-25T12:00:00.000Z\", \"topic\": \"run\",\n \"type\": \"run.text\", \"data\": {\"run_id\": \"…\", \"run_seq\": 3, \"kind\": \"task\", \"attempt\": 1}}\n```\n\nTwo sequences number events. `seq` is per home: every event has one, and\n`events.subscribe {since}` resumes after it. `data.run_seq` is per run: every event\nwhose topic is `run` has one, with the run's `run_id`, `kind`, `attempt` and\n`job_id?`, so a client can replay one run from a known point.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "description": "The type's own fields. On the `run` topic, also `run_id`, `run_seq`, `kind`,\n`attempt` and `job_id?`.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "schema_version": {
+          "description": "The schema version this document follows.",
+          "type": "integer",
+          "const": 1
+        },
+        "seq": {
+          "description": "Strictly increasing per home, from 1, across every topic. `events.subscribe\n{since}` resumes after it.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 1
+        },
+        "time": {
+          "description": "When it happened: RFC 3339, in UTC, to the millisecond (`2026-11-25T12:00:00.000Z`).",
+          "type": "string",
+          "format": "date-time"
+        },
+        "topic": {
+          "description": "What it is about, in snake_case, such as `run` or `needs_you`. A client ignores\ntopics it does not know.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "type": {
+          "description": "What happened: `<topic>.<event>`, the event in snake_case, such as `run.text`,\n`fleet.agent_spawned` or `connector.login.open_url`. It starts with this event's\nown topic. A client ignores types it does not know.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "daemon"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^daemon\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^run\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "job"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^job\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "connector"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^connector\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "pty"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^pty\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "hook"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^hook\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "fleet"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^fleet\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "board"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^board\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "needs_you"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^needs_you\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "upgrade"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^upgrade\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "settings"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^settings\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "install"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^install\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "signin"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "pattern": "^signin\\.[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topic": {
+                "const": "run"
+              }
+            },
+            "required": [
+              "topic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "attempt": {
+                    "description": "Which attempt of the run, from 1.",
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 1
+                  },
+                  "job_id": {
+                    "description": "The scheduler job that fired the run, if one did.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "description": "The run's kind, such as task or widget_refresh.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "run_id": {
+                    "description": "The run this event belongs to.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "run_seq": {
+                    "description": "Strictly increasing per run, from 1.",
+                    "type": "integer",
+                    "maximum": 18446744073709551615,
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "run_seq",
+                  "kind",
+                  "attempt"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "required": [
+        "schema_version",
+        "seq",
+        "time",
+        "topic",
+        "type",
+        "data"
+      ]
+    },
+    "FireCause": {
+      "description": "Why a fire was made.",
+      "oneOf": [
+        {
+          "description": "It came due.",
+          "type": "string",
+          "const": "due"
+        },
+        {
+          "description": "`catch_up: once`, for fires it couldn't make: no app was connected, or rlxd was\ndown.",
+          "type": "string",
+          "const": "catch_up"
+        },
+        {
+          "description": "`job.run_now`.",
+          "type": "string",
+          "const": "run_now"
+        }
+      ]
+    },
+    "JobFiredData": {
+      "description": "`job.fired`.",
+      "type": "object",
+      "properties": {
+        "cause": {
+          "description": "Why.",
+          "$ref": "#/$defs/FireCause"
+        },
+        "fired_at": {
+          "description": "When it fired.",
+          "type": "string"
+        },
+        "job_id": {
+          "description": "The job's id.",
+          "$ref": "#/$defs/JobId"
+        },
+        "loud": {
+          "description": "Opaque: as `job.put` gave it.",
+          "type": "boolean"
+        },
+        "run_id": {
+          "description": "The fire's run.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "scheduled_for": {
+          "description": "The scheduled time it fired for (RFC 3339, UTC): for `run_now`, when it was asked.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "run_id",
+        "scheduled_for",
+        "fired_at",
+        "cause",
+        "loud"
+      ]
+    },
+    "JobId": {
+      "description": "A job's id, which the app picks: 1 to 128 ASCII letters, digits, `.`, `_`, `-` and\n`:`, starting with a letter or a digit.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "JobRef": {
+      "title": "JobRef",
+      "description": "`{job_id}`: `job.delete`'s, `job.pause`'s and `job.resume`'s params, `job.put`'s,\n`job.delete`'s, `job.pause`'s and `job.resume`'s reply, and `job.run_now`'s params.",
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "description": "The job's id.",
+          "$ref": "#/$defs/JobId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "job_id"
+      ]
+    },
+    "JobSkippedData": {
+      "description": "`job.skipped`.",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "For `connector_account_limited`: the account that holds it, limited (the one whose\nlimit resets soonest, when several do).",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "code": {
+          "description": "For `start_failed`: the error code the run's start was refused with.",
+          "type": "string"
+        },
+        "connector": {
+          "description": "For `connector_account_limited`: the connector its route was refused by.",
+          "type": "string"
+        },
+        "job_id": {
+          "description": "The job's id.",
+          "$ref": "#/$defs/JobId"
+        },
+        "reason": {
+          "description": "Why.",
+          "$ref": "#/$defs/SkipReason"
+        },
+        "resets_at": {
+          "description": "For `connector_account_limited`: when that account's limit resets, if rlx knows\n(RFC 3339).",
+          "type": "string",
+          "format": "date-time"
+        },
+        "scheduled_for": {
+          "description": "The scheduled time it skipped (RFC 3339, UTC).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id",
+        "scheduled_for",
+        "reason"
+      ]
+    },
+    "JobWatchResultData": {
+      "description": "`job.watch_result`: a watch job's call's raw result, from the fire's run.",
+      "type": "object",
+      "properties": {
+        "content": {
+          "description": "The call's result, exactly as Claude Code gave it, up to 1 MiB of JSON; past that,\nits first 1 MiB as a string (`truncated`)."
+        },
+        "input_sha256": {
+          "description": "The SHA-256 of the call's input as RFC 8785 JSON: the job's pinned call.",
+          "type": "string"
+        },
+        "is_error": {
+          "description": "Whether the call failed: then `content` is its error, not a result to match on.",
+          "type": "boolean"
+        },
+        "job_id": {
+          "description": "The job's id.",
+          "$ref": "#/$defs/JobId"
+        },
+        "run_id": {
+          "description": "The fire's run, as `job.fired` named it.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "tool": {
+          "description": "The tool called.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Whether `content` was cut: then it is no result to match on either.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "job_id",
+        "run_id",
+        "tool",
+        "input_sha256",
+        "content",
+        "is_error",
+        "truncated"
+      ]
+    },
+    "SkipReason": {
+      "description": "Why a due fire was not made.",
+      "oneOf": [
+        {
+          "description": "The job's last run was still queued or running.",
+          "type": "string",
+          "const": "overlap"
+        },
+        {
+          "description": "`job.pause` paused it.",
+          "type": "string",
+          "const": "paused"
+        },
+        {
+          "description": "A run of the job was rate-limited, and the limit hasn't reset.",
+          "type": "string",
+          "const": "rate_limited"
+        },
+        {
+          "description": "No app gate client was connected.",
+          "type": "string",
+          "const": "app_absent"
+        },
+        {
+          "description": "It came due while rlxd was down (or the clock jumped past it), and its `catch_up`\nis `skip`.",
+          "type": "string",
+          "const": "missed"
+        },
+        {
+          "description": "Its run could not be started: `code` says why (`run.start`'s refusal code, or\n`engine_restarted` for a start rlxd stopped in the middle of).",
+          "type": "string",
+          "const": "start_failed"
+        },
+        {
+          "description": "Its template routes by `connectors`, and every account that has them all\nconnected is usage-limited (#15): `connector`, `account` and `resets_at` say\nwhich, as `run.start`'s `connector_account_limited` does. No run is started on\nanother account.",
+          "type": "string",
+          "const": "connector_account_limited"
+        }
+      ]
+    }
+  }
+}

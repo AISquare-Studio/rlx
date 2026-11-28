@@ -1,0 +1,1 @@
+{"schema_version": 1, "id": 1, "ok": false, "error": {"code": "unauthorized", "message": "the first frame must be hello"}}

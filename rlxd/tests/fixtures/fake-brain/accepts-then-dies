@@ -1,0 +1,10 @@
+#!/bin/sh
+# fake-brain/accepts-then-dies: says a good hello, accepts its first request (id 1),
+# then dies before it answers. rlxd must say the request failed, never that it was not
+# delivered: once accepted, it may have run. accepts-then-dies.cmd is the same for
+# Windows.
+read -r hello
+printf '%s\n' "{\"type\":\"hello\",\"protocol\":1,\"pid\":$$,\"rlx_version\":\"0.0.0\"}"
+read -r request
+printf '%s\n' '{"type":"accepted","id":1}'
+exit 1

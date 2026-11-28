@@ -1,0 +1,615 @@
+name: rlxd
+
+# The rlxd Cargo workspace (rlxd/), on the three OSes it ships for (handoff 0.10.3,
+# 1.1). ci.yml runs the Python suite; this runs the Rust one, plus the daemon
+# registry's two cross-language tests (4.1), which need both, and rlxd-release.yml's
+# jobs, the upgrade's with rlx's daemons (4.2) among them. A PR gets it when it touches
+# rlxd/ (Cargo.lock included), this file, pyproject.toml, whose version
+# rlxd/crates/rlxd/tests/version.rs holds rlxd's to, the Python side of the registry's
+# shared format, the resident brain rlxd runs (`rlx brain --stdio`, 1.6), whose real
+# process rlxd/crates/rlxd/tests/brain.rs starts, rlxd's install, or the upgrade: its
+# daemons' module and its call sites, and the files that write the argv it starts a
+# daemon again from (selfcli, watch, serve, the global flags). Every push to main or an
+# rc/** branch runs it whatever
+# changed, as does a run by hand (`gh workflow run rlxd.yml --ref <branch>`).
+on:
+  pull_request:
+    paths:
+      - "rlxd/**"
+      - ".github/workflows/rlxd.yml"
+      - ".github/workflows/rlxd-release.yml"
+      - "scripts/rlxd_archive.py"
+      - "src/aisquare/services/rlxd_install.py"
+      - "src/aisquare/cli/daemon.py"
+      - "tests/stub_releases.py"
+      - "tests/test_rlxd_install.py"
+      - "tests/test_rlxd_release_attach.py"
+      - "tests/test_rlxd_release_features.py"
+      - "pyproject.toml"
+      - "src/aisquare/core/daemons.py"
+      - "src/aisquare/core/locking.py"
+      - "src/aisquare/core/registry.py"
+      - "tests/test_daemon_registry.py"
+      - "src/aisquare/cli/brain.py"
+      - "src/aisquare/services/brain.py"
+      - "src/aisquare/services/upgrade_daemons.py"
+      - "src/aisquare/services/lifecycle.py"
+      - "src/aisquare/services/install_route.py"
+      - "src/aisquare/cli/install.py"
+      - "src/aisquare/core/spawn.py"
+      - "src/aisquare/core/selfcli.py"
+      - "src/aisquare/core/state.py"
+      - "src/aisquare/services/watch.py"
+      - "src/aisquare/cli/serve.py"
+      - "tests/test_upgrade_daemons.py"
+      - "tests/fake_rlxd.py"
+      - "tests/installer_seams.py"
+  push:
+    branches: [main, "rc/**"]
+  workflow_dispatch:
+    # rlxd-release.yml's attach, by hand (1.2): a dry run unless dry_run is unticked, and
+    # run on the tag itself (`--ref vX.Y.Z`), which attach checks.
+    inputs:
+      release_tag:
+        description: Also attach the archives to this GitHub Release (vX.Y.Z). Run on that tag (--ref vX.Y.Z); any other ref is refused. Empty builds and packages only.
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: With release_tag, check everything and print the upload instead of running it.
+        required: false
+        type: boolean
+        default: true
+
+# Cancel superseded runs on the same branch/PR, grouped by event as ci.yml's are, so a
+# run by hand never cancels a push's run or the other way round.
+# A newer run of a ref cancels the older, but never a dispatch with a release_tag: its
+# attach may be part-way through `gh release upload --clobber`, and one cut off can leave
+# the release with some archives replaced and the sums not. The release_tag is in the
+# group, so such a run shares it only with dispatches attaching the same tag, which wait
+# rather than cancel. A plain dispatch on the tag's ref (no release_tag) is in another
+# group: it can neither cancel a running attach nor replace a pending one, as GitHub
+# replaces a group's pending run with any newer one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.release_tag }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.release_tag == '' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+# rustup picks the toolchain from rlxd/rust-toolchain.toml only when cargo runs inside
+# rlxd/, so every step does.
+defaults:
+  run:
+    shell: bash
+    working-directory: rlxd
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    # The registry's interop tests skip where neither this nor RLXD_BIN is set (the
+    # Python suite, a checkout with no uv). Here they must run: a missing uv or rlxd
+    # fails them. So must the brain's (tests/brain.rs), which run the checkout's own
+    # `rlx brain --stdio` through `uv run`. Likewise the gate's peer checks that need `sudo -n` (Linux) or an
+    # administrator (Windows) skip elsewhere, and must run here.
+    env:
+      RLXD_INTEROP_REQUIRED: "1"
+      RLXD_GATE_PEER_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # rustup is on every hosted runner; with no argument it installs what
+      # rust-toolchain.toml pins, rustfmt and clippy included.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rlxd -> target
+
+      # For the registry's interop tests: registry_interop (in cargo test) runs Python's
+      # registry through `uv run python`, and the last step runs its pytest. Pinned as
+      # ci.yml pins it.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # The macOS gate tests sign a helper with a self-signed identity. macOS 15's
+      # codesign finds identities only in keychains on the search list, which the tests
+      # never write (tests/macos_signing). So this throwaway runner lists a keychain of
+      # its own, and hands it to them.
+      - name: A keychain for the gate's signing tests (macOS)
+        if: runner.os == 'macOS'
+        working-directory: .
+        run: |
+          kc="$RUNNER_TEMP/rlxd-gate-test.keychain-db"
+          security create-keychain -p rlxd-gate-test "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p rlxd-gate-test "$kc"
+          existing=$(security list-keychains -d user | tr -d '"')
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$kc" $existing
+          echo "RLXD_GATE_TEST_KEYCHAIN=$kc" >> "$GITHUB_ENV"
+          echo "RLXD_GATE_TEST_KEYCHAIN_PASSWORD=rlxd-gate-test" >> "$GITHUB_ENV"
+
+      # 1.4: the PTY host's frame must equal tmux's capture-pane byte for byte, so the
+      # tests compare against tmux itself, installed here for them only. With
+      # RLXD_TMUX_REQUIRED, a missing tmux fails them rather than skipping.
+      - name: tmux, for the frame tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux
+          tmux -V
+          echo "RLXD_TMUX_REQUIRED=1" >> "$GITHUB_ENV"
+
+      - name: tmux, for the frame tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install tmux
+          tmux -V
+          echo "RLXD_TMUX_REQUIRED=1" >> "$GITHUB_ENV"
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # The gate's peer tests build only with the test-identity feature.
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      # 5.1: the gate's peer identity check, against helpers signed or built with a test
+      # identity that only the gate-test-requirement feature lets rlxd accept. Each test
+      # compiles to nothing on the other OSes.
+      - name: cargo test, the gate's peer checks (gate-test-requirement)
+        run: >-
+          cargo test -p rlxd --features gate-test-requirement --locked
+          --test gate_peer_macos --test gate_peer_linux --test gate_peer_windows
+
+      - name: cargo build --release
+        run: cargo build --workspace --release --locked
+
+      # 5.1: the shipped build's compiled-in requirement, which nothing can replace.
+      - name: the gate's compiled-in requirement (macOS, release)
+        if: runner.os == 'macOS'
+        run: cargo test --release -p rlxd --locked --test gate_peer_macos_release
+
+      # --release reuses the build above rather than building gen-schemas again.
+      - name: schemas/v1 matches rlxd-proto
+        run: cargo run --release --locked -p rlxd-proto --bin gen-schemas -- --check
+
+      # 4.1: Python's registry reads the real rlxd as live while it runs, and as dead
+      # after a stop or a kill.
+      - name: Python's registry reads rlxd (test_daemon_registry.py)
+        working-directory: .
+        env:
+          RLXD_BIN: ${{ github.workspace }}/rlxd/target/release/rlxd${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: uv run --extra dev pytest tests/test_daemon_registry.py -q -p no:cacheprovider
+
+  # 7.6's scheduler Accept lines, on real one-minute schedules (tests/scheduler_accept.rs):
+  # each takes one to three minutes, so they are #[ignore]d in the test job and run here,
+  # all at once. tests/scheduler.rs has every rule fast, on a test clock, in the test job.
+  scheduler:
+    name: scheduler accept (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rlxd -> target
+          key: scheduler-accept
+
+      - name: cargo test, the scheduler's Accept lines
+        run: >-
+          cargo test -p rlxd --locked --test scheduler_accept --
+          --ignored --test-threads 16
+
+  # Licences and RustSec advisories, once: the dependency graph is the same on every
+  # OS, since cargo-deny reads every target's dependencies wherever it runs.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-deny@0.22.1
+
+      - name: cargo deny check
+        run: cargo deny --locked check
+
+  # rlx.app's way to a host over a real `ssh localhost` (the owner's remote brief, §3).
+  # First `rlxd here`, as rlx.app runs it: by absolute path, in a non-login session that
+  # has not read the user's profile. It must give the answer `env -i HOME=$HOME rlxd here
+  # --json` gives locally, in each state. Then rlxd's socket through a direct-streamlocal
+  # forward. sshd is the runner's own. Its host key is pinned from its own file, not
+  # fetched over the connection, and both sides allow public-key auth only.
+  ssh:
+    name: rlxd here and its socket over ssh (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: rlxd -> target
+
+      # check-jsonschema, for the schema checks below.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.13.0"
+
+      - name: cargo build
+        run: cargo build --locked -p rlxd
+
+      - name: Start sshd on localhost, key-only, its host key pinned
+        run: |
+          if ! command -v sshd >/dev/null && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          # The server takes public keys only, and forwards as little as rlx.app's channel
+          # allows: local (-L) only, no remote (-R) forward of either kind, no listening, and
+          # no agent, X11 or tunnel. OpenSSH's defaults allow both directions. Local TCP
+          # forwarding can't be refused: OpenSSH applies its local TCP forwarding permission
+          # to direct-streamlocal channels too, so AllowTcpForwarding no refuses rlx.app's
+          # channel as well (the next step shows it). sshd keeps the first value it reads for
+          # an option, and Ubuntu's sshd_config includes sshd_config.d/*.conf first; sshd -T
+          # checks what took effect.
+          printf '%s\n' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' \
+            'AllowStreamLocalForwarding local' 'AllowTcpForwarding local' 'PermitListen none' \
+            'AllowAgentForwarding no' 'X11Forwarding no' 'PermitTunnel no' \
+            | sudo tee /etc/ssh/sshd_config.d/10-rlxd-ci.conf >/dev/null
+          sudo systemctl restart ssh || sudo service ssh restart
+          # -C: what applies to this job's own connection, Match blocks included.
+          effective=$(sudo sshd -T -C "user=$(id -un),host=localhost,addr=127.0.0.1")
+          for want in 'passwordauthentication no' 'kbdinteractiveauthentication no' \
+            'allowstreamlocalforwarding local' 'allowtcpforwarding local' 'permitlisten none' \
+            'allowagentforwarding no' 'x11forwarding no' 'permittunnel no'; do
+            if ! grep -Fxq "$want" <<< "$effective"; then
+              echo "::error::sshd -T: not '$want' but '$(grep -i "^${want%% *} " <<< "$effective")'"
+              exit 1
+            fi
+          done
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          chmod go-w ~
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          # The host key, read from the host's own file: pinned, not trusted on first use.
+          printf 'localhost %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" \
+            > ~/.ssh/known_hosts
+          # Every ssh below: that key only, public-key auth only, never a prompt.
+          printf '%s\n' 'Host localhost' '  BatchMode yes' '  StrictHostKeyChecking yes' \
+            '  HostKeyAlgorithms ssh-ed25519' '  PreferredAuthentications publickey' \
+            '  IdentitiesOnly yes' '  IdentityFile ~/.ssh/id_ed25519' > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          ssh -G localhost | grep -E '^(batchmode|stricthostkeychecking|preferredauthentications|hostkeyalgorithms) '
+          ssh localhost true
+          echo "a non-login session's PATH: $(ssh localhost 'echo $PATH')"
+
+      # What sshd refuses, beside what the forward step uses. Every remote (-R) forward,
+      # of a Unix socket or a TCP port. And, on a second sshd with AllowTcpForwarding no,
+      # the very -L to a Unix socket that port 22 serves: OpenSSH's session.c disables all
+      # local forwarding then, and channel_connect_to_path (direct-streamlocal) checks
+      # that permission too. So rlx.app's host must allow local TCP forwarding, and this
+      # fails, to say so, if OpenSSH ever stops tying the two together.
+      - name: sshd refuses every remote forward, and streamlocal needs local TCP forwarding
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          probe=$(mktemp -d)
+          refused_r() {
+            local what=$1 spec=$2 code=0
+            timeout 20 ssh -N -o ExitOnForwardFailure=yes -R "$spec" localhost \
+              2> "$probe/r.err" || code=$?
+            cat "$probe/r.err"
+            [ "$code" != 0 ] && [ "$code" != 124 ] || fail "ssh -R ($what) was not refused (exit $code)"
+            grep -q "remote port forwarding failed" "$probe/r.err" \
+              || fail "ssh -R ($what) failed, but not as a refused forward"
+          }
+          refused_r "a Unix socket" "$probe/remote.sock:$probe/none.sock"
+          [ ! -e "$probe/remote.sock" ] || fail "sshd made the -R socket"
+          refused_r "a TCP port" "127.0.0.1:47614:127.0.0.1:22"
+          ! ss -Htln "sport = :47614" | grep -q . || fail "sshd listens on the -R port"
+
+          # A Unix socket that answers "ok", and an -L to it through each sshd.
+          python3 -c 'import socket, sys, time
+          s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(4)
+          while True:
+              c, _ = s.accept(); c.sendall(b"ok\n"); c.close()' "$probe/target.sock" &
+          target=$!
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -p 2222 -o AllowTcpForwarding=no -o PidFile="$probe/sshd.pid"
+          printf '[localhost]:2222 %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" \
+            >> ~/.ssh/known_hosts
+          through() {
+            local port=$1 local_sock="$probe/via-$1.sock" forward said
+            ssh -p "$port" -N -o ExitOnForwardFailure=yes -L "$local_sock:$probe/target.sock" \
+              localhost 2> "$probe/via-$port.err" &
+            forward=$!
+            for _ in $(seq 100); do [ -S "$local_sock" ] && break; sleep 0.1; done
+            said=$(timeout 10 python3 -c 'import socket, sys
+          c = socket.socket(socket.AF_UNIX); c.connect(sys.argv[1]); print(c.recv(16).decode().strip())' \
+              "$local_sock" || true)
+            sleep 0.5
+            kill "$forward"
+            wait "$forward" || true
+            echo "through port $port: '$said'; ssh said: $(tr '\n' ' ' < "$probe/via-$port.err")" >&2
+            printf '%s' "$said"
+          }
+          [ "$(through 22)" = ok ] || fail "the -L through port 22 got no answer"
+          [ -z "$(through 2222)" ] || fail "AllowTcpForwarding no let a streamlocal -L through"
+          grep -q "open failed" "$probe/via-2222.err" \
+            || fail "the -L through port 2222 failed, but not as a refused channel"
+          sudo kill "$(sudo cat "$probe/sshd.pid")"
+          kill "$target"
+          rm -rf "$probe"
+
+      # The step's shell is `bash -e`: an exit the check expects, 3, 5 or 127, is caught
+      # with `|| code=$?`.
+      - name: rlxd here gives the same answer over ssh as locally
+        working-directory: .
+        run: |
+          rlxd="$PWD/rlxd/target/debug/rlxd"
+          over_ssh() { ssh localhost "$@"; }
+          # `rlxd here --json` locally with nothing but HOME, and over ssh, into
+          # <state>-local.json and <state>-ssh.json. Both must exit $2 and match.
+          both() {
+            local state=$1 want=$2 code
+            code=0; env -i HOME="$HOME" "$rlxd" here --json > "$state-local.json" || code=$?
+            [ "$code" = "$want" ] || { echo "::error::$state: local exit $code, not $want"; exit 1; }
+            code=0; over_ssh "$rlxd here --json" > "$state-ssh.json" || code=$?
+            [ "$code" = "$want" ] || { echo "::error::$state: ssh exit $code, not $want"; exit 1; }
+            diff <(jq -S . "$state-local.json") <(jq -S . "$state-ssh.json") \
+              || { echo "::error::$state: the answer over ssh differs"; exit 1; }
+            jq -c .data "$state-ssh.json"
+          }
+
+          both stopped 3
+          jq -e '.ok and .data.installed and (.data.running|not) and (.data|has("pid")|not)' stopped-ssh.json
+
+          over_ssh "$rlxd here --json --start" > started-ssh.json
+          jq -e '.ok and .data.running and .data.started and .data.pid > 0' started-ssh.json
+          pid=$(jq .data.pid started-ssh.json)
+
+          # The session had SSH_CONNECTION and SSH_CLIENT; the rlxd it started has none.
+          [ -n "$(over_ssh 'echo "$SSH_CONNECTION"')" ] \
+            || { echo "::error::the ssh session has no SSH_CONNECTION"; exit 1; }
+          echo "the started rlxd's SSH_ and PATH variables, as ps eww -p $pid shows them:"
+          ps eww -p "$pid" | tr ' ' '\n' | grep -E '^(SSH_[A-Z_]*|PATH)=' || true
+          tr '\0' '\n' < "/proc/$pid/environ" > daemon-environ.txt
+          grep -q '^PATH=' daemon-environ.txt \
+            || { echo "::error::the started rlxd's environment was not read"; exit 1; }
+          if grep -E '^SSH_[A-Z_]*=' daemon-environ.txt; then
+            echo "::error::the rlxd --start started kept the SSH session's variables"; exit 1
+          fi
+
+          both running 0
+          jq -e --argjson pid "$pid" --arg home "$HOME" '.data.running and (.data.started|not)
+            and .data.pid == $pid and .data.socket == ($home + "/.aisquare/run/rlxd.sock")
+            and .data.protocol_versions == [1]' running-ssh.json
+
+          # The README's command, as an app sends it, in its three cases. It runs rlxd by
+          # absolute path, as on a host whose non-login PATH lacks ~/.local/bin (this
+          # runner's has it).
+          snippet=$(grep -m1 -E "^sh -c '.*exit 127'\$" rlxd/README.md)
+          mkdir -p ~/.local/bin
+          cp "$rlxd" ~/.local/bin/rlxd
+          over_ssh "$snippet" > snippet-ssh.json
+          jq -e --argjson pid "$pid" '.data.running and .data.pid == $pid
+            and (.data.rlxd.path|endswith("/.local/bin/rlxd"))' snippet-ssh.json
+
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/envelope.json -- *-ssh.json *-local.json
+          mkdir data
+          for answer in *-ssh.json *-local.json; do jq .data "$answer" > "data/$answer"; done
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/here-reply.json -- data/*.json
+
+          over_ssh "$rlxd stop"
+          rm ~/.local/bin/rlxd
+
+          # rlx with no rlxd, as on a host with rlx from before 0.10.3: exit 5, rlx's version.
+          printf '#!/bin/sh\necho "rlx 0.10.1"\n' > ~/.local/bin/rlx
+          chmod 755 ~/.local/bin/rlx
+          code=0; said=$(over_ssh "$snippet") || code=$?
+          [ "$code" = 5 ] || { echo "::error::rlx and no rlxd: the command exits $code, not 5"; exit 1; }
+          [ "$said" = "rlx 0.10.1" ] || { echo "::error::rlx and no rlxd: it said '$said'"; exit 1; }
+          rm ~/.local/bin/rlx
+
+          code=0; over_ssh "$snippet" > /dev/null || code=$?
+          [ "$code" = 127 ] || { echo "::error::with nothing installed the command exits $code, not 127"; exit 1; }
+
+      # rlxd's socket as rlx.app reaches it: a direct-streamlocal channel, here OpenSSH's
+      # `ssh -N -L <local socket>:<host's socket>`, so nothing listens on TCP. The client
+      # side is a home with no rlxd and no token: `socket` and the token come from `rlxd
+      # here --start --show-token`, run inside the session. Through the forward: `status`,
+      # the gate refusing the unsigned test client (its peer is sshd), then an `rlxd
+      # events` stream that must live through a quiet wait and take rlxd's stop live.
+      # Two homes: ~/.aisquare, whose socket is its run/rlxd.sock, waiting 60 s, and one
+      # too deep for that, served on its short socket in /tmp/rlxd-<uid>/.
+      - name: rlxd's socket through an ssh direct-streamlocal forward
+        working-directory: .
+        run: |
+          rlxd="$PWD/rlxd/target/debug/rlxd"
+          client_home=$(mktemp -d)
+          forwards=$(mktemp -d)
+          uid=$(id -u)
+          # 20 folders of 21 bytes: run/rlxd.sock is far past Linux's 107 bytes.
+          deep="$HOME/$(printf 'a-folder-of-the-home/%.0s' $(seq 20))home"
+          fail() { echo "::error::$*"; exit 1; }
+
+          through_a_forward() {
+            local name=$1 home=$2 hold=$3 here remote token local_sock forward code
+            local pid events began elapsed token_file
+            here="$name-here.json"
+            code=0
+            ssh localhost "RLX_HOME='$home' '$rlxd' here --json --start --show-token" > "$here" \
+              || code=$?
+            token=$(jq -r '.data.auth.token // empty' "$here")
+            [ -z "$token" ] || echo "::add-mask::$token"
+            [ "$code" = 0 ] && jq -e '.ok and .data.running and .data.supported' "$here" > /dev/null \
+              || fail "$name: rlxd here --start exits $code: $(jq -c .error "$here")"
+            remote=$(jq -r .data.socket "$here")
+            echo "$name: the host's socket is $remote (${#remote} bytes)"
+            # The token goes in a file in the 0700 folder, not on a command line.
+            token_file="$forwards/$name.token"
+            (umask 077 && printf '%s\n' "$token" > "$token_file")
+
+            local_sock="$forwards/$name.sock"
+            ssh -N -o ExitOnForwardFailure=yes -L "$local_sock:$remote" localhost &
+            forward=$!
+            for _ in $(seq 100); do [ -S "$local_sock" ] && break; sleep 0.1; done
+            [ -S "$local_sock" ] || fail "$name: the forward made no local socket"
+
+            # Without a token of the host's, --socket is a usage error: the client home's
+            # would never be sent.
+            code=0
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" status 2> /dev/null || code=$?
+            [ "$code" = 2 ] || fail "$name: --socket with no token exits $code, not 2"
+
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token-file "$token_file" \
+              status > "$name-status.json" \
+              || fail "$name: status through the forward: $(cat "$name-status.json")"
+            jq -e --arg socket "$remote" --arg home "$home" \
+              '.ok and .data.paths.socket == $socket and .data.paths.home == $home' \
+              "$name-status.json" > /dev/null \
+              || fail "$name: status through the forward names another rlxd: $(jq -c .data.paths "$name-status.json")"
+            jq -c '.data | {pid, clients, paths}' "$name-status.json"
+
+            # The gate holds through the forward. rlxd runs outside gate dev mode, and the
+            # connection's peer is sshd, not rlx's signed app, so the unsigned test client
+            # can neither pair nor be the gate.
+            for args in "--as-app --gate-credential-file $forwards/$name.credential status" \
+              "--role app --gate-credential made-up status" gate.pair; do
+              code=0
+              # shellcheck disable=SC2086 # $args is words
+              RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" \
+                --token-file "$token_file" $args > "$name-gate.json" || code=$?
+              [ "$code" = 1 ] && jq -e '.error.code == "not_gate"' "$name-gate.json" > /dev/null \
+                || fail "$name: through the forward, call $args exits $code: $(cat "$name-gate.json")"
+            done
+            [ ! -e "$home/rlxd/gate.json" ] || fail "$name: a device was paired through the forward"
+            [ ! -e "$client_home/test-gate-credential" ] && [ ! -e "$forwards/$name.credential" ] \
+              || fail "$name: the client kept a credential"
+            rm "$name-gate.json"
+
+            # Nothing listens on TCP or UDP: not rlxd, not ssh.
+            if ss -Htulnp | grep -E 'users:\(\("(rlxd|ssh)"'; then
+              fail "$name: rlxd or ssh listens on a port"
+            fi
+
+            # A stream through the forward: this rlxd's daemon.started, replayed, then $hold
+            # quiet seconds, then daemon.stopping, live, when rlxd stops over ssh. The
+            # buffer is this rlxd's own, so no earlier rlxd's daemon.stopping is in it.
+            pid=$(jq .data.pid "$name-status.json")
+            began=$(date +%s)
+            RLX_HOME="$client_home" "$rlxd" events --socket "$local_sock" --token-file "$token_file" \
+              --since 0 --until daemon.stopping --timeout $((hold + 60)) \
+              > "$name-events.jsonl" 2> "$name-events.err" &
+            events=$!
+            sleep "$hold"
+            kill -0 "$events" 2> /dev/null \
+              || fail "$name: the stream ended within $hold s: $(cat "$name-events.err")"
+            ssh localhost "RLX_HOME='$home' '$rlxd' stop" > /dev/null
+            code=0
+            wait "$events" || code=$?
+            elapsed=$(( $(date +%s) - began ))
+            [ "$code" = 0 ] || fail "$name: rlxd events exits $code: $(cat "$name-events.err")"
+            [ "$elapsed" -ge "$hold" ] || fail "$name: the stream ended after $elapsed s"
+            jq -s -e --argjson pid "$pid" '
+              (map(.type == "daemon.started" and .data.pid == $pid) | index(true)) as $start
+              | $start != null and .[-1].type == "daemon.stopping" and .[-1].seq > .[$start].seq' \
+              "$name-events.jsonl" > /dev/null \
+              || fail "$name: the stream through the forward: $(jq -s -c 'map([.seq, .type])' "$name-events.jsonl")"
+            echo "$name: the stream lived $elapsed s: $(jq -s -c 'map(.type)' "$name-events.jsonl")"
+
+            kill "$forward"
+            wait "$forward" || true
+            code=0
+            RLX_HOME="$client_home" "$rlxd" call --socket "$local_sock" --token-file "$token_file" \
+              status > /dev/null || code=$?
+            [ "$code" = 3 ] || fail "$name: with the forward gone the call exits $code, not 3"
+            rm "$here" "$token_file"
+          }
+
+          through_a_forward default "$HOME/.aisquare" 60
+          [ "$(jq -r .data.paths.socket default-status.json)" = "$HOME/.aisquare/run/rlxd.sock" ] \
+            || fail "the default home is not served on its run/rlxd.sock"
+
+          through_a_forward deep "$deep" 2
+          short=$(jq -r .data.paths.socket deep-status.json)
+          case "$short" in
+            "/tmp/rlxd-$uid/"?*.sock) ;;
+            *) fail "the deep home's socket is $short, not its short one in /tmp/rlxd-$uid/" ;;
+          esac
+          [ "$(stat -c '%a %u' "/tmp/rlxd-$uid")" = "700 $uid" ] \
+            || fail "/tmp/rlxd-$uid is $(stat -c '%a %u' "/tmp/rlxd-$uid"), not 700 $uid"
+          [ ! -e "$deep/run/rlxd.sock" ] || fail "the deep home has a socket of its own"
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/envelope.json -- *-status.json
+          for stream in *-events.jsonl; do jq -s . "$stream" > "${stream%.jsonl}.json"; done
+          uvx check-jsonschema==0.39.0 --schemafile rlxd/schemas/v1/event-list.json -- *-events.json
+
+  # 1.2: rlxd and rlxd-hook for the five targets, as the artifact `rlxd-archives`,
+  # installed by `rlx daemon install` on each OS (rlxd-release.yml). It attaches to a
+  # release only with a release_tag given by hand, and then only if dry_run is off.
+  # contents: write is for that attach job alone; rlxd-release.yml holds every other
+  # job to read.
+  release:
+    name: release
+    uses: ./.github/workflows/rlxd-release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ inputs.release_tag || '' }}
+      dry_run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}

@@ -39,6 +39,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -47,7 +48,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from aisquare.core import atomic, locking, selfcli
+from aisquare.core import atomic, daemons, locking, selfcli
 from aisquare.core import program as prog
 from aisquare.core.config import WatchSettings, load_config
 from aisquare.core.spawn import untraced_env
@@ -61,6 +62,12 @@ SOURCE_TIMEOUT = 60.0
 """Seconds an operator's source command may run in one tick."""
 DETACHED_SESSION = "asq-watch"
 """The tmux session ``watch --detach`` runs the watcher in, on the fleet's own server."""
+STOP_WAIT_SECONDS = 3.0
+"""How long ``watch --stop`` waits for the watcher to leave (its sleep is up to 1 s) before it
+kills the watcher's tmux session (:func:`stop_detached`)."""
+DETACHED_ENV = "AISQUARE_WATCH_DETACHED"
+"""Set to ``1`` for the window :func:`detach` opens, so the watcher there registers in the
+daemon registry as ``watch --detach`` starts it again (:func:`_registration`)."""
 
 _sleep: Callable[[float], None] = time.sleep
 
@@ -690,8 +697,10 @@ def run(
     on_tick: Callable[[TickReport], None],
     on_error: Callable[[str], None] = lambda said: None,
 ) -> None:
-    """The watcher's loop, holding this home's lock for its whole life; returns on
-    SIGTERM or SIGINT. Raises :class:`AlreadyWatching`."""
+    """The watcher's loop, holding this home's lock for its whole life, and registered in the
+    daemon registry as a ``watch`` for as long (``core.daemons``, :func:`_registration`);
+    returns on SIGTERM, SIGHUP (its terminal or tmux window closed: ``watch --stop`` kills
+    the session) or SIGINT, leaving the registry. Raises :class:`AlreadyWatching`."""
     watch_dir().mkdir(parents=True, exist_ok=True)
     fd = locking.open_lock_file(lock_path())
     try:
@@ -712,22 +721,54 @@ def run(
     try:
         pid_path().write_text(str(os.getpid()), encoding="utf-8")
         with contextlib.suppress(ValueError):  # not the main thread (tests)
-            signal.signal(signal.SIGTERM, stopping)
-        watcher = Watcher()
-        every = interval or watcher.settings.interval_seconds
-        while not stop:
-            try:
-                on_tick(watcher.tick())
-            except Exception as exc:  # one bad tick never ends the watcher (review of #377)
-                on_error(f"{type(exc).__name__}: {exc}")
-            waited = 0.0
-            while not stop and waited < every:
-                _sleep(min(1.0, every - waited))
-                waited += 1.0
+            _stop_on(signal.SIGTERM, stopping)
+            if sys.platform != "win32":  # no SIGHUP there
+                _stop_on(signal.SIGHUP, stopping)
+        argv, restartable = _registration(interval)
+        with daemons.registered(
+            "watch",
+            argv=argv,
+            restartable=restartable,
+            on_error=lambda exc: on_error(
+                f"not in the daemon registry, so an upgrade will not count this watcher: {exc}"
+            ),
+        ):
+            watcher = Watcher()
+            every = interval or watcher.settings.interval_seconds
+            while not stop:
+                try:
+                    on_tick(watcher.tick())
+                except Exception as exc:  # one bad tick never ends the watcher (review of #377)
+                    on_error(f"{type(exc).__name__}: {exc}")
+                waited = 0.0
+                while not stop and waited < every:
+                    _sleep(min(1.0, every - waited))
+                    waited += 1.0
     finally:
         with contextlib.suppress(OSError):
             pid_path().unlink()
         os.close(fd)
+
+
+def _stop_on(signum: int, stopping: Callable[[int, object], None]) -> None:
+    """End the loop on ``signum``, unless this process was started with it ignored: under
+    ``nohup rlx watch &`` SIGHUP is ``SIG_IGN``, and the watcher must outlive the logout it was
+    told to. Raises ``ValueError`` off the main thread."""
+    if signal.getsignal(signum) is not signal.SIG_IGN:
+        signal.signal(signum, stopping)
+
+
+def _registration(interval: float | None) -> tuple[list[str], bool]:
+    """The command that starts this watcher again, and whether an upgrade may (the daemon
+    registry's ``argv`` and ``restartable``, ``core.daemons``). The one :func:`detach` opened
+    is started again by ``watch --detach``, which opens its window again; one run in the
+    foreground is a person's terminal's, not the upgrade's to restart, and is recorded as that
+    terminal ran it."""
+    flags = selfcli.global_flags()
+    if os.environ.get(DETACHED_ENV) == "1":
+        return selfcli.argv_for([*flags, "watch", "--detach"]), True
+    every = ["--interval", str(interval)] if interval else []
+    return selfcli.argv_for([*flags, "watch", *every]), False
 
 
 def detach() -> int:
@@ -749,6 +790,7 @@ def detach() -> int:
         name="watch",
         cwd=Path.home(),
         command=selfcli.argv_for(["watch"]),
+        env={DETACHED_ENV: "1"},
         config=config,
     )
     for _ in range(50):  # up to 5 s for it to take the lock
@@ -761,13 +803,21 @@ def detach() -> int:
 
 def stop_detached() -> int | None:
     """Stop the running watcher (SIGTERM) and its tmux session; the pid it had, or
-    ``None`` when none ran."""
+    ``None`` when none ran. The session is killed once the watcher has let its lock go (it
+    leaves the daemon registry first), or after :data:`STOP_WAIT_SECONDS` all the same. A
+    watcher in a long look (a source runs up to :data:`SOURCE_TIMEOUT`) takes SIGHUP like
+    SIGTERM, so it still finishes that look and leaves the registry as it exits:
+    :func:`running_pid` says whether it has, which ``watch --stop`` reports."""
     from aisquare.services import fleet as fleet_service
 
     pid = running_pid()
     if pid is not None and pid > 0:
         with contextlib.suppress(OSError):
             os.kill(pid, signal.SIGTERM)
+        waited = 0.0
+        while running_pid() is not None and waited < STOP_WAIT_SECONDS:
+            _sleep(0.1)
+            waited += 0.1
     with contextlib.suppress(Exception):
         fleet_service.server(fleet_service.settings()).kill_session(DETACHED_SESSION)
     return pid
