@@ -147,16 +147,48 @@ fn with_no_rlxd_a_fleet_hook_is_rlx_hooks_with_the_same_stdin_and_says_nothing()
 #[test]
 fn with_no_rlxd_pre_tool_use_denies_and_never_falls_back() {
     let here = NoRlxd::new("deny");
-    for args in [
-        &["pre-tool-use"][..],
-        &["pre-tool-use", "--run", "x", "--attempt", "1"],
+    let key = "c0ffee00".repeat(8);
+    // With no run, no deadline or no key it asks nothing; with all of them it goes as far
+    // as connecting, which finds no rlxd: a deny each time, never `rlx hook`.
+    let whole = [
+        "pre-tool-use",
+        "--run",
+        "x",
+        "--attempt",
+        "1",
+        "--deadline-ms",
+        "120000",
+    ];
+    for (args, envs, reason) in [
+        (&["pre-tool-use"][..], &[][..], "no --run"),
+        (
+            &["pre-tool-use", "--run", "x", "--attempt", "1"][..],
+            &[][..],
+            "arguments it does not take",
+        ),
+        (&whole[..], &[][..], "no RLXD_HOOK_KEY"),
+        (
+            &whole[..],
+            &[("RLXD_HOOK_KEY", key.as_str())][..],
+            "rlxd could not be asked",
+        ),
     ] {
-        let output = here.run(args, b"{\"tool_name\":\"t\",\"tool_input\":{}}");
-        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let output = here.run_with(args, b"{\"tool_name\":\"t\",\"tool_input\":{}}", envs);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
         let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        let said = &reply["hookSpecificOutput"];
+        assert_eq!(said["permissionDecision"], "deny", "{args:?}");
+        assert_eq!(said["hookEventName"], "PreToolUse");
+        assert!(
+            said["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains(reason),
+            "{args:?}: {reply}"
+        );
         assert!(!String::from_utf8_lossy(&output.stdout).contains("fake rlx"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(&key));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&key));
     }
 }
 
