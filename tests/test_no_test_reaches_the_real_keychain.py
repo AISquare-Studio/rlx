@@ -415,7 +415,9 @@ def agents_elsewhere(tmp_path: Path) -> Iterator[Path]:
         tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         tool.chmod(0o755)
     before = guard.snapshot()
-    guard.restore({**before, "allowed": (guard._norm(str(tmp_path / "run-root")),)})
+    # The checkout stays a run root, as it is the suite's: it may lie in a guarded dir (#3851).
+    allowed = tuple(guard._norm(str(root)) for root in (tmp_path / "run-root", REPO))
+    guard.restore({**before, "allowed": allowed})
     yield where
     guard.restore(before)
 
@@ -479,14 +481,24 @@ def test_the_lift_lets_a_real_agent_through_here_and_in_a_child_told_so(
     finally:
         guard.lift(agents=before)
     assert guard.refusal_kind(claude) == "agent"
-    monkeypatch.setenv(guard.ALLOWED_VAR, str(tmp_path / "run-root"))  # elsewhere is none of it
+    # Elsewhere is none of the run's roots; the checkout still is, and is guarded here as if it
+    # were a scratchpad worktree inside ~/.aisquare, where a child started in it lists it at
+    # import (tester #3851): the checkout must stay a run root for it to be let through.
+    monkeypatch.setenv(guard.ALLOWED_VAR, os.pathsep.join([str(tmp_path / "run-root"), str(REPO)]))
+    guarded = [os.environ.get(guard.GUARDED_VAR, ""), str(REPO.parent)]
+    monkeypatch.setenv(guard.GUARDED_VAR, os.pathsep.join(part for part in guarded if part))
     code = f"import rlx_keychain_guard as g; print(g.refusal_kind({claude!r}))"
     for told, said in ((None, "agent"), ("1", "None")):
         env = {k: v for k, v in os.environ.items() if k != guard.AGENTS_VAR}
         if told:
             env[guard.AGENTS_VAR] = told
         child = subprocess.run(
-            [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60
+            [sys.executable, "-c", code],
+            env=env,
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         assert child.stdout.strip() == said, child.stderr
     assert refusals(own_log) == []
