@@ -232,6 +232,16 @@ MARKER_ENV_VARS = (
 #: user-visible output and the reserved-var guard.
 IDENTITY_ENV_VARS = (*TRACING_ENV_VARS, *MARKER_ENV_VARS)
 
+TMP_KEY_ENV = "AISQUARE_TMP_KEY"
+"""The agent's own temporary directory's key, a fleet window's alone (``fleet.spawn``'s
+``-e`` pair, from its launch spec): ``aisquare launch`` makes ``<home>/tmp/<key>`` its
+``TMPDIR`` (``services.agent_tmp``, #57)."""
+
+OUTER_TMPDIR_ENV = "AISQUARE_OUTER_TMPDIR"
+"""The ``TMPDIR`` an agent's launch inherited (``""``: none), kept beside the agent's own: a
+tmux server started from the agent's tool shell gets it back (:func:`tmux_client_env`), so no
+window opened there by hand is left with a directory that goes when the agent ends."""
+
 #: The variables that tie a process to one board, seat or role. A fleet window gets
 #: each of its own (``fleet.spawn``'s ``-e`` pairs). A tmux server copies the
 #: environment of the client that starts it into its global environment, and every
@@ -247,6 +257,7 @@ TEAM_ENV_VARS = (
     "AISQUARE_ROLE",
     "AISQUARE_PERSONA",
     "AISQUARE_BOARD_CONTEXT",
+    TMP_KEY_ENV,
 )
 
 TRACED = "traced"
@@ -778,7 +789,8 @@ def run_agents(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
 def tmux_client_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """What a tmux client runs with: :func:`untraced_env` less :data:`TEAM_ENV_VARS`, every
     agent's process identity (:func:`agent_identity_env_vars`) and, from an agent's tool
-    shell, that agent's home (:func:`tool_shell_homes`).
+    shell, that agent's home (:func:`tool_shell_homes`). From an agent's tool shell, the
+    ``TMPDIR`` its launch inherited (:data:`OUTER_TMPDIR_ENV`) in place of the agent's own.
 
     The client that finds no server starts one, and the server keeps that client's
     environment as its global one, so a server the fleet starts holds no team
@@ -788,4 +800,11 @@ def tmux_client_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """
     env = untraced_env(base)
     dropped = {*TEAM_ENV_VARS, *agent_identity_env_vars(), *tool_shell_homes(env)}
-    return {k: v for k, v in env.items() if k not in dropped}
+    client = {k: v for k, v in env.items() if k not in dropped}
+    # An agent's own TMPDIR goes when the agent ends: the server keeps the one it inherited.
+    outer = client.pop(OUTER_TMPDIR_ENV, None)
+    if outer is not None:
+        client.pop("TMPDIR", None)
+        if outer:
+            client["TMPDIR"] = outer
+    return client

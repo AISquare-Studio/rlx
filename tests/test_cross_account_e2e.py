@@ -43,6 +43,9 @@ CLAUDE = shutil.which("claude") if A and B else None
 
 pytestmark = [
     pytest.mark.e2e,
+    # The one test file that may use the developer's real home and run the real claude: the
+    # two config dirs it names live there. Everywhere else the suite's guard refuses both (#54).
+    pytest.mark.usefixtures("real_home", "real_agent_binaries"),
     pytest.mark.skipif(
         not (A and B and CLAUDE),
         reason="needs AISQUARE_E2E_CLAUDE_A/_B (two signed-in config dirs) and claude on PATH",

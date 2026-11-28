@@ -217,9 +217,9 @@ def doctor(*, live: bool = False, cwd: Path | None = None) -> list[DoctorCheck]:
             # Warns when two asqs, or an asq and this aisquare, run different releases (#20), so
             # it waits with the late rows.
             _check_instances(),
-            # Only while the experimental captain is off: one ok row saying how to turn it
-            # on. On, doctor is as it was before the switch.
-            *_optional(_captain_check()),
+            # The experimental switches, captain and Remote (#46): one ok row, and how to
+            # turn one on while it is off.
+            _experimental_check(),
             # A stale ANTHROPIC_BASE_URL kills a launch whether or not tracing or the team is on
             # (#51), so it is a machine check of its own, and not part of explainability's
             # section.
@@ -3989,22 +3989,40 @@ def _check_code_index(cwd: Path | None = None) -> DoctorCheck:
     return _ok(name, detail)
 
 
-def _captain_check() -> DoctorCheck | None:
-    """``captain: off (experimental)`` while the switch is off; ``None`` while it is on.
+def _experimental_check() -> DoctorCheck:
+    """``experimental: captain off, remote on``: both switches of Settings' *Experimental*
+    (#46), each with what decides it when that is not the config alone.
 
-    Ok, not a warning: off is the shipped state (``core.experimental``), and the row
-    is there to say how to turn it on.
+    Ok either way: off is how each ships (``core.experimental``). While one is off, the row
+    says how to turn it on: by command at a shell, by Settings in rlx (R13).
     """
-    if experimental.captain_enabled():
-        return None
-    return _ok(
-        "captain",
-        "off (experimental)"
-        + prog.detail_advice(
-            f" — turn it on with: {prog.word()} config set experimental.captain true "
-            f"(or {experimental.CAPTAIN_ENV}=1)"
-        ),
+    captain = experimental.captain_enabled()
+    remote = experimental.remote_enabled()
+    detail = (
+        f"captain {_switch_state(captain, experimental.captain_forced(), experimental.CAPTAIN_ENV)}"
+        f", remote {_switch_state(remote, experimental.remote_forced(), experimental.REMOTE_ENV)}"
     )
+    if remote and experimental.remote_forced() is None and _remote_undecided():
+        detail += " (set up before it had a switch)"
+    if not (captain and remote):
+        names = [name for name, on in (("captain", captain), ("remote", remote)) if not on]
+        detail += prog.detail_advice(
+            " — turn one on with: "
+            + " or ".join(f"{prog.word()} config set experimental.{name} true" for name in names),
+            app=" — turn one on in Settings > App settings > Experimental",
+        )
+    return _ok("experimental", detail)
+
+
+def _switch_state(on: bool, forced: bool | None, variable: str) -> str:
+    return ("on" if on else "off") + (f" ({variable})" if forced is not None else "")
+
+
+def _remote_undecided() -> bool:
+    try:
+        return load_config(copy=False).experimental.remote is None
+    except Exception:  # doctor's config row says why
+        return False
 
 
 def last_injection() -> InjectionRecord | None:

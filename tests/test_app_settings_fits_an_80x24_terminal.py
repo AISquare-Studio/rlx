@@ -30,9 +30,9 @@ from aisquare.cli.ui.sidebar import AppSettingsSelected
 from aisquare.cli.ui.views.app_settings import (
     AGENT_ADVANCED,
     AGENT_TAB,
-    CAPTAIN,
     DISPLAY_CHOICES,
     DISPLAY_TAB,
+    EXPERIMENTAL,
     PREFERENCES_ADVANCED,
     PREFERENCES_TAB,
     REMOTE_TAB,
@@ -90,7 +90,7 @@ def test_at_80x24_the_tabs_keep_mains_rows_and_every_preference_is_on_screen() -
         # to it, from another tab, as the link's message lands (``AppSettingsSelected``).
         tabs.active = REMOTE_TAB
         await settle(app)
-        app.post_message(AppSettingsSelected(CAPTAIN))
+        app.post_message(AppSettingsSelected(EXPERIMENTAL))
         await settle(app)
         seen["captain tab"] = tabs.active
         seen["captain"] = [

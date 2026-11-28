@@ -1963,6 +1963,7 @@ def test_reap_json(runner: CliRunner, resolved: Seen, monkeypatch: pytest.Monkey
         "claims_released",
         "release_failures",
         "held",
+        "temp_dirs_removed",
     }
     assert [a["label"] for a in payload["ended"]] == ["coder-auth"]
     assert payload["claims_released"] == []

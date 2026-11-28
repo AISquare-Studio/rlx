@@ -431,6 +431,12 @@ class Watcher:
         from aisquare.services import fleet as fleet_service
 
         fleet_service.retry_deferred_nudges(scheduled_only=True)
+        # Ended agents' own temporary directories (#57), on every tick: quiet, and a sweep
+        # that fails costs the tick nothing.
+        with contextlib.suppress(Exception):
+            from aisquare.services import agent_tmp
+
+            agent_tmp.sweep_ended()
         if self.settings.auto_stop:
             with contextlib.suppress(Exception):  # a stop never costs the tick its news
                 from aisquare.services import autostop
