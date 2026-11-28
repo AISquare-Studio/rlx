@@ -180,8 +180,8 @@ pub mod topics {
     pub const CLI: &[&str] = &[INSTALL, SIGNIN];
 }
 
-/// The types rlxd itself sends on the `daemon` topic (7.3), on `settings` and on `pty`. A
-/// client must also accept types not listed here.
+/// The types rlxd itself sends on the `daemon` topic (7.3), on `settings`, on `pty` and
+/// on `hook`. A client must also accept types not listed here.
 pub mod types {
     /// `{version, pid}`: rlxd started. The first event of each rlxd's life.
     pub const DAEMON_STARTED: &str = "daemon.started";
@@ -209,6 +209,21 @@ pub mod types {
     /// and again after output the client missed. Only that stream carries it: rlxd keeps
     /// none, and its `seq` is the last event the screen takes in.
     pub const PTY_SNAPSHOT: &str = "pty.snapshot";
+    /// The `hook` topic's types (1.5, 7.3), one per hook rlxd-hook hands rlxd, each with
+    /// [`HookEventData`](crate::HookEventData): `{session_id, cwd, run_id?}`.
+    pub const HOOK_SESSION_START: &str = "hook.session_start";
+    /// See [`HOOK_SESSION_START`].
+    pub const HOOK_USER_PROMPT_SUBMIT: &str = "hook.user_prompt_submit";
+    /// See [`HOOK_SESSION_START`].
+    pub const HOOK_SESSION_END: &str = "hook.session_end";
+    /// See [`HOOK_SESSION_START`].
+    pub const HOOK_STOP: &str = "hook.stop";
+    /// See [`HOOK_SESSION_START`].
+    pub const HOOK_STOP_FAILURE: &str = "hook.stop_failure";
+    /// See [`HOOK_SESSION_START`].
+    pub const HOOK_NOTIFICATION: &str = "hook.notification";
+    /// See [`HOOK_SESSION_START`]. The gate's (5.1).
+    pub const HOOK_PRE_TOOL_USE: &str = "hook.pre_tool_use";
 }
 
 impl Event {

@@ -194,6 +194,14 @@ class ClaudeCodeAdapter:
     mark: AgentMark | None = AgentMark("✻", on_dark="#DF8B70", on_light="#AA4726")
     binary = "claude"
     home_env = "CLAUDE_CONFIG_DIR"
+    #: What its hooks' environment carries that rlx's hook path reads (``services.brain``):
+    #: its config dir, its pid, its temporary folder and its effort.
+    hook_env: tuple[str, ...] = (
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_PID",
+        "CLAUDE_CODE_TMPDIR",
+        "CLAUDE_EFFORT",
+    )
     home_name = ".claude"
     settings_name = "settings.json"
     install_hint = "https://claude.ai/install.sh"
