@@ -43,7 +43,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::brain::CallError;
-use crate::log::warning;
+use crate::log::{info, warning};
 use crate::server::Daemon;
 
 /// How long the brain may take to accept a hook when rlxd-hook does not say, and at most.
@@ -153,6 +153,13 @@ async fn pre_tool_use(
     let Ok(stdin) = serde_json::from_slice::<Value>(stdin) else {
         return Ok(reply(deny_output(NOT_JSON).as_bytes()));
     };
+    if let Some(hold) = test_hold() {
+        info!(
+            "hook: holding a pre-tool-use {} ms, as RLXD_TEST_HOOK_HOLD_MS asks",
+            hold.as_millis()
+        );
+        tokio::time::sleep(hold).await;
+    }
     let ask = crate::runner::Ask {
         run_id,
         attempt,
@@ -168,6 +175,22 @@ async fn pre_tool_use(
             "the hook's connection was dropped before the call was decided",
         )),
     }
+}
+
+/// Test builds only: `RLXD_TEST_HOOK_HOLD_MS` holds each `pre-tool-use` that long before
+/// the gate sees it, as an rlxd that never answers (rlxd-hook's own timer, a connection
+/// dropped mid-request).
+#[cfg(feature = "debug-methods")]
+fn test_hold() -> Option<Duration> {
+    std::env::var("RLXD_TEST_HOOK_HOLD_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_hold() -> Option<Duration> {
+    None
 }
 
 /// Whether the hook's own rlx home, by `rlxd_client::Home`'s rules on the variables

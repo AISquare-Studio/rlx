@@ -80,6 +80,7 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "RLXD_TEST_CONNECTORS_CALL",
         "RLXD_TEST_CALL_WAIT_MS",
         "RLXD_TEST_CALL_DEADLINE_MS",
+        "RLXD_TEST_HOOK_HOLD_MS",
     ] {
         let found = bytes
             .windows(needle.len())

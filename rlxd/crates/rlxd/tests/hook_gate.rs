@@ -259,6 +259,18 @@ fn hook_command(home: &TestHome, r: &str) -> String {
 /// `rlxd-hook pre-tool-use` for run `r`'s attempt 1, run from the test, outside every run,
 /// with `key` and `stdin`: its stdout's decision and reason, and its stderr.
 fn outsider(home: &TestHome, r: &str, key: &str, stdin: &Value) -> (String, String, String) {
+    outsider_within(home, r, key, stdin, 120_000)
+}
+
+/// [`outsider`], its command line saying `deadline_ms`.
+fn outsider_within(
+    home: &TestHome,
+    r: &str,
+    key: &str,
+    stdin: &Value,
+    deadline_ms: u64,
+) -> (String, String, String) {
+    let deadline_ms = deadline_ms.to_string();
     let (code, stdout, stderr) = home.run_bytes(
         &rlxd_hook(),
         &[
@@ -268,7 +280,7 @@ fn outsider(home: &TestHome, r: &str, key: &str, stdin: &Value) -> (String, Stri
             "--attempt",
             "1",
             "--deadline-ms",
-            "120000",
+            &deadline_ms,
         ],
         home.root(),
         stdin.to_string().as_bytes(),
@@ -441,4 +453,77 @@ fn through_rlxd_hook_a_request_not_bound_to_the_run_is_refused_and_no_key_leaks(
         }
     }
     assert!(files > 5, "{files}");
+}
+
+/// Why rlxd-hook denies a call it could not ask rlxd about.
+const UNREACHED: &str = "rlxd could not be asked about this tool call, so it is denied";
+
+#[test]
+fn an_rlxd_that_never_answers_is_a_deny_from_rlxd_hooks_own_timer() {
+    // rlxd holds each pre-tool-use 30 s; rlxd-hook's timer is deadline_ms (1 s) and 5 s.
+    let home = home_with(&[("RLXD_TEST_HOOK_HOLD_MS", "30000")]);
+    let stdin = json!({"hook_event_name": "PreToolUse", "tool_name": SEND,
+        "tool_input": {}, "tool_use_id": "toolu_held"});
+    let started = Instant::now();
+    let (decision, reason, stderr) =
+        outsider_within(&home, &run_id(), &"2".repeat(64), &stdin, 1_000);
+    let took = started.elapsed();
+    assert_eq!(decision, "deny", "{reason}");
+    assert_eq!(reason, UNREACHED);
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(
+        took >= Duration::from_millis(5_500) && took < Duration::from_secs(15),
+        "{took:?}"
+    );
+    assert!(
+        home.log().contains("holding a pre-tool-use"),
+        "{}",
+        home.log()
+    );
+}
+
+#[test]
+fn a_connection_rlxd_drops_mid_request_is_a_deny() {
+    // rlxd holds the request, then is killed with it: rlxd-hook's connection drops long
+    // before its own timer (20 s and 5 s).
+    let home = home_with(&[("RLXD_TEST_HOOK_HOLD_MS", "60000")]);
+    let pid = home.status()["pid"].as_u64().unwrap();
+    let stdin = json!({"hook_event_name": "PreToolUse", "tool_name": SEND,
+        "tool_input": {}, "tool_use_id": "toolu_dropped"});
+    let mut command = home.command_of(
+        &rlxd_hook(),
+        &[
+            "pre-tool-use",
+            "--run",
+            &run_id(),
+            "--attempt",
+            "1",
+            "--deadline-ms",
+            "20000",
+        ],
+    );
+    command
+        .env("RLXD_HOOK_KEY", "3".repeat(64))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let started = Instant::now();
+    let mut child = common::launch(&mut command).expect("rlxd-hook starts");
+    {
+        use std::io::Write;
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(stdin.to_string().as_bytes()).unwrap();
+    }
+    common::eventually("rlxd holds the request", || {
+        home.log().contains("holding a pre-tool-use")
+    });
+    common::kill_hard(pid);
+    let run = common::finish(child);
+    let took = started.elapsed();
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let reply: Value = serde_json::from_str(run.stdout.trim()).unwrap();
+    let said = &reply["hookSpecificOutput"];
+    assert_eq!(said["permissionDecision"], "deny", "{run:?}");
+    assert_eq!(said["permissionDecisionReason"], UNREACHED, "{run:?}");
+    assert!(took < Duration::from_secs(15), "{took:?}");
 }
