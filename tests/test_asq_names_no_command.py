@@ -17,10 +17,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import re
+import string
 import subprocess
 import sys
 import tomllib
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -593,12 +594,44 @@ SPELLERS = frozenset(
 )
 """The calls that spell a command (``core.program``'s and the services' builders)."""
 
+PLACEHOLDER = "rlx"
+"""What a placeholder the sweep cannot trace is read as saying: a program's name, so a command
+after it (``f"{PRODUCT} tidy"``) is still one (reviewer #4214)."""
 
-def _ui_fix_sites(tree: ast.Module) -> Iterator[tuple[ast.expr, ast.AST | None]]:
+MOST_WAYS = 256
+"""The most texts one ``ui_fix`` is read as saying; past them it cannot be read."""
+
+TEXT_METHODS: dict[str, Callable[[str], str]] = {
+    "upper": str.upper,
+    "lower": str.lower,
+    "capitalize": str.capitalize,
+    "title": str.title,
+    "strip": str.strip,
+    "lstrip": str.lstrip,
+    "rstrip": str.rstrip,
+}
+"""A string's own methods a ``ui_fix`` may call on its text: each read as it acts."""
+
+_PERCENT = re.compile(r"%(?:\((\w+)\))?[#0 +-]*(?:\*|\d+)?(?:\.(?:\*|\d+))?([a-zA-Z%])")
+
+Scope = ast.FunctionDef | ast.AsyncFunctionDef | None
+"""The function a value is read in, or ``None`` for the module's top level."""
+
+
+class _Unreadable(Exception):
+    """A part of a ``ui_fix`` the sweep cannot trace to text: it fails closed (reviewer #4214)."""
+
+    def __init__(self, node: ast.AST, what: str) -> None:
+        super().__init__(f"cannot read {what}")
+        self.line: int = getattr(node, "lineno", 0)
+
+
+def _ui_fix_sites(tree: ast.Module) -> Iterator[tuple[ast.expr, Scope]]:
     """(what a ``ui_fix`` is set to, the function around it) for every place ``tree`` sets one:
-    a ``ui_fix=`` argument, a ``{"ui_fix": …}`` update, an ``….ui_fix = …`` assignment."""
+    a ``ui_fix=`` argument, a ``{"ui_fix": …}`` update, an ``….ui_fix = …`` assignment, a
+    ``setattr(…, "ui_fix", …)``."""
 
-    def visit(node: ast.AST, around: ast.AST | None) -> Iterator[tuple[ast.expr, ast.AST | None]]:
+    def visit(node: ast.AST, around: Scope) -> Iterator[tuple[ast.expr, Scope]]:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             around = node
         if isinstance(node, ast.keyword) and node.arg == "ui_fix":
@@ -611,19 +644,28 @@ def _ui_fix_sites(tree: ast.Module) -> Iterator[tuple[ast.expr, ast.AST | None]]
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(t, ast.Attribute) and t.attr == "ui_fix" for t in targets):
                 yield node.value, around
+        if (
+            isinstance(node, ast.Call)
+            and _callee(node) == "setattr"
+            and len(node.args) == 3
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "ui_fix"
+        ):
+            yield node.args[2], around
         for child in ast.iter_child_nodes(node):
             yield from visit(child, around)
 
     yield from visit(tree, None)
 
 
-def _assigned(scope: ast.AST, name: str) -> list[ast.expr]:
-    """What ``name`` is set to in ``scope``: anywhere in a function, at a module's top level."""
+def _assigned(scope: ast.AST, name: str, *, added: bool = True) -> list[ast.expr]:
+    """What ``name`` is set to in ``scope``, anywhere in a function or at a module's top
+    level; ``added``: what ``+=`` adds to it too."""
     found: list[ast.expr] = []
     for node in scope.body if isinstance(scope, ast.Module) else ast.walk(scope):
         if isinstance(node, ast.Assign):
             targets = node.targets
-        elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+        elif isinstance(node, ast.AnnAssign) or (isinstance(node, ast.AugAssign) and added):
             targets = [node.target]
         else:
             continue
@@ -634,60 +676,322 @@ def _assigned(scope: ast.AST, name: str) -> list[ast.expr]:
     return found
 
 
+def _built_up(scope: ast.AST, name: str) -> bool:
+    """Whether ``name`` is added to with ``+=`` in ``scope`` (a module: at its top level)."""
+    return any(
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == name
+        for node in (scope.body if isinstance(scope, ast.Module) else ast.walk(scope))
+    )
+
+
 def _callee(call: ast.Call) -> str | None:
     if isinstance(call.func, ast.Attribute):
         return call.func.attr
     return call.func.id if isinstance(call.func, ast.Name) else None
 
 
+def _product(parts: list[set[str]], node: ast.AST, glue: str = "") -> set[str]:
+    """Each text ``parts`` make, one of each in order, joined by ``glue``."""
+    out = {""}
+    for index, part in enumerate(parts):
+        out = {f"{before}{glue if index else ''}{text}" for before in out for text in part}
+        if len(out) > MOST_WAYS:
+            raise _Unreadable(node, f"a text that can be more than {MOST_WAYS} ways")
+    return out
+
+
+class _Reader:
+    """Every text a ``ui_fix`` in one module can say, read from its source (:meth:`texts`):
+    literals, f-strings, ``+``, ``.format``, ``%``, a separator's ``join``, a string's own
+    methods, the module's constants, the function's variables and comprehensions, and what the
+    module's own helpers return. Anything else cannot be read and fails; a placeholder that
+    cannot be traced is read as a program's name (:data:`PLACEHOLDER`)."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.tree = tree
+        self.functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        self.spelt: list[tuple[int, str]] = []
+        self.reading: set[str] = set()
+        self.naming: set[tuple[int, str]] = set()
+
+    def texts(self, expr: ast.expr, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        if isinstance(expr, ast.Constant):
+            if isinstance(expr.value, str):
+                return {expr.value}
+            if expr.value is None:
+                return set()
+            raise _Unreadable(expr, f"the constant {expr.value!r}")
+        if isinstance(expr, ast.JoinedStr):
+            parts: list[set[str]] = []
+            for part in expr.values:
+                if isinstance(part, ast.FormattedValue):
+                    parts.append(self.hole(part.value, scope, bound))
+                else:
+                    parts.append(self.texts(part, scope, bound))
+            return _product(parts, expr)
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            return _product(
+                [self.texts(side, scope, bound) for side in (expr.left, expr.right)], expr
+            )
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mod):
+            return self._percent(expr, scope, bound)
+        if isinstance(expr, ast.IfExp):
+            return self.texts(expr.body, scope, bound) | self.texts(expr.orelse, scope, bound)
+        if isinstance(expr, ast.BoolOp):
+            return set().union(*(self.texts(value, scope, bound) for value in expr.values))
+        if isinstance(expr, ast.Name):
+            key = (id(scope), expr.id)
+            if key in self.naming:
+                raise _Unreadable(expr, f"{expr.id}, which is made from itself")
+            self.naming.add(key)
+            try:
+                values = self._values(expr, scope, bound, text=True)
+                return set().union(*(self.texts(v, s, b) for v, s, b in values))
+            finally:
+                self.naming.discard(key)
+        if isinstance(expr, ast.Subscript):
+            return self._subscript(expr, scope, bound)
+        if isinstance(expr, ast.Call):
+            return self._call(expr, scope, bound)
+        raise _Unreadable(expr, ast.unparse(expr)[:60])
+
+    def hole(self, expr: ast.expr, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        """What a placeholder says: its texts, or a program's name where they cannot be read."""
+        try:
+            return self.texts(expr, scope, bound) or {PLACEHOLDER}
+        except _Unreadable:
+            return {PLACEHOLDER}
+
+    def _values(
+        self, name: ast.Name, scope: Scope, bound: dict[str, set[str]], *, text: bool
+    ) -> list[tuple[ast.expr, Scope, dict[str, set[str]]]]:
+        """What ``name`` is set to, each with the scope to read it in: a comprehension's
+        binding, the function's own variables, else the module's constants. A ``text`` built
+        up with ``+=`` cannot be read; a list's ``+=`` adds its items."""
+        if name.id in bound:
+            return [(ast.Constant(text), scope, {}) for text in sorted(bound[name.id])]
+        for where, around in ((scope, scope), (self.tree, None)):
+            if where is None or not (values := _assigned(where, name.id, added=not text)):
+                if around is not None and name.id in {
+                    arg.arg
+                    for arg in (
+                        *around.args.posonlyargs,
+                        *around.args.args,
+                        *around.args.kwonlyargs,
+                    )
+                }:
+                    raise _Unreadable(name, f"{name.id}, a parameter of {around.name}")
+                continue
+            if text and _built_up(where, name.id):
+                raise _Unreadable(name, f"{name.id}, built up with +=")
+            return [(value, around, bound if around is not None else {}) for value in values]
+        raise _Unreadable(name, f"{name.id}, which this module does not set")
+
+    def _subscript(self, expr: ast.Subscript, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        """A text's character or slice, at whole numbers written in place."""
+
+        def number(end: ast.expr | None) -> int | None:
+            if end is None:
+                return None
+            if isinstance(end, ast.Constant) and isinstance(end.value, int):
+                return end.value
+            raise _Unreadable(expr, ast.unparse(expr)[:60])
+
+        texts = self.texts(expr.value, scope, bound)
+        index = expr.slice
+        if isinstance(index, ast.Slice):
+            cut = slice(number(index.lower), number(index.upper), number(index.step))
+            return {text[cut] for text in texts}
+        at = number(index)
+        if at is None:
+            raise _Unreadable(expr, ast.unparse(expr)[:60])
+        return {text[at] for text in texts if -len(text) <= at < len(text)}
+
+    def _call(self, expr: ast.Call, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        func, callee = expr.func, _callee(expr)
+        if callee in SPELLERS:
+            self.spelt.append((expr.lineno, f"calls {callee}()"))
+            return {PLACEHOLDER}
+        if isinstance(func, ast.Attribute) and callee == "format":
+            if any(kw.arg is None for kw in expr.keywords) or any(
+                isinstance(arg, ast.Starred) for arg in expr.args
+            ):
+                raise _Unreadable(expr, "a .format given * or ** arguments")
+            holes = [self.hole(arg, scope, bound) for arg in expr.args]
+            named = {kw.arg: self.hole(kw.value, scope, bound) for kw in expr.keywords if kw.arg}
+            return set().union(
+                *(
+                    self._format(text, holes, named, expr)
+                    for text in self.texts(func.value, scope, bound)
+                )
+            )
+        if isinstance(func, ast.Attribute) and callee == "join" and len(expr.args) == 1:
+            items = self._items(expr.args[0], scope, bound)
+            return set().union(
+                *(_product(items, expr, glue) for glue in self.texts(func.value, scope, bound))
+            )
+        if isinstance(func, ast.Attribute) and callee in TEXT_METHODS and not expr.args:
+            act = TEXT_METHODS[callee]
+            return {act(text) for text in self.texts(func.value, scope, bound)}
+        if isinstance(func, ast.Name) and callee in self.functions:
+            if callee in self.reading:
+                raise _Unreadable(expr, f"{callee}, which calls itself")
+            helper = self.functions[callee]
+            self.reading.add(callee)
+            try:
+                returns = [
+                    node.value
+                    for node in ast.walk(helper)
+                    if isinstance(node, ast.Return) and node.value is not None
+                ]
+                return set().union(*(self.texts(value, helper, {}) for value in returns))
+            finally:
+                self.reading.discard(callee)
+        raise _Unreadable(expr, f"a call to {ast.unparse(func)[:50]}")
+
+    def _items(self, expr: ast.expr, scope: Scope, bound: dict[str, set[str]]) -> list[set[str]]:
+        """The texts of each item ``expr`` holds, for a ``join``: a literal list, tuple or set
+        (a starred part spliced in, both of a conditional's), a comprehension (its names bound
+        to what it walks), ``sorted``/``list``/``tuple`` of one, and a variable's every
+        assignment, ``append``, ``extend`` and ``insert``."""
+        if isinstance(expr, ast.List | ast.Tuple | ast.Set):
+            items: list[set[str]] = []
+            for element in expr.elts:
+                if isinstance(element, ast.Starred):
+                    items += self._items(element.value, scope, bound)
+                else:
+                    items.append(self.texts(element, scope, bound))
+            return items
+        if isinstance(expr, ast.IfExp):
+            return self._items(expr.body, scope, bound) + self._items(expr.orelse, scope, bound)
+        if isinstance(expr, ast.ListComp | ast.GeneratorExp | ast.SetComp):
+            binding = dict(bound)
+            for walk in expr.generators:
+                if not isinstance(walk.target, ast.Name):
+                    raise _Unreadable(walk.target, "a comprehension that unpacks")
+                binding[walk.target.id] = set().union(*self._items(walk.iter, scope, binding))
+            return [self.texts(expr.elt, scope, binding)]
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id in ("sorted", "list", "tuple")
+            and len(expr.args) == 1
+        ):
+            return self._items(expr.args[0], scope, bound)
+        if isinstance(expr, ast.Name):
+            items = []
+            for value, where, binding in self._values(expr, scope, bound, text=False):
+                items += self._items(value, where, binding)
+            for node in ast.walk(scope if scope is not None else self.tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == expr.id
+                    and node.func.attr in ("append", "extend", "insert")
+                    and node.args
+                ):
+                    added = node.args[-1]
+                    if node.func.attr == "extend":
+                        items += self._items(added, scope, bound)
+                    else:
+                        items.append(self.texts(added, scope, bound))
+            return items
+        raise _Unreadable(expr, f"the items of {ast.unparse(expr)[:50]}")
+
+    def _percent(self, expr: ast.BinOp, scope: Scope, bound: dict[str, set[str]]) -> set[str]:
+        """``template % args``: each conversion is the argument it takes, as a placeholder."""
+        args = expr.right
+        named: dict[str, set[str]] = {}
+        holes: list[set[str]] = []
+        if isinstance(args, ast.Dict):
+            for key, value in zip(args.keys, args.values, strict=True):
+                if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                    raise _Unreadable(args, "a % mapping whose keys are not plain words")
+                named[key.value] = self.hole(value, scope, bound)
+        else:
+            elements = args.elts if isinstance(args, ast.Tuple) else [args]
+            holes = [self.hole(element, scope, bound) for element in elements]
+        out: set[str] = set()
+        for template in self.texts(expr.left, scope, bound):
+            parts: list[set[str]] = []
+            at, taken = 0, 0
+            for spec in _PERCENT.finditer(template):
+                parts.append({template[at : spec.start()]})
+                if spec.group(2) == "%":
+                    parts.append({"%"})
+                elif spec.group(1) is not None:
+                    parts.append(named.get(spec.group(1), {PLACEHOLDER}))
+                else:
+                    parts.append(holes[taken] if taken < len(holes) else {PLACEHOLDER})
+                    taken += 1
+                at = spec.end()
+            parts.append({template[at:]})
+            out |= _product(parts, expr)
+        return out
+
+    def _format(
+        self, template: str, holes: list[set[str]], named: dict[str, set[str]], node: ast.AST
+    ) -> set[str]:
+        """``template.format(…)``: each field is the argument it names, as a placeholder."""
+        parts: list[set[str]] = []
+        taken = 0
+        try:
+            fields = list(string.Formatter().parse(template))
+        except ValueError as exc:
+            raise _Unreadable(node, f"the .format template {template[:40]!r} ({exc})") from exc
+        for literal, field, _spec, _conversion in fields:
+            parts.append({literal})
+            if field is None:
+                continue
+            key = re.split(r"[.\[]", field, maxsplit=1)[0]
+            whole = key == field  # not one of its attributes or items
+            if key == "":
+                key, taken = str(taken), taken + 1
+            if key.isdigit():
+                hole = holes[int(key)] if int(key) < len(holes) else {PLACEHOLDER}
+            else:
+                hole = named.get(key, {PLACEHOLDER})
+            parts.append(hole if whole else {PLACEHOLDER})
+        return _product(parts, node)
+
+
 def _ui_fix_findings(tree: ast.Module) -> list[tuple[int, str]]:
-    """(line, why) for each ``ui_fix`` in ``tree`` that names a command: its literals and
-    f-strings (a placeholder read as ``{…}``), the module's constants and the function's own
-    variables it names, and what the module's own functions it calls return."""
-    functions = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
-    found: list[tuple[int, str]] = []
-
-    def read(expr: ast.expr, around: ast.AST | None, seen: set[tuple[int, str]]) -> None:
-        for node in ast.walk(expr):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                said(node.lineno, node.value)
-            elif isinstance(node, ast.JoinedStr):
-                parts = [v.value if isinstance(v, ast.Constant) else "{…}" for v in node.values]
-                said(node.lineno, "".join(map(str, parts)))
-            elif isinstance(node, ast.Call) and (callee := _callee(node)) is not None:
-                if callee in SPELLERS:
-                    found.append((node.lineno, f"calls {callee}()"))
-                elif callee in functions and (id(tree), callee) not in seen:
-                    seen.add((id(tree), callee))
-                    helper = functions[callee]
-                    for inner in ast.walk(helper):
-                        if isinstance(inner, ast.Return) and inner.value is not None:
-                            read(inner.value, helper, seen)
-            elif isinstance(node, ast.Name):
-                for scope in (around, tree):
-                    if scope is not None and (id(scope), node.id) not in seen:
-                        seen.add((id(scope), node.id))
-                        for value in _assigned(scope, node.id):
-                            read(value, scope if scope is around else None, seen)
-
-    def said(line: int, text: str) -> None:
-        match = GUARD.search(text)
-        if match:
-            found.append((line, f"{match.group(0)!r} in {text[:70]!r}"))
-
-    for expr, around in _ui_fix_sites(tree):
-        read(expr, around, set())
-    return found
+    """(line, why) for each ``ui_fix`` in ``tree`` that names a command or cannot be read
+    (:class:`_Reader`). A function's keyword-only ``ui_fix`` handed on as a ``ui_fix`` (the
+    doctor's ``_warn`` and ``_fail``) is read where each caller sets it, by name."""
+    reader = _Reader(tree)
+    found: set[tuple[int, str]] = set()
+    for value, scope in _ui_fix_sites(tree):
+        if (
+            isinstance(value, ast.Name)
+            and value.id == "ui_fix"
+            and scope is not None
+            and "ui_fix" in {arg.arg for arg in scope.args.kwonlyargs}
+            and not _assigned(scope, "ui_fix")
+        ):
+            continue
+        try:
+            texts = reader.texts(value, scope, {})
+        except _Unreadable as exc:
+            found.add((exc.line, str(exc)))
+            continue
+        for text in texts:
+            if match := GUARD.search(text):
+                found.add((value.lineno, f"{match.group(0)!r} in {text[:70]!r}"))
+    return sorted(found | set(reader.spelt))
 
 
 def test_no_ui_fix_the_source_can_build_names_a_command() -> None:
     """Tester #4105: the doctor rows a sandbox makes set no ``ui_fix``, so none was read. What
     asq says under a row (``ui_way``) is its ``ui_fix`` as it is: each is read from the source,
-    in every module that sets one."""
+    in every module that sets one, and one it cannot read fails (reviewer #4214)."""
     found = []
     for path in sorted(SRC.rglob("*.py")):
         text = path.read_text(encoding="utf-8")
@@ -697,35 +1001,115 @@ def test_no_ui_fix_the_source_can_build_names_a_command() -> None:
     assert found == []
 
 
-UI_FIX_SHAPES = {
-    "a literal": 'row = _warn("x", "d", "f", ui_fix="Run rlx tidy")\n',
-    "an f-string": 'row = _warn("x", "d", "f", ui_fix=f"Run rlx {what} or rlx status")\n',
-    "a constant": 'WAY = "rlx service install"\nrow = _warn("x", "d", "f", ui_fix=WAY)\n',
+_ROW = 'row = _warn("x", "d", "f", ui_fix={})\n'
+
+UI_FIX_SHAPES: dict[str, tuple[str, str]] = {
+    "a literal": (_ROW.format('"Run rlx tidy"'), "'rlx tidy'"),
+    "an f-string": (_ROW.format('f"Run {what}, or rlx tidy"'), "'rlx tidy'"),
+    "a constant": ('WAY = "rlx tidy"\n' + _ROW.format("WAY"), "'rlx tidy'"),
     "a variable": (
-        "def check():\n"
-        "    way = 'asq doctor --fix'\n"
-        '    return _warn("x", "d", "f", ui_fix=way)\n'
+        "def check():\n    way = 'Run rlx tidy'\n    return "
+        + _ROW.format("way").split("= ", 1)[1],
+        "'rlx tidy'",
     ),
     "a helper": (
-        "def _way(n):\n"
-        "    if n:\n"
-        "        return 'Run aisquare tidy'\n"
-        "    return 'Wait'\n"
-        'row = _warn("x", "d", "f", ui_fix="; ".join([_way(1)]))\n'
+        "def _way(n):\n    if n:\n        return 'Run rlx tidy'\n    return 'Wait'\n"
+        + _ROW.format('"; ".join([_way(1)])'),
+        "'rlx tidy'",
     ),
-    "an update": 'row = old.model_copy(update={"ui_fix": "relax status"})\n',
-    "an assignment": 'row.ui_fix = "rlx why"\n',
-    "a speller": 'row = _warn("x", "d", "f", ui_fix=f"{prog.word()} tidy")\n',
+    "an update": ('row = old.model_copy(update={"ui_fix": "rlx tidy"})\n', "'rlx tidy'"),
+    "an assignment": ('row.ui_fix = "rlx tidy"\n', "'rlx tidy'"),
+    "a speller": (_ROW.format('f"{prog.word()} tidy"'), "calls word()"),
+    # Reviewer #4214's ten ways past the first sweep, each read or failed now:
+    "a constant's placeholder": (
+        'PRODUCT = "rlx"\n' + _ROW.format('f"{PRODUCT} tidy frees it"'),
+        "'rlx tidy'",
+    ),
+    "an imported placeholder": (
+        "from aisquare.core.program import PRODUCT\n" + _ROW.format('f"{PRODUCT} tidy"'),
+        "'rlx tidy'",
+    ),
+    "an attribute's placeholder": (_ROW.format('f"{prog.NAME} tidy"'), "'rlx tidy'"),
+    "a '+'": (_ROW.format('"Run rlx " + "tidy"'), "'rlx tidy'"),
+    "a .format": (_ROW.format('"Run {} {how}".format(PRODUCT, how="tidy")'), "'rlx tidy'"),
+    "a %": (_ROW.format('"Run %s tidy" % (PRODUCT,)'), "'rlx tidy'"),
+    "an imported constant": (
+        "from aisquare.services.ways import TIDY\n" + _ROW.format("TIDY"),
+        "cannot read TIDY",
+    ),
+    "an attribute": (_ROW.format("ways.TIDY"), "cannot read ways.TIDY"),
+    "another module's helper": (_ROW.format("ways.tidy_way()"), "cannot read a call to"),
+    "a helper's parameter": (
+        "def _row(way):\n    return " + _ROW.format("way").split("= ", 1)[1],
+        "cannot read way, a parameter of _row",
+    ),
+    "a setattr": ('setattr(row, "ui_fix", "Run rlx tidy")\n', "'rlx tidy'"),
+    "a list built up": (
+        "def check():\n    parts = []\n    parts.append('rlx tidy')\n    return "
+        + _ROW.format('"; ".join(parts)').split("= ", 1)[1],
+        "'rlx tidy'",
+    ),
+    "a text built up": (
+        "def check():\n    way = 'rlx '\n    way += 'tidy'\n    return "
+        + _ROW.format("way").split("= ", 1)[1],
+        "cannot read way, built up with +=",
+    ),
+    "another parameter handed on": (
+        "def _row(name, *, ui_fix=None, way=None):\n"
+        "    return DoctorCheck(name=name, ui_fix=way)\n",
+        "cannot read way, a parameter of _row",
+    ),
+    "a positional pass-through": (
+        "def _warn(name, ui_fix=None):\n    return DoctorCheck(name=name, ui_fix=ui_fix)\n",
+        "cannot read ui_fix, a parameter of _warn",
+    ),
 }
+"""shape → (a module that sets a ``ui_fix`` so, what the sweep says of it)."""
 
 
 @pytest.mark.parametrize("shape", sorted(UI_FIX_SHAPES))
-def test_the_ui_fix_sweep_reads_each_way_a_ui_fix_is_built(shape: str) -> None:
-    assert _ui_fix_findings(ast.parse(UI_FIX_SHAPES[shape])), shape
-    plain = re.sub(
-        r"(?:rlx|asq|aisquare|relax) \w+|\{prog\.word\(\)\} tidy", "Restart", UI_FIX_SHAPES[shape]
-    )
-    assert _ui_fix_findings(ast.parse(plain)) == [], plain
+def test_the_ui_fix_sweep_fails_each_way_a_command_could_hide(shape: str) -> None:
+    source, said = UI_FIX_SHAPES[shape]
+    found = _ui_fix_findings(ast.parse(source))
+    assert any(said in why for _, why in found), found
+
+
+UI_FIX_PLAIN: dict[str, str] = {
+    "words": _ROW.format('"Restart it on its row"'),
+    "an f-string of a page": (
+        'PAGE = "https://example.com/tmux"\n'
+        + _ROW.format('f"Install tmux as {PAGE} says, as {label} does"')
+    ),
+    "an attribute's placeholder": _ROW.format('f"Install it as {adapter.install_page} says"'),
+    "a '+', a .format and a %": _ROW.format(
+        '"Restart " + "it" + " {} {how}".format(1, how="now") + " %s%%" % (name,)'
+    ),
+    "a join of a comprehension and a helper": (
+        "def _way(every):\n"
+        "    if every == 60:\n"
+        "        within = 'within the hour'\n"
+        "    else:\n"
+        "        within = f'within {every:g} minutes'\n"
+        "    return f'rlx frees it by itself {within}'\n"
+        "def check(named, to_free):\n"
+        "    unread = [f'make {named} readable'] if named else []\n"
+        "    return "
+        + _ROW.format(
+            '"; ".join([*(f"{w[0].upper()}{w[1:]}" for w in unread), '
+            "*([_way(60)] if to_free else [])])"
+        ).split("= ", 1)[1]
+    ),
+    "a keyword-only pass-through": (
+        "def _warn(name, *, ui_fix=None):\n    return DoctorCheck(name=name, ui_fix=ui_fix)\n"
+    ),
+    "none": _ROW.format("None"),
+}
+"""shape → a module whose ``ui_fix`` names no command, built each way the sweep can read."""
+
+
+@pytest.mark.parametrize("shape", sorted(UI_FIX_PLAIN))
+def test_the_ui_fix_sweep_passes_plain_words_however_built(shape: str) -> None:
+    assert _ui_fix_findings(ast.parse(UI_FIX_PLAIN[shape])) == []
 
 
 @pytest.mark.parametrize(
