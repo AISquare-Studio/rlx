@@ -101,6 +101,40 @@ pub fn settings_via(
     ]}]}})
 }
 
+/// The command line after the program of a `connectors.call` run (5.3; spike #5, route a):
+/// a control channel with no session and its MCP servers loaded, on which every
+/// permission prompt comes to rlxd as a `can_use_tool` request. No `--settings`, so no
+/// hook of rlxd's is consulted: the `can_use_tool` alone carries the gate's decision.
+///
+/// ```text
+/// -p --input-format stream-json --output-format stream-json --verbose
+///   --tools "" --no-session-persistence --setting-sources project
+///   --permission-mode manual --permission-prompts host --permission-prompt-tool stdio
+/// ```
+pub fn call_args() -> Vec<OsString> {
+    [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--tools",
+        "",
+        "--no-session-persistence",
+        "--setting-sources",
+        "project",
+        "--permission-mode",
+        "manual",
+        "--permission-prompts",
+        "host",
+        "--permission-prompt-tool",
+        "stdio",
+    ]
+    .map(OsString::from)
+    .to_vec()
+}
+
 /// The command line after the program of the connectors' one-turn probe (5.3), with its
 /// settings file at `settings`: a run's, with no session, its MCP servers loaded
 /// (`--tools ""` and no `--strict-mcp-config`), and one turn at most.

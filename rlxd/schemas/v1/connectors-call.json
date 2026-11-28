@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorsCallParams",
+  "description": "`connectors.call`'s params (5.3): `{run_id, connector, tool, input}`, one call of the\nconnector's `tool` with `input`, made as the `watch` run `run_id` with no model turn.",
+  "type": "object",
+  "properties": {
+    "connector": {
+      "description": "The connector, such as `claude.ai Slack`: the run's mount.",
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
+    },
+    "input": {
+      "description": "The tool's input: the run's pinned call is its RFC 8785 SHA-256, and it is the very\ninput the call is made with.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "run_id": {
+      "description": "The run the call is made as: a new lower-case UUID, the app's to pick.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "tool": {
+      "description": "The tool, as Claude Code names it: `mcp__<connector as Claude Code writes it>__…`.",
+      "type": "string",
+      "maxLength": 512,
+      "minLength": 6,
+      "pattern": "^mcp__"
+    }
+  },
+  "required": [
+    "run_id",
+    "connector",
+    "tool",
+    "input"
+  ]
+}
