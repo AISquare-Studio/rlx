@@ -1,11 +1,14 @@
 //! Connectors (handoff 0.10.3, 2.4, 5.3's listing, 5.5 and 7.7): the user's Claude Code
 //! connectors, the claude.ai MCP servers, with their auth state and their tools.
 //!
-//! - `connectors.list {refresh?, allow_turn?}` ([`ConnectorsListParams`]) gives
-//!   [`ConnectorsList`]: the connectors of the latest `system/init` rlxd saw, from a run
-//!   or a refresh. A plain list never makes a model turn. `refresh: true` needs a route
-//!   with no turn (capability [`capabilities::CONNECTORS_NO_TURN`]), and until there is
-//!   one it is `no_route`, unless `allow_turn: true` lets rlxd run a one-turn probe.
+//! - `connectors.list {refresh?, allow_turn?, account?}` ([`ConnectorsListParams`]) gives
+//!   [`ConnectorsList`]: for each Claude Code account rlx knows ([`AccountConnectors`],
+//!   by its slot), the connectors rlxd last saw there, from a run's `system/init` or a
+//!   refresh; its top-level `connectors` are the default account's (slot 1). A plain list
+//!   never makes a model turn. `refresh: true` reads each account's (or `account`'s)
+//!   from Claude Code with no turn (capability [`capabilities::CONNECTORS_NO_TURN`]), and
+//!   without that route it is `no_route`, unless `allow_turn: true` lets rlxd run a
+//!   one-turn probe, of one account.
 //! - `connectors.call {run_id, connector, tool, input}` ([`ConnectorsCallParams`]) makes
 //!   one read call through Claude Code's MCP client with no model turn (capability
 //!   [`capabilities::CONNECTORS_CALL`]), as a gated `watch` run, and gives
@@ -37,13 +40,14 @@ pub mod capabilities {
 
 /// The types of the `connector` topic (7.7).
 pub mod connector_types {
-    /// `{id}` ([`ConnectorId`](crate::ConnectorId)): a connector rlxd had not seen.
+    /// `{account, id}` ([`ConnectorId`](crate::ConnectorId)): a connector rlxd had not
+    /// seen on `account`.
     pub const ADDED: &str = "connector.added";
-    /// `{id}`: a connector the latest `system/init` no longer lists.
+    /// `{account, id}`: a connector `account`'s latest listing no longer lists.
     pub const REMOVED: &str = "connector.removed";
-    /// `{id, status, previous_status}` ([`ConnectorChanged`](crate::ConnectorChanged)):
-    /// a connector in another status than the last `system/init` showed. Once a change:
-    /// the same status again is no change.
+    /// `{account, id, status, previous_status}` ([`ConnectorChanged`](crate::
+    /// ConnectorChanged)): a connector of `account` in another status than rlxd last saw
+    /// there. Once a change: the same status again is no change.
     pub const CHANGED: &str = "connector.changed";
     /// `{login_id, id, url}`: the login's URL, to open in a browser.
     pub const LOGIN_OPEN_URL: &str = "connector.login.open_url";
@@ -132,13 +136,23 @@ pub struct Connector {
     /// Its name, as runs name it in `needs_connectors` and mounts: `claude.ai Slack`.
     #[schemars(length(min = 1, max = 256))]
     pub id: String,
-    /// Where it comes from: `claude.ai` for a claude.ai connector, else `mcp`.
+    /// Its kind, where it comes from: `claude.ai` for a claude.ai connector, else `mcp`
+    /// (a local MCP server).
     #[schemars(length(min = 1))]
     pub source: String,
     /// Its status.
     pub status: ConnectorState,
-    /// Its tools, as the `system/init` mounted them.
+    /// Its tools, as Claude Code mounted them.
     pub tools: Vec<ConnectorTool>,
+    /// When its status was last read: a run's `system/init`, a refresh, or a login's end.
+    /// Absent in a list saved before rlxd kept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, extend("format" = "date-time"))]
+    pub checked_at: Option<String>,
+    /// Who the account is on this connector (a Slack workspace and user, a Gmail
+    /// address), where rlxd has read it: `null` until then.
+    #[serde(default)]
+    pub identity: Option<ConnectorIdentity>,
 }
 
 impl Connector {
@@ -154,7 +168,98 @@ impl Connector {
             source: source.into(),
             status,
             tools,
+            checked_at: None,
+            identity: None,
         }
+    }
+
+    /// This connector, its status read at `checked_at`.
+    #[must_use]
+    pub fn checked_at(mut self, checked_at: impl Into<String>) -> Self {
+        self.checked_at = Some(checked_at.into());
+        self
+    }
+}
+
+/// Who an account is on one connector, as a read call of the connector's own said.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[non_exhaustive]
+pub struct ConnectorIdentity {
+    /// The workspace or organisation, such as a Slack workspace's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub workspace: Option<String>,
+    /// The user there, such as a Slack user's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub user: Option<String>,
+    /// The address, such as a Gmail account's or a calendar owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null)]
+    pub email: Option<String>,
+}
+
+/// The slot of the default account: the Claude Code a plain `claude` on rlxd's own
+/// environment is (rlx's slot 1).
+pub const DEFAULT_ACCOUNT: u32 = 1;
+
+fn default_account() -> u32 {
+    DEFAULT_ACCOUNT
+}
+
+/// One account's connectors in `connectors.list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(transform = all_required)]
+#[non_exhaustive]
+pub struct AccountConnectors {
+    /// The account's rlx slot: 1 for the default one, the plain `claude` on rlxd's own
+    /// environment.
+    #[schemars(range(min = 1))]
+    pub account: u32,
+    /// The account's alias in rlx, when it has one.
+    pub label: Option<String>,
+    /// Its connectors, by `id`. Empty until a run or a refresh has shown any.
+    pub connectors: Vec<Connector>,
+    /// When its connectors were last read, or `null` before they were.
+    #[schemars(extend("format" = "date-time"))]
+    pub as_of: Option<String>,
+    /// Where they were last read from.
+    pub from: ListedFrom,
+    /// Why its latest refresh failed, or `null`: its connectors are then the ones read
+    /// before.
+    pub error: Option<crate::ErrorBody>,
+}
+
+impl AccountConnectors {
+    /// `account`'s `connectors`, as of `as_of`, from `from`.
+    pub fn new(
+        account: u32,
+        connectors: Vec<Connector>,
+        as_of: Option<String>,
+        from: ListedFrom,
+    ) -> Self {
+        Self {
+            account,
+            label: None,
+            connectors,
+            as_of,
+            from,
+            error: None,
+        }
+    }
+
+    /// This account, aliased `label`.
+    #[must_use]
+    pub fn with_label(mut self, label: Option<String>) -> Self {
+        self.label = label;
+        self
+    }
+
+    /// This account, its latest refresh failed with `error`.
+    #[must_use]
+    pub fn with_error(mut self, error: Option<crate::ErrorBody>) -> Self {
+        self.error = error;
+        self
     }
 }
 
@@ -172,23 +277,31 @@ pub enum ListedFrom {
 ///
 /// ```json
 /// {"connectors": [{"id": "claude.ai Slack", "source": "claude.ai", "status": "connected",
-///   "tools": [{"name": "mcp__claude_ai_Slack__slack_search_public", "read_only_hint": true}]}],
-///  "as_of": "2026-11-27T09:00:00.000Z", "from": "init", "model_turns": 0}
+///   "tools": [{"name": "mcp__claude_ai_Slack__slack_search_public", "read_only_hint": true}],
+///   "checked_at": "2026-11-27T09:00:00.000Z", "identity": null}],
+///  "as_of": "2026-11-27T09:00:00.000Z", "from": "init", "model_turns": 0,
+///  "accounts": [{"account": 1, "label": null, "connectors": […],
+///    "as_of": "2026-11-27T09:00:00.000Z", "from": "init", "error": null}]}
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "ConnectorsList", transform = all_required)]
 #[non_exhaustive]
 pub struct ConnectorsList {
-    /// The connectors, by `id`. Empty until a run or a refresh has shown any.
+    /// The default account's connectors (slot 1's), by `id`. Empty until a run or a
+    /// refresh has shown any.
     pub connectors: Vec<Connector>,
-    /// When the list's `system/init` came, or `null` before any did.
+    /// When the default account's connectors were last read, or `null` before they were.
     #[schemars(extend("format" = "date-time"))]
     pub as_of: Option<String>,
-    /// Where the list came from.
+    /// Where the default account's connectors were last read from.
     pub from: ListedFrom,
-    /// The model turns this call made: 0 for a plain list, 1 for a one-turn refresh.
+    /// The model turns this call made: 0, or 1 for a one-turn refresh.
     #[schemars(range(max = 1))]
     pub model_turns: u32,
+    /// Every account's connectors, by slot: each account rlx knows, the default one
+    /// first. With `account`, that account's alone.
+    #[serde(default)]
+    pub accounts: Vec<AccountConnectors>,
 }
 
 impl ConnectorsList {
@@ -204,24 +317,39 @@ impl ConnectorsList {
             as_of,
             from,
             model_turns,
+            accounts: Vec::new(),
         }
+    }
+
+    /// This list, with every account's connectors.
+    #[must_use]
+    pub fn with_accounts(mut self, accounts: Vec<AccountConnectors>) -> Self {
+        self.accounts = accounts;
+        self
     }
 }
 
-/// `connectors.list`'s params: `{refresh?, allow_turn?}`, both `false` when absent.
+/// `connectors.list`'s params: `{refresh?, allow_turn?, account?}`; `refresh` and
+/// `allow_turn` are `false` when absent, and with no `account` it is every account.
 #[derive(Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "ConnectorsListParams")]
 #[non_exhaustive]
 pub struct ConnectorsListParams {
-    /// Read the connectors from Claude Code now, rather than the latest `system/init`.
+    /// Read the connectors from Claude Code now, rather than as rlxd last saw them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub refresh: Option<bool>,
-    /// With `refresh`, and no route without a turn: run a one-turn probe for it. For
-    /// `app`, `cli` and `tui`; `remote` gets `role_not_allowed`.
+    /// With `refresh`, and no route without a turn: run a one-turn probe for it, of
+    /// `account` (the default account without one). For `app`, `cli` and `tui`; `remote`
+    /// gets `role_not_allowed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null)]
     pub allow_turn: Option<bool>,
+    /// The one account to list, and to refresh, by its rlx slot. An account rlx doesn't
+    /// know is `no_such_account`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, range(min = 1))]
+    pub account: Option<u32>,
 }
 
 impl ConnectorsListParams {
@@ -237,6 +365,9 @@ impl ConnectorsListParams {
 
     /// Whether these params keep every rule of `connectors-list.json`.
     pub fn validate(&self) -> Result<(), Invalid> {
+        if self.account == Some(0) {
+            return Err(Invalid::new("account", "is 0: slots begin at 1"));
+        }
         Ok(())
     }
 }
@@ -256,6 +387,12 @@ struct UncheckedList {
         deserialize_with = "present"
     )]
     allow_turn: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    account: Option<u32>,
 }
 
 /// `connectors.login`'s params: `{id}`, the connector to sign in again.
@@ -470,28 +607,48 @@ impl ConnectorsLoginData {
     }
 }
 
-/// `connector.added` and `connector.removed`: `{id}`.
+/// `connector.added` and `connector.removed`: `{account, id}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "ConnectorId")]
 #[non_exhaustive]
 pub struct ConnectorId {
+    /// The account's rlx slot: 1 when absent, as in an event published before rlxd kept
+    /// more than one account.
+    #[serde(default = "default_account")]
+    #[schemars(range(min = 1))]
+    pub account: u32,
     /// The connector.
     #[schemars(length(min = 1))]
     pub id: String,
 }
 
 impl ConnectorId {
-    /// The connector `id`.
+    /// The connector `id` of the default account.
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            account: DEFAULT_ACCOUNT,
+            id: id.into(),
+        }
+    }
+
+    /// This connector, of `account`.
+    #[must_use]
+    pub fn on(mut self, account: u32) -> Self {
+        self.account = account;
+        self
     }
 }
 
-/// `connector.changed`: `{id, status, previous_status}`.
+/// `connector.changed`: `{account, id, status, previous_status}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(title = "ConnectorChanged")]
 #[non_exhaustive]
 pub struct ConnectorChanged {
+    /// The account's rlx slot: 1 when absent, as in an event published before rlxd kept
+    /// more than one account.
+    #[serde(default = "default_account")]
+    #[schemars(range(min = 1))]
+    pub account: u32,
     /// The connector.
     #[schemars(length(min = 1))]
     pub id: String,
@@ -509,10 +666,18 @@ impl ConnectorChanged {
         previous_status: ConnectorState,
     ) -> Self {
         Self {
+            account: DEFAULT_ACCOUNT,
             id: id.into(),
             status,
             previous_status,
         }
+    }
+
+    /// This change, of `account`.
+    #[must_use]
+    pub fn on(mut self, account: u32) -> Self {
+        self.account = account;
+        self
     }
 }
 

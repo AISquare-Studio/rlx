@@ -105,6 +105,14 @@ the hook. Allowed, the tool gives `watch-call/content.json`, which `job.watch_re
 carries; for the input `{"ref": "missing"}` an error, and for `{"ref": "huge"}` 2 MiB of
 text, as a tool would. Then it tries the identical call again, which rlxd denies `pinned_call_used`.
 
+**`mcp-accounts`** plays Claude Code on the control channel of a no-turn read of one
+account's connectors (task #14): `initialize` as `mcp-direct`'s, then `mcp_status` lists no
+server for its first 300 ms, then the rows `<config dir>/fake-connectors.json` holds,
+read at each ask (`CLAUDE_CONFIG_DIR`, else `~/.claude`), so each account home answers its
+own and a test changes a status by writing the file. Anything else (`mcp_call` included)
+is refused; the log keeps each request under `control_requests`. `mcp-accounts-old`
+refuses `mcp_status` too, as a Claude Code without it would.
+
 **`mcp-direct`** plays Claude Code on a `connectors.call` run's control channel (5.3), as
 spike #5 found 2.1.332: no user message, no `system/init`, only answers to rlxd's
 control requests. `initialize` lists `mcp_call_check_permissions_v1`; `mcp_status` lists

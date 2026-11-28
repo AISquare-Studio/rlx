@@ -56,6 +56,7 @@ use tokio::sync::watch;
 
 use crate::brain::Brain;
 use crate::bus::{self, Bus, Cursor, Line, Topics};
+use crate::connector_map::ConnectorMap;
 use crate::connectors::Connectors;
 use crate::gate::{self, AnswerError, Gate, Hold, Refused, Route, UnpairError};
 use crate::listener::Hangup;
@@ -105,6 +106,8 @@ pub struct Daemon {
     bus: Arc<Bus>,
     runner: Arc<Runner>,
     connectors: Arc<Connectors>,
+    /// Each account's connectors, kept fresh.
+    map: Arc<ConnectorMap>,
     /// The scheduler, or why it couldn't start (its database couldn't be made).
     scheduler: Result<Arc<Scheduler>, String>,
     settings: Settings,
@@ -218,6 +221,12 @@ impl Daemon {
         let runner = Runner::new(home.clone(), Arc::clone(&bus), Arc::clone(&connectors));
         let gate = Arc::new(gate);
         runner.follow_apps(gate.apps());
+        let map = ConnectorMap::new(
+            Arc::clone(&runner),
+            Arc::clone(&connectors),
+            Arc::clone(&brain),
+        );
+        tokio::spawn(Arc::clone(&map).run());
         let scheduler = Scheduler::new(&home, Arc::clone(&bus), Arc::clone(&runner), gate.apps());
         match &scheduler {
             Ok(scheduler) => {
@@ -236,6 +245,7 @@ impl Daemon {
             bus,
             runner,
             connectors,
+            map,
             scheduler,
             settings,
             stopping: AtomicBool::new(false),
@@ -2113,9 +2123,17 @@ impl Daemon {
     async fn connectors_list(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
         let method = methods::CONNECTORS_LIST;
         let params = params_of::<ConnectorsListParams>(method, params)?;
+        let only = params.account;
+        if let Some(slot) = only {
+            self.map.knows(slot).await?;
+        }
         if !params.refresh() {
             // The cache's lock is held while its file is written.
-            return printed(&off_worker(|| self.connectors.list(0)));
+            return printed(&off_worker(|| self.connectors.list(0, only)));
+        }
+        if self.connectors.no_turn() {
+            self.map.refresh(only).await?;
+            return printed(&off_worker(|| self.connectors.list(0, only)));
         }
         if !params.allow_turn() {
             return Err(error(
@@ -2124,8 +2142,8 @@ impl Daemon {
                  (capability connectors.no_turn)",
             )
             .with_hint(
-                "List without refresh for the latest run's connectors, or pass allow_turn: \
-                 true to let rlxd run a one-turn probe.",
+                "List without refresh for the connectors as rlxd last saw them, or pass \
+                 allow_turn: true to let rlxd run a one-turn probe of one account.",
             ));
         }
         // A model turn is the user's to spend: not remote's.
@@ -2137,8 +2155,8 @@ impl Daemon {
                  without refresh.",
             ));
         }
-        self.runner.probe_connectors().await?;
-        printed(&off_worker(|| self.connectors.list(1)))
+        self.map.probe(only).await?;
+        printed(&off_worker(|| self.connectors.list(1, only)))
     }
 
     /// `connectors.call {run_id, connector, tool, input}` (5.3): one gated read call with

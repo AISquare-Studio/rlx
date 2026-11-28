@@ -25,6 +25,7 @@ use super::process::Launch;
 use super::stream::{self, Line};
 use super::{Runner, argv, blocking, refusal, run_env};
 use crate::claude;
+use crate::connectors::{Account, Read};
 use crate::log::{info, warning};
 
 /// The probe's prompt. It asks for nothing that needs a tool.
@@ -37,10 +38,11 @@ const PROBE_INIT: Duration = Duration::from_secs(60);
 const PROBE_END: Duration = Duration::from_secs(30);
 
 impl Runner {
-    /// Runs one probe and puts its `system/init` in the connectors' cache. One probe runs
-    /// at a time: a second waits for the first, then runs its own. Refused with
+    /// Runs one probe on `account`'s environment and puts its `system/init` in the
+    /// connectors' cache as `account`'s. One probe runs at a time (and no no-turn read
+    /// beside it): a second waits for the first, then runs its own. Refused with
     /// `claude_not_found` when there is no Claude Code, or `probe_failed`, saying why.
-    pub async fn probe_connectors(&self) -> Result<(), ErrorBody> {
+    pub async fn probe_connectors(&self, account: &Account) -> Result<(), ErrorBody> {
         let _one = self.probing.lock().await;
         let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
             return Err(refusal(
@@ -68,12 +70,18 @@ impl Runner {
             crate::files::write_private(&settings_file, &settings.to_string())
         })
         .map_err(|e| failed(format!("its folder could not be set up: {e}")))?;
-        info!("connectors: a one-turn probe starts (model_turns: 1)");
+        info!(
+            "connectors: a one-turn probe of account {} starts (model_turns: 1)",
+            account.slot
+        );
+        let mut env = run_env();
+        env.extend(account.env());
         let launch = Launch {
             program: program.clone(),
             args: argv::probe_args(&settings_file),
             cwd: dir,
-            env: run_env(),
+            env,
+            unset: account.unset(),
         };
         let (mut child, tree) = self.spawner.spawn(launch).await.map_err(|e| {
             failed(format!(
@@ -95,14 +103,17 @@ impl Runner {
         match read {
             Ok(init) => {
                 blocking(|| {
-                    self.connectors.observe(init.observed());
+                    self.connectors
+                        .observe_on(account, init.observed(), Read::Init);
                 });
                 info!("connectors: the probe ended");
                 Ok(())
             }
             Err(why) => {
                 warning!("connectors: the probe failed: {why}");
-                Err(failed(why))
+                let error = failed(why);
+                blocking(|| self.connectors.refresh_failed(account, error.clone()));
+                Err(error)
             }
         }
     }

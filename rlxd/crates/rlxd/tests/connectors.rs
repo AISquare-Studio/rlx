@@ -773,7 +773,11 @@ fn a_connector_an_init_no_longer_lists_is_removed_and_one_it_lists_new_is_added(
     let added = connector_events(&home, 0);
     assert_eq!(added.len(), 1, "{added:#?}");
     assert_eq!(added[0]["type"], "connector.added", "{added:#?}");
-    assert_eq!(added[0]["data"], json!({"id": SLACK}), "{added:#?}");
+    assert_eq!(
+        added[0]["data"],
+        json!({"account": 1, "id": SLACK}),
+        "{added:#?}"
+    );
     assert_valid("connector-id.json", &added[0]["data"]);
     let since = seq(&home);
     std::fs::write(home.root().join("scenario"), "init-other").unwrap();

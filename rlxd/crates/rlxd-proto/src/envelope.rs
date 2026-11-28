@@ -434,6 +434,12 @@ pub mod codes {
     /// `connectors.list {refresh: true, allow_turn: true}`: the one-turn probe ended
     /// without a `system/init`. The message says why.
     pub const PROBE_FAILED: &str = "probe_failed";
+    /// `connectors.list {refresh: true}`, an account's `error`: its `mcp_status` still
+    /// listed no server, or one still `pending`, when the read's wait ran out. Its
+    /// connectors are the ones read before.
+    pub const SETTLE_TIMEOUT: &str = "settle_timeout";
+    /// `connectors.list {account}`: rlx knows no Claude Code account of that slot.
+    pub const NO_SUCH_ACCOUNT: &str = "no_such_account";
 }
 
 impl Envelope {

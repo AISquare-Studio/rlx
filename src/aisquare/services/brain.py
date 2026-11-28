@@ -46,6 +46,13 @@ What the process writes to stdout before that (as it imports and starts) reaches
 before the hello: rlxd logs a line that is not JSON and passes over it, and takes any
 JSON line that is not a hello of its protocol for a brain of another release.
 
+Accounts (task #14)
+-------------------
+
+``accounts`` lists the Claude Code accounts rlx knows, read-only, for rlxd's connector map:
+each one's slot, a managed slot's ``CLAUDE_CONFIG_DIR`` and ``CLAUDE_CODE_TMPDIR``, and a
+mark of who is signed in there (a SHA-256 of the account's id), never the id or email.
+
 Hooks (1.5)
 -----------
 
@@ -177,6 +184,7 @@ import base64
 import collections
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -807,8 +815,40 @@ def _hook(params: Mapping[str, Any]) -> Result:
     }
 
 
+def _accounts(params: Mapping[str, Any]) -> Result:
+    """``accounts``: the Claude Code accounts rlx knows, for rlxd's connector map (task
+    #14). ``{accounts: [{slot, label, config_dir, tmp_dir, login}]}``, the plain slot first.
+
+    Read-only, through ``core.claude_accounts`` alone: its account list, Claude Code's
+    slots only, and each one's ``identity``. Nothing is written, and no store is opened,
+    so ``label`` (the registry's alias) is ``None``. ``config_dir`` and ``tmp_dir`` are a
+    managed slot's two variables, ``None`` for the plain one, which rlxd runs as it is.
+    ``login`` is the SHA-256 of the signed-in account's id (its email when it records
+    none), ``None`` when no one is: the id and the email never leave the brain.
+    """
+    del params
+    from aisquare.core import claude_accounts as core
+
+    rows: list[dict[str, Any]] = []
+    for account in core.list_accounts():
+        if account.agent != core.AGENT:
+            continue
+        who = core.identity(account)
+        key = (who.account_uuid or who.email) if who is not None else None
+        rows.append(
+            {
+                "slot": account.slot,
+                "label": None,
+                "config_dir": str(account.config_dir) if account.managed else None,
+                "tmp_dir": str(account.tmp_dir) if account.managed and account.tmp_dir else None,
+                "login": hashlib.sha256(key.encode("utf-8")).hexdigest() if key else None,
+            }
+        )
+    return {"accounts": rows}
+
+
 #: The methods, by name.
-METHODS: dict[str, Method] = {"ping": _ping, "hook": _hook}
+METHODS: dict[str, Method] = {"ping": _ping, "hook": _hook, "accounts": _accounts}
 
 
 def _rlx_version() -> str:

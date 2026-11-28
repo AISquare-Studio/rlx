@@ -420,25 +420,60 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   removed, so the next try starts it anew. On a resumed attempt (`--resume`), the file is
   the run's whole session: it is never removed, only cut back to its length before the
   attempt's first try, so a later resume goes on from what was delivered.
-- **The cache.** Each `system/init` rlxd takes as a run's truth updates the list: an
-  ungated run's (not `no_tools`, which lists none), a gated run's once confirmed, the
-  last try's of one that failed, and a refresh's. An init that lists no server at all
-  empties nothing, since a Claude Code that loaded none (E9's stdin at EOF) says the
-  same. A server's `source` is init's where it gives one (`claudeai` is a claude.ai
-  connector), and its tools are those under `mcp__<name>__`, the name as Claude Code
-  writes it (the tool-call gate's `claude_server_name`). The cache is kept in
-  `<home>/rlxd/connectors.json` (0600), written whole (`durable::write`) under the
-  cache's lock before any change is published. Each change is an event on the
-  `connector` topic: `connector.added`, `connector.removed`, and `connector.changed
-  {id, status, previous_status}` once for each real change.
-- **`connectors.list {refresh?, allow_turn?}`** gives the cache (`from: "init"`,
-  `model_turns: 0`), to every role. `refresh` is `no_route` until there is a route with
-  no turn (`connectors.no_turn`), unless `allow_turn`, which `app`, `cli` and `tui` may
-  pass (`remote` gets `role_not_allowed`): then rlxd runs its own one-turn probe, not a
-  run, with the user's MCP servers loaded and every tool call it attempts denied by rlxd
-  itself (its settings' hook is `rlxd __probe-deny`, which opens no connection), and
-  reports `model_turns: 1`. rlxd's log says when each probe ran, and holds neither its
-  prompt nor what it listed.
+- **Accounts.** The map holds each Claude Code account rlx knows, by its slot (task #14,
+  `crate::connector_map`). The brain says which there are (`accounts`, read-only: rlxd
+  never writes the account registry or reads the Keychain): slot 1, the default account,
+  the plain `claude`; and each managed slot, with its `CLAUDE_CONFIG_DIR` and
+  `CLAUDE_CODE_TMPDIR`, and a mark of who is signed in there (a SHA-256 the brain makes of
+  the account's id). Those homes and that mark stay in rlxd's file: never on the wire, in
+  an event, or in rlxd's log. Without a brain, there is the default account alone; with
+  the brain unavailable, the accounts stay as they were. An account gone from its list is
+  dropped, with a `connector.removed {account, id}` for each of its connectors.
+- **The cache.** Each `system/init` rlxd takes as a run's truth updates the account the
+  runs use (the default one, but under a managed slot's `CLAUDE_CONFIG_DIR`, that
+  slot): an ungated run's (not `no_tools`, which lists none), a gated run's once
+  confirmed, the last try's of one that failed, and a one-turn probe's. So does a
+  `connectors.call` that finds its connector `needs-auth` or `failed`. A read that lists
+  no server at all empties nothing, since a Claude Code that loaded none (E9's stdin at
+  EOF) says the same. A server's `source` is its kind (`claude.ai`, or `mcp` for a local
+  one), init's where it gives one (`claudeai` is a claude.ai connector), and its tools
+  are those under `mcp__<name>__`, the name as Claude Code writes it (the tool-call
+  gate's `claude_server_name`). Each connector has the `checked_at` of its last read, and
+  an `identity`, `null` until rlxd reads one (a later step). The cache is kept in
+  `<home>/rlxd/connectors.json` (0600), each account's entry by slot, written whole
+  (`durable::write`) under the cache's lock before any change is published; a file from
+  before accounts loads as the default account's. Each change is an event on the
+  `connector` topic: `connector.added {account, id}`, `connector.removed {account, id}`,
+  and `connector.changed {account, id, status, previous_status}` once for each real
+  change.
+- **`connectors.list {refresh?, allow_turn?, account?}`** gives the cache, to every
+  role: `accounts`, each account's `{account, label, connectors, as_of, from, error}`
+  (only `account`'s with one; a slot rlx doesn't know is `no_such_account`), and, at the
+  top level as before, the runs' account's `connectors`, `as_of` and `from`.
+  - With the capability `connectors.no_turn` (a test build with
+    `RLXD_TEST_CONNECTORS_NO_TURN=1`; a release build only once the owner's probe P6
+    confirms the route), `refresh` reads each account's connectors, or `account`'s, with
+    no model turn (`runner/discover.rs`, spike #5's `mcp_status`), one Claude Code at a
+    time: started on a control channel in `<home>/rlxd/connectors-read/<slot>/`, with no
+    tools, no session and project settings only, on the account's environment (both
+    variables taken away for the default account, both set for a managed one). It writes
+    no user line and makes no call: `initialize`, then `mcp_status` every 250 ms until it
+    lists a server and none is `pending`, and `model_turns: 0`, `from: "listing"`. An
+    account that hasn't settled in 15 s keeps what was read before, with `error:
+    {code: "settle_timeout"}`, and no event; one whose Claude Code refuses `mcp_status`,
+    `no_route`. The refresh fails only when no account was read. A refresh of an
+    account being read joins that read.
+  - Without the capability, `refresh` is `no_route`, unless `allow_turn`, which `app`,
+    `cli` and `tui` may pass (`remote` gets `role_not_allowed`): then rlxd runs its own
+    one-turn probe of one account, `account` or the default one, never more: not a run,
+    with the user's MCP servers loaded and every tool call it attempts denied by rlxd
+    itself (its settings' hook is `rlxd __probe-deny`, which opens no connection), and
+    reports `model_turns: 1`. rlxd's log says when each probe and each read ran, of which
+    slot, and holds neither a probe's prompt nor what either listed.
+  - **In the background**, only with `connectors.no_turn` (no turn is ever spent unasked):
+    every 10 minutes rlxd asks the brain for the accounts again and reads each new one,
+    each in another home and each signed in again, and each account last read over 24 h
+    ago.
 - **`read_only_hint`** is each tool's MCP `readOnlyHint` when `system/init` lists the
   tool with annotations, else `null`: Claude Code 2.1 lists names only.
 - **`connectors.login {id}`**, for `app`, `cli` and `tui` (`remote` gets

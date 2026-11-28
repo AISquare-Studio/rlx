@@ -49,6 +49,7 @@ mod claude;
 mod cli;
 mod clock;
 mod config;
+mod connector_map;
 mod connectors;
 mod durable;
 mod events;

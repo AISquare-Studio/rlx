@@ -1,9 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ConnectorChanged",
-  "description": "`connector.changed`: `{id, status, previous_status}`.",
+  "description": "`connector.changed`: `{account, id, status, previous_status}`.",
   "type": "object",
   "properties": {
+    "account": {
+      "description": "The account's rlx slot: 1 when absent, as in an event published before rlxd kept\nmore than one account.",
+      "type": "integer",
+      "format": "uint32",
+      "default": 1,
+      "maximum": 4294967295,
+      "minimum": 1
+    },
     "id": {
       "description": "The connector.",
       "type": "string",
