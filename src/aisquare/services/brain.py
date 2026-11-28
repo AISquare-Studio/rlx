@@ -53,6 +53,14 @@ Accounts (task #14)
 each one's slot, a managed slot's ``CLAUDE_CONFIG_DIR`` and ``CLAUDE_CODE_TMPDIR``, and a
 mark of who is signed in there (a SHA-256 of the account's id), never the id or email.
 
+Usage (task #15)
+----------------
+
+``usage`` gives each of those accounts' room, for rlxd's routes by connector: its fullest
+window, percent used, from the reading on record, and whether it refuses requests now, with
+when that ends. Python owns usage; rlxd only orders what this says. It asks the usage
+endpoint nothing.
+
 Hooks (1.5)
 -----------
 
@@ -855,8 +863,73 @@ def _accounts(params: Mapping[str, Any]) -> Result:
     return {"accounts": rows}
 
 
+def _usage(params: Mapping[str, Any]) -> Result:
+    """``usage``: each Claude Code account's room, for rlxd's routes by connector (task
+    #15). ``{accounts: [{slot, used_percent, limited, resets_at}]}``, for the accounts
+    ``accounts`` lists, in its order.
+
+    Nothing is asked of the usage endpoint: each account's reading is the one ON RECORD
+    for the login it holds now, no older than the cache's five minutes
+    (``services.claude_accounts._on_record``, what ``cached_usage`` serves without a fetch,
+    as ``room_on_record`` reads it), and the limit marks in force (``limit_marks``).
+
+    - ``used_percent``: that reading's ``headroom_percent``, its fullest window, percent
+      USED; ``None`` with no reading, which rlxd ranks last.
+    - ``limited``: whether it refuses requests now, by Python's own rule and clock: a
+      limit mark in force that every model shares (``LimitMark.blocks(None)``), or the
+      reading's limiting window spent (100 % used): a reading on record is one whose
+      windows haven't reset since. Not the fleet's ``switch_at`` line, a spawn's rule.
+    - ``resets_at``: for a limited account, when the last of what limits it ends (RFC 3339,
+      UTC), or ``None`` when none says.
+
+    Every account rlx reads ``_on_record`` from is one of ``core.claude_accounts``' (the
+    plain one, then each managed one), as ``accounts`` lists them. The private reader is
+    the same on rc/0.10.2 and rc/0.10.3.
+    """
+    del params
+    from datetime import UTC
+
+    from aisquare.core import claude_accounts as core
+    from aisquare.services import claude_accounts as accounts
+
+    managed = core.managed_accounts()
+    plain = core.default_account(env={})
+    listed = [*([plain] if core.plain_home_counts(plain, managed=bool(managed)) else []), *managed]
+    # Both on the accounts code's own clock: the marks in force now, and each reading on
+    # record now whose windows haven't reset since it was taken (``_served``'s rule).
+    marks = accounts.limit_marks()
+    readings = accounts._on_record(listed, max_age=accounts.USAGE_MAX_AGE_SECONDS)
+    rows: list[dict[str, Any]] = []
+    for account in listed:
+        reading = readings.get(account.slot)
+        ends = [mark.until for mark in marks.get(account.slot, []) if mark.blocks(None)]
+        limiting = reading.limiting if reading is not None else None
+        spent = limiting is not None and (limiting.used_percent or 0.0) >= 100.0
+        if spent and limiting is not None and limiting.resets_at is not None:
+            ends.append(limiting.resets_at)
+        resets = max(ends) if ends else None
+        rows.append(
+            {
+                "slot": account.slot,
+                "used_percent": accounts.headroom_percent(reading) if reading is not None else None,
+                "limited": spent or bool(ends),
+                "resets_at": (
+                    resets.astimezone(UTC).isoformat().replace("+00:00", "Z")
+                    if resets is not None
+                    else None
+                ),
+            }
+        )
+    return {"accounts": rows}
+
+
 #: The methods, by name.
-METHODS: dict[str, Method] = {"ping": _ping, "hook": _hook, "accounts": _accounts}
+METHODS: dict[str, Method] = {
+    "ping": _ping,
+    "hook": _hook,
+    "accounts": _accounts,
+    "usage": _usage,
+}
 
 
 def _rlx_version() -> str:
