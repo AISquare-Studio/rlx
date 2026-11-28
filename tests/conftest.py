@@ -111,6 +111,16 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         pytest.exit(reason, returncode=4)
     if _TEMP_PROBLEM is not None:
         pytest.exit(_TEMP_PROBLEM, returncode=4)
+    # Here, not in a fixture: under xdist the controller runs no fixture, and makes the
+    # basetemp in its own pytest_sessionstart, which is trylast (reviewer #3783).
+    named = session.config.getoption("basetemp", None)
+    if named is not None and inside(named, _DEVELOPERS_HOME):
+        pytest.exit(
+            f"--basetemp {named} is inside your home ({_DEVELOPERS_HOME}): no test's folder "
+            "may be, or a markerless one resolves to the home as a project (#54). Name one "
+            "outside it.",
+            returncode=4,
+        )
     # Once per run, in the process that starts it: an xdist worker's siblings are alive,
     # so a sweep there would find nothing more, only race the others for it.
     if not hasattr(session.config, "workerinput"):
@@ -585,7 +595,7 @@ _OUTSIDE_A_TEST: dict[str, str] = {}
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _home_of_the_run(tmp_path_factory: pytest.TempPathFactory, pytestconfig: pytest.Config) -> Path:
+def _home_of_the_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """The user's home wherever no test's own is in force: a directory of the run's, never the
     developer's (#54). Named to sort first among the session's autouse fixtures (pytest takes
     them alphabetically), so none of them sees the real home.
@@ -597,15 +607,7 @@ def _home_of_the_run(tmp_path_factory: pytest.TempPathFactory, pytestconfig: pyt
     environment for the guard's ``sitecustomize``. Left as is at the end, as
     :func:`home_outside_a_test` leaves its home, for what still runs at the interpreter's exit.
     """
-    named = pytestconfig.getoption("basetemp", None)  # asked before pytest makes it
-    if named is not None and inside(named, _DEVELOPERS_HOME):
-        pytest.exit(
-            f"--basetemp {named} is inside your home ({_DEVELOPERS_HOME}): no test's folder "
-            "may be, or a markerless one resolves to the home as a project (#54). Name one "
-            "outside it.",
-            returncode=4,
-        )
-    basetemp = tmp_path_factory.getbasetemp()
+    basetemp = tmp_path_factory.getbasetemp()  # never in the home (pytest_sessionstart)
     home = tmp_path_factory.mktemp("user-home-outside-a-test", numbered=False)
     for name in USER_HOME_VARS:
         os.environ[name] = str(home)

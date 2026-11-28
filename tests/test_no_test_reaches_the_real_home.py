@@ -311,10 +311,11 @@ def test_where_the_temp_root_may_go_starts_with_the_developers_pick() -> None:
 
 
 def _inner_run(
-    tmp_path: Path, files: dict[str, str], env: dict[str, str], *args: str
+    tmp_path: Path, files: dict[str, str], env: dict[str, str], *args: str, xdist: bool = False
 ) -> subprocess.CompletedProcess[str]:
     """A pytest of its own in ``tmp_path``, with the suite's conftest, ``files`` as its tests,
-    and ``env`` over the suite's environment less what the inner run names for itself."""
+    and ``env`` over the suite's environment less what the inner run names for itself; xdist
+    off unless ``xdist``."""
     for name, source in files.items():
         (tmp_path / name).write_text(textwrap.dedent(source), encoding="utf-8")
     full = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO), os.environ["PYTHONPATH"]])}
@@ -322,14 +323,18 @@ def _inner_run(
         full.pop(name, None)  # the inner run names its own
     full.pop("PYTEST_DEBUG_TEMPROOT", None)
     full.update(env)
-    argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:xdist"]
+    argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    argv += [] if xdist else ["-p", "no:xdist"]
     argv += ["-o", "addopts=", *args, *files]
     return subprocess.run(argv, cwd=tmp_path, env=full, capture_output=True, text=True, timeout=300)
 
 
+#: The suite's fixtures, and its session-start hook (where the run refuses a --basetemp in the
+#: home, in the controller too), for a pytest of its own.
 INNER_CONFTEST = (
     "from tests.conftest import (  # noqa: F401\n"
     "    _home_of_the_run, isolated_user_home, keychain_guard, no_real_keychain,\n"
+    "    pytest_sessionstart,\n"
     ")\n"
 )
 
@@ -381,14 +386,24 @@ def test_a_temp_dir_in_the_real_home_is_moved_out_so_no_walk_reaches_the_home(
     assert "1 passed" in inner.stdout
 
 
-def test_a_basetemp_named_in_the_real_home_is_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize("workers", [None, "2"], ids=["serial", "xdist -n 2"])
+def test_a_basetemp_named_in_the_real_home_is_refused_before_anything_is_made(
+    workers: str | None, tmp_path: Path
+) -> None:
+    """Refused at session start, in the process that makes the basetemp: under xdist that is
+    the controller, which runs no fixture and makes it in its own (trylast) session start
+    (reviewer #3783). Nothing is made in the home: ``deep`` is a folder already there (a
+    ``~/Code``), so the guard's rule on writes directly in the home can't be what stops it."""
     real = tmp_path / "developer"
-    real.mkdir()
+    (real / "deep").mkdir(parents=True)
     env = {name: str(real) for name in conftest.USER_HOME_VARS}
     files = {"conftest.py": INNER_CONFTEST, "test_any.py": "def test_any():\n    pass\n"}
-    inner = _inner_run(tmp_path, files, env, "--basetemp", str(real / "projects" / "base"))
+    args = ["--basetemp", str(real / "deep" / "base")]
+    args += ["-n", workers] if workers else []
+    inner = _inner_run(tmp_path, files, env, *args, xdist=workers is not None)
     assert inner.returncode == 4, inner.stdout + inner.stderr
     assert "is inside your home" in inner.stdout + inner.stderr
+    assert list((real / "deep").iterdir()) == [], "nothing is made there"
 
 
 # --- the opt-ins, enforced by the asking test's file (reviewer #3717, minor 1) -------------
