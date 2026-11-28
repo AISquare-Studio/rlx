@@ -116,6 +116,21 @@ done
 
 DRY="--dry-run --yes --no-project --no-agent --no-system-deps"
 
+# The package as the release's installer installs it on this machine (install.sh's
+# cli_package): with the tray's extra on macOS and on Linux outside WSL (#34), plain
+# anywhere else. PKG_RE is it as a pattern for grep -E, its brackets escaped.
+PKG=aisquare-cli
+case "$(uname -s)" in
+    Darwin) PKG='aisquare-cli[tray]' ;;
+    Linux)
+        if [ -z "${WSL_DISTRO_NAME:-}" ] &&
+            ! { [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; }; then
+            PKG='aisquare-cli[tray]'
+        fi
+        ;;
+esac
+PKG_RE=$(printf '%s' "$PKG" | sed 's/[][]/\\&/g')
+
 # One run of main's install.sh: $1 is the PATH, $2 the shell, the rest are its
 # arguments. Output in $WORK/out, status in $RC, and the TMPDIR must be empty.
 installer() {
@@ -178,12 +193,13 @@ for name in $SHELLS; do
     # No version named: the release's installer installs the latest UNPINNED, as
     # main's would (it is handed --version latest).
     ! grep -q "pinned to" "$WORK/out" || fail "the release's installer pinned its own version"
-    # The install target, on uv's line: plain on a machine without aisquare,
-    # `@latest` on one that has it, and never ==V or @V. A machine whose aisquare
-    # is already the latest has no install line (`is current`), only the check above.
+    # The install target, on uv's line: the package as this OS takes it ($PKG),
+    # plain on a machine without aisquare, `@latest` on one that has it, and never
+    # ==V or @V. A machine whose aisquare is already the latest has no install line
+    # (`is current`), only the check above.
     if ! grep -q "^==> aisquare-cli $VERSION is current\$" "$WORK/out"; then
-        grep -Eq "^ *would run: uv tool install .* aisquare-cli(@latest)?\$" "$WORK/out" ||
-            fail "the release's installer did not install the latest release"
+        grep -Eq "^ *would run: uv tool install .* $PKG_RE(@latest)?\$" "$WORK/out" ||
+            fail "the release's installer did not install the latest release, as $PKG"
     fi
     expect "nothing above was actually run" "--dry-run was not passed through"
     fetched "github.com/AISquare-Studio/rlx/releases/latest/download/install.sh" \
