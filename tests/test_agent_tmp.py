@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,10 +41,13 @@ from typer.testing import CliRunner
 
 from aisquare.cli.app import app
 from aisquare.core import paths, procs
+from aisquare.core.agent_adapters import get_adapter
+from aisquare.core.agent_adapters.codex import PERMISSION_PROFILE
+from aisquare.core.agent_adapters.types import store_dir
 from aisquare.core.spawn import OUTER_TMPDIR_ENV, TMP_KEY_ENV, tmux_client_env
 from aisquare.core.store import store_session
 from aisquare.models import FleetAgent, LaunchSpec, ProjectInfo
-from aisquare.services import agent_tmp, usage_stats
+from aisquare.services import agent_tmp, store_broker, usage_stats
 from aisquare.services import fleet as fleet_service
 from tests import test_fleet_service as fleet_suite
 from tests import test_launch as launch_suite
@@ -212,10 +216,27 @@ def test_a_home_too_long_for_a_socket_keeps_the_inherited_temp_dir() -> None:
     env = {"TMPDIR": "/inherited"}
     environ: dict[str, str] = {}
 
-    assert agent_tmp.prepare(env, environ=environ) is None, "quietly: today's TMPDIR"
+    said = agent_tmp.prepare(env, environ=environ)
 
+    assert said is not None and "keeps the inherited one" in said and "49" in said
     assert env == {"TMPDIR": "/inherited"} and environ == {}
     assert not paths.agent_tmp_root().exists()
+
+
+@posix
+def test_a_launch_that_keeps_the_inherited_temp_dir_says_so_once_it_goes_ahead(
+    runner: CliRunner, work_dir: Path, spy: dict[str, Any]
+) -> None:
+    """The test home is too long: the launch says so in one line, before its banner. A launch
+    refused before that (an account no one holds) says nothing of it."""
+    result = runner.invoke(app, ["launch", "coder"])
+    assert result.exit_code == 0, result.output
+    said = [line for line in result.output.splitlines() if line.startswith("agent temp: ")]
+    assert len(said) == 1 and "keeps the inherited one" in said[0]
+    assert result.output.index("agent temp: ") < result.output.index("Launching ")
+
+    refused = runner.invoke(app, ["launch", "coder", "--account", "9"])
+    assert refused.exit_code != 0 and "agent temp: " not in refused.output
 
 
 @posix
@@ -386,6 +407,92 @@ def test_every_listing_sweeps_at_most_once_a_minute(
     fleet_service.list_agents(project)
 
     assert swept == [1]
+
+
+@posix
+def test_removal_clears_what_the_agent_left_read_only_and_never_follows_a_link(
+    processes: dict[int, str], tmp_path: Path
+) -> None:
+    directory = _dir("aaaaaa", kind="launch", pid=12)
+    locked = directory / "locked"
+    (locked / "deeper").mkdir(parents=True)
+    (locked / "deeper" / "file").write_text("x")
+    (locked / "deeper").chmod(0o500)
+    locked.chmod(0o000)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("mine")
+    outside.chmod(0o500)
+    (directory / "link").symlink_to(outside)
+
+    assert agent_tmp.sweep_ended(now=NOW) == [directory] and not directory.exists()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o500, "a link's target is never changed"
+    assert (outside / "keep").read_text() == "mine"
+    outside.chmod(0o700)
+
+
+# --- a sandboxed Codex may write its own TMPDIR, inside the home it holds read-only -----
+
+
+def _table(
+    env: dict[str, str], argv: list[str], monkeypatch: pytest.MonkeyPatch
+) -> dict[str, str] | None:
+    """What ``start_for_launch`` hands Codex as its filesystem table; ``None`` when it hands
+    none (no store profile: the operator's sandbox). Its broker is never started."""
+
+    def not_started(directory: Path, env: object) -> None:
+        raise RuntimeError("not started in this test")
+
+    monkeypatch.setattr(store_broker, "run_broker", not_started)
+    launched, _ = store_broker.start_for_launch(env, get_adapter("codex"), argv)
+    key = f"permissions.{PERMISSION_PROFILE}.filesystem="
+    found = [arg for arg in launched if arg.startswith(key)]
+    if not found:
+        return None
+    table: dict[str, str] = tomllib.loads(f"t = {found[-1].partition('=')[2]}")["t"]
+    return table
+
+
+@pytest.mark.parametrize(
+    ("case", "seat", "own", "writes"),
+    [
+        ("the store's profile, a coder", "workspace", True, True),
+        ("the store's profile, a read-only reviewer", "read_only", True, True),
+        ("a TMPDIR outside the home: Codex's own rule", "workspace", False, False),
+        ("the operator's sandbox, no store profile", None, True, None),
+    ],
+)
+def test_a_sandboxed_codex_may_write_its_own_tmpdir_in_the_home_it_holds_read_only(
+    case: str,
+    seat: str | None,
+    own: bool,
+    writes: bool | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of #643, the MAJOR: under the store's profile a sandboxed Codex holds the whole
+    rlx home read-only, and its TMPDIR is in it. Its own directory is writable within (the
+    more specific path winning, as its broker's inbox is), to every seat; its owner record
+    stays read-only; another TMPDIR adds nothing."""
+    monkeypatch.chdir(tmp_path)
+    mine = paths.agent_tmp_dir("abc234").resolve() if own else tmp_path / "T"
+    env = {"AISQUARE_LAUNCH_ID": "launch-57", "TMPDIR": str(mine)}
+    codex = get_adapter("codex")
+    argv = (
+        ["codex", *codex.store_access(seat, store_dir())]  # type: ignore[arg-type]
+        if seat is not None
+        else ["codex", "--sandbox", "workspace-write"]
+    )
+
+    table = _table(env, argv, monkeypatch)
+
+    if writes is None:
+        assert table is None, case
+        return
+    assert table is not None and table[str(store_dir())] == "read", case
+    assert (table.get(str(mine)) == "write") is writes, case
+    owner = paths.agent_tmp_root().resolve() / "abc234.owner"
+    assert table.get(str(owner)) != "write", "the record beside it stays the home's"
 
 
 # --- what stays shared ------------------------------------------------------------------

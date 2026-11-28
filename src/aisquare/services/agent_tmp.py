@@ -13,7 +13,7 @@ read or set: tmux keeps its sockets there or in ``/tmp``, never under ``TMPDIR``
 **Short.** macOS caps a unix socket's path at 104 bytes, and a test that binds one in pytest's
 ``tmp_path`` adds about 66 to its ``TMPDIR``. ``/Users/<name>/.rlx/tmp/<key>`` is about 28
 bytes; macOS's own default (``/var/folders/…/T/``) is 49. A home that would make it longer than
-:data:`MAX_BYTES` keeps the inherited ``TMPDIR``, as every launch had before.
+:data:`MAX_BYTES` keeps the inherited ``TMPDIR``, and the launch says so in one line.
 
 **The key.** A fleet agent's is minted at its first spawn and kept in its launch spec
 (``LaunchSpec.tmp_key``), which every replacement replays: a restart, a switch, a hand-over
@@ -46,7 +46,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Collection, MutableMapping
+from collections.abc import Collection, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -143,12 +143,11 @@ def prepare(
     environ: MutableMapping[str, str] | None = None,
 ) -> str | None:
     """Make this launch's directory and point ``env`` (the agent's) and ``environ`` (this
-    process's, ``os.environ`` by default) at it. Returns a line to say when the directory
-    could not be made (a link or a file in its place, someone else's, a disk that refuses),
-    and the inherited one is kept. ``None`` otherwise: the agent's own is set; or
-    ``explicit`` (the binding's and ``--env``'s variables) names one, which is the operator's;
-    or the home is too long for a socket under it (:data:`MAX_BYTES`), and the inherited one
-    is kept as before.
+    process's, ``os.environ`` by default) at it. Returns a line to say when it keeps the
+    inherited directory instead: the home is too long for a socket under it
+    (:data:`MAX_BYTES`), or the directory could not be made (a link or a file in its place,
+    someone else's, a disk that refuses). ``None`` when it set the agent's own, or when
+    ``explicit`` (the binding's and ``--env``'s variables) names one: the operator's.
 
     A fleet window's key is its spec's (``AISQUARE_TMP_KEY``, honoured only where no launch
     id is inherited: a launch from inside an agent is a launch by hand, with its own)."""
@@ -159,8 +158,12 @@ def prepare(
     fleet = not env.get("AISQUARE_LAUNCH_ID") and is_key(carried)
     key = carried if fleet else new_key()
     directory = paths.agent_tmp_dir(key)
-    if sys.platform != "win32" and len(os.fsencode(directory)) > MAX_BYTES:
-        return None  # today's TMPDIR, quietly: a socket under ours would not fit
+    size = len(os.fsencode(directory))
+    if sys.platform != "win32" and size > MAX_BYTES:
+        return (
+            f"agent temp: {directory} would be {size} bytes, over the {MAX_BYTES} that leave "
+            "room for a socket under it; it keeps the inherited one"
+        )
     try:
         _make(directory)
         _write_owner(key, "fleet" if fleet else "launch")
@@ -285,15 +288,53 @@ def sweep_ended(store: ContextStore | None = None, *, now: datetime | None = Non
 
 def remove_dir(directory: Path) -> bool:
     """Remove one agent directory and its owner record: only a real directory directly under
-    ``<home>/tmp`` whose name is a key. Whether it is gone."""
+    ``<home>/tmp`` whose name is a key. What the agent left read-only is made writable first
+    (never through a link), so nothing stays behind for good. Whether it is gone."""
     root = paths.agent_tmp_root()
     if directory.parent != root or not is_key(directory.name) or not _real_dir(directory):
         return False
+    _writable_within(directory)
     shutil.rmtree(directory, ignore_errors=True)
     if directory.exists():
         return False
     _owner_path(directory.name).unlink(missing_ok=True)
     return True
+
+
+def _writable_within(top: Path) -> None:
+    """Give this user write and search on every directory under ``top``, and write on every
+    file on Windows (where a read-only file cannot be deleted), before removal. A link is
+    never followed nor changed: ``os.walk`` does not descend into one, and each is skipped."""
+
+    def own(path: str, mode: int) -> None:
+        with contextlib.suppress(OSError):
+            if not os.path.islink(path):
+                os.chmod(path, mode)
+
+    own(str(top), stat.S_IRWXU)
+    for here, dirs, files in os.walk(top, followlinks=False):
+        for name in dirs:
+            own(os.path.join(here, name), stat.S_IRWXU)
+        if sys.platform == "win32":
+            for name in files:
+                own(os.path.join(here, name), stat.S_IREAD | stat.S_IWRITE)
+
+
+def own_dir(env: Mapping[str, str]) -> Path | None:
+    """The agent's own directory ``env`` names as its temporary directory, resolved: a key's
+    directory directly under ``<home>/tmp``. ``None`` for any other (the inherited one, the
+    operator's): what a sandbox that holds the home read-only must still let it write."""
+    named = env.get(VARS[0], "")
+    if not named:
+        return None
+    try:
+        root = paths.agent_tmp_root().resolve()
+        resolved = Path(named).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if resolved.parent != root or not is_key(resolved.name):
+        return None
+    return resolved
 
 
 _last_sweep = 0.0
