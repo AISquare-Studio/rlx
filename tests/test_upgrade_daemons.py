@@ -32,6 +32,7 @@ from aisquare.core import locking, registry
 from aisquare.services import install_route, lifecycle, upgrade_daemons
 from aisquare.services.install_route import Captured, Facts, LatestRelease
 from aisquare.services.upgrade_daemons import Around, Events, Options, Refused
+from tests.fake_rlxd import read_state, update_state
 from tests.installer_seams import no_real_installer  # noqa: F401 — autouse, applied by import
 
 FAKE = Path(__file__).with_name("fake_rlxd.py")
@@ -61,14 +62,11 @@ class Daemons:
         (self.dir / "version").write_text(version, encoding="utf-8")
 
     def state(self, **values: Any) -> None:
-        path = self.dir / "state.json"
-        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        state.update(values)
-        path.write_text(json.dumps(state), encoding="utf-8")
+        """Sets ``values`` in the fake's state, under the lock the fake's own writes take."""
+        update_state(self.dir, lambda state: state.update(values))
 
     def read_state(self) -> dict[str, Any]:
-        state: dict[str, Any] = json.loads((self.dir / "state.json").read_text(encoding="utf-8"))
-        return state
+        return read_state(self.dir)
 
     def start(self, kind: str = "rlxd") -> daemons_core.Daemon:
         argv = [sys.executable, str(FAKE), "serve" if kind == "rlxd" else "watch", "--detach"]
@@ -337,6 +335,30 @@ def test_end_ptys_ends_each_live_pty_before_rlxd_stops(fake: Daemons) -> None:
     }
     around.installed("2.0.0", None)
     around.finish(())
+
+
+def test_a_state_written_while_the_fake_saves_its_own_is_kept(
+    fake: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#44: the fake registered (live) before it saved its own entry, and a test's write
+    that came in between was overwritten by the fake's stale copy (ci.yml 46151216330:
+    the live PTY lost, so nothing refused). Here the old order comes back, the fake's save
+    held 2 s between its read and its write, and the test writes inside that window: both
+    writes are kept, as they share one lock."""
+    monkeypatch.setenv("FAKE_RLXD_SAVE_LATE", "2")
+    fake.start()
+    deadline = time.monotonic() + 20
+    while not (fake.dir / "saving").exists():
+        assert time.monotonic() < deadline, "the fake never began its save"
+        time.sleep(0.02)
+    fake.state(ptys=[{"pty_id": "p1", "exited": False}])
+    state = fake.read_state()
+    assert state["ptys"] == [{"pty_id": "p1", "exited": False}], state
+    assert state["rlxd"]["pid"] == fake.pids[-1], state
+    around, _ = _around(fake, Options(restart_daemons=True))
+    with pytest.raises(Refused) as refused:
+        around.before_install()
+    assert refused.value.code == "ptys_live"
 
 
 def test_without_end_ptys_a_live_pty_refuses_at_the_stop_and_none_is_ended(
@@ -1171,6 +1193,8 @@ class _ClaimWatch:
         self.most = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._passes = 0
+        self._passed = threading.Condition()
 
     def __enter__(self) -> _ClaimWatch:
         self._thread.start()
@@ -1195,7 +1219,19 @@ class _ClaimWatch:
                     continue
                 if upgrade_daemons._claim_helper_pid(claim) is None and claim.exists():
                     self.half_written.append(text)
+            with self._passed:
+                self._passes += 1
+                self._passed.notify_all()
             time.sleep(0.005)
+
+    def settle(self) -> None:
+        """Waits for a whole pass that began after this call: what is on disk now, the watch
+        has seen. Stopped sooner, a loaded runner may not have scheduled it since a claim was
+        made (ci.yml run 46157412521: ``most`` 0)."""
+        with self._passed:
+            since = self._passes
+            done = self._passed.wait_for(lambda: self._passes >= since + 2, timeout=30)
+        assert done, "the watch never finished a pass"
 
 
 def test_a_reader_never_sees_a_claim_without_its_helper_pid(
@@ -1210,12 +1246,22 @@ def test_a_reader_never_sees_a_claim_without_its_helper_pid(
         began = time.monotonic()
         old, _ = _given_up_on(fake)
         took = time.monotonic() - began
+        # restart_when_gone waits for the claim only up to CLAIM_WAIT_SECONDS: a helper
+        # slower than that to start (a loaded runner) claims after it returns, so the claim
+        # is waited for here, whole, and seen by the watch (as #670's racing test is).
+        claim = upgrade_daemons.restarts_dir() / f"{old.id}.json"
+        deadline = time.monotonic() + 30
+        while upgrade_daemons._claim_helper_pid(claim) is None:
+            assert time.monotonic() < deadline, "the claim was never written whole"
+            time.sleep(0.05)
+        watch.settle()
         pending = upgrade_daemons.pending_restarts()
     assert watch.half_written == [], watch.half_written
     assert len(pending) == 1, pending
     assert isinstance(pending[0]["helper_pid"], int), pending
     assert pending[0]["id"] == old.id
-    assert took >= 1.0, "restart_when_gone waited for the claim, whole"
+    waited = min(1.0, upgrade_daemons.CLAIM_WAIT_SECONDS)
+    assert took >= waited, "restart_when_gone waited for the claim, whole, up to its limit"
     assert list(upgrade_daemons.restarts_dir().glob("*.tmp")) == []
     (fake.dir / "stuck-rlxd").unlink()  # rlxd finishes its stop: the helper ends
     fake.wait_live("rlxd", not_pid=old.pid)
@@ -1245,6 +1291,14 @@ def test_two_helpers_racing_for_one_daemon_give_exactly_one_claim(
         while refused not in (log.read_text(encoding="utf-8") if log.exists() else ""):
             assert time.monotonic() < deadline, log.read_text(encoding="utf-8")
             time.sleep(0.1)
+        # The loser refuses on the lock alone, and restart_when_gone gives up on the claim
+        # after CLAIM_WAIT_SECONDS: the winner's claim may come later still, so it is waited
+        # for whole, and seen by the watch, before the watch stops.
+        claim = upgrade_daemons.restarts_dir() / f"{old.id}.json"
+        while upgrade_daemons._claim_helper_pid(claim) is None:
+            assert time.monotonic() < deadline, "the winner's claim was never written whole"
+            time.sleep(0.05)
+        watch.settle()
         pending = upgrade_daemons.pending_restarts()
     assert watch.half_written == [], watch.half_written
     assert watch.most == 1, watch.most

@@ -14,6 +14,14 @@ Run as ``python tests/fake_rlxd.py <command> …`` with ``FAKE_RLXD_DIR`` naming
 - ``status --json``, ``call <method> [params]`` and ``stop`` answer as rlxd's command line:
   one JSON envelope (``ok``, ``data`` or ``error``). The runs and PTYs are
   ``<dir>/state.json``'s, which a test writes; ``pty.kill`` marks one exited.
+
+``state.json`` is read and written only under ``<dir>/state.lock``
+(:func:`read_state`, :func:`update_state`), the test's writes as the fake's: a write
+is a read, a change and a write under the one lock, so none loses another's (#44). A
+daemon saves its own entry before it registers, so a test that sees it live writes after
+it. ``FAKE_RLXD_SAVE_LATE=<seconds>`` (a test's) puts back the old order, registered
+first, and holds its save that long between its read and its write, with
+``<dir>/saving`` there meanwhile.
 """
 
 from __future__ import annotations
@@ -23,25 +31,53 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
-from aisquare.core import daemons
+from aisquare.core import daemons, locking
 
-DIR = Path(os.environ["FAKE_RLXD_DIR"])
-STATE = DIR / "state.json"
+#: How long a read or a write of ``state.json`` waits for another to finish.
+STATE_WAIT_S = 20.0
 
 
-def _state() -> dict[str, Any]:
+def _dir() -> Path:
+    return Path(os.environ["FAKE_RLXD_DIR"])
+
+
+def _read(directory: Path) -> dict[str, Any]:
     try:
-        loaded: dict[str, Any] = json.loads(STATE.read_text(encoding="utf-8"))
+        loaded: dict[str, Any] = json.loads((directory / "state.json").read_text(encoding="utf-8"))
         return loaded
     except (OSError, ValueError):
         return {}
 
 
-def _save(state: dict[str, Any]) -> None:
-    STATE.write_text(json.dumps(state), encoding="utf-8")
+def read_state(directory: Path) -> dict[str, Any]:
+    """``<directory>/state.json``, read under its lock: ``{}`` before the first write."""
+    with locking.holding(directory / "state.lock", wait_s=STATE_WAIT_S):
+        return _read(directory)
+
+
+def update_state(
+    directory: Path, change: Callable[[dict[str, Any]], None], *, hold_s: float = 0.0
+) -> None:
+    """Changes ``<directory>/state.json`` as ``change`` changes what it holds: read, changed
+    and written under its one lock, so this write and another's never lose each other.
+    ``hold_s`` holds it between the read and the write, ``<directory>/saving`` there
+    meanwhile (``FAKE_RLXD_SAVE_LATE``)."""
+    with locking.holding(directory / "state.lock", wait_s=STATE_WAIT_S):
+        state = _read(directory)
+        if hold_s:
+            (directory / "saving").touch()
+            time.sleep(hold_s)
+        change(state)
+        (directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        (directory / "saving").unlink(missing_ok=True)
+
+
+def _state() -> dict[str, Any]:
+    return read_state(_dir())
 
 
 def _say(envelope: dict[str, Any], code: int = 0) -> NoReturn:
@@ -72,24 +108,33 @@ def _daemon(kind: str) -> None:
     # As rlx's watch does (services.watch._stop_on): a SIGTERM ignored at start stays so.
     if signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN:
         signal.signal(signal.SIGTERM, stop)
-    version = (DIR / "version").read_text(encoding="utf-8").strip()
+    directory = _dir()
+    version = (directory / "version").read_text(encoding="utf-8").strip()
     argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
-    planted = DIR / f"argv-{kind}"  # a record that names another program (a review's H1a)
+    planted = directory / f"argv-{kind}"  # a record that names another program (a review's H1a)
     if planted.exists():
         argv = json.loads(planted.read_text(encoding="utf-8"))
-    registration = daemons.register(kind, argv=argv, restartable=True)  # type: ignore[arg-type]
-    mute = DIR / f"mute-{kind}"
+    mute = directory / f"mute-{kind}"
     answers_at = time.time() + float(mute.read_text(encoding="utf-8")) if mute.exists() else 0.0
-    state = _state()
-    state[kind] = {"pid": os.getpid(), "version": version, "answers_at": answers_at}
-    _save(state)
+    entry = {"pid": os.getpid(), "version": version, "answers_at": answers_at}
+
+    def save(state: dict[str, Any]) -> None:
+        state[kind] = entry
+
+    late = float(os.environ.get("FAKE_RLXD_SAVE_LATE", "0"))
+    if not late:
+        # Saved before it is live: a test that sees it registered writes after this.
+        update_state(directory, save)
+    registration = daemons.register(kind, argv=argv, restartable=True)  # type: ignore[arg-type]
+    if late:
+        update_state(directory, save, hold_s=late)
     try:
-        while not (DIR / "teardown").exists():
-            flag = DIR / f"stop-{kind}"
+        while not (directory / "teardown").exists():
+            flag = directory / f"stop-{kind}"
             if flag.exists():
                 flag.unlink(missing_ok=True)
                 asked = True
-            if asked and not (DIR / f"stuck-{kind}").exists():
+            if asked and not (directory / f"stuck-{kind}").exists():
                 break
             time.sleep(0.05)
     finally:
@@ -123,18 +168,21 @@ def main() -> None:
         if method == "pty.list":
             _say({"ok": True, "data": {"ptys": state.get("ptys", [])}})
         if method == "pty.kill":
-            for pty in state.get("ptys", []):
-                if pty.get("pty_id") == params.get("pty_id"):
-                    pty["exited"] = True
-            state.setdefault("killed", []).append(params.get("pty_id"))
-            _save(state)
+
+            def kill(state: dict[str, Any]) -> None:
+                for pty in state.get("ptys", []):
+                    if pty.get("pty_id") == params.get("pty_id"):
+                        pty["exited"] = True
+                state.setdefault("killed", []).append(params.get("pty_id"))
+
+            update_state(_dir(), kill)
             _say({"ok": True, "data": {}})
         _say({"ok": False, "error": {"code": "unknown_method", "message": method}}, 1)
     if command == ["stop"]:
         live = _live()
         if live is None:
             _say({"ok": True, "data": {}})
-        (DIR / "stop-rlxd").write_text("", encoding="utf-8")
+        (_dir() / "stop-rlxd").write_text("", encoding="utf-8")
         deadline = time.monotonic() + float(os.environ.get("FAKE_RLXD_STOP_WAIT", "10"))
         while time.monotonic() < deadline:
             if _live() is None:
