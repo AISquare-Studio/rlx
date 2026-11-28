@@ -138,6 +138,8 @@ a watch job's fallback run is), each plays `watch-call`.
 | `mcp-direct-twice-other` | The same, its second ask for `create_issue` |
 | `mcp-direct-defiant` | Runs the call even when rlxd denies it |
 | `mcp-direct-garbled` | Asks `can_use_tool` first with no `tool_use_id`, then well formed |
+| `mcp-direct-slow-reply` | Answers a call rlxd denied only after 9 s |
+| `mcp-direct-slow-ask` | Asks `can_use_tool` only 3 s after the call |
 | `mcp-direct-orphan` | Leaves a process in a process group of its own holding its stderr for a minute (`lingering_pid` in the log), then writes an `assistant` line |
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
