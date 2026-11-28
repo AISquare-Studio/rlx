@@ -378,9 +378,14 @@ fn ask_in_time(
     let stage = Arc::new(AtomicU8::new(READY));
     let (said, answer) = mpsc::channel();
     let asking = Arc::clone(&stage);
-    thread::spawn(move || {
+    // A thread that can't start has sent nothing: never a panic (an exit 101 a
+    // `pre-tool-use` must not have), a hook that never ran.
+    let started = thread::Builder::new().spawn(move || {
         let _ = said.send(ask(params, &asking));
     });
+    if let Err(e) = started {
+        return Asked::NeverRan(format!("rlxd-hook could not start its thread: {e}"));
+    }
     match answer.recv_timeout(budget) {
         Ok(asked) => asked,
         Err(_) => {
@@ -539,7 +544,7 @@ fn fall_back(event: &str, stdin: &[u8]) {
 /// `rlxd-hook ping`: rlxd and its brain answer, through the brain's queue.
 fn ping() -> ExitCode {
     let (said, answer) = mpsc::channel();
-    thread::spawn(move || {
+    let started = thread::Builder::new().spawn(move || {
         let outcome = connect().and_then(|mut connection| {
             connection
                 .request(methods::HOOK_PING, Data::new())
@@ -547,6 +552,10 @@ fn ping() -> ExitCode {
         });
         let _ = said.send(outcome);
     });
+    if let Err(e) = started {
+        say(&format!("could not start its thread: {e}"));
+        return ExitCode::FAILURE;
+    }
     match answer.recv_timeout(PING_WAIT) {
         Ok(Ok(reply)) if reply.is_ok() => ExitCode::SUCCESS,
         Ok(Ok(reply)) => {
