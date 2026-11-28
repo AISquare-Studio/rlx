@@ -763,8 +763,7 @@ fn a_status_call_stays_fast_while_large_sets_write_the_file() {
         })
         .collect();
     let mut status = connect(&home);
-    let mut slowest_status = Duration::ZERO;
-    let mut asked = 0;
+    let mut waits = Vec::new();
     while writers.iter().any(|w| !w.is_finished()) {
         let started = Instant::now();
         assert!(
@@ -773,8 +772,7 @@ fn a_status_call_stays_fast_while_large_sets_write_the_file() {
                 .unwrap()
                 .is_ok()
         );
-        slowest_status = slowest_status.max(started.elapsed());
-        asked += 1;
+        waits.push(started.elapsed());
         std::thread::sleep(Duration::from_millis(10));
     }
     let slowest_set = writers
@@ -782,14 +780,23 @@ fn a_status_call_stays_fast_while_large_sets_write_the_file() {
         .map(|w| w.join().unwrap())
         .max()
         .unwrap();
+    let asked = waits.len();
     assert!(asked >= 1);
+    let slowest = waits.iter().max().copied().unwrap();
     let bound = (solo / 2).max(Duration::from_millis(100));
-    assert!(
-        slowest_status < bound,
-        "status waited {slowest_status:?} ({asked} asked), more than {bound:?}: half a \
-         set alone ({solo:?}), at least 100 ms; status alone took {baseline:?}, and the \
-         slowest concurrent set {slowest_set:?}"
+    // At most one call in a hundred over the bound, and none over five times it. The
+    // writers keep a write in flight nearly all the time, so a status that waited on
+    // writes, even now and then, would wait on more calls than that. One call can stall on
+    // the runner instead: on a Windows runner one of 1193 waited 450 ms, the others under
+    // the bound (rlxd.yml run 46043922492).
+    let over = waits.iter().filter(|wait| **wait >= bound).count();
+    let said = format!(
+        "{over} of {asked} status calls over {bound:?}, the slowest {slowest:?}: the bound \
+         is half a set alone ({solo:?}), at least 100 ms; status alone took {baseline:?}, \
+         and the slowest concurrent set {slowest_set:?}"
     );
+    assert!(over <= asked / 100, "more than 1%: {said}");
+    assert!(slowest < bound * 5, "one over 5 times the bound: {said}");
 }
 
 #[test]
