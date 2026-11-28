@@ -81,7 +81,11 @@ use super::{
     refusal, run_env, store, stream, tail, with_detail,
 };
 use crate::claude;
+use crate::connectors::Account;
 use crate::log::{info, warning};
+
+/// Who an identity read's run is recorded as started by.
+pub const IDENTITY_CLIENT: &str = "rlxd-identity";
 
 /// The `initialize` capability without which a Claude Code runs `mcp_call` unchecked.
 pub const CHECK_PERMISSIONS: &str = "mcp_call_check_permissions_v1";
@@ -175,6 +179,13 @@ pub(super) struct CallRun {
     input: Map<String, Value>,
     /// How the call came out, once it has.
     outcome: Mutex<Option<Outcome>>,
+    /// The account whose environment the call runs on, when rlxd makes it for that
+    /// account (an identity read, [`Runner::identity_call`]); else rlxd's own.
+    account: Option<Account>,
+    /// Whether the call's result is the caller's alone (an identity read): its
+    /// `run.tool_result` carries no content, so neither the run's events nor its folder
+    /// hold any.
+    withheld: bool,
 }
 
 impl CallRun {
@@ -183,6 +194,8 @@ impl CallRun {
         Self {
             input: Map::new(),
             outcome: Mutex::new(None),
+            account: None,
+            withheld: false,
         }
     }
 
@@ -252,6 +265,17 @@ impl Runner {
         client: &str,
         job: Option<JobTag>,
     ) -> Result<RunRef, ErrorBody> {
+        self.start_call_on(params, client, job, None)
+    }
+
+    /// [`Runner::start_call`], on `account`'s environment when one is given.
+    fn start_call_on(
+        self: &Arc<Self>,
+        params: ConnectorsCallParams,
+        client: &str,
+        job: Option<JobTag>,
+        account: Option<Account>,
+    ) -> Result<RunRef, ErrorBody> {
         let prefix = crate::connectors::tool_prefix(&params.connector);
         if params
             .tool
@@ -289,6 +313,8 @@ impl Runner {
         let call = CallRun {
             input: params.input,
             outcome: Mutex::new(None),
+            withheld: account.is_some(),
+            account,
         };
         self.start_checked(start, client, job_id, loud, watch_job, Some(call))
     }
@@ -301,11 +327,40 @@ impl Runner {
         params: ConnectorsCallParams,
         client: &str,
     ) -> Result<ConnectorsCallData, ErrorBody> {
+        self.call_on(params, client, None).await
+    }
+
+    /// One identity read (task #14, step 2): `params`' call, made as a `connectors.call`
+    /// is (the gate's path: the app decides it), on `account`'s environment. Refused
+    /// `account_unknown` when rlxd doesn't know both of a managed account's homes.
+    pub async fn identity_call(
+        self: &Arc<Self>,
+        params: ConnectorsCallParams,
+        account: &Account,
+    ) -> Result<ConnectorsCallData, ErrorBody> {
+        if !account.homes_known() {
+            return Err(refusal(
+                codes::ACCOUNT_UNKNOWN,
+                format!("account {}'s homes are not known", account.slot),
+            ));
+        }
+        self.call_on(params, IDENTITY_CLIENT, Some(account.clone()))
+            .await
+    }
+
+    /// The call's run, started on `account`'s environment (rlxd's own without one), and
+    /// waited for: its reply.
+    async fn call_on(
+        self: &Arc<Self>,
+        params: ConnectorsCallParams,
+        client: &str,
+        account: Option<Account>,
+    ) -> Result<ConnectorsCallData, ErrorBody> {
         let run_id = params.run_id.clone();
         let started = {
             let runner = Arc::clone(self);
             let client = client.to_owned();
-            blocking(move || runner.start_call(params, &client, None))
+            blocking(move || runner.start_call_on(params, &client, None, account))
         };
         started?;
         let run = self.find(&run_id)?;
@@ -379,6 +434,9 @@ impl Runner {
             .unwrap_or_else(|| times.timeout_s(params.deadline_ms));
         let deadline = Instant::now() + Duration::from_secs(timeout_s);
         let mut env = run_env();
+        if let Some(account) = &call.account {
+            env.extend(account.env());
+        }
         env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
         {
             // No hook key: no hook decides anything of this run.
@@ -392,7 +450,11 @@ impl Runner {
             args: argv::call_args(),
             cwd: cwd.clone(),
             env,
-            unset: Vec::new(),
+            unset: call
+                .account
+                .as_ref()
+                .map(Account::unset)
+                .unwrap_or_default(),
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -899,8 +961,13 @@ impl Runner {
                 truncated,
             });
         }
-        let data =
-            RunToolResultData::new(call_id, tool, is_error, content.clone()).truncated(truncated);
+        // An identity read's content is its reader's alone: the stream says only how it
+        // came out.
+        let data = if call.withheld {
+            RunToolResultData::new(call_id, tool, is_error, Value::Null)
+        } else {
+            RunToolResultData::new(call_id, tool, is_error, content.clone()).truncated(truncated)
+        };
         self.emit(run, &mut inner, run_types::TOOL_RESULT, &data);
         drop(inner);
         if let Some(error) = failure {
