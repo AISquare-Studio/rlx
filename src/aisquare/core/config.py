@@ -977,6 +977,18 @@ class WatchSettings(BaseModel):
     sources: dict[str, WatchSource] = Field(default_factory=dict)
 
 
+class TidySettings(BaseModel):
+    """``[tidy]`` — ``rlx tidy``, which frees the disk rlx's ended agents and sessions left
+    (the owner's disk tidy, #58).
+
+    ``idle_build_hours``: a LIVE coder that has waited this long with no task in doing loses
+    the ``CACHEDIR.TAG`` build output in its worktree (regenerable: its next build is slower,
+    not wrong). ``0`` turns that rule off; nothing else here depends on it.
+    """
+
+    idle_build_hours: float = Field(default=24, ge=0)
+
+
 class CodeSettings(BaseModel):
     """``[code]`` — the per-project symbol index behind ``aisquare code`` (#285).
 
@@ -1285,6 +1297,7 @@ class AppConfig(BaseModel):
     experimental: ExperimentalSettings = Field(default_factory=ExperimentalSettings)
     persona: PersonaSettings = Field(default_factory=PersonaSettings)
     watch: WatchSettings = Field(default_factory=WatchSettings)
+    tidy: TidySettings = Field(default_factory=TidySettings)
     code: CodeSettings = Field(default_factory=CodeSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
     tray: TraySettings = Field(default_factory=TraySettings)

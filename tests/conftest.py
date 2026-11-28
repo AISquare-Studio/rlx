@@ -573,6 +573,23 @@ def no_look_at_the_machines_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(instance_scan, "_ps", lambda: "")
 
 
+@pytest.fixture(autouse=True)
+def no_tidy_of_the_machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``rlx tidy`` (``services.tidy``, #58) never reads this machine's per-user temp directory
+    nor its process table under the suite: the system temp it would free stale locks in is a
+    folder of the test's own, and no process runs (tester #3507: a guard that ran a real
+    ``rlx tidy`` scanned the real temp dir, where a free lock older than a day would have gone).
+    Its own tests hand it command lines of their own; the home is the sandbox's already. The
+    folder is named, not made: a test that reads what its ``tmp_path`` holds sees nothing new,
+    and a folder that is not there holds no lock."""
+    from aisquare.services import tidy
+
+    system = tmp_path / "system-temp"
+    monkeypatch.setattr(tidy, "_system_temp_dirs", lambda: [system])
+    monkeypatch.setattr(tidy, "_command_lines", lambda: [])
+    return system
+
+
 _uid = private_fleets.uid
 
 

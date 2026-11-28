@@ -98,6 +98,11 @@ UNINVOKED = {
     "accounts add": "starts a real Claude Code session and waits for a browser sign-in",
     "accounts run": "replaces the process with Claude Code (os.execve)",
     "accounts usage": "sends the developer's own Claude token to the usage endpoint",
+    "tidy": (
+        "deletes ended agents' trees and session temp in every project the home lists, the "
+        "real checkout `init` registers among them (review of #58); its read-only plan "
+        "(`--dry-run`) is invoked by test_the_tidy_plan_is_held_to_it"
+    ),
 }
 
 CORRUPT = b"this is not a sqlite database, and open_store must say so in words"
@@ -453,6 +458,18 @@ def test_the_upgrade_check_is_held_to_it(
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     assert len(lines) == 1, f"--json must print exactly one object, got {result.stdout!r}"
     assert json.loads(lines[0])["latest"] is None
+
+
+def test_the_tidy_plan_is_held_to_it(damaged_store: str) -> None:
+    """``tidy`` is UNINVOKED because a real run deletes, but ``--dry-run`` is its read-only plan,
+    and the plan reads the store for every project's rows: a store that cannot answer is said in
+    words, never raised."""
+    result = CliRunner().invoke(app, ["--json", "tidy", "--dry-run"], catch_exceptions=True)
+
+    assert _escaped(result.exception) is None, (
+        f"`aisquare --json tidy --dry-run` raised under {damaged_store} damage: "
+        f"{result.exception!r}"
+    )
 
 
 def test_the_uninstall_plan_is_held_to_it(damaged_store: str) -> None:
