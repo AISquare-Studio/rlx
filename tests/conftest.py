@@ -437,19 +437,69 @@ AMBIENT_ENV_PREFIXES = ("AISQUARE_BIN_", "AISQUARE_MODEL_", "AISQUARE_EFFORT_")
 #: ``PYTHONPATH``, so its ``sitecustomize`` installs the guard there (:func:`keychain_guard`).
 KEYCHAIN_GUARD_DIR = str(Path(__file__).resolve().parent / "keychain_guard")
 
-#: The home the shell named, if it named one; ``None`` leaves the run to name its own
-#: for wherever no test's own home is in force (:func:`home_outside_a_test`).
+#: The rlx home the shell named, if it named one. The run never uses it: it names its own for
+#: wherever no test's own home is in force (:func:`home_outside_a_test`), and the guard refuses
+#: this one (:data:`_GUARDED`).
 SHELL_HOME: str | None = os.environ.get("RLX_HOME") or os.environ.get(HOME_ENV_VAR) or None
 
 #: The developer's home directory as the run found it, and which project markers
 #: (``core.workspace.ROOT_MARKERS``) it held already: one that appears in it during the
 #: run is named in the summary (:func:`pytest_terminal_summary`).
 _DEVELOPERS_HOME = Path.home()
+_DEVELOPERS_USERPROFILE = os.environ.get("USERPROFILE")
+
+#: What the suite's guard refuses to let any test or child open, list or change (#54): the real
+#: home's ``.claude*``, ``.codex*``, ``.aisquare`` and ``.rlx``, and the Claude Code, Codex and
+#: rlx directories the shell named, as the run found them. Every test's ``HOME`` is its own
+#: (:func:`isolated_user_home`), so nothing should look there; the guard proves nothing does.
+_GUARDED = rlx_keychain_guard.guarded_paths(_DEVELOPERS_HOME, os.environ)
+#: The run's own roots, never refused even inside a guarded directory, and where a stand-in
+#: ``claude`` or ``codex`` may live: the temp dir (every ``tmp_path``), ``/tmp`` (the private
+#: tmux folders, ``tests/private_fleets.py``, where ``no_real_fleet`` puts its stand-ins) and
+#: this checkout.
+_RUN_ROOTS = [tempfile.gettempdir(), "/tmp", str(SRC.parent)]
+rlx_keychain_guard.configure(_GUARDED, _RUN_ROOTS)
+rlx_keychain_guard.install()
+
+#: The variables that name a user's home: ``HOME``, and on Windows ``USERPROFILE``, which is
+#: the one ``Path.home()`` reads there.
+USER_HOME_VARS = ("HOME", "USERPROFILE") if os.name == "nt" else ("HOME",)
+#: The test files that exist to run the real ``claude`` and ``codex`` (the native suites, as
+#: ``tests/run_claude_native.py`` and ``tests/run_codex_native.py`` select them).
+NATIVE_SUITES = ("test_claude_native", "test_codex_native")
 _ROOT_MARKERS = (".git", ".hg", ".aisquare")
 _MARKERS_AT_START = frozenset(m for m in _ROOT_MARKERS if (_DEVELOPERS_HOME / m).exists())
 _RUN_HOME: list[Path] = []
 _OUTSIDE_A_TEST: dict[str, str] = {}
 """What appeared outside every test's own home, and the test that had just ended."""
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _home_of_the_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The user's home wherever no test's own is in force: a directory of the run's, never the
+    developer's (#54). Named to sort first among the session's autouse fixtures (pytest takes
+    them alphabetically), so none of them sees the real home.
+
+    ``HOME`` (and ``USERPROFILE`` on Windows) is the run's, and the Claude Code and Codex
+    directories the shell named are cleared: a module-scoped fixture, or a thread a test left
+    running, finds no signed-in account, so it never asks the Keychain for one. What the run's
+    children are told to guard (:data:`_GUARDED`) and where its own roots are goes into the
+    environment for the guard's ``sitecustomize``. Left as is at the end, as
+    :func:`home_outside_a_test` leaves its home, for what still runs at the interpreter's exit.
+    """
+    home = tmp_path_factory.mktemp("user-home-outside-a-test", numbered=False)
+    for name in USER_HOME_VARS:
+        os.environ[name] = str(home)
+    for name in rlx_keychain_guard.REAL_DIR_VARS:
+        if name not in (HOME_ENV_VAR,):  # the rlx home is home_outside_a_test's to name
+            os.environ.pop(name, None)
+    run_roots = [*_RUN_ROOTS, str(tmp_path_factory.getbasetemp())]
+    rlx_keychain_guard.configure(_GUARDED, run_roots)
+    os.environ[rlx_keychain_guard.REAL_HOME_VAR] = str(_DEVELOPERS_HOME)
+    os.environ[rlx_keychain_guard.GUARDED_VAR] = os.pathsep.join(_GUARDED)
+    os.environ[rlx_keychain_guard.ALLOWED_VAR] = os.pathsep.join(run_roots)
+    os.environ.pop(rlx_keychain_guard.AGENTS_VAR, None)
+    return home
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -471,12 +521,15 @@ def home_outside_a_test(tmp_path_factory: pytest.TempPathFactory) -> Path:
     So the run names a home of its own, in its own temp tree beside the tests' and above
     none of them, for module-scoped fixtures and for what outlives a test. Left set at
     the end on purpose: the panel's writer thread is joined at the interpreter's exit,
-    and what it still had to write lands here, not in the developer's home. A home the
-    shell named is kept: CI's two ambient legs (py3.11 and py3.13) name a configured one,
-    and a fixture reading it outside a test is the leak those legs exist to catch.
+    and what it still had to write lands here, not in the developer's home.
+
+    A home the shell named is NOT kept, and ``RLX_HOME``, which wins over this, is cleared
+    (:func:`_home_of_the_run`). Run from a fleet pane, that home is the fleet's live one, and
+    what a test left running wrote into it (#54). It is guarded instead (:data:`_GUARDED`):
+    on CI's two ambient legs (py3.11 and py3.13), which name a configured home, a fixture or
+    module that still reads it, by a path taken at import, is refused and named, which is
+    the leak those legs exist to catch.
     """
-    if SHELL_HOME is not None:
-        return Path(SHELL_HOME)
     home = tmp_path_factory.mktemp("home-outside-a-test", numbered=False)
     os.environ[HOME_ENV_VAR] = str(home)
     _RUN_HOME.append(home)
@@ -519,6 +572,57 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
     terminalreporter.section("written outside every test's own home")
     for path, nodeid in _OUTSIDE_A_TEST.items():
         terminalreporter.write_line(f"{path}  (there when {nodeid} ended)")
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Path:
+    """Every test's ``HOME`` (and ``USERPROFILE`` on Windows) is a directory of its own (#54).
+
+    :func:`isolated_home` moves rlx's home and :func:`isolated_agent_home` the product's
+    ``_home`` in this process, but a child read the real ``HOME``: the developer's
+    ``~/.claude.json`` named a signed-in account, and the child asked the Keychain for its
+    login (#52's nine tests). These are environment variables, so every child gets them,
+    ``python -E`` children too (``-E`` drops only ``PYTHON*``). Beside ``tmp_path``, not in
+    it, so a test that lists ``tmp_path`` finds only its own files, and above no test's
+    directory. A test file of the native suites may run the real ``claude`` and ``codex``
+    (:func:`real_agent_binaries`).
+    """
+    home = tmp_path.with_name(tmp_path.name + "-home")
+    home.mkdir(exist_ok=True)
+    for name in USER_HOME_VARS:
+        monkeypatch.setenv(name, str(home))
+    if request.node.path.name.startswith(NATIVE_SUITES):
+        request.getfixturevalue("real_agent_binaries")
+    return home
+
+
+@pytest.fixture
+def real_agent_binaries(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A real ``claude`` or ``codex`` may run in this test and its children. Only for the
+    native suites (:data:`NATIVE_SUITES`, given it by :func:`isolated_user_home`) and the
+    opt-in real-account e2e. Everywhere else the guard refuses one, wherever it resolves
+    outside the run's own roots (``tests/keychain_guard/rlx_keychain_guard.py``)."""
+    monkeypatch.setenv(rlx_keychain_guard.AGENTS_VAR, "1")
+    before, _ = rlx_keychain_guard.lift(agents=True)
+    yield
+    rlx_keychain_guard.lift(agents=before)
+
+
+@pytest.fixture
+def real_home(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """The developer's real home, for the one test that must use it: the opt-in real-account
+    e2e (``tests/test_cross_account_e2e.py``, marked ``e2e`` and skipped unless two signed-in
+    config dirs are named). ``HOME`` is put back, and the guard lets this test and its
+    children open what it refuses everywhere else. No other test may ask for it."""
+    for name, real in (("HOME", str(_DEVELOPERS_HOME)), ("USERPROFILE", _DEVELOPERS_USERPROFILE)):
+        if name in USER_HOME_VARS and real is not None:
+            monkeypatch.setenv(name, real)
+    monkeypatch.delenv(rlx_keychain_guard.GUARDED_VAR, raising=False)
+    _, before = rlx_keychain_guard.lift(home=True)
+    yield _DEVELOPERS_HOME
+    rlx_keychain_guard.lift(home=before)
 
 
 @pytest.fixture(autouse=True)
@@ -751,7 +855,9 @@ def project_capture(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def no_real_ngrok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def no_real_ngrok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_user_home: Path
+) -> None:
     """No test reaches ngrok's service, or reads the developer's own ngrok config (#34).
 
     - **the bundled ngrok is a stand-in** (``tests/fake_ngrok_sdk``) that refuses every
@@ -759,15 +865,17 @@ def no_real_ngrok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
       test that wants a tunnel puts its own stand-in in ``sys.modules["ngrok"]``.
     - **ngrok's own configs are the test's**: ``~/.config/ngrok/ngrok.yml`` (or macOS's, or
       ``%LocalAppData%``'s) and ``~/.ngrok2/ngrok.yml`` hold the developer's authtoken, and a
-      tunnel's start reads them. Asked for with the developer's home in force, they are looked
-      for in a folder of the test's; a test that names a home of its own (``HOME``, or
-      ``home=``) gets that one's, as ever.
+      tunnel's start reads them. Asked for with the developer's home, or the one the suite
+      gave the test (:func:`isolated_user_home`), in force, they are looked for in a folder of
+      the test's, and never in the real ``%LocalAppData%``; a test that names a home of its
+      own (``HOME``, or ``home=``) gets that one's, as ever.
     """
     from aisquare.services import ngrok_sdk, ngrok_tunnel
     from tests.fake_ngrok_sdk import Script, fake_sdk
 
     monkeypatch.setitem(sys.modules, "ngrok", fake_sdk(Script(refuse="ERR_NGROK_TEST")))
     stand_in = tmp_path / "ngrok-home"
+    unnamed = (_DEVELOPERS_HOME, isolated_user_home)
     real_config, real_ngrok2 = ngrok_tunnel.ngrok_default_config, ngrok_sdk.ngrok2_config
 
     def config(
@@ -776,15 +884,13 @@ def no_real_ngrok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         environ: Mapping[str, str] = os.environ,
         home: Path | None = None,
     ) -> Path:
-        if home is None and Path.home() == _DEVELOPERS_HOME:
+        if home is None and Path.home() in unnamed:
             home = stand_in
             environ = {k: v for k, v in environ.items() if k not in ("LOCALAPPDATA",)}
         return real_config(platform=platform, environ=environ, home=home)
 
     def ngrok2() -> Path:
-        return (
-            stand_in / ".ngrok2" / "ngrok.yml" if Path.home() == _DEVELOPERS_HOME else real_ngrok2()
-        )
+        return stand_in / ".ngrok2" / "ngrok.yml" if Path.home() in unnamed else real_ngrok2()
 
     monkeypatch.setattr(ngrok_tunnel, "ngrok_default_config", config)
     monkeypatch.setattr(ngrok_sdk, "ngrok2_config", ngrok2)

@@ -2,8 +2,10 @@
 directory first on ``PYTHONPATH`` (``tests/conftest.py``'s ``keychain_guard``).
 
 It installs ``rlx_keychain_guard``'s audit hook, so a child can never run the real macOS
-Keychain tool, and points the child's ``claude_accounts.KEYCHAIN_TOOL`` at the fake named by
-``RLX_TESTS_KEYCHAIN_TOOL`` when a test gives it one. Not a test module.
+Keychain tool, another credential store's tool or (outside the native suites) a real agent
+binary, nor open the developer's real home, which the environment names
+(``RLX_TESTS_GUARDED_PATHS``, #54). It points the child's ``claude_accounts.KEYCHAIN_TOOL`` at
+the fake named by ``RLX_TESTS_KEYCHAIN_TOOL`` when a test gives it one. Not a test module.
 """
 
 import importlib.util
