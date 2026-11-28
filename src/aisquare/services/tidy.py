@@ -219,11 +219,41 @@ def _remove(path: Path, roots: Roots) -> None:
         if (here.st_dev, here.st_ino) != (info.st_dev, info.st_ino) or stat.S_ISLNK(here.st_mode):
             raise Refused(f"{path} changed while tidy looked")
         if stat.S_ISDIR(here.st_mode):
+            _contents_first(path, fd, info)
             cachedir.remove_dir(path.name, dir_fd=fd)
         else:
             os.unlink(path.name, dir_fd=fd)
     finally:
         os.close(fd)
+
+
+def _contents_first(path: Path, parent: int, info: os.stat_result) -> None:
+    """All but its own ``CACHEDIR.TAG`` out of the folder ``path``, in ``parent`` pinned, so
+    its tag goes last (#59 round 2): a delete ended mid-way, its process killed, leaves a cache
+    still tagged, which the next pass frees, never an untagged rest no rule judges again. What
+    refuses here (a read-only folder) is left to ``cachedir.remove_dir``, which loosens it."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        inner = os.open(path.name, flags, dir_fd=parent)
+    except OSError:
+        return
+    try:
+        opened = os.fstat(inner)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise Refused(f"{path} changed while tidy looked")
+        with os.scandir(inner) as listing:
+            entries = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in listing]
+        for entry, is_dir in entries:
+            if entry == cachedir.TAG:
+                continue
+            if is_dir:
+                cachedir.remove_dir(entry, dir_fd=inner)
+            else:
+                os.unlink(entry, dir_fd=inner)
+    except OSError:
+        return
+    finally:
+        os.close(inner)
 
 
 def _there(path: Path) -> bool:
@@ -1086,6 +1116,9 @@ class PassReport:
     """The line said on a board: only for a pass that freed :data:`RECEIPT_BYTES` or more."""
     board: str | None = None
     """The board it was said on: the one most of the freed bytes count to."""
+    stamp_error: str | None = None
+    """Why its stamp could not be written, when it could not (reviewer #3894, MINOR 1): the
+    pass ran, and whoever runs the job keeps its time in memory instead (:func:`is_due`)."""
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -1096,6 +1129,7 @@ class PassReport:
             "kept": self.kept,
             "receipt": self.receipt,
             "board": self.board,
+            "stamp_error": self.stamp_error,
         }
 
 
@@ -1140,11 +1174,26 @@ def _last_pass_at(stamp: dict[str, Any]) -> datetime | None:
     return found if found.tzinfo is not None else None
 
 
-def is_due(at: datetime, every_minutes: float) -> bool:
+def is_due(at: datetime, every_minutes: float, *, last_attempt: datetime | None = None) -> bool:
     """Whether a pass is due at ``at``: none yet in this home, or the last one began
-    ``every_minutes`` ago or more (or, by a clock set back, after ``at``)."""
-    last = _last_pass_at(read_stamp())
-    return last is None or last > at or at - last >= timedelta(minutes=every_minutes)
+    ``every_minutes`` ago or more (or, by a clock set back, after ``at``). ``last_attempt``:
+    when the job's runner last ran one, kept in its memory, so a stamp that could not be
+    written still spaces the passes (reviewer #3894, MINOR 1): due only when both say so."""
+    for last in (_last_pass_at(read_stamp()), last_attempt):
+        if last is not None and last <= at and at - last < timedelta(minutes=every_minutes):
+            return False
+    return True
+
+
+def pass_due(at: datetime, *, last_attempt: datetime | None = None) -> bool:
+    """Whether the periodic job has a pass to run at ``at`` (:func:`periodic_pass` asks it all
+    again, under its lock): tidy deletes here, ``[tidy] every_minutes`` is on, and the last
+    pass began that long ago. Reads the config and the stamp alone: a caller asks it each tick
+    to decide whether to start a pass off its own thread."""
+    if not DELETES:
+        return False
+    every = _settings().every_minutes
+    return every > 0 and is_due(at, every, last_attempt=last_attempt)
 
 
 def pass_lock() -> Path | None:
@@ -1158,7 +1207,9 @@ def pass_lock() -> Path | None:
     return found[0] / f"{PASS_LOCK_PREFIX}{uid}.lock"
 
 
-def periodic_pass(now: datetime | None = None) -> PassReport | None:
+def periodic_pass(
+    now: datetime | None = None, *, last_attempt: datetime | None = None
+) -> PassReport | None:
     """Tidy's periodic job: once due (:func:`is_due`, ``[tidy] every_minutes``; ``0`` is off),
     and while no other pass on the machine holds :func:`pass_lock` (one that does is waited
     for not at all: the pass stays due), the same rules as ``rlx tidy``, :func:`plan` then
@@ -1167,18 +1218,25 @@ def periodic_pass(now: datetime | None = None) -> PassReport | None:
     and nudges no one; a pass that freed :data:`RECEIPT_BYTES` or more says so in one line on
     one board (:func:`_say_it`). ``None``: not due, off, another pass is running, or a move of
     the home is (:func:`a_home_move_runs`). Never on native Windows, where tidy deletes nothing
-    (:data:`DELETES`)."""
+    (:data:`DELETES`).
+
+    ``last_attempt``: when the caller last ran a pass (:func:`is_due`). A pass whose stamp could
+    not be written is still returned, with :attr:`PassReport.stamp_error`: it ran. One ended
+    mid-delete (its process killed) wrote no stamp, so the next is due, and frees what is left
+    (:func:`_remove` deletes a cache's tag last). It is long, the backlog's first pass most of
+    all: a caller that must not wait (the watcher's tick) runs it on a thread of its own."""
     if not DELETES:
         return None
     every = _settings().every_minutes
     if every <= 0:
         return None
     at = now or _now()
-    if not is_due(at, every):
+    if not is_due(at, every, last_attempt=last_attempt):
         return None
     lock = pass_lock()
     if lock is None:
         return None
+    failed = {"last_pass_at": at.isoformat(timespec="seconds"), "failed": True}
     with contextlib.ExitStack() as stack:
         try:
             stack.enter_context(locking.holding(lock, wait_s=0, mode=0o600))
@@ -1186,22 +1244,25 @@ def periodic_pass(now: datetime | None = None) -> PassReport | None:
             return None  # another pass runs now; this one stays due
         except OSError:
             # No lock to be had (the temp dir unwritable): said once per interval, not per tick.
-            _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), "failed": True})
+            _write_failed_stamp(failed)
             raise
         # Whatever raises once the lock is held writes the stamp, the looks before the plan too
         # (tester #3875 (c)): a pass that cannot be asked is tried once per interval.
         try:
-            if not is_due(at, every):
+            if not is_due(at, every, last_attempt=last_attempt):
                 return None  # one ran between the first look and the lock
             if a_home_move_runs():
                 return None  # never during a move of the home: it stays due (manager #3815)
             made = plan(now=at, size_kept=False)
             done = apply(made)
         except BaseException:
-            _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), "failed": True})
+            _write_failed_stamp(failed)
             raise
         report = _pass_report(at, done)
-        _write_stamp({"last_pass_at": report.at.isoformat(timespec="seconds"), **_totals(report)})
+        try:
+            _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), **_totals(report)})
+        except OSError as exc:  # the pass ran: said so, never as a failed pass (MINOR 1)
+            report = replace(report, stamp_error=f"{type(exc).__name__}: {exc}")
     if report.freed_bytes < RECEIPT_BYTES:
         return report
     return _say_it(report, done)
@@ -1210,6 +1271,13 @@ def periodic_pass(now: datetime | None = None) -> PassReport | None:
 def _totals(report: PassReport) -> dict[str, Any]:
     found = report.as_json()
     return {key: found[key] for key in ("freed_bytes", "freed", "not_freed", "kept")}
+
+
+def _write_failed_stamp(data: dict[str, Any]) -> None:
+    """A failed pass's stamp, if it can be written: what failed is what is said, never that
+    the stamp could not be written too (the runner's memory spaces the passes then)."""
+    with contextlib.suppress(OSError):
+        _write_stamp(data)
 
 
 def _write_stamp(data: dict[str, Any]) -> None:
@@ -1236,7 +1304,12 @@ def a_home_move_runs() -> bool:
     unfinished (``paths.unfinished_home_move``), or a move holds its lock, ``.rlx-home-move-
     <digest>.lock`` in the folder the move keeps it in. That file is removed as a move lets go
     (#62), so one that is there is taken at once to ask: held, a move runs; free, a crash left
-    it, and nothing runs. Never a wait."""
+    it, and nothing runs. Never a wait.
+
+    What cannot be told fails closed, as an unreadable journal does (reviewer #3894, MINOR 2):
+    a folder that cannot be listed, a lock that cannot be opened or asked, is taken for a move,
+    and the pass waits. A folder that is not there holds no lock, and a lock gone between the
+    listing and the open was let go."""
     from aisquare.services import home_migration
 
     if paths.unfinished_home_move() is not None:
@@ -1250,19 +1323,21 @@ def a_home_move_runs() -> bool:
                 if entry.name.startswith(home_migration.MOVE_LOCK_PREFIX)
                 and entry.name.endswith(".lock")
             ]
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        return True
     for name in names:
         try:
             fd = locking.open_lock_file(folder / name, create=False)
-        except OSError:
+        except FileNotFoundError:
             continue
+        except OSError:
+            return True
         try:
             locking.acquire(fd, wait_s=0)
-        except TimeoutError:
+        except (TimeoutError, OSError):
             return True
-        except OSError:
-            continue
         else:
             with contextlib.suppress(OSError):
                 locking.unlock(fd)

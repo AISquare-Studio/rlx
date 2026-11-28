@@ -100,7 +100,9 @@ def watch(
         return
     if once:
         try:
-            looked = watch_service.Watcher().tick()
+            # A look and its news alone: tidy's job is the loop's, on a thread of its own, and
+            # one look never waits on a pass, nor leaves one cut short as it exits (#59).
+            looked = watch_service.Watcher(tidy=False).tick()
         except TimeoutError:  # a running watcher's tick holds the state lock
             fail("another look is running; try again in a moment", error="busy")
         _print_tick(looked)

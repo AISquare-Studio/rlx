@@ -583,15 +583,16 @@ def no_tidy_of_the_machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> P
     folder is named, not made: a test that reads what its ``tmp_path`` holds sees nothing new,
     and a folder that is not there holds no lock.
 
-    Nor does a watcher's tick run tidy's periodic job (#59): a test that ticks a watcher over a
-    sandbox fleet of ended agents would have that fleet tidied under it. The job's own tests
-    put it back (``tests/test_tidy_tick.py``)."""
+    Nor does a watcher's tick run tidy's periodic job (#59), nor start its thread: a test that
+    ticks a watcher over a sandbox fleet of ended agents would have that fleet tidied under it.
+    The job's own tests put it back (``tests/test_tidy_tick.py``)."""
     from aisquare.services import tidy
 
     system = tmp_path / "system-temp"
     monkeypatch.setattr(tidy, "_system_temp_dirs", lambda: [system])
     monkeypatch.setattr(tidy, "_command_lines", lambda: [])
-    monkeypatch.setattr(tidy, "periodic_pass", lambda now=None: None)
+    monkeypatch.setattr(tidy, "pass_due", lambda at, *, last_attempt=None: False)
+    monkeypatch.setattr(tidy, "periodic_pass", lambda now=None, *, last_attempt=None: None)
     return system
 
 

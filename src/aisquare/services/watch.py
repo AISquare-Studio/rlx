@@ -39,6 +39,7 @@ import os
 import signal
 import stat
 import subprocess
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -127,8 +128,8 @@ class TickReport:
     notes: list[str] = field(default_factory=list)
     """Lines for the operator: a source failing (once per streak), a GitHub error."""
     tidied: PassReport | None = None
-    """What tidy's periodic job did this tick (``services.tidy.periodic_pass``, #59), when it
-    ran: it runs at most every ``[tidy] every_minutes``."""
+    """What tidy's periodic job did (``services.tidy.periodic_pass``, #59), in the tick that
+    found its pass finished: it runs off the tick, at most every ``[tidy] every_minutes``."""
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -157,10 +158,14 @@ class Watcher:
         *,
         needs_sources: Callable[[], Any] | None = None,
         stale: bool = True,
+        tidy: bool = True,
     ) -> None:
         self.settings = settings or load_config().watch
         self._needs_sources = needs_sources
         self._stale = stale
+        self.tidy_job: TidyJob | None = TidyJob() if tidy else None
+        """Tidy's periodic job, run off the tick (#59); ``None``: this watcher runs none
+        (``watch --once``, which looks once and exits)."""
         self.first_seen: dict[str, datetime] = {}
         self.failing: set[str] = set()
         self.kept: list[Any] = []
@@ -435,22 +440,87 @@ class Watcher:
                     for done in autostop.reap_finished(autostop.every_project())
                     if done.stopped
                 ]
-        report.tidied = _tidy_pass(now, notes)
+        if self.tidy_job is not None:
+            report.tidied = self.tidy_job.after_tick(now, notes)
         return report
 
 
-def _tidy_pass(now: datetime, notes: list[str]) -> PassReport | None:
-    """Tidy's periodic job (#59), when it is due: quiet, one pass at a time on the machine,
-    its own lock and cadence (``services.tidy.periodic_pass``). A pass that raises is one line
-    in the tick's notes: a tidy never costs the tick its news, and its stamp says it ran, so it
-    is tried again an interval on, not every tick."""
-    try:
-        from aisquare.services import tidy
+TIDY_THREAD = "rlx-tidy-pass"
+"""The name of the thread a watcher runs tidy's periodic job on."""
 
-        return tidy.periodic_pass(now)
-    except Exception as exc:
-        notes.append(f"the tidy pass failed: {type(exc).__name__}: {exc}")
-        return None
+
+class TidyJob:
+    """Tidy's periodic job (#59), off the tick (reviewer #3894): one thread the watcher owns,
+    started by a tick when a pass is due (``services.tidy.pass_due``) and none runs; a later
+    tick reads what it did. A tick never waits on it, so a pass of minutes (an upgrade's
+    backlog) holds back no news, and the Doctor never finds the watcher stuck.
+
+    The thread is a daemon: a stop ends the watcher at once, and a pass ended mid-delete wrote
+    no stamp, so the next one is due and frees what is left. Quiet, one pass at a time on the
+    machine, its own lock and cadence: ``services.tidy.periodic_pass``. A pass that raised is
+    one line in the notes of the tick that reads it, and is tried again an interval on."""
+
+    def __init__(self) -> None:
+        self.thread: threading.Thread | None = None
+        self.began: datetime | None = None
+        """The time the running (or last) pass was started for."""
+        self.last_attempt: datetime | None = None
+        """When this watcher's last pass ran, in memory: a stamp that could not be written
+        still spaces the passes (reviewer #3894, MINOR 1)."""
+        self._outcome: PassReport | Exception | None = None
+
+    def after_tick(self, now: datetime, notes: list[str]) -> PassReport | None:
+        """Each tick: what a pass that finished since did (said in ``notes`` when it raised or
+        its stamp could not be written), and a pass started when one is due and none runs.
+        Never waits."""
+        done = self._finished(notes)
+        if self.thread is not None:
+            return done
+        try:
+            from aisquare.services import tidy
+
+            due = tidy.pass_due(now, last_attempt=self.last_attempt)
+        except Exception as exc:
+            notes.append(f"the tidy pass failed: {type(exc).__name__}: {exc}")
+            return done
+        if due:
+            self.began = now
+            self.thread = threading.Thread(
+                target=self._pass_off_the_tick,
+                args=(now, self.last_attempt),
+                name=TIDY_THREAD,
+                daemon=True,
+            )
+            self.thread.start()
+        return done
+
+    def _pass_off_the_tick(self, now: datetime, last_attempt: datetime | None) -> None:
+        try:
+            from aisquare.services import tidy
+
+            self._outcome = tidy.periodic_pass(now, last_attempt=last_attempt)
+        except Exception as exc:  # said by the tick that reads it
+            self._outcome = exc
+
+    def _finished(self, notes: list[str]) -> PassReport | None:
+        if self.thread is None or self.thread.is_alive():
+            return None
+        self.thread.join()
+        self.thread = None
+        outcome, self._outcome = self._outcome, None
+        if isinstance(outcome, Exception):
+            self.last_attempt = self.began
+            notes.append(f"the tidy pass failed: {type(outcome).__name__}: {outcome}")
+            return None
+        if outcome is None:  # not due after all, off, another pass ran, or a move of the home
+            return None
+        self.last_attempt = outcome.at
+        if outcome.stamp_error is not None:
+            notes.append(
+                f"tidy freed what it planned, but its stamp could not be written "
+                f"({outcome.stamp_error}): this watcher waits an interval before the next pass"
+            )
+        return outcome
 
 
 IDLE_BY_DESIGN_KINDS: frozenset[str] = frozenset({"result", "question", "task_review", "task_done"})

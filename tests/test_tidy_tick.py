@@ -13,10 +13,14 @@ files are in ``tmp_path`` and whose sizes are said, not written; ``tidy.apply`` 
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
+import signal
 import sys
 import threading
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +42,7 @@ from aisquare.services import watch as watch_service
 from tests.test_remote_needs import Fleet, _sources
 
 PERIODIC_PASS = tidy.periodic_pass
+PASS_DUE = tidy.pass_due
 """The real job, kept before the suite's fixture turns it off for every other test's tick."""
 T0 = datetime(2026, 11, 27, 12, 0, tzinfo=UTC)
 GB = 10**9
@@ -62,12 +67,17 @@ class Plans:
 
 
 @pytest.fixture(autouse=True)
-def the_real_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """The job back, and the sandbox's system temp dir made, where its lock is."""
+def the_real_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """The job back, and the sandbox's system temp dir made, where its lock is. No pass a
+    watcher started outlives its test: each is let finish."""
     monkeypatch.setattr(tidy, "periodic_pass", PERIODIC_PASS)
+    monkeypatch.setattr(tidy, "pass_due", PASS_DUE)
     system = tmp_path / "system-temp"
     system.mkdir(exist_ok=True)
-    return system
+    yield system
+    for thread in threading.enumerate():
+        if thread.name == watch_service.TIDY_THREAD:
+            thread.join(10)
 
 
 @pytest.fixture
@@ -133,6 +143,24 @@ def _watcher() -> watch_service.Watcher:
     )
 
 
+def _settle(watcher: watch_service.Watcher) -> None:
+    """The pass ``watcher`` started, if any, let finish."""
+    job = watcher.tidy_job
+    if job is not None and job.thread is not None:
+        job.thread.join(10)
+        assert not job.thread.is_alive()
+
+
+def _pass_of(watcher: watch_service.Watcher, now: datetime) -> watch_service.TickReport:
+    """A tick, which starts a pass when one is due, that pass let finish, and the tick after
+    (at the same time) that reads what it did; any pass that one started is let finish too."""
+    watcher.tick(now)
+    _settle(watcher)
+    read = watcher.tick(now)
+    _settle(watcher)
+    return read
+
+
 # --- the setting ---------------------------------------------------------------------------
 
 
@@ -147,6 +175,17 @@ def test_every_minutes_is_60_by_default_never_negative_and_shown_by_config() -> 
     assert load_config().tidy.every_minutes == 15
     refused = runner.invoke(app, ["config", "set", "tidy.every_minutes", "-5"])
     assert refused.exit_code != 0 and load_config().tidy.every_minutes == 15
+
+
+@pytest.mark.parametrize("given", [float("inf"), float("nan"), 10081, 1e13])
+def test_every_minutes_is_a_number_of_at_most_a_week(given: float) -> None:
+    """Reviewer #3894's NIT: an infinite one overflowed the cadence's clock in ``is_due``, so
+    every tick said the pass failed and none ever ran. Refused, and a week is the most."""
+    with pytest.raises(ValidationError):
+        TidySettings(every_minutes=given)
+    assert TidySettings(every_minutes=10080).every_minutes == 10080
+    refused = CliRunner().invoke(app, ["config", "set", "tidy.every_minutes", str(given)])
+    assert refused.exit_code != 0 and load_config().tidy.every_minutes == 60
 
 
 def test_a_config_that_cannot_be_read_turns_the_job_off(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,11 +217,13 @@ def test_a_pass_runs_at_most_every_every_minutes(plans: Plans) -> None:
 @posix_only
 def test_the_cadence_is_the_homes_so_a_new_watcher_does_not_run_it_again(plans: Plans) -> None:
     """The stamp is on disk: a watcher started again (or ``--once`` beside the loop) reads it."""
-    first = _watcher().tick(T0)
-    again = _watcher().tick(T0 + timedelta(minutes=30))
-    later = _watcher().tick(T0 + timedelta(minutes=61))
+    first = _pass_of(_watcher(), T0)
+    again = _watcher()
+    looked = again.tick(T0 + timedelta(minutes=30))
+    later = _pass_of(_watcher(), T0 + timedelta(minutes=61))
 
-    assert first.tidied is not None and again.tidied is None and later.tidied is not None
+    assert first.tidied is not None and later.tidied is not None
+    assert looked.tidied is None and again.tidy_job is not None and again.tidy_job.thread is None
     assert len(plans.calls) == 2
 
 
@@ -192,7 +233,9 @@ def test_zero_turns_the_job_off(plans: Plans) -> None:
     config.tidy.every_minutes = 0
     save_config(config)
 
-    assert tidy.periodic_pass(T0) is None and _watcher().tick(T0).tidied is None
+    watcher = _watcher()
+    assert tidy.periodic_pass(T0) is None and watcher.tick(T0).tidied is None
+    assert watcher.tidy_job is not None and watcher.tidy_job.thread is None, "no thread started"
     assert plans.calls == [] and not tidy.stamp_path().exists()
 
 
@@ -201,7 +244,7 @@ def test_on_native_windows_no_pass_runs(plans: Plans, monkeypatch: pytest.Monkey
     would be all cost. No stamp either."""
     monkeypatch.setattr(tidy, "DELETES", False)
 
-    assert tidy.periodic_pass(T0) is None
+    assert tidy.periodic_pass(T0) is None and not tidy.pass_due(T0)
     assert plans.calls == [] and not tidy.stamp_path().exists()
 
 
@@ -238,7 +281,7 @@ def test_two_watchers_at_once_run_one_pass(plans: Plans, monkeypatch: pytest.Mon
     first = threading.Thread(target=lambda: results.update(first=tidy.periodic_pass(T0)))
     first.start()
     assert started.wait(10)
-    results["second"] = _watcher().tick(T0).tidied
+    results["second"] = _pass_of(_watcher(), T0).tidied
     second_done.set()
     first.join(10)
 
@@ -257,9 +300,11 @@ def test_a_pass_that_looked_before_another_finished_asks_again_under_the_lock(
     real = tidy.is_due
     looks: list[bool] = []
 
-    def stale_first(at: datetime, every_minutes: float) -> bool:
+    def stale_first(
+        at: datetime, every_minutes: float, *, last_attempt: datetime | None = None
+    ) -> bool:
         looks.append(True)
-        return True if len(looks) == 1 else real(at, every_minutes)
+        return True if len(looks) == 1 else real(at, every_minutes, last_attempt=last_attempt)
 
     monkeypatch.setattr(tidy, "is_due", stale_first)
 
@@ -279,8 +324,9 @@ def test_no_pass_runs_while_a_move_of_the_home_is_unfinished(plans: Plans) -> No
     journal.write_text(json.dumps({"steps": ["back up the store"]}), encoding="utf-8")
     assert paths.unfinished_home_move() == journal
 
-    assert tidy.periodic_pass(T0) is None and _watcher().tick(T0).tidied is None
+    assert tidy.periodic_pass(T0) is None and _pass_of(_watcher(), T0).tidied is None
     assert plans.calls == [] and not tidy.stamp_path().exists()
+    assert tidy.pass_due(T0), "it stays due"
     journal.write_text("{", encoding="utf-8")
     assert tidy.periodic_pass(T0) is None
     journal.write_text(json.dumps({"steps": ["back up the store", "done"]}), encoding="utf-8")
@@ -485,8 +531,8 @@ def test_a_pass_that_raises_is_one_note_and_is_tried_again_an_interval_on(
 
     monkeypatch.setattr(tidy, "plan", broken)
 
-    looked = _watcher().tick(T0)
-    again = _watcher().tick(T0 + timedelta(minutes=5))
+    looked = _pass_of(_watcher(), T0)
+    again = _pass_of(_watcher(), T0 + timedelta(minutes=5))
 
     assert looked.tidied is None
     assert looked.notes == ["the tidy pass failed: RuntimeError: the store is busy"]
@@ -512,16 +558,18 @@ def test_a_raise_before_the_plan_is_tried_again_an_interval_on(
     else:
         real = tidy.is_due
 
-        def is_due(at: datetime, every_minutes: float) -> bool:
+        def is_due(
+            at: datetime, every_minutes: float, *, last_attempt: datetime | None = None
+        ) -> bool:
             asked.append(at)
-            if len(asked) == 2:  # the first look passes, the second, under the lock, raises
+            if len(asked) == 3:  # the tick's look and the pass's first pass; the third raises
                 raise PermissionError("the watch folder")
-            return real(at, every_minutes)
+            return real(at, every_minutes, last_attempt=last_attempt)
 
         monkeypatch.setattr(tidy, "is_due", is_due)
 
-    looked = _watcher().tick(T0)
-    again = _watcher().tick(T0 + timedelta(minutes=5))
+    looked = _pass_of(_watcher(), T0)
+    again = _pass_of(_watcher(), T0 + timedelta(minutes=5))
 
     assert len(looked.notes) == 1 and looked.notes[0].startswith("the tidy pass failed")
     assert again.notes == [] and plans.calls == []
@@ -532,26 +580,229 @@ def test_a_raise_before_the_plan_is_tried_again_an_interval_on(
 def test_no_lock_to_be_had_is_said_once_per_interval(the_real_job: Path, plans: Plans) -> None:
     the_real_job.rmdir()  # no system temp dir: the lock cannot be made
 
-    looked = _watcher().tick(T0)
-    again = _watcher().tick(T0 + timedelta(minutes=5))
+    looked = _pass_of(_watcher(), T0)
+    again = _pass_of(_watcher(), T0 + timedelta(minutes=5))
 
     assert len(looked.notes) == 1 and looked.notes[0].startswith("the tidy pass failed")
     assert again.notes == [] and plans.calls == []
 
 
-# --- the real rules, once ------------------------------------------------------------------
+# --- off the tick (reviewer #3894, manager #3897) ------------------------------------------
+
+
+def _held_plan(monkeypatch: pytest.MonkeyPatch) -> tuple[list[datetime | None], threading.Event]:
+    """``tidy.plan`` made to wait, on an event (no load), until the test lets it go: the
+    times each pass entered it, and the event."""
+    faked = tidy.plan
+    entered: list[datetime | None] = []
+    release = threading.Event()
+
+    def held(*, now: datetime | None = None, size_kept: bool = True) -> tidy.Plan:
+        entered.append(now)
+        assert release.wait(30), "never let go"
+        return faked(now=now, size_kept=size_kept)
+
+    monkeypatch.setattr(tidy, "plan", held)
+    return entered, release
+
+
+def _entered(entered: list[datetime | None], count: int) -> None:
+    deadline = time.monotonic() + 10
+    while len(entered) < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(entered) == count
 
 
 @posix_only
-def test_a_real_pass_frees_what_rlx_tidy_would_and_watch_once_json_says_so(
-    the_real_job: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_slow_pass_holds_no_tick_and_the_news_flows_meanwhile(
+    plans: Plans, boards: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No fake: a stale, free migration lock in the sandbox's system temp dir is what tidy's
-    rules free, and ``watch --once --json`` shows the pass."""
-    lock = the_real_job / f"rlx-home-migration-{'e' * 16}.lock"
+    """The MAJOR: the pass ran inline, so an upgrade's backlog held the tick for minutes. Now
+    it runs on the watcher's own thread: while it waits in its plan, every tick returns at
+    once with its news delivered, starts no second pass, and a later tick reads what it did."""
+    entered, release = _held_plan(monkeypatch)
+    plans.items = [(tidy.ENDED_WORKTREE, 10, BOARD_A)]
+    delivered: list[list[str]] = []
+    started: list[datetime | None] = []
+
+    def counted(
+        now: datetime | None = None, *, last_attempt: datetime | None = None
+    ) -> tidy.PassReport | None:
+        started.append(now)
+        return PERIODIC_PASS(now, last_attempt=last_attempt)
+
+    monkeypatch.setattr(tidy, "periodic_pass", counted)
+
+    def deliver(project_id: str, items: Any, path: Path) -> bool:
+        delivered.append([item.id for item in items])
+        return True
+
+    def look_all(self: Any, now: datetime, notes: Any = None, failed: Any = None) -> Any:
+        return [
+            watch_service.WatchItem(
+                id=f"capacity:{now:%H%M}",
+                project_id=BOARD_A,
+                project_name="a",
+                kind="capacity_freed",
+                summary="a slot came free",
+            )
+        ]
+
+    monkeypatch.setattr(watch_service, "_deliver", deliver)
+    monkeypatch.setattr(watch_service.Watcher, "look_all", look_all)
+    watcher = _watcher()
+    took: list[float] = []
+    try:
+        for minutes in range(3):
+            began = time.monotonic()
+            looked = watcher.tick(T0 + timedelta(minutes=minutes))
+            took.append(time.monotonic() - began)
+            _entered(entered, 1)
+            assert looked.tidied is None and looked.nudged == [BOARD_A] and looked.notes == []
+        assert watcher.tidy_job is not None and watcher.tidy_job.thread is not None
+        assert watcher.tidy_job.thread.is_alive(), "the pass still waits in its plan"
+        assert delivered == [["capacity:1200"], ["capacity:1201"], ["capacity:1202"]]
+        assert started == [T0], "no tick starts a pass while one runs"
+        assert entered == [T0] and max(took) < 2, took
+    finally:
+        release.set()
+    _settle(watcher)
+    read = watcher.tick(T0 + timedelta(minutes=3))
+    assert read.tidied is not None and read.tidied.at == T0 and read.tidied.freed_bytes == 10
+    assert plans.calls == [T0]
+
+
+@posix_only
+def test_a_stop_ends_the_watcher_at_once_while_a_pass_runs(
+    plans: Plans, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``watch --stop`` is a SIGTERM, then the end of its tmux session: the loop ends at its
+    next look at the flag, never waiting on a pass. The pass's thread is a daemon, so neither
+    does the process's exit; one ended mid-delete wrote no stamp (the test below, in
+    ``test_tidy.py``)."""
+    entered, release = _held_plan(monkeypatch)
+    handlers: list[tuple[int, Any]] = []
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: handlers.append((signum, handler))
+    )
+    monkeypatch.setattr(watch_service.Watcher, "look_all", lambda self, *args, **kwargs: [])
+    config = load_config()
+    config.watch.auto_stop = False
+    save_config(config)
+
+    def sleep(seconds: float) -> None:
+        _entered(entered, 1)
+        [(signum, stopping)] = handlers
+        stopping(signum, None)  # what `watch --stop` sends
+
+    monkeypatch.setattr(watch_service, "_sleep", sleep)
+    try:
+        began = time.monotonic()
+        watch_service.run(interval=60, on_tick=lambda report: None)
+        took = time.monotonic() - began
+        [thread] = [t for t in threading.enumerate() if t.name == watch_service.TIDY_THREAD]
+        assert thread.daemon and thread.is_alive(), "the pass was not waited for"
+        assert took < 5, took
+    finally:
+        release.set()
+
+
+@posix_only
+def test_a_stamp_that_cannot_be_written_is_said_and_the_watcher_waits_an_interval(
+    plans: Plans, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer #3894's MINOR 1: on a full disk, every tick ran a full pass, each said to have
+    failed though each freed what it planned. The pass ran: said so, and the watcher keeps its
+    time in memory, so the next waits an interval."""
+
+    def full(data: Any) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(tidy, "_write_stamp", full)
+    plans.items = [(tidy.ENDED_WORKTREE, 10, BOARD_A)]
+    watcher = _watcher()
+
+    read = _pass_of(watcher, T0)
+
+    assert read.tidied is not None and read.tidied.freed_bytes == 10
+    assert read.tidied.stamp_error == "OSError: [Errno 28] No space left on device"
+    assert read.notes == [
+        "tidy freed what it planned, but its stamp could not be written (OSError: [Errno 28] "
+        "No space left on device): this watcher waits an interval before the next pass"
+    ]
+    for minutes in (1, 30, 59):
+        assert _pass_of(watcher, T0 + timedelta(minutes=minutes)).notes == []
+    assert plans.calls == [T0]
+    assert _pass_of(watcher, T0 + timedelta(minutes=60)).tidied is not None
+    assert plans.calls == [T0, T0 + timedelta(minutes=60)]
+
+
+@posix_only
+def test_a_failed_pass_whose_stamp_cannot_be_written_says_what_failed_once(
+    plans: Plans, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*, now: datetime | None = None, size_kept: bool = True) -> tidy.Plan:
+        plans.calls.append(now)
+        raise RuntimeError("the store is busy")
+
+    def full(data: Any) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(tidy, "plan", broken)
+    monkeypatch.setattr(tidy, "_write_stamp", full)
+    watcher = _watcher()
+
+    assert _pass_of(watcher, T0).notes == ["the tidy pass failed: RuntimeError: the store is busy"]
+    assert _pass_of(watcher, T0 + timedelta(minutes=5)).notes == []
+    assert plans.calls == [T0]
+
+
+@posix_only
+def test_what_cannot_tell_whether_a_move_runs_is_taken_for_one(
+    tmp_path: Path, plans: Plans, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer #3894's MINOR 2: the probe failed open where the journal fails closed. A lock
+    folder that cannot be listed, a lock that cannot be opened or asked: a move may run, so
+    the pass waits, still due. A folder that is not there, or a lock gone before the open
+    (let go), holds none."""
+    folder = tidy._move_lock_folder()
+    lock = folder / f"{home_migration.MOVE_LOCK_PREFIX}{'b' * 16}.lock"
     lock.write_bytes(b"")
-    old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
-    os.utime(lock, (old, old))
+
+    def no_locks(fd: int, *, wait_s: float) -> None:
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    def shut(path: Path, *, mode: int = 0o644, create: bool = True) -> int:
+        raise PermissionError(errno.EACCES, "Permission denied", str(path))
+
+    def gone(path: Path, *, mode: int = 0o644, create: bool = True) -> int:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+
+    a_file = tmp_path / "not-a-folder"
+    a_file.write_bytes(b"")
+    for name, value, moving in (
+        ("acquire", no_locks, True),
+        ("open_lock_file", shut, True),
+        ("open_lock_file", gone, False),
+    ):
+        with monkeypatch.context() as patched:
+            patched.setattr(locking, name, value)
+            assert tidy.a_home_move_runs() is moving, (name, value)
+    for where, moving in ((a_file, True), (tmp_path / "nowhere", False)):
+        with monkeypatch.context() as patched:
+            patched.setattr(tidy, "_move_lock_folder", lambda where=where: where)
+            assert tidy.a_home_move_runs() is moving, where
+    assert not tidy.a_home_move_runs(), "free, a crash left it: no move"
+
+    monkeypatch.setattr(tidy, "_move_lock_folder", lambda: a_file)
+    assert tidy.periodic_pass(T0) is None and plans.calls == []
+    assert tidy.pass_due(T0), "it stays due"
+
+
+@posix_only
+def test_watch_once_looks_and_runs_no_pass(plans: Plans, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A look and its news alone: tidy's job is the loop's. One look never waits on a pass,
+    nor leaves one cut short as it exits."""
     fleet = Fleet(agents=[])
     monkeypatch.setattr(
         remote_needs, "live_needs_sources", lambda: replace(_sources(fleet), list_projects=list)
@@ -563,6 +814,54 @@ def test_a_real_pass_frees_what_rlx_tidy_would_and_watch_once_json_says_so(
     shown = CliRunner().invoke(app, ["--json", "watch", "--once"])
 
     assert shown.exit_code == 0, shown.output
-    tidied = json.loads(shown.stdout.strip().splitlines()[-1])["tidied"]
-    assert tidied["freed"] == {tidy.MIGRATION_LOCK: 1} and tidied["receipt"] is None
-    assert not lock.exists()
+    assert json.loads(shown.stdout.strip().splitlines()[-1])["tidied"] is None
+    assert plans.calls == [] and not tidy.stamp_path().exists()
+    assert not [t for t in threading.enumerate() if t.name == watch_service.TIDY_THREAD]
+    assert tidy.pass_due(datetime.now(UTC)), "still due, for the loop"
+
+
+# --- the real rules, once ------------------------------------------------------------------
+
+
+@posix_only
+def test_a_real_pass_frees_what_rlx_tidy_would_and_watch_json_says_so(
+    the_real_job: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No fake: a stale, free migration lock in the sandbox's system temp dir is what tidy's
+    rules free, on the loop's own thread, and the look after it says so in ``watch --json``."""
+    lock = the_real_job / f"rlx-home-migration-{'e' * 16}.lock"
+    lock.write_bytes(b"")
+    old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
+    os.utime(lock, (old, old))
+    fleet = Fleet(agents=[])
+    monkeypatch.setattr(
+        remote_needs, "live_needs_sources", lambda: replace(_sources(fleet), list_projects=list)
+    )
+    config = load_config()
+    config.watch.auto_stop = False
+    save_config(config)
+    handlers: list[tuple[int, Any]] = []
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: handlers.append((signum, handler))
+    )
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        """The time between two looks, in which the pass finishes; a stop after the second."""
+        slept.append(seconds)
+        for thread in threading.enumerate():
+            if thread.name == watch_service.TIDY_THREAD:
+                thread.join(10)
+        if len(slept) == 2:
+            [(signum, stopping)] = handlers
+            stopping(signum, None)
+
+    monkeypatch.setattr(watch_service, "_sleep", sleep)
+
+    shown = CliRunner().invoke(app, ["--json", "watch", "--interval", "1"])
+
+    assert shown.exit_code == 0, shown.output
+    first, second = (json.loads(line)["tidied"] for line in shown.stdout.strip().splitlines())
+    assert first is None, "the look that started it never waits for it"
+    assert second["freed"] == {tidy.MIGRATION_LOCK: 1} and second["receipt"] is None
+    assert second["stamp_error"] is None and not lock.exists()

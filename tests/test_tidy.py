@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -55,6 +56,8 @@ project = fleet_suite.project
 
 TAG = cachedir.SIGNATURE + b"\n# a cache, by its own word\n"
 SYSTEM_TEMP_DIRS = tidy._system_temp_dirs
+PERIODIC_PASS = tidy.periodic_pass
+"""The real periodic job (#59), kept before the suite's fixture turns it off."""
 """The real lookup, kept before :func:`sandboxed` replaces it: asked only for a path."""
 COMMAND_LINES = tidy._command_lines
 """The real reader, kept before the suite's fixture replaces it: run here only with a fake
@@ -1583,6 +1586,149 @@ def test_a_cache_kept_for_what_tidy_cannot_read_is_named(tmp_path: Path) -> None
     assert size is not None and size >= 4096
     assert [k.bytes for k in unsized.kept if k.path == cache] == [None]
     assert shut.is_file() and not plain.exists()
+
+
+class _TagFirst:
+    """A listing with ``CACHEDIR.TAG`` first: the worst order a filesystem may list."""
+
+    def __init__(self, listing: Any) -> None:
+        with listing:
+            self.entries = sorted(listing, key=lambda entry: entry.name != cachedir.TAG)
+
+    def __enter__(self) -> _TagFirst:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.entries)
+
+
+def test_a_caches_tag_is_deleted_last(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#59 round 2: a delete ended mid-way leaves a cache still tagged, never an untagged rest
+    no rule judges again. Listed tag first, the tag still goes last; a read-only cache still
+    goes whole."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target", files=6)
+    (cache / "deep").mkdir()
+    (cache / "deep" / "inner.bin").write_bytes(b"x")
+    shut = tag(recent / "scratchpad" / "shut", files=2)
+    aged(recent, 3 * HOUR)
+    made = planned(tmp_path)
+    assert rules(made) == {cache: tidy.SESSION_CACHE, shut: tidy.SESSION_CACHE}
+    real_scandir, real_unlink = os.scandir, os.unlink
+    unlinked: list[str] = []
+
+    def unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        real_unlink(path, *args, **kwargs)
+        unlinked.append(os.fsdecode(path))
+
+    monkeypatch.setattr(os, "scandir", lambda path=".": _TagFirst(real_scandir(path)))
+    monkeypatch.setattr(os, "unlink", unlink)
+
+    tidy._remove(cache, made.roots)
+
+    assert not cache.exists() and len(unlinked) == 8
+    assert unlinked[-1] == cachedir.TAG and unlinked.count(cachedir.TAG) == 1
+    shut.chmod(0o500)  # nothing in it can be unlinked until it is loosened
+    try:
+        tidy._remove(shut, made.roots)
+    finally:
+        if shut.exists():
+            shut.chmod(0o700)
+    assert not shut.exists()
+
+
+_KILLED_MID_DELETE = """
+import json, os, sys, time
+from datetime import datetime
+from pathlib import Path
+
+given = json.loads(sys.argv[1])
+sandbox = Path(given["sandbox"])
+for path in (given["system"], given["cache"], *given["temp"], os.environ["AISQUARE_HOME"]):
+    assert Path(path).resolve().is_relative_to(sandbox), path  # the sandbox's alone
+
+from aisquare.services import tidy
+
+system, cache = Path(given["system"]), Path(given["cache"])
+tidy._system_temp_dirs = lambda: [system]  # never this machine's temp dir
+tidy._command_lines = lambda: []
+tidy.a_home_move_runs = lambda: False
+roots = tidy.Roots(temp=frozenset(Path(root) for root in given["temp"]))
+
+
+def plan(*, now=None, size_kept=True):
+    made = tidy.Plan(roots=roots)
+    made.add([tidy.Item(tidy.SESSION_CACHE, cache, 1, None)], lambda: tidy._remove(cache, roots))
+    return made
+
+
+tidy.plan = plan  # no rule runs here: the one delete, of the sandbox's one cache
+real_unlink, gone = os.unlink, []
+
+
+def unlink(path, *args, **kwargs):
+    real_unlink(path, *args, **kwargs)
+    gone.append(path)
+    if len(gone) == 5:
+        print("deleting", flush=True)
+        time.sleep(600)
+
+
+os.unlink = unlink
+tidy.periodic_pass(datetime.fromisoformat(given["at"]))
+print("finished", flush=True)
+"""
+
+
+def test_a_pass_killed_mid_delete_leaves_no_stamp_and_the_next_frees_the_rest(
+    tmp_path: Path,
+) -> None:
+    """Manager #3897 (c): a pass killed mid-delete (a stop's end of its tmux session, a
+    SIGKILL) wrote no stamp, so a pass is still due; its cache is still tagged (the tag goes
+    last), and the next pass, the real rules, frees the rest and writes its stamp."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target", files=40)
+    aged(recent, 3 * HOUR)
+    made = planned(tmp_path)
+    assert rules(made) == {cache: tidy.SESSION_CACHE}
+    at = datetime.now(UTC)
+    given = {
+        "sandbox": str(tmp_path.resolve()),
+        "system": str(tmp_path / "system-temp"),
+        "cache": str(cache),
+        "temp": [str(root) for root in made.roots.temp],
+        "at": at.isoformat(),
+    }
+    child = subprocess.Popen(
+        [sys.executable, "-c", _KILLED_MID_DELETE, json.dumps(given)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "HOME": str(tmp_path / "child-home")},
+    )
+    watchdog = threading.Timer(60, child.kill)  # a child that never says so ends anyway
+    watchdog.start()
+    try:
+        assert child.stdout is not None
+        said = child.stdout.readline().strip()
+        assert said == "deleting", child.stderr.read() if child.stderr else said
+    finally:
+        watchdog.cancel()
+        child.kill()
+        child.wait(30)
+    left = {path.name for path in cache.iterdir()}
+
+    assert cachedir.TAG in left and 30 < len(left) < 41, "killed mid-delete, the tag kept"
+    assert not tidy.stamp_path().exists() and tidy.is_due(at, 60)
+    passed = PERIODIC_PASS(at)
+    assert passed is not None and passed.freed == {tidy.SESSION_CACHE: 1}
+    assert not cache.exists() and tidy.read_stamp()["last_pass_at"] == at.isoformat(
+        timespec="seconds"
+    )
+    assert not tidy.is_due(at, 60)
 
 
 def test_a_plan_without_kept_sizes_walks_no_kept_repository(tmp_path: Path, repo: Path) -> None:
