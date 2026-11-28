@@ -59,6 +59,8 @@ def test_a_tick_that_lands_while_asq_is_torn_down_raises_nothing(
         )
         async with app.run_test(size=(140, 40)):
             await settle_page(app)
+            await app.action_welcome()  # Welcome, built when first shown (#45), ticking
+            await settle_page(app)
             await app.on_project_selected(ProjectSelected("prj_a"))  # its Board, ticking
             await settle_page(app)
             await app.on_accounts_selected(AccountsSelected())  # the Accounts page, ticking

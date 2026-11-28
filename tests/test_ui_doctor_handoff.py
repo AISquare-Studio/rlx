@@ -737,6 +737,9 @@ def _starts_with_a_hand_over(
         assert isinstance(app, ui_app.FleetApp)
         app.exit = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
         app.notify = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+        # Welcome mounted and hidden, as a start built it before #45 (it is built when first
+        # shown now): its look and list are among the starts.
+        await app.content.add_content(app._new_welcome())
         await app.on_accounts_selected(AccountsSelected())
         await settle_page(app)
         try:
