@@ -134,14 +134,15 @@ pub struct Times {
 }
 
 impl Times {
-    /// The times: test builds take every one from `RLXD_TEST_CALL_WAIT_MS`.
+    /// The times: test builds take them from `RLXD_TEST_CALL_WAIT_MS` (one wait for every
+    /// step, or `init,connect,ask,result`).
     pub fn get() -> Self {
-        match test_wait() {
-            Some(wait) => Self {
-                init: wait,
-                connect: wait,
-                ask: wait,
-                result: wait,
+        match test_waits() {
+            Some([init, connect, ask, result]) => Self {
+                init,
+                connect,
+                ask,
+                result,
             },
             None => Self {
                 init: Duration::from_secs(15),
@@ -1317,17 +1318,24 @@ async fn ending(run: &Run) -> FailReason {
     }
 }
 
-/// Test builds only: `RLXD_TEST_CALL_WAIT_MS` is every step's wait of a call.
+/// Test builds only: `RLXD_TEST_CALL_WAIT_MS` is every step's wait of a call, or each
+/// one's (`init,connect,ask,result`, in milliseconds).
 #[cfg(feature = "debug-methods")]
-fn test_wait() -> Option<Duration> {
-    std::env::var("RLXD_TEST_CALL_WAIT_MS")
-        .ok()
-        .and_then(|ms| ms.parse().ok())
-        .map(Duration::from_millis)
+fn test_waits() -> Option<[Duration; 4]> {
+    let text = std::env::var("RLXD_TEST_CALL_WAIT_MS").ok()?;
+    let waits: Vec<Duration> = text
+        .split(',')
+        .map(|ms| ms.trim().parse().ok().map(Duration::from_millis))
+        .collect::<Option<_>>()?;
+    match waits.as_slice() {
+        [all] => Some([*all; 4]),
+        [init, connect, ask, result] => Some([*init, *connect, *ask, *result]),
+        _ => None,
+    }
 }
 
 #[cfg(not(feature = "debug-methods"))]
-fn test_wait() -> Option<Duration> {
+fn test_waits() -> Option<[Duration; 4]> {
     None
 }
 

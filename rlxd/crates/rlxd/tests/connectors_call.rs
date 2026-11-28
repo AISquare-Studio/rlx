@@ -807,6 +807,61 @@ fn a_process_left_holding_stderr_doesnt_hold_the_reply() {
     assert_eq!(home.status()["runs"]["live"], 0, "{:#}", home.status());
 }
 
+#[test]
+fn a_denied_calls_reply_that_comes_after_the_ask_wait_still_ends_denied() {
+    // Pins the result wait's reset after a deny alone. The ask waits 7 s (deadline_ms 2 s
+    // and the slack), the result 12 s. With no app the deny is at once, and Claude Code
+    // replies 9 s later: past the ask's wait, inside the result's from the deny.
+    let home = home(
+        "mcp-direct-slow-reply",
+        &[
+            ("RLXD_TEST_CALL_WAIT_MS", "5000,5000,1000,12000"),
+            ("RLXD_TEST_CALL_DEADLINE_MS", "2000"),
+        ],
+    );
+    let since = seq(&home);
+    let r = run_id();
+    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "denied", "{run:?}");
+    assert_eq!(detail["by"], "unreachable", "{run:?}");
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    let failed = one(&events, &r, "run.failed");
+    assert_eq!(failed["data"]["reason"], "denied", "{failed}");
+    // Claude Code gave its reply and ended by itself: not killed.
+    let start = the_start(&home);
+    assert_eq!(start["exit"], 0, "{start:#}");
+}
+
+#[test]
+fn a_can_use_tool_later_than_the_ask_steps_wait_but_within_the_deadline_is_decided() {
+    // Pins the ask wait's floor of deadline_ms alone. The ask step waits 1 s of its own,
+    // and 9 s with deadline_ms 4 s and the slack; Claude Code asks 3 s after the call.
+    let home = home(
+        "mcp-direct-slow-ask",
+        &[
+            ("RLXD_TEST_CALL_WAIT_MS", "5000,5000,1000,5000"),
+            ("RLXD_TEST_CALL_DEADLINE_MS", "4000"),
+        ],
+    );
+    let since = seq(&home);
+    let r = run_id();
+    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "denied", "{run:?}");
+    assert_eq!(detail["by"], "unreachable", "{run:?}");
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    assert_eq!(one(&events, &r, "run.failed")["data"]["reason"], "denied");
+    assert_eq!(
+        one(&events, &r, "run.tool_decided")["data"]["by"],
+        "unreachable"
+    );
+}
+
 // --- No route, and what rlxd does not trust -----------------------------------------------
 
 #[test]

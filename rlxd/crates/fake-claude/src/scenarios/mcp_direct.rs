@@ -33,6 +33,8 @@
 //! tool into its cwd's `.claude/settings.json` once it has answered `initialize`, and
 //! `-twice` (`-twice-other`) runs the allowed call, then asks `can_use_tool` again under a
 //! new id for the same call (for [`WRITE`]) before it gives the first one's result,
+//! `-slow-reply` waits [`SLOW_REPLY_MS`] before it answers a call rlxd denied,
+//! `-slow-ask` waits [`SLOW_ASK_MS`] before it asks `can_use_tool`,
 //! `-defiant` runs the call even when rlxd denies it, `-garbled` first asks a
 //! `can_use_tool` with no `tool_use_id`, then a well-formed one, and `-orphan` starts a
 //! process of its own in a process group of its own that holds its stderr (logged as
@@ -77,6 +79,12 @@ pub const MISSING: &str = "No commit found for the ref missing";
 /// How long `mcp_status` lists no server after the start.
 pub const EARLY_MS: u64 = 300;
 
+/// How long `-slow-reply` waits before it answers a call rlxd denied.
+pub const SLOW_REPLY_MS: u64 = 9000;
+
+/// How long `-slow-ask` waits before it asks `can_use_tool`.
+pub const SLOW_ASK_MS: u64 = 3000;
+
 /// The line `-huge` writes: past rlxd's 4 MiB for a control line.
 pub const HUGE_BYTES: usize = 5 << 20;
 
@@ -113,6 +121,10 @@ pub enum Variant {
     Garbled,
     /// It leaves a process holding its stderr, then writes an `assistant` line.
     Orphan,
+    /// It answers a call rlxd denied only after [`SLOW_REPLY_MS`].
+    SlowReply,
+    /// It asks `can_use_tool` only after [`SLOW_ASK_MS`].
+    SlowAsk,
 }
 
 /// The longest it waits for rlxd's next message.
@@ -305,6 +317,9 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
     } else {
         arguments.clone()
     };
+    if variant == Variant::SlowAsk {
+        fake.sleep_ms(SLOW_ASK_MS);
+    }
     if variant == Variant::Garbled {
         // No tool_use_id: rlxd can't read it as a call.
         let display = tool.rsplit("__").next().unwrap_or_default().to_owned();
@@ -374,6 +389,9 @@ fn call(fake: &mut Fake, id: &Value, request: &Value, variant: Variant, n: u32) 
         // Denied, and run all the same.
         run_tool(fake, id, &arguments);
     } else {
+        if variant == Variant::SlowReply {
+            fake.sleep_ms(SLOW_REPLY_MS);
+        }
         let why = decided["message"].as_str().unwrap_or("denied");
         fake.emit(
             &json!({"type": "control_response", "response": {"subtype": "error",
