@@ -2876,7 +2876,7 @@ def test_a_lock_taken_on_the_file_its_holder_removed_is_taken_again(
     a new one and ran beside it. The mover sees the file gone and takes the one there now."""
     key = str(user_home / paths.OLD_HOME_NAME)
     lock = home_migration.move_lock_path(key, named=False)
-    real = home_migration.open_lock_file
+    real = locking.open_lock_file
     gone: list[int] = []
 
     def opened_before_its_holder_let_go(path: Path, **kwargs: Any) -> int:
@@ -2895,6 +2895,89 @@ def test_a_lock_taken_on_the_file_its_holder_removed_is_taken_again(
         ):
             pass
     assert len(gone) == 1 and not lock.exists()
+
+
+def test_on_posix_the_lock_is_still_held_when_its_file_is_removed(
+    user_home: Path, own_tmp: Path
+) -> None:
+    """The order a removed lock file needs on POSIX (the reviewer's minor 1 on #62): removed
+    while still held. Let go first, as Windows must, a mover could lock the file between the
+    let-go and the removal, and then hold one no other process finds."""
+    key = str(user_home / paths.OLD_HOME_NAME)
+    lock = home_migration.move_lock_path(key, named=False)
+    real = os.unlink
+    held_when_removed: list[bool] = []
+
+    def unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        if Path(path) == lock:
+            probe = os.open(lock, os.O_RDWR)
+            try:
+                locking.lock_exclusive(probe)
+            except OSError:
+                held_when_removed.append(True)
+            else:
+                held_when_removed.append(False)
+                locking.unlock(probe)
+            finally:
+                os.close(probe)
+        real(path, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as spy:
+        spy.setattr(os, "unlink", unlink)
+        with home_migration._one_at_a_time(key, named=False):
+            assert lock.is_file()
+    assert held_when_removed == [True] and not lock.exists()
+
+
+def test_a_holder_whose_file_was_replaced_leaves_the_new_one_to_its_holder(
+    user_home: Path, own_tmp: Path
+) -> None:
+    """The tester's S6 on #62: a holder whose file was moved away while it held it, and a new
+    one taken by another mover meanwhile, removes nothing as it lets go: that file is the other
+    mover's, which still holds it, and removes it in its turn."""
+    key = str(user_home / paths.OLD_HOME_NAME)
+    lock = home_migration.move_lock_path(key, named=False)
+    first = home_migration._one_at_a_time(key, named=False)
+    first.__enter__()
+    lock.rename(lock.with_name("moved-away"))
+    second = home_migration._one_at_a_time(key, named=False)
+    second.__enter__()
+
+    first.__exit__(None, None, None)
+    assert lock.is_file(), "the second mover's file is left to it"
+    with (
+        pytest.raises(home_migration.MigrationRefused, match=home_migration.ANOTHER_MOVE),
+        home_migration._one_at_a_time(key, named=False),
+    ):
+        pass
+    second.__exit__(None, None, None)
+    assert not lock.exists()
+
+
+def test_a_named_home_through_a_link_in_another_folder_takes_the_lock_beside_the_real_home(
+    user_home: Path, tmp_path: Path, own_tmp: Path
+) -> None:
+    """The tester's M5 on #62: the lock's folder is the real home's, not the folder a link to
+    it is in, so a mover through a link in another folder is refused beside the holder (the
+    NB2 test's link is beside the home, which could not tell the two apart)."""
+    folder = tmp_path / "x"
+    home = folder / "named"
+    home.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    link = elsewhere / "named-link"
+    link.symlink_to(home)
+    lock = home_migration.move_lock_path(str(home), named=True)
+    assert home_migration.move_lock_path(str(link), named=True) == lock
+    assert lock.parent == Path(os.path.realpath(folder))
+
+    with (
+        home_migration._one_at_a_time(str(home), named=True),
+        pytest.raises(home_migration.MigrationRefused, match=home_migration.ANOTHER_MOVE),
+        home_migration._one_at_a_time(str(link), named=True),
+    ):
+        pass
+    assert _move_locks(folder, elsewhere) == []
 
 
 @pytest.mark.skipif(not can_deny_writes(), reason="this machine cannot deny a folder's writes")
