@@ -46,12 +46,20 @@ READERS = 2
 #: 16-core workstation; 61.6 s and 61.7 s on GitHub's two-core ubuntu-latest
 #: runners (a4975fd on #108, c0946fb on main) against the 60 s this was set to
 #: when the CLI imported less — 200 CLI invocations at ~0.3 s of import each,
-#: eight abreast on two cores, is a minute. Three times that keeps the box a
-#: guard against the catastrophic and stops it grading the runner. The Windows
-#: leg is held to ``budget(TIME_BOX_SECONDS)`` (tests/budgets.py): a process
-#: starts slower there, and the storm took 86-143 s on eight windows-latest
-#: runs and 191.7 s on a ninth (job 108259151826).
-TIME_BOX_SECONDS = 180.0
+#: eight abreast on two cores, is a minute. Three times that, 180 s, kept the box
+#: a guard against the catastrophic and stopped it grading the runner, until the
+#: storm's ~240 CLI starts grew with the CLI: CI's recorded times went 54.5 s
+#: (2026-10) -> 98.8 -> 127.5 -> 117.9 -> 133.5 s (2026-11-27), and rc's push run
+#: 46171646076 (2026-11-28) took 144, 151, 167 and 196 s on its four Linux legs
+#: (py3.12, captain-off, py3.11 proxy-down, py3.13 proxy-up), failing 180 s on the
+#: last. 0.10.2 itself added ~4% a start (#73, medians of 10 on one Mac: `import
+#: aisquare.cli.app` 263 -> 277 ms; the storm's own commands 381 -> 395 ms); the
+#: rest is the runner, one tree spanning 144-196 s in one run. 400 s is twice the
+#: slowest healthy run measured. The Windows leg is held to
+#: ``budget(TIME_BOX_SECONDS)`` (tests/budgets.py): a process starts slower there,
+#: and the storm took 86-143 s on eight windows-latest runs, 191.7 s on a ninth
+#: (job 108259151826) and 195 s in 46171646076.
+TIME_BOX_SECONDS = 400.0
 _CLI_TIMEOUT = 30.0  # any single call outliving this is already a failure
 
 
