@@ -1,5 +1,6 @@
 //! Hooks over the socket (handoff 0.10.3, 1.5, and 7.3's hook bullet): `rlxd-hook <event>`
-//! prints what `rlx hook <event>` prints, has its side effect, publishes one `hook.<event>`,
+//! prints what `rlx hook <event>` prints, has its side effect, publishes one `hook.<event>`
+//! (none for the gate's `pre-tool-use`),
 //! falls back to `rlx hook` with rlxd stopped, and turns on the brain's `accepted`: before
 //! it, the hook runs as `rlx hook`; after it, never again. `pre-tool-use` always denies.
 //! And 1.6's twenty hooks through one brain.
@@ -104,6 +105,23 @@ impl Seeded {
         (stdout, stderr)
     }
 
+    /// `rlxd-hook args…` with `stdin` and `envs`: its stdout and stderr.
+    fn rlxd_hook_args(
+        &self,
+        args: &[&str],
+        stdin: &[u8],
+        envs: &[(&str, &str)],
+    ) -> (Vec<u8>, String) {
+        let rlx = self.rlx.display().to_string();
+        let mut all = vec![("RLXD_RLX_BIN", rlx.as_str())];
+        all.extend_from_slice(envs);
+        let (code, stdout, stderr) =
+            self.home
+                .run_bytes(&rlxd_hook(), args, &self.project, stdin, &all);
+        assert_eq!(code, Some(0), "rlxd-hook {args:?} exits 0: {stderr}");
+        (stdout, stderr)
+    }
+
     /// `rlx hook <event>` with `stdin`: its stdout.
     fn rlx_hook(&self, event: &str, stdin: &[u8]) -> Vec<u8> {
         let (code, stdout, stderr) =
@@ -181,22 +199,50 @@ fn every_hook_prints_what_rlx_hook_prints_and_publishes_one_event() {
             );
         }
     }
-    // The gate's hook: denied, never allowed, and its event too (7.3: all seven).
+    // The gate's hook: denied, never allowed, and it publishes no hook event: the gate's run
+    // events are its own, and a request the gate refuses reaches no topic.
     let payload = seeded.payload(
         "PreToolUse",
         json!({"tool_name": "mcp__claude_ai_Slack__slack_send_message", "tool_input": {}}),
     );
-    let denied = seeded.rlxd_hook("pre-tool-use", &payload);
+    // It reaches rlxd's gate with a run, an attempt and a key; no such run is live here, so
+    // the gate denies it, and the key is in nothing rlxd-hook writes or rlxd publishes.
+    let key = "5eed".repeat(16);
+    let (denied, stderr) = seeded.rlxd_hook_args(
+        &[
+            "pre-tool-use",
+            "--run",
+            "0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f",
+            "--attempt",
+            "1",
+            "--deadline-ms",
+            "120000",
+        ],
+        &payload,
+        &[("RLXD_HOOK_KEY", &key)],
+    );
     let reply: Value = serde_json::from_slice(&denied).unwrap();
     assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(
+        reply["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("no such run"),
+        "{reply}"
+    );
+    assert!(!String::from_utf8_lossy(&denied).contains(&key));
+    assert!(!stderr.contains(&key), "{stderr}");
     let events = seeded.hook_events();
-    for (event, _, _) in fleet_events()
-        .into_iter()
-        .chain([("pre-tool-use", "", json!({}))])
-    {
+    assert!(
+        events.iter().all(|e| e["type"] != "hook.pre_tool_use"),
+        "{events:?}"
+    );
+    assert!(!serde_json::to_string(&events).unwrap().contains(&key));
+    for (event, _, _) in fleet_events() {
         let r#type = format!("hook.{}", event.replace('-', "_"));
         let matching: Vec<&Value> = events.iter().filter(|e| e["type"] == r#type).collect();
         assert_eq!(matching.len(), 1, "{type}: {events:?}");
+        assert!(!matching[0].to_string().contains(&key), "{type}");
         assert_eq!(matching[0]["data"]["session_id"], "t1");
         assert_eq!(
             matching[0]["data"]["cwd"],

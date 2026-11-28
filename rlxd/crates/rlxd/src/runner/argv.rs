@@ -74,8 +74,9 @@ pub fn args(params: &RunStartParams, attempt: u64, settings: &Path) -> Vec<OsStr
 }
 
 /// The run's own settings for `attempt` (5.1): one PreToolUse hook, matching every tool,
-/// that runs `rlxd-hook pre-tool-use --run <run_id> --attempt <n>` by the absolute path
-/// `hook`, with a timeout of `deadline_ms / 1000 + 10` seconds (rounded up), so Claude
+/// that runs `rlxd-hook pre-tool-use --run <run_id> --attempt <n> --deadline-ms <ms>` by the
+/// absolute path `hook` (its own timer is `deadline_ms` and 5 s), with a timeout of
+/// `deadline_ms / 1000 + 10` seconds (rounded up), so Claude
 /// Code never ends the hook before rlxd's own deadline.
 pub fn settings(params: &RunStartParams, attempt: u64, hook: &Path) -> Value {
     settings_via(params, attempt, hook, None)
@@ -91,9 +92,10 @@ pub fn settings_via(
 ) -> Value {
     let via = via.map(|via| format!(" {via}")).unwrap_or_default();
     let command = format!(
-        "{}{via} pre-tool-use --run {} --attempt {attempt}",
+        "{}{via} pre-tool-use --run {} --attempt {attempt} --deadline-ms {}",
         quoted(hook),
-        params.run_id
+        params.run_id,
+        params.deadline_ms
     );
     let timeout = params.deadline_ms.div_ceil(1000) + 10;
     json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
@@ -415,7 +417,9 @@ mod tests {
         } else {
             assert_eq!(
                 command,
-                format!("/opt/rlx/bin/rlxd-hook pre-tool-use --run {ID} --attempt 1")
+                format!(
+                    "/opt/rlx/bin/rlxd-hook pre-tool-use --run {ID} --attempt 1 --deadline-ms 1000"
+                )
             );
         }
         assert_eq!(hook["hooks"][0]["timeout"], 11);
@@ -426,7 +430,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             command,
-            format!("\"/Users/a b/bin/rlxd-hook\" pre-tool-use --run {ID} --attempt 2")
+            format!(
+                "\"/Users/a b/bin/rlxd-hook\" pre-tool-use --run {ID} --attempt 2 --deadline-ms 1500"
+            )
         );
         assert_eq!(spaced["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 12);
     }

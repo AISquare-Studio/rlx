@@ -34,9 +34,9 @@
 //! ([`super::call`]), which is rlxd's own child's stdio and needs no binding. Both take
 //! the same path from there ([`Runner::decide_call`]): rlxd's rules, the app, the ledger.
 //!
-//! Until rlxd-hook's own pre-tool-use is wired to [`Runner::pre_tool_use`] (with #617, at
-//! rc/0.10.3's merge), only test builds reach the hook side, through `debug.pre_tool_use`:
-//! the items marked so are unused in a release build until then.
+//! A hook request comes from `rlxd-hook pre-tool-use` over the socket (`hook`, through
+//! [`crate::hooks`]), which sends the attempt's key it has in [`HOOK_KEY_ENV`] and is
+//! pinned as the connection's peer; test builds also take it from `debug.pre_tool_use`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,8 +93,9 @@ fn is_mounted(connector: &str, server: &Server) -> bool {
         && (!connector.starts_with(CLAUDE_AI) || server.source.as_deref() == Some(CLAUDE_AI_SOURCE))
 }
 
-/// The name of the variable that holds an attempt's hook key.
-pub const HOOK_KEY_ENV: &str = "RLXD_HOOK_KEY";
+/// The name of the variable that holds an attempt's hook key: rlxd-proto's, which
+/// rlxd-hook reads.
+pub use rlxd_proto::HOOK_KEY_ENV;
 
 /// The reason of a call still open as its run ends.
 const RUN_ENDED: &str = "the run ended before the call was decided";
@@ -109,7 +110,6 @@ const STOPPED: &str = "the app stopped the run";
 const TIMED_OUT: &str = "no answer came from the app before the call's deadline";
 
 /// A hook request: what `rlxd-hook pre-tool-use` sends for one call.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub struct Ask {
     pub run_id: String,
     pub attempt: u64,
@@ -192,7 +192,6 @@ impl Taken {
         }
     }
 
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     fn output(&self) -> String {
         output(self.decision, &self.reason)
     }
@@ -258,7 +257,6 @@ impl Runner {
     /// The gate's answer to one hook request: Claude Code's hook JSON, allow or deny.
     /// `None` when its connection was dropped (`debug.drop_hook_connections`): the hook
     /// then gets no answer, and denies.
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     pub async fn pre_tool_use(self: &Arc<Self>, ask: Ask) -> Option<String> {
         let (run, call) = match self.bind(&ask) {
             Ok(bound) => bound,
@@ -462,7 +460,6 @@ impl Runner {
 
     /// The run and the call a hook request is about, when it is bound to the run's live
     /// attempt: its key, and a process inside the run (the module's doc).
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     fn bind(&self, ask: &Ask) -> Result<(Arc<Run>, Call), String> {
         let id =
             rlxd_proto::RunId::new(ask.run_id.clone()).map_err(|_| "no such run".to_owned())?;
@@ -880,24 +877,17 @@ pub fn claude_server_name(name: &str) -> String {
     collapsed.trim_matches('_').to_owned()
 }
 
-/// Claude Code's PreToolUse hook output for `decision`, with `reason`.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+/// Claude Code's PreToolUse hook output for `decision`, with `reason`: rlxd-proto's, so
+/// rlxd-hook reads it as the gate's (`is_gate_output`). Anything but an allow is a deny.
 pub fn output(decision: Decision, reason: &str) -> String {
-    let permission = if decision == Decision::Allow {
-        "allow"
+    if decision == Decision::Allow {
+        rlxd_proto::allow_output(reason)
     } else {
-        "deny"
-    };
-    json!({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": permission,
-        "permissionDecisionReason": reason,
-    }})
-    .to_string()
+        rlxd_proto::deny_output(reason)
+    }
 }
 
 /// Whether `a` and `b` are equal, in time that doesn't depend on where they differ.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 fn equal(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

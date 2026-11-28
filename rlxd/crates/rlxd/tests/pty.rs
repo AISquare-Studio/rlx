@@ -199,27 +199,15 @@ fn the_pty_topic_carries_pty_exited() {
 }
 
 /// A program that counts, a line every 200 ms, for as long as it runs.
+/// The test build's ticker (src/bin/ticker.rs): `tick <n>` every 200 ms, started in
+/// moments on every OS. Windows PowerShell, the counter before, took past 10 s to start on
+/// a loaded runner (#2794).
 fn counter_argv() -> Value {
-    if cfg!(windows) {
-        json!([
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "$i = 0; while ($true) { $i++; \"tick $i\"; Start-Sleep -Milliseconds 200 }"
-        ])
-    } else {
-        json!([
-            "sh",
-            "-c",
-            "i=0; while :; do i=$((i+1)); echo \"tick $i\"; sleep 0.2; done"
-        ])
-    }
+    json!([env!("CARGO_BIN_EXE_ticker")])
 }
 
-/// The highest count on `id`'s screen, 0 before the first.
-/// Waits up to a minute for PTY `id` to count past `after`: a shared Windows runner may
-/// take more than `eventually`'s 10 s to start PowerShell (#2794). Fails showing what the
-/// PTY printed, and whether it ended.
+/// Waits for PTY `id` to count past `after`. The minute is a ceiling for a loaded runner,
+/// not what the ticker takes. Fails showing what the PTY printed, and whether it ended.
 fn counts_past(home: &TestHome, id: &str, after: u64, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -242,6 +230,7 @@ fn counts_past(home: &TestHome, id: &str, after: u64, what: &str) {
     }
 }
 
+/// The highest count on `id`'s screen, 0 before the first.
 fn count(home: &TestHome, id: &str) -> u64 {
     count_in(&screen(home, id))
 }
