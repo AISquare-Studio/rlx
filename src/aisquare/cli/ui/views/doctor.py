@@ -92,7 +92,8 @@ class FixApplied(Message):
 
 _SUBCOMMANDS = (
     "fleet|team|accounts|agents|project|doctor|config|remote|explainability|metrics|captain|"
-    "upgrade|uninstall|instances|launch|init|login|logout|board|watch|persona|task|note|hook|code"
+    "upgrade|uninstall|instances|launch|init|login|logout|board|watch|persona|task|note|hook|code|"
+    "tidy"
 )
 COMMAND = re.compile(
     rf"\b(?:rlx|aisquare|asq|relax) (?:{_SUBCOMMANDS})\b"

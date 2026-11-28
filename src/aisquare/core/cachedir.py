@@ -19,11 +19,14 @@ no cache. Git judges those, never the tag.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import stat
 import sys
+import time
 from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +145,35 @@ def _is_file(path: Path) -> bool:
         return False
 
 
+class OutOfTime(BaseException):
+    """A walk went past the deadline :func:`walking_until` set (the Doctor's budgeted look at
+    the disk, #60). A ``BaseException``, so no ``except Exception`` on the way swallows it: the
+    look ends where it is, and what it had measured is a lower bound."""
+
+
+_DEADLINE: ContextVar[float | None] = ContextVar("cachedir_walk_deadline", default=None)
+
+
+@contextlib.contextmanager
+def walking_until(deadline: float) -> Iterator[None]:
+    """Every walk in this module (and ``rlx tidy``'s, which ask :func:`in_time`) raises
+    :class:`OutOfTime` once ``time.monotonic()`` passes ``deadline``, in this thread alone: a
+    context variable, which no other thread (the watcher's pass) shares."""
+    token = _DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def in_time() -> None:
+    """:class:`OutOfTime` past the deadline :func:`walking_until` set, if any: asked once per
+    folder a walk lists."""
+    deadline = _DEADLINE.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise OutOfTime
+
+
 def holds_repository(path: Path, *, below_only: bool = False) -> bool:
     """Whether a git repository of any kind is at or anywhere under ``path``: a ``.git`` (a
     clone's directory, a worktree's or a submodule's file, ``.GIT`` on a case-insensitive disk),
@@ -158,6 +190,7 @@ def holds_repository(path: Path, *, below_only: bool = False) -> bool:
     pending: list[tuple[Path, bool]] = [(path, True)]
     while pending:
         here, top = pending.pop()
+        in_time()
         try:
             with os.scandir(here) as listing:
                 entries = list(listing)
@@ -199,6 +232,7 @@ def newest_mtime(path: Path, *, limit: int = 200_000) -> float | None:
     seen = 0
     while pending:
         here = pending.pop()
+        in_time()
         try:
             with os.scandir(here) as listing:
                 entries = list(listing)
@@ -233,6 +267,7 @@ def holds_environment(path: Path) -> bool:
 
 
 def _entries(path: Path) -> Iterator[os.DirEntry[str]]:
+    in_time()
     try:
         with os.scandir(path) as listing:
             yield from listing

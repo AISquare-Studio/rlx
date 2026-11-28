@@ -69,6 +69,7 @@ import re
 import shutil
 import stat
 import sys
+import time
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -331,11 +332,13 @@ class Report:
         return sum(item.bytes for item in self.freed)
 
 
-def plan(*, now: datetime | None = None, size_kept: bool = True) -> Plan:
+def plan(*, now: datetime | None = None, size_kept: bool = True, into: Plan | None = None) -> Plan:
     """Every path ``rlx tidy`` would free now, with its rule and size, and every path a rule
     keeps, with why. Reads only: nothing is deleted, and no lock is taken. ``size_kept``: a
     kept repository's size, for a person deciding what to remove by hand; the periodic job
-    (#59) asks without, or each pass would walk again every repository tidy never deletes."""
+    (#59) asks without, or each pass would walk again every repository tidy never deletes.
+    ``into``: the plan filled in as the rules go, so a look cut short (``cachedir.OutOfTime``,
+    the Doctor's, #60) keeps what it had found: each item whole, a lower bound."""
     at = now or _now()
     config = _settings()
     with store_session() as store:
@@ -343,10 +346,9 @@ def plan(*, now: datetime | None = None, size_kept: bool = True) -> Plan:
         # Liveness from every row there is, a forgotten project's too (review of #58, M2):
         # forgetting refuses only live rows, so a paused agent can sit in one.
         every = _every_row(store)
-        result = Plan(
-            roots=_roots(projects, store.list_projects(all=True, include_forgotten=True)),
-            size_kept=size_kept,
-        )
+        result = into if into is not None else Plan()
+        result.roots = _roots(projects, store.list_projects(all=True, include_forgotten=True))
+        result.size_kept = size_kept
         commands = _command_lines()
         for project in projects:
             _ended_worktrees(store, project, result)
@@ -430,6 +432,7 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
         return
     going: list[Path] = []
     for agent in trees.candidates:
+        cachedir.in_time()
         tree = agent.cwd
         try:
             if not fleet_service._present(tree):
@@ -591,6 +594,7 @@ def _session_dirs(root: Path) -> list[Path]:
 
 
 def _subdirs(path: Path) -> list[Path]:
+    cachedir.in_time()  # a budgeted look (the Doctor's, #60) ends here once out of time
     try:
         with os.scandir(path) as listing:
             return sorted(
@@ -704,6 +708,7 @@ def _session_trees(
         )
         return
     for directory in sessions:
+        cachedir.in_time()
         session_id = directory.name
         alive = _liveness(store, session_id, directory, every, commands)
         if alive.held or alive.running is not False or alive.ended_at is None:
@@ -728,6 +733,7 @@ def _repositories(directory: Path) -> list[Path]:
         if _there(here / ".git") or cachedir._is_bare_repository(here):
             found.append(here)
             continue
+        cachedir.in_time()
         try:
             with os.scandir(here) as listing:
                 entries = list(listing)
@@ -940,6 +946,7 @@ def _idle_build_output(
 ) -> None:
     roots = result.roots
     for row in rows:
+        cachedir.in_time()
         if not _idle_coder(store, project, row, config.idle_build_hours, at):
             continue
         placed = fleet_service.resolve_place(row)
@@ -1078,6 +1085,7 @@ def _agent_tmpdirs(at: datetime, result: Plan) -> None:
     its agent's board (:func:`_tmpdir_boards`), for the periodic job's receipt (#59)."""
     boards = _tmpdir_boards()
     for directory in agent_tmp.ended_dirs(now=at):
+        cachedir.in_time()  # a budgeted look (the Doctor's, #60) ends here once out of time
         repositories = _repositories(directory)
         for repository in repositories:
             result.kept.append(
@@ -1169,6 +1177,9 @@ class PassReport:
     stamp_error: str | None = None
     """Why its stamp could not be written, when it could not (reviewer #3894, MINOR 1): the
     pass ran, and whoever runs the job keeps its time in memory instead (:func:`is_due`)."""
+    not_freed_bytes: int = 0
+    """What it planned and could not free: what tidy would still free just after it (the
+    Doctor's disk row reads it from a fresh stamp, #60)."""
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -1176,6 +1187,7 @@ class PassReport:
             "freed_bytes": self.freed_bytes,
             "freed": dict(self.freed),
             "not_freed": self.not_freed,
+            "not_freed_bytes": self.not_freed_bytes,
             "kept": self.kept,
             "receipt": self.receipt,
             "board": self.board,
@@ -1321,7 +1333,8 @@ def periodic_pass(
 
 def _totals(report: PassReport) -> dict[str, Any]:
     found = report.as_json()
-    return {key: found[key] for key in ("freed_bytes", "freed", "not_freed", "kept")}
+    keys = ("freed_bytes", "freed", "not_freed", "not_freed_bytes", "kept")
+    return {key: found[key] for key in keys}
 
 
 def _write_failed_stamp(data: dict[str, Any]) -> None:
@@ -1418,6 +1431,7 @@ def _pass_report(at: datetime, done: Report) -> PassReport:
         freed={rule: n for rule, n in freed.items() if n},
         not_freed=len(done.not_freed),
         kept=len(done.kept),
+        not_freed_bytes=sum(item.bytes for item, _why in done.not_freed),
     )
 
 
@@ -1474,3 +1488,149 @@ def _say_it(report: PassReport, done: Report) -> PassReport:
     except Exception:
         return said  # the pass is done; a board that would not take its line costs it nothing
     return replace(said, board=board)
+
+
+# --- the Doctor's look at the disk (#60) -----------------------------------------------------
+
+DISK_BUDGET_S = 2.0
+"""How long the Doctor's disk row looks, at most (#60): what it had not measured by then, it
+says as a lower bound ("at least")."""
+
+
+@dataclass(frozen=True)
+class DiskUse:
+    """rlx's disk, as the Doctor's row says it (#60): what rlx's folders take, and what tidy
+    would free. A size measured past the budget is a lower bound (``*_whole`` False)."""
+
+    worktrees: int
+    """Every project's ``.aisquare-worktrees``: the agents' checkouts."""
+    build_caches: int
+    """The build output (``CACHEDIR.TAG`` caches) inside those worktrees: part of them."""
+    session_temp: int
+    """The sessions' temp and the agents' own (#57's per-agent TMPDIR): tidy's temp roots."""
+    use_whole: bool
+    would_free: int
+    """What tidy would free: now, by a dry run; or, from a fresh stamp, what the last pass
+    could not free (it freed the rest)."""
+    free_whole: bool
+    as_of: datetime | None = None
+    """The last pass's time, when ``would_free`` is its stamp's; ``None``: a dry run now."""
+    freed_then: int = 0
+    """What that pass freed."""
+    unreadable: tuple[Path, ...] = ()
+    """Roots that could not be listed: nothing in them was measured."""
+
+    @property
+    def total(self) -> int:
+        return self.worktrees + self.session_temp
+
+
+@dataclass(frozen=True)
+class _Fresh:
+    at: datetime
+    freed_bytes: int
+    not_freed_bytes: int
+
+
+def fresh_pass(at: datetime) -> _Fresh | None:
+    """The last periodic pass, from its stamp, when it is fresh: it began within twice
+    ``[tidy] every_minutes`` of ``at`` and did not fail. ``None`` where the job is off (``0``,
+    or native Windows), or the stamp is stale, failed, torn, or from before #60 (it does not
+    say what was left)."""
+    if not DELETES:
+        return None
+    every = _settings().every_minutes
+    if every <= 0:
+        return None
+    stamp = read_stamp()
+    last = _last_pass_at(stamp)
+    if last is None or stamp.get("failed") or last > at:
+        return None
+    if at - last >= timedelta(minutes=2 * every):
+        return None
+    freed, left = stamp.get("freed_bytes"), stamp.get("not_freed_bytes")
+    if not isinstance(freed, int) or not isinstance(left, int):
+        return None
+    return _Fresh(at=last, freed_bytes=freed, not_freed_bytes=left)
+
+
+def disk_use(*, budget_s: float | None = None, now: datetime | None = None) -> DiskUse:
+    """rlx's disk for the Doctor (#60), in ``budget_s`` at most. What tidy would free comes
+    from the last pass's stamp while it is fresh (:func:`fresh_pass`), else from a dry run
+    (:func:`plan`, never :func:`apply`); then the worktrees and the sessions' temp are sized
+    in what is left of the budget. Past it every walk stops (``cachedir.walking_until``) and
+    what was found stands as a lower bound. Nothing is deleted, and nothing is written."""
+    deadline = time.monotonic() + (DISK_BUDGET_S if budget_s is None else budget_s)
+    at = now or _now()
+    fresh = fresh_pass(at)
+    made = Plan()
+    free_whole = True
+    if fresh is None:
+        try:
+            with cachedir.walking_until(deadline):
+                plan(now=at, size_kept=False, into=made)
+        except cachedir.OutOfTime:
+            free_whole = False
+    roots = made.roots if made.roots != Roots() else _disk_roots()
+    trees = _measure(roots.trees, deadline, caches=True)
+    temp = _measure(roots.temp, deadline)
+    return DiskUse(
+        worktrees=trees.bytes,
+        build_caches=trees.caches,
+        session_temp=temp.bytes,
+        use_whole=trees.whole and temp.whole,
+        would_free=fresh.not_freed_bytes if fresh else sum(item.bytes for item in made.items),
+        free_whole=free_whole,
+        as_of=fresh.at if fresh else None,
+        freed_then=fresh.freed_bytes if fresh else 0,
+        unreadable=(*trees.unreadable, *temp.unreadable),
+    )
+
+
+def _disk_roots() -> Roots:
+    with store_session() as store:
+        projects = store.list_projects(all=True)
+        return _roots(projects, store.list_projects(all=True, include_forgotten=True))
+
+
+@dataclass(frozen=True)
+class _Measured:
+    bytes: int
+    caches: int
+    whole: bool
+    unreadable: tuple[Path, ...]
+
+
+def _measure(roots: Iterable[Path], deadline: float, *, caches: bool = False) -> _Measured:
+    """What everything in ``roots`` takes (``cachedir.allocated_bytes``), entry by entry until
+    ``deadline``, and with ``caches`` how much of it is build output. A root that cannot be
+    listed is named, every one of them, whatever the time; one that is not there takes
+    nothing."""
+    unreadable: list[Path] = []
+    entries: list[Path] = []
+    for root in sorted(roots):
+        try:
+            with os.scandir(root) as listing:
+                entries.extend(sorted(Path(entry.path) for entry in listing))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable.append(root)
+    total = inside = 0
+    for entry in entries:
+        try:
+            with cachedir.walking_until(deadline):
+                size = cachedir.allocated_bytes(entry)
+                found = (
+                    sum(
+                        cachedir.allocated_bytes(cache)
+                        for cache in cachedir.cache_dirs(entry, skip=cachedir.is_environment)
+                    )
+                    if caches
+                    else 0
+                )
+        except cachedir.OutOfTime:
+            return _Measured(total, inside, False, tuple(unreadable))
+        total += size
+        inside += found
+    return _Measured(total, inside, True, tuple(unreadable))
