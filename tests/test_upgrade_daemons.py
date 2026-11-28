@@ -32,6 +32,7 @@ from aisquare.core import locking, registry
 from aisquare.services import install_route, lifecycle, upgrade_daemons
 from aisquare.services.install_route import Captured, Facts, LatestRelease
 from aisquare.services.upgrade_daemons import Around, Events, Options, Refused
+from tests.fake_rlxd import read_state, update_state
 from tests.installer_seams import no_real_installer  # noqa: F401 — autouse, applied by import
 
 FAKE = Path(__file__).with_name("fake_rlxd.py")
@@ -61,14 +62,11 @@ class Daemons:
         (self.dir / "version").write_text(version, encoding="utf-8")
 
     def state(self, **values: Any) -> None:
-        path = self.dir / "state.json"
-        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        state.update(values)
-        path.write_text(json.dumps(state), encoding="utf-8")
+        """Sets ``values`` in the fake's state, under the lock the fake's own writes take."""
+        update_state(self.dir, lambda state: state.update(values))
 
     def read_state(self) -> dict[str, Any]:
-        state: dict[str, Any] = json.loads((self.dir / "state.json").read_text(encoding="utf-8"))
-        return state
+        return read_state(self.dir)
 
     def start(self, kind: str = "rlxd") -> daemons_core.Daemon:
         argv = [sys.executable, str(FAKE), "serve" if kind == "rlxd" else "watch", "--detach"]
@@ -337,6 +335,30 @@ def test_end_ptys_ends_each_live_pty_before_rlxd_stops(fake: Daemons) -> None:
     }
     around.installed("2.0.0", None)
     around.finish(())
+
+
+def test_a_state_written_while_the_fake_saves_its_own_is_kept(
+    fake: Daemons, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#44: the fake registered (live) before it saved its own entry, and a test's write
+    that came in between was overwritten by the fake's stale copy (ci.yml 46151216330:
+    the live PTY lost, so nothing refused). Here the old order comes back, the fake's save
+    held 2 s between its read and its write, and the test writes inside that window: both
+    writes are kept, as they share one lock."""
+    monkeypatch.setenv("FAKE_RLXD_SAVE_LATE", "2")
+    fake.start()
+    deadline = time.monotonic() + 20
+    while not (fake.dir / "saving").exists():
+        assert time.monotonic() < deadline, "the fake never began its save"
+        time.sleep(0.02)
+    fake.state(ptys=[{"pty_id": "p1", "exited": False}])
+    state = fake.read_state()
+    assert state["ptys"] == [{"pty_id": "p1", "exited": False}], state
+    assert state["rlxd"]["pid"] == fake.pids[-1], state
+    around, _ = _around(fake, Options(restart_daemons=True))
+    with pytest.raises(Refused) as refused:
+        around.before_install()
+    assert refused.value.code == "ptys_live"
 
 
 def test_without_end_ptys_a_live_pty_refuses_at_the_stop_and_none_is_ended(
