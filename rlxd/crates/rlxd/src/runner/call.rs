@@ -1068,19 +1068,29 @@ fn reply(
 /// `local`'s too): neither may be there, whatever it is (a file, a folder, a link).
 const PROJECT_SETTINGS: [&str; 2] = ["settings.json", "settings.local.json"];
 
-/// The first settings file in the call's working folder `cwd`, which rlxd writes none of:
-/// `None` when there is none. It fails closed: any answer but "not there" (anything there,
-/// or an error reading it) is one.
+/// The first settings file in the call's working folder `cwd`, which rlxd writes none of,
+/// or its `.claude` when that is anything but a folder: `None` when there is none. It fails
+/// closed, the same on every OS: any answer but "not there" (anything there, or an error
+/// reading it) is one.
 fn untrusted(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let not_there = |path: &std::path::Path| {
+        matches!(
+            std::fs::symlink_metadata(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    };
+    let folder = cwd.join(".claude");
+    match std::fs::symlink_metadata(&folder) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Ok(meta) if meta.is_dir() => {}
+        // A file, a link, or an error: Windows reads a path through a file as not found,
+        // others as not a folder; neither is let pass.
+        _ => return Some(folder),
+    }
     PROJECT_SETTINGS
         .iter()
-        .map(|name| cwd.join(".claude").join(name))
-        .find(|path| {
-            !matches!(
-                std::fs::symlink_metadata(path),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound
-            )
-        })
+        .map(|name| folder.join(name))
+        .find(|path| !not_there(path))
 }
 
 fn untrusted_message(path: &std::path::Path) -> String {
@@ -1421,14 +1431,10 @@ mod tests {
             std::fs::remove_dir(&path).unwrap();
         }
         assert_eq!(untrusted(&dir), None);
-        // It fails closed: a .claude that is a file can't be read as a folder, and is
-        // refused all the same.
+        // It fails closed, the same on every OS: a .claude that is a file is refused.
         std::fs::remove_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(".claude"), "x").unwrap();
-        assert_eq!(
-            untrusted(&dir),
-            Some(dir.join(".claude").join("settings.json"))
-        );
+        assert_eq!(untrusted(&dir), Some(dir.join(".claude")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
