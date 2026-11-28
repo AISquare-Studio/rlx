@@ -311,6 +311,11 @@ call) raises nothing for the store-unreadable notice to say, and each tick only 
 more read: the sidebar went silently stale (review of #272)."""
 ACCOUNTS_WORKER = "shell-accounts"
 """The thread worker that reads the accounts' frame (``FleetApp.refresh_accounts``)."""
+FOLDED_SWEEP_SECONDS = 30.0
+"""How often, at most, a fleet read lists the projects a collapsed group folds away, so the rows of
+panes that died there are ended (:func:`_read_fleet`'s ``sweep_folded``): a frame reads only
+what it shows (#83), and the view left behind another no longer keeps its folded project read
+(rlx#557). A read that fails does not count (:meth:`FleetApp._fleet_read`): the next one sweeps."""
 HEADROOM_WORKER = "sidebar-headroom"
 """The thread worker that reads the status line's headroom (``FleetApp.refresh_headroom``)."""
 HOUSEKEEPING_SECONDS = 30.0
@@ -562,13 +567,22 @@ def _read_frame(
     captain: bool,
     viewed: Collection[str] | None = None,
     scope: Collection[str] | None = None,
+    *,
+    sweep_folded: bool = False,
 ) -> _FleetRead:
     """One frame of the sidebar, read on the calling thread: the fleet, then the captain's
-    home board and row when the captain is on (``experimental.captain``). ``viewed`` and
-    ``scope`` as for :func:`_read_fleet`."""
+    home board and row when the captain is on (``experimental.captain``). ``viewed``,
+    ``scope`` and ``sweep_folded`` as for :func:`_read_fleet`."""
     asqs = _live_asqs()
     service = service_host.hosting(asqs)  # it retries held-back nudges then, not this TUI (#32)
-    read = _read_fleet(show_captured, viewed, scope, captain=captain, nudges=service is None)
+    read = _read_fleet(
+        show_captured,
+        viewed,
+        scope,
+        captain=captain,
+        nudges=service is None,
+        sweep_folded=sweep_folded,
+    )
     read = replace(_read_captain(read), captain_asked=True) if captain else read
     return replace(read, asqs=asqs, service=service)
 
@@ -591,6 +605,7 @@ def _read_fleet(
     *,
     captain: bool = False,
     nudges: bool = True,
+    sweep_folded: bool = False,
 ) -> _FleetRead:
     """One frame of the fleet, read on the calling thread: the projects and their groups,
     then their agents. One store session reads them all; ``list_agents_many`` then asks
@@ -602,6 +617,12 @@ def _read_fleet(
     ``viewed``: the projects an open view shows, read even when folded away, whose view a
     frame without them would leave to age; ``None`` folds nothing (the first frame, read
     before the views it reopens). ``scope``: the only projects listed (``ui --project``).
+
+    ``sweep_folded``: the folded projects are listed too, so the rows of panes that died there
+    are ended (``list_agents_many``) as everywhere else, and the frame still holds none of their
+    rows: what it shows is as without it. :data:`FOLDED_SWEEP_SECONDS` apart at most, so a folded
+    project's agent never reads running much longer than that after it died (the manager's
+    condition on rlx#557's skip of a left view's folded project, #51).
 
     With ``captain``, the captain's home board is read in the same session, by the id
     resolved here: :func:`_read_captain` opened a second session and resolved the home
@@ -624,7 +645,8 @@ def _read_fleet(
             groups = store.project_groups()
             home = store.get_project(home_id) if captain else None
             folded = set() if viewed is None else _folded(projects, groups) - set(viewed)
-            listings = fleet_service.read_listings(store, projects, skip=folded)
+            listed = set() if sweep_folded else folded
+            listings = fleet_service.read_listings(store, projects, skip=listed)
             # A manager nudge a draft held back (P0-W2, #276), read in this frame's session.
             owed = fleet_service.deferred_nudge_targets(store)
             # Which are fleet-paused, for their Resume (one read of the signals, any board).
@@ -643,6 +665,8 @@ def _read_fleet(
     agents = {p.id: many.agents.get(p.id, []) for p in projects if p.id not in folded}
     notices: dict[str, str] = {}
     for project_id, failure in many.errors.items():
+        if project_id in folded:
+            continue  # swept, not shown: its card is folded away, as when it is not read
         # A bug in the fleet path must not take the view down: said, with its class.
         notices[project_id] = f"agents unavailable — {_why_unread(failure)}"
     if home_id in agents:  # the captain is the captain section's, never the card's
@@ -1643,6 +1667,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """The fleet read in flight, or the last one; only one runs at a time."""
         self._fleet_owed = False
         """A frame was asked for while a read was in flight: read once more after it."""
+        self._fleet_viewed: frozenset[str] = frozenset()
+        """The project the next fleet read reads though folded (:meth:`_viewed_projects`)."""
+        self._folded_swept_at = time.monotonic()
+        """When the last fleet read that listed the folded projects too and painted its frame
+        began (:data:`FOLDED_SWEEP_SECONDS`); the first frame folds nothing."""
+        self._fleet_sweeps: dict[Worker[_FleetRead], float] = {}
+        """When each read that lists the folded projects too began, by read, until it ends."""
         self._fleet_calls = 0
         """How many calls have asked for a fleet frame (:meth:`refresh_data`): the newest
         one's number. It orders a call against an accounts read where a clock cannot:
@@ -2136,18 +2167,27 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """Start the fleet read that answers the calls up to number ``asked``, the newest."""
         after = [*self._fleet_owed_after, *([] if then is None else [then])]
         self._fleet_owed, self._fleet_owed_after = False, []
-        # `a`'s choice is read as the read begins, so one held for a hand-over and started
-        # when it is called off reads what is shown then.
+        # `a`'s choice and the viewed project are read as the read begins, so one held for a
+        # hand-over and started when it is called off reads what is shown then.
         self._fleet_since = time.monotonic()
-        viewed = self._viewed_projects()  # asked here, on the UI thread, not in the worker
+        self._fleet_viewed = self._viewed_projects()  # asked here, on the UI thread
+        sweep = self._fleet_since - self._folded_swept_at >= FOLDED_SWEEP_SECONDS
         self._fleet_worker = self.run_worker(
-            lambda: _read_frame(self.show_captured, self.captain_on, viewed, self.scope),
+            lambda: _read_frame(
+                self.show_captured,
+                self.captain_on,
+                self._fleet_viewed,
+                self.scope,
+                sweep_folded=sweep,
+            ),
             name=FLEET_WORKER,
             group=FLEET_WORKER,
             thread=True,
             exit_on_error=False,
         )
         self._fleet_asked[self._fleet_worker] = asked
+        if sweep:
+            self._fleet_sweeps[self._fleet_worker] = self._fleet_since
         if after:
             self._fleet_after[self._fleet_worker] = after
 
@@ -2163,6 +2203,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if event.state is WorkerState.CANCELLED:
             self._fleet_after.pop(worker, None)  # with the app: nothing to paint or owe
             self._fleet_asked.pop(worker, None)
+            self._fleet_sweeps.pop(worker, None)
             return
         result = worker.result if event.state is WorkerState.SUCCESS else None
         if isinstance(result, _FleetRead):
@@ -2175,6 +2216,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             if event.state is WorkerState.RUNNING:
                 self._fleet_since = time.monotonic()  # a read held for a hand-over begins now
             return  # still running
+        swept = self._fleet_sweeps.pop(worker, None)
+        if swept is not None and read.error is None:
+            # Swept only by a read that painted its frame: one that failed listed nothing, so the
+            # next read sweeps, and a folded project's dead pane is still ended within the bound.
+            self._folded_swept_at = max(self._folded_swept_at, swept)
         self._paint_fleet(read, asked=self._fleet_asked.pop(worker, None))
         newer = self._fleet_worker
         if self._fleet_owed and (newer is None or newer.is_finished):
@@ -2440,12 +2486,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.refresh_headroom()
 
     def _viewed_projects(self) -> frozenset[str]:
-        """The projects an open Project or Agent view shows (:func:`_read_fleet`'s ``viewed``)."""
-        content = self.content
-        return frozenset(
-            [view.project.id for view in content.query_children(ProjectView)]
-            + [view.status.agent.project_id for view in content.query_children(AgentView)]
-        )
+        """The project the right pane's Project or Agent view shows now (:func:`_read_fleet`'s
+        ``viewed``): a view left open behind another keeps its folded project unread."""
+        shown = self._shown_project_id()
+        return frozenset() if shown is None else frozenset({shown})
 
     def _feed_open_views(self, snapshot: FleetSnapshot) -> None:
         """Hand every open Project/Agent view its row from the new frame.
@@ -3923,9 +3967,15 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.query_one("#accounts", AccountsView).begin_claude_sign_in(None, agent=event.agent)
 
     def _content_switched(self, current: str | None) -> None:
-        """Any other page than Accounts drops the way back: the user went elsewhere first."""
+        """Any other page than Accounts drops the way back: the user went elsewhere first. A
+        Project or Agent view opened or gone back to, of a project the last frame did not
+        read, has it read at once."""
         if current != "accounts":
             self.after_sign_in = None
+        self._fleet_viewed = self._viewed_projects()  # what a read held for a hand-over reads
+        snapshot = self.snapshot
+        if snapshot is not None and self._fleet_viewed - snapshot.agents.keys():
+            self.refresh_data()
 
     async def on_sign_in_landed(self, event: SignInLanded) -> None:
         """A sign-in landed: back to where it was started from, used once — or, from
