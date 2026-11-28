@@ -3258,19 +3258,40 @@ def _check_disk() -> DoctorCheck:
 
 def _disk_detail(use: DiskUse) -> str:
     """``disk``'s detail: the sizes, "at least" where the look ran out of time, and what tidy
-    would free, now or as of the last pass (local time)."""
+    would free, now or as of the last pass (local time). A size the look never reached is
+    said so, never as "at least 0 B" (reviewer #4085, NIT 1)."""
     from aisquare.services.tidy import size_text
 
     def amount(count: int, whole: bool) -> str:
         return size_text(count) if whole else f"at least {size_text(count)}"
 
-    whole = use.use_whole
-    said = (
-        f"rlx's folders take {amount(use.total, whole)}: worktrees {amount(use.worktrees, whole)}"
-        f" (build caches {amount(use.build_caches, whole)} of it), session and agent temp "
-        f"{amount(use.session_temp, whole)}; tidy would free "
-        f"{amount(use.would_free, use.free_whole)}"
+    whole, trees = use.use_whole, use.trees_whole
+    if not (trees or use.worktrees):
+        sizes = "rlx's folders: not reached in time"
+    else:
+        head = (
+            f"rlx's folders take {amount(use.total, whole)}"
+            if whole or use.total
+            else "rlx's folders"
+        )
+        caches = (
+            f" (build caches {amount(use.build_caches, trees)} of it)"
+            if trees or use.build_caches
+            else ""
+        )
+        temp = (
+            amount(use.session_temp, whole) if whole or use.session_temp else "not reached in time"
+        )
+        sizes = (
+            f"{head}: worktrees {amount(use.worktrees, trees)}{caches}, session and agent temp "
+            f"{temp}"
+        )
+    free = (
+        f"tidy would free {amount(use.would_free, use.free_whole)}"
+        if use.free_whole or use.would_free
+        else "what tidy would free was not reached in time"
     )
+    said = f"{sizes}; {free}"
     if use.as_of is not None:
         when = use.as_of.astimezone().strftime("%H:%M")
         said += f" as of its last pass at {when}, which freed {size_text(use.freed_then)}"

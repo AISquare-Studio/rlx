@@ -31,11 +31,14 @@ from aisquare.core.config import load_config, save_config
 from aisquare.core.store import store_session
 from aisquare.models import CheckStatus, DoctorCheck, ProjectInfo
 from aisquare.services import diagnostics, tidy
+from aisquare.services import fleet as fleet_service
 from aisquare.services import watch as watch_service
 from tests.test_ui_shell import drive, script  # noqa: F401 — `script` is a fixture
 from tests.ui_workers import settle_until
 
 GB = 10**9
+PERIODIC_PASS = tidy.periodic_pass  # the real ones: conftest stands in for the pass, and
+APPLY = tidy.apply  # ``never_frees`` for apply, in every test
 TAG = cachedir.SIGNATURE + b"\n# a cache, by its own word\n"
 
 posix_only = pytest.mark.skipif(
@@ -207,6 +210,92 @@ def test_gbs_to_free_warn_with_tidy_for_the_shell_and_rlxs_own_way_in_asq(
 
 
 @pytest.mark.parametrize(
+    ("fields", "said"),
+    [
+        (
+            {
+                "use_whole": False,
+                "trees_whole": False,
+                "worktrees": 3 * GB,
+                "build_caches": GB,
+                "session_temp": 0,
+            },
+            "rlx's folders take at least 3.0 GB: worktrees at least 3.0 GB (build caches at "
+            "least 1.0 GB of it), session and agent temp not reached in time; tidy would free 0 B",
+        ),
+        (
+            {
+                "use_whole": False,
+                "trees_whole": False,
+                "worktrees": 3 * GB,
+                "build_caches": 0,
+                "session_temp": 0,
+            },
+            "rlx's folders take at least 3.0 GB: worktrees at least 3.0 GB, session and agent "
+            "temp not reached in time; tidy would free 0 B",
+        ),
+        (
+            {"use_whole": False, "session_temp": 2 * GB},
+            "rlx's folders take at least 22.0 GB: worktrees 20.0 GB (build caches 6.0 GB of it), "
+            "session and agent temp at least 2.0 GB; tidy would free 0 B",
+        ),
+        (
+            {"use_whole": False, "session_temp": 0},
+            "rlx's folders take at least 20.0 GB: worktrees 20.0 GB (build caches 6.0 GB of it), "
+            "session and agent temp not reached in time; tidy would free 0 B",
+        ),
+        (
+            {"use_whole": False, "worktrees": 0, "build_caches": 0, "session_temp": 0},
+            "rlx's folders: worktrees 0 B (build caches 0 B of it), session and agent temp not "
+            "reached in time; tidy would free 0 B",
+        ),
+        (
+            {
+                "use_whole": False,
+                "trees_whole": False,
+                "worktrees": 0,
+                "build_caches": 0,
+                "session_temp": 0,
+                "free_whole": False,
+            },
+            "rlx's folders: not reached in time; what tidy would free was not reached in time",
+        ),
+    ],
+    ids=[
+        "in the worktrees",
+        "in the worktrees, no cache yet",
+        "in the temp",
+        "before the temp",
+        "before the temp, no worktree",
+        "before anything",
+    ],
+)
+def test_a_look_cut_short_says_what_it_never_reached_and_never_at_least_0_b(
+    monkeypatch: pytest.MonkeyPatch, fields: dict[str, Any], said: str
+) -> None:
+    """Reviewer #4085, NIT 1: past the budget, what was measured is "at least" so much, and
+    what the look never reached (the temp roots are measured after the worktrees) is said so.
+    Never "at least 0 B"."""
+    row = _row(monkeypatch, _use(**fields))
+
+    assert row.detail == said
+    assert "at least 0 B" not in row.detail
+
+
+def test_the_disk_row_waits_with_the_late_rows_beside_the_watcher() -> None:
+    """Reviewer #4085, NIT 2: it can warn (1 GB to free), and the not-ok rows are read in
+    doctor order (the fleet sidebar showed the first three), so it comes after the actionable
+    machine checks, with the late rows, right after the watcher whose periodic tidy frees what
+    it counts."""
+    names = [check.name for check in diagnostics.doctor()]
+
+    disk = names.index("disk")
+    for actionable in ("claude-code", "tmux", "gh", "fleet", "fleet terminal"):
+        assert names.index(actionable) < disk, (actionable, names)
+    assert names[disk - 1] == "fleet watcher" and names[disk + 1] == "asq instances", names
+
+
+@pytest.mark.parametrize(
     ("watching", "every", "deletes", "said"),
     [
         (True, 60, True, "rlx frees it by itself within the hour"),
@@ -261,38 +350,49 @@ def india() -> Iterator[None]:
 def test_a_fresh_stamp_is_read_and_no_dry_run_runs(
     plans: list[datetime | None], india: None
 ) -> None:
-    """The last pass began within twice ``every_minutes``: what it could not free is what
-    tidy would free, as of then, in local time."""
+    """The last pass began within twice ``every_minutes`` and freed all it planned: tidy
+    would free nothing more as of then, said in local time."""
     last = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=30)
-    _stamp(last, freed_bytes=3 * GB, not_freed_bytes=2 * GB)
+    _stamp(last, freed_bytes=3 * GB, not_freed=0)
 
     row = diagnostics._check_disk()
 
     when = last.astimezone().strftime("%H:%M")
     assert when != last.strftime("%H:%M"), "control: local time is not UTC here"
     assert row.detail.endswith(
-        f"tidy would free 2.0 GB as of its last pass at {when}, which freed 3.0 GB"
+        f"tidy would free 0 B as of its last pass at {when}, which freed 3.0 GB"
     ), row.detail
-    assert row.status is CheckStatus.warn and plans == []
+    assert row.status is CheckStatus.ok and plans == []
 
 
 @posix_only
 @pytest.mark.parametrize(
     ("ago", "every", "totals"),
     [
-        (timedelta(minutes=121), 60, {"freed_bytes": 0, "not_freed_bytes": 0}),
-        (timedelta(minutes=10), 0, {"freed_bytes": 0, "not_freed_bytes": 0}),
+        (timedelta(minutes=121), 60, {"freed_bytes": 0, "not_freed": 0}),
+        (timedelta(minutes=10), 0, {"freed_bytes": 0, "not_freed": 0}),
         (timedelta(minutes=10), 60, {"failed": True}),
         (timedelta(minutes=10), 60, {"freed_bytes": 0}),
-        (-timedelta(minutes=10), 60, {"freed_bytes": 0, "not_freed_bytes": 0}),
+        (timedelta(minutes=10), 60, {"freed_bytes": 0, "not_freed": 1}),
+        (timedelta(minutes=10), 60, {"freed_bytes": 0, "not_freed": False}),
+        (-timedelta(minutes=10), 60, {"freed_bytes": 0, "not_freed": 0}),
     ],
-    ids=["stale", "the job off", "failed", "from before #60", "from the future"],
+    ids=[
+        "stale",
+        "the job off",
+        "failed",
+        "says not what it left",
+        "left something",
+        "not a count",
+        "from the future",
+    ],
 )
 def test_a_stamp_that_is_not_fresh_is_not_read(
     plans: list[datetime | None], ago: timedelta, every: float, totals: dict[str, Any]
 ) -> None:
     """Stale past twice ``every_minutes``; ``0`` = off counts as stale (manager #3817); a
-    failed pass, a stamp that does not say what was left, a clock set back: a dry run."""
+    failed pass, a stamp that does not say what was left or says something was (reviewer
+    #4085, MINOR 2), a clock set back: a dry run."""
     config = load_config()
     config.tidy.every_minutes = every
     save_config(config)
@@ -301,6 +401,36 @@ def test_a_stamp_that_is_not_fresh_is_not_read(
     use = tidy.disk_use()
 
     assert use.as_of is None and len(plans) == 1
+
+
+@posix_only
+def test_what_the_last_pass_declined_is_not_what_tidy_would_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plans: list[datetime | None]
+) -> None:
+    """Reviewer #4085, MINOR 2, its probe: the last pass's re-check declined a 5 GB tree (its
+    agent back since the plan), so the pass left it, and tidy would not free it. That pass's
+    stamp is not fresh: a dry run says what tidy would free now, never 5 GB "as of" the pass,
+    nor a warning to free it."""
+    (tmp_path / "system-temp").mkdir(exist_ok=True)  # the sandbox's, where the pass's lock is
+    tree = tmp_path / "proj" / tidy.WORKTREES_DIR / "coder-2"
+    tree.mkdir(parents=True)
+    declined = tidy.Plan()
+    declined.add(
+        [tidy.Item(tidy.ENDED_WORKTREE, tree, 5 * GB, None)],
+        lambda: "skipped: the agent is paused or back since the plan",
+    )
+    with monkeypatch.context() as passing:  # the pass alone frees; the row's look never does
+        passing.setattr(tidy, "plan", lambda **kwargs: declined)
+        passing.setattr(tidy, "apply", APPLY)
+        passed = PERIODIC_PASS(datetime.now(UTC))
+    assert passed is not None and passed.freed_bytes == 0 and passed.not_freed == 1
+    assert tree.exists() and tidy.read_stamp()["not_freed"] == 1
+
+    row = diagnostics._check_disk()
+
+    assert len(plans) == 1, "a dry run, not the stamp"
+    assert row.status is CheckStatus.ok and row.fix is None, row
+    assert row.detail.endswith("; tidy would free 0 B"), row.detail
 
 
 def test_the_look_stops_at_its_budget_and_says_at_least(
@@ -329,8 +459,62 @@ def test_the_look_stops_at_its_budget_and_says_at_least(
 
     assert took < 0.3 + 1.0, took
     assert row.status is CheckStatus.warn
-    assert "tidy would free at least 3.0 GB" in row.detail, row.detail
-    assert "rlx's folders take at least" in row.detail, "no time left to size them"
+    assert row.detail == ("rlx's folders: not reached in time; tidy would free at least 3.0 GB"), (
+        "no time left to size them, and never 'at least 0 B'"
+    )
+
+
+@pytest.mark.parametrize("trees", [False, True], ids=["no ended trees", "none to take"])
+def test_the_budget_bounds_the_real_dry_runs_git_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trees: bool
+) -> None:
+    """Reviewer #4085, MINOR 1: the budget bounds the dry run's git steps, not only its walks.
+    The REAL plan over three projects, each project's git steps slowed (a sleep, never load)
+    until the look's deadline has passed: that one finishes, and nothing after it starts,
+    neither the next project's steps nor the branch sweep. It fails with tidy's own
+    ``in_time()`` gone: the one before each project (no ended trees, so no sweep comes
+    between), or the one before the sweep (ended trees, none to take)."""
+    for n in range(3):
+        root = tmp_path / f"proj-{n}"
+        root.mkdir()
+        with store_session() as store:
+            store.onboard_project(ProjectInfo(id=f"prj_doctordiskgit{n:02}", root=root))
+    steps: list[str] = []
+
+    def slowed(store: Any, project: ProjectInfo) -> fleet_service.EndedTrees | None:
+        steps.append(f"the ended trees of {project.id}")
+        deadline = cachedir._DEADLINE.get()
+        assert deadline is not None, "asked within the look's deadline"
+        for _ in range(500):  # 5 s at most: a look with no deadline never hangs
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.01)
+        if not trees:
+            return None
+        return fleet_service.EndedTrees(
+            root=project.root,
+            read_at=datetime.now(UTC),
+            default="main",
+            common=project.root / ".git",
+            candidates=[],
+            placed=[],
+            owners={},
+            in_use=set(),
+        )
+
+    def sweep(*args: Any, **kwargs: Any) -> tuple[dict[str, str], list[str]]:
+        steps.append("the branch sweep")
+        return {}, []
+
+    monkeypatch.setattr(fleet_service, "ended_trees", slowed)
+    monkeypatch.setattr(fleet_service, "sweep_plan", sweep)
+    monkeypatch.setattr(tidy, "_command_lines", lambda: [])  # no ps before the first project
+    monkeypatch.setattr(tidy, "DISK_BUDGET_S", 1.0)
+
+    use = tidy.disk_use()
+
+    assert len(steps) == 1 and steps[0].startswith("the ended trees of "), steps
+    assert not use.free_whole
 
 
 def test_a_walk_past_its_deadline_stops_in_this_thread_alone(tmp_path: Path) -> None:

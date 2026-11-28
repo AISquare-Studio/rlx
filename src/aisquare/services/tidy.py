@@ -338,7 +338,10 @@ def plan(*, now: datetime | None = None, size_kept: bool = True, into: Plan | No
     kept repository's size, for a person deciding what to remove by hand; the periodic job
     (#59) asks without, or each pass would walk again every repository tidy never deletes.
     ``into``: the plan filled in as the rules go, so a look cut short (``cachedir.OutOfTime``,
-    the Doctor's, #60) keeps what it had found: each item whole, a lower bound."""
+    the Doctor's, #60) keeps what it had found: each item whole, a lower bound. Its deadline
+    (``cachedir.walking_until``) is asked before each project's git steps, each tree, the
+    branch sweep and each walk, so none starts once it has passed. One already running (a
+    git call, up to its own timeout) finishes first: the deadline stops what comes next."""
     at = now or _now()
     config = _settings()
     with store_session() as store:
@@ -351,6 +354,7 @@ def plan(*, now: datetime | None = None, size_kept: bool = True, into: Plan | No
         result.size_kept = size_kept
         commands = _command_lines()
         for project in projects:
+            cachedir.in_time()  # no project's git steps start past a budgeted look's deadline
             _ended_worktrees(store, project, result)
             if config.idle_build_hours > 0:
                 rows = [row for row in every if row.project_id == project.id]
@@ -477,6 +481,7 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
     result.kept.extend(Kept(ENDED_WORKTREE, tree, why) for tree, why in unplaced)
     root, common, default = trees.root, trees.common, trees.default
     rows = store.fleet_agents(project.id)
+    cachedir.in_time()  # the branch sweep asks git of each branch: not past the deadline either
     try:
         done, _kept = fleet_service.sweep_plan(root, common, default, rows, gone=going)
     except fleet_service.FleetError:
@@ -1177,9 +1182,6 @@ class PassReport:
     stamp_error: str | None = None
     """Why its stamp could not be written, when it could not (reviewer #3894, MINOR 1): the
     pass ran, and whoever runs the job keeps its time in memory instead (:func:`is_due`)."""
-    not_freed_bytes: int = 0
-    """What it planned and could not free: what tidy would still free just after it (the
-    Doctor's disk row reads it from a fresh stamp, #60)."""
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -1187,7 +1189,6 @@ class PassReport:
             "freed_bytes": self.freed_bytes,
             "freed": dict(self.freed),
             "not_freed": self.not_freed,
-            "not_freed_bytes": self.not_freed_bytes,
             "kept": self.kept,
             "receipt": self.receipt,
             "board": self.board,
@@ -1333,7 +1334,7 @@ def periodic_pass(
 
 def _totals(report: PassReport) -> dict[str, Any]:
     found = report.as_json()
-    keys = ("freed_bytes", "freed", "not_freed", "not_freed_bytes", "kept")
+    keys = ("freed_bytes", "freed", "not_freed", "kept")
     return {key: found[key] for key in keys}
 
 
@@ -1431,7 +1432,6 @@ def _pass_report(at: datetime, done: Report) -> PassReport:
         freed={rule: n for rule, n in freed.items() if n},
         not_freed=len(done.not_freed),
         kept=len(done.kept),
-        not_freed_bytes=sum(item.bytes for item, _why in done.not_freed),
     )
 
 
@@ -1509,9 +1509,11 @@ class DiskUse:
     session_temp: int
     """The sessions' temp and the agents' own (#57's per-agent TMPDIR): tidy's temp roots."""
     use_whole: bool
+    """Every size measured whole. The worktrees are measured first, then the temp roots in
+    what is left of the budget: :attr:`trees_whole` says which of them the time ran out in."""
     would_free: int
-    """What tidy would free: now, by a dry run; or, from a fresh stamp, what the last pass
-    could not free (it freed the rest)."""
+    """What tidy would free: now, by a dry run; or nothing, from a fresh stamp, whose pass
+    freed all it planned (one that left anything is not fresh, :func:`fresh_pass`)."""
     free_whole: bool
     as_of: datetime | None = None
     """The last pass's time, when ``would_free`` is its stamp's; ``None``: a dry run now."""
@@ -1519,6 +1521,9 @@ class DiskUse:
     """What that pass freed."""
     unreadable: tuple[Path, ...] = ()
     """Roots that could not be listed: nothing in them was measured."""
+    trees_whole: bool = True
+    """The worktrees (and their build caches) measured whole: past them the time ran out in
+    the temp roots, if anywhere."""
 
     @property
     def total(self) -> int:
@@ -1529,14 +1534,15 @@ class DiskUse:
 class _Fresh:
     at: datetime
     freed_bytes: int
-    not_freed_bytes: int
 
 
 def fresh_pass(at: datetime) -> _Fresh | None:
     """The last periodic pass, from its stamp, when it is fresh: it began within twice
-    ``[tidy] every_minutes`` of ``at`` and did not fail. ``None`` where the job is off (``0``,
-    or native Windows), or the stamp is stale, failed, torn, or from before #60 (it does not
-    say what was left)."""
+    ``[tidy] every_minutes`` of ``at``, did not fail, and freed all it planned, so tidy would
+    free nothing more as of then. ``None`` where the job is off (``0``, or native Windows), or
+    the stamp is stale, failed or torn, or its pass left anything (reviewer #4085, MINOR 2):
+    what it left may be what its re-check declined (an agent back, a repository there now),
+    which tidy would not free, so a dry run says what it would."""
     if not DELETES:
         return None
     every = _settings().every_minutes
@@ -1548,10 +1554,10 @@ def fresh_pass(at: datetime) -> _Fresh | None:
         return None
     if at - last >= timedelta(minutes=2 * every):
         return None
-    freed, left = stamp.get("freed_bytes"), stamp.get("not_freed_bytes")
-    if not isinstance(freed, int) or not isinstance(left, int):
+    freed, left = stamp.get("freed_bytes"), stamp.get("not_freed")
+    if type(freed) is not int or type(left) is not int or left:
         return None
-    return _Fresh(at=last, freed_bytes=freed, not_freed_bytes=left)
+    return _Fresh(at=last, freed_bytes=freed)
 
 
 def disk_use(*, budget_s: float | None = None, now: datetime | None = None) -> DiskUse:
@@ -1579,11 +1585,12 @@ def disk_use(*, budget_s: float | None = None, now: datetime | None = None) -> D
         build_caches=trees.caches,
         session_temp=temp.bytes,
         use_whole=trees.whole and temp.whole,
-        would_free=fresh.not_freed_bytes if fresh else sum(item.bytes for item in made.items),
+        would_free=0 if fresh else sum(item.bytes for item in made.items),
         free_whole=free_whole,
         as_of=fresh.at if fresh else None,
         freed_then=fresh.freed_bytes if fresh else 0,
         unreadable=(*trees.unreadable, *temp.unreadable),
+        trees_whole=trees.whole,
     )
 
 
