@@ -415,7 +415,8 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   by a resume or the space's erase. A run that never reached `run.started` has no
   session to resume (`no_session`): a new run is the way on.
 - **What a missed try leaves.** Nothing of a try ended unconfirmed stays in the run's
-  session. On a first attempt (`--session-id`), the session file the try left is
+  session: a miss, or any other end before its connectors are confirmed (a cancel, the
+  timeout, rlxd stopping, a broken read, Claude Code's exit). On a first attempt (`--session-id`), the session file the try left is
   removed, so the next try starts it anew. On a resumed attempt (`--resume`), the file is
   the run's whole session: it is never removed, only cut back to its length before the
   attempt's first try, so a later resume goes on from what was delivered.

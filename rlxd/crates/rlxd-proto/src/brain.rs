@@ -7,8 +7,9 @@
 //!
 //! 1. rlxd writes [`BrainInput::Hello`], with the [`BRAIN_PROTOCOL`] it speaks.
 //! 2. The brain answers [`BrainOutput::Hello`] with the protocol it agrees on, or
-//!    [`BrainOutput::Refused`] (`incompatible_protocol`, with the protocols it speaks) and
-//!    exits. rlxd likewise refuses a brain whose hello names a protocol rlxd does not
+//!    [`BrainOutput::Refused`] and exits: `incompatible_protocol`, with the protocols it
+//!    speaks, or `env_allowlist_differs`, when rlxd's hook variables are not the ones it
+//!    sets. rlxd likewise refuses a brain whose hello names a protocol rlxd does not
 //!    speak, and its `status` then says `brain_incompatible`.
 //! 3. Requests follow, one at a time: [`BrainInput::Request`]. The brain answers each
 //!    with [`BrainOutput::Accepted`] as soon as it has read it, before it runs anything,
@@ -36,7 +37,7 @@ pub const BRAIN_PROTOCOLS: &[u32] = &[BRAIN_PROTOCOL];
 /// A frame rlxd writes on the brain's stdin.
 ///
 /// ```json
-/// {"type": "hello", "protocol": 1, "rlxd_version": "0.10.3"}
+/// {"type": "hello", "protocol": 1, "rlxd_version": "0.10.3", "env_allowlist": ["…"]}
 /// {"type": "request", "id": 7, "method": "ping", "params": {}}
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -52,6 +53,11 @@ pub enum BrainInput {
         /// rlxd's version, which is rlx's.
         #[schemars(length(min = 1))]
         rlxd_version: String,
+        /// The variables rlxd-hook sends with each hook, by exact name (`HOOK_ENV_NAMES`),
+        /// sorted. The brain refuses an rlxd whose list is not the one it sets
+        /// (`env_allowlist_differs`).
+        #[serde(default)]
+        env_allowlist: Vec<String>,
     },
     /// One request. rlxd sends the next only once this one has its reply.
     Request {
@@ -75,6 +81,8 @@ enum UncheckedInput {
     Hello {
         protocol: u32,
         rlxd_version: String,
+        #[serde(default)]
+        env_allowlist: Vec<String>,
     },
     Request {
         id: u64,
@@ -202,12 +210,18 @@ pub mod codes {
     pub const BRAIN_FAILED: &str = "brain_failed";
 }
 
+fn owned(list: &[&str]) -> Vec<String> {
+    list.iter().map(|&item| item.to_owned()).collect()
+}
+
 impl BrainInput {
-    /// rlxd's hello, speaking [`BRAIN_PROTOCOL`].
+    /// rlxd's hello, speaking [`BRAIN_PROTOCOL`] and naming the hook variables
+    /// ([`hook_env_forwarded`](crate::hook_env_forwarded)'s list).
     pub fn hello(rlxd_version: impl Into<String>) -> Result<Self, Invalid> {
         let hello = Self::Hello {
             protocol: BRAIN_PROTOCOL,
             rlxd_version: rlxd_version.into(),
+            env_allowlist: owned(crate::HOOK_ENV_NAMES),
         };
         hello.validate()?;
         Ok(hello)
@@ -230,6 +244,7 @@ impl BrainInput {
             Self::Hello {
                 protocol,
                 rlxd_version,
+                ..
             } => {
                 check::at_least("protocol", u64::from(*protocol), 1)?;
                 check::non_empty("rlxd_version", rlxd_version)

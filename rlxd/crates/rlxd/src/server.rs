@@ -255,6 +255,11 @@ impl Daemon {
         &self.bus
     }
 
+    /// The home this rlxd serves.
+    pub fn home(&self) -> &Home {
+        &self.home
+    }
+
     /// Ends every PTY's process, as rlxd stops: none outlives it.
     pub fn end_ptys(&self) {
         self.ptys.kill_all();
@@ -522,6 +527,10 @@ impl Daemon {
             }
             methods::HOOK_PING => match cli_only(session, methods::HOOK_PING) {
                 Ok(()) => crate::brain::ping(&self.brain).await,
+                Err(refused) => Err(refused),
+            },
+            methods::HOOK => match cli_only(session, methods::HOOK) {
+                Ok(()) => crate::hooks::hook(self, request.params).await,
                 Err(refused) => Err(refused),
             },
             methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
@@ -2392,6 +2401,7 @@ fn served() -> Vec<&'static str> {
         methods::STATUS,
         methods::STOP,
         methods::HOOK_PING,
+        methods::HOOK,
         methods::EVENTS_SUBSCRIBE,
         methods::SETTINGS_GET,
         methods::SETTINGS_SET,

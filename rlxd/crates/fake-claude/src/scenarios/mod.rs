@@ -52,6 +52,7 @@ pub const ALL: &[(&str, Scenario)] = &[
     ("connectors-never", |fake| {
         connectors::play(fake, Schedule::Never, ANSWER)
     }),
+    ("connectors-slow-init", connectors::slow_init),
     ("crash", crash::run),
     ("gate", gate::by_prompt),
     ("hello", hello::run),
