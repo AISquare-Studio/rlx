@@ -2,11 +2,15 @@ name: rlxd
 
 # The rlxd Cargo workspace (rlxd/), on the three OSes it ships for (handoff 0.10.3,
 # 1.1). ci.yml runs the Python suite; this runs the Rust one, plus the daemon
-# registry's two cross-language tests (4.1), which need both. A PR gets it when it
-# touches rlxd/ (Cargo.lock included), this file, pyproject.toml, whose version
-# rlxd/crates/rlxd/tests/version.rs holds rlxd's to, the Python side of the
-# registry's shared format, or the resident brain rlxd runs (`rlx brain --stdio`, 1.6),
-# whose real process rlxd/crates/rlxd/tests/brain.rs starts. Every push to main or an rc/** branch runs it whatever
+# registry's two cross-language tests (4.1), which need both, and rlxd-release.yml's
+# jobs, the upgrade's with rlx's daemons (4.2) among them. A PR gets it when it touches
+# rlxd/ (Cargo.lock included), this file, pyproject.toml, whose version
+# rlxd/crates/rlxd/tests/version.rs holds rlxd's to, the Python side of the registry's
+# shared format, the resident brain rlxd runs (`rlx brain --stdio`, 1.6), whose real
+# process rlxd/crates/rlxd/tests/brain.rs starts, rlxd's install, or the upgrade: its
+# daemons' module and its call sites, and the files that write the argv it starts a
+# daemon again from (selfcli, watch, serve, the global flags). Every push to main or an
+# rc/** branch runs it whatever
 # changed, as does a run by hand (`gh workflow run rlxd.yml --ref <branch>`).
 on:
   pull_request:
@@ -28,6 +32,18 @@ on:
       - "tests/test_daemon_registry.py"
       - "src/aisquare/cli/brain.py"
       - "src/aisquare/services/brain.py"
+      - "src/aisquare/services/upgrade_daemons.py"
+      - "src/aisquare/services/lifecycle.py"
+      - "src/aisquare/services/install_route.py"
+      - "src/aisquare/cli/install.py"
+      - "src/aisquare/core/spawn.py"
+      - "src/aisquare/core/selfcli.py"
+      - "src/aisquare/core/state.py"
+      - "src/aisquare/services/watch.py"
+      - "src/aisquare/cli/serve.py"
+      - "tests/test_upgrade_daemons.py"
+      - "tests/fake_rlxd.py"
+      - "tests/installer_seams.py"
   push:
     branches: [main, "rc/**"]
   workflow_dispatch:
