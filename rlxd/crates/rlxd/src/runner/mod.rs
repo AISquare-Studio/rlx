@@ -1775,6 +1775,7 @@ impl Runner {
         let mut tries = 0;
         loop {
             tries += 1;
+            let mut confirmed = false;
             let end = match self
                 .try_once(
                     run,
@@ -1784,10 +1785,20 @@ impl Runner {
                     &settings,
                     gate.as_ref(),
                     deadline,
+                    &mut confirmed,
                 )
                 .await
             {
-                Tried::End(end) => end,
+                Tried::End(end) => {
+                    // A gated try that ended before its connectors were confirmed (a
+                    // cancel, the timeout, rlxd stopping, a broken read, Claude Code's
+                    // exit) is taken back as a miss is: on route 2 it may have written
+                    // the undelivered message to the session.
+                    if !confirmed && let Some(kept) = &kept {
+                        blocking(|| self.forget_try(run, kept));
+                    }
+                    end
+                }
                 Tried::Missed {
                     connectors,
                     stop,
@@ -1875,12 +1886,13 @@ impl Runner {
         }
     }
 
-    /// After a gated try that was ended unconfirmed: what it wrote to its session is
-    /// taken back, so the next try (or a later resume) has nothing the run didn't
-    /// deliver. A first attempt's session started with the try, so its file goes. A
-    /// resumed attempt's file is the run's whole session: it is never removed, only cut
-    /// back to its length before the attempt's first try, and left as it is (with a
-    /// warning) when it is shorter than that or is no file.
+    /// After a gated try that was ended unconfirmed (a miss, or any other end before its
+    /// connectors were confirmed): what it wrote to its session is taken back, so the
+    /// next try (or a later resume) has nothing the run didn't deliver. A first attempt's
+    /// session started with the try, so its file goes. A resumed attempt's file is the
+    /// run's whole session: it is never removed, only cut back to its length before the
+    /// attempt's first try, and left as it is (with a warning) when it is shorter than
+    /// that or is no file.
     fn forget_try(&self, run: &Run, kept: &Kept) {
         for (path, before) in &kept.files {
             let now = std::fs::symlink_metadata(path)
@@ -1937,7 +1949,8 @@ impl Runner {
         }
     }
 
-    /// One Claude Code of an attempt: started, streamed, and ended.
+    /// One Claude Code of an attempt: started, streamed, and ended. `confirmed` says,
+    /// after, whether its connectors were confirmed (always, ungated).
     #[allow(clippy::too_many_arguments, reason = "one try's facts, each its own")]
     async fn try_once(
         &self,
@@ -1948,6 +1961,7 @@ impl Runner {
         settings: &std::path::Path,
         gate: Option<&Gate>,
         deadline: Option<Instant>,
+        confirmed: &mut bool,
     ) -> Tried {
         let params = &run.params;
         let failed = |message: String| {
@@ -2022,6 +2036,7 @@ impl Runner {
                 &tree,
                 gate,
                 deadline,
+                confirmed,
             )
             .await;
         let end = match streamed {
@@ -2113,7 +2128,7 @@ impl Runner {
     /// A gated try ([`connector_gate`]) settles first on route 2, or holds the prompt on route 1
     /// until a `system/init` shows each named connector connected. Until its connectors
     /// are confirmed, nothing it reads is published, and a miss ends the read
-    /// ([`Streamed::Missed`]).
+    /// ([`Streamed::Missed`]). `delivered` is set once they are (at once, ungated).
     #[allow(clippy::too_many_arguments, reason = "one try's facts, each its own")]
     async fn stream<R: AsyncBufRead + Unpin>(
         &self,
@@ -2124,6 +2139,7 @@ impl Runner {
         tree: &Tree,
         gate: Option<&Gate>,
         deadline: Option<Instant>,
+        delivered: &mut bool,
     ) -> Streamed {
         let params = &run.params;
         let try_started = Instant::now();
@@ -2186,6 +2202,7 @@ impl Runner {
             sent = true;
         }
         let mut confirmed = gate.is_none();
+        *delivered = confirmed;
         if confirmed {
             run.inner().reply = None;
         }
@@ -2231,6 +2248,7 @@ impl Runner {
                         match gate.verdict(&init.mcp_servers) {
                             Verdict::Connected => {
                                 confirmed = true;
+                                *delivered = true;
                                 // Delivered from here on: a later attempt is a resume's.
                                 run.inner().reply = None;
                                 if !sent {

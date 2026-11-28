@@ -304,6 +304,61 @@ fn a_resumed_runs_missed_tries_keep_its_session_route_1() {
 }
 
 #[test]
+fn a_cancel_of_an_unconfirmed_try_takes_its_session_writes_back_too() {
+    // Route 2: the resumed try sends the reply, which Claude Code writes to the session at
+    // once, and its init is late; a cancel then ends it unconfirmed (review #3563, nit 1).
+    let home = home_with_scenario_file("init-connectors");
+    let (id, events) = gated_start(&home, &task(), 60).wait();
+    assert_eq!(
+        of(&events, &id).last().unwrap()["type"],
+        "run.done",
+        "{events:#?}"
+    );
+    let file = session_file(&home, &id).expect("the task's session file");
+    let before = std::fs::read(&file).unwrap();
+    std::fs::write(home.root().join("scenario"), "connectors-slow-init").unwrap();
+    let since = seq(&home);
+    let capture = home.spawn(&[
+        "events",
+        "--as-app",
+        "--topics",
+        "run",
+        "--since",
+        &since.to_string(),
+        "--follow",
+        "--until",
+        "run.done,run.failed,run.needs_you",
+        "--timeout",
+        "60",
+    ]);
+    eventually("the capture holds the app role", || home.app_clients() >= 1);
+    let resume = json!({"run_id": id, "reply": "again"}).to_string();
+    let run = home.rlxd(&["call", "--as-app", "run.resume", &resume]);
+    assert_eq!(run.code(), Some(0), "{run:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(&file).unwrap().len() <= before.len() as u64 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the try never wrote its reply"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let cancel = home.rlxd(&[
+        "call",
+        "--as-app",
+        "run.cancel",
+        &json!({"run_id": id}).to_string(),
+    ]);
+    assert_eq!(cancel.code(), Some(0), "{cancel:?}");
+    let ended = common::finish(capture);
+    let events = ended.lines();
+    let last = of(&events, &id).last().copied().cloned().unwrap();
+    assert_eq!(last["type"], "run.failed", "{events:#?}");
+    assert_eq!(last["data"]["reason"], "cancelled", "{events:#?}");
+    assert_eq!(std::fs::read(&file).unwrap(), before, "{}", file.display());
+}
+
+#[test]
 fn a_first_attempts_missed_tries_leave_no_session_file() {
     // Route 2: each try was sent the prompt, and wrote its session file.
     let home = home_with("connectors-never", &[]);
