@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -178,6 +179,45 @@ def test_the_personas_page_says_what_was_copied_once(repo: Path) -> None:
     assert "Copied your project personas to your personas: tempo." in text  # behind the fold
     assert "tempo" in names, "and the page lists it as yours"
     assert not again, "said once: the second opening has nothing to say"
+
+
+def test_the_one_time_copy_runs_on_a_worker_thread_that_a_quit_waits_for(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The validator's F8: ``migrate_once`` ran on Textual's thread as the page mounted, which
+    reads every project's folder and writes your layer and ``state.json``. It runs on a named
+    thread worker now, one Update and Uninstall refuse under (``_writing_workers``), and the
+    page shows its report and lists what it copied once it is done."""
+    from aisquare.cli.ui import app as ui_app
+    from aisquare.cli.ui.views import personas_tab
+
+    _project_persona(repo, "tempo", "Tempo.")
+    real = persona_service.migrate_once
+    ran_on: list[threading.Thread] = []
+
+    def migrate_once() -> persona_service.MigrationReport:
+        ran_on.append(threading.current_thread())
+        return real()
+
+    monkeypatch.setattr(persona_service, "migrate_once", migrate_once)
+
+    class Page(App[None]):
+        def compose(self) -> ComposeResult:
+            yield PersonasTab(id="personas")
+
+    async def open_page() -> tuple[threading.Thread, str, list[str]]:
+        app = Page()
+        async with app.run_test(size=(120, 40)):
+            await settle_page(app)
+            fold = app.query_one("#personas-migrated", Collapsible)
+            names = [entry.name for entry in app.query_one(PersonasTab).entries]
+            return threading.current_thread(), str(fold.title) if fold.display else "", names
+
+    ui_thread, title, names = asyncio.run(open_page())
+
+    assert len(ran_on) == 1 and ran_on[0] is not ui_thread, "off Textual's thread"
+    assert title == "Projects: 1 copied" and "tempo" in names, "shown, and listed, once done"
+    assert personas_tab.MIGRATE_WORKER in ui_app._writing_workers(), "a quit refuses under it"
 
 
 def test_at_80x24_a_long_migration_report_leaves_the_page_usable(

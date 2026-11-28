@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import math
 import textwrap
 import time
 from collections.abc import Mapping, Sequence
@@ -1459,7 +1460,7 @@ class BoardPanel(Vertical):
         if not fresh:
             return
         following = self.autoscroll and self._following
-        hidden = self.query_one("#feedpane").has_class("collapsed") or self._reading is not None
+        hidden = self._stream_out_of_sight()
         for event in fresh:
             self._events_by_id[event.id] = event
             self._feed_order.append(event.id)
@@ -1499,13 +1500,39 @@ class BoardPanel(Vertical):
             self._show_unseen()
 
     def _recount_unseen(self) -> None:
-        """No ``↓ N new`` while the feed's last line is in view: a feed that does not overflow,
-        or one the view still ends at. Only a scroll used to clear it, which a short feed with
-        autoscroll off never has (review of #554)."""
+        """``↓ N new`` counts only the lines that came in below the view, once laid out.
+
+        No marker while the feed's last line is in view: a feed that does not overflow, or one
+        the view still ends at. Only a scroll used to clear it, which a short feed with
+        autoscroll off never has (review of #554). Nor more than the rows below the view: a
+        refresh that pushed a feed that fit into overflow counted every line it brought,
+        those the view still shows among them (the validator's F10). The newest lines are the
+        unseen ones, so the count's "since" is the first of those it keeps.
+
+        Out of sight (Work has the column, or the reader is open) the feed's sizes are the
+        last ones laid out, not what it will show: the count waits until the Stream shows
+        again (:meth:`_apply_layout`, :meth:`on_resize`)."""
+        if not self.unseen or self._stream_out_of_sight():
+            return
         feed = self.query_one("#feed", OptionList)
-        if self.unseen and feed.scroll_y >= feed.max_scroll_y:
-            self.unseen = 0
-            self._show_unseen()
+        below = max(0, math.ceil(feed.max_scroll_y - feed.scroll_y))
+        if self.unseen <= below:
+            return
+        self.unseen = below
+        self._unseen_since = self._first_unseen_at(feed) if below else None
+        self._show_unseen()
+
+    def _stream_out_of_sight(self) -> bool:
+        """Work has the Stream's column, or the reader covers it."""
+        return self.query_one("#feedpane").has_class("collapsed") or self._reading is not None
+
+    def _first_unseen_at(self, feed: OptionList) -> datetime | None:
+        """When the first of the :attr:`unseen` lines (the feed's last ones) came in."""
+        index = feed.option_count - self.unseen
+        if index < 0 or self.unseen <= 0:
+            return self._unseen_since
+        event = self._events_by_id.get(feed.get_option_at_index(index).id or "")
+        return event.created_at if event is not None else self._unseen_since
 
     def _show_unseen(self) -> None:
         feed = self.query_one("#feed", OptionList)
@@ -1962,6 +1989,8 @@ class BoardPanel(Vertical):
             self._catch_up = False
             feed = self.query_one("#feed", OptionList)
             self.call_after_refresh(feed.scroll_end, animate=False)
+        elif stream and self._reading is None and self.unseen:
+            self.call_after_refresh(self._recount_unseen)  # shown again: laid out, it counts
         self._retitle_feed()
         self._remember_view()  # the half shown, when b or a pick moved it
         focused = self.app.focused

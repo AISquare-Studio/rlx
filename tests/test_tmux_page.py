@@ -38,6 +38,7 @@ from aisquare.cli.ui.views.tmux_page import (
 )
 from aisquare.core import claude_accounts as accounts_core
 from aisquare.core import tmux as tmux_core
+from aisquare.core.store import store_session
 from aisquare.core.tmux import Completed, ForeignServer, PanePids, TmuxError, WindowInfo
 from aisquare.models import AdoptableConversation, FleetAgent, ProjectInfo
 from aisquare.services import adopt as adopt_service
@@ -332,6 +333,37 @@ def test_stop_refuses_a_window_that_is_an_agents_by_the_time_it_acts(
     with pytest.raises(PaneRefused, match="is gone"):
         tmux_panes.stop(shell)
     assert tmux.killed == []
+
+
+@pytest.mark.parametrize("ended", [False, True], ids=["row-still-live", "row-reaped-as-died"])
+def test_stop_on_an_agents_own_exited_window_stops_the_agent_through_the_fleet(
+    world: World, tmux: PagedTmux, ended: bool
+) -> None:
+    """The validator's F9: Stop on an agent's own exited window closed the window alone. With
+    no fleet stop, the row stayed live with no pane, and the sidebar read it as lost until a
+    reap. Now the agent is stopped through the fleet, pinned to its row: the row ends
+    ``stopped`` on the owner's word, whether it was still live or already reaped as died
+    (a 💤 row), and the window goes."""
+    tmux.die(world.agent_pane, 0)
+    if ended:
+        fleet_service.reap(world.project)
+    with store_session() as store:
+        before = store.get_fleet_agent(world.agent.id)
+    pane = _by_pane(tmux_panes.read())[world.agent_pane]
+    assert before is not None and (before.ended_at is not None) is ended, "the premise"
+    assert pane.agent is not None and pane.agent.id == world.agent.id and pane.stoppable
+    question = tmux_page.stop_question(pane).plain
+
+    said = tmux_panes.stop(pane)
+
+    with store_session() as store:
+        row = store.get_fleet_agent(world.agent.id)
+    assert row is not None and row.ended_at is not None, "its row ended, not left to a reap"
+    assert row.ended_by == "stopped", "on the owner's word, as its own Stop records it"
+    assert world.agent_pane in tmux.killed, "its window closed"
+    assert world.agent_pane not in _by_pane(tmux_panes.read())
+    assert said == f"stopped {world.agent.label}: closed {pane.where}"
+    assert f"{world.agent.label} is recorded as stopped" in question, "the confirm says so"
 
 
 # --- Adopt: a live Claude Code or Codex nobody's ---------------------------------------------

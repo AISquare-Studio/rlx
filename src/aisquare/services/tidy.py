@@ -36,8 +36,9 @@ explicit confirmation per path.
    ``[tidy] idle_build_hours`` with no task in doing loses the tagged directories in its
    worktree, never one that is a PEP 405 environment (``core.cachedir.is_environment``: the one
    standard-marker exception, since a live agent runs its commands from it).
-4. **Stale home-migration locks** in the system's temp directory, found whatever this
-   process's ``TMPDIR`` is (each agent has its own): ``rlx-home-migration-<16 hex>.lock``,
+4. **Stale home-migration locks** in the system's temp directories (on macOS its per-user
+   one and ``/tmp``), found whatever this process's ``TMPDIR`` is (each agent has its own):
+   ``rlx-home-migration-<16 hex>.lock``,
    this user's, untouched for :data:`LOCK_AGE`, and free (taken at once, then unlinked while
    held).
 5. **Ended agents' own temp directories** (#57, ruling #3494): ``<home>/tmp/<key>/``, each
@@ -51,7 +52,7 @@ explicit confirmation per path.
 
 **Never touched:** anything outside rlx-owned roots (each project's ``.aisquare-worktrees``,
 the accounts' temp root, the agents' temp root, and those lock names in the system temp
-directory); a project's own checkout; ``~/.claude``; a paused agent's anything. Every delete
+directories); a project's own checkout; ``~/.claude``; a paused agent's anything. Every delete
 goes through :func:`_remove`, which refuses a path outside the roots :func:`plan` computed, the
 roots themselves, and any symlink, whose target is never followed.
 
@@ -1014,14 +1015,20 @@ def _while_idle(
 
 
 def _system_temp_dirs() -> list[Path]:
-    """The system's temp directory, whatever this process's ``TMPDIR`` says (each fleet agent
-    has its own): macOS's per-user one, else the platform's default."""
+    """The system's temp directories, whatever this process's ``TMPDIR`` says (each fleet agent
+    has its own): on macOS its per-user one AND ``/tmp``, where the disk-tidy brief found
+    these locks too (a mover run with ``TMPDIR`` unset, or set to ``/tmp``, leaves its lock
+    there; the validator's F12); else the platform's default. Only the lock names are looked
+    for in either (:data:`LOCK_NAME`), and only a stale and free one goes."""
     if sys.platform == "darwin":
         try:
             found = os.confstr(_DARWIN_USER_TEMP_DIR)
-        except (OSError, ValueError):
+        except (AttributeError, OSError, ValueError):
             found = None
-        return [Path(found)] if found else [Path("/tmp")]
+        shared = Path("/tmp")
+        if not found or os.path.realpath(found) == os.path.realpath(shared):
+            return [shared]
+        return [Path(found), shared]
     if sys.platform == "win32":
         local = os.environ.get("LOCALAPPDATA")
         return [Path(local) / "Temp"] if local else []

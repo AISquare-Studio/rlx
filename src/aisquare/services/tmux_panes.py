@@ -15,6 +15,7 @@ it acts (a read on screen is seconds old):
 
 - :func:`stop` closes a dead window (the bundled config's ``remain-on-exit`` keeps an exited
   agent's), or a live one no row names. Never a row's live pane: that is its agent's Stop.
+  An agent's own exited window is stopped through the fleet, so its row ends ``stopped``.
 - :func:`adopt` brings a live Claude Code or Codex that runs in an orphan window into the
   fleet: ``fleet adopt`` resumes a conversation, not a pane, and refuses one a live process
   holds, so the agent in the pane is quit at its own exit command first and its conversation
@@ -555,13 +556,55 @@ def stop(
     listed: Callable[[], list[Process]] | None = None,
 ) -> str:
     """Close ``pane``'s window, a dead one or a live one nobody's; what was closed. Never a
-    row's live pane, nor a window another of whose panes is one (:class:`PaneRefused`)."""
+    row's live pane, nor a window another of whose panes is one (:class:`PaneRefused`).
+
+    An agent's own exited window is stopped through the fleet (:func:`_stop_through_the_fleet`),
+    never closed alone: closed alone, its row stayed live with no pane, and the sidebar read
+    it as lost until a reap (the validator's F9)."""
     config = config or fleet_service.settings()
     now, srv = _again(pane, config, listed)
     if not now.stoppable:
         raise PaneRefused(_kept(now))
+    said = f"closed {now.where}"
+    if now.agent is not None:
+        said, left = _stop_through_the_fleet(now, config, listed)
+        if left is None:
+            return said
+        now = left
     srv.kill_window(now.pane_id)
-    return f"closed {now.where}"
+    return said
+
+
+def _stop_through_the_fleet(
+    pane: Pane, config: FleetSettings, listed: Callable[[], list[Process]] | None
+) -> tuple[str, Pane | None]:
+    """Stop the agent whose exited window ``pane`` is (:attr:`Pane.agent`, placed by its launch
+    record) as its agent view's Stop does: ``fleet.stop`` pinned to that row, on the owner's
+    word. Its row ends ``stopped`` (``ended_by``), the claims it held go back to the board and
+    its exit is announced, and the fleet's stop closes the window. What to say, and the pane
+    :func:`stop` is still to close, if any.
+
+    Should the fleet's stop leave the window standing (it can mark an ended row stopped
+    with no kill, where its own listing finds no window of the row's), it is handed back for
+    :func:`stop` to close, once tmux still lists it dead and that row's: asked again of tmux
+    and the records (:func:`_again`), so a pane gone meanwhile, or a server restarted since,
+    is left alone."""
+    agent = pane.agent
+    assert agent is not None  # the caller's
+    with store_session() as store:
+        project = store.get_project(agent.project_id, include_forgotten=True)
+    if project is None:
+        raise PaneRefused(f"{pane.where} is {agent.label}'s, whose project rlx no longer has")
+    fleet_service.stop(project, agent.label, agent_id=agent.id, actor="user")
+    stopped = f"stopped {agent.label}: closed {pane.where}"
+    try:
+        after, _srv = _again(pane, config, listed)
+    except PaneRefused:
+        return stopped, None  # gone with the fleet's stop
+    same = after.agent is not None and after.agent.id == agent.id
+    if not (after.dead and same and not after.shares_window):
+        return f"stopped {agent.label}; {pane.where} is left as it is: {_kept(after)}", None
+    return stopped, after
 
 
 def plan_adopt(

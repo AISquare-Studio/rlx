@@ -2876,6 +2876,58 @@ def _check_role_bindings() -> list[DoctorCheck]:
 _OS_RELEASE = Path("/etc/os-release")
 _APT_FAMILY = frozenset({"debian", "ubuntu", "linuxmint", "pop", "raspbian", "kali", "elementary"})
 _DNF_FAMILY = frozenset({"fedora", "rhel", "centos", "rocky", "almalinux", "amzn", "nobara", "ol"})
+SOCKET_PATH_MAX = 107 if sys.platform.startswith("linux") else 103
+"""The longest socket path tmux can make or reach: ``sun_path`` holds 108 bytes on Linux and
+104 on macOS and the BSDs, the last of them the terminating NUL. tmux refuses a longer one
+with "File name too long", so the fleet's server cannot start (the validator's F14: a
+131-byte path under a long ``TMUX_TMPDIR``, while this row said "fleet available")."""
+
+
+def _fleet_socket_too_long() -> tuple[Path, int] | None:
+    """The fleet's socket path and its length in bytes when it is over
+    :data:`SOCKET_PATH_MAX`, else ``None``. Where tmux would put it (``TmuxServer.socket_path``:
+    ``$TMUX_TMPDIR``, else ``/tmp``, then ``tmux-<uid>/<[fleet] tmux_socket>``), asked of no
+    tmux and nothing on disk; ``None`` where there is no uid (Windows: no tmux)."""
+    try:
+        path = _fleet_server(fleet_service.settings().tmux_socket).socket_path()
+    except tmux_core.TmuxUnavailable:
+        return None
+    size = len(os.fsencode(str(path)))
+    return (path, size) if size > SOCKET_PATH_MAX else None
+
+
+def _socket_too_long(tmux: str, path: Path, size: int) -> DoctorCheck:
+    """The tmux row's warning for a fleet socket path over :data:`SOCKET_PATH_MAX`; ``tmux`` is
+    how the row names the tmux it found."""
+    folder = "TMUX_TMPDIR" if os.environ.get("TMUX_TMPDIR") else "[fleet] tmux_socket"
+    if folder == "TMUX_TMPDIR":
+        fix = (
+            "Start rlx from a shell with a shorter TMUX_TMPDIR, or none (tmux then uses /tmp): "
+            "unset TMUX_TMPDIR"
+        )
+        ui_fix = (
+            "Quit rlx and start it again from a terminal whose TMUX_TMPDIR names a shorter "
+            "folder, or none: then rlx's agent server can start"
+        )
+    else:
+        fix = "Give the fleet's socket a shorter name: [fleet] tmux_socket in the config"
+        ui_fix = (
+            "Give rlx's agent server a shorter socket name ([fleet] tmux_socket in rlx's "
+            "config), then start rlx again"
+        )
+    return _warn(
+        "tmux",
+        f"{tmux}, but the fleet's socket path is {size} bytes, over the "
+        f"{SOCKET_PATH_MAX} a socket may take here: "
+        + prog.detail_advice(
+            f"{path} — the fleet's server cannot start",
+            app="rlx's agent server cannot start",
+        ),
+        fix,
+        ui_fix=ui_fix,
+    )
+
+
 _RECOMMENDED_TMUX = EXTENDED_MINIMUM
 """The extended chords reach an agent pane from here — measured: 3.3/3.4 type
 their names literally, so the key table drops them there, and sends shift+enter
@@ -2922,7 +2974,9 @@ def _check_tmux(server: tmux_core.TmuxServer | None = None) -> DoctorCheck:
     Absent or too old is a WARNING, never a failure: the fleet is the one
     feature that needs it, and a machine that runs every other command is not
     unhealthy. ``version()`` reads ``tmux -V`` through the one tmux seam and
-    never touches the home, so this runs on an uninitialised machine too.
+    never touches the home, so this runs on an uninitialised machine too. A fleet socket
+    path too long for a socket warns as well (:func:`_fleet_socket_too_long`): with tmux new
+    enough, the fleet's server still cannot start, and the row said "fleet available".
     ``server`` is for tests; the default is the real binary on PATH.
     """
     name = "tmux"
@@ -2937,6 +2991,15 @@ def _check_tmux(server: tmux_core.TmuxServer | None = None) -> DoctorCheck:
             )
         version = server.version()
         minimum = f"{tmux_core.MIN_VERSION[0]}.{tmux_core.MIN_VERSION[1]}"
+        too_long = _fleet_socket_too_long()
+        if too_long is not None and (version is None or version >= tmux_core.MIN_VERSION):
+            # Before "fleet available": with tmux new enough, the fleet still cannot start.
+            tmux = (
+                f"tmux at {server.binary()}"
+                if version is None
+                else f"tmux {version[0]}.{version[1]}"
+            )
+            return _socket_too_long(tmux, *too_long)
         if version is None:
             return _ok(
                 name,

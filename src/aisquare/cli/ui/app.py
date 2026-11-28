@@ -21,7 +21,8 @@ otherwise.
 palette are declared non-priority and refused by ``check_action`` unless focus
 is in the sidebar (or nowhere yet) — not merely "unless a ``TerminalPane`` has
 focus": the views mount ``Button``s, ``Select``s and ``Switch``es, none of which
-consumes a letter key, so ``q`` in a half-filled form used to quit. Textual's
+consumes a letter key, so ``q`` in a half-filled form used to quit. ``?`` and
+``ctrl+q`` are live wherever focus is but an agent's pane. Textual's
 defaults that would steal keys from the agent are removed:
 ``inherit_bindings=False`` drops the priority ``ctrl+q`` and the ``ctrl+c`` "how
 to quit" hint, and the command palette moves from ``ctrl+p`` to ``F1``. Claude
@@ -1527,7 +1528,9 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # own keys come before the app's.
         Binding("question_mark", "help", "help", key_display="?"),
         Binding("q", "quit", "quit"),
-        Binding("ctrl+q", "quit", "quit", show=False),
+        # Its own action: live wherever focus is, but an agent's pane (`check_action`), where
+        # `q` and `w` stay the sidebar's (the validator's F15).
+        Binding("ctrl+q", "quit_anywhere", "quit", show=False),
         Binding("w", "welcome", "welcome"),
         Binding("home", "home", "home", show=False),
         Binding("plus", "add_project", "add project", key_display="+"),
@@ -2107,10 +2110,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         unquittable (at mount the sidebar has focus, so this is only the
         fallback).
         """
-        if action == "help":
+        if action in ("help", "quit_anywhere"):
             # `?` from anywhere it is not typing: the board, a form's button, a list —
             # never an agent's pane, where every key is the agent's. An Input keeps it
-            # itself (``check_consume_key``).
+            # itself (``check_consume_key``). ctrl+q likewise: a Settings page's form held
+            # it too, with q and w, and nothing quit (the validator's F15); an Input has no
+            # use for it.
             focused = self.focused
             return focused is None or not any(
                 isinstance(node, TerminalPane) for node in (focused, *focused.ancestors)
@@ -5137,6 +5142,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if self.content.current == "welcome":
             self.doctor_scope = event.project_id
 
+    async def action_quit_anywhere(self) -> None:
+        """``ctrl+q``: :meth:`action_quit`, from wherever focus is but an agent's pane
+        (:meth:`check_action`)."""
+        await self.action_quit()
+
     async def action_quit(self) -> None:
         """``q`` and ``ctrl+q``: quit, unless a restart, stop, pause or resume of many agents
         (Settings ▸ Fleet's, a card's) still runs, which is refused with a toast as Update and
@@ -5451,6 +5461,7 @@ def _writing_workers() -> dict[str, str]:
         spawn.SPAWN_WORKER: "an agent's spawn",
         persona_dialogs.IMPORT_WORKER: "a persona's import",
         personas_tab.ATTACH_WORKER: "a persona's attachment",
+        personas_tab.MIGRATE_WORKER: "the one-time copy of the project personas to yours",
         captain.TELL_WORKER: "a line to the captain",
         captain.VOICE_WORKER: "the captain's speaker switch",
         remote_workers.TOKEN_WORKER: "Settings ▸ Remote's save of the ngrok token",

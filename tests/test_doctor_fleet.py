@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import sys
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -348,6 +349,48 @@ def test_tmux_below_the_recommended_version_is_ok_but_says_what_is_missing() -> 
     assert older.status is CheckStatus.ok and "3.5+ carries the shifted chords" in older.detail
     assert "shift+enter travels as ctrl+j" in older.detail, older.detail
     assert current.status is CheckStatus.ok and "ctrl+j" not in current.detail
+
+
+def _tmux_tmpdir_for(size: int) -> str:
+    """A ``TMUX_TMPDIR`` under ``/tmp`` that puts the fleet's socket at ``size`` bytes. Named,
+    never made: the check asks no tmux and nothing on disk."""
+    getuid = getattr(os, "getuid", None)
+    assert callable(getuid), "no uid, no tmux socket (Windows)"
+    tail = f"/tmux-{getuid()}/{FleetSettings().tmux_socket}"
+    return "/tmp/" + "d" * (size - len("/tmp/") - len(tail))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no tmux socket: no uid")
+def test_a_fleet_socket_path_too_long_for_a_socket_warns_and_names_the_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validator's F14 (live): under a long ``TMUX_TMPDIR`` the fleet's socket path was 131
+    bytes, too long for a socket, so the fleet's server could not start ("File name too
+    long"); the tmux row said "fleet available". It warns now and names the fix: a command
+    at the shell, words in asq. At the cap itself it passes."""
+    from aisquare.cli.ui.views.doctor import names_a_command, ui_way
+    from aisquare.core import program
+
+    monkeypatch.setenv("TMUX_TMPDIR", _tmux_tmpdir_for(131))
+    check = diagnostics._check_tmux(FakeServer(version=(3, 7)))
+    monkeypatch.setenv(program.IN_APP_ENV, "1")  # as asq's `doctor --json` builds the row
+    in_app = diagnostics._check_tmux(FakeServer(version=(3, 7)))
+    monkeypatch.delenv(program.IN_APP_ENV)
+    monkeypatch.setenv("TMUX_TMPDIR", _tmux_tmpdir_for(diagnostics.SOCKET_PATH_MAX))
+    at_the_cap = diagnostics._check_tmux(FakeServer(version=(3, 7)))
+
+    cap = diagnostics.SOCKET_PATH_MAX
+    assert check.status is CheckStatus.warn and "fleet available" not in check.detail
+    assert check.detail.startswith(
+        f"tmux 3.7, but the fleet's socket path is 131 bytes, over the {cap}"
+    )
+    assert "the fleet's server cannot start" in check.detail
+    assert check.fix is not None and check.fix.endswith("unset TMUX_TMPDIR"), check.fix
+    way = ui_way(in_app, {})
+    assert way == in_app.ui_fix and way is not None and "shorter folder" in way, way
+    assert "TMUX_TMPDIR" in way and not names_a_command(way), way
+    assert "rlx's agent server cannot start" in in_app.detail and "/tmp/" not in in_app.detail
+    assert at_the_cap.status is CheckStatus.ok and at_the_cap.detail == "tmux 3.7 — fleet available"
 
 
 def test_tmux_with_an_unreadable_version_fails_open_and_says_so() -> None:
