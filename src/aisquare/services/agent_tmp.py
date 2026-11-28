@@ -40,7 +40,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import secrets
 import shutil
 import stat
 import sys
@@ -97,6 +96,8 @@ def is_key(name: str) -> bool:
 
 def new_key(taken: Collection[str] = ()) -> str:
     """A key no directory or owner record under the root has, nor ``taken``."""
+    import secrets  # here, not at module scope: a heavy import (test_iam_single_reader)
+
     root = paths.agent_tmp_root()
     while True:
         key = "".join(secrets.choice(_ALPHABET) for _ in range(KEY_LENGTH))
