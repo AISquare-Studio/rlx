@@ -229,9 +229,9 @@ pub use event::{Event, RunScope, topics, types as event_types};
 pub use hello::{HelloData, HelloParams, Role};
 pub use here::{Auth, HereData, InstalledRlx, InstalledRlxd};
 pub use hook::{
-    HOOK_ENV_NAMES, HOOK_ENV_VALUE_MOST, HOOK_EVENTS, HOOK_FRAME_MOST, HookEventData, HookParams,
-    HookReply, PRE_TOOL_USE, codes as hook_codes, deny_output, event_type as hook_event_type,
-    hook_env_forwarded, is_deny_output,
+    HOOK_ENV_NAMES, HOOK_ENV_VALUE_MOST, HOOK_EVENTS, HOOK_FRAME_MOST, HOOK_KEY_ENV, HOOK_KEY_LEN,
+    HookEventData, HookParams, HookReply, PRE_TOOL_USE, allow_output, codes as hook_codes,
+    deny_output, event_type as hook_event_type, hook_env_forwarded, is_deny_output, is_gate_output,
 };
 pub use job::{
     CatchUp, ClockAdvanceParams, ClockSetParams, FireCause, JobEvent, JobFiredData, JobId,

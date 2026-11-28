@@ -7,9 +7,12 @@
 //! the six fleet events rlxd asks the resident brain (1.6), which runs `rlx hook <event>`'s
 //! own code as that process would, and answers [`HookReply`]: the bytes for rlxd-hook to
 //! write on its stdout and stderr. `pre-tool-use` is the gate's (5.1): rlxd answers it
-//! itself, and until the gate decides tool calls it denies every one
-//! ([`deny_output`]). Each `hook` that reaches rlxd publishes one `hook.<event>`
-//! ([`HookEventData`]) on the `hook` topic.
+//! itself, from its gate, with the run's attempt and its key ([`HookParams::hook_key`], from
+//! [`HOOK_KEY_ENV`]), and the answer is an allow ([`allow_output`]) or a deny
+//! ([`deny_output`]): rlxd-hook prints nothing else ([`is_gate_output`]). Each fleet `hook`
+//! that reaches rlxd publishes one `hook.<event>` ([`HookEventData`]) on the `hook` topic; a
+//! `pre-tool-use` publishes none (the gate's `run.tool_call` and `run.tool_decided` are its
+//! events).
 //!
 //! A hook rlxd could not hand to the brain gets [`codes::HOOK_NOT_DELIVERED`]: it never ran,
 //! and rlxd-hook runs `rlx hook <event>` itself. Once the brain accepted it, a failure is
@@ -37,6 +40,15 @@ pub const HOOK_EVENTS: &[&str] = &[
 
 /// The gate's hook (5.1), which never falls back to `rlx hook`.
 pub const PRE_TOOL_USE: &str = "pre-tool-use";
+
+/// The variable that holds a run attempt's hook key (5.1): 256 random bits rlxd makes at
+/// each attempt's start, in hex, which the gate wants back with each `pre-tool-use`. It is
+/// never one of [`HOOK_ENV_NAMES`]: rlxd-hook sends it as [`HookParams::hook_key`] only,
+/// never with the variables, so no brain, log or event ever gets it.
+pub const HOOK_KEY_ENV: &str = "RLXD_HOOK_KEY";
+
+/// The length of a hook key, in hex digits.
+pub const HOOK_KEY_LEN: usize = 64;
 
 /// The variables rlxd-hook sends with a hook, by exact name, and the brain sets for it (or
 /// removes, when rlxd-hook had none): `aisquare.services.brain.ENV_NAMES`, whose doc says
@@ -118,10 +130,19 @@ pub fn event_type(event: &str) -> Option<String> {
 /// What a `pre-tool-use` hook prints to deny the call, with `reason`: Claude Code's
 /// `PreToolUse` reply.
 pub fn deny_output(reason: &str) -> String {
+    output("deny", reason)
+}
+
+/// What a `pre-tool-use` hook prints to allow the call, with `reason`: the gate's allow.
+pub fn allow_output(reason: &str) -> String {
+    output("allow", reason)
+}
+
+fn output(decision: &str, reason: &str) -> String {
     let reply = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
+            "permissionDecision": decision,
             "permissionDecisionReason": reason,
         }
     });
@@ -129,11 +150,21 @@ pub fn deny_output(reason: &str) -> String {
 }
 
 /// Whether `stdout` is a `pre-tool-use` deny and nothing else: one JSON document that is
-/// [`deny_output`]'s for some reason, whitespace around it aside. Until the gate decides
-/// tool calls (5.1), rlxd-hook prints rlxd's reply only when it is one; any other (empty,
-/// text, `{}`, an allow, an ask, a deny with more in it) is denied as unreached, so no reply
-/// lets a call through.
+/// [`deny_output`]'s for some reason, whitespace around it aside.
 pub fn is_deny_output(stdout: &[u8]) -> bool {
+    is_output(stdout, "deny")
+}
+
+/// Whether `stdout` is the gate's answer and nothing else: one JSON document that is
+/// [`allow_output`]'s or [`deny_output`]'s for some reason, whitespace around it aside.
+/// rlxd-hook prints rlxd's `pre-tool-use` reply only when it is one; any other (empty, text,
+/// `{}`, an ask, an answer with more in it) is a deny, so no other reply lets a call
+/// through.
+pub fn is_gate_output(stdout: &[u8]) -> bool {
+    is_output(stdout, "allow") || is_output(stdout, "deny")
+}
+
+fn is_output(stdout: &[u8], decision: &str) -> bool {
     let Ok(said) = serde_json::from_slice::<serde_json::Value>(stdout) else {
         return false;
     };
@@ -143,7 +174,8 @@ pub fn is_deny_output(stdout: &[u8]) -> bool {
     else {
         return false;
     };
-    serde_json::from_str::<serde_json::Value>(&deny_output(reason)).is_ok_and(|deny| deny == said)
+    serde_json::from_str::<serde_json::Value>(&output(decision, reason))
+        .is_ok_and(|answer| answer == said)
 }
 
 /// `hook`'s params: one hook, as rlxd-hook read it.
@@ -153,7 +185,7 @@ pub fn is_deny_output(stdout: &[u8]) -> bool {
 ///  "cwd": "/Users/me/project", "env": {"AISQUARE_ROLE": "coder"},
 ///  "accept_ms": 5000, "deadline_ms": 117000}
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, JsonSchema)]
 #[schemars(title = "HookParams")]
 #[non_exhaustive]
 pub struct HookParams {
@@ -191,6 +223,28 @@ pub struct HookParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, range(min = 1))]
     pub attempt: Option<u64>,
+    /// `pre-tool-use`: the attempt's hook key, from rlxd-hook's [`HOOK_KEY_ENV`] (5.1), 64
+    /// hex digits. Only a `pre-tool-use` carries one. It is a secret: rlxd never logs,
+    /// publishes or forwards it, and this type's `Debug` doesn't show it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(transform = drop_null, regex(pattern = r"^[0-9a-f]{64}$"))]
+    pub hook_key: Option<String>,
+}
+
+impl std::fmt::Debug for HookParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookParams")
+            .field("event", &self.event)
+            .field("stdin_b64", &self.stdin_b64)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("accept_ms", &self.accept_ms)
+            .field("deadline_ms", &self.deadline_ms)
+            .field("run_id", &self.run_id)
+            .field("attempt", &self.attempt)
+            .field("hook_key", &self.hook_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -230,6 +284,12 @@ struct UncheckedParams {
         deserialize_with = "present"
     )]
     attempt: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    hook_key: Option<String>,
 }
 
 /// `hook`'s reply: what rlxd-hook writes, byte for byte, and how the hook ended.
@@ -264,7 +324,8 @@ pub struct HookEventData {
     /// The session's working directory: the hook JSON's `cwd`, else rlxd-hook's; empty
     /// when neither is known.
     pub cwd: String,
-    /// The run the hook belongs to, for a run's `pre-tool-use` (5.1).
+    /// The run the hook belongs to. A run's `pre-tool-use` (5.1), the one hook that names
+    /// a run, publishes no event, so no event rlxd publishes today carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(transform = drop_null, length(min = 1))]
     pub run_id: Option<String>,
@@ -314,6 +375,7 @@ impl HookParams {
             deadline_ms: None,
             run_id: None,
             attempt: None,
+            hook_key: None,
         };
         params.validate()?;
         Ok(params)
@@ -332,6 +394,14 @@ impl HookParams {
     pub fn with_run(mut self, run_id: impl Into<String>, attempt: u64) -> Result<Self, Invalid> {
         self.run_id = Some(run_id.into());
         self.attempt = Some(attempt);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// These params, with the run attempt's hook `key` (5.1). Refuses one that is not 64
+    /// hex digits, or a hook that is not `pre-tool-use`; neither refusal says the key.
+    pub fn with_key(mut self, key: impl Into<String>) -> Result<Self, Invalid> {
+        self.hook_key = Some(key.into());
         self.validate()?;
         Ok(self)
     }
@@ -383,6 +453,21 @@ impl HookParams {
         }
         if let Some(attempt) = self.attempt {
             check::at_least("attempt", attempt, 1)?;
+        }
+        if let Some(key) = &self.hook_key {
+            // Neither message says the key.
+            if self.event != PRE_TOOL_USE {
+                return Err(Invalid::new("hook_key", "is a pre-tool-use's only"));
+            }
+            let hex = key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if key.len() != HOOK_KEY_LEN || !hex {
+                return Err(Invalid::new(
+                    "hook_key",
+                    format!("is not {HOOK_KEY_LEN} lower-case hex digits"),
+                ));
+            }
         }
         Ok(())
     }
@@ -447,6 +532,68 @@ impl<'de> Deserialize<'de> for HookEventData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hook_key_is_never_a_variable_a_hook_sends_or_the_brain_gets() {
+        assert!(!HOOK_ENV_NAMES.contains(&HOOK_KEY_ENV));
+        assert!(!hook_env_forwarded(HOOK_KEY_ENV));
+        assert!(
+            !HOOK_ENV_NAMES
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(HOOK_KEY_ENV))
+        );
+        // Nor can rlxd-hook put it in the variables: a name off the list is refused.
+        let mut env = BTreeMap::new();
+        env.insert(HOOK_KEY_ENV.to_owned(), "a".repeat(HOOK_KEY_LEN));
+        assert!(HookParams::new(PRE_TOOL_USE, "", None, env).is_err());
+    }
+
+    #[test]
+    fn a_hook_key_is_a_pre_tool_uses_64_hex_digits_and_no_message_or_debug_says_it() {
+        let key = "0123456789abcdef".repeat(4);
+        let params = HookParams::new(PRE_TOOL_USE, "", None, BTreeMap::new())
+            .unwrap()
+            .with_run("r", 1)
+            .unwrap()
+            .with_key(&key)
+            .unwrap();
+        assert_eq!(params.hook_key.as_deref(), Some(key.as_str()));
+        assert!(!format!("{params:?}").contains(&key), "{params:?}");
+        let round: HookParams =
+            serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
+        assert_eq!(round, params);
+        let secret = "fedcba9876543210".repeat(4);
+        let fleet = HookParams::new("stop", "", None, BTreeMap::new()).unwrap();
+        for (base, bad) in [
+            (params.clone(), "abc".to_owned()),
+            (params.clone(), secret.to_uppercase()),
+            (params.clone(), format!("{secret}0")),
+            (fleet, secret.clone()),
+        ] {
+            let refused = base.with_key(&bad).unwrap_err().to_string();
+            assert!(!refused.contains(&bad), "{refused}");
+            assert!(!refused.to_lowercase().contains(&secret), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_gate_output_is_an_allow_or_a_deny_and_nothing_else() {
+        assert!(is_gate_output(allow_output("ok").as_bytes()));
+        assert!(is_gate_output(deny_output("no").as_bytes()));
+        assert!(is_gate_output(b" {\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"allow\", \"permissionDecisionReason\": \"r\"}}\n"));
+        for other in [
+            &b""[..],
+            b"text",
+            b"{}",
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": "r"}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "r", "updatedInput": {}}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}"#,
+            br#"{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "r"}, "continue": true}"#,
+        ] {
+            assert!(!is_gate_output(other), "{}", String::from_utf8_lossy(other));
+        }
+        assert!(!is_deny_output(allow_output("ok").as_bytes()));
+    }
 
     #[test]
     fn each_hook_has_its_event_type() {

@@ -194,6 +194,9 @@ enum Action {
         /// The run's attempt.
         #[arg(long)]
         attempt: u64,
+        /// The run's `deadline_ms`, as rlxd-hook's command line carries it: unused here.
+        #[arg(long)]
+        deadline_ms: Option<u64>,
     },
     /// Print the notices of what rlxd carries from others: tmux's ISC licence, for the
     /// parts of rlxd ported from tmux.
@@ -394,6 +397,7 @@ pub fn main() -> ExitCode {
             event,
             run,
             attempt,
+            deadline_ms: _,
         } => test_hook::main(&event, &run, attempt),
         #[cfg(unix)]
         Action::RunGuard { argv } => runner::guard::main(&argv),
