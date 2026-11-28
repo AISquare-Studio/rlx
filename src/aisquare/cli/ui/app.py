@@ -60,7 +60,7 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Button, ContentSwitcher, Footer, Static, TextArea
 from textual.widgets._footer import FooterKey
-from textual.worker import Worker, WorkerState, WorkType
+from textual.worker import Worker, WorkerState, WorkType, active_worker
 from textual.worker_manager import WorkerManager
 
 from aisquare.cli.ui.agent_menu import RENAME as AGENT_RENAME
@@ -1417,6 +1417,17 @@ class _WorkerThreads(WorkerManager):
         super()._remove_worker(worker)
 
     def _counted(self, work: Callable[[], Any], name: str) -> Callable[[], Any]:
+        """``work`` counted while its thread runs it (:meth:`still_running`), and its worker let
+        go of by that thread once it ends.
+
+        Textual runs a thread worker's callable in the loop's executor and sets its
+        ``active_worker`` there first (``Worker._run_threaded``). ``run_in_executor`` copies no
+        context, so the set lands in the pool thread's own and stays: an idle thread held the
+        last worker it ran and, through its ``node``, the widget that started it. A removed
+        agent view, and its pane, outlived the removal for as long as its thread idled (#43:
+        windows-py3.12, CI 46092818407; 3 runs in 5 on Python 3.12). Cleared here, the last
+        thing the thread does for it."""
+
         def counted() -> Any:
             with self._lock:
                 self._threads[name] += 1
@@ -1425,6 +1436,7 @@ class _WorkerThreads(WorkerManager):
             finally:
                 with self._lock:
                     self._threads[name] -= 1
+                active_worker.set(None)  # type: ignore[arg-type]  # Textual's var takes a Worker
 
         return counted
 

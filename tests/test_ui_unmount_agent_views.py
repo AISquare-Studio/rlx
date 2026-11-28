@@ -17,11 +17,13 @@ frame read as the two-second tick reads it.
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import inspect
 import threading
 import types
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,7 @@ from textual.message import Message
 from textual.pilot import Pilot
 from textual.widget import Widget
 from textual.widgets import Button
+from textual.worker import Worker, active_worker
 
 from aisquare.cli.ui.app import FleetApp, HelpScreen, Panes
 from aisquare.cli.ui.sidebar import AgentSelected, ProjectSelected
@@ -387,6 +390,37 @@ def test_a_removed_view_and_its_pane_are_freed(tmp_path: Path, script: Script) -
     held = "the removed {} is still referenced by:\n{}"
     assert not view_held, held.format("AgentView", "\n".join(view_held))
     assert not pane_held, held.format("TerminalPane", "\n".join(pane_held))
+
+
+def test_the_thread_a_worker_ran_in_lets_go_of_it(tmp_path: Path, script: Script) -> None:
+    """What held the removed view on windows-py3.12 (CI 46092818407, the GC test above): Textual
+    sets its ``active_worker`` in the executor thread that runs a thread worker
+    (``Worker._run_threaded``), and ``run_in_executor`` copies no context, so the pool thread
+    kept the last worker it ran, and through ``worker.node`` the view that started it, for as
+    long as it idled. The app's worker manager clears it as the work ends.
+
+    One thread in the loop's executor, so the look after the worker runs where it ran."""
+    two_projects(tmp_path, script, coder(0))
+
+    async def go(pilot: Pilot[None]) -> tuple[bool, bool, object]:
+        app = fleet_app(pilot)
+        loop = asyncio.get_running_loop()
+        one = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(one)
+        view = await open_agent(app, coder(0))
+        worker: Worker[int] = view.run_worker(threading.get_ident, thread=True)
+        ran_on = await worker.wait()
+        await settle(app)
+
+        def look() -> tuple[int, object]:
+            return threading.get_ident(), active_worker.get(None)
+
+        where, held = await loop.run_in_executor(None, look)
+        return where == ran_on, worker.node is view, held
+
+    same_thread, its_view, held = drive(go)
+    assert same_thread and its_view, "the premise: the look ran in the worker's own thread"
+    assert held is None, f"the thread still holds {held!r}"
 
 
 # --- the keyboard ----------------------------------------------------------------------------
