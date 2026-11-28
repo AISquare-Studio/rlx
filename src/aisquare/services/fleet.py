@@ -161,6 +161,7 @@ from aisquare.services import (
     explainability_ops,
     handoff,
     install_route,
+    manager_seat,
     model_memory,
     pane_idle,
 )
@@ -220,8 +221,10 @@ sandbox, :func:`nudge_manager`). Its value is when; :func:`deliver_owed_nudge` t
 
 NUDGE_DEFERRED = "nudge_deferred:"
 """The ``team_meta`` prefix of a nudge a draft held back (P0-W2), or a dialog on the manager's
-screen (R25): ``nudge_deferred:<session>`` → when it was held back. :func:`retry_deferred_nudges`
-sends it once the box is clear and no dialog is open."""
+screen (R25), or a scheduled manager's routine news not due yet (#41,
+``team.pending_wake``): ``nudge_deferred:<session>`` → when it was held back.
+:func:`retry_deferred_nudges` sends it once the box is clear, no dialog is open and the news is
+due."""
 
 _NUDGE_RE_PRESS: tuple[float, ...] = (2.0,)
 _NUDGE_LAST_WAIT = 2.0
@@ -5703,6 +5706,19 @@ def spawn(
             beside = [*defaults.args, *unbound, *role_args, *extra]
             if slot_args and selected.adapter.native_choice(beside).model is None:
                 bound = unbound
+        # A list the agent would not start on is refused, named, before a worktree, codename or
+        # window is made; a word after the options may be its prompt only in the spawn's own,
+        # beside no first message of the fleet's on its command line.
+        prompt_way = delivery.first_prompt_way(
+            positional=selected.adapter.capabilities.positional_prompt, setting=config.first_prompt
+        )
+        prompt_in_argv = prompt_way == "argv" and bool(prompt or (task_id is not None and kickoff))
+        launch_lists = (
+            (f"team.profiles.{role}.args", list(bound), False),
+            (f"fleet.roles.{role}.agent_args.{selected.adapter.id}", list(role_args), False),
+            ("the spawn's own arguments", list(extra), not prompt_in_argv),
+        )
+        _refuse_what_the_agent_would_not_start_on(selected.adapter, launch_lists)
         # The binding's first for an agent that keeps 0.9.2's order (`binding_args_first`):
         # the window's line opens with them (`agent_launch.BOUND_IN_LINE_FLAG`), so the
         # window's own flags and the user's come later and win, as on 0.9.2 (R8, F-bound).
@@ -6009,6 +6025,14 @@ def spawn(
         raise FleetError(
             f"--account selects an account, and {selected.adapter.label} has no account slots"
         )
+    # The lists again, under the home the window runs in now that its account is chosen: what
+    # only that home can say (a Codex profile is a file there) is asked of it, still before
+    # the codename and the worktree.
+    _refuse_what_the_agent_would_not_start_on(
+        selected.adapter,
+        launch_lists,
+        home=choice.account.config_dir if choice.account is not None else selected.config_dir,
+    )
     if experimental.captain_role(role):
         # Asked of the home the window runs under, the account's, else this process's,
         # which the window is given below: its operator's own MCP servers are the ones the
@@ -9486,6 +9510,7 @@ def _first_prompt_unsent(agent: FleetAgent, why: str) -> bool:
                 "prompt_unsent",
                 f"{agent.label}: first prompt not taken — {why}",
                 session_id=agent.session_id,
+                meta={manager_seat.EVENT_PROJECT: agent.project_id},
             )
     except Exception:
         return False
@@ -15387,6 +15412,20 @@ def _hooks_installed_first(
         )
 
 
+def _refuse_what_the_agent_would_not_start_on(
+    adapter: AgentAdapter,
+    lists: Sequence[tuple[str, Sequence[str], bool]],
+    *,
+    home: Path | None = None,
+) -> None:
+    """Each list a fleet launch gives the agent (the setting it came from, its words, whether a
+    word after its options may be the prompt) refused, naming that setting, where the agent
+    would not start on it (:meth:`AgentAdapter.args_refusal`), read in ``home`` once known."""
+    for source, args, may_prompt in lists:
+        if refusal := adapter.args_refusal(args, may_prompt=may_prompt, home=home):
+            raise FleetError(f"{source}: {refusal}")
+
+
 def _refuse_an_install_the_sandbox_writes(
     argv: list[str],
     cwd: Path,
@@ -18535,6 +18574,7 @@ def _emit_exit(
         "force": force,
         "released": released,
         "why": why,
+        manager_seat.EVENT_PROJECT: agent.project_id,
     }
     if reason is not None:
         meta["reason"] = reason
@@ -19476,16 +19516,22 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
             session = store.get_session(row.session_id)
             if session is None or session.ended_at is not None:
                 return False
-            # Due only for news it wakes for, unread (``team.wake_pending``, R12): its own
+            # Due only for news it wakes for, unread (``team.pending_wake``, R12): its own
             # result, an echo of news it has read, or a line its standby holds wakes nobody,
             # whichever write asked. An owed one was always asked this; now every one is.
-            if not _team().wake_pending(store, session):
+            # A scheduled manager's routine news not due yet is held for the tickers (#41).
+            pending = _team().pending_wake(store, session)
+            now = _now()
+            if pending.now is None:
+                if pending.held:
+                    _hold(store, session, now)
                 return False
             key = f"nudge:{session.id}"
-            now = _now()
             last = store.get_meta(key)
             if last is not None and now - datetime.fromisoformat(last) < NUDGE_DEBOUNCE:
                 return False
+            if pending.scheduled and not _claim(store, key, last, now):
+                return False  # another process took this wake: the rlx service, asq or watch
             try:
                 facts = pane.facts_or_raise()
             except TmuxError:
@@ -19535,7 +19581,28 @@ def _nudge(project_id: str, *, owe: bool, board: str | None = None) -> bool:
         return False
 
 
-def retry_deferred_nudges() -> int:
+def _hold(store: ContextStore, session: TeamSession, now: datetime) -> None:
+    """Hold back a scheduled manager's nudge for routine news that is not due yet
+    (:data:`NUDGE_DEFERRED`), for :func:`retry_deferred_nudges` to send once it is. Written
+    when no mark is there, or the one there predates its last prompt, which read the news it
+    was for: a tick that finds it held still writes nothing."""
+    key = f"{NUDGE_DEFERRED}{session.id}"
+    since = store.get_meta(key)
+    prompted = session.prompted_at
+    if not since or (prompted is not None and datetime.fromisoformat(since) <= prompted):
+        store.set_meta(key, now.isoformat())
+
+
+def _claim(store: ContextStore, key: str, last: str | None, now: datetime) -> bool:
+    """Take a scheduled manager's nudge (its debounce ``key``) before typing it, by compare and
+    set: of the tickers that send a held one (the rlx service, ``asq``, ``rlx watch``), the
+    one that takes it types it, and the others see it taken (#41)."""
+    if last is None:
+        return store.set_meta_once(key, now.isoformat())
+    return store.compare_meta(key, last, now.isoformat())
+
+
+def retry_deferred_nudges(*, scheduled_only: bool = False) -> int:
     """Send each manager nudge a draft or a dialog held back (:data:`NUDGE_DEFERRED`), now that
     its input box may be clear and the dialog closed: ``asq``'s refresh asks every frame. How
     many were sent.
@@ -19550,16 +19617,19 @@ def retry_deferred_nudges() -> int:
     per read (P2-W3, #83)."""
     try:
         with store_session() as store:
-            targets = deferred_nudge_targets(store)
+            targets = deferred_nudge_targets(store, scheduled_only=scheduled_only)
     except Exception:
         return 0
     return send_deferred_nudges(targets)
 
 
-def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
+def deferred_nudge_targets(
+    store: ContextStore, *, scheduled_only: bool = False
+) -> list[FleetAgent]:
     """The managers whose held-back nudge is still owed, read in ``store``; one owed no
     more (its manager prompted since, or its row ended) is dropped there. One indexed read
-    when nothing is held back."""
+    when nothing is held back. ``scheduled_only``: those of fleets whose policy is
+    ``schedule`` alone (``rlx watch``'s, #41), the others left as they were."""
     held = {
         key.removeprefix(NUDGE_DEFERRED): since
         for key, since in store.list_meta(NUDGE_DEFERRED).items()
@@ -19568,6 +19638,10 @@ def deferred_nudge_targets(store: ContextStore) -> list[FleetAgent]:
     targets: list[FleetAgent] = []
     for session_id, since in held.items():
         row = store.fleet_agent_for_session(session_id)
+        if scheduled_only and (
+            row is None or not manager_seat.policy(store, row.project_id).scheduled
+        ):
+            continue
         session = store.get_session(session_id)
         prompted = session.prompted_at if session is not None else None
         gone = row is None or row.ended_at is not None or row.label != MANAGER_LABEL

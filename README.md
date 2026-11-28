@@ -69,6 +69,30 @@ spending tokens without losing them, *⚙ Settings ▸ Fleet ▸ Pause all…* e
 each one and keeps its task, worktree and session; *Resume all…* brings each
 back where it was.
 
+In a Claude Code or Codex pane, press `Ctrl+J` to add a line. Claude Code also
+accepts a backslash followed by `Enter`. `Shift+Enter` works when your terminal
+reports it through the kitty keyboard protocol. In Terminal.app, `Shift+Enter`
+and `Option+Enter` with *Use Option as Meta key* can submit the prompt.
+
+### Manager wake schedule
+
+By default a fleet's manager is woken by every board write that concerns it. A busy
+fleet can wake it for urgent news only, and for routine news at most every N minutes:
+
+```sh
+rlx fleet manager-policy manager_wake schedule --project <project>
+rlx fleet manager-policy manager_pass_minutes 15 --project <project>
+```
+
+Urgent news wakes it at once: a question to it, a note to it from you, an agent's usage
+limit, a hand-over that failed, a first prompt not taken, an exit that needs it, and
+watch's urgent lines (a dialog, a crash). Routine news (results, task moves, agents'
+notes) waits until N minutes after its last prompt; it then reads it all in one turn.
+N is 15 unless set; 0 means routine news waits for an urgent wake or your next prompt.
+`team standby` holds until you speak again, with tasks in flight or not. Run
+`rlx fleet manager-policy --project <project>` to read the policy, and `--clear` with a
+key to restore its default.
+
 ## Accounts
 
 Each account signs in through its agent's own login, and *⚙ Settings ▸
@@ -134,6 +158,18 @@ rlx instances                        # every rlx open on this home: at the Mac, 
 rlx outcomes                         # what the agents got done this week, and who steered
 rlx doctor                           # is everything wired? (and how to fix anything)
 ```
+
+Agents on different accounts reach each other through rlx; Claude Code's own `/peers`
+and `SendMessage` stay within one account:
+
+```sh
+rlx --json fleet top                           # every project's live agents: project_id, label
+rlx fleet tell -P <project_id> <label> "done"  # a message to one of them
+```
+
+Within this project, `rlx fleet ls` and `rlx fleet tell <label> "done"` are enough. A
+waiting agent has the message typed at its prompt; a busy one gets it later, when its
+turn ends or at its next prompt.
 
 ## Requirements
 

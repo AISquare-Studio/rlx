@@ -335,17 +335,24 @@ class UsagePart:
         from aisquare.services import claude_accounts as accounts_service
 
         read = self._read or accounts_service.read_fleet_headroom
-        agents = sorted({account.agent for account in accounts_service.list_accounts()})
+        accounts = accounts_service.list_accounts()
+        agents = sorted({account.agent for account in accounts})
         said: list[str] = []
+        room = 0
         for agent in agents or [accounts_service.AGENT]:
             summary = read(agent=agent)
             line = f"{agent}: {summary.level}, {summary.usable} usable"
             if summary.needs_login:
                 line += f", {summary.needs_login} to sign in"
             said.append(line)
+            lefts = getattr(summary, "left_by_slot", None) or {}
+            room += sum(1 for left in lefts.values() if left > 0)
+        # The tray's "Accounts with room: k of n" (#34): an account with any of its limiting
+        # window left, of the enabled ones.
+        counts = {"room": room, "accounts": sum(1 for a in accounts if not a.disabled)}
         if self._locked:
-            return PartHealth("error", f"{KEYCHAIN_OUT_OF_REACH} ({'; '.join(said)})")
-        return PartHealth("ok", "; ".join(said))
+            return PartHealth("error", f"{KEYCHAIN_OUT_OF_REACH} ({'; '.join(said)})", extra=counts)
+        return PartHealth("ok", "; ".join(said), extra=counts)
 
     def stop_part(self) -> None:
         return None
@@ -478,8 +485,11 @@ def _detached(command: Sequence[str]) -> subprocess.Popen[bytes]:
 
 
 def default_parts() -> list[Part]:
-    """What the service hosts, in the order they start (and stop in reverse)."""
-    return [RemotePart(), UsagePart(), NudgePart(), SweepPart(), ShipPart()]
+    """What the service hosts, in the order they start (and stop in reverse). The tray last
+    (#34): its child reads what the others wrote."""
+    from aisquare.services.service_tray import TrayPart
+
+    return [RemotePart(), UsagePart(), NudgePart(), SweepPart(), ShipPart(), TrayPart()]
 
 
 # --- the host ----------------------------------------------------------------------------------

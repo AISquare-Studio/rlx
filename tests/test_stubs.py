@@ -24,6 +24,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
     ("status",),
     ("doctor",),
     ("upgrade",),
+    ("move-home",),  # what `upgrade` runs in the new install (#31)
     ("uninstall",),
     ("log",),
     ("note",),
@@ -87,6 +88,7 @@ IMPLEMENTED: set[tuple[str, ...]] = {
             "top",
             "gate",
             "adopt",
+            "manager-policy",
         )
     ),
     ("code", "find"),

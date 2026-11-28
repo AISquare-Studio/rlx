@@ -1311,6 +1311,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         # Under Advanced, which three more lines above pushed a scroll down at 80x24: the rlx
         # service's login item (S2, #33), the OS's, not the file's, so a widget of its own.
         yield StartAtLogin(id="settings-start-at-login")
+        from aisquare.cli.ui.views.settings_tray import TrayToggle  # its own module (#34)
+
+        yield TrayToggle(id="settings-tray")
 
     def _compose_display(self) -> ComposeResult:
         yield Static(section_title(*self.DISPLAY_SECTION), classes="section")
@@ -1515,6 +1518,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
             self.query_one(f"#{wid}", Switch).value = getattr(self.ui, key)
         self._show_ui(self.ui)
         self.query_one(CaptainToggle).reread(config)
+        from aisquare.cli.ui.views.settings_tray import TrayToggle  # its own module (#34)
+
+        self.query_one(TrayToggle).reread(config)
         for role in self._roles:
             row = self._role_row(role)
             if row is None:
@@ -1935,7 +1941,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         keeps what was typed, to try again."""
         for wid in changed:
             control = self.query_one(f"#{wid}")
-            if not isinstance(control, CommitInput):
+            if isinstance(control, CommitInput):
+                control.release()  # committed again, to try again (#53)
+            else:
                 self._put_shown(control, self._shown_value(wid))
 
     @staticmethod

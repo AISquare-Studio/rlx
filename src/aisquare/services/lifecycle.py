@@ -313,6 +313,9 @@ def settings_name(agent: str) -> str:
 
 VERSION_CHECK_TIMEOUT_SECONDS = 60.0
 HOOK_REFRESH_TIMEOUT_SECONDS = 120.0
+HOME_MOVE_TIMEOUT_SECONDS = 600.0
+"""How long the new install's move of an old home may take (``rlx move-home``, #31): renames
+and one store transaction, but a store of years and every slot's Keychain item."""
 
 
 class InvalidVersion(ValueError):
@@ -403,6 +406,15 @@ class UpgradePlan:
     """The roles a move back to a release up to :data:`LAST_ARGS_ONLY_DENY` launches with
     tools their safety list denies here, each with those tools:
     ``reviewer (Edit, NotebookEdit, Write)``."""
+    home_move: str | None = None
+    """The move this home needs to the layout 0.10.2 keeps (``services.home_migration``), in
+    words: ``~/.aisquare → ~/.rlx``; ``None`` for a home laid out so already (#31)."""
+    home_refusal: str | None = None
+    """Why this home cannot be moved as it stands, when it cannot (both homes there)."""
+    home_busy: tuple[str, ...] = ()
+    """What runs on this home that the move waits for, each named with how it is stopped
+    (``home_migration.running_on_home``, the service left out: the move stops it): read only
+    when there is a move to make (the reviewer's m7 on #31)."""
 
     @property
     def runnable(self) -> bool:
@@ -539,6 +551,22 @@ class UpgradePlan:
         )
 
     @property
+    def home_warning(self) -> str | None:
+        """What a move back to a release before ``services.home_migration.FIRST_RELEASE``
+        costs a home in the new layout (#31, the manager's condition 7): it keeps its home in
+        ``~/.aisquare``, laid out as before, and finds no store there. ``None`` for any other
+        run."""
+        from aisquare.services import home_migration
+
+        if self.target is None or not self.backwards:
+            return None
+        if install_route.is_newer(home_migration.FIRST_RELEASE, self.target) is not True:
+            return None
+        if paths.home_layout() != paths.NEW:
+            return None
+        return home_migration.DOWNGRADE_GAP
+
+    @property
     def store_warning(self) -> str | None:
         """What a move back to a release before :data:`FIRST_ACCOUNT_RANK` keeps and loses of
         this home's store, or ``None`` for any other run.
@@ -628,6 +656,20 @@ class HookRefresh:
 
 
 @dataclass(frozen=True)
+class HomeMove:
+    """What the move of an old home did (``services.home_migration``): its lines for a person,
+    or why it did not move (``problem``), the home then as it was."""
+
+    moved: bool
+    lines: tuple[str, ...] = ()
+    problem: str | None = None
+    rolled_back: bool = True
+    """Whether a move that stopped left the home as it was (else the next run finishes it)."""
+    payload: dict[str, Any] | None = None
+    """What ``move-home --json`` answered, for ``upgrade --json``."""
+
+
+@dataclass(frozen=True)
 class UpgradeReport:
     """What an upgrade did. ``problem`` is set when the new version could not be confirmed."""
 
@@ -639,6 +681,8 @@ class UpgradeReport:
     problem: str | None = None
     hooks: tuple[HookRefresh, ...] = ()
     notes: tuple[str, ...] = ()
+    home: HomeMove | None = None
+    """The home's move, when the plan had one (:attr:`UpgradePlan.home_move`)."""
 
     @property
     def installed(self) -> bool:
@@ -743,6 +787,8 @@ def upgrade_plan(
         live, _unlistened, fleet_error = running_fleet()
         remote = running_remote()
         asqs = running_asqs()
+    home_move, home_refusal = planned_home_move()
+    home_busy = _running_on_home() if home_move is not None else ()
     return UpgradePlan(
         route=route,
         current=__version__,
@@ -764,7 +810,123 @@ def upgrade_plan(
         config_defaults_lost=lost,
         env_files_dropped=dropped,
         tools_regained=regained,
+        home_move=home_move,
+        home_refusal=home_refusal,
+        home_busy=home_busy,
     )
+
+
+def planned_home_move() -> tuple[str | None, str | None]:
+    """``(move, refusal)``: the move this home needs, in words, and why it cannot be made as
+    it stands; both ``None`` for a home in the new layout. Reads only."""
+    from aisquare.services import home_migration
+
+    try:
+        found = home_migration.planned_move()
+    except home_migration.MigrationRefused as exc:
+        return None, exc.reason
+    if found is None:
+        return None, None
+    if found.journal is not None:
+        # A run of the move stopped part-way (the tester's N4): the next one finishes it.
+        return f"{found.shown}, part-way: a run of the move stopped and the next finishes it", None
+    return found.shown, None
+
+
+def _running_on_home() -> tuple[str, ...]:
+    """What the home's move would wait for now (``home_migration.running_on_home``), the
+    service left out; one line saying so when it cannot be told."""
+    from aisquare.services import home_migration
+
+    try:
+        return tuple(home_migration.running_on_home(but_the_service=True))
+    except Exception as exc:
+        return (f"whether anything runs on the home could not be told ({exc})",)
+
+
+def move_home_here(*, drop_cache: bool = False) -> HomeMove:
+    """Move an old home in this process (``services.home_migration.move_home``): what ``rlx
+    upgrade`` does when the release is already the latest, so the first upgrade to one that
+    moves homes is followed by the move (#31)."""
+    from aisquare.services import home_migration
+
+    try:
+        moved = home_migration.move_home(drop_cache=drop_cache)
+    except home_migration.MigrationRefused as exc:
+        return HomeMove(False, problem=_home_refusal_text(exc.reason, exc.running))
+    except home_migration.MigrationFailed as exc:
+        return HomeMove(False, problem=exc.reason, rolled_back=exc.rolled_back)
+    if moved is None:
+        return HomeMove(False)
+    return HomeMove(True, tuple(home_migration.said_of_move(moved)), payload=moved.as_json())
+
+
+def _home_refusal_text(reason: str, running: Sequence[str]) -> str:
+    return f"{reason}: {'; '.join(running)}" if running else reason
+
+
+def move_home_in(script: Path) -> HomeMove:
+    """Move an old home by the NEW install, in a process of its own: ``<script> --json
+    move-home``, as the hook refresh runs it (:func:`_refresh`). Its answer is one JSON object;
+    anything else is said as the problem, and the home is then whatever that run left, which
+    its journal says (a re-run finishes or rolls it back)."""
+    from aisquare.services import home_migration
+
+    answer = install_route.run_captured(
+        [str(script), "--json", "move-home"], timeout=HOME_MOVE_TIMEOUT_SECONDS
+    )
+    # Whether the home is as it was is read from the home, never from what the run said: a
+    # run killed at its timeout says nothing, and its journal says where it stopped (the
+    # reviewer's m2 on #31).
+    as_it_was = paths.unfinished_home_move() is None
+    if answer.error is not None:
+        return HomeMove(
+            False,
+            problem=f"the new install's move did not finish ({answer.error})",
+            rolled_back=as_it_was,
+        )
+    payload = _last_json_object(answer.stdout)
+    if payload is None:
+        said = _reason_line(answer.stderr, answer.stdout) or f"exit {answer.returncode}"
+        return HomeMove(
+            False,
+            problem=f"the new install's move answered nothing readable ({said})",
+            rolled_back=as_it_was,
+        )
+    if answer.returncode != 0 or payload.get("error"):
+        message = str(payload.get("message") or payload.get("error") or "it stopped")
+        return HomeMove(
+            False,
+            problem=message.removeprefix("the home was not moved: "),
+            rolled_back=as_it_was,
+            payload=payload,
+        )
+    if not payload.get("moved"):
+        return HomeMove(False, payload=payload)
+    moved = home_migration.Moved(
+        old_root=Path(str(payload.get("old_home", ""))),
+        new_root=Path(str(payload.get("home", ""))),
+        named=bool(payload.get("in_place")),
+        backup=Path(str(payload.get("backup", ""))),
+        copied=[str(one) for one in payload.get("keychain_copied") or []],
+        notes=[str(one) for one in payload.get("notes") or []],
+        left=[str(one) for one in payload.get("left") or []],
+        linked=bool(payload.get("linked")),
+        cache_dropped=bool(payload.get("cache_dropped")),
+    )
+    return HomeMove(True, tuple(home_migration.said_of_move(moved)), payload=payload)
+
+
+def _last_json_object(stdout: str) -> dict[str, Any] | None:
+    """The last line of ``stdout`` that is a JSON object, or ``None``."""
+    for line in reversed(stdout.splitlines()):
+        try:
+            loaded: Any = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(loaded, dict):
+            return loaded
+    return None
 
 
 def _pin_unmet(
@@ -1300,21 +1462,34 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         )
     ran = _as_recorded(plan.route)
     version, problem = _verify(plan, ran)
+    # The login items first, by what is in place now (S2, #33): into a release with no service,
+    # the item goes; where the installer said yes but the release in place has the service (one
+    # other than asked for, or this one still), what was taken away for the move comes back as
+    # it was (reviewer of #33, round 4).
     if version is not None and lacks_the_service(version):
         item_said = item_said or _no_login_item_for(service_login, version)[0]
-    elif version is not None:
-        if taken is not None:
-            # The installer said yes, but what is in place has the service (a release other
-            # than the one asked for): what was taken away for the move comes back as it was
-            # (reviewer of #33, round 4).
-            item_said = _put_the_login_items_back(service_login, taken) or item_said
-        # Only ever refreshed, never made (design #1875), by the install now in place, as its
-        # hooks are: a new path to rlx, a new PATH.
-        _refresh_the_login_item(plan)
-    service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
+    elif version is not None and taken is not None:
+        item_said = _put_the_login_items_back(service_login, taken) or item_said
     if problem is not None:
+        if version is not None and not lacks_the_service(version):
+            _refresh_the_login_item(plan)
+        service_said = (
+            _start_the_service_again(service_host, plan, version) if service_ran else None
+        )
         said = tuple(note for note in (item_said, service_said) if note)
         return UpgradeReport(plan, exit_code=code, version=version, problem=problem, notes=said)
+    home = None
+    if plan.home_move is not None and not plan.backwards:
+        # The new install moves the home after it said its version, while the service is still
+        # stopped and before any hook is rewritten (#31): the service then starts on the home
+        # where it now is, and the sites are read again at their new places.
+        home = move_home_in(_new_install_script(plan.route.facts))
+    if version is not None and not lacks_the_service(version):
+        # Only ever refreshed, never made (design #1875), by the install now in place, as its
+        # hooks are: a new path to rlx, a new PATH, and after the home moved (#31), the home
+        # where it now is.
+        _refresh_the_login_item(plan)
+    service_said = _start_the_service_again(service_host, plan, version) if service_ran else None
     notes: list[str] = [note for note in (item_said, service_said) if note]
     latest = plan.latest_version
     moved_elsewhere = latest is not None and not install_route.same_version(version or "", latest)
@@ -1339,8 +1514,25 @@ def upgrade(plan: UpgradePlan, *, to_stderr: bool = False) -> UpgradeReport:
         # A move back to a release before `agents refresh-hooks`: the plan left every site,
         # each saying so with its remedy.
         return UpgradeReport(plan, exit_code=code, version=version, notes=tuple(notes))
-    hooks = tuple(_refresh(site, plan.route.facts) for site in plan.refresh)
-    return UpgradeReport(plan, exit_code=code, version=version, hooks=hooks, notes=tuple(notes))
+    sites = _sites_after_move(plan) if home is not None and home.moved else plan.refresh
+    hooks = tuple(_refresh(site, plan.route.facts) for site in sites)
+    return UpgradeReport(
+        plan, exit_code=code, version=version, hooks=hooks, notes=tuple(notes), home=home
+    )
+
+
+def _new_install_script(found: install_route.Facts) -> Path:
+    """The new install's console script, as :func:`_refresh` runs it."""
+    return found.executable.with_name("aisquare.exe" if found.platform == "win32" else "aisquare")
+
+
+def _sites_after_move(plan: UpgradePlan) -> tuple[HookSite, ...]:
+    """The hook sites :func:`upgrade_plan` would list now that the home moved: the connected
+    directories and account homes, at their new places."""
+    refresh, _left = refresh_sites(plan.route.facts)
+    if plan.target is not None:
+        refresh, _held = _held_by_target(refresh, plan.target)
+    return refresh
 
 
 def _no_login_item_for(
@@ -1576,7 +1768,7 @@ def _refresh(site: HookSite, found: install_route.Facts) -> HookRefresh:
     whose definition the rewrite changed is said to need review (:func:`_definition`):
     an identical one is not rewritten at all (``agent_core._write_settings``).
     """
-    script = found.executable.with_name("aisquare.exe" if found.platform == "win32" else "aisquare")
+    script = _new_install_script(found)
     if not script.exists():
         return HookRefresh(
             site.config_dir, False, f"the new install has no {script}", agent=site.agent

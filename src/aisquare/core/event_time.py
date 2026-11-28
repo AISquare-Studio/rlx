@@ -4,7 +4,8 @@ A board's feed, its details, its done archive and ``aisquare board``'s text all 
 ``%H:%M`` alone, so yesterday's ``14:05`` read as today's. :func:`stamp` is the one rule
 for a moment that has passed (a lease's end too): the clock time alone today, the day
 before it on any other day. A rate-limit reset, which lies ahead, has its own
-(``core.claude_accounts.format_reset``: a distance and a weekday).
+(``core.claude_accounts.format_reset``: a distance and a weekday). :func:`clock_minute` is
+no moment shown: it is what tells two sessions of one name apart.
 
 In core so ``services.team`` (the text board) and ``cli.watch`` (the TUI) share it.
 """
@@ -31,3 +32,10 @@ def stamp(when: datetime, *, seconds: bool = False, now: datetime | None = None)
     if local.year == today.year:
         return f"{local:%b} {local.day} {hours}"
     return f"{local:%Y-%m-%d} {hours}"
+
+
+def clock_minute(when: datetime) -> str:
+    """The local minute ``when`` fell in, ``14:02``, with no day: what ``cli.board_names`` tells
+    two sessions of one name apart by, and what ``services.team.board_sessions`` reads their
+    namesakes by, so the two can never differ."""
+    return f"{when.astimezone():%H:%M}"

@@ -66,6 +66,9 @@ narrowing their environment would be change without a reason:
   * ``core/claude_accounts.py::_ask_keychain`` — ``/usr/bin/security
     find-generic-password`` on macOS: the Claude Code login an account's
     Keychain item holds, read for its usage. No model.
+  * ``core/claude_accounts.py::_run_security`` — ``/usr/bin/security`` on macOS, for the
+    home's move (#31): an account's Keychain item read, copied to its new name through
+    ``security -i`` on stdin, and the old one deleted. No model.
   * ``core/agents.py::hook_binary_version`` — ``<hook's aisquare> --version``,
     a string: doctor asking another install of this CLI what version it is,
     so hooks that name a stale binary stop grading as healthy (#84).
@@ -344,6 +347,12 @@ SEAMS: dict[str, Seam] = {
         "`/usr/bin/security find-generic-password` on macOS — reads the login Claude Code keeps "
         "in an account's Keychain item, for its usage; a string, no model",
     ),
+    "aisquare/core/claude_accounts.py::_run_security": Seam(
+        EXCLUDED,
+        "`/usr/bin/security` on macOS, for the home's move (#31): an account's Keychain item "
+        "read, copied to the name its new place hashes to through `security -i` on stdin, and "
+        "the old one deleted; strings, no model",
+    ),
     "aisquare/core/agents.py::hook_binary_version": Seam(
         EXCLUDED,
         "`<the aisquare a hook names> --version`, a string — doctor asking another "
@@ -376,8 +385,21 @@ SEAMS: dict[str, Seam] = {
     ),
     "aisquare/services/service_host.py::_detached": Seam(
         EXCLUDED,
-        "the rlx service's own workers, one at a time: the usage sweep and the anonymous usage "
-        "shipment (when sharing is on); aisquare's work for the home, not an agent session (#32)",
+        "the rlx service's own workers, one at a time: the usage sweep, the anonymous usage "
+        "shipment (when sharing is on) and the tray (#34); aisquare's work for the home, not an "
+        "agent session (#32)",
+        strips_identity=True,
+    ),
+    "aisquare/services/tray.py::_spawn_terminal": Seam(
+        EXCLUDED,
+        "the tray's Open rlx: the person's terminal app running rlx, on its own, so it outlives "
+        "the tray; a window for the person, not an agent session (#34)",
+        strips_identity=True,
+    ),
+    "aisquare/services/tray.py::_spawn_rlx": Seam(
+        EXCLUDED,
+        "the tray's Restart rlx and Quit rlx: a detached `rlx service restart` or `stop`, since "
+        "either stops the service and the service stops the tray; aisquare's own command (#34)",
         strips_identity=True,
     ),
     "aisquare/services/service_login.py::_service_manager": Seam(

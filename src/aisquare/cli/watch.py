@@ -618,8 +618,13 @@ def board_frame(height: int, width: int, project: ProjectInfo | None = None) -> 
     """One fallback frame: header, sessions, open tasks, then as many recent
     events as the remaining terminal rows can hold — the captain's audit left out,
     as ``aisquare board`` leaves it out (``team.CAPTAIN_AUDIT_KINDS``)."""
+    # Paged (#44): the open tasks, the archive counted, and the sessions the frame shows.
     read = team_service.board_read(
-        events=200, project=project, exclude_kinds=team_service.CAPTAIN_AUDIT_KINDS
+        events=200,
+        project=project,
+        exclude_kinds=team_service.CAPTAIN_AUDIT_KINDS,
+        closed=False,
+        sessions=(),
     )
     project, sessions, tasks, events, switches = read[:5]
     names = board_names.board_names(sessions, read.fleet_labels, cells=board_names.BOARD_NAME_CELLS)
@@ -634,9 +639,9 @@ def board_frame(height: int, width: int, project: ProjectInfo | None = None) -> 
         text.append(_session_lines(sessions, switches=switches, names=names))
     else:
         text.append("  (none live)\n", style="dim")
-    statuses = {t.id: t.status for t in tasks}
+    statuses = read.statuses
     open_tasks = [t for t in tasks if t.status in ("todo", "doing", "review", "blocked")]
-    done = sum(1 for t in tasks if t.status == "done")
+    done = read.closed.get("done", 0)
     text.append(f"tasks — {len(open_tasks)} open · {done} done\n", style="bold cyan")
     for task in open_tasks[:10]:
         holder = task.claimed_by

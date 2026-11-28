@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import sqlite3
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -756,6 +757,11 @@ def spawn(
         if broker_note:
             typer.echo(broker_note, err=True)
         agent_launch.prepare_sandbox(selected, argv)
+        if sys.platform != "win32":
+            # It becomes its agent: recorded, so the home's move does not run under it (#31).
+            from aisquare.core import launchers
+
+            launchers.execing(Path(argv[0]).stem, command="team spawn")
         os.execvpe(argv[0], argv, env)
     if not get_state().json_output:
         stdout_console().print(f"  run it in the role's terminal:\n  {command}", markup=False)

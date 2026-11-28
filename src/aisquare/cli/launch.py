@@ -396,6 +396,8 @@ def _exec(binary: str, argv: list[str], env: dict[str, str]) -> None:
         with launchers.waiting(Path(binary).stem):
             status = subprocess.call([binary, *argv[1:]], env=env)
         raise SystemExit(status)
+    # It becomes its agent: recorded, so the home's move does not run under it (#31).
+    launchers.execing(Path(binary).stem)
     os.execve(binary, argv, env)
 
 

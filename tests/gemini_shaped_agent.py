@@ -1068,6 +1068,11 @@ class GeminiShapedAdapter:
         )
         return list(self.permission_args(intent, role, native).args)
 
+    def args_refusal(
+        self, args: Sequence[str], *, may_prompt: bool, home: Path | None = None
+    ) -> str | None:
+        return None
+
     def label_args(self, label: str) -> LaunchPart:
         return LaunchPart(env={"CLI_TITLE": label})  # its title is a variable, not a flag
 

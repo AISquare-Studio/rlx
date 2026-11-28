@@ -326,6 +326,7 @@ class TokenSlot(Vertical):
             self.notify("✓ ngrok token saved", timeout=5, markup=False)
             self.post_message(TokenSaved())
             return
+        self.query_one("#settings-remote-token-field", CommitInput).release()  # to try again
         if isinstance(error, TokenRefused):
             said = str(error)
         elif event.state is WorkerState.ERROR:  # never the token: only what kind of failure

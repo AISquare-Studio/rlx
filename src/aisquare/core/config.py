@@ -1137,6 +1137,32 @@ class UpdatesSettings(BaseModel):
     check: bool = True
 
 
+TrayIcon = Literal["backslash", "mark", "template"]
+"""What the tray shows (``core.glyph.ICONS``)."""
+
+
+class TraySettings(BaseModel):
+    """``[tray]`` — the rlx service's menu bar icon (macOS) or tray icon (Linux), #34: App
+    settings ▸ User preferences ▸ *Tray*.
+
+    ``enabled`` on, the default: a running service shows it, where the OS has a place for
+    one (macOS's menu bar in the login session; a StatusNotifierItem host on Linux) and the
+    ``tray`` extra is installed. Off, the running service takes it down within half a minute
+    (``service_tray.TrayPart`` follows the file).
+
+    ``icon``: ``backslash`` (rlx's ``\\`` in its blue, the default), ``mark`` (the whole
+    ``r\\x``) or ``template`` (the backslash painted by macOS as its other menu bar icons).
+
+    ``terminal``: the terminal app *Open rlx* starts it in; ``""``, the default, the
+    person's own (macOS: the app that opens a ``.command`` file; Linux: ``xdg-terminal-exec``,
+    ``$TERMINAL``, then the first of the common ones found).
+    """
+
+    enabled: bool = True
+    icon: TrayIcon = "backslash"
+    terminal: str = ""
+
+
 class UiSettings(BaseModel):
     """``[ui]`` — how ``asq`` shows things to the person at it: the *User preferences* tab
     of App settings.
@@ -1261,6 +1287,7 @@ class AppConfig(BaseModel):
     watch: WatchSettings = Field(default_factory=WatchSettings)
     code: CodeSettings = Field(default_factory=CodeSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
+    tray: TraySettings = Field(default_factory=TraySettings)
     sharing: SharingSettings = Field(default_factory=SharingSettings)
     service: ServiceSettings = Field(default_factory=ServiceSettings)
 

@@ -1566,10 +1566,23 @@ Open a new shell and rerun, or add it by hand:
 # once 0.9.0 is the latest. Gate it, with RELEASE_ERA_AMBER, on the version
 # being installed (below 0.9.0) instead.
 
+# The package with the extras this OS takes: the tray's on macOS and on Linux outside WSL
+# (#34, the rlx service's menu bar / tray icon), none on WSL or Windows, which have no tray
+# in 0.10.2. Only for the PyPI package: a path (CI's) installs as given, so CI runs the
+# no-extra path. `rlx upgrade` keeps it, as uv's receipt records the extra.
+cli_package() {
+    if [ "$OS" = macos ] || { [ "$OS" = linux ] && [ "${IS_WSL:-0}" != 1 ]; }; then
+        printf '%s[tray]' "$PYPI_PACKAGE"
+    else
+        printf '%s' "$PYPI_PACKAGE"
+    fi
+}
+
 install_cli() {
     _target=$INSTALL_TARGET
+    [ "$INSTALL_TARGET" = "$PYPI_PACKAGE" ] && _target=$(cli_package)
     [ -n "$PIN_VERSION" ] && [ "$INSTALL_TARGET" = "$PYPI_PACKAGE" ] &&
-        _target="$PYPI_PACKAGE==$PIN_VERSION"
+        _target="$(cli_package)==$PIN_VERSION"
 
     case "$CLI_ACTION" in
         current)
@@ -1608,8 +1621,8 @@ Rerun with --verbose to see uv's own output."
                 # treat the whole thing as a package name.
                 _spec=$INSTALL_TARGET
             else
-                _spec="$PYPI_PACKAGE@latest"
-                [ -n "$PIN_VERSION" ] && _spec="$PYPI_PACKAGE@$PIN_VERSION"
+                _spec="$(cli_package)@latest"
+                [ -n "$PIN_VERSION" ] && _spec="$(cli_package)@$PIN_VERSION"
             fi
             if ! run uv tool install --force --python "$PYTHON_VERSION" \
                 --with tiktoken "$_spec"; then
