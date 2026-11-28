@@ -54,6 +54,7 @@ One connector, `claude.ai Slack`, with made-up tools (`init-connectors/expected-
 | `connectors-later` | Slack `pending`, then connected from 8 s |
 | `connectors-later-noisy` | `connectors-later`, writing assistant text before each start can be confirmed: before its `system/init` on route 2, after its first one on route 1 |
 | `connectors-never` | Slack `pending` throughout |
+| `connectors-slow-init` | Slack connected, but `system/init` comes 10 s after the message (written to the session at once): a route-2 try sits sent and unconfirmed |
 | `connectors-needs-auth` | Slack `needs-auth` throughout |
 | `stdin-eof-empty` | No servers in `system/init` when stdin is at EOF by then, as E9 found; Slack connected while it is open |
 | `mcp-login` | `claude mcp login <name>`: prints an `https://` URL whose query holds made-up secrets, waits, says it signed in, and exits 0 |

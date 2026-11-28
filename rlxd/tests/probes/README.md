@@ -15,6 +15,10 @@ rlxd/tests/probes/connectors_route.sh            # P1-P3, P5-P7
 rlxd/tests/probes/connectors_route.sh --login    # and P4, a real `claude mcp login`
 ```
 
+P5 writes up to three session transcripts (one short turn each) in your real Claude Code
+config dir (`$CLAUDE_CONFIG_DIR`, else `~/.claude`), under `projects/<its temp folder>/`,
+and removes them, and that folder, when it is done.
+
 Every Claude Code it starts itself (P1, P5) runs in an empty folder with no user or local
 settings (`--setting-sources project`), asks for no permission (`--permission-mode
 dontAsk`), and has each tool call it attempts denied by rlxd's own probe hook (`rlxd
