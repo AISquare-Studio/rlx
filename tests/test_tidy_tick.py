@@ -27,7 +27,6 @@ from typer.testing import CliRunner
 
 from aisquare.cli.app import app
 from aisquare.core import locking, paths
-from aisquare.core import program as prog
 from aisquare.core.config import TidySettings, WatchSettings, load_config, save_config
 from aisquare.core.store import store_session
 from aisquare.models import ProjectInfo, TeamSession
@@ -399,9 +398,7 @@ def test_a_pass_of_1_gb_or_more_says_so_once_on_the_board_most_of_it_counts_to(
 
     passed = tidy.periodic_pass(T0)
 
-    said = (
-        f"{prog.word()} tidy freed 1.6 GB: 1 worktree, 2 session temp paths, 1 build cache, 1 lock"
-    )
+    said = "tidy freed 1.6 GB: 1 worktree, 2 session temp paths, 1 build cache, 1 lock"
     assert passed is not None and passed.receipt == said and passed.board == BOARD_A
     [note] = _notes(BOARD_A)
     assert note.text == said and note.to_role is None and note.session_id is None
@@ -422,7 +419,7 @@ def test_exactly_1_gb_is_said_and_a_pass_no_board_counts_to_says_it_nowhere(
 ) -> None:
     plans.items = [(tidy.ENDED_WORKTREE, GB, BOARD_B)]
     assert tidy.periodic_pass(T0) is not None
-    assert [n.text for n in _notes(BOARD_B)] == [f"{prog.word()} tidy freed 1.0 GB: 1 worktree"]
+    assert [n.text for n in _notes(BOARD_B)] == ["tidy freed 1.0 GB: 1 worktree"]
 
     plans.items = [(tidy.MIGRATION_LOCK, 2 * GB, None)]
     passed = tidy.periodic_pass(T0 + timedelta(hours=1))

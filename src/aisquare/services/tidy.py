@@ -69,7 +69,6 @@ from pathlib import Path
 from typing import Any
 
 from aisquare.core import atomic, cachedir, claude_accounts, locking, paths, process_table
-from aisquare.core import program as prog
 from aisquare.core.config import TidySettings, load_config
 from aisquare.core.store import FLEET_HELD, ContextStore, store_session
 from aisquare.models import FleetAgent, ProjectInfo
@@ -1267,14 +1266,15 @@ _RECEIPT_PARTS = (
 
 
 def receipt_text(report: PassReport) -> str:
-    """``rlx tidy freed 14.2 GB: 3 worktrees, 30 session temp paths, 8 build caches, 1 lock``:
-    the pass's totals, never a path (a manager pays for every character in its context)."""
+    """``tidy freed 14.2 GB: 3 worktrees, 30 session temp paths, 8 build caches, 1 lock``: the
+    pass's totals, never a path (a manager pays for every character in its context), and no
+    command: a board line asq shows too names none (R13b, ``tests/test_shell_advice.py``)."""
     parts = []
     for rules, one, many in _RECEIPT_PARTS:
         count = sum(report.freed.get(rule, 0) for rule in rules)
         if count:
             parts.append(f"{count} {one if count == 1 else many}")
-    said = f"{prog.word()} tidy freed {size_text(report.freed_bytes)}"
+    said = f"tidy freed {size_text(report.freed_bytes)}"
     return f"{said}: {', '.join(parts)}" if parts else said
 
 
