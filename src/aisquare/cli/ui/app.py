@@ -1925,6 +1925,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         # A start saves its switch here once its deadline is written on the controller's
         # writer thread, in order with a turn-off's own save (post_message is thread-safe).
         controller.call_back = self.call_later
+        # The R panel's switch waits for those still turning off too (review of #45, #3931).
+        controller.others_stopping = lambda: [
+            old for old in self.remotes_stopping if old is not controller
+        ]
         self._remote = controller
         self.service_client.use_remote(controller)
 
@@ -1987,7 +1991,12 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.call_from_thread(then, remote)
 
     def _restore_if_current(self, remote: RemoteController) -> None:
-        if self._remote is remote:
+        """Bring ``remote`` up: still the app's, and rlx still running. A look that passed
+        just before Textual's cancel at the quit hops here as rlx goes (``is_running`` is
+        false by then, before the app's unmount on both of its exit paths), and a Remote
+        started then came up after its own ``shutdown_for_exit``, run_ui's wait passing
+        over it: it served on after rlx quit (review of #45, #3931)."""
+        if self._remote is remote and self.is_running:
             remote.restore(wait=False)
 
     def _restore_overdue(self, remote: RemoteController) -> None:

@@ -82,22 +82,29 @@ def _own_scope(where: ast.FunctionDef) -> Iterator[ast.AST]:
 def _imported_in(where: ast.FunctionDef | None, name: str) -> Any:
     """What ``name`` is bound to by an import in ``where``'s own body (:func:`_own_scope`),
     ``None`` without one: a module, or a name of one, imported where it is first used (#45).
-    The walk below has imported every UI module already. One that cannot be imported is
-    ``None`` too, so the guard fails on it in its own words (review of #45, #3879)."""
+    The last such import, as Python binds it (review of #45, #3931). The walk below has
+    imported every UI module already. One that cannot be imported fails in the guard's own
+    words, with why (#3879, #3931)."""
     if where is None:
         return None
+    bound: tuple[str, str] | None = None
     for node in _own_scope(where):
         if isinstance(node, ast.ImportFrom) and node.module and not node.level:
             for alias in node.names:
                 if (alias.asname or alias.name) == name:
-                    try:
-                        module = importlib.import_module(node.module)
-                        if hasattr(module, alias.name):
-                            return getattr(module, alias.name)
-                        return importlib.import_module(f"{node.module}.{alias.name}")
-                    except ImportError:
-                        return None
-    return None
+                    bound = (node.module, alias.name)
+    if bound is None:
+        return None
+    module_name, attribute = bound
+    try:
+        module = importlib.import_module(module_name)
+        if hasattr(module, attribute):
+            return getattr(module, attribute)
+        return importlib.import_module(f"{module_name}.{attribute}")
+    except ImportError as exc:
+        raise AssertionError(
+            f"a worker name this guard cannot read: {name}, from {module_name} ({exc})"
+        ) from exc
 
 
 def _names(
@@ -389,6 +396,36 @@ def test_a_first_use_import_the_start_cannot_see_fails_in_the_guards_words(shape
     as the start's, where it would raise ``NameError``. Each is a name the guard cannot read."""
     with pytest.raises(AssertionError, match="cannot read"):
         started_workers(UNREADABLE_IMPORTS[shape], {})
+
+
+def test_the_last_first_use_import_of_a_name_is_the_one_read() -> None:
+    """Review of #45 (#3931): Python binds a name its last import made, and the guard read
+    the first. A start after two imports of one name is read as the second's."""
+    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER
+
+    source = (
+        "def go(self):\n"
+        "    from aisquare.cli.ui.views.usage_stats import LOAD_WORKER as NAME\n"
+        "    from aisquare.cli.ui.views.usage_sharing import SHIP_WORKER as NAME\n"
+        "\n"
+        "    self.run_worker(job, name=NAME, thread=True)\n"
+    )
+    assert started_workers(source, {}) == {SHIP_WORKER}
+
+
+def test_an_import_the_guard_cannot_make_says_why() -> None:
+    """Review of #45 (#3931): the guard's "cannot read" for an import it cannot make kept
+    back why; it says the module and what the import raised."""
+    source = (
+        "def go(self):\n"
+        "    from aisquare.no_such_module import SHIP_WORKER\n"
+        "\n"
+        "    self.run_worker(job, name=SHIP_WORKER, thread=True)\n"
+    )
+    with pytest.raises(AssertionError, match="cannot read") as failed:
+        started_workers(source, {})
+    assert "aisquare.no_such_module" in str(failed.value)
+    assert isinstance(failed.value.__cause__, ModuleNotFoundError)
 
 
 def test_a_first_use_import_anywhere_in_the_starts_own_body_is_read() -> None:

@@ -723,6 +723,89 @@ def test_a_quit_while_remote_waits_for_the_one_turning_off_is_not_held_by_the_wa
     assert server.calls.count("start_remote_server") == 1
 
 
+def test_a_wait_whose_look_passes_as_rlx_quits_brings_nothing_up(
+    script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #45 (#3931), the reviewer's probe: the wait looks at the cancel only while a
+    look fails, so a look that passes just before Textual's cancel at the quit still hops to
+    the UI thread as rlx goes. That hop started the new Remote after its own shutdown, and it
+    served on after the run. Here the old one's write lands as the quit cancels the workers,
+    the wait hops before the cancel, and the hop lands as rlx goes: nothing comes up."""
+    server, made = _one_server(monkeypatch)
+    hopping = threading.Event()
+    landed: list[bool] = []
+
+    async def body(pilot: Pilot[None]) -> None:
+        app = fleet_app(pilot)
+        first = await _a_write_in_flight(pilot, made)
+        app.post_message(RemoteSwitched(False))
+        app.post_message(RemoteSwitched(True))
+        await _until(pilot, lambda: len(made) == 2 and _waiting(app), "the wait running")
+        hop, restore, cancel_all = (
+            app._from_its_thread,
+            app._restore_if_current,
+            app.workers.cancel_all,
+        )
+
+        def hopped(then: Callable[[RemoteController], None], remote: RemoteController) -> None:
+            hopping.set()
+            hop(then, remote)
+
+        def restoring(remote: RemoteController) -> None:
+            landed.append(app.is_running)
+            restore(remote)
+
+        def cancelling() -> None:  # the quit's cancel, on the UI thread
+            server.held.set()
+            assert first.writes_done(10) and first.wait_until_off(10), "the old one never off"
+            assert hopping.wait(10), "the wait's look passed, yet it never hopped"
+            cancel_all()
+
+        monkeypatch.setattr(app, "_from_its_thread", hopped)
+        monkeypatch.setattr(app, "_restore_if_current", restoring)
+        monkeypatch.setattr(app.workers, "cancel_all", cancelling)
+
+    ui_suite.drive(body)
+    assert landed == [False], "the hop landed, as rlx went"
+    assert not made[1].remote_serving, "a Remote started after rlx quit"
+    assert _starts_after_the_last_stop(server) == 0
+
+
+def test_the_r_panels_switch_waits_for_a_remote_still_turning_off_too(
+    script: Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #45 (#3931): Remote's own switch in the R panel started the new Remote beside
+    the one Settings' Experimental switch had turned off a moment before, its write still in
+    flight: a press waited only for its own Remote's stopping. It waits for that one too now,
+    a moment at most, and says Remote is still turning off, as for its own; once the old one
+    is off, the new one comes up, one start after the last stop."""
+    server, made = _one_server(monkeypatch)
+
+    async def body(pilot: Pilot[None]) -> dict[str, object]:
+        app = fleet_app(pilot)
+        await _a_write_in_flight(pilot, made)
+        app.post_message(RemoteSwitched(False))
+        app.post_message(RemoteSwitched(True))
+        await _until(pilot, lambda: len(made) == 2 and _waiting(app), "the wait running")
+        second = made[1]
+        second.turn_on(wait=False)  # the panel's switch pressed on (RemotePanel.on_switch_changed)
+        pressed = (second.remote_serving, second.message)
+        server.held.set()
+        await _until(pilot, lambda: second.remote_serving, "the second Remote serving")
+        await settle_page(app)
+        return {
+            "the press": pressed,
+            "server running": server.running,
+            "starts after the last stop": _starts_after_the_last_stop(server),
+        }
+
+    assert drive(body) == {
+        "the press": (False, remote_control.STILL_TURNING_OFF),
+        "server running": True,
+        "starts after the last stop": 1,
+    }
+
+
 # --- the rlx service ---------------------------------------------------------------------------
 
 _SERVICE_PART = textwrap.dedent(
