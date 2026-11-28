@@ -432,3 +432,46 @@ def test_a_page_s_re_read_of_what_is_on_disk_answers_the_value_in_flight() -> No
     cleared, asked = drive_late(go)
     assert cleared is None
     assert asked == ["new", "newer", "newer"]
+
+
+def test_keep_leaves_text_typed_since_and_shows_what_it_answers() -> None:
+    """#56: an earlier save's answer keeps its value (``kept``) but does not replace text typed
+    in the field since: that is the person's. What it answers (the value in flight, here
+    normalised) and a field showing the value kept (Undo's keep) are shown as before."""
+
+    async def go(pilot: Any, app: LateHost, page: LatePage) -> dict[str, Any]:
+        field = page.query_one(CommitInput)
+        field.focus()
+        await pilot.pause()
+        field.value = "new"
+        await pilot.press("enter")
+        await pilot.pause()
+        field.value = "typed"  # typed after Enter, not committed
+        page.land()
+        seen: dict[str, Any] = {"typing": (field.value, field.kept)}
+        field.value = " padded "
+        await pilot.press("enter")
+        await pilot.pause()
+        field.keep("padded")  # the store's own spelling of the value it answers
+        seen["answered"] = (field.value, field.kept)
+        field.keep("old")  # Undo's: the field shows what was kept
+        seen["undone"] = (field.value, field.kept)
+        return seen
+
+    seen = drive_late(go)
+    assert seen["typing"] == ("typed", "new"), "the typed text stays; the value is kept"
+    assert seen["answered"] == ("padded", "padded")
+    assert seen["undone"] == ("old", "old")
+
+
+def test_undos_keep_shows_its_value_over_text_typed_since() -> None:
+    """#3597: Undo's keep (``over_typing``) shows the value it puts back over text typed in the
+    field since; a save's keep leaves that text (the test above)."""
+
+    async def go(pilot: Any, app: Host, page: Page) -> tuple[str, str]:
+        field = page.query_one(CommitInput)
+        field.value = "half-typed"
+        field.keep("old", over_typing=True)
+        return field.value, field.kept
+
+    assert drive(go) == ("old", "old")
