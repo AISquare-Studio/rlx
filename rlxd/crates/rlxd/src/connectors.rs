@@ -163,6 +163,18 @@ impl Connectors {
         self.call_route
     }
 
+    /// What the cache says of `connector`'s `tool`: its `read_only_hint`, or `None` when
+    /// the cache doesn't list that tool of that connector.
+    pub fn read_only_hint(&self, connector: &str, tool: &str) -> Option<Option<bool>> {
+        let cache = self.cache();
+        cache
+            .connectors
+            .iter()
+            .find(|c| c.id == connector)
+            .and_then(|c| c.tools.iter().find(|t| t.name == tool))
+            .map(|t| t.read_only_hint)
+    }
+
     /// The gate's times.
     pub fn gate_times(&self) -> GateTimes {
         self.gate

@@ -77,6 +77,9 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "__test-hook",
         "RLXD_TEST_HOOK",
         "RLXD_TEST_FAIL_LEDGER",
+        "RLXD_TEST_CONNECTORS_CALL",
+        "RLXD_TEST_CALL_WAIT_MS",
+        "RLXD_TEST_CALL_DEADLINE_MS",
     ] {
         let found = bytes
             .windows(needle.len())
@@ -91,6 +94,28 @@ fn check_7_a_release_build_has_no_debug_methods() {
         .filter(|w| *w == needle.as_bytes())
         .count();
     assert_eq!(found, 0, "{needle} is in the release build");
+
+    // connectors.call is served, but has no route until the probe confirms it (5.3): no
+    // capability, and no_route, even with the test build's switch set.
+    let release = TestHome::new()
+        .with_binary(release_rlxd())
+        .with_env("RLXD_TEST_CONNECTORS_CALL", "1");
+    release.start();
+    let capabilities = release.status()["capabilities"].clone();
+    assert!(
+        !capabilities
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "connectors.call"),
+        "{capabilities}"
+    );
+    let call = release.rlxd(&[
+        "call",
+        "connectors.call",
+        r#"{"run_id":"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f","connector":"claude.ai GitHub","tool":"mcp__claude_ai_GitHub__get_check_runs","input":{}}"#,
+    ]);
+    assert_eq!(call.error_code(), "no_route", "{call:?}");
 
     let test_build = TestHome::new();
     test_build.start();

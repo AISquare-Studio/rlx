@@ -509,7 +509,7 @@ impl Runner {
     /// its answer. An allow whose entry can't be written is a deny `by: "rlxd"` instead
     /// (the pinned call stays used): never an allow without its entry on disk.
     #[allow(clippy::too_many_arguments)]
-    fn decide_now(
+    pub(super) fn decide_now(
         &self,
         run: &Run,
         inner: &mut RunInner,

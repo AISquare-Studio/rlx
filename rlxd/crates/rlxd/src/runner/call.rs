@@ -14,12 +14,21 @@
 //!   end the run `failed {reason: "connectors"}`, as does its wait running out). Its rows
 //!   are what the gate's rules decide by: each tool, named as Claude Code names it, and its
 //!   read-only hint, which `mcp_status` gives as `readOnly: true` or nothing.
+//! - **rlxd's own rules first**, before anything is sent ([`gate::rlxd_rule`] on that
+//!   listing: the mount and the tool's one claude.ai server, kind `watch` so the tool must
+//!   be read-only, the pinned call). One that denies is a deny `by: "rlxd"` in the ledger
+//!   (under [`RLXD_CALL_ID`], as Claude Code has named no call yet), and no `mcp_call` is
+//!   sent: whatever might let Claude Code skip its ask, a call of a tool rlxd's rules deny
+//!   never reaches it. A tool the connectors' cache already knows is not read-only is
+//!   denied so before Claude Code is even started.
 //! - **One `mcp_call`**, always with `check_permissions: true` (without it, Claude Code
 //!   runs the call past every check). Claude Code asks `can_use_tool`, which goes to the
-//!   gate's own path ([`Runner::decide_call`]): rlxd's rules, then the app, then the
+//!   gate's own path ([`Runner::decide_call`]): rlxd's rules again, then the app, then the
 //!   ledger. An allow answers with `updatedInput` = the pinned input, always, never what
 //!   the request carried; a deny with its reason. A call that comes back with no
-//!   `can_use_tool` first is a failure, and its content is dropped.
+//!   `can_use_tool` first (or after a deny) is a failure: its content is dropped, the
+//!   ledger keeps it (`by: "rlxd"`, `unknown`, or `error` when Claude Code said it
+//!   failed), and rlxd's log names what can skip the ask.
 //! - **Its result** goes to the ledger (`ok` or `error`), to `run.tool_result`, and for a
 //!   watch job to the scheduler; the run ends `run.done {num_turns: 0}`, or `run.failed
 //!   {reason: "denied"}` on a deny.
@@ -32,13 +41,18 @@
 //! empty folder of the run's own ([`store::RunDir::create_call_dir`]), private, which rlxd
 //! writes nothing into: no project settings either. Before Claude Code starts, and again
 //! before the call is sent, rlxd checks that folder holds no `.claude/settings.json` or
-//! `.claude/settings.local.json`; one there fails the run (`error`) and the call is
-//! `untrusted_settings`, with no call made. A call that comes back with no `can_use_tool`
-//! all the same still fails (above).
+//! `.claude/settings.local.json`, and fails closed: anything but "not there" (a file, a
+//! folder, a link, an error reading it) fails the run (`error`) and the call is
+//! `untrusted_settings`, with no call made. These checks are of a moment: a file planted
+//! and removed between them, or after the second, is not seen, so a call that comes back
+//! with no `can_use_tool` all the same still fails (above). Settings Claude Code reads
+//! whatever rlxd passes (an organisation's managed policy) are its user's own control;
+//! rlxd's rules before the call, and that check after it, are what holds there.
 //!
 //! Everything read is bounded: each line ([`MAX_LINE`]), each wait (for `initialize`'s
-//! reply, the connector, the `can_use_tool`, the result: [`Times`]), and the run as a
-//! whole (its `timeout_s`, their sum and the app's `deadline_ms`). Each write must be taken
+//! reply, the connector, the `can_use_tool`, at least the app's `deadline_ms` and
+//! [`ASK_SLACK`], and the result, from the moment any answer is given: [`Times`]), and the
+//! run as a whole (its `timeout_s`, their sum). Each write must be taken
 //! within its wait too. Any of them running out, a line too long, or anything Claude Code
 //! does that a no-turn call never does (a model turn, a garbled reply), kills the process
 //! tree.
@@ -47,9 +61,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rlxd_proto::{
-    ConnectorStatus, ConnectorsCallData, ConnectorsCallParams, DecidedBy, Decision, ErrorBody,
-    FailReason, McpServer, Mount, PinnedCall, RunDoneData, RunFailedData, RunId, RunKind, RunRef,
-    RunStartParams, RunStartedData, RunState, RunToolResultData, codes, run_types,
+    CallState, ConnectorStatus, ConnectorsCallData, ConnectorsCallParams, DecidedBy, Decision,
+    ErrorBody, FailReason, McpServer, Mount, PinnedCall, RunDoneData, RunFailedData, RunId,
+    RunKind, RunRef, RunStartParams, RunStartedData, RunState, RunToolResultData, codes, run_types,
 };
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
@@ -85,6 +99,17 @@ const PROMPT: &str = "connectors.call: one call, with no model turn";
 const INIT_ID: &str = "rlxd-initialize";
 const CALL_ID: &str = "rlxd-mcp-call";
 
+/// The ledger's `call_id` for the call when Claude Code named none: denied by rlxd's
+/// rules before it was sent, or made with no `can_use_tool`.
+pub const RLXD_CALL_ID: &str = "rlxd_mcp_call";
+
+/// The ledger's reason for a call Claude Code made with no `can_use_tool`.
+const RAN_UNASKED: &str = "ran_without_can_use_tool: Claude Code made the call without asking \
+                           rlxd's gate";
+
+/// What the wait for `can_use_tool` adds to the app's `deadline_ms`.
+pub const ASK_SLACK: Duration = Duration::from_secs(5);
+
 /// How long each step of a call may take.
 #[derive(Clone, Copy, Debug)]
 pub struct Times {
@@ -117,10 +142,17 @@ impl Times {
         }
     }
 
-    /// The run's `timeout_s`: every step's time and the app's `deadline_ms`, and a
+    /// The wait for the `can_use_tool`, once the call is sent: at least the app's
+    /// `deadline_ms` and [`ASK_SLACK`].
+    fn ask_wait(&self, deadline_ms: u64) -> Duration {
+        self.ask
+            .max(Duration::from_millis(deadline_ms).saturating_add(ASK_SLACK))
+    }
+
+    /// The run's `timeout_s`: every step's wait, the app's `deadline_ms` to decide, and a
     /// little more, so a step's own wait, not the run's, says which step ran out.
     fn timeout_s(&self, deadline_ms: u64) -> u64 {
-        let steps = self.init + self.connect + self.ask + self.result;
+        let steps = self.init + self.connect + self.ask_wait(deadline_ms) + self.result;
         steps.as_secs() + deadline_ms.div_ceil(1000) + 5
     }
 }
@@ -229,6 +261,9 @@ impl Runner {
             input_sha256: jcs::sha256(&input),
         });
         start.persist_session = Some(false);
+        if let Some(ms) = test_deadline_ms() {
+            start.deadline_ms = ms;
+        }
         start.timeout_s = Some(Times::get().timeout_s(start.deadline_ms));
         check_start(&start)?;
         let (job_id, loud, watch_job) = match job {
@@ -306,6 +341,21 @@ impl Runner {
         let ending = run.inner().ending;
         if let Some(reason) = ending {
             return ended_early(run, reason);
+        }
+        // A tool rlxd already knows is not read-only: denied before Claude Code starts.
+        if let (Some(pinned), Mount::Connectors { connectors }) =
+            (&params.pinned_call, &params.mount)
+            && connectors.iter().any(|connector| {
+                self.connectors.read_only_hint(connector, &pinned.tool) == Some(Some(false))
+            })
+        {
+            let reason = format!(
+                "a watch run makes read calls only, and {} is not read-only, as the \
+                 connectors' cache knows it",
+                pinned.tool
+            );
+            self.deny_unsent(run, call, &reason);
+            return denied_end(call);
         }
         let times = Times::get();
         let timeout_s = params
@@ -408,19 +458,7 @@ impl Runner {
                 done.loud = run.loud;
                 End::Done(done)
             }
-            Driven::Denied => {
-                let reason = match call.outcome() {
-                    Some(Outcome::Denied { by, reason, .. }) => {
-                        format!("the call was denied by {}: {reason}", by.as_str())
-                    }
-                    _ => "the call was denied".to_owned(),
-                };
-                End::Failed(RunFailedData::new(
-                    FailReason::Denied,
-                    reason,
-                    String::new(),
-                ))
-            }
+            Driven::Denied => denied_end(call),
             Driven::NoRoute(message) => {
                 call.set(Outcome::NoRoute(message.clone()));
                 failed(message)
@@ -552,7 +590,7 @@ impl Runner {
                 return Driven::Ended(reason);
             }
         };
-        {
+        let refused = {
             let mut inner = run.inner();
             let mut tools: Vec<String> = listed.tools.iter().cloned().collect();
             tools.sort();
@@ -560,6 +598,18 @@ impl Runner {
             let data =
                 RunStartedData::new(cwd.display().to_string(), "", "").with_tools(tools, servers);
             self.emit(run, &mut inner, run_types::STARTED, &data);
+            // rlxd's own rules, before anything is sent (the module's doc).
+            gate::rlxd_rule(
+                &run.params,
+                inner.pinned_call_used,
+                &inner.listed,
+                &pinned.tool,
+                &pinned.input_sha256,
+            )
+        };
+        if let Some(reason) = refused {
+            self.deny_unsent(run, call, &reason);
+            return Driven::Denied;
         }
         // Nothing planted since Claude Code started: no rule or hook can skip the ask.
         if let Some(path) = blocking(|| untrusted(cwd)) {
@@ -571,7 +621,7 @@ impl Runner {
             "request": {"subtype": "mcp_call", "tool": pinned.tool, "arguments": input,
                 "check_permissions": true, "result_not_for_model": true,
                 "soft_error_result": true}});
-        let mut until = Instant::now() + times.ask;
+        let mut until = Instant::now() + times.ask_wait(run.params.deadline_ms);
         if let Err(driven) = channel.write(&mcp_call, until, "take the call").await {
             return driven;
         }
@@ -619,11 +669,11 @@ impl Runner {
                     };
                     let response = json!({"type": "control_response", "response": {
                         "subtype": "success", "request_id": request_id, "response": answer}});
+                    // Answered, allow or deny, however long the app took: the result's
+                    // wait (or the deny's reply) starts now.
+                    until = Instant::now() + times.result;
                     if let Err(driven) = channel.write(&response, until, "take the answer").await {
                         return driven;
-                    }
-                    if allowed.is_some() {
-                        until = Instant::now() + times.result;
                     }
                 }
                 Message::Asked {
@@ -694,41 +744,59 @@ impl Runner {
         denied: bool,
         result: Result<Value, String>,
     ) -> Driven {
-        let Some(call_id) = allowed else {
-            return match result {
-                Ok(_) if denied => {
-                    warning!(
-                        "run {}: Claude Code made the call the gate denied: its content is \
-                         dropped",
-                        run.params.run_id
-                    );
-                    Driven::Broken(
-                        "Claude Code made the call rlxd's gate denied: its content is dropped"
-                            .to_owned(),
-                    )
-                }
-                Err(_) if denied => Driven::Denied,
-                Ok(_) => {
-                    warning!(
-                        "run {}: Claude Code made the call with no can_use_tool: its content \
-                         is dropped",
-                        run.params.run_id
-                    );
-                    Driven::Broken(
-                        "Claude Code made the call without asking rlxd's gate (it did not \
-                         honour check_permissions): its content is dropped"
-                            .to_owned(),
-                    )
-                }
-                Err(error) => Driven::Broken(format!("Claude Code did not make the call: {error}")),
-            };
-        };
         let tool = run
             .params
             .pinned_call
             .as_ref()
             .map(|pinned| pinned.tool.clone())
             .unwrap_or_default();
+        let Some(call_id) = allowed else {
+            return match result {
+                Err(_) if denied => Driven::Denied,
+                Ok(_) if denied => {
+                    // It ran all the same: the ledger's deny says it may have.
+                    if let Some(Outcome::Denied { call_id, .. }) = call.outcome() {
+                        let mut inner = run.inner();
+                        self.ran_anyway(run, &mut inner, &call_id, CallState::Unknown);
+                    }
+                    warning!(
+                        "run {}: Claude Code made the call of {tool} that rlxd's gate denied: \
+                         its content is dropped. A rule or hook rlxd does not control (an \
+                         organisation's managed settings) may allow it",
+                        run.params.run_id
+                    );
+                    Driven::Broken(format!(
+                        "Claude Code made the call of {tool} that rlxd's gate denied: its \
+                         content is dropped"
+                    ))
+                }
+                unasked => {
+                    let state = if unasked.is_ok() {
+                        CallState::Unknown
+                    } else {
+                        CallState::Error
+                    };
+                    self.record_unasked(run, call, state);
+                    warning!(
+                        "run {}: Claude Code made the call of {tool} with no can_use_tool, so \
+                         the app never decided it: its content is dropped. Either a rule or \
+                         hook rlxd does not control allowed it (an organisation's managed \
+                         settings), or this Claude Code does not honour check_permissions",
+                        run.params.run_id
+                    );
+                    Driven::Broken(match unasked {
+                        Ok(_) => format!(
+                            "Claude Code made the call of {tool} without asking rlxd's gate: its \
+                             content is dropped"
+                        ),
+                        Err(error) => format!(
+                            "Claude Code did not make the call, and did not ask rlxd's gate: \
+                             {error}"
+                        ),
+                    })
+                }
+            };
+        };
         let mut inner = run.inner();
         let (content, is_error, failure) = match result {
             Ok(result) => {
@@ -771,6 +839,92 @@ impl Runner {
         );
         Driven::Ran
     }
+}
+
+impl Runner {
+    /// Denies the run's call `by: "rlxd"` for `reason` before it is sent: into the ledger
+    /// (under [`RLXD_CALL_ID`]) and the stream (`run.tool_decided`).
+    fn deny_unsent(&self, run: &Run, call: &CallRun, reason: &str) {
+        let Some(pinned) = &run.params.pinned_call else {
+            return;
+        };
+        let mut inner = run.inner();
+        let unsent = Call::new(
+            RLXD_CALL_ID.to_owned(),
+            pinned.tool.clone(),
+            Value::Object(call.input.clone()),
+        );
+        let taken = self.decide_now(
+            run,
+            &mut inner,
+            &unsent,
+            Decision::Deny,
+            DecidedBy::Rlxd,
+            reason,
+            None,
+        );
+        drop(inner);
+        info!(
+            "run {}: rlxd's rules deny the call, which is not sent: {reason}",
+            run.params.run_id
+        );
+        call.set(Outcome::Denied {
+            call_id: RLXD_CALL_ID.to_owned(),
+            by: taken.by,
+            reason: taken.reason,
+        });
+    }
+
+    /// Keeps a call Claude Code made with no `can_use_tool` in the ledger: `by: "rlxd"`
+    /// (no one allowed it), in `state`.
+    fn record_unasked(&self, run: &Run, call: &CallRun, state: CallState) {
+        let Some(pinned) = &run.params.pinned_call else {
+            return;
+        };
+        let mut inner = run.inner();
+        let unasked = Call::new(
+            RLXD_CALL_ID.to_owned(),
+            pinned.tool.clone(),
+            Value::Object(call.input.clone()),
+        );
+        self.decide_now(
+            run,
+            &mut inner,
+            &unasked,
+            Decision::Deny,
+            DecidedBy::Rlxd,
+            RAN_UNASKED,
+            None,
+        );
+        self.ran_anyway(run, &mut inner, RLXD_CALL_ID, state);
+    }
+
+    /// Notes in the ledger that the call `call_id`, which no allow let run, ran all the same
+    /// (`state`: `unknown`, or `error`).
+    fn ran_anyway(&self, run: &Run, inner: &mut super::RunInner, call_id: &str, state: CallState) {
+        if let Some(entry) = inner.calls.iter_mut().find(|c| c.call_id == call_id) {
+            entry.state = state;
+        }
+        let record = run.record(inner);
+        if let Err(e) = blocking(|| run.dir.write_record(&record)) {
+            warning!("run {}: the ledger was not written: {e}", run.params.run_id);
+        }
+    }
+}
+
+/// The end of a call's run its deny ended: `failed {reason: "denied"}`.
+fn denied_end(call: &CallRun) -> End {
+    let reason = match call.outcome() {
+        Some(Outcome::Denied { by, reason, .. }) => {
+            format!("the call was denied by {}: {reason}", by.as_str())
+        }
+        _ => "the call was denied".to_owned(),
+    };
+    End::Failed(RunFailedData::new(
+        FailReason::Denied,
+        reason,
+        String::new(),
+    ))
 }
 
 /// `connectors.call`'s reply, from how its run ended.
@@ -835,12 +989,18 @@ fn reply(
 const PROJECT_SETTINGS: [&str; 2] = ["settings.json", "settings.local.json"];
 
 /// The first settings file in the call's working folder `cwd`, which rlxd writes none of:
-/// `None` when there is none.
+/// `None` when there is none. It fails closed: any answer but "not there" (anything there,
+/// or an error reading it) is one.
 fn untrusted(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     PROJECT_SETTINGS
         .iter()
         .map(|name| cwd.join(".claude").join(name))
-        .find(|path| std::fs::symlink_metadata(path).is_ok())
+        .find(|path| {
+            !matches!(
+                std::fs::symlink_metadata(path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            )
+        })
 }
 
 fn untrusted_message(path: &std::path::Path) -> String {
@@ -1080,6 +1240,20 @@ fn test_wait() -> Option<Duration> {
     None
 }
 
+/// Test builds only: `RLXD_TEST_CALL_DEADLINE_MS` is a call run's `deadline_ms`, the app's
+/// time to decide.
+#[cfg(feature = "debug-methods")]
+fn test_deadline_ms() -> Option<u64> {
+    std::env::var("RLXD_TEST_CALL_DEADLINE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+}
+
+#[cfg(not(feature = "debug-methods"))]
+fn test_deadline_ms() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1161,6 +1335,14 @@ mod tests {
             std::fs::remove_dir(&path).unwrap();
         }
         assert_eq!(untrusted(&dir), None);
+        // It fails closed: a .claude that is a file can't be read as a folder, and is
+        // refused all the same.
+        std::fs::remove_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude"), "x").unwrap();
+        assert_eq!(
+            untrusted(&dir),
+            Some(dir.join(".claude").join("settings.json"))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1172,8 +1354,11 @@ mod tests {
             ask: Duration::from_secs(30),
             result: Duration::from_secs(60),
         };
-        assert_eq!(times.timeout_s(120_000), 135 + 120 + 5);
-        assert_eq!(times.timeout_s(1), 135 + 1 + 5);
+        // The ask waits the app's deadline and the slack: 125 s for 120 s.
+        assert_eq!(times.ask_wait(120_000), Duration::from_secs(125));
+        assert_eq!(times.ask_wait(1), Duration::from_secs(30));
+        assert_eq!(times.timeout_s(120_000), 15 + 30 + 125 + 60 + 120 + 5);
+        assert_eq!(times.timeout_s(1), 15 + 30 + 30 + 60 + 1 + 5);
     }
 
     #[test]

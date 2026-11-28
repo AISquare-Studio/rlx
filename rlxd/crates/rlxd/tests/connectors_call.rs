@@ -17,7 +17,7 @@ use std::process::Child;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::runs::{fixture_log, home_with, run_id, seq};
+use common::runs::{fixture_log, home_with, link, run_id, seq};
 use common::{TestHome, assert_valid, finish};
 use serde_json::{Value, json};
 
@@ -64,6 +64,30 @@ fn home(scenario: &str, envs: &[(&str, &str)]) -> TestHome {
     let mut all = vec![ON];
     all.extend_from_slice(envs);
     let home = home_with(scenario, &all);
+    common::eventually("the pairing call is gone", || home.app_clients() == 0);
+    home
+}
+
+/// [`home`], its connectors' cache planted first: `cache` as `connectors.json` holds it.
+fn home_with_cache(scenario: &str, cache: &Value) -> TestHome {
+    let home = TestHome::new();
+    let claude = link(home.root(), scenario);
+    let config = home.root().join("claude-config");
+    let user = home.root().join("user-home");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    let rlxd = home.root().join("rlxd");
+    std::fs::create_dir_all(&rlxd).unwrap();
+    std::fs::write(rlxd.join("connectors.json"), cache.to_string()).unwrap();
+    let home = home
+        .with_claude(claude)
+        .with_env(ON.0, ON.1)
+        .with_env("CLAUDE_CONFIG_DIR", config.to_str().unwrap())
+        .with_env("HOME", user.to_str().unwrap())
+        .with_env("USERPROFILE", user.to_str().unwrap());
+    home.start_dev();
+    let paired = home.rlxd(&["call", "--as-app", "status"]);
+    assert_eq!(paired.code(), Some(0), "{paired:?}");
     common::eventually("the pairing call is gone", || home.app_clients() == 0);
     home
 }
@@ -439,12 +463,68 @@ fn a_write_tool_is_denied_by_rlxd_before_the_app_sees_it() {
             .contains("not marked read-only"),
         "{detail}"
     );
-    let events = replay(&home, since);
+    assert_eq!(detail["call_id"], "rlxd_mcp_call");
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
     assert!(
         of(&events, &r, Some("run.tool_call")).is_empty(),
         "{events:#?}"
     );
-    assert_eq!(the_start(&home)["tool_runs"], 0);
+    let decided = one(&events, &r, "run.tool_decided");
+    assert_eq!(decided["data"]["by"], "rlxd");
+    assert_eq!(one(&events, &r, "run.failed")["data"]["reason"], "denied");
+    // rlxd's rules ran before anything was sent: Claude Code never got the call.
+    let start = the_start(&home);
+    assert!(requests(&start, "mcp_call").is_empty(), "{start:#}");
+    assert_eq!(start["tool_runs"], 0);
+    let calls = ledger(&home, &r);
+    assert_eq!(calls.len(), 1, "{calls:#?}");
+    assert_eq!(calls[0]["call_id"], "rlxd_mcp_call");
+    assert_eq!(calls[0]["tool"], WRITE);
+    assert_eq!(calls[0]["decision"], "deny");
+    assert_eq!(calls[0]["by"], "rlxd");
+}
+
+#[test]
+fn a_write_tool_never_reaches_a_claude_code_that_would_skip_its_ask() {
+    // mcp-direct-unasked runs any call it is sent with no can_use_tool, as a Claude Code
+    // whose managed settings allowed it would: rlxd's rules must keep the call from it.
+    let home = home("mcp-direct-unasked", &[]);
+    let r = run_id();
+    let run = call(&home, &params(&r, WRITE, &json!({"title": "x"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "denied", "{run:?}");
+    assert_eq!(detail["by"], "rlxd");
+    let start = the_start(&home);
+    assert!(requests(&start, "mcp_call").is_empty(), "{start:#}");
+    assert_eq!(start["tool_runs"], 0, "{start:#}");
+}
+
+#[test]
+fn a_tool_the_cache_knows_writes_is_denied_before_claude_code_starts() {
+    let cache = json!({"as_of": "2026-11-27T00:00:00.000Z", "connectors": [
+        {"id": GITHUB, "source": "claude.ai", "status": "connected", "tools": [
+            {"name": READ, "read_only_hint": true},
+            {"name": WRITE, "read_only_hint": false}]}]});
+    let home = home_with_cache("mcp-direct", &cache);
+    let since = seq(&home);
+    let r = run_id();
+    let run = call(&home, &params(&r, WRITE, &json!({"title": "x"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "denied", "{run:?}");
+    assert_eq!(detail["by"], "rlxd");
+    assert!(
+        detail["reason"].as_str().unwrap().contains("not read-only"),
+        "{detail}"
+    );
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    assert_eq!(one(&events, &r, "run.failed")["data"]["reason"], "denied");
+    assert_eq!(ledger(&home, &r)[0]["by"], "rlxd");
+    // No Claude Code was started for it.
+    assert!(!home.root().join("fake-claude.log.json").exists());
 }
 
 #[test]
@@ -471,6 +551,73 @@ fn the_allow_answers_with_the_pinned_input_never_the_requests() {
     assert_eq!(*updated, input, "{start:#}");
     assert!(updated["n"].is_u64(), "{updated}");
     assert_eq!(start["tool_inputs"], json!([input]));
+}
+
+#[test]
+fn a_deny_that_comes_after_the_steps_waits_still_ends_denied() {
+    // Each step waits 1.5 s; the app takes 3 s. The deny is the run's end all the same.
+    let home = home("mcp-direct", &[("RLXD_TEST_CALL_WAIT_MS", "1500")]);
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = run_id();
+    let reply = call_in_background(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let events = wait_until(&home, since, "the call reaches the app", |e| {
+        !of(e, &r, Some("run.tool_call")).is_empty()
+    });
+    let call_id = one(&events, &r, "run.tool_call")["data"]["call_id"].clone();
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(decide(&home, &r, &call_id, "deny").code(), Some(0));
+    let run = finish(reply);
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "denied", "{run:?}");
+    assert_eq!(detail["by"], "app");
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    assert_eq!(one(&events, &r, "run.failed")["data"]["reason"], "denied");
+    // It ended as Claude Code ended it, not killed.
+    let start = the_start(&home);
+    assert_eq!(start["exit"], 0, "{start:#}");
+}
+
+#[test]
+fn a_deny_by_timeout_ends_the_run_failed_denied() {
+    // The app has 3 s to decide, each step waits 1.5 s, and the app never answers.
+    let home = home(
+        "mcp-direct",
+        &[
+            ("RLXD_TEST_CALL_WAIT_MS", "1500"),
+            ("RLXD_TEST_CALL_DEADLINE_MS", "3000"),
+        ],
+    );
+    let _app = App::open(&home);
+    let since = seq(&home);
+    let r = run_id();
+    let began = Instant::now();
+    let run = call(&home, &params(&r, READ, &json!({"ref": "main"})));
+    let (code, detail) = refusal(&run);
+    assert_eq!(code, "denied", "{run:?}");
+    assert_eq!(detail["by"], "timeout", "{run:?}");
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        began.elapsed()
+    );
+    let events = wait_until(&home, since, "the run ends", |e| {
+        !of(e, &r, Some("run.failed")).is_empty()
+    });
+    let failed = one(&events, &r, "run.failed");
+    assert_eq!(failed["data"]["reason"], "denied", "{failed}");
+    assert_eq!(
+        one(&events, &r, "run.tool_call")["data"]["deadline_ms"],
+        3000
+    );
+    let calls = ledger(&home, &r);
+    assert_eq!(calls[0]["by"], "timeout");
+    assert_eq!(calls[0]["decision"], "deny");
+    let start = the_start(&home);
+    assert_eq!(start["tool_runs"], 0, "{start:#}");
+    assert_eq!(start["control_answers"][0]["response"]["behavior"], "deny");
 }
 
 // --- No route, and what rlxd does not trust -----------------------------------------------
@@ -512,7 +659,8 @@ fn a_call_made_without_can_use_tool_is_a_failure_and_its_content_is_dropped() {
     let (code, detail) = refusal(&run);
     assert_eq!(code, "call_failed", "{run:?}");
     assert_eq!(detail["reason"], "error");
-    assert!(!run.stdout.contains("check_runs"), "{run:?}");
+    // Nothing of content.json's (its head_sha) is in the reply.
+    assert!(!run.stdout.contains("3d9a1b7"), "{run:?}");
     let events = wait_until(&home, since, "the run ends", |e| {
         !of(e, &r, Some("run.failed")).is_empty()
     });
@@ -525,7 +673,13 @@ fn a_call_made_without_can_use_tool_is_a_failure_and_its_content_is_dropped() {
         "{failed}"
     );
     assert!(of(&events, &r, Some("run.tool_result")).is_empty());
-    assert!(ledger(&home, &r).is_empty());
+    // The ledger keeps it: no one allowed it, and it may have run.
+    let calls = ledger(&home, &r);
+    assert_eq!(calls.len(), 1, "{calls:#?}");
+    assert_eq!(calls[0]["call_id"], "rlxd_mcp_call");
+    assert_eq!(calls[0]["by"], "rlxd");
+    assert_eq!(calls[0]["state"], "unknown");
+    assert_eq!(the_start(&home)["tool_runs"], 1);
 }
 
 #[test]
