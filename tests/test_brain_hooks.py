@@ -54,9 +54,13 @@ PAYLOADS: dict[str, dict[str, Any]] = {
 }
 
 #: Where each environment's transcript is in its home: the Stop reads it for the turn's
-#: usage, and its path names the account slot it ran on.
+#: usage, and its path names the account slot it ran on. A managed slot's folder names its
+#: slot itself; the plain home is the one the plain copies name (``plain_vars``), so a hook
+#: not sent them records another slot (tester round 3, N2).
 TRANSCRIPT = "transcripts/t1.jsonl"
 SLOT_TRANSCRIPT = "claude-accounts/2/projects/-proj/t1.jsonl"
+PLAIN_HOME = "plain-claude"
+PLAIN_TRANSCRIPT = f"{PLAIN_HOME}/projects/-proj/t1.jsonl"
 
 #: Columns whose values are times, durations or fresh ids, the same nowhere twice.
 _MASKED = {"id", "trace_id", "wall_ms", "round_trip_ms", "server_ms"}
@@ -194,7 +198,7 @@ def template(tmp_path: Path) -> tuple[Path, Path]:
         check=True,
         capture_output=True,
     )
-    for where in (TRANSCRIPT, SLOT_TRANSCRIPT):
+    for where in (TRANSCRIPT, SLOT_TRANSCRIPT, PLAIN_TRANSCRIPT):
         (home / where).parent.mkdir(parents=True, exist_ok=True)
         (home / where).write_text(_transcript_lines(project), encoding="utf-8")
     return home, project
@@ -253,13 +257,49 @@ def _rows(home: Path) -> dict[str, list[dict[str, Any]]]:
     return dumped
 
 
+#: A column one row has and the other does not.
+_ABSENT = "<absent>"
+
+
+def _differences(
+    brain_rows: dict[str, list[dict[str, Any]]], fresh_rows: dict[str, list[dict[str, Any]]]
+) -> list[str]:
+    """Where the brain's rows (:func:`_rows`) are not a fresh process's, a line each: the table
+    (or ``joins.jsonl``) and row that differ, and in a row each column, with both values. None
+    when they are equal. A loaded CI run once failed the parity test on a bare ``name``, with
+    nothing to say which table it was (tester round 3, N1)."""
+    said: list[str] = []
+    for table in sorted(brain_rows.keys() | fresh_rows.keys()):
+        if table not in fresh_rows or table not in brain_rows:
+            whose = "the brain" if table in brain_rows else "the fresh process"
+            said.append(f"{table}: only {whose} has the table")
+            continue
+        through, fresh = brain_rows[table], fresh_rows[table]
+        for index in range(max(len(through), len(fresh))):
+            if index >= len(fresh):
+                said.append(f"{table} row {index}: only the brain wrote it: {through[index]}")
+            elif index >= len(through):
+                said.append(f"{table} row {index}: only the fresh process wrote it: {fresh[index]}")
+            elif through[index] != fresh[index]:
+                columns = sorted(through[index].keys() | fresh[index].keys())
+                changed = [
+                    f"{column}: brain {through[index].get(column, _ABSENT)!r},"
+                    f" fresh {fresh[index].get(column, _ABSENT)!r}"
+                    for column in columns
+                    if through[index].get(column, _ABSENT) != fresh[index].get(column, _ABSENT)
+                ]
+                said.append(f"{table} row {index}: " + "; ".join(changed))
+    return said
+
+
 def _environments(tmp_path: Path) -> dict[str, dict[str, str]]:
     """Six hooks' environments, each its own role, config dir, agent ids and zone; the
     third names none of them, so whatever an earlier one set must be gone; the fourth and
     fifth name the same relative hub, which every fresh process warns of, so the brain must
-    warn of it in both; the sixth is the fleet's usual agent: traced, and on a managed
-    account slot, whose plain copies (``plain_vars``) tell it from the plain home. ``{home}``
-    is each run's own home, ``{tmp}`` the test's folder."""
+    warn of it in both, and the fifth's transcript is a managed slot's; the sixth is the
+    fleet's usual agent: traced, and on a managed account slot, whose plain copies
+    (``plain_vars``) tell it from the plain home its transcript is in (:func:`_transcript_of`).
+    ``{home}`` is each run's own home, ``{tmp}`` the test's folder."""
     return {
         "a": {
             "AISQUARE_ROLE": "coder",
@@ -288,7 +328,7 @@ def _environments(tmp_path: Path) -> dict[str, dict[str, str]]:
             "AISQUARE_RUN_TRACE_ID": "tr_parity",
             "CLAUDE_CONFIG_DIR": "{home}/claude-accounts/2",
             "CLAUDE_CODE_TMPDIR": "{home}/cache/claude-accounts/2",
-            "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR": "{tmp}/cc-plain",
+            "AISQUARE_PLAIN_CLAUDE_CONFIG_DIR": "{home}/" + PLAIN_HOME,
             "AISQUARE_PLAIN_CLAUDE_CODE_TMPDIR": "{tmp}/cc-plain-tmp",
             "CODEX_HOME": "{home}/codex-accounts/3",
             "AISQUARE_PLAIN_CODEX_HOME": "{tmp}/codex-plain",
@@ -298,7 +338,9 @@ def _environments(tmp_path: Path) -> dict[str, dict[str, str]]:
 
 
 def _transcript_of(name: str, home: Path) -> Path:
-    return home / (SLOT_TRANSCRIPT if name == "f" else TRANSCRIPT)
+    """Environment ``name``'s transcript in ``home``: the slot agent's in the plain home, which
+    only its plain copies name; the fifth's in slot 2's folder; the others' in no home."""
+    return home / {"e": SLOT_TRANSCRIPT, "f": PLAIN_TRANSCRIPT}.get(name, TRANSCRIPT)
 
 
 #: What rlxd's own environment holds that no hook of these does: each must stay out.
@@ -528,7 +570,11 @@ def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
         brain_printed, brain_rows = parity["brain"][name]
         for event in PAYLOADS:
             assert brain_printed[event] == fresh_printed[event], (name, event)
-        assert brain_rows == fresh_rows, name
+        differs = _differences(brain_rows, fresh_rows)
+        assert not differs, f"{name}: the brain's rows are not a fresh process's:\n" + "\n".join(
+            differs
+        )
+        assert brain_rows == fresh_rows, name  # whatever _differences could miss
     # The checks can fail: what each environment says is its own.
     a_start, a_said = _started(parity, "a")
     if a_start is not None:
@@ -545,14 +591,43 @@ def test_every_event_prints_the_same_bytes_and_writes_the_same_rows_both_ways(
         start_err = parity["brain"][name][0]["session-start"][2]
         assert b"RELATIVE" in start_err, f"{name}: the brain warns of the hub each time"
     # The traced agent on slot 2: its join names it and its Run (review #2562 round 2, M1),
-    # and the Stop recorded its turn's usage, on its slot.
+    # and the Stop recorded its turn's usage on the plain slot its transcript is in, which
+    # only its plain copies name: a brain not sent them records no slot (tester round 3, N2).
     f_rows = parity["fresh"]["f"][1]
     assert [
         (join.get("pipeline_id"), join.get("agent_name"), join.get("trace_id"))
         for join in f_rows["joins.jsonl"]
     ] == [("pl_parity", "agent-parity", "tr_parity")]
     assert f_rows["usage_session"], "the Stop read the transcript"
-    assert f_rows["usage_session"][0]["account_slot"] == 2
+    assert f_rows["usage_session"][0]["account_slot"] == 1
+    # A transcript in a managed slot's folder is that slot's.
+    assert parity["fresh"]["e"][1]["usage_session"][0]["account_slot"] == 2
+
+
+def test_rows_that_differ_are_named_by_table_row_and_column() -> None:
+    fresh: dict[str, list[dict[str, Any]]] = {
+        "usage_session": [{"account_slot": 1, "turns": 1}, {"account_slot": 2, "turns": 1}],
+        "prompt": [],
+        "team_session": [{"role": "coder"}],
+    }
+    through_brain: dict[str, list[dict[str, Any]]] = {
+        "usage_session": [{"account_slot": 1, "turns": 1}, {"account_slot": None, "turns": 1}],
+        "prompt": [{"text": "hook-parity-probe"}],
+        "joins.jsonl": [],
+    }
+    assert _differences(through_brain, fresh) == [
+        "joins.jsonl: only the brain has the table",
+        "prompt row 0: only the brain wrote it: {'text': 'hook-parity-probe'}",
+        "team_session: only the fresh process has the table",
+        "usage_session row 1: account_slot: brain None, fresh 2",
+    ]
+    assert _differences({"t": [{"a": 1}]}, {"t": [{"a": 1}, {"b": 2}]}) == [
+        "t row 1: only the fresh process wrote it: {'b': 2}"
+    ]
+    assert _differences({"t": [{"a": 1}]}, {"t": [{"b": 1}]}) == [
+        "t row 0: a: brain 1, fresh '<absent>'; b: brain '<absent>', fresh 1"
+    ]
+    assert _differences(fresh, fresh) == []
 
 
 def test_the_allowlist_is_what_the_hooks_read_and_nothing_else(parity: dict[str, Any]) -> None:
