@@ -362,3 +362,33 @@ fn no_test_can_start_a_real_claude() {
     let own = serde_json::json!({"PATH": home.root().join("bin").to_str().unwrap()}).to_string();
     drop(home.command(&["call", "--as-app", "env.set", &own]));
 }
+
+/// 4.3's Accept, as written: `cargo tree --manifest-path rlxd/Cargo.toml | grep -E
+/// 'security-framework|keyring'` exits 1, as rlx keeps `/usr/bin/security` the only
+/// Keychain reader. Then for every target's normal dependencies (`--target all -e
+/// normal`), which `deny.toml`'s bans hold too.
+#[test]
+fn no_keychain_crate_in_rlxd() {
+    let repo = common::workspace().parent().unwrap().to_path_buf();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    for more in [&[][..], &["--target", "all", "-e", "normal"][..]] {
+        let output = std::process::Command::new(&cargo)
+            .args(["tree", "--manifest-path", "rlxd/Cargo.toml"])
+            .args(more)
+            .current_dir(&repo)
+            .stdin(Stdio::null())
+            .output()
+            .expect("cargo runs");
+        let tree = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && tree.contains("rlxd v"),
+            "cargo tree {more:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let found: Vec<&str> = tree
+            .lines()
+            .filter(|line| line.contains("security-framework") || line.contains("keyring"))
+            .collect();
+        assert!(found.is_empty(), "cargo tree {more:?}: {found:?}");
+    }
+}

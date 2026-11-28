@@ -6,7 +6,9 @@
 //! events`. One rlxd runs per home, on a local socket or named pipe, and a client gets in
 //! with the shared token through `hello`. Every reply is the 7.2 envelope, and
 //! `events.subscribe` streams the home's events. `settings.get`, `settings.set` and
-//! `settings.list` serve the app settings every device shares. `run.start`,
+//! `settings.list` serve the app settings every device shares. rlxd keeps one resident
+//! Python brain running, `rlx brain --stdio` (`brain`), and `hook` hands it the Claude
+//! Code hooks rlxd-hook sends, publishing `hook.*` on the bus (`hooks`). `run.start`,
 //! `run.cancel`, `run.resume`, `run.get`, `run.list` and `run.events` drive the headless
 //! runner and its durable log (2.1, 5.4, 7.5), and `space.ensure` and `space.erase` the
 //! spaces its runs work in (2.5). The PTY host and the rest are later items, each a method on this
@@ -54,6 +56,7 @@ mod events;
 mod files;
 mod gate;
 mod here;
+mod hooks;
 mod host;
 mod listener;
 mod lock;
@@ -192,6 +195,9 @@ enum Action {
         /// The run's attempt.
         #[arg(long)]
         attempt: u64,
+        /// The run's `deadline_ms`, as rlxd-hook's command line carries it: unused here.
+        #[arg(long)]
+        deadline_ms: Option<u64>,
     },
     /// Print the notices of what rlxd carries from others: tmux's ISC licence, for the
     /// parts of rlxd ported from tmux.
@@ -392,6 +398,7 @@ pub fn main() -> ExitCode {
             event,
             run,
             attempt,
+            deadline_ms: _,
         } => test_hook::main(&event, &run, attempt),
         #[cfg(unix)]
         Action::RunGuard { argv } => runner::guard::main(&argv),

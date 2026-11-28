@@ -283,7 +283,7 @@ rlxd call env.get
   `claude_not_found` when no `claude` was found where rlxd looked, and
   `claude_not_runnable` when the one found is a batch file. The message says where it
   looked. Every other Claude Code rlxd starts does the same: the connectors' refresh
-  probe and a connector's login ([Connectors](#connectors)).
+  probe, a connector's login and a `connectors.call` ([Connectors](#connectors)).
 - **The brain** (`rlx brain --stdio`) runs with the values raw on top of rlxd's own
   environment too, as they are when it starts. A change that alters them starts it again
   with the new values once it is idle: the request it runs ends first, and the next one,
@@ -291,8 +291,9 @@ rlxd call env.get
   at once, with no backoff and no `error`; `status.brain.restarts` counts it. A change to
   the values it already has doesn't restart it.
 - **Keychain.** rlx keeps `/usr/bin/security` as the only Keychain reader, and rlxd
-  links no Keychain crate: `rlxd.yml`'s `deny` job fails when `cargo tree --target all
-  -e normal` holds `security-framework` or `keyring`.
+  links no Keychain crate. `deny.toml` bans `security-framework` and `keyring` for
+  `rlxd.yml`'s `cargo deny`, and `tests/env.rs` runs 4.3's `cargo tree` line as written,
+  then with `--target all -e normal`.
 
 `crates/rlxd/tests/env.rs` runs 4.3's Accept lines that start no run, and
 `crates/rlxd/tests/env_runs.rs` those that do, with fake-claude's `print-env`, on three
@@ -376,15 +377,21 @@ rlxd runs Claude Code headless, with no tmux and no PTY (handoff 0.10.3, 2.1, 2.
   environment, or when rlxd started (4.3, never a lookup at the run's start), with the
   app's `PATH`, `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` on top of rlxd's
   own environment ([The app's environment](#the-apps-environment-for-claude-code)).
-  `run.start` and `run.resume` refuse `claude_not_found` when that resolved to none, and
-  `claude_not_runnable` when to a batch file.
+  `run.start`, `run.resume` and `connectors.call` refuse `claude_not_found` when that
+  resolved to none, and `claude_not_runnable` when to a batch file.
 - **Each attempt's settings** hold one PreToolUse hook (matcher `*`) running `rlxd-hook
-  pre-tool-use --run <run_id> --attempt <n>` by the absolute path of the `rlxd-hook`
-  beside rlxd (quoted when it must be; on Windows in forward slashes, always quoted),
-  with a timeout of `deadline_ms / 1000 + 10` s. When rlxd can't name that path,
-  `run.start` refuses `hook_not_found`; it never falls back to a name on `PATH`. Its
-  requests are decided by the tool-call gate below; until rlxd-hook's pre-tool-use is
-  wired to it, `rlxd-hook` denies every call.
+  pre-tool-use --run <run_id> --attempt <n> --deadline-ms <deadline_ms>` by the absolute
+  path of the `rlxd-hook` beside rlxd (quoted when it must be; on Windows in forward
+  slashes, always quoted), with a timeout of `deadline_ms / 1000 + 10` s. When rlxd can't
+  name that path, `run.start` refuses `hook_not_found`; it never falls back to a name on
+  `PATH`. Its requests are decided by the tool-call gate below. rlxd-hook reads the
+  attempt's key from its `RLXD_HOOK_KEY` and sends it as `hook`'s `hook_key` only (never
+  with the hook's variables, never on its stdout or stderr), and rlxd binds the request to
+  the run's live attempt by that key and by the process that connected. Its own timer is
+  `deadline_ms` and 5 s, past the gate's deadline and below Claude Code's timeout for the
+  hook. It prints rlxd's reply only when it is the gate's allow or deny; anything else (no
+  run or key on its side, no rlxd, a refusal, a dropped connection, a reply it can't
+  read, its timer) is a deny.
 - **Stdin stays open**: the prompt is a stream-json user message, and stdin closes only
   after the `result`. Each stream-json line becomes `run.started`, `run.text` (and
   partial chunks under `partial`), `run.tool_result` (content up to 1 MiB, then
@@ -488,7 +495,8 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   by a resume or the space's erase. A run that never reached `run.started` has no
   session to resume (`no_session`): a new run is the way on.
 - **What a missed try leaves.** Nothing of a try ended unconfirmed stays in the run's
-  session. On a first attempt (`--session-id`), the session file the try left is
+  session: a miss, or any other end before its connectors are confirmed (a cancel, the
+  timeout, rlxd stopping, a broken read, Claude Code's exit). On a first attempt (`--session-id`), the session file the try left is
   removed, so the next try starts it anew. On a resumed attempt (`--resume`), the file is
   the run's whole session: it is never removed, only cut back to its length before the
   attempt's first try, so a later resume goes on from what was delivered.
@@ -526,6 +534,55 @@ listing, 5.5 and 7.7): `crate::connectors`, and the gate in `crate::runner::conn
   `claude_not_found`, `claude_not_runnable`). Its `claude` and environment are a run's:
   the app's (4.3), on top of rlxd's own. No URL's query, where a login's secrets are, is
   ever in rlxd's log. The PTY is killed when the login ends.
+- **`connectors.call {run_id, connector, tool, input}`** (5.3 phase 2; spike #5, route a)
+  makes exactly one call of the connector's tool through Claude Code's own MCP client,
+  with no model turn, for `app`, `cli` and `tui` (`remote` gets `role_not_allowed`). It
+  needs the capability `connectors.call`, which a release build doesn't announce until
+  the owner-run probe confirms the route (test builds: `RLXD_TEST_CONNECTORS_CALL=1`);
+  without it the call is `no_route`. The call is a run: kind `watch`, mounting the one
+  connector, `pinned_call` its tool and its input's RFC 8785 SHA-256, never resumed
+  (`not_resumable`). Its Claude Code is started on a control channel (`--permission-mode
+  manual --permission-prompts host --permission-prompt-tool stdio`, no `--settings`, no
+  session), the `claude` and environment a run's (4.3), and is never written a user line: `initialize`, whose capabilities must list
+  `mcp_call_check_permissions_v1` (else the run fails `error`, naming it, and the call is
+  `no_route`: an older Claude Code would run it unchecked); `mcp_status`, polled until the
+  connector is `connected`, whose tools (named as Claude Code names them) and
+  `readOnly: true` hints are what the gate's rules decide by. **rlxd's rules run before
+  anything is sent:** the mount and the tool's one claude.ai server, kind `watch` (so the
+  tool must be read-only) and the pinned call; one that denies is a deny `by: "rlxd"` in
+  the ledger (`call_id: "rlxd_mcp_call"`) and the call is never sent, so nothing that might
+  let Claude Code skip its ask can run a tool rlxd's rules deny. A tool the connectors'
+  cache knows is not read-only is denied so before Claude Code starts. Then one
+  `mcp_call`, always with `check_permissions: true`. Claude Code's `can_use_tool` takes
+  the gate's own path (rlxd's rules again, then the app, then the ledger), and an allow
+  answers with the pinned input as `updatedInput`, never the request's. A second
+  `can_use_tool` (one rlxd can't read counts as the first) is a second call, which a
+  `connectors.call` never makes: it is denied `by: "rlxd"` at once (never the app's), the
+  tree is killed, and the call is `call_failed`, the first call's content dropped. **No settings but rlxd's:** Claude Code
+  decides a `check_permissions` call by its settings' rules and hooks before it asks
+  `can_use_tool`, and a rule that allowed the call would skip every rule of rlxd's. So it
+  loads no user or local settings (`--setting-sources project`) and runs not in the space
+  but in an empty, private folder of the run's own (`runs/<run_id>/call/`), which rlxd
+  writes nothing into; before Claude Code starts and again before the call is sent, rlxd
+  checks it holds no `.claude/settings.json` or `.claude/settings.local.json`, failing
+  closed (anything there, or an error reading it, fails the run with no call made:
+  `untrusted_settings`, `detail.path`). The checks are of a moment; an organisation's
+  managed settings, which no flag turns off, are its own control. The run
+  emits `run.started`,
+  `run.tool_call`, `run.tool_decided` and `run.tool_result`, and ends `run.done
+  {num_turns: 0}`, or `run.failed {reason: "denied"}` on a deny. The reply is `{run_id,
+  decision, content?, is_error?, model_turns: 0}`; a deny is `denied` (`detail.by`,
+  `detail.reason`, `detail.call_id`); any other end is `call_failed` (`detail.reason`,
+  the run's). A call that comes back with no `can_use_tool` first (or after a deny) fails
+  all the same, `call_failed` (never `denied`: it ran): its content is dropped, the ledger keeps it (`by: "rlxd"`, `unknown`, or
+  `error`), and rlxd's log names what can skip the ask. Every read is bounded: a 4 MiB
+  line, a wait for `initialize`'s reply (15 s), the connector (30 s), the `can_use_tool`
+  (30 s, and at least the app's `deadline_ms` and 5 s), and the result (60 s from the
+  moment any answer, allow or deny, is given), and the run's `timeout_s` (their sum and
+  `deadline_ms`); any of them, or a model turn's line, kills the tree, and after a kill
+  Claude Code's stderr is read for 5 s at most (a process that left the tree may hold
+  it). A deny, however
+  long the app took or by `timeout`, ends `run.failed {reason: "denied"}`.
 - **The probe.** `rlxd/tests/probes/connectors_route.sh` is the owner-run check of what
   only the real Claude Code can say: the route, whether `system/init` carries
   annotations, `claude mcp login`'s output, and the handoff's `[real]` lines.
@@ -616,7 +673,8 @@ Every tool call of every run is decided by rlxd (handoff 0.10.3, 5.1), the
   from the connection's own process, and `debug.drop_hook_connections`, which ends every
   hook connection waiting on the gate. With `RLXD_TEST_HOOK` set, each run's settings name
   rlxd itself as the hook (the hidden `rlxd __test-hook pre-tool-use`, which asks
-  `debug.pre_tool_use`), so fake-claude's gate scenarios run a real hook command.
+  `debug.pre_tool_use`); without it, they name the real rlxd-hook beside rlxd
+  (`tests/hook_gate.rs`).
   `RLXD_TEST_FAIL_LEDGER=<space>` fails the ledger writes of that space's runs. A
   release build has none of these, nor their names.
 
@@ -666,8 +724,12 @@ them by `job_id`; rlxd keeps a definition only to fire it, and records what each
   connector's (`mcp__<connector as Claude Code writes it>__…`), else `invalid_params` at
   `job.put`. Every fire is a `watch` run with an rlxd-picked `run_id`, gated like any run
   (5.1): an app must be connected (else `app_absent`, as for any job) and must allow the
-  call. Until `connectors.call` (5.3) exists, the run is the fallback,
-  `scheduler::watch_job`'s one route: Claude Code with rlxd's fixed prompt, "Call this
+  call. With the capability `connectors.call`, each fire is a `connectors.call` run (the
+  job's one call with no model turn, its `job_id` on its events, its allowed result
+  `job.watch_result` as below); when that run finds no route (a Claude Code without
+  `mcp_call_check_permissions_v1`), the scheduler makes the same fire again (the same
+  `scheduled_for`, a second `job.fired`) by the fallback. Without the capability, the run
+  is the fallback: Claude Code with rlxd's fixed prompt, "Call this
   tool once with exactly this input; do nothing else", as its appended system prompt (so
   its command line carries it) and as its message, which quotes the connector, the tool
   and the input as canonical JSON in a fence, as data, and nothing of the job's as text.
@@ -677,9 +739,7 @@ them by `job_id`; rlxd keeps a definition only to fire it, and records what each
   `job.watch_result {job_id, run_id, tool, input_sha256, content, is_error, truncated}`
   (`content` as `run.tool_result` carries it, up to 1 MiB): the app evaluates `match`
   itself, never on an error or a cut result. A denied call gives none, and so does a run
-  job, even one whose template is a pinned `watch` run. When 5.3 lands,
-  `connectors.call` becomes a second route there, with the same `run_id`, gate and
-  result.
+  job, even one whose template is a pinned `watch` run.
 - **Once.** Before a fire's run starts, the job (its schedule moved past the fire) and a
   `starting` record of the fire, with its `run_id`, are written in one transaction. So
   a crash while the run starts never fires that time again: the next rlxd settles the

@@ -55,6 +55,7 @@ One connector, `claude.ai Slack`, with made-up tools (`init-connectors/expected-
 | `connectors-later` | Slack `pending`, then connected from 8 s |
 | `connectors-later-noisy` | `connectors-later`, writing assistant text before each start can be confirmed: before its `system/init` on route 2, after its first one on route 1 |
 | `connectors-never` | Slack `pending` throughout |
+| `connectors-slow-init` | Slack connected, but `system/init` comes 10 s after the message (written to the session at once): a route-2 try sits sent and unconfirmed |
 | `connectors-needs-auth` | Slack `needs-auth` throughout |
 | `stdin-eof-empty` | No servers in `system/init` when stdin is at EOF by then, as E9 found; Slack connected while it is open |
 | `mcp-login` | `claude mcp login <name>`: prints an `https://` URL whose query holds made-up secrets, waits, says it signed in, and exits 0 |
@@ -104,6 +105,44 @@ the tool and the input from the JSON rlxd quotes in its message, lists that tool
 the hook. Allowed, the tool gives `watch-call/content.json`, which `job.watch_result`
 carries; for the input `{"ref": "missing"}` an error, and for `{"ref": "huge"}` 2 MiB of
 text, as a tool would. Then it tries the identical call again, which rlxd denies `pinned_call_used`.
+
+**`mcp-direct`** plays Claude Code on a `connectors.call` run's control channel (5.3), as
+spike #5 found 2.1.332: no user message, no `system/init`, only answers to rlxd's
+control requests. `initialize` lists `mcp_call_check_permissions_v1`; `mcp_status` lists
+no server for its first 300 ms, then two connectors connected (`source: "claudeai"`):
+`claude.ai GitHub` with `get_check_runs` (`readOnly: true`) and `create_issue`
+(`openWorld: true` only), and `claude.ai Slack`, the 5.3 Accept lines' connector, with
+`slack_search_public` (`readOnly: true`); each read gives `mcp-direct/content.json`; an
+`mcp_call` with `check_permissions: true` asks rlxd one `can_use_tool` (a
+`toolu_mcp_call_…` id), and runs the tool with the answer's `updatedInput` only on an
+allow, giving `mcp-direct/content.json` (an error result for `{"ref": "missing"}`). The
+log adds `control_requests` (each request rlxd sent), `control_answers` (each answer to
+a `can_use_tool`), `tool_inputs` and its `cwd`. As Claude Code does, a
+`permissions.allow` rule for the tool (its name, `mcp__<server>` or `mcp__<server>__*`) in
+a settings file of the sources `--setting-sources` names (`user`, `project`: the cwd's
+`.claude/settings.json`, `local`: its `settings.local.json`) runs the call with no
+`can_use_tool`, logged in `allowed_by`. Started as a conversation (with `--settings`, as
+a watch job's fallback run is), each plays `watch-call`.
+
+| Scenario | What it does |
+|---|---|
+| `mcp-direct` | As above |
+| `mcp-direct-old` | `initialize` lists no `mcp_call_check_permissions_v1` |
+| `mcp-direct-unasked` | Ignores `check_permissions`: runs the call with no `can_use_tool` |
+| `mcp-direct-respelled` | Asks `can_use_tool` with the input's whole numbers written as `1.0` |
+| `mcp-direct-needs-auth` | Lists the connector `needs-auth` |
+| `mcp-direct-silent` | Never answers `initialize` |
+| `mcp-direct-huge` | Writes a 5 MiB line after `initialize` |
+| `mcp-direct-turn` | Writes an `assistant` line after `initialize` |
+| `mcp-direct-hang` | Never answers the allowed call |
+| `mcp-direct-plant` | Writes an allow rule for the read tool into its cwd's `.claude/settings.json` once it has answered `initialize` |
+| `mcp-direct-twice` | Allowed, runs the tool, then asks `can_use_tool` again for the same call under a new id before it gives the result |
+| `mcp-direct-twice-other` | The same, its second ask for `create_issue` |
+| `mcp-direct-defiant` | Runs the call even when rlxd denies it |
+| `mcp-direct-garbled` | Asks `can_use_tool` first with no `tool_use_id`, then well formed |
+| `mcp-direct-slow-reply` | Answers a call rlxd denied only after 9 s |
+| `mcp-direct-slow-ask` | Asks `can_use_tool` only 3 s after the call |
+| `mcp-direct-orphan` | Leaves a process in a process group of its own holding its stderr for a minute (`lingering_pid` in the log), then writes an `assistant` line |
 
 Each writes `$AISQUARE_HOME/fake-claude.log.json` in the handoff's shape: see the crate's
 documentation for each field. Like Claude Code, every scenario exits 1 for

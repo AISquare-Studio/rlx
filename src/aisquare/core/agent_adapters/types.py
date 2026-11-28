@@ -1604,6 +1604,12 @@ class AgentAdapter(Protocol):
     other agent's shares, as it marked every agent's before (``Fa`` for a Fake Agent)."""
     binary: str
     home_env: str
+    hook_env: tuple[str, ...]
+    """The variables of its own that its hooks' environment carries and rlx's hook path
+    reads, beside :attr:`home_env` (which is among them when read): what rlxd-hook sends
+    the resident brain with each hook of this agent's, by name
+    (``services.brain.ENV_NAMES``). Empty for an agent whose hooks rlxd-hook does not
+    take."""
     home_name: str
     settings_name: str
     capabilities: AgentCapabilities

@@ -29,9 +29,14 @@
 //!   can't be written is a deny `by: "rlxd"`; `ok` or `error` from the call's
 //!   `tool_result`; `unknown` when the run ends with it still executing.
 //!
-//! Until rlxd-hook's own pre-tool-use is wired to [`Runner::pre_tool_use`] (with #617, at
-//! rc/0.10.3's merge), only test builds reach the hook side, through `debug.pre_tool_use`:
-//! the items marked so are unused in a release build until then.
+//! A call reaches the gate one of two ways ([`Via`]): a hook request, bound as above, or
+//! Claude Code's own `can_use_tool` on the control channel of a `connectors.call` run
+//! ([`super::call`]), which is rlxd's own child's stdio and needs no binding. Both take
+//! the same path from there ([`Runner::decide_call`]): rlxd's rules, the app, the ledger.
+//!
+//! A hook request comes from `rlxd-hook pre-tool-use` over the socket (`hook`, through
+//! [`crate::hooks`]), which sends the attempt's key it has in [`HOOK_KEY_ENV`] and is
+//! pinned as the connection's peer; test builds also take it from `debug.pre_tool_use`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +58,8 @@ pub const PINNED_CALL_USED: &str = "pinned_call_used";
 /// The reason of a call to a tool the attempt's `system/init` didn't list.
 pub const TOOL_NOT_IN_INIT: &str = "tool_not_in_init";
 
-/// What an attempt's `system/init` listed, which rlxd's rules decide by.
+/// What an attempt's `system/init` listed (a `connectors.call` run's: its `mcp_status`),
+/// which rlxd's rules decide by.
 #[derive(Clone, Debug, Default)]
 pub struct Listed {
     /// Its tools, by their exact names.
@@ -87,8 +93,9 @@ fn is_mounted(connector: &str, server: &Server) -> bool {
         && (!connector.starts_with(CLAUDE_AI) || server.source.as_deref() == Some(CLAUDE_AI_SOURCE))
 }
 
-/// The name of the variable that holds an attempt's hook key.
-pub const HOOK_KEY_ENV: &str = "RLXD_HOOK_KEY";
+/// The name of the variable that holds an attempt's hook key: rlxd-proto's, which
+/// rlxd-hook reads.
+pub use rlxd_proto::HOOK_KEY_ENV;
 
 /// The reason of a call still open as its run ends.
 const RUN_ENDED: &str = "the run ended before the call was decided";
@@ -103,7 +110,6 @@ const STOPPED: &str = "the app stopped the run";
 const TIMED_OUT: &str = "no answer came from the app before the call's deadline";
 
 /// A hook request: what `rlxd-hook pre-tool-use` sends for one call.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub struct Ask {
     pub run_id: String,
     pub attempt: u64,
@@ -119,7 +125,6 @@ pub struct Ask {
 pub(super) enum Status {
     /// Not decided yet: waiting for the app, whose answer goes to `answer`, or, `answer`
     /// taken, the app's answer on its way to the call.
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     Open {
         tool: String,
         sha256: String,
@@ -130,7 +135,6 @@ pub(super) enum Status {
 }
 
 /// The app's `run.decide`, handed to the call waiting for it.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub(super) struct AppAnswer {
     decision: Decision,
     reason: String,
@@ -142,30 +146,58 @@ pub(super) struct AppAnswer {
 }
 
 /// One call, as the gate reads it.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
-struct Call {
-    id: String,
-    tool: String,
-    input: Value,
-    sha256: String,
+pub(super) struct Call {
+    pub(super) id: String,
+    pub(super) tool: String,
+    pub(super) input: Value,
+    pub(super) sha256: String,
 }
 
-/// A decision as taken, and its reason.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
-struct Taken {
-    decision: Decision,
-    reason: String,
+impl Call {
+    /// The call `id` of `tool` with `input`, as Claude Code asked it.
+    pub(super) fn new(id: String, tool: String, input: Value) -> Self {
+        let sha256 = jcs::sha256(&input);
+        Self {
+            id,
+            tool,
+            input,
+            sha256,
+        }
+    }
+}
+
+/// Where a call came to the gate from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Via {
+    /// A hook request, bound to the run's live attempt.
+    Hook,
+    /// Claude Code's `can_use_tool` on a `connectors.call` run's control channel.
+    Control,
+}
+
+/// A decision as taken: who took it, and its reason.
+pub(super) struct Taken {
+    pub(super) decision: Decision,
+    pub(super) by: DecidedBy,
+    pub(super) reason: String,
 }
 
 impl Taken {
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+    /// A deny by `by`, for `reason`.
+    fn deny(by: DecidedBy, reason: &str) -> Self {
+        Self {
+            decision: Decision::Deny,
+            by,
+            reason: reason.to_owned(),
+        }
+    }
+
     fn output(&self) -> String {
         output(self.decision, &self.reason)
     }
 }
 
 /// What a waiting call got.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 enum Came {
     Answer(AppAnswer),
     Deadline,
@@ -181,7 +213,6 @@ impl Runner {
         }
     }
 
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     fn app_present(&self) -> bool {
         self.apps.get().is_some_and(|apps| *apps.borrow() > 0)
     }
@@ -207,7 +238,6 @@ impl Runner {
     }
 
     #[cfg(not(feature = "debug-methods"))]
-    #[allow(dead_code)]
     fn hooks_dropped(&self) -> impl std::future::Future<Output = ()> + use<> {
         std::future::pending()
     }
@@ -222,13 +252,11 @@ impl Runner {
     }
 
     #[cfg(not(feature = "debug-methods"))]
-    #[allow(dead_code)]
     fn count_waiting(&self, _up: bool) {}
 
     /// The gate's answer to one hook request: Claude Code's hook JSON, allow or deny.
     /// `None` when its connection was dropped (`debug.drop_hook_connections`): the hook
     /// then gets no answer, and denies.
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     pub async fn pre_tool_use(self: &Arc<Self>, ask: Ask) -> Option<String> {
         let (run, call) = match self.bind(&ask) {
             Ok(bound) => bound,
@@ -242,6 +270,21 @@ impl Runner {
                 return Some(output(Decision::Deny, &reason));
             }
         };
+        let taken = self.decide_call(&run, call, Via::Hook).await?;
+        Some(taken.output())
+    }
+
+    /// The gate's decision on `call` of `run`, which came `via` a hook or the control
+    /// channel: rlxd's rules at once, else the app's answer before the run's
+    /// `deadline_ms`, written to the ledger before it is returned. `None` only for a hook
+    /// whose connection was dropped (`debug.drop_hook_connections`): the call is denied
+    /// all the same, and its hook gets no answer.
+    pub(super) async fn decide_call(
+        self: &Arc<Self>,
+        run: &Arc<Run>,
+        call: Call,
+        via: Via,
+    ) -> Option<Taken> {
         let deadline_ms = run.params.deadline_ms;
         // Decided at once (rlxd's rules, no app), or registered to wait for the app.
         let mut waiting = {
@@ -251,7 +294,7 @@ impl Runner {
             if inner.gate.contains_key(&call.id) || inner.calls.iter().any(|c| c.call_id == call.id)
             {
                 let reason = "rlxd already decided a call of this id";
-                return Some(output(Decision::Deny, reason));
+                return Some(Taken::deny(DecidedBy::Rlxd, reason));
             }
             let at_once = if inner.stopped.is_some() {
                 Some((DecidedBy::Rlxd, STOPPED.to_owned()))
@@ -271,8 +314,8 @@ impl Runner {
             };
             if let Some((by, reason)) = at_once {
                 let taken =
-                    self.decide_now(&run, &mut inner, &call, Decision::Deny, by, &reason, None);
-                return Some(taken.output());
+                    self.decide_now(run, &mut inner, &call, Decision::Deny, by, &reason, None);
+                return Some(taken);
             }
             let (answer, waiting) = oneshot::channel();
             let open = Status::Open {
@@ -288,11 +331,18 @@ impl Runner {
                 call.sha256.clone(),
                 deadline_ms,
             );
-            self.emit(&run, &mut inner, run_types::TOOL_CALL, &data);
+            self.emit(run, &mut inner, run_types::TOOL_CALL, &data);
             waiting
         };
-        let mut guard = Unanswered::new(self, &run, call);
-        let dropped = self.hooks_dropped();
+        let mut guard = Unanswered::new(self, run, call, via);
+        // Only a hook's connection is dropped so; the control channel's call is ended by
+        // its run's end, which its driver watches.
+        let dropped = async {
+            match via {
+                Via::Hook => self.hooks_dropped().await,
+                Via::Control => std::future::pending().await,
+            }
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(deadline_ms);
         let mut came = tokio::select! {
             answer = &mut waiting => answer.map_or(Came::Gone, Came::Answer),
@@ -318,7 +368,7 @@ impl Runner {
                 waiting.then(|| {
                     let call = guard.take();
                     self.decide_now(
-                        &run,
+                        run,
                         &mut inner,
                         &call,
                         Decision::Deny,
@@ -329,7 +379,7 @@ impl Runner {
                 })
             };
             if let Some(taken) = timed_out {
-                return Some(taken.output());
+                return Some(taken);
             }
             // The app's answer was taken as the deadline came: it is on its way.
             came = waiting.await.map_or(Came::Gone, Came::Answer);
@@ -343,12 +393,12 @@ impl Runner {
             } else {
                 RUN_ENDED
             };
-            return Some(output(Decision::Deny, reason));
+            return Some(Taken::deny(DecidedBy::Rlxd, reason));
         }
         let Came::Answer(answer) = came else {
             // No answer, yet not settled: denied all the same.
             let taken = self.decide_now(
-                &run,
+                run,
                 &mut inner,
                 &call,
                 Decision::Deny,
@@ -356,7 +406,7 @@ impl Runner {
                 RUN_ENDED,
                 None,
             );
-            return Some(taken.output());
+            return Some(taken);
         };
         // A pinned call is allowed once: two calls waiting together (Claude Code's
         // parallel calls) can't both be.
@@ -365,7 +415,7 @@ impl Runner {
             && inner.pinned_call_used
         {
             self.decide_now(
-                &run,
+                run,
                 &mut inner,
                 &call,
                 Decision::Deny,
@@ -375,7 +425,7 @@ impl Runner {
             )
         } else {
             self.decide_now(
-                &run,
+                run,
                 &mut inner,
                 &call,
                 answer.decision,
@@ -385,11 +435,13 @@ impl Runner {
             )
         };
         let _ = answer.written.send(taken.decision);
-        if answer.stop && taken.decision != Decision::Allow {
+        // A connectors.call run makes one call, and a deny ends it `failed {reason:
+        // "denied"}` whatever `stop` says: there is nothing more of it to stop.
+        if answer.stop && taken.decision != Decision::Allow && via == Via::Hook {
             // The run ends needing the user, once the hook has its deny; rlxd denies its
             // other calls itself, those waiting and those to come.
             inner.stopped = Some(call.id.clone());
-            self.settle(&run, &mut inner, STOPPED);
+            self.settle(run, &mut inner, STOPPED);
             if let Some(tree) = inner.tree.clone() {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -403,12 +455,11 @@ impl Runner {
             call.id,
             taken.decision.as_str()
         );
-        Some(taken.output())
+        Some(taken)
     }
 
     /// The run and the call a hook request is about, when it is bound to the run's live
     /// attempt: its key, and a process inside the run (the module's doc).
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     fn bind(&self, ask: &Ask) -> Result<(Arc<Run>, Call), String> {
         let id =
             rlxd_proto::RunId::new(ask.run_id.clone()).map_err(|_| "no such run".to_owned())?;
@@ -447,25 +498,15 @@ impl Runner {
             .filter(|id| !id.is_empty())
             .ok_or_else(|| "no tool_use_id".to_owned())?
             .to_owned();
-        let sha256 = jcs::sha256(&input);
-        Ok((
-            run,
-            Call {
-                id,
-                tool,
-                input,
-                sha256,
-            },
-        ))
+        Ok((run, Call::new(id, tool, input)))
     }
 
     /// Writes `call`'s decision to the ledger, durably (and `executing` for an allow, and
     /// the pinned call used), then publishes `run.tool_decided`: all before the hook gets
     /// its answer. An allow whose entry can't be written is a deny `by: "rlxd"` instead
     /// (the pinned call stays used): never an allow without its entry on disk.
-    #[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
-    fn decide_now(
+    pub(super) fn decide_now(
         &self,
         run: &Run,
         inner: &mut RunInner,
@@ -522,6 +563,7 @@ impl Runner {
         self.emit(run, inner, run_types::TOOL_DECIDED, &data);
         Taken {
             decision,
+            by,
             reason: reason.to_owned(),
         }
     }
@@ -660,24 +702,28 @@ impl Runner {
     }
 }
 
-/// A call waiting for the app whose hook connection ended before it was decided: denied
-/// by rlxd, so the ledger and the stream say so.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+/// A call waiting for the app whose asker went before it was decided (a hook's
+/// connection that ended, a control channel's run that is ending): denied by rlxd, so the
+/// ledger and the stream say so.
 struct Unanswered {
     runner: Arc<Runner>,
     run: Arc<Run>,
     call: Option<Call>,
+    via: Via,
 }
 
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 impl Unanswered {
-    /// Holds `call` of `run`, counted among the hook connections waiting on the gate.
-    fn new(runner: &Arc<Runner>, run: &Arc<Run>, call: Call) -> Self {
-        runner.count_waiting(true);
+    /// Holds `call` of `run`, counted among the hook connections waiting on the gate when
+    /// it came `via` a hook.
+    fn new(runner: &Arc<Runner>, run: &Arc<Run>, call: Call, via: Via) -> Self {
+        if via == Via::Hook {
+            runner.count_waiting(true);
+        }
         Self {
             runner: Arc::clone(runner),
             run: Arc::clone(run),
             call: Some(call),
+            via,
         }
     }
 
@@ -695,7 +741,9 @@ impl Unanswered {
 
 impl Drop for Unanswered {
     fn drop(&mut self) {
-        self.runner.count_waiting(false);
+        if self.via == Via::Hook {
+            self.runner.count_waiting(false);
+        }
         let Some(call) = self.call.take() else {
             return;
         };
@@ -703,7 +751,10 @@ impl Drop for Unanswered {
         if matches!(inner.gate.get(&call.id), Some(Status::Decided(_))) {
             return;
         }
-        let reason = "the hook's connection ended before the call was decided";
+        let reason = match self.via {
+            Via::Hook => "the hook's connection ended before the call was decided",
+            Via::Control => "the run ended before the call was decided",
+        };
         self.runner.decide_now(
             &self.run,
             &mut inner,
@@ -725,7 +776,6 @@ impl Drop for Unanswered {
 /// mount names. A connector still connecting when the init is written has no tools in it,
 /// so its calls are denied: a run that names it in `needs_connectors` starts its first
 /// turn only once it is connected (5.5).
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub fn rlxd_rule(
     params: &RunStartParams,
     pinned_call_used: bool,
@@ -797,7 +847,6 @@ pub fn rlxd_rule(
 /// `system/init` (tools listed as `{name, annotations: {readOnlyHint}}`). `None` when no
 /// hint is known, which every rule counts as a write (fail closed). The one place the hint
 /// comes from (hub question #2718).
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 pub fn read_only(hints: &HashMap<String, bool>, tool: &str) -> Option<bool> {
     hints.get(tool).copied()
 }
@@ -828,24 +877,17 @@ pub fn claude_server_name(name: &str) -> String {
     collapsed.trim_matches('_').to_owned()
 }
 
-/// Claude Code's PreToolUse hook output for `decision`, with `reason`.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
+/// Claude Code's PreToolUse hook output for `decision`, with `reason`: rlxd-proto's, so
+/// rlxd-hook reads it as the gate's (`is_gate_output`). Anything but an allow is a deny.
 pub fn output(decision: Decision, reason: &str) -> String {
-    let permission = if decision == Decision::Allow {
-        "allow"
+    if decision == Decision::Allow {
+        rlxd_proto::allow_output(reason)
     } else {
-        "deny"
-    };
-    json!({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": permission,
-        "permissionDecisionReason": reason,
-    }})
-    .to_string()
+        rlxd_proto::deny_output(reason)
+    }
 }
 
 /// Whether `a` and `b` are equal, in time that doesn't depend on where they differ.
-#[cfg_attr(not(feature = "debug-methods"), allow(dead_code))]
 fn equal(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

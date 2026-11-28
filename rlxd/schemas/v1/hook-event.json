@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HookEventData",
+  "description": "The `data` of a `hook.*` event (7.3): whose hook it was, where, and for which run.\n\n```json\n{\"session_id\": \"t1\", \"cwd\": \"/Users/me/project\"}\n```",
+  "type": "object",
+  "properties": {
+    "cwd": {
+      "description": "The session's working directory: the hook JSON's `cwd`, else rlxd-hook's; empty\nwhen neither is known.",
+      "type": "string"
+    },
+    "run_id": {
+      "description": "The run the hook belongs to. A run's `pre-tool-use` (5.1), the one hook that names\na run, publishes no event, so no event rlxd publishes today carries it.",
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "description": "Claude Code's session id, from the hook's JSON; empty when it named none.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "cwd"
+  ]
+}

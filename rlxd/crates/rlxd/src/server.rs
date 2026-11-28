@@ -40,12 +40,12 @@ use std::time::{Duration, Instant};
 
 use rlxd_client::Home;
 use rlxd_proto::{
-    Claude, Clients, ConnectorsListParams, ConnectorsLoginParams, Data, EnvRefusal, EnvValues,
-    Envelope, ErrorBody, Event, HelloData, HelloParams, JobListParams, JobPutParams, JobRef,
-    PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams, PtyResizeParams,
-    PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role,
-    RunDecideParams, RunEventsParams, RunListParams, RunRef, RunResumeParams, RunStartParams,
-    SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
+    Claude, Clients, ConnectorsCallParams, ConnectorsListParams, ConnectorsLoginParams, Data,
+    EnvRefusal, EnvValues, Envelope, ErrorBody, Event, HelloData, HelloParams, JobListParams,
+    JobPutParams, JobRef, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams,
+    PtyResizeParams, PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request,
+    RequestId, Role, RunDecideParams, RunEventsParams, RunListParams, RunRef, RunResumeParams,
+    RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
     SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
     methods, setting_keys, topics,
 };
@@ -265,6 +265,16 @@ impl Daemon {
     /// The home's event bus.
     pub fn bus(&self) -> &Bus {
         &self.bus
+    }
+
+    /// The home this rlxd serves.
+    pub fn home(&self) -> &Home {
+        &self.home
+    }
+
+    /// The runner, whose gate decides each run's tool calls.
+    pub fn runner(&self) -> &Arc<Runner> {
+        &self.runner
     }
 
     /// Ends every PTY's process, as rlxd stops: none outlives it.
@@ -573,6 +583,10 @@ impl Daemon {
                 Ok(()) => crate::brain::ping(&self.brain).await,
                 Err(refused) => Err(refused),
             },
+            methods::HOOK => match cli_only(session, methods::HOOK) {
+                Ok(()) => crate::hooks::hook(self, Arc::clone(&session.peer), request.params).await,
+                Err(refused) => Err(refused),
+            },
             methods::EVENTS_SUBSCRIBE => match self.subscribe(id, request.params) {
                 Ok(subscription) => return Answer::Stream(subscription),
                 Err(error) => Err(error),
@@ -612,6 +626,7 @@ impl Daemon {
             methods::GATE_DEVICES => Ok(object(&json!({"devices": self.gate.devices()}))),
             methods::CONNECTORS_LIST => self.connectors_list(session, request.params).await,
             methods::CONNECTORS_LOGIN => self.connectors_login(session, request.params),
+            methods::CONNECTORS_CALL => self.connectors_call(session, request.params).await,
             methods::GATE_UNPAIR => self.gate_unpair(session, &request.params),
             methods::HELLO => Err(error(
                 codes::INVALID_REQUEST,
@@ -2198,6 +2213,34 @@ impl Daemon {
         printed(&off_worker(|| self.connectors.list(1)))
     }
 
+    /// `connectors.call {run_id, connector, tool, input}` (5.3): one gated read call with
+    /// no model turn, as a `watch` run, for `app`, `cli` and `tui` (`remote` is refused, as
+    /// it is a model turn). Without the capability `connectors.call`, `no_route`.
+    async fn connectors_call(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
+        let method = methods::CONNECTORS_CALL;
+        if !matches!(session.role, Role::App | Role::Cli | Role::Tui) {
+            return Err(role_refused(
+                session.role,
+                method,
+                "app, cli and tui may make a connector call; remote may not.",
+            ));
+        }
+        let params = params_of::<ConnectorsCallParams>(method, params)?;
+        if !self.runner.calls_connectors() {
+            return Err(error(
+                codes::NO_ROUTE,
+                "rlxd has no route to one connector call that makes no model turn \
+                 (capability connectors.call)",
+            )
+            .with_hint(
+                "Make the call as a watch run instead: run.start {kind: \"watch\", mount: \
+                 {kind: \"connectors\", connectors: [connector]}, pinned_call}.",
+            ));
+        }
+        let data = self.runner.connectors_call(params, &session.client).await?;
+        printed(&data)
+    }
+
     /// `connectors.login {id}`: for `app`, `cli` and `tui`; `remote` is refused.
     fn connectors_login(&self, session: &Session, params: Params) -> Result<Data, ErrorBody> {
         let method = methods::CONNECTORS_LOGIN;
@@ -2430,6 +2473,7 @@ fn served() -> Vec<&'static str> {
         methods::STATUS,
         methods::STOP,
         methods::HOOK_PING,
+        methods::HOOK,
         methods::EVENTS_SUBSCRIBE,
         methods::SETTINGS_GET,
         methods::SETTINGS_SET,
@@ -2460,6 +2504,7 @@ fn served() -> Vec<&'static str> {
         methods::SPACE_ERASE,
         methods::CONNECTORS_LIST,
         methods::CONNECTORS_LOGIN,
+        methods::CONNECTORS_CALL,
         methods::JOB_PUT,
         methods::JOB_LIST,
         methods::JOB_DELETE,

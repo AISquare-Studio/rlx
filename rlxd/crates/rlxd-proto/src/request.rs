@@ -129,6 +129,11 @@ pub mod methods {
     /// the request within 5 s, a `brain_*` error says why. rlxd-hook's `ping` (1.5); only a
     /// `cli` client may call it, any other gets `role_not_allowed`.
     pub const HOOK_PING: &str = "hook.ping";
+    /// One Claude Code hook, from rlxd-hook (1.5): [`HookParams`](crate::HookParams) in,
+    /// [`HookReply`](crate::HookReply) out, and one `hook.<event>` on the stream. A hook
+    /// the brain never took fails with `hook_not_delivered`, and rlxd-hook runs `rlx hook`
+    /// instead. Only a `cli` client may call it; any other gets `role_not_allowed`.
+    pub const HOOK: &str = "hook";
     /// Pairs a device as the app gate (5.1): `{device?, gate_credential?}` in,
     /// `{gate_credential, device, route}` out. The credential is shown this once.
     pub const GATE_PAIR: &str = "gate.pair";
@@ -229,6 +234,15 @@ pub mod methods {
     /// [`ConnectorsLoginData`](crate::ConnectorsLoginData) out, then `connector.login.*`
     /// events (7.7). Not for a `remote` connection.
     pub const CONNECTORS_LOGIN: &str = "connectors.login";
+    /// One read call of a connector's tool with no model turn, as a gated `watch` run
+    /// (5.3): [`ConnectorsCallParams`](crate::ConnectorsCallParams) in,
+    /// [`ConnectorsCallData`](crate::ConnectorsCallData) out. Needs the capability
+    /// `connectors.call` (else `no_route`); not for a `remote` connection. It answers once
+    /// the call's run has ended, which may wait on the app's decision; a connection answers
+    /// one request at a time, so the app decides it (`run.decide`) on a connection of its
+    /// own: one sent on the same connection waits behind it, until the call's deadline
+    /// denies it.
+    pub const CONNECTORS_CALL: &str = "connectors.call";
     /// Test builds only: `run.start` with a scheduler `job_id`, which no other client can
     /// set: [`RunStartParams`](crate::RunStartParams) plus `job_id` in,
     /// [`RunRef`](crate::RunRef) out. A release build answers `unknown_method`.

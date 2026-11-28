@@ -197,6 +197,9 @@ pub struct Fake {
     args: Vec<String>,
     log: Option<Log>,
     input: Receiver<Option<Value>>,
+    /// The control messages on stdin (`control_request`, `control_response`), as they
+    /// come: `None` once stdin has closed.
+    control: Receiver<Option<Value>>,
     finished: Arc<Mutex<bool>>,
     /// Whether stdin has closed.
     closed: Arc<AtomicBool>,
@@ -216,11 +219,16 @@ impl Fake {
         let finished = Arc::new(Mutex::new(false));
         let closed = Arc::new(AtomicBool::new(false));
         let (sender, input) = mpsc::channel();
+        let (control_sender, control) = mpsc::channel();
         {
             let log = log.clone();
             let finished = Arc::clone(&finished);
             let closed = Arc::clone(&closed);
-            thread::spawn(move || read_stdin(&sender, log.as_ref(), &finished, &closed));
+            let senders = Senders {
+                user: sender,
+                control: control_sender,
+            };
+            thread::spawn(move || read_stdin(&senders, log.as_ref(), &finished, &closed));
         }
         let cwd = std::env::current_dir()
             .map(|dir| dir.display().to_string())
@@ -229,6 +237,7 @@ impl Fake {
             args,
             log,
             input,
+            control,
             finished,
             closed,
             started_at,
@@ -282,6 +291,29 @@ impl Fake {
         wait: Duration,
     ) -> Result<Option<Value>, RecvTimeoutError> {
         self.input.recv_timeout(wait)
+    }
+
+    /// The next control message on stdin, waiting at most `wait`: `Ok(None)` once stdin
+    /// has closed, `Err(Timeout)` when none came in time.
+    pub fn next_control_within(
+        &mut self,
+        wait: Duration,
+    ) -> Result<Option<Value>, RecvTimeoutError> {
+        self.control.recv_timeout(wait)
+    }
+
+    /// Appends `entry` to the list `key` of this start's log entry.
+    pub fn log_push(&self, key: &str, entry: Value) {
+        if let Some(log) = &self.log {
+            log.update(|start| {
+                if !start[key].is_array() {
+                    start[key] = Value::Array(Vec::new());
+                }
+                if let Some(list) = start[key].as_array_mut() {
+                    list.push(entry);
+                }
+            });
+        }
     }
 
     /// When this start began, on the fixture clock: 0 with no log.
@@ -564,7 +596,7 @@ fn run_hook(command: &str, stdin: &str) -> (String, Option<i32>) {
 }
 
 /// Claude Code's config directory: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(dir));
     }
@@ -579,13 +611,15 @@ pub fn encode_project(cwd: &str) -> String {
         .collect()
 }
 
-/// Reads stdin's stream-json lines, logging each, and hands the user messages over.
-fn read_stdin(
-    sender: &mpsc::Sender<Option<Value>>,
-    log: Option<&Log>,
-    finished: &Mutex<bool>,
-    closed: &AtomicBool,
-) {
+/// Where stdin's messages go: the user messages, and the control messages.
+struct Senders {
+    user: mpsc::Sender<Option<Value>>,
+    control: mpsc::Sender<Option<Value>>,
+}
+
+/// Reads stdin's stream-json lines, logging each, and hands the user messages and the
+/// control messages over.
+fn read_stdin(senders: &Senders, log: Option<&Log>, finished: &Mutex<bool>, closed: &AtomicBool) {
     let stdin = io::stdin();
     let mut lines = stdin.lock();
     let mut line = String::new();
@@ -607,7 +641,10 @@ fn read_stdin(
                 }
             });
         }
-        if kind == "user" && sender.send(Some(message)).is_err() {
+        if kind.starts_with("control_") {
+            // A scenario that reads no control message drops them.
+            let _ = senders.control.send(Some(message));
+        } else if kind == "user" && senders.user.send(Some(message)).is_err() {
             return;
         }
     }
@@ -619,7 +656,8 @@ fn read_stdin(
         log.update(|start| start["stdin_eof_at"] = Value::from(at));
     }
     closed.store(true, Ordering::SeqCst);
-    let _ = sender.send(None);
+    let _ = senders.user.send(None);
+    let _ = senders.control.send(None);
 }
 
 /// A random-enough version-4 UUID for a line's `uuid`: nothing reads it.

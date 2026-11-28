@@ -772,6 +772,7 @@ class GeminiShapedAdapter:
     mark: AgentMark | None = None
     binary = "gemini"
     home_env = HOME_ENV
+    hook_env: tuple[str, ...] = ()
     home_name = CONFIG
     settings_name = "settings.json"
     install_hint = "npm install -g @google/gemini-cli"

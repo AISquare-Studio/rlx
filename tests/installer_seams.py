@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 
 from aisquare.core import selfcli
-from aisquare.services import install_route
+from aisquare.services import install_route, upgrade_daemons
 
 #: Everything in ``install_route`` that leaves this process or reads ambient
 #: machine state. ``open_url`` is listed beside ``fetch_latest`` so a test of the
@@ -54,6 +54,9 @@ def no_real_installer(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
         raise AssertionError("a test reached the real selfcli.exec_self")
 
     monkeypatch.setattr(selfcli, "exec_self", no_exec_self)
+    # rlxd beside rlx (uv's tool bin directory) is the machine's, not the test home's: an
+    # upgrade in a test swaps no rlxd unless the test says one is installed (4.2).
+    monkeypatch.setattr(upgrade_daemons, "installed_rlxd", lambda: None)
     yield reached
     assert not reached, (
         f"the real installer seam(s) {reached} were reached — replace them in the test "

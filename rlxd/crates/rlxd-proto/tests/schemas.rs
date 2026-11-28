@@ -9,14 +9,16 @@ use std::path::{Path, PathBuf};
 
 use rlxd_proto::{
     Auth, BRAIN_PROTOCOL, BRAIN_PROTOCOLS, BrainInput, BrainOutput, DaemonRecord, Data, Detail,
-    EnvValues, Envelope, ErrorBody, Event, HelloData, HelloParams, HereData, InstalledRlx,
-    InstalledRlxd, Invalid, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, PtyCursor, PtyExited,
-    PtyInfo, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen,
+    EnvValues, Envelope, ErrorBody, Event, HOOK_ENV_NAMES, HOOK_ENV_VALUE_MOST, HOOK_EVENTS,
+    HelloData, HelloParams, HereData, HookEventData, HookParams, HookReply, InstalledRlx,
+    InstalledRlxd, Invalid, PRE_TOOL_USE, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Paths, PtyCursor,
+    PtyExited, PtyInfo, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen,
     PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RequestId, Role,
     RunScope, SCHEMA_VERSION, Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams,
-    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, brain_codes,
-    codes, daemon_kinds, env_keys, event_types, methods, protocol_version_of, schema_version_of,
-    schemas, send_safety_lowers, send_safety_modes, setting_is_protected, setting_keys, topics,
+    SettingsList, SettingsListParams, SettingsSetParams, StatusData, SubscribeParams, b64,
+    brain_codes, codes, daemon_kinds, deny_output, env_keys, event_types, hook_codes,
+    hook_env_forwarded, hook_event_type, methods, protocol_version_of, schema_version_of, schemas,
+    send_safety_lowers, send_safety_modes, setting_is_protected, setting_keys, topics,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2270,7 +2272,8 @@ fn env_documents_and_the_env_type_agree() {
 #[test]
 fn brain_frames_validate_and_print_back_as_themselves() {
     for frame in [
-        json!({"type": "hello", "protocol": 1, "rlxd_version": "0.10.3"}),
+        json!({"type": "hello", "protocol": 1, "rlxd_version": "0.10.3",
+               "env_allowlist": ["AISQUARE_ROLE", "PATH"]}),
         json!({"type": "request", "id": 7, "method": "ping", "params": {}}),
         json!({"type": "request", "id": 8, "method": "hook", "params": {"event": "stop"}}),
     ] {
@@ -2294,7 +2297,7 @@ fn brain_frames_validate_and_print_back_as_themselves() {
         json!({"type": "request", "id": 1, "method": "ping", "params": {}})
     );
     let later = json!({"type": "hello", "protocol": 1, "pid": 2, "rlx_version": "v",
-                       "env_allowlist": {"names": ["PATH"]}});
+                       "later": {"names": ["PATH"]}});
     agrees::<BrainOutput>("brain-output.json", &later);
 }
 
@@ -2345,7 +2348,8 @@ fn the_brain_builders_print_what_the_schema_accepts() {
     let printed = agrees::<BrainInput>("brain-input.json", &serde_json::to_value(&hello).unwrap());
     assert_eq!(
         printed,
-        json!({"type": "hello", "protocol": BRAIN_PROTOCOL, "rlxd_version": "0.10.3"})
+        json!({"type": "hello", "protocol": BRAIN_PROTOCOL, "rlxd_version": "0.10.3",
+               "env_allowlist": HOOK_ENV_NAMES})
     );
     assert!(BRAIN_PROTOCOLS.contains(&BRAIN_PROTOCOL));
     let request = BrainInput::request(3, "ping", Data::new()).unwrap();
@@ -2386,6 +2390,79 @@ fn a_status_says_why_no_brain_runs_and_how_long_until_the_next_start() {
     }
     assert_eq!(methods::HOOK_PING, "hook.ping");
     assert_eq!(codes::ROLE_NOT_ALLOWED, "role_not_allowed");
+}
+
+// --- hooks over the socket (1.5, 7.3) ----------------------------------------------------------
+
+#[test]
+fn hook_documents_validate_and_print_back_as_themselves() {
+    let params = json!({"event": "session-start", "stdin_b64": "eyJzZXNzaW9uX2lkIjoidDEifQ==",
+        "cwd": "/p", "env": {"AISQUARE_ROLE": "coder"}, "accept_ms": 5000, "deadline_ms": 113000});
+    assert_eq!(agrees::<HookParams>("hook.json", &params), params);
+    let run = json!({"event": "pre-tool-use", "stdin_b64": "", "env": {}, "run_id": "r",
+        "attempt": 2});
+    assert_eq!(agrees::<HookParams>("hook.json", &run), run);
+    let bare = json!({"event": "stop", "stdin_b64": ""});
+    assert_eq!(
+        agrees::<HookParams>("hook.json", &bare),
+        json!({"event": "stop", "stdin_b64": "", "env": {}})
+    );
+    let reply = json!({"stdout_b64": "c2VlZAo=", "stderr_b64": "", "exit_code": 0});
+    assert_eq!(agrees::<HookReply>("hook-reply.json", &reply), reply);
+    let data = json!({"session_id": "t1", "cwd": "/p"});
+    assert_eq!(agrees::<HookEventData>("hook-event.json", &data), data);
+    let with_run = json!({"session_id": "", "cwd": "", "run_id": "r"});
+    assert_eq!(
+        agrees::<HookEventData>("hook-event.json", &with_run),
+        with_run
+    );
+}
+
+#[test]
+fn hook_documents_refuse_their_wrong_shapes() {
+    for params in [
+        json!({"stdin_b64": ""}),
+        json!({"event": "Stop", "stdin_b64": ""}),
+        json!({"event": "stop", "stdin_b64": "", "cwd": null}),
+        json!({"event": "stop", "stdin_b64": "", "cwd": ""}),
+        json!({"event": "stop", "stdin_b64": "", "accept_ms": 0}),
+        json!({"event": "stop", "stdin_b64": "", "env": {"A": 1}}),
+        json!({"event": "stop", "stdin_b64": "", "run_id": ""}),
+        json!({"event": "stop", "stdin_b64": "", "attempt": 0}),
+        json!({"event": "stop", "stdin_b64": "",
+               "env": {"PATH": "a".repeat(HOOK_ENV_VALUE_MOST + 1)}}),
+    ] {
+        both_refuse::<HookParams>("hook.json", params);
+    }
+    let longest = json!({"event": "stop", "stdin_b64": "",
+                         "env": {"PATH": "a".repeat(HOOK_ENV_VALUE_MOST)}});
+    assert_eq!(agrees::<HookParams>("hook.json", &longest), longest);
+    // What the schema cannot say: the event is one rlxd-hook takes, the bytes base64, and
+    // each variable one of the list, by its exact name.
+    for params in [
+        json!({"event": "codex", "stdin_b64": ""}),
+        json!({"event": "stop", "stdin_b64": "not base64!"}),
+        json!({"event": "stop", "stdin_b64": "", "env": {"aisquare_role": "coder"}}),
+        json!({"event": "stop", "stdin_b64": "", "env": {"ANTHROPIC_API_KEY": "k"}}),
+    ] {
+        assert!(
+            serde_json::from_value::<HookParams>(params.clone()).is_err(),
+            "{params}"
+        );
+    }
+    for reply in [
+        json!({"stdout_b64": "", "stderr_b64": ""}),
+        json!({"stdout_b64": "", "stderr_b64": "", "exit_code": "0"}),
+    ] {
+        both_refuse::<HookReply>("hook-reply.json", reply);
+    }
+    for data in [
+        json!({"cwd": "/p"}),
+        json!({"session_id": "t1", "cwd": "/p", "run_id": ""}),
+        json!({"session_id": "t1", "cwd": "/p", "run_id": null}),
+    ] {
+        both_refuse::<HookEventData>("hook-event.json", data);
+    }
 }
 
 const PTY: &str = "6f1c2e0a9b8d4f3e2a1b0c9d8e7f6a5b";
@@ -2611,6 +2688,64 @@ fn pty_documents_refuse_their_wrong_shapes() {
     ] {
         both_refuse::<PtyExited>("pty-exited.json", wrong);
     }
+}
+
+#[test]
+fn the_hook_builders_print_what_the_schemas_accept() {
+    let env = std::collections::BTreeMap::from([("PATH".to_owned(), "/bin".to_owned())]);
+    let params = HookParams::new("stop", b64::encode(b"{}"), Some("/p".into()), env)
+        .unwrap()
+        .with_times(5000, 53000)
+        .unwrap();
+    agrees::<HookParams>("hook.json", &serde_json::to_value(&params).unwrap());
+    assert_eq!(
+        refused(HookParams::new("nope", "", None, Default::default())),
+        "event"
+    );
+    assert_eq!(
+        refused(HookParams::new("stop", "%%%", None, Default::default())),
+        "stdin_b64"
+    );
+    let data = HookEventData::new("t1", "/p").with_run("r1").unwrap();
+    agrees::<HookEventData>("hook-event.json", &serde_json::to_value(&data).unwrap());
+    assert_eq!(
+        refused(HookEventData::new("t1", "/p").with_run("")),
+        "run_id"
+    );
+}
+
+#[test]
+fn the_hooks_name_their_events_methods_and_codes() {
+    assert_eq!(HOOK_EVENTS.len(), 7);
+    assert!(HOOK_EVENTS.contains(&PRE_TOOL_USE));
+    let types: Vec<String> = HOOK_EVENTS
+        .iter()
+        .filter_map(|e| hook_event_type(e))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            event_types::HOOK_SESSION_START,
+            event_types::HOOK_USER_PROMPT_SUBMIT,
+            event_types::HOOK_SESSION_END,
+            event_types::HOOK_STOP,
+            event_types::HOOK_STOP_FAILURE,
+            event_types::HOOK_NOTIFICATION,
+            event_types::HOOK_PRE_TOOL_USE,
+        ]
+    );
+    for r#type in &types {
+        let event = Event::new(1, TIME, topics::HOOK, r#type.clone(), data(json!({}))).unwrap();
+        assert_valid("event.json", &serde_json::to_value(&event).unwrap());
+    }
+    assert_eq!(methods::HOOK, "hook");
+    assert_eq!(hook_codes::HOOK_NOT_DELIVERED, "hook_not_delivered");
+    let deny: Value = serde_json::from_str(&deny_output("r")).unwrap();
+    assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(HOOK_ENV_NAMES.contains(&"AISQUARE_ROLE"));
+    assert!(hook_env_forwarded("CLAUDE_CONFIG_DIR"));
+    assert!(!hook_env_forwarded("CLAUDE_CODE_OAUTH_TOKEN"));
+    assert!(!hook_env_forwarded("CLAUDE_CODE_AUTH"));
 }
 
 #[test]

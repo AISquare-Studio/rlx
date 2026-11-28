@@ -636,6 +636,7 @@ class FakeAgentAdapter:
     mark: AgentMark | None = None
     binary = "fakeagent"
     home_env = "FAKE_AGENT_HOME"
+    hook_env: tuple[str, ...] = ()
     home_name = ".fakeagent"
     settings_name = "hooks.json"
     install_hint = "pipx install fake-agent"
