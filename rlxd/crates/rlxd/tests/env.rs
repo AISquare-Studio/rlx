@@ -363,32 +363,103 @@ fn no_test_can_start_a_real_claude() {
     drop(home.command(&["call", "--as-app", "env.set", &own]));
 }
 
-/// 4.3's Accept, as written: `cargo tree --manifest-path rlxd/Cargo.toml | grep -E
-/// 'security-framework|keyring'` exits 1, as rlx keeps `/usr/bin/security` the only
-/// Keychain reader. Then for every target's normal dependencies (`--target all -e
-/// normal`), which `deny.toml`'s bans hold too.
+/// 4.3's Accept line, exactly as the handoff writes it: it must exit 1.
+const CRATE_BAN: &str =
+    "cargo tree --manifest-path rlxd/Cargo.toml | grep -E 'security-framework|keyring'";
+
+/// The ban, on a `cargo tree` of rlxd: `Err` with the lines the Accept's `grep -E
+/// 'security-framework|keyring'` matches (its exit 0), or when the output is no tree of
+/// rlxd at all, so a `cargo tree` that printed nothing can't pass.
+fn crate_ban(tree: &str) -> Result<(), String> {
+    if !tree.lines().any(|line| line.starts_with("rlxd v")) {
+        return Err(format!("not a cargo tree of rlxd: {tree:?}"));
+    }
+    let found: Vec<&str> = tree
+        .lines()
+        .filter(|line| line.contains("security-framework") || line.contains("keyring"))
+        .collect();
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("a Keychain crate in rlxd: {found:?}"))
+    }
+}
+
+/// `cargo tree --manifest-path rlxd/Cargo.toml`, then `more`, from the repository's root,
+/// where the Accept runs it, by the cargo running the tests: its output.
+fn cargo_tree(more: &[&str]) -> String {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args(["tree", "--manifest-path", "rlxd/Cargo.toml"])
+        .args(more)
+        .current_dir(common::workspace().parent().unwrap())
+        .stdin(Stdio::null())
+        .output()
+        .expect("cargo runs");
+    assert!(
+        output.status.success(),
+        "cargo tree {more:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// rlx keeps `/usr/bin/security` the only Keychain reader, so rlxd links no Keychain
+/// crate (4.3). The Accept's line itself through `sh` where there is one, and on every OS
+/// its two halves: the same `cargo tree`, and its `grep`'s match ([`crate_ban`]). Then
+/// every target's normal dependencies (`--target all -e normal`), which `deny.toml`'s
+/// bans hold too.
 #[test]
 fn no_keychain_crate_in_rlxd() {
-    let repo = common::workspace().parent().unwrap().to_path_buf();
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    for more in [&[][..], &["--target", "all", "-e", "normal"][..]] {
-        let output = std::process::Command::new(&cargo)
-            .args(["tree", "--manifest-path", "rlxd/Cargo.toml"])
-            .args(more)
-            .current_dir(&repo)
+    #[cfg(unix)]
+    {
+        // The line's `cargo` is the one running the tests.
+        let cargo = std::env::var_os("CARGO").map(PathBuf::from);
+        let dirs = cargo
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path =
+            std::env::join_paths(dirs.into_iter().chain(std::env::split_paths(&path))).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", CRATE_BAN])
+            .current_dir(common::workspace().parent().unwrap())
+            .env("PATH", path)
             .stdin(Stdio::null())
             .output()
-            .expect("cargo runs");
-        let tree = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && tree.contains("rlxd v"),
-            "cargo tree {more:?}: {}",
+            .expect("sh runs");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{CRATE_BAN}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let found: Vec<&str> = tree
-            .lines()
-            .filter(|line| line.contains("security-framework") || line.contains("keyring"))
-            .collect();
-        assert!(found.is_empty(), "cargo tree {more:?}: {found:?}");
     }
+    for more in [&[][..], &["--target", "all", "-e", "normal"][..]] {
+        if let Err(why) = crate_ban(&cargo_tree(more)) {
+            panic!("cargo tree {more:?}: {why}");
+        }
+    }
+}
+
+/// The ban can't pass by finding nothing: a Keychain crate planted in a tree fails it, as
+/// does an output that is no tree of rlxd.
+#[test]
+fn the_crate_ban_fails_on_a_planted_keychain_crate() {
+    let tree = "rlxd v0.10.1 (/src/rlx/rlxd/crates/rlxd)\n\
+                ├── anyhow v1.0.98\n\
+                └── tokio v1.47.1\n";
+    assert_eq!(crate_ban(tree), Ok(()));
+    for planted in [
+        "│   └── security-framework v2.11.1",
+        "├── security-framework-sys v2.14.0",
+        "└── keyring v3.6.2",
+    ] {
+        let why = crate_ban(&format!("{tree}{planted}\n")).unwrap_err();
+        assert!(why.contains(planted), "{why}");
+    }
+    assert!(crate_ban("").is_err());
+    assert!(crate_ban("error: could not find `Cargo.toml`\n").is_err());
 }
