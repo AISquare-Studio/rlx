@@ -302,9 +302,10 @@ def holders(ref: weakref.ref[object], *, depth: int = 3, limit: int = 60) -> lis
         return []
     lines: list[str] = []
     made: list[object] = [lines]
-    ignored = {id(lines), id(made), id(inspect.currentframe())}
+    ignored = {id(lines), id(made), id(target), id(inspect.currentframe())}
     # What the object holds itself (its styles, its __dict__'s values) points back at it: a
-    # cycle of its own, which the collector frees with it. Named, not followed.
+    # cycle of its own, which the collector frees with it unless something else holds a part
+    # of it. Marked, and followed for that something.
     own = {id(part) for part in gc.get_referents(target)}
     own |= {
         id(value)
@@ -325,10 +326,8 @@ def holders(ref: weakref.ref[object], *, depth: int = 3, limit: int = 60) -> lis
             if id(holder) in ignored:
                 continue
             ignored.add(id(holder))
-            if level == 1 and id(holder) in own:
-                lines.append(f"(its own) {_described(holder)}")
-                continue
-            lines.append(f"{'  ' * (level - 1)}{_described(holder)}")
+            mark = "(its own) " if level == 1 and id(holder) in own else ""
+            lines.append(f"{'  ' * (level - 1)}{mark}{_described(holder)}")
             walk(holder, level + 1)
 
     walk(target, 1)
