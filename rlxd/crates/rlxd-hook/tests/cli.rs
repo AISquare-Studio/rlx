@@ -377,6 +377,31 @@ fn pre_tool_use_prints_only_the_gates_answer_whatever_rlxd_answers() {
     }
 }
 
+/// rlxd-hook prints the gate's answer rebuilt from its decision and reason, never rlxd's
+/// bytes as they came, and never rlxd's stderr.
+#[cfg(unix)]
+#[test]
+fn pre_tool_use_prints_the_answer_rebuilt_and_never_rlxds_stderr() {
+    use rlxd_client::proto::b64;
+    let spaced = "  {\"hookSpecificOutput\": {\"permissionDecisionReason\": \"go\", \"permissionDecision\": \"allow\", \"hookEventName\": \"PreToolUse\"}}\n\n";
+    let here = NoRlxd::new("gate-rebuilt");
+    let data = serde_json::json!({"stdout_b64": b64::encode(spaced.as_bytes()),
+        "stderr_b64": b64::encode(b"something rlxd says on stderr"), "exit_code": 0});
+    let _rlxd = FakeRlxd::replying(&here, serde_json::json!({"ok": true, "data": data}));
+    let output = here.run_with(
+        GATED,
+        b"{\"tool_name\":\"t\",\"tool_input\":{}}",
+        &[("RLXD_HOOK_KEY", KEY)],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        rlxd_client::proto::allow_output("go").as_bytes(),
+        "{output:?}"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
 /// With no run or no key, `pre-tool-use` asks rlxd nothing, and denies.
 #[cfg(unix)]
 #[test]

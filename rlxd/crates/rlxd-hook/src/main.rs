@@ -52,10 +52,12 @@
 //!   command line names none): past the gate's own deadline, which denies the call
 //!   `by: "timeout"`, and below Claude Code's timeout for the hook, which rlxd writes as
 //!   `deadline_ms` and 10 s.
-//! - It prints rlxd's reply only when it is the gate's answer, an allow or a deny and
-//!   nothing else (`is_gate_output`). Anything else (no rlxd, a refusal, a dropped
-//!   connection, a reply it cannot read, an empty one, its timer) prints a deny, so nothing
-//!   but the gate's allow lets a call through.
+//! - It prints the gate's answer only, rebuilt from the decision and the reason it read
+//!   (`allow_output` or `deny_output`), never rlxd's bytes as they came nor anything on
+//!   stderr, and only when rlxd's reply is that answer and nothing else (`is_gate_output`).
+//!   Anything else (no rlxd, a refusal, a dropped connection, a reply it cannot read, an
+//!   empty one, its timer) prints a deny, so nothing but the gate's allow lets a call
+//!   through.
 //!
 //! Every hook exits 0, a usage error too (Claude Code reads 2 as a blocking error): it says
 //! why on stderr, and `pre-tool-use` still prints its deny.
@@ -72,8 +74,8 @@ use std::time::Duration;
 
 use rlxd_client::proto::{
     DEFAULT_DEADLINE_MS, Data, HOOK_ENV_NAMES, HOOK_EVENTS, HOOK_FRAME_MOST, HOOK_KEY_ENV,
-    HelloParams, HookParams, HookReply, PRE_TOOL_USE, Role, VERSION, b64, codes, deny_output,
-    hook_codes, is_gate_output, methods,
+    HelloParams, HookParams, HookReply, PRE_TOOL_USE, Role, VERSION, allow_output, b64, codes,
+    deny_output, hook_codes, is_gate_output, methods,
 };
 use rlxd_client::{CallError, ConnectError, Connection, Home, install};
 use serde::Deserialize;
@@ -303,25 +305,38 @@ fn pre_tool_use(run: Option<Run>) -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let budget = gate_budget(run.deadline_ms);
-    // Only the gate's answer goes through: any other reply, an empty one included (on
-    // which Claude Code asks no one), is a deny.
-    match ask_in_time(
+    // Only the gate's answer goes through, rebuilt: any other reply, an empty one included
+    // (on which Claude Code asks no one), is a deny, and rlxd's stderr is never written.
+    let answer = match ask_in_time(
         PRE_TOOL_USE,
         &stdin,
         Some((run.id, run.attempt)),
         Some(key),
         budget,
     ) {
-        Asked::Answered(reply)
-            if decoded(&reply.stdout_b64).is_some_and(|stdout| is_gate_output(&stdout)) =>
-        {
-            emit(&reply);
+        Asked::Answered(reply) => {
+            decoded(&reply.stdout_b64).and_then(|stdout| gate_answer(&stdout))
         }
-        Asked::Answered(_) | Asked::NeverRan(_) | Asked::MayHaveRun(_) => {
-            write_out(deny_output(UNREACHED).as_bytes());
-        }
-    }
+        Asked::NeverRan(_) | Asked::MayHaveRun(_) => None,
+    };
+    write_out(answer.unwrap_or_else(|| deny_output(UNREACHED)).as_bytes());
     ExitCode::SUCCESS
+}
+
+/// The gate's answer in `stdout`, rebuilt from its decision and its reason alone: `None`
+/// unless `stdout` is that answer and nothing else (`is_gate_output`).
+fn gate_answer(stdout: &[u8]) -> Option<String> {
+    if !is_gate_output(stdout) {
+        return None;
+    }
+    let said: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let output = &said["hookSpecificOutput"];
+    let reason = output["permissionDecisionReason"].as_str()?;
+    match output["permissionDecision"].as_str()? {
+        "allow" => Some(allow_output(reason)),
+        "deny" => Some(deny_output(reason)),
+        _ => None,
+    }
 }
 
 fn decoded(text: &str) -> Option<Vec<u8>> {
@@ -584,6 +599,19 @@ mod tests {
             attempt,
             deadline_ms,
         }))
+    }
+
+    #[test]
+    fn the_gates_answer_is_rebuilt_from_its_decision_and_reason_alone() {
+        let spaced = b" { \"hookSpecificOutput\" : {\"permissionDecisionReason\": \"ok\", \"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"allow\"} }\n\n";
+        assert_eq!(gate_answer(spaced), Some(allow_output("ok")));
+        assert_eq!(
+            gate_answer(deny_output("no").as_bytes()),
+            Some(deny_output("no"))
+        );
+        for other in [&b""[..], b"{}", b"allow"] {
+            assert_eq!(gate_answer(other), None);
+        }
     }
 
     #[test]
