@@ -21,6 +21,7 @@ run's log, where any line fails the test, stays clean.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -470,6 +471,12 @@ def test_real_agent_binaries_is_refused_to_a_test_outside_its_files(
     assert guard.AGENTS_VAR not in os.environ
 
 
+def _children_allowed(tmp_path: Path, checkout: Path = REPO) -> str:
+    """The run roots the lift test tells its children: none of them holds ``elsewhere``, and
+    the checkout stays one, as it is the suite's (tester #3851)."""
+    return os.pathsep.join([str(tmp_path / "run-root"), str(checkout)])
+
+
 def test_the_lift_lets_a_real_agent_through_here_and_in_a_child_told_so(
     agents_elsewhere: Path, own_log: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -481,12 +488,7 @@ def test_the_lift_lets_a_real_agent_through_here_and_in_a_child_told_so(
     finally:
         guard.lift(agents=before)
     assert guard.refusal_kind(claude) == "agent"
-    # Elsewhere is none of the run's roots; the checkout still is, and is guarded here as if it
-    # were a scratchpad worktree inside ~/.aisquare, where a child started in it lists it at
-    # import (tester #3851): the checkout must stay a run root for it to be let through.
-    monkeypatch.setenv(guard.ALLOWED_VAR, os.pathsep.join([str(tmp_path / "run-root"), str(REPO)]))
-    guarded = [os.environ.get(guard.GUARDED_VAR, ""), str(REPO.parent)]
-    monkeypatch.setenv(guard.GUARDED_VAR, os.pathsep.join(part for part in guarded if part))
+    monkeypatch.setenv(guard.ALLOWED_VAR, _children_allowed(tmp_path))
     code = f"import rlx_keychain_guard as g; print(g.refusal_kind({claude!r}))"
     for told, said in ((None, "agent"), ("1", "None")):
         env = {k: v for k, v in os.environ.items() if k != guard.AGENTS_VAR}
@@ -495,13 +497,53 @@ def test_the_lift_lets_a_real_agent_through_here_and_in_a_child_told_so(
         child = subprocess.run(
             [sys.executable, "-c", code],
             env=env,
-            cwd=REPO,
+            cwd=tmp_path,
             capture_output=True,
             text=True,
             timeout=60,
         )
         assert child.stdout.strip() == said, child.stderr
     assert refusals(own_log) == []
+
+
+@pytest.mark.parametrize(
+    "kept", [True, False], ids=["the checkout kept a run root", "round 2's narrowing"]
+)
+def test_a_child_started_in_a_checkout_inside_a_guarded_dir_is_let_through(
+    kept: bool, own_log: Path, tmp_path: Path
+) -> None:
+    """Pin for tester #3851: a checkout under a scratch ``~/.aisquare``, as a Claude Code
+    scratchpad worktree lies, with the guard loaded from it. A child started in it lists it
+    at import: let through while the lift test's run roots keep the checkout, and refused
+    under round 2's narrowing, which shows this shape is the one that went red."""
+    guarded = tmp_path.resolve() / "home" / ".aisquare"
+    checkout = guarded / "cache" / "claude-accounts" / "2" / "scratchpad" / "wt"
+    copy = checkout / "tests" / "keychain_guard"
+    shutil.copytree(KEYCHAIN_GUARD_DIR, copy, ignore=shutil.ignore_patterns("__pycache__"))
+    rest = os.environ["PYTHONPATH"].split(os.pathsep)[1:]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(copy), *rest]),
+        guard.GUARDED_VAR: os.pathsep.join([os.environ[guard.GUARDED_VAR], str(guarded)]),
+        guard.ALLOWED_VAR: (
+            _children_allowed(tmp_path, checkout) if kept else str(tmp_path / "run-root")
+        ),
+    }
+    child = subprocess.run(
+        [sys.executable, "-c", "import rlx_keychain_guard as g; print(g.__file__)"],
+        env=env,
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert Path(child.stdout.strip()).parent == copy, child.stderr
+    entries, _ = guard.read_log(own_log)
+    listed = [entry for entry in entries if entry["kind"] == "home"]
+    if kept:
+        assert entries == []
+    else:
+        assert [guard._norm(entry["path"]) for entry in listed] == [guard._norm(str(checkout))]
 
 
 def test_the_native_suites_are_the_files_their_runners_run() -> None:
