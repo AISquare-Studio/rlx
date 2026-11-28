@@ -91,6 +91,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from aisquare.core import claude_sharing, paths, tls
 from aisquare.core.harness import MODEL_FAMILIES, model_family
 from aisquare.core.names import name_flaw, name_key
+from aisquare.core.parsed_files import forget_under, json_object, parsed_or
 from aisquare.core.version import __version__
 from aisquare.models import (
     ClaudeAccount,
@@ -779,8 +780,21 @@ def identity(
 
 
 def read_identity(path: Path) -> ClaudeIdentity | None:
-    """Read stable account identity without using or fingerprinting rotating tokens."""
-    return identity_in(_read_json(path))
+    """Read stable account identity without using or fingerprinting rotating tokens. The file
+    is read only once its stat changes; until then the parse kept for it is reused
+    (``core.parsed_files``), and each caller gets its own copy."""
+    identity = parsed_or(path, _identity_in_file, None)
+    return identity.model_copy() if identity is not None else None
+
+
+def _identity_in_file(path: Path, text: str) -> ClaudeIdentity | None:
+    return identity_in(json_object(path, text))
+
+
+def forget_unlisted_identities(accounts: Iterable[ClaudeAccount]) -> None:
+    """Drop the identities :func:`read_identity` keeps for files under :func:`accounts_root`
+    that are in none of ``accounts``' directories: an overview's sweep of removed slots."""
+    forget_under(accounts_root(), [account.config_dir for account in accounts])
 
 
 def identity_in(data: Mapping[str, Any] | None) -> ClaudeIdentity | None:

@@ -279,7 +279,9 @@ def overview() -> AccountsOverview:
             accounts = _arranged(store)
             statuses = describe_all(accounts, store=store)
     except sqlite3.Error:  # as `list_accounts` fails open: the listing, without the arrangement
-        statuses = describe_all(core.list_accounts())
+        accounts = core.list_accounts()
+        statuses = describe_all(accounts)
+    core.forget_unlisted_identities(accounts)
     return AccountsOverview(
         claude=installs.get(AGENT) or install(), accounts=statuses, installs=installs
     )

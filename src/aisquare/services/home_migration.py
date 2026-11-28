@@ -63,7 +63,6 @@ import shutil
 import sqlite3
 import stat
 import sys
-import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -76,7 +75,7 @@ from aisquare.core import claude_accounts as accounts_core
 from aisquare.core import launch_seal, paths
 from aisquare.core import program as prog
 from aisquare.core.atomic import write_replacing
-from aisquare.core.locking import holding
+from aisquare.core.locking import acquire, open_lock_file, unlock
 from aisquare.models import ClaudeAccount
 
 if TYPE_CHECKING:
@@ -734,25 +733,103 @@ class Moved:
         }
 
 
+MOVE_LOCK_PREFIX = ".rlx-home-move-"
+"""The move lock's name, before its digest: a hidden file beside the home it is for."""
+_MOVE_LOCK_TRIES = 5
+"""Takes of the move lock that may find its file removed by a holder as it let go."""
+ANOTHER_MOVE = "another move of this home, or a drop of its cache, is running"
+
+
 @contextlib.contextmanager
 def _one_at_a_time(old_root: str, *, named: bool) -> Iterator[None]:
-    """Hold this home's move lock, outside the home (its folders are renamed under it, and
-    Windows renames no folder with a file open in it); refuse while another move holds it.
+    """Hold this home's move lock (:func:`move_lock_path`); refuse while another move holds it.
 
-    A home a variable names is keyed by its real path, so a link to it or another spelling of
-    it is the same home (the tester's NB2 on #31). The default home keeps its own spelling,
-    ``~/.aisquare``: its real path is ``~/.rlx`` once linked, so a run that came after the link
-    and before the move was done would have held another lock."""
+    Removed as it is let go, so no lock is left behind a move (#62: one was left in the
+    system's temp folder per home ever moved, thousands of them where a suite's homes came and
+    went). A process that took the lock of a file its holder had just removed takes the one
+    there now, so two movers still never hold it at once."""
+    lock = move_lock_path(old_root, named=named)
+    fd = _take_the_move_lock(lock)
+    try:
+        yield
+    finally:
+        _let_go_of_the_move_lock(lock, fd)
+
+
+def move_lock_path(old_root: str, *, named: bool) -> Path:
+    """The move lock of the home at ``old_root``: ``.rlx-home-move-<digest>.lock`` in the folder
+    that holds the home, outside the tree the move renames (Windows renames no folder with a
+    file open in it), and found the same way by every process: not in the temp folder, which
+    can be another for each agent (#57).
+
+    A home a variable names is keyed by its real path, its folder too, so a link to it or
+    another spelling of it is the same home (the tester's NB2 on #31). The default home keeps
+    its own spelling, ``~/.aisquare``: its real path is ``~/.rlx`` once linked, so a run that
+    came after the link and before the move was done would have held another lock."""
     key = os.path.realpath(old_root) if named else old_root
     digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-    lock = Path(tempfile.gettempdir()) / f"rlx-home-migration-{digest}.lock"
+    return Path(key).parent / f"{MOVE_LOCK_PREFIX}{digest}.lock"
+
+
+def _take_the_move_lock(lock: Path) -> int:
+    """The move lock taken, at once or not at all, as a descriptor :func:`_let_go_of_the_move_lock`
+    closes. Raises :class:`MigrationRefused` while another process holds it, or when it cannot
+    be made (a folder the home is in that its user may not write)."""
+    for _ in range(_MOVE_LOCK_TRIES):
+        try:
+            fd = open_lock_file(lock, mode=0o600)
+        except OSError as exc:
+            raise MigrationRefused(_no_move_lock(lock, exc)) from exc
+        try:
+            acquire(fd, wait_s=0)
+        except TimeoutError:
+            os.close(fd)
+            raise MigrationRefused(ANOTHER_MOVE) from None
+        except OSError as exc:
+            os.close(fd)
+            raise MigrationRefused(_no_move_lock(lock, exc)) from exc
+        except BaseException:
+            os.close(fd)
+            raise
+        if _still_the_file(fd, lock):
+            return fd
+        os.close(fd)  # its holder removed it as it let go: the lock is the file there now
+    raise MigrationRefused(ANOTHER_MOVE)
+
+
+def _no_move_lock(lock: Path, exc: OSError) -> str:
+    return f"its lock beside the home could not be taken ({lock}: {exc.strerror or exc})"
+
+
+def _still_the_file(fd: int, lock: Path) -> bool:
+    """Whether ``fd`` is the file at ``lock`` still: not one a holder removed as it let go."""
     try:
-        with holding(lock, wait_s=0, mode=0o600):
-            yield
-    except TimeoutError:
-        raise MigrationRefused(
-            "another move of this home, or a drop of its cache, is running"
-        ) from None
+        there = os.stat(lock)
+    except OSError:
+        return False
+    held = os.fstat(fd)
+    return (there.st_dev, there.st_ino) == (held.st_dev, held.st_ino)
+
+
+def _let_go_of_the_move_lock(lock: Path, fd: int) -> None:
+    """The move lock let go and its file removed. On POSIX it is removed while still held, so a
+    process that opens it after this finds none, or a new one, and one that opened it before
+    sees it gone once it holds it (:func:`_still_the_file`). Windows removes no file open
+    anywhere: let go first, then removed unless another process has it open, which removes it
+    in its turn."""
+    if sys.platform == "win32":
+        with contextlib.suppress(OSError):
+            unlock(fd)
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(lock)
+        return
+    try:
+        if _still_the_file(fd, lock):
+            with contextlib.suppress(OSError):
+                os.unlink(lock)
+    finally:
+        os.close(fd)  # and the lock with it
 
 
 def _names_the_default_home(environment: Mapping[str, str] | None = None) -> bool:
