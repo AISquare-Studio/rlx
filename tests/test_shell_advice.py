@@ -80,6 +80,12 @@ ALLOWED: dict[str, str] = {
     "core/agent_adapters/claude_usage.py::_attachment": (
         "data: a trace line naming the hook that ran"
     ),
+    "core/agent_adapters/claude_usage.py::_scan_for_markers": (
+        "data: a usage trace's label: aisquare's context (a noun) found in a message"
+    ),
+    "core/agent_adapters/codex_usage.py::_item": (
+        "data: a usage trace's label: aisquare's context (a noun) found in a message"
+    ),
     "core/agent_adapters/codex.py::<module>": (
         "data: a third party's install line; asq links the install page instead (R13a)"
     ),
@@ -130,6 +136,18 @@ ALLOWED: dict[str, str] = {
         "data: returns the restart's command line; spawn_note wraps it"
     ),
     "services/briefs.py::_command_of": "data: the command a report ran, shown as what ran",
+    "services/briefs.py::<module>": "agent: the pointer in the session start's requirements",
+    "services/briefs.py::_pass_refusals": (
+        "agent: why a report cannot back a pass, in `brief evidence`'s refusal to the agent"
+    ),
+    "services/briefs.py::_record": "agent: `brief evidence`'s refusals, to the agent recording it",
+    "services/briefs.py::record_hint": (
+        "agent: how an agent records a check, in its session start and `task done`'s refusal"
+    ),
+    "services/briefs.py::session_requirements": "agent: the session start's requirements block",
+    "services/briefs.py::update": (
+        "agent: the reopen note a corrected brief puts on each linked task, for its agent"
+    ),
     "services/captain/__main__.py::main": (
         "cli: `python -m aisquare.services.captain`'s own help and its stderr"
     ),
@@ -155,6 +173,15 @@ ALLOWED: dict[str, str] = {
     "services/code.py::index_hint": (
         "data: returns the command line; `code` prints it at a shell, and its refusal is the "
         "agents'"
+    ),
+    "services/command_reports.py::_adopt": (
+        "agent: the refusal of a report the sandboxed agent's broker did not seal"
+    ),
+    "services/command_reports.py::_check_sandboxed": (
+        "agent: the refusal of a sandboxed agent's report taken for another board"
+    ),
+    "services/context.py::_to_markdown": (
+        "data: the context export's heading: aisquare's context (a noun), not a command"
     ),
     "services/destinations.py::<module>": (
         "doctor-fix: REVOKE_RETRY, the revocation row's fix and the CLI's hint; revoke_retry() "
@@ -323,6 +350,9 @@ ALLOWED: dict[str, str] = {
     "services/remote_server.py::revoke_later": "phone: a 503 the Remote page shows (B.6)",
     "services/remote_server.py::revoke_unsaved": "phone: a 503 the Remote page shows (B.6)",
     "services/remote_server.py::too_many_devices": "phone: a 409 the Remote page shows (B.6)",
+    "services/store_broker.py::<module>": (
+        "agent: what each command a sandboxed agent's broker runs does, as the agent is told"
+    ),
     "services/store_broker.py::_remedy": "agent: the broker's refusal, read by the sandboxed agent",
     "services/store_broker.py::ask": "agent: the broker's refusal, read by the sandboxed agent",
     "services/store_broker.py::sandbox_environment": (
@@ -558,7 +588,7 @@ def _fresh_replacement() -> FleetAgent:
 
 def _builders() -> dict[str, Callable[[], str]]:
     from aisquare.models import UsageCause
-    from aisquare.services import agents, destinations, fleet, hooks, lifecycle, remote_server
+    from aisquare.services import agents, destinations, fleet, hooks, lifecycle, remote_server, team
     from aisquare.services import claude_accounts as accounts
     from aisquare.services.captain import gate
 
@@ -578,6 +608,8 @@ def _builders() -> dict[str, Callable[[], str]]:
         "a fresh replacement's move": lambda: (
             hooks.fresh_replacement_refusal(_fresh_replacement(), now=_MOVED + _THREE_MIN) or ""
         ),
+        # asq's Personas tab attaches through a board note, whose read-back can fail (#69).
+        "an unconfirmed board write": lambda: str(team.DeliveryUnconfirmedError("evt_1", "api")),
     }
 
 
@@ -593,6 +625,8 @@ SHELL = {
     "the captain's gate": "say your authenticator's code to the captain, or run: rlx captain "
     "gate unlock <code>",
     "the captain's row in a pause": "the captain — `rlx captain` runs it",
+    "an unconfirmed board write": "write evt_1 was not confirmed on board api — not reporting "
+    "success; check `aisquare log` before retrying",
     "a fresh replacement's move": "'coder-1' was moved 3 min ago by the usage-limit "
     "hand-over; `--force` moves it again",
 }

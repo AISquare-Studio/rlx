@@ -90,13 +90,29 @@ class FixApplied(Message):
         super().__init__()
 
 
-_SUBCOMMANDS = (
-    "fleet|team|accounts|agents|project|doctor|config|remote|explainability|metrics|captain|"
-    "upgrade|uninstall|instances|launch|init|login|logout|board|watch|persona|task|note|hook|code|"
-    "tidy"
-)
+PROGRAMS = ("rlx", "asq", "aisquare", "relax")
+"""The names rlx is typed by: each console script that runs its CLI."""
+
+RLX_COMMANDS = (
+    "accounts", "agents", "auth", "board", "brief", "captain", "capture", "code", "config",
+    "connectors", "context", "ctx", "doctor", "enforce", "exec", "explainability", "fleet",
+    "hook", "init", "inject", "instances", "launch", "log", "login", "logout", "metrics",
+    "move-home", "note", "open", "outcomes", "persona", "policy", "project", "remember",
+    "remote", "reports", "serve", "service", "status", "sync", "task", "team", "tidy", "ui",
+    "uninstall", "upgrade", "watch", "whoami", "why", "workspace",
+)  # fmt: skip
+"""Every top-level command and group of rlx's CLI, the hidden ones too. A hand list: reading
+them off the CLI would load all of it into asq (#45). ``tests/test_asq_names_no_command.py``
+fails when it differs from the CLI's own (#69)."""
+
+
+def _either(words: Iterable[str]) -> str:
+    """``words`` as one alternation, the longest first."""
+    return "|".join(sorted(map(re.escape, words), key=lambda word: (-len(word), word)))
+
+
 COMMAND = re.compile(
-    rf"\b(?:rlx|aisquare|asq|relax) (?:{_SUBCOMMANDS})\b"
+    rf"\b(?:{_either(PROGRAMS)}) (?:{_either(RLX_COMMANDS)})\b"
     r"|`--[a-z][\w-]*"
     r"|\btmux -[LS]\b|\bnpm install\b|\bpip install\b|\bbrew install\b|\buv tool\b"
     r"|curl -fsSL|\bpipx (?:install|inject|upgrade)\b"
