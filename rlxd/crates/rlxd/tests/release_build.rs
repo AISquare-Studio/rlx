@@ -267,8 +267,11 @@ fn a_release_build_has_no_gate_dev_mode() {
 #[test]
 fn a_release_build_has_no_fake_claude() {
     // Every binary of the package that a release build makes, as `cargo build --release
-    // -p rlxd --bins` makes them: fake-claude needs the test-only feature, so it is not one.
+    // -p rlxd --bins` makes them: fake-claude and the PTY tests' ticker need the test-only
+    // feature, so neither is one.
     let built = &common::release_build().binaries;
     assert!(built.iter().any(|name| name == "rlxd"), "{built:?}");
-    assert!(!built.iter().any(|name| name == "fake-claude"), "{built:?}");
+    for test_only in ["fake-claude", "ticker"] {
+        assert!(!built.iter().any(|name| name == test_only), "{built:?}");
+    }
 }
