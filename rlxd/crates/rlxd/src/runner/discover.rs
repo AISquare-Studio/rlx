@@ -33,7 +33,8 @@ use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::time::Instant;
 
-use super::call::{MAX_LINE, Message, listed_of};
+use super::call::{MAX_LINE, Message, listed_of, untrusted};
+use super::probe::Tended;
 use super::process::Launch;
 use super::{Runner, argv, blocking, refusal, run_env, stream};
 use crate::claude;
@@ -151,6 +152,17 @@ impl Runner {
 
     /// One read: Claude Code started on `account`'s environment, driven, and ended.
     async fn list_connectors(&self, account: &Account) -> Result<Listing, ErrorBody> {
+        if !account.homes_known() {
+            return Err(refusal(
+                codes::ACCOUNT_UNKNOWN,
+                format!(
+                    "account {}'s connectors were not read: rlxd doesn't know both of its \
+                     homes (CLAUDE_CONFIG_DIR and CLAUDE_CODE_TMPDIR), and reads none with \
+                     another account's",
+                    account.slot
+                ),
+            ));
+        }
         let _one = self.probing.lock().await;
         let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
             return Err(refusal(
@@ -175,6 +187,19 @@ impl Runner {
             .join(account.slot.to_string());
         blocking(|| std::fs::create_dir_all(&dir))
             .map_err(|e| failed(format!("its folder could not be made: {e}")))?;
+        // As a connectors.call's folder is: no settings rlxd did not write, which
+        // `--setting-sources project` would load.
+        if let Some(path) = blocking(|| untrusted(&dir)) {
+            return Err(refusal(
+                codes::UNTRUSTED_SETTINGS,
+                format!(
+                    "account {}'s connectors were not read: its folder holds Claude Code \
+                     settings rlxd did not write ({})",
+                    account.slot,
+                    path.display()
+                ),
+            ));
+        }
         info!(
             "connectors: account {}'s connectors are read (model_turns: 0)",
             account.slot
@@ -194,8 +219,7 @@ impl Runner {
                 program.display()
             ))
         })?;
-        let tree = Arc::new(tree);
-        *self.probe_tree.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&tree));
+        let tended = Tended::new(Arc::new(tree), &self.probe_tree);
         let read = match (child.stdin.take(), child.stdout.take()) {
             (Some(mut stdin), Some(stdout)) => {
                 let read = Control {
@@ -213,11 +237,7 @@ impl Runner {
                 "Claude Code's stdio was not piped".to_owned(),
             )),
         };
-        if tree.reap(&mut child, Some(EXIT_GRACE)).await.is_none() {
-            tree.kill();
-            tree.reap(&mut child, None).await;
-        }
-        *self.probe_tree.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        tended.reap(&mut child, EXIT_GRACE).await;
         info!("connectors: account {}'s read ended", account.slot);
         read.map_err(|failure| match failure {
             Failure::NoRoute(why) => refusal(

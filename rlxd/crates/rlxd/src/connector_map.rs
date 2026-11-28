@@ -11,17 +11,21 @@
 //!   time. A read that fails keeps the account's connectors as read before, with its
 //!   error. Without the route (capability `connectors.no_turn`), `allow_turn: true` runs
 //!   the one-turn probe instead, of one account.
+//! - **At rlxd's start**, when its environment names a `CLAUDE_CONFIG_DIR`, the brain is
+//!   asked once, so rlxd knows which account its own runs use (with none named, it is the
+//!   default account): a run's `system/init` updates that account's connectors as it
+//!   comes, so a connector a run finds failing needs no refresh.
 //! - **In the background**, only on the no-turn route, so no turn is ever spent unasked:
-//!   every [`TICK`], the brain is asked again, and each account that is new, in another
-//!   home or signed in again ([`Account::login`]) is read; so is each one last read more
-//!   than [`STALE`] ago. A run's `system/init` updates the default account's connectors
-//!   as it comes, so a connector a run finds failing needs no refresh.
+//!   every [`TICK`], the brain is asked again, and each account that is new or signed in
+//!   again (another [`Account::login`] mark) is read at once; so is each one whose last
+//!   read, whether it succeeded or failed, was more than [`STALE`] ago. So an account is
+//!   read in the background at most daily, unless it is new or signed in again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use rlxd_proto::{Data, ErrorBody, codes};
+use rlxd_proto::{DEFAULT_ACCOUNT, Data, ErrorBody, codes};
 use tokio::sync::watch;
 
 use crate::brain::{Brain, CallError};
@@ -125,6 +129,7 @@ impl ConnectorMap {
             Ok(listed) => off_worker(|| self.connectors.set_accounts(listed)),
             Err(why) => {
                 info!("connectors: the accounts stay as they were: {why}");
+                off_worker(|| self.connectors.unanswered());
                 Vec::new()
             }
         }
@@ -141,8 +146,9 @@ impl ConnectorMap {
             .await
         {
             Ok(data) => data,
+            // Its code only: a brain's message may name a home.
             Err(CallError::NotDelivered(error) | CallError::Failed(error)) => {
-                return Err(format!("the brain said {}: {}", error.code, error.message));
+                return Err(format!("the brain said {}", error.code));
             }
             Err(CallError::TimedOut) => return Err("the brain did not answer in time".into()),
         };
@@ -177,10 +183,11 @@ impl ConnectorMap {
     }
 
     /// `connectors.list {refresh: true, allow_turn: true}` without the no-turn route: the
-    /// one-turn probe, of `only` or the default account.
+    /// one-turn probe, of `only` or the default account, as rlx knows it.
     pub async fn probe(&self, only: Option<u32>) -> Result<(), ErrorBody> {
-        let account = only
-            .and_then(|slot| self.connectors.account(slot))
+        let account = self
+            .connectors
+            .account(only.unwrap_or(DEFAULT_ACCOUNT))
             .unwrap_or_else(Account::default_one);
         self.runner.probe_connectors(&account).await
     }
@@ -201,12 +208,18 @@ impl ConnectorMap {
         ))
     }
 
-    /// The background, for as long as rlxd runs: on the no-turn route only.
+    /// The background, for as long as rlxd runs. When rlxd's environment names a
+    /// `CLAUDE_CONFIG_DIR`, it asks the brain for the accounts at its start, so rlxd knows
+    /// which account its own runs use; then, on the no-turn route only, it ticks.
     pub async fn run(self: Arc<Self>) {
-        if !self.connectors.no_turn() {
+        let ticks = test_times().unwrap_or(Some((TICK, STALE)));
+        if !self.connectors.no_turn() || ticks.is_none() {
+            if self.connectors.runs_account_unknown() {
+                self.learn_accounts().await;
+            }
             return;
         }
-        let Some((tick, stale)) = test_times().unwrap_or(Some((TICK, STALE))) else {
+        let Some((tick, stale)) = ticks else {
             return;
         };
         loop {

@@ -16,13 +16,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::runs::{fixture_log, home_with_scenario_file_in, run_id, seq, start};
-use common::{TestHome, assert_valid, eventually};
+use common::{TestHome, assert_valid, eventually, real_rlx};
 use serde_json::{Value, json};
 
 const SLACK: &str = "claude.ai Slack";
 
 /// Slot 2's login mark, which never leaves rlxd's file.
 const MARK: &str = "mark-of-slot-2";
+
+/// Slot 1's: the default account is signed in too, as it normally is.
+const MARK_1: &str = "mark-of-slot-1";
 
 /// `mcp_status` rows: Slack in `status`, with one read tool.
 fn slack(status: &str) -> Value {
@@ -61,7 +64,7 @@ impl Accounts {
 
     /// The brain's list: slot 1, and slot 2 when `two`.
     fn listed(&self, two: bool) -> Value {
-        let mut listed = vec![json!({"slot": 1, "label": "main"})];
+        let mut listed = vec![json!({"slot": 1, "label": "main", "login": MARK_1})];
         if two {
             listed.push(json!({"slot": 2, "label": "work",
                 "config_dir": self.managed, "tmp_dir": self.managed_tmp, "login": MARK}));
@@ -74,16 +77,24 @@ impl Accounts {
 /// `mcp-accounts`, two accounts listed: slot 1 with Slack connected, slot 2 with Slack
 /// signed out. `envs` are set too.
 fn map_home(no_turn: bool, envs: &[(&str, &str)]) -> (TestHome, Accounts) {
+    map_home_with(no_turn, envs, &slack("needs-auth"))
+}
+
+/// [`map_home`], slot 2's connectors being `rows` from its start.
+fn map_home_with(no_turn: bool, envs: &[(&str, &str)], rows: &Value) -> (TestHome, Accounts) {
     let root = TestHome::new();
     let accounts = Accounts::of(root.root());
     accounts.set(1, &slack("connected"));
-    accounts.set(2, &slack("needs-auth"));
+    accounts.set(2, rows);
     let listed = root.root().join("accounts.json");
     std::fs::write(&listed, accounts.listed(true).to_string()).unwrap();
     let listed = listed.to_str().unwrap().to_owned();
+    // rlxd itself, and so its runs, on the plain account: no CLAUDE_CONFIG_DIR (its HOME
+    // is the test's own).
     let mut all = vec![
         ("RLXD_TEST_ACCOUNTS", listed.as_str()),
         ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
+        ("CLAUDE_CONFIG_DIR", ""),
     ];
     if no_turn {
         all.push(("RLXD_TEST_CONNECTORS_NO_TURN", "1"));
@@ -132,6 +143,22 @@ fn connector_events(home: &TestHome, since: u64) -> Vec<Value> {
 fn assert_no_user_line(start: &Value) {
     let lines = start["stdin"].as_array().unwrap();
     assert!(lines.iter().all(|line| line["type"] != "user"), "{start:#}");
+}
+
+/// rlxd's own file: each account's entry, by slot.
+fn saved(home: &TestHome) -> Value {
+    let text = std::fs::read_to_string(home.root().join("rlxd").join("connectors.json")).unwrap();
+    serde_json::from_str::<Value>(&text).unwrap()["accounts"].clone()
+}
+
+/// Waits for the run `id` to end.
+fn ended(home: &TestHome, id: &str) {
+    eventually("the run ends", || {
+        let runs = home.rlxd(&["call", "run.list"]).data();
+        runs["runs"].as_array().unwrap().iter().any(|run| {
+            run["run_id"] == id && ["done", "failed"].contains(&run["state"].as_str().unwrap_or(""))
+        })
+    });
 }
 
 /// The fixture log's starts.
@@ -253,10 +280,10 @@ fn the_map_survives_a_restart_and_keeps_its_homes_and_marks_to_itself() {
     let after = list(&home, &json!({}));
     assert_eq!(after["accounts"], before["accounts"], "{after:#}");
     assert_eq!(after["model_turns"], 0);
-    let file = home.root().join("rlxd").join("connectors.json");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let file = home.root().join("rlxd").join("connectors.json");
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{}", file.display());
     }
@@ -266,6 +293,7 @@ fn the_map_survives_a_restart_and_keeps_its_homes_and_marks_to_itself() {
     let log = home.log();
     for secret in [
         MARK.to_owned(),
+        MARK_1.to_owned(),
         accounts.managed.display().to_string(),
         accounts.managed_tmp.display().to_string(),
     ] {
@@ -298,10 +326,11 @@ fn a_runs_init_that_finds_a_connector_signed_out_updates_the_map() {
     assert_eq!(changed.len(), 1, "{events:#?}");
     assert_eq!(changed[0]["data"]["account"], 1, "{events:#?}");
     assert_eq!(changed[0]["data"]["status"], "needs-auth", "{events:#?}");
-    // Account 2 is as it was read.
+    // Account 2 is as it was read, and slot 1 keeps the brain's mark for it.
     let data = list(&home, &json!({}));
     assert_eq!(row(&data, 2)["from"], "listing", "{data:#}");
     assert_eq!(row(&data, 1)["from"], "init", "{data:#}");
+    assert_eq!(saved(&home)["1"]["login"], MARK_1);
 }
 
 #[test]
@@ -449,8 +478,339 @@ fn without_the_route_nothing_is_read_unasked_and_a_turn_reads_one_account() {
         starts[0]["env"]["CLAUDE_CONFIG_DIR"],
         accounts.managed.to_str().unwrap()
     );
-    // Without one: the default account's alone, one turn.
+    // Without one: the default account's alone, one turn, filed under the brain's own
+    // entry for it, its mark kept.
     let data = list(&home, &json!({"refresh": true, "allow_turn": true}));
     assert_eq!(data["model_turns"], 1, "{data:#}");
     assert_eq!(row(&data, 1)["from"], "init", "{data:#}");
+    assert_eq!(saved(&home)["1"]["login"], MARK_1);
+}
+
+#[test]
+fn a_runs_init_files_under_the_brains_own_entry_and_an_empty_one_empties_nothing() {
+    let (home, _accounts) = map_home(true, &[("RLXD_TEST_CONNECTOR_MAP_MS", "200,600000")]);
+    eventually("both accounts are read unasked", || {
+        let data = list(&home, &json!({}));
+        data["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["from"] == "listing")
+    });
+    assert_eq!(saved(&home)["1"]["login"], MARK_1);
+    let reads = starts(&home).len();
+    let since = seq(&home);
+    // A run whose init lists no server, as Claude Code's does with stdin at EOF.
+    std::fs::write(home.root().join("scenario"), "hello").unwrap();
+    let id = run_id();
+    start(
+        &home,
+        &json!({"kind": "widget_refresh", "prompt": "digest",
+            "mount": {"kind": "connectors", "connectors": [SLACK]}, "space": "default"}),
+        &id,
+    );
+    ended(&home, &id);
+    std::fs::write(home.root().join("scenario"), "mcp-accounts").unwrap();
+    // Ticks go by: slot 1 is not "signed in again", so it is not read again.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(starts(&home).len(), reads + 1, "the run's start only");
+    let data = list(&home, &json!({}));
+    assert_eq!(row(&data, 1)["connectors"][0]["id"], SLACK, "{data:#}");
+    let removed: Vec<Value> = connector_events(&home, since)
+        .into_iter()
+        .filter(|e| e["type"] == "connector.removed")
+        .collect();
+    assert!(removed.is_empty(), "{removed:#?}");
+    assert_eq!(saved(&home)["1"]["login"], MARK_1, "the mark is kept");
+}
+
+#[test]
+fn a_failed_read_ages_as_one_that_succeeded() {
+    // Slot 2's read fails at every try (signed out, it never settles).
+    let (home, _accounts) = map_home_with(
+        true,
+        &[
+            ("RLXD_TEST_CONNECTOR_MAP_MS", "200,600000"),
+            ("RLXD_TEST_CONNECTORS_SETTLE_MS", "1200"),
+        ],
+        &slack("pending"),
+    );
+    let tried = || {
+        let data = list(&home, &json!({}));
+        row(&data, 1)["from"] == "listing" && row(&data, 2)["error"]["code"] == "settle_timeout"
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !tried() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never tried: {:#}\n{:#?}",
+            list(&home, &json!({})),
+            starts(&home)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let tried = starts(&home).len();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        starts(&home).len(),
+        tried,
+        "no read again before the day is out"
+    );
+}
+
+#[test]
+fn the_brains_accounts_reach_rlxd_with_their_homes_and_marks() {
+    let Some(rlx) = real_rlx() else { return };
+    let root = TestHome::new().with_rlx(rlx);
+    // Slot 2, a managed slot as rlx makes one, signed in.
+    let slot = root.root().join("claude-accounts").join("2");
+    std::fs::create_dir_all(&slot).unwrap();
+    std::fs::write(
+        slot.join(".aisquare-account.json"),
+        r#"{"slot": 2, "created_at": "2026-11-28T00:00:00+00:00"}"#,
+    )
+    .unwrap();
+    let uuid = "0e9d6c1a-uuid-of-the-fixture";
+    std::fs::write(
+        slot.join(".claude.json"),
+        json!({"oauthAccount": {"emailAddress": "fixture@example.com", "accountUuid": uuid}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        slot.join("fake-connectors.json"),
+        slack("needs-auth").to_string(),
+    )
+    .unwrap();
+    let plain = root.root().join("user-home").join(".claude");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(
+        plain.join("fake-connectors.json"),
+        slack("connected").to_string(),
+    )
+    .unwrap();
+    let home = home_with_scenario_file_in(
+        root,
+        "mcp-accounts",
+        &[
+            ("RLXD_TEST_CONNECTORS_NO_TURN", "1"),
+            ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
+        ],
+    );
+    // The brain starts, then lists slot 2.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let run = home.rlxd(&["call", "connectors.list", r#"{"account":2}"#]);
+        if run.code() == Some(0) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the brain never listed slot 2: {run:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let data = list(&home, &json!({"refresh": true}));
+    assert_eq!(
+        row(&data, 1)["connectors"][0]["status"],
+        "connected",
+        "{data:#}"
+    );
+    assert_eq!(
+        row(&data, 2)["connectors"][0]["status"],
+        "needs-auth",
+        "{data:#}"
+    );
+    // Slot 2's read ran on its own two homes, as the brain named them.
+    let starts = starts(&home);
+    let managed = starts
+        .iter()
+        .find(|start| start["env"].get("CLAUDE_CONFIG_DIR").is_some())
+        .unwrap_or_else(|| panic!("{starts:#?}"));
+    let named = PathBuf::from(managed["env"]["CLAUDE_CONFIG_DIR"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(&named).unwrap(),
+        std::fs::canonicalize(&slot).unwrap()
+    );
+    let tmp = managed["env"]["CLAUDE_CODE_TMPDIR"].as_str().unwrap();
+    assert!(
+        Path::new(tmp).ends_with(Path::new("cache").join("claude-accounts").join("2")),
+        "{tmp}"
+    );
+    // Its mark is the SHA-256 of its account id, in rlxd's file and nowhere else.
+    use sha2::{Digest, Sha256};
+    let mark: String = Sha256::digest(uuid.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(saved(&home)["2"]["login"], mark.as_str());
+    let wire = data.to_string();
+    for secret in [mark.as_str(), uuid, "fixture@example.com"] {
+        assert!(!wire.contains(secret), "{secret} in {wire}");
+        assert!(!home.log().contains(secret), "{secret} in rlxd's log");
+    }
+}
+
+#[test]
+fn a_read_folder_holding_settings_rlxd_did_not_write_is_not_read() {
+    let (home, _accounts) = map_home(true, &[]);
+    let planted = home
+        .root()
+        .join("rlxd")
+        .join("connectors-read")
+        .join("2")
+        .join(".claude");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join("settings.json"), r#"{"hooks": {}}"#).unwrap();
+    let refused = home.rlxd(&["call", "connectors.list", r#"{"refresh":true,"account":2}"#]);
+    assert_eq!(refused.error_code(), "untrusted_settings", "{refused:?}");
+    assert_eq!(starts(&home).len(), 0, "no Claude Code started on it");
+    let data = list(&home, &json!({}));
+    assert_eq!(
+        row(&data, 2)["error"]["code"],
+        "untrusted_settings",
+        "{data:#}"
+    );
+}
+
+#[test]
+fn under_a_managed_slots_home_runs_file_there_with_the_route_off() {
+    // rlxd itself runs on slot 2's two variables, and reads nothing with no turn.
+    let root = TestHome::new();
+    let accounts = Accounts::of(root.root());
+    std::fs::create_dir_all(&accounts.managed).unwrap();
+    std::fs::create_dir_all(&accounts.managed_tmp).unwrap();
+    let listed = root.root().join("accounts.json");
+    std::fs::write(&listed, accounts.listed(true).to_string()).unwrap();
+    let (listed, dir, tmp) = (
+        listed.to_str().unwrap().to_owned(),
+        accounts.managed.to_str().unwrap().to_owned(),
+        accounts.managed_tmp.to_str().unwrap().to_owned(),
+    );
+    let home = home_with_scenario_file_in(
+        root,
+        "init-connectors",
+        &[
+            ("RLXD_TEST_ACCOUNTS", listed.as_str()),
+            ("CLAUDE_CONFIG_DIR", dir.as_str()),
+            ("CLAUDE_CODE_TMPDIR", tmp.as_str()),
+        ],
+    );
+    let id = run_id();
+    start(
+        &home,
+        &json!({"kind": "widget_refresh", "prompt": "digest",
+            "mount": {"kind": "connectors", "connectors": [SLACK]}, "space": "default"}),
+        &id,
+    );
+    ended(&home, &id);
+    // With no connectors.list that asks the brain: rlxd asked at its start.
+    eventually("the run's connectors are slot 2's", || {
+        row(&list(&home, &json!({})), 2)["connectors"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty())
+    });
+    let data = list(&home, &json!({}));
+    assert_eq!(row(&data, 1)["connectors"], json!([]), "{data:#}");
+    assert_eq!(
+        data["connectors"],
+        json!([]),
+        "the top level is the plain account's"
+    );
+    assert_eq!(
+        saved(&home)["2"]["login"],
+        MARK,
+        "filed under the brain's own entry"
+    );
+}
+
+#[test]
+fn under_a_home_that_is_no_account_a_runs_init_is_filed_nowhere() {
+    let root = TestHome::new();
+    let accounts = Accounts::of(root.root());
+    let listed = root.root().join("accounts.json");
+    std::fs::write(&listed, accounts.listed(true).to_string()).unwrap();
+    let listed = listed.to_str().unwrap().to_owned();
+    // home_in's own CLAUDE_CONFIG_DIR, a folder that is neither slot.
+    let home = home_with_scenario_file_in(
+        root,
+        "init-connectors",
+        &[("RLXD_TEST_ACCOUNTS", listed.as_str())],
+    );
+    let since = seq(&home);
+    let id = run_id();
+    start(
+        &home,
+        &json!({"kind": "widget_refresh", "prompt": "digest",
+            "mount": {"kind": "connectors", "connectors": [SLACK]}, "space": "default"}),
+        &id,
+    );
+    ended(&home, &id);
+    std::thread::sleep(Duration::from_millis(500));
+    let data = list(&home, &json!({}));
+    for slot in [1, 2] {
+        assert_eq!(row(&data, slot)["connectors"], json!([]), "{data:#}");
+    }
+    assert!(connector_events(&home, since).is_empty());
+}
+
+#[test]
+fn after_a_restart_with_no_brain_a_managed_read_takes_both_homes_from_its_record() {
+    let (mut home, accounts) = map_home(true, &[]);
+    list(&home, &json!({"refresh": true}));
+    home.stop();
+    // The brain gone, and rlxd with a CLAUDE_CODE_TMPDIR of its own.
+    let own_tmp = home.root().join("rlxd-own-tmp");
+    std::fs::create_dir_all(&own_tmp).unwrap();
+    let gone = home.root().join("no-accounts.json");
+    home.set_env("RLXD_TEST_ACCOUNTS", gone.to_str().unwrap());
+    home.set_env("CLAUDE_CODE_TMPDIR", own_tmp.to_str().unwrap());
+    home.start_dev();
+    let reads = starts(&home).len();
+    list(&home, &json!({"refresh": true, "account": 2}));
+    let starts = starts(&home);
+    assert_eq!(starts.len(), reads + 1, "{starts:#?}");
+    let env = &starts.last().unwrap()["env"];
+    assert_eq!(env["CLAUDE_CONFIG_DIR"], accounts.managed.to_str().unwrap());
+    assert_eq!(
+        env["CLAUDE_CODE_TMPDIR"],
+        accounts.managed_tmp.to_str().unwrap()
+    );
+}
+
+#[test]
+fn a_managed_account_whose_tmp_dir_is_not_known_is_not_read() {
+    let root = TestHome::new();
+    let accounts = Accounts::of(root.root());
+    accounts.set(2, &slack("connected"));
+    // A file from before tmp dirs were kept, and no brain to say slot 2's.
+    std::fs::create_dir_all(root.root().join("rlxd")).unwrap();
+    std::fs::write(
+        root.root().join("rlxd").join("connectors.json"),
+        json!({"accounts": {"2": {"config_dir": accounts.managed, "login": MARK,
+            "as_of": null, "connectors": []}}})
+        .to_string(),
+    )
+    .unwrap();
+    let gone = root.root().join("no-accounts.json");
+    let gone = gone.to_str().unwrap().to_owned();
+    let home = home_with_scenario_file_in(
+        root,
+        "mcp-accounts",
+        &[
+            ("RLXD_TEST_ACCOUNTS", gone.as_str()),
+            ("RLXD_TEST_CONNECTOR_MAP_MS", "off"),
+            ("RLXD_TEST_CONNECTORS_NO_TURN", "1"),
+            ("CLAUDE_CONFIG_DIR", ""),
+        ],
+    );
+    let refused = home.rlxd(&["call", "connectors.list", r#"{"refresh":true,"account":2}"#]);
+    assert_eq!(refused.error_code(), "account_unknown", "{refused:?}");
+    assert_eq!(starts(&home).len(), 0);
+    let data = list(&home, &json!({}));
+    assert_eq!(
+        row(&data, 2)["error"]["code"],
+        "account_unknown",
+        "{data:#}"
+    );
 }

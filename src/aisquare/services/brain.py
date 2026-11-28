@@ -819,8 +819,11 @@ def _accounts(params: Mapping[str, Any]) -> Result:
     """``accounts``: the Claude Code accounts rlx knows, for rlxd's connector map (task
     #14). ``{accounts: [{slot, label, config_dir, tmp_dir, login}]}``, the plain slot first.
 
-    Read-only, through ``core.claude_accounts`` alone: its account list, Claude Code's
-    slots only, and each one's ``identity``. Nothing is written, and no store is opened,
+    Read-only, through ``core.claude_accounts`` alone: Claude Code's slots, as its
+    ``list_accounts`` lists them (the plain one, then each managed one), and each one's
+    ``identity``, the plain one's read from its own home (``~/.claude.json``) whatever
+    ``CLAUDE_CONFIG_DIR`` the brain runs under, as rlxd reads that account with neither
+    variable set. Nothing is written, and no store is opened,
     so ``label`` (the registry's alias) is ``None``. ``config_dir`` and ``tmp_dir`` are a
     managed slot's two variables, ``None`` for the plain one, which rlxd runs as it is.
     ``login`` is the SHA-256 of the signed-in account's id (its email when it records
@@ -829,11 +832,16 @@ def _accounts(params: Mapping[str, Any]) -> Result:
     del params
     from aisquare.core import claude_accounts as core
 
+    # Claude Code's accounts, as core.list_accounts lists them: its plain slot, then its
+    # managed slots (the default agent of both calls). The plain one is read as rlxd reads
+    # it, with neither variable set (``env={}``): ~/.claude and ~/.claude.json, whatever
+    # CLAUDE_CONFIG_DIR the brain's own environment names.
+    managed = core.managed_accounts()
+    plain = core.default_account(env={})
+    listed = [plain] if core.plain_home_counts(plain, managed=bool(managed)) else []
     rows: list[dict[str, Any]] = []
-    for account in core.list_accounts():
-        if account.agent != core.AGENT:
-            continue
-        who = core.identity(account)
+    for account in [*listed, *managed]:
+        who = core.identity(account, env={} if account is plain else None)
         key = (who.account_uuid or who.email) if who is not None else None
         rows.append(
             {

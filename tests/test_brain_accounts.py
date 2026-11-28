@@ -10,6 +10,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from aisquare.core import claude_accounts as core
 from aisquare.models import ClaudeAccount
 from aisquare.services import brain
@@ -90,3 +92,26 @@ def test_the_list_writes_nothing() -> None:
     before = _files(*roots)
     brain.answer("accounts", {}, brain.METHODS)
     assert _files(*roots) == before
+
+
+def test_the_plain_accounts_mark_is_its_own_homes_whatever_the_brains_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rlxd reads the plain account with neither variable set, so its mark is read from
+    ``~/.claude.json``, even when the brain runs under another ``CLAUDE_CONFIG_DIR`` (rlxd
+    under a managed slot, or a shell that names one)."""
+    _sign_in(core.default_account(env={}), "plain@example.com", "uuid-of-the-plain-one")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "other@example.com", "accountUuid": "x"}}),
+        encoding="utf-8",
+    )
+    second = core.create_account()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(elsewhere))
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path / "elsewhere-tmp"))
+    rows = brain.answer("accounts", {}, brain.METHODS)["result"]["accounts"]
+    assert rows[0]["slot"] == 1
+    assert rows[0]["login"] == _sha256("uuid-of-the-plain-one")
+    assert rows[0]["config_dir"] is None
+    assert [row["slot"] for row in rows] == [1, second.slot]

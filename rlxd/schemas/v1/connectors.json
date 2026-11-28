@@ -5,7 +5,7 @@
   "type": "object",
   "properties": {
     "accounts": {
-      "description": "Every account's connectors, by slot: each account rlx knows, the default one\nfirst. With `account`, that account's alone.",
+      "description": "Every account's connectors, by slot: each account rlx knows, the plain one first.\nWith `account`, that account's alone.",
       "type": "array",
       "default": [],
       "items": {
@@ -13,7 +13,7 @@
       }
     },
     "as_of": {
-      "description": "When the default account's connectors were last read, or `null` before they were.",
+      "description": "When the plain account's connectors were last read, or `null` before they were.",
       "type": [
         "string",
         "null"
@@ -21,14 +21,14 @@
       "format": "date-time"
     },
     "connectors": {
-      "description": "The default account's connectors (slot 1's), by `id`. Empty until a run or a\nrefresh has shown any.",
+      "description": "The plain account's connectors (slot 1, the plain `claude`), by `id`. Empty until\na run or a refresh has shown any.",
       "type": "array",
       "items": {
         "$ref": "#/$defs/Connector"
       }
     },
     "from": {
-      "description": "Where the default account's connectors were last read from.",
+      "description": "Where the plain account's connectors were last read from.",
       "$ref": "#/$defs/ListedFrom"
     },
     "model_turns": {

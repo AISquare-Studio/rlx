@@ -53,7 +53,9 @@ rlxd/tests/probes/connector_map.sh
 ```
 
 It prints slots, connector names, kinds and statuses only: never an email, an account
-id, a login mark or a home's path. Each read starts Claude Code in an empty folder of the
+id, a login mark or a home's path. Its folder keeps only that (`summary.tsv` and
+`map.txt`); what it reads to get there (the brain's reply, the temp rlxd home, `claude mcp
+list`'s output) is in a private temp folder it deletes when it ends. Each read starts Claude Code in an empty folder of the
 probe's rlxd home with no session (`--no-session-persistence`) and project settings only,
 on that account's home, which Claude Code may update as any start of it does. M3 runs
 `claude mcp list` in each account's home, which starts each local MCP server to check it.

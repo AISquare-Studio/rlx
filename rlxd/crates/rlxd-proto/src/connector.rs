@@ -4,7 +4,7 @@
 //! - `connectors.list {refresh?, allow_turn?, account?}` ([`ConnectorsListParams`]) gives
 //!   [`ConnectorsList`]: for each Claude Code account rlx knows ([`AccountConnectors`],
 //!   by its slot), the connectors rlxd last saw there, from a run's `system/init` or a
-//!   refresh; its top-level `connectors` are the default account's (slot 1). A plain list
+//!   refresh; its top-level `connectors` are the plain account's (slot 1). A plain list
 //!   never makes a model turn. `refresh: true` reads each account's (or `account`'s)
 //!   from Claude Code with no turn (capability [`capabilities::CONNECTORS_NO_TURN`]), and
 //!   without that route it is `no_route`, unless `allow_turn: true` lets rlxd run a
@@ -287,19 +287,19 @@ pub enum ListedFrom {
 #[schemars(title = "ConnectorsList", transform = all_required)]
 #[non_exhaustive]
 pub struct ConnectorsList {
-    /// The default account's connectors (slot 1's), by `id`. Empty until a run or a
-    /// refresh has shown any.
+    /// The plain account's connectors (slot 1, the plain `claude`), by `id`. Empty until
+    /// a run or a refresh has shown any.
     pub connectors: Vec<Connector>,
-    /// When the default account's connectors were last read, or `null` before they were.
+    /// When the plain account's connectors were last read, or `null` before they were.
     #[schemars(extend("format" = "date-time"))]
     pub as_of: Option<String>,
-    /// Where the default account's connectors were last read from.
+    /// Where the plain account's connectors were last read from.
     pub from: ListedFrom,
     /// The model turns this call made: 0, or 1 for a one-turn refresh.
     #[schemars(range(max = 1))]
     pub model_turns: u32,
-    /// Every account's connectors, by slot: each account rlx knows, the default one
-    /// first. With `account`, that account's alone.
+    /// Every account's connectors, by slot: each account rlx knows, the plain one first.
+    /// With `account`, that account's alone.
     #[serde(default)]
     pub accounts: Vec<AccountConnectors>,
 }

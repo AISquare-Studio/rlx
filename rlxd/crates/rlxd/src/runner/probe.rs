@@ -21,7 +21,7 @@ use rlxd_proto::{ErrorBody, codes};
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader};
 
-use super::process::Launch;
+use super::process::{Launch, Tree};
 use super::stream::{self, Line};
 use super::{Runner, argv, blocking, refusal, run_env};
 use crate::claude;
@@ -43,6 +43,17 @@ impl Runner {
     /// beside it): a second waits for the first, then runs its own. Refused with
     /// `claude_not_found` when there is no Claude Code, or `probe_failed`, saying why.
     pub async fn probe_connectors(&self, account: &Account) -> Result<(), ErrorBody> {
+        if !account.homes_known() {
+            return Err(refusal(
+                codes::ACCOUNT_UNKNOWN,
+                format!(
+                    "account {}'s connectors were not probed: rlxd doesn't know both of its \
+                     homes (CLAUDE_CONFIG_DIR and CLAUDE_CODE_TMPDIR), and reads none with \
+                     another account's",
+                    account.slot
+                ),
+            ));
+        }
         let _one = self.probing.lock().await;
         let Some(program) = claude::resolve().and_then(|p| std::path::absolute(p).ok()) else {
             return Err(refusal(
@@ -89,17 +100,12 @@ impl Runner {
                 program.display()
             ))
         })?;
-        let tree = Arc::new(tree);
-        *self.probe_tree.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&tree));
+        let tended = Tended::new(Arc::new(tree), &self.probe_tree);
         let read = self.probe_init(&mut child).await;
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.shutdown().await;
         }
-        if tree.reap(&mut child, Some(PROBE_END)).await.is_none() {
-            tree.kill();
-            tree.reap(&mut child, None).await;
-        }
-        *self.probe_tree.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        tended.reap(&mut child, PROBE_END).await;
         match read {
             Ok(init) => {
                 blocking(|| {
@@ -167,6 +173,45 @@ impl Runner {
                 }
             }
         }
+    }
+}
+
+/// rlxd's own Claude Code of a probe or a no-turn read, its tree held in the runner's
+/// `probe_tree` (which rlxd's stop ends) while it runs. If what waits on it goes first (a
+/// client gone mid-request), the tree is ended with it: none outlives its request.
+pub(super) struct Tended<'a> {
+    tree: Arc<Tree>,
+    held: &'a std::sync::Mutex<Option<Arc<Tree>>>,
+    reaped: bool,
+}
+
+impl<'a> Tended<'a> {
+    /// `tree`, held in `held` until it is reaped or dropped.
+    pub(super) fn new(tree: Arc<Tree>, held: &'a std::sync::Mutex<Option<Arc<Tree>>>) -> Self {
+        *held.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&tree));
+        Self {
+            tree,
+            held,
+            reaped: false,
+        }
+    }
+
+    /// Waits up to `grace` for `child` to exit, then ends the tree.
+    pub(super) async fn reap(mut self, child: &mut tokio::process::Child, grace: Duration) {
+        if self.tree.reap(child, Some(grace)).await.is_none() {
+            self.tree.kill();
+            self.tree.reap(child, None).await;
+        }
+        self.reaped = true;
+    }
+}
+
+impl Drop for Tended<'_> {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.tree.kill();
+        }
+        *self.held.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 

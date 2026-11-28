@@ -1088,7 +1088,7 @@ const PROJECT_SETTINGS: [&str; 2] = ["settings.json", "settings.local.json"];
 /// or its `.claude` when that is anything but a folder: `None` when there is none. It fails
 /// closed, the same on every OS: any answer but "not there" (anything there, or an error
 /// reading it) is one.
-fn untrusted(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(super) fn untrusted(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let not_there = |path: &std::path::Path| {
         matches!(
             std::fs::symlink_metadata(path),

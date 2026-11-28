@@ -438,6 +438,11 @@ pub mod codes {
     /// listed no server, or one still `pending`, when the read's wait ran out. Its
     /// connectors are the ones read before.
     pub const SETTLE_TIMEOUT: &str = "settle_timeout";
+    /// `connectors.list {refresh: true}`, an account's `error`: rlxd doesn't know both of
+    /// that managed account's homes (its `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_TMPDIR`), as
+    /// after a restart with no brain to say them, so its connectors are not read rather
+    /// than read with another account's.
+    pub const ACCOUNT_UNKNOWN: &str = "account_unknown";
     /// `connectors.list {account}`: rlx knows no Claude Code account of that slot.
     pub const NO_SUCH_ACCOUNT: &str = "no_such_account";
 }
