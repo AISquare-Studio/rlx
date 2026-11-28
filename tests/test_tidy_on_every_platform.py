@@ -206,6 +206,25 @@ def test_a_file_that_only_looks_like_a_bundle_is_none(tmp_path: Path) -> None:
     assert not cachedir.holds_repository(tree)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32" or not hasattr(os, "getuid") or os.getuid() == 0,
+    reason="needs a mode that denies reading: not as root, nor on Windows",
+)
+def test_a_file_that_cannot_be_read_is_taken_to_hold_a_repository(tmp_path: Path) -> None:
+    """As an unreadable folder is (#3804): what it holds is not known, so a cache holding one
+    is kept, never freed. A file that went away holds nothing."""
+    tree = _tree(tmp_path / "tree")
+    shut = tree / "build" / "out" / "unreadable.bin"
+    shut.write_bytes(b"# v2 git bundle\n" + b"x" * 64)
+    shut.chmod(0)
+    try:
+        assert cachedir.holds_repository(tree) and not cachedir.is_bundle(shut)
+        assert cachedir._bundle_or_unread(tree / "gone") is False
+    finally:
+        shut.chmod(0o600)
+    assert cachedir.is_bundle(shut)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="a symlink needs a privilege on Windows")
 def test_a_link_to_a_bundle_elsewhere_is_no_repository_here(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")

@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -32,9 +33,9 @@ from aisquare.core import cachedir, claude_accounts, locking, paths, process_tab
 from aisquare.core.config import TidySettings
 from aisquare.core.locking import holding
 from aisquare.core.store import FLEET_HELD, store_session
-from aisquare.models import EndedBy, FleetAgent, ProjectInfo, TeamSession
+from aisquare.models import EndedBy, FleetAgent, LaunchSpec, ProjectInfo, TeamSession
+from aisquare.services import agent_tmp, tidy
 from aisquare.services import fleet as fleet_service
-from aisquare.services import tidy
 from tests import test_fleet_service as fleet_suite
 from tests.test_fleet_pause_resume import _claim
 from tests.test_fleet_service import _add_task, _git, _stale_board_session
@@ -55,6 +56,8 @@ project = fleet_suite.project
 
 TAG = cachedir.SIGNATURE + b"\n# a cache, by its own word\n"
 SYSTEM_TEMP_DIRS = tidy._system_temp_dirs
+PERIODIC_PASS = tidy.periodic_pass
+"""The real periodic job (#59), kept before the suite's fixture turns it off."""
 """The real lookup, kept before :func:`sandboxed` replaces it: asked only for a path."""
 COMMAND_LINES = tidy._command_lines
 """The real reader, kept before the suite's fixture replaces it: run here only with a fake
@@ -1556,3 +1559,310 @@ def test_a_git_bundle_is_a_repository_tidy_never_deletes(tmp_path: Path, repo: P
     assert [k.bytes for k in made.kept if k.path == bundle] == [cachedir.allocated_bytes(bundle)]
     tidy.apply(made)
     assert bundle.is_file() and inside.is_file() and not lookalike.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or not hasattr(os, "getuid") or os.getuid() == 0,
+    reason="needs a mode that denies reading: not as root, nor on Windows",
+)
+def test_a_cache_kept_for_what_tidy_cannot_read_is_named(tmp_path: Path) -> None:
+    """Tester #3875 (d): a session's cache holding a file tidy cannot read (#3804) stays, and the
+    plan says why, the outermost only, with its size; a cache beside it goes."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target")
+    inner = tag(cache / "deep" / "target")
+    shut = inner / "unreadable.bin"
+    shut.write_bytes(b"x" * 4096)
+    plain = tag(recent / "scratchpad" / "plain")
+    aged(recent, 3 * HOUR)
+    shut.chmod(0)
+    try:
+        made = planned(tmp_path)
+        unsized = tidy.plan(size_kept=False)
+        tidy.apply(made)
+    finally:
+        shut.chmod(0o600)
+
+    assert rules(made) == {plain: tidy.SESSION_CACHE}
+    named = [(k.rule, k.path, k.why) for k in made.kept if k.path.is_relative_to(cache)]
+    assert named == [(tidy.SESSION_CACHE, cache, tidy.UNSEEN_THROUGH)]
+    [size] = [k.bytes for k in made.kept if k.path == cache]
+    assert size is not None and size >= 4096
+    assert [k.bytes for k in unsized.kept if k.path == cache] == [None]
+    assert shut.is_file() and not plain.exists()
+
+
+class _TagFirst:
+    """A listing with ``CACHEDIR.TAG`` first: the worst order a filesystem may list."""
+
+    def __init__(self, listing: Any) -> None:
+        with listing:
+            self.entries = sorted(listing, key=lambda entry: entry.name != cachedir.TAG)
+
+    def __enter__(self) -> _TagFirst:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.entries)
+
+
+def test_a_caches_tag_is_deleted_last(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#59: a delete ended mid-way leaves a cache still tagged, never an untagged rest no rule
+    judges again. Listed tag first, the tag still goes last, through tidy's pinned delete and
+    through reap's (``cachedir.remove_within``, an ended tree's build output: reviewer #3926);
+    a read-only cache still goes whole."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target", files=6)
+    (cache / "deep").mkdir()
+    (cache / "deep" / "inner.bin").write_bytes(b"x")
+    shut = tag(recent / "scratchpad" / "shut", files=2)
+    aged(recent, 3 * HOUR)
+    made = planned(tmp_path)
+    assert rules(made) == {cache: tidy.SESSION_CACHE, shut: tidy.SESSION_CACHE}
+    real_scandir, real_unlink = os.scandir, os.unlink
+    unlinked: list[str] = []
+
+    def unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        real_unlink(path, *args, **kwargs)
+        unlinked.append(os.fsdecode(path))
+
+    monkeypatch.setattr(os, "scandir", lambda path=".": _TagFirst(real_scandir(path)))
+    monkeypatch.setattr(os, "unlink", unlink)
+
+    tidy._remove(cache, made.roots)
+
+    assert not cache.exists() and len(unlinked) == 8
+    assert unlinked[-1] == cachedir.TAG and unlinked.count(cachedir.TAG) == 1
+    tree = tmp_path / "tree"
+    built = tag(tree / "target", files=3)
+    tag(built / "nested", files=2)
+    unlinked.clear()
+    cachedir.remove_within(built, tree)
+    assert not built.exists() and len(unlinked) == 7
+    assert unlinked[-1] == cachedir.TAG and unlinked.count(cachedir.TAG) == 2, unlinked
+    shut.chmod(0o500)  # nothing in it can be unlinked until it is loosened
+    try:
+        tidy._remove(shut, made.roots)
+    finally:
+        if shut.exists():
+            shut.chmod(0o700)
+    assert not shut.exists()
+
+
+_KILLED_MID_DELETE = """
+import json, os, sys, time
+from datetime import datetime
+from pathlib import Path
+
+given = json.loads(sys.argv[1])
+sandbox = Path(given["sandbox"])
+for path in (given["system"], given["cache"], *given["temp"], os.environ["AISQUARE_HOME"]):
+    assert Path(path).resolve().is_relative_to(sandbox), path  # the sandbox's alone
+assert given["tree"] is None or Path(given["tree"]).resolve().is_relative_to(sandbox)
+
+from aisquare.services import fleet, tidy
+
+system, cache = Path(given["system"]), Path(given["cache"])
+tidy._system_temp_dirs = lambda: [system]  # never this machine's temp dir
+tidy._command_lines = lambda: []
+tidy.a_home_move_runs = lambda: False
+roots = tidy.Roots(temp=frozenset(Path(root) for root in given["temp"]))
+
+
+def delete():
+    if given["tree"] is None:  # a session's cache: tidy's own pinned delete
+        tidy._remove(cache, roots)
+    else:  # an ended tree's build output: the delete reap makes before git removes the tree
+        fleet._remove_untracked_caches(Path(given["tree"]))
+
+
+def plan(*, now=None, size_kept=True):
+    made = tidy.Plan(roots=roots)
+    made.add([tidy.Item(given["rule"], cache, 1, None)], delete)
+    return made
+
+
+tidy.plan = plan  # no rule runs here: the one delete, of the sandbox's one cache
+real_unlink, gone = os.unlink, []
+
+
+def unlink(path, *args, **kwargs):
+    real_unlink(path, *args, **kwargs)
+    gone.append(path)
+    if len(gone) == 5:
+        print("deleting", flush=True)
+        time.sleep(600)
+
+
+class TagFirst:  # every listing with CACHEDIR.TAG first: the worst order a disk may list in
+    def __init__(self, listing):
+        with listing:
+            self.entries = sorted(listing, key=lambda entry: entry.name != "CACHEDIR.TAG")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def __iter__(self):
+        return iter(self.entries)
+
+
+real_scandir = os.scandir
+os.scandir = lambda path=".": TagFirst(real_scandir(path))
+os.unlink = unlink
+tidy.periodic_pass(datetime.fromisoformat(given["at"]))
+print("finished", flush=True)
+"""
+
+
+def _killed_mid_delete(
+    tmp_path: Path, made: tidy.Plan, at: datetime, cache: Path, rule: str, tree: Path | None
+) -> set[str]:
+    """A pass in a child process, its one delete ``cache`` (tidy's, or reap's for an ended
+    ``tree``), every folder listed tag first, SIGKILLed after 5 files went; what is left in
+    ``cache``."""
+    given = {
+        "sandbox": str(tmp_path.resolve()),
+        "system": str(tmp_path / "system-temp"),
+        "cache": str(cache),
+        "temp": [str(root) for root in made.roots.temp],
+        "at": at.isoformat(),
+        "rule": rule,
+        "tree": None if tree is None else str(tree),
+    }
+    child = subprocess.Popen(
+        [sys.executable, "-c", _KILLED_MID_DELETE, json.dumps(given)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "HOME": str(tmp_path / "child-home")},
+    )
+    watchdog = threading.Timer(60, child.kill)  # a child that never says so ends anyway
+    watchdog.start()
+    try:
+        assert child.stdout is not None
+        said = child.stdout.readline().strip()
+        assert said == "deleting", child.stderr.read() if child.stderr else said
+    finally:
+        watchdog.cancel()
+        child.kill()
+        child.wait(30)
+    return {path.name for path in cache.iterdir()}
+
+
+def test_a_pass_killed_mid_delete_leaves_no_stamp_and_the_next_frees_the_rest(
+    tmp_path: Path,
+) -> None:
+    """Manager #3897 (c): a pass killed mid-delete (a stop's end of its tmux session, a
+    SIGKILL) wrote no stamp, so a pass is still due; its cache is still tagged (the tag goes
+    last), and the next pass, the real rules, frees the rest and writes its stamp."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target", files=40)
+    aged(recent, 3 * HOUR)
+    made = planned(tmp_path)
+    assert rules(made) == {cache: tidy.SESSION_CACHE}
+    at = datetime.now(UTC)
+
+    left = _killed_mid_delete(tmp_path, made, at, cache, tidy.SESSION_CACHE, None)
+
+    assert cachedir.TAG in left and 30 < len(left) < 41, "killed mid-delete, the tag kept"
+    assert not tidy.stamp_path().exists() and tidy.is_due(at, 60)
+    passed = PERIODIC_PASS(at)
+    assert passed is not None and passed.freed == {tidy.SESSION_CACHE: 1}
+    assert not cache.exists() and tidy.read_stamp()["last_pass_at"] == at.isoformat(
+        timespec="seconds"
+    )
+    assert not tidy.is_due(at, 60)
+
+
+def test_an_ended_trees_build_output_killed_mid_delete_is_still_freed_with_its_tree(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """Reviewer #3926's MINOR 2, the brief's reviewer-* case: an ended reviewer's tree whose
+    only untracked content is build output. Reap deletes that first (``cachedir.remove_within``)
+    and then the tree. Killed with the cache's tag gone, the rest would be an untagged
+    untracked folder, and reap would keep the tree for good. The tag goes last: the next pass
+    frees the rest and the tree."""
+    built = fleet_service.spawn(project, "reviewer", label="reviewer-built").agent
+    fleet_service.stop(project, "reviewer-built", force=True)
+    cache = tag(built.cwd / "target", files=40)
+    made = planned(tmp_path)
+    assert rules(made) == {built.cwd: tidy.ENDED_WORKTREE}
+    at = datetime.now(UTC)
+
+    left = _killed_mid_delete(tmp_path, made, at, cache, tidy.ENDED_WORKTREE_CACHE, built.cwd)
+
+    assert cachedir.TAG in left and 30 < len(left) < 41, "killed mid-delete, the tag kept"
+    assert not tidy.stamp_path().exists() and tidy.is_due(at, 60)
+    assert rules(planned(tmp_path)) == {built.cwd: tidy.ENDED_WORKTREE}, "still reap's to free"
+    passed = PERIODIC_PASS(at)
+    assert passed is not None and passed.freed == {tidy.ENDED_WORKTREE: 1}
+    assert not built.cwd.exists() and not tidy.is_due(at, 60)
+
+
+def test_both_rules_keep_what_they_cannot_see_into_with_one_reason(tmp_path: Path) -> None:
+    """Manager #4001: a session's tagged cache (#59) and an ended agent's temp directory (#57),
+    each holding a folder tidy cannot read, are kept with ONE reason, the same text in
+    ``rlx tidy --dry-run --json``'s ``why`` for both."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target")
+    shut = cache / "deep"
+    shut.mkdir()
+    (shut / "inside.bin").write_bytes(b"x")
+    aged(recent, 3 * HOUR)
+    key = "a" * agent_tmp.KEY_LENGTH
+    temp = paths.agent_tmp_dir(key)
+    locked = temp / "locked"
+    locked.mkdir(parents=True)
+    with store_session() as store:
+        store.upsert_fleet_agent(
+            FleetAgent(
+                id=f"agt_{key}",
+                project_id=BOARD,
+                label="coder-1",
+                role="coder",
+                pane_id="%9",
+                cwd=tmp_path,
+                created_at=datetime.now(UTC) - timedelta(days=2),
+                ended_at=datetime.now(UTC) - timedelta(days=1),
+                launch_spec=LaunchSpec(binary="claude", tmp_key=key),
+            )
+        )
+    shut.chmod(0)
+    locked.chmod(0)
+    try:
+        shown = CliRunner().invoke(app, ["--json", "tidy", "--dry-run"])
+    finally:
+        shut.chmod(0o700)
+        locked.chmod(0o700)
+
+    assert shown.exit_code == 0, shown.output
+    said = {
+        (entry["rule"], entry["why"])
+        for entry in json.loads(shown.stdout)["kept"]
+        if entry["rule"] in (tidy.SESSION_CACHE, tidy.AGENT_TMPDIR)
+    }
+    assert said == {
+        (tidy.SESSION_CACHE, tidy.UNSEEN_THROUGH),
+        (tidy.AGENT_TMPDIR, tidy.UNSEEN_THROUGH),
+    }
+
+
+def test_a_plan_without_kept_sizes_walks_no_kept_repository(tmp_path: Path, repo: Path) -> None:
+    """#59's periodic job plans without them: a repository tidy never deletes is never walked
+    again each pass. A person's dry run still shows them."""
+    session = session_dir()
+    clone = _clone(repo, session / "scratchpad" / "clone")
+    aged(session, 3 * HOUR)
+
+    sized = planned(tmp_path)
+    unsized = tidy.plan(size_kept=False)
+
+    [with_size] = [k.bytes for k in sized.kept if k.path == clone]
+    assert with_size is not None and with_size > 0
+    assert [k.bytes for k in unsized.kept if k.path == clone] == [None]

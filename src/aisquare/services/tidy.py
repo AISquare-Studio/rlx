@@ -62,6 +62,8 @@ one that no longer holds skipped and said so, never swapped for another.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import shutil
@@ -69,11 +71,12 @@ import stat
 import sys
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
-from aisquare.core import cachedir, claude_accounts, locking, paths, process_table
+from aisquare.core import atomic, cachedir, claude_accounts, locking, paths, process_table
 from aisquare.core.config import TidySettings, load_config
 from aisquare.core.store import FLEET_HELD, ContextStore, store_session
 from aisquare.models import FleetAgent, ProjectInfo
@@ -122,12 +125,12 @@ def _now() -> datetime:
 
 
 def _settings() -> TidySettings:
-    """``[tidy]``; with a config that cannot be read, the coder rule OFF (review of #58): a rule
-    that deletes fails closed."""
+    """``[tidy]``; with a config that cannot be read, the coder rule and the periodic job OFF
+    (review of #58): a rule that deletes fails closed."""
     try:
         return load_config().tidy
     except Exception:
-        return TidySettings(idle_build_hours=0)
+        return TidySettings(idle_build_hours=0, every_minutes=0)
 
 
 ROOT_TAG = (
@@ -141,7 +144,10 @@ a git repository in 0.10.2)."""
 UNSEEN_THROUGH = (
     "part of it cannot be read, or is another disk: kept, as a repository could be there"
 )
-"""Why an ended agent's temp directory with no repository found is kept all the same."""
+"""Why a folder tidy cannot see all the way into is kept, with no repository found in it: part
+of it could not be read (#3804) or is another filesystem (M3). One reason for every rule that
+says it (manager #4001): an ended agent's temp directory (#57), a session's tagged cache
+(tester #3875 (d))."""
 DELETES = sys.platform != "win32"
 """Whether tidy deletes here. Not on native Windows in 0.10.2 (manager #3647): it reports and
 lists, and removes nothing; the fleet there runs in WSL, where tidy deletes."""
@@ -229,7 +235,7 @@ def _remove(path: Path, roots: Roots) -> None:
         if (here.st_dev, here.st_ino) != (info.st_dev, info.st_ino) or stat.S_ISLNK(here.st_mode):
             raise Refused(f"{path} changed while tidy looked")
         if stat.S_ISDIR(here.st_mode):
-            cachedir.remove_dir(path.name, dir_fd=fd)
+            cachedir.remove_dir(path.name, dir_fd=fd)  # a cache's tag last (#59)
         else:
             os.unlink(path.name, dir_fd=fd)
     finally:
@@ -254,6 +260,8 @@ class Item:
     rule: str
     path: Path
     bytes: int
+    board: str | None = None
+    """The board it counts to (#59's receipt): its agent's, or its session's; a lock's none."""
 
 
 @dataclass(frozen=True)
@@ -289,6 +297,8 @@ class Plan:
     ignored: list[Path] = field(default_factory=list)
     """Roots whose CACHEDIR.TAG authorises nothing (:data:`ROOT_TAG`), said apart from what is
     kept, so a freed tree is never also named under ``kept`` (tester #3577, m1)."""
+    size_kept: bool = True
+    """Whether a kept repository is listed with its size (:func:`plan`'s ``size_kept``)."""
 
     @property
     def bytes(self) -> int:
@@ -321,9 +331,11 @@ class Report:
         return sum(item.bytes for item in self.freed)
 
 
-def plan(*, now: datetime | None = None) -> Plan:
+def plan(*, now: datetime | None = None, size_kept: bool = True) -> Plan:
     """Every path ``rlx tidy`` would free now, with its rule and size, and every path a rule
-    keeps, with why. Reads only: nothing is deleted, and no lock is taken."""
+    keeps, with why. Reads only: nothing is deleted, and no lock is taken. ``size_kept``: a
+    kept repository's size, for a person deciding what to remove by hand; the periodic job
+    (#59) asks without, or each pass would walk again every repository tidy never deletes."""
     at = now or _now()
     config = _settings()
     with store_session() as store:
@@ -331,7 +343,10 @@ def plan(*, now: datetime | None = None) -> Plan:
         # Liveness from every row there is, a forgotten project's too (review of #58, M2):
         # forgetting refuses only live rows, so a paused agent can sit in one.
         every = _every_row(store)
-        result = Plan(roots=_roots(projects, store.list_projects(all=True, include_forgotten=True)))
+        result = Plan(
+            roots=_roots(projects, store.list_projects(all=True, include_forgotten=True)),
+            size_kept=size_kept,
+        )
         commands = _command_lines()
         for project in projects:
             _ended_worktrees(store, project, result)
@@ -442,12 +457,15 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
         except fleet_service.FleetError as exc:
             result.kept.append(Kept(ENDED_WORKTREE, tree, f"git could not be asked ({exc})"))
             continue
+        board = agent.board or agent.project_id
         if why is None:
             going.append(tree)
-            items = [Item(ENDED_WORKTREE, tree, cachedir.allocated_bytes(tree))]
+            items = [Item(ENDED_WORKTREE, tree, cachedir.allocated_bytes(tree), board)]
         else:
             result.kept.append(Kept(ENDED_WORKTREE, tree, why))
-            items = [Item(ENDED_WORKTREE_CACHE, c, cachedir.allocated_bytes(c)) for c in caches]
+            items = [
+                Item(ENDED_WORKTREE_CACHE, c, cachedir.allocated_bytes(c), board) for c in caches
+            ]
         result.add(
             items,
             _reap_one(project, agent, trees, remove=why is None, caches=caches, roots=result.roots),
@@ -597,6 +615,8 @@ class _Liveness:
     """A running process names it; ``None`` when the processes could not be read."""
     wrote: datetime | None
     """When the session itself last wrote: its board row's last hook, its transcript."""
+    board: str | None = None
+    """The board its own row is on, which what tidy frees of it counts to (#59)."""
 
 
 def _naming(store: ContextStore, session_id: str, every: list[FleetAgent]) -> list[FleetAgent]:
@@ -665,6 +685,7 @@ def _liveness(
         ended_at=ended_at,
         running=_named_running(session_id, commands),
         wrote=max(known) if known else None,
+        board=session.project_id if session is not None else None,
     )
 
 
@@ -690,7 +711,7 @@ def _session_trees(
         moved = _last_moved(directory, alive.wrote)
         if moved is None or at - moved < ENDED_IDLE:
             continue
-        _one_session(directory, session_id, alive.ended_at, at, result)
+        _one_session(directory, session_id, alive.ended_at, at, result, board=alive.board)
 
 
 def _repositories(directory: Path) -> list[Path]:
@@ -765,6 +786,7 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
     every folder but a bare repository and a mount, checkouts included: their ignored or
     untracked build output is most of the space (the brief). Ignored roots are said."""
     found: list[Path] = []
+    unread: list[Path] = []
     pending = [directory]
     device = cachedir._device(directory)
     if device is None:
@@ -777,6 +799,10 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
         elif _session_cache(here, directory):
             found.append(here)
             continue
+        elif _kept_unread(here, unread):
+            unread.append(here)
+            size = cachedir.allocated_bytes(here) if result.size_kept else None
+            result.kept.append(Kept(SESSION_CACHE, here, UNSEEN_THROUGH, size))
         if cachedir._is_bare_repository(here):
             continue
         for inner in _subdirs(here):
@@ -786,8 +812,22 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
     return sorted(found)
 
 
+def _kept_unread(tagged: Path, named: list[Path]) -> bool:
+    """Whether a tagged folder stays only for what tidy cannot read or a mount in it (tester
+    #3875 (d)): no repository in it to name, so it is named itself, the outermost only."""
+    if not cachedir.is_cache_dir(tagged) or any(tagged.is_relative_to(at) for at in named):
+        return False
+    return cachedir.holds_repository(tagged) and not _repositories(tagged)
+
+
 def _one_session(
-    directory: Path, session_id: str, ended_at: datetime, at: datetime, result: Plan
+    directory: Path,
+    session_id: str,
+    ended_at: datetime,
+    at: datetime,
+    result: Plan,
+    *,
+    board: str | None = None,
 ) -> None:
     """An ENDED session (current evidence, no process, idle): its repositories are kept and
     listed with their size, never removed (manager #3585); its caches holding no repository go;
@@ -800,7 +840,7 @@ def _one_session(
                 SESSION_CHECKOUT,
                 repository,
                 NEVER_A_REPOSITORY,
-                cachedir.allocated_bytes(repository),
+                cachedir.allocated_bytes(repository) if result.size_kept else None,
             )
         )
     roots = result.roots
@@ -810,7 +850,7 @@ def _one_session(
         and _settled_a_week(directory, at)
         and not cachedir.holds_repository(directory)  # nor a mount, which no rule crosses (M3)
     ):
-        whole = Item(SESSION_DIR, directory, cachedir.allocated_bytes(directory))
+        whole = Item(SESSION_DIR, directory, cachedir.allocated_bytes(directory), board)
 
         def drop() -> str | None:
             if cachedir.holds_repository(directory):
@@ -823,7 +863,7 @@ def _one_session(
         result.add([whole], _guarded(session_id, directory, drop, at_least=EVIDENCE_TTL))
         return
     for tagged in _session_caches(directory, result):
-        item = Item(SESSION_CACHE, tagged, cachedir.allocated_bytes(tagged))
+        item = Item(SESSION_CACHE, tagged, cachedir.allocated_bytes(tagged), board)
 
         def free(path: Path = tagged) -> str | None:
             if not _session_cache(path, directory):
@@ -911,7 +951,9 @@ def _idle_build_output(
         if cachedir.is_cache_dir(tree):
             result.ignored.append(tree)
         for tagged in _build_output(tree):
-            item = Item(IDLE_BUILD_CACHE, tagged, cachedir.allocated_bytes(tagged))
+            item = Item(
+                IDLE_BUILD_CACHE, tagged, cachedir.allocated_bytes(tagged), row.board or project.id
+            )
             result.add(
                 [item], _while_idle(project, row, config.idle_build_hours, tree, tagged, roots)
             )
@@ -1032,7 +1074,9 @@ def _agent_tmpdirs(at: datetime, result: Plan) -> None:
     """Each directory ``agent_tmp.ended_dirs`` lists (its agent ended, by that module's rules):
     freed whole, with its owner record, through :func:`_remove`; kept, each repository in it
     named with its size, when it holds one (manager #3585), or when part of it cannot be looked
-    through (``cachedir.holds_repository``: an unreadable folder, a mount)."""
+    through (``cachedir.holds_repository``: an unreadable folder, a mount). Each item counts to
+    its agent's board (:func:`_tmpdir_boards`), for the periodic job's receipt (#59)."""
+    boards = _tmpdir_boards()
     for directory in agent_tmp.ended_dirs(now=at):
         repositories = _repositories(directory)
         for repository in repositories:
@@ -1041,7 +1085,7 @@ def _agent_tmpdirs(at: datetime, result: Plan) -> None:
                     AGENT_TMPDIR,
                     repository,
                     NEVER_A_REPOSITORY,
-                    cachedir.allocated_bytes(repository),
+                    cachedir.allocated_bytes(repository) if result.size_kept else None,
                 )
             )
         if repositories:
@@ -1050,10 +1094,23 @@ def _agent_tmpdirs(at: datetime, result: Plan) -> None:
             result.kept.append(Kept(AGENT_TMPDIR, directory, UNSEEN_THROUGH))
             continue
         owner = agent_tmp.owner_path(directory.name)
-        items = [Item(AGENT_TMPDIR, directory, cachedir.allocated_bytes(directory))]
+        board = boards.get(directory.name)
+        items = [Item(AGENT_TMPDIR, directory, cachedir.allocated_bytes(directory), board)]
         if _there(owner):
-            items.append(Item(AGENT_TMPDIR, owner, cachedir.allocated_bytes(owner)))
+            items.append(Item(AGENT_TMPDIR, owner, cachedir.allocated_bytes(owner), board))
         result.add(items, _free_agent_tmpdir(directory, owner, result.roots))
+
+
+def _tmpdir_boards() -> dict[str, str]:
+    """Each agent temp key's board: that of the newest fleet row carrying it (its board, or its
+    project), as ``agent_tmp.ended_dirs`` reads the rows. A launch by hand's has none."""
+    newest: dict[str, FleetAgent] = {}
+    with store_session() as store:
+        for row in store.fleet_label_heads():
+            key = row.launch_spec.tmp_key if row.launch_spec is not None else None
+            if key is not None and (key not in newest or row.created_at >= newest[key].created_at):
+                newest[key] = row
+    return {key: row.board or row.project_id for key, row in newest.items()}
 
 
 def _free_agent_tmpdir(directory: Path, owner: Path, roots: Roots) -> Callable[[], str | None]:
@@ -1071,3 +1128,349 @@ def _free_agent_tmpdir(directory: Path, owner: Path, roots: Roots) -> Callable[[
         return None
 
     return run
+
+
+# --- the periodic job (#59) ---------------------------------------------------------------
+#
+# ``aisquare watch`` runs it from its tick; 0.10.3's rlxd scheduler is to carry the same job
+# with the same setting (``[tidy] every_minutes``). Everything that makes it periodic is here,
+# not in the watcher: when it is due, the one-at-a-time lock, the stamp, the receipt.
+
+RECEIPT_BYTES = 10**9
+"""What a pass must free before it says so on a board: 1 GB (the owner's brief)."""
+PASS_LOCK_PREFIX = "rlx-tidy-"
+"""The pass lock's name before the user id: ``rlx-tidy-<uid>.lock`` in the system temp dir."""
+
+
+def size_text(count: int) -> str:
+    """``count`` bytes as a person reads a disk: decimal units, one decimal place past KB."""
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1000:
+            return f"{value:.0f} {unit}" if unit in ("B", "KB") else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{value:.1f} TB"
+
+
+@dataclass(frozen=True)
+class PassReport:
+    """What one periodic pass did, as its stamp and ``watch --json`` say it."""
+
+    at: datetime
+    freed_bytes: int
+    freed: dict[str, int]
+    """How many paths each rule freed (:data:`RULES`), the rules that freed none left out."""
+    not_freed: int
+    kept: int
+    receipt: str | None = None
+    """The line said on a board: only for a pass that freed :data:`RECEIPT_BYTES` or more."""
+    board: str | None = None
+    """The board it was said on: the one most of the freed bytes count to."""
+    stamp_error: str | None = None
+    """Why its stamp could not be written, when it could not (reviewer #3894, MINOR 1): the
+    pass ran, and whoever runs the job keeps its time in memory instead (:func:`is_due`)."""
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "at": self.at.isoformat(timespec="seconds"),
+            "freed_bytes": self.freed_bytes,
+            "freed": dict(self.freed),
+            "not_freed": self.not_freed,
+            "kept": self.kept,
+            "receipt": self.receipt,
+            "board": self.board,
+            "stamp_error": self.stamp_error,
+        }
+
+
+def stamp_path() -> Path:
+    """This home's record of its last pass: when (the cadence's clock) and what it did."""
+    return paths.watch_dir() / "tidy.json"
+
+
+_STAMP_READ = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+"""How the stamp is opened: never blocking, so a FIFO at its path is never waited on (tester
+#3875 (a): the tick hung opening one); it is no file, so it is unreadable, and due."""
+
+
+def read_stamp() -> dict[str, Any]:
+    """The stamp's record, or ``{}`` where there is none, or none that can be read: anything
+    but a regular file (a FIFO, a folder), a torn or unreadable one. ``{}`` is due."""
+    try:
+        fd = os.open(stamp_path(), _STAMP_READ)
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        with open(fd, "rb", closefd=False) as opened:
+            body = opened.read()
+    except OSError:
+        return {}
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _last_pass_at(stamp: dict[str, Any]) -> datetime | None:
+    try:
+        found = datetime.fromisoformat(str(stamp["last_pass_at"]))
+    except (KeyError, ValueError):
+        return None
+    return found if found.tzinfo is not None else None
+
+
+def is_due(at: datetime, every_minutes: float, *, last_attempt: datetime | None = None) -> bool:
+    """Whether a pass is due at ``at``: none yet in this home, or the last one began
+    ``every_minutes`` ago or more (or, by a clock set back, after ``at``). ``last_attempt``:
+    when the job's runner last ran one, kept in its memory, so a stamp that could not be
+    written still spaces the passes (reviewer #3894, MINOR 1): due only when both say so."""
+    for last in (_last_pass_at(read_stamp()), last_attempt):
+        if last is not None and last <= at and at - last < timedelta(minutes=every_minutes):
+            return False
+    return True
+
+
+def pass_due(at: datetime, *, last_attempt: datetime | None = None) -> bool:
+    """Whether the periodic job has a pass to run at ``at`` (:func:`periodic_pass` asks it all
+    again, under its lock): tidy deletes here, ``[tidy] every_minutes`` is on, and the last
+    pass began that long ago. Reads the config and the stamp alone: a caller asks it each tick
+    to decide whether to start a pass off its own thread."""
+    if not DELETES:
+        return False
+    every = _settings().every_minutes
+    return every > 0 and is_due(at, every, last_attempt=last_attempt)
+
+
+def pass_lock() -> Path | None:
+    """``rlx-tidy-<uid>.lock`` in the system temp dir, found the way rule 4 finds it, whatever
+    this process's ``TMPDIR`` says: one pass at a time on the machine, every home's watcher
+    alike. ``None`` where there is no such dir."""
+    found = _system_temp_dirs()
+    if not found:
+        return None
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return found[0] / f"{PASS_LOCK_PREFIX}{uid}.lock"
+
+
+def periodic_pass(
+    now: datetime | None = None, *, last_attempt: datetime | None = None
+) -> PassReport | None:
+    """Tidy's periodic job: once due (:func:`is_due`, ``[tidy] every_minutes``; ``0`` is off),
+    and while no other pass on the machine holds :func:`pass_lock` (one that does is waited
+    for not at all: the pass stays due), the same rules as ``rlx tidy``, :func:`plan` then
+    :func:`apply`. Its stamp is written under the lock, whether the pass finished or raised,
+    so a pass that keeps failing is tried once per interval, never every tick. Quiet: it wakes
+    and nudges no one; a pass that freed :data:`RECEIPT_BYTES` or more says so in one line on
+    one board (:func:`_say_it`). ``None``: not due, off, another pass is running, or a move of
+    the home is (:func:`a_home_move_runs`). Never on native Windows, where tidy deletes nothing
+    (:data:`DELETES`).
+
+    ``last_attempt``: when the caller last ran a pass (:func:`is_due`). A pass whose stamp could
+    not be written is still returned, with :attr:`PassReport.stamp_error`: it ran. One ended
+    mid-delete (its process killed) wrote no stamp, so the next is due, and frees what is left
+    (``cachedir.remove_dir`` deletes a cache's tag last). It is long, the backlog's first pass
+    most of all: a caller that must not wait (the watcher's tick) runs it on a thread of its
+    own."""
+    if not DELETES:
+        return None
+    every = _settings().every_minutes
+    if every <= 0:
+        return None
+    at = now or _now()
+    if not is_due(at, every, last_attempt=last_attempt):
+        return None
+    lock = pass_lock()
+    if lock is None:
+        return None
+    failed = {"last_pass_at": at.isoformat(timespec="seconds"), "failed": True}
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(locking.holding(lock, wait_s=0, mode=0o600))
+        except TimeoutError:
+            return None  # another pass runs now; this one stays due
+        except OSError:
+            # No lock to be had (the temp dir unwritable): said once per interval, not per tick.
+            _write_failed_stamp(failed)
+            raise
+        # Whatever raises once the lock is held writes the stamp, the looks before the plan too
+        # (tester #3875 (c)): a pass that cannot be asked is tried once per interval.
+        try:
+            if not is_due(at, every, last_attempt=last_attempt):
+                return None  # one ran between the first look and the lock
+            if a_home_move_runs():
+                return None  # never during a move of the home: it stays due (manager #3815)
+            made = plan(now=at, size_kept=False)
+            done = apply(made)
+        except BaseException:
+            _write_failed_stamp(failed)
+            raise
+        report = _pass_report(at, done)
+        try:
+            _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), **_totals(report)})
+        except OSError as exc:  # the pass ran: said so, never as a failed pass (MINOR 1)
+            report = replace(report, stamp_error=f"{type(exc).__name__}: {exc}")
+    if report.freed_bytes < RECEIPT_BYTES:
+        return report
+    return _say_it(report, done)
+
+
+def _totals(report: PassReport) -> dict[str, Any]:
+    found = report.as_json()
+    return {key: found[key] for key in ("freed_bytes", "freed", "not_freed", "kept")}
+
+
+def _write_failed_stamp(data: dict[str, Any]) -> None:
+    """A failed pass's stamp, if it can be written: what failed is what is said, never that
+    the stamp could not be written too (the runner's memory spaces the passes then)."""
+    with contextlib.suppress(OSError):
+        _write_stamp(data)
+
+
+def _write_stamp(data: dict[str, Any]) -> None:
+    """The stamp written whole (a temp file replaced into place, in its own folder): a reader
+    never sees half of one. Whatever is at its path that is not a file (a folder, a link) is
+    renamed aside first, never deleted, or no replace could go over it and every tick would be
+    due (manager #3815: a torn or unreadable stamp is due, and is written again)."""
+    path = stamp_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        aside = _now().strftime("%Y%m%dT%H%M%S%fZ")
+        os.rename(path, path.with_name(f"{path.name}.unreadable-{aside}"))
+    # Never the old file's mode: one that could not be read (mode 000) would be written as
+    # unreadable again, and every tick would find a pass due.
+    atomic.write_replacing(path, json.dumps(data), durable=False, keep_mode=False)
+
+
+def a_home_move_runs() -> bool:
+    """Whether H2's move of this home is under way (manager #3815): its journal is there and
+    unfinished (``paths.unfinished_home_move``), or a move holds its lock, ``.rlx-home-move-
+    <digest>.lock`` in the folder the move keeps it in. That file is removed as a move lets go
+    (#62), so one that is there is taken at once to ask: held, a move runs; free, a crash left
+    it, and nothing runs. Never a wait.
+
+    What cannot be told fails closed, as an unreadable journal does (reviewer #3894, MINOR 2):
+    a folder that cannot be listed, a lock that cannot be opened or asked, is taken for a move,
+    and the pass waits. A folder that is not there holds no lock, and a lock gone between the
+    listing and the open was let go."""
+    from aisquare.services import home_migration
+
+    if paths.unfinished_home_move() is not None:
+        return True
+    folder = _move_lock_folder()
+    try:
+        with os.scandir(folder) as listing:
+            names = [
+                entry.name
+                for entry in listing
+                if entry.name.startswith(home_migration.MOVE_LOCK_PREFIX)
+                and entry.name.endswith(".lock")
+            ]
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    for name in names:
+        try:
+            fd = locking.open_lock_file(folder / name, create=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        try:
+            locking.acquire(fd, wait_s=0)
+        except (TimeoutError, OSError):
+            return True
+        else:
+            with contextlib.suppress(OSError):
+                locking.unlock(fd)
+        finally:
+            os.close(fd)
+    return False
+
+
+def _move_lock_folder() -> Path:
+    """Where a move of this home keeps its lock (``home_migration.move_lock_path``): beside a
+    home a variable names, by its real path; beside ``~/.aisquare`` for the default home."""
+    from aisquare.services import home_migration
+
+    named = paths.named_home()
+    if named is not None and not home_migration._names_the_default_home():
+        return Path(os.path.realpath(named)).parent
+    return Path.home()
+
+
+def _pass_report(at: datetime, done: Report) -> PassReport:
+    freed = {rule: 0 for rule in RULES}
+    for item in done.freed:
+        freed[item.rule] += 1
+    return PassReport(
+        at=at,
+        freed_bytes=done.bytes,
+        freed={rule: n for rule, n in freed.items() if n},
+        not_freed=len(done.not_freed),
+        kept=len(done.kept),
+    )
+
+
+_RECEIPT_PARTS = (
+    ((ENDED_WORKTREE,), "worktree", "worktrees"),
+    ((SESSION_DIR, SESSION_CACHE), "session temp path", "session temp paths"),
+    ((ENDED_WORKTREE_CACHE, IDLE_BUILD_CACHE), "build cache", "build caches"),
+    ((MIGRATION_LOCK,), "lock", "locks"),
+    ((AGENT_TMPDIR,), "agent temp path", "agent temp paths"),
+)
+
+
+def receipt_text(report: PassReport) -> str:
+    """``tidy freed 14.2 GB: 3 worktrees, 30 session temp paths, 8 build caches, 1 lock``: the
+    pass's totals, never a path (a manager pays for every character in its context), and no
+    command: a board line asq shows too names none (R13b, ``tests/test_shell_advice.py``)."""
+    parts = []
+    for rules, one, many in _RECEIPT_PARTS:
+        count = sum(report.freed.get(rule, 0) for rule in rules)
+        if count:
+            parts.append(f"{count} {one if count == 1 else many}")
+    said = f"tidy freed {size_text(report.freed_bytes)}"
+    return f"{said}: {', '.join(parts)}" if parts else said
+
+
+def receipt_board(done: Report) -> str | None:
+    """The board most of what the pass freed counts to (each item's :attr:`Item.board`), the
+    first by id on a tie; ``None`` when none of it counts to one."""
+    shares: dict[str, int] = {}
+    for item in done.freed:
+        if item.board is not None:
+            shares[item.board] = shares.get(item.board, 0) + item.bytes
+    if not shares:
+        return None
+    return min(shares, key=lambda board: (-shares[board], board))
+
+
+def _say_it(report: PassReport, done: Report) -> PassReport:
+    """The receipt, one plain ``note`` on one board (:func:`receipt_board`): never a
+    ``result`` nor addressed to the manager, which would wake one (``team.wake_class``), and
+    no nudge. Said nowhere when no board is the pass's, and never raised out of it."""
+    said = replace(report, receipt=receipt_text(report))
+    board = receipt_board(done)
+    if board is None:
+        return said
+    from aisquare.core import orchestrator
+    from aisquare.services import team as team_service
+
+    try:
+        if not orchestrator.team_enabled():
+            return said
+        with store_session() as store:
+            team_service._emit(store, board, "note", said.receipt or "")
+    except Exception:
+        return said  # the pass is done; a board that would not take its line costs it nothing
+    return replace(said, board=board)

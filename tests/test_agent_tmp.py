@@ -709,6 +709,35 @@ def test_tidy_keeps_an_ended_agents_dir_holding_a_repository_and_names_it(
 
 
 @tidy_only_deletes_on_posix
+def test_an_ended_agents_dir_counts_to_its_board_and_a_plan_without_sizes_walks_no_clone(
+    project: ProjectInfo, processes: dict[int, str], tmp_path: Path
+) -> None:
+    """Where #57 meets #59's periodic job: each item counts to its agent's board (its fleet
+    row's), so a pass that frees GBs of agent temp says so on that board; and the job's plan
+    (``size_kept=False``) walks no clone it keeps, as no other rule's does."""
+    now = datetime.now(UTC)
+    ended, cloned = _dir("aaaaaa", pid=9999), _dir("bbbbbb", pid=9999)
+    _row(project, "aaaaaa", ended=now - timedelta(hours=1), label="coder-1")
+    _row(project, "bbbbbb", ended=now - timedelta(hours=1), label="coder-2")
+    clone = cloned / "scratch" / "repo"
+    (clone / ".git").mkdir(parents=True)
+    (clone / "README").write_text("work no ref may hold")
+
+    made = _tidy_plan(tmp_path)
+    unsized = tidy.plan(size_kept=False)
+
+    assert _agent_items(made) == [ended, agent_tmp.owner_path("aaaaaa")]
+    assert {item.board for item in made.items if item.rule == tidy.AGENT_TMPDIR} == {project.id}
+    [sized] = [k.bytes for k in made.kept if k.path == clone]
+    assert sized is not None and sized > 0
+    assert [k.bytes for k in unsized.kept if k.path == clone] == [None]
+    report = tidy.PassReport(
+        at=now, freed_bytes=2 * 10**9, freed={tidy.AGENT_TMPDIR: 2}, not_freed=0, kept=1
+    )
+    assert tidy.receipt_text(report) == "tidy freed 2.0 GB: 2 agent temp paths"
+
+
+@tidy_only_deletes_on_posix
 def test_tidy_asks_again_before_it_frees_and_skips_what_no_longer_holds(
     project: ProjectInfo, processes: dict[int, str], tmp_path: Path
 ) -> None:
