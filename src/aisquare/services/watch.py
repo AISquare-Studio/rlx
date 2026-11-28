@@ -45,7 +45,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aisquare.core import atomic, locking, selfcli
 from aisquare.core import program as prog
@@ -54,6 +54,9 @@ from aisquare.core.spawn import untraced_env
 from aisquare.core.store import store_session
 from aisquare.models import ProjectInfo
 from aisquare.services import github_prs
+
+if TYPE_CHECKING:
+    from aisquare.services.tidy import PassReport
 
 STATE_LOCK_WAIT = 10.0
 """How long a tick waits for ``state.json``'s lock."""
@@ -123,6 +126,9 @@ class TickReport:
     """Labels of the finished workers auto-stop stopped this tick."""
     notes: list[str] = field(default_factory=list)
     """Lines for the operator: a source failing (once per streak), a GitHub error."""
+    tidied: PassReport | None = None
+    """What tidy's periodic job did this tick (``services.tidy.periodic_pass``, #59), when it
+    ran: it runs at most every ``[tidy] every_minutes``."""
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -133,6 +139,7 @@ class TickReport:
             "nudged": self.nudged,
             "stopped": self.stopped,
             "notes": self.notes,
+            "tidied": self.tidied.as_json() if self.tidied is not None else None,
         }
 
 
@@ -428,7 +435,22 @@ class Watcher:
                     for done in autostop.reap_finished(autostop.every_project())
                     if done.stopped
                 ]
+        report.tidied = _tidy_pass(now, notes)
         return report
+
+
+def _tidy_pass(now: datetime, notes: list[str]) -> PassReport | None:
+    """Tidy's periodic job (#59), when it is due: quiet, one pass at a time on the machine,
+    its own lock and cadence (``services.tidy.periodic_pass``). A pass that raises is one line
+    in the tick's notes: a tidy never costs the tick its news, and its stamp says it ran, so it
+    is tried again an interval on, not every tick."""
+    try:
+        from aisquare.services import tidy
+
+        return tidy.periodic_pass(now)
+    except Exception as exc:
+        notes.append(f"the tidy pass failed: {type(exc).__name__}: {exc}")
+        return None
 
 
 IDLE_BY_DESIGN_KINDS: frozenset[str] = frozenset({"result", "question", "task_review", "task_done"})

@@ -984,9 +984,14 @@ class TidySettings(BaseModel):
     ``idle_build_hours``: a LIVE coder that has waited this long with no task in doing loses
     the ``CACHEDIR.TAG`` build output in its worktree (regenerable: its next build is slower,
     not wrong). ``0`` turns that rule off; nothing else here depends on it.
+
+    ``every_minutes``: how often ``aisquare watch`` runs tidy's periodic job (#59), at most:
+    the same rules as ``rlx tidy``, one pass at a time on the machine, waking nobody. ``0``
+    turns it off; ``rlx tidy`` by hand is unchanged.
     """
 
     idle_build_hours: float = Field(default=24, ge=0)
+    every_minutes: float = Field(default=60, ge=0)
 
 
 class CodeSettings(BaseModel):

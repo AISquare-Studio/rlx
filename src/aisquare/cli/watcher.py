@@ -41,6 +41,15 @@ def _print_tick(report: watch_service.TickReport) -> None:
         console.print(f"  → {path}", markup=False)
     for label in report.stopped:
         console.print(f"  auto-stopped {label}", markup=False)
+    if report.tidied is not None:
+        from aisquare.services import tidy
+
+        tidied = report.tidied
+        console.print(
+            f"  tidy freed {tidy.size_text(tidied.freed_bytes)} in {sum(tidied.freed.values())}"
+            f" paths ({tidied.not_freed} not freed, {tidied.kept} kept)",
+            markup=False,
+        )
     for note in report.notes:
         stderr_console().print(f"{prog.word()} watch: {note}", markup=False)
 

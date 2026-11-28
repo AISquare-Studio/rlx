@@ -54,6 +54,8 @@ one that no longer holds skipped and said so, never swapped for another.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import shutil
@@ -61,11 +63,13 @@ import stat
 import sys
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
-from aisquare.core import cachedir, claude_accounts, locking, process_table
+from aisquare.core import atomic, cachedir, claude_accounts, locking, paths, process_table
+from aisquare.core import program as prog
 from aisquare.core.config import TidySettings, load_config
 from aisquare.core.store import FLEET_HELD, ContextStore, store_session
 from aisquare.models import FleetAgent, ProjectInfo
@@ -110,12 +114,12 @@ def _now() -> datetime:
 
 
 def _settings() -> TidySettings:
-    """``[tidy]``; with a config that cannot be read, the coder rule OFF (review of #58): a rule
-    that deletes fails closed."""
+    """``[tidy]``; with a config that cannot be read, the coder rule and the periodic job OFF
+    (review of #58): a rule that deletes fails closed."""
     try:
         return load_config().tidy
     except Exception:
-        return TidySettings(idle_build_hours=0)
+        return TidySettings(idle_build_hours=0, every_minutes=0)
 
 
 ROOT_TAG = (
@@ -238,6 +242,8 @@ class Item:
     rule: str
     path: Path
     bytes: int
+    board: str | None = None
+    """The board it counts to (#59's receipt): its agent's, or its session's; a lock's none."""
 
 
 @dataclass(frozen=True)
@@ -425,12 +431,15 @@ def _ended_worktrees(store: ContextStore, project: ProjectInfo, result: Plan) ->
         except fleet_service.FleetError as exc:
             result.kept.append(Kept(ENDED_WORKTREE, tree, f"git could not be asked ({exc})"))
             continue
+        board = agent.board or agent.project_id
         if why is None:
             going.append(tree)
-            items = [Item(ENDED_WORKTREE, tree, cachedir.allocated_bytes(tree))]
+            items = [Item(ENDED_WORKTREE, tree, cachedir.allocated_bytes(tree), board)]
         else:
             result.kept.append(Kept(ENDED_WORKTREE, tree, why))
-            items = [Item(ENDED_WORKTREE_CACHE, c, cachedir.allocated_bytes(c)) for c in caches]
+            items = [
+                Item(ENDED_WORKTREE_CACHE, c, cachedir.allocated_bytes(c), board) for c in caches
+            ]
         result.add(
             items,
             _reap_one(project, agent, trees, remove=why is None, caches=caches, roots=result.roots),
@@ -580,6 +589,8 @@ class _Liveness:
     """A running process names it; ``None`` when the processes could not be read."""
     wrote: datetime | None
     """When the session itself last wrote: its board row's last hook, its transcript."""
+    board: str | None = None
+    """The board its own row is on, which what tidy frees of it counts to (#59)."""
 
 
 def _naming(store: ContextStore, session_id: str, every: list[FleetAgent]) -> list[FleetAgent]:
@@ -648,6 +659,7 @@ def _liveness(
         ended_at=ended_at,
         running=_named_running(session_id, commands),
         wrote=max(known) if known else None,
+        board=session.project_id if session is not None else None,
     )
 
 
@@ -673,7 +685,7 @@ def _session_trees(
         moved = _last_moved(directory, alive.wrote)
         if moved is None or at - moved < ENDED_IDLE:
             continue
-        _one_session(directory, session_id, alive.ended_at, at, result)
+        _one_session(directory, session_id, alive.ended_at, at, result, board=alive.board)
 
 
 def _repositories(directory: Path) -> list[Path]:
@@ -770,7 +782,13 @@ def _session_caches(directory: Path, result: Plan) -> list[Path]:
 
 
 def _one_session(
-    directory: Path, session_id: str, ended_at: datetime, at: datetime, result: Plan
+    directory: Path,
+    session_id: str,
+    ended_at: datetime,
+    at: datetime,
+    result: Plan,
+    *,
+    board: str | None = None,
 ) -> None:
     """An ENDED session (current evidence, no process, idle): its repositories are kept and
     listed with their size, never removed (manager #3585); its caches holding no repository go;
@@ -793,7 +811,7 @@ def _one_session(
         and _settled_a_week(directory, at)
         and not cachedir.holds_repository(directory)  # nor a mount, which no rule crosses (M3)
     ):
-        whole = Item(SESSION_DIR, directory, cachedir.allocated_bytes(directory))
+        whole = Item(SESSION_DIR, directory, cachedir.allocated_bytes(directory), board)
 
         def drop() -> str | None:
             if cachedir.holds_repository(directory):
@@ -806,7 +824,7 @@ def _one_session(
         result.add([whole], _guarded(session_id, directory, drop, at_least=EVIDENCE_TTL))
         return
     for tagged in _session_caches(directory, result):
-        item = Item(SESSION_CACHE, tagged, cachedir.allocated_bytes(tagged))
+        item = Item(SESSION_CACHE, tagged, cachedir.allocated_bytes(tagged), board)
 
         def free(path: Path = tagged) -> str | None:
             if not _session_cache(path, directory):
@@ -894,7 +912,9 @@ def _idle_build_output(
         if cachedir.is_cache_dir(tree):
             result.ignored.append(tree)
         for tagged in _build_output(tree):
-            item = Item(IDLE_BUILD_CACHE, tagged, cachedir.allocated_bytes(tagged))
+            item = Item(
+                IDLE_BUILD_CACHE, tagged, cachedir.allocated_bytes(tagged), row.board or project.id
+            )
             result.add(
                 [item], _while_idle(project, row, config.idle_build_hours, tree, tagged, roots)
             )
@@ -1006,3 +1026,212 @@ def _free_lock(path: Path, roots: Roots) -> Callable[[], str | None]:
         return None
 
     return run
+
+
+# --- the periodic job (#59) ---------------------------------------------------------------
+#
+# ``aisquare watch`` runs it from its tick; 0.10.3's rlxd scheduler is to carry the same job
+# with the same setting (``[tidy] every_minutes``). Everything that makes it periodic is here,
+# not in the watcher: when it is due, the one-at-a-time lock, the stamp, the receipt.
+
+RECEIPT_BYTES = 10**9
+"""What a pass must free before it says so on a board: 1 GB (the owner's brief)."""
+PASS_LOCK_PREFIX = "rlx-tidy-"
+"""The pass lock's name before the user id: ``rlx-tidy-<uid>.lock`` in the system temp dir."""
+
+
+def size_text(count: int) -> str:
+    """``count`` bytes as a person reads a disk: decimal units, one decimal place past KB."""
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1000:
+            return f"{value:.0f} {unit}" if unit in ("B", "KB") else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{value:.1f} TB"
+
+
+@dataclass(frozen=True)
+class PassReport:
+    """What one periodic pass did, as its stamp and ``watch --once --json`` say it."""
+
+    at: datetime
+    freed_bytes: int
+    freed: dict[str, int]
+    """How many paths each rule freed (:data:`RULES`), the rules that freed none left out."""
+    not_freed: int
+    kept: int
+    receipt: str | None = None
+    """The line said on a board: only for a pass that freed :data:`RECEIPT_BYTES` or more."""
+    board: str | None = None
+    """The board it was said on: the one most of the freed bytes count to."""
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "at": self.at.isoformat(timespec="seconds"),
+            "freed_bytes": self.freed_bytes,
+            "freed": dict(self.freed),
+            "not_freed": self.not_freed,
+            "kept": self.kept,
+            "receipt": self.receipt,
+            "board": self.board,
+        }
+
+
+def stamp_path() -> Path:
+    """This home's record of its last pass: when (the cadence's clock) and what it did."""
+    return paths.watch_dir() / "tidy.json"
+
+
+def read_stamp() -> dict[str, Any]:
+    try:
+        data = json.loads(stamp_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _last_pass_at(stamp: dict[str, Any]) -> datetime | None:
+    try:
+        found = datetime.fromisoformat(str(stamp["last_pass_at"]))
+    except (KeyError, ValueError):
+        return None
+    return found if found.tzinfo is not None else None
+
+
+def is_due(at: datetime, every_minutes: float) -> bool:
+    """Whether a pass is due at ``at``: none yet in this home, or the last one began
+    ``every_minutes`` ago or more (or, by a clock set back, after ``at``)."""
+    last = _last_pass_at(read_stamp())
+    return last is None or last > at or at - last >= timedelta(minutes=every_minutes)
+
+
+def pass_lock() -> Path | None:
+    """``rlx-tidy-<uid>.lock`` in the system temp dir, found the way rule 4 finds it, whatever
+    this process's ``TMPDIR`` says: one pass at a time on the machine, every home's watcher
+    alike. ``None`` where there is no such dir."""
+    found = _system_temp_dirs()
+    if not found:
+        return None
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return found[0] / f"{PASS_LOCK_PREFIX}{uid}.lock"
+
+
+def periodic_pass(now: datetime | None = None) -> PassReport | None:
+    """Tidy's periodic job: once due (:func:`is_due`, ``[tidy] every_minutes``; ``0`` is off),
+    and while no other pass on the machine holds :func:`pass_lock` (one that does is waited
+    for not at all: the pass stays due), the same rules as ``rlx tidy``, :func:`plan` then
+    :func:`apply`. Its stamp is written under the lock, whether the pass finished or raised,
+    so a pass that keeps failing is tried once per interval, never every tick. Quiet: it wakes
+    and nudges no one; a pass that freed :data:`RECEIPT_BYTES` or more says so in one line on
+    one board (:func:`_say_it`). ``None``: not due, off, or another pass is running. Never on
+    native Windows, where tidy deletes nothing (:data:`DELETES`)."""
+    if not DELETES:
+        return None
+    every = _settings().every_minutes
+    if every <= 0:
+        return None
+    at = now or _now()
+    if not is_due(at, every):
+        return None
+    lock = pass_lock()
+    if lock is None:
+        return None
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(locking.holding(lock, wait_s=0, mode=0o600))
+        except TimeoutError:
+            return None  # another pass runs now; this one stays due
+        except OSError:
+            # No lock to be had (the temp dir unwritable): said once per interval, not per tick.
+            _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), "failed": True})
+            raise
+        if not is_due(at, every):
+            return None  # one ran between the first look and the lock
+        try:
+            made = plan(now=at)
+            done = apply(made)
+        except BaseException:
+            _write_stamp({"last_pass_at": at.isoformat(timespec="seconds"), "failed": True})
+            raise
+        report = _pass_report(at, done)
+        _write_stamp({"last_pass_at": report.at.isoformat(timespec="seconds"), **_totals(report)})
+    if report.freed_bytes < RECEIPT_BYTES:
+        return report
+    return _say_it(report, done)
+
+
+def _totals(report: PassReport) -> dict[str, Any]:
+    found = report.as_json()
+    return {key: found[key] for key in ("freed_bytes", "freed", "not_freed", "kept")}
+
+
+def _write_stamp(data: dict[str, Any]) -> None:
+    path = stamp_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic.write_replacing(path, json.dumps(data), durable=False)
+
+
+def _pass_report(at: datetime, done: Report) -> PassReport:
+    freed = {rule: 0 for rule in RULES}
+    for item in done.freed:
+        freed[item.rule] += 1
+    return PassReport(
+        at=at,
+        freed_bytes=done.bytes,
+        freed={rule: n for rule, n in freed.items() if n},
+        not_freed=len(done.not_freed),
+        kept=len(done.kept),
+    )
+
+
+_RECEIPT_PARTS = (
+    ((ENDED_WORKTREE,), "worktree", "worktrees"),
+    ((SESSION_DIR, SESSION_CACHE), "session temp path", "session temp paths"),
+    ((ENDED_WORKTREE_CACHE, IDLE_BUILD_CACHE), "build cache", "build caches"),
+    ((MIGRATION_LOCK,), "lock", "locks"),
+)
+
+
+def receipt_text(report: PassReport) -> str:
+    """``rlx tidy freed 14.2 GB: 3 worktrees, 30 session temp paths, 8 build caches, 1 lock``:
+    the pass's totals, never a path (a manager pays for every character in its context)."""
+    parts = []
+    for rules, one, many in _RECEIPT_PARTS:
+        count = sum(report.freed.get(rule, 0) for rule in rules)
+        if count:
+            parts.append(f"{count} {one if count == 1 else many}")
+    said = f"{prog.word()} tidy freed {size_text(report.freed_bytes)}"
+    return f"{said}: {', '.join(parts)}" if parts else said
+
+
+def receipt_board(done: Report) -> str | None:
+    """The board most of what the pass freed counts to (each item's :attr:`Item.board`), the
+    first by id on a tie; ``None`` when none of it counts to one."""
+    shares: dict[str, int] = {}
+    for item in done.freed:
+        if item.board is not None:
+            shares[item.board] = shares.get(item.board, 0) + item.bytes
+    if not shares:
+        return None
+    return min(shares, key=lambda board: (-shares[board], board))
+
+
+def _say_it(report: PassReport, done: Report) -> PassReport:
+    """The receipt, one plain ``note`` on one board (:func:`receipt_board`): never a
+    ``result`` nor addressed to the manager, which would wake one (``team.wake_class``), and
+    no nudge. Said nowhere when no board is the pass's, and never raised out of it."""
+    said = replace(report, receipt=receipt_text(report))
+    board = receipt_board(done)
+    if board is None:
+        return said
+    from aisquare.core import orchestrator
+    from aisquare.services import team as team_service
+
+    try:
+        if not orchestrator.team_enabled():
+            return said
+        with store_session() as store:
+            team_service._emit(store, board, "note", said.receipt or "")
+    except Exception:
+        return said  # the pass is done; a board that would not take its line costs it nothing
+    return replace(said, board=board)

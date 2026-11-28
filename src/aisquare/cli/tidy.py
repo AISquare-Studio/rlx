@@ -21,15 +21,8 @@ from aisquare.core.console import stdout_console
 from aisquare.core.state import get_state
 from aisquare.services import tidy as tidy_service
 
-
-def size(count: int) -> str:
-    """``count`` bytes as a person reads a disk: decimal units, one decimal place past KB."""
-    value = float(count)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1000:
-            return f"{value:.0f} {unit}" if unit in ("B", "KB") else f"{value:.1f} {unit}"
-        value /= 1000
-    return f"{value:.1f} TB"
+size = tidy_service.size_text
+"""``count`` bytes as a person reads a disk: the service's, which the watcher's receipt says."""
 
 
 def _item(item: tidy_service.Item) -> dict[str, Any]:
