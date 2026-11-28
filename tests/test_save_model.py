@@ -462,3 +462,16 @@ def test_keep_leaves_text_typed_since_and_shows_what_it_answers() -> None:
     assert seen["typing"] == ("typed", "new"), "the typed text stays; the value is kept"
     assert seen["answered"] == ("padded", "padded")
     assert seen["undone"] == ("old", "old")
+
+
+def test_undos_keep_shows_its_value_over_text_typed_since() -> None:
+    """#3597: Undo's keep (``over_typing``) shows the value it puts back over text typed in the
+    field since; a save's keep leaves that text (the test above)."""
+
+    async def go(pilot: Any, app: Host, page: Page) -> tuple[str, str]:
+        field = page.query_one(CommitInput)
+        field.value = "half-typed"
+        field.keep("old", over_typing=True)
+        return field.value, field.kept
+
+    assert drive(go) == ("old", "old")

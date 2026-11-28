@@ -331,7 +331,7 @@ class SettingsView(SavesAsYouGo, VerticalScroll):
         previous = asked_of.nickname or ""
         self.project = updated
         field = self.query_one("#nickname", CommitInput)
-        field.keep(updated.nickname or "")
+        field.keep(updated.nickname or "", over_typing=self._undoing)  # Undo wins (#3597)
         self.accept(field)
         self.query_one("#settings-title", Static).update(self._title())
         self.query_one("#fleet-id", Static).update(fleet_id_line(updated))

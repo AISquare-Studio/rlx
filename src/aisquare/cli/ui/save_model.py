@@ -129,12 +129,15 @@ class CommitInput(Input):
         stays to try again (the store or the file said no): its next commit goes again."""
         self.in_flight = None
 
-    def keep(self, value: str) -> None:
+    def keep(self, value: str, *, over_typing: bool = False) -> None:
         """``value`` is on disk now (saved, or put back by Undo): kept, and not committed again;
         shown when the field still shows what was kept or what the page is answering
         (:attr:`in_flight`). Text typed since is the person's, and stays: an earlier save's
-        report replaced it (#56), as a frame does not (``SettingsView.show_project``)."""
-        ours = self.value in (self.kept, self.in_flight)
+        report replaced it (#56), as a frame does not (``SettingsView.show_project``).
+        ``over_typing``: Undo's own keep, shown over it all the same. ctrl+z takes the last
+        change back, on disk and on screen, half-typed text in the field included; left
+        there, leaving the field wrote it over the Undo (reviewer of #56, #3595/#3597)."""
+        ours = over_typing or self.value in (self.kept, self.in_flight)
         self.kept = value
         if ours and self.value != value:
             with self.prevent(Input.Changed):

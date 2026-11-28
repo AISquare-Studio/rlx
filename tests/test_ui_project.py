@@ -2956,6 +2956,54 @@ def test_an_earlier_saves_report_leaves_the_name_being_typed_in_the_field(
     assert seen["undone"] == ("V1", "V1", 1), "ctrl+z: back to V1"
 
 
+def test_ctrl_z_while_typing_takes_the_change_back_over_the_typed_text(
+    project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer of #56 (#3595), ruled UNDO WINS (#3597): V1 kept, V2 typed without Enter,
+    ctrl+z (the page's key, which the field does not take). Undo's keep left the typed V2 in
+    the field once text typed since was kept (#56's first round), and leaving the field then
+    wrote V2 over the Undo. ctrl+z takes the last change back on disk and on screen, the
+    half-typed text included: leaving writes nothing, and the store and field stay undone."""
+    from aisquare.core.store import store_session
+    from tests.fleet_fakes import tmux_sessions_as
+
+    tmux_sessions_as(monkeypatch)
+    real_rename = fleet_service.rename_project
+    writes: list[str | None] = []
+
+    def counted(target: ProjectInfo, nickname: str | None, **kwargs: Any) -> ProjectInfo:
+        writes.append(nickname)
+        return real_rename(target, nickname, **kwargs)
+
+    monkeypatch.setattr(fleet_service, "rename_project", counted)
+
+    def stored() -> str | None:
+        with store_session() as store:
+            return store.get_project(project.id).nickname  # type: ignore[union-attr]
+
+    async def scenario(pilot: Pilot[None], host: Host) -> dict[str, Any]:
+        host.query_one(ProjectView).active = "tab-settings"
+        await settle(pilot)
+        page = host.query_one(SettingsView)
+        field = host.query_one("#nickname", CommitInput)
+        await pilot.click("#nickname")
+        field.value = "V1"
+        await pilot.press("enter")
+        await settle(pilot)
+        field.value = "V2"  # typed, not entered
+        await pilot.press("ctrl+z")
+        await settle(pilot)
+        seen: dict[str, Any] = {"undone": (stored(), field.value, field.kept, len(page.changes))}
+        field.blur()  # leaving the field
+        await settle(pilot)
+        seen["left"] = (stored(), field.value, field.kept, len(page.changes), list(writes))
+        return seen
+
+    seen = drive(project, scenario)
+    assert seen["undone"] == (None, "", "", 0), "ctrl+z: the old value, on disk and on screen"
+    assert seen["left"] == (None, "", "", 0, ["V1", None]), "leaving writes nothing back"
+
+
 def test_a_nickname_whose_save_failed_is_saved_again_on_enter(
     project: ProjectInfo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
