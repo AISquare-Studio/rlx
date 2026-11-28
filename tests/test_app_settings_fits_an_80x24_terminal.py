@@ -30,9 +30,9 @@ from aisquare.cli.ui.sidebar import AppSettingsSelected
 from aisquare.cli.ui.views.app_settings import (
     AGENT_ADVANCED,
     AGENT_TAB,
-    EXPERIMENTAL,
     DISPLAY_CHOICES,
     DISPLAY_TAB,
+    EXPERIMENTAL,
     PREFERENCES_ADVANCED,
     PREFERENCES_TAB,
     REMOTE_TAB,

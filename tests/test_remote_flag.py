@@ -16,6 +16,7 @@ import logging
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 from textual.pilot import Pilot
@@ -30,7 +31,7 @@ from aisquare.cli.ui.views.app_settings import REMOTE_TAB
 from aisquare.cli.ui.views.settings_captain import CaptainToggle, ExperimentalSection, RemoteToggle
 from aisquare.core import experimental, paths
 from aisquare.core import program as prog
-from aisquare.core.config import load_config, save_config
+from aisquare.core.config import load_config, salvaged_remote, save_config
 from aisquare.core.state_file import update_state
 from aisquare.services import diagnostics, service_host
 from aisquare.services.service_host import RemotePart
@@ -204,6 +205,91 @@ def test_config_list_and_get_show_both_flags_remote_as_it_reads(decides: None) -
     assert runner.invoke(cli, ["config", "set", "experimental.remote", "false"]).exit_code == 0
     assert _got(runner) == "false"
     assert load_config().experimental.remote is False, "written: an explicit off"
+
+
+# --- Reset all and `init --reinit` keep a decided switch (the manager's Q3 on #46) ----------
+
+
+#: (what the person chose, whether the home had Remote set up, how it reads after): each a
+#: case where losing the choice would flip how Remote reads. Undecided stays undecided.
+KEPT = [(False, True, False), (True, False, True), (None, True, True)]
+KEPT_IDS = ["off-on-a-set-up-home", "on-on-a-fresh-home", "undecided-on-a-set-up-home"]
+
+
+def _choose(chosen: bool | None, set_up: bool) -> None:
+    if set_up:
+        _set_up("token")
+    config = load_config()
+    config.experimental.remote = chosen
+    save_config(config)
+
+
+@pytest.mark.parametrize(("chosen", "set_up", "on"), KEPT, ids=KEPT_IDS)
+def test_reset_all_keeps_the_switch_and_a_file_with_only_it_holds_nothing_to_reset(
+    decides: None, chosen: bool | None, set_up: bool, on: bool
+) -> None:
+    """As S2's Reset all keeps ``[service]``: forgotten, an off on a home set up before the
+    switch read as on again, and an on of a fresh home read as off."""
+    from aisquare.services import settings as settings_service
+
+    _choose(chosen, set_up)
+    settings_service.set_value("fleet.escape_key", "f11")
+
+    backup = settings_service.reset_settings()
+
+    assert backup is not None and "f11" in backup.read_text(encoding="utf-8")
+    assert load_config().fleet.escape_key != "f11"
+    assert load_config().experimental.remote is chosen
+    assert experimental.remote_enabled() is on
+    assert settings_service.anything_to_reset() is False
+    assert settings_service.reset_settings() is None
+
+
+@pytest.mark.parametrize(("chosen", "set_up", "on"), KEPT, ids=KEPT_IDS)
+def test_init_reinit_keeps_the_switch(
+    decides: None, tmp_path: Path, chosen: bool | None, set_up: bool, on: bool
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    first = CliRunner().invoke(cli, ["init", "--local", "--yes", "--no-onboard", str(project)])
+    assert first.exit_code == 0, first.output
+    _choose(chosen, set_up)
+
+    again = CliRunner().invoke(
+        cli, ["init", "--reinit", "--yes", "--local", "--no-onboard", str(project)]
+    )
+
+    assert again.exit_code == 0, again.output
+    assert load_config().experimental.remote is chosen
+    assert experimental.remote_enabled() is on
+
+
+@pytest.mark.parametrize("command", [["config", "reset", "--yes"], ["init", "--reinit", "--yes"]])
+def test_a_reset_of_a_broken_file_keeps_an_off_read_from_its_text(
+    decides: None, tmp_path: Path, command: list[str]
+) -> None:
+    """The reset rlx recommends for a file that no longer parses must not lose the off, as
+    S2's does not lose ``[service]``'s (tester of #33, round 2)."""
+    _choose(False, set_up=True)
+    path = paths.config_path()
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n[ui]\nthis is = not [toml\n", encoding="utf-8"
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    more = ["--local", "--no-onboard", str(project)] if command[0] == "init" else []
+
+    reset = CliRunner().invoke(cli, [*command, *more])
+
+    assert reset.exit_code == 0, reset.output
+    assert load_config().experimental.remote is False
+    assert experimental.remote_enabled() is False
+
+
+def test_the_switch_is_salvaged_from_its_own_table_alone() -> None:
+    assert salvaged_remote(b"[ui]\nremote = true\n[experimental]\nremote = false # off\n") is False
+    assert salvaged_remote(b"[experimental]\ncaptain = true\n[ui]\nremote = true\n") is None
+    assert salvaged_remote(b"[ experimental ]\n  remote = true\n\xff[oops\n") is True
 
 
 # --- `rlx remote` -----------------------------------------------------------------------------
