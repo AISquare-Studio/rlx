@@ -679,8 +679,9 @@ def _session_trees(
 def _repositories(directory: Path) -> list[Path]:
     """Every git repository in ``directory``, ``directory`` itself among them when it is one:
     each folder holding a ``.git`` (a clone's, a worktree's or a submodule's) and each bare
-    repository, the outermost only, links not followed and no mount walked (M3: one holds what
-    no rule judges, :func:`_one_session`). A tag hides none (review of #58, C2)."""
+    repository, and each bundle (``cachedir.is_bundle``: a repository in one file, manager
+    #3697), the outermost only, links not followed and no mount walked (M3: one holds what no
+    rule judges, :func:`_one_session`). A tag hides none (review of #58, C2)."""
     found: list[Path] = []
     pending = [directory]
     device = cachedir._device(directory)
@@ -689,7 +690,18 @@ def _repositories(directory: Path) -> list[Path]:
         if _there(here / ".git") or cachedir._is_bare_repository(here):
             found.append(here)
             continue
-        pending.extend(inner for inner in _subdirs(here) if cachedir._device(inner) == device)
+        try:
+            with os.scandir(here) as listing:
+                entries = list(listing)
+        except OSError:
+            continue
+        for entry in entries:
+            inner = Path(entry.path)
+            if entry.is_dir(follow_symlinks=False):
+                if cachedir._device(inner) == device:
+                    pending.append(inner)
+            elif entry.is_file(follow_symlinks=False) and cachedir.is_bundle(inner):
+                found.append(inner)
     return sorted(found)
 
 

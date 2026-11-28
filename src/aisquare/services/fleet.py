@@ -38,6 +38,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import unicodedata
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -3199,6 +3200,12 @@ def _status_failed(status: _GitResult) -> str:
     return f"git status failed there ({status.stderr.strip() or status.returncode})"
 
 
+REAP_FREES_CACHES = sys.platform != "win32"
+"""Whether reap frees an ended tree's untracked ``CACHEDIR.TAG`` output before judging the tree
+(#58). Not on native Windows in 0.10.2 (manager #3697, as ``rlx tidy`` reports only there,
+#3647): reap judges a tree there as 0.10.1 did, and an untracked cache keeps it."""
+
+
 def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
     """``tree``'s status read once: why git could not say (else ``None``), the untracked
     entries whose every file lies inside a ``CACHEDIR.TAG`` directory (``core.cachedir``:
@@ -3221,8 +3228,14 @@ def _untracked_caches(tree: Path) -> tuple[str | None, list[Path], bool]:
         if "R" in code or "C" in code:
             next(fields, None)  # a rename's or copy's other path
         path = tree / name.rstrip("/")
-        # A mount is never build output, whatever it holds (review of #58, M3).
-        if code == "??" and cachedir.same_filesystem(path, tree) and cachedir.only_caches(path):
+        # A mount is never build output, whatever it holds (review of #58, M3); nor is any
+        # untracked entry where reap does not free caches (REAP_FREES_CACHES): 0.10.1's reap.
+        if (
+            code == "??"
+            and REAP_FREES_CACHES
+            and cachedir.same_filesystem(path, tree)
+            and cachedir.only_caches(path)
+        ):
             caches.append(path)
         else:
             other = True
@@ -3237,8 +3250,8 @@ def _remove_untracked_caches(
     """Delete the ``CACHEDIR.TAG`` directories in ``tree``'s untracked entries that hold
     nothing else (:func:`_untracked_caches`); the ones deleted. One that will not go is left
     for ``git worktree remove`` to refuse, which says so."""
-    if os.path.islink(tree):
-        return []  # a tree reached through a link: nothing is deleted through it
+    if not REAP_FREES_CACHES or os.path.islink(tree):
+        return []  # off on native Windows; and nothing is deleted through a link
     _failed, caches, _other = _untracked_caches(tree)
     removed: list[Path] = []
     for entry in caches:

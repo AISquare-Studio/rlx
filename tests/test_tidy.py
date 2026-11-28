@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -207,7 +208,14 @@ def test_live_paused_running_and_recent_sessions_are_untouched_and_an_ended_one_
 ) -> None:
     live, paused, running, recent, ended = (session_dir() for _ in range(5))
     row(project, live.name)
-    row(project, paused.name, ended_at=datetime.now(UTC) - 3 * HOUR, paused_at=datetime.now(UTC))
+    # A pause's real shape (review #3696): its row ended ``stopped`` (stop()'s default), paused.
+    row(
+        project,
+        paused.name,
+        ended_at=datetime.now(UTC) - 3 * HOUR,
+        ended_by="stopped",
+        paused_at=datetime.now(UTC),
+    )
     sandboxed.append(f"claude --session-id {running.name} --model opus")
     for directory in (live, paused, running, ended):
         tag(directory / "scratchpad" / "target")
@@ -503,7 +511,13 @@ def test_a_paused_row_in_a_forgotten_project_still_holds_its_session(
     tmp_path: Path, project: ProjectInfo
 ) -> None:
     session = session_dir()
-    row(project, session.name, ended_at=datetime.now(UTC), paused_at=datetime.now(UTC))
+    row(
+        project,
+        session.name,
+        ended_at=datetime.now(UTC),
+        ended_by="stopped",  # a pause's real shape (review #3696)
+        paused_at=datetime.now(UTC),
+    )
     with store_session() as store:
         store.forget_project(project.id)
     tag(session / "scratchpad" / "target")
@@ -1275,15 +1289,18 @@ def test_no_session_rule_crosses_a_mount(tmp_path: Path, monkeypatch: pytest.Mon
     mounts = (mounted, under.parent, old / "scratchpad" / "mnt")
     _mounted_at(monkeypatch, *mounts)
     listed: list[Path] = []
-    real_subdirs = tidy._subdirs
+    real_scandir = os.scandir
 
-    def subdirs(path: Path) -> list[Path]:
-        listed.append(path)
-        return real_subdirs(path)
+    def scandir(path: Any = ".") -> Any:
+        """Every folder any walk lists, tidy's and ``cachedir``'s alike."""
+        if isinstance(path, (str, os.PathLike)):
+            listed.append(Path(path))
+        return real_scandir(path)
 
-    monkeypatch.setattr(tidy, "_subdirs", subdirs)
+    monkeypatch.setattr(os, "scandir", scandir)
 
     made = planned(tmp_path)
+    monkeypatch.setattr(os, "scandir", real_scandir)
 
     assert rules(made) == {ours: tidy.SESSION_CACHE}
     assert not [p for p in listed if any(p == m or p.is_relative_to(m) for m in mounts)]
@@ -1453,3 +1470,65 @@ def test_a_cache_inside_a_tree_reap_judges_honours_the_callers_roots(tmp_path: P
     assert fleet_service._remove_untracked_caches(tree, allows=lambda path: False) == []
     assert target.is_dir()
     assert fleet_service._remove_untracked_caches(tree, allows=lambda path: True) == [target]
+
+
+# --- round 5 (review #3696, manager #3697) --------------------------------------------------
+
+
+def test_a_real_pause_ends_its_row_stopped_and_the_pause_alone_holds_the_session(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """A fleet pause ends its row ``stopped`` (stop()'s default) with ``paused_at``. With the
+    board's end and that explicit end both there, the pause alone (``_held_by``) keeps the
+    session's build output."""
+    agent = fleet_service.spawn(project, "coder", label="coder-paused").agent
+    fleet_service.pause_agent(project, "coder-paused", grace=0)
+    with store_session() as store:
+        paused = store.get_fleet_agent(agent.id)
+    assert paused is not None and paused.session_id
+    assert paused.ended_by == "stopped" and paused.paused_at is not None
+    session = session_dir(session=paused.session_id)
+    with store_session() as store:  # made before the board's end: no resume says it is live
+        store.upsert_fleet_agent(
+            paused.model_copy(update={"created_at": datetime.now(UTC) - 5 * HOUR})
+        )
+    cache = tag(session / "scratchpad" / "target")
+    aged(session, 3 * HOUR)
+
+    made = planned(tmp_path)
+
+    assert made.items == []
+    tidy.apply(made)
+    assert (cache / cachedir.TAG).is_file()
+
+
+def _bundle(where: Path, repo: Path) -> Path:
+    where.parent.mkdir(parents=True, exist_ok=True)
+    _git("bundle", "create", str(where), "--all", cwd=repo)
+    return where
+
+
+def test_a_git_bundle_is_a_repository_tidy_never_deletes(tmp_path: Path, repo: Path) -> None:
+    """A bundle is a repository in one file (manager #3697). A session holding only one is kept
+    whole a week on, the bundle listed with its size; a cache holding one is no cache; a file
+    that only looks like one keeps nothing."""
+    week = 8 * timedelta(days=1)
+    holding = session_dir(ended=week)
+    bundle = _bundle(holding / "scratchpad" / "work.bundle", repo)
+    lookalike = session_dir(ended=week)
+    (lookalike / "scratchpad" / "notes.bundle").write_bytes(b"# v2 git bundles are files\n")
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target")
+    inside = _bundle(cache / "deep" / "x.bundle", repo)
+    plain = tag(recent / "scratchpad" / "plain")
+    for directory, ago in ((holding, week), (lookalike, week), (recent, 3 * HOUR)):
+        aged(directory, ago)
+
+    made = planned(tmp_path)
+
+    assert rules(made) == {lookalike: tidy.SESSION_DIR, plain: tidy.SESSION_CACHE}
+    assert _kept_why(made, bundle) == tidy.NEVER_A_REPOSITORY
+    assert _kept_why(made, inside) == tidy.NEVER_A_REPOSITORY
+    assert [k.bytes for k in made.kept if k.path == bundle] == [cachedir.allocated_bytes(bundle)]
+    tidy.apply(made)
+    assert bundle.is_file() and inside.is_file() and not lookalike.exists()

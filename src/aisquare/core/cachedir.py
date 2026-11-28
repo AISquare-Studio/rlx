@@ -92,6 +92,36 @@ def same_filesystem(path: Path, root: Path) -> bool:
     return device is not None and device == _device(root)
 
 
+BUNDLE_SIGNATURES = (b"# v2 git bundle\n", b"# v3 git bundle\n")
+"""A git bundle's first line (git's bundle format, v2 and v3): a repository in one file."""
+_BUNDLE_HEAD = len(BUNDLE_SIGNATURES[0])
+_READ_ONLY = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+
+
+def is_bundle(path: Path | str) -> bool:
+    """Whether ``path`` is a git bundle (manager #3697: a repository in one file): a regular
+    file, no link followed, whose first line is a bundle's (:data:`BUNDLE_SIGNATURES`). Read
+    without blocking (never a FIFO's reader), its first line alone."""
+    try:
+        fd = os.open(path, _READ_ONLY)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        head = os.read(fd, _BUNDLE_HEAD)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return head in BUNDLE_SIGNATURES
+
+
 def _is_git(name: str) -> bool:
     """``.git`` as git finds it, whatever its case on a case-insensitive disk (``.GIT``)."""
     return name.lower() == ".git"
@@ -106,8 +136,9 @@ def _is_file(path: Path) -> bool:
 
 def holds_repository(path: Path, *, below_only: bool = False) -> bool:
     """Whether a git repository of any kind is at or anywhere under ``path``: a ``.git`` (a
-    clone's directory, a worktree's or a submodule's file, ``.GIT`` on a case-insensitive disk)
-    or a bare repository, ignored by git or not, links not followed (review of #58, C-a).
+    clone's directory, a worktree's or a submodule's file, ``.GIT`` on a case-insensitive disk),
+    a bare repository or a bundle (:func:`is_bundle`), ignored by git or not, links not
+    followed (review of #58, C-a).
     ``below_only``: ``path``'s own ``.git`` (a checkout's) is neither counted nor walked into, a
     repository inside it counts. A folder that cannot be read, or on another filesystem (a
     mount: no rule crosses one, M3), is taken to hold one: kept."""
@@ -130,6 +161,8 @@ def holds_repository(path: Path, *, below_only: bool = False) -> bool:
                     continue  # the checkout's own repository: never walked into, nor counted
                 return True
             if not entry.is_dir(follow_symlinks=False):
+                if entry.is_file(follow_symlinks=False) and is_bundle(entry.path):
+                    return True  # a repository in one file (manager #3697)
                 continue
             inner = Path(entry.path)
             if _device(inner) != device:
