@@ -658,10 +658,6 @@ fn a_template_run_start_would_refuse_is_refused_at_put() {
         (with("kind", json!("send_executor")), "pinned_call_required"),
         (with("space", json!("../x")), "invalid_params"),
         (
-            with("needs_connectors", json!(["claude.ai Slack"])),
-            "not_implemented",
-        ),
-        (
             with("run_id", json!("0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f")),
             "invalid_params",
         ),
@@ -718,6 +714,12 @@ fn a_template_run_start_would_refuse_is_refused_at_put() {
         assert_eq!(refused(&home, "job.put", &bad), code, "{bad:#}");
     }
     assert_eq!(listed(&home, "bad"), Value::Null, "nothing was stored");
+    // run.start serves needs_connectors (5.5), so a template naming connectors is put.
+    let mut gated = every_minute("gated", "skip");
+    gated["run"]["mount"] = json!({"kind": "connectors", "connectors": ["claude.ai Slack"]});
+    gated["run"]["needs_connectors"] = json!(["claude.ai Slack"]);
+    put(&home, &gated);
+    assert_eq!(listed(&home, "gated")["job_id"], "gated");
 }
 
 trait Pipe: Sized {

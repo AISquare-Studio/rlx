@@ -115,6 +115,20 @@ pub enum Refused {
     ScreenFailed(String),
 }
 
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooMany => write!(f, "the home holds {MAX_PTYS} ptys, the most it may"),
+            Self::Unknown(id) => write!(f, "no pty {id}"),
+            Self::Exited(id) => write!(f, "pty {id}'s process has ended"),
+            Self::SpawnFailed(why)
+            | Self::Invalid(why)
+            | Self::Busy(why)
+            | Self::ScreenFailed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// How a PTY's process ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Exit {
@@ -353,13 +367,29 @@ impl Host {
         let failed = |what: &str, e: &dyn std::fmt::Display| {
             Refused::SpawnFailed(format!("{what} {:?}: {e}", params.argv[0]))
         };
-        let pair = native_pty_system()
-            .openpty(size)
-            .map_err(|e| failed("no pseudo-terminal for", &e))?;
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|e| failed("cannot start", &e))?;
+        // One program start at a time across rlxd (`crate::spawn`): the pseudo-terminal's
+        // descriptors made, the program started, and the master's copies taken, never the
+        // wait for its end. So no other start inherits this one's descriptors before they
+        // are close-on-exec, nor this one another's.
+        let (pair, child, reader, writer) = {
+            let _alone = crate::spawn::alone();
+            let pair = native_pty_system()
+                .openpty(size)
+                .map_err(|e| failed("no pseudo-terminal for", &e))?;
+            let child = pair
+                .slave
+                .spawn_command(command)
+                .map_err(|e| failed("cannot start", &e))?;
+            let reader = pair
+                .master
+                .try_clone_reader()
+                .map_err(|e| failed("no output for", &e))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|e| failed("no input for", &e))?;
+            (pair, child, reader, writer)
+        };
         drop(pair.slave);
         let Some(pid) = child.process_id() else {
             return Err(Refused::SpawnFailed(format!(
@@ -367,14 +397,6 @@ impl Host {
                 params.argv[0]
             )));
         };
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| failed("no output for", &e))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| failed("no input for", &e))?;
         let id = new_id();
         let (input, queue) = mpsc::channel::<Vec<u8>>();
         let queued = Arc::new(AtomicUsize::new(0));

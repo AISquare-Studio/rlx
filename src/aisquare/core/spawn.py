@@ -100,6 +100,8 @@ narrowing their environment would be change without a reason:
     such asq's ``AISQUARE_HOME``/``HOME``, whether it runs on this home (#21). No model.
   * ``core/process_table.py::ps_text`` — ``ps -A -o pid=,ppid=,pcpu=,rss=,etime=``: every
     process at once, for ``fleet top`` and asq's Agent resources page. A listing, no model.
+  * ``cli/connectors.py::run_rlxd`` — ``rlxd call connectors.list``, one request to
+    this machine's rlxd; no model.
   * ``cli/watch.py::action_open_transcript`` — a pager/viewer on a file.
   * ``cli/ui/terminal.py::wsl_path`` — ``wslpath -u`` on a Windows path pasted into a
     pane under WSL (#288). A path converter, no model.
@@ -425,6 +427,11 @@ SEAMS: dict[str, Seam] = {
         EXCLUDED,
         "`ps -A -o pid=,ppid=,pcpu=,rss=,etime=`: every process at once, for `fleet top` and "
         "asq's Agent resources page. A listing, no model",
+    ),
+    "aisquare/cli/connectors.py::run_rlxd": Seam(
+        EXCLUDED,
+        "`rlxd call connectors.list`: one request to this machine's rlxd over its socket, "
+        "for `connectors list`. rlxd answers from its cache; no model",
     ),
     "aisquare/cli/watch.py::action_open_transcript": Seam(
         EXCLUDED, "a pager/viewer on a transcript file"

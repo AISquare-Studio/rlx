@@ -9,14 +9,17 @@ use schemars::{JsonSchema, Schema};
 use serde_json::Value;
 
 use crate::{
-    BrainInput, BrainOutput, DaemonRecord, Envelope, Event, HelloData, HelloParams, HereData,
-    JobEvent, JobListData, JobListParams, JobPutParams, JobRef, JobRunNowData, PtyExited,
-    PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams, PtyScreen, PtyScreenParams,
-    PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request, RunCancelData, RunDecideData,
-    RunDecideParams, RunEvent, RunEventsData, RunEventsParams, RunGetData, RunListData,
-    RunListParams, RunRef, RunResumeData, RunResumeParams, RunStartParams, Setting,
-    SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList, SettingsListParams,
-    SettingsSetParams, SpaceEnsureData, SpaceEraseData, SpaceParams, StatusData, SubscribeParams,
+    BrainInput, BrainOutput, ConnectorChanged, ConnectorId, ConnectorLoginDone,
+    ConnectorLoginError, ConnectorLoginOpenUrl, ConnectorLoginWaiting, ConnectorsList,
+    ConnectorsListParams, ConnectorsLoginData, ConnectorsLoginParams, DaemonRecord, Envelope,
+    Event, HelloData, HelloParams, HereData, JobEvent, JobListData, JobListParams, JobPutParams,
+    JobRef, JobRunNowData, PtyExited, PtyKillParams, PtyList, PtyOutput, PtyRef, PtyResizeParams,
+    PtyScreen, PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request,
+    RunCancelData, RunDecideData, RunDecideParams, RunEvent, RunEventsData, RunEventsParams,
+    RunGetData, RunListData, RunListParams, RunRef, RunResumeData, RunResumeParams, RunStartParams,
+    Setting, SettingsChanged, SettingsDeleteParams, SettingsGetParams, SettingsList,
+    SettingsListParams, SettingsSetParams, SpaceEnsureData, SpaceEraseData, SpaceParams,
+    StatusData, SubscribeParams,
 };
 
 /// One schema file: its name under `schemas/v1/`, and its contents.
@@ -33,6 +36,16 @@ pub fn all() -> Vec<SchemaFile> {
     let mut files = vec![
         file::<BrainInput>("brain-input.json"),
         file::<BrainOutput>("brain-output.json"),
+        file::<ConnectorChanged>("connector-changed.json"),
+        file::<ConnectorId>("connector-id.json"),
+        file::<ConnectorLoginDone>("connector-login-done.json"),
+        file::<ConnectorLoginError>("connector-login-error.json"),
+        file::<ConnectorLoginOpenUrl>("connector-login-open-url.json"),
+        file::<ConnectorLoginWaiting>("connector-login-waiting.json"),
+        file::<ConnectorsList>("connectors.json"),
+        file::<ConnectorsListParams>("connectors-list.json"),
+        file::<ConnectorsLoginParams>("connectors-login.json"),
+        file::<ConnectorsLoginData>("connectors-login-reply.json"),
         file::<DaemonRecord>("daemon-record.json"),
         file::<Envelope>("envelope.json"),
         file::<Event>("event.json"),

@@ -409,17 +409,6 @@ fn refused_starts_name_their_reason() {
     let refused = home.rlxd(&["call", "run.start", &with_id(&send, &run_id())]);
     assert_eq!(refused.error_code(), "pinned_call_required", "{refused:?}");
 
-    let needs = json!({"kind": "task", "prompt": "x", "mount": {"kind": "no_tools"},
-        "needs_connectors": ["claude.ai Slack"]});
-    let refused = home.rlxd(&["call", "run.start", &with_id(&needs, &run_id())]);
-    assert_eq!(refused.error_code(), "not_implemented", "{refused:?}");
-    assert!(
-        refused.json()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("needs_connectors")
-    );
-
     let upper = home.rlxd(&[
         "call",
         "run.start",

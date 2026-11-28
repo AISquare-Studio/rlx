@@ -415,6 +415,14 @@ pub mod codes {
     /// every run's gate hook runs by (never a name looked up on `PATH`). The message says
     /// why.
     pub const HOOK_NOT_FOUND: &str = "hook_not_found";
+    /// `connectors.list {refresh: true}`: rlxd has no route to Claude Code's connectors
+    /// that makes no model turn yet. `allow_turn: true` lets it take one.
+    pub const NO_ROUTE: &str = "no_route";
+    /// `connectors.list {refresh: true, allow_turn: true}`: Claude Code was not found.
+    pub const CLAUDE_NOT_FOUND: &str = "claude_not_found";
+    /// `connectors.list {refresh: true, allow_turn: true}`: the one-turn probe ended
+    /// without a `system/init`. The message says why.
+    pub const PROBE_FAILED: &str = "probe_failed";
 }
 
 impl Envelope {
