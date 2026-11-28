@@ -90,6 +90,17 @@ impl Home {
         )
     }
 
+    /// The home another process's environment names, by [`Home::from_env`]'s rules:
+    /// `rlx_home` and `legacy_home` are its `RLX_HOME` and `AISQUARE_HOME`, and
+    /// `user_home` its user's home directory. rlxd checks a hook's with it (1.5).
+    pub fn from_values(
+        rlx_home: Option<OsString>,
+        legacy_home: Option<OsString>,
+        user_home: Option<PathBuf>,
+    ) -> Result<Self, NoHome> {
+        Self::from_vars(rlx_home, legacy_home, user_home)
+    }
+
     /// [`Home::from_env`], given what the environment holds.
     fn from_vars(
         rlx_home: Option<OsString>,

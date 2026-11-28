@@ -39,8 +39,8 @@
 //!   directories on top, raw ([`run_env`], 4.3), and its program the absolute `claude`
 //!   the app's environment resolved to ([`claude_from`]), both read together when each
 //!   attempt starts. `RLXD_CLAUDE_BIN` is read from rlxd's own environment only; no
-//!   client names the program. The connectors' probe and a connector's login start
-//!   Claude Code the same way.
+//!   client names the program. A `connectors.call`'s attempt, the connectors' probe and a
+//!   connector's login start Claude Code the same way.
 //!
 //! Locks: the runner's (its runs and pools), then a run's, never the other way round.
 
@@ -73,6 +73,7 @@ use crate::log::{info, warning};
 use crate::{clock, spaces};
 
 mod argv;
+mod call;
 mod connector_gate;
 mod gate;
 #[cfg(unix)]
@@ -131,6 +132,10 @@ pub enum RunNote {
         run_id: RunId,
         state: RunState,
     },
+    /// A `connectors.call` run found no route to a call with no model turn (a Claude
+    /// Code without `mcp_call_check_permissions_v1`): its watch fire falls back (5.3).
+    /// Noted before the run's `Ended`.
+    NoRoute { job_id: String, run_id: RunId },
     /// A watch run's pinned call, allowed, gave its result (7.6): `content` as
     /// `run.tool_result` carries it, bounded.
     WatchResult {
@@ -144,9 +149,10 @@ pub enum RunNote {
     },
 }
 
+pub use gate::Ask;
 pub(crate) use gate::claude_server_name;
 #[cfg(feature = "debug-methods")]
-pub use gate::{Ask, HOOK_KEY_ENV, output as hook_output};
+pub use gate::{HOOK_KEY_ENV, output as hook_output};
 
 /// The runner of one rlxd.
 pub struct Runner {
@@ -239,6 +245,9 @@ struct Run {
     /// Whether a watch job fired the run: then its pinned call's result goes to the
     /// scheduler as `job.watch_result`. Not kept across a restart, which ends the run.
     watch_job: bool,
+    /// A `connectors.call` run's own facts ([`call`]): its attempt is one call on a
+    /// control channel, and it is never resumed.
+    call: Option<call::CallRun>,
     client: String,
     dir: RunDir,
     inner: Mutex<RunInner>,
@@ -589,6 +598,7 @@ impl Runner {
                 job_id: record.job_id.clone(),
                 loud: record.loud,
                 watch_job: false,
+                call: record.connectors_call.then(call::CallRun::ended),
                 client: record.client.clone(),
                 dir,
                 inner: Mutex::new(RunInner {
@@ -751,10 +761,10 @@ impl Runner {
             Some(job) => (Some(job.job_id), Some(job.loud), job.watch),
             None => (None, None, false),
         };
-        self.start_checked(params, client, job_id, loud, watch_job)
+        self.start_checked(params, client, job_id, loud, watch_job, None)
     }
 
-    /// [`Runner::start`], its params checked.
+    /// [`Runner::start`], its params checked; `call` for a `connectors.call` run.
     fn start_checked(
         self: &Arc<Self>,
         params: RunStartParams,
@@ -762,6 +772,7 @@ impl Runner {
         job_id: Option<String>,
         loud: Option<bool>,
         watch_job: bool,
+        call: Option<call::CallRun>,
     ) -> Result<RunRef, ErrorBody> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(refusal(
@@ -815,6 +826,7 @@ impl Runner {
             job_id,
             loud,
             watch_job,
+            call,
             client: client.to_owned(),
             dir,
             inner: Mutex::new(RunInner {
@@ -1095,6 +1107,14 @@ impl Runner {
                 format!(
                     "run {id} is {}: only a run with no live process resumes",
                     inner.state
+                ),
+            ));
+        }
+        if run.call.is_some() {
+            return Err(refusal(
+                codes::NOT_RESUMABLE,
+                format!(
+                    "run {id} is a connectors.call, which is never resumed: make the call again"
                 ),
             ));
         }
@@ -1522,7 +1542,11 @@ impl Runner {
         let runner = Arc::clone(self);
         let run = Arc::clone(run);
         tokio::spawn(async move {
-            let end = runner.attempt(&run).await;
+            let end = if run.call.is_some() {
+                runner.call_attempt(&run).await
+            } else {
+                runner.attempt(&run).await
+            };
             let mut inner = run.inner();
             let placed = runner.end(&run, &mut inner, end);
             drop(inner);
@@ -1686,10 +1710,17 @@ impl Runner {
                 "run {}: its connectors are signed in again; its needs-you is cleared",
                 run.params.run_id
             );
-            self.clear_needs_you(&mut inner);
+            // Durable before published: the record holds the needs-you no more before
+            // anyone hears it is cleared, so a client that reads the run then, or the next
+            // rlxd after a crash between the two, never finds it still out.
+            inner.auth.clear();
+            let needs_you = inner.needs_you.take();
             let record = run.record(&inner);
             if let Err(e) = blocking(|| run.dir.write_record(&record)) {
                 warning!("run {}: its record was not written: {e}", run.params.run_id);
+            }
+            if let Some(id) = needs_you {
+                self.publish_needs_you(run_types::NEEDS_YOU_CLEARED, &NeedsYouClearedData::new(id));
             }
         }
     }
@@ -1795,6 +1826,7 @@ impl Runner {
         let mut tries = 0;
         loop {
             tries += 1;
+            let mut confirmed = false;
             let end = match self
                 .try_once(
                     run,
@@ -1805,10 +1837,20 @@ impl Runner {
                     &settings,
                     gate.as_ref(),
                     deadline,
+                    &mut confirmed,
                 )
                 .await
             {
-                Tried::End(end) => end,
+                Tried::End(end) => {
+                    // A gated try that ended before its connectors were confirmed (a
+                    // cancel, the timeout, rlxd stopping, a broken read, Claude Code's
+                    // exit) is taken back as a miss is: on route 2 it may have written
+                    // the undelivered message to the session.
+                    if !confirmed && let Some(kept) = &kept {
+                        blocking(|| self.forget_try(run, kept));
+                    }
+                    end
+                }
                 Tried::Missed {
                     connectors,
                     stop,
@@ -1896,12 +1938,13 @@ impl Runner {
         }
     }
 
-    /// After a gated try that was ended unconfirmed: what it wrote to its session is
-    /// taken back, so the next try (or a later resume) has nothing the run didn't
-    /// deliver. A first attempt's session started with the try, so its file goes. A
-    /// resumed attempt's file is the run's whole session: it is never removed, only cut
-    /// back to its length before the attempt's first try, and left as it is (with a
-    /// warning) when it is shorter than that or is no file.
+    /// After a gated try that was ended unconfirmed (a miss, or any other end before its
+    /// connectors were confirmed): what it wrote to its session is taken back, so the
+    /// next try (or a later resume) has nothing the run didn't deliver. A first attempt's
+    /// session started with the try, so its file goes. A resumed attempt's file is the
+    /// run's whole session: it is never removed, only cut back to its length before the
+    /// attempt's first try, and left as it is (with a warning) when it is shorter than
+    /// that or is no file.
     fn forget_try(&self, run: &Run, kept: &Kept) {
         for (path, before) in &kept.files {
             let now = std::fs::symlink_metadata(path)
@@ -1958,7 +2001,8 @@ impl Runner {
         }
     }
 
-    /// One Claude Code of an attempt: started, streamed, and ended.
+    /// One Claude Code of an attempt: started, streamed, and ended. `confirmed` says,
+    /// after, whether its connectors were confirmed (always, ungated).
     #[allow(clippy::too_many_arguments, reason = "one try's facts, each its own")]
     async fn try_once(
         &self,
@@ -1970,6 +2014,7 @@ impl Runner {
         settings: &std::path::Path,
         gate: Option<&Gate>,
         deadline: Option<Instant>,
+        confirmed: &mut bool,
     ) -> Tried {
         let params = &run.params;
         let failed = |message: String| {
@@ -2044,6 +2089,7 @@ impl Runner {
                 &tree,
                 gate,
                 deadline,
+                confirmed,
             )
             .await;
         let end = match streamed {
@@ -2135,7 +2181,7 @@ impl Runner {
     /// A gated try ([`connector_gate`]) settles first on route 2, or holds the prompt on route 1
     /// until a `system/init` shows each named connector connected. Until its connectors
     /// are confirmed, nothing it reads is published, and a miss ends the read
-    /// ([`Streamed::Missed`]).
+    /// ([`Streamed::Missed`]). `delivered` is set once they are (at once, ungated).
     #[allow(clippy::too_many_arguments, reason = "one try's facts, each its own")]
     async fn stream<R: AsyncBufRead + Unpin>(
         &self,
@@ -2146,6 +2192,7 @@ impl Runner {
         tree: &Tree,
         gate: Option<&Gate>,
         deadline: Option<Instant>,
+        delivered: &mut bool,
     ) -> Streamed {
         let params = &run.params;
         let try_started = Instant::now();
@@ -2208,6 +2255,7 @@ impl Runner {
             sent = true;
         }
         let mut confirmed = gate.is_none();
+        *delivered = confirmed;
         if confirmed {
             run.inner().reply = None;
         }
@@ -2253,6 +2301,7 @@ impl Runner {
                         match gate.verdict(&init.mcp_servers) {
                             Verdict::Connected => {
                                 confirmed = true;
+                                *delivered = true;
                                 // Delivered from here on: a later attempt is a resume's.
                                 run.inner().reply = None;
                                 if !sent {
@@ -2621,6 +2670,7 @@ impl Run {
             calls: inner.calls.clone(),
             pinned_call_used: inner.pinned_call_used,
             auth: inner.auth.clone(),
+            connectors_call: self.call.is_some(),
         }
     }
 }
@@ -2848,8 +2898,8 @@ fn needs_you(params: &RunStartParams, done: &RunDoneData) -> Option<RunNeedsYouD
     Some(RunNeedsYouData::question(question))
 }
 
-/// The `claude` Claude Code starts as, for a run, the connectors' probe or a connector's
-/// login, from what the app's environment resolved to and where it looked (`Env::claude`,
+/// The `claude` Claude Code starts as, for a run (a `connectors.call`'s too), the
+/// connectors' probe or a connector's login, from what the app's environment resolved to and where it looked (`Env::claude`,
 /// `Env::snapshot`): its absolute path (4.3), or the refusal (`claude_not_found`,
 /// `claude_not_runnable`), which says where rlxd looked.
 pub(crate) fn claude_from(

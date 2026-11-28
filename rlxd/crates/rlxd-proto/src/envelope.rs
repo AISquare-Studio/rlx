@@ -419,12 +419,23 @@ pub mod codes {
     /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` (4.3). Nothing changed.
     pub const BAD_ENV_KEY: &str = "bad_env_key";
     /// `connectors.list {refresh: true}`: rlxd has no route to Claude Code's connectors
-    /// that makes no model turn yet. `allow_turn: true` lets it take one.
+    /// that makes no model turn yet. `allow_turn: true` lets it take one. And
+    /// `connectors.call`: no route to one call with no model turn (no capability
+    /// `connectors.call`, or a Claude Code without `mcp_call_check_permissions_v1`).
     pub const NO_ROUTE: &str = "no_route";
+    /// `connectors.call`: the gate denied the call; `detail.by` says who (5.1, 5.3).
+    pub const DENIED: &str = "denied";
+    /// `connectors.call`: the call's run ended otherwise (`detail.reason`, its
+    /// `run.failed` reason; `detail.run_id`). The message says why.
+    pub const CALL_FAILED: &str = "call_failed";
+    /// `connectors.call`: the call's working folder holds Claude Code settings rlxd did not
+    /// write (`.claude/settings.json` or `.claude/settings.local.json`, `detail.path`),
+    /// whose rules or hooks could let the call past the gate. No call is made.
+    pub const UNTRUSTED_SETTINGS: &str = "untrusted_settings";
     /// Claude Code could not start: no `claude` on the app's `PATH` (4.3), or rlxd's own
     /// when the app set none, and `RLXD_CLAUDE_BIN` names none. Refuses `run.start`,
-    /// `run.resume` and `connectors.list {refresh: true, allow_turn: true}`. Agreed with
-    /// the runner (7.5).
+    /// `run.resume`, `connectors.call` and `connectors.list {refresh: true, allow_turn:
+    /// true}`. Agreed with the runner (7.5).
     pub const CLAUDE_NOT_FOUND: &str = "claude_not_found";
     /// Claude Code could not start: the `claude` found first is a batch file, such as
     /// npm's `claude.cmd` shim on Windows, which rlxd does not run through `cmd` (4.3).

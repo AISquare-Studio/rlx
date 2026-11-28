@@ -20,6 +20,10 @@
 //!
 //! `init-other` lists one made-up local server, `fixture-local`, and no Slack.
 //!
+//! `connectors-slow-init` has Slack connected, but writes its `system/init` 10 s after
+//! the message (which it writes to the session at once), so a route-2 try sits sent and
+//! unconfirmed meanwhile.
+//!
 //! `stdin-eof-empty` is Claude Code as E9 found it: when stdin is at EOF by the time it
 //! writes `system/init`, it lists no servers and mounts no connector tools; held open, it
 //! lists Slack connected.
@@ -214,6 +218,21 @@ pub fn stdin_eof_empty(fake: &mut Fake) -> i32 {
     }
     fake.say(ANSWER_EOF);
     fake.succeed(ANSWER_EOF, None);
+    0
+}
+
+/// `connectors-slow-init`: the message to the session at once, then `system/init` with
+/// Slack connected 10 s later, and the answer.
+pub fn slow_init(fake: &mut Fake) -> i32 {
+    let Some(message) = fake.next_user_message() else {
+        return super::NO_PROMPT;
+    };
+    fake.remember(&message);
+    fake.persist();
+    fake.sleep_ms(10_000);
+    init(fake, Schedule::ConnectsAt(0), "connected");
+    fake.say(super::ANSWER);
+    fake.succeed(super::ANSWER, None);
     0
 }
 

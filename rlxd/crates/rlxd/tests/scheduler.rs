@@ -1233,6 +1233,151 @@ fn a_watch_job_makes_its_pinned_call_and_its_raw_result_is_job_watch_result() {
     assert_eq!(listed(&home, "ci-green")["last_run_id"], r);
 }
 
+/// `<fixture>/content.json` of fake-claude's scenario folder `scenario`.
+fn content_of(scenario: &str) -> Value {
+    let path = common::workspace()
+        .join("tests/fixtures/fake-claude")
+        .join(scenario)
+        .join("content.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The fixture log's starts, each one's command line as words.
+fn argvs(home: &TestHome) -> Vec<Vec<String>> {
+    let log: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.root().join("fake-claude.log.json")).unwrap(),
+    )
+    .unwrap();
+    log["starts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|start| {
+            start["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+// Without the capability `connectors.call`, as every check above runs, a watch fire is the
+// fallback: a pinned run of Claude Code with rlxd's fixed prompt.
+
+#[test]
+fn with_connectors_call_a_watch_fire_is_one_call_with_no_model_turn() {
+    let home = unstarted_with("mcp-direct", T0, &[("RLXD_TEST_CONNECTORS_CALL", "1")]);
+    start(&home);
+    let _app = app(&home);
+    let since = seq(&home);
+    put(&home, &watch_job("ci-green"));
+    advance(&home, 60);
+    let r = fired_run(&home, since, "ci-green");
+    let seen = wait_until(&home, since, 30, "the call reaches the app", |e| {
+        !of_run(e, &r, "run.tool_call").is_empty()
+    });
+    let calls = of_run(&seen, &r, "run.tool_call");
+    assert_eq!(calls[0]["data"]["kind"], "watch");
+    assert_eq!(calls[0]["data"]["tool"], WATCH_TOOL);
+    assert_eq!(calls[0]["data"]["input_sha256"], WATCH_SHA256);
+    assert_eq!(calls[0]["data"]["job_id"], "ci-green");
+    let call_id = calls[0]["data"]["call_id"].as_str().unwrap().to_owned();
+    assert!(call_id.starts_with("toolu_mcp_call_"), "{call_id}");
+    assert_eq!(decide(&home, &r, &call_id, "allow").code(), Some(0));
+    let seen = wait_until(&home, since, 30, "the run ends", |e| run_ended(e, &r));
+    let results = typed(&seen, "job.watch_result", Some("ci-green"));
+    assert_eq!(results.len(), 1, "{seen:#?}");
+    assert_valid("job-event.json", results[0]);
+    let data = &results[0]["data"];
+    assert_eq!(data["run_id"], r);
+    assert_eq!(data["tool"], WATCH_TOOL);
+    assert_eq!(data["input_sha256"], WATCH_SHA256);
+    assert_eq!(data["content"], content_of("mcp-direct"));
+    assert_eq!(data["is_error"], false);
+    let done = of_run(&seen, &r, "run.done");
+    assert_eq!(done.len(), 1, "{seen:#?}");
+    assert_eq!(done[0]["data"]["num_turns"], 0);
+    // One Claude Code, on the control channel: no prompt, fixed or other.
+    let argvs = argvs(&home);
+    assert_eq!(argvs.len(), 1, "{argvs:?}");
+    assert!(
+        argvs[0].iter().any(|a| a == "--permission-prompt-tool"),
+        "{argvs:?}"
+    );
+    assert!(
+        !argvs[0].iter().any(|a| a == "--append-system-prompt"),
+        "{argvs:?}"
+    );
+    assert_eq!(listed(&home, "ci-green")["last_run_id"], r);
+    assert_eq!(listed(&home, "ci-green")["last_state"], "done");
+}
+
+#[test]
+fn a_watch_fire_whose_call_finds_no_route_goes_by_the_fallback() {
+    // mcp-direct-old lists no mcp_call_check_permissions_v1: the call run fails, and the
+    // same fire is made again as the fallback's pinned run (which it plays as watch-call).
+    let home = unstarted_with(
+        "mcp-direct-old",
+        T0,
+        &[("RLXD_TEST_CONNECTORS_CALL", "1"), ("RLXD_TEST_HOOK", "1")],
+    );
+    start(&home);
+    let _app = app(&home);
+    let since = seq(&home);
+    put(&home, &watch_job("ci-green"));
+    advance(&home, 60);
+    let first = fired_run(&home, since, "ci-green");
+    let seen = wait_until(&home, since, 30, "the fire is made again", |e| {
+        typed(e, "job.fired", Some("ci-green")).len() == 2
+    });
+    let fired = typed(&seen, "job.fired", Some("ci-green"));
+    assert_eq!(fired[0]["data"]["run_id"], first);
+    let second = fired[1]["data"]["run_id"].clone();
+    assert_ne!(second, first);
+    assert_eq!(
+        fired[1]["data"]["scheduled_for"],
+        fired[0]["data"]["scheduled_for"]
+    );
+    let seen = wait_until(
+        &home,
+        since,
+        30,
+        "the fallback's call reaches the app",
+        |e| !of_run(e, &second, "run.tool_call").is_empty(),
+    );
+    let failed = of_run(&seen, &first, "run.failed");
+    assert_eq!(failed.len(), 1, "{seen:#?}");
+    assert!(
+        failed[0]["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mcp_call_check_permissions_v1"),
+        "{seen:#?}"
+    );
+    assert!(of_run(&seen, &first, "run.tool_call").is_empty());
+    assert_eq!(decide(&home, &second, WATCH_CALL, "allow").code(), Some(0));
+    let seen = wait_until(&home, since, 30, "the fallback ends", |e| {
+        run_ended(e, &second)
+    });
+    let results = typed(&seen, "job.watch_result", Some("ci-green"));
+    assert_eq!(results.len(), 1, "{seen:#?}");
+    assert_eq!(results[0]["data"]["run_id"], second);
+    assert_eq!(results[0]["data"]["content"], content_of("watch-call"));
+    let argvs = argvs(&home);
+    assert_eq!(argvs.len(), 2, "{argvs:?}");
+    assert!(
+        argvs[0].iter().any(|a| a == "--permission-prompt-tool"),
+        "{argvs:?}"
+    );
+    assert!(
+        argvs[1].iter().any(|a| a == "--append-system-prompt"),
+        "{argvs:?}"
+    );
+    assert_eq!(listed(&home, "ci-green")["last_run_id"], second);
+}
+
 #[test]
 fn a_watch_call_the_app_denies_gives_no_watch_result() {
     let home = watch_home();

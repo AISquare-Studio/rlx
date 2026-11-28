@@ -258,6 +258,38 @@ impl TestHome {
         )
     }
 
+    /// `program args…` in this home, from `cwd`, with `stdin` on its stdin and `envs` set:
+    /// stdout as bytes, for a hook's, which must match byte for byte.
+    pub fn run_bytes(
+        &self,
+        program: &Path,
+        args: &[&str],
+        cwd: &Path,
+        stdin: &[u8],
+        envs: &[(&str, &str)],
+    ) -> (Option<i32>, Vec<u8>, String) {
+        let mut command = self.command_of(program, args);
+        command
+            .current_dir(cwd)
+            .envs(envs.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = launch(&mut command).expect("the program starts");
+        let mut input = child.stdin.take().unwrap();
+        let bytes = stdin.to_vec();
+        let writer = thread::spawn(move || {
+            let _ = input.write_all(&bytes);
+        });
+        let output = wait_output(child);
+        let _ = writer.join();
+        (
+            output.status.code(),
+            output.stdout,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
     /// `rlxd args…` in this home, with `stdin` on its stdin.
     pub fn rlxd_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Run {
         for line in stdin.unwrap_or_default().lines() {
@@ -275,7 +307,8 @@ impl TestHome {
     }
 
     /// The `rlxd` command, in this home: `AISQUARE_HOME` names it and `RLX_HOME` is
-    /// unset, so neither a developer's home nor CI's is touched.
+    /// unset, so neither a developer's home nor CI's is touched, and no agent's variables
+    /// are passed on.
     pub fn command(&self, args: &[&str]) -> Command {
         let binary = self
             .binary
@@ -303,6 +336,18 @@ impl TestHome {
             .or_else(|| std::env::var_os("PATH"))
             .unwrap_or_default();
         let mut command = Command::new(program);
+        // Not the identity of an agent the tests run under (its role, fleet agent, config
+        // dir, tmux pane): rlx's hooks would act on it.
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            if name.starts_with("AISQUARE_")
+                || name.starts_with("CLAUDE")
+                || name.starts_with("CODEX_")
+                || name.starts_with("TMUX")
+            {
+                command.env_remove(name.as_ref());
+            }
+        }
         command
             .args(args)
             .envs(self.envs.iter().map(|(k, v)| (k, v)))
@@ -574,6 +619,18 @@ fn end_within(mut child: Child, limit: Duration) -> Result<Run, String> {
     })
 }
 
+/// `child`'s end and all its output, failing the test past [`COMMAND_LIMIT`].
+fn wait_output(child: Child) -> std::process::Output {
+    let (done, output) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    output
+        .recv_timeout(COMMAND_LIMIT)
+        .expect("the program ended in time")
+        .expect("its output was read")
+}
+
 /// All of `pipe`, once every process holding it open has let it go.
 fn read_all(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
     let (read, text) = mpsc::channel();
@@ -714,6 +771,40 @@ pub fn real_rlx() -> Option<PathBuf> {
     found
 }
 
+/// rlxd-hook, built from this tree: the executable cargo reports, so a test of the rlxd
+/// package runs the rlxd-hook of the same sources. Set `CARGO_BUILD_JOBS` to bound it.
+pub fn rlxd_hook() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let output = Command::new(cargo)
+                .args([
+                    "build",
+                    "--locked",
+                    "--package",
+                    "rlxd-hook",
+                    "--bin",
+                    "rlxd-hook",
+                    "--message-format=json-render-diagnostics",
+                ])
+                .current_dir(workspace())
+                .stdin(Stdio::null())
+                .stderr(Stdio::inherit())
+                .output()
+                .expect("cargo runs");
+            assert!(output.status.success(), "cargo build -p rlxd-hook failed");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|message| message["reason"] == "compiler-artifact")
+                .filter(|message| message["target"]["name"] == "rlxd-hook")
+                .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+                .expect("cargo names the rlxd-hook executable it built")
+        })
+        .clone()
+}
+
 /// Whether process `pid` is running.
 pub fn alive(pid: u64) -> bool {
     if cfg!(windows) {
@@ -817,38 +908,70 @@ fn kill(pid: u64) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// rlxd, built as a release is (`cargo build --release`): without the features that only
-/// rlxd's dev-dependency on itself turns on for the tests, `debug-methods` and
-/// `gate-dev-mode`. The executable cargo reports, in the workspace's own target folder,
-/// so rlxd.yml's later `cargo build --release` finds it done. Set `CARGO_BUILD_JOBS` to
-/// bound it.
+/// What `cargo build --release -p rlxd --bins` made: [`release_build`].
+pub struct ReleaseBuild {
+    /// The rlxd executable cargo reports, in the workspace's own target folder.
+    pub rlxd: PathBuf,
+    /// Every binary of the package the build made, by name.
+    pub binaries: Vec<String>,
+}
+
+/// rlxd's binaries, built as a release builds them (`cargo build --release`): without the
+/// features that only rlxd's dev-dependency on itself turns on for the tests,
+/// `debug-methods`, `gate-dev-mode` and `fake-claude`. In the workspace's own target
+/// folder, so rlxd.yml's later `cargo build --release` finds it done. Set
+/// `CARGO_BUILD_JOBS` to bound it.
+///
+/// Built ONCE per test process, the first caller building while the others wait. Each
+/// `cargo build` links `target/release/rlxd` afresh, removing it first, even when nothing
+/// changed, so a build while another test runs that rlxd pulls it from under it: its
+/// `serve --detach` could not start its own path again (ENOENT, #2568), and on Windows a
+/// running rlxd.exe cannot be removed.
+pub fn release_build() -> &'static ReleaseBuild {
+    static BUILT: std::sync::OnceLock<ReleaseBuild> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let output = std::process::Command::new(cargo)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--package",
+                "rlxd",
+                "--bins",
+                "--message-format=json-render-diagnostics",
+            ])
+            .current_dir(workspace())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .expect("cargo runs");
+        assert!(output.status.success(), "cargo build --release failed");
+        let built: Vec<(String, PathBuf)> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter_map(|message| {
+                let name = message["target"]["name"].as_str()?.to_owned();
+                let executable = message["executable"].as_str()?;
+                Some((name, PathBuf::from(executable)))
+            })
+            .collect();
+        let rlxd = built
+            .iter()
+            .find_map(|(name, executable)| (name == "rlxd").then(|| executable.clone()))
+            .expect("cargo names the rlxd executable it built");
+        ReleaseBuild {
+            rlxd,
+            binaries: built.into_iter().map(|(name, _)| name).collect(),
+        }
+    })
+}
+
+/// The rlxd of [`release_build`].
 ///
 /// Under `cargo test --release` that is the path of this test build's rlxd too, which it
 /// then replaces: a test calls this before it runs or copies `CARGO_BIN_EXE_rlxd`.
 pub fn release_rlxd() -> PathBuf {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = std::process::Command::new(cargo)
-        .args([
-            "build",
-            "--release",
-            "--locked",
-            "--package",
-            "rlxd",
-            "--bin",
-            "rlxd",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(workspace())
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .expect("cargo runs");
-    assert!(output.status.success(), "cargo build --release failed");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|message| message["reason"] == "compiler-artifact")
-        .filter(|message| message["target"]["name"] == "rlxd")
-        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
-        .expect("cargo names the rlxd executable it built")
+    release_build().rlxd.clone()
 }

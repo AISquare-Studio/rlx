@@ -77,6 +77,10 @@ fn check_7_a_release_build_has_no_debug_methods() {
         "__test-hook",
         "RLXD_TEST_HOOK",
         "RLXD_TEST_FAIL_LEDGER",
+        "RLXD_TEST_CONNECTORS_CALL",
+        "RLXD_TEST_CALL_WAIT_MS",
+        "RLXD_TEST_CALL_DEADLINE_MS",
+        "RLXD_TEST_HOOK_HOLD_MS",
     ] {
         let found = bytes
             .windows(needle.len())
@@ -91,6 +95,28 @@ fn check_7_a_release_build_has_no_debug_methods() {
         .filter(|w| *w == needle.as_bytes())
         .count();
     assert_eq!(found, 0, "{needle} is in the release build");
+
+    // connectors.call is served, but has no route until the probe confirms it (5.3): no
+    // capability, and no_route, even with the test build's switch set.
+    let release = TestHome::new()
+        .with_binary(release_rlxd())
+        .with_env("RLXD_TEST_CONNECTORS_CALL", "1");
+    release.start();
+    let capabilities = release.status()["capabilities"].clone();
+    assert!(
+        !capabilities
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "connectors.call"),
+        "{capabilities}"
+    );
+    let call = release.rlxd(&[
+        "call",
+        "connectors.call",
+        r#"{"run_id":"0f8e2d6c-3b1a-4c5d-9e7f-1a2b3c4d5e6f","connector":"claude.ai GitHub","tool":"mcp__claude_ai_GitHub__get_check_runs","input":{}}"#,
+    ]);
+    assert_eq!(call.error_code(), "no_route", "{call:?}");
 
     let test_build = TestHome::new();
     test_build.start();
@@ -242,31 +268,11 @@ fn a_release_build_has_no_gate_dev_mode() {
 #[test]
 fn a_release_build_has_no_fake_claude() {
     // Every binary of the package that a release build makes, as `cargo build --release
-    // -p rlxd` makes them: fake-claude needs the test-only feature, so it is not one.
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = std::process::Command::new(cargo)
-        .args([
-            "build",
-            "--release",
-            "--locked",
-            "--package",
-            "rlxd",
-            "--bins",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(common::workspace())
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .expect("cargo runs");
-    assert!(output.status.success(), "cargo build --release failed");
-    let built: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|message| message["reason"] == "compiler-artifact")
-        .filter(|message| message["executable"].is_string())
-        .filter_map(|message| message["target"]["name"].as_str().map(str::to_owned))
-        .collect();
+    // -p rlxd --bins` makes them: fake-claude and the PTY tests' ticker need the test-only
+    // feature, so neither is one.
+    let built = &common::release_build().binaries;
     assert!(built.iter().any(|name| name == "rlxd"), "{built:?}");
-    assert!(!built.iter().any(|name| name == "fake-claude"), "{built:?}");
+    for test_only in ["fake-claude", "ticker"] {
+        assert!(!built.iter().any(|name| name == test_only), "{built:?}");
+    }
 }

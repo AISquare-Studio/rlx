@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HookReply",
+  "description": "`hook`'s reply: what rlxd-hook writes, byte for byte, and how the hook ended.\n\n```json\n{\"stdout_b64\": \"c2VlZCBmYWN0Cg==\", \"stderr_b64\": \"\", \"exit_code\": 0}\n```",
+  "type": "object",
+  "properties": {
+    "exit_code": {
+      "description": "How `rlx hook <event>` ended. rlxd-hook exits 0 whatever it says, as every hook does.",
+      "type": "integer",
+      "format": "int32"
+    },
+    "stderr_b64": {
+      "description": "The bytes for rlxd-hook's stderr, in base64.",
+      "type": "string"
+    },
+    "stdout_b64": {
+      "description": "The bytes for rlxd-hook's stdout, in base64: what `rlx hook <event>` would print,\nwhich Claude Code reads as the hook's reply.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "stdout_b64",
+    "stderr_b64",
+    "exit_code"
+  ]
+}

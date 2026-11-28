@@ -698,6 +698,11 @@ fn call_error(error: CallError) -> AskError {
 /// takes every connection, and closes it once sshd fails to reach the host's socket, as
 /// when no rlxd runs there. Only for `hello`: after its reply, rlxd has answered on this
 /// connection, so a later close is a plain `disconnected`.
+///
+/// How a close shows depends on the OS and on when it lands: an end of file, a reset, a
+/// broken pipe, or, on macOS, "not connected" (ENOTCONN) when the close lands while the
+/// hello is being written. That last one came back with no hint, about one call in ten
+/// against a stand-in that closes at once (rlxd.yml run 46101742089).
 fn socket_call_error(error: CallError, socket: Option<&Path>) -> AskError {
     let closed = match &error {
         CallError::Closed => true,
@@ -707,6 +712,7 @@ fn socket_call_error(error: CallError, socket: Option<&Path>) -> AskError {
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::BrokenPipe
                 | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::NotConnected
         ),
         _ => false,
     };
@@ -806,4 +812,55 @@ fn report_to_a_person(error: AskError) -> ExitCode {
     };
     eprintln!("rlxd: {message}");
     ExitCode::from(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every way a forward's close during `hello` reaches the client, by OS and by when it
+    /// lands, is a closed forward through `--socket`, with its hint; without `--socket`,
+    /// or once hello was answered, it is a plain `disconnected`.
+    #[test]
+    fn a_forward_that_closes_during_hello_is_said_so_however_the_os_says_it() {
+        let closed = || {
+            let mut errors = vec![CallError::Closed];
+            for kind in [
+                io::ErrorKind::UnexpectedEof,
+                io::ErrorKind::ConnectionReset,
+                io::ErrorKind::ConnectionAborted,
+                io::ErrorKind::BrokenPipe,
+                // macOS, the close landing while the hello is written (rlxd.yml run
+                // 46101742089).
+                io::ErrorKind::NotConnected,
+            ] {
+                errors.push(CallError::Io(io::Error::from(kind)));
+            }
+            errors
+        };
+        let socket = Path::new("/tmp/fwd.sock");
+        for error in closed() {
+            let said = error.to_string();
+            assert!(
+                matches!(
+                    socket_call_error(error, Some(socket)),
+                    AskError::ForwardClosed(_)
+                ),
+                "{said}: no forward hint"
+            );
+        }
+        for error in closed() {
+            let said = error.to_string();
+            assert!(
+                matches!(socket_call_error(error, None), AskError::Failed(_)),
+                "{said}: not this home's forward"
+            );
+        }
+        // Not a close: the hint would mislead.
+        let other = CallError::Io(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(matches!(
+            socket_call_error(other, Some(socket)),
+            AskError::Failed(_)
+        ));
+    }
 }

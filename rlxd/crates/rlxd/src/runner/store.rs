@@ -80,6 +80,9 @@ pub struct Record {
     /// it is out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth: Vec<String>,
+    /// Whether the run is a `connectors.call` (5.3): it is never resumed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub connectors_call: bool,
 }
 
 /// A run's process, as the sweep finds it again.
@@ -117,6 +120,14 @@ impl RunDir {
     /// Makes the folder, private to the user.
     pub fn create(&self) -> io::Result<()> {
         private_dir(&self.dir)
+    }
+
+    /// `call/`: a `connectors.call` run's working folder (5.3), private, which rlxd writes
+    /// nothing into: Claude Code finds no project settings there.
+    pub fn create_call_dir(&self) -> io::Result<PathBuf> {
+        let dir = self.dir.join("call");
+        private_dir(&dir)?;
+        Ok(dir)
     }
 
     /// `<attempt>/settings.json`.

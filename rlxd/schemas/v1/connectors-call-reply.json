@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConnectorsCallData",
+  "description": "`connectors.call`'s reply (5.3): `{run_id, decision, content?, is_error?, model_turns}`.\nA denied call is an error (`denied`, with `detail.by`), never this reply, so `decision`\nis `allow`; `content` is the tool's result exactly as Claude Code gave it, up to 1 MiB,\nand `is_error` whether the tool said it failed.",
+  "type": "object",
+  "properties": {
+    "content": {
+      "description": "The tool's result content."
+    },
+    "decision": {
+      "description": "The gate's decision.",
+      "$ref": "#/$defs/Decision"
+    },
+    "is_error": {
+      "description": "Whether the tool said it failed.",
+      "type": "boolean"
+    },
+    "model_turns": {
+      "description": "Always 0: the call is made with no model turn.",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 0,
+      "minimum": 0
+    },
+    "run_id": {
+      "description": "The call's run.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  },
+  "required": [
+    "run_id",
+    "decision",
+    "model_turns"
+  ],
+  "$defs": {
+    "Decision": {
+      "description": "What a tool call was decided (5.1).",
+      "oneOf": [
+        {
+          "description": "It runs.",
+          "type": "string",
+          "const": "allow"
+        },
+        {
+          "description": "It doesn't.",
+          "type": "string",
+          "const": "deny"
+        },
+        {
+          "description": "It doesn't, and the app saved it as a draft (`draft_id`).",
+          "type": "string",
+          "const": "draft"
+        }
+      ]
+    }
+  }
+}

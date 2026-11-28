@@ -32,8 +32,8 @@ use jiff::{SignedDuration, Timestamp};
 use rlxd_client::Home;
 use rlxd_proto::{
     Data, ErrorBody, FireCause, JobFiredData, JobId, JobListData, JobPutParams, JobRef,
-    JobRunNowData, JobSkippedData, JobSummary, JobType, JobWatchResultData, Jobs, RunId,
-    RunStartParams, RunState, SkipReason, codes, job_types, topics,
+    JobRunNowData, JobSkippedData, JobSummary, JobType, JobWatchResultData, Jobs, RunId, RunState,
+    SkipReason, codes, job_types, topics,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -107,6 +107,10 @@ struct Job {
     put_at: Timestamp,
     /// A fire missed while rlxd was down waits until then for an app (not stored).
     startup_wait: Option<Timestamp>,
+    /// The last fire, when it was a `connectors.call` run: its run, when it was
+    /// scheduled for and why, to make again by the fallback if the run finds no route
+    /// (not stored).
+    call_fire: Option<(RunId, Timestamp, FireCause)>,
 }
 
 impl Scheduler {
@@ -403,6 +407,7 @@ impl Scheduler {
                 skipped_count: 0,
                 put_at: now,
                 startup_wait: None,
+                call_fire: None,
             }),
         };
         if let Some(job) = job {
@@ -666,6 +671,27 @@ impl Scheduler {
                 data.truncated = truncated;
                 self.publish(job_types::WATCH_RESULT, &data);
             }
+            RunNote::NoRoute { job_id, run_id } => {
+                let Some(job) = JobId::new(job_id).ok().and_then(|id| jobs.get_mut(&id)) else {
+                    return;
+                };
+                let Some((scheduled, cause)) = job
+                    .call_fire
+                    .take()
+                    .filter(|(fired, ..)| *fired == run_id)
+                    .map(|(_, scheduled, cause)| (scheduled, cause))
+                else {
+                    return;
+                };
+                // The same fire, again, by the fallback (5.3): the run that found no
+                // route has made no call.
+                info!(
+                    "scheduler: job {}: run {run_id} found no route to connectors.call; its \
+                     fire goes by the fallback",
+                    job.def.job_id
+                );
+                let _ = self.fire_by(job, now, scheduled, cause, watch_job::Route::Fallback);
+            }
             RunNote::Ended {
                 job_id,
                 run_id,
@@ -738,13 +764,26 @@ impl Scheduler {
         scheduled: Timestamp,
         cause: FireCause,
     ) -> Result<RunId, ErrorBody> {
+        let route = watch_job::route(self.runner.calls_connectors());
+        self.fire_by(job, now, scheduled, cause, route)
+    }
+
+    /// [`Scheduler::fire`], a watch job's call made by `route`.
+    fn fire_by(
+        &self,
+        job: &mut Job,
+        now: Timestamp,
+        scheduled: Timestamp,
+        cause: FireCause,
+        route: watch_job::Route,
+    ) -> Result<RunId, ErrorBody> {
         let cause_name = match cause {
             FireCause::Due => "due",
             FireCause::CatchUp => "catch_up",
             FireCause::RunNow => "run_now",
         };
         let run_id = fresh_run_id();
-        let begun = start_params(&job.def, &run_id).and_then(|params| {
+        let begun = start_params(&job.def, &run_id, route).and_then(|params| {
             let fire = db::Fire {
                 job_id: job.def.job_id.as_str(),
                 scheduled_for: &scheduled.to_string(),
@@ -763,6 +802,7 @@ impl Scheduler {
             })?;
             Ok((id, params))
         });
+        job.call_fire = None;
         let (id, started) = match begun {
             Ok((id, params)) => {
                 let tag = JobTag {
@@ -770,12 +810,21 @@ impl Scheduler {
                     loud: job.def.loud,
                     watch: job.def.r#type == JobType::Watch,
                 };
-                let started = match test_refusal() {
-                    Some(code) => Err(refusal(
+                let started = match (test_refusal(), params) {
+                    (Some(code), _) => Err(refusal(
                         &code,
                         "refused by RLXD_TEST_REFUSE_FIRES".to_owned(),
                     )),
-                    None => self.runner.start(params, CLIENT, Some(tag)),
+                    (None, watch_job::Start::Run(params)) => {
+                        self.runner.start(*params, CLIENT, Some(tag))
+                    }
+                    (None, watch_job::Start::Call(call)) => {
+                        let started = self.runner.start_call(call, CLIENT, Some(tag));
+                        if started.is_ok() {
+                            job.call_fire = Some((run_id.clone(), scheduled, cause));
+                        }
+                        started
+                    }
                 };
                 test_crash_after_start(started.is_ok());
                 (Some(id), started)
@@ -990,6 +1039,7 @@ impl Job {
             skipped_count: row.skipped_count,
             put_at: row.put_at.parse().map_err(|e: jiff::Error| e.to_string())?,
             startup_wait: None,
+            call_fire: None,
             def,
         })
     }
@@ -1027,17 +1077,22 @@ fn test_crash_after_start(started: bool) {
     let _ = started;
 }
 
-/// The run a fire of the job `def` starts as `run_id`: a run job's template, or a watch
-/// job's call, by its route ([`watch_job::run`]).
-fn start_params(def: &JobPutParams, run_id: &RunId) -> Result<RunStartParams, ErrorBody> {
+/// What a fire of the job `def` starts as `run_id`: a run job's template, or a watch
+/// job's call, by `route` ([`watch_job::start`]).
+fn start_params(
+    def: &JobPutParams,
+    run_id: &RunId,
+    route: watch_job::Route,
+) -> Result<watch_job::Start, ErrorBody> {
     match def.r#type {
         JobType::Run => def
             .run
             .as_ref()
             .ok_or_else(|| refusal(codes::INVALID_PARAMS, "a run job needs its run".to_owned()))?
             .start(run_id)
+            .map(|params| watch_job::Start::Run(Box::new(params)))
             .map_err(|invalid| refusal(codes::INVALID_PARAMS, invalid.to_string())),
-        JobType::Watch => watch_job::run(def, run_id),
+        JobType::Watch => watch_job::start(def, run_id, route),
     }
 }
 
