@@ -78,6 +78,7 @@ def the_real_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     for thread in threading.enumerate():
         if thread.name == watch_service.TIDY_THREAD:
             thread.join(10)
+            assert not thread.is_alive(), "a pass a watcher started outlived its test"
 
 
 @pytest.fixture
@@ -705,6 +706,54 @@ def test_a_stop_ends_the_watcher_at_once_while_a_pass_runs(
         assert took < 5, took
     finally:
         release.set()
+
+
+@posix_only
+def test_a_pass_thread_that_cannot_start_costs_no_tick_its_news(
+    plans: Plans, boards: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reviewer #3926's MINOR 1: the thread was kept before it started, so one that could not
+    start ("can't start new thread") could never be joined, and every later tick raised there,
+    its news with it. It is kept only once it runs: a start that fails is one note, the ticks
+    after it deliver their news, and the pass is tried again once due."""
+    plans.items = [(tidy.ENDED_WORKTREE, 10, BOARD_A)]
+    delivered: list[list[str]] = []
+
+    def deliver(project_id: str, items: Any, path: Path) -> bool:
+        delivered.append([item.id for item in items])
+        return True
+
+    def look_all(self: Any, now: datetime, notes: Any = None, failed: Any = None) -> Any:
+        return [
+            watch_service.WatchItem(
+                id=f"capacity:{now:%H%M}",
+                project_id=BOARD_A,
+                project_name="a",
+                kind="capacity_freed",
+                summary="a slot came free",
+            )
+        ]
+
+    def cannot(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(watch_service, "_deliver", deliver)
+    monkeypatch.setattr(watch_service.Watcher, "look_all", look_all)
+    watcher = _watcher()
+    with monkeypatch.context() as patched:
+        patched.setattr(threading.Thread, "start", cannot)
+        looked = [watcher.tick(T0 + timedelta(minutes=minutes)) for minutes in range(3)]
+
+    assert [r.notes for r in looked] == [
+        ["the tidy pass could not start: RuntimeError: can't start new thread"],
+        [],
+        [],
+    ]
+    assert delivered == [["capacity:1200"], ["capacity:1201"], ["capacity:1202"]]
+    assert watcher.tidy_job is not None and watcher.tidy_job.thread is None
+    assert plans.calls == []
+    read = _pass_of(watcher, T0 + timedelta(minutes=60))
+    assert read.tidied is not None and plans.calls == [T0 + timedelta(minutes=60)]
 
 
 @posix_only

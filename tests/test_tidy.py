@@ -1606,9 +1606,10 @@ class _TagFirst:
 
 
 def test_a_caches_tag_is_deleted_last(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """#59 round 2: a delete ended mid-way leaves a cache still tagged, never an untagged rest
-    no rule judges again. Listed tag first, the tag still goes last; a read-only cache still
-    goes whole."""
+    """#59: a delete ended mid-way leaves a cache still tagged, never an untagged rest no rule
+    judges again. Listed tag first, the tag still goes last, through tidy's pinned delete and
+    through reap's (``cachedir.remove_within``, an ended tree's build output: reviewer #3926);
+    a read-only cache still goes whole."""
     recent = session_dir()
     cache = tag(recent / "scratchpad" / "target", files=6)
     (cache / "deep").mkdir()
@@ -1631,6 +1632,13 @@ def test_a_caches_tag_is_deleted_last(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert not cache.exists() and len(unlinked) == 8
     assert unlinked[-1] == cachedir.TAG and unlinked.count(cachedir.TAG) == 1
+    tree = tmp_path / "tree"
+    built = tag(tree / "target", files=3)
+    tag(built / "nested", files=2)
+    unlinked.clear()
+    cachedir.remove_within(built, tree)
+    assert not built.exists() and len(unlinked) == 7
+    assert unlinked[-1] == cachedir.TAG and unlinked.count(cachedir.TAG) == 2, unlinked
     shut.chmod(0o500)  # nothing in it can be unlinked until it is loosened
     try:
         tidy._remove(shut, made.roots)
@@ -1649,8 +1657,9 @@ given = json.loads(sys.argv[1])
 sandbox = Path(given["sandbox"])
 for path in (given["system"], given["cache"], *given["temp"], os.environ["AISQUARE_HOME"]):
     assert Path(path).resolve().is_relative_to(sandbox), path  # the sandbox's alone
+assert given["tree"] is None or Path(given["tree"]).resolve().is_relative_to(sandbox)
 
-from aisquare.services import tidy
+from aisquare.services import fleet, tidy
 
 system, cache = Path(given["system"]), Path(given["cache"])
 tidy._system_temp_dirs = lambda: [system]  # never this machine's temp dir
@@ -1659,9 +1668,16 @@ tidy.a_home_move_runs = lambda: False
 roots = tidy.Roots(temp=frozenset(Path(root) for root in given["temp"]))
 
 
+def delete():
+    if given["tree"] is None:  # a session's cache: tidy's own pinned delete
+        tidy._remove(cache, roots)
+    else:  # an ended tree's build output: the delete reap makes before git removes the tree
+        fleet._remove_untracked_caches(Path(given["tree"]))
+
+
 def plan(*, now=None, size_kept=True):
     made = tidy.Plan(roots=roots)
-    made.add([tidy.Item(tidy.SESSION_CACHE, cache, 1, None)], lambda: tidy._remove(cache, roots))
+    made.add([tidy.Item(given["rule"], cache, 1, None)], delete)
     return made
 
 
@@ -1677,30 +1693,43 @@ def unlink(path, *args, **kwargs):
         time.sleep(600)
 
 
+class TagFirst:  # every listing with CACHEDIR.TAG first: the worst order a disk may list in
+    def __init__(self, listing):
+        with listing:
+            self.entries = sorted(listing, key=lambda entry: entry.name != "CACHEDIR.TAG")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def __iter__(self):
+        return iter(self.entries)
+
+
+real_scandir = os.scandir
+os.scandir = lambda path=".": TagFirst(real_scandir(path))
 os.unlink = unlink
 tidy.periodic_pass(datetime.fromisoformat(given["at"]))
 print("finished", flush=True)
 """
 
 
-def test_a_pass_killed_mid_delete_leaves_no_stamp_and_the_next_frees_the_rest(
-    tmp_path: Path,
-) -> None:
-    """Manager #3897 (c): a pass killed mid-delete (a stop's end of its tmux session, a
-    SIGKILL) wrote no stamp, so a pass is still due; its cache is still tagged (the tag goes
-    last), and the next pass, the real rules, frees the rest and writes its stamp."""
-    recent = session_dir()
-    cache = tag(recent / "scratchpad" / "target", files=40)
-    aged(recent, 3 * HOUR)
-    made = planned(tmp_path)
-    assert rules(made) == {cache: tidy.SESSION_CACHE}
-    at = datetime.now(UTC)
+def _killed_mid_delete(
+    tmp_path: Path, made: tidy.Plan, at: datetime, cache: Path, rule: str, tree: Path | None
+) -> set[str]:
+    """A pass in a child process, its one delete ``cache`` (tidy's, or reap's for an ended
+    ``tree``), every folder listed tag first, SIGKILLed after 5 files went; what is left in
+    ``cache``."""
     given = {
         "sandbox": str(tmp_path.resolve()),
         "system": str(tmp_path / "system-temp"),
         "cache": str(cache),
         "temp": [str(root) for root in made.roots.temp],
         "at": at.isoformat(),
+        "rule": rule,
+        "tree": None if tree is None else str(tree),
     }
     child = subprocess.Popen(
         [sys.executable, "-c", _KILLED_MID_DELETE, json.dumps(given)],
@@ -1719,7 +1748,23 @@ def test_a_pass_killed_mid_delete_leaves_no_stamp_and_the_next_frees_the_rest(
         watchdog.cancel()
         child.kill()
         child.wait(30)
-    left = {path.name for path in cache.iterdir()}
+    return {path.name for path in cache.iterdir()}
+
+
+def test_a_pass_killed_mid_delete_leaves_no_stamp_and_the_next_frees_the_rest(
+    tmp_path: Path,
+) -> None:
+    """Manager #3897 (c): a pass killed mid-delete (a stop's end of its tmux session, a
+    SIGKILL) wrote no stamp, so a pass is still due; its cache is still tagged (the tag goes
+    last), and the next pass, the real rules, frees the rest and writes its stamp."""
+    recent = session_dir()
+    cache = tag(recent / "scratchpad" / "target", files=40)
+    aged(recent, 3 * HOUR)
+    made = planned(tmp_path)
+    assert rules(made) == {cache: tidy.SESSION_CACHE}
+    at = datetime.now(UTC)
+
+    left = _killed_mid_delete(tmp_path, made, at, cache, tidy.SESSION_CACHE, None)
 
     assert cachedir.TAG in left and 30 < len(left) < 41, "killed mid-delete, the tag kept"
     assert not tidy.stamp_path().exists() and tidy.is_due(at, 60)
@@ -1729,6 +1774,31 @@ def test_a_pass_killed_mid_delete_leaves_no_stamp_and_the_next_frees_the_rest(
         timespec="seconds"
     )
     assert not tidy.is_due(at, 60)
+
+
+def test_an_ended_trees_build_output_killed_mid_delete_is_still_freed_with_its_tree(
+    tmp_path: Path, tmux: object, claude_on_path: Path, project: ProjectInfo
+) -> None:
+    """Reviewer #3926's MINOR 2, the brief's reviewer-* case: an ended reviewer's tree whose
+    only untracked content is build output. Reap deletes that first (``cachedir.remove_within``)
+    and then the tree. Killed with the cache's tag gone, the rest would be an untagged
+    untracked folder, and reap would keep the tree for good. The tag goes last: the next pass
+    frees the rest and the tree."""
+    built = fleet_service.spawn(project, "reviewer", label="reviewer-built").agent
+    fleet_service.stop(project, "reviewer-built", force=True)
+    cache = tag(built.cwd / "target", files=40)
+    made = planned(tmp_path)
+    assert rules(made) == {built.cwd: tidy.ENDED_WORKTREE}
+    at = datetime.now(UTC)
+
+    left = _killed_mid_delete(tmp_path, made, at, cache, tidy.ENDED_WORKTREE_CACHE, built.cwd)
+
+    assert cachedir.TAG in left and 30 < len(left) < 41, "killed mid-delete, the tag kept"
+    assert not tidy.stamp_path().exists() and tidy.is_due(at, 60)
+    assert rules(planned(tmp_path)) == {built.cwd: tidy.ENDED_WORKTREE}, "still reap's to free"
+    passed = PERIODIC_PASS(at)
+    assert passed is not None and passed.freed == {tidy.ENDED_WORKTREE: 1}
+    assert not built.cwd.exists() and not tidy.is_due(at, 60)
 
 
 def test_a_plan_without_kept_sizes_walks_no_kept_repository(tmp_path: Path, repo: Path) -> None:

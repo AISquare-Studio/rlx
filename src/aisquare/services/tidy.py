@@ -219,41 +219,11 @@ def _remove(path: Path, roots: Roots) -> None:
         if (here.st_dev, here.st_ino) != (info.st_dev, info.st_ino) or stat.S_ISLNK(here.st_mode):
             raise Refused(f"{path} changed while tidy looked")
         if stat.S_ISDIR(here.st_mode):
-            _contents_first(path, fd, info)
-            cachedir.remove_dir(path.name, dir_fd=fd)
+            cachedir.remove_dir(path.name, dir_fd=fd)  # a cache's tag last (#59)
         else:
             os.unlink(path.name, dir_fd=fd)
     finally:
         os.close(fd)
-
-
-def _contents_first(path: Path, parent: int, info: os.stat_result) -> None:
-    """All but its own ``CACHEDIR.TAG`` out of the folder ``path``, in ``parent`` pinned, so
-    its tag goes last (#59 round 2): a delete ended mid-way, its process killed, leaves a cache
-    still tagged, which the next pass frees, never an untagged rest no rule judges again. What
-    refuses here (a read-only folder) is left to ``cachedir.remove_dir``, which loosens it."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        inner = os.open(path.name, flags, dir_fd=parent)
-    except OSError:
-        return
-    try:
-        opened = os.fstat(inner)
-        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-            raise Refused(f"{path} changed while tidy looked")
-        with os.scandir(inner) as listing:
-            entries = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in listing]
-        for entry, is_dir in entries:
-            if entry == cachedir.TAG:
-                continue
-            if is_dir:
-                cachedir.remove_dir(entry, dir_fd=inner)
-            else:
-                os.unlink(entry, dir_fd=inner)
-    except OSError:
-        return
-    finally:
-        os.close(inner)
 
 
 def _there(path: Path) -> bool:
@@ -1104,7 +1074,7 @@ def size_text(count: int) -> str:
 
 @dataclass(frozen=True)
 class PassReport:
-    """What one periodic pass did, as its stamp and ``watch --once --json`` say it."""
+    """What one periodic pass did, as its stamp and ``watch --json`` say it."""
 
     at: datetime
     freed_bytes: int
@@ -1223,8 +1193,9 @@ def periodic_pass(
     ``last_attempt``: when the caller last ran a pass (:func:`is_due`). A pass whose stamp could
     not be written is still returned, with :attr:`PassReport.stamp_error`: it ran. One ended
     mid-delete (its process killed) wrote no stamp, so the next is due, and frees what is left
-    (:func:`_remove` deletes a cache's tag last). It is long, the backlog's first pass most of
-    all: a caller that must not wait (the watcher's tick) runs it on a thread of its own."""
+    (``cachedir.remove_dir`` deletes a cache's tag last). It is long, the backlog's first pass
+    most of all: a caller that must not wait (the watcher's tick) runs it on a thread of its
+    own."""
     if not DELETES:
         return None
     every = _settings().every_minutes

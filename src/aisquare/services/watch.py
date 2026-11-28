@@ -483,15 +483,23 @@ class TidyJob:
         except Exception as exc:
             notes.append(f"the tidy pass failed: {type(exc).__name__}: {exc}")
             return done
-        if due:
-            self.began = now
-            self.thread = threading.Thread(
-                target=self._pass_off_the_tick,
-                args=(now, self.last_attempt),
-                name=TIDY_THREAD,
-                daemon=True,
-            )
-            self.thread.start()
+        if not due:
+            return done
+        thread = threading.Thread(
+            target=self._pass_off_the_tick,
+            args=(now, self.last_attempt),
+            name=TIDY_THREAD,
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception as exc:  # "can't start new thread": once, then an interval on
+            # Kept only once it runs (reviewer #3926, MINOR 1): a thread that never started
+            # cannot be joined, and every later tick would raise there, its news with it.
+            self.last_attempt = now
+            notes.append(f"the tidy pass could not start: {type(exc).__name__}: {exc}")
+            return done
+        self.began, self.thread = now, thread
         return done
 
     def _pass_off_the_tick(self, now: datetime, last_attempt: datetime | None) -> None:

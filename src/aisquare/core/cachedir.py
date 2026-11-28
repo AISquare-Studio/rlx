@@ -309,7 +309,12 @@ def remove_dir(path: Path | str, *, dir_fd: int | None = None) -> None:
     unlinks a link it meets, and refuses one given as ``path``). With ``dir_fd``, ``path`` is a
     name in that folder, opened and checked by the caller (``rlx tidy``'s pinned delete). What
     refuses (a read-only folder) is made writable, inside ``path`` alone and never through a
-    link, and a second pass removes it; what still refuses is raised then."""
+    link, and a second pass removes it; what still refuses is raised then.
+
+    A cache's own :data:`TAG` goes last (:func:`_all_but_the_tag`, #59): a delete ended
+    mid-way, its process killed, leaves a cache still tagged, which the next tidy or reap
+    frees, never an untagged rest that no rule judges again and that keeps its tree."""
+    _all_but_the_tag(path, dir_fd)
     top = None if dir_fd is not None else os.path.realpath(path)
 
     def loosen(_function: Callable[..., object], name: str, _exc: BaseException | object) -> None:
@@ -346,6 +351,42 @@ def remove_dir(path: Path | str, *, dir_fd: int | None = None) -> None:
         shutil.rmtree(path, onerror=loosen, **kwargs)
     if not gone():
         shutil.rmtree(path, **kwargs)  # what still refuses is raised now
+
+
+def _all_but_the_tag(path: Path | str, dir_fd: int | None) -> None:
+    """Everything in the folder ``path`` but its own :data:`TAG`, when it holds one, deleted
+    first, as :func:`remove_dir` deletes (no link followed: the folder is opened without
+    following one, and must be the one looked at). What refuses here (a read-only folder) is
+    left to ``remove_dir``'s rmtree, which loosens it, the order then its own. Only where rmtree
+    deletes by descriptor (not on Windows, where tidy deletes nothing and reap frees no cache)."""
+    if not shutil.rmtree.avoids_symlink_attacks:  # pragma: no cover - not on POSIX
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        looked = os.lstat(path, dir_fd=dir_fd)
+        if not stat.S_ISDIR(looked.st_mode):
+            return
+        inner = os.open(path, flags, dir_fd=dir_fd)
+    except OSError:
+        return
+    try:
+        if not os.path.samestat(looked, os.fstat(inner)):
+            return  # moved since it was looked at: rmtree's own check judges it
+        with os.scandir(inner) as listing:
+            entries = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in listing]
+        if TAG not in {name for name, _ in entries}:
+            return
+        for name, is_dir in entries:
+            if name == TAG:
+                continue
+            if is_dir:
+                remove_dir(name, dir_fd=inner)
+            else:
+                os.unlink(name, dir_fd=inner)
+    except OSError:
+        return
+    finally:
+        os.close(inner)
 
 
 def _writable(info: os.stat_result) -> int:
