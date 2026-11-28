@@ -6,7 +6,8 @@ for every process (a lock, a socket, a file another process reads) would split t
 agent's ``rlx`` and the ``asq`` beside it would each see their own.
 
 This scan holds every use under ``src/aisquare`` to the list below: per file, how many lines
-use the temporary directory, and why each stays shared or needs to be. A new use fails here,
+use the temporary directory, and why each stays shared. None splits (:data:`SPLITS`): H2's
+migration lock, the one that did, is beside the homes since #62. A new use fails here,
 naming its file, until its author adds it with its reason. Lines that read ``TMUX_TMPDIR``
 are tmux's own rule (``$TMUX_TMPDIR`` or ``/tmp``, never ``TMPDIR``), which no agent's
 directory changes, and are not counted.
@@ -35,11 +36,6 @@ SHARED: dict[str, tuple[int, str]] = {
         "path; Windows reads the temp dir, but Python there has no AF_UNIX "
         "(captain/actions.py), so nothing binds or dials it",
     ),
-    "services/home_migration.py": (
-        1,
-        "H2's migration lock in tempfile.gettempdir(): SPLITS under per-agent TMPDIRs. #62 "
-        "moves it beside the homes, and #57 merges after #62 (manager, #3454)",
-    ),
     # One process, or a path handed to the child explicitly.
     "core/editor.py": (1, "the file's path is the editor's argument"),
     "services/native_telemetry.py": (
@@ -63,6 +59,12 @@ SHARED: dict[str, tuple[int, str]] = {
     "services/usage_stats.py": (3, "throwaway-repository roots, <home>/tmp among them"),
     "core/workspace.py": (1, "a docstring"),
 }
+
+
+#: Uses that would SPLIT once each agent has its own TMPDIR: none. H2's migration lock was the
+#: one (#3445), and #62 (#641) moved it beside the homes. A use listed here fails the suite
+#: until it is moved to a fixed place.
+SPLITS: dict[str, str] = {}
 
 
 def _uses() -> dict[str, int]:
@@ -89,6 +91,11 @@ def test_every_use_of_the_temp_dir_is_listed_with_how_it_stays_shared() -> None:
     )
     gone = sorted(set(listed) - set(found))
     assert not gone, f"listed, but no longer there: {gone}"
+
+
+def test_no_use_of_the_temp_dir_splits_across_agents() -> None:
+    assert not SPLITS, f"these would split once each agent has its own TMPDIR: {SPLITS}"
+    assert set(SPLITS) <= set(SHARED), "a split use is listed among the uses too"
 
 
 def test_the_scan_sees_a_new_use() -> None:

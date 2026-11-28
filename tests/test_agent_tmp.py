@@ -21,6 +21,7 @@ exec intercepted). No real tmux server, and no real agent, is started.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -424,11 +425,15 @@ def test_removal_clears_what_the_agent_left_read_only_and_never_follows_a_link(
     (outside / "keep").write_text("mine")
     outside.chmod(0o500)
     (directory / "link").symlink_to(outside)
-
-    assert agent_tmp.sweep_ended(now=NOW) == [directory] and not directory.exists()
-    assert stat.S_IMODE(outside.stat().st_mode) == 0o500, "a link's target is never changed"
-    assert (outside / "keep").read_text() == "mine"
-    outside.chmod(0o700)
+    try:
+        assert agent_tmp.sweep_ended(now=NOW) == [directory] and not directory.exists()
+        assert stat.S_IMODE(outside.stat().st_mode) == 0o500, "a link's target is never changed"
+        assert (outside / "keep").read_text() == "mine"
+    finally:  # what a failure leaves, pytest can still clean
+        for each in (outside, locked, locked / "deeper"):
+            if os.path.lexists(each):
+                with contextlib.suppress(OSError):
+                    each.chmod(0o700)
 
 
 # --- a sandboxed Codex may write its own TMPDIR, inside the home it holds read-only -----
