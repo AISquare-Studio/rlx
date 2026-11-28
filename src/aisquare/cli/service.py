@@ -93,6 +93,26 @@ def service_sweep() -> None:
     )
 
 
+@app.command("tray", hidden=True)
+def service_tray() -> None:
+    """The menu bar / tray icon in this terminal, until Ctrl-C (#34): the manual check's way
+    to see it. The service starts it its own way, ``python -m aisquare.services.tray_process``
+    (``TrayPart``), which imports no CLI. Its exit says when there is no tray here
+    (``service_tray.NO_TRAY_EXITS``)."""
+    from aisquare.core.config import TraySettings, load_config
+    from aisquare.services import tray
+    from aisquare.services.service_tray import NO_TRAY_EXITS
+
+    try:
+        settings = load_config().tray
+    except Exception:  # a broken config.toml: the tray in its defaults
+        settings = TraySettings()
+    code = tray.run_tray(icon=settings.icon, terminal=settings.terminal)
+    if code in NO_TRAY_EXITS:  # said, not only logged: the CLI has no log handler
+        typer.echo(f"No tray: {NO_TRAY_EXITS[code]}.", err=True)
+    raise typer.Exit(code)
+
+
 @app.command("stop")
 def service_stop() -> None:
     """Stop the service: Remote and ngrok wound down, Remote's switch kept for its next start."""

@@ -1432,6 +1432,7 @@ def test_spawn_print_enabled_defers_identity_to_launch(isolated_home: Path) -> N
     reason="the printed command runs `aisquare launch`, which finds the agent with "
     "shutil.which and execs it: an sh stub is no program on Windows (tests/fakebin.py)",
 )
+@pytest.mark.usefixtures("keychain_fake_for_children")
 def test_spawn_prelude_clears_every_marker_a_previous_paste_exported(
     isolated_home: Path,
     tmp_path: Path,
@@ -1478,6 +1479,7 @@ def test_spawn_prelude_clears_every_marker_a_previous_paste_exported(
     reason="the printed command runs `aisquare launch`, which finds the agent with "
     "shutil.which and execs it: an sh stub is no program on Windows (tests/fakebin.py)",
 )
+@pytest.mark.usefixtures("keychain_fake_for_children")
 def test_a_launch_hands_the_agent_the_pid_it_runs_as(
     isolated_home: Path,
     tmp_path: Path,
@@ -1677,6 +1679,7 @@ def test_spawn_exec_dead_proxy_fails_open(
     assert "untraced" in result.output
 
 
+@pytest.mark.usefixtures("keychain_fake_for_children")
 def test_a_pasted_team_spawn_line_starts_claude_code_on_every_platform(
     isolated_home: Path, tmp_path: Path
 ) -> None:
@@ -1736,6 +1739,7 @@ def test_a_pasted_team_spawn_line_starts_claude_code_on_every_platform(
     reason="the printed command runs `aisquare launch`, which finds the agent with "
     "shutil.which and execs it: an sh stub is no program on Windows (tests/fakebin.py)",
 )
+@pytest.mark.usefixtures("keychain_fake_for_children")
 def test_spawn_printed_launch_fails_open_through_a_real_shell(
     isolated_home: Path, tmp_path: Path
 ) -> None:
@@ -1819,6 +1823,7 @@ def test_spawn_printed_launch_fails_open_through_a_real_shell(
     reason="the printed command runs `aisquare launch`, which finds the agent with "
     "shutil.which and execs it: an sh stub is no program on Windows (tests/fakebin.py)",
 )
+@pytest.mark.usefixtures("keychain_fake_for_children")
 def test_spawn_printed_command_joins_each_paste_to_its_own_run(
     isolated_home: Path, tmp_path: Path
 ) -> None:

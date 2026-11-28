@@ -30,7 +30,7 @@ from aisquare.core.config import load_config, save_config
 from aisquare.core.store import store_session
 from aisquare.core.tmux import TmuxServer
 from aisquare.models import FleetAgent, ProjectInfo, TeamSession
-from aisquare.services import delivery, quiet_compact
+from aisquare.services import delivery, manager_seat, quiet_compact
 from aisquare.services import fleet as fleet_service
 from aisquare.services import hooks as hooks_service
 from aisquare.services import team as team_service
@@ -516,3 +516,32 @@ def test_a_later_turn_that_asks_supersedes_the_worker_an_earlier_one_armed(
     # The control: a third, quiet turn arms again, and its worker compacts.
     third = manager.stop(armed)
     assert _check(manager, third) == "compacted"
+
+
+def test_a_scheduled_manager_compacts_past_held_results_but_not_urgent_news(
+    manager: Manager,
+) -> None:
+    """#41: a scheduled manager's held routine news is no wake to come (in a busy fleet it
+    would never be compacted, #551); a question to it is."""
+    with store_session() as store:
+        store.set_project_setting(manager.project.id, manager_seat.WAKE, "schedule")
+        store.touch_session(manager.sid, state="waiting")
+        store.mark_prompted(manager.sid, datetime.now(UTC))
+    team_service.add_note("held result", kind="result", board_id=manager.project.id)
+    with store_session() as store:
+        session = manager.session()
+        settings = load_config().fleet
+        why = quiet_compact.refusal(store, session, manager.agent, session.cursor, settings)
+    assert "pending" not in (why or ""), why
+    team_service.add_note(
+        "urgent question", kind="question", to_role=manager.sid, board_id=manager.project.id
+    )
+    with store_session() as store:
+        session = manager.session()
+        why = quiet_compact.refusal(store, session, manager.agent, session.cursor, settings)
+    assert (why or "").startswith("a question is pending")
+    with store_session() as store:
+        store.set_project_setting(manager.project.id, manager_seat.WAKE, "every_write")
+        session = manager.session()
+        why = quiet_compact.refusal(store, session, manager.agent, session.cursor, settings)
+    assert (why or "").startswith("a result is pending"), "every_write: as before"

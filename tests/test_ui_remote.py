@@ -38,6 +38,7 @@ from textual.widgets import Button, DataTable, Select, Static, Switch
 from aisquare.cli.ui import app as app_mod
 from aisquare.cli.ui import remote_control
 from aisquare.cli.ui.app import FleetApp, HelpScreen
+from aisquare.cli.ui.autosave import Autosave
 from aisquare.cli.ui.remote_control import RemoteController, load_remote_state
 from aisquare.cli.ui.views import remote as remote_view
 from aisquare.cli.ui.views.remote import RemotePanel, qr_text
@@ -1529,8 +1530,18 @@ def test_the_switches_save_off_textuals_thread_and_land_once_the_lock_is_free(
                 break
             await asyncio.sleep(0.05)
         assert read_state()["remote_enabled"] is True, "saved once the lock was free"
+        # Picked, and quit inside the save's debounce: quit lands it. The debounce is long
+        # here, so only quit can; and the pick is waited for, bounded, until the panel has
+        # taken it and its save is pending. One pause was the wait before, and a
+        # windows-py3.12 runner quit before the panel had handled the pick (#55).
+        monkeypatch.setattr(Autosave, "DEBOUNCE", 60.0)
         modal.query_one("#remote-auto-off", Select).value = 120
-        await pilot.pause()  # picked, and quit inside the save's debounce: quit lands it
+        saver = app._remote_savers["auto_off_minutes"]
+        deadline = time.monotonic() + 10
+        while not (app.remote.state.auto_off_minutes == 120 and saver.dirty):
+            assert time.monotonic() < deadline, "the panel never took the pick"
+            await pilot.pause(0.02)
+        assert "auto_off_minutes" not in read_state(), "the premise: quit is what lands it"
 
     drive(go, tunnel=missing_ngrok)
     assert read_state() == {"board_theme": "nord", "remote_enabled": True, "auto_off_minutes": 120}

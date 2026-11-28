@@ -77,22 +77,30 @@ from aisquare.cli.ui.groups import (
     GroupPicker,
     GroupProjects,
     MoveRow,
+    OpenGroupMenu,
+    RenameGroup,
     ToggleCollapse,
     TogglePin,
     UndoLayout,
 )
 from aisquare.cli.ui.needs_you_bar import BAR_WORKER, OPEN_KEY, NeedsYouBar
 from aisquare.cli.ui.project_menu import (
+    COLLAPSE,
+    DELETE,
     FRESH,
+    MOVE_DOWN,
+    MOVE_UP,
     PAUSE,
     PIN,
     REMOVE,
     RENAME,
     RESUME,
     SETTINGS,
+    GroupMenu,
     ProjectMenu,
 )
 from aisquare.cli.ui.receiver import listen_for_ui, stop_listening_for_ui
+from aisquare.cli.ui.save_model import UNDO_SAID
 from aisquare.cli.ui.service_client import ServiceClient
 from aisquare.cli.ui.sidebar import (
     ALIVE_STATES,
@@ -130,6 +138,7 @@ from aisquare.cli.ui.sidebar import (
     UsageStatsSelected,
     ViewSelected,
     agent_name,
+    group_name_refusal,
     rename_refusal_words,
 )
 from aisquare.cli.ui.spawn import SpawnCompleted, SpawnDialog
@@ -302,6 +311,11 @@ call) raises nothing for the store-unreadable notice to say, and each tick only 
 more read: the sidebar went silently stale (review of #272)."""
 ACCOUNTS_WORKER = "shell-accounts"
 """The thread worker that reads the accounts' frame (``FleetApp.refresh_accounts``)."""
+FOLDED_SWEEP_SECONDS = 30.0
+"""How often, at most, a fleet read lists the projects a collapsed group folds away, so the rows of
+panes that died there are ended (:func:`_read_fleet`'s ``sweep_folded``): a frame reads only
+what it shows (#83), and the view left behind another no longer keeps its folded project read
+(rlx#557). A read that fails does not count (:meth:`FleetApp._fleet_read`): the next one sweeps."""
 HEADROOM_WORKER = "sidebar-headroom"
 """The thread worker that reads the status line's headroom (``FleetApp.refresh_headroom``)."""
 HOUSEKEEPING_SECONDS = 30.0
@@ -553,13 +567,22 @@ def _read_frame(
     captain: bool,
     viewed: Collection[str] | None = None,
     scope: Collection[str] | None = None,
+    *,
+    sweep_folded: bool = False,
 ) -> _FleetRead:
     """One frame of the sidebar, read on the calling thread: the fleet, then the captain's
-    home board and row when the captain is on (``experimental.captain``). ``viewed`` and
-    ``scope`` as for :func:`_read_fleet`."""
+    home board and row when the captain is on (``experimental.captain``). ``viewed``,
+    ``scope`` and ``sweep_folded`` as for :func:`_read_fleet`."""
     asqs = _live_asqs()
     service = service_host.hosting(asqs)  # it retries held-back nudges then, not this TUI (#32)
-    read = _read_fleet(show_captured, viewed, scope, captain=captain, nudges=service is None)
+    read = _read_fleet(
+        show_captured,
+        viewed,
+        scope,
+        captain=captain,
+        nudges=service is None,
+        sweep_folded=sweep_folded,
+    )
     read = replace(_read_captain(read), captain_asked=True) if captain else read
     return replace(read, asqs=asqs, service=service)
 
@@ -582,6 +605,7 @@ def _read_fleet(
     *,
     captain: bool = False,
     nudges: bool = True,
+    sweep_folded: bool = False,
 ) -> _FleetRead:
     """One frame of the fleet, read on the calling thread: the projects and their groups,
     then their agents. One store session reads them all; ``list_agents_many`` then asks
@@ -593,6 +617,12 @@ def _read_fleet(
     ``viewed``: the projects an open view shows, read even when folded away, whose view a
     frame without them would leave to age; ``None`` folds nothing (the first frame, read
     before the views it reopens). ``scope``: the only projects listed (``ui --project``).
+
+    ``sweep_folded``: the folded projects are listed too, so the rows of panes that died there
+    are ended (``list_agents_many``) as everywhere else, and the frame still holds none of their
+    rows: what it shows is as without it. :data:`FOLDED_SWEEP_SECONDS` apart at most, so a folded
+    project's agent never reads running much longer than that after it died (the manager's
+    condition on rlx#557's skip of a left view's folded project, #51).
 
     With ``captain``, the captain's home board is read in the same session, by the id
     resolved here: :func:`_read_captain` opened a second session and resolved the home
@@ -615,7 +645,8 @@ def _read_fleet(
             groups = store.project_groups()
             home = store.get_project(home_id) if captain else None
             folded = set() if viewed is None else _folded(projects, groups) - set(viewed)
-            listings = fleet_service.read_listings(store, projects, skip=folded)
+            listed = set() if sweep_folded else folded
+            listings = fleet_service.read_listings(store, projects, skip=listed)
             # A manager nudge a draft held back (P0-W2, #276), read in this frame's session.
             owed = fleet_service.deferred_nudge_targets(store)
             # Which are fleet-paused, for their Resume (one read of the signals, any board).
@@ -634,6 +665,8 @@ def _read_fleet(
     agents = {p.id: many.agents.get(p.id, []) for p in projects if p.id not in folded}
     notices: dict[str, str] = {}
     for project_id, failure in many.errors.items():
+        if project_id in folded:
+            continue  # swept, not shown: its card is folded away, as when it is not read
         # A bug in the fleet path must not take the view down: said, with its class.
         notices[project_id] = f"agents unavailable — {_why_unread(failure)}"
     if home_id in agents:  # the captain is the captain section's, never the card's
@@ -826,7 +859,7 @@ class HelpScreen(ModalScreen[None]):
             # Arranging the sidebar (#140): every one of these has a CLI twin.
             ("shift+↑ ↓", "move the highlighted row one place"),
             ("g p space", "group · pin · fold the highlighted row"),
-            ("u", "undo the last arrangement; a toast says what"),
+            ("u ctrl+z", "undo the last arrangement; a toast says what"),
             ("m", "mark the highlighted card, as shift+click does"),
             ("shift+g", "group the marked cards; Esc clears the marks"),
             ("drag title", "move a card or a group header to a new place"),
@@ -843,6 +876,11 @@ class HelpScreen(ModalScreen[None]):
             (
                 ". ⋯ r-click",
                 "on an agent's row, its menu: Pause or Resume, Stop, Restart, Rename",
+            ),
+            (
+                ". ⋯ r-click",
+                "on a group's header, its menu: rename, pin, fold, move, delete the group "
+                "(its projects stay); F2 renames it in place",
             ),
             (self.escape_key.upper(), "hand focus from an agent's pane back to the sidebar"),
             (
@@ -1643,6 +1681,13 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """The fleet read in flight, or the last one; only one runs at a time."""
         self._fleet_owed = False
         """A frame was asked for while a read was in flight: read once more after it."""
+        self._fleet_viewed: frozenset[str] = frozenset()
+        """The project the next fleet read reads though folded (:meth:`_viewed_projects`)."""
+        self._folded_swept_at = time.monotonic()
+        """When the last fleet read that listed the folded projects too and painted its frame
+        began (:data:`FOLDED_SWEEP_SECONDS`); the first frame folds nothing."""
+        self._fleet_sweeps: dict[Worker[_FleetRead], float] = {}
+        """When each read that lists the folded projects too began, by read, until it ends."""
         self._fleet_calls = 0
         """How many calls have asked for a fleet frame (:meth:`refresh_data`): the newest
         one's number. It orders a call against an accounts read where a clock cannot:
@@ -2229,18 +2274,27 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         """Start the fleet read that answers the calls up to number ``asked``, the newest."""
         after = [*self._fleet_owed_after, *([] if then is None else [then])]
         self._fleet_owed, self._fleet_owed_after = False, []
-        # `a`'s choice is read as the read begins, so one held for a hand-over and started
-        # when it is called off reads what is shown then.
+        # `a`'s choice and the viewed project are read as the read begins, so one held for a
+        # hand-over and started when it is called off reads what is shown then.
         self._fleet_since = time.monotonic()
-        viewed = self._viewed_projects()  # asked here, on the UI thread, not in the worker
+        self._fleet_viewed = self._viewed_projects()  # asked here, on the UI thread
+        sweep = self._fleet_since - self._folded_swept_at >= FOLDED_SWEEP_SECONDS
         self._fleet_worker = self.run_worker(
-            lambda: _read_frame(self.show_captured, self.captain_on, viewed, self.scope),
+            lambda: _read_frame(
+                self.show_captured,
+                self.captain_on,
+                self._fleet_viewed,
+                self.scope,
+                sweep_folded=sweep,
+            ),
             name=FLEET_WORKER,
             group=FLEET_WORKER,
             thread=True,
             exit_on_error=False,
         )
         self._fleet_asked[self._fleet_worker] = asked
+        if sweep:
+            self._fleet_sweeps[self._fleet_worker] = self._fleet_since
         if after:
             self._fleet_after[self._fleet_worker] = after
 
@@ -2256,6 +2310,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if event.state is WorkerState.CANCELLED:
             self._fleet_after.pop(worker, None)  # with the app: nothing to paint or owe
             self._fleet_asked.pop(worker, None)
+            self._fleet_sweeps.pop(worker, None)
             return
         result = worker.result if event.state is WorkerState.SUCCESS else None
         if isinstance(result, _FleetRead):
@@ -2268,6 +2323,11 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             if event.state is WorkerState.RUNNING:
                 self._fleet_since = time.monotonic()  # a read held for a hand-over begins now
             return  # still running
+        swept = self._fleet_sweeps.pop(worker, None)
+        if swept is not None and read.error is None:
+            # Swept only by a read that painted its frame: one that failed listed nothing, so the
+            # next read sweeps, and a folded project's dead pane is still ended within the bound.
+            self._folded_swept_at = max(self._folded_swept_at, swept)
         self._paint_fleet(read, asked=self._fleet_asked.pop(worker, None))
         newer = self._fleet_worker
         if self._fleet_owed and (newer is None or newer.is_finished):
@@ -2533,12 +2593,10 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.refresh_headroom()
 
     def _viewed_projects(self) -> frozenset[str]:
-        """The projects an open Project or Agent view shows (:func:`_read_fleet`'s ``viewed``)."""
-        content = self.content
-        return frozenset(
-            [view.project.id for view in content.query_children(ProjectView)]
-            + [view.status.agent.project_id for view in content.query_children(AgentView)]
-        )
+        """The project the right pane's Project or Agent view shows now (:func:`_read_fleet`'s
+        ``viewed``): a view left open behind another keeps its folded project unread."""
+        shown = self._shown_project_id()
+        return frozenset() if shown is None else frozenset({shown})
 
     def _feed_open_views(self, snapshot: FleetSnapshot) -> None:
         """Hand every open Project/Agent view its row from the new frame.
@@ -3088,26 +3146,28 @@ class FleetApp(SelectionHost, inherit_bindings=False):
 
     # --- groups, pins and order (#140) -------------------------------------------------
 
-    def _layout(self, what: Callable[[ContextStore], project_groups.UndoEntry], said: str) -> None:
-        """Apply one gesture through the service, remember its way back, repaint, say so."""
+    def _layout(self, what: Callable[[ContextStore], project_groups.UndoEntry], said: str) -> bool:
+        """Apply one gesture through the service, remember its way back, repaint, say so;
+        whether it was applied."""
         try:
             with store_session() as store:
                 entry = what(store)
         except KeyError as exc:
             self.notify(f"nothing to do: {exc.args[0]!r} is gone", severity="warning", timeout=4)
-            return
+            return False
         except ValueError as exc:
             self.notify(str(exc), severity="error", timeout=6, markup=False)
-            return
+            return False
         except Exception as exc:  # the store said no: the frame stands, the gesture is lost
             self.notify(f"could not {said}: {exc}", severity="error", timeout=6, markup=False)
-            return
+            return False
         if entry.projects or entry.groups:
             # A gesture that touched no row ("nothing to move": a step at an end,
             # a pinned row) is no step back — `u` would undo nothing and say it did.
             self._undo.append(entry)
             del self._undo[:-UNDO_DEPTH]
         self.refresh_data()
+        return True
 
     def on_move_row(self, event: MoveRow) -> None:
         # One step is one row ON SCREEN: the captured rows count only while `a` shows them,
@@ -3199,6 +3259,43 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             self.sidebar.action_clear_marks()
 
         self.push_screen(GroupPicker(groups, len(ids)), chosen)
+
+    def on_open_group_menu(self, event: OpenGroupMenu) -> None:
+        """⋯, ``.`` or a right-click on a group's header (#39): its menu, then what was chosen,
+        each through the gesture's own handler, onto the one undo stack."""
+        group_id, name = event.group.id, event.group.name
+
+        def chosen(choice: str | None) -> None:
+            if choice == RENAME:
+                # Once the menu has gone: closing it hands the focus back to the sidebar.
+                self.call_after_refresh(self.sidebar.open_group_rename, group_id)
+            elif choice == PIN:
+                self.on_toggle_pin(TogglePin("group", group_id))
+            elif choice == COLLAPSE:
+                self.on_toggle_collapse(ToggleCollapse(group_id))
+            elif choice in (MOVE_UP, MOVE_DOWN):
+                self.on_move_row(MoveRow("group", group_id, -1 if choice == MOVE_UP else 1))
+            elif choice == DELETE and self._layout(
+                lambda s: project_groups.delete_group(s, group_id), "delete the group"
+            ):
+                self.notify(f"Deleted group {name} · Undo: {UNDO_SAID}", timeout=6, markup=False)
+
+        menu = GroupMenu(event.group, event.anchor, count=event.count, up=event.up, down=event.down)
+        self.push_screen(menu, chosen)
+
+    def on_rename_group(self, event: RenameGroup) -> None:
+        """A group header's name field was saved (#39). A name another shell took since the
+        frame was read is refused in the sidebar's words (``group_name_refusal``, asked of the
+        store's groups now), and the field opens again with what was typed."""
+
+        def rename(store: ContextStore) -> project_groups.UndoEntry:
+            refusal = group_name_refusal(event.typed, event.group_id, store.project_groups())
+            if refusal is not None:
+                raise ValueError(f"not renamed: {refusal}")
+            return project_groups.rename_group(store, event.group_id, event.typed)
+
+        if not self._layout(rename, "rename"):
+            self.sidebar.open_group_rename(event.group_id, event.typed)
 
     def on_undo_layout(self, event: UndoLayout) -> None:
         if not self._undo:
@@ -3977,9 +4074,15 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         self.query_one("#accounts", AccountsView).begin_claude_sign_in(None, agent=event.agent)
 
     def _content_switched(self, current: str | None) -> None:
-        """Any other page than Accounts drops the way back: the user went elsewhere first."""
+        """Any other page than Accounts drops the way back: the user went elsewhere first. A
+        Project or Agent view opened or gone back to, of a project the last frame did not
+        read, has it read at once."""
         if current != "accounts":
             self.after_sign_in = None
+        self._fleet_viewed = self._viewed_projects()  # what a read held for a hand-over reads
+        snapshot = self.snapshot
+        if snapshot is not None and self._fleet_viewed - snapshot.agents.keys():
+            self.refresh_data()
 
     async def on_sign_in_landed(self, event: SignInLanded) -> None:
         """A sign-in landed: back to where it was started from, used once — or, from
@@ -4112,7 +4215,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         if offer is None:
             self.sidebar.show_update(None)
             return
-        self.sidebar.show_update(offer.version, runnable=offer.runnable)
+        self.sidebar.show_update(offer.version, runnable=offer.runnable, home=offer.home_only)
         if offer.announce:
             how = "restarts rlx to update" if offer.runnable else "says how to update this install"
             self.notify(
@@ -4208,7 +4311,8 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         An answer that nothing is newer than the version that runs takes the row away and
         says so, and closes the dialog, or keeps it from opening (:meth:`_update_planned`
         opens none without an offer): before the plan was read, the click opened nothing and
-        the row went in silence (review of #301, m2)."""
+        the row went in silence (review of #301, m2). But not with a home from before 0.10.2
+        to move (#31): the dialog and the row stay, as the move alone."""
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR):
             return
         if event.worker is not self._refresh_worker:
@@ -4220,8 +4324,14 @@ class FleetApp(SelectionHost, inherit_bindings=False):
         offer = self.release
         screen = self.screen if isinstance(self.screen, UpdateScreen) else None
         current = offer.current if offer is not None else screen.plan.current if screen else None
+        home = offer.home_move if offer is not None else screen.plan.home_move if screen else None
         if found is not None and current is not None:
-            if lifecycle_service.newer_release(found, current) is not True:
+            newer = lifecycle_service.newer_release(found, current) is True
+            if not newer and home is not None:
+                if offer is not None and not offer.home_only:
+                    self.release = offer = replace(offer, version=current, announce=False)
+                    self.sidebar.show_update(current, runnable=offer.runnable, home=True)
+            elif not newer:
                 self.release = None
                 self.sidebar.show_update(None)
                 if screen is not None:
@@ -4232,7 +4342,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
                     markup=False,
                 )
                 return
-            if offer is not None and found != offer.version:
+            elif offer is not None and found != offer.version:
                 self.release = replace(offer, version=found)
                 self.sidebar.show_update(found, runnable=offer.runnable)
                 if self._planned_runnable is not None:
@@ -4281,7 +4391,7 @@ class FleetApp(SelectionHost, inherit_bindings=False):
             # The row was decided from the install's route alone; the dialog's plan has the
             # last word (uv gone from PATH since, say), and the row says what it says.
             self.release = offer = replace(offer, runnable=plan.runnable)
-            self.sidebar.show_update(offer.version, runnable=plan.runnable)
+            self.sidebar.show_update(offer.version, runnable=plan.runnable, home=offer.home_only)
         screen = UpdateScreen(plan, len(self._live_agents()), offer.version)
         if self._refreshed is not None:
             screen.show_latest(self._refreshed[0])  # PyPI answered before the plan was read

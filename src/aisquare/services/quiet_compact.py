@@ -190,7 +190,8 @@ def refusal(
     """Why the manager may not be compacted now, or ``None``: every condition but the pane's.
 
     Still ``waiting`` (not working, limited, mid-hand-over or needing the human); its
-    cursor where it was when its turn ended; no wake-class event past it; a context of at
+    cursor where it was when its turn ended; no wake-class event past it (for a scheduled
+    manager, none that wakes it now: ``team.pending_wake``); a context of at
     least ``quiet_compact_at`` tokens (its transcript's last request, as its agent's reader
     reads it: ``AgentTranscript.context_tokens``); no quiet compaction
     within the cooldown; and a state file written within ``quiet_compact_state_max_age``
@@ -202,11 +203,23 @@ def refusal(
         return f"it reads {session.state}, not waiting"
     if session.cursor != cursor:
         return "it has read the board since its turn ended"
-    for event in store.events_since(
-        session.project_id, cursor, exclude_session=session.id, exclude_actor=session.id, limit=500
-    ):
-        if team_service.wake_class(event, session) == "wake":
-            return f"a {event.kind} is pending (#{event.seq})"
+    if team_service.schedule_of(store, session) is not None:
+        # A scheduled manager (#41): only what wakes it now, as its nudge and its Stop
+        # decide. Its held routine news is no wake to come, or one in a busy fleet would
+        # never be compacted (#551).
+        pending = team_service.pending_wake(store, session).now
+        if pending is not None:
+            return f"a {pending.kind} is pending (#{pending.seq})"
+    else:
+        for event in store.events_since(
+            session.project_id,
+            cursor,
+            exclude_session=session.id,
+            exclude_actor=session.id,
+            limit=500,
+        ):
+            if team_service.wake_class(event, session) == "wake":
+                return f"a {event.kind} is pending (#{event.seq})"
     reader = _reader(session)
     size = (
         reader.context_tokens(Path(session.transcript_path))

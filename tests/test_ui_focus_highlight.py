@@ -268,11 +268,17 @@ def test_a_flip_changes_nothing_on_screen_but_the_highlighted_row(
     tmp_path: Path, script: Script
 ) -> None:
     """The keyboard's mark on a side, taken off and put back without moving the keyboard: the
-    only cells that change are the highlighted row's (the sidebar), and none (the page)."""
+    only cells that change are the highlighted row's (the sidebar), and none (the page).
+
+    Textual's animations are off (#55): opening the project's view relabels its tabs, and
+    Textual slides the tab row's underline (row 1) to its place over 0.3 s, which ``settle``
+    does not wait for. On a slow runner it was still sliding when the screen was first read,
+    and row 1 changed under a flip that changed nothing there (windows-py3.12, twice)."""
     seed(tmp_path, ("prj_a", "proj", None), ("prj_b", "other", None))
 
     async def body(pilot: Pilot[None]) -> tuple[set[int], int, set[int]]:
         app = fleet_app(pilot)
+        app.animation_level = "none"  # the underline lands at once, before the first read
         await _select(app)
         await _keyboard_on(app, "sidebar")
         row = _selected(app).region.y

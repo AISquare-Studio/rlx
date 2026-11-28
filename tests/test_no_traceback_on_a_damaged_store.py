@@ -72,6 +72,7 @@ UNINVOKED = {
     "captain voice": "binds a port and serves the voice page until Ctrl-C",
     "remote serve": "binds a port and blocks",
     "service run": "runs the rlx service in the foreground until it is stopped",
+    "service tray": "draws the tray icon in the foreground until it is stopped (#34)",
     "service start": "starts a real rlx service in the background, which reads the accounts",
     "service restart": "starts a real rlx service in the background, which reads the accounts",
     "launch": "spawns a real agent process",

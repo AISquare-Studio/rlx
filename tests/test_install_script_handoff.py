@@ -50,6 +50,9 @@ from tests.install_flags import DRY
 if sys.platform == "win32":  # pragma: no cover - the POSIX installer's own tests
     pytest.skip("install.sh is a POSIX shell script", allow_module_level=True)
 
+#: The PyPI package as this OS installs it: with the tray's extra on macOS and Linux (#34).
+_PKG = "aisquare-cli[tray]" if sys.platform in ("darwin", "linux") else "aisquare-cli"
+
 REPO = Path(__file__).resolve().parents[1]
 #: Always the repository's copy, never AISQUARE_TEST_INSTALL_SH: the hand-off is
 #: what an UNSTAMPED script does, and a stamped one is made here when needed.
@@ -360,8 +363,8 @@ def test_a_release_copy_of_this_tree_runs_its_own_dry_run(machine: Machine) -> N
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert result.stdout.splitlines()[0].strip() == "using the v7.7.7 installer"
     assert "pinned to" not in result.stdout, result.stdout
-    assert "aisquare-cli@latest" in result.stdout, "the child did not install unpinned"
-    assert "aisquare-cli@7.7.7" not in result.stdout and "aisquare-cli==" not in result.stdout
+    assert f"{_PKG}@latest" in result.stdout, "the child did not install unpinned"
+    assert f"{_PKG}@7.7.7" not in result.stdout and "aisquare-cli==" not in result.stdout
     pypi = [url for url in machine.requests() if "pypi" in url]
     assert len(pypi) == 1, f"PyPI asked {len(pypi)} times: the child reuses the parent's answer"
     assert "nothing above was actually run" in result.stdout
@@ -420,7 +423,7 @@ def test_a_release_copy_of_this_tree_keeps_a_pin(machine: Machine) -> None:
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert result.stdout.splitlines()[0].strip() == "using the v7.7.7 installer"
     assert f"pinned to {STAMP}" in result.stdout, result.stdout
-    assert "aisquare-cli@latest" not in result.stdout, result.stdout
+    assert f"{_PKG}@latest" not in result.stdout, result.stdout
     assert machine.release_requests() == [f"{RELEASES}/download/v{STAMP}/install.sh"]
 
 
@@ -595,7 +598,7 @@ def test_a_stamped_copy_never_hands_off(machine: Machine) -> None:
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert machine.release_requests() == [], "a stamped installer asked for a release"
     assert "using " not in result.stdout
-    assert "aisquare-cli@7.7.7" in result.stdout
+    assert f"{_PKG}@7.7.7" in result.stdout
 
 
 def test_the_guard_stops_a_second_hop(machine: Machine) -> None:
@@ -997,7 +1000,7 @@ def test_a_piped_hand_off_leaves_the_parents_stdin_unread(machine: Machine) -> N
 
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert result.stdout.splitlines()[0].strip() == "using the v7.7.7 installer"
-    assert "aisquare-cli@latest" in result.stdout  # no version named: unpinned
+    assert f"{_PKG}@latest" in result.stdout  # no version named: unpinned
     assert "nothing above was actually run" in result.stdout
     assert "TRAILER-RAN" not in result.stdout + result.stderr
     assert left.endswith(_SENTINEL), "the hand-off consumed the parent's stdin"

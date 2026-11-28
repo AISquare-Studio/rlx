@@ -1304,6 +1304,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
                 id="preferences-from-a-shell",
                 classes="about",
             )
+        from aisquare.cli.ui.views.settings_tray import TrayToggle  # its own module (#34)
+
+        yield TrayToggle(id="settings-tray")
 
     def _compose_display(self) -> ComposeResult:
         yield Static(section_title(*self.DISPLAY_SECTION), classes="section")
@@ -1533,6 +1536,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
             self.query_one(f"#{wid}", Switch).value = getattr(self.ui, key)
         self._show_ui(self.ui)
         self.query_one(ExperimentalSection).reread(config)
+        from aisquare.cli.ui.views.settings_tray import TrayToggle  # its own module (#34)
+
+        self.query_one(TrayToggle).reread(config)
         for role in self._roles:
             row = self._role_row(role)
             if row is None:
@@ -1953,7 +1959,9 @@ class AppSettingsView(SavesAsYouGo, Vertical):
         keeps what was typed, to try again."""
         for wid in changed:
             control = self.query_one(f"#{wid}")
-            if not isinstance(control, CommitInput):
+            if isinstance(control, CommitInput):
+                control.release()  # committed again, to try again (#53)
+            else:
                 self._put_shown(control, self._shown_value(wid))
 
     @staticmethod

@@ -58,6 +58,7 @@ from aisquare.cli.ui.terminal import (
     TMUX_UNAVAILABLE,
     DisplayedRow,
     EscapeToSidebar,
+    RenderCache,
     SelectionHost,
     Shown,
     TerminalPane,
@@ -75,10 +76,12 @@ from tests import toast_log
 from tests.pane_harness import (
     FakePane,
     FakeTmux,
+    bracketed_paste,
     click,
     drag,
     mouse_event,
     move,
+    post_terminal_input,
     press,
     release,
 )
@@ -811,6 +814,34 @@ def test_paste_goes_through_the_paste_buffer_not_send_keys(fake: FakeTmux, tmp_p
     pasted = [call for call in fake.input if call[0] in ("load-buffer", "paste-buffer")]
     assert pasted == [("load-buffer", "one\ntwo\n"), ("paste-buffer", "%1")]
     assert fake.sent() == []  # the negative: no Enter per line
+
+
+def test_a_paste_holding_a_raw_escape_reaches_the_agent_whole_with_no_key(
+    fake: FakeTmux, tmp_path: Path
+) -> None:
+    """From the terminal's bytes, through the parser as the driver runs it. Textual's own parse
+    sends what follows an Escape in a paste as keys, its Enter submitting half a prompt; the
+    guard keeps it one paste (``cli.ui.paste_guard``). This test reads every paste-buffer
+    write and every send-keys."""
+
+    async def drive() -> None:
+        host = Host(fake.server(tmp_path), "%1")
+        async with host.run_test(size=(40, 6)) as pilot:
+            host.pane.focus()
+            await pilot.pause()
+            post_terminal_input(host, bracketed_paste("one\x1b\rtwo"))
+            post_terminal_input(host, bracketed_paste("one\x1b"))
+            await pilot.pause()
+
+    run(drive())
+    pasted = [call for call in fake.input if call[0] in ("load-buffer", "paste-buffer")]
+    assert pasted == [
+        ("load-buffer", "one\x1b\rtwo"),
+        ("paste-buffer", "%1"),
+        ("load-buffer", "one\x1b"),
+        ("paste-buffer", "%1"),
+    ]
+    assert fake.sent() == []  # no Enter, no Escape, no text typed
 
 
 def test_a_typed_separator_is_a_keystroke_not_a_paste(fake: FakeTmux, tmp_path: Path) -> None:
@@ -6662,3 +6693,262 @@ def test_a_lone_windows_path_under_wsl_becomes_its_linux_path_in_its_quotes(
         "/tmp/shot.png",
     )
     assert len(wslpath.calls) == 3, "asked only for a lone Windows path under WSL"
+
+
+# --- the render cache (#42) ------------------------------------------------------------------
+
+#: The scroll tests' pane, 40 x 24. They set the floor to 0, so its render cache holds four
+#: screens, 96 rows, and they go through three of those in about 30 steps each way. Through
+#: three of the floor's 512 rows took 136 steps, 32 s a test. The height test covers the floor.
+CACHED_PANE = (40, 24)
+
+
+def _claude_like(count: int) -> list[str]:
+    """``count`` rows as Claude Code paints its transcript, no two alike: colours, bold and dim
+    runs, its own glyphs and wide characters."""
+    glyphs = ("⏺", "✻", "⎿", "→", "✓", "│")
+    return [
+        f"\x1b[3{1 + n % 7}m{glyphs[n % len(glyphs)]}\x1b[0m row {n:05d} "
+        f"\x1b[1m{'日本語'[: n % 4]}\x1b[22m \x1b[2m{'界' * (n % 3)}dim\x1b[0m"
+        for n in range(count)
+    ]
+
+
+def _plain(line: str) -> str:
+    from rich.text import Text
+
+    return Text.from_ansi(line).plain
+
+
+def _painted(pane: TerminalPane) -> list[list[tuple[str, Style | None]]]:
+    """The pane's rows as painted, top to bottom: each segment's text and style."""
+    return [[(segment.text, segment.style) for segment in strip] for strip in rows(pane)]
+
+
+def _through_three_caches(
+    tmp_path: Path, *, in_app: bool
+) -> tuple[list[list[list[tuple[str, Style | None]]]], int, int, int]:
+    """Up a screen at a time (alt+PgUp) from the live screen through a transcript three
+    render caches long, and back down (alt+PgDn): every screen as painted, the most rows the
+    cache held after any step, the cache's bound, and the distinct rows shown.
+
+    ``in_app``: the program owns its transcript, as Claude Code and Codex do with mouse
+    interactions on (alternate screen, mouse reporting): the keys reach it as wheel notches,
+    it moves three rows a notch, and tmux holds no history. Otherwise the transcript scrolled
+    into tmux's history, read a screen at a time."""
+    width, height = CACHED_PANE
+    transcript = _claude_like(3 * TerminalPane.CACHE_SCREENS * height + 2 * height)
+    deepest = len(transcript) - height
+    fake = FakeTmux()
+    pane = fake.panes["%1"] = FakePane(screen=[], width=width, height=height, cursor_visible=False)
+    program = {"back": 0, "read": 0}
+    if in_app:
+        pane.alternate_on = pane.mouse_on = pane.mouse_sgr = True
+
+        def scroll_its_transcript(target: FakePane) -> None:
+            sent = fake.sent_text()
+            for text in sent[program["read"] :]:
+                notches = 3 * (text.count("\x1b[<64;") - text.count("\x1b[<65;"))
+                program["back"] = min(max(program["back"] + notches, 0), deepest)
+            program["read"] = len(sent)
+            end = len(transcript) - program["back"]
+            target.screen = transcript[end - height : end]
+
+        fake.before_capture = scroll_its_transcript
+        scroll_its_transcript(pane)
+    else:
+        pane.history, pane.screen = transcript[:deepest], transcript[deepest:]
+
+    held_pane: list[TerminalPane] = []  # the pane, once the host has mounted it
+
+    def back() -> int:
+        return program["back"] if in_app else held_pane[0].scrollback
+
+    def top_row() -> str:
+        return _plain(transcript[len(transcript) - height - back() + 1])
+
+    screens: list[list[list[tuple[str, Style | None]]]] = []
+    shown: set[str] = set()
+    most = 0
+
+    async def step(pilot: Pilot[None], key: str, wanted: int) -> None:
+        nonlocal most
+        widget = held_pane[0]
+        await pilot.press(key)
+        await wait_until(
+            pilot, lambda: back() == wanted and screen_text(widget)[1] == top_row(), timeout=10.0
+        )
+        await pilot.pause()
+        screens.append(_painted(widget))
+        shown.update(screen_text(widget)[1:])
+        held = max(len(widget._strip_cache), len(widget._row_cache))
+        assert held <= widget._cache_limit(), (held, widget._cache_limit())
+        most = max(most, held)
+
+    async def drive() -> int:
+        host = Host(fake.server(tmp_path), "%1")
+        async with host.run_test(size=CACHED_PANE) as pilot:
+            widget = host.pane
+            held_pane.append(widget)
+            widget.focus()
+            await wait_until(pilot, lambda: synced(widget))
+            distance = 21 if in_app else height - 1  # 7 notches of 3 rows; a screen
+            wanted = 0
+            while wanted < deepest:
+                wanted = min(wanted + distance, deepest)
+                await step(pilot, "alt+pageup", wanted)
+            while wanted > 0:
+                wanted = max(wanted - distance, 0)
+                await step(pilot, "alt+pagedown", wanted)
+            return widget._cache_limit()
+
+    limit = run(drive())
+    return screens, most, limit, len(shown)
+
+
+def _bounded_and_unbounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, in_app: bool
+) -> tuple[str, int]:
+    """The scroll of :func:`_through_three_caches` with the bounded cache and with an
+    unbounded one: the first screen whose paint differs ("" for none), with the premise that
+    the scroll went through three bounded caches' rows (0 when it did, else what it lacked)."""
+    monkeypatch.setattr(TerminalPane, "CACHE_FLOOR", 0)  # four screens: CACHED_PANE says why
+    bounded, most, limit, shown = _through_three_caches(tmp_path / "bounded", in_app=in_app)
+    with monkeypatch.context() as unbounded_cache:
+        unbounded_cache.setattr(TerminalPane, "_cache_limit", lambda self: 10**9)
+        unbounded, _, _, _ = _through_three_caches(tmp_path / "unbounded", in_app=in_app)
+    lacked = 0 if limit == 96 and most == limit and shown >= 3 * limit else 3 * 96 - shown
+    if len(bounded) != len(unbounded):
+        return f"{len(bounded)} screens against {len(unbounded)}", lacked
+    for index, (got, unbounded_screen) in enumerate(zip(bounded, unbounded, strict=True)):
+        if got != unbounded_screen:
+            return f"screen {index} of {len(bounded)}", lacked
+    return "", lacked
+
+
+def test_in_app_scrolling_paints_every_screen_as_an_unbounded_cache_did(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#42, scroll mode (a): Claude Code and Codex with mouse interactions on scroll their
+    own transcript, the input staying at the bottom, and tmux holds no history. Up through
+    three render caches' worth of their rows and back, a screen at a time: every screen is
+    painted as it was with the unbounded cache, segment by segment, style and all."""
+    differs, lacked = _bounded_and_unbounded(tmp_path, monkeypatch, in_app=True)
+    assert lacked == 0, "the premise: a 96-row cache filled, and three of them scrolled by"
+    assert differs == "", f"painted unlike the unbounded cache: {differs}"
+
+
+def test_classic_scrollback_paints_every_screen_as_an_unbounded_cache_did(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#42, scroll mode (b): the output scrolled into the pane's tmux history, read one screen
+    at a time (alt+PgUp, as the wheel and shift+PgUp do). Up through three render caches'
+    worth of it and back: every screen is painted as it was with the unbounded cache."""
+    differs, lacked = _bounded_and_unbounded(tmp_path, monkeypatch, in_app=False)
+    assert lacked == 0, "the premise: a 96-row cache filled, and three of them scrolled by"
+    assert differs == "", f"painted unlike the unbounded cache: {differs}"
+
+
+def test_the_render_cache_drops_the_least_recently_used_row_past_its_bound() -> None:
+    cache: RenderCache[str, int] = RenderCache(3)
+    for value, key in enumerate("abc"):
+        cache.put(key, value)
+    assert cache.get("a") == 0  # used again: "b" is now the oldest
+    cache.put("d", 3)
+    assert len(cache) == 3
+    assert cache.get("b") is None and cache.get("c") == 2 and cache.get("a") == 0
+    cache.resize(1)
+    assert len(cache) == 1 and cache.get("a") == 0, "shrunk: the most recently used stays"
+    cache.clear()
+    assert len(cache) == 0
+
+
+def test_the_render_cache_holds_four_screens_of_the_pane_as_its_height_changes(
+    fake: FakeTmux, tmp_path: Path
+) -> None:
+    """#42: max(4 x the pane's height, 512) rows, sized again as the pane is: a pane that
+    shrinks drops its oldest rows at once."""
+
+    async def drive() -> tuple[int, int, int, int, int]:
+        host = Host(fake.server(tmp_path), "%1")
+        async with host.run_test(size=(40, 200)) as pilot:
+            pane = host.pane
+            await wait_until(pilot, lambda: synced(pane))
+            tall = pane._cache_limit()
+            for n in range(700):
+                pane._strip_for(f"filler {n}")
+            filled = len(pane._strip_cache)
+            await pilot.resize_terminal(40, 24)
+            await wait_until(pilot, lambda: pane.content_size.height == 24)
+            await pilot.pause()
+            short, kept = pane._cache_limit(), len(pane._strip_cache)
+            await pilot.resize_terminal(40, 150)
+            await wait_until(pilot, lambda: pane.content_size.height == 150)
+            return tall, filled, short, kept, pane._strip_cache.limit
+
+    tall, filled, short, kept, grown = run(drive())
+    assert tall == 800 and filled > 512, "the premise: more rows than four short screens"
+    assert short == kept == 512, "the pane shrank: its oldest rows went at once"
+    assert grown == 600
+
+
+def test_a_hidden_pane_keeps_no_rendered_rows_and_paints_the_same_when_shown(
+    fake: FakeTmux, tmp_path: Path
+) -> None:
+    """#42: a pane behind another tab drops its render cache; shown again, it paints exactly
+    what it painted before."""
+    fake.panes["%2"] = FakePane(screen=["second pane"])
+
+    async def drive() -> tuple[int, tuple[int, int], bool]:
+        host = SwitcherHost(fake.server(tmp_path))
+        async with host.run_test(size=(40, 6)) as pilot:
+            first = host.query_one("#first", TerminalPane)
+            await wait_until(pilot, lambda: synced(first) and screen_text(first)[0] == "red plain")
+            before = _painted(first)
+            cached = len(first._strip_cache)
+            host.tabs.current = "second"
+            # Off screen at the layout, hidden (``on_hide``) a moment later: polled, bounded.
+            await wait_until(
+                pilot,
+                lambda: (
+                    not first.is_on_screen and len(first._strip_cache) == len(first._row_cache) == 0
+                ),
+            )
+            hidden = (len(first._strip_cache), len(first._row_cache))
+            host.tabs.current = "first"
+            await wait_until(pilot, lambda: first.is_on_screen and synced(first))
+            await pilot.pause()
+            return cached, hidden, _painted(first) == before
+
+    cached, hidden, same = run(drive())
+    assert cached > 0, "the premise: the shown pane had rendered rows"
+    assert hidden == (0, 0)
+    assert same, "shown again, it paints what it painted before"
+
+
+def test_attach_to_another_pane_drops_the_rows_the_first_rendered(
+    fake: FakeTmux, tmp_path: Path
+) -> None:
+    """#42: attach to another pane empties the render cache of the first pane's rows; attach
+    to the same pane (its agent restarted in place) keeps them."""
+    fake.panes["%2"] = FakePane(screen=["second pane"])
+
+    async def drive() -> tuple[list[str], int, int, list[str]]:
+        host = Host(fake.server(tmp_path), "%1")
+        async with host.run_test(size=(40, 6)) as pilot:
+            pane = host.pane
+            await wait_until(pilot, lambda: synced(pane) and screen_text(pane)[0] == "red plain")
+            rows(pane)
+            first = [line for line in pane._strip_cache._entries if "row" in line or "red" in line]
+            pane.attach("%1")
+            same = sum(pane._strip_cache.get(line) is not None for line in first)
+            pane.attach("%2")
+            other = sum(pane._strip_cache.get(line) is not None for line in first)
+            await wait_until(pilot, lambda: screen_text(pane)[0] == "second pane")
+            return first, same, other, screen_text(pane)
+
+    first, same, other, text = run(drive())
+    assert len(first) == 3, first
+    assert same == 3, "the same pane again keeps its rows"
+    assert other == 0, "another pane's attach dropped the first one's rows"
+    assert text[0] == "second pane"

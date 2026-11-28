@@ -35,7 +35,7 @@ from textual.message import Message
 from textual.notifications import SeverityLevel
 from textual.widgets._toast import ToastRack
 
-from aisquare.cli.ui import timers, toasts
+from aisquare.cli.ui import paste_guard, timers, toasts
 from aisquare.core import clipboard, program
 
 ReturnType = TypeVar("ReturnType")
@@ -136,6 +136,8 @@ class ClipboardApp(App[ReturnType]):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # Before any timer: on Windows, none of them waits in a thread (``cli.ui.timers``).
         timers.install()
+        # Before the driver builds its parser, which binds the parse in place at that moment.
+        paste_guard.install()
         super().__init__(*args, **kwargs)
 
     def _on_load(self) -> None:
