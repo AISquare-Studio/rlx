@@ -67,6 +67,7 @@ mod out;
 pub mod peer;
 pub mod pty;
 pub mod registry;
+mod route;
 mod runner;
 pub(crate) mod scheduler;
 mod serve;

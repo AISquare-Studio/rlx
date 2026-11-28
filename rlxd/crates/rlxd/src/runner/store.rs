@@ -84,6 +84,10 @@ pub struct Record {
     /// sign-in `auth` waits on. None when they gave none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
+    /// The account the run is on, and why (#15): its route, which every attempt keeps.
+    /// Absent in a record from before routing: `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<rlxd_proto::RunAccount>,
     /// Whether the run is a `connectors.call` (5.3): it is never resumed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub connectors_call: bool,

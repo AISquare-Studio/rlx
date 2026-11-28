@@ -54,10 +54,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use rlxd_client::Home;
 use rlxd_proto::{
     Data, EnvValues, ErrorBody, Event, FailReason, Mount, NeedsYouClearedData, NeedsYouRaisedData,
-    NeedsYouReason, RunCancelData, RunDoneData, RunEventsData, RunEventsParams, RunFailedData,
-    RunGetData, RunId, RunKind, RunListData, RunListParams, RunNeedsYouData, RunQueuedData,
-    RunRateLimitedData, RunRef, RunResumeData, RunResumeParams, RunStartParams, RunStartedData,
-    RunState, RunSummary, RunTextData, RunToolResultData, SpaceEraseData, codes, run_types, topics,
+    NeedsYouReason, RouteBy, RunAccount, RunCancelData, RunDoneData, RunEventsData,
+    RunEventsParams, RunFailedData, RunGetData, RunId, RunKind, RunListData, RunListParams,
+    RunNeedsYouData, RunQueuedData, RunRateLimitedData, RunRef, RunResumeData, RunResumeParams,
+    RunStartParams, RunStartedData, RunState, RunSummary, RunTextData, RunToolResultData,
+    SpaceEraseData, codes, run_types, topics,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -67,7 +68,7 @@ use tokio::sync::watch;
 
 use crate::bus::{self, Bus};
 use crate::claude::{self, Resolved};
-use crate::connectors::{Account, Connectors};
+use crate::connectors::{Account, Connectors, RanOn};
 use crate::env::Env;
 use crate::log::{info, warning};
 use crate::{clock, spaces};
@@ -288,6 +289,7 @@ struct View {
     started_at: String,
     ended_at: Option<String>,
     last_run_seq: u64,
+    account: RunAccount,
 }
 
 impl View {
@@ -298,6 +300,7 @@ impl View {
             started_at: inner.started_at.clone(),
             ended_at: inner.ended_at.clone(),
             last_run_seq: inner.last_run_seq,
+            account: inner.account,
         }
     }
 }
@@ -337,6 +340,10 @@ struct RunInner {
     /// (4.3), `None` when they gave none: then it ran on rlxd's own. Whose sign-in its
     /// `auth` waits on.
     home: Option<String>,
+    /// The account the run is on, and why (#15): its route, decided at `run.start` and
+    /// kept by every attempt. A `default` run's slot is worked out again at each attempt,
+    /// from [`RunInner::home`]; a pinned or routed run's never changes.
+    account: RunAccount,
     /// Events appended to the log since its last fsync.
     unsynced: u32,
     /// The last `run_seq` in the run's log: an event whose append failed is not counted,
@@ -647,6 +654,9 @@ impl Runner {
                     needs_you,
                     auth,
                     home: record.home.clone(),
+                    account: record
+                        .account
+                        .unwrap_or(RunAccount::new(None, RouteBy::Default)),
                     unsynced: 0,
                     logged: tail.last_run_seq,
                     // A call still executing when its rlxd stopped may have run: unknown.
@@ -677,6 +687,9 @@ impl Runner {
                     started_at: record.started_at.clone(),
                     ended_at: record.ended_at.clone(),
                     last_run_seq,
+                    account: record
+                        .account
+                        .unwrap_or(RunAccount::new(None, RouteBy::Default)),
                 }),
                 ends: watch::Sender::new(if record.state.is_live() {
                     Vec::new()
@@ -776,21 +789,26 @@ impl Runner {
     /// enforces it, 5.1), `run_exists`, `claude_not_found` or `claude_not_runnable` when
     /// the `claude` resolved for the app's environment (4.3) is none rlxd runs, or
     /// `run_start_failed` when rlxd is stopping or the run's record can't be written.
+    ///
+    /// `account` is the run's route (#15, [`crate::route::Router::route`]): the account a
+    /// pinned or routed run starts on, which every attempt keeps, or `default`.
     pub fn start(
         self: &Arc<Self>,
         params: RunStartParams,
         client: &str,
         job: Option<JobTag>,
+        account: RunAccount,
     ) -> Result<RunRef, ErrorBody> {
         check_start(&params)?;
         let (job_id, loud, watch_job) = match job {
             Some(job) => (Some(job.job_id), Some(job.loud), job.watch),
             None => (None, None, false),
         };
-        self.start_checked(params, client, job_id, loud, watch_job, None)
+        self.start_checked(params, client, job_id, loud, watch_job, None, account)
     }
 
     /// [`Runner::start`], its params checked; `call` for a `connectors.call` run.
+    #[allow(clippy::too_many_arguments)]
     fn start_checked(
         self: &Arc<Self>,
         params: RunStartParams,
@@ -799,6 +817,7 @@ impl Runner {
         loud: Option<bool>,
         watch_job: bool,
         call: Option<call::CallRun>,
+        account: RunAccount,
     ) -> Result<RunRef, ErrorBody> {
         if self.stopping.load(Ordering::SeqCst) {
             return Err(refusal(
@@ -875,6 +894,7 @@ impl Runner {
                 needs_you: None,
                 auth: Vec::new(),
                 home: None,
+                account,
                 unsynced: 0,
                 logged: 0,
                 session_started: false,
@@ -895,6 +915,7 @@ impl Runner {
                 started_at,
                 ended_at: None,
                 last_run_seq: 0,
+                account,
             }),
             ends: watch::Sender::new(Vec::new()),
             params,
@@ -1080,7 +1101,9 @@ impl Runner {
         if let Some(delay) = self.resume_delay {
             std::thread::sleep(delay);
         }
-        let resumed = self.resume_under_its_lock(&run, params.reply);
+        let resumed = self
+            .account_still_known(&run)
+            .and_then(|()| self.resume_under_its_lock(&run, params.reply));
         let kind = run.params.kind;
         let queued = {
             let mut runs = self.runs();
@@ -1118,6 +1141,36 @@ impl Runner {
             }
         }
         Ok(RunResumeData::new(id, attempt))
+    }
+
+    /// Whether a pinned or routed run's account is one rlx still knows, with both its
+    /// homes (#15): a resume keeps the run's account and never picks another, so it is
+    /// refused `no_such_account` (or `account_unknown`) otherwise. Worked out with no
+    /// run's lock held.
+    fn account_still_known(&self, run: &Run) -> Result<(), ErrorBody> {
+        let account = run.inner().account;
+        let Some(slot) = account.slot.filter(|_| account.by != RouteBy::Default) else {
+            return Ok(());
+        };
+        match self.connectors.account(slot) {
+            Some(known) if known.homes_known() => Ok(()),
+            Some(_) => Err(refusal(
+                codes::ACCOUNT_UNKNOWN,
+                format!(
+                    "run {} is on account {slot}, whose homes rlxd doesn't know now: it \
+                     resumes there or nowhere",
+                    run.params.run_id
+                ),
+            )),
+            None => Err(refusal(
+                codes::NO_SUCH_ACCOUNT,
+                format!(
+                    "run {} is on account {slot}, which rlx no longer knows: it resumes \
+                     there or nowhere",
+                    run.params.run_id
+                ),
+            )),
+        }
     }
 
     /// `run.resume`'s checks and its new attempt, under the run's own lock alone: the
@@ -1243,6 +1296,7 @@ impl Runner {
         data.structured_output.clone_from(&inner.structured_output);
         // The gate's ledger: what the app reads of a send after any end (5.1).
         data.calls.clone_from(&inner.calls);
+        data.account = Some(inner.account);
         Ok(data)
     }
 
@@ -1274,6 +1328,7 @@ impl Runner {
                 summary.client.clone_from(&run.client);
                 summary.attempt = view.attempt;
                 summary.space.clone_from(&run.params.space);
+                summary.account = Some(view.account);
                 Some(summary)
             })
             .collect();
@@ -1445,7 +1500,19 @@ impl Runner {
         // has runs, whose session files are there.
         let mut projects_held: Vec<Vec<remove::Dir>> = Vec::new();
         if !ours.is_empty() {
-            for config in config_dirs() {
+            // A pinned or routed run's sessions are in its account's home (#15).
+            let mut configs = config_dirs();
+            for dir in self
+                .connectors
+                .accounts()
+                .into_iter()
+                .filter_map(|account| account.config_dir)
+            {
+                if !configs.contains(&dir) {
+                    configs.push(dir);
+                }
+            }
+            for config in configs {
                 for folder in &folders {
                     match remove::walk(&config, &[OsStr::new("projects"), OsStr::new(folder)]) {
                         Ok(Ok(Some(held))) => projects_held.push(held),
@@ -1796,16 +1863,20 @@ impl Runner {
             !inner.auth.is_empty() && inner.auth.iter().all(|id| connected.contains(id))
         };
         for run in self.snapshot() {
-            let home = {
+            let (home, account) = {
                 let inner = run.inner();
                 if !waits(&inner) {
                     continue;
                 }
-                inner.home.clone()
+                (inner.home.clone(), inner.account)
             };
             // Only a sign-in on the account its own attempt ran on (4.3), worked out with no
-            // run's lock held.
-            if self.connectors.slot_of_home(home.as_deref()) != Some(slot) {
+            // run's lock held: a pinned or routed run's own (#15), else its home's.
+            let ran = match account.by {
+                RouteBy::Default => self.connectors.slot_of_home(home.as_deref()),
+                RouteBy::Pinned | RouteBy::Connectors => account.slot,
+            };
+            if ran != Some(slot) {
                 continue;
             }
             let mut inner = run.inner();
@@ -1896,6 +1967,16 @@ impl Runner {
         // when there was none; this is for an environment changed since.
         let (values, resolved) = self.env.snapshot();
         run.inner().home.clone_from(&values.claude_config_dir);
+        // The account this attempt runs on (#15): a pinned or routed run's own, which it
+        // keeps; else the app's environment, as before routing.
+        let on = match self.account_of(run, &values) {
+            Ok(on) => on,
+            Err(message) => return failed(message),
+        };
+        let ran = match &on {
+            Some(account) => RanOn::Account(account.slot),
+            None => RanOn::Home(values.claude_config_dir.as_deref()),
+        };
         let program = match claude_from(resolved) {
             Ok(program) => program,
             Err(refused) => return failed(refused.message),
@@ -1929,7 +2010,7 @@ impl Runner {
         // session as it was before its first try.
         let kept = gate
             .as_ref()
-            .map(|_| self.session_kept(run, &space, attempt));
+            .map(|_| self.session_kept(run, &space, attempt, on.as_ref()));
         let mut tries = 0;
         loop {
             tries += 1;
@@ -1939,7 +2020,7 @@ impl Runner {
                     run,
                     attempt,
                     &program,
-                    &values,
+                    (&values, on.as_ref()),
                     &space,
                     &settings,
                     gate.as_ref(),
@@ -1982,9 +2063,9 @@ impl Runner {
                         continue;
                     }
                     if let Some(init) = init.filter(|_| reads_connectors(params)) {
-                        // Filed by the home this attempt ran on, never the runs' home now.
-                        let home = values.claude_config_dir.as_deref();
-                        blocking(|| self.connectors.observe(init.observed(), home));
+                        // Filed by the account or home this attempt ran on, never the runs'
+                        // home now.
+                        blocking(|| self.connectors.observe_ran(init.observed(), ran));
                     }
                     End::Failed(
                         RunFailedData::new(
@@ -2010,27 +2091,74 @@ impl Runner {
     /// The gate of a run with `needs_connectors`, on this rlxd's route; `None` for a run
     /// without.
     fn gate_of(&self, params: &RunStartParams) -> Option<Gate> {
-        if params.needs_connectors.is_empty() {
+        let named = gated(params);
+        if named.is_empty() {
             return None;
         }
         let times = self.connectors.gate_times();
         Some(Gate {
-            named: params.needs_connectors.clone(),
+            named,
             route_1: self.connectors.route_1(),
             wait: times.wait,
             settle: times.settle,
         })
     }
 
+    /// The account a run's attempt runs on (#15), its environment snapshot `values` in
+    /// hand: a pinned or routed run's own, as rlx knows it now (`None` for a `default`
+    /// run, whose slot is worked out again from its home, as its init is filed); or why it
+    /// can't run there, for an account rlx no longer knows or whose homes it doesn't. A
+    /// route is never picked again. Worked out with no lock of the run's held across it.
+    fn account_of(&self, run: &Run, values: &EnvValues) -> Result<Option<Account>, String> {
+        let account = run.inner().account;
+        let slot = match account.by {
+            RouteBy::Default => {
+                let slot = self
+                    .connectors
+                    .slot_of_home(values.claude_config_dir.as_deref());
+                run.inner().account = RunAccount::new(slot, RouteBy::Default);
+                return Ok(None);
+            }
+            RouteBy::Pinned | RouteBy::Connectors => account.slot,
+        };
+        let Some(slot) = slot else {
+            return Err("the run's account was never recorded: it runs nowhere".to_owned());
+        };
+        match self.connectors.account(slot) {
+            Some(known) if known.homes_known() => Ok(Some(known)),
+            Some(_) => Err(format!(
+                "rlxd doesn't know both homes of account {slot}, which the run is on: it runs \
+                 there or nowhere"
+            )),
+            None => Err(format!(
+                "rlx no longer knows account {slot}, which the run is on: it runs there or \
+                 nowhere"
+            )),
+        }
+    }
+
     /// The session files a gated attempt's tries write to, each with its length before
     /// the first try when the attempt resumes one ([`Kept`]). None for a run whose
-    /// session isn't kept.
-    fn session_kept(&self, run: &Run, space: &std::path::Path, attempt: u64) -> Kept {
+    /// session isn't kept. A run on a managed account (`on`, #15) keeps its sessions in
+    /// that account's `CLAUDE_CONFIG_DIR`.
+    fn session_kept(
+        &self,
+        run: &Run,
+        space: &std::path::Path,
+        attempt: u64,
+        on: Option<&Account>,
+    ) -> Kept {
         if !run.params.persists() {
             return Kept::default();
         }
         let file = format!("{}.jsonl", run.params.run_id);
-        let files = config_dirs()
+        let mut dirs = config_dirs();
+        if let Some(dir) = on.and_then(|account| account.config_dir.clone())
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
+        let files = dirs
             .into_iter()
             .map(|dir| {
                 let path = dir.join("projects").join(project_folder(space)).join(&file);
@@ -2118,7 +2246,7 @@ impl Runner {
         run: &Arc<Run>,
         attempt: u64,
         program: &std::path::Path,
-        values: &EnvValues,
+        (values, on): (&EnvValues, Option<&Account>),
         space: &std::path::Path,
         settings: &std::path::Path,
         gate: Option<&Gate>,
@@ -2137,7 +2265,12 @@ impl Runner {
         if let Some(reason) = ending {
             return Tried::End(ended_early(run, reason));
         }
-        let mut env = run_env(values);
+        // A pinned or routed run's on its account's homes, as #618's reads are (#15); else
+        // the app's values as they are.
+        let (mut env, unset) = match on {
+            Some(account) => account_env(values, account),
+            None => (run_env(values), Vec::new()),
+        };
         // Every process of the run inherits it: the start sweep's way to know them.
         env.push((process::RUN_ID_ENV.into(), params.run_id.as_str().into()));
         // The attempt's hook key: its hooks inherit it, and the gate wants it back (5.1).
@@ -2156,7 +2289,7 @@ impl Runner {
             args: argv::args(params, attempt, settings),
             cwd: space.to_owned(),
             env,
-            unset: Vec::new(),
+            unset,
         };
         let (mut child, tree) = match self.spawner.spawn(launch).await {
             Ok(spawned) => spawned,
@@ -2200,7 +2333,10 @@ impl Runner {
                 gate,
                 deadline,
                 confirmed,
-                values.claude_config_dir.as_deref(),
+                match on {
+                    Some(account) => RanOn::Account(account.slot),
+                    None => RanOn::Home(values.claude_config_dir.as_deref()),
+                },
             )
             .await;
         let end = match streamed {
@@ -2304,7 +2440,7 @@ impl Runner {
         gate: Option<&Gate>,
         deadline: Option<Instant>,
         delivered: &mut bool,
-        home: Option<&str>,
+        ran: RanOn<'_>,
     ) -> Streamed {
         let params = &run.params;
         let try_started = Instant::now();
@@ -2480,7 +2616,8 @@ impl Runner {
                         };
                         let data = RunStartedData::new(init.cwd, init.model, init.claude_version)
                             .with_tools(init.tools, init.mcp_servers)
-                            .resumed(attempt > 1);
+                            .resumed(attempt > 1)
+                            .on_account(inner.account);
                         self.emit(run, &mut inner, run_types::STARTED, &data);
                     }
                     Line::Text(text) => {
@@ -2556,9 +2693,9 @@ impl Runner {
                 // only after the gate has what the init listed: a hook that asks about the
                 // turn's first call never waits on the cache (5.1).
                 if let Some(init) = seen {
-                    // Filed by the home this attempt ran on (4.3), never the runs' home now,
-                    // which an env.set may have changed since it started.
-                    blocking(|| self.connectors.observe(init.observed(), home));
+                    // Filed by the account or home this attempt ran on (4.3, #15), never the
+                    // runs' home now, which an env.set may have changed since it started.
+                    blocking(|| self.connectors.observe_ran(init.observed(), ran));
                 }
             }
         }
@@ -2802,6 +2939,7 @@ impl Run {
             pinned_call_used: inner.pinned_call_used,
             auth: inner.auth.clone(),
             home: inner.home.clone(),
+            account: Some(inner.account),
             connectors_call: self.call.is_some(),
         }
     }
@@ -2887,6 +3025,18 @@ fn reads_connectors(params: &RunStartParams) -> bool {
     params.mount != Mount::NoTools
 }
 
+/// The connectors a run's every try checks at init (5.5): its `needs_connectors`, then
+/// those it is routed by (`connectors`, #15) that they don't name, each once.
+fn gated(params: &RunStartParams) -> Vec<String> {
+    let mut named = params.needs_connectors.clone();
+    for connector in &params.connectors {
+        if !named.contains(connector) {
+            named.push(connector.clone());
+        }
+    }
+    named
+}
+
 /// A gated attempt's session files ([`Runner::session_kept`]).
 #[derive(Debug, Default)]
 struct Kept {
@@ -2897,12 +3047,11 @@ struct Kept {
     files: Vec<(PathBuf, Option<u64>)>,
 }
 
-/// The Claude Code config directories whose sessions `space.erase` deletes:
-/// `CLAUDE_CONFIG_DIR` from rlxd's environment, and the default `~/.claude`.
-///
-/// TODO(manager): rlx knows every account's config directory (Python's
-/// `services/claude_accounts.py`); once the brain (#30) serves that list, take it from
-/// there, so an erase reaches every account's sessions.
+/// The Claude Code config directories whose sessions `space.erase` deletes and a gated
+/// try takes back: `CLAUDE_CONFIG_DIR` from rlxd's environment, and the default
+/// `~/.claude`. `space.erase` adds every managed account's that rlx lists (the brain's
+/// `accounts`), where pinned and routed runs keep theirs (#15), and a try its own
+/// account's.
 fn config_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
@@ -3229,6 +3378,14 @@ pub fn check_start(params: &RunStartParams) -> Result<(), ErrorBody> {
         return Err(refusal(
             codes::KIND_MOUNT_MISMATCH,
             "a run with needs_connectors takes a mount that loads them: mount \
+             {\"kind\": \"no_tools\"} loads none"
+                .to_owned(),
+        ));
+    }
+    if !params.connectors.is_empty() && params.mount == Mount::NoTools {
+        return Err(refusal(
+            codes::KIND_MOUNT_MISMATCH,
+            "a run with connectors takes a mount that loads them: mount \
              {\"kind\": \"no_tools\"} loads none"
                 .to_owned(),
         ));

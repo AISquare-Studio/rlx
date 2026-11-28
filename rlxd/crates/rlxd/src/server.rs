@@ -44,10 +44,10 @@ use rlxd_proto::{
     EnvRefusal, EnvValues, Envelope, ErrorBody, Event, HelloData, HelloParams, JobListParams,
     JobPutParams, JobRef, PROTOCOL_VERSION, PROTOCOL_VERSIONS, Params, Paths, PtyKillParams,
     PtyResizeParams, PtyScreenParams, PtySpawnParams, PtySubscribeParams, PtyWriteParams, Request,
-    RequestId, Role, RunDecideParams, RunEventsParams, RunListParams, RunRef, RunResumeParams,
-    RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams, SettingsSetParams,
-    SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes, event_types,
-    methods, setting_keys, topics,
+    RequestId, Role, RouteBy, RunAccount, RunDecideParams, RunEventsParams, RunListParams, RunRef,
+    RunResumeParams, RunStartParams, SettingsDeleteParams, SettingsGetParams, SettingsListParams,
+    SettingsSetParams, SpaceEnsureData, SpaceParams, StatusData, SubscribeParams, VERSION, codes,
+    event_types, methods, setting_keys, topics,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -64,8 +64,9 @@ use crate::listener::Hangup;
 use crate::log::{info, warning};
 use crate::peer::Peer;
 use crate::pty::{self, Host};
+use crate::route::Router;
 use crate::runner::{Replay, Runner};
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Prefetch, Scheduler};
 use crate::settings::{self, Settings};
 use crate::{claude, spaces, token};
 
@@ -111,6 +112,8 @@ pub struct Daemon {
     map: Arc<ConnectorMap>,
     /// The scheduler, or why it couldn't start (its database couldn't be made).
     scheduler: Result<Arc<Scheduler>, String>,
+    /// Picks a run's account by its connectors (#15), for `run.start` and job fires.
+    router: Arc<Router>,
     settings: Settings,
     /// The app's environment for Claude Code (4.3), and the `claude` it resolves to.
     env: Arc<Env>,
@@ -238,7 +241,14 @@ impl Daemon {
             Arc::clone(&brain),
         );
         tokio::spawn(Arc::clone(&map).run());
-        let scheduler = Scheduler::new(&home, Arc::clone(&bus), Arc::clone(&runner), gate.apps());
+        let router = Router::new(Arc::clone(&connectors), Arc::clone(&brain));
+        let scheduler = Scheduler::new(
+            &home,
+            Arc::clone(&bus),
+            Arc::clone(&runner),
+            Arc::clone(&router),
+            gate.apps(),
+        );
         match &scheduler {
             Ok(scheduler) => {
                 tokio::spawn(Arc::clone(scheduler).run(runner.notes()));
@@ -258,6 +268,7 @@ impl Daemon {
             connectors,
             map,
             scheduler,
+            router,
             settings,
             env,
             stopping: AtomicBool::new(false),
@@ -561,7 +572,7 @@ impl Daemon {
                     .await
             }
             #[cfg(feature = "debug-methods")]
-            methods::DEBUG_RUN_START => self.debug_run_start(session, request.params),
+            methods::DEBUG_RUN_START => self.debug_run_start(session, request.params).await,
             methods::RUN_DECIDE => self.run_decide(session, request.params).await,
             #[cfg(feature = "debug-methods")]
             methods::DEBUG_PRE_TOOL_USE => {
@@ -580,10 +591,10 @@ impl Daemon {
             | methods::JOB_DELETE
             | methods::JOB_PAUSE
             | methods::JOB_RESUME
-            | methods::JOB_RUN_NOW => self.jobs(&request.method, request.params),
+            | methods::JOB_RUN_NOW => self.jobs(&request.method, request.params).await,
             #[cfg(feature = "debug-methods")]
             methods::DEBUG_CLOCK_ADVANCE | methods::DEBUG_CLOCK_SET => {
-                self.debug_clock(&request.method, request.params)
+                self.debug_clock(&request.method, request.params).await
             }
             methods::STOP => {
                 let data = object(&json!({"pid": self.pid}));
@@ -966,7 +977,11 @@ impl Daemon {
     /// `debug.run_start`: `run.start`'s params plus a scheduler `job_id`, which only rlxd
     /// sets otherwise (7.6), so tests can check `run.list {job_id}`. Test builds only.
     #[cfg(feature = "debug-methods")]
-    fn debug_run_start(&self, session: &Session, mut params: Params) -> Result<Data, ErrorBody> {
+    async fn debug_run_start(
+        &self,
+        session: &Session,
+        mut params: Params,
+    ) -> Result<Data, ErrorBody> {
         let job_id = match params.remove("job_id") {
             Some(Value::String(job_id)) if !job_id.is_empty() => job_id,
             _ => {
@@ -977,6 +992,7 @@ impl Daemon {
             }
         };
         let params = params_of::<RunStartParams>(methods::DEBUG_RUN_START, params)?;
+        let account = self.route(&params).await?;
         printed(&off_worker(|| {
             self.runner.start(
                 params,
@@ -986,6 +1002,7 @@ impl Daemon {
                     loud: false,
                     watch: false,
                 }),
+                account,
             )
         })?)
     }
@@ -1044,7 +1061,7 @@ impl Daemon {
 
     /// The scheduler's methods (handoff 0.10.3, 7.6): `job.put`, `job.list`, `job.delete`,
     /// `job.pause`, `job.resume` and `job.run_now`. They write its store: blocking work.
-    fn jobs(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
+    async fn jobs(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
         let scheduler = self.scheduler.as_ref().map_err(|why| {
             error(
                 codes::INTERNAL,
@@ -1071,6 +1088,8 @@ impl Daemon {
             }
             methods::JOB_RUN_NOW => {
                 let job = params_of::<JobRef>(method, params)?;
+                // A fire that routes by connectors has the brain's usage first (#15).
+                scheduler.prefetch(Prefetch::Job(&job.job_id)).await;
                 printed(&off_worker(|| scheduler.run_now(&job))?)
             }
             _ => Err(error(codes::UNKNOWN_METHOD, method)),
@@ -1081,7 +1100,7 @@ impl Daemon {
     /// the scheduler's test clock, and answer `{now}` once every decision due by then is
     /// made.
     #[cfg(feature = "debug-methods")]
-    fn debug_clock(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
+    async fn debug_clock(&self, method: &str, params: Params) -> Result<Data, ErrorBody> {
         let scheduler = self.scheduler.as_ref().map_err(|why| {
             error(
                 codes::INTERNAL,
@@ -1102,8 +1121,36 @@ impl Daemon {
                 .parse::<jiff::Timestamp>()
                 .map_err(|e| error(codes::INVALID_PARAMS, &format!("at: {e}")))?
         };
+        // Any job may come due: one that routes by connectors has the brain's usage first.
+        scheduler.prefetch(Prefetch::Any).await;
         let now = off_worker(|| scheduler.clock_to(at))?;
         Ok(object(&json!({"now": now.to_string()})))
+    }
+
+    /// The account `params` start on (#15): `run.start`'s own checks first, then the
+    /// route, with the brain's usage when it routes by connectors. Logged by slot and
+    /// reason alone.
+    async fn route(&self, params: &RunStartParams) -> Result<RunAccount, ErrorBody> {
+        crate::runner::check_start(params)?;
+        let usage = if Router::wants_usage(params) {
+            Some(self.router.usage().await)
+        } else {
+            None
+        };
+        let account = self.router.route(params, usage.as_ref());
+        match &account {
+            Ok(account) if account.by != RouteBy::Default => {
+                if let Some(slot) = account.slot {
+                    info!("run {}: on account {slot} ({})", params.run_id, account.by);
+                }
+            }
+            Ok(_) => {}
+            Err(refused) => info!(
+                "run {}: no account takes it: {}",
+                params.run_id, refused.code
+            ),
+        }
+        account
     }
 
     /// The runner's methods (handoff 0.10.3, 5.4 and 7.5) and spaces' (2.5): `run.start`,
@@ -1118,9 +1165,10 @@ impl Daemon {
         match method {
             methods::RUN_START => {
                 let params = params_of::<RunStartParams>(method, params)?;
+                let account = self.route(&params).await?;
                 // Blocking work: it may wait on a run's lock, or write the run's record.
                 printed(&off_worker(|| {
-                    self.runner.start(params, &session.client, None)
+                    self.runner.start(params, &session.client, None, account)
                 })?)
             }
             methods::RUN_CANCEL => {
